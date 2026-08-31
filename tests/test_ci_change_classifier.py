@@ -3060,6 +3060,46 @@ def _analyse_function(
             unresolved.append(
                 f"{filename}:{node.lineno}: subprocess docs-path provenance is ambiguous"
             )
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "map"
+            and node.args
+            and isinstance(node.args[0], ast.Attribute)
+            and node.args[0].attr in _READ_METHOD_NAMES
+        ):
+            callback = node.args[0]
+            if isinstance(callback.value, ast.Name) and callback.value.id == "Path":
+                if len(node.args) != 2 or isinstance(node.args[1], ast.Starred):
+                    unresolved.append(
+                        f"{filename}:{node.lineno}: reader callback provenance is ambiguous"
+                    )
+                elif isinstance(node.args[1], (ast.List, ast.Tuple, ast.Set)):
+                    states = [
+                        (
+                            "ambiguous"
+                            if not _string_constants(argument)
+                            else _argument_state(argument)
+                        )
+                        for argument in node.args[1].elts
+                    ]
+                    if "docs" in states:
+                        reads = True
+                    elif "ambiguous" in states:
+                        unresolved.append(
+                            f"{filename}:{node.lineno}: reader callback provenance is ambiguous"
+                        )
+                else:
+                    unresolved.append(
+                        f"{filename}:{node.lineno}: reader callback provenance is ambiguous"
+                    )
+            else:
+                callback_state = _reader_alias_state(callback)
+                if callback_state == "docs":
+                    reads = True
+                elif callback_state == "ambiguous":
+                    unresolved.append(
+                        f"{filename}:{node.lineno}: reader callback provenance is ambiguous"
+                    )
         qualified_target = _qualified_open_target(node)
         if qualified_target is not None:
             target = qualified_target
@@ -3192,6 +3232,10 @@ def _analyse_function(
             if (call_key := _call_key(node)) is not None:
                 _record_call(call_key, node)
                 continue
+            local_module_key = f"{node.func.value.id}.{node.func.attr}"
+            if local_module_key in (local_functions or {}):
+                _record_call((local_functions or {})[local_module_key], node)
+                continue
             receiver = node.func.value
             helper_class = helper_class_instances.get(receiver.id, receiver.id)
             if helper_class in (relevant_helper_classes or set()):
@@ -3291,8 +3335,39 @@ def _assert_no_unattributable_module_docs_reads(
 def _assert_no_unaudited_collected_test_bases(tree: ast.Module, filename: str) -> None:
     """Reject collected test classes whose inherited methods are outside this module audit."""
 
+    unittest_modules = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "unittest"
+    }
+    testcase_names = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom) and statement.module == "unittest"
+        for alias in statement.names
+        if alias.name == "TestCase"
+    }
+
+    def is_collected(statement: ast.ClassDef) -> bool:
+        """Return whether pytest collects this static class form."""
+
+        if statement.name.startswith("Test"):
+            return True
+        return any(
+            (isinstance(base, ast.Name) and base.id in testcase_names)
+            or (
+                isinstance(base, ast.Attribute)
+                and base.attr == "TestCase"
+                and isinstance(base.value, ast.Name)
+                and base.value.id in unittest_modules
+            )
+            for base in statement.bases
+        )
+
     for statement in tree.body:
-        if not isinstance(statement, ast.ClassDef) or not statement.name.startswith("Test"):
+        if not isinstance(statement, ast.ClassDef) or not is_collected(statement):
             continue
         if statement.bases:
             bases = ", ".join(ast.unparse(base) for base in statement.bases)
@@ -3614,6 +3689,42 @@ def _docs_reading_test_modules(
             ambiguous_local_targets[key] = ambiguous
             local_keys.add(key)
 
+    scoped_imported_analyses: dict[str, _FunctionAnalysis] = {}
+    for owner, node in list(functions.items()):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        imports = [
+            statement
+            for statement in ast.walk(node)
+            if isinstance(statement, (ast.Import, ast.ImportFrom))
+        ]
+        if not imports:
+            continue
+        scoped_tree = ast.Module(body=[*imports, node], type_ignores=[])
+        scoped_analyses, scoped_ambiguous, *_ = _repository_imported_function_analyses(
+            scoped_tree, filename, repository_root
+        )
+        targets = local_targets.setdefault(owner, {})
+        ambiguous_targets = ambiguous_local_targets.setdefault(owner, set())
+        assigned_names = {
+            target.id
+            for assignment in ast.walk(node)
+            if isinstance(assignment, (ast.Assign, ast.AnnAssign))
+            for target in (
+                assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+            )
+            if isinstance(target, ast.Name)
+        }
+        for alias, analysis in scoped_analyses.items():
+            if alias in targets or alias in assigned_names:
+                ambiguous_targets.add(alias)
+                targets.pop(alias, None)
+                continue
+            key = f"{owner}::<import>::{alias}"
+            targets[alias] = key
+            scoped_imported_analyses[key] = analysis
+        ambiguous_targets.update(scoped_ambiguous)
+
     analyses: dict[str, _FunctionAnalysis] = {}
     unresolved: list[str] = []
     for name, node in functions.items():
@@ -3658,6 +3769,7 @@ def _docs_reading_test_modules(
             f"could hide an unmarked docs read: {unresolved}"
         )
     analyses.update(imported_analyses)
+    analyses.update(scoped_imported_analyses)
     analyses.update(imported_fixture_analyses)
 
     pytest_decorator_modules = pytest_module_aliases | {"pytest"}
@@ -4342,6 +4454,48 @@ def test_docs_governance_follows_repository_local_imported_helpers(tmp_path: Pat
         _docs_reading_test_modules(
             "from _agent_defs import missing\n\ndef test_ambiguous() -> None:\n    missing()\n",
             filename=str(tests_root / "test_imported.py"),
+            repository_root=tmp_path,
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_follows_function_scoped_repository_imports(tmp_path: Path) -> None:
+    """Collected tests retain provenance from repository-local nested imports."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/imported-local.md').read_text()\n\n"
+        "def load_config() -> str:\n    return Path('config/imported-local.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "def test_local_import() -> None:\n"
+        "    from helpers import load\n"
+        "    assert load()\n\n"
+        "def test_local_module_import() -> None:\n"
+        "    import helpers\n"
+        "    assert helpers.load()\n\n"
+        "def test_local_non_docs_import() -> None:\n"
+        "    from helpers import load_config\n"
+        "    assert load_config()\n\n"
+        "class TestMethodImport:\n"
+        "    def test_local_method_import(self) -> None:\n"
+        "        from helpers import load\n"
+        "        assert load()\n"
+    )
+    assert _docs_reading_test_modules(
+        source, filename=str(tmp_path / "test_local_import.py"), repository_root=tmp_path
+    ) == {
+        "test_local_import",
+        "test_local_module_import",
+        "TestMethodImport::test_local_method_import",
+    }
+    with pytest.raises(AssertionError, match="unresolved local helper edge `load\\(\\)`"):
+        _docs_reading_test_modules(
+            "def test_local_relative_import() -> None:\n"
+            "    from .missing import load\n"
+            "    load()\n",
+            filename=str(tmp_path / "test_local_relative.py"),
             repository_root=tmp_path,
         )
 
@@ -6124,6 +6278,46 @@ def test_docs_governance_rejects_unaudited_inherited_collected_test_methods() ->
     ):
         with pytest.raises(AssertionError, match="unaudited inherited base"):
             _docs_reading_test_modules(source, filename="inherited_test.py")
+
+    unittest_source = (
+        "from pathlib import Path\nimport unittest\n\nclass LocalBase:\n"
+        "    def test_reader(self) -> None:\n        Path('docs/base.md').read_text()\n\n"
+        "class DocsCase(LocalBase, unittest.TestCase):\n    pass\n"
+    )
+    with pytest.raises(AssertionError, match="unaudited inherited base"):
+        _docs_reading_test_modules(unittest_source, filename="unittest_inherited_test.py")
+    assert (
+        _docs_reading_test_modules(
+            "class LocalBase:\n    def test_plain(self) -> None:\n        assert True\n\n"
+            "class DocsCase(LocalBase):\n    pass\n"
+        )
+        == set()
+    )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_static_path_reader_callbacks() -> None:
+    """A static pathlib reader callback cannot hide docs content in ``map``."""
+
+    assert _docs_reading_test_modules(
+        "from pathlib import Path\n\n"
+        "def test_reader_callback() -> None:\n"
+        "    list(map(Path.read_text, [Path('docs/guide.md')]))\n"
+    ) == {"test_reader_callback"}
+    assert (
+        _docs_reading_test_modules(
+            "from pathlib import Path\n\n"
+            "def test_non_docs_reader_callback() -> None:\n"
+            "    list(map(Path.read_text, [Path('config/guide.md')]))\n"
+        )
+        == set()
+    )
+    with pytest.raises(AssertionError, match="reader callback provenance is ambiguous"):
+        _docs_reading_test_modules(
+            "from pathlib import Path\n\n"
+            "def test_dynamic_reader_callback(root: str) -> None:\n"
+            "    list(map(Path.read_text, [Path(root)]))\n"
+        )
 
 
 @pytest.mark.docs_ci
