@@ -5294,6 +5294,26 @@ def test_docs_governance_tracks_iterdir_aliases_and_fails_closed_on_dynamic_root
             "    for entry in Path(root).iterdir():\n        entry.read_text()\n"
         )
 
+    assert _docs_reading_test_modules(
+        "from pathlib import Path\n\nDOCS = Path('docs')\n\n"
+        "def test_docs_comprehension_alias() -> None:\n"
+        "    [entry.read_text() for entry in DOCS.iterdir()]\n"
+    ) == {"test_docs_comprehension_alias"}
+    assert (
+        _docs_reading_test_modules(
+            "from pathlib import Path\n\nCONFIG = Path('config')\n\n"
+            "def test_non_docs_comprehension_alias() -> None:\n"
+            "    [entry.read_text() for entry in CONFIG.iterdir()]\n"
+        )
+        == set()
+    )
+    with pytest.raises(AssertionError, match="dynamic read receiver"):
+        _docs_reading_test_modules(
+            "from pathlib import Path\n\n"
+            "def test_unknown_comprehension_root(root: str) -> None:\n"
+            "    [entry.read_text() for entry in Path(root).iterdir()]\n"
+        )
+
 
 @pytest.mark.docs_ci
 def test_docs_governance_fails_closed_on_rebound_parametrization_sources() -> None:
