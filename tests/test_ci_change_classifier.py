@@ -1143,8 +1143,8 @@ def _builtin_open_import_aliases(tree: ast.Module) -> set[str]:
     }
 
 
-def _pytest_fixture_aliases(tree: ast.Module) -> tuple[set[str], set[str]]:
-    """Return direct pytest.fixture aliases and aliases rebound in this module."""
+def _pytest_fixture_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str], set[str]]:
+    """Return fixture and pytest-module aliases, separating rebound provenance."""
 
     aliases = {
         alias.asname or alias.name
@@ -1162,21 +1162,41 @@ def _pytest_fixture_aliases(tree: ast.Module) -> tuple[set[str], set[str]]:
         )
         if isinstance(target, ast.Name) and target.id in aliases
     }
-    return aliases - rebound, rebound
+    module_aliases = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "pytest"
+    }
+    module_rebound = {
+        target.id
+        for statement in tree.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        )
+        if isinstance(target, ast.Name) and target.id in module_aliases
+    }
+    return aliases - rebound, rebound, module_aliases - module_rebound, module_rebound
 
 
 def _is_pytest_fixture_decorator(
-    decorator: ast.expr, fixture_aliases: set[str], ambiguous_fixture_aliases: set[str]
+    decorator: ast.expr,
+    fixture_aliases: set[str],
+    ambiguous_fixture_aliases: set[str],
+    pytest_module_aliases: set[str],
+    ambiguous_pytest_module_aliases: set[str],
 ) -> bool:
     """Return whether a decorator expression is (a call to) ``pytest.fixture``."""
 
     target = decorator.func if isinstance(decorator, ast.Call) else decorator
     if isinstance(target, ast.Attribute):
-        return (
-            target.attr == "fixture"
-            and isinstance(target.value, ast.Name)
-            and target.value.id == "pytest"
-        )
+        if not isinstance(target.value, ast.Name):
+            return False
+        if target.value.id in ambiguous_pytest_module_aliases:
+            raise AssertionError(f"pytest module alias `{target.value.id}` is ambiguous")
+        return target.attr == "fixture" and target.value.id in pytest_module_aliases | {"pytest"}
     if isinstance(target, ast.Name):
         if target.id in ambiguous_fixture_aliases:
             raise AssertionError(f"fixture decorator alias `{target.id}` is ambiguous")
@@ -1189,13 +1209,21 @@ def _fixture_exposed_name(
     decorators: list[ast.expr],
     fixture_aliases: set[str],
     ambiguous_fixture_aliases: set[str],
+    pytest_module_aliases: set[str],
+    ambiguous_pytest_module_aliases: set[str],
 ) -> str | None:
     """Return one statically resolved fixture name or fail closed on ambiguity."""
 
     fixture_decorators = [
         decorator
         for decorator in decorators
-        if _is_pytest_fixture_decorator(decorator, fixture_aliases, ambiguous_fixture_aliases)
+        if _is_pytest_fixture_decorator(
+            decorator,
+            fixture_aliases,
+            ambiguous_fixture_aliases,
+            pytest_module_aliases,
+            ambiguous_pytest_module_aliases,
+        )
     ]
     if not fixture_decorators:
         return None
@@ -1225,13 +1253,21 @@ def _fixture_is_autouse(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     fixture_aliases: set[str],
     ambiguous_fixture_aliases: set[str],
+    pytest_module_aliases: set[str],
+    ambiguous_pytest_module_aliases: set[str],
 ) -> bool:
     """Return a fixture's literal autouse setting or fail closed on ambiguity."""
 
     decorators = [
         decorator
         for decorator in node.decorator_list
-        if _is_pytest_fixture_decorator(decorator, fixture_aliases, ambiguous_fixture_aliases)
+        if _is_pytest_fixture_decorator(
+            decorator,
+            fixture_aliases,
+            ambiguous_fixture_aliases,
+            pytest_module_aliases,
+            ambiguous_pytest_module_aliases,
+        )
     ]
     if not decorators or not isinstance(decorators[0], ast.Call):
         return False
@@ -1349,13 +1385,21 @@ def _fixture_params_state(
     sources: dict[str, ast.expr],
     fixture_aliases: set[str],
     ambiguous_fixture_aliases: set[str],
+    pytest_module_aliases: set[str],
+    ambiguous_pytest_module_aliases: set[str],
 ) -> str:
     """Return ``none``, ``docs``, ``non-doc``, or ``ambiguous`` fixture params state."""
 
     decorators = [
         decorator
         for decorator in node.decorator_list
-        if _is_pytest_fixture_decorator(decorator, fixture_aliases, ambiguous_fixture_aliases)
+        if _is_pytest_fixture_decorator(
+            decorator,
+            fixture_aliases,
+            ambiguous_fixture_aliases,
+            pytest_module_aliases,
+            ambiguous_pytest_module_aliases,
+        )
     ]
     if len(decorators) != 1 or not isinstance(decorators[0], ast.Call):
         return "none"
@@ -1488,6 +1532,247 @@ class _FunctionAnalysis:
     parameter_names: tuple[str, ...]
     has_variadic_parameters: bool
     call_arguments: list[tuple[str, tuple[str, ...], dict[str, str]]]
+
+
+def _repository_module_candidates(module: str, filename: str, repository_root: Path) -> set[Path]:
+    """Return confined importer-relative/repository-root candidates for one module."""
+
+    importer = Path(filename)
+    if not importer.is_absolute():
+        importer = repository_root / importer
+    candidates: set[Path] = set()
+    for base in (importer.parent, repository_root):
+        module_path = base.joinpath(*module.split("."))
+        for path in (module_path.with_suffix(".py"), module_path / "__init__.py"):
+            if path.is_file() and path.is_relative_to(repository_root):
+                candidates.add(path)
+    return candidates
+
+
+def _repository_imported_fixture_analyses(
+    tree: ast.Module, filename: str, repository_root: Path
+) -> tuple[dict[str, _FunctionAnalysis], set[str]]:
+    """Return synthetic analyses for directly imported first-party fixtures.
+
+    Fixtures imported into a test module are executable pytest dependencies even
+    though their definition lives outside the module AST.  Each admitted import
+    becomes a synthetic graph node; ambiguous local origins or fixture metadata
+    are deliberately retained as named unresolved fixture names.
+    """
+
+    analyses: dict[str, _FunctionAnalysis] = {}
+    ambiguous: set[str] = set()
+    for statement in tree.body:
+        if not isinstance(statement, ast.ImportFrom) or statement.module is None:
+            continue
+        candidates = _repository_module_candidates(statement.module, filename, repository_root)
+        if not candidates:
+            continue
+        if len(candidates) != 1:
+            ambiguous.update(alias.asname or alias.name for alias in statement.names)
+            continue
+        source_path = next(iter(candidates))
+        imported_tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        (
+            fixture_aliases,
+            ambiguous_fixture_aliases,
+            pytest_module_aliases,
+            ambiguous_pytest_module_aliases,
+        ) = _pytest_fixture_aliases(imported_tree)
+        functions = {
+            node.name: node
+            for node in imported_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for imported in statement.names:
+            if imported.name not in functions:
+                continue
+            function = functions[imported.name]
+            fixture_name = _fixture_exposed_name(
+                function.name,
+                function.decorator_list,
+                fixture_aliases,
+                ambiguous_fixture_aliases,
+                pytest_module_aliases,
+                ambiguous_pytest_module_aliases,
+            )
+            if fixture_name is None:
+                continue
+            source = source_path.read_text(encoding="utf-8")
+            proxy = (
+                source
+                + "\n\ndef test_import_direct() -> None:\n"
+                + f"    {function.name}()\n\n"
+                + "def test_import_return() -> None:\n"
+                + f"    {function.name}().read_text()\n"
+            )
+            readers = _docs_reading_test_modules(
+                proxy, filename=str(source_path), repository_root=repository_root
+            )
+            analysis = _FunctionAnalysis(
+                reads_directly="test_import_direct" in readers,
+                calls=set(),
+                unresolved=[],
+                returns_docs="test_import_return" in readers,
+                return_calls=set(),
+                return_names=set(),
+                call_result_assignments={},
+                read_names=set(),
+                read_calls=set(),
+                parameter_names=(),
+                has_variadic_parameters=False,
+                call_arguments=[],
+            )
+            for name in {fixture_name, imported.asname or imported.name}:
+                previous = analyses.get(name)
+                if previous is not None and previous != analysis:
+                    ambiguous.add(name)
+                    analyses.pop(name, None)
+                else:
+                    analyses[name] = analysis
+    return analyses, ambiguous
+
+
+def _pytest_generate_tests_parameter_states(
+    tree: ast.Module,
+    functions: dict[str, _FunctionNode],
+    sources: dict[str, ast.expr],
+) -> dict[str, tuple[set[str], set[str]]]:
+    """Return docs and ambiguous ``pytest_generate_tests`` parameter names per test.
+
+    The admitted form is a literal ``metafunc.parametrize`` name and a
+    statically folded value collection.  A dynamic value is fail-closed only
+    for tests that actually accept that named receiver; unrelated hook code
+    cannot create reader provenance for unrelated tests.
+    """
+
+    states = {
+        name: (set[str](), set[str]())
+        for name in functions
+        if name.startswith("test_") or "::test_" in name
+    }
+
+    def condition_target(condition: ast.expr) -> set[str] | None:
+        """Return static test names selected by one recognised hook guard."""
+
+        pairs: list[tuple[ast.expr, ast.expr]] = []
+        if (
+            isinstance(condition, ast.Compare)
+            and len(condition.ops) == len(condition.comparators) == 1
+        ):
+            pairs.append((condition.left, condition.comparators[0]))
+            pairs.append((condition.comparators[0], condition.left))
+        for left, right in pairs:
+            if (
+                isinstance(right, ast.Constant)
+                and isinstance(right.value, str)
+                and isinstance(left, ast.Attribute)
+                and left.attr == "__name__"
+                and isinstance(left.value, ast.Attribute)
+                and left.value.attr == "function"
+                and isinstance(left.value.value, ast.Name)
+                and left.value.value.id == "metafunc"
+            ):
+                return {right.value}
+            if (
+                isinstance(right, ast.Name)
+                and isinstance(left, ast.Attribute)
+                and left.attr == "function"
+                and isinstance(left.value, ast.Name)
+                and left.value.id == "metafunc"
+            ):
+                return {right.id}
+        return None
+
+    def visit(nodes: list[ast.stmt], selected: set[str] | None) -> None:
+        """Walk hook statements while retaining an optional static test selection."""
+
+        for statement in nodes:
+            if isinstance(statement, ast.If):
+                target = condition_target(statement.test)
+                visit(statement.body, target if target is not None else selected)
+                visit(statement.orelse, selected)
+                continue
+            for call in (node for node in ast.walk(statement) if isinstance(node, ast.Call)):
+                if not (
+                    isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "parametrize"
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "metafunc"
+                    and len(call.args) >= 2
+                ):
+                    continue
+                name_expression = call.args[0]
+                if not isinstance(name_expression, ast.Constant) or not isinstance(
+                    name_expression.value, str
+                ):
+                    continue
+                names = [name.strip() for name in name_expression.value.split(",")]
+                if len(names) != 1 or not names[0]:
+                    continue
+                values = _resolve_module_values(call.args[1], sources)
+                docs = values is not None and any(
+                    _expression_is_docs_markdown(value, set()) for value in values
+                )
+                ambiguous = values is None or any(
+                    not _string_constants(value) for value in values or []
+                )
+                for test_name, node in functions.items():
+                    if test_name not in states or (
+                        selected is not None and test_name not in selected
+                    ):
+                        continue
+                    parameters = _fixture_parameter_names(
+                        cast(ast.FunctionDef | ast.AsyncFunctionDef, node)
+                    )
+                    if names[0] not in parameters:
+                        continue
+                    if docs:
+                        states[test_name][0].add(names[0])
+                    elif ambiguous:
+                        states[test_name][1].add(names[0])
+
+    for hook in tree.body:
+        if (
+            isinstance(hook, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and hook.name == "pytest_generate_tests"
+        ):
+            visit(hook.body, None)
+    return states
+
+
+def _class_attribute_states(
+    tree: ast.Module, module_aliases: set[str], module_partial_aliases: set[str]
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Return statically docs-rooted and ambiguous class attribute names by class."""
+
+    docs: dict[str, set[str]] = {}
+    ambiguous: dict[str, set[str]] = {}
+    for statement in tree.body:
+        if not isinstance(statement, ast.ClassDef):
+            continue
+        values: dict[str, ast.expr] = {}
+        duplicates: set[str] = set()
+        for member in statement.body:
+            if not isinstance(member, (ast.Assign, ast.AnnAssign)) or member.value is None:
+                continue
+            targets = member.targets if isinstance(member, ast.Assign) else [member.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    if target.id in values:
+                        duplicates.add(target.id)
+                    else:
+                        values[target.id] = member.value
+        for name, value in values.items():
+            if name in duplicates:
+                ambiguous.setdefault(statement.name, set()).add(name)
+            elif _expression_is_docs_markdown(
+                value, module_aliases
+            ) or _expression_completes_partial_docs_alias(value, module_partial_aliases):
+                docs.setdefault(statement.name, set()).add(name)
+            elif _expression_has_docs_root(value) or not _string_constants(value):
+                ambiguous.setdefault(statement.name, set()).add(name)
+    return docs, ambiguous
 
 
 def _function_parameter_names(func: _FunctionNode) -> tuple[str, ...]:
@@ -1835,6 +2120,14 @@ def _analyse_function(
     builtin_open_import_aliases: set[str] | None = None,
     fixture_aliases: set[str] | None = None,
     ambiguous_fixture_aliases: set[str] | None = None,
+    pytest_module_aliases: set[str] | None = None,
+    ambiguous_pytest_module_aliases: set[str] | None = None,
+    generated_docs_parameters: set[str] | None = None,
+    generated_ambiguous_parameters: set[str] | None = None,
+    class_docs_attributes: dict[str, set[str]] | None = None,
+    class_ambiguous_attributes: dict[str, set[str]] | None = None,
+    all_class_methods: dict[str, dict[str, str]] | None = None,
+    relevant_helper_classes: set[str] | None = None,
 ) -> _FunctionAnalysis:
     """Walk one function body for a direct docs read, calls, and unresolved reads.
 
@@ -1851,6 +2144,8 @@ def _analyse_function(
             func, module_value_sources
         )
         aliases.update(parameter_docs)
+        aliases.update(generated_docs_parameters or set())
+        ambiguous_parameters.update(generated_ambiguous_parameters or set())
     else:
         ambiguous_parameters: set[str] = set()
     calls: set[str] = set()
@@ -1864,6 +2159,8 @@ def _analyse_function(
             module_value_sources,
             fixture_aliases or set(),
             ambiguous_fixture_aliases or set(),
+            pytest_module_aliases or set(),
+            ambiguous_pytest_module_aliases or set(),
         )
         if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef))
         else "none"
@@ -1882,6 +2179,8 @@ def _analyse_function(
     non_docs_aliases: set[str] = set()
     imported_class_instances: set[str] = set()
     ambiguous_imported_class_instances: set[str] = set()
+    helper_class_instances: dict[str, str] = {}
+    ambiguous_helper_class_instances: set[str] = set()
     control_flow_docs_aliases = {
         target.id
         for conditional in ast.walk(func)
@@ -1972,17 +2271,59 @@ def _analyse_function(
             and expression.func.value.id in {"self", "cls", class_name}
         ):
             return (class_methods or {}).get(expression.func.attr)
+        if isinstance(expression.func, ast.Attribute):
+            receiver = expression.func.value
+            helper_class: str | None = None
+            if isinstance(receiver, ast.Name):
+                helper_class = helper_class_instances.get(receiver.id)
+                if receiver.id in (all_class_methods or {}):
+                    helper_class = receiver.id
+            elif (
+                isinstance(receiver, ast.Call)
+                and isinstance(receiver.func, ast.Name)
+                and receiver.func.id in (all_class_methods or {})
+            ):
+                helper_class = receiver.func.id
+            if helper_class is not None:
+                return (all_class_methods or {}).get(helper_class, {}).get(expression.func.attr)
         return None
 
     def _receiver_is_docs(target: ast.expr) -> bool:
         if isinstance(target, ast.Name):
             return target.id in aliases or has_docs_glob
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in {"self", "cls", class_name}
+            and target.attr in (class_docs_attributes or {}).get(class_name or "", set())
+        ):
+            return True
         return _expression_is_docs_markdown(target, aliases)
 
     def _receiver_is_partial(target: ast.expr) -> bool:
         if isinstance(target, ast.Name):
             return target.id in partial_aliases
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in {"self", "cls", class_name}
+            and target.attr in (class_ambiguous_attributes or {}).get(class_name or "", set())
+        ):
+            return True
         return _expression_has_docs_root(target)
+
+    def _helper_class_instance(value: ast.expr) -> str | None:
+        """Return one exact same-module helper-class instance provenance."""
+
+        if isinstance(value, ast.Name):
+            return helper_class_instances.get(value.id)
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id in (all_class_methods or {})
+        ):
+            return value.func.id
+        return None
 
     def _module_receiver_state(target: ast.expr) -> str:
         """Return local imported-module receiver provenance, if applicable."""
@@ -2095,8 +2436,28 @@ def _analyse_function(
             reader_alias_state = _reader_alias_state(node.value)
             builtin_open_alias_state = _builtin_open_alias_state(node.value)
             imported_class_instance_state = _imported_class_instance_state(node.value)
+            helper_class_instance = _helper_class_instance(node.value)
             for target in targets:
                 if isinstance(target, ast.Name):
+                    if helper_class_instance is not None:
+                        helper_class_instances[target.id] = helper_class_instance
+                        ambiguous_helper_class_instances.discard(target.id)
+                    elif (
+                        isinstance(node.value, ast.Name)
+                        and node.value.id in ambiguous_helper_class_instances
+                    ) or (
+                        isinstance(node.value, ast.Call)
+                        and any(
+                            isinstance(argument, ast.Name)
+                            and argument.id in (all_class_methods or {})
+                            for argument in node.value.args
+                        )
+                    ):
+                        helper_class_instances.pop(target.id, None)
+                        ambiguous_helper_class_instances.add(target.id)
+                    else:
+                        helper_class_instances.pop(target.id, None)
+                        ambiguous_helper_class_instances.discard(target.id)
                     if imported_class_instance_state == "known":
                         imported_class_instances.add(target.id)
                         ambiguous_imported_class_instances.discard(target.id)
@@ -2264,6 +2625,19 @@ def _analyse_function(
             unresolved.append(
                 f"{filename}:{node.lineno}: imported class instance provenance is ambiguous"
             )
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Call)
+            and isinstance(node.func.value.func, ast.Name)
+            and node.func.value.func.id in (all_class_methods or {})
+        ):
+            if (call_key := _call_key(node)) is not None:
+                _record_call(call_key, node)
+            elif node.func.value.func.id in (relevant_helper_classes or set()):
+                unresolved.append(
+                    f"{filename}:{node.lineno}: unresolved same-module helper-class call edge "
+                    f"`{node.func.value.func.id}().{node.func.attr}()`"
+                )
         elif isinstance(node.func, ast.Attribute) and node.func.attr in _READ_METHOD_NAMES:
             target = node.func.value
             if isinstance(target, ast.Name) and target.id == "Path":
@@ -2295,6 +2669,23 @@ def _analyse_function(
                     "is or is not a docs read"
                 )
         elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            if node.func.value.id in ambiguous_helper_class_instances:
+                unresolved.append(
+                    f"{filename}:{node.lineno}: same-module helper-class instance provenance "
+                    "is ambiguous"
+                )
+                continue
+            if (call_key := _call_key(node)) is not None:
+                _record_call(call_key, node)
+                continue
+            receiver = node.func.value
+            helper_class = helper_class_instances.get(receiver.id, receiver.id)
+            if helper_class in (relevant_helper_classes or set()):
+                unresolved.append(
+                    f"{filename}:{node.lineno}: unresolved same-module helper-class call edge "
+                    f"`{receiver.id}.{node.func.attr}()`"
+                )
+                continue
             if node.func.value.id in (imported_classes or set()):
                 unresolved.append(
                     f"{filename}:{node.lineno}: imported class method call provenance is ambiguous"
@@ -2314,6 +2705,10 @@ def _analyse_function(
                 continue
             callee = (class_methods or {}).get(node.func.attr)
             if callee is None:
+                if class_name not in (relevant_helper_classes or set()) and not (
+                    class_name or ""
+                ).startswith("Test"):
+                    continue
                 unresolved.append(
                     f"{filename}:{node.lineno}: unresolved same-class call edge "
                     f"`{receiver}.{node.func.attr}()`"
@@ -2443,8 +2838,24 @@ def _docs_reading_test_modules(
     _assert_no_imported_collected_test_callables(
         tree, filename, imported_analyses, ambiguous_imports
     )
+    imported_fixture_by_name, ambiguous_imported_fixtures = _repository_imported_fixture_analyses(
+        tree, filename, repository_root
+    )
+    imported_fixture_nodes = {
+        fixture_name: f"<imported-fixture>::{fixture_name}"
+        for fixture_name in imported_fixture_by_name
+    }
+    imported_fixture_analyses = {
+        imported_fixture_nodes[fixture_name]: analysis
+        for fixture_name, analysis in imported_fixture_by_name.items()
+    }
     module_value_sources = _module_value_sources(tree)
-    fixture_aliases, ambiguous_fixture_aliases = _pytest_fixture_aliases(tree)
+    (
+        fixture_aliases,
+        ambiguous_fixture_aliases,
+        pytest_module_aliases,
+        ambiguous_pytest_module_aliases,
+    ) = _pytest_fixture_aliases(tree)
     module_aliases: set[str] = set()
     module_partial_aliases: set[str] = set()
     module_aliases.update(imported_docs_values)
@@ -2484,6 +2895,7 @@ def _docs_reading_test_modules(
     _assert_no_unaudited_collected_test_bases(tree, filename)
     _assert_no_unattributable_module_docs_reads(tree, module_aliases, functions, filename)
     class_methods: dict[str, dict[str, str]] = {}
+    all_class_methods: dict[str, dict[str, str]] = {}
     for statement in tree.body:
         if not isinstance(statement, ast.ClassDef):
             continue
@@ -2492,14 +2904,32 @@ def _docs_reading_test_modules(
             for member in statement.body
             if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
-        if not any(member.name.startswith("test_") for member in members):
-            continue
         methods: dict[str, str] = {}
         for member in members:
             qualified_name = f"{statement.name}::{member.name}"
-            functions[qualified_name] = member
             methods[member.name] = qualified_name
-        class_methods[statement.name] = methods
+            functions[qualified_name] = member
+        all_class_methods[statement.name] = methods
+        if any(member.name.startswith("test_") for member in members):
+            class_methods[statement.name] = methods
+    class_docs_attributes, class_ambiguous_attributes = _class_attribute_states(
+        tree, module_aliases, module_partial_aliases
+    )
+    relevant_helper_classes = {
+        statement.name
+        for statement in tree.body
+        if isinstance(statement, ast.ClassDef)
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr in _READ_METHOD_NAMES
+            and _expression_is_docs_markdown(call.func.value, module_aliases)
+            for call in ast.walk(statement)
+        )
+    } | set(class_docs_attributes)
+    generated_parameter_states = _pytest_generate_tests_parameter_states(
+        tree, functions, module_value_sources
+    )
     module_usefixtures = _module_usefixtures_names(tree)
     class_usefixtures = {
         statement.name: _class_usefixtures_names(statement)
@@ -2512,7 +2942,12 @@ def _docs_reading_test_modules(
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         fixture_name = _fixture_exposed_name(
-            node.name, node.decorator_list, fixture_aliases, ambiguous_fixture_aliases
+            node.name,
+            node.decorator_list,
+            fixture_aliases,
+            ambiguous_fixture_aliases,
+            pytest_module_aliases,
+            ambiguous_pytest_module_aliases,
         )
         if fixture_name is None:
             continue
@@ -2535,6 +2970,12 @@ def _docs_reading_test_modules(
                 f"class `{class_name}` fixture name(s) collide with module fixtures: "
                 f"{sorted(shared_names)}"
             )
+    shared_imported_fixture_names = module_fixture_nodes.keys() & imported_fixture_nodes.keys()
+    if shared_imported_fixture_names:
+        raise AssertionError(
+            f"module fixtures collide with imported fixture name(s): "
+            f"{sorted(shared_imported_fixture_names)}"
+        )
     fixtures = set(module_fixture_nodes.values()) | {
         fixture
         for fixture_nodes in class_fixture_nodes.values()
@@ -2546,7 +2987,7 @@ def _docs_reading_test_modules(
 
         class_name = function_key.partition("::")[0] if "::" in function_key else None
         if class_name is None:
-            return module_fixture_nodes
+            return module_fixture_nodes | imported_fixture_nodes
         return module_fixture_nodes | class_fixture_nodes.get(class_name, {})
 
     def activated_fixture_nodes(
@@ -2560,6 +3001,12 @@ def _docs_reading_test_modules(
         requested |= _requested_fixture_names(node)
         if class_name is not None:
             requested |= class_usefixtures.get(class_name, set())
+        ambiguous_requested = requested & ambiguous_imported_fixtures
+        if ambiguous_requested:
+            raise AssertionError(
+                f"{filename}: imported fixture provenance is ambiguous for "
+                f"{sorted(ambiguous_requested)}"
+            )
         missing = requested - available.keys()
         if missing:
             raise AssertionError(
@@ -2568,10 +3015,13 @@ def _docs_reading_test_modules(
         autouse = {
             fixture_name
             for fixture_name in available.values()
+            if fixture_name in functions
             if _fixture_is_autouse(
                 cast(ast.FunctionDef | ast.AsyncFunctionDef, functions[fixture_name]),
                 fixture_aliases,
                 ambiguous_fixture_aliases,
+                pytest_module_aliases,
+                ambiguous_pytest_module_aliases,
             )
         }
         return autouse | {available[name] for name in requested}
@@ -2612,7 +3062,7 @@ def _docs_reading_test_modules(
             known_functions,
             filename,
             class_name,
-            class_methods.get(class_name) if class_name else None,
+            all_class_methods.get(class_name) if class_name else None,
             local_targets.get(name),
             ambiguous_local_targets.get(name),
             module_calls,
@@ -2623,6 +3073,14 @@ def _docs_reading_test_modules(
             builtin_open_import_aliases,
             fixture_aliases,
             ambiguous_fixture_aliases,
+            pytest_module_aliases,
+            ambiguous_pytest_module_aliases,
+            generated_parameter_states.get(name, (set(), set()))[0],
+            generated_parameter_states.get(name, (set(), set()))[1],
+            class_docs_attributes,
+            class_ambiguous_attributes,
+            all_class_methods,
+            relevant_helper_classes,
         )
         analyses[name] = analysis
         if name not in local_keys:
@@ -2633,6 +3091,24 @@ def _docs_reading_test_modules(
             f"could hide an unmarked docs read: {unresolved}"
         )
     analyses.update(imported_analyses)
+    analyses.update(imported_fixture_analyses)
+
+    module_xunit_hooks = {
+        name
+        for name in ("setup_module", "teardown_module", "setup_function", "teardown_function")
+        if name in analyses
+    }
+    for name in functions:
+        if name.startswith("test_"):
+            analyses[name].calls.update(module_xunit_hooks)
+        if "::test_" not in name:
+            continue
+        class_name = name.partition("::")[0]
+        analyses[name].calls.update(
+            f"{class_name}::{hook}"
+            for hook in ("setup_class", "teardown_class", "setup_method", "teardown_method")
+            if f"{class_name}::{hook}" in analyses
+        )
 
     def bound_argument_state(
         callee: _FunctionAnalysis,
@@ -2701,6 +3177,12 @@ def _docs_reading_test_modules(
         fixture = functions[fixture_name]
         assert isinstance(fixture, (ast.FunctionDef, ast.AsyncFunctionDef))
         available_fixture_nodes = fixture_nodes_for(fixture_name)
+        ambiguous_parameters = _fixture_parameter_names(fixture) & ambiguous_imported_fixtures
+        if ambiguous_parameters:
+            raise AssertionError(
+                f"{filename}: imported fixture provenance is ambiguous for "
+                f"{sorted(ambiguous_parameters)}"
+            )
         fixture_parameters = {
             available_fixture_nodes[parameter]
             for parameter in _fixture_parameter_names(fixture)
@@ -2769,6 +3251,12 @@ def _docs_reading_test_modules(
             continue
         assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         available_fixture_nodes = fixture_nodes_for(name)
+        ambiguous_parameters = _fixture_parameter_names(node) & ambiguous_imported_fixtures
+        if ambiguous_parameters:
+            raise AssertionError(
+                f"{filename}: imported fixture provenance is ambiguous for "
+                f"{sorted(ambiguous_parameters)}"
+            )
         fixture_edges = {
             available_fixture_nodes[parameter]
             for parameter in _fixture_parameter_names(node)
@@ -4253,6 +4741,21 @@ def test_docs_governance_follows_a_same_module_fixture() -> None:
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_tracks_applicable_xunit_lifecycle_hooks() -> None:
+    """Docs reads in pytest xunit hooks reach only their governed collected tests."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def setup_function() -> None:\n    Path('docs/module-hook.md').read_text()\n\n"
+        "def test_module_hook() -> None:\n    assert True\n\n"
+        "class TestHooks:\n"
+        "    def setup_method(self) -> None:\n        Path('docs/method-hook.md').read_text()\n\n"
+        "    def test_method_hook(self) -> None:\n        assert True\n"
+    )
+    assert _docs_reading_test_modules(source) == {"TestHooks::test_method_hook", "test_module_hook"}
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_tracks_literal_request_getfixturevalue_dependencies() -> None:
     """Literal request.getfixturevalue calls add their fixture edge exactly."""
 
@@ -4302,6 +4805,15 @@ def test_docs_governance_recognizes_scoped_pytest_fixture_import_aliases() -> No
     assert _docs_reading_test_modules(source) == {"test_alias"}
     with pytest.raises(AssertionError, match="fixture decorator alias `fx` is ambiguous"):
         _docs_reading_test_modules(source.replace("@fx", "fx = object\n\n@fx"))
+
+    module_alias = source.replace(
+        "from pytest import fixture as fx", "import pytest as pt"
+    ).replace("@fx", "@pt.fixture")
+    assert _docs_reading_test_modules(module_alias) == {"test_alias"}
+    with pytest.raises(AssertionError, match="pytest module alias `pt` is ambiguous"):
+        _docs_reading_test_modules(
+            module_alias.replace("@pt.fixture", "pt = object\n\n@pt.fixture")
+        )
 
 
 @pytest.mark.docs_ci
@@ -4892,6 +5404,181 @@ def test_docs_governance_fails_closed_on_an_unresolved_dynamic_call_edge() -> No
     )
     with pytest.raises(AssertionError, match="unresolved dynamic read receiver"):
         _docs_reading_test_modules(source, filename="dynamic_example.py")
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_repository_imported_fixture_dependencies(tmp_path: Path) -> None:
+    """Imported first-party fixtures reach signature, mark, and request consumers only."""
+
+    (tmp_path / "fixtures.py").write_text(
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture\ndef docs_fixture() -> str:\n"
+        "    return Path('docs/imported-fixture.md').read_text()\n\n"
+        "@pytest.fixture\ndef config_fixture() -> str:\n"
+        "    return Path('config/imported-fixture.md').read_text()\n"
+    )
+    source = (
+        "from fixtures import config_fixture, docs_fixture\nimport pytest\n\n"
+        "def test_signature(docs_fixture: str) -> None:\n    assert docs_fixture\n\n"
+        "@pytest.mark.usefixtures('docs_fixture')\ndef test_mark() -> None:\n    assert True\n\n"
+        "def test_request(request) -> None:\n"
+        "    assert request.getfixturevalue('docs_fixture')\n\n"
+        "def test_non_reader(config_fixture: str) -> None:\n    assert config_fixture\n"
+    )
+    assert _docs_reading_test_modules(source, repository_root=tmp_path) == {
+        "test_mark",
+        "test_request",
+        "test_signature",
+    }
+
+    tests_root = tmp_path / "tests"
+    tests_root.mkdir()
+    (tests_root / "fixtures.py").write_text((tmp_path / "fixtures.py").read_text())
+    with pytest.raises(AssertionError, match="imported fixture provenance is ambiguous"):
+        _docs_reading_test_modules(
+            "from fixtures import docs_fixture\n\n"
+            "def test_signature(docs_fixture):\n    assert docs_fixture\n",
+            filename=str(tests_root / "test_import.py"),
+            repository_root=tmp_path,
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_static_pytest_generate_tests_parameters() -> None:
+    """Static generated docs parameters seed only their matching read receivers."""
+
+    source = (
+        "def pytest_generate_tests(metafunc) -> None:\n"
+        "    if metafunc.function.__name__ == 'test_generated':\n"
+        "        metafunc.parametrize('path', ['docs/generated.md'])\n\n"
+        "def test_generated(path) -> None:\n    path.read_text()\n\n"
+        "def test_unrelated(value) -> None:\n    assert value\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_generated"}
+    dynamic = source.replace("['docs/generated.md']", "build_paths()")
+    with pytest.raises(AssertionError, match="parametrized receiver `path` is ambiguous"):
+        _docs_reading_test_modules(dynamic)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_static_class_attributes() -> None:
+    """Static docs class attributes propagate through self, cls, and class names."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class TestAttributes:\n"
+        "    DOCS_PATH = Path('docs/class-attribute.md')\n"
+        "    CONFIG_PATH = Path('config/class-attribute.md')\n\n"
+        "    @classmethod\n    def _path(cls):\n        return cls.DOCS_PATH\n\n"
+        "    def test_self(self) -> None:\n        self.DOCS_PATH.read_text()\n\n"
+        "    def test_cls(self) -> None:\n        self._path().read_text()\n\n"
+        "    def test_qualified(self) -> None:\n        TestAttributes.DOCS_PATH.read_text()\n\n"
+        "    def test_non_reader(self) -> None:\n        self.CONFIG_PATH.read_text()\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "TestAttributes::test_cls",
+        "TestAttributes::test_qualified",
+        "TestAttributes::test_self",
+    }
+    ambiguous = source.replace("Path('docs/class-attribute.md')", "Path('docs') / dynamic_name")
+    with pytest.raises(AssertionError, match="cannot prove this is or is not a docs read"):
+        _docs_reading_test_modules(ambiguous)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_same_module_helper_class_dispatch() -> None:
+    """Constructor and class-style helper calls add bounded same-module reader edges."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLoader:\n"
+        "    def load(self) -> str:\n        return Path('docs/helper-class.md').read_text()\n\n"
+        "    @staticmethod\n    def static() -> str:\n"
+        "        return Path('docs/helper-class-static.md').read_text()\n\n"
+        "class ConfigLoader:\n"
+        "    def load(self) -> str:\n        return Path('config/helper-class.md').read_text()\n\n"
+        "def test_chained() -> None:\n    assert DocsLoader().load()\n\n"
+        "def test_assigned() -> None:\n"
+        "    loader = DocsLoader()\n    alias = loader\n    assert alias.load()\n\n"
+        "def test_static() -> None:\n    assert DocsLoader.static()\n\n"
+        "def test_non_reader() -> None:\n    assert ConfigLoader().load()\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_assigned",
+        "test_chained",
+        "test_static",
+    }
+    with pytest.raises(AssertionError, match="helper-class call edge"):
+        _docs_reading_test_modules(source.replace("DocsLoader.static()", "DocsLoader.dynamic()"))
+    with pytest.raises(AssertionError, match="helper-class instance provenance is ambiguous"):
+        _docs_reading_test_modules(
+            source.replace("loader = DocsLoader()", "loader = construct(DocsLoader)")
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_boundary_mutations_red_against_exact_markers(tmp_path: Path) -> None:
+    """Each of the six admitted provenance boundaries has a direct red mutation proof."""
+
+    cases = [
+        (
+            "import pytest\nimport pytest as pt\nfrom pathlib import Path\n\n"
+            "@pt.fixture\ndef value():\n"
+            "    return Path('docs/alias.md').read_text()\n\n@pytest.mark.docs\n"
+            "def test_alias(value):\n    assert value\n",
+            "alias",
+        ),
+        (
+            "import pytest\nfrom pathlib import Path\n\ndef setup_function():\n"
+            "    Path('docs/hook.md').read_text()\n\n@pytest.mark.docs\n"
+            "def test_hook():\n    assert True\n",
+            "xunit",
+        ),
+        (
+            "def pytest_generate_tests(metafunc):\n"
+            "    metafunc.parametrize('path', ['docs/generated.md'])\n\n"
+            "import pytest\n@pytest.mark.docs\ndef test_generated(path):\n    path.read_text()\n",
+            "generated",
+        ),
+        (
+            "from pathlib import Path\nimport pytest\n\nclass TestAttrs:\n"
+            "    PATH = Path('docs/attribute.md')\n\n    @pytest.mark.docs\n"
+            "    def test_attribute(self):\n        self.PATH.read_text()\n",
+            "attribute",
+        ),
+        (
+            "from pathlib import Path\nimport pytest\n\nclass Loader:\n"
+            "    def load(self):\n        return Path('docs/helper.md').read_text()\n\n"
+            "@pytest.mark.docs\ndef test_helper():\n    assert Loader().load()\n",
+            "helper",
+        ),
+    ]
+    (tmp_path / "fixtures.py").write_text(
+        "from pathlib import Path\nimport pytest\n\n@pytest.fixture\ndef imported():\n"
+        "    return Path('docs/imported.md').read_text()\n"
+    )
+    imported = (
+        "from fixtures import imported\nimport pytest\n\n@pytest.mark.docs\n"
+        "def test_imported(imported):\n    assert imported\n"
+    )
+    for source, label in cases:
+        readers = _docs_reading_test_modules(source)
+        _assert_exact_docs_markers(ast.parse(source), readers, f"{label}.py")
+        mutated = source.replace("docs/", "config/", 1)
+        with pytest.raises(AssertionError, match="must sit on exactly the readers"):
+            _assert_exact_docs_markers(
+                ast.parse(mutated), _docs_reading_test_modules(mutated), f"{label}-mutated.py"
+            )
+    readers = _docs_reading_test_modules(imported, repository_root=tmp_path)
+    _assert_exact_docs_markers(ast.parse(imported), readers, "imported.py")
+    mutated_imported = (tmp_path / "fixtures.py").read_text().replace("docs/", "config/", 1)
+    (tmp_path / "fixtures.py").write_text(mutated_imported)
+    with pytest.raises(AssertionError, match="must sit on exactly the readers"):
+        _assert_exact_docs_markers(
+            ast.parse(imported),
+            _docs_reading_test_modules(imported, repository_root=tmp_path),
+            "imported.py",
+        )
 
 
 #: D180 §2.3: every job that declares `needs: classify`, exactly.
