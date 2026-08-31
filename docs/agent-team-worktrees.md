@@ -663,6 +663,8 @@ fired yet).
 
 Rule: **opening the PR is the branch-ownership handoff — WHOEVER opens it.**
 
+Proof-only documentation change for #702 exact-head CI classification.
+
 1. When the lead opens a PR on a teammate's branch, the accompanying message
    includes an explicit **FREEZE** — no further pushes without a lead
    go-ahead. When a teammate opens their own PR (lead-delegated — see the
