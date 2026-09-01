@@ -2780,6 +2780,7 @@ def _analyse_function(
     os_read_call_aliases: set[str] | None = None,
     ambiguous_os_open_read_aliases: set[str] | None = None,
     class_property_getters: dict[str, str] | None = None,
+    ambiguous_class_property_getters: set[str] | None = None,
 ) -> _FunctionAnalysis:
     """Walk one function body for a direct docs read, calls, and unresolved reads.
 
@@ -3373,6 +3374,15 @@ def _analyse_function(
             continue
         nodes.extend(ast.iter_child_nodes(node))
         if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in {"self", "cls", class_name}
+            and node.attr in (ambiguous_class_property_getters or set())
+        ):
+            unresolved.append(
+                f"{filename}:{node.lineno}: same-class property getter `{node.attr}` is ambiguous"
+            )
+        elif (
             isinstance(node, ast.Attribute)
             and isinstance(node.value, ast.Name)
             and node.value.id in {"self", "cls", class_name}
@@ -4331,6 +4341,7 @@ def _docs_reading_test_modules(
     class_methods: dict[str, dict[str, str]] = {}
     all_class_methods: dict[str, dict[str, str]] = {}
     class_property_getters: dict[str, dict[str, str]] = {}
+    ambiguous_class_property_getters: dict[str, set[str]] = {}
     for statement in tree.body:
         if not isinstance(statement, ast.ClassDef):
             continue
@@ -4349,6 +4360,24 @@ def _docs_reading_test_modules(
                 for decorator in member.decorator_list
             ):
                 class_property_getters.setdefault(statement.name, {})[member.name] = qualified_name
+        shadowed_members = {
+            target.id
+            for assignment in statement.body
+            if isinstance(assignment, (ast.Assign, ast.AnnAssign))
+            for target in (
+                assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+            )
+            if isinstance(target, ast.Name)
+        }
+        shadowed_properties = (
+            shadowed_members & class_property_getters.get(statement.name, {}).keys()
+        )
+        if shadowed_properties:
+            for property_name in shadowed_properties:
+                class_property_getters[statement.name].pop(property_name)
+            ambiguous_class_property_getters[statement.name] = shadowed_properties
+        for member in shadowed_members:
+            methods.pop(member, None)
         for assignment in statement.body:
             if not isinstance(assignment, (ast.Assign, ast.AnnAssign)) or assignment.value is None:
                 continue
@@ -4605,6 +4634,7 @@ def _docs_reading_test_modules(
             os_read_call_aliases,
             ambiguous_os_open_read_aliases,
             class_property_getters.get(class_name, {}) if class_name else {},
+            ambiguous_class_property_getters.get(class_name, set()) if class_name else set(),
         )
         analyses[name] = analysis
         if name not in local_keys:
@@ -7075,6 +7105,54 @@ def test_docs_governance_rejects_malformed_staticmethod_collected_aliases(
         f"    test_extra = {alias_expression}\n"
     )
     with pytest.raises(AssertionError, match="collected class callable alias"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize("shadow", ["docs_reader = object", "docs_reader: object = object"])
+def test_docs_governance_rejects_shadowed_staticmethod_alias_targets(shadow: str) -> None:
+    """Class-body rebinding invalidates a collected staticmethod alias target."""
+
+    source = (
+        "from pathlib import Path\n\nclass TestDocs:\n"
+        "    @staticmethod\n    def docs_reader() -> None:\n"
+        "        Path('docs/shadowed-static.md').read_text()\n\n"
+        f"    {shadow}\n"
+        "    test_docs = staticmethod(docs_reader)\n"
+    )
+    with pytest.raises(AssertionError, match="collected class callable alias"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize("shadow", ["content = object", "content: object = object"])
+def test_docs_governance_rejects_shadowed_property_getters(shadow: str) -> None:
+    """Class-body rebinding invalidates the provenance of a property getter."""
+
+    source = (
+        "from pathlib import Path\n\nclass TestDocs:\n"
+        "    @property\n    def content(self) -> str:\n"
+        "        return Path('docs/shadowed-property.md').read_text()\n\n"
+        f"    {shadow}\n\n"
+        "    def test_docs(self) -> None:\n        assert self.content\n"
+    )
+    with pytest.raises(AssertionError, match="same-class property getter `content` is ambiguous"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize("path", ["'config/reassigned.md'", "'docs/reassigned.md'"])
+def test_docs_governance_rejects_reassigned_low_level_os_descriptors(path: str) -> None:
+    """A tracked ``os`` descriptor cannot be trusted after reassignment."""
+
+    source = (
+        "import os\n\n"
+        "def test_descriptor() -> None:\n"
+        f"    descriptor = os.open({path}, 0)\n"
+        "    descriptor = build_descriptor()\n"
+        "    os.read(descriptor, 1)\n"
+    )
+    with pytest.raises(AssertionError, match="os.read descriptor provenance is ambiguous"):
         _docs_reading_test_modules(source)
 
 
