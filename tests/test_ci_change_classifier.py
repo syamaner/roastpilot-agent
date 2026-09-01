@@ -1335,6 +1335,232 @@ def _os_open_read_aliases(
     return modules - rebound, opens - rebound, reads - rebound, rebound
 
 
+def _functools_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str], set[str]]:
+    """Return admitted ``functools`` module, ``wraps``, and ``cached_property`` aliases.
+
+    Returns:
+        A ``(module_aliases, wraps_aliases, cached_property_aliases,
+        ambiguous_aliases)`` four-tuple. A decorator target named in
+        ``module_aliases`` requires a same-decorator qualified
+        ``<alias>.wraps``/``<alias>.cached_property`` attribute access; a
+        target in ``wraps_aliases``/``cached_property_aliases`` is used bare,
+        including one level of safe static rebinding such as
+        ``cached = functools.cached_property``. Any of these names reassigned
+        after being admitted — however it is reassigned — moves to
+        ``ambiguous_aliases`` instead, closing the rebind hole rather than
+        silently keeping stale provenance.
+    """
+
+    scoped_statements = _control_flow_scoped_statements(tree.body)
+    modules = {
+        alias.asname or alias.name
+        for statement in scoped_statements
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "functools"
+    }
+    wraps_aliases = {
+        alias.asname or alias.name
+        for statement in scoped_statements
+        if isinstance(statement, ast.ImportFrom) and statement.module == "functools"
+        for alias in statement.names
+        if alias.name == "wraps"
+    }
+    cached_property_aliases = {
+        alias.asname or alias.name
+        for statement in scoped_statements
+        if isinstance(statement, ast.ImportFrom) and statement.module == "functools"
+        for alias in statement.names
+        if alias.name == "cached_property"
+    }
+    ambiguous: set[str] = set()
+
+    def _invalidate(name: str) -> None:
+        ambiguous.add(name)
+        modules.discard(name)
+        wraps_aliases.discard(name)
+        cached_property_aliases.discard(name)
+
+    for statement in scoped_statements:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)) or statement.value is None:
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        tracked = modules | wraps_aliases | cached_property_aliases | ambiguous
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            for candidate in (
+                name_node
+                for assigned in targets
+                for name_node in ast.walk(assigned)
+                if isinstance(name_node, ast.Name) and isinstance(name_node.ctx, ast.Store)
+            ):
+                if candidate.id in tracked:
+                    _invalidate(candidate.id)
+            continue
+        target = targets[0].id
+        value = statement.value
+        if target in tracked:
+            _invalidate(target)
+            continue
+        if (
+            isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and value.value.id in modules
+            and value.attr in {"wraps", "cached_property"}
+        ):
+            (wraps_aliases if value.attr == "wraps" else cached_property_aliases).add(target)
+        elif isinstance(value, ast.Name) and value.id in wraps_aliases:
+            wraps_aliases.add(target)
+        elif isinstance(value, ast.Name) and value.id in cached_property_aliases:
+            cached_property_aliases.add(target)
+        elif isinstance(value, ast.Name) and value.id in ambiguous:
+            ambiguous.add(target)
+    return modules, wraps_aliases, cached_property_aliases, ambiguous
+
+
+def _cached_property_decorator_state(
+    decorator: ast.expr,
+    functools_module_aliases: set[str],
+    cached_property_aliases: set[str],
+    ambiguous_functools_aliases: set[str],
+) -> str:
+    """Return closed same-class ``functools.cached_property`` decorator provenance.
+
+    Returns:
+        ``"ambiguous"`` for a rebound alias or a called/otherwise malformed
+        shape naming ``cached_property``; ``"resolved"`` for a statically
+        admitted qualified reference or safe direct alias; ``"none"`` for an
+        unrelated decorator.
+    """
+
+    target = decorator.func if isinstance(decorator, ast.Call) else decorator
+    resolved = False
+    ambiguous = False
+    if isinstance(target, ast.Attribute) and target.attr == "cached_property":
+        if isinstance(target.value, ast.Name):
+            if target.value.id in functools_module_aliases:
+                resolved = True
+            elif target.value.id in ambiguous_functools_aliases:
+                ambiguous = True
+    elif isinstance(target, ast.Name):
+        if target.id in cached_property_aliases:
+            resolved = True
+        elif target.id in ambiguous_functools_aliases:
+            ambiguous = True
+    if not resolved and not ambiguous:
+        return "none"
+    if ambiguous or isinstance(decorator, ast.Call):
+        return "ambiguous"
+    return "resolved"
+
+
+def _is_functools_wraps_decorator(
+    decorator: ast.expr,
+    functools_module_aliases: set[str],
+    wraps_aliases: set[str],
+    ambiguous_functools_aliases: set[str],
+) -> str:
+    """Return closed provenance for one decorator applied to a nested wrapper def.
+
+    Returns:
+        ``"safe"`` for a statically resolved, called ``functools.wraps(...)``
+        form (qualified or a safe direct alias); ``"ambiguous"`` for every
+        other shape, including a rebound alias, a bare (uncalled) reference,
+        and any unrelated decorator — none of these can be proven not to
+        change the wrapper's behavior, so this fails closed rather than
+        silently accepting an unverified decorator on the traced wrapper.
+    """
+
+    target = decorator.func if isinstance(decorator, ast.Call) else decorator
+    resolved = False
+    ambiguous = False
+    if isinstance(target, ast.Attribute) and target.attr == "wraps":
+        if isinstance(target.value, ast.Name):
+            if target.value.id in functools_module_aliases:
+                resolved = True
+            elif target.value.id in ambiguous_functools_aliases:
+                ambiguous = True
+    elif isinstance(target, ast.Name):
+        if target.id in wraps_aliases:
+            resolved = True
+        elif target.id in ambiguous_functools_aliases:
+            ambiguous = True
+    if resolved and isinstance(decorator, ast.Call):
+        return "safe"
+    if resolved or ambiguous:
+        return "ambiguous"
+    return "ambiguous"
+
+
+def _nested_wrapper_return(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    functools_module_aliases: set[str],
+    wraps_aliases: set[str],
+    ambiguous_functools_aliases: set[str],
+) -> tuple[str, ast.FunctionDef | ast.AsyncFunctionDef] | str:
+    """Return one statically resolved same-scope nested wrapper return, or a closed state.
+
+    Args:
+        node: A same-module candidate decorator function definition.
+        functools_module_aliases: Admitted ``import functools`` aliases.
+        wraps_aliases: Admitted bare ``functools.wraps`` aliases.
+        ambiguous_functools_aliases: Rebound ``functools``/``wraps`` names.
+
+    Returns:
+        ``"none"`` when the function's directly-scoped body defines no nested
+        ``def``/``async def`` at all — an ordinary identity decorator (for
+        example ``return func`` unchanged) is untouched by this helper.
+        ``"ambiguous"`` for every other shape that does define at least one
+        nested function: more than one distinct returned name, a non-``Name``
+        return, a returned name that is not a directly nested ``def``, a
+        nested wrapper name reassigned before the return, or a nested wrapper
+        decorated with anything but a statically safe ``functools.wraps(...)``
+        call. A ``(wrapper_name, wrapper_node)`` pair only for the single
+        unambiguous resolved case.
+    """
+
+    scoped_statements = _control_flow_scoped_statements(node.body)
+    nested_defs = {
+        statement.name: statement
+        for statement in scoped_statements
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if not nested_defs:
+        return "none"
+    reassigned_names = {
+        target.id
+        for statement in scoped_statements
+        if isinstance(statement, (ast.Assign, ast.AnnAssign)) and statement.value is not None
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        )
+        if isinstance(target, ast.Name) and target.id in nested_defs
+    }
+    returned_names: set[str] = set()
+    non_name_return = False
+    for statement in scoped_statements:
+        if not isinstance(statement, ast.Return):
+            continue
+        if statement.value is None or not isinstance(statement.value, ast.Name):
+            non_name_return = True
+        else:
+            returned_names.add(statement.value.id)
+    if non_name_return or len(returned_names) != 1:
+        return "ambiguous"
+    (returned_name,) = returned_names
+    if returned_name not in nested_defs or returned_name in reassigned_names:
+        return "ambiguous"
+    wrapper_node = nested_defs[returned_name]
+    for decorator in wrapper_node.decorator_list:
+        if (
+            _is_functools_wraps_decorator(
+                decorator, functools_module_aliases, wraps_aliases, ambiguous_functools_aliases
+            )
+            != "safe"
+        ):
+            return "ambiguous"
+    return (returned_name, wrapper_node)
+
+
 def _codecs_open_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
     """Return exact and rebound aliases for the admitted ``codecs.open`` call.
 
@@ -4332,6 +4558,12 @@ def _docs_reading_test_modules(
         ambiguous_os_open_read_aliases,
     ) = _os_open_read_aliases(tree)
     (
+        functools_module_aliases,
+        functools_wraps_aliases,
+        functools_cached_property_aliases,
+        ambiguous_functools_aliases,
+    ) = _functools_aliases(tree)
+    (
         imported_analyses,
         ambiguous_imports,
         imported_classes,
@@ -4435,6 +4667,25 @@ def _docs_reading_test_modules(
     local_callable_aliases = _local_collected_callable_aliases(tree, functions, filename)
     functions.update({alias: functions[target] for alias, target in local_callable_aliases.items()})
     _assert_no_unaudited_collected_test_bases(tree, filename)
+    decorator_wrapper_returns: dict[str, str] = {}
+    ambiguous_decorator_wrapper_names: set[str] = set()
+    for statement in tree.body:
+        if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        wrapper_resolution = _nested_wrapper_return(
+            statement,
+            functools_module_aliases,
+            functools_wraps_aliases,
+            ambiguous_functools_aliases,
+        )
+        if isinstance(wrapper_resolution, str):
+            if wrapper_resolution == "ambiguous":
+                ambiguous_decorator_wrapper_names.add(statement.name)
+            continue
+        wrapper_name, wrapper_node = wrapper_resolution
+        wrapper_key = f"__decorator_wrapper__{statement.name}__{wrapper_name}"
+        functions[wrapper_key] = wrapper_node
+        decorator_wrapper_returns[statement.name] = wrapper_key
     class_methods: dict[str, dict[str, str]] = {}
     all_class_methods: dict[str, dict[str, str]] = {}
     class_property_getters: dict[str, dict[str, str]] = {}
@@ -4452,10 +4703,22 @@ def _docs_reading_test_modules(
             qualified_name = f"{statement.name}::{member.name}"
             methods[member.name] = qualified_name
             functions[qualified_name] = member
-            if any(
+            has_property_decorator = any(
                 isinstance(decorator, ast.Name) and decorator.id == "property"
                 for decorator in member.decorator_list
-            ):
+            )
+            cached_property_states = {
+                _cached_property_decorator_state(
+                    decorator,
+                    functools_module_aliases,
+                    functools_cached_property_aliases,
+                    ambiguous_functools_aliases,
+                )
+                for decorator in member.decorator_list
+            }
+            if "ambiguous" in cached_property_states:
+                ambiguous_class_property_getters.setdefault(statement.name, set()).add(member.name)
+            elif has_property_decorator or "resolved" in cached_property_states:
                 class_property_getters.setdefault(statement.name, {})[member.name] = qualified_name
         shadowed_members = {
             target.id
@@ -4472,7 +4735,9 @@ def _docs_reading_test_modules(
         if shadowed_properties:
             for property_name in shadowed_properties:
                 class_property_getters[statement.name].pop(property_name)
-            ambiguous_class_property_getters[statement.name] = shadowed_properties
+            ambiguous_class_property_getters.setdefault(statement.name, set()).update(
+                shadowed_properties
+            )
         for member in shadowed_members:
             methods.pop(member, None)
         for assignment in statement.body:
@@ -4857,11 +5122,23 @@ def _docs_reading_test_modules(
                     )
                 if target.id in pytest_marker_aliases:
                     continue
+                canonical_decorator_name: str | None = None
                 if target.id in decorator_aliases:
-                    analyses[name].calls.add(decorator_aliases[target.id])
-                    continue
-                if target.id in analyses:
+                    canonical_decorator_name = decorator_aliases[target.id]
+                    analyses[name].calls.add(canonical_decorator_name)
+                elif target.id in analyses:
+                    canonical_decorator_name = target.id
                     analyses[name].calls.add(target.id)
+                if canonical_decorator_name is not None:
+                    if canonical_decorator_name in ambiguous_decorator_wrapper_names:
+                        raise AssertionError(
+                            f"{filename}:{decorator.lineno}: decorator "
+                            f"`{canonical_decorator_name}` nested wrapper provenance is ambiguous"
+                        )
+                    if canonical_decorator_name in decorator_wrapper_returns:
+                        analyses[name].calls.add(
+                            decorator_wrapper_returns[canonical_decorator_name]
+                        )
                 continue
             if not (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)):
                 continue
@@ -7254,6 +7531,140 @@ def test_docs_governance_rejects_shadowed_property_getters(shadow: str) -> None:
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_traces_same_class_cached_property_descriptors() -> None:
+    """A same-class ``functools.cached_property`` getter propagates docs provenance."""
+
+    source = (
+        "import functools\nfrom functools import cached_property as cp\n"
+        "from pathlib import Path\n\n"
+        "def some_other_decorator(func):\n    return func\n\n"
+        "class TestDocs:\n"
+        "    @functools.cached_property\n    def content(self) -> str:\n"
+        "        return Path('docs/cached.md').read_text()\n\n"
+        "    def test_qualified(self) -> None:\n        assert self.content\n\n"
+        "    @cp\n    def alias_content(self) -> str:\n"
+        "        return Path('docs/cached-alias.md').read_text()\n\n"
+        "    def test_direct_alias(self) -> None:\n        assert self.alias_content\n\n"
+        "    @property\n    def plain(self) -> str:\n"
+        "        return Path('docs/plain-property.md').read_text()\n\n"
+        "    def test_plain_property(self) -> None:\n        assert self.plain\n\n"
+        "    @functools.cached_property\n    def config(self) -> str:\n"
+        "        return Path('config/cached.md').read_text()\n\n"
+        "    def test_non_reader(self) -> None:\n        assert self.config\n\n"
+        "    @some_other_decorator\n    def other(self) -> str:\n"
+        "        return Path('docs/unreached-other.md').read_text()\n\n"
+        "    def test_other_not_marked(self) -> None:\n        assert self.other\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "TestDocs::test_direct_alias",
+        "TestDocs::test_plain_property",
+        "TestDocs::test_qualified",
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_static_cached_property_alias_chains() -> None:
+    """A safe static alias, including one chained rebind, retains cached_property provenance."""
+
+    source = (
+        "import functools\nfrom pathlib import Path\n\n"
+        "cached = functools.cached_property\nchained = cached\n\n"
+        "class TestDocs:\n"
+        "    @chained\n    def content(self) -> str:\n"
+        "        return Path('docs/chained-cached.md').read_text()\n\n"
+        "    def test_docs(self) -> None:\n        assert self.content\n"
+    )
+    assert _docs_reading_test_modules(source) == {"TestDocs::test_docs"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_rebound_cached_property_aliases() -> None:
+    """Rebinding the ``functools`` module or a ``cached_property`` alias fails closed."""
+
+    module_rebound = (
+        "import functools\nfrom pathlib import Path\n\n"
+        "functools = object()\n\n"
+        "class TestDocs:\n"
+        "    @functools.cached_property\n    def content(self) -> str:\n"
+        "        return Path('docs/rebound-module.md').read_text()\n\n"
+        "    def test_docs(self) -> None:\n        assert self.content\n"
+    )
+    direct_rebound = (
+        "from functools import cached_property as cp\nfrom pathlib import Path\n\n"
+        "cp = object()\n\n"
+        "class TestDocs:\n"
+        "    @cp\n    def content(self) -> str:\n"
+        "        return Path('docs/rebound-direct.md').read_text()\n\n"
+        "    def test_docs(self) -> None:\n        assert self.content\n"
+    )
+    for source in (module_rebound, direct_rebound):
+        with pytest.raises(
+            AssertionError, match="same-class property getter `content` is ambiguous"
+        ):
+            _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_malformed_cached_property_call_shapes() -> None:
+    """A called ``cached_property`` decorator shape cannot skip its reader provenance."""
+
+    source = (
+        "import functools\nfrom pathlib import Path\n\n"
+        "class TestDocs:\n"
+        "    @functools.cached_property()\n    def content(self) -> str:\n"
+        "        return Path('docs/malformed-cached.md').read_text()\n\n"
+        "    def test_docs(self) -> None:\n        assert self.content\n"
+    )
+    with pytest.raises(AssertionError, match="same-class property getter `content` is ambiguous"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize("shadow", ["content = object", "content: object = object"])
+def test_docs_governance_rejects_shadowed_cached_property_getters(shadow: str) -> None:
+    """Class-body rebinding invalidates the provenance of a ``cached_property`` getter."""
+
+    source = (
+        "import functools\nfrom pathlib import Path\n\nclass TestDocs:\n"
+        "    @functools.cached_property\n    def content(self) -> str:\n"
+        "        return Path('docs/shadowed-cached.md').read_text()\n\n"
+        f"    {shadow}\n\n"
+        "    def test_docs(self) -> None:\n        assert self.content\n"
+    )
+    with pytest.raises(AssertionError, match="same-class property getter `content` is ambiguous"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_merges_alias_and_shadow_ambiguous_cached_properties() -> None:
+    """A decorator-alias ambiguity and a class-body shadow ambiguity coexist without loss."""
+
+    source = (
+        "import functools\nfrom pathlib import Path\n\n"
+        "functools = object()\n\n"
+        "class TestDocs:\n"
+        "    @functools.cached_property\n    def content(self) -> str:\n"
+        "        return Path('docs/merge-alias.md').read_text()\n\n"
+        "    def test_alias_ambiguous(self) -> None:\n        pass\n\n"
+        "    @property\n    def shadowed(self) -> str:\n"
+        "        return Path('docs/merge-shadow.md').read_text()\n\n"
+        "    shadowed = object\n\n"
+        "    def test_shadow_ambiguous(self) -> None:\n        assert self.shadowed\n"
+    )
+    with pytest.raises(AssertionError, match="same-class property getter `shadowed` is ambiguous"):
+        _docs_reading_test_modules(source)
+    reversed_access = source.replace(
+        "def test_alias_ambiguous(self) -> None:\n        pass",
+        "def test_alias_ambiguous(self) -> None:\n        assert self.content",
+    ).replace(
+        "def test_shadow_ambiguous(self) -> None:\n        assert self.shadowed",
+        "def test_shadow_ambiguous(self) -> None:\n        pass",
+    )
+    with pytest.raises(AssertionError, match="same-class property getter `content` is ambiguous"):
+        _docs_reading_test_modules(reversed_access)
+
+
+@pytest.mark.docs_ci
 @pytest.mark.parametrize("path", ["'config/reassigned.md'", "'docs/reassigned.md'"])
 def test_docs_governance_rejects_reassigned_low_level_os_descriptors(path: str) -> None:
     """A tracked ``os`` descriptor cannot be trusted after reassignment."""
@@ -8793,6 +9204,217 @@ def test_docs_governance_resolves_bare_decorator_aliases_fail_closed() -> None:
     with pytest.raises(AssertionError, match="must sit on exactly the readers"):
         _assert_exact_docs_markers(
             ast.parse(mutated), _docs_reading_test_modules(mutated), "decorator-alias-mutated.py"
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_statically_resolved_decorator_nested_wrappers() -> None:
+    """A same-module decorator that returns a nested wrapper resolves execution-time reads."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def deco(func):\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        Path('docs/wrapper-body.md').read_text()\n"
+        "        return func(*args, **kwargs)\n"
+        "    return wrapper\n\n"
+        "@deco\ndef test_wrapped() -> None:\n    assert True\n\n"
+        "def deco_non_reader(func):\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        return func(*args, **kwargs)\n"
+        "    return wrapper\n\n"
+        "@deco_non_reader\ndef test_non_reader() -> None:\n    assert True\n\n"
+        "def deco_non_doc_read(func):\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        Path('config/wrapper-body.md').read_text()\n"
+        "        return func(*args, **kwargs)\n"
+        "    return wrapper\n\n"
+        "@deco_non_doc_read\ndef test_non_doc_wrapper() -> None:\n    assert True\n\n"
+        "def docs_wrapper(func):\n    Path('docs/identity.md').read_text()\n    return func\n\n"
+        "@docs_wrapper\ndef test_identity_still_works() -> None:\n    assert True\n\n"
+        "def docs_factory():\n    Path('docs/factory-still-works.md').read_text()\n"
+        "    return lambda func: func\n\n"
+        "@docs_factory()\ndef test_factory_still_works() -> None:\n    assert True\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_factory_still_works",
+        "test_identity_still_works",
+        "test_wrapped",
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_decorator_wrapper_functools_wraps_forms() -> None:
+    """Every admitted ``functools.wraps`` import form on the nested wrapper still resolves."""
+
+    source = (
+        "import functools\nfrom functools import wraps\nfrom functools import wraps as fw\n"
+        "from pathlib import Path\n\n"
+        "def deco_module(func):\n"
+        "    @functools.wraps(func)\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        Path('docs/module-wraps.md').read_text()\n"
+        "        return func(*args, **kwargs)\n"
+        "    return wrapper\n\n"
+        "@deco_module\ndef test_module_wraps() -> None:\n    assert True\n\n"
+        "def deco_bare(func):\n"
+        "    @wraps(func)\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        Path('docs/bare-wraps.md').read_text()\n"
+        "        return func(*args, **kwargs)\n"
+        "    return wrapper\n\n"
+        "@deco_bare\ndef test_bare_wraps() -> None:\n    assert True\n\n"
+        "def deco_aliased(func):\n"
+        "    @fw(func)\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        Path('docs/aliased-wraps.md').read_text()\n"
+        "        return func(*args, **kwargs)\n"
+        "    return wrapper\n\n"
+        "chain = deco_aliased\n\n"
+        "@chain\ndef test_aliased_wraps() -> None:\n    assert True\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_aliased_wraps",
+        "test_bare_wraps",
+        "test_module_wraps",
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_decorator_wrapper_transitively() -> None:
+    """A nested wrapper that calls a same-module helper still resolves docs provenance."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def helper() -> None:\n    Path('docs/transitive-helper.md').read_text()\n\n"
+        "def deco(func):\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        helper()\n"
+        "        return func(*args, **kwargs)\n"
+        "    return wrapper\n\n"
+        "@deco\ndef test_transitive() -> None:\n    assert True\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_transitive"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_decorator_wrapper_on_class_methods() -> None:
+    """A same-module nested-wrapper decorator on a ``TestClass`` method resolves provenance."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def deco(func):\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        Path('docs/class-method-wrapper.md').read_text()\n"
+        "        return func(*args, **kwargs)\n"
+        "    return wrapper\n\n"
+        "class TestDocs:\n"
+        "    @deco\n    def test_method(self) -> None:\n        assert True\n"
+    )
+    assert _docs_reading_test_modules(source) == {"TestDocs::test_method"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_ambiguous_decorator_wrapper_shapes() -> None:
+    """Every unresolved same-module nested-wrapper shape fails closed once applied."""
+
+    def build(nested_body: str) -> str:
+        return (
+            "from pathlib import Path\nimport functools\n"
+            "from functools import wraps\nfrom functools import wraps as fw\n\n"
+            f"{nested_body}\n\n"
+            "@deco\ndef test_wrapped() -> None:\n    assert True\n"
+        )
+
+    cases = [
+        (
+            "def deco(func):\n"
+            "    if True:\n"
+            "        def wrapper(*a, **kw):\n"
+            "            return func(*a, **kw)\n"
+            "        return wrapper\n"
+            "    def other(*a, **kw):\n"
+            "        Path('docs/other.md').read_text()\n"
+            "        return func(*a, **kw)\n"
+            "    return other\n"
+        ),
+        (
+            "def deco(func):\n"
+            "    def wrapper(*a, **kw):\n"
+            "        Path('docs/reassigned.md').read_text()\n"
+            "        return func(*a, **kw)\n"
+            "    wrapper = func\n"
+            "    return wrapper\n"
+        ),
+        (
+            "def unrelated(func):\n    return func\n\n"
+            "def deco(func):\n"
+            "    @unrelated\n"
+            "    def wrapper(*a, **kw):\n"
+            "        Path('docs/unrelated-decorator.md').read_text()\n"
+            "        return func(*a, **kw)\n"
+            "    return wrapper\n"
+        ),
+        (
+            "def deco(func):\n"
+            "    @functools.wraps\n"
+            "    def wrapper(*a, **kw):\n"
+            "        Path('docs/bare-wraps.md').read_text()\n"
+            "        return func(*a, **kw)\n"
+            "    return wrapper\n"
+        ),
+        (
+            "def deco(func):\n"
+            "    def wrapper(*a, **kw):\n"
+            "        return other(*a, **kw)\n"
+            "    return other\n"
+        ),
+        (
+            "functools = object()\n\n"
+            "def deco(func):\n"
+            "    @functools.wraps(func)\n"
+            "    def wrapper(*a, **kw):\n"
+            "        Path('docs/rebound-module.md').read_text()\n"
+            "        return func(*a, **kw)\n"
+            "    return wrapper\n"
+        ),
+        (
+            "wraps = object()\n\n"
+            "def deco(func):\n"
+            "    @wraps(func)\n"
+            "    def wrapper(*a, **kw):\n"
+            "        Path('docs/rebound-wraps.md').read_text()\n"
+            "        return func(*a, **kw)\n"
+            "    return wrapper\n"
+        ),
+    ]
+    for nested_body in cases:
+        with pytest.raises(
+            AssertionError, match="decorator `deco` nested wrapper provenance is ambiguous"
+        ):
+            _docs_reading_test_modules(build(nested_body))
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_decorator_wrapper_mutation_reds_against_exact_markers() -> None:
+    """Marking and mutating the wrapper-only docs boundary keeps exact markers honest."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "def deco(func):\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        Path('docs/wrapper-marker.md').read_text()\n"
+        "        return func(*args, **kwargs)\n"
+        "    return wrapper\n\n"
+        "@pytest.mark.docs\n@deco\ndef test_wrapped() -> None:\n    assert True\n"
+    )
+    tree = ast.parse(source)
+    readers = _docs_reading_test_modules(source)
+    _assert_exact_docs_markers(tree, readers, "wrapper-marker.py")
+    mutated = source.replace("docs/wrapper-marker.md", "config/wrapper-marker.md")
+    with pytest.raises(AssertionError, match="must sit on exactly the readers"):
+        _assert_exact_docs_markers(
+            ast.parse(mutated), _docs_reading_test_modules(mutated), "wrapper-marker-mutated.py"
         )
 
 
