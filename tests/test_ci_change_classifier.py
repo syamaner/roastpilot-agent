@@ -10107,6 +10107,109 @@ def test_docs_governance_iteration_protocol_mutation_reds_against_exact_markers(
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_traces_filter_and_map_iterable_arguments() -> None:
+    """``filter`` and ``map`` follow only their statically known iterable argument."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/filter-map.md').read_text().splitlines())\n\n"
+        "class ConfigLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('config/filter-map.md').read_text().splitlines())\n\n"
+        "def test_filter_docs() -> None:\n    assert list(filter(bool, DocsLines()))\n\n"
+        "def test_map_docs() -> None:\n    assert list(map(str, DocsLines()))\n\n"
+        "def test_filter_non_docs() -> None:\n"
+        "    assert list(filter(bool, ConfigLines()))\n\n"
+        "def test_map_non_docs() -> None:\n    assert list(map(str, ConfigLines()))\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_filter_docs", "test_map_docs"}
+
+    for builtin, callback in (("filter", "bool"), ("map", "str")):
+        ambiguous = (
+            "from pathlib import Path\n\n"
+            "class DocsLines:\n"
+            "    def __iter__(self):\n"
+            "        return iter(Path('docs/filter-map-ambiguous.md').read_text().splitlines())\n\n"
+            "def test_ambiguous() -> None:\n"
+            "    loader = construct(DocsLines)\n"
+            f"    assert list({builtin}({callback}, loader))\n"
+        )
+        with pytest.raises(AssertionError, match="helper-class instance provenance is ambiguous"):
+            _docs_reading_test_modules(ambiguous)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_malformed_filter_and_map_iteration_calls() -> None:
+    """Malformed two-argument iteration calls cannot hide a helper-class reader."""
+
+    template = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/filter-map-malformed.md').read_text().splitlines())\n\n"
+        "def test_malformed() -> None:\n    assert {call}\n"
+    )
+    for call in (
+        "list(filter(bool, DocsLines(), None))",
+        "list(filter(bool, DocsLines(), default=None))",
+        "list(map(DocsLines(), str, *()))",
+        "list(map(DocsLines(), str, option=None))",
+    ):
+        with pytest.raises(
+            AssertionError, match="malformed `(?:filter|map)\\(\\.\\.\\.\\)` iteration"
+        ):
+            _docs_reading_test_modules(template.format(call=call))
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    "builtin",
+    ("all", "any", "bytearray", "bytes", "dict", "max", "min", "sum"),
+)
+def test_docs_governance_traces_every_newly_admitted_one_argument_iteration_builtin(
+    builtin: str,
+) -> None:
+    """Each newly admitted one-argument builtin reaches a docs reader's ``__iter__``."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/one-arg-builtin.md').read_text().splitlines())\n\n"
+        f"def test_{builtin}_docs() -> None:\n    assert {builtin}(DocsLines())\n"
+    )
+    assert _docs_reading_test_modules(source) == {f"test_{builtin}_docs"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_filter_map_and_one_argument_builtins_red_against_exact_markers() -> None:
+    """The iterable-builtin edges remain load-bearing for exact docs-marker checks."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/builtin-marker.md').read_text().splitlines())\n\n"
+        "@pytest.mark.docs\n"
+        "def test_filter() -> None:\n    assert list(filter(bool, DocsLines()))\n\n"
+        "@pytest.mark.docs\n"
+        "def test_sum() -> None:\n    assert sum(DocsLines())\n"
+    )
+    _assert_exact_docs_markers(
+        ast.parse(source), _docs_reading_test_modules(source), "builtin-marker.py"
+    )
+    mutated = source.replace("docs/", "config/", 1)
+    with pytest.raises(AssertionError, match="must sit on exactly the readers"):
+        _assert_exact_docs_markers(
+            ast.parse(mutated),
+            _docs_reading_test_modules(mutated),
+            "builtin-marker-mutated.py",
+        )
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_traces_context_manager_enter_and_exit_edges() -> None:
     """A repository-local helper's implicit ``__enter__``/``__exit__`` cannot hide a read."""
 
