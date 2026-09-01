@@ -1222,6 +1222,36 @@ def _fileinput_input_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[
     return modules - rebound, calls - rebound, rebound
 
 
+def _linecache_get_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
+    """Return exact and rebound aliases for ``linecache.getline``/``getlines``."""
+
+    scoped_statements = _control_flow_scoped_statements(tree.body)
+    modules = {
+        alias.asname or alias.name
+        for statement in scoped_statements
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "linecache"
+    }
+    calls = {
+        alias.asname or alias.name
+        for statement in scoped_statements
+        if isinstance(statement, ast.ImportFrom) and statement.module == "linecache"
+        for alias in statement.names
+        if alias.name in {"getline", "getlines"}
+    }
+    rebound = {
+        target.id
+        for statement in scoped_statements
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        )
+        if isinstance(target, ast.Name) and target.id in modules | calls
+    }
+    return modules - rebound, calls - rebound, rebound
+
+
 _SHUTIL_COPY_ENTRY_POINTS = frozenset({"copy", "copy2", "copyfile", "copytree"})
 
 #: Repository-plugin pytest hooks that run around every collected test item,
@@ -3065,6 +3095,9 @@ def _analyse_function(
     fileinput_module_aliases: set[str] | None = None,
     fileinput_call_aliases: set[str] | None = None,
     ambiguous_fileinput_aliases: set[str] | None = None,
+    linecache_module_aliases: set[str] | None = None,
+    linecache_call_aliases: set[str] | None = None,
+    ambiguous_linecache_aliases: set[str] | None = None,
     codecs_module_aliases: set[str] | None = None,
     codecs_call_aliases: set[str] | None = None,
     ambiguous_codecs_aliases: set[str] | None = None,
@@ -3539,6 +3572,45 @@ def _analyse_function(
             _receiver_is_partial(target)
             or _module_receiver_state(target) == "ambiguous"
             or not _string_constants(target)
+        ):
+            return "ambiguous"
+        return "none"
+
+    def _linecache_state(call: ast.Call) -> str:
+        """Return closed docs provenance for one admitted linecache read."""
+
+        target_is_linecache = (
+            isinstance(call.func, ast.Name) and call.func.id in (linecache_call_aliases or set())
+        ) or (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr in {"getline", "getlines"}
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in (linecache_module_aliases or set())
+        )
+        target_is_rebound = (
+            isinstance(call.func, ast.Name)
+            and call.func.id in (ambiguous_linecache_aliases or set())
+        ) or (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr in {"getline", "getlines"}
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in (ambiguous_linecache_aliases or set())
+        )
+        if target_is_rebound:
+            return "ambiguous"
+        if not target_is_linecache or any(keyword.arg is None for keyword in call.keywords):
+            return "none" if not target_is_linecache else "ambiguous"
+        if not call.args or isinstance(call.args[0], ast.Starred):
+            return "ambiguous"
+        if any(keyword.arg == "filename" for keyword in call.keywords):
+            return "ambiguous"
+        filename = call.args[0]
+        if _receiver_is_docs(filename) or _module_receiver_state(filename) == "docs":
+            return "docs"
+        if (
+            _receiver_is_partial(filename)
+            or _module_receiver_state(filename) == "ambiguous"
+            or not _string_constants(filename)
         ):
             return "ambiguous"
         return "none"
@@ -4140,6 +4212,13 @@ def _analyse_function(
             unresolved.append(
                 f"{filename}:{node.lineno}: codecs.open filename provenance is ambiguous"
             )
+        linecache_state = _linecache_state(node)
+        if linecache_state == "docs":
+            reads = True
+        elif linecache_state == "ambiguous":
+            unresolved.append(
+                f"{filename}:{node.lineno}: linecache filename provenance is ambiguous"
+            )
         os_operation = _os_operation(node)
         if os_operation == "ambiguous":
             unresolved.append(f"{filename}:{node.lineno}: low-level os provenance is ambiguous")
@@ -4647,6 +4726,9 @@ def _docs_reading_test_modules(
     fileinput_module_aliases, fileinput_call_aliases, ambiguous_fileinput_aliases = (
         _fileinput_input_aliases(tree)
     )
+    linecache_module_aliases, linecache_call_aliases, ambiguous_linecache_aliases = (
+        _linecache_get_aliases(tree)
+    )
     codecs_module_aliases, codecs_call_aliases, ambiguous_codecs_aliases = _codecs_open_aliases(
         tree
     )
@@ -5094,6 +5176,9 @@ def _docs_reading_test_modules(
             fileinput_module_aliases,
             fileinput_call_aliases,
             ambiguous_fileinput_aliases,
+            linecache_module_aliases,
+            linecache_call_aliases,
+            ambiguous_linecache_aliases,
             codecs_module_aliases,
             codecs_call_aliases,
             ambiguous_codecs_aliases,
@@ -9952,6 +10037,41 @@ def test_docs_governance_traces_usefixtures_decorator_aliases_fail_closed() -> N
             AssertionError, match="usefixtures decorator alias provenance is ambiguous"
         ):
             _docs_reading_test_modules(ambiguous, filename="usefixtures-alias-ambiguous.py")
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_static_linecache_reads_and_mutation() -> None:
+    """Closed linecache aliases cannot hide committed Markdown reads."""
+
+    source = (
+        "import linecache as cache\nfrom linecache import getline as line\n"
+        "from linecache import getlines as lines\nimport pytest\n\n"
+        "@pytest.mark.docs\ndef test_qualified() -> None:\n"
+        "    cache.getline('docs/cache.md', 1)\n\n"
+        "@pytest.mark.docs\ndef test_direct() -> None:\n    line('docs/direct.md', 1)\n\n"
+        "@pytest.mark.docs\ndef test_plural() -> None:\n    lines('docs/plural.md')\n\n"
+        "def test_non_docs() -> None:\n    cache.getline('config/cache.md', 1)\n"
+    )
+    _assert_exact_docs_markers(
+        ast.parse(source), _docs_reading_test_modules(source), "linecache.py"
+    )
+    mutated = source.replace("docs/cache.md", "config/cache.md")
+    with pytest.raises(AssertionError, match="must sit on exactly the readers"):
+        _assert_exact_docs_markers(
+            ast.parse(mutated), _docs_reading_test_modules(mutated), "linecache-mutated.py"
+        )
+    for ambiguous in (
+        source.replace("cache.getline('docs/cache.md', 1)", "cache.getline(dynamic_name, 1)"),
+        source.replace("cache.getline('docs/cache.md', 1)", "cache.getline()"),
+        source.replace("cache.getline('docs/cache.md', 1)", "cache.getline(*names)"),
+        source.replace("import linecache as cache", "import linecache as cache\ncache = object()"),
+        source.replace(
+            "from linecache import getline as line",
+            "from linecache import getline as line\nline = object()",
+        ),
+    ):
+        with pytest.raises(AssertionError, match="linecache filename provenance is ambiguous"):
+            _docs_reading_test_modules(ambiguous)
 
 
 #: D180 §2.3: every job that declares `needs: classify`, exactly.
