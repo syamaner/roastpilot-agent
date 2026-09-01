@@ -7044,6 +7044,41 @@ def test_docs_governance_rejects_malformed_os_and_staticmethod_alias_shapes() ->
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_rejects_rebound_direct_os_reader_aliases() -> None:
+    """Each rebound direct low-level ``os`` alias remains a closed ambiguity."""
+
+    source = (
+        "from os import open as open_fd, read as read_fd\n\n"
+        "open_fd = object\nread_fd = object\n\n"
+        "def test_rebound_direct_aliases() -> None:\n"
+        "    descriptor = open_fd('docs/rebound.md', 0)\n"
+        "    read_fd(descriptor, 1)\n"
+    )
+    with pytest.raises(AssertionError, match="low-level os provenance is ambiguous"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    "alias_expression",
+    ["staticmethod(docs_reader, docs_reader)", "staticmethod(fn=docs_reader)"],
+)
+def test_docs_governance_rejects_malformed_staticmethod_collected_aliases(
+    alias_expression: str,
+) -> None:
+    """Malformed collected ``staticmethod`` aliases cannot skip their reader provenance."""
+
+    source = (
+        "from pathlib import Path\n\nclass TestDocs:\n"
+        "    @staticmethod\n    def docs_reader() -> None:\n"
+        "        Path('docs/static.md').read_text()\n\n"
+        f"    test_extra = {alias_expression}\n"
+    )
+    with pytest.raises(AssertionError, match="collected class callable alias"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_recognizes_scoped_pytest_fixture_import_aliases() -> None:
     """A direct pytest.fixture import alias participates in the fixture graph."""
 
