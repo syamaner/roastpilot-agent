@@ -972,7 +972,26 @@ def test_module_entrypoint_exits_cleanly(monkeypatch: pytest.MonkeyPatch, tmp_pa
 _READ_METHOD_NAMES = frozenset({"read_text", "read_bytes", "open"})
 _GLOB_METHOD_NAMES = frozenset({"glob", "rglob"})
 _MAX_DOCS_CALL_GRAPH_DEPTH = 8
-_ITERATION_ONE_ARG_BUILTINS = frozenset({"list", "tuple", "set", "frozenset", "iter"})
+_ITERATION_ONE_ARG_BUILTINS = frozenset(
+    {
+        "all",
+        "any",
+        "bytearray",
+        "bytes",
+        "dict",
+        "enumerate",
+        "frozenset",
+        "iter",
+        "list",
+        "max",
+        "min",
+        "set",
+        "sorted",
+        "sum",
+        "tuple",
+    }
+)
+_ITERATION_TWO_ARG_BUILTINS = frozenset({"filter", "map"})
 
 
 def _string_constants(expression: ast.expr) -> list[str]:
@@ -4374,6 +4393,30 @@ def _analyse_function(
                         or _ambiguous_iteration_receiver(argument)
                     )
                     for argument in positional
+                ):
+                    unresolved.append(
+                        f"{filename}:{node.lineno}: malformed `{node.func.id}(...)` iteration "
+                        "call shape cannot rule out a same-module helper-class read"
+                    )
+            elif node.func.id in _ITERATION_TWO_ARG_BUILTINS:
+                if (
+                    len(node.args) == 2
+                    and not node.keywords
+                    and not any(isinstance(argument, ast.Starred) for argument in node.args)
+                ):
+                    argument = node.args[1]
+                    if _ambiguous_iteration_receiver(argument):
+                        unresolved.append(
+                            f"{filename}:{node.lineno}: same-module helper-class instance "
+                            "provenance is ambiguous"
+                        )
+                    elif (helper_class := _helper_class_instance(argument)) is not None:
+                        _bind_iteration_dunder(helper_class, "__iter__", node, node.func.id)
+                elif any(
+                    _helper_class_instance(argument) is not None
+                    or _ambiguous_iteration_receiver(argument)
+                    for argument in node.args
+                    if not isinstance(argument, ast.Starred)
                 ):
                     unresolved.append(
                         f"{filename}:{node.lineno}: malformed `{node.func.id}(...)` iteration "
