@@ -6968,6 +6968,11 @@ def test_docs_governance_traces_class_aliases_low_level_os_and_properties() -> N
         "    @property\n    def content(self) -> str:\n"
         "        return Path('docs/property.md').read_text()\n\n"
         "    def test_property(self) -> None:\n        assert self.content\n\n"
+        "    @classmethod\n    def test_property_cls(cls) -> None:\n        assert cls.content\n\n"
+        "    def test_property_qualified(self) -> None:\n        assert TestDocs.content\n\n"
+        "    @property\n    def config(self) -> str:\n"
+        "        return Path('config/property.md').read_text()\n\n"
+        "    def test_property_non_reader(self) -> None:\n        assert self.config\n\n"
         "def test_module_os() -> None:\n"
         "    descriptor = operating_system.open('docs/low-level.md', 0)\n"
         "    assert operating_system.read(descriptor, 1)\n\n"
@@ -6980,6 +6985,8 @@ def test_docs_governance_traces_class_aliases_low_level_os_and_properties() -> N
     )
     assert _docs_reading_test_modules(source) == {
         "TestDocs::test_property",
+        "TestDocs::test_property_cls",
+        "TestDocs::test_property_qualified",
         "TestDocs::test_static",
         "test_direct_os",
         "test_module_os",
@@ -6988,6 +6995,52 @@ def test_docs_governance_traces_class_aliases_low_level_os_and_properties() -> N
         _docs_reading_test_modules(source.replace("descriptor, 1)", "unknown, 1)", 1))
     with pytest.raises(AssertionError, match="collected class callable alias"):
         _docs_reading_test_modules(source.replace("docs_alias)", "dynamic_alias)", 1))
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_malformed_os_and_staticmethod_alias_shapes() -> None:
+    """Rebound and malformed low-level-reader or collected-alias shapes fail closed."""
+
+    os_source = (
+        "import os as module_os\nfrom os import open as open_fd, read as read_fd\n\n"
+        "module_os = object\nopen_fd = object\n\n"
+        "def test_module_rebound() -> None:\n"
+        "    descriptor = module_os.open('docs/rebound.md', 0)\n"
+        "    module_os.read(descriptor, 1)\n\n"
+        "def test_direct_rebound() -> None:\n"
+        "    descriptor = open_fd('docs/rebound.md', 0)\n"
+        "    read_fd(descriptor, 1)\n"
+    )
+    with pytest.raises(AssertionError, match="low-level os provenance is ambiguous"):
+        _docs_reading_test_modules(os_source)
+
+    malformed = (
+        "import os\n\n"
+        "def test_malformed() -> None:\n"
+        "    descriptor = os.open(path='docs/malformed.md', flags=0)\n"
+        "    os.read(descriptor)\n"
+    )
+    with pytest.raises(AssertionError, match="os.read descriptor provenance is ambiguous"):
+        _docs_reading_test_modules(malformed)
+    with pytest.raises(AssertionError, match="os.read descriptor provenance is ambiguous"):
+        _docs_reading_test_modules(
+            malformed.replace("path='docs/malformed.md', flags=0", "*arguments")
+        )
+
+    class_source = (
+        "from pathlib import Path\n\nclass TestDocs:\n"
+        "    @staticmethod\n    def docs_reader() -> None:\n"
+        "        Path('docs/static.md').read_text()\n\n"
+        "    test_extra = staticmethod(docs_reader, docs_reader)\n"
+    )
+    with pytest.raises(AssertionError, match="collected class callable alias"):
+        _docs_reading_test_modules(class_source)
+    with pytest.raises(AssertionError, match="collected class callable alias"):
+        _docs_reading_test_modules(
+            class_source.replace(
+                "staticmethod(docs_reader, docs_reader)", "staticmethod(fn=docs_reader)"
+            )
+        )
 
 
 @pytest.mark.docs_ci
