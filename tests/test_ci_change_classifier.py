@@ -2290,6 +2290,192 @@ def _indirect_fixture_parameter_states(
     return docs, ambiguous
 
 
+def _import_call_module_aliases(
+    tree: ast.Module,
+    *,
+    additional_admitted_names: frozenset[str] = frozenset(),
+) -> tuple[set[str], set[str], set[str], set[str], set[str]]:
+    """Return admitted ``importlib``/``pytest`` import-call aliases.
+
+    Recognises the standard-library ``import importlib`` /
+    ``from importlib import import_module`` and ``import pytest`` /
+    ``from pytest import importorskip`` spellings, including explicit
+    ``as`` renames. A later reassignment of any admitted alias -- found in
+    ``tree`` itself, or named through ``additional_admitted_names`` (an
+    outer, already-admitted alias visible in this scope, e.g. a module-scope
+    import shadowed by a function-local reassignment) -- rebinds it out of
+    every returned set and into the trailing ambiguous set, matching this
+    module's existing scoped-alias convention (see
+    :func:`_linecache_get_aliases`).
+    """
+
+    scoped_statements = _control_flow_scoped_statements(tree.body)
+    importlib_modules = {
+        alias.asname or alias.name
+        for statement in scoped_statements
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "importlib"
+    }
+    pytest_modules = {
+        alias.asname or alias.name
+        for statement in scoped_statements
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "pytest"
+    }
+    import_module_calls = {
+        alias.asname or alias.name
+        for statement in scoped_statements
+        if isinstance(statement, ast.ImportFrom) and statement.module == "importlib"
+        for alias in statement.names
+        if alias.name == "import_module"
+    }
+    importorskip_calls = {
+        alias.asname or alias.name
+        for statement in scoped_statements
+        if isinstance(statement, ast.ImportFrom) and statement.module == "pytest"
+        for alias in statement.names
+        if alias.name == "importorskip"
+    }
+    admitted = (
+        importlib_modules
+        | pytest_modules
+        | import_module_calls
+        | importorskip_calls
+        | additional_admitted_names
+    )
+    rebound = {
+        target.id
+        for statement in scoped_statements
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        )
+        if isinstance(target, ast.Name) and target.id in admitted
+    }
+    return (
+        importlib_modules - rebound,
+        pytest_modules - rebound,
+        import_module_calls - rebound,
+        importorskip_calls - rebound,
+        rebound,
+    )
+
+
+def _import_call_bindings(
+    statements: Sequence[ast.stmt],
+    importlib_module_aliases: set[str],
+    pytest_module_aliases: set[str],
+    import_module_call_aliases: set[str],
+    importorskip_call_aliases: set[str],
+    ambiguous_entry_point_aliases: frozenset[str] = frozenset(),
+) -> tuple[list[ast.Import], set[str], set[int]]:
+    """Return synthetic imports for admitted import-call bindings.
+
+    Recognises exactly ``target = importlib.import_module("literal")`` and
+    ``target = pytest.importorskip("literal")`` -- through either a module
+    alias (``il.import_module(...)``) or a direct call alias
+    (``from importlib import import_module as im`` then ``im(...)``) -- with
+    one statically literal module string, no keyword or starred arguments,
+    and one statically unique simple-name assignment target. Each admitted
+    binding becomes a synthetic ``import <literal> as <target>`` statement so
+    the existing repository-local import machinery
+    (:func:`_repository_module_candidates` and the module-member analysis in
+    :func:`_repository_imported_function_analyses`) resolves and audits it
+    exactly as a written import. Every other admitted-callee shape -- a
+    dynamic or missing module string, extra/starred/keyword call arguments,
+    a non-``Name``/tuple assignment target, or the same target name bound
+    more than once -- fails closed into the returned ambiguous name set
+    instead of being silently dropped. ``ambiguous_entry_point_aliases``
+    names entry-point aliases (``importlib``/``pytest``/a direct call alias)
+    that were shadowed or rebound somewhere in this same scope: a call that
+    still targets one of them by name -- ``shadowed.import_module(...)``,
+    ``shadowed.importorskip(...)``, or a bare shadowed direct-call alias --
+    fails closed too, since its true target can no longer be proven.
+
+    Returns:
+        A tuple of the synthetic ``ast.Import`` statements to splice into a
+        governed scope, the fail-closed ambiguous binding names, and the
+        ``id()`` of every source statement consumed into a synthetic import
+        (so a caller can exclude it from its own general-reassignment
+        ambiguity bookkeeping).
+    """
+
+    def is_admitted_call(call: ast.Call) -> bool:
+        """Return whether a call targets one admitted import-call spelling."""
+
+        func = call.func
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            return (func.value.id in importlib_module_aliases and func.attr == "import_module") or (
+                func.value.id in pytest_module_aliases and func.attr == "importorskip"
+            )
+        if isinstance(func, ast.Name):
+            return func.id in import_module_call_aliases or func.id in importorskip_call_aliases
+        return False
+
+    def targets_shadowed_entry_point(call: ast.Call) -> bool:
+        """Return whether a call shape still targets a shadowed entry-point name."""
+
+        func = call.func
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            return func.value.id in ambiguous_entry_point_aliases and func.attr in {
+                "import_module",
+                "importorskip",
+            }
+        if isinstance(func, ast.Name):
+            return func.id in ambiguous_entry_point_aliases
+        return False
+
+    well_formed: dict[str, list[tuple[ast.stmt, str]]] = {}
+    ambiguous: set[str] = set()
+    for statement in statements:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)) or statement.value is None:
+            continue
+        call = statement.value
+        if not isinstance(call, ast.Call):
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        target_names = {
+            leaf.id
+            for target in targets
+            for leaf in ast.walk(target)
+            if isinstance(leaf, ast.Name) and isinstance(leaf.ctx, ast.Store)
+        }
+        if targets_shadowed_entry_point(call):
+            ambiguous.update(target_names)
+            continue
+        if not is_admitted_call(call):
+            continue
+        literal_module_shape = (
+            len(call.args) == 1
+            and not call.keywords
+            and not any(isinstance(argument, ast.Starred) for argument in call.args)
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+        )
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name) or not literal_module_shape:
+            ambiguous.update(target_names)
+            continue
+        target_name = targets[0].id
+        module = cast(str, cast(ast.Constant, call.args[0]).value)
+        well_formed.setdefault(target_name, []).append((statement, module))
+
+    synthetic_imports: list[ast.Import] = []
+    consumed_statement_ids: set[int] = set()
+    for target_name, occurrences in well_formed.items():
+        if target_name in ambiguous or len(occurrences) != 1:
+            ambiguous.add(target_name)
+            continue
+        statement, module = occurrences[0]
+        synthetic_import = ast.Import(names=[ast.alias(name=module, asname=target_name)])
+        ast.copy_location(synthetic_import, statement)
+        ast.fix_missing_locations(synthetic_import)
+        synthetic_imports.append(synthetic_import)
+        consumed_statement_ids.add(id(statement))
+    return synthetic_imports, ambiguous, consumed_statement_ids
+
+
 @dataclass
 class _FunctionAnalysis:
     """One same-module function's direct docs-read status and call edges."""
@@ -3132,6 +3318,7 @@ def _analyse_function(
     ambiguous_os_open_read_aliases: set[str] | None = None,
     class_property_getters: dict[str, str] | None = None,
     ambiguous_class_property_getters: set[str] | None = None,
+    ambiguous_import_call_receivers: set[str] | None = None,
 ) -> _FunctionAnalysis:
     """Walk one function body for a direct docs read, calls, and unresolved reads.
 
@@ -4226,6 +4413,18 @@ def _analyse_function(
                         calls.add(exit_name)
             continue
         if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in (ambiguous_import_call_receivers or set())
+        ) or (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in (ambiguous_import_call_receivers or set())
+        ):
+            unresolved.append(
+                f"{filename}:{node.lineno}: import-call binding provenance is ambiguous"
+            )
+            continue
+        if (
             isinstance(node.func, ast.Attribute)
             and node.func.attr == "addfinalizer"
             and isinstance(node.func.value, ast.Name)
@@ -4842,6 +5041,26 @@ def _docs_reading_test_modules(
         ambiguous_functools_aliases,
     ) = _functools_aliases(tree)
     (
+        importlib_module_aliases,
+        pytest_import_call_module_aliases,
+        import_module_call_aliases,
+        importorskip_call_aliases,
+        ambiguous_import_call_entry_points,
+    ) = _import_call_module_aliases(tree)
+    module_import_call_imports, ambiguous_module_import_call_names, _ = _import_call_bindings(
+        _control_flow_scoped_statements(tree.body),
+        importlib_module_aliases,
+        pytest_import_call_module_aliases,
+        import_module_call_aliases,
+        importorskip_call_aliases,
+        frozenset(ambiguous_import_call_entry_points),
+    )
+    tree_with_import_call_imports = (
+        ast.Module(body=[*tree.body, *module_import_call_imports], type_ignores=[])
+        if module_import_call_imports
+        else tree
+    )
+    (
         imported_analyses,
         ambiguous_imports,
         imported_classes,
@@ -4852,7 +5071,10 @@ def _docs_reading_test_modules(
         module_docs_values,
         ambiguous_module_values,
         imported_collected_test_classes,
-    ) = _repository_imported_function_analyses(tree, filename, repository_root)
+    ) = _repository_imported_function_analyses(
+        tree_with_import_call_imports, filename, repository_root
+    )
+    ambiguous_imports = ambiguous_imports | ambiguous_module_import_call_names
     if "*" in ambiguous_imports:
         raise AssertionError(
             f"{filename}: wildcard repository-local import provenance is ambiguous"
@@ -5197,6 +5419,7 @@ def _docs_reading_test_modules(
             local_keys.add(key)
 
     scoped_imported_analyses: dict[str, _FunctionAnalysis] = {}
+    ambiguous_import_call_targets: dict[str, set[str]] = {}
     for owner, node in list(functions.items()):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -5205,9 +5428,51 @@ def _docs_reading_test_modules(
             for statement in ast.walk(node)
             if isinstance(statement, (ast.Import, ast.ImportFrom))
         ]
-        if not imports:
+        scoped_assign_statements = [
+            statement
+            for statement in ast.walk(node)
+            if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        ]
+        module_level_entry_points = frozenset(
+            importlib_module_aliases
+            | pytest_import_call_module_aliases
+            | import_module_call_aliases
+            | importorskip_call_aliases
+        )
+        (
+            scoped_importlib_module_aliases,
+            scoped_pytest_import_call_module_aliases,
+            scoped_import_module_call_aliases,
+            scoped_importorskip_call_aliases,
+            scoped_ambiguous_entry_points,
+        ) = _import_call_module_aliases(
+            ast.Module(body=[*imports, *scoped_assign_statements], type_ignores=[]),
+            additional_admitted_names=module_level_entry_points,
+        )
+        effective_ambiguous_entry_points = frozenset(
+            ambiguous_import_call_entry_points | scoped_ambiguous_entry_points
+        )
+        (
+            scoped_import_call_imports,
+            scoped_import_call_ambiguous,
+            consumed_import_call_statement_ids,
+        ) = _import_call_bindings(
+            scoped_assign_statements,
+            (importlib_module_aliases | scoped_importlib_module_aliases)
+            - effective_ambiguous_entry_points,
+            (pytest_import_call_module_aliases | scoped_pytest_import_call_module_aliases)
+            - effective_ambiguous_entry_points,
+            (import_module_call_aliases | scoped_import_module_call_aliases)
+            - effective_ambiguous_entry_points,
+            (importorskip_call_aliases | scoped_importorskip_call_aliases)
+            - effective_ambiguous_entry_points,
+            effective_ambiguous_entry_points,
+        )
+        if not imports and not scoped_import_call_imports and not scoped_import_call_ambiguous:
             continue
-        scoped_tree = ast.Module(body=[*imports, node], type_ignores=[])
+        scoped_tree = ast.Module(
+            body=[*imports, *scoped_import_call_imports, node], type_ignores=[]
+        )
         scoped_analyses, scoped_ambiguous, *_ = _repository_imported_function_analyses(
             scoped_tree, filename, repository_root
         )
@@ -5217,6 +5482,7 @@ def _docs_reading_test_modules(
             target.id
             for assignment in ast.walk(node)
             if isinstance(assignment, (ast.Assign, ast.AnnAssign))
+            and id(assignment) not in consumed_import_call_statement_ids
             for target in (
                 assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
             )
@@ -5231,6 +5497,8 @@ def _docs_reading_test_modules(
             targets[alias] = key
             scoped_imported_analyses[key] = analysis
         ambiguous_targets.update(scoped_ambiguous)
+        if scoped_import_call_ambiguous:
+            ambiguous_import_call_targets[owner] = scoped_import_call_ambiguous
 
     analyses: dict[str, _FunctionAnalysis] = {}
     unresolved: list[str] = []
@@ -5287,6 +5555,7 @@ def _docs_reading_test_modules(
             ambiguous_os_open_read_aliases,
             class_property_getters.get(class_name, {}) if class_name else {},
             ambiguous_class_property_getters.get(class_name, set()) if class_name else set(),
+            ambiguous_import_call_targets.get(name),
         )
         analyses[name] = analysis
         if name not in local_keys:
@@ -6418,6 +6687,441 @@ def test_docs_governance_rejects_wildcard_and_reimport_local_imports(tmp_path: P
             "def test_reader() -> None:\n    docs_reader()\n",
             repository_root=tmp_path,
         )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_follows_import_call_module_scope_bindings(tmp_path: Path) -> None:
+    """A module-scope ``importlib.import_module`` binding reaches its reader member."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/import-call.md').read_text()\n\n"
+        "def load_config() -> str:\n    return Path('config/import-call.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "import importlib\n\n"
+        "def test_module_scope_reader() -> None:\n"
+        "    helpers = importlib.import_module('helpers')\n"
+        "    assert helpers.load()\n\n"
+        "def test_module_scope_non_docs() -> None:\n"
+        "    helpers = importlib.import_module('helpers')\n"
+        "    assert helpers.load_config()\n"
+    )
+    assert _docs_reading_test_modules(
+        source, filename=str(tmp_path / "test_import_call.py"), repository_root=tmp_path
+    ) == {"test_module_scope_reader"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_follows_import_call_function_scope_bindings(tmp_path: Path) -> None:
+    """A function-local ``pytest.importorskip`` binding stays scoped to its own test."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/import-call-local.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "import pytest\n\n"
+        "def test_local_bind() -> None:\n"
+        "    helpers = pytest.importorskip('helpers')\n"
+        "    assert helpers.load()\n\n"
+        "def test_unrelated() -> None:\n"
+        "    assert True\n\n"
+        "class TestMethodBind:\n"
+        "    def test_local_method_bind(self) -> None:\n"
+        "        helpers = pytest.importorskip('helpers')\n"
+        "        assert helpers.load()\n"
+    )
+    assert _docs_reading_test_modules(
+        source, filename=str(tmp_path / "test_import_call_local.py"), repository_root=tmp_path
+    ) == {"test_local_bind", "TestMethodBind::test_local_method_bind"}
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    ("import_line", "call"),
+    [
+        pytest.param("import importlib", "importlib.import_module('helpers')", id="local-import"),
+        pytest.param(
+            "import importlib as il", "il.import_module('helpers')", id="local-import-module-alias"
+        ),
+        pytest.param(
+            "from importlib import import_module as im",
+            "im('helpers')",
+            id="local-from-import-call-alias",
+        ),
+        pytest.param("import pytest", "pytest.importorskip('helpers')", id="local-pytest-import"),
+        pytest.param(
+            "from pytest import importorskip as skip_import",
+            "skip_import('helpers')",
+            id="local-from-pytest-call-alias",
+        ),
+    ],
+)
+def test_docs_governance_follows_function_scoped_import_call_statements(
+    tmp_path: Path, import_line: str, call: str
+) -> None:
+    """A function-local import statement admits the same import-call spellings."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/local-import-statement.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "def test_local() -> None:\n"
+        f"    {import_line}\n"
+        f"    helpers = {call}\n"
+        "    assert helpers.load()\n"
+    )
+    assert _docs_reading_test_modules(
+        source, filename=str(tmp_path / "test_local_import_statement.py"), repository_root=tmp_path
+    ) == {"test_local"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_import_call_after_function_local_shadow(tmp_path: Path) -> None:
+    """Shadowing ``importlib`` inside the same function before the call fails closed."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/local-shadow.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "def test_local_shadow() -> None:\n"
+        "    import importlib\n"
+        "    importlib = None\n"
+        "    helpers = importlib.import_module('helpers')\n"
+        "    assert helpers.load()\n"
+    )
+    with pytest.raises(AssertionError, match="import-call binding provenance is ambiguous"):
+        _docs_reading_test_modules(
+            source, filename=str(tmp_path / "test_local_shadow.py"), repository_root=tmp_path
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_import_call_after_shadowing_a_module_scope_import(
+    tmp_path: Path,
+) -> None:
+    """A function-local shadow of a module-scope ``importlib`` import fails closed."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/module-then-local-shadow.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "import importlib\n\n"
+        "def test_shadowed() -> None:\n"
+        "    importlib = get_fake_importlib()\n"
+        "    helpers = importlib.import_module('helpers')\n"
+        "    assert helpers.load()\n"
+    )
+    with pytest.raises(AssertionError, match="import-call binding provenance is ambiguous"):
+        _docs_reading_test_modules(
+            source,
+            filename=str(tmp_path / "test_module_then_local_shadow.py"),
+            repository_root=tmp_path,
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_scopes_a_function_local_shadow_to_its_own_test(tmp_path: Path) -> None:
+    """A shadow in one test does not taint an unrelated test's clean binding."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/scoped-shadow.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "import importlib\n\n"
+        "def test_local_shadow() -> None:\n"
+        "    importlib = None\n"
+        "    assert importlib is None\n\n"
+        "def test_clean() -> None:\n"
+        "    helpers = importlib.import_module('helpers')\n"
+        "    assert helpers.load()\n"
+    )
+    assert _docs_reading_test_modules(
+        source, filename=str(tmp_path / "test_scoped_shadow.py"), repository_root=tmp_path
+    ) == {"test_clean"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_ignores_a_shadowed_name_used_for_something_unrelated(
+    tmp_path: Path,
+) -> None:
+    """A shadowed entry-point name that is never called as an import stays unmarked."""
+
+    source = (
+        "import importlib\n\n"
+        "def test_local() -> None:\n"
+        "    importlib = None\n"
+        "    assert importlib is None\n"
+    )
+    assert (
+        _docs_reading_test_modules(
+            source, filename=str(tmp_path / "test_unrelated_shadow.py"), repository_root=tmp_path
+        )
+        == set()
+    )
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    "import_line",
+    [
+        pytest.param("import importlib as il", id="importlib-module-alias"),
+        pytest.param("from importlib import import_module as im", id="import-module-call-alias"),
+    ],
+)
+def test_docs_governance_follows_import_module_call_and_module_aliases(
+    tmp_path: Path, import_line: str
+) -> None:
+    """Renamed ``importlib``/``import_module`` spellings resolve the same reader."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/import-module-alias.md').read_text()\n",
+        encoding="utf-8",
+    )
+    call = "il.import_module('helpers')" if "il" in import_line else "im('helpers')"
+    source = (
+        f"{import_line}\n\n"
+        "def test_aliased() -> None:\n"
+        f"    helpers = {call}\n"
+        "    assert helpers.load()\n"
+    )
+    assert _docs_reading_test_modules(
+        source, filename=str(tmp_path / "test_alias.py"), repository_root=tmp_path
+    ) == {"test_aliased"}
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    "import_line",
+    [
+        pytest.param("import pytest as pt", id="pytest-module-alias"),
+        pytest.param(
+            "from pytest import importorskip as skip_import", id="importorskip-call-alias"
+        ),
+    ],
+)
+def test_docs_governance_follows_importorskip_call_and_module_aliases(
+    tmp_path: Path, import_line: str
+) -> None:
+    """Renamed ``pytest``/``importorskip`` spellings resolve the same reader."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/importorskip-alias.md').read_text()\n",
+        encoding="utf-8",
+    )
+    call = "pt.importorskip('helpers')" if "pt" in import_line else "skip_import('helpers')"
+    source = (
+        f"{import_line}\n\n"
+        "def test_aliased() -> None:\n"
+        f"    helpers = {call}\n"
+        "    assert helpers.load()\n"
+    )
+    assert _docs_reading_test_modules(
+        source, filename=str(tmp_path / "test_alias.py"), repository_root=tmp_path
+    ) == {"test_aliased"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_non_repository_import_call_modules(tmp_path: Path) -> None:
+    """A third-party or standard-library literal module string is never marked."""
+
+    source = (
+        "import importlib\n\n"
+        "def test_stdlib_module() -> None:\n"
+        "    posixpath = importlib.import_module('posixpath')\n"
+        "    assert posixpath.sep\n"
+    )
+    assert (
+        _docs_reading_test_modules(
+            source, filename=str(tmp_path / "test_stdlib.py"), repository_root=tmp_path
+        )
+        == set()
+    )
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    ("statement", "usage"),
+    [
+        pytest.param(
+            "helpers = importlib.import_module(name)",
+            "helpers.load()",
+            id="function-dynamic-module-name",
+        ),
+        pytest.param(
+            "helpers = importlib.import_module('helpers', package=None)",
+            "helpers.load()",
+            id="function-keyword-argument",
+        ),
+        pytest.param(
+            "helpers = importlib.import_module(*names)",
+            "helpers.load()",
+            id="function-starred-argument",
+        ),
+        pytest.param(
+            "a, b = importlib.import_module('helpers')",
+            "a.load()",
+            id="function-tuple-unpack-target",
+        ),
+        pytest.param(
+            "helpers = importlib.import_module('helpers')\n    "
+            "helpers = importlib.import_module('helpers')",
+            "helpers.load()",
+            id="function-duplicate-binding",
+        ),
+    ],
+)
+def test_docs_governance_rejects_malformed_function_scoped_import_call_bindings(
+    tmp_path: Path, statement: str, usage: str
+) -> None:
+    """A malformed function-scoped admitted import-call shape fails closed."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/malformed.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        f"import importlib\n\ndef test_reader(name, names) -> None:\n    {statement}\n    {usage}\n"
+    )
+    with pytest.raises(AssertionError, match="import-call binding provenance is ambiguous"):
+        _docs_reading_test_modules(
+            source, filename=str(tmp_path / "test_malformed.py"), repository_root=tmp_path
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_malformed_module_scoped_import_call_bindings(
+    tmp_path: Path,
+) -> None:
+    """A malformed module-scoped admitted import-call shape fails closed."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/malformed-module.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "import importlib\n\n"
+        "name = 'helpers'\n"
+        "helpers = importlib.import_module(name)\n\n"
+        "def test_reader() -> None:\n    assert helpers.load()\n"
+    )
+    with pytest.raises(AssertionError, match="imported callable provenance"):
+        _docs_reading_test_modules(
+            source, filename=str(tmp_path / "test_malformed_module.py"), repository_root=tmp_path
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_import_call_duplicate_binding_of_different_modules(
+    tmp_path: Path,
+) -> None:
+    """Binding the same target name via import-call twice is ambiguous either way."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/duplicate.md').read_text()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "other_helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/duplicate.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "import importlib\n\n"
+        "def test_dup() -> None:\n"
+        "    helpers = importlib.import_module('helpers')\n"
+        "    helpers = importlib.import_module('other_helpers')\n"
+        "    assert helpers.load()\n"
+    )
+    with pytest.raises(AssertionError, match="import-call binding provenance is ambiguous"):
+        _docs_reading_test_modules(
+            source, filename=str(tmp_path / "test_dup.py"), repository_root=tmp_path
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_import_module_call_after_importlib_is_shadowed_at_module_scope(
+    tmp_path: Path,
+) -> None:
+    """A module-scope shadowed ``importlib`` name reaching a test fails closed."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/shadowed.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "import importlib\n"
+        "importlib = None\n\n"
+        "def test_shadowed() -> None:\n"
+        "    helpers = importlib.import_module('helpers')\n"
+        "    assert helpers.load()\n"
+    )
+    with pytest.raises(AssertionError, match="import-call binding provenance is ambiguous"):
+        _docs_reading_test_modules(
+            source, filename=str(tmp_path / "test_shadowed.py"), repository_root=tmp_path
+        )
+    unrelated_source = (
+        "import importlib\nimportlib = None\n\ndef test_unrelated() -> None:\n    assert True\n"
+    )
+    assert (
+        _docs_reading_test_modules(
+            unrelated_source,
+            filename=str(tmp_path / "test_shadowed_unrelated.py"),
+            repository_root=tmp_path,
+        )
+        == set()
+    )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_detects_a_hidden_import_call_markdown_read(tmp_path: Path) -> None:
+    """An unmarked ``importlib.import_module`` reader is caught by the exact-marker audit."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def load() -> str:\n    return Path('docs/hidden-import-call.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "import importlib\n\n"
+        "def test_hidden() -> None:\n"
+        "    helpers = importlib.import_module('helpers')\n"
+        "    helpers.load()\n"
+    )
+    filename = str(tmp_path / "test_hidden_import_call.py")
+    readers = _docs_reading_test_modules(source, filename=filename, repository_root=tmp_path)
+    assert readers == {"test_hidden"}
+    tree = ast.parse(source)
+    with pytest.raises(AssertionError, match="pytest.mark.docs must sit on exactly"):
+        _assert_exact_docs_markers(tree, readers, filename)
+    _assert_exact_docs_markers(
+        ast.parse(
+            "import pytest\n"
+            + source.replace(
+                "def test_hidden() -> None:",
+                "@pytest.mark.docs\ndef test_hidden() -> None:",
+            )
+        ),
+        readers,
+        filename,
+    )
 
 
 @pytest.mark.docs_ci
