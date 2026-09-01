@@ -11,12 +11,19 @@ on:
     types: [submitted]
 
 jobs:
+  # D-ToS-1 (mirrors roastpilot-cloud #411): the headless @claude responder is
+  # retired (ToS: Anthropic consumer OAuth tokens are not permitted for CI
+  # automation). GATED OFF — skips unless `vars.CLAUDE_HEADLESS_ENABLED == 'true'`,
+  # so an @claude mention no longer fails on the removed CLAUDE_CODE_OAUTH_TOKEN.
+  # Machinery retained but inert; revive only via a metered anthropic_api_key + var.
   claude:
-    if: |
+    if: >-
+      ${{ vars.CLAUDE_HEADLESS_ENABLED == 'true' && (
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      ) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -2884,8 +2884,18 @@ def test_track_progress_disabled_only_for_unsupported_pull_request_actions() -> 
     # The action step itself is never conditionally skipped.
     assert "if" not in step
 
-    # The job `if` remains only the Dependabot-author guard.
-    assert job["if"] == "${{ github.event.pull_request.user.login != 'dependabot[bot]' }}"
+    # The job `if` is the Dependabot-author guard AND the D-ToS-1 headless gate
+    # (mirrors roastpilot-cloud #411): the job SKIPS unless an operator sets
+    # `vars.CLAUDE_HEADLESS_ENABLED == 'true'`. The #735 "edited stays a fully
+    # reviewed trigger / the reviewer must still run" guarantee is therefore
+    # DORMANT behind the var (retired, not deleted). The action step is still
+    # never conditionally skipped (asserted above), so that guarantee is
+    # restored intact if the job is revived by setting the var.
+    assert (
+        job["if"]
+        == "${{ github.event.pull_request.user.login != 'dependabot[bot]' "
+        "&& vars.CLAUDE_HEADLESS_ENABLED == 'true' }}"
+    )
 
     # Concurrency group and cancellation policy are unchanged.
     concurrency = _mapping(workflow["concurrency"])
