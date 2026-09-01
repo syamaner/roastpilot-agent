@@ -3457,6 +3457,21 @@ def _analyse_function(
 
         return isinstance(value, ast.Name) and value.id in ambiguous_helper_class_instances
 
+    def _relevant_async_iteration_receiver(value: ast.expr) -> bool:
+        """Return whether ``value`` is an ambiguous or resolved relevant async iteration source.
+
+        ``async for``/async comprehensions are not governed by ``__iter__``/``__next__`` —
+        this module implements no ``__aiter__``/``__anext__`` tracing — so any statically
+        resolved or ambiguous relevant same-module helper reached through async iteration
+        syntax must fail closed as unsupported ambiguity rather than silently falling
+        through untraced.
+        """
+
+        if _ambiguous_iteration_receiver(value):
+            return True
+        helper_class = _helper_class_instance(value)
+        return helper_class is not None and helper_class in (relevant_helper_classes or set())
+
     def _bind_iteration_dunder(helper_class: str, dunder: str, node: ast.AST, shape: str) -> None:
         """Add one same-module iteration-protocol call edge, or fail closed if unresolved.
 
@@ -3955,6 +3970,16 @@ def _analyse_function(
                         non_docs_aliases.add(target.id)
                     else:
                         non_docs_aliases.discard(target.id)
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    if _ambiguous_iteration_receiver(node.value):
+                        unresolved.append(
+                            f"{filename}:{node.lineno}: same-module helper-class instance "
+                            "provenance is ambiguous"
+                        )
+                    elif helper_class_instance is not None:
+                        _bind_iteration_dunder(
+                            helper_class_instance, "__iter__", node, "destructuring"
+                        )
         if isinstance(node, ast.For) and isinstance(node.iter, ast.Call):
             walk_call = node.iter
             target_is_os_walk = (
@@ -4076,6 +4101,12 @@ def _analyse_function(
                 non_docs_aliases.add(node.target.id)
         if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
             for generator in node.generators:
+                if generator.is_async and _relevant_async_iteration_receiver(generator.iter):
+                    unresolved.append(
+                        f"{filename}:{getattr(node, 'lineno', 0)}: async comprehension over a "
+                        "same-module helper-class instance is unsupported ambiguity "
+                        "(no __aiter__/__anext__ governance)"
+                    )
                 if _is_docs_markdown_glob_call(generator.iter, docs_root_aliases) and isinstance(
                     generator.target, ast.Name
                 ):
@@ -4119,10 +4150,29 @@ def _analyse_function(
                     non_docs_aliases.add(generator.target.id)
         if _is_docs_markdown_glob_call(node, docs_root_aliases):
             has_docs_glob = True
+        if isinstance(node, ast.AsyncFor) and _relevant_async_iteration_receiver(node.iter):
+            unresolved.append(
+                f"{filename}:{node.lineno}: async iteration over a same-module helper-class "
+                "instance is unsupported ambiguity (no __aiter__/__anext__ governance)"
+            )
         if isinstance(node, ast.For):
             iteration_sources = [(node.iter, "for-loop")]
         elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-            iteration_sources = [(generator.iter, "comprehension") for generator in node.generators]
+            iteration_sources = [
+                (generator.iter, "comprehension")
+                for generator in node.generators
+                if not generator.is_async
+            ]
+        elif isinstance(node, ast.YieldFrom):
+            iteration_sources = [(node.value, "yield-from")]
+        elif isinstance(node, ast.Starred) and isinstance(node.ctx, ast.Load):
+            iteration_sources = [(node.value, "starred-expansion")]
+        elif isinstance(node, ast.Compare):
+            iteration_sources = [
+                (comparator, "membership")
+                for compare_op, comparator in zip(node.ops, node.comparators, strict=True)
+                if isinstance(compare_op, (ast.In, ast.NotIn))
+            ]
         else:
             iteration_sources = []
         for iteration_source, iteration_shape in iteration_sources:
@@ -9424,6 +9474,339 @@ def test_docs_governance_traces_async_context_manager_edges_without_overreaching
         "        assert context\n"
     )
     assert _docs_reading_test_modules(source) == {"test_async_context"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_destructuring_assignment_iteration_dispatch() -> None:
+    """Tuple/list destructuring reaches ``__iter__``; a rebind to a non-instance is safe."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/destructure.md').read_text().splitlines())\n\n"
+        "class ConfigLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('config/destructure.md').read_text().splitlines())\n\n"
+        "def test_tuple_destructure() -> None:\n"
+        "    first, second = DocsLines()\n    assert first and second\n\n"
+        "def test_list_destructure() -> None:\n"
+        "    [first, second] = DocsLines()\n    assert first and second\n\n"
+        "def test_non_reader_destructure() -> None:\n"
+        "    first, second = ConfigLines()\n    assert first and second\n\n"
+        "def test_rebind_to_non_instance() -> None:\n"
+        "    value = DocsLines()\n    value = 5\n    first, second = value\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_tuple_destructure",
+        "test_list_destructure",
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_ambiguous_destructuring_receiver() -> None:
+    """An ambiguously-constructed same-module instance fails closed for destructuring too."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/destructure-ambiguous.md').read_text().splitlines())\n\n"
+        "def test_ambiguous_destructure() -> None:\n"
+        "    loader = construct(DocsLines)\n    first, second = loader\n"
+    )
+    with pytest.raises(AssertionError, match="helper-class instance provenance is ambiguous"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_starred_expansion_iteration_dispatch() -> None:
+    """Starred call, list, tuple, and set expansion each reach ``__iter__``."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/starred.md').read_text().splitlines())\n\n"
+        "class ConfigLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('config/starred.md').read_text().splitlines())\n\n"
+        "def test_starred_list() -> None:\n    assert [*DocsLines()]\n\n"
+        "def test_starred_tuple() -> None:\n    assert (*DocsLines(),)\n\n"
+        "def test_starred_set() -> None:\n    assert {*DocsLines()}\n\n"
+        "def test_starred_call() -> None:\n    assert some_function(*DocsLines())\n\n"
+        "def test_starred_non_reader() -> None:\n    assert [*ConfigLines()]\n\n"
+        "def test_starred_plain() -> None:\n    assert [*[1, 2, 3]]\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_starred_list",
+        "test_starred_tuple",
+        "test_starred_set",
+        "test_starred_call",
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_ambiguous_starred_expansion_receiver() -> None:
+    """An ambiguously-constructed same-module instance fails closed for starred expansion too."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/starred-ambiguous.md').read_text().splitlines())\n\n"
+        "def test_ambiguous_starred() -> None:\n"
+        "    loader = construct(DocsLines)\n    assert [*loader]\n"
+    )
+    with pytest.raises(AssertionError, match="helper-class instance provenance is ambiguous"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_membership_iteration_dispatch() -> None:
+    """``in``/``not in``, including a chained comparison, reach ``__iter__``."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/membership.md').read_text().splitlines())\n\n"
+        "class ConfigLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('config/membership.md').read_text().splitlines())\n\n"
+        "def test_membership_in() -> None:\n    assert 'x' in DocsLines()\n\n"
+        "def test_membership_not_in() -> None:\n    assert 'x' not in DocsLines()\n\n"
+        "def test_chained_membership() -> None:\n    assert 0 <= 1 in DocsLines()\n\n"
+        "def test_membership_non_reader() -> None:\n    assert 'x' in ConfigLines()\n\n"
+        "def test_membership_plain() -> None:\n    assert 'x' in [1, 2, 3]\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_membership_in",
+        "test_membership_not_in",
+        "test_chained_membership",
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_ambiguous_membership_receiver() -> None:
+    """An ambiguously-constructed same-module instance fails closed for membership too."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/membership-ambiguous.md').read_text().splitlines())\n\n"
+        "def test_ambiguous_membership() -> None:\n"
+        "    loader = construct(DocsLines)\n    assert 'x' in loader\n"
+    )
+    with pytest.raises(AssertionError, match="helper-class instance provenance is ambiguous"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_yield_from_iteration_dispatch() -> None:
+    """``yield from`` reaches ``__iter__`` like any other iteration site."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/yield-from.md').read_text().splitlines())\n\n"
+        "class ConfigLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('config/yield-from.md').read_text().splitlines())\n\n"
+        "def test_yield_from() -> None:\n    yield from DocsLines()\n\n"
+        "def test_yield_from_non_reader() -> None:\n    yield from ConfigLines()\n\n"
+        "def test_yield_from_plain() -> None:\n    yield from [1, 2, 3]\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_yield_from"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_ambiguous_yield_from_receiver() -> None:
+    """An ambiguously-constructed same-module instance fails closed for ``yield from`` too."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/yield-from-ambiguous.md').read_text().splitlines())\n\n"
+        "def test_ambiguous_yield_from() -> None:\n"
+        "    loader = construct(DocsLines)\n    yield from loader\n"
+    )
+    with pytest.raises(AssertionError, match="helper-class instance provenance is ambiguous"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_async_for_over_relevant_or_ambiguous_helper_receiver() -> None:
+    """``async for`` fails closed on a relevant or ambiguous receiver; unrelated ones pass."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/async-for.md').read_text().splitlines())\n\n"
+        "async def test_async_for() -> None:\n"
+        "    async for line in DocsLines():\n        assert line\n"
+    )
+    with pytest.raises(AssertionError, match="unsupported ambiguity"):
+        _docs_reading_test_modules(source)
+
+    ambiguous_source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/async-for-ambiguous.md').read_text().splitlines())\n\n"
+        "async def test_async_for_ambiguous() -> None:\n"
+        "    loader = construct(DocsLines)\n"
+        "    async for line in loader:\n        assert line\n"
+    )
+    with pytest.raises(AssertionError, match="unsupported ambiguity"):
+        _docs_reading_test_modules(ambiguous_source)
+
+    preserved_source = (
+        "class IrrelevantAsync:\n"
+        "    def load(self) -> str:\n        return 'ready'\n\n"
+        "async def test_async_for_irrelevant() -> None:\n"
+        "    async for item in IrrelevantAsync():\n        assert item\n\n"
+        "async def test_async_for_plain() -> None:\n"
+        "    async for item in some_async_iterable():\n        assert item\n"
+    )
+    assert _docs_reading_test_modules(preserved_source) == set()
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_async_comprehension_over_relevant_helper_receiver() -> None:
+    """An async comprehension fails closed the same way a bare ``async for`` does."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/async-comprehension.md').read_text().splitlines())\n\n"
+        "async def test_async_comprehension() -> None:\n"
+        "    assert [line async for line in DocsLines()]\n"
+    )
+    with pytest.raises(AssertionError, match="unsupported ambiguity"):
+        _docs_reading_test_modules(source)
+
+    preserved_source = (
+        "class IrrelevantAsync:\n"
+        "    def load(self) -> str:\n        return 'ready'\n\n"
+        "async def test_async_comprehension_irrelevant() -> None:\n"
+        "    assert [item async for item in IrrelevantAsync()]\n"
+    )
+    assert _docs_reading_test_modules(preserved_source) == set()
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_new_iteration_syntax_preserves_ordinary_call_arguments() -> None:
+    """No blanket call-argument fallback: an ordinary, non-starred argument stays inert."""
+
+    source = (
+        "from pathlib import Path\nfrom typing import cast\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/no-fallback.md').read_text().splitlines())\n\n"
+        "class Request:\n    pass\n\n"
+        "def test_ordinary_argument() -> None:\n"
+        "    loader = DocsLines()\n    assert some_function(loader)\n\n"
+        "def test_cast_call() -> None:\n"
+        "    assert cast(Request, DocsLines())\n"
+    )
+    assert _docs_reading_test_modules(source) == set()
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_new_iteration_syntax_fails_closed_on_missing_iter_dunder() -> None:
+    """A relevant helper class missing ``__iter__`` still fails closed via the new call sites."""
+
+    missing_iter_source = (
+        "from pathlib import Path\n\n"
+        "class RelevantNoIter:\n"
+        "    def load(self) -> str:\n"
+        "        return Path('docs/destructure-missing-iter.md').read_text()\n\n"
+        "def test_missing_iter_destructure() -> None:\n"
+        "    first, second = RelevantNoIter()\n    assert first and second\n"
+    )
+    with pytest.raises(AssertionError, match="unresolved same-module helper-class iteration"):
+        _docs_reading_test_modules(missing_iter_source)
+
+    missing_iter_starred_source = missing_iter_source.replace(
+        "first, second = RelevantNoIter()\n    assert first and second\n",
+        "assert [*RelevantNoIter()]\n",
+    )
+    with pytest.raises(AssertionError, match="unresolved same-module helper-class iteration"):
+        _docs_reading_test_modules(missing_iter_starred_source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_new_iteration_syntax_mutation_reds_against_exact_markers() -> None:
+    """Each newly governed iteration-syntax boundary reds against the exact docs marker."""
+
+    cases = [
+        (
+            "from pathlib import Path\nimport pytest\n\n"
+            "class DocsLines:\n    def __iter__(self):\n"
+            "        return iter(Path('docs/destructure-marker.md').read_text().splitlines())\n\n"
+            "@pytest.mark.docs\ndef test_destructure():\n"
+            "    first, second = DocsLines()\n    assert first and second\n",
+            "destructure",
+        ),
+        (
+            "from pathlib import Path\nimport pytest\n\n"
+            "class DocsLines:\n    def __iter__(self):\n"
+            "        return iter(Path('docs/starred-marker.md').read_text().splitlines())\n\n"
+            "@pytest.mark.docs\ndef test_starred():\n    assert [*DocsLines()]\n",
+            "starred",
+        ),
+        (
+            "from pathlib import Path\nimport pytest\n\n"
+            "class DocsLines:\n    def __iter__(self):\n"
+            "        return iter(Path('docs/membership-marker.md').read_text().splitlines())\n\n"
+            "@pytest.mark.docs\ndef test_membership():\n    assert 'x' in DocsLines()\n",
+            "membership",
+        ),
+        (
+            "from pathlib import Path\nimport pytest\n\n"
+            "class DocsLines:\n    def __iter__(self):\n"
+            "        return iter(Path('docs/yield-from-marker.md').read_text().splitlines())\n\n"
+            "@pytest.mark.docs\ndef test_yield_from():\n    yield from DocsLines()\n",
+            "yield-from",
+        ),
+    ]
+    for source, label in cases:
+        readers = _docs_reading_test_modules(source)
+        _assert_exact_docs_markers(ast.parse(source), readers, f"{label}.py")
+        mutated = source.replace("docs/", "config/", 1)
+        with pytest.raises(AssertionError, match="must sit on exactly the readers"):
+            _assert_exact_docs_markers(
+                ast.parse(mutated), _docs_reading_test_modules(mutated), f"{label}-mutated.py"
+            )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_sorted_enumerate_and_destructuring_all_identify_the_same_test() -> None:
+    """The closed builtin-consumer table and destructuring agree on one probe test's identity."""
+
+    preamble = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/probe.md').read_text().splitlines())\n\n"
+    )
+    sorted_probe = preamble + "def test_contract() -> None:\n    assert sorted(DocsLines())\n"
+    enumerate_probe = (
+        preamble + "def test_contract() -> None:\n    assert list(enumerate(DocsLines()))\n"
+    )
+    destructuring_probe = (
+        preamble
+        + "def test_contract() -> None:\n    first, second = DocsLines()\n    assert first\n"
+    )
+    assert _docs_reading_test_modules(sorted_probe) == {"test_contract"}
+    assert _docs_reading_test_modules(enumerate_probe) == {"test_contract"}
+    assert _docs_reading_test_modules(destructuring_probe) == {"test_contract"}
 
 
 @pytest.mark.docs_ci
