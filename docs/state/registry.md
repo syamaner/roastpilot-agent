@@ -2,6 +2,240 @@
 
 ## Active Epic
 
+**30 Aug 2026 — #702 (D180) collection-governance addendum:** Following
+`c5342b1`, pytest function collection is pinned to `test_*` and the
+docs-reader audit enforces that exact shape. The audit also fails closed on
+un-attributable module-scope docs reads and collected test classes with
+unaudited inherited bases. This is local governance coverage only; hosted
+proof, coverage status, final review, and merge remain separate in-progress
+evidence.
+
+**30 Aug 2026 — #702 (D180) test-coverage addendum:** Following `7bef8e3`,
+the exact-head repair adds direct docs-only gate-result mapping coverage in
+both modes and multi-chunk live-output coverage after the closed Git-output
+limit is set. These are test-only fail-closed proofs; they do not update the
+separate hosted-proof, coverage-status, final-review, or merge state.
+
+**30 Aug 2026 — #702 (D180) exact-head evidence addendum:** The earlier
+`3f0bf47` closure addendum is superseded only for later evidence. `998c29c`
+hardened the docs CI fast-path governance; `803327d` added hidden-Codecov-
+artifact coverage; `3d313ea` added deterministic live Git polling guard
+coverage; and `4e7eb35` made the existing live per-call-timeout proof unable
+to fall through clock exhaustion. The current exact-head Python suite recorded
+**6525 passed, 4 skipped**. That is local gate evidence, not an assertion that
+the hosted docs-only/mixed proof runs or Codecov coverage status are current at
+this later head; final review and merge remain in progress.
+
+**30 Aug 2026 — #702 (D180) slice-3 exact-head closure addendum (head
+`3f0bf4752e30f68875900d8c520d4bbcc166dda7`; supersedes the overlapping
+same-day mutation catalogues below):** The ratified M1-M28 table remains
+historical evidence and is not renumbered. Later, separate AST-governance
+mutations covered a direct imported-class method, a chained imported-class
+instance, an assigned/re-aliased imported-class instance, and an invoked
+bound-reader alias; each was proven RED before byte-exact restoration and
+GREEN after restoration. The later Codecov executable-guard mutation was
+likewise proven RED, restored byte-exactly, and GREEN after restoration.
+
+**29 Aug 2026 (second lead audit correction, supersedes the entry directly
+below) — #702 (D180) slice 3: the exact, literal ratified section 3.9 M1-M28
+table (not a self-reconstructed catalogue) was executed on the same commit
+`382b089` (unchanged tree; every mutation was byte-exactly restored via `cp`,
+never `git`). Each item below was applied to the real committed file,
+proven RED against its guard test with real pytest output, restored, `diff`-
+confirmed byte-identical against a fresh pre-mutation snapshot, then
+confirmed GREEN again. `ci.yml`/`codeql.yml` mutations restore from
+`/tmp/rp702-exact-snapshots/{ci.yml,codeql.yml}`; `ci_change_classifier.py`
+mutations from the matching snapshot; the three test-file mutations (M25-M27)
+each snapshot their own file first.
+
+| # | Mutation | Guard test | Result |
+|---|---|---|---|
+| M1 | `classify` runs `python scripts/ci_change_classifier.py` (head copy, not `.ci-gate-base/...`) | `test_ci_gate_result_governance.py::test_every_protected_script_invocation_is_base_trusted` | RED -> restored -> GREEN |
+| M2 | A gate job runs `python3 scripts/ci_gate_result.py` (head copy) | same as M1 | RED -> restored -> GREEN |
+| M3 | Trusted-base checkout `ref:` widened to `${{ github.sha }}` | same as M1 | RED -> restored -> GREEN |
+| M4 | A gate job gains a second, plain (non-`.ci-gate-base`) `actions/checkout` | same as M1 | RED -> restored -> GREEN |
+| M5 | classify's base checkout step moved before the head checkout step | same as M1 | RED -> restored -> GREEN |
+| M6 | A `*-full-only` worker's `if:` condition deleted | `test_pytest_governance.py::test_full_only_workers_carry_the_exact_literal_condition_and_no_status_function` | RED -> restored -> GREEN |
+| M7 | A worker's `if:` inverted to `== 'docs-only'` | same as M6 | RED -> restored -> GREEN |
+| M8 | `always() &&` prepended to a full-only worker's `if:` | same as M6 | RED -> restored -> GREEN |
+| M9 | A gate job's `needs:` list drops one job with no matching `ci_gate_result.py` argv change | `test_pytest_governance.py::test_gate_needs_equals_the_union_of_its_declared_argv_classes` | RED -> restored -> GREEN |
+| M10 | `Checks` job `name:` renamed to `Checks (gate)` | `test_pytest_governance.py::test_checks_is_a_fail_closed_aggregate_of_every_python_gate` | RED -> restored -> GREEN |
+| M11 | Trigger-level `paths-ignore: ["docs/**"]` added | `test_pytest_governance.py::test_no_trigger_level_path_filtering_or_continue_on_error` | RED -> restored -> GREEN |
+| M12 | `continue-on-error: true` added to a gate step | same as M11 | RED -> restored -> GREEN |
+| M13 | `docs-fastpath`'s Codecov upload step deleted | `test_tooling_coverage.py::test_ci_normalizes_coverage_filenames_before_codecov_upload` | RED -> restored -> GREEN |
+| M14 | `docs-fastpath`'s `--cov`/`--cov-branch` flags dropped from its pytest command | `test_pytest_governance.py::test_docs_fastpath_job_structure_and_dependency_group` | RED -> restored -> GREEN |
+| M15 | `git diff --check` whitespace-validation step deleted from `docs-fastpath` | same as M14 | RED -> restored -> GREEN |
+| M16 | Classifier returns `docs-only` for `push`/`schedule` (drop only the `event_name != "pull_request"` sub-condition, SHA checks kept) — non-PR CodeQL "skip" | `test_ci_change_classifier.py::test_non_pr_or_malformed_inputs_are_full_without_git` | RED (1 of 4 params: `push`) -> restored -> GREEN |
+| M17 | `contents: read` removed from CodeQL `classify` job's narrowed `permissions:` | `test_codeql_workflow_governance.py::test_classify_job_pins_checkout_by_sha_and_narrows_permissions` | RED -> restored -> GREEN |
+| M18 | `timeout=` argument dropped from `_run_git`'s `subprocess.run` call | `test_ci_change_classifier.py::test_run_git_uses_only_the_local_closed_command_shape` | RED -> restored -> GREEN |
+| M19 | The `deadline`/`time.monotonic()` pre-flight check removed from `_run_git` | `test_ci_change_classifier.py::test_a_slow_git_call_past_the_per_call_timeout_is_full` / `test_run_git_rejects_a_call_already_past_its_deadline` | RED -> restored -> GREEN |
+| M20 | `classify_change` returns `DOCS_ONLY` instead of `FULL` on a caught `subprocess.TimeoutExpired` | `test_ci_change_classifier.py::test_directly_raised_timeout_expired_is_full` | RED -> restored -> GREEN |
+| M21 | `_DOCS_PATH_PATTERN` widened to also accept top-level `README.md` | `test_ci_change_classifier.py::test_boundary_crossing_or_unusual_path_is_full` (the `(b"A", b"README.md")` case) | RED -> restored -> GREEN |
+| M22 | Rename/copy both-path allowlist check — `all(_is_docs_markdown_path(path) for path in paths)` replaced with destination-only admission (`_is_docs_markdown_path(paths[-1])`) | `test_ci_change_classifier.py::test_boundary_crossing_or_unusual_path_is_full` (the `(b"C100", b"src/old.py", b"docs/new.md")` case — source outside the docs grammar, destination inside it) | RED (exactly that one parametrized case failed: `DOCS_ONLY` instead of correct `FULL`; the sibling `R100` case, whose destination itself fails the grammar, correctly stayed green under the same mutation) -> restored -> GREEN |
+| M23 | `metadata[0] in _REGULAR_FILE_MODES` (the object-mode check) dropped from `_is_regular_file` | `test_ci_change_classifier.py::test_symlink_is_full_even_when_its_path_matches_the_docs_grammar` | RED -> restored -> GREEN |
+| M24 | The entire `event_name != "pull_request" or not SHA or not SHA` guard clause deleted (distinct from M16: all three conditions, not just the event-name one) | `test_ci_change_classifier.py::test_non_pr_or_malformed_inputs_are_full_without_git` | RED (all 4 of 4 params) -> restored -> GREEN |
+| M25 | `@pytest.mark.docs` removed from `test_agent_model_pins.py::test_topology_reference_table_rows_match_the_map` (a genuine `docs/agent-topology.md` reader) | `test_ci_change_classifier.py::test_docs_reading_tests_carry_the_exact_docs_marker_and_nothing_else` | RED -> restored -> GREEN |
+| M26 | A new unmarked reader injected into `test_config.py` using `os.path.join("docs", stem + ".md")` + `open(path).read()` | same as M25 | RED (detector correctly caught the hidden non-literal read) -> restored -> GREEN |
+| M27 | Module-level `pytestmark = pytest.mark.docs` reintroduced at the top of `test_config.py` | same as M25 (`_module_has_pytestmark_docs` sub-check) | RED -> restored -> GREEN |
+| M28 | `scripts/ci_change_classifier.py` deleted entirely | `test_ci_change_classifier.py` (collection-level `ModuleNotFoundError`) + `test_ci_gate_result_governance.py::test_protected_script_files_are_present_at_their_exact_regular_repository_paths`/`test_protected_script_presence_rejects_a_symlink_mutation`/`test_protected_scripts_import_only_the_standard_library` | RED (collection error + 3 governance failures) -> restored -> GREEN |
+
+All 28 restorations were verified byte-identical to their pre-mutation
+snapshot via `diff` before re-confirming green, matching this repo's
+cp-restore mutation convention (never `git checkout --`/`restore`/`reset`).
+The working tree was confirmed clean (`git diff --stat` empty, `git status
+--porcelain --ignored` showing only ordinary build/cache artefacts) after
+all 28 items.
+
+**Pinned-container `Web (Playwright snapshots)` evidence (new this session):**
+`docker pull --platform linux/amd64 ghcr.io/syamaner/roastpilot-agent/
+playwright:v1.55.1-noble` succeeded (the exact SHA/tag `ci.yml`'s
+`web-snapshots-worker` job resolves via `github.repository`). Ran, inside
+that exact container, the workflow's real sequence against the current
+worktree mounted at `/workspace` (isolated Docker volumes for
+`web/node_modules` and `web/dist` so host-arm64 binaries never leaked into
+the linux/amd64 container run): install Python 3.11 (via `ppa:deadsnakes`,
+since the base image ships 3.12 and `actions/setup-python`'s mechanism isn't
+locally reproducible bit-for-bit) into a fresh venv, `pip install -e .`,
+`npm ci`, `npm run build`, `npx playwright test` (no `--update-snapshots`,
+no baseline regeneration). Result: **36 of 37 passed**; the one failure
+(`dashboard.spec.ts:125` `dashboard-fault`, an off-by-one chart-scale
+assertion, `toBeGreaterThanOrEqual(241)` received `240`) was re-run alone
+inside the same container and **passed clean** — confirmed as a pre-existing
+flake, not a regression: `git diff --stat $(git merge-base origin/main HEAD)
+-- web/` is **empty** for this entire branch, so this slice touches zero
+files under `web/` and cannot be its cause. All host-generated artefacts
+(`web/test-results/`, the two Docker volumes) were removed after the run;
+`git status --porcelain --ignored` confirmed clean before and after.
+
+The full local gate suite was re-run after all of the above (no source fix
+was needed this session — every mutation restored to the exact prior green
+state): `ruff check` clean, `ruff format --check` clean (220 files), `pyright`
+strict 0 errors/0 warnings, and a single-process `python -m pytest` with
+`OPENROUTER_API_KEY` stripped (no `ROASTPILOT_*` vars were set) — EXIT=0,
+6395 tests collected, no failures.
+
+**29 Aug 2026 (lead audit correction) — #702 (D180) slice 3's handback is
+corrected: the prior entry below understated verification with a 14-mutation
+sample. The corrected, complete local verification on the same commit
+`c254d221b20cd5cec91282d17cb1ad34e6635398` (unchanged — no source fix was
+needed, only fuller execution): a self-reconstructed 28-item mutation
+catalogue (this session had no literal access to the original contract's
+verbatim section 3.9 table, disclosed rather than fabricated) — every item
+proven red, then byte-exactly restored via `cp` and confirmed `diff`-clean
+against a fresh pre-mutation snapshot, then green. `cd web && npx playwright
+test` was run for real (not skipped): 12 passed, 25 failed, and every single
+failure traced to the identical documented cause ("A snapshot doesn't exist
+at .../*-darwin.png" — only Linux CI baselines are committed by project
+design; confirmed by inspecting every failure message, none were functional).
+A full single-process `python -m pytest` gate with `OPENROUTER_API_KEY` and
+the entire `ROASTPILOT_*` namespace stripped (leak-check itself passed
+clean, printing no values) ran twice: the first attempt showed one
+self-inflicted failure from running the mutation sweep concurrently with
+this background gate (the nested `test_rendered_qa_full_suite_gate_runs_
+under_the_actual_wrapper` subprocess re-read `ci_change_classifier.py`
+mid-mutation — a real process-isolation mistake, not a product defect); the
+second, isolated re-run passed clean (EXIT=0, 0 failures, 6395/6395, 99%
+coverage). The sole changed non-test Python source file,
+`scripts/ci_change_classifier.py`, measured at 100% statement and 100%
+branch coverage (126 stmts / 50 branches, 0 missed) via its dedicated test
+modules. `git diff --check` was clean; the four structural class-sweep greps
+were re-run with exact outputs matching the first pass; `docs/recent-fixes.md`
+was read in full and cross-checked — no listed hazard signature matches this
+diff; the `pr-preflight` skill's orient/gates/size/self-critique steps were
+followed (its independent-review and draft/ready/merge steps are out of
+scope by explicit operator instruction: no model input, no push, no PR).
+
+**29 Aug 2026 — #702 (D180) slice 3 implemented and locally gated on branch
+`feature/702-docs-only-ci-fast-path-3`, base `fa221a1`. Every exact CI-lane
+command from `ci.yml` was run locally against a fresh worktree-local `.venv`
+and passed: `quality` (ruff check, ruff format --check, pyright strict,
+`check_contract_drift.py`, CLI smoke), `pytest-ordinary` (`-n 4 --dist
+worksteal -m "not serial and not stress"`), `pytest-serial` (`-m "serial and
+not stress"`, includes the pre-existing `test_rendered_qa_full_suite_gate_
+runs_under_the_actual_wrapper` nested-harness test), the three named
+`pytest-stress` node IDs, `package` (real wheel build + clean-venv install +
+SPA-bundled smoke), the coverage combine/xml/`tooling_coverage.py`
+normalize/report pipeline, and `web` (`npm ci`, lint, typecheck, build,
+`vitest run --coverage`: 74 files / 1210 tests). A separate, freshly
+provisioned `docs-ci`-only venv (no `coffee-roaster-mcp`, no ML/audio stack,
+no Playwright, no build tooling) ran the exact `docs-fastpath` pytest
+command end to end: 70 of 6395 collected tests selected
+(`-m "(docs or docs_ci) and not stress"`), all passing in ~18s, coverage.xml
+generated and normalized cleanly by `tooling_coverage.py` — empirically
+confirming the Tier-1 minimal dependency group is sufficient. 14 genuine
+source mutations (bounded worktime, base-trusted checkout structure, argv/
+needs equality, the `docs-ci` group's `coffee-roaster-mcp` exclusion, exact
+docs-marker placement — both under- and over-marking, the AST detector's
+`docs/` prefix requirement, the unresolved-dynamic-call fail-closed raise,
+the frozen `ci_gate_result.py` helper's `_expected_result` logic, and
+`_REGULAR_FILE_MODES` widened to admit a symlink) were each applied to the
+real committed file (snapshotted first via `cp`, restored the same way,
+never via git), proven to fail the intended guard test(s) red, then restored
+to green — full detail in the handback. The `Web (Playwright snapshots)`
+job's real Docker/Linux run was not executed locally (project convention:
+baselines are generated and diffed only inside the pinned CI container, never
+on a dev machine — see `web/tests/e2e/README.md`); its job structure is
+covered instead by the static YAML governance tests. Two real, in-scope bugs
+were found and fixed by this local execution that could not have been caught
+by static review alone: a base-trusted-reference prefix check that only
+matched when the script sat directly under `.ci-gate-base/` (missed the real
+`.ci-gate-base/scripts/` layout), and three monkeypatched test doubles for
+`_run_git`/`_is_regular_file` missing the new `deadline` keyword parameter.
+`ci.yml` splits `Checks`/`Web (lint + typecheck + unit)`/
+`Web (Playwright snapshots)` into tiny always-on gate jobs (one base
+checkout + one `ci_gate_result.py` invocation) plus `*-worker` jobs that run
+only when `classify.outputs.mode != 'docs-only'`, and adds `docs-fastpath`
+(docs-only-only: whitespace/diff validation, the new `docs-ci` dependency
+group, the `(docs or docs_ci) and not stress` pytest lane, and a real
+Codecov upload). Both `ci_gate_result.py` and `ci_change_classifier.py` now
+execute from a trusted base checkout (`.ci-gate-base`, resolved via
+`github.event.pull_request.base.sha` on `pull_request` or the default
+branch otherwise) rather than the pull request's own copy — base-trusted
+execution — with the classify step order fixed at head-checkout,
+base-checkout, run. `ci_change_classifier.py` gained a bounded per-call
+Git timeout (20s) and a total worktime budget (60s, checked before each
+subsequent call so an exceeded budget issues no further Git call); this
+hardening is inert on the slice's own PR (which runs the base copy from
+`main`) and takes effect starting with the next PR. `codeql.yml` gained a
+matching `classify` job (narrowed to `contents: read`, SHA-pinned checkout)
+and `analyze` now needs it with the same docs-only skip condition; every
+non-`pull_request` trigger (push, schedule, `workflow_dispatch`) is
+unaffected because the classifier returns `full` for any non-`pull_request`
+event. The five module-level `pytestmark = pytest.mark.docs` markers are
+replaced by exact per-function `@pytest.mark.docs` decorators on the ~36
+functions that actually read committed `docs/**/*.md` content (an AST
+reader-detector extended for non-literal construction — `.joinpath`,
+`os.path.join`, f-strings, `str.format`, loop-bound glob aliases, same-module
+helper/fixture call graphs, and a named-reason failure on an unresolved
+dynamic read receiver); a new `docs_ci` marker covers focused fast-path
+tooling/workflow-structure tests that do not read committed Markdown. The
+three slice-1/2a inertness governance tests ("no job may consume this yet")
+are replaced by equally mechanical consumption guards, not deleted.
+
+**Residual, stated rather than buried (D180 §2.2):** base-trusted execution
+removes the classifier/gate-helper *bytes* from pull-request control but
+cannot remove the *workflow file itself* from `pull_request`-event control;
+containment is the existing D118 privileged-review-override path plus these
+`main`-side governance tests.
+
+**Explicitly NOT claimed by this entry (hosted-CI only, per the D180
+contract's proof protocol — this delegation committed both the implementation
+and provisional plan branches locally but did not push or open a PR, per
+explicit operator instruction):** every gate above ran locally, not on a
+GitHub Actions runner, so the live CodeQL docs-only skip, the `main`-push
+full-coverage Codecov upload, the disposable docs-only/mixed proof-PR pair,
+the GHCR-container `Web (Playwright snapshots)` run, and the D118
+dispatch/merge lifecycle are all still unobserved. `#702` stays open pending
+that hosted evidence. PR #864 (superseded slice-2 branch) is untouched by
+this delegation.
+
+**Operating notes:** (1) if `classify` fails, is cancelled, or times out, the
+gates fail closed (`MODE` empty) — re-run the workflow run. (2) a pull
+request whose base commit predates `fa221a1` has no
+`scripts/ci_gate_result.py` at that commit, so a gate step exits non-zero
+(helper absent) until the branch is updated onto current `main`; strict-mode
+branch protection already requires this before merge.
+
 **27 Aug 2026 — #710 (RP-C) slice 3 implementation complete (`Refs #710`,
 decision-level acceptance half 2 pending): the deterministic joint-window
 drop planner (`post_fc_control.plan_joint_window`,

@@ -16,8 +16,6 @@ from pathlib import Path
 import pytest
 from _agent_defs import AGENTS_DIR, agent_files, agent_text, agent_tools, parse_frontmatter
 
-pytestmark = pytest.mark.docs
-
 _REPO = Path(__file__).resolve().parents[1]
 _DISCIPLINE_HEADING = re.compile(
     r"^## [^\n]*worktree discipline[^\n]*$", re.IGNORECASE | re.MULTILINE
@@ -400,6 +398,7 @@ def test_runbook_line_citation_forms_are_detected(citation: str) -> None:
     assert _has_runbook_line_citation(citation)
 
 
+@pytest.mark.docs
 def test_runbook_citations_never_use_line_anchors() -> None:
     """Runbook citations use durable section names, never line numbers."""
     role_offenders = [

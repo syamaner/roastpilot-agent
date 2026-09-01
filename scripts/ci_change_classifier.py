@@ -12,6 +12,8 @@ import argparse
 import os
 import re
 import subprocess
+import threading
+import time
 from collections.abc import Sequence
 from contextlib import suppress
 from enum import Enum
@@ -31,28 +33,126 @@ _SINGLE_PATH_STATUSES = frozenset({"A", "M", "D"})
 _PAIR_STATUS_PATTERN = re.compile(r"^[RC][0-9]{3}$")
 _REGULAR_FILE_MODES = frozenset({b"100644", b"100755"})
 
+#: Bounded per-call and total classifier worktime (D180 §2.7, B4-ii). Neither
+#: is environment-configurable: a PR cannot widen its own classifier budget.
+_GIT_CALL_TIMEOUT_SECONDS = 20.0
+_TOTAL_BUDGET_SECONDS = 60.0
+_MAX_GIT_OUTPUT_BYTES = 1_000_000
+_GIT_POLL_INTERVAL_SECONDS = 0.01
 
-def _run_git(arguments: Sequence[str]) -> bytes:
+
+class _BudgetExceeded(Exception):
+    """Internal signal that the total classifier worktime budget elapsed."""
+
+
+class _GitOutputLimitExceeded(Exception):
+    """Internal signal that a Git command exceeded the closed output cap."""
+
+
+def _terminate_git_process(process: subprocess.Popen[bytes]) -> None:
+    """Stop one local Git child without letting cleanup mask the fail-closed result."""
+
+    with suppress(OSError):
+        process.terminate()
+    try:
+        process.wait(timeout=_GIT_POLL_INTERVAL_SECONDS)
+    except subprocess.TimeoutExpired:
+        with suppress(OSError):
+            process.kill()
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=_GIT_POLL_INTERVAL_SECONDS)
+
+
+def _run_git(arguments: Sequence[str], *, deadline: float | None = None) -> bytes:
     """Run one local Git command and return its standard output.
 
     Args:
         arguments: Git arguments excluding the executable name.
+        deadline: Optional ``time.monotonic()`` instant that caps both Git
+            process start and its timeout. Raises :class:`_BudgetExceeded`
+            when no positive budget remains, before spawning a process.
 
     Returns:
         The command's byte-for-byte standard output.
 
     Raises:
         subprocess.CalledProcessError: If Git exits unsuccessfully.
+        subprocess.TimeoutExpired: If the call exceeds the per-call timeout.
         OSError: If Git cannot be executed.
+        _BudgetExceeded: If the total worktime budget has already elapsed.
     """
 
-    completed = subprocess.run(
-        ["git", *arguments],
-        check=True,
+    timeout = _GIT_CALL_TIMEOUT_SECONDS
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _BudgetExceeded
+        timeout = min(timeout, remaining)
+    command = ["git", *arguments]
+    process = subprocess.Popen(
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        shell=False,
     )
-    return completed.stdout
+    stdout = process.stdout
+    assert stdout is not None
+    output: list[bytes] = []
+    output_size = 0
+    output_limit_exceeded = threading.Event()
+    drain_complete = threading.Event()
+    drain_errors: list[BaseException] = []
+
+    def drain_stdout() -> None:
+        """Drain the child pipe while retaining no more than the closed cap."""
+
+        nonlocal output_size
+        try:
+            while chunk := stdout.read(65_536):
+                if output_limit_exceeded.is_set():
+                    continue
+                output_size += len(chunk)
+                if output_size > _MAX_GIT_OUTPUT_BYTES:
+                    output.clear()
+                    output_limit_exceeded.set()
+                else:
+                    output.append(chunk)
+        except BaseException as error:
+            drain_errors.append(error)
+        finally:
+            drain_complete.set()
+
+    drain_thread = threading.Thread(target=drain_stdout, daemon=True)
+    drain_thread.start()
+    started = time.monotonic()
+    try:
+        while process.poll() is None or not drain_complete.is_set():
+            if drain_errors:
+                _terminate_git_process(process)
+                raise drain_errors[0]
+            if output_limit_exceeded.is_set():
+                _terminate_git_process(process)
+                raise _GitOutputLimitExceeded
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                _terminate_git_process(process)
+                raise _BudgetExceeded
+            if now - started >= timeout:
+                _terminate_git_process(process)
+                raise subprocess.TimeoutExpired(command, timeout)
+            time.sleep(_GIT_POLL_INTERVAL_SECONDS)
+    except BaseException:
+        _terminate_git_process(process)
+        drain_thread.join(timeout=_GIT_POLL_INTERVAL_SECONDS)
+        raise
+    drain_thread.join()
+    if drain_errors:
+        raise drain_errors[0]
+    if output_limit_exceeded.is_set():
+        raise _GitOutputLimitExceeded
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(process.returncode, command)
+    return b"".join(output)
 
 
 def _is_docs_markdown_path(path: bytes) -> bool:
@@ -96,24 +196,36 @@ def _parse_name_status(output: bytes) -> tuple[tuple[str, tuple[bytes, ...]], ..
     return tuple(entries)
 
 
-def _is_regular_file(commit: str, path: bytes) -> bool:
-    """Return whether ``path`` is a regular file at ``commit``.
+def _regular_file_mode(commit: str, path: bytes, *, deadline: float | None = None) -> bytes | None:
+    """Return a regular-file mode for ``path`` at ``commit``, else ``None``.
 
     This separate local object check rejects symlinks and submodules, which
     ``git diff --name-status`` intentionally does not describe.
     """
 
     decoded_path = path.decode("utf-8", errors="strict")
-    output = _run_git(["ls-tree", "-z", commit, "--", decoded_path])
+    output = _run_git(["ls-tree", "-z", commit, "--", decoded_path], deadline=deadline)
     expected_suffix = b"\t" + path + b"\0"
     if not output.endswith(expected_suffix):
-        return False
+        return None
     metadata = output[: -len(expected_suffix)].split(b" ")
-    return len(metadata) == 3 and metadata[0] in _REGULAR_FILE_MODES and metadata[1] == b"blob"
+    if len(metadata) != 3 or metadata[0] not in _REGULAR_FILE_MODES or metadata[1] != b"blob":
+        return None
+    return metadata[0]
+
+
+def _is_regular_file(commit: str, path: bytes, *, deadline: float | None = None) -> bool:
+    """Return whether ``path`` is a regular file at ``commit``."""
+
+    return _regular_file_mode(commit, path, deadline=deadline) is not None
 
 
 def _entries_are_docs_only(
-    entries: Sequence[tuple[str, tuple[bytes, ...]]], merge_base: str, head_sha: str
+    entries: Sequence[tuple[str, tuple[bytes, ...]]],
+    merge_base: str,
+    head_sha: str,
+    *,
+    deadline: float | None = None,
 ) -> bool:
     """Return whether non-empty status entries are all safe docs regular files."""
 
@@ -123,27 +235,32 @@ def _entries_are_docs_only(
         if not all(_is_docs_markdown_path(path) for path in paths):
             return False
         if status == "A":
-            if not _is_regular_file(head_sha, paths[0]):
+            if not _is_regular_file(head_sha, paths[0], deadline=deadline):
                 return False
         elif status == "M":
-            if not (
-                _is_regular_file(merge_base, paths[0]) and _is_regular_file(head_sha, paths[0])
-            ):
+            base_mode = _regular_file_mode(merge_base, paths[0], deadline=deadline)
+            head_mode = _regular_file_mode(head_sha, paths[0], deadline=deadline)
+            if base_mode is None or head_mode is None or base_mode != head_mode:
                 return False
         elif status == "D":
-            if not _is_regular_file(merge_base, paths[0]):
+            if not _is_regular_file(merge_base, paths[0], deadline=deadline):
                 return False
         else:
             old_path, new_path = paths
-            if not (
-                _is_regular_file(merge_base, old_path) and _is_regular_file(head_sha, new_path)
-            ):
+            base_mode = _regular_file_mode(merge_base, old_path, deadline=deadline)
+            head_mode = _regular_file_mode(head_sha, new_path, deadline=deadline)
+            if base_mode is None or head_mode is None or base_mode != head_mode:
                 return False
     return True
 
 
 def classify_change(event_name: str, base_sha: str, head_sha: str) -> ChangeMode:
     """Classify an exact pull-request comparison, failing closed on every error.
+
+    Every local Git call is bounded by a per-call timeout
+    (:data:`_GIT_CALL_TIMEOUT_SECONDS`) and the whole classification is bounded
+    by a total worktime budget (:data:`_TOTAL_BUDGET_SECONDS`).
+    Neither bound is environment-configurable.
 
     Args:
         event_name: GitHub event name supplied by the workflow.
@@ -161,19 +278,23 @@ def classify_change(event_name: str, base_sha: str, head_sha: str) -> ChangeMode
         or not _SHA_PATTERN.fullmatch(head_sha)
     ):
         return ChangeMode.FULL
+    deadline = time.monotonic() + _TOTAL_BUDGET_SECONDS
     try:
-        _run_git(["cat-file", "-e", f"{base_sha}^{{commit}}"])
-        _run_git(["cat-file", "-e", f"{head_sha}^{{commit}}"])
-        merge_base = _run_git(["merge-base", base_sha, head_sha]).decode("ascii").strip()
+        _run_git(["cat-file", "-e", f"{base_sha}^{{commit}}"], deadline=deadline)
+        _run_git(["cat-file", "-e", f"{head_sha}^{{commit}}"], deadline=deadline)
+        merge_base = (
+            _run_git(["merge-base", base_sha, head_sha], deadline=deadline).decode("ascii").strip()
+        )
         if _SHA_PATTERN.fullmatch(merge_base) is None:
             return ChangeMode.FULL
         diff = _run_git(
-            ["diff", "-z", "--name-status", "--find-renames", "--no-color", merge_base, head_sha]
+            ["diff", "-z", "--name-status", "--find-renames", "--no-color", merge_base, head_sha],
+            deadline=deadline,
         )
         entries = _parse_name_status(diff)
         if entries is None:
             return ChangeMode.FULL
-        if _entries_are_docs_only(entries, merge_base, head_sha):
+        if _entries_are_docs_only(entries, merge_base, head_sha, deadline=deadline):
             return ChangeMode.DOCS_ONLY
     except Exception:
         return ChangeMode.FULL

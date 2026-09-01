@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import runpy
 import shlex
+import stat
 import sys
 import tomllib
 import xml.etree.ElementTree as ElementTree
@@ -118,11 +119,37 @@ def test_ci_normalizes_coverage_filenames_before_codecov_upload() -> None:
     combine_index = step_names.index("Combine coverage data")
     xml_index = step_names.index("Generate combined coverage XML")
     normalize_index = step_names.index("Normalize coverage filenames for Codecov")
-    upload_index = step_names.index("Upload coverage to Codecov")
+    upload_index = step_names.index("Upload normalized full coverage artifact")
 
     assert combine_index < xml_index < normalize_index < upload_index
     normalize_step = coverage_steps[normalize_index]
-    assert normalize_step["run"] == "python scripts/tooling_coverage.py coverage.xml"
+    assert normalize_step["run"] == "python scripts/tooling_coverage.py coverage.xml codecov-input"
+    docs_job = _mapping(jobs["docs-fastpath"])
+    docs_steps = [_mapping(step) for step in cast(list[object], docs_job["steps"])]
+    staged_artifacts = {
+        step["name"]: _mapping(step["with"])
+        for step in [coverage_steps[upload_index], *docs_steps]
+        if step.get("uses") == "actions/upload-artifact@v4"
+        and step.get("name")
+        in {
+            "Upload normalized full coverage artifact",
+            "Upload normalized docs coverage artifact",
+        }
+    }
+    assert staged_artifacts == {
+        "Upload normalized full coverage artifact": {
+            "name": "codecov-coverage-full",
+            "path": "codecov-input",
+            "if-no-files-found": "error",
+            "include-hidden-files": True,
+        },
+        "Upload normalized docs coverage artifact": {
+            "name": "codecov-coverage-docs",
+            "path": "codecov-input",
+            "if-no-files-found": "error",
+            "include-hidden-files": True,
+        },
+    }
 
     codecov_steps: list[tuple[str, dict[str, object]]] = []
     pytest_runs: list[str] = []
@@ -134,12 +161,56 @@ def test_ci_normalizes_coverage_filenames_before_codecov_upload() -> None:
             run = step_mapping.get("run")
             if isinstance(run, str) and run.startswith("python -m pytest"):
                 pytest_runs.append(run)
-    assert len(codecov_steps) == 1
-    codecov_job, codecov_step = codecov_steps[0]
-    assert codecov_job == "coverage"
-    codecov_with = _mapping(codecov_step["with"])
-    assert codecov_with["files"] == "./coverage.xml"
-    assert codecov_with["disable_search"] is True
+    # The token-bearing Codecov boundary is structurally isolated from every
+    # checkout/run step and consumes only the two narrow producer artifacts.
+    assert len(codecov_steps) == 2
+    codecov_job_ids = {job_id for job_id, _ in codecov_steps}
+    assert codecov_job_ids == {"codecov-upload"}
+    for _, codecov_step in codecov_steps:
+        codecov_with = _mapping(codecov_step["with"])
+        assert codecov_with["files"] == "./coverage.xml"
+        assert codecov_with["root_dir"] == "."
+        assert codecov_with["working-directory"] == "./codecov-input"
+        assert codecov_with["disable_search"] is True
+        assert codecov_with["disable_file_fixes"] is True
+        assert codecov_with["token"] == "${{ secrets.CODECOV_TOKEN }}"
+    upload_job = _mapping(jobs["codecov-upload"])
+    assert upload_job["needs"] == ["classify", "coverage", "docs-fastpath"]
+    assert upload_job["if"] == "always()"
+    upload_steps = [_mapping(step) for step in cast(list[object], upload_job["steps"])]
+    assert [step["name"] for step in upload_steps] == [
+        "Download normalized full coverage artifact",
+        "Upload full coverage to Codecov",
+        "Download normalized docs coverage artifact",
+        "Upload docs coverage to Codecov",
+    ]
+    expected_step_conditions = {
+        "Download normalized full coverage artifact": (
+            "needs.classify.outputs.mode == 'full' && needs.coverage.result == 'success'"
+        ),
+        "Upload full coverage to Codecov": (
+            "needs.classify.outputs.mode == 'full' && needs.coverage.result == 'success'"
+        ),
+        "Download normalized docs coverage artifact": (
+            "needs.classify.outputs.mode == 'docs-only' && needs.docs-fastpath.result == 'success'"
+        ),
+        "Upload docs coverage to Codecov": (
+            "needs.classify.outputs.mode == 'docs-only' && needs.docs-fastpath.result == 'success'"
+        ),
+    }
+    assert {step["name"]: step.get("if") for step in upload_steps} == expected_step_conditions
+    assert all(
+        "run" not in step and step.get("uses") != "actions/checkout@v6.0.2" for step in upload_steps
+    )
+    downloads = [step for step in upload_steps if step["uses"] == "actions/download-artifact@v4"]
+    assert [_mapping(step["with"])["name"] for step in downloads] == [
+        "codecov-coverage-full",
+        "codecov-coverage-docs",
+    ]
+    for job_id, job in jobs.items():
+        job_mapping = _mapping(job)
+        receives_token = "CODECOV_TOKEN" in str(job_mapping)
+        assert not receives_token or job_id == "codecov-upload"
     assert pytest_runs and all(
         "--cov-report=" in shlex.split(run)
         and not any(
@@ -148,6 +219,263 @@ def test_ci_normalizes_coverage_filenames_before_codecov_upload() -> None:
         )
         for run in pytest_runs
     )
+
+
+def test_stage_codecov_input_directory_contains_only_inert_required_inputs(tmp_path: Path) -> None:
+    """The uploader artifact has the report, configuration, and zero-byte path skeleton only."""
+    coverage_xml = _coverage_fixture(
+        tmp_path, ("src/roastpilot_agent/app.py", "script_only.py", "skill_only.py")
+    )
+    (tmp_path / "codecov.yml").write_text("coverage:\n  status: {}\n", encoding="utf-8")
+    tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+    staging_directory = tmp_path / "codecov-input"
+    tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+
+    expected_paths = {
+        ".agents/skills/demo/scripts/skill_only.py",
+        "codecov.yml",
+        "coverage.xml",
+        "scripts/script_only.py",
+        "src/roastpilot_agent/app.py",
+    }
+    actual_paths = {
+        path.relative_to(staging_directory).as_posix()
+        for path in staging_directory.rglob("*")
+        if path.is_file()
+    }
+    assert actual_paths == expected_paths
+    assert (staging_directory / "coverage.xml").read_bytes() == coverage_xml.read_bytes()
+    assert (staging_directory / "codecov.yml").read_text(encoding="utf-8") == (
+        "coverage:\n  status: {}\n"
+    )
+    for path in actual_paths - {"coverage.xml", "codecov.yml"}:
+        assert (staging_directory / path).stat().st_size == 0
+    assert all(not path.is_symlink() for path in staging_directory.rglob("*"))
+
+
+def test_stage_codecov_input_directory_replaces_stale_safe_output(tmp_path: Path) -> None:
+    """A rerun removes stale files instead of adding a second artifact tree."""
+    coverage_xml = _coverage_fixture(tmp_path, ("script_only.py", "skill_only.py"))
+    (tmp_path / "codecov.yml").touch()
+    tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+    staging_directory = tmp_path / "codecov-input"
+    tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+    (staging_directory / "stale.txt").touch()
+
+    tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+
+    assert not (staging_directory / "stale.txt").exists()
+
+
+def test_stage_codecov_input_directory_rejects_an_executable_in_stale_output(
+    tmp_path: Path,
+) -> None:
+    """A stale executable cannot be removed as though it were inert input."""
+    coverage_xml = _write_coverage_xml(tmp_path, ("scripts/child.py",))
+    (tmp_path / "codecov.yml").touch()
+    staging_directory = tmp_path / "codecov-input"
+    staging_directory.mkdir()
+    executable = staging_directory / "stale.py"
+    executable.touch()
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+
+    with pytest.raises(ValueError, match="executable"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+
+    assert executable.exists()
+
+
+def test_stage_codecov_input_directory_rejects_an_empty_normalized_report(tmp_path: Path) -> None:
+    """Removing every covered filename fails before a no-source artifact is created."""
+    coverage_xml = _write_coverage_xml(tmp_path, ())
+    (tmp_path / "codecov.yml").touch()
+    staging_directory = tmp_path / "codecov-input"
+
+    with pytest.raises(ValueError, match="no filenames"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+
+    assert not staging_directory.exists()
+
+
+def test_stage_codecov_input_directory_rechecks_invalid_xml_at_staging_boundary(
+    tmp_path: Path,
+) -> None:
+    """Staging revalidates malformed, oversized, duplicate, and incomplete reports."""
+    config_path = tmp_path / "codecov.yml"
+    config_path.touch()
+    staging_directory = tmp_path / "codecov-input"
+
+    oversized = tmp_path / "oversized.xml"
+    oversized.write_bytes(b"x" * (tooling_coverage.MAX_COVERAGE_XML_BYTES + 1))
+    with pytest.raises(ValueError, match="size limit"):
+        tooling_coverage.stage_codecov_input_directory(oversized, tmp_path, staging_directory)
+
+    malformed = tmp_path / "malformed.xml"
+    malformed.write_text("<coverage>", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed"):
+        tooling_coverage.stage_codecov_input_directory(malformed, tmp_path, staging_directory)
+
+    duplicate = _write_coverage_xml(tmp_path, ("scripts/child.py", "scripts/child.py"))
+    with pytest.raises(ValueError, match="duplicate final filenames"):
+        tooling_coverage.stage_codecov_input_directory(duplicate, tmp_path, staging_directory)
+
+    missing_filename = tmp_path / "missing-filename.xml"
+    missing_filename.write_text(
+        "<coverage><packages><package><classes><class /></classes></package></packages></coverage>",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="has no filename"):
+        tooling_coverage.stage_codecov_input_directory(
+            missing_filename, tmp_path, staging_directory
+        )
+
+    assert not staging_directory.exists()
+
+
+def test_stage_codecov_input_directory_caps_filename_and_config_resource_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Small test caps prove both artifact-derived resource limits fail closed."""
+    coverage_xml = _write_coverage_xml(tmp_path, ("scripts/one.py", "scripts/two.py"))
+    config_path = tmp_path / "codecov.yml"
+    config_path.write_bytes(b"xx")
+    staging_directory = tmp_path / "codecov-input"
+    monkeypatch.setattr(tooling_coverage, "MAX_CODECOV_COVERED_FILENAMES", 1)
+
+    with pytest.raises(ValueError, match="too many filenames"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+    assert not staging_directory.exists()
+
+    monkeypatch.setattr(tooling_coverage, "MAX_CODECOV_COVERED_FILENAMES", 2)
+    monkeypatch.setattr(tooling_coverage, "MAX_CODECOV_CONFIG_BYTES", 1)
+    with pytest.raises(ValueError, match="configuration exceeds"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+    assert not staging_directory.exists()
+
+
+def test_stage_codecov_input_directory_never_removes_arbitrary_destinations(tmp_path: Path) -> None:
+    """Only the fixed direct staging child is eligible for replacement."""
+    coverage_xml = _write_coverage_xml(tmp_path, ("scripts/child.py",))
+    (tmp_path / "codecov.yml").touch()
+    sentinel = tmp_path / "sentinel.txt"
+    sentinel.write_text("must survive", encoding="utf-8")
+    arbitrary_directory = tmp_path / "arbitrary-codecov-target"
+    arbitrary_directory.mkdir()
+    arbitrary_sentinel = arbitrary_directory / "sentinel.txt"
+    arbitrary_sentinel.write_text("must survive", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="fixed repository child"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, tmp_path)
+    with pytest.raises(ValueError, match="fixed repository child"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, arbitrary_directory)
+
+    assert sentinel.read_text(encoding="utf-8") == "must survive"
+    assert arbitrary_sentinel.read_text(encoding="utf-8") == "must survive"
+
+
+@pytest.mark.parametrize(
+    "filename",
+    (
+        "/absolute.py",
+        "../traversal.py",
+        "scripts\\windows.py",
+        "scripts//empty.py",
+        "codecov.yml/x.py",
+    ),
+)
+def test_stage_codecov_input_directory_rejects_unsafe_normalized_paths(
+    tmp_path: Path, filename: str
+) -> None:
+    """Unsafe post-normalization XML paths cannot enter the artifact skeleton."""
+    coverage_xml = _write_coverage_xml(tmp_path, (filename,))
+    (tmp_path / "codecov.yml").touch()
+
+    with pytest.raises(ValueError, match="unsafe"):
+        tooling_coverage.stage_codecov_input_directory(
+            coverage_xml, tmp_path, tmp_path / "codecov-input"
+        )
+
+
+def test_stage_codecov_input_directory_rejects_path_conflicts_and_symlinked_output(
+    tmp_path: Path,
+) -> None:
+    """File/directory collisions and symlink output state fail before replacement."""
+    coverage_xml = _write_coverage_xml(tmp_path, ("scripts", "scripts/child.py"))
+    (tmp_path / "codecov.yml").touch()
+    with pytest.raises(ValueError, match="conflicts"):
+        tooling_coverage.stage_codecov_input_directory(
+            coverage_xml, tmp_path, tmp_path / "codecov-input"
+        )
+
+    safe_xml = _write_coverage_xml(tmp_path, ("scripts/child.py",))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    staging_directory = tmp_path / "codecov-input"
+    staging_directory.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="non-symlink directory"):
+        tooling_coverage.stage_codecov_input_directory(safe_xml, tmp_path, staging_directory)
+
+
+def test_stage_codecov_input_directory_rejects_a_symlinked_repository_root(tmp_path: Path) -> None:
+    """The fixed staging child cannot be rooted through a repository symlink."""
+    real_repository_root = tmp_path / "real-repository"
+    real_repository_root.mkdir()
+    coverage_xml = _write_coverage_xml(real_repository_root, ("scripts/child.py",))
+    (real_repository_root / "codecov.yml").touch()
+    repository_link = tmp_path / "repository-link"
+    repository_link.symlink_to(real_repository_root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="repository root must be a non-symlink directory"):
+        tooling_coverage.stage_codecov_input_directory(
+            coverage_xml, repository_link, repository_link / "codecov-input"
+        )
+
+
+def test_stage_codecov_input_directory_rejects_a_symlinked_coverage_xml(tmp_path: Path) -> None:
+    """The top-level normalized report must not traverse a symlink."""
+    report_target = _write_coverage_xml(tmp_path, ("scripts/child.py",))
+    coverage_xml = tmp_path / "coverage-link.xml"
+    coverage_xml.symlink_to(report_target)
+    (tmp_path / "codecov.yml").touch()
+    staging_directory = tmp_path / "codecov-input"
+
+    with pytest.raises(ValueError, match="coverage XML must be a regular non-symlink file"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+
+    assert not staging_directory.exists()
+
+
+def test_stage_codecov_input_directory_rejects_a_symlinked_codecov_configuration(
+    tmp_path: Path,
+) -> None:
+    """The top-level Codecov configuration must not traverse a symlink."""
+    coverage_xml = _write_coverage_xml(tmp_path, ("scripts/child.py",))
+    config_target = tmp_path / "config-target.yml"
+    config_target.touch()
+    (tmp_path / "codecov.yml").symlink_to(config_target)
+    staging_directory = tmp_path / "codecov-input"
+
+    with pytest.raises(
+        ValueError, match="codecov configuration must be a regular non-symlink file"
+    ):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+
+    assert not staging_directory.exists()
+
+
+def test_stage_codecov_input_directory_rejects_a_symlink_in_existing_output(tmp_path: Path) -> None:
+    """A stale symlink prevents replacement instead of being silently removed."""
+    coverage_xml = _write_coverage_xml(tmp_path, ("scripts/child.py",))
+    (tmp_path / "codecov.yml").touch()
+    staging_directory = tmp_path / "codecov-input"
+    staging_directory.mkdir()
+    outside = tmp_path / "outside"
+    outside.touch()
+    (staging_directory / "linked.py").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="symlink"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
 
 
 def test_each_discovered_skill_root_is_registered_in_flattened_settings() -> None:
@@ -516,10 +844,12 @@ def test_main_normalizes_coverage_xml_from_current_repository(
 ) -> None:
     """The CI command entry point normalizes exactly one local report."""
     coverage_xml = _coverage_fixture(tmp_path, ("script_only.py", "skill_only.py"))
+    (tmp_path / "codecov.yml").touch()
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, "argv", ["tooling_coverage.py", str(coverage_xml)])
+    monkeypatch.setattr(sys, "argv", ["tooling_coverage.py", str(coverage_xml), "codecov-input"])
 
     assert tooling_coverage.main() == 0
+    assert (tmp_path / "codecov-input" / "coverage.xml").is_file()
 
 
 def test_script_entrypoint_normalizes_coverage_xml(
@@ -527,8 +857,9 @@ def test_script_entrypoint_normalizes_coverage_xml(
 ) -> None:
     """The direct CI script command exits successfully after normalization."""
     coverage_xml = _coverage_fixture(tmp_path, ("script_only.py", "skill_only.py"))
+    (tmp_path / "codecov.yml").touch()
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, "argv", ["tooling_coverage.py", str(coverage_xml)])
+    monkeypatch.setattr(sys, "argv", ["tooling_coverage.py", str(coverage_xml), "codecov-input"])
 
     with pytest.raises(SystemExit) as exit_status:
         runpy.run_path(str(REPO_ROOT / "scripts" / "tooling_coverage.py"), run_name="__main__")
@@ -553,6 +884,11 @@ def _coverage_fixture(tmp_path: Path, filenames: tuple[str, ...]) -> Path:
     app = tmp_path / "src" / "roastpilot_agent"
     app.mkdir(parents=True)
     (app / "app.py").touch()
+    return _write_coverage_xml(tmp_path, filenames)
+
+
+def _write_coverage_xml(tmp_path: Path, filenames: tuple[str, ...]) -> Path:
+    """Write a minimal Coverage.py XML report with the supplied class paths."""
     coverage_xml = tmp_path / "coverage.xml"
     root = ElementTree.Element("coverage")
     classes = ElementTree.SubElement(ElementTree.SubElement(root, "packages"), "classes")

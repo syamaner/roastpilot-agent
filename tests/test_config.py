@@ -40,8 +40,6 @@ from roastpilot_agent.config import (
 from roastpilot_agent.models import RoastPhase
 from roastpilot_agent.store import FrozenRunConfig
 
-pytestmark = pytest.mark.docs
-
 
 def _declared_le(model: type[pydantic.BaseModel], field: str) -> float:
     """Return a field's declared ``le`` bound from its own constraint metadata.
@@ -85,6 +83,7 @@ def test_trim_authority_comment_distinguishes_override_and_ceiling_terms() -> No
     assert "60/75" in source
 
 
+@pytest.mark.docs
 def test_runbook_recovery_off_describes_the_d88_ceiling_not_heat_direction() -> None:
     """Recovery-off runbook text keeps PI heat motion bounded, not one-way."""
     runbook = (Path(__file__).parents[1] / "docs" / "roast-session-runbook.md").read_text()

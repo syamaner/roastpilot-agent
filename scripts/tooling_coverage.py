@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import stat
 import sys
 import tempfile
 import xml.etree.ElementTree as ElementTree
@@ -13,6 +15,12 @@ from pathlib import Path, PurePosixPath
 TOOLING_ROOTS = ("scripts", ".agents/skills/capture-agent-usage/scripts")
 APP_COVERAGE_ROOT = "src/roastpilot_agent/"
 MAX_COVERAGE_XML_BYTES = 10 * 1024 * 1024
+CODECOV_REPORT_NAME = "coverage.xml"
+CODECOV_CONFIG_NAME = "codecov.yml"
+CODECOV_RESERVED_PATHS = frozenset({CODECOV_REPORT_NAME, CODECOV_CONFIG_NAME, ".git"})
+CODECOV_INPUT_DIRECTORY_NAME = "codecov-input"
+MAX_CODECOV_COVERED_FILENAMES = 10_000
+MAX_CODECOV_CONFIG_BYTES = 1024 * 1024
 
 
 def skill_script_roots(repo_root: Path) -> tuple[str, ...]:
@@ -141,6 +149,129 @@ def normalize_coverage_xml(coverage_xml: Path, repo_root: Path) -> None:
     _write_xml_atomically(report_path, report)
 
 
+def stage_codecov_input_directory(
+    coverage_xml: Path, repo_root: Path, staging_directory: Path
+) -> None:
+    """Build a minimal, inert Codecov input directory from a normalized report.
+
+    Args:
+        coverage_xml: Normalized Coverage.py XML report to copy into the staging directory.
+        repo_root: Repository root containing the trusted Codecov configuration.
+        staging_directory: Destination directory replaced with the deterministic input tree.
+
+    Raises:
+        ValueError: If an input, normalized filename, or pre-existing destination is unsafe.
+    """
+    report_path = _regular_file(coverage_xml, "coverage XML")
+    filenames = _normalized_coverage_filenames(report_path)
+    config_path = _regular_file(repo_root / CODECOV_CONFIG_NAME, "codecov configuration")
+    if config_path.stat().st_size > MAX_CODECOV_CONFIG_BYTES:
+        raise ValueError("codecov configuration exceeds the size limit")
+    _require_safe_staging_destination(repo_root, staging_directory)
+
+    temporary_directory = Path(
+        tempfile.mkdtemp(prefix=".codecov-input-", dir=staging_directory.parent)
+    )
+    try:
+        _copy_regular_file(report_path, temporary_directory / CODECOV_REPORT_NAME)
+        _copy_regular_file(config_path, temporary_directory / CODECOV_CONFIG_NAME)
+        for filename in filenames:
+            placeholder = temporary_directory.joinpath(*PurePosixPath(filename).parts)
+            placeholder.parent.mkdir(parents=True, exist_ok=True)
+            placeholder.touch(exist_ok=False)
+        _require_inert_staging_tree(temporary_directory)
+        _remove_existing_staging_directory(staging_directory)
+        os.replace(temporary_directory, staging_directory)
+    finally:
+        if temporary_directory.exists():
+            shutil.rmtree(temporary_directory)
+
+
+def _normalized_coverage_filenames(coverage_xml: Path) -> tuple[str, ...]:
+    """Parse a normalized report and return its safe, unique repository paths."""
+    if coverage_xml.stat().st_size > MAX_COVERAGE_XML_BYTES:
+        raise ValueError("coverage XML exceeds the size limit")
+    try:
+        report = ElementTree.fromstring(coverage_xml.read_bytes())
+    except ElementTree.ParseError as error:
+        raise ValueError("coverage XML is malformed") from error
+
+    filenames = tuple(
+        _require_safe_codecov_filename(class_element.get("filename"))
+        for class_element in report.findall(".//class")
+    )
+    if len(filenames) != len(set(filenames)):
+        raise ValueError("coverage XML contains duplicate final filenames")
+    if not filenames:
+        raise ValueError("coverage XML contains no filenames")
+    if len(filenames) > MAX_CODECOV_COVERED_FILENAMES:
+        raise ValueError("coverage XML contains too many filenames")
+    _require_no_staging_path_conflicts(filenames)
+    return filenames
+
+
+def _require_safe_codecov_filename(filename: str | None) -> str:
+    """Validate one normalized XML filename before creating a placeholder."""
+    if filename is None or not filename:
+        raise ValueError("coverage XML class has no filename")
+    path = PurePosixPath(filename)
+    parts = filename.split("/")
+    if (
+        "\\" in filename
+        or path.is_absolute()
+        or any(not part or part in {".", ".."} for part in parts)
+        or any(part in CODECOV_RESERVED_PATHS for part in parts)
+    ):
+        raise ValueError(f"coverage XML filename is unsafe for Codecov staging: {filename!r}")
+    return filename
+
+
+def _require_no_staging_path_conflicts(filenames: Sequence[str]) -> None:
+    """Reject file/directory collisions in the zero-byte placeholder tree."""
+    files = set(filenames)
+    for filename in files:
+        parts = PurePosixPath(filename).parts
+        if any("/".join(parts[:index]) in files for index in range(1, len(parts))):
+            raise ValueError(f"coverage XML filename conflicts in Codecov staging: {filename!r}")
+
+
+def _copy_regular_file(source: Path, destination: Path) -> None:
+    """Copy an already-validated file without preserving executable metadata."""
+    destination.write_bytes(source.read_bytes())
+
+
+def _require_safe_staging_destination(repo_root: Path, staging_directory: Path) -> None:
+    """Bind staging to the one safe direct child of a regular repository root."""
+    if repo_root.is_symlink() or not repo_root.is_dir():
+        raise ValueError("repository root must be a non-symlink directory")
+    expected_staging_directory = repo_root / CODECOV_INPUT_DIRECTORY_NAME
+    if staging_directory != expected_staging_directory:
+        raise ValueError("Codecov staging destination must be the fixed repository child")
+    if staging_directory.is_symlink() or (
+        staging_directory.exists() and not staging_directory.is_dir()
+    ):
+        raise ValueError("Codecov staging destination must be a non-symlink directory")
+
+
+def _remove_existing_staging_directory(staging_directory: Path) -> None:
+    """Remove a fully validated old staging directory so reruns retain no files."""
+    if not staging_directory.exists():
+        return
+    _require_inert_staging_tree(staging_directory)
+    shutil.rmtree(staging_directory)
+
+
+def _require_inert_staging_tree(staging_directory: Path) -> None:
+    """Require directories and non-executable regular files only in staging output."""
+    if not staging_directory.is_dir():  # pragma: no cover - callers validate or create dirs
+        raise ValueError("Codecov staging output must be a non-symlink directory")
+    for path in staging_directory.rglob("*"):
+        if path.is_symlink() or not (path.is_dir() or path.is_file()):
+            raise ValueError("Codecov staging output contains a symlink or non-regular path")
+        if path.is_file() and path.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+            raise ValueError("Codecov staging output contains an executable file")
+
+
 def _normalize_coverage_filename(
     filename: str | None, repo_root: Path, tooling_roots: Sequence[str]
 ) -> str:
@@ -236,11 +367,15 @@ def _write_xml_atomically(report_path: Path, report: ElementTree.Element) -> Non
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Normalize one Coverage.py XML report from the current repository root."""
+    """Normalize one Coverage.py XML report and stage its Codecov input directory."""
     arguments = tuple(sys.argv[1:] if argv is None else argv)
-    if len(arguments) != 1:
-        raise ValueError("usage: tooling_coverage.py COVERAGE_XML")
-    normalize_coverage_xml(Path(arguments[0]), Path.cwd())
+    if len(arguments) != 2:
+        raise ValueError("usage: tooling_coverage.py COVERAGE_XML STAGING_DIRECTORY")
+    repo_root = Path.cwd()
+    coverage_xml = Path(arguments[0])
+    normalize_coverage_xml(coverage_xml, repo_root)
+    staging_directory = repo_root / arguments[1]
+    stage_codecov_input_directory(coverage_xml, repo_root, staging_directory)
     return 0
 
 

@@ -37,8 +37,6 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.docs
-
 _REPO = Path(__file__).resolve().parents[1]
 _RUNBOOK = _REPO / "docs" / "agent-team-worktrees.md"
 
@@ -564,6 +562,7 @@ def _outer_site_packages() -> str:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.docs
 def test_recipe_extraction_is_well_formed() -> None:
     """The closed-grammar parse succeeds and matches the Class A line count."""
     recipe = _load_recipe()
@@ -576,6 +575,7 @@ def test_recipe_extraction_is_well_formed() -> None:
     assert recipe.all_lines[-2] == recipe.verification
 
 
+@pytest.mark.docs
 def test_t0_complete_recipe_stops_before_later_commands_when_guard_fails(tmp_path: Path) -> None:
     """T0: a copied complete recipe exits non-zero before any later command runs."""
     (tmp_path / ".venv").mkdir()
@@ -598,6 +598,7 @@ def test_t0_complete_recipe_stops_before_later_commands_when_guard_fails(tmp_pat
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.docs
 def test_t1_prefix_probe_exits_zero_when_contained() -> None:
     """T1: the prefix probe exits 0 and prints path+True when contained."""
     recipe = _load_recipe()
@@ -608,6 +609,7 @@ def test_t1_prefix_probe_exits_zero_when_contained() -> None:
     assert lines[1] == "True"
 
 
+@pytest.mark.docs
 def test_t2_prefix_probe_exits_nonzero_when_borrowed(tmp_path: Path) -> None:
     """T2: the prefix probe exits non-zero against an unrelated directory."""
     recipe = _load_recipe()
@@ -616,6 +618,7 @@ def test_t2_prefix_probe_exits_nonzero_when_borrowed(tmp_path: Path) -> None:
     assert "False" in result.stdout
 
 
+@pytest.mark.docs
 def test_t3_first_party_probe_contained_and_borrowed(tmp_path: Path) -> None:
     """T3: the first-party probe exits 0 for the real repo, non-zero otherwise."""
     recipe = _load_recipe()
@@ -628,6 +631,7 @@ def test_t3_first_party_probe_contained_and_borrowed(tmp_path: Path) -> None:
     assert "False" in borrowed.stdout
 
 
+@pytest.mark.docs
 def test_t4_third_party_probe_contained() -> None:
     """T4: the numpy probe exits 0 under this interpreter's own venv."""
     recipe = _load_recipe()
@@ -636,6 +640,7 @@ def test_t4_third_party_probe_contained() -> None:
     assert "True" in result.stdout
 
 
+@pytest.mark.docs
 def test_t5_third_party_probe_contaminated(tmp_path: Path) -> None:
     """T5: a throwaway venv resolving numpy via PYTHONPATH exits non-zero."""
     recipe = _load_recipe()
@@ -665,6 +670,7 @@ def test_t5_third_party_probe_contaminated(tmp_path: Path) -> None:
     assert "False" in result.stdout
 
 
+@pytest.mark.docs
 def test_t6_probes_still_fail_closed_under_pythonoptimize(tmp_path: Path) -> None:
     """T6: every negative arm above still exits non-zero under PYTHONOPTIMIZE=2 (G2)."""
     recipe = _load_recipe()
@@ -697,6 +703,7 @@ def test_t6_probes_still_fail_closed_under_pythonoptimize(tmp_path: Path) -> Non
     assert third_party_result.returncode != 0
 
 
+@pytest.mark.docs
 def test_t7_probes_print_path_and_boolean_on_positive_arm() -> None:
     """T7: every probe prints exactly a path line then a boolean line, positive arm."""
     recipe = _load_recipe()
@@ -720,12 +727,14 @@ def test_t7_probes_print_path_and_boolean_on_positive_arm() -> None:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.docs
 def test_t8_absence_guard_exits_zero_when_venv_absent(tmp_path: Path) -> None:
     """T8: the absence guard exits 0 for a clean worktree."""
     result = _run_absence_guard(_load_recipe(), tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.docs
 def test_t9_absence_guard_exits_nonzero_for_real_directory(tmp_path: Path) -> None:
     """T9: a real `.venv` directory fails the guard."""
     (tmp_path / ".venv").mkdir()
@@ -733,6 +742,7 @@ def test_t9_absence_guard_exits_nonzero_for_real_directory(tmp_path: Path) -> No
     assert result.returncode != 0
 
 
+@pytest.mark.docs
 def test_t10_absence_guard_exits_nonzero_for_live_symlink(tmp_path: Path) -> None:
     """T10: a live symlinked `.venv` fails the guard."""
     target = tmp_path / "other-checkout-venv"
@@ -742,6 +752,7 @@ def test_t10_absence_guard_exits_nonzero_for_live_symlink(tmp_path: Path) -> Non
     assert result.returncode != 0
 
 
+@pytest.mark.docs
 def test_t11_absence_guard_exits_nonzero_for_dangling_symlink(tmp_path: Path) -> None:
     """T11: a dangling symlinked `.venv` fails the guard (the lexists case)."""
     (tmp_path / ".venv").symlink_to(tmp_path / "does-not-exist")
@@ -749,6 +760,7 @@ def test_t11_absence_guard_exits_nonzero_for_dangling_symlink(tmp_path: Path) ->
     assert result.returncode != 0
 
 
+@pytest.mark.docs
 def test_t12_absence_guard_exits_nonzero_for_regular_file(tmp_path: Path) -> None:
     """T12: a regular file named `.venv` fails the guard."""
     (tmp_path / ".venv").write_text("not a venv")
@@ -756,12 +768,14 @@ def test_t12_absence_guard_exits_nonzero_for_regular_file(tmp_path: Path) -> Non
     assert result.returncode != 0
 
 
+@pytest.mark.docs
 def test_t13_no_forbidden_literals_in_command_lines() -> None:
     """T13: the recipe's command lines carry no `--clear` and no `rm -rf .venv/`."""
     recipe = _load_recipe()
     _assert_no_forbidden_literals(recipe.all_lines)
 
 
+@pytest.mark.docs
 def test_t14_canonical_remedy_sentence_present_byte_exact() -> None:
     """T14: the closed rebuild and serialization disclosures are byte-exact."""
     runbook_text = _RUNBOOK.read_text(encoding="utf-8")
@@ -775,6 +789,7 @@ def test_t14_canonical_remedy_sentence_present_byte_exact() -> None:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.docs
 def test_t15_full_strip_reports_zero_leaks() -> None:
     """T15: the extracted strip prefix removes the whole poisoned namespace."""
     recipe = _load_recipe()
@@ -790,6 +805,7 @@ def test_t15_full_strip_reports_zero_leaks() -> None:
     assert _parse_leaked(result.stdout) == []
 
 
+@pytest.mark.docs
 def test_t16_verification_fails_closed_when_strip_bypassed() -> None:
     """T16: running the verification's inspector with no strip fails closed."""
     recipe = _load_recipe()
@@ -803,6 +819,7 @@ def test_t16_verification_fails_closed_when_strip_bypassed() -> None:
     assert set(_ALL_POISON_VALUES) <= set(leaked)
 
 
+@pytest.mark.docs
 def test_t17_no_poisoned_value_disclosed() -> None:
     """T17: neither T15's nor T16's combined output ever prints a poisoned VALUE."""
     recipe = _load_recipe()
@@ -826,6 +843,7 @@ def test_t17_no_poisoned_value_disclosed() -> None:
     _assert_no_poisoned_values(combined)
 
 
+@pytest.mark.docs
 def test_t18_pythonpath_and_api_key_also_isolated() -> None:
     """T18: the full-strip inspector run also confirms PYTHONPATH/OPENROUTER_API_KEY
     absence (G9)."""
@@ -846,6 +864,7 @@ def test_t18_pythonpath_and_api_key_also_isolated() -> None:
     assert "OPENROUTER_API_KEY" not in leaked
 
 
+@pytest.mark.docs
 @pytest.mark.parametrize(
     "environment_name",
     (
@@ -947,6 +966,7 @@ def _heading_lines(runbook_text: str) -> set[str]:
     return {line[3:].strip() for line in runbook_text.splitlines() if line.startswith("## ")}
 
 
+@pytest.mark.docs
 def test_t20_section_heading_matches_role_prompt_citations() -> None:
     """T20: the runbook heading still matches what every role prompt quotes."""
     headings = _quoted_gate_headings()
@@ -961,6 +981,7 @@ def test_t20_section_heading_matches_role_prompt_citations() -> None:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.docs
 def test_mutation_g1_print_only_probe_exits_zero_when_borrowed(tmp_path: Path) -> None:
     """G1 mutation: dropping SystemExit restores the historic print-only form,
     which must fail T2/T3-negative/T5 (proving they are non-vacuous)."""
@@ -972,6 +993,7 @@ def test_mutation_g1_print_only_probe_exits_zero_when_borrowed(tmp_path: Path) -
     assert "False" in result.stdout
 
 
+@pytest.mark.docs
 def test_mutation_g2_assert_based_probe_passes_under_pythonoptimize(tmp_path: Path) -> None:
     """G2 mutation: an assert-based probe must fail T6 under PYTHONOPTIMIZE=2."""
     recipe = _load_recipe()
@@ -987,6 +1009,7 @@ def test_mutation_g2_assert_based_probe_passes_under_pythonoptimize(tmp_path: Pa
     )
 
 
+@pytest.mark.docs
 def test_mutation_g3_relaxed_grep_would_false_pass(tmp_path: Path) -> None:
     """G3 mutation: relaxing `-Fx` to a substring `-F` would false-pass a
     `... = true` line the real `-Fx` line correctly rejects."""
@@ -1029,6 +1052,7 @@ def test_mutation_g4_exists_based_guard_fails_open_on_dangling_symlink(tmp_path:
     )
 
 
+@pytest.mark.docs
 def test_mutation_g5_forbidden_literals_detected_by_scanner() -> None:
     """G5 mutation: reintroducing `--clear` or `rm -rf .venv/` must fail T13's scanner."""
     recipe = _load_recipe()
@@ -1049,6 +1073,7 @@ def test_mutation_g6_bare_rebuild_remedy_fails_t14() -> None:
     assert CANONICAL_REMEDY_SENTENCE not in historic_phrasing
 
 
+@pytest.mark.docs
 def test_mutation_g7_single_key_prefix_leaks_the_namespace() -> None:
     """G7 mutation: reinstating the historic single-key strip leaks `ROASTPILOT_*` (fails T15).
 
@@ -1072,6 +1097,7 @@ def test_mutation_g7_single_key_prefix_leaks_the_namespace() -> None:
     assert "ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE" in leaked
 
 
+@pytest.mark.docs
 def test_mutation_g8_missing_verification_line_fails_structural_check() -> None:
     """G8 mutation: deleting the verification line fails the structural parse (fails T16)."""
     recipe = _load_recipe()
@@ -1080,6 +1106,7 @@ def test_mutation_g8_missing_verification_line_fails_structural_check() -> None:
         _locate_verification_and_pytest(mutated)
 
 
+@pytest.mark.docs
 def test_mutation_g9_g10_value_echoing_prefix_leaks_a_value() -> None:
     """G9/G10 mutation: the extracted verifier must never echo a value.
 
