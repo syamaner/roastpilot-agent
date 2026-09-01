@@ -1063,3 +1063,6 @@ def test_bare_app_config_joint_window_planner_group_is_inert() -> None:
     inert."""
     config = AppConfig()
     assert config.controller.joint_window_planner.enabled is False
+
+
+# Disposable #702 hosted-proof fixture: this comment intentionally changes no behaviour.
