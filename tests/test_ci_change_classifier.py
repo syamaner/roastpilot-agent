@@ -1626,16 +1626,30 @@ def _fixture_is_autouse(
     return values[0].value
 
 
-def _usefixtures_names(decorators: Iterable[ast.expr]) -> set[str]:
+def _usefixtures_names(
+    decorators: Iterable[ast.expr],
+    usefixtures_aliases: set[str] | None = None,
+    ambiguous_usefixtures_aliases: set[str] | None = None,
+) -> set[str]:
     """Return literal ``usefixtures`` names or fail closed on dynamic forms."""
 
+    usefixtures_aliases = usefixtures_aliases or set()
+    ambiguous_usefixtures_aliases = ambiguous_usefixtures_aliases or set()
     names: set[str] = set()
     for decorator in decorators:
-        if not (
-            isinstance(decorator, ast.Call)
-            and isinstance(decorator.func, ast.Attribute)
-            and decorator.func.attr == "usefixtures"
-        ):
+        if not isinstance(decorator, ast.Call):
+            continue
+        if isinstance(decorator.func, ast.Name):
+            if decorator.func.id in ambiguous_usefixtures_aliases:
+                raise AssertionError(
+                    "pytest.mark.usefixtures decorator alias provenance is ambiguous"
+                )
+            is_usefixtures = decorator.func.id in usefixtures_aliases
+        else:
+            is_usefixtures = (
+                isinstance(decorator.func, ast.Attribute) and decorator.func.attr == "usefixtures"
+            )
+        if not is_usefixtures:
             continue
         if (
             decorator.keywords
@@ -1654,7 +1668,11 @@ def _usefixtures_names(decorators: Iterable[ast.expr]) -> set[str]:
     return names
 
 
-def _module_usefixtures_names(tree: ast.Module) -> set[str]:
+def _module_usefixtures_names(
+    tree: ast.Module,
+    usefixtures_aliases: set[str],
+    ambiguous_usefixtures_aliases: set[str],
+) -> set[str]:
     """Return literal module-level ``usefixtures`` marks."""
 
     names: set[str] = set()
@@ -1669,14 +1687,20 @@ def _module_usefixtures_names(tree: ast.Module) -> set[str]:
             if isinstance(statement.value, (ast.List, ast.Set, ast.Tuple))
             else [statement.value]
         )
-        names.update(_usefixtures_names(values))
+        names.update(_usefixtures_names(values, usefixtures_aliases, ambiguous_usefixtures_aliases))
     return names
 
 
-def _class_usefixtures_names(node: ast.ClassDef) -> set[str]:
+def _class_usefixtures_names(
+    node: ast.ClassDef,
+    usefixtures_aliases: set[str],
+    ambiguous_usefixtures_aliases: set[str],
+) -> set[str]:
     """Return literal class decorator and ``pytestmark`` fixture activation."""
 
-    names = _usefixtures_names(node.decorator_list)
+    names = _usefixtures_names(
+        node.decorator_list, usefixtures_aliases, ambiguous_usefixtures_aliases
+    )
     for statement in node.body:
         if not isinstance(statement, ast.Assign) or not any(
             isinstance(target, ast.Name) and target.id == "pytestmark"
@@ -1688,8 +1712,56 @@ def _class_usefixtures_names(node: ast.ClassDef) -> set[str]:
             if isinstance(statement.value, (ast.List, ast.Set, ast.Tuple))
             else [statement.value]
         )
-        names.update(_usefixtures_names(values))
+        names.update(_usefixtures_names(values, usefixtures_aliases, ambiguous_usefixtures_aliases))
     return names
+
+
+def _pytest_usefixtures_aliases(
+    tree: ast.Module, pytest_module_aliases: set[str]
+) -> tuple[set[str], set[str]]:
+    """Return statically unique ``pytest.mark.usefixtures`` aliases and ambiguities."""
+
+    aliases: set[str] = set()
+    ambiguous: set[str] = set()
+
+    def is_usefixtures(value: ast.expr) -> bool:
+        """Return whether one expression is the exact marker decorator."""
+
+        return (
+            isinstance(value, ast.Attribute)
+            and value.attr == "usefixtures"
+            and isinstance(value.value, ast.Attribute)
+            and value.value.attr == "mark"
+            and isinstance(value.value.value, ast.Name)
+            and value.value.value.id in pytest_module_aliases | {"pytest"}
+        )
+
+    for statement in tree.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)) or statement.value is None:
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        target_names = {target.id for target in targets if isinstance(target, ast.Name)}
+        if len(target_names) != 1:
+            if is_usefixtures(statement.value) or (
+                isinstance(statement.value, ast.Call) and is_usefixtures(statement.value.func)
+            ):
+                ambiguous.update(target_names)
+            continue
+        target = next(iter(target_names))
+        if target in aliases | ambiguous:
+            aliases.discard(target)
+            ambiguous.add(target)
+            continue
+        if is_usefixtures(statement.value):
+            aliases.add(target)
+        elif isinstance(statement.value, ast.Name):
+            if statement.value.id in aliases:
+                aliases.add(target)
+            elif statement.value.id in ambiguous:
+                ambiguous.add(target)
+        elif isinstance(statement.value, ast.Call) and is_usefixtures(statement.value.func):
+            ambiguous.add(target)
+    return aliases, ambiguous
 
 
 def _fixture_parameter_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
@@ -4074,9 +4146,26 @@ def _assert_no_unattributable_module_docs_reads(
     tree: ast.Module,
     module_aliases: set[str],
     functions: dict[str, _FunctionNode],
+    analyses: dict[str, _FunctionAnalysis],
     filename: str,
 ) -> None:
     """Reject import-time docs reads that cannot be assigned to one collected test."""
+
+    def helper_reads_docs(name: str, seen: frozenset[str]) -> bool:
+        """Return whether one bounded local helper reaches a direct docs read."""
+
+        if name in seen or name not in analyses:
+            return False
+        if len(seen) >= _MAX_DOCS_CALL_GRAPH_DEPTH:
+            raise AssertionError(
+                f"{filename}: module-scope helper-call provenance exceeds the bounded graph"
+            )
+        analysis = analyses[name]
+        if analysis.unresolved:
+            raise AssertionError(f"{filename}: module-scope helper-call provenance is ambiguous")
+        return analysis.reads_directly or any(
+            helper_reads_docs(callee, seen | {name}) for callee in analysis.calls
+        )
 
     collected = {name for name in functions if name.startswith("test_")}
     collected.update(
@@ -4095,6 +4184,15 @@ def _assert_no_unattributable_module_docs_reads(
         for node in ast.walk(statement):
             if not isinstance(node, ast.Call):
                 continue
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in analyses
+                and helper_reads_docs(node.func.id, frozenset())
+            ):
+                raise AssertionError(
+                    f"{filename}:{node.lineno}: module-scope docs-reading helper call "
+                    "cannot be attributed to an exact collected test"
+                )
             receiver: ast.expr | None = None
             if isinstance(node.func, ast.Attribute) and node.func.attr in _READ_METHOD_NAMES:
                 receiver = node.func.value
@@ -4337,7 +4435,6 @@ def _docs_reading_test_modules(
     local_callable_aliases = _local_collected_callable_aliases(tree, functions, filename)
     functions.update({alias: functions[target] for alias, target in local_callable_aliases.items()})
     _assert_no_unaudited_collected_test_bases(tree, filename)
-    _assert_no_unattributable_module_docs_reads(tree, module_aliases, functions, filename)
     class_methods: dict[str, dict[str, str]] = {}
     all_class_methods: dict[str, dict[str, str]] = {}
     class_property_getters: dict[str, dict[str, str]] = {}
@@ -4424,9 +4521,16 @@ def _docs_reading_test_modules(
     generated_parameter_states = _pytest_generate_tests_parameter_states(
         tree, functions, module_value_sources
     )
-    module_usefixtures = _module_usefixtures_names(tree)
+    usefixtures_aliases, ambiguous_usefixtures_aliases = _pytest_usefixtures_aliases(
+        tree, pytest_module_aliases
+    )
+    module_usefixtures = _module_usefixtures_names(
+        tree, usefixtures_aliases, ambiguous_usefixtures_aliases
+    )
     class_usefixtures = {
-        statement.name: _class_usefixtures_names(statement)
+        statement.name: _class_usefixtures_names(
+            statement, usefixtures_aliases, ambiguous_usefixtures_aliases
+        )
         for statement in tree.body
         if isinstance(statement, ast.ClassDef)
     }
@@ -4493,7 +4597,9 @@ def _docs_reading_test_modules(
 
         available = fixture_nodes_for(function_key)
         class_name = function_key.partition("::")[0] if "::" in function_key else None
-        requested = module_usefixtures | _usefixtures_names(node.decorator_list)
+        requested = module_usefixtures | _usefixtures_names(
+            node.decorator_list, usefixtures_aliases, ambiguous_usefixtures_aliases
+        )
         requested |= _requested_fixture_names(node)
         if class_name is not None:
             requested |= class_usefixtures.get(class_name, set())
@@ -4739,6 +4845,11 @@ def _docs_reading_test_modules(
         for decorator in node.decorator_list:
             target = decorator.func if isinstance(decorator, ast.Call) else decorator
             if isinstance(target, ast.Name):
+                if target.id in ambiguous_usefixtures_aliases:
+                    raise AssertionError(
+                        f"{filename}:{decorator.lineno}: pytest.mark.usefixtures decorator "
+                        f"alias provenance is ambiguous for `{target.id}`"
+                    )
                 if target.id in ambiguous_decorator_names:
                     raise AssertionError(
                         f"{filename}:{decorator.lineno}: decorator provenance for "
@@ -4952,6 +5063,8 @@ def _docs_reading_test_modules(
             return True
         next_seen = seen | {name}
         return any(reads_transitively(callee, next_seen) for callee in analysis.calls)
+
+    _assert_no_unattributable_module_docs_reads(tree, module_aliases, functions, analyses, filename)
 
     readers: set[str] = set()
     for name, node in functions.items():
@@ -8827,6 +8940,63 @@ def test_docs_governance_new_boundary_mutations_red_against_exact_markers(
             _docs_reading_test_modules(plugin_source, repository_root=tmp_path),
             "plugin-mutated.py",
         )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_import_time_same_module_helper_reads() -> None:
+    """A collected test cannot inherit docs content from a module helper call."""
+
+    docs_source = (
+        "from pathlib import Path\n\n"
+        "def load_docs() -> str:\n    return Path('docs/import-time.md').read_text()\n\n"
+        "cached = load_docs()\n\n"
+        "def test_cached() -> None:\n    assert cached\n"
+    )
+    with pytest.raises(AssertionError, match="module-scope docs-reading helper call"):
+        _docs_reading_test_modules(docs_source, filename="import_time_helper.py")
+
+    non_docs_source = docs_source.replace("docs/import-time.md", "config/import-time.md")
+    assert _docs_reading_test_modules(non_docs_source) == set()
+
+    ambiguous_source = docs_source.replace(
+        "return Path('docs/import-time.md').read_text()",
+        "receiver = get_dynamic_receiver('docs')\n    return receiver.read_text()",
+    )
+    with pytest.raises(AssertionError, match="unresolved dynamic read receiver"):
+        _docs_reading_test_modules(ambiguous_source, filename="import_time_ambiguous.py")
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_usefixtures_decorator_aliases_fail_closed() -> None:
+    """Only statically unique ``usefixtures`` aliases activate fixture reader edges."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture\ndef docs_fixture() -> str:\n"
+        "    return Path('docs/alias-fixture.md').read_text()\n\n"
+        "@pytest.fixture\ndef config_fixture() -> str:\n"
+        "    return Path('config/alias-fixture.md').read_text()\n\n"
+        "use = pytest.mark.usefixtures\nuse_chain = use\n\n"
+        "@use_chain('docs_fixture')\ndef test_docs_alias() -> None:\n    assert True\n\n"
+        "@use('config_fixture')\ndef test_non_reader_alias() -> None:\n    assert True\n\n"
+        "def ordinary_decorator(func):\n    return func\n\n"
+        "@ordinary_decorator\ndef test_ordinary_decorator() -> None:\n    assert True\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_docs_alias"}
+    marked = source.replace(
+        "@use_chain('docs_fixture')", "@pytest.mark.docs\n@use_chain('docs_fixture')"
+    )
+    _assert_exact_docs_markers(
+        ast.parse(marked), _docs_reading_test_modules(marked), "usefixtures-alias.py"
+    )
+    for ambiguous in (
+        source.replace("use_chain = use", "use_chain = use\nuse_chain = ordinary_decorator"),
+        source.replace("use = pytest.mark.usefixtures", "use = pytest.mark.usefixtures()"),
+    ):
+        with pytest.raises(
+            AssertionError, match="usefixtures decorator alias provenance is ambiguous"
+        ):
+            _docs_reading_test_modules(ambiguous, filename="usefixtures-alias-ambiguous.py")
 
 
 #: D180 §2.3: every job that declares `needs: classify`, exactly.
