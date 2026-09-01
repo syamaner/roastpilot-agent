@@ -2892,8 +2892,7 @@ def test_track_progress_disabled_only_for_unsupported_pull_request_actions() -> 
     # never conditionally skipped (asserted above), so that guarantee is
     # restored intact if the job is revived by setting the var.
     assert (
-        job["if"]
-        == "${{ github.event.pull_request.user.login != 'dependabot[bot]' "
+        job["if"] == "${{ github.event.pull_request.user.login != 'dependabot[bot]' "
         "&& vars.CLAUDE_HEADLESS_ENABLED == 'true' }}"
     )
 
