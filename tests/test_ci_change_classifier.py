@@ -1296,6 +1296,45 @@ def _os_walk_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
     return modules - rebound, calls - rebound, rebound
 
 
+def _os_open_read_aliases(
+    tree: ast.Module,
+) -> tuple[set[str], set[str], set[str], set[str]]:
+    """Return exact and rebound aliases for the admitted ``os.open``/``os.read`` flow."""
+
+    scoped_statements = _control_flow_scoped_statements(tree.body)
+    modules = {
+        alias.asname or alias.name
+        for statement in scoped_statements
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "os"
+    }
+    opens = {
+        alias.asname or alias.name
+        for statement in scoped_statements
+        if isinstance(statement, ast.ImportFrom) and statement.module == "os"
+        for alias in statement.names
+        if alias.name == "open"
+    }
+    reads = {
+        alias.asname or alias.name
+        for statement in scoped_statements
+        if isinstance(statement, ast.ImportFrom) and statement.module == "os"
+        for alias in statement.names
+        if alias.name == "read"
+    }
+    rebound = {
+        target.id
+        for statement in scoped_statements
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        )
+        if isinstance(target, ast.Name) and target.id in modules | opens | reads
+    }
+    return modules - rebound, opens - rebound, reads - rebound, rebound
+
+
 def _codecs_open_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
     """Return exact and rebound aliases for the admitted ``codecs.open`` call.
 
@@ -2736,6 +2775,11 @@ def _analyse_function(
     os_walk_module_aliases: set[str] | None = None,
     os_walk_call_aliases: set[str] | None = None,
     ambiguous_os_walk_aliases: set[str] | None = None,
+    os_open_module_aliases: set[str] | None = None,
+    os_open_call_aliases: set[str] | None = None,
+    os_read_call_aliases: set[str] | None = None,
+    ambiguous_os_open_read_aliases: set[str] | None = None,
+    class_property_getters: dict[str, str] | None = None,
 ) -> _FunctionAnalysis:
     """Walk one function body for a direct docs read, calls, and unresolved reads.
 
@@ -2756,6 +2800,10 @@ def _analyse_function(
     scoped_os_walk_modules: set[str] = set()
     scoped_os_walk_calls: set[str] = set()
     scoped_ambiguous_os_walk: set[str] = set()
+    scoped_os_open_modules: set[str] = set()
+    scoped_os_open_calls: set[str] = set()
+    scoped_os_read_calls: set[str] = set()
+    scoped_ambiguous_os_open_read: set[str] = set()
     if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
         parameter_docs, ambiguous_parameters = _parametrized_docs_and_ambiguous_parameters(
             func, module_value_sources
@@ -2774,6 +2822,12 @@ def _analyse_function(
         scoped_os_walk_modules, scoped_os_walk_calls, scoped_ambiguous_os_walk = _os_walk_aliases(
             ast.Module(body=list(func.body), type_ignores=[])
         )
+        (
+            scoped_os_open_modules,
+            scoped_os_open_calls,
+            scoped_os_read_calls,
+            scoped_ambiguous_os_open_read,
+        ) = _os_open_read_aliases(ast.Module(body=list(func.body), type_ignores=[]))
     else:
         ambiguous_parameters: set[str] = set()
     codecs_module_aliases = (codecs_module_aliases or set()) | scoped_codecs_modules
@@ -2785,6 +2839,12 @@ def _analyse_function(
     os_walk_module_aliases = (os_walk_module_aliases or set()) | scoped_os_walk_modules
     os_walk_call_aliases = (os_walk_call_aliases or set()) | scoped_os_walk_calls
     ambiguous_os_walk_aliases = (ambiguous_os_walk_aliases or set()) | scoped_ambiguous_os_walk
+    os_open_module_aliases = (os_open_module_aliases or set()) | scoped_os_open_modules
+    os_open_call_aliases = (os_open_call_aliases or set()) | scoped_os_open_calls
+    os_read_call_aliases = (os_read_call_aliases or set()) | scoped_os_read_calls
+    ambiguous_os_open_read_aliases = (
+        ambiguous_os_open_read_aliases or set()
+    ) | scoped_ambiguous_os_open_read
     calls: set[str] = set()
     unresolved: list[str] = []
     has_docs_glob = False
@@ -2834,6 +2894,7 @@ def _analyse_function(
     walk_root_aliases: set[str] = set()
     walk_files_aliases: set[str] = set()
     walk_name_aliases: set[str] = set()
+    os_file_descriptors: dict[str, str] = {}
     control_flow_docs_aliases = {
         target.id
         for conditional in ast.walk(func)
@@ -3264,6 +3325,39 @@ def _analyse_function(
             return "ambiguous"
         return "none"
 
+    def _os_operation(call: ast.Call) -> str:
+        """Return one admitted low-level ``os`` operation or closed ambiguity."""
+
+        if isinstance(call.func, ast.Name):
+            if call.func.id in (ambiguous_os_open_read_aliases or set()):
+                return "ambiguous"
+            if call.func.id in (os_open_call_aliases or set()):
+                return "open"
+            if call.func.id in (os_read_call_aliases or set()):
+                return "read"
+        if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+            if call.func.value.id in (ambiguous_os_open_read_aliases or set()):
+                return "ambiguous"
+            if call.func.value.id in (os_open_module_aliases or set()):
+                return call.func.attr if call.func.attr in {"open", "read"} else "none"
+        return "none"
+
+    def _os_open_source_state(call: ast.Call) -> str:
+        """Return closed provenance for the source passed to admitted ``os.open``."""
+
+        if (
+            len(call.args) < 2
+            or call.keywords
+            or any(isinstance(argument, ast.Starred) for argument in call.args)
+        ):
+            return "ambiguous"
+        source = call.args[0]
+        if _receiver_is_docs(source) or _module_receiver_state(source) == "docs":
+            return "docs"
+        if _receiver_is_partial(source) or _module_receiver_state(source) == "ambiguous":
+            return "ambiguous"
+        return "none" if _string_constants(source) else "ambiguous"
+
     def _is_imported_class_instance(value: ast.expr) -> bool:
         """Return whether one call receiver is a known imported-class instance."""
         return (isinstance(value, ast.Name) and value.id in imported_class_instances) or (
@@ -3278,6 +3372,13 @@ def _analyse_function(
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
             continue
         nodes.extend(ast.iter_child_nodes(node))
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in {"self", "cls", class_name}
+            and node.attr in (class_property_getters or {})
+        ):
+            calls.add(cast(dict[str, str], class_property_getters)[node.attr])
         if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             full_match = _expression_is_docs_markdown(
@@ -3292,8 +3393,17 @@ def _analyse_function(
             builtin_open_alias_state = _builtin_open_alias_state(node.value)
             imported_class_instance_state = _imported_class_instance_state(node.value)
             helper_class_instance = _helper_class_instance(node.value)
+            os_open_source_state = (
+                _os_open_source_state(node.value)
+                if isinstance(node.value, ast.Call) and _os_operation(node.value) == "open"
+                else "none"
+            )
             for target in targets:
                 if isinstance(target, ast.Name):
+                    if isinstance(node.value, ast.Call) and _os_operation(node.value) == "open":
+                        os_file_descriptors[target.id] = os_open_source_state
+                    elif target.id in os_file_descriptors:
+                        os_file_descriptors[target.id] = "ambiguous"
                     if (
                         isinstance(node.value, ast.Name)
                         and node.value.id in subprocess_entry_aliases
@@ -3679,6 +3789,25 @@ def _analyse_function(
             unresolved.append(
                 f"{filename}:{node.lineno}: codecs.open filename provenance is ambiguous"
             )
+        os_operation = _os_operation(node)
+        if os_operation == "ambiguous":
+            unresolved.append(f"{filename}:{node.lineno}: low-level os provenance is ambiguous")
+        elif os_operation == "read":
+            if (
+                len(node.args) != 2
+                or node.keywords
+                or any(isinstance(argument, ast.Starred) for argument in node.args)
+                or not isinstance(node.args[0], ast.Name)
+            ):
+                unresolved.append(
+                    f"{filename}:{node.lineno}: os.read descriptor provenance is ambiguous"
+                )
+            elif os_file_descriptors.get(node.args[0].id) == "docs":
+                reads = True
+            elif os_file_descriptors.get(node.args[0].id) != "none":
+                unresolved.append(
+                    f"{filename}:{node.lineno}: os.read descriptor provenance is ambiguous"
+                )
         shutil_copy_state = _shutil_copy_state(node)
         if shutil_copy_state == "docs":
             reads = True
@@ -4089,6 +4218,12 @@ def _docs_reading_test_modules(
     )
     os_walk_module_aliases, os_walk_call_aliases, ambiguous_os_walk_aliases = _os_walk_aliases(tree)
     (
+        os_open_module_aliases,
+        os_open_call_aliases,
+        os_read_call_aliases,
+        ambiguous_os_open_read_aliases,
+    ) = _os_open_read_aliases(tree)
+    (
         imported_analyses,
         ambiguous_imports,
         imported_classes,
@@ -4195,6 +4330,7 @@ def _docs_reading_test_modules(
     _assert_no_unattributable_module_docs_reads(tree, module_aliases, functions, filename)
     class_methods: dict[str, dict[str, str]] = {}
     all_class_methods: dict[str, dict[str, str]] = {}
+    class_property_getters: dict[str, dict[str, str]] = {}
     for statement in tree.body:
         if not isinstance(statement, ast.ClassDef):
             continue
@@ -4208,6 +4344,36 @@ def _docs_reading_test_modules(
             qualified_name = f"{statement.name}::{member.name}"
             methods[member.name] = qualified_name
             functions[qualified_name] = member
+            if any(
+                isinstance(decorator, ast.Name) and decorator.id == "property"
+                for decorator in member.decorator_list
+            ):
+                class_property_getters.setdefault(statement.name, {})[member.name] = qualified_name
+        for assignment in statement.body:
+            if not isinstance(assignment, (ast.Assign, ast.AnnAssign)) or assignment.value is None:
+                continue
+            targets = (
+                assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+            )
+            for target in targets:
+                if not isinstance(target, ast.Name) or not target.id.startswith("test_"):
+                    continue
+                value = assignment.value
+                if (
+                    isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Name)
+                    and value.func.id == "staticmethod"
+                    and len(value.args) == 1
+                    and not value.keywords
+                ):
+                    value = value.args[0]
+                if not isinstance(value, ast.Name) or value.id not in methods:
+                    raise AssertionError(
+                        f"{filename}:{target.lineno}: collected class callable alias "
+                        f"`{statement.name}::{target.id}` is ambiguous"
+                    )
+                methods[target.id] = methods[value.id]
+                functions[f"{statement.name}::{target.id}"] = functions[methods[value.id]]
         all_class_methods[statement.name] = methods
         if any(member.name.startswith("test_") for member in members):
             class_methods[statement.name] = methods
@@ -4434,6 +4600,11 @@ def _docs_reading_test_modules(
             os_walk_module_aliases,
             os_walk_call_aliases,
             ambiguous_os_walk_aliases,
+            os_open_module_aliases,
+            os_open_call_aliases,
+            os_read_call_aliases,
+            ambiguous_os_open_read_aliases,
+            class_property_getters.get(class_name, {}) if class_name else {},
         )
         analyses[name] = analysis
         if name not in local_keys:
@@ -6764,14 +6935,59 @@ def test_docs_governance_tracks_docs_rooted_parameter_defaults() -> None:
         "from pathlib import Path\n\n"
         "def test_positional(path=Path('docs/default.md')) -> None:\n    path.read_text()\n\n"
         "def test_keyword_only(*, path=Path('docs/keyword.md')) -> None:\n    path.read_bytes()\n\n"
+        "async def test_async_default(path=Path('docs/async-default.md')) -> None:\n"
+        "    path.read_text()\n\n"
         "def test_plain(path=Path('config/default.md')) -> None:\n    path.read_text()\n"
     )
-    assert _docs_reading_test_modules(source) == {"test_keyword_only", "test_positional"}
+    assert _docs_reading_test_modules(source) == {
+        "test_async_default",
+        "test_keyword_only",
+        "test_positional",
+    }
     with pytest.raises(AssertionError, match="parametrized receiver `path` is ambiguous"):
         _docs_reading_test_modules(
             "from pathlib import Path\n\ndef test_dynamic(path=build_path()) -> None:\n"
             "    path.read_text()\n"
         )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_class_aliases_low_level_os_and_properties() -> None:
+    """Bounded class aliases, descriptors, and low-level reads retain docs provenance."""
+
+    source = (
+        "from pathlib import Path\nimport os as operating_system\n"
+        "from os import open as open_fd, read as read_fd\n\n"
+        "class TestDocs:\n"
+        "    @staticmethod\n    def docs_alias() -> None:\n"
+        "        Path('docs/class-alias.md').read_text()\n\n"
+        "    @staticmethod\n    def plain_alias() -> None:\n"
+        "        Path('config/class-alias.md').read_text()\n\n"
+        "    test_static = staticmethod(docs_alias)\n"
+        "    test_plain = staticmethod(plain_alias)\n\n"
+        "    @property\n    def content(self) -> str:\n"
+        "        return Path('docs/property.md').read_text()\n\n"
+        "    def test_property(self) -> None:\n        assert self.content\n\n"
+        "def test_module_os() -> None:\n"
+        "    descriptor = operating_system.open('docs/low-level.md', 0)\n"
+        "    assert operating_system.read(descriptor, 1)\n\n"
+        "def test_direct_os() -> None:\n"
+        "    descriptor = open_fd('docs/direct-low-level.md', 0)\n"
+        "    assert read_fd(descriptor, 1)\n\n"
+        "def test_non_docs_os() -> None:\n"
+        "    descriptor = operating_system.open('config/low-level.md', 0)\n"
+        "    assert operating_system.read(descriptor, 1)\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "TestDocs::test_property",
+        "TestDocs::test_static",
+        "test_direct_os",
+        "test_module_os",
+    }
+    with pytest.raises(AssertionError, match="os.read descriptor provenance is ambiguous"):
+        _docs_reading_test_modules(source.replace("descriptor, 1)", "unknown, 1)", 1))
+    with pytest.raises(AssertionError, match="collected class callable alias"):
+        _docs_reading_test_modules(source.replace("docs_alias)", "dynamic_alias)", 1))
 
 
 @pytest.mark.docs_ci
