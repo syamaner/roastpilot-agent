@@ -972,6 +972,7 @@ def test_module_entrypoint_exits_cleanly(monkeypatch: pytest.MonkeyPatch, tmp_pa
 _READ_METHOD_NAMES = frozenset({"read_text", "read_bytes", "open"})
 _GLOB_METHOD_NAMES = frozenset({"glob", "rglob"})
 _MAX_DOCS_CALL_GRAPH_DEPTH = 8
+_ITERATION_ONE_ARG_BUILTINS = frozenset({"list", "tuple", "set", "frozenset", "iter"})
 
 
 def _string_constants(expression: ast.expr) -> list[str]:
@@ -3399,6 +3400,32 @@ def _analyse_function(
             return value.func.id
         return None
 
+    def _ambiguous_iteration_receiver(value: ast.expr) -> bool:
+        """Return whether ``value`` names a same-module instance of ambiguous provenance."""
+
+        return isinstance(value, ast.Name) and value.id in ambiguous_helper_class_instances
+
+    def _bind_iteration_dunder(helper_class: str, dunder: str, node: ast.AST, shape: str) -> None:
+        """Add one same-module iteration-protocol call edge, or fail closed if unresolved.
+
+        Every statically resolvable iteration site (``list(Instance())``, a
+        ``for``/comprehension loop, ``iter(...)``, or ``next(...)``) must connect to the
+        relevant dunder method's own analysis so a docs read hiding inside ``__iter__`` or
+        ``__next__`` cannot silently disappear from the call graph. A relevant helper class
+        missing the dunder the shape actually requires fails closed instead of being
+        silently skipped.
+        """
+
+        method_name = (all_class_methods or {}).get(helper_class, {}).get(dunder)
+        if method_name is None:
+            if helper_class in (relevant_helper_classes or set()):
+                unresolved.append(
+                    f"{filename}:{getattr(node, 'lineno', 0)}: unresolved same-module "
+                    f"helper-class iteration `{dunder}` edge for `{helper_class}` ({shape})"
+                )
+            return
+        calls.add(method_name)
+
     def _module_receiver_state(target: ast.expr) -> str:
         """Return local imported-module receiver provenance, if applicable."""
 
@@ -4001,6 +4028,22 @@ def _analyse_function(
                     non_docs_aliases.add(generator.target.id)
         if _is_docs_markdown_glob_call(node, docs_root_aliases):
             has_docs_glob = True
+        if isinstance(node, ast.For):
+            iteration_sources = [(node.iter, "for-loop")]
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            iteration_sources = [(generator.iter, "comprehension") for generator in node.generators]
+        else:
+            iteration_sources = []
+        for iteration_source, iteration_shape in iteration_sources:
+            if _ambiguous_iteration_receiver(iteration_source):
+                unresolved.append(
+                    f"{filename}:{getattr(node, 'lineno', 0)}: same-module helper-class "
+                    "instance provenance is ambiguous"
+                )
+                continue
+            iteration_helper_class = _helper_class_instance(iteration_source)
+            if iteration_helper_class is not None:
+                _bind_iteration_dunder(iteration_helper_class, "__iter__", node, iteration_shape)
         if not isinstance(node, ast.Call):
             if isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)) and node.value is not None:
                 is_request_param = (
@@ -4226,6 +4269,66 @@ def _analyse_function(
                         f"{filename}:{node.lineno}: `open(...)` receiver folds a 'docs' "
                         "component with no provable '.md' segment — cannot prove this is "
                         "or is not a docs read"
+                    )
+            elif node.func.id in _ITERATION_ONE_ARG_BUILTINS:
+                positional = node.args
+                exact_shape = (
+                    len(positional) == 1
+                    and not node.keywords
+                    and not isinstance(positional[0], ast.Starred)
+                )
+                if exact_shape:
+                    argument = positional[0]
+                    if _ambiguous_iteration_receiver(argument):
+                        unresolved.append(
+                            f"{filename}:{node.lineno}: same-module helper-class instance "
+                            "provenance is ambiguous"
+                        )
+                    else:
+                        helper_class = _helper_class_instance(argument)
+                        if helper_class is not None:
+                            _bind_iteration_dunder(helper_class, "__iter__", node, node.func.id)
+                elif any(
+                    not isinstance(argument, ast.Starred)
+                    and (
+                        _helper_class_instance(argument) is not None
+                        or _ambiguous_iteration_receiver(argument)
+                    )
+                    for argument in positional
+                ):
+                    unresolved.append(
+                        f"{filename}:{node.lineno}: malformed `{node.func.id}(...)` iteration "
+                        "call shape cannot rule out a same-module helper-class read"
+                    )
+            elif node.func.id == "next":
+                positional = node.args
+                exact_shape = (
+                    1 <= len(positional) <= 2
+                    and not node.keywords
+                    and not any(isinstance(argument, ast.Starred) for argument in positional)
+                )
+                if exact_shape:
+                    argument = positional[0]
+                    if _ambiguous_iteration_receiver(argument):
+                        unresolved.append(
+                            f"{filename}:{node.lineno}: same-module helper-class instance "
+                            "provenance is ambiguous"
+                        )
+                    else:
+                        helper_class = _helper_class_instance(argument)
+                        if helper_class is not None:
+                            _bind_iteration_dunder(helper_class, "__next__", node, "next")
+                elif (
+                    positional
+                    and not isinstance(positional[0], ast.Starred)
+                    and (
+                        _helper_class_instance(positional[0]) is not None
+                        or _ambiguous_iteration_receiver(positional[0])
+                    )
+                ):
+                    unresolved.append(
+                        f"{filename}:{node.lineno}: malformed `next(...)` iteration call "
+                        "shape cannot rule out a same-module helper-class read"
                     )
             elif node.func.id in (local_functions or {}):
                 _record_call((local_functions or {})[node.func.id], node)
@@ -8888,6 +8991,236 @@ def test_docs_governance_traces_same_module_helper_class_dispatch() -> None:
     with pytest.raises(AssertionError, match="helper-class instance provenance is ambiguous"):
         _docs_reading_test_modules(
             source.replace("loader = DocsLoader()", "loader = construct(DocsLoader)")
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_same_module_helper_class_iteration_dispatch() -> None:
+    """Builtin iteration, a ``for`` loop, a comprehension, and ``iter()`` reach ``__iter__``."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/iteration.md').read_text().splitlines())\n\n"
+        "class ConfigLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('config/iteration.md').read_text().splitlines())\n\n"
+        "def test_builtin_list() -> None:\n    assert list(DocsLines())\n\n"
+        "def test_for_loop() -> None:\n"
+        "    lines = []\n"
+        "    for line in DocsLines():\n        lines.append(line)\n    assert lines\n\n"
+        "def test_comprehension() -> None:\n"
+        "    assert [line for line in DocsLines()]\n\n"
+        "def test_bare_iter() -> None:\n    assert iter(DocsLines())\n\n"
+        "def test_non_reader_builtin() -> None:\n    assert list(ConfigLines())\n\n"
+        "def test_non_reader_for_loop() -> None:\n"
+        "    for line in ConfigLines():\n        assert line\n\n"
+        "def test_plain_container() -> None:\n    assert list([1, 2, 3])\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_builtin_list",
+        "test_for_loop",
+        "test_comprehension",
+        "test_bare_iter",
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_iteration_protocol_transitively() -> None:
+    """A same-module helper the ``__iter__`` body calls still propagates a docs read."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def _load_docs_lines():\n"
+        "    return Path('docs/iteration-transitive.md').read_text().splitlines()\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n        return iter(_load_docs_lines())\n\n"
+        "def test_transitive_iteration() -> None:\n    assert list(DocsLines())\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_transitive_iteration"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_next_protocol_dispatch() -> None:
+    """``next(...)`` reaches ``__next__`` directly, independent of the ``__iter__`` edge."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsIterator:\n"
+        "    def __iter__(self):\n        return self\n\n"
+        "    def __next__(self) -> str:\n"
+        "        return Path('docs/next-shape.md').read_text()\n\n"
+        "class ConfigIterator:\n"
+        "    def __iter__(self):\n        return self\n\n"
+        "    def __next__(self) -> str:\n"
+        "        return Path('config/next-shape.md').read_text()\n\n"
+        "def test_direct_next() -> None:\n    assert next(DocsIterator())\n\n"
+        "def test_aliased_next() -> None:\n"
+        "    iterator = DocsIterator()\n    assert next(iterator)\n\n"
+        "def test_next_with_default() -> None:\n"
+        "    assert next(DocsIterator(), None)\n\n"
+        "def test_non_reader_next() -> None:\n    assert next(ConfigIterator())\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_direct_next",
+        "test_aliased_next",
+        "test_next_with_default",
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_iteration_alias_and_rejects_rebind() -> None:
+    """A same-module iteration alias chain is followed; rebinding to a non-instance is safe."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/iteration-alias.md').read_text().splitlines())\n\n"
+        "def test_chained_alias() -> None:\n"
+        "    origin = DocsLines()\n    alias = origin\n    assert list(alias)\n\n"
+        "def test_rebind_to_non_instance() -> None:\n"
+        "    value = DocsLines()\n    value = 5\n    assert list([value])\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_chained_alias"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_ambiguous_iteration_receiver() -> None:
+    """An ambiguously-constructed same-module instance fails closed for every iteration shape."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/iteration-ambiguous.md').read_text().splitlines())\n\n"
+        "def test_ambiguous_builtin() -> None:\n"
+        "    loader = construct(DocsLines)\n    assert list(loader)\n"
+    )
+    with pytest.raises(AssertionError, match="helper-class instance provenance is ambiguous"):
+        _docs_reading_test_modules(source)
+
+    for_loop_source = source.replace(
+        "assert list(loader)", "for line in loader:\n        assert line"
+    )
+    with pytest.raises(AssertionError, match="helper-class instance provenance is ambiguous"):
+        _docs_reading_test_modules(for_loop_source)
+
+    next_source = (
+        "from pathlib import Path\n\n"
+        "class DocsIterator:\n"
+        "    def __iter__(self):\n        return self\n\n"
+        "    def __next__(self) -> str:\n"
+        "        return Path('docs/iteration-ambiguous-next.md').read_text()\n\n"
+        "def test_ambiguous_next() -> None:\n"
+        "    iterator = construct(DocsIterator)\n    assert next(iterator)\n"
+    )
+    with pytest.raises(AssertionError, match="helper-class instance provenance is ambiguous"):
+        _docs_reading_test_modules(next_source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_malformed_iteration_call_shapes() -> None:
+    """A near-miss ``list``/``next`` call shape cannot silently skip a helper-class read."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/iteration-malformed.md').read_text().splitlines())\n\n"
+        "def test_malformed_list() -> None:\n"
+        "    assert list(DocsLines(), 5)\n"
+    )
+    with pytest.raises(AssertionError, match="cannot rule out a same-module helper-class read"):
+        _docs_reading_test_modules(source)
+
+    next_source = (
+        "from pathlib import Path\n\n"
+        "class DocsIterator:\n"
+        "    def __iter__(self):\n        return self\n\n"
+        "    def __next__(self) -> str:\n"
+        "        return Path('docs/iteration-malformed-next.md').read_text()\n\n"
+        "def test_malformed_next() -> None:\n"
+        "    assert next(DocsIterator(), None, None)\n"
+    )
+    with pytest.raises(AssertionError, match="cannot rule out a same-module helper-class read"):
+        _docs_reading_test_modules(next_source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_missing_iteration_dunder_methods() -> None:
+    """A relevant helper class missing the dunder an iteration shape needs fails closed."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class RelevantNoIter:\n"
+        "    def load(self) -> str:\n"
+        "        return Path('docs/iteration-missing-iter.md').read_text()\n\n"
+        "def test_missing_iter() -> None:\n"
+        "    assert list(RelevantNoIter())\n"
+    )
+    with pytest.raises(AssertionError, match="unresolved same-module helper-class iteration"):
+        _docs_reading_test_modules(source)
+
+    next_source = (
+        "from pathlib import Path\n\n"
+        "class RelevantNoNext:\n"
+        "    def __iter__(self):\n        return self\n\n"
+        "    def load(self) -> str:\n"
+        "        return Path('docs/iteration-missing-next.md').read_text()\n\n"
+        "def test_missing_next() -> None:\n"
+        "    assert next(RelevantNoNext())\n"
+    )
+    with pytest.raises(AssertionError, match="unresolved same-module helper-class iteration"):
+        _docs_reading_test_modules(next_source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_iteration_governance_preserves_prior_helper_class_boundaries() -> None:
+    """Ordinary helper-class method dispatch and unrelated builtins stay unaffected."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsLoader:\n"
+        "    def load(self) -> str:\n"
+        "        return Path('docs/iteration-preserve.md').read_text()\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/iteration-preserve-iter.md').read_text().splitlines())\n\n"
+        "def test_plain_method() -> None:\n    assert DocsLoader().load()\n\n"
+        "def test_unrelated_builtins() -> None:\n"
+        "    assert sum([1, 2, 3]) and dict(a=1) and sorted([3, 1, 2])\n\n"
+        "def test_uses_both() -> None:\n"
+        "    assert DocsLoader().load() and list(DocsLines())\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_plain_method",
+        "test_uses_both",
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_iteration_protocol_mutation_reds_against_exact_markers() -> None:
+    """A ``list(Instance())`` docs read only calibrates the marker while it actually reads docs."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "class DocsLines:\n"
+        "    def __iter__(self):\n"
+        "        return iter(Path('docs/iteration-marker.md').read_text().splitlines())\n\n"
+        "@pytest.mark.docs\n"
+        "def test_reads_via_iteration() -> None:\n"
+        "    assert list(DocsLines())\n"
+    )
+    readers = _docs_reading_test_modules(source)
+    _assert_exact_docs_markers(ast.parse(source), readers, "iteration-marker.py")
+    mutated = source.replace("docs/", "config/", 1)
+    with pytest.raises(AssertionError, match="must sit on exactly the readers"):
+        _assert_exact_docs_markers(
+            ast.parse(mutated),
+            _docs_reading_test_modules(mutated),
+            "iteration-marker-mutated.py",
         )
 
 
