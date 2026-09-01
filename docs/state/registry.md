@@ -2,6 +2,17 @@
 
 ## Active Epic
 
+**1 Sep 2026 — #702 (D180/D181) closure:** PR #872 merged at
+`fdb354cd7b697261faf55212eee73e9504528281`; the issue is closed and the
+project item is Done. Main CI run `33542699280` and CodeQL run `33542699137`
+are green; disposable proofs #930, #931, and #933 completed. All 98 threads
+are resolved; the final 22 were independently classified as 17 addressed and
+5 deferred to #932 under the finite approved AST boundary. Plan PR #55 merged
+to main at `44996e047f9b76ec702ecf535448da03b738e859`. D181 narrows and
+corrects D180's final implementation and evidence clauses. This closure
+supersedes the in-progress or stays-open-pending language in all earlier #702
+(D180) entries below, which are now historical.
+
 **30 Aug 2026 — #702 (D180) collection-governance addendum:** Following
 `c5342b1`, pytest function collection is pinned to `test_*` and the
 docs-reader audit enforces that exact shape. The audit also fails closed on
