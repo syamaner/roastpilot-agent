@@ -24,13 +24,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # D-ToS-1 (mirrors roastpilot-cloud #411): headless Claude review is retired
+  # (ToS: Anthropic consumer OAuth tokens are not permitted for CI automation).
+  # This job is GATED OFF — it SKIPS while `vars.CLAUDE_HEADLESS_ENABLED` is
+  # unset, instead of FAILING on the now-removed CLAUDE_CODE_OAUTH_TOKEN secret.
+  # Machinery is retained but inert; revive only via a metered anthropic_api_key
+  # AND setting the var. This does NOT restore the required-approval merge path
+  # (claude-review-approval.yml only auto-approves on a successful review) — that
+  # remains an operator-owned branch-protection decision (roastpilot-cloud L223).
   claude-review:
     # Skip Dependabot PRs: GitHub withholds repository secrets from Dependabot
     # `pull_request` runs (read-only token), so CLAUDE_CODE_OAUTH_TOKEN is empty
     # and the action fails. Dependency bumps don't need a Claude code review —
     # CI + codecov cover them. (claude-review is not a required check, so a
     # Dependabot PR is never blocked; this just removes the spurious red X.)
-    if: ${{ github.event.pull_request.user.login != 'dependabot[bot]' }}
+    if: ${{ github.event.pull_request.user.login != 'dependabot[bot]' && vars.CLAUDE_HEADLESS_ENABLED == 'true' }}
 
     runs-on: ubuntu-latest
     permissions:
