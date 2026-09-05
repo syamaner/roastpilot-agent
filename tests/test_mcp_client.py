@@ -2929,7 +2929,8 @@ def test_project_live_ambient_voids_a_partially_populated_triad(absent: str) -> 
 
     An earlier revision of this PR forwarded a partial triad and deferred this
     case, on the grounds that some ambient probe might legitimately report fewer
-    than three members. It cannot: ``coffee-roaster-mcp`` is pinned ``==0.1.13``,
+    than three members. It cannot: the development dependency group pins
+    ``coffee-roaster-mcp==0.1.13``,
     whose ``build_configured_ambient_reader`` supports exactly one mode, whose
     ``YoctoMeteoAmbientReader.read`` raises for the WHOLE read if any one sensor
     fails, whose ``AmbientReading`` declares all three members as required

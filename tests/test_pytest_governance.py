@@ -48,6 +48,7 @@ _FULL_ONLY_WORKER_JOBS = (
     "pytest-serial",
     "pytest-stress",
     "package",
+    "package-arm64",
     "coverage",
     "web-unit-worker",
     "web-snapshots-worker",
@@ -65,6 +66,7 @@ _TIMEOUT_BEARING_JOBS = (
     "web-snapshots",
     "docs-fastpath",
     "codecov-upload",
+    "package-arm64",
 )
 _CHECKOUT_PIN = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
 
@@ -675,6 +677,79 @@ def test_new_or_newly_tiny_jobs_carry_a_timeout() -> None:
     jobs = _mapping(workflow["jobs"])
     for job_id in _TIMEOUT_BEARING_JOBS:
         assert isinstance(_mapping(jobs[job_id]).get("timeout-minutes"), int)
+
+
+@pytest.mark.docs_ci
+def test_package_arm64_isolated_pi_smoke_is_structurally_fail_closed() -> None:
+    """E11-S1 keeps the native ARM64 appliance smoke bounded and isolated."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    package = _mapping(jobs["package"])
+    arm64 = _mapping(jobs["package-arm64"])
+
+    assert package["needs"] == ["classify", "package-arm64"]
+    package_runs = [cast(str, step["run"]) for step in _steps(package) if "run" in step]
+    assert any("/tmp/wheel-pi-smoke-venv" in run for run in package_runs)
+    assert any('"${wheel_path}[pi]"' in run for run in package_runs)
+    assert any('version("coffee-roaster-mcp") == "0.2.0"' in run for run in package_runs)
+    assert any('denied = {"torch", "torchaudio", "transformers"}' in run for run in package_runs)
+    assert any('print("\\n".join(names))' in run for run in package_runs)
+    assert any('distribution.metadata.get("Name")' in run for run in package_runs)
+    assert any("valid = all(isinstance(name, str)" in run for run in package_runs)
+    assert any("if valid else []" in run for run in package_runs)
+
+    assert arm64["name"] == "Package ARM64 (wheel[pi] clean-venv smoke)"
+    assert arm64["runs-on"] == "ubuntu-24.04-arm"
+    assert arm64["needs"] == ["classify"]
+    assert arm64["if"] == _FULL_ONLY_CONDITION
+    assert arm64["timeout-minutes"] == 20
+    assert "permissions" not in arm64
+
+    steps = _steps(arm64)
+    action_uses = [step["uses"] for step in steps if "uses" in step]
+    assert action_uses == [_CHECKOUT_PIN, "actions/setup-python@v6.2.0", "actions/setup-node@v4"]
+    runs = [cast(str, step["run"]) for step in steps if "run" in step]
+    assert all("--group dev" not in run or "[pi]" not in run for run in runs)
+    assert all("continue-on-error" not in run for run in runs)
+    assert all("|| true" not in run for run in runs)
+    assert all("always()" not in run for run in runs)
+    assert all("retry" not in run.lower() for run in runs)
+    assert all("source-build" not in run for run in runs)
+    assert any("import platform; actual = platform.machine()" in run for run in runs)
+    assert any('actual == "aarch64"' in run for run in runs)
+    assert any('version("coffee-roaster-mcp") == "0.2.0"' in run for run in runs)
+    assert any('denied = {"torch", "torchaudio", "transformers"}' in run for run in runs)
+    assert any('print("\\n".join(names))' in run for run in runs)
+    assert any('distribution.metadata.get("Name")' in run for run in runs)
+    assert any("valid = all(isinstance(name, str)" in run for run in runs)
+    assert any("if valid else []" in run for run in runs)
+    assert any("--port 18235" in run and "--replay" in run for run in runs)
+
+    all_runs = [
+        cast(str, step["run"])
+        for job in jobs.values()
+        for step in _steps(_mapping(job))
+        if "run" in step
+    ]
+    assert all("--group dev" not in run or "[pi]" not in run for run in all_runs)
+
+
+@pytest.mark.docs
+def test_e11_packaging_status_is_current_and_honest() -> None:
+    """E11 records package delivery without claiming Pi hardware validation."""
+    epic = (REPO_ROOT / "docs/epics/E11-packaging.md").read_text(encoding="utf-8")
+    registry = (REPO_ROOT / "docs/state/registry.md").read_text(encoding="utf-8")
+    assert "E11-S1 | Wheel with bundled SPA + the `[pi]` extra | done" in epic
+    assert (
+        "E11-S2 | Native installer, systemd unit, bundled model, deploy doc | not started" in epic
+    )
+    assert (
+        "E11-S3 | Pi 5 dual-mic recording + FC-detection CPU soak "
+        "(overflow validation) | not started" in epic
+    )
+    assert "Hosted ARM64 evidence is package compatibility" in epic
+    assert "not Raspberry Pi hardware validation" in registry
+    assert "does not state that `coffee-roaster-mcp#157` or #194 is\nclosed" in registry
 
 
 @pytest.mark.docs_ci

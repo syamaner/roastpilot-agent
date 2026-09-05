@@ -614,7 +614,8 @@ def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | N
     path**, forwarding a partial triad where the finiteness clause was meant to
     void the whole reading. The completeness clause closes that, and it is safe
     to require completeness because a partial triad is not something the pinned
-    probe can produce: ``coffee-roaster-mcp`` is pinned ``==0.1.13``, whose
+    probe can produce: the development dependency group pins
+    ``coffee-roaster-mcp==0.1.13``, whose
     ``build_configured_ambient_reader`` supports exactly one mode, whose
     ``YoctoMeteoAmbientReader.read`` raises for the WHOLE read if any one sensor
     fails, whose ``AmbientReading`` declares all three members as required

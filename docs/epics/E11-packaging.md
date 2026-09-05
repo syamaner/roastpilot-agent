@@ -45,24 +45,15 @@ child, per D6), mDNS, and a deployment doc. **No Docker image; no PyTorch on the
 
 ### E11-S1 — Wheel with bundled SPA + the `[pi]` extra
 
-**SPLIT 14 Jul 2026 (lead-ratified):** the wheel/SPA-bundling half shipped; the
-`[pi]` extra is held OUT of this story entirely — not even scaffolded — because
-its prerequisite (D27 Phase 2, `coffee-roaster-mcp#157`) is still open. PyPI's
-current `coffee-roaster-mcp` release (0.1.13) still hard-requires
-`transformers`, so there is no torch-free release to pin yet, and an extra
-labeled for Pi appliance use that pulls `transformers`/`torch` is exactly the
-overclaim the plan's public-accuracy rules exist to prevent — a TODO-comment
-scaffold would still be a published, installable `pip install
-roastpilot-agent[pi]` doing the wrong thing. **Verified the base wheel stays
-lean in the meantime:** the built wheel's `Requires-Dist` has no
-`coffee-roaster-mcp`/`transformers`/`torch` (it is a dev-group-only pin for
-tests, never a runtime dependency of the shipped wheel), confirmed both by
-inspecting the wheel's METADATA and by installing it into a clean venv and
-checking `pip list` for those three packages — none present. See plan.md open
-item 3 (now resolved: the build-hook approach below is what shipped), D93, and
-the D27 gate above. #137 stays open carrying the `[pi]`-extra half until
-`coffee-roaster-mcp#157` ships; this PR uses `Refs #137` / `Part of #137`, not
-`Closes #137`.
+**Delivered 5 Sep 2026:** E11-S1 now publishes a `pi` optional dependency
+extra pinned exactly to the torch-free `coffee-roaster-mcp==0.2.0`. The base
+wheel remains lean: it has no unconditional MCP, `torch`, `torchaudio`, or
+`transformers` requirement. The development group deliberately remains pinned
+to MCP 0.1.13 for the mock-driver mirrors and fixtures, so development and Pi
+smokes use separate venvs. The package lane covers the base wheel on x86 and a
+native hosted ARM64 runner covers `wheel[pi]`, its exact MCP pin, the CLI, and
+the replay-mode bundled SPA. Hosted ARM64 evidence is package compatibility
+only; it is not Raspberry Pi hardware validation.
 
 Acceptance criteria:
 
@@ -75,16 +66,14 @@ Acceptance criteria:
   now resolves packaged data via `importlib.resources` first, falling back to the
   source-checkout `web/dist` (editable installs skip the hook entirely). CI `package`
   job builds the real wheel + smoke-tests it in a clean venv.
-- [ ] **DEFERRED to a follow-up story (blocked on `coffee-roaster-mcp#157`).** A **`pi`
-  optional-dependency extra** declares the **torch-free**
-  `coffee-roaster-mcp` (pinned) + the Pi runtime deps (`onnxruntime`, `librosa`,
-  `soundfile`, `sounddevice`, `numpy`, …) — **no `torch`/`transformers`**. The base
-  wheel stays lean; `roastpilot-agent[pi]` pulls the appliance set.
-- [x] Built-wheel smoke test in CI (install into clean venv, CLI + health route).
-  **DEFERRED (tracked in the follow-up story alongside the `[pi]` extra):** the
-  **arm64** smoke (qemu or an arm runner) — no reason to gate the x86_64 wheel/SPA
-  smoke that shipped here on arm64 runner availability; the arm64 smoke matters most
-  once the `[pi]` extra (and its heavier Pi-only deps) exists to actually verify.
+- [x] A **`pi` optional-dependency extra** declares exactly the pinned,
+  torch-free `coffee-roaster-mcp==0.2.0`; package metadata and clean-venv
+  tests reject `torch`, `torchaudio`, and `transformers`. The base wheel stays
+  lean; `roastpilot-agent[pi]` pulls only the appliance MCP dependency.
+- [x] Built-wheel smoke tests in CI: x86_64 installs the base wheel; native
+  hosted ARM64 builds its own wheel, installs `wheel[pi]` in a separate clean
+  venv, verifies `aarch64` and MCP 0.2.0, and runs CLI and replay-mode SPA
+  smokes. This hosted-runner proof is not Pi hardware validation.
 - [x] Build-hook approach recorded in plan §11 (closes open item 3; fallback: commit
   built dist for the first release — **not needed**, the build hook shipped).
 
@@ -152,16 +141,14 @@ sample-locked, which is fine for FC training).
 
 | Story | Title | Status |
 |-------|-------|--------|
-| E11-S1 | Wheel with bundled SPA + the `[pi]` extra | **SPLIT (14 Jul 2026): SPA-bundling shipped (PR refs #137); `[pi]` extra BLOCKED on `coffee-roaster-mcp#157` (D27 Phase 2, Pi-5-gated)** |
+| E11-S1 | Wheel with bundled SPA + the `[pi]` extra | done — base-wheel, `[pi]`, and native hosted ARM64 package smokes delivered 5 Sep 2026; hosted-runner evidence is not Pi hardware validation |
 | E11-S2 | Native installer, systemd unit, bundled model, deploy doc | not started |
 | E11-S3 | Pi 5 dual-mic recording + FC-detection CPU soak (overflow validation) | not started |
 
-Epic status: **in progress — D28 manual-test gate ✅ CLEARED (28 Jun 2026); wheel/SPA
-bundling shipped 14 Jul 2026 (lead-ratified SPLIT); the `[pi]` extra remains held out
-entirely, gated on the D27 torch-free chain.** The **operator manual tests** (D28) are
+Epic status: **in progress — E11-S1 is done; E11-S2 and E11-S3 are not started.**
+The **operator manual tests** (D28) are
 both Done — **#135 ✅** (device SSE) and **#134 ✅ validated by roast 6** (27 Jun).
-**E11-S1's wheel/SPA-bundling half shipped (PR refs #137, not Closes — #137 stays open
-for the `[pi]`-extra half):** a hatchling custom build hook (`hatch_build.py`) runs the
+**E11-S1 is complete:** a hatchling custom build hook (`hatch_build.py`) runs the
 SPA's `npm run build` and force-includes `web/dist` into the wheel at
 `roastpilot_agent/_web_dist`; `live.default_spa_dir()` resolves it via
 `importlib.resources` before falling back to the source-checkout path; a CI `package` job
@@ -172,14 +159,11 @@ fallback was not needed). **Verified the base wheel stays lean:** the shipped wh
 the wheel's METADATA and from a clean-venv install's `pip list` — so nothing pulls the
 heavy ML stack through transitively; `coffee-roaster-mcp` is a dev-group-only pin (tests
 spawn it in mock-driver mode) and never a runtime dependency of the shipped artifact.
-**The `[pi]` extra is held OUT of this PR entirely (not even scaffolded)** because its
-prerequisite is still open: the **torch-free `coffee-roaster-mcp`** (D27 rollout Phase 2 =
-`coffee-roaster-mcp#157`, gated on FC-repo Phase 1 `coffee-first-crack-detection#54` — both
-cross-repo, NOT this repo's #134/#135/#54/#157) has not shipped — PyPI's current
-`coffee-roaster-mcp` release (0.1.13) still hard-requires `transformers`, so there is no
-torch-free release to pin yet, and a scaffolded `[pi]` extra would still be a published,
-installable `pip install roastpilot-agent[pi]` doing the wrong thing; the arm64 smoke
-deferred alongside it (most useful once the Pi-only deps exist to verify). **E11-S3
+**E11-S1 now includes the `[pi]` extra:** it pins `coffee-roaster-mcp==0.2.0`, while the
+development group intentionally retains its 0.1.13 mock-driver pin and fixtures. The clean
+native-hosted ARM64 smoke builds a wheel independently, installs `wheel[pi]` separately,
+verifies its denylist and exact pin, and runs CLI/replay SPA smokes. This is package evidence
+only, not validation on Pi hardware. **E11-S3
 logged:** the recording bundle it soaks shipped in MCP 0.1.10/0.1.11
 (#180/#162/#181/#178; agent pinned 0.1.11), so the Mac side is validated and the Pi-5 CPU
 soak is the open work. Re-sliced for native-only + torch-free + bundled-model distribution
