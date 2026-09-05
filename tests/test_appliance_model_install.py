@@ -203,6 +203,31 @@ def test_cached_verification_stops_when_file_grows_over_cap(
         )
 
 
+def test_bounded_hash_failure_is_not_masked_by_close_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bounded-hash failure remains authoritative when descriptor cleanup fails."""
+    monkeypatch.setattr(model_install_module, "_MAX_MODEL_FILE_BYTES", 8)
+    target = tmp_path / "oversized.bin"
+    target.write_bytes(b"x" * 9)
+    close_calls: list[int] = []
+    original_close = os.close
+
+    def failing_close(fd: int) -> None:
+        close_calls.append(fd)
+        raise OSError("simulated close failure")
+
+    monkeypatch.setattr(os, "close", failing_close)
+
+    with pytest.raises(ModelInstallError, match="per-file cap"):
+        model_install_module._sha256_of_file(  # pyright: ignore[reportPrivateUsage]
+            target
+        )
+
+    assert len(close_calls) == 1
+    original_close(close_calls[0])
+
+
 # --- T4: --from-dir missing a file -> error, no fallback to network --------
 
 
@@ -837,6 +862,50 @@ def test_fchmod_failure_after_digest_verification_removes_temp_file(
             dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
         )
 
+    assert not (dest / "a" / "file1.bin").exists()
+    assert list(dest.rglob("*.part")) == []
+
+
+def test_temp_close_failure_is_not_retried_and_removes_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deferred-writeback close error cannot close a reused descriptor."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    dest = tmp_path / "dest"
+    temp_fds: list[int] = []
+    close_calls: list[int] = []
+    original_fchmod = os.fchmod
+    original_close = os.close
+
+    def tracking_fchmod(fd: int, mode: int) -> None:
+        temp_fds.append(fd)
+        original_fchmod(fd, mode)
+
+    def failing_temp_close(fd: int) -> None:
+        if temp_fds and fd == temp_fds[0]:
+            close_calls.append(fd)
+            raise OSError("simulated deferred writeback failure")
+        original_close(fd)
+
+    monkeypatch.setattr(os, "fchmod", tracking_fchmod)
+    monkeypatch.setattr(os, "close", failing_temp_close)
+    client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"hello")))
+
+    try:
+        with pytest.raises(OSError, match="simulated deferred writeback failure"):
+            install_model(
+                dest,
+                manifest_files=manifest,
+                repo_id=_REPO_ID,
+                revision=_REVISION,
+                http_client=client,
+            )
+    finally:
+        if temp_fds:
+            original_close(temp_fds[0])
+
+    assert len(temp_fds) == 1
+    assert close_calls == temp_fds
     assert not (dest / "a" / "file1.bin").exists()
     assert list(dest.rglob("*.part")) == []
 

@@ -269,6 +269,12 @@ def _sha256_of_file(path: Path | str, *, dir_fd: int | None = None) -> str:
     initial size and its final size must be within the cap and agree with the
     bytes read, so a file that grows while it is verified cannot turn cached
     verification into an unbounded read.
+
+    Raises:
+        ModelInstallError: The entry is unsafe or violates bounded cached
+            verification.
+        OSError: A local filesystem operation fails outside the fail-closed
+            validation cases.
     """
     digest = hashlib.sha256()
     flags = os.O_RDONLY | os.O_NOFOLLOW
@@ -300,7 +306,11 @@ def _sha256_of_file(path: Path | str, *, dir_fd: int | None = None) -> str:
         final = os.fstat(fd)
         if final.st_size != total or final.st_size > _MAX_MODEL_FILE_BYTES:
             raise ModelInstallError(f"cached destination {path} changed while being verified")
-    finally:
+    except BaseException:
+        with suppress(OSError):
+            os.close(fd)
+        raise
+    else:
         os.close(fd)
     return digest.hexdigest()
 
@@ -508,6 +518,12 @@ def _open_destination_parent(
     descriptor with ``O_NOFOLLOW``.  Creation, temporary-file placement, and
     replacement can therefore remain anchored even if an attacker swaps a
     pathname component for a symlink after the initial path validation.
+
+    Raises:
+        ModelInstallError: The destination root or a component cannot be
+            safely traversed.
+        OSError: A local filesystem operation fails outside the fail-closed
+            validation cases.
     """
     _validate_relative_path(relative_path)
     components = relative_path.split("/")
@@ -561,6 +577,10 @@ def _stream_to_temp(
     Returns:
         The temp filename (relative to ``parent_fd``), its still-open
         descriptor, and its streamed SHA-256 hex digest.
+
+    Raises:
+        ModelInstallError: Streamed bytes exceed the per-file cap.
+        OSError: A local filesystem operation fails.
     """
     tmp_name = f".{target_name}.{uuid.uuid4().hex}.part"
     fd = os.open(
@@ -606,6 +626,7 @@ def _place_verified(
         ModelInstallError: The streamed digest does not match
             ``expected_sha256`` (the temp file is removed; the final path is
             never written before verification) or streaming itself failed.
+        OSError: A local filesystem operation fails.
     """
     tmp_name, tmp_fd, digest_hex = _stream_to_temp(
         parent_fd, target_name, chunks, byte_cap=byte_cap
@@ -614,8 +635,9 @@ def _place_verified(
         if digest_hex != expected_sha256:
             raise ModelInstallError(f"digest mismatch for {context!r}")
         os.fchmod(tmp_fd, 0o644)
-        os.close(tmp_fd)
+        fd_to_close = tmp_fd
         tmp_fd = -1
+        os.close(fd_to_close)
         os.replace(tmp_name, target_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
     except BaseException:
         # A chmod/replace failure (e.g. a permission error, or the target's
@@ -718,6 +740,8 @@ def install_model(
     Raises:
         ModelInstallError: Any manifest, path, verification, or fetch step
             fails closed (see the per-step docstrings above).
+        OSError: A local filesystem or environment operation fails outside
+            the fail-closed validation cases.
     """
     _validate_revision(revision)
     _validate_repo_id(repo_id)
