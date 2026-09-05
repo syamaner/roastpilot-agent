@@ -17,9 +17,11 @@ Two run modes plus the scaffold default:
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import signal
+import sys
 import tempfile
 import threading
 from collections.abc import Awaitable, Callable, Generator, Sequence
@@ -1152,11 +1154,161 @@ async def _serve_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_appliance_parser() -> argparse.ArgumentParser:
+    """Build the parser for the ``roastpilot-agent appliance ...`` command tree.
+
+    Issue #138 (E11-S2), PR slice 1: only ``appliance model install`` exists
+    so far. This is kept as its own parser tree, dispatched directly from
+    :func:`main` ahead of :func:`_build_parser`, rather than folded into that
+    parser's single ``action`` positional — the existing ``serve``/``--replay``/
+    ``--version`` surface (and its tests) is untouched by this addition.
+    Later slices add sibling subcommands (e.g. ``appliance render``) under the
+    same tree.
+    """
+    parser = argparse.ArgumentParser(
+        prog="roastpilot-agent appliance",
+        description="Native Pi appliance packaging support (E11-S2).",
+    )
+    subparsers = parser.add_subparsers(dest="appliance_command", required=True)
+
+    model_parser = subparsers.add_parser(
+        "model", help="Bundled/pinned first-crack model management"
+    )
+    model_subparsers = model_parser.add_subparsers(dest="model_command", required=True)
+
+    install_parser = model_subparsers.add_parser(
+        "install",
+        help="Place and verify the pinned first-crack model locally (offline-capable)",
+    )
+    install_parser.add_argument(
+        "--dest",
+        metavar="DIR",
+        type=Path,
+        default=None,
+        help=(
+            "destination root for the placed model files (defaults to "
+            "$XDG_DATA_HOME/roastpilot/models, else "
+            "~/.local/share/roastpilot/models)"
+        ),
+    )
+    install_parser.add_argument(
+        "--from-dir",
+        dest="from_dir",
+        metavar="DIR",
+        type=Path,
+        default=None,
+        help=(
+            "local source directory for air-gapped preparation, mirroring the "
+            "manifest's relative layout; a missing file here is an error, "
+            "never a silent fallback to network"
+        ),
+    )
+    install_parser.add_argument(
+        "--verify-only",
+        dest="verify_only",
+        action="store_true",
+        help="only verify an existing destination; never place or fetch anything",
+    )
+    install_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="print a machine-readable summary instead of plain text",
+    )
+    return parser
+
+
+def _resolve_appliance_model_dest(args: argparse.Namespace) -> Path:
+    """Resolve the destination root for ``appliance model install``.
+
+    Precedence: an explicit ``--dest``, else
+    ``$XDG_DATA_HOME/roastpilot/models``, else
+    ``~/.local/share/roastpilot/models``. A later slice's rendered appliance
+    config becomes the primary source for this path; this default keeps the
+    subcommand independently usable before that renderer exists.
+
+    Args:
+        args: Parsed ``appliance model install`` namespace.
+
+    Returns:
+        The resolved, user-expanded destination path.
+    """
+    if args.dest is not None:
+        return cast(Path, args.dest).expanduser()
+    data_home = os.environ.get("XDG_DATA_HOME")
+    base = Path(data_home) if data_home else Path.home() / ".local" / "share"
+    return base / "roastpilot" / "models"
+
+
+def _run_appliance_model_install(args: argparse.Namespace) -> int:
+    """Run ``appliance model install``: place/verify the pinned model (AC5).
+
+    Args:
+        args: Parsed ``appliance model install`` namespace.
+
+    Returns:
+        ``0`` on success (every manifest file verified at the destination);
+        ``1`` if placement/verification failed closed for any reason.
+    """
+    from roastpilot_agent.appliance.model_install import ModelInstallError, install_model
+
+    dest = _resolve_appliance_model_dest(args)
+    from_dir = cast("Path | None", args.from_dir)
+    if from_dir is not None:
+        from_dir = from_dir.expanduser()
+    try:
+        summary = install_model(dest, from_dir=from_dir, verify_only=args.verify_only)
+    except ModelInstallError as exc:
+        print(f"model install failed: {exc}")
+        return 1
+    except OSError as exc:
+        # Matches the repo's established friendly-failure convention for a
+        # filesystem-level error (`--replay`'s saved-config read at
+        # cli.py:910/1094): a permission error or an unwritable/unreadable
+        # destination is reported plainly rather than as an uncaught
+        # traceback. `ModelInstallError` never wraps this (it always carries
+        # its own message and no `__cause__` OSError), so the two except
+        # clauses never overlap.
+        print(f"model install failed: destination is unusable — {exc}")
+        return 1
+    if args.json_output:
+        print(json.dumps(summary.to_json_dict()))
+        return 0
+    print(f"model files verified at {summary.dest}")
+    for file_result in summary.files:
+        print(f"  {file_result.relative_path} ({file_result.source}) sha256={file_result.sha256}")
+    if not summary.network_used:
+        print("no network fetch was required")
+    return 0
+
+
+def _run_appliance_cli(argv: Sequence[str]) -> int:
+    """Dispatch a parsed ``appliance ...`` command line to its handler.
+
+    Args:
+        argv: Arguments after the leading ``appliance`` token (e.g.
+            ``["model", "install", "--json"]``).
+
+    Returns:
+        The subcommand's exit code.
+    """
+    parser = _build_appliance_parser()
+    args = parser.parse_args(argv)
+    if args.appliance_command == "model" and args.model_command == "install":
+        return _run_appliance_model_install(args)
+    parser.print_help()  # pragma: no cover - unreachable while both subparsers are required=True
+    return 2  # pragma: no cover - unreachable while both subparsers are required=True
+
+
 def main() -> int:
     """Parse arguments and run the agent service.
 
     ``serve`` drives a live roast; ``--replay`` serves the replay harness;
-    without either the scaffold entrypoint prints help."""
+    ``appliance ...`` runs the native Pi appliance packaging commands (#138);
+    without any of these the scaffold entrypoint prints help."""
+    argv = sys.argv[1:]
+    if argv and argv[0] == "appliance":
+        return _run_appliance_cli(argv[1:])
     parser = _build_parser()
     args = parser.parse_args()
     # --db is live-serve only; replay is always ephemeral. Combining them would
