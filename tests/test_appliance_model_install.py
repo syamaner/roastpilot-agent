@@ -220,12 +220,67 @@ def test_bounded_hash_failure_is_not_masked_by_close_error(
     monkeypatch.setattr(os, "close", failing_close)
 
     with pytest.raises(ModelInstallError, match="per-file cap"):
-        model_install_module._sha256_of_file(  # pyright: ignore[reportPrivateUsage]
-            target
-        )
+        model_install_module._sha256_of_file(target)  # pyright: ignore[reportPrivateUsage]
 
     assert len(close_calls) == 1
     original_close(close_calls[0])
+
+
+def test_stream_cleanup_unlink_failure_preserves_byte_cap_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Temporary-file cleanup notes but cannot replace the streaming failure."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    original_unlink = os.unlink
+
+    def failing_unlink(_path: object, **_kwargs: object) -> None:
+        raise OSError("simulated unlink failure")
+
+    monkeypatch.setattr(os, "unlink", failing_unlink)
+    try:
+        with pytest.raises(ModelInstallError, match="per-file cap") as exc_info:
+            model_install_module._stream_to_temp(  # pyright: ignore[reportPrivateUsage]
+                parent_fd, "model.bin", [b"too-large"], byte_cap=1
+            )
+    finally:
+        os.close(parent_fd)
+
+    assert any(
+        "removing temporary model file: OSError" in note for note in exc_info.value.__notes__
+    )
+    for temporary_file in tmp_path.glob("*.part"):
+        original_unlink(temporary_file)
+
+
+def test_placement_cleanup_unlink_failure_preserves_digest_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Digest failure remains primary when its temporary-file unlink fails."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    original_unlink = os.unlink
+
+    def failing_unlink(_path: object, **_kwargs: object) -> None:
+        raise OSError("simulated unlink failure")
+
+    monkeypatch.setattr(os, "unlink", failing_unlink)
+    try:
+        with pytest.raises(ModelInstallError, match="digest mismatch") as exc_info:
+            model_install_module._place_verified(  # pyright: ignore[reportPrivateUsage]
+                parent_fd,
+                "model.bin",
+                [b"wrong"],
+                expected_sha256=hashlib.sha256(b"expected").hexdigest(),
+                byte_cap=8,
+                context="model.bin",
+            )
+    finally:
+        os.close(parent_fd)
+
+    assert any(
+        "removing temporary model file: OSError" in note for note in exc_info.value.__notes__
+    )
+    for temporary_file in tmp_path.glob("*.part"):
+        original_unlink(temporary_file)
 
 
 # --- T4: --from-dir missing a file -> error, no fallback to network --------
@@ -379,6 +434,131 @@ def test_cached_destination_wins_even_with_an_invalid_from_dir(tmp_path: Path) -
 
     assert summary.files[0].source == "cached"
     assert summary.network_used is False
+
+
+def test_cached_continue_propagates_parent_close_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-file descriptor cleanup still fails loudly after a cached continue."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    dest = tmp_path / "dest"
+    (dest / "a").mkdir(parents=True)
+    (dest / "a" / "file1.bin").write_bytes(b"hello")
+    captured_parent_fds: list[int] = []
+    original_open_parent = model_install_module._open_destination_parent  # pyright: ignore[reportPrivateUsage]
+    original_close = os.close
+
+    def capture_parent(
+        dest_root_real: Path, relative_path: str, *, create: bool
+    ) -> tuple[int, str]:
+        result = original_open_parent(dest_root_real, relative_path, create=create)
+        captured_parent_fds.append(result[0])
+        return result
+
+    def failing_parent_close(fd: int) -> None:
+        if captured_parent_fds and fd == captured_parent_fds[0]:
+            raise OSError("simulated parent close failure")
+        original_close(fd)
+
+    monkeypatch.setattr(
+        model_install_module,
+        "_open_destination_parent",
+        capture_parent,
+    )
+    monkeypatch.setattr(os, "close", failing_parent_close)
+    try:
+        with pytest.raises(OSError, match="simulated parent close failure"):
+            install_model(dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION)
+    finally:
+        if captured_parent_fds:
+            original_close(captured_parent_fds[0])
+
+
+def test_primary_error_survives_parent_close_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-file parent cleanup annotates but cannot replace a digest failure."""
+    manifest = _make_manifest({"a/file1.bin": b"expected"})
+    dest = tmp_path / "dest"
+    (dest / "a").mkdir(parents=True)
+    captured_parent_fds: list[int] = []
+    original_open_parent = model_install_module._open_destination_parent  # pyright: ignore[reportPrivateUsage]
+    original_close = os.close
+
+    def capture_parent(
+        dest_root_real: Path, relative_path: str, *, create: bool
+    ) -> tuple[int, str]:
+        result = original_open_parent(dest_root_real, relative_path, create=create)
+        captured_parent_fds.append(result[0])
+        return result
+
+    def failing_parent_close(fd: int) -> None:
+        if captured_parent_fds and fd == captured_parent_fds[0]:
+            raise OSError("simulated parent close failure")
+        original_close(fd)
+
+    monkeypatch.setattr(model_install_module, "_open_destination_parent", capture_parent)
+    monkeypatch.setattr(os, "close", failing_parent_close)
+    client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"wrong")))
+    try:
+        with pytest.raises(ModelInstallError, match="digest mismatch") as exc_info:
+            install_model(
+                dest,
+                manifest_files=manifest,
+                repo_id=_REPO_ID,
+                revision=_REVISION,
+                http_client=client,
+            )
+    finally:
+        if captured_parent_fds:
+            original_close(captured_parent_fds[0])
+
+    assert any(
+        "closing destination directory descriptor: OSError" in note
+        for note in exc_info.value.__notes__
+    )
+
+
+def test_owned_client_close_failure_propagates_after_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owned-client cleanup remains observable when installation otherwise succeeds."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    dest = tmp_path / "dest"
+    (dest / "a").mkdir(parents=True)
+    (dest / "a" / "file1.bin").write_bytes(b"hello")
+
+    def failing_client_close(_client: httpx.Client) -> None:
+        raise OSError("simulated client close failure")
+
+    monkeypatch.setattr(httpx.Client, "close", failing_client_close)
+
+    with pytest.raises(OSError, match="simulated client close failure"):
+        install_model(dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION)
+
+
+def test_primary_error_survives_owned_client_close_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owned-client cleanup annotates but cannot replace a manifest failure."""
+    invalid_manifest = (ManifestFile(relative_path="a/file1.bin", sha256="invalid"),)
+
+    def failing_client_close(_client: httpx.Client) -> None:
+        raise OSError("simulated client close failure")
+
+    monkeypatch.setattr(httpx.Client, "close", failing_client_close)
+
+    with pytest.raises(ModelInstallError, match="manifest digest") as exc_info:
+        install_model(
+            tmp_path / "dest",
+            manifest_files=invalid_manifest,
+            repo_id=_REPO_ID,
+            revision=_REVISION,
+        )
+
+    assert any(
+        "closing model download client: OSError" in note for note in exc_info.value.__notes__
+    )
 
 
 # --- T5: closed-grammar rejections, parametrised -----------------------------

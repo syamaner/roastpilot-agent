@@ -73,8 +73,9 @@ import ipaddress
 import os
 import re
 import stat
+import sys
 import uuid
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -138,6 +139,29 @@ class ModelInstallError(RuntimeError):
     every message here is built only from manifest fields (repo id,
     revision, relative path) and local filesystem paths.
     """
+
+
+def _cleanup_preserving_primary(cleanup: Callable[[], None], *, action: str) -> None:
+    """Run cleanup without replacing an already-propagating exception.
+
+    A cleanup failure after successful work remains observable and therefore
+    propagates. During unwinding, the primary error stays authoritative and
+    receives a concise Python 3.11 exception note about the failed cleanup.
+
+    Args:
+        cleanup: The close, unlink, or client-close operation to run.
+        action: A safe, local description of the cleanup operation.
+
+    Raises:
+        OSError: The cleanup failure when no primary exception is active.
+    """
+    primary = sys.exception()
+    try:
+        cleanup()
+    except BaseException as cleanup_error:
+        if primary is None:
+            raise
+        primary.add_note(f"cleanup failed while {action}: {type(cleanup_error).__name__}")
 
 
 def _validate_revision(revision: str) -> None:
@@ -307,8 +331,9 @@ def _sha256_of_file(path: Path | str, *, dir_fd: int | None = None) -> str:
         if final.st_size != total or final.st_size > _MAX_MODEL_FILE_BYTES:
             raise ModelInstallError(f"cached destination {path} changed while being verified")
     except BaseException:
-        with suppress(OSError):
-            os.close(fd)
+        _cleanup_preserving_primary(
+            lambda: os.close(fd), action="closing cached model file descriptor"
+        )
         raise
     else:
         os.close(fd)
@@ -552,15 +577,18 @@ def _open_destination_parent(
             try:
                 os.close(parent_fd)
             except BaseException:
-                with suppress(OSError):
-                    os.close(child_fd)
+                _cleanup_preserving_primary(
+                    lambda fd=child_fd: os.close(fd),
+                    action="closing child destination directory descriptor",
+                )
                 parent_fd = None
                 raise
             parent_fd = child_fd
     except BaseException:
         if parent_fd is not None:
-            with suppress(OSError):
-                os.close(parent_fd)
+            _cleanup_preserving_primary(
+                lambda: os.close(parent_fd), action="closing destination directory descriptor"
+            )
         raise
     return parent_fd, components[-1]
 
@@ -604,9 +632,12 @@ def _stream_to_temp(
             fh.flush()
             os.fsync(fh.fileno())
     except BaseException:
-        with suppress(OSError):
-            os.close(fd)
-        os.unlink(tmp_name, dir_fd=parent_fd)
+        _cleanup_preserving_primary(
+            lambda: os.close(fd), action="closing temporary model file descriptor"
+        )
+        _cleanup_preserving_primary(
+            lambda: os.unlink(tmp_name, dir_fd=parent_fd), action="removing temporary model file"
+        )
         raise
     return tmp_name, fd, digest.hexdigest()
 
@@ -647,9 +678,12 @@ def _place_verified(
         # rename on POSIX: if it raises, the file never moved, so the temp
         # path is still the one to remove.
         if tmp_fd != -1:
-            with suppress(OSError):
-                os.close(tmp_fd)
-        os.unlink(tmp_name, dir_fd=parent_fd)
+            _cleanup_preserving_primary(
+                lambda: os.close(tmp_fd), action="closing temporary model file descriptor"
+            )
+        _cleanup_preserving_primary(
+            lambda: os.unlink(tmp_name, dir_fd=parent_fd), action="removing temporary model file"
+        )
         raise
 
 
@@ -846,9 +880,12 @@ def install_model(
                 )
             finally:
                 if parent_fd is not None:
-                    os.close(parent_fd)
+                    _cleanup_preserving_primary(
+                        lambda fd=parent_fd: os.close(fd),
+                        action="closing destination directory descriptor",
+                    )
     finally:
         if owned_client:
-            client.close()
+            _cleanup_preserving_primary(client.close, action="closing model download client")
 
     return ModelInstallSummary(dest=dest_root_real, files=tuple(results), network_used=network_used)
