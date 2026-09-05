@@ -478,7 +478,7 @@ def test_swapped_destination_parent_cannot_redirect_placement_outside_dest(
 
     def swap_parent_then_stream(
         parent_fd: int, target_name: str, chunks: Iterable[bytes], *, byte_cap: int
-    ) -> tuple[str, str]:
+    ) -> tuple[str, int, str]:
         parent.rename(parked_parent)
         parent.symlink_to(outside, target_is_directory=True)
         return original_stream_to_temp(parent_fd, target_name, chunks, byte_cap=byte_cap)
@@ -817,28 +817,57 @@ def test_network_error_aborts_with_no_url_or_env_value_in_message(tmp_path: Path
     assert list(dest.rglob("*.part")) == []
 
 
-def test_chmod_failure_after_digest_verification_removes_temp_file(
+def test_fchmod_failure_after_digest_verification_removes_temp_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failure in the chmod/replace step (after the digest already matched)
+    """A failure in the fchmod/replace step (after the digest already matched)
     must still remove the temp file — cleanup is not only a digest-mismatch
     behavior."""
     manifest = _make_manifest({"a/file1.bin": b"hello"})
     dest = tmp_path / "dest"
 
-    def failing_chmod(_path: object, _mode: int, **_kwargs: object) -> None:
-        raise OSError("simulated chmod failure")
+    def failing_fchmod(_fd: int, _mode: int) -> None:
+        raise OSError("simulated fchmod failure")
 
-    monkeypatch.setattr("os.chmod", failing_chmod)
+    monkeypatch.setattr("os.fchmod", failing_fchmod)
     client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"hello")))
 
-    with pytest.raises(OSError, match="simulated chmod failure"):
+    with pytest.raises(OSError, match="simulated fchmod failure"):
         install_model(
             dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
         )
 
     assert not (dest / "a" / "file1.bin").exists()
     assert list(dest.rglob("*.part")) == []
+
+
+def test_placement_uses_fchmod_without_pathname_chmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Placement changes the verified temporary file mode through its descriptor."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    dest = tmp_path / "dest"
+    fchmod_calls: list[tuple[int, int]] = []
+    original_fchmod = os.fchmod
+
+    def spying_fchmod(fd: int, mode: int) -> None:
+        fchmod_calls.append((fd, mode))
+        original_fchmod(fd, mode)
+
+    def unexpected_chmod(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("placement must not use pathname-based chmod")
+
+    monkeypatch.setattr(os, "fchmod", spying_fchmod)
+    monkeypatch.setattr(os, "chmod", unexpected_chmod)
+    client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"hello")))
+
+    install_model(
+        dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
+    )
+
+    assert len(fchmod_calls) == 1
+    assert fchmod_calls[0][1] == 0o644
+    assert stat.S_IMODE((dest / "a" / "file1.bin").stat().st_mode) == 0o644
 
 
 def test_replace_failure_after_digest_verification_removes_temp_file(

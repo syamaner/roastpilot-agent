@@ -533,17 +533,25 @@ def _open_destination_parent(
                 raise ModelInstallError(
                     f"cannot safely open destination directory for {relative_path!r}"
                 ) from exc
-            os.close(parent_fd)
+            try:
+                os.close(parent_fd)
+            except BaseException:
+                with suppress(OSError):
+                    os.close(child_fd)
+                parent_fd = None
+                raise
             parent_fd = child_fd
     except BaseException:
-        os.close(parent_fd)
+        if parent_fd is not None:
+            with suppress(OSError):
+                os.close(parent_fd)
         raise
     return parent_fd, components[-1]
 
 
 def _stream_to_temp(
     parent_fd: int, target_name: str, chunks: Iterable[bytes], *, byte_cap: int
-) -> tuple[str, str]:
+) -> tuple[str, int, str]:
     """Stream ``chunks`` to a descriptor-anchored temp file, hashing as it writes.
 
     The temp file lives in the already-open destination parent so the eventual
@@ -551,8 +559,8 @@ def _stream_to_temp(
     including exceeding ``byte_cap`` — removes the temp file before propagating.
 
     Returns:
-        The temp filename (relative to ``parent_fd``) and its streamed SHA-256
-        hex digest.
+        The temp filename (relative to ``parent_fd``), its still-open
+        descriptor, and its streamed SHA-256 hex digest.
     """
     tmp_name = f".{target_name}.{uuid.uuid4().hex}.part"
     fd = os.open(
@@ -564,7 +572,7 @@ def _stream_to_temp(
     digest = hashlib.sha256()
     total = 0
     try:
-        with os.fdopen(fd, "wb") as fh:
+        with os.fdopen(fd, "wb", closefd=False) as fh:
             for chunk in chunks:
                 total += len(chunk)
                 if total > byte_cap:
@@ -576,9 +584,11 @@ def _stream_to_temp(
             fh.flush()
             os.fsync(fh.fileno())
     except BaseException:
+        with suppress(OSError):
+            os.close(fd)
         os.unlink(tmp_name, dir_fd=parent_fd)
         raise
-    return tmp_name, digest.hexdigest()
+    return tmp_name, fd, digest.hexdigest()
 
 
 def _place_verified(
@@ -597,12 +607,15 @@ def _place_verified(
             ``expected_sha256`` (the temp file is removed; the final path is
             never written before verification) or streaming itself failed.
     """
-    tmp_name, digest_hex = _stream_to_temp(parent_fd, target_name, chunks, byte_cap=byte_cap)
-    if digest_hex != expected_sha256:
-        os.unlink(tmp_name, dir_fd=parent_fd)
-        raise ModelInstallError(f"digest mismatch for {context!r}")
+    tmp_name, tmp_fd, digest_hex = _stream_to_temp(
+        parent_fd, target_name, chunks, byte_cap=byte_cap
+    )
     try:
-        os.chmod(tmp_name, 0o644, dir_fd=parent_fd, follow_symlinks=False)
+        if digest_hex != expected_sha256:
+            raise ModelInstallError(f"digest mismatch for {context!r}")
+        os.fchmod(tmp_fd, 0o644)
+        os.close(tmp_fd)
+        tmp_fd = -1
         os.replace(tmp_name, target_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
     except BaseException:
         # A chmod/replace failure (e.g. a permission error, or the target's
@@ -611,6 +624,9 @@ def _place_verified(
         # path, not only a digest mismatch. `os.replace` is a single atomic
         # rename on POSIX: if it raises, the file never moved, so the temp
         # path is still the one to remove.
+        if tmp_fd != -1:
+            with suppress(OSError):
+                os.close(tmp_fd)
         os.unlink(tmp_name, dir_fd=parent_fd)
         raise
 
