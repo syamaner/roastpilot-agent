@@ -147,6 +147,36 @@ def test_run_appliance_model_install_success_plain_text(
     assert "no network fetch was required" in out
 
 
+def test_run_appliance_model_install_success_plain_text_when_network_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When at least one file was actually fetched over the network, the
+    plain-text summary reports the ``fetched`` source per file and never
+    claims that no network fetch was required."""
+    dest = tmp_path / "dest"
+    summary = _summary(dest=dest, network_used=True)
+
+    def fake_install_model(
+        given_dest: Path, *, from_dir: Path | None = None, verify_only: bool = False
+    ) -> ModelInstallSummary:
+        assert given_dest == dest
+        assert from_dir is None
+        assert verify_only is False
+        return summary
+
+    monkeypatch.setattr(model_install_module, "install_model", fake_install_model)
+    args = cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
+        ["model", "install", "--dest", str(dest)]
+    )
+    exit_code = cli._run_appliance_model_install(args)  # pyright: ignore[reportPrivateUsage]
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert str(dest) in out
+    assert "fetched" in out
+    assert "no network fetch was required" not in out
+
+
 def test_run_appliance_model_install_success_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

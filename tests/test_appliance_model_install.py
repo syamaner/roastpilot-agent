@@ -509,16 +509,16 @@ def test_allowed_cross_host_cdn_redirect_is_followed(tmp_path: Path, cdn_host: s
 
 
 @pytest.mark.parametrize(
-    "location",
+    ("location", "expected_reason"),
     [
-        "https://internal.example/a/file1.bin",
-        "https://evil.hf.co.attacker.example/a/file1.bin",
-        "https://notreallyhf.co/a/file1.bin",
-        "https://203.0.113.7/a/file1.bin",
-        "https://[2001:db8::1]/a/file1.bin",
-        "https://user:pass@hf.co/a/file1.bin",
-        "https://hf.co/a/file1.bin#fragment",
-        "https://hf.co:8443/a/file1.bin",
+        ("https://internal.example/a/file1.bin", "outside the allowed policy"),
+        ("https://evil.hf.co.attacker.example/a/file1.bin", "outside the allowed policy"),
+        ("https://notreallyhf.co/a/file1.bin", "outside the allowed policy"),
+        ("https://203.0.113.7/a/file1.bin", "IP-literal host"),
+        ("https://[2001:db8::1]/a/file1.bin", "IP-literal host"),
+        ("https://user:pass@hf.co/a/file1.bin", "embedded userinfo"),
+        ("https://hf.co/a/file1.bin#fragment", "a fragment"),
+        ("https://hf.co:8443/a/file1.bin", "non-default port"),
     ],
     ids=[
         "arbitrary-internal-host",
@@ -532,22 +532,34 @@ def test_allowed_cross_host_cdn_redirect_is_followed(tmp_path: Path, cdn_host: s
     ],
 )
 def test_disallowed_redirect_destination_aborts_with_no_file_written(
-    tmp_path: Path, location: str
+    tmp_path: Path, location: str, expected_reason: str
 ) -> None:
     """Every disallowed redirect-hop shape is rejected before the hop is made:
     an arbitrary/internal host, a hostname that merely *looks* like it is
     within the ``hf.co`` policy (suffix/prefix lookalikes), an IP literal
     (v4 or v6), embedded userinfo, a fragment, and a non-default port — none
-    ever leaves a final or partial file behind."""
+    ever leaves a final or partial file behind.
+
+    Each case also asserts the specific :class:`ModelInstallError` reason for
+    its rejected class, and that exactly one HTTP request is ever made: the
+    initial allowed Hugging Face request that returns the redirect. The
+    disallowed redirect target itself is never connected to —
+    ``_validate_fetch_url`` rejects the joined redirect URL, on the next loop
+    iteration, before ``client.stream`` is called again — so the request
+    counter proves validation happens before any connection attempt, not
+    merely that the outcome is an error.
+    """
     manifest = _make_manifest({"a/file1.bin": b"hello"})
     dest = tmp_path / "dest"
+    calls = [0]
 
     def redirect_handler(_request: httpx.Request) -> httpx.Response:
+        calls[0] += 1
         return httpx.Response(302, headers={"location": location})
 
     client = httpx.Client(transport=httpx.MockTransport(redirect_handler))
 
-    with pytest.raises(ModelInstallError):
+    with pytest.raises(ModelInstallError, match=expected_reason):
         install_model(
             dest,
             manifest_files=manifest,
@@ -556,6 +568,7 @@ def test_disallowed_redirect_destination_aborts_with_no_file_written(
             http_client=client,
         )
 
+    assert calls[0] == 1
     assert not (dest / "a" / "file1.bin").exists()
     assert list(dest.rglob("*.part")) == []
 
