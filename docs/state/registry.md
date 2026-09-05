@@ -1197,12 +1197,11 @@ mark-ready/reopen draft-cycle workaround for metadata edits.**
 > *the scores find the symptom, only the reasoning found the cause*; #281 (bounded-concurrency
 > replay) queued on top. Plan: D40/D41 in `plan.md` §1.
 
-- Epic file: `docs/epics/E11-packaging.md` — **D28 gate ✅ CLEARED (28 Jun 2026); now
-  gated only on D27 (torch-free chain).** E10 closed 11 Jun 2026. E11 is next in order;
-  S1/S2 contract-buildable scaffolding is startable on operator opt-in — do **not** begin
-  S3 or pin/ship the `[pi]` extra until the torch-free `coffee-roaster-mcp` (**D27**:
-  `coffee-first-crack-detection#54` → `coffee-roaster-mcp#157`, cross-repo) lands. See
-  **D28**.
+- Epic file: `docs/epics/E11-packaging.md` — **E11-S1's D27 dependency/publication
+  gate is ✅ CLEARED by published `coffee-roaster-mcp==0.2.0`; this PR delivers the
+  exact `[pi]` extra.** E11-S2 and E11-S3 remain not started. `coffee-roaster-mcp#157`
+  and #194 remain open for separate hardware and acceptance boundaries; E11-S1 package
+  delivery is not Pi hardware-readiness or acceptance evidence. See **D28**.
 - Project: RoastPilot (GitHub user project, owner `syamaner`)
 - Repository: `syamaner/roastpilot-agent`
 - Package: `roastpilot-agent`

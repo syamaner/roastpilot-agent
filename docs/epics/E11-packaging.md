@@ -9,28 +9,27 @@ installer, a **bundled/offline FC model**, **one systemd unit** (agent spawns MC
 child, per D6), mDNS, and a deployment doc. **No Docker image; no PyTorch on the Pi**
 (D27).
 
-> **Cross-repo dependency (D27 / `torch-free-pi-appliance.md`):** E11 is Phase 3 of a
-> 3-repo rollout, **gated on the torch-free `coffee-roaster-mcp`** (Phase 2), which is
-> gated on the FC-detection repo's librosa-filterbank swap + accuracy gate (Phase 1).
-> E11 can be *specced/built* against the contract now, but the `[pi]` extra pins the
-> torch-free MCP release.
+> **Cross-repo dependency (D27 / `torch-free-pi-appliance.md`):** E11-S1's D27
+> dependency/publication gate is **cleared** by the published torch-free
+> `coffee-roaster-mcp==0.2.0` release. This PR delivers E11-S1's `[pi]` extra
+> against that exact release. `coffee-roaster-mcp#157` and #194 remain open for
+> their separate hardware and acceptance boundaries; this package delivery is not
+> Pi hardware-readiness or acceptance evidence.
 
 > **Operator manual-test gate (D28) — ✅ CLEARED (28 Jun 2026).** Both operator-owned
 > (@syamaner) manual test tasks are Done. **#135** (E10-S6 manual Safari/iPadOS SSE on
 > real devices) is **✅ DONE/CLOSED** (13 Jun, iPad + iPhone Safari). **#134** (E12-S1
 > supervised hardware roast through the agent harness, D17 criterion 3) is **✅ VALIDATED
 > by roast 6** (27 Jun — auto-FC detection + advisor dev%-gated drop + full charge→drop
-> recording, supervised, clean light roast) and **re-confirmed by roast 8** (28 Jun — first
-> fully autonomous LLM-driven drop through the safety box, clean medium ~193 °C / 21 % DTR).
+> recording, supervised, clean light roast) and **re-confirmed by roast 8** (28 Jun —
+> LLM-advised drop through the safety box, clean medium ~193 °C / 21 % DTR).
 > **The D28 gate no longer blocks E11.**
 >
-> **Still gated on D27 (independent):** the **torch-free `coffee-roaster-mcp`** chain
-> (Phase 1 `coffee-first-crack-detection#54` → Phase 2 `coffee-roaster-mcp#157`, both
-> cross-repo) — E11's `[pi]` extra pins the torch-free MCP release, so do not pin/ship
-> the `[pi]` extra until that lands. Contract-buildable scaffolding (S1/S2 against the
-> contract) is now startable on operator opt-in; E11-S3 (the Pi soak) depends on the
-> recording bundle that shipped in MCP 0.1.10/0.1.11 (see below). (Prove the harness on
-> real hardware + devices before packaging it.)
+> **D27 E11-S1 dependency/publication gate — ✅ CLEARED:** the published torch-free
+> `coffee-roaster-mcp==0.2.0` release permits the exact `[pi]` pin delivered here.
+> E11-S2 and E11-S3 remain not started. E11-S3 (the Pi soak) still depends on the
+> recording bundle that shipped in MCP 0.1.10/0.1.11 (see below); prove the harness
+> on real hardware and devices before making any hardware-readiness or acceptance claim.
 
 ## Plan links
 

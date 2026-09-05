@@ -750,6 +750,11 @@ def test_e11_packaging_status_is_current_and_honest() -> None:
     assert "Hosted ARM64 evidence is package compatibility" in epic
     assert "not Raspberry Pi hardware validation" in registry
     assert "does not state that `coffee-roaster-mcp#157` or #194 is\nclosed" in registry
+    assert "published torch-free\n> `coffee-roaster-mcp==0.2.0` release" in epic
+    assert "E11-S1's D27 dependency/publication\n  gate is ✅ CLEARED" in registry
+    assert "Still gated on D27 (independent)" not in epic
+    assert "do not pin/ship\n> the `[pi]` extra until that lands" not in epic
+    assert "gated only on D27 (torch-free chain)" not in registry
 
 
 @pytest.mark.docs_ci
