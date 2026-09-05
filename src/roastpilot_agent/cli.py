@@ -1252,23 +1252,23 @@ def _run_appliance_model_install(args: argparse.Namespace) -> int:
     """
     from roastpilot_agent.appliance.model_install import ModelInstallError, install_model
 
-    dest = _resolve_appliance_model_dest(args)
-    from_dir = cast("Path | None", args.from_dir)
-    if from_dir is not None:
-        from_dir = from_dir.expanduser()
     try:
+        dest = _resolve_appliance_model_dest(args)
+        from_dir = cast("Path | None", args.from_dir)
+        if from_dir is not None:
+            from_dir = from_dir.expanduser()
         summary = install_model(dest, from_dir=from_dir, verify_only=args.verify_only)
     except ModelInstallError as exc:
         print(f"model install failed: {exc}")
         return 1
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         # Matches the repo's established friendly-failure convention for a
-        # filesystem-level error (`--replay`'s saved-config read at
-        # cli.py:910/1094): a permission error or an unwritable/unreadable
-        # destination is reported plainly rather than as an uncaught
-        # traceback. `ModelInstallError` never wraps this (it always carries
-        # its own message and no `__cause__` OSError), so the two except
-        # clauses never overlap.
+        # filesystem/path-expansion error (`--replay`'s saved-config read at
+        # cli.py:910/1094): an unknown ``~user`` reference, permission error,
+        # or unwritable/unreadable destination is reported plainly rather than
+        # as an uncaught traceback. `ModelInstallError` never wraps this (it
+        # always carries its own message and no `__cause__` OSError), so the
+        # two except clauses never overlap.
         print(f"model install failed: destination is unusable — {exc}")
         return 1
     if args.json_output:

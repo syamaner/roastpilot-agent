@@ -139,6 +139,70 @@ def test_second_run_with_valid_files_makes_no_network_call(tmp_path: Path) -> No
     assert {f.source for f in summary.files} == {"cached"}
 
 
+def test_verify_only_rejects_an_initially_oversized_cached_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cached verification never hashes a file already over the per-file cap."""
+    monkeypatch.setattr(model_install_module, "_MAX_MODEL_FILE_BYTES", 8)
+    dest = tmp_path / "dest"
+    (dest / "a").mkdir(parents=True)
+    (dest / "a" / "file1.bin").write_bytes(b"x" * 9)
+    manifest = _make_manifest({"a/file1.bin": b"expected"})
+
+    with pytest.raises(ModelInstallError, match="per-file cap"):
+        install_model(
+            dest,
+            verify_only=True,
+            manifest_files=manifest,
+            repo_id=_REPO_ID,
+            revision=_REVISION,
+        )
+
+
+def test_cached_verification_stops_when_file_grows_over_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A growing cached file is rejected before an unbounded hash can occur."""
+    monkeypatch.setattr(model_install_module, "_MAX_MODEL_FILE_BYTES", 8)
+    monkeypatch.setattr(model_install_module, "_CHUNK_SIZE", 2)
+    target = tmp_path / "cached.bin"
+    target.write_bytes(b"good")
+    original_fdopen = os.fdopen
+    grew = False
+
+    class GrowingReader:
+        """Append beyond the cap after the first bounded read."""
+
+        def __init__(self, file_handle: object) -> None:
+            self._file_handle = file_handle
+
+        def __enter__(self) -> "GrowingReader":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self._file_handle.close()  # type: ignore[union-attr]
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal grew
+            result = self._file_handle.read(size)  # type: ignore[union-attr]
+            if not grew:
+                grew = True
+                with target.open("ab") as growing_file:
+                    growing_file.write(b"overflow")
+            return result  # type: ignore[no-any-return]
+
+    def growing_fdopen(fd: int, mode: str, *, closefd: bool = True) -> GrowingReader:
+        return GrowingReader(original_fdopen(fd, mode, closefd=closefd))
+
+    monkeypatch.setattr(os, "fdopen", growing_fdopen)
+    expected = hashlib.sha256(b"good").hexdigest()
+
+    with pytest.raises(ModelInstallError, match="per-file cap"):
+        model_install_module._is_already_valid(  # pyright: ignore[reportPrivateUsage]
+            target, expected
+        )
+
+
 # --- T4: --from-dir missing a file -> error, no fallback to network --------
 
 
@@ -398,7 +462,37 @@ def test_symlinked_subdirectory_escape_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ModelInstallError, match="escapes"):
         install_model(dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION)
 
+
+def test_swapped_destination_parent_cannot_redirect_placement_outside_dest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parent swapped for a symlink after descriptor open cannot redirect writes."""
+    dest = tmp_path / "dest"
+    parent = dest / "a"
+    parent.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    parked_parent = tmp_path / "parked-parent"
+    manifest = _make_manifest({"a/file1.bin": b"payload"})
+    original_stream_to_temp = model_install_module._stream_to_temp  # pyright: ignore[reportPrivateUsage]
+
+    def swap_parent_then_stream(
+        parent_fd: int, target_name: str, chunks: Iterable[bytes], *, byte_cap: int
+    ) -> tuple[str, str]:
+        parent.rename(parked_parent)
+        parent.symlink_to(outside, target_is_directory=True)
+        return original_stream_to_temp(parent_fd, target_name, chunks, byte_cap=byte_cap)
+
+    monkeypatch.setattr(model_install_module, "_stream_to_temp", swap_parent_then_stream)
+    client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"payload")))
+
+    summary = install_model(
+        dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
+    )
+
+    assert summary.files[0].source == "fetched"
     assert not (outside / "file1.bin").exists()
+    assert (parked_parent / "file1.bin").read_bytes() == b"payload"
 
 
 @pytest.mark.parametrize("bad_repo_id", ["", "no-slash", "a/b/c", "a/", "/b", "a b/c"])
@@ -732,7 +826,7 @@ def test_chmod_failure_after_digest_verification_removes_temp_file(
     manifest = _make_manifest({"a/file1.bin": b"hello"})
     dest = tmp_path / "dest"
 
-    def failing_chmod(_path: object, _mode: int) -> None:
+    def failing_chmod(_path: object, _mode: int, **_kwargs: object) -> None:
         raise OSError("simulated chmod failure")
 
     monkeypatch.setattr("os.chmod", failing_chmod)
@@ -756,7 +850,7 @@ def test_replace_failure_after_digest_verification_removes_temp_file(
     manifest = _make_manifest({"a/file1.bin": b"hello"})
     dest = tmp_path / "dest"
 
-    def failing_replace(_src: object, _dst: object) -> None:
+    def failing_replace(_src: object, _dst: object, **_kwargs: object) -> None:
         raise OSError("simulated replace failure")
 
     monkeypatch.setattr("os.replace", failing_replace)
@@ -781,12 +875,16 @@ def test_replace_is_called_with_the_temp_file_beside_the_exact_final_target(
     manifest = _make_manifest({"a/file1.bin": b"hello"})
     dest = tmp_path / "dest"
     target = dest / "a" / "file1.bin"
-    calls: list[tuple[Path, Path]] = []
+    calls: list[tuple[str, str, int, int]] = []
     original_replace = os.replace
 
-    def spying_replace(src: str, dst: str) -> None:
-        calls.append((Path(src), Path(dst)))
-        original_replace(src, dst)
+    def spying_replace(src: str, dst: str, **kwargs: object) -> None:
+        src_dir_fd = kwargs["src_dir_fd"]
+        dst_dir_fd = kwargs["dst_dir_fd"]
+        assert isinstance(src_dir_fd, int)
+        assert isinstance(dst_dir_fd, int)
+        calls.append((src, dst, src_dir_fd, dst_dir_fd))
+        original_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
     monkeypatch.setattr("os.replace", spying_replace)
     client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"hello")))
@@ -797,10 +895,10 @@ def test_replace_is_called_with_the_temp_file_beside_the_exact_final_target(
 
     assert summary.files[0].source == "fetched"
     assert len(calls) == 1
-    src, dst = calls[0]
-    assert dst == target
-    assert src.parent == target.parent
-    assert src != target
+    src, dst, src_dir_fd, dst_dir_fd = calls[0]
+    assert src.startswith(".file1.bin.") and src.endswith(".part")
+    assert dst == "file1.bin"
+    assert src_dir_fd == dst_dir_fd
     assert target.read_bytes() == b"hello"
 
 

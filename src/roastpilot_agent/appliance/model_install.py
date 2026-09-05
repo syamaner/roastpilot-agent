@@ -73,8 +73,9 @@ import ipaddress
 import os
 import re
 import stat
-import tempfile
+import uuid
 from collections.abc import Iterable, Iterator, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -261,26 +262,60 @@ def _resolve_and_validate_source(from_dir_real: Path, relative_path: str) -> Pat
     return final_source
 
 
-def _sha256_of_file(path: Path) -> str:
+def _sha256_of_file(path: Path | str, *, dir_fd: int | None = None) -> str:
+    """Hash one regular file without reading more than the model-file cap.
+
+    The descriptor is opened without following a final symlink.  Both its
+    initial size and its final size must be within the cap and agree with the
+    bytes read, so a file that grows while it is verified cannot turn cached
+    verification into an unbounded read.
+    """
     digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        while True:
-            chunk = fh.read(_CHUNK_SIZE)
-            if not chunk:
-                break
-            digest.update(chunk)
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise ModelInstallError(f"cannot safely verify cached destination {path}") from exc
+    try:
+        initial = os.fstat(fd)
+        if not stat.S_ISREG(initial.st_mode):
+            raise ModelInstallError(f"cached destination {path} is not a regular file")
+        if initial.st_size > _MAX_MODEL_FILE_BYTES:
+            raise ModelInstallError(
+                f"cached destination {path} exceeds the {_MAX_MODEL_FILE_BYTES}-byte per-file cap"
+            )
+        total = 0
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            while True:
+                chunk = fh.read(min(_CHUNK_SIZE, _MAX_MODEL_FILE_BYTES - total + 1))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_MODEL_FILE_BYTES:
+                    raise ModelInstallError(
+                        f"cached destination {path} exceeded the "
+                        f"{_MAX_MODEL_FILE_BYTES}-byte per-file cap"
+                    )
+                digest.update(chunk)
+        final = os.fstat(fd)
+        if final.st_size != total or final.st_size > _MAX_MODEL_FILE_BYTES:
+            raise ModelInstallError(f"cached destination {path} changed while being verified")
+    finally:
+        os.close(fd)
     return digest.hexdigest()
 
 
-def _is_already_valid(target: Path, expected_sha256: str) -> bool:
+def _is_already_valid(
+    target: Path | str, expected_sha256: str, *, dir_fd: int | None = None
+) -> bool:
     """A regular file already exists at ``target`` with the expected digest."""
     try:
-        st = os.lstat(target)
+        st = os.lstat(target, dir_fd=dir_fd)
     except FileNotFoundError:
         return False
     if not stat.S_ISREG(st.st_mode):
         return False
-    return _sha256_of_file(target) == expected_sha256
+    return _sha256_of_file(target, dir_fd=dir_fd) == expected_sha256
 
 
 def _iter_file_bytes(path: Path) -> Iterator[bytes]:
@@ -464,20 +499,68 @@ def _iter_https_bytes(client: httpx.Client, url: str, *, byte_cap: int) -> Itera
     raise ModelInstallError("exceeded the maximum number of redirects while fetching the model")
 
 
-def _stream_to_temp(target: Path, chunks: Iterable[bytes], *, byte_cap: int) -> tuple[Path, str]:
-    """Stream ``chunks`` to a temp file beside ``target``, hashing as it writes.
+def _open_destination_parent(
+    dest_root_real: Path, relative_path: str, *, create: bool
+) -> tuple[int, str]:
+    """Open a manifest file's parent directory beneath ``dest_root_real``.
 
-    The temp file lives in ``target``'s own parent directory so the eventual
+    Every path component is opened relative to an already-verified directory
+    descriptor with ``O_NOFOLLOW``.  Creation, temporary-file placement, and
+    replacement can therefore remain anchored even if an attacker swaps a
+    pathname component for a symlink after the initial path validation.
+    """
+    _validate_relative_path(relative_path)
+    components = relative_path.split("/")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        parent_fd = os.open(dest_root_real, flags)
+    except OSError as exc:
+        raise ModelInstallError("cannot safely open the model destination root") from exc
+    try:
+        for component in components[:-1]:
+            if create:
+                with suppress(FileExistsError):
+                    os.mkdir(component, mode=0o755, dir_fd=parent_fd)
+            try:
+                child_fd = os.open(component, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                raise ModelInstallError(
+                    f"destination directory disappeared for {relative_path!r}"
+                ) from None
+            except OSError as exc:
+                raise ModelInstallError(
+                    f"cannot safely open destination directory for {relative_path!r}"
+                ) from exc
+            os.close(parent_fd)
+            parent_fd = child_fd
+    except BaseException:
+        os.close(parent_fd)
+        raise
+    return parent_fd, components[-1]
+
+
+def _stream_to_temp(
+    parent_fd: int, target_name: str, chunks: Iterable[bytes], *, byte_cap: int
+) -> tuple[str, str]:
+    """Stream ``chunks`` to a descriptor-anchored temp file, hashing as it writes.
+
+    The temp file lives in the already-open destination parent so the eventual
     ``os.replace`` is an atomic same-filesystem rename. Any exception —
-    including exceeding ``byte_cap`` — removes the temp file before
-    propagating.
+    including exceeding ``byte_cap`` — removes the temp file before propagating.
 
     Returns:
-        The temp file path and its streamed SHA-256 hex digest.
+        The temp filename (relative to ``parent_fd``) and its streamed SHA-256
+        hex digest.
     """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".part")
-    tmp_path = Path(tmp_name)
+    tmp_name = f".{target_name}.{uuid.uuid4().hex}.part"
+    fd = os.open(
+        tmp_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=parent_fd,
+    )
     digest = hashlib.sha256()
     total = 0
     try:
@@ -486,20 +569,21 @@ def _stream_to_temp(target: Path, chunks: Iterable[bytes], *, byte_cap: int) -> 
                 total += len(chunk)
                 if total > byte_cap:
                     raise ModelInstallError(
-                        f"download for {target.name!r} exceeded the {byte_cap}-byte per-file cap"
+                        f"download for {target_name!r} exceeded the {byte_cap}-byte per-file cap"
                     )
                 digest.update(chunk)
                 fh.write(chunk)
             fh.flush()
             os.fsync(fh.fileno())
     except BaseException:
-        tmp_path.unlink(missing_ok=True)
+        os.unlink(tmp_name, dir_fd=parent_fd)
         raise
-    return tmp_path, digest.hexdigest()
+    return tmp_name, digest.hexdigest()
 
 
 def _place_verified(
-    target: Path,
+    parent_fd: int,
+    target_name: str,
     chunks: Iterable[bytes],
     *,
     expected_sha256: str,
@@ -513,13 +597,13 @@ def _place_verified(
             ``expected_sha256`` (the temp file is removed; the final path is
             never written before verification) or streaming itself failed.
     """
-    tmp_path, digest_hex = _stream_to_temp(target, chunks, byte_cap=byte_cap)
+    tmp_name, digest_hex = _stream_to_temp(parent_fd, target_name, chunks, byte_cap=byte_cap)
     if digest_hex != expected_sha256:
-        tmp_path.unlink(missing_ok=True)
+        os.unlink(tmp_name, dir_fd=parent_fd)
         raise ModelInstallError(f"digest mismatch for {context!r}")
     try:
-        os.chmod(tmp_path, 0o644)
-        os.replace(tmp_path, target)
+        os.chmod(tmp_name, 0o644, dir_fd=parent_fd, follow_symlinks=False)
+        os.replace(tmp_name, target_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
     except BaseException:
         # A chmod/replace failure (e.g. a permission error, or the target's
         # parent disappearing between verification and rename) must not leave
@@ -527,7 +611,7 @@ def _place_verified(
         # path, not only a digest mismatch. `os.replace` is a single atomic
         # rename on POSIX: if it raises, the file never moved, so the temp
         # path is still the one to remove.
-        tmp_path.unlink(missing_ok=True)
+        os.unlink(tmp_name, dir_fd=parent_fd)
         raise
 
 
@@ -644,57 +728,85 @@ def install_model(
         for manifest_file in manifest_files:
             _validate_digest(manifest_file.sha256, label=manifest_file.relative_path)
             target = _resolve_and_validate_target(dest_root_real, manifest_file.relative_path)
-
-            if _is_already_valid(target, manifest_file.sha256):
-                results.append(
-                    ManifestFileResult(manifest_file.relative_path, manifest_file.sha256, "cached")
+            target_name = manifest_file.relative_path.rsplit("/", maxsplit=1)[-1]
+            try:
+                parent_fd, target_name = _open_destination_parent(
+                    dest_root_real, manifest_file.relative_path, create=False
                 )
-                continue
+            except FileNotFoundError:
+                parent_fd = None
+            try:
+                if parent_fd is not None and _is_already_valid(
+                    target_name, manifest_file.sha256, dir_fd=parent_fd
+                ):
+                    results.append(
+                        ManifestFileResult(
+                            manifest_file.relative_path, manifest_file.sha256, "cached"
+                        )
+                    )
+                    continue
 
-            if verify_only:
-                raise ModelInstallError(
-                    f"verification failed for {manifest_file.relative_path!r}: "
-                    f"missing or digest mismatch at {target}"
-                )
+                if verify_only:
+                    raise ModelInstallError(
+                        f"verification failed for {manifest_file.relative_path!r}: "
+                        f"missing or digest mismatch at {target}"
+                    )
 
-            if from_dir is not None:
-                from_dir_real = Path(os.path.realpath(from_dir))
-                source = _resolve_and_validate_source(from_dir_real, manifest_file.relative_path)
-                try:
-                    source_stat = os.lstat(source)
-                except FileNotFoundError:
-                    raise ModelInstallError(
-                        f"--from-dir is missing required file {manifest_file.relative_path!r}"
-                    ) from None
-                if not stat.S_ISREG(source_stat.st_mode):
-                    raise ModelInstallError(
-                        f"--from-dir source for {manifest_file.relative_path!r} is not a "
-                        "regular file (a symlink, directory, or device is never read)"
+                if from_dir is not None:
+                    from_dir_real = Path(os.path.realpath(from_dir))
+                    source = _resolve_and_validate_source(
+                        from_dir_real, manifest_file.relative_path
+                    )
+                    try:
+                        source_stat = os.lstat(source)
+                    except FileNotFoundError:
+                        raise ModelInstallError(
+                            f"--from-dir is missing required file {manifest_file.relative_path!r}"
+                        ) from None
+                    if not stat.S_ISREG(source_stat.st_mode):
+                        raise ModelInstallError(
+                            f"--from-dir source for {manifest_file.relative_path!r} is not a "
+                            "regular file (a symlink, directory, or device is never read)"
+                        )
+                    if parent_fd is None:
+                        parent_fd, target_name = _open_destination_parent(
+                            dest_root_real, manifest_file.relative_path, create=True
+                        )
+                    _place_verified(
+                        parent_fd,
+                        target_name,
+                        _iter_file_bytes(source),
+                        expected_sha256=manifest_file.sha256,
+                        byte_cap=_MAX_MODEL_FILE_BYTES,
+                        context=manifest_file.relative_path,
+                    )
+                    results.append(
+                        ManifestFileResult(
+                            manifest_file.relative_path, manifest_file.sha256, "local"
+                        )
+                    )
+                    continue
+
+                network_used = True
+                url = _build_url(repo_id, revision, manifest_file.relative_path)
+                if parent_fd is None:
+                    parent_fd, target_name = _open_destination_parent(
+                        dest_root_real, manifest_file.relative_path, create=True
                     )
                 _place_verified(
-                    target,
-                    _iter_file_bytes(source),
+                    parent_fd,
+                    target_name,
+                    _iter_https_bytes(client, url, byte_cap=_MAX_MODEL_FILE_BYTES),
                     expected_sha256=manifest_file.sha256,
                     byte_cap=_MAX_MODEL_FILE_BYTES,
                     context=manifest_file.relative_path,
                 )
                 results.append(
-                    ManifestFileResult(manifest_file.relative_path, manifest_file.sha256, "local")
+                    ManifestFileResult(manifest_file.relative_path, manifest_file.sha256, "fetched")
                 )
-                continue
-
-            network_used = True
-            url = _build_url(repo_id, revision, manifest_file.relative_path)
-            _place_verified(
-                target,
-                _iter_https_bytes(client, url, byte_cap=_MAX_MODEL_FILE_BYTES),
-                expected_sha256=manifest_file.sha256,
-                byte_cap=_MAX_MODEL_FILE_BYTES,
-                context=manifest_file.relative_path,
-            )
-            results.append(
-                ManifestFileResult(manifest_file.relative_path, manifest_file.sha256, "fetched")
-            )
+            finally:
+                if parent_fd is not None:
+                    os.close(parent_fd)
     finally:
         if owned_client:
             client.close()

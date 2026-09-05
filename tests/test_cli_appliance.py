@@ -269,6 +269,38 @@ def test_run_appliance_model_install_oserror_prints_friendly_message(
     assert "Permission denied" in out
 
 
+@pytest.mark.parametrize("option", ["--dest", "--from-dir"])
+def test_run_appliance_model_install_unknown_user_path_is_friendly_failure(
+    option: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Unknown-user ``~name`` expansion remains inside the CLI error boundary."""
+    unknown_user_path = Path("~no_such_roastpilot_user/models")
+    original_expanduser = type(unknown_user_path).expanduser
+
+    def raising_expanduser(path: Path) -> Path:
+        if path == unknown_user_path:
+            raise RuntimeError("unknown user")
+        return original_expanduser(path)
+
+    monkeypatch.setattr(type(unknown_user_path), "expanduser", raising_expanduser)
+    args_values = ["model", "install", "--dest", "/tmp/dest"]
+    if option == "--dest":
+        args_values = ["model", "install", "--dest", str(unknown_user_path)]
+    else:
+        args_values.extend(["--from-dir", str(unknown_user_path)])
+    args = cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
+        args_values
+    )
+
+    exit_code = cli._run_appliance_model_install(args)  # pyright: ignore[reportPrivateUsage]
+
+    assert exit_code == 1
+    out = capsys.readouterr().out
+    assert "model install failed" in out
+    assert "unknown user" in out
+    assert "Traceback" not in out
+
+
 def test_run_appliance_model_install_passes_verify_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
