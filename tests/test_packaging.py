@@ -15,12 +15,16 @@ requires a real Node toolchain to build the SPA.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import sys
+import tomllib
 import venv
 import zipfile
+from email.parser import BytesParser
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -33,6 +37,128 @@ pytestmark = [
 ]
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_DENYLISTED_DISTRIBUTIONS = frozenset({"torch", "torchaudio", "transformers"})
+_PEP503_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
+_EXPECTED_BASE_REQUIREMENT_NAMES = frozenset(
+    {
+        "aiosqlite",
+        "anyio",
+        "fastapi",
+        "httpx",
+        "httpcore",
+        "lxml",
+        "mcp",
+        "pydantic",
+        "pydantic-ai-slim",
+        "pydantic-settings",
+        "filelock",
+        "pyyaml",
+        "pyserial",
+        "sounddevice",
+        "uvicorn",
+        "webencodings",
+        "extruct",
+        "openai",
+        "trafilatura",
+    }
+)
+
+
+def _normalise_pep503_name(raw_name: object) -> str:
+    """Return one PEP-503-normalised distribution name or fail closed."""
+    assert isinstance(raw_name, str), f"distribution name must be a string: {raw_name!r}"
+    assert _PEP503_NAME.fullmatch(raw_name), f"unparseable distribution name: {raw_name!r}"
+    return re.sub(r"[-_.]+", "-", raw_name).lower()
+
+
+def _requirement_name(requirement: object) -> str:
+    """Extract and normalise one simple metadata requirement name fail-closed."""
+    assert isinstance(requirement, str), f"requirement must be a string: {requirement!r}"
+    name = re.split(r"[<>=!~;\[\s]", requirement, maxsplit=1)[0]
+    return _normalise_pep503_name(name)
+
+
+def _wheel_requires_dist(wheel: Path) -> list[str]:
+    """Return all Requires-Dist values from one wheel's METADATA file."""
+    with zipfile.ZipFile(wheel) as archive:
+        metadata_names = [
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        ]
+        assert len(metadata_names) == 1, f"expected one METADATA file, found {metadata_names}"
+        message = BytesParser().parsebytes(archive.read(metadata_names[0]))
+    values = message.get_all("Requires-Dist", [])
+    assert all(isinstance(value, str) for value in values)
+    return values
+
+
+def test_pi_extra_is_the_exact_torch_free_mcp_pin() -> None:
+    """E11-S1 exposes only the ratified appliance extra and exact MCP pin."""
+    with (_REPO_ROOT / "pyproject.toml").open("rb") as config_file:
+        project = cast(dict[str, object], tomllib.load(config_file))
+    metadata = cast(dict[str, object], project["project"])
+    extras = cast(dict[str, object], metadata["optional-dependencies"])
+    assert extras == {
+        "anthropic": ["pydantic-ai-slim[anthropic]>=1.0,<2", "anthropic<1"],
+        "google": ["pydantic-ai-slim[google]>=1.0,<2"],
+        "all-providers": [
+            "pydantic-ai-slim[anthropic]>=1.0,<2",
+            "anthropic<1",
+            "pydantic-ai-slim[google]>=1.0,<2",
+        ],
+        "pi": ["coffee-roaster-mcp==0.2.0"],
+    }
+    pi_requirement = cast(list[str], extras["pi"])
+    assert len(pi_requirement) == 1
+    assert _requirement_name(pi_requirement[0]) == "coffee-roaster-mcp"
+    assert pi_requirement[0] == "coffee-roaster-mcp==0.2.0"
+
+
+def test_pi_extra_metadata_preserves_a_lean_base_wheel(built_wheel: Path) -> None:
+    """Wheel metadata marks only the exact Pi pin and preserves base requirements."""
+    requirements = _wheel_requires_dist(built_wheel)
+    pi_requirements = [
+        requirement
+        for requirement in requirements
+        if requirement.partition(";")[2].strip() == "extra == 'pi'"
+    ]
+    assert pi_requirements == ["coffee-roaster-mcp==0.2.0; extra == 'pi'"]
+    assert {_requirement_name(requirement) for requirement in pi_requirements} == {
+        "coffee-roaster-mcp"
+    }
+
+    unconditional = [requirement for requirement in requirements if ";" not in requirement]
+    unconditional_names = {_requirement_name(requirement) for requirement in unconditional}
+    assert unconditional_names == _EXPECTED_BASE_REQUIREMENT_NAMES
+    assert _DENYLISTED_DISTRIBUTIONS.isdisjoint(
+        {_requirement_name(requirement) for requirement in requirements}
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw_name", "expected"),
+    [
+        ("Torch", "torch"),
+        ("torchaudio", "torchaudio"),
+        ("torch_audio", "torch-audio"),
+        ("TRANSFORMERS", "transformers"),
+        ("torch.audio", "torch-audio"),
+        ("pytorch-lightning", "pytorch-lightning"),
+        ("transformers-stream-generator", "transformers-stream-generator"),
+    ],
+)
+def test_pep503_normaliser_uses_exact_distribution_names(raw_name: str, expected: str) -> None:
+    """Denylist matching is PEP-503 exact, never a substring heuristic."""
+    normalised = _normalise_pep503_name(raw_name)
+    assert normalised == expected
+    assert (normalised in _DENYLISTED_DISTRIBUTIONS) is (
+        expected in {"torch", "torchaudio", "transformers"}
+    )
+
+
+def test_pep503_normaliser_rejects_an_unparseable_name() -> None:
+    """Malformed distribution names cannot silently bypass the appliance denylist."""
+    with pytest.raises(AssertionError, match="unparseable distribution name"):
+        _normalise_pep503_name("torch audio")
 
 
 @pytest.fixture

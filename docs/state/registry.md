@@ -1197,12 +1197,11 @@ mark-ready/reopen draft-cycle workaround for metadata edits.**
 > *the scores find the symptom, only the reasoning found the cause*; #281 (bounded-concurrency
 > replay) queued on top. Plan: D40/D41 in `plan.md` §1.
 
-- Epic file: `docs/epics/E11-packaging.md` — **D28 gate ✅ CLEARED (28 Jun 2026); now
-  gated only on D27 (torch-free chain).** E10 closed 11 Jun 2026. E11 is next in order;
-  S1/S2 contract-buildable scaffolding is startable on operator opt-in — do **not** begin
-  S3 or pin/ship the `[pi]` extra until the torch-free `coffee-roaster-mcp` (**D27**:
-  `coffee-first-crack-detection#54` → `coffee-roaster-mcp#157`, cross-repo) lands. See
-  **D28**.
+- Epic file: `docs/epics/E11-packaging.md` — **E11-S1's D27 dependency/publication
+  gate is ✅ CLEARED by published `coffee-roaster-mcp==0.2.0`; this PR delivers the
+  exact `[pi]` extra.** E11-S2 and E11-S3 remain not started. `coffee-roaster-mcp#157`
+  and #194 remain open for separate hardware and acceptance boundaries; E11-S1 package
+  delivery is not Pi hardware-readiness or acceptance evidence. See **D28**.
 - Project: RoastPilot (GitHub user project, owner `syamaner`)
 - Repository: `syamaner/roastpilot-agent`
 - Package: `roastpilot-agent`
@@ -1629,6 +1628,17 @@ findings folded + 1 evidence-based refutation across the batch; zero un-triaged 
 Remaining backlog unchanged: #521 (tasting-gated), #396 (credits-gated), #137's extra half +
 MCP#194/#157 (Pi-5-gated), E11-S2/S3, E12 (operator-supervised), #380 (wrong-premise candidate
 vs the fc-detector-lag no-magic-offset decision — flagged, not closed).
+
+**5 Sep 2026 — #137 E11-S1 package completion (supersedes only the stale #137 blocking
+prose below):** the package publishes the exact `pi = ["coffee-roaster-mcp==0.2.0"]`
+extra while the development group deliberately remains at 0.1.13 for its mock-driver
+mirrors and fixtures. CI keeps those conflicting pins in separate venvs: x86 proves the
+base wheel; a bounded full-only native hosted ARM64 job builds its own wheel, installs
+`wheel[pi]`, verifies `aarch64`, the exact MCP pin, no `torch`/`torchaudio`/`transformers`,
+and the CLI plus replay-mode bundled SPA. This is hosted package compatibility evidence,
+not Raspberry Pi hardware validation. E11-S1 is done; E11-S2 and E11-S3 remain not started;
+the epic remains in progress. This does not state that `coffee-roaster-mcp#157` or #194 is
+closed, and does not change their separate hardware-validation boundaries.
 
 **12–13 Jul 2026 — OVERNIGHT TEAM BATCH + FOLLOW-UP BATCH 2 COMPLETE (18 PRs, 3 repos,
 MCP v0.1.13).** Batch 1 (four tracks: fe-523 / be-signals / mcp-audio / fc-docs — 13 PRs: agent

@@ -6189,6 +6189,7 @@ def test_docs_reading_tests_carry_the_exact_docs_marker_and_nothing_else() -> No
         _REPO / "tests" / "test_agent_worktree_controls.py",
         _REPO / "tests" / "test_capture_agent_usage.py",
         _REPO / "tests" / "test_config.py",
+        _REPO / "tests" / "test_pytest_governance.py",
         _REPO / "tests" / "test_worktree_gate_recipe.py",
     }
     assert (
@@ -11315,6 +11316,7 @@ _EXACT_CLASSIFY_CONSUMERS = frozenset(
         "pytest-serial",
         "pytest-stress",
         "package",
+        "package-arm64",
         "coverage",
         "docs-fastpath",
         "codecov-upload",
@@ -11338,6 +11340,7 @@ _FULL_ONLY_WORKERS = frozenset(
         "pytest-serial",
         "pytest-stress",
         "package",
+        "package-arm64",
         "coverage",
         "web-unit-worker",
         "web-snapshots-worker",
