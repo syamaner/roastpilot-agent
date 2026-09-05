@@ -7,7 +7,9 @@ Hardware-free and network-free throughout: every HTTPS fetch goes through
 
 import hashlib
 import json
+import os
 import stat
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 import httpx
@@ -19,6 +21,32 @@ from roastpilot_agent.appliance.model_manifest import ManifestFile
 
 _REVISION = "a" * 40
 _REPO_ID = "acme/test-model"
+
+
+class _LazyByteStream(httpx.SyncByteStream):
+    """A genuinely lazy, not-yet-consumed byte stream for test responses.
+
+    ``httpx.Response(status, content=...)`` eagerly reads (and, per a
+    ``Content-Encoding`` header, eagerly *decodes*) the body the moment the
+    response is constructed — before this module's own code ever runs. That
+    masks two things this module must control itself: rejecting an
+    undesired ``Content-Encoding`` before any decoding is attempted, and
+    calling ``response.iter_raw()`` (which requires an unconsumed stream,
+    unlike ``iter_bytes()``'s fully-materialized-content fallback). Building
+    the response with ``stream=`` instead reproduces what a real,
+    not-yet-read network response looks like.
+    """
+
+    def __init__(self, chunks: Iterable[bytes]) -> None:
+        self._chunks = chunks
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield from self._chunks
+
+
+def _ok_response(content: bytes, *, headers: dict[str, str] | None = None) -> httpx.Response:
+    """Build a lazy-streamed ``200`` response (see :class:`_LazyByteStream`)."""
+    return httpx.Response(200, headers=headers or {}, stream=_LazyByteStream([content]))
 
 
 def _make_manifest(contents: dict[str, bytes]) -> tuple[ManifestFile, ...]:
@@ -43,7 +71,7 @@ def _serving_transport(
         relative = url[len(prefix) :]
         if relative not in contents:
             return httpx.Response(404)
-        return httpx.Response(200, content=contents[relative])
+        return _ok_response(contents[relative])
 
     return httpx.MockTransport(handler)
 
@@ -76,9 +104,7 @@ def test_digest_mismatch_removes_partial_and_writes_nothing_final(tmp_path: Path
     correct = b"hello-world-bytes"
     wrong = correct[:-1] + bytes([correct[-1] ^ 0x01])
     manifest = _make_manifest({"a/file1.bin": correct})
-    client = httpx.Client(
-        transport=httpx.MockTransport(lambda _r: httpx.Response(200, content=wrong))
-    )
+    client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(wrong)))
     dest = tmp_path / "dest"
 
     with pytest.raises(ModelInstallError, match="digest mismatch"):
@@ -188,6 +214,84 @@ def test_from_dir_copy_places_with_correct_mode(tmp_path: Path) -> None:
     assert stat.S_IMODE(placed.stat().st_mode) == 0o644
 
 
+def test_from_dir_symlinked_subdirectory_escape_is_rejected(tmp_path: Path) -> None:
+    """A directory symlink inside ``--from-dir`` that points outside it is
+    caught the same way the destination-side escape is (directive 4): the
+    source root gets exactly the same containment strictness as the
+    destination root."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file1.bin").write_bytes(b"do-not-read")
+    from_dir = tmp_path / "src"
+    from_dir.mkdir()
+    (from_dir / "evil").symlink_to(outside)
+    manifest = _make_manifest({"evil/file1.bin": b"do-not-read"})
+    dest = tmp_path / "dest"
+
+    with pytest.raises(ModelInstallError, match="escapes the --from-dir root"):
+        install_model(
+            dest, from_dir=from_dir, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION
+        )
+
+    assert not (dest / "evil").exists()
+
+
+def test_from_dir_symlinked_source_file_is_rejected_as_non_regular(tmp_path: Path) -> None:
+    """A manifest file that resolves to a symlink inside ``--from-dir`` is
+    refused — never read through — even when the symlink target holds the
+    exact expected bytes (directive 4)."""
+    real = tmp_path / "real.bin"
+    real.write_bytes(b"payload")
+    from_dir = tmp_path / "src"
+    (from_dir / "a").mkdir(parents=True)
+    (from_dir / "a" / "file1.bin").symlink_to(real)
+    manifest = _make_manifest({"a/file1.bin": b"payload"})
+    dest = tmp_path / "dest"
+
+    with pytest.raises(ModelInstallError, match="not a regular file"):
+        install_model(
+            dest, from_dir=from_dir, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION
+        )
+
+    assert not (dest / "a" / "file1.bin").exists()
+
+
+def test_from_dir_directory_source_is_rejected_as_non_regular(tmp_path: Path) -> None:
+    """A manifest file that resolves to a directory inside ``--from-dir`` is
+    refused (directive 4)."""
+    from_dir = tmp_path / "src"
+    (from_dir / "a" / "file1.bin").mkdir(parents=True)
+    manifest = _make_manifest({"a/file1.bin": b"payload"})
+    dest = tmp_path / "dest"
+
+    with pytest.raises(ModelInstallError, match="not a regular file"):
+        install_model(
+            dest, from_dir=from_dir, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION
+        )
+
+
+def test_cached_destination_wins_even_with_an_invalid_from_dir(tmp_path: Path) -> None:
+    """A valid cached destination is used with zero I/O against ``--from-dir``
+    — an invalid/missing ``--from-dir`` never surfaces as an error when every
+    file is already correctly placed (directive 6a)."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    dest = tmp_path / "dest"
+    (dest / "a").mkdir(parents=True)
+    (dest / "a" / "file1.bin").write_bytes(b"hello")
+    missing_from_dir = tmp_path / "does-not-exist-at-all"
+
+    summary = install_model(
+        dest,
+        from_dir=missing_from_dir,
+        manifest_files=manifest,
+        repo_id=_REPO_ID,
+        revision=_REVISION,
+    )
+
+    assert summary.files[0].source == "cached"
+    assert summary.network_used is False
+
+
 # --- T5: closed-grammar rejections, parametrised -----------------------------
 
 
@@ -261,6 +365,20 @@ def test_directory_at_destination_is_rejected(tmp_path: Path) -> None:
     manifest = _make_manifest({"a/file1.bin": b"hello"})
     dest = tmp_path / "dest"
     (dest / "a" / "file1.bin").mkdir(parents=True)
+
+    with pytest.raises(ModelInstallError, match="non-regular-file"):
+        install_model(dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="os.mkfifo is POSIX-only")
+def test_fifo_at_destination_is_rejected(tmp_path: Path) -> None:
+    """A portable non-regular entry (a FIFO, where the platform supports one)
+    at the destination is refused exactly like a symlink or directory
+    (directive 6c)."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    dest = tmp_path / "dest"
+    (dest / "a").mkdir(parents=True)
+    os.mkfifo(dest / "a" / "file1.bin")
 
     with pytest.raises(ModelInstallError, match="non-regular-file"):
         install_model(dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION)
@@ -366,15 +484,18 @@ def test_malformed_redirect_location_aborts(tmp_path: Path) -> None:
     assert not (dest / "a" / "file1.bin").exists()
 
 
-def test_cross_host_https_redirect_is_followed(tmp_path: Path) -> None:
-    """Integrity is the committed digest, not the transport host — a
-    same-scheme cross-host redirect must still be followed."""
+@pytest.mark.parametrize("cdn_host", ["hf.co", "cdn-lfs.hf.co", "cdn-lfs-us-1.hf.co"])
+def test_allowed_cross_host_cdn_redirect_is_followed(tmp_path: Path, cdn_host: str) -> None:
+    """A same-scheme redirect to a host within the small HF-operated policy
+    (``huggingface.co``, ``hf.co``, or any ``*.hf.co`` subdomain) must still
+    be followed — host trust and byte-integrity are independent controls,
+    and a legitimate CDN redirect satisfies both."""
     manifest = _make_manifest({"a/file1.bin": b"hello"})
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "cdn.example":
-            return httpx.Response(200, content=b"hello")
-        return httpx.Response(302, headers={"location": "https://cdn.example/a/file1.bin"})
+        if request.url.host == cdn_host:
+            return _ok_response(b"hello")
+        return httpx.Response(302, headers={"location": f"https://{cdn_host}/a/file1.bin"})
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     summary = install_model(
@@ -385,6 +506,58 @@ def test_cross_host_https_redirect_is_followed(tmp_path: Path) -> None:
         http_client=client,
     )
     assert summary.files[0].source == "fetched"
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://internal.example/a/file1.bin",
+        "https://evil.hf.co.attacker.example/a/file1.bin",
+        "https://notreallyhf.co/a/file1.bin",
+        "https://203.0.113.7/a/file1.bin",
+        "https://[2001:db8::1]/a/file1.bin",
+        "https://user:pass@hf.co/a/file1.bin",
+        "https://hf.co/a/file1.bin#fragment",
+        "https://hf.co:8443/a/file1.bin",
+    ],
+    ids=[
+        "arbitrary-internal-host",
+        "hf.co-lookalike-suffix",
+        "hf.co-lookalike-prefix",
+        "ipv4-literal",
+        "ipv6-literal",
+        "userinfo",
+        "fragment",
+        "non-default-port",
+    ],
+)
+def test_disallowed_redirect_destination_aborts_with_no_file_written(
+    tmp_path: Path, location: str
+) -> None:
+    """Every disallowed redirect-hop shape is rejected before the hop is made:
+    an arbitrary/internal host, a hostname that merely *looks* like it is
+    within the ``hf.co`` policy (suffix/prefix lookalikes), an IP literal
+    (v4 or v6), embedded userinfo, a fragment, and a non-default port — none
+    ever leaves a final or partial file behind."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    dest = tmp_path / "dest"
+
+    def redirect_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": location})
+
+    client = httpx.Client(transport=httpx.MockTransport(redirect_handler))
+
+    with pytest.raises(ModelInstallError):
+        install_model(
+            dest,
+            manifest_files=manifest,
+            repo_id=_REPO_ID,
+            revision=_REVISION,
+            http_client=client,
+        )
+
+    assert not (dest / "a" / "file1.bin").exists()
+    assert list(dest.rglob("*.part")) == []
 
 
 def test_unexpected_http_status_aborts(tmp_path: Path) -> None:
@@ -400,6 +573,100 @@ def test_unexpected_http_status_aborts(tmp_path: Path) -> None:
         )
 
 
+# --- Content-Encoding / declared Content-Length rejection (transparent-decompression) --
+
+
+def test_response_with_content_encoding_is_rejected(tmp_path: Path) -> None:
+    """A response declaring any ``Content-Encoding`` is refused outright,
+    never transparently decoded, even though ``Accept-Encoding: identity``
+    was sent — a byte-cap check that only inspects the wire bytes must never
+    be bypassable by a compressed body that expands after decoding."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    dest = tmp_path / "dest"
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _r: _ok_response(b"hello", headers={"content-encoding": "gzip"})
+        )
+    )
+
+    with pytest.raises(ModelInstallError, match="Content-Encoding"):
+        install_model(
+            dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
+        )
+
+    assert not (dest / "a" / "file1.bin").exists()
+    assert list(dest.rglob("*.part")) == []
+
+
+def test_response_with_oversized_declared_content_length_is_rejected_before_reading_body(
+    tmp_path: Path,
+) -> None:
+    """A declared ``Content-Length`` over the byte cap is rejected before any
+    body bytes are read — a cheap pre-check ahead of the streaming backstop."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    dest = tmp_path / "dest"
+    oversized = model_install_module._MAX_MODEL_FILE_BYTES + 1  # pyright: ignore[reportPrivateUsage]
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _r: httpx.Response(
+                200, headers={"content-length": str(oversized)}, content=b"hello"
+            )
+        )
+    )
+
+    with pytest.raises(ModelInstallError, match="Content-Length"):
+        install_model(
+            dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
+        )
+
+    assert not (dest / "a" / "file1.bin").exists()
+    assert list(dest.rglob("*.part")) == []
+
+
+def test_response_with_valid_in_cap_content_length_is_fetched_normally(tmp_path: Path) -> None:
+    """A declared ``Content-Length`` that is a valid integer within the byte
+    cap passes the pre-check and the file is fetched and placed normally —
+    the pre-check must never reject a legitimate response."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    dest = tmp_path / "dest"
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _r: _ok_response(b"hello", headers={"content-length": "5"})
+        )
+    )
+
+    summary = install_model(
+        dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
+    )
+
+    assert summary.files[0].source == "fetched"
+    assert (dest / "a" / "file1.bin").read_bytes() == b"hello"
+
+
+def test_response_with_non_numeric_content_length_falls_back_to_the_streaming_cap(
+    tmp_path: Path,
+) -> None:
+    """A ``Content-Length`` header that is not a valid integer is ignored by
+    the declared-length pre-check (never crashes it) and the file still
+    places correctly once the real streamed bytes are hashed and verified —
+    the streaming cap in :func:`_stream_to_temp` remains the authoritative
+    backstop for this case."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    dest = tmp_path / "dest"
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _r: _ok_response(b"hello", headers={"content-length": "not-a-number"})
+        )
+    )
+
+    summary = install_model(
+        dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
+    )
+
+    assert summary.files[0].source == "fetched"
+    assert (dest / "a" / "file1.bin").read_bytes() == b"hello"
+
+
 # --- T7: response longer than the byte cap ----------------------------------
 
 
@@ -408,9 +675,7 @@ def test_response_exceeding_byte_cap_aborts_and_removes_partial(
 ) -> None:
     monkeypatch.setattr(model_install_module, "_MAX_MODEL_FILE_BYTES", 8)
     manifest = _make_manifest({"a/file1.bin": b"x" * 100})
-    client = httpx.Client(
-        transport=httpx.MockTransport(lambda _r: httpx.Response(200, content=b"x" * 100))
-    )
+    client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"x" * 100)))
     dest = tmp_path / "dest"
 
     with pytest.raises(ModelInstallError, match="cap"):
@@ -458,9 +723,7 @@ def test_chmod_failure_after_digest_verification_removes_temp_file(
         raise OSError("simulated chmod failure")
 
     monkeypatch.setattr("os.chmod", failing_chmod)
-    client = httpx.Client(
-        transport=httpx.MockTransport(lambda _r: httpx.Response(200, content=b"hello"))
-    )
+    client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"hello")))
 
     with pytest.raises(OSError, match="simulated chmod failure"):
         install_model(
@@ -484,9 +747,7 @@ def test_replace_failure_after_digest_verification_removes_temp_file(
         raise OSError("simulated replace failure")
 
     monkeypatch.setattr("os.replace", failing_replace)
-    client = httpx.Client(
-        transport=httpx.MockTransport(lambda _r: httpx.Response(200, content=b"hello"))
-    )
+    client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"hello")))
 
     with pytest.raises(OSError, match="simulated replace failure"):
         install_model(
@@ -495,6 +756,39 @@ def test_replace_failure_after_digest_verification_removes_temp_file(
 
     assert not (dest / "a" / "file1.bin").exists()
     assert list(dest.rglob("*.part")) == []
+
+
+def test_replace_is_called_with_the_temp_file_beside_the_exact_final_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``os.replace`` is called with the streamed temp file sitting beside
+    (same parent directory as) the exact final target path — never some
+    other location — so the rename really is the same-filesystem atomic
+    placement the module docstring promises (directive 6e)."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    dest = tmp_path / "dest"
+    target = dest / "a" / "file1.bin"
+    calls: list[tuple[Path, Path]] = []
+    original_replace = os.replace
+
+    def spying_replace(src: str, dst: str) -> None:
+        calls.append((Path(src), Path(dst)))
+        original_replace(src, dst)
+
+    monkeypatch.setattr("os.replace", spying_replace)
+    client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"hello")))
+
+    summary = install_model(
+        dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
+    )
+
+    assert summary.files[0].source == "fetched"
+    assert len(calls) == 1
+    src, dst = calls[0]
+    assert dst == target
+    assert src.parent == target.parent
+    assert src != target
+    assert target.read_bytes() == b"hello"
 
 
 # --- verify-only -------------------------------------------------------------
@@ -569,6 +863,129 @@ def test_install_model_owns_and_closes_its_own_client_when_unused(tmp_path: Path
 
     summary = install_model(dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION)
     assert summary.network_used is False
+
+
+def test_internal_http_client_disables_environment_trust(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The internally-owned production ``httpx.Client`` — the one
+    ``install_model`` constructs itself when no ``http_client`` is supplied —
+    is built with ``trust_env=False`` so it never inherits an ambient
+    HTTP_PROXY/HTTPS_PROXY/NO_PROXY or CA-bundle environment value
+    (directive 3). Captured via a constructor spy so no real network request
+    is ever performed: the spy substitutes a ``MockTransport`` before
+    delegating to the real ``httpx.Client.__init__``."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    dest = tmp_path / "dest"
+    captured_kwargs: dict[str, object] = {}
+    real_client_cls = httpx.Client
+
+    def spying_client(*args: object, **kwargs: object) -> httpx.Client:
+        captured_kwargs.update(kwargs)
+        kwargs = dict(kwargs)
+        kwargs["transport"] = httpx.MockTransport(lambda _r: _ok_response(b"hello"))
+        return real_client_cls(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(httpx, "Client", spying_client)
+
+    summary = install_model(dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION)
+
+    assert captured_kwargs.get("trust_env") is False
+    assert summary.files[0].source == "fetched"
+
+
+def test_outbound_request_has_no_credential_and_expected_anonymous_headers(tmp_path: Path) -> None:
+    """The one real network call this module ever makes carries no
+    ``Authorization``/credential header, and does carry the fixed anonymous
+    headers: ``Accept-Encoding: identity`` and the expected User-Agent
+    (directive 5)."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    captured_headers: list[httpx.Headers] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_headers.append(request.headers)
+        return _ok_response(b"hello")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    install_model(
+        tmp_path / "dest",
+        manifest_files=manifest,
+        repo_id=_REPO_ID,
+        revision=_REVISION,
+        http_client=client,
+    )
+
+    assert len(captured_headers) == 1
+    headers = captured_headers[0]
+    assert "authorization" not in headers
+    assert "cookie" not in headers
+    assert all("token" not in name.lower() for name in headers)
+    assert headers["accept-encoding"] == "identity"
+    assert headers["user-agent"] == "roastpilot-agent-appliance-model-install/1"
+
+
+def test_configured_byte_cap_is_at_least_90_000_000_bytes() -> None:
+    """The per-file byte cap must comfortably exceed the pinned int8 model's
+    real size (~89.9 MB, `roastpilot-agent/plan.md:30`) — directive 6d."""
+    assert (
+        model_install_module._MAX_MODEL_FILE_BYTES  # pyright: ignore[reportPrivateUsage]
+        >= 90_000_000
+    )
+
+
+# --- #138 invariant: cleanly separate from the roast advisor / control path --
+
+
+def test_model_install_module_does_not_directly_import_controller_safety_or_mcp_client() -> None:
+    """Static check on this module's own import statements (directive 6f,
+    mirroring the established #573 pattern in ``test_bean_sourcing.py``)."""
+    import ast
+
+    tree = ast.parse(Path(str(model_install_module.__file__)).read_text())
+    imported_modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported_modules.add(node.module)
+        elif isinstance(node, ast.Import):
+            imported_modules.update(alias.name for alias in node.names)
+    forbidden = {
+        "roastpilot_agent.controller",
+        "roastpilot_agent.safety",
+        "roastpilot_agent.mcp_client",
+    }
+    assert imported_modules.isdisjoint(forbidden)
+
+
+def test_model_install_never_transitively_imports_controller_safety_or_mcp_client() -> None:
+    """Authoritative transitive-import check, run in a FRESH subprocess so an
+    already-imported module elsewhere in this test session cannot produce a
+    false pass (mirrors ``test_bean_sourcing.py``'s established #573
+    pattern)."""
+    import subprocess
+    import sys
+
+    script = (
+        "import sys\n"
+        "import roastpilot_agent.appliance.model_install\n"
+        "loaded = {m for m in sys.modules if m.startswith('roastpilot_agent.')}\n"
+        "forbidden = {\n"
+        "    'roastpilot_agent.controller',\n"
+        "    'roastpilot_agent.safety',\n"
+        "    'roastpilot_agent.mcp_client',\n"
+        "}\n"
+        "hit = sorted(loaded & forbidden)\n"
+        "print(','.join(hit))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == "", (
+        "appliance.model_install transitively imported forbidden modules: "
+        f"{result.stdout.strip()}\nstderr: {result.stderr}"
+    )
 
 
 # --- direct unit coverage for small private helpers --------------------------

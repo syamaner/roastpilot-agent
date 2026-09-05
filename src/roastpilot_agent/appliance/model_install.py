@@ -8,27 +8,45 @@ so the appliance can be prepared fully air-gapped via ``--from-dir``.
 **External-input surface.** When neither a cached copy nor ``--from-dir``
 satisfies a manifest file, this module fetches it anonymously over HTTPS from
 ``huggingface.co``. This is why the story requires ``security-reviewer``: the
-fetched bytes originate outside this process. The mitigations below are the
-whole of the trust model:
+fetched bytes originate outside this process. Digest verification alone does
+not make an arbitrary redirect destination safe — a byte-for-byte match only
+proves *what* was served, never *whether the connection should have been made
+at all* (e.g. exfiltrating the signed query string on a redirect to an
+attacker-controlled host, or a DNS/route-level MITM against an unpinned
+internal address). Host trust and byte-integrity are therefore two
+independent, both-mandatory controls. The mitigations below are the whole of
+the trust model:
 
 - The fetch URL is built **only** from the closed manifest fields (a
   40-hex-char revision, a validated relative path, and the fixed
   ``owner/name`` repo id) — never from any operator-supplied string, so there
   is no URL-injection surface.
-- Every byte is verified against the manifest's committed SHA-256 digest
-  before it is ever visible at its final path (stream-to-temp, verify,
-  ``os.replace``). **Cross-host redirects are deliberately permitted**: a
-  redirect may legitimately land on a CDN host different from
-  ``huggingface.co``. That is safe here specifically because integrity is
-  established by the committed digest, not by transport host trust — a
-  redirect to any host still has to serve exactly the pinned bytes or the
-  install fails closed. Only the *scheme* (``https`` only) and the *number*
-  of hops (bounded) are policed on the redirect chain itself.
-  Downloaded bytes are never executed, unpacked, or made executable.
+- **Every hop — the initial request and every redirect — must land on a
+  fixed, small Hugging-Face-operated hostname policy**: exactly
+  ``huggingface.co``, exactly ``hf.co``, or a subdomain of ``hf.co`` (the
+  CDN hosts HF's model-file redirects legitimately use). An IP-literal host,
+  a non-default port, embedded userinfo, a URL fragment, or any other
+  hostname is rejected *before* that hop is ever made — regardless of what
+  bytes the far end would have served. A signed query string on an allowed
+  CDN redirect is preserved (never stripped) so the redirect still resolves,
+  but it is never included in any error message this module raises.
+- Every byte is **also** verified against the manifest's committed SHA-256
+  digest before it is ever visible at its final path (stream-to-temp, verify,
+  ``os.replace``) — the second, independent control. Downloaded bytes are
+  never executed, unpacked, or made executable.
 - The request is anonymous: no ``Authorization`` header is ever sent and no
-  token is ever read from the environment.
-- A per-file byte cap, connect/read timeouts, and a bounded redirect chain
+  token is ever read from the environment; ``Accept-Encoding: identity`` is
+  sent and any response carrying a ``Content-Encoding`` header is rejected
+  outright (a transparently-decompressed body could otherwise expand past
+  every byte-cap check that inspects the wire bytes).
+- A per-file byte cap (checked against a declared ``Content-Length`` before
+  any body bytes are read, and re-checked against the actual streamed byte
+  count as a backstop), connect/read timeouts, and a bounded redirect chain
   (the "total attempt bound") each fail closed and remove any partial file.
+- The internally-owned production ``httpx.Client`` is constructed with
+  ``trust_env=False`` so no ambient ``HTTP_PROXY``/``HTTPS_PROXY``/
+  ``NO_PROXY`` or CA-bundle environment variable can redirect or intercept
+  this traffic. A caller-supplied test/mock client is unaffected.
 
 **MCP layout coupling.** The manifest's relative paths
 (``onnx/int8/model_quantized.onnx`` / ``onnx/int8/preprocessor_config.json``)
@@ -51,6 +69,7 @@ the MCP server's expected root layout with no MCP-side change.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import re
 import stat
@@ -69,11 +88,24 @@ from roastpilot_agent.appliance.model_manifest import (
     ManifestFile,
 )
 
-#: Anonymous, fixed User-Agent. No credential, token, or environment value is
-#: ever placed in a request header.
+#: Anonymous, fixed User-Agent, and ``identity`` encoding only. No credential,
+#: token, or environment value is ever placed in a request header, and
+#: ``Accept-Encoding: identity`` (plus the response-side check in
+#: :func:`_iter_https_bytes`) closes the transparent-decompression risk: a
+#: byte-cap check that only ever sees the wire bytes cannot be bypassed by a
+#: compressed body that expands after the cap has already been satisfied.
 _ANONYMOUS_HEADERS: Final[dict[str, str]] = {
     "user-agent": "roastpilot-agent-appliance-model-install/1",
+    "accept-encoding": "identity",
 }
+
+#: Hosts permitted for the initial request and every redirect hop. Exactly
+#: ``huggingface.co`` (the pinned origin) plus ``hf.co`` and its subdomains
+#: (the CDN hosts Hugging Face's own model-file redirects legitimately land
+#: on) — a small, explicit, Hugging-Face-operated policy, not "any host that
+#: serves the right bytes" (see the module docstring's trust model).
+_ALLOWED_REDIRECT_HOSTS_EXACT: Final[frozenset[str]] = frozenset({"huggingface.co", "hf.co"})
+_ALLOWED_REDIRECT_HOST_SUFFIX: Final[str] = ".hf.co"
 
 #: At most this many redirect hops are followed for one file fetch (matches
 #: the existing bean-sourcing fetch's bound, ``bean_sourcing.py``'s
@@ -192,6 +224,43 @@ def _resolve_and_validate_target(dest_root_real: Path, relative_path: str) -> Pa
     return final_target
 
 
+def _resolve_and_validate_source(from_dir_real: Path, relative_path: str) -> Path:
+    """Resolve ``relative_path`` under ``from_dir_real``, fail closed on escape.
+
+    Mirrors :func:`_resolve_and_validate_target`'s containment logic for the
+    ``--from-dir`` source root — the destination boundary and the source
+    boundary are validated exactly as strictly. The caller separately checks
+    that the resolved path, once it exists, is a regular file (never a
+    symlink, directory, or device); this function only resolves and checks
+    containment, since a missing source is a distinct, expected error
+    (:func:`install_model`'s "missing required file" message).
+
+    Args:
+        from_dir_real: The ``--from-dir`` root, already
+            ``os.path.realpath``-resolved.
+        relative_path: A manifest-declared relative path (already
+            grammar-validated by the destination-side resolution earlier in
+            the same per-file iteration).
+
+    Returns:
+        The resolved source path (not required to exist yet).
+
+    Raises:
+        ModelInstallError: The resolved location escapes ``from_dir_real``.
+    """
+    _validate_relative_path(relative_path)
+    candidate = from_dir_real.joinpath(*relative_path.split("/"))
+    resolved_parent = Path(os.path.realpath(candidate.parent))
+    final_source = resolved_parent / candidate.name
+    try:
+        final_source.relative_to(from_dir_real)
+    except ValueError as exc:
+        raise ModelInstallError(
+            f"--from-dir source for {relative_path!r} escapes the --from-dir root"
+        ) from exc
+    return final_source
+
+
 def _sha256_of_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as fh:
@@ -232,23 +301,115 @@ def _build_url(repo_id: str, revision: str, relative_path: str) -> str:
     return f"https://huggingface.co/{repo_id}/resolve/{revision}/{relative_path}"
 
 
-def _iter_https_bytes(client: httpx.Client, url: str) -> Iterator[bytes]:
+def _validate_fetch_url(url: httpx.URL) -> None:
+    """Reject any hop (initial request or redirect) outside the trust model.
+
+    This is the redirect-destination policy referenced by the module
+    docstring: HTTPS-only, a fixed small Hugging-Face-operated hostname
+    allow-list (``huggingface.co``, ``hf.co``, or a subdomain of ``hf.co``),
+    no embedded userinfo, no fragment, no IP-literal host, and no non-default
+    port. Every check runs *before* the hop is made — a host that would have
+    served the exact pinned bytes is still rejected if it fails this policy,
+    because host trust and byte-integrity are independent controls (see the
+    module docstring).
+
+    Args:
+        url: The URL about to be requested (the initial built URL, or a
+            redirect target already joined against the prior URL).
+
+    Raises:
+        ModelInstallError: Any check fails. The message never includes the
+            URL itself (so it can never leak a signed query string or
+            embedded credential) — only the fixed reason and, where safe,
+            the offending hostname.
+    """
+    if url.scheme != "https":
+        raise ModelInstallError("refusing a non-https URL while fetching the model")
+    if url.userinfo:
+        raise ModelInstallError("refusing a URL with embedded userinfo while fetching the model")
+    if url.fragment:
+        raise ModelInstallError("refusing a URL with a fragment while fetching the model")
+    if url.port is not None:
+        raise ModelInstallError("refusing a URL with a non-default port while fetching the model")
+    host = url.host
+    if not host:  # pragma: no cover - defensive: an absolute https URL always
+        # has a host by the time it reaches here. The initial URL is always
+        # `_build_url`'s fixed `huggingface.co` origin, and `httpx.URL.join()`
+        # (used for every redirect hop) follows RFC 3986 §5.3: an empty
+        # authority component in the reference is resolved as "keep the
+        # base's authority", so a redirect Location cannot actually produce
+        # an empty host here (confirmed empirically against httpx 0.28).
+        raise ModelInstallError("refusing a URL with no hostname while fetching the model")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ModelInstallError("refusing an IP-literal host while fetching the model")
+    if host in _ALLOWED_REDIRECT_HOSTS_EXACT or host.endswith(_ALLOWED_REDIRECT_HOST_SUFFIX):
+        return
+    raise ModelInstallError(f"refusing redirect host {host!r}: outside the allowed policy")
+
+
+def _reject_content_encoding(response: httpx.Response) -> None:
+    """Fail closed if the response declares any ``Content-Encoding``.
+
+    ``Accept-Encoding: identity`` already asks the origin not to compress the
+    body; this is the response-side half of that control. Any
+    ``Content-Encoding`` value — including one an origin sends despite the
+    request header — is rejected outright rather than transparently decoded,
+    because a byte-cap check that only ever inspects the wire bytes could
+    otherwise be bypassed by a compressed body that expands past the cap only
+    after decoding.
+    """
+    if "content-encoding" in response.headers:
+        raise ModelInstallError(
+            "refusing a response with a Content-Encoding header while fetching the model"
+        )
+
+
+def _reject_oversized_declared_length(response: httpx.Response, *, byte_cap: int) -> None:
+    """Fail closed before reading any body bytes if ``Content-Length`` exceeds the cap.
+
+    This is a cheap pre-check ahead of the streaming cap enforced in
+    :func:`_stream_to_temp`, which remains the authoritative backstop for a
+    response that declares no length (or an inaccurate one) at all.
+    """
+    declared = response.headers.get("content-length")
+    if declared is None:
+        return
+    try:
+        declared_bytes = int(declared)
+    except ValueError:
+        return
+    if declared_bytes > byte_cap:
+        raise ModelInstallError(
+            f"declared Content-Length {declared_bytes} exceeds the {byte_cap}-byte per-file cap"
+        )
+
+
+def _iter_https_bytes(client: httpx.Client, url: str, *, byte_cap: int) -> Iterator[bytes]:
     """Stream a file's bytes over HTTPS, following a bounded https-only redirect chain.
 
     Args:
         client: The HTTP client (a real ``httpx.Client()`` in production, a
             ``httpx.MockTransport``-backed one in tests).
         url: The initial HTTPS URL built by :func:`_build_url`.
+        byte_cap: The per-file byte cap, checked against a declared
+            ``Content-Length`` before any body bytes are read.
 
     Yields:
-        Body chunks of the final ``200`` response.
+        Raw (never transparently decompressed) body chunks of the final
+        ``200`` response.
 
     Raises:
-        ModelInstallError: A non-https URL appears anywhere in the chain, a
+        ModelInstallError: A hop fails :func:`_validate_fetch_url`, a
             redirect is malformed, the chain exceeds :data:`_MAX_REDIRECTS`,
-            the final response is not ``200``, or a transport/timeout error
-            occurs. The message never contains the request URL (so it can
-            never leak a query string or embedded credential).
+            the final response is not ``200``, the response carries a
+            ``Content-Encoding`` header or an over-cap declared
+            ``Content-Length``, or a transport/timeout error occurs. The
+            message never contains the request URL (so it can never leak a
+            query string or embedded credential).
     """
     current = httpx.URL(url)
     timeout = httpx.Timeout(
@@ -258,8 +419,7 @@ def _iter_https_bytes(client: httpx.Client, url: str) -> Iterator[bytes]:
         pool=_CONNECT_TIMEOUT_SECONDS,
     )
     for _attempt in range(_MAX_REDIRECTS + 1):
-        if current.scheme != "https":
-            raise ModelInstallError("refusing a non-https URL while fetching the model")
+        _validate_fetch_url(current)
         try:
             with client.stream(
                 "GET",
@@ -268,6 +428,7 @@ def _iter_https_bytes(client: httpx.Client, url: str) -> Iterator[bytes]:
                 follow_redirects=False,
                 timeout=timeout,
             ) as response:
+                _reject_content_encoding(response)
                 if response.has_redirect_location:
                     location = response.headers["location"]
                     # Empirically, httpx itself eagerly parses/validates the
@@ -290,7 +451,13 @@ def _iter_https_bytes(client: httpx.Client, url: str) -> Iterator[bytes]:
                     raise ModelInstallError(
                         f"unexpected HTTP status {response.status_code} while fetching the model"
                     )
-                yield from response.iter_bytes()
+                _reject_oversized_declared_length(response, byte_cap=byte_cap)
+                # `iter_raw()`, never `iter_bytes()`: with `Accept-Encoding:
+                # identity` and `_reject_content_encoding` above, there is
+                # nothing to transparently decode — using the raw stream
+                # keeps that true even against a future httpx version whose
+                # auto-decoding behavior changes.
+                yield from response.iter_raw()
                 return
         except httpx.HTTPError as exc:
             raise ModelInstallError("network error while fetching the model") from exc
@@ -468,7 +635,11 @@ def install_model(
     results: list[ManifestFileResult] = []
     network_used = False
     owned_client = http_client is None
-    client = http_client if http_client is not None else httpx.Client()
+    # `trust_env=False`: this internally-owned client must never inherit
+    # ambient HTTP_PROXY/HTTPS_PROXY/NO_PROXY or CA-bundle environment
+    # variables (a caller-supplied test/mock client is unaffected — only the
+    # internal default construction here sets it).
+    client = http_client if http_client is not None else httpx.Client(trust_env=False)
     try:
         for manifest_file in manifest_files:
             _validate_digest(manifest_file.sha256, label=manifest_file.relative_path)
@@ -487,10 +658,18 @@ def install_model(
                 )
 
             if from_dir is not None:
-                source = from_dir / manifest_file.relative_path
-                if not source.is_file():
+                from_dir_real = Path(os.path.realpath(from_dir))
+                source = _resolve_and_validate_source(from_dir_real, manifest_file.relative_path)
+                try:
+                    source_stat = os.lstat(source)
+                except FileNotFoundError:
                     raise ModelInstallError(
                         f"--from-dir is missing required file {manifest_file.relative_path!r}"
+                    ) from None
+                if not stat.S_ISREG(source_stat.st_mode):
+                    raise ModelInstallError(
+                        f"--from-dir source for {manifest_file.relative_path!r} is not a "
+                        "regular file (a symlink, directory, or device is never read)"
                     )
                 _place_verified(
                     target,
@@ -508,7 +687,7 @@ def install_model(
             url = _build_url(repo_id, revision, manifest_file.relative_path)
             _place_verified(
                 target,
-                _iter_https_bytes(client, url),
+                _iter_https_bytes(client, url, byte_cap=_MAX_MODEL_FILE_BYTES),
                 expected_sha256=manifest_file.sha256,
                 byte_cap=_MAX_MODEL_FILE_BYTES,
                 context=manifest_file.relative_path,
