@@ -400,6 +400,100 @@ def test_from_dir_symlinked_source_file_is_rejected_as_non_regular(tmp_path: Pat
     assert not (dest / "a" / "file1.bin").exists()
 
 
+def test_from_dir_parent_swap_after_validation_cannot_read_outside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source parent replaced after realpath validation is not followed."""
+    from_dir = tmp_path / "src"
+    source_parent = from_dir / "a"
+    source_parent.mkdir(parents=True)
+    (source_parent / "file1.bin").write_bytes(b"payload")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file1.bin").write_bytes(b"outside-bytes")
+    parked_parent = tmp_path / "parked-source-parent"
+    manifest = _make_manifest({"a/file1.bin": b"payload"})
+    dest = tmp_path / "dest"
+    original_resolve = model_install_module._resolve_and_validate_source  # pyright: ignore[reportPrivateUsage]
+
+    def swap_after_validation(root: Path, relative_path: str) -> Path:
+        result = original_resolve(root, relative_path)
+        source_parent.rename(parked_parent)
+        source_parent.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(model_install_module, "_resolve_and_validate_source", swap_after_validation)
+
+    with pytest.raises(ModelInstallError, match="cannot safely open --from-dir directory"):
+        install_model(
+            dest, from_dir=from_dir, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION
+        )
+
+    assert (outside / "file1.bin").read_bytes() == b"outside-bytes"
+    assert not (dest / "a" / "file1.bin").exists()
+
+
+def test_from_dir_final_symlink_swap_after_validation_is_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A final source symlink substituted after validation is refused by O_NOFOLLOW."""
+    from_dir = tmp_path / "src"
+    source = from_dir / "a" / "file1.bin"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"payload")
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside-bytes")
+    manifest = _make_manifest({"a/file1.bin": b"payload"})
+    dest = tmp_path / "dest"
+    original_resolve = model_install_module._resolve_and_validate_source  # pyright: ignore[reportPrivateUsage]
+
+    def swap_after_validation(root: Path, relative_path: str) -> Path:
+        result = original_resolve(root, relative_path)
+        source.unlink()
+        source.symlink_to(outside)
+        return result
+
+    monkeypatch.setattr(model_install_module, "_resolve_and_validate_source", swap_after_validation)
+
+    with pytest.raises(ModelInstallError, match="not a regular file"):
+        install_model(
+            dest, from_dir=from_dir, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION
+        )
+
+    assert outside.read_bytes() == b"outside-bytes"
+    assert not (dest / "a" / "file1.bin").exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="os.mkfifo is POSIX-only")
+def test_from_dir_final_fifo_swap_after_validation_is_not_read_or_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A substituted FIFO is opened non-blocking then rejected before any read."""
+    from_dir = tmp_path / "src"
+    source = from_dir / "a" / "file1.bin"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"payload")
+    manifest = _make_manifest({"a/file1.bin": b"payload"})
+    dest = tmp_path / "dest"
+    original_resolve = model_install_module._resolve_and_validate_source  # pyright: ignore[reportPrivateUsage]
+
+    def replace_with_fifo(root: Path, relative_path: str) -> Path:
+        result = original_resolve(root, relative_path)
+        source.unlink()
+        os.mkfifo(source)
+        return result
+
+    monkeypatch.setattr(model_install_module, "_resolve_and_validate_source", replace_with_fifo)
+
+    with pytest.raises(ModelInstallError, match="not a regular file"):
+        install_model(
+            dest, from_dir=from_dir, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION
+        )
+
+    assert source.is_fifo()
+    assert not (dest / "a" / "file1.bin").exists()
+
+
 def test_from_dir_directory_source_is_rejected_as_non_regular(tmp_path: Path) -> None:
     """A manifest file that resolves to a directory inside ``--from-dir`` is
     refused (directive 4)."""

@@ -53,6 +53,19 @@ _SIGBREAK = cast(int | None, getattr(signal, "SIGBREAK", None))
 _LIVE_TERMINATION_SIGNALS: tuple[int, ...] = (signal.SIGINT, signal.SIGTERM) + (
     () if _SIGBREAK is None else (_SIGBREAK,)
 )
+_APPLIANCE_CLEANUP_ACTIONS = frozenset(
+    {
+        "closing cached model file descriptor",
+        "closing child destination directory descriptor",
+        "closing child --from-dir directory descriptor",
+        "closing destination directory descriptor",
+        "closing model download client",
+        "closing temporary model file descriptor",
+        "closing --from-dir directory descriptor",
+        "closing --from-dir source descriptor",
+        "removing temporary model file",
+    }
+)
 
 
 class _LiveExitGuard:
@@ -440,8 +453,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "action",
         nargs="?",
-        choices=["serve"],
-        help="'serve' drives a live roast against the wired coffee-roaster-mcp child",
+        choices=["serve", "appliance"],
+        help=(
+            "'serve' drives a live roast against the wired coffee-roaster-mcp child; "
+            "'appliance' manages native Pi appliance support"
+        ),
     )
     parser.add_argument(
         "--replay",
@@ -1260,6 +1276,7 @@ def _run_appliance_model_install(args: argparse.Namespace) -> int:
         summary = install_model(dest, from_dir=from_dir, verify_only=args.verify_only)
     except ModelInstallError as exc:
         print(f"model install failed: {exc}")
+        _print_appliance_cleanup_notes(exc)
         return 1
     except (OSError, RuntimeError) as exc:
         # Matches the repo's established friendly-failure convention for a
@@ -1270,6 +1287,7 @@ def _run_appliance_model_install(args: argparse.Namespace) -> int:
         # always carries its own message and no `__cause__` OSError), so the
         # two except clauses never overlap.
         print(f"model install failed: destination is unusable — {exc}")
+        _print_appliance_cleanup_notes(exc)
         return 1
     if args.json_output:
         print(json.dumps(summary.to_json_dict()))
@@ -1280,6 +1298,24 @@ def _run_appliance_model_install(args: argparse.Namespace) -> int:
     if not summary.network_used:
         print("no network fetch was required")
     return 0
+
+
+def _print_appliance_cleanup_notes(exc: BaseException) -> None:
+    """Print only recognised, sanitised model-install cleanup notes.
+
+    Notes are local diagnostic metadata. Restricting output to this closed
+    action list and identifier-only error types avoids surfacing arbitrary
+    exception text, URLs, secrets, or environment values.
+    """
+    for note in getattr(exc, "__notes__", ()):
+        if not isinstance(note, str):
+            continue
+        prefix = "cleanup failed while "
+        if not note.startswith(prefix):
+            continue
+        action, separator, error_type = note[len(prefix) :].rpartition(": ")
+        if separator and action in _APPLIANCE_CLEANUP_ACTIONS and error_type.isidentifier():
+            print(f"model install warning: cleanup failed while {action}: {error_type}")
 
 
 def _run_appliance_cli(argv: Sequence[str]) -> int:

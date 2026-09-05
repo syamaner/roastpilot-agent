@@ -353,8 +353,88 @@ def _is_already_valid(
     return _sha256_of_file(target, dir_fd=dir_fd) == expected_sha256
 
 
-def _iter_file_bytes(path: Path) -> Iterator[bytes]:
-    with path.open("rb") as fh:
+def _open_verified_source_file(from_dir_real: Path, relative_path: str) -> int:
+    """Open one regular ``--from-dir`` source through no-follow descriptors.
+
+    Every source path component is opened relative to its verified parent, and
+    the final file uses ``O_NONBLOCK`` before its type is checked. A swapped
+    symlink therefore cannot redirect the read, while a swapped FIFO or device
+    cannot block or be consumed before it is rejected.
+
+    Raises:
+        ModelInstallError: The source is missing, unsafe, or not a regular file.
+        OSError: A local filesystem operation fails outside the fail-closed
+            validation cases.
+    """
+    _validate_relative_path(relative_path)
+    components = relative_path.split("/")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    source_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        parent_fd = os.open(from_dir_real, directory_flags)
+    except FileNotFoundError:
+        raise ModelInstallError(f"--from-dir is missing required file {relative_path!r}") from None
+    except OSError as exc:
+        raise ModelInstallError("cannot safely open the --from-dir root") from exc
+    source_fd: int | None = None
+    try:
+        for component in components[:-1]:
+            try:
+                child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                raise ModelInstallError(
+                    f"--from-dir is missing required file {relative_path!r}"
+                ) from None
+            except OSError as exc:
+                raise ModelInstallError(
+                    f"cannot safely open --from-dir directory for {relative_path!r}"
+                ) from exc
+            try:
+                os.close(parent_fd)
+            except BaseException:
+                _cleanup_preserving_primary(
+                    lambda fd=child_fd: os.close(fd),
+                    action="closing child --from-dir directory descriptor",
+                )
+                parent_fd = None
+                raise
+            parent_fd = child_fd
+        try:
+            source_fd = os.open(components[-1], source_flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            raise ModelInstallError(
+                f"--from-dir is missing required file {relative_path!r}"
+            ) from None
+        except OSError as exc:
+            raise ModelInstallError(
+                f"--from-dir source for {relative_path!r} is not a regular file "
+                "(a symlink, directory, or device is never read)"
+            ) from exc
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ModelInstallError(
+                f"--from-dir source for {relative_path!r} is not a regular file "
+                "(a symlink, directory, or device is never read)"
+            )
+        verified_source_fd = source_fd
+        source_fd = None
+        return verified_source_fd
+    except BaseException:
+        if source_fd is not None:
+            _cleanup_preserving_primary(
+                lambda fd=source_fd: os.close(fd), action="closing --from-dir source descriptor"
+            )
+        raise
+    finally:
+        if parent_fd is not None:
+            _cleanup_preserving_primary(
+                lambda fd=parent_fd: os.close(fd), action="closing --from-dir directory descriptor"
+            )
+
+
+def _iter_open_file_bytes(fd: int) -> Iterator[bytes]:
+    """Yield bounded-copy source bytes without relinquishing ``fd`` ownership."""
+    with os.fdopen(fd, "rb", closefd=False) as fh:
         while True:
             chunk = fh.read(_CHUNK_SIZE)
             if not chunk:
@@ -828,32 +908,28 @@ def install_model(
 
                 if from_dir is not None:
                     from_dir_real = Path(os.path.realpath(from_dir))
-                    source = _resolve_and_validate_source(
+                    _resolve_and_validate_source(from_dir_real, manifest_file.relative_path)
+                    source_fd = _open_verified_source_file(
                         from_dir_real, manifest_file.relative_path
                     )
                     try:
-                        source_stat = os.lstat(source)
-                    except FileNotFoundError:
-                        raise ModelInstallError(
-                            f"--from-dir is missing required file {manifest_file.relative_path!r}"
-                        ) from None
-                    if not stat.S_ISREG(source_stat.st_mode):
-                        raise ModelInstallError(
-                            f"--from-dir source for {manifest_file.relative_path!r} is not a "
-                            "regular file (a symlink, directory, or device is never read)"
+                        if parent_fd is None:
+                            parent_fd, target_name = _open_destination_parent(
+                                dest_root_real, manifest_file.relative_path, create=True
+                            )
+                        _place_verified(
+                            parent_fd,
+                            target_name,
+                            _iter_open_file_bytes(source_fd),
+                            expected_sha256=manifest_file.sha256,
+                            byte_cap=_MAX_MODEL_FILE_BYTES,
+                            context=manifest_file.relative_path,
                         )
-                    if parent_fd is None:
-                        parent_fd, target_name = _open_destination_parent(
-                            dest_root_real, manifest_file.relative_path, create=True
+                    finally:
+                        _cleanup_preserving_primary(
+                            lambda fd=source_fd: os.close(fd),
+                            action="closing --from-dir source descriptor",
                         )
-                    _place_verified(
-                        parent_fd,
-                        target_name,
-                        _iter_file_bytes(source),
-                        expected_sha256=manifest_file.sha256,
-                        byte_cap=_MAX_MODEL_FILE_BYTES,
-                        context=manifest_file.relative_path,
-                    )
                     results.append(
                         ManifestFileResult(
                             manifest_file.relative_path, manifest_file.sha256, "local"

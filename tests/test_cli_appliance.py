@@ -82,6 +82,21 @@ def test_appliance_model_requires_a_subcommand() -> None:
     assert exc_info.value.code == 2
 
 
+def test_top_level_help_advertises_appliance(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The normal help surface advertises the specialised appliance tree."""
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "--help"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 0
+    out = capsys.readouterr().out
+    assert "{serve,appliance}" in out
+    assert "'appliance' manages native Pi appliance support" in " ".join(out.split())
+
+
 # --- destination resolution ----------------------------------------------
 
 
@@ -243,6 +258,37 @@ def test_run_appliance_model_install_failure_prints_message_and_returns_1(
     out = capsys.readouterr().out
     assert "model install failed" in out
     assert "digest mismatch" in out
+    assert "model install warning" not in out
+
+
+def test_run_appliance_model_install_prints_sanitised_cleanup_notes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Recognised cleanup notes are actionable without exposing arbitrary text."""
+    failure = ModelInstallError("digest mismatch")
+    failure.add_note("cleanup failed while removing temporary model file: OSError")
+    failure.add_note("https://example.invalid/?token=secret")
+
+    def fake_install_model(
+        given_dest: Path, *, from_dir: Path | None = None, verify_only: bool = False
+    ) -> ModelInstallSummary:
+        raise failure
+
+    monkeypatch.setattr(model_install_module, "install_model", fake_install_model)
+    args = cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
+        ["model", "install", "--dest", str(tmp_path / "dest")]
+    )
+
+    exit_code = cli._run_appliance_model_install(args)  # pyright: ignore[reportPrivateUsage]
+
+    assert exit_code == 1
+    out = capsys.readouterr().out
+    assert "model install failed: digest mismatch" in out
+    assert (
+        "model install warning: cleanup failed while removing temporary model file: OSError" in out
+    )
+    assert "example.invalid" not in out
+    assert "secret" not in out
 
 
 def test_run_appliance_model_install_oserror_prints_friendly_message(
