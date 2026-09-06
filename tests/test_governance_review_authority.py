@@ -381,7 +381,7 @@ def _assert_precedence_policy(text: str) -> None:
 
 def _assert_no_nonzero_approval_requirement(text: str, spans: list[tuple[int, int]]) -> None:
     """Reject review-count requirements except the explicit zero/no forms."""
-    operative = re.sub(r"\s+", " ", re.sub(r"\*", "", _operative_text(text, spans)))
+    operative = re.sub(r"\s+", " ", re.sub(r"[`*]", "", _operative_text(text, spans)))
     nonzero_requirement = re.compile(
         r"(?<!no longer )(?<!not )\b(?:require(?:s|d|ing)?|must\s+have|needs)\s+"
         r"(?!(?:zero|no)\s+(?:approving\s+reviews?|approvals?)\b)"
@@ -393,7 +393,7 @@ def _assert_no_nonzero_approval_requirement(text: str, spans: list[tuple[int, in
         re.IGNORECASE,
     )
     assert not nonzero_requirement.search(operative)
-    assert not machine_nonzero_requirement.search(operative.replace("`", ""))
+    assert not machine_nonzero_requirement.search(operative)
 
 
 def _assert_branch_protection_policy(text: str) -> None:
@@ -1138,6 +1138,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "requires one approval",
         "must have two approvals",
         "needs ten approvals",
+        "requires `two` approving reviews",
+        "requires `two approving` reviews",
+        "must `have two` approvals",
         "required_approving_review_count=1",
         "required_approving_review_count = 10",
         "required_approving_review_count: 2",
@@ -1238,6 +1241,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "requires one approval",
         "must have two approvals",
         "needs ten approvals",
+        "requires `two` approving reviews",
+        "requires `two approving` reviews",
+        "must `have two` approvals",
         "required_approving_review_count=1",
         "required_approving_review_count = 10",
         "required_approving_review_count: 2",
@@ -1283,6 +1289,8 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             "no longer requires two approving reviews",
             "requires zero approvals",
             "must have no approvals",
+            "requires `zero` approving reviews",
+            "must have `no` approvals",
             "does not require two approvals",
             "no longer requires one approval",
             "approval is required before publication",
@@ -1302,6 +1310,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "requires one approval",
         "must have two approvals",
         "needs ten approvals",
+        "requires `two` approving reviews",
+        "requires `two approving` reviews",
+        "must `have two` approvals",
     ):
         historical_nonzero = (
             agents
@@ -1339,6 +1350,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "requires one approval",
         "must have two approvals",
         "needs ten approvals",
+        "requires `two` approving reviews",
+        "requires `two approving` reviews",
+        "must `have two` approvals",
     ):
         with pytest.raises(AssertionError):
             _assert_no_nonzero_approval_requirement(
@@ -1352,6 +1366,8 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "no longer requires two approving reviews",
         "requires zero approvals",
         "must have no approvals",
+        "requires `zero` approving reviews",
+        "must have `no` approvals",
         "does not require two approvals",
         "no longer requires one approval",
         "approval is required before publication",
