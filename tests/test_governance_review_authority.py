@@ -17,23 +17,23 @@ any malformed marker structure (unclosed, orphaned, nested, or reversed)
 rather than silently reporting zero historical blocks.
 
 T5 (the D-ToS-1 headless-gate mechanism still matches its documented
-description) is deliberately NOT duplicated here: the mechanism was shipped
-by commit ``299fb5a93d09e54f58d370f7a35e5ce15f278150`` and the
-``claude-code-review.yml`` reviewer job's exact ``if:`` condition (the
-Dependabot-author guard AND the `CLAUDE_HEADLESS_ENABLED` conjunct) is
-already asserted, byte-for-byte, by the existing, unchanged
+description) has split witnesses. The ``claude-code-review.yml`` reviewer
+job's exact ``if:`` condition (the Dependabot-author guard AND the
+`CLAUDE_HEADLESS_ENABLED` conjunct) remains asserted, byte-for-byte, by the existing, unchanged
 ``tests/test_claude_review_approval.py::test_track_progress_disabled_only_for_unsupported_pull_request_actions``
-regression test. Re-running that unchanged test is this slice's T5 witness;
-adding a second, overlapping assertion of the same guard would be an
-unintended duplicate.
+regression test. This module adds the distinct ``claude.yml`` responder-job
+conjunct witness, including in-memory negative controls; it does not duplicate
+the reviewer assertion.
 """
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import cast
 
 import pytest
+import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _AGENTS_MD_PATH = _REPO_ROOT / "AGENTS.md"
@@ -65,6 +65,7 @@ _CANONICAL_LIVE_STATE_HEADING = "**Verified live state — 6 Sep 2026 (D-ToS-1).
 # checks/admin enforcement (including the four exact app-pinned check
 # names), and zero approving reviews.
 _CANONICAL_LIVE_STATE_REQUIRED_PHRASES: tuple[str, ...] = (
+    "CLAUDE_HEADLESS_ENABLED",
     "requires zero approving reviews",
     "strict mode",
     "app-pinned",
@@ -260,6 +261,7 @@ def _assert_canonical_live_policy(text: str) -> None:
     start, end = _canonical_bullet_bounds(text)
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
     bullet = _canonical_live_state_bullet(text)
+    assert "CLAUDE_HEADLESS_ENABLED" in bullet, "missing canonical headless token"
     for phrase in _CANONICAL_LIVE_STATE_REQUIRED_PHRASES:
         assert _occurrences(bullet, phrase), f"missing canonical policy phrase: {phrase!r}"
     for check_name in _REQUIRED_CHECK_NAMES:
@@ -341,6 +343,22 @@ def _remove_first_occurrence(text: str, phrase: str) -> str:
     """Remove the first formatting-tolerant occurrence of ``phrase`` from text."""
     match = _occurrences(text, phrase)[0]
     return text[: match.start()] + text[match.end() :]
+
+
+def _assert_responder_headless_gate(workflow: object) -> None:
+    """Assert parsed responder workflow data retains the true-only headless gate."""
+    assert isinstance(workflow, dict)
+    workflow_map = cast(dict[str, object], workflow)
+    jobs = workflow_map.get("jobs")
+    assert isinstance(jobs, dict)
+    jobs_map = cast(dict[str, object], jobs)
+    claude_job = jobs_map.get("claude")
+    assert isinstance(claude_job, dict)
+    claude_map = cast(dict[str, object], claude_job)
+    condition = claude_map.get("if")
+    assert isinstance(condition, str)
+    normalized_condition = re.sub(r"\s+", " ", condition)
+    assert re.match(r"^\$\{\{ vars\.CLAUDE_HEADLESS_ENABLED == 'true' && \(", normalized_condition)
 
 
 def test_agents_md_forbidden_phrases_are_contained_in_historical_blocks() -> None:
@@ -466,6 +484,31 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
     assert not _is_affirmative_enablement_instruction("OTHER_HEADLESS_ENABLED=true")
 
 
+def test_responder_workflow_requires_the_true_only_headless_conjunct() -> None:
+    """T5 responder witness: parsed data and in-memory mutations share one guard."""
+    responder_path = _REPO_ROOT / ".github" / "workflows" / "claude.yml"
+    workflow = yaml.safe_load(responder_path.read_text(encoding="utf-8"))
+    _assert_responder_headless_gate(workflow)
+
+    assert isinstance(workflow, dict)
+    workflow_map = cast(dict[str, object], workflow)
+    jobs = workflow_map["jobs"]
+    assert isinstance(jobs, dict)
+    jobs_map = cast(dict[str, object], jobs)
+    claude_job = jobs_map["claude"]
+    assert isinstance(claude_job, dict)
+    claude_map = cast(dict[str, object], claude_job)
+    condition = claude_map["if"]
+    assert isinstance(condition, str)
+    for mutated_condition in (
+        condition.replace("== 'true'", "!= 'true'", 1),
+        condition.replace("vars.CLAUDE_HEADLESS_ENABLED == 'true' && ", "", 1),
+        condition.replace("== 'true' &&", "== 'true' ||", 1),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_responder_headless_gate({"jobs": {"claude": {"if": mutated_condition}}})
+
+
 @pytest.mark.docs
 def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> None:
     """Exercise focused synthetic failure modes without mutating governed files.
@@ -482,6 +525,22 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     )
     with pytest.raises(AssertionError, match="missing canonical check"):
         _assert_canonical_live_policy(generic_checks)
+
+    missing_headless_token = (
+        agents[:start]
+        + _remove_first_occurrence(agents[start:end], "CLAUDE_HEADLESS_ENABLED")
+        + agents[end:]
+    )
+    with pytest.raises(AssertionError, match="missing canonical headless token"):
+        _assert_canonical_live_policy(missing_headless_token)
+
+    lower_case_headless_token = (
+        agents[:start]
+        + agents[start:end].replace("CLAUDE_HEADLESS_ENABLED", "claude_headless_enabled", 1)
+        + agents[end:]
+    )
+    with pytest.raises(AssertionError, match="missing canonical headless token"):
+        _assert_canonical_live_policy(lower_case_headless_token)
 
     bullet_line_start = agents.rfind("\n", 0, start) + 1
     wrapped = (
