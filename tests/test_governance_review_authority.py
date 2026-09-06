@@ -409,6 +409,50 @@ def _assert_draft_phase_policy(text: str) -> None:
     assert not _occurrences(paragraph, "findings there are real and worth folding")
 
 
+def _assert_retained_mechanism_policy(text: str) -> None:
+    """Assert the operative retained-mechanism bullet remains dormant and operator-owned."""
+    spans = _historical_spans(text)
+    start = text.index("- Mechanism retained but")
+    end = text.index("\n  <!-- historical-evidence: begin -->", start)
+    assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    mechanism = text[start:end]
+    assert _occurrences(mechanism, "dormant")
+    assert _occurrences(mechanism, "operator-owned branch-protection decision")
+    assert not _occurrences(mechanism, "not dormant")
+    assert not _occurrences(mechanism, "not operator-owned branch-protection decision")
+
+
+def _assert_preserved_wait_policy(text: str) -> None:
+    """Assert the operative preservation sentence keeps the wait non-gating."""
+    spans = _historical_spans(text)
+    heading = "Preserved as the D108-D118 design/evidence record:"
+    assert text.count(heading) == 1
+    start = text.index(heading)
+    end = text.index("\n\n<!-- historical-evidence: begin -->", start)
+    assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    preserved = text[start:end]
+    assert _occurrences(preserved, "this wait does not gate merge")
+    assert _occurrences(preserved, "current verified state")
+
+
+def _assert_claude_review_note_policy(text: str) -> None:
+    """Assert the operative Claude-review note documents both headless skips."""
+    spans = _historical_spans(text)
+    heading = "> Note: `claude-review` is intentionally"
+    assert text.count(heading) == 1
+    start = text.index(heading)
+    end = text.index("\n\n## Codex-Led Delivery Topology", start)
+    assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    note = text[start:end]
+    for required in (
+        ".github/workflows/claude-code-review.yml:27-41",
+        ".github/workflows/claude.yml:14-26",
+        "a skipped headless job is expected, never a failure, and never a reason "
+        "to set the variable or re-trigger",
+    ):
+        assert _occurrences(note, required), f"missing operative Claude-review note: {required!r}"
+
+
 def _assert_registry_735_clarification(text: str) -> None:
     """Assert the #735 clarification is operative and preserves D-ToS-1 skip semantics."""
     spans = _historical_spans(text)
@@ -742,6 +786,9 @@ def test_agents_md_headless_skip_is_documented_and_never_instructed_on() -> None
     _assert_review_roster_policy(text)
     _assert_minimum_sufficient_review_policy(text)
     _assert_draft_phase_policy(text)
+    _assert_retained_mechanism_policy(text)
+    _assert_preserved_wait_policy(text)
+    _assert_claude_review_note_policy(text)
     _assert_precedence_policy(text)
 
 
@@ -1225,6 +1272,37 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
                 1,
             )
         )
+
+    mechanism_start = agents.index("- Mechanism retained but")
+    mechanism_end = agents.index("\n  <!-- historical-evidence: begin -->", mechanism_start)
+    for original, replacement in (
+        ("dormant", ""),
+        ("dormant", "not dormant"),
+        ("operator-owned branch-protection decision", ""),
+        ("operator-owned branch-protection decision", "not operator-owned"),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_retained_mechanism_policy(
+                agents[:mechanism_start]
+                + agents[mechanism_start:mechanism_end].replace(original, replacement, 1)
+                + agents[mechanism_end:]
+            )
+
+    preserved_start = agents.index("Preserved as the D108-D118 design/evidence record:")
+    preserved_end = agents.index("\n\n<!-- historical-evidence: begin -->", preserved_start)
+    with pytest.raises(AssertionError):
+        _assert_preserved_wait_policy(agents[:preserved_start] + agents[preserved_end:])
+
+    note_start = agents.index("> Note: `claude-review` is intentionally")
+    note_end = agents.index("\n\n## Codex-Led Delivery Topology", note_start)
+    with pytest.raises(AssertionError):
+        _assert_claude_review_note_policy(agents[:note_start] + agents[note_end:])
+    for citation in (
+        ".github/workflows/claude-code-review.yml:27-41",
+        ".github/workflows/claude.yml:14-26",
+    ):
+        with pytest.raises(AssertionError):
+            _assert_claude_review_note_policy(agents.replace(citation, "", 1))
 
     for document, assertion in (
         (agents, _assert_agents_historical_evidence),
