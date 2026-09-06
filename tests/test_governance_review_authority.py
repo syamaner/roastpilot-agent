@@ -302,6 +302,7 @@ def _assert_canonical_live_policy(text: str) -> None:
         "exact-current-head review and wait, required_conversation_resolution, independent triage, "
         "and risk-routed authenticated local Claude assurance (below)." in normalized_bullet
     )
+    assert normalized_bullet == _CANONICAL_POLICY_SNAPSHOT
     assert not _is_affirmative_enablement_instruction(_operative_text(text, spans))
     for phrase in _CANONICAL_LIVE_STATE_REQUIRED_PHRASES:
         assert _occurrences(bullet, phrase), f"missing canonical policy phrase: {phrase!r}"
@@ -352,6 +353,7 @@ def _assert_registry_policy(text: str) -> None:
         "exact-current-head review and wait, required_conversation_resolution, independent triage, "
         "and risk-routed authenticated local Claude assurance." in normalized_entry
     )
+    assert normalized_entry == _REGISTRY_POLICY_SNAPSHOT
     assert not _is_affirmative_enablement_instruction(_operative_text(text, spans))
     for phrase in (
         _DTOS1_COMMIT_SHA,
@@ -408,6 +410,45 @@ def _remove_first_occurrence(text: str, phrase: str) -> str:
 def _normalized_visible(text: str) -> str:
     """Normalize finite Markdown presentation differences for scoped clauses."""
     return re.sub(r"\s+", " ", re.sub(r"[`*>]", "", text)).strip()
+
+
+_CANONICAL_POLICY_SNAPSHOT = _normalized_visible(
+    """**Verified live state — 6 Sep 2026 (D-ToS-1).** `main` currently requires
+    **zero** approving reviews. Required, app-pinned: `Checks`, `Web (lint +
+    typecheck + unit)`, `Web (Playwright snapshots)`, and `codecov/patch`;
+    strict mode, `required_conversation_resolution`, and `enforce_admins`
+    remain enabled; force-push/deletion off. Consumer-OAuth headless Claude CI
+    is retired (`CLAUDE_HEADLESS_ENABLED` unset; a skipped headless job is
+    expected, never a failure, and never a reason to set the variable). The
+    merge bar instead rests on CI, `codecov/patch`, CodeQL handling, GitHub
+    Codex's exact-current-head review and wait, `required_conversation_resolution`,
+    independent triage, and risk-routed authenticated local Claude assurance
+    (below)."""
+)
+_REGISTRY_POLICY_SNAPSHOT = _normalized_visible(
+    """**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).** Verified live
+    `main` branch protection: `required_approving_review_count=0`; strict mode;
+    `enforce_admins=true`; `required_conversation_resolution=true`; force-push/
+    deletion `false`; app-pinned required checks `Checks`, `Web (lint + typecheck
+    + unit)`, `Web (Playwright snapshots)`, and `codecov/patch`.
+    `CLAUDE_HEADLESS_ENABLED` is unset: consumer-OAuth headless Claude CI (the
+    hosted `Claude Code Review` job and the `@claude` responder) is retired under
+    D-ToS-1, mirroring roastpilot-cloud #411, merged in agent commit
+    `299fb5a93d09e54f58d370f7a35e5ce15f278150` (PR #923). A skipped headless job
+    is expected, never a failure. The D108-D118 PR-scoped Claude approval bridge
+    mechanism is retained in the codebase but **dormant**: it gates nothing while
+    `main` requires zero approving reviews. Restoring it is an operator-owned
+    branch-protection decision, not automatic. The merge bar remains CI,
+    `codecov/patch`, CodeQL handling, GitHub Codex's exact-current-head review
+    and wait, `required_conversation_resolution`, independent triage, and
+    risk-routed authenticated local Claude assurance. This entry supersedes the
+    operative approval wording in the "31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL
+    RESTORED (#663 / D108-D118)" record, the earlier 31-Jul "#663 / D108-D118"
+    status summary, and the residual June instructions to arm or require the
+    SHA-scoped `review-gate`, all now marked historical. D108-D118 already retired
+    that SHA-scoped mechanism; D-ToS-1 does not first retire it and it must not be
+    restored."""
+)
 
 
 def _operative_text(text: str, spans: list[tuple[int, int]]) -> str:
@@ -631,8 +672,18 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     generic_checks = (
         agents[:start] + agents[start:end].replace("`Checks`", "required checks", 1) + agents[end:]
     )
-    with pytest.raises(AssertionError, match="missing canonical check"):
+    with pytest.raises(AssertionError):
         _assert_canonical_live_policy(generic_checks)
+
+    for original, replacement in (
+        ("`Checks`", "`Checks` (optional)"),
+        ("app-pinned", "not app-pinned"),
+        ("**zero** approving reviews", "**not zero** approving reviews"),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_canonical_live_policy(
+                agents[:start] + agents[start:end].replace(original, replacement, 1) + agents[end:]
+            )
 
     missing_headless_token = (
         agents[:start]
@@ -709,6 +760,20 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
     )
     registry_entry_end = registry.index("\n**1 Sep 2026", registry_entry_start)
+    for original, replacement in (
+        ("`Checks`", "`Checks` (optional)"),
+        ("app-pinned", "not app-pinned"),
+        ("zero approving reviews", "not zero approving reviews"),
+        ("**dormant**", "**active**"),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_registry_policy(
+                registry[:registry_entry_start]
+                + registry[registry_entry_start:registry_entry_end].replace(
+                    original, replacement, 1
+                )
+                + registry[registry_entry_end:]
+            )
     for clause in (
         "requires zero approving reviews",
         "skipped headless job is expected",
