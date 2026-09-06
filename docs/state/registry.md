@@ -2,6 +2,26 @@
 
 ## Active Epic
 
+**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).** Verified live
+`main` branch protection: `required_approving_review_count=0`; strict mode;
+`enforce_admins=true`; `required_conversation_resolution=true`; force-push/
+deletion `false`; app-pinned required checks `Checks`, `Web (lint + typecheck
++ unit)`, `Web (Playwright snapshots)`, and `codecov/patch`.
+`CLAUDE_HEADLESS_ENABLED` is unset: consumer-OAuth headless Claude CI (the
+hosted `Claude Code Review` job and the `@claude` responder) is retired under
+D-ToS-1, mirroring roastpilot-cloud #411, merged in agent commit
+`299fb5a93d09e54f58d370f7a35e5ce15f278150` (PR #923). A skipped headless job
+is expected, never a failure. The D108-D118 PR-scoped Claude approval bridge
+mechanism is retained in the codebase but **dormant**: it gates nothing while
+`main` requires zero approving reviews. Restoring it is an operator-owned
+branch-protection decision, not automatic. The merge bar remains CI,
+`codecov/patch`, CodeQL handling, GitHub Codex's exact-current-head review
+and wait, `required_conversation_resolution`, independent triage, and
+risk-routed authenticated local Claude assurance. This entry supersedes the
+operative approval wording in the "31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL
+RESTORED (#663 / D108-D118)" record and the earlier 31-Jul "#663 / D108-D118"
+status summary below, both now marked historical.
+
 **1 Sep 2026 — #702 (D180/D181) closure:** PR #872 merged at
 `fdb354cd7b697261faf55212eee73e9504528281`; the issue is closed and the
 project item is Done. Main CI run `33542699280` and CodeQL run `33542699137`
@@ -1004,11 +1024,20 @@ mark-ready/reopen draft-cycle workaround for metadata edits.**
 > **Review + process.** PR size is a **reviewability guide, not a hard cap** (#661,
 > 26 Jul) — a cohesive single-slice story stays one PR. `security-reviewer` is now
 > wired into the `review-branch` roster (#598/#678); **#680** tracks two fail-opens
-> found in that workflow post-merge. **#663 / D108-D118 is ACTIVE (31 Jul):** the
+> found in that workflow post-merge.
+> [Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file: `main`
+> no longer requires any approving review, and the D108-D118 mechanism below
+> is retained but dormant.]
+> <!-- historical-evidence: begin -->
+> **[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by the D-ToS-1
+> governance reconciliation at the top of this file.]**
+> **#663 / D108-D118 is ACTIVE (31 Jul):** the
 > PR-scoped Claude approval bridge and bounded solo-maintainer privileged override are
 > on `main`; live adversarial proofs passed; `main` now requires one stale-dismissing
 > approval. The temporary 25-Jul Claude outage exception is closed. The retired
-> SHA-scoped `review-gate` must not be restored. **#683 CodeQL triage is down from
+> SHA-scoped `review-gate` must not be restored.
+> <!-- historical-evidence: end -->
+> **#683 CodeQL triage is down from
 > 3,532 alerts to one open first-party alert** (`js/prototype-pollution-utility` in
 > `web/src/pages/config/configState.ts`); the fixture-provenance, workflow-permission,
 > Python logging, and digest batches are complete, but #683 stays open for that final
@@ -1247,6 +1276,17 @@ recovery evidence. It does not prove advisor use or hardware behaviour; #742
 was not merged or closed at that pre-merge point, then subsequently merged and
 closed via PR #851.
 
+[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file: `main` no
+longer requires any approving review. The 31 Jul 2026 "CLAUDE PR-SCOPED
+APPROVAL RESTORED (#663 / D108-D118)" record immediately below is retained
+verbatim as historical evidence; it is dormant, not current policy.]
+
+<!-- historical-evidence: begin -->
+
+**[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by the D-ToS-1
+governance reconciliation recorded at the top of this file. The approval
+requirement this record describes no longer applies.]**
+
 **31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL RESTORED (#663 / D108-D118).** The
 25-Jul operator-authorized outage exception is closed. The trusted bridge merged in
 #679 and the bounded privileged-PR override merged in #688. The pre-activation
@@ -1344,6 +1384,8 @@ Strict required-status mode, stale-review dismissal, admin enforcement, and
 disabled protected-base force-push/deletion are load-bearing for D110: a normal
 base-tip advance cannot merge a behind head, and the required head update
 dismisses approval and starts fresh review.
+
+<!-- historical-evidence: end -->
 
 **25 Jul 2026 — #665 MCP/pytest shutdown hardening completed (D104).** Three CI runs reached
 the complete pytest summary and then failed to exit, exposing lifecycle ownership bugs rather than
