@@ -960,6 +960,7 @@ def _place_verified(
         if digest_hex != expected_sha256:
             raise ModelInstallError(f"digest mismatch for {context!r}")
         os.fchmod(tmp_fd, 0o644)
+        os.fsync(tmp_fd)
         verified_temp = os.fstat(tmp_fd)
         named_temp = os.stat(tmp_name, dir_fd=parent_fd, follow_symlinks=False)
         if (
@@ -1183,12 +1184,14 @@ def install_model(
     results: list[ManifestFileResult] = []
     network_used = False
     owned_client = http_client is None
-    # `trust_env=False`: this internally-owned client must never inherit
-    # ambient HTTP_PROXY/HTTPS_PROXY/NO_PROXY or CA-bundle environment
-    # variables (a caller-supplied test/mock client is unaffected — only the
-    # internal default construction here sets it).
-    client = http_client if http_client is not None else httpx.Client(trust_env=False)
+    client = http_client
     try:
+        # `trust_env=False`: this internally-owned client must never inherit
+        # ambient HTTP_PROXY/HTTPS_PROXY/NO_PROXY or CA-bundle environment
+        # variables (a caller-supplied test/mock client is unaffected).
+        if client is None:
+            client = httpx.Client(trust_env=False)
+        assert client is not None
         for manifest_file in manifest_files:
             _validate_digest(manifest_file.sha256, label=manifest_file.relative_path)
             target = _resolve_and_validate_target(dest_root_path, manifest_file.relative_path)
@@ -1310,7 +1313,7 @@ def install_model(
                     )
     finally:
         try:
-            if owned_client:
+            if owned_client and client is not None:
                 _cleanup_preserving_primary(client.close, action="closing model download client")
         finally:
             _cleanup_preserving_primary(

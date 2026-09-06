@@ -497,6 +497,39 @@ def test_placement_fsyncs_containing_directory_after_replace(
     assert (tmp_path / "model.bin").read_bytes() == b"payload"
 
 
+def test_mode_fsync_failure_prevents_placement_and_removes_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The post-fchmod file sync is required before the rename can occur."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    original_fsync = os.fsync
+    file_syncs = [0]
+
+    def fail_second_file_sync(fd: int) -> None:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            file_syncs[0] += 1
+            if file_syncs[0] == 2:
+                raise OSError("simulated mode fsync failure")
+        original_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_second_file_sync)
+    try:
+        with pytest.raises(OSError, match="simulated mode fsync failure"):
+            model_install_module._place_verified(  # pyright: ignore[reportPrivateUsage]
+                parent_fd,
+                "model.bin",
+                [b"payload"],
+                expected_sha256=hashlib.sha256(b"payload").hexdigest(),
+                byte_cap=8,
+                context="model.bin",
+            )
+    finally:
+        os.close(parent_fd)
+
+    assert not (tmp_path / "model.bin").exists()
+    assert list(tmp_path.glob("*.part")) == []
+
+
 def test_directory_fsync_failure_after_replace_propagates_without_temp_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1099,6 +1132,37 @@ def test_owned_client_close_failure_propagates_after_success(
 
     with pytest.raises(OSError, match="simulated client close failure"):
         install_model(dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION)
+
+
+def test_owned_client_constructor_failure_closes_destination_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Root setup is cleaned up when internally-owned client construction fails."""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    root_fd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY)
+    original_close = os.close
+    close_calls: list[int] = []
+
+    def fixed_root(_dest: Path, *, create: bool) -> tuple[Path, int]:
+        assert create
+        return dest, root_fd
+
+    def failing_client(**_kwargs: object) -> httpx.Client:
+        raise OSError("simulated client construction failure")
+
+    def capture_close(fd: int) -> None:
+        close_calls.append(fd)
+        original_close(fd)
+
+    monkeypatch.setattr(model_install_module, "_open_destination_root", fixed_root)
+    monkeypatch.setattr(httpx, "Client", failing_client)
+    monkeypatch.setattr(os, "close", capture_close)
+
+    with pytest.raises(OSError, match="simulated client construction failure"):
+        install_model(dest, manifest_files=_make_manifest({"a/file1.bin": b"payload"}))
+
+    assert close_calls.count(root_fd) == 1
 
 
 def test_primary_error_survives_owned_client_close_failure(
