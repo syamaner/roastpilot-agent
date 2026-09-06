@@ -392,7 +392,7 @@ def _assert_no_nonzero_approval_requirement(text: str, spans: list[tuple[int, in
         re.IGNORECASE,
     )
     assert not nonzero_requirement.search(operative)
-    assert not machine_nonzero_requirement.search(operative)
+    assert not machine_nonzero_requirement.search(operative.replace("`", ""))
 
 
 def _assert_branch_protection_policy(text: str) -> None:
@@ -1105,6 +1105,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "required_approving_review_count=1",
         "required_approving_review_count = 10",
         "required_approving_review_count: 2",
+        "`required_approving_review_count`: 1",
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
         "gh variable set " + "\\\n" + "CLAUDE_HEADLESS_ENABLED --body true",
         'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
@@ -1199,6 +1200,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "required_approving_review_count=1",
         "required_approving_review_count = 10",
         "required_approving_review_count: 2",
+        "`required_approving_review_count`: 1",
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
         "gh variable set " + "\\\n" + "CLAUDE_HEADLESS_ENABLED --body true",
         'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
@@ -1234,7 +1236,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         for allowed_instruction in (
             "requires no approving reviews",
             "requires **no** approving reviews",
+            "required_approving_review_count=0",
             "required_approving_review_count = 0",
+            "required_approving_review_count: 0",
             "gh variable set --repo=owner/repo CLAUDE_HEADLESS_ENABLED --body 'false'",
             "Do not gh variable set -R owner/repo CLAUDE_HEADLESS_ENABLED --body true",
             "gh variable set --repo owner/repo OTHER_HEADLESS_ENABLED --body true",
@@ -1247,12 +1251,23 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     _assert_no_nonzero_approval_requirement(
         historical_nonzero, _historical_spans(historical_nonzero)
     )
-    historical_machine_nonzero = (
-        agents + "\n" + _BEGIN_MARKER + "\nrequired_approving_review_count: 1\n" + _END_MARKER
-    )
-    _assert_no_nonzero_approval_requirement(
-        historical_machine_nonzero, _historical_spans(historical_machine_nonzero)
-    )
+    for historical_machine_assignment in (
+        "required_approving_review_count=1",
+        "required_approving_review_count = 1",
+        "required_approving_review_count: 1",
+    ):
+        historical_machine_nonzero = (
+            agents
+            + "\n"
+            + _BEGIN_MARKER
+            + "\n"
+            + historical_machine_assignment
+            + "\n"
+            + _END_MARKER
+        )
+        _assert_no_nonzero_approval_requirement(
+            historical_machine_nonzero, _historical_spans(historical_machine_nonzero)
+        )
     bold_nonzero = agents + "\nrequires **two** approving reviews"
     with pytest.raises(AssertionError):
         _assert_no_nonzero_approval_requirement(bold_nonzero, _historical_spans(bold_nonzero))
@@ -1260,6 +1275,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "required_approving_review_count=1",
         "required_approving_review_count = 10",
         "required_approving_review_count: 2",
+        "`required_approving_review_count`: 1",
     ):
         with pytest.raises(AssertionError):
             _assert_no_nonzero_approval_requirement(
