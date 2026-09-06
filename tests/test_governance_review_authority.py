@@ -390,9 +390,43 @@ def _assert_review_roster_policy(text: str) -> None:
     assert _normalized_visible(text[start:end]) == _REVIEW_ROSTER_SNAPSHOT
 
 
+def _assert_minimum_sufficient_review_policy(text: str) -> None:
+    """Assert the operative local-review gate list excludes retired Claude approval."""
+    start = text.index("### Minimum sufficient local review")
+    paragraph_end = text.index("\n\n- Ordinary slice:", start)
+    paragraph = text[start:paragraph_end]
+    assert _normalized_visible(paragraph) == _MINIMUM_SUFFICIENT_REVIEW_SNAPSHOT
+    assert not _occurrences(paragraph, "GitHub Claude exact-head approval")
+    assert not _occurrences(paragraph, "Claude exact-head approval")
+
+
+def _assert_draft_phase_policy(text: str) -> None:
+    """Assert draft opening triggers a skipped headless job, not findings to fold."""
+    start = text.index("**Draft phase vs ready phase")
+    end = text.index("\n\n**WAIT for Codex's verdict before merging", start)
+    paragraph = text[start:end]
+    assert _normalized_visible(paragraph) == _DRAFT_PHASE_SNAPSHOT
+    assert not _occurrences(paragraph, "findings there are real and worth folding")
+
+
+def _assert_registry_735_clarification(text: str) -> None:
+    """Assert the #735 clarification is operative and preserves D-ToS-1 skip semantics."""
+    spans = _historical_spans(text)
+    _span_start, span_end = next(
+        (start, end)
+        for start, end in spans
+        if "#735 story-closing implementation complete" in text[start:end]
+    )
+    clarification_end = text.index("\n\n**11 Aug 2026", span_end)
+    clarification = text[span_end:clarification_end]
+    assert _normalized_visible(clarification) == _REGISTRY_735_CLARIFICATION_SNAPSHOT
+    assert "the review itself still runs unskipped" not in clarification
+
+
 def _assert_registry_policy(text: str) -> None:
     """Assert the first registry reconciliation entry is operative and complete."""
     spans = _historical_spans(text)
+    _assert_registry_735_clarification(text)
     header_index = text.index("## Active Epic")
     entry_heading = "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
     entry_start = text.index(entry_heading, header_index)
@@ -548,6 +582,42 @@ _REVIEW_ROSTER_SNAPSHOT = _normalized_visible(
     it is no longer a live roster member. **CodeRabbit stays disabled (15 Jun) and
     the Augment Code trial ENDED (28 Jun).**"""
 )
+_MINIMUM_SUFFICIENT_REVIEW_SNAPSHOT = _normalized_visible(
+    """### Minimum sufficient local review
+
+    This routing changes only additional local/pre-open model review. Ready-head
+    Codex review and wait, branch protection, conversation resolution, CI, CodeQL
+    handling, and `codecov/patch` rules above remain unchanged."""
+)
+_DRAFT_PHASE_SNAPSHOT = _normalized_visible(
+    """**Draft phase vs ready phase (the shift-left reconciliation, D103-adjacent; corrected 27
+    Jul 2026).** The once-on-final-commit rule above governs the **post-ready** phase: a
+    marked-ready PR heading to merge, where re-triggering across pushes is re-litigation
+    churn. Codex itself does not review a PR while it sits in **draft**: GitHub's Codex
+    connector fires automatically only at the ready transition (opened ready, or a draft
+    marked ready), confirmed against roastpilot-cloud PR #150 (27 Jul 2026), where Codex
+    produced no review during the draft phase and then reviewed automatically the moment the
+    PR was marked ready. Under the D158 pilot, the pre-ready fold is the
+    minimum-sufficient independent review selected by the Codex parent and run locally under
+    `pr-preflight`; it is not the former fixed local-Codex step. A GitHub-side `@codex review`
+    comment left on a draft is a different thing again, and is NOT simply inert: D105 observed
+    on 19 Jul 2026 that it does run and does post findings-reviews, but never completes the
+    clean-verdict flow on a draft, so a draft waiting on a clean signal waits forever. Both facts
+    hold, because they describe different mechanisms: the automatic trigger does not fire until
+    ready, while an explicit comment runs but cannot produce a clean verdict there. Neither makes
+    the draft a place to converge to clean. Draft = fold locally and let the runner gates
+    (`ci.yml`, tests, `ruff`, `pyright`) run; ready = the automatic Codex review fires on that
+    head, then once-on-final-commit applies to any later push. Opening a draft still triggers the
+    `claude-review` workflow's `on: opened` event, but under D-ToS-1 the job itself SKIPS while
+    `CLAUDE_HEADLESS_ENABLED` is unset — it is not a required check, and a skipped run posts no
+    findings to fold. Unlike Codex, this job is not draft-suppressed by GitHub; it is gated off by
+    the headless retirement instead."""
+)
+_REGISTRY_735_CLARIFICATION_SNAPSHOT = _normalized_visible(
+    """The trigger remains configured, but under D-ToS-1 its headless job skips while
+    `CLAUDE_HEADLESS_ENABLED` is unset; the retained `track_progress` implementation
+    above is not undone."""
+)
 
 
 def _operative_text(text: str, spans: list[tuple[int, int]]) -> str:
@@ -670,6 +740,8 @@ def test_agents_md_headless_skip_is_documented_and_never_instructed_on() -> None
 
     _assert_branch_protection_policy(text)
     _assert_review_roster_policy(text)
+    _assert_minimum_sufficient_review_policy(text)
+    _assert_draft_phase_policy(text)
     _assert_precedence_policy(text)
 
 
@@ -1116,6 +1188,43 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
                 + agents[roster_start:roster_end].replace(original, replacement, 1)
                 + agents[roster_end:]
             )
+
+    review_start = agents.index("### Minimum sufficient local review")
+    review_end = agents.index("\n\n- Ordinary slice:", review_start)
+    with pytest.raises(AssertionError):
+        _assert_minimum_sufficient_review_policy(
+            agents[:review_start]
+            + agents[review_start:review_end].replace(
+                "Ready-head\nCodex review and wait", "GitHub Claude exact-head approval", 1
+            )
+            + agents[review_end:]
+        )
+
+    draft_start = agents.index("**Draft phase vs ready phase")
+    draft_end = agents.index("\n\n**WAIT for Codex's verdict before merging", draft_start)
+    with pytest.raises(AssertionError):
+        _assert_draft_phase_policy(
+            agents[:draft_start]
+            + agents[draft_start:draft_end].replace(
+                "a\nskipped run posts no findings to fold",
+                "findings there are real and worth folding",
+                1,
+            )
+            + agents[draft_end:]
+        )
+
+    with pytest.raises(AssertionError):
+        _assert_registry_735_clarification(
+            registry.replace("The trigger remains configured", "", 1)
+        )
+    with pytest.raises(AssertionError):
+        _assert_registry_735_clarification(
+            registry.replace(
+                "its headless job skips while\n`CLAUDE_HEADLESS_ENABLED` is unset",
+                "the review itself still runs unskipped",
+                1,
+            )
+        )
 
     for document, assertion in (
         (agents, _assert_agents_historical_evidence),
