@@ -1105,11 +1105,12 @@ def test_live_destination_revalidation_rejects_replaced_target(tmp_path: Path) -
     target = parent / "file1.bin"
     parent.mkdir(parents=True)
     target.write_bytes(b"payload")
-    verified = target.stat()
+    target_fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
     parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-    target.unlink()
-    target.write_bytes(b"payload")
     try:
+        verified = os.fstat(target_fd)
+        target.unlink()
+        target.write_bytes(b"payload")
         with pytest.raises(
             ModelInstallError, match="destination changed before placement could be confirmed"
         ):
@@ -1121,7 +1122,10 @@ def test_live_destination_revalidation_rejects_replaced_target(tmp_path: Path) -
                 inode=verified.st_ino,
             )
     finally:
-        os.close(parent_fd)
+        try:
+            os.close(parent_fd)
+        finally:
+            os.close(target_fd)
 
 
 def test_replaced_temporary_entry_before_rename_is_rejected(
