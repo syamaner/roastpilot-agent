@@ -397,15 +397,8 @@ def _is_already_valid(  # pyright: ignore[reportUnusedFunction]
     if verified is None:
         return False
     digest_hex, fd, _device, _inode = verified
-    try:
-        is_valid = digest_hex == expected_sha256
-    except BaseException:
-        _cleanup_preserving_primary(
-            lambda: os.close(fd), action="closing cached model file descriptor"
-        )
-        raise
-    else:
-        os.close(fd)
+    is_valid = digest_hex == expected_sha256
+    os.close(fd)
     return is_valid
 
 

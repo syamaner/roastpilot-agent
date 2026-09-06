@@ -181,19 +181,20 @@ def test_cached_parent_renamed_after_hash_is_not_reported_as_success(
     parent.mkdir(parents=True)
     target.write_bytes(b"verified")
     parked_parent = tmp_path / "parked-parent"
-    outside = tmp_path / "outside"
-    outside.mkdir()
     original_hash = model_install_module._sha256_of_open_file  # pyright: ignore[reportPrivateUsage]
 
     def rename_parent_after_hash(fd: int, path: Path | str) -> tuple[str, int, int]:
         result = original_hash(fd, path)
         parent.rename(parked_parent)
-        parent.symlink_to(outside, target_is_directory=True)
+        parent.mkdir(mode=0o700)
+        os.link(parked_parent / "file1.bin", target)
         return result
 
     monkeypatch.setattr(model_install_module, "_sha256_of_open_file", rename_parent_after_hash)
 
-    with pytest.raises(ModelInstallError, match="cannot safely open destination directory"):
+    with pytest.raises(
+        ModelInstallError, match="destination changed before placement could be confirmed"
+    ):
         install_model(
             dest,
             verify_only=True,
@@ -202,8 +203,7 @@ def test_cached_parent_renamed_after_hash_is_not_reported_as_success(
             revision=_REVISION,
         )
 
-    assert (parked_parent / "file1.bin").read_bytes() == b"verified"
-    assert not (outside / "file1.bin").exists()
+    assert os.path.samefile(parked_parent / "file1.bin", target)
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFO support")
@@ -1052,29 +1052,76 @@ def test_swapped_destination_parent_cannot_redirect_placement_outside_dest(
     dest = tmp_path / "dest"
     parent = dest / "a"
     parent.mkdir(parents=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
     parked_parent = tmp_path / "parked-parent"
     manifest = _make_manifest({"a/file1.bin": b"payload"})
     original_stream_to_temp = model_install_module._stream_to_temp  # pyright: ignore[reportPrivateUsage]
+    original_place_verified = model_install_module._place_verified  # pyright: ignore[reportPrivateUsage]
 
     def swap_parent_then_stream(
         parent_fd: int, target_name: str, chunks: Iterable[bytes], *, byte_cap: int
     ) -> tuple[str, int, str]:
         parent.rename(parked_parent)
-        parent.symlink_to(outside, target_is_directory=True)
+        parent.mkdir(mode=0o700)
         return original_stream_to_temp(parent_fd, target_name, chunks, byte_cap=byte_cap)
 
+    def link_placed_file_into_replacement(
+        parent_fd: int,
+        target_name: str,
+        chunks: Iterable[bytes],
+        *,
+        expected_sha256: str,
+        byte_cap: int,
+        context: str,
+    ) -> tuple[int, int]:
+        result = original_place_verified(
+            parent_fd,
+            target_name,
+            chunks,
+            expected_sha256=expected_sha256,
+            byte_cap=byte_cap,
+            context=context,
+        )
+        os.link(parked_parent / target_name, parent / target_name)
+        return result
+
     monkeypatch.setattr(model_install_module, "_stream_to_temp", swap_parent_then_stream)
+    monkeypatch.setattr(model_install_module, "_place_verified", link_placed_file_into_replacement)
     client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"payload")))
 
-    with pytest.raises(ModelInstallError, match="cannot safely open destination directory"):
+    with pytest.raises(
+        ModelInstallError, match="destination changed before placement could be confirmed"
+    ):
         install_model(
             dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
         )
 
-    assert not (outside / "file1.bin").exists()
-    assert (parked_parent / "file1.bin").read_bytes() == b"payload"
+    assert os.path.samefile(parked_parent / "file1.bin", parent / "file1.bin")
+
+
+def test_live_destination_revalidation_rejects_replaced_target(tmp_path: Path) -> None:
+    """A live target must retain the verified device and inode before success."""
+    dest = tmp_path / "dest"
+    parent = dest / "a"
+    target = parent / "file1.bin"
+    parent.mkdir(parents=True)
+    target.write_bytes(b"payload")
+    verified = target.stat()
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    target.unlink()
+    target.write_bytes(b"payload")
+    try:
+        with pytest.raises(
+            ModelInstallError, match="destination changed before placement could be confirmed"
+        ):
+            model_install_module._revalidate_live_destination(  # pyright: ignore[reportPrivateUsage]
+                dest,
+                "a/file1.bin",
+                parent_fd=parent_fd,
+                device=verified.st_dev,
+                inode=verified.st_ino,
+            )
+    finally:
+        os.close(parent_fd)
 
 
 def test_replaced_temporary_entry_before_rename_is_rejected(
