@@ -1809,6 +1809,40 @@ def test_is_already_valid_treats_a_symlink_as_not_valid(tmp_path: Path) -> None:
     assert is_valid is False
 
 
+@pytest.mark.parametrize("expected_bytes", [b"hello", b"mismatch"])
+def test_is_already_valid_closes_cached_descriptor_after_digest_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, expected_bytes: bytes
+) -> None:
+    """Direct cached verification closes its retained descriptor on both outcomes."""
+    target = tmp_path / "cached.bin"
+    target.write_bytes(b"hello")
+    original_close = os.close
+    cached_fds: list[int] = []
+    closed_cached_fds: list[int] = []
+    original_open = model_install_module._open_cached_file  # pyright: ignore[reportPrivateUsage]
+
+    def capture_cached_open(path: Path | str, *, dir_fd: int | None = None) -> int:
+        fd = original_open(path, dir_fd=dir_fd)
+        cached_fds.append(fd)
+        return fd
+
+    def capture_close(fd: int) -> None:
+        if fd in cached_fds:
+            closed_cached_fds.append(fd)
+        original_close(fd)
+
+    monkeypatch.setattr(model_install_module, "_open_cached_file", capture_cached_open)
+    monkeypatch.setattr(os, "close", capture_close)
+
+    is_valid = model_install_module._is_already_valid(  # pyright: ignore[reportPrivateUsage]
+        target, hashlib.sha256(expected_bytes).hexdigest()
+    )
+
+    assert is_valid is (expected_bytes == b"hello")
+    assert cached_fds
+    assert closed_cached_fds == [cached_fds[0]]
+
+
 def test_is_already_valid_treats_missing_as_not_valid(tmp_path: Path) -> None:
     digest = hashlib.sha256(b"hello").hexdigest()
     is_valid = model_install_module._is_already_valid(  # pyright: ignore[reportPrivateUsage]

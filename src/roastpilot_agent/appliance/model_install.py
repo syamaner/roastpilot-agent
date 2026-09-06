@@ -398,7 +398,7 @@ def _is_already_valid(  # pyright: ignore[reportUnusedFunction]
         return False
     digest_hex, fd, _device, _inode = verified
     try:
-        return digest_hex == expected_sha256
+        is_valid = digest_hex == expected_sha256
     except BaseException:
         _cleanup_preserving_primary(
             lambda: os.close(fd), action="closing cached model file descriptor"
@@ -406,6 +406,7 @@ def _is_already_valid(  # pyright: ignore[reportUnusedFunction]
         raise
     else:
         os.close(fd)
+    return is_valid
 
 
 def _validate_destination_parent_trust(parent_fd: int) -> None:
