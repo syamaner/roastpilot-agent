@@ -285,19 +285,20 @@ def _is_affirmative_enablement_instruction(text: str) -> bool:
     has_assignment = any(
         match.group("prohibition") is None for match in assignment.finditer(normalized)
     )
-    gh_matches = list(gh_variable_set.finditer(markdown_clean))
+    gh_scan = re.sub(r"\\[ \t]*\r?\n[ \t]*", " ", markdown_clean)
+    gh_matches = list(gh_variable_set.finditer(gh_scan))
     has_gh_enablement = False
     for index, match in enumerate(gh_matches):
-        line_end = markdown_clean.find("\n", match.end())
+        line_end = gh_scan.find("\n", match.end())
         if line_end == -1:
-            line_end = len(markdown_clean)
-        command_separator = re.search(r";|&&|\|\|", markdown_clean[match.end() : line_end])
+            line_end = len(gh_scan)
+        command_separator = re.search(r";|&&|\|\|", gh_scan[match.end() : line_end])
         if command_separator is not None:
             line_end = match.end() + command_separator.start()
         next_command_start = (
             gh_matches[index + 1].start() if index + 1 < len(gh_matches) else line_end
         )
-        command_segment = markdown_clean[match.end() : min(line_end, next_command_start)]
+        command_segment = gh_scan[match.end() : min(line_end, next_command_start)]
         target = re.search(r"\bCLAUDE_HEADLESS_ENABLED\b", command_segment)
         if target is None:
             continue
@@ -417,6 +418,7 @@ def _assert_retained_mechanism_policy(text: str) -> None:
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
     mechanism = text[start:end]
     assert _occurrences(mechanism, "dormant")
+    assert _occurrences(mechanism, "gates nothing today")
     assert _occurrences(mechanism, "operator-owned branch-protection decision")
     assert not _occurrences(mechanism, "not dormant")
     assert not _occurrences(mechanism, "not operator-owned branch-protection decision")
@@ -444,6 +446,12 @@ def _assert_claude_review_note_policy(text: str) -> None:
     end = text.index("\n\n## Codex-Led Delivery Topology", start)
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
     note = text[start:end]
+    normalized_note = _normalized_visible(note)
+    assert "not a required status check" in normalized_note
+    assert (
+        "The real findings-gate is GitHub Codex's inline threads + "
+        "required_conversation_resolution" in normalized_note
+    )
     for required in (
         ".github/workflows/claude-code-review.yml:27-41",
         ".github/workflows/claude.yml:14-26",
@@ -857,6 +865,9 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true"
     )
     assert _is_affirmative_enablement_instruction(
+        "gh variable set " + "\\\n" + "CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert _is_affirmative_enablement_instruction(
         'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"'
     )
     assert _is_affirmative_enablement_instruction(
@@ -915,6 +926,9 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
     )
     assert not _is_affirmative_enablement_instruction(
         "gh variable set --repo owner/repo OTHER_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh variable set\nunconnected prose\nCLAUDE_HEADLESS_ENABLED --body true"
     )
     assert _is_affirmative_enablement_instruction(
         "gh variable set CLAUDE_HEADLESS_ENABLED --body false; "
@@ -1048,6 +1062,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "export CLAUDE_HEADLESS_ENABLED='true'",
         "CLAUDE_HEADLESS_ENABLED=true",
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
+        "gh variable set " + "\\\n" + "CLAUDE_HEADLESS_ENABLED --body true",
         'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
         "gh variable set CLAUDE_HEADLESS_ENABLED -b='true'",
         "gh variable set CLAUDE_HEADLESS_ENABLED -b=true",
@@ -1133,6 +1148,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "export CLAUDE_HEADLESS_ENABLED='true'",
         "CLAUDE_HEADLESS_ENABLED=true",
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
+        "gh variable set " + "\\\n" + "CLAUDE_HEADLESS_ENABLED --body true",
         'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
         "gh variable set CLAUDE_HEADLESS_ENABLED -b='true'",
         "gh variable set CLAUDE_HEADLESS_ENABLED -b=true",
@@ -1280,6 +1296,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         ("dormant", "not dormant"),
         ("operator-owned branch-protection decision", ""),
         ("operator-owned branch-protection decision", "not operator-owned"),
+        ("gates nothing\n  today", "gates merge today"),
     ):
         with pytest.raises(AssertionError):
             _assert_retained_mechanism_policy(
@@ -1303,6 +1320,10 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     ):
         with pytest.raises(AssertionError):
             _assert_claude_review_note_policy(agents.replace(citation, "", 1))
+    with pytest.raises(AssertionError):
+        _assert_claude_review_note_policy(
+            agents.replace("**not** a required status check", "a required status check", 1)
+        )
 
     for document, assertion in (
         (agents, _assert_agents_historical_evidence),
