@@ -190,7 +190,7 @@ def test_reclaim_rejects_unsafe_matching_part_without_deleting_it(tmp_path: Path
     parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     stale = tmp_path / ".model.bin.0123456789abcdef0123456789abcdef.part"
     stale.write_bytes(b"unsafe")
-    stale.chmod(0o644)
+    stale.chmod(0o640)
     try:
         with pytest.raises(ModelInstallError, match="unsafe abandoned"):
             model_install_module._reclaim_abandoned_parts(  # pyright: ignore[reportPrivateUsage]
@@ -200,6 +200,23 @@ def test_reclaim_rejects_unsafe_matching_part_without_deleting_it(tmp_path: Path
         os.close(parent_fd)
 
     assert stale.read_bytes() == b"unsafe"
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o644])
+def test_reclaim_accepts_installer_created_part_modes(tmp_path: Path, mode: int) -> None:
+    """Crash-left temps remain reclaimable before and after final-mode fchmod."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    stale = tmp_path / ".model.bin.0123456789abcdef0123456789abcdef.part"
+    stale.write_bytes(b"stale")
+    stale.chmod(mode)
+    try:
+        model_install_module._reclaim_abandoned_parts(  # pyright: ignore[reportPrivateUsage]
+            parent_fd, "model.bin"
+        )
+    finally:
+        os.close(parent_fd)
+
+    assert not stale.exists()
 
 
 def test_reclaim_rejects_matching_hardlinked_part_without_deleting_it(tmp_path: Path) -> None:
@@ -480,7 +497,7 @@ def test_source_open_missing_and_root_errors_are_typed(
     def fail_root_open(
         path: Path | str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
     ) -> int:
-        if path == source_root:
+        if path == source_root.name:
             raise OSError("permission")
         return original_open(path, flags, mode, dir_fd=dir_fd)
 
@@ -501,6 +518,43 @@ def test_source_final_missing_is_typed_after_parent_open(tmp_path: Path) -> None
         )
 
 
+@pytest.mark.parametrize("swap_component", ["ancestor", "root"])
+def test_source_root_descriptor_walk_rejects_swapped_ancestor_or_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, swap_component: str
+) -> None:
+    """No absolute ``--from-dir`` ancestor or root is followed after a swap."""
+    ancestor = tmp_path / "source-ancestor"
+    source_root = ancestor / "source-root"
+    source = source_root / "a" / "file.bin"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"safe")
+    outside = tmp_path / "outside"
+    (outside / "a").mkdir(parents=True)
+    (outside / "a" / "file.bin").write_bytes(b"outside")
+    target = ancestor if swap_component == "ancestor" else source_root
+    parked = tmp_path / f"parked-{swap_component}"
+    original_open = os.open
+    swapped = False
+
+    def swap_before_open(
+        path: Path | str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        nonlocal swapped
+        if path == target.name and not swapped:
+            swapped = True
+            target.rename(parked)
+            target.symlink_to(outside, target_is_directory=True)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", swap_before_open)
+    with pytest.raises(ModelInstallError, match="cannot safely open the --from-dir root"):
+        model_install_module._open_verified_source_file(  # pyright: ignore[reportPrivateUsage]
+            source_root, "a/file.bin"
+        )
+
+    assert (outside / "a" / "file.bin").read_bytes() == b"outside"
+
+
 def test_source_parent_close_failure_releases_child_descriptor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -512,14 +566,16 @@ def test_source_parent_close_failure_releases_child_descriptor(
     root_fds: list[int] = []
     child_fds: list[int] = []
     close_calls: list[int] = []
+    close_start: list[int] = []
 
     def record_open(
         path: Path | str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
     ) -> int:
         fd = original_open(path, flags, mode, dir_fd=dir_fd)
-        if path == source_root:
+        if path == source_root.name:
             root_fds.append(fd)
-        elif path == "a":
+        elif path == "a" and root_fds and dir_fd == root_fds[0]:
+            close_start.append(len(close_calls))
             child_fds.append(fd)
         return fd
 
@@ -540,7 +596,7 @@ def test_source_parent_close_failure_releases_child_descriptor(
         for fd in root_fds:
             original_close(fd)
 
-    assert child_fds and close_calls.count(child_fds[0]) == 1
+    assert child_fds and close_calls[close_start[0] :].count(child_fds[0]) == 1
 
 
 def test_destination_walkers_normalise_mkdir_and_disappearance_races(

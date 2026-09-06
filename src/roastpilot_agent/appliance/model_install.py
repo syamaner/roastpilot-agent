@@ -466,7 +466,7 @@ def _reclaim_abandoned_parts(parent_fd: int, target_name: str) -> None:
             if (
                 not stat.S_ISREG(opened.st_mode)
                 or opened.st_uid != os.geteuid()
-                or stat.S_IMODE(opened.st_mode) != 0o600
+                or stat.S_IMODE(opened.st_mode) not in (0o600, 0o644)
                 or opened.st_nlink != 1
                 or opened.st_size > _MAX_MODEL_FILE_BYTES
                 or entry.st_dev != opened.st_dev
@@ -491,6 +491,41 @@ def _reclaim_abandoned_parts(parent_fd: int, target_name: str) -> None:
             raise ModelInstallError("cannot safely reclaim abandoned model temporary file") from exc
 
 
+def _open_source_root(from_dir_real: Path, relative_path: str) -> int:
+    """Open an absolute ``--from-dir`` root through no-follow descriptors."""
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_path = Path(os.path.abspath(from_dir_real))
+    parent_fd = os.open("/", directory_flags)
+    try:
+        for component in root_path.parts[1:]:
+            try:
+                child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                raise ModelInstallError(
+                    f"--from-dir is missing required file {relative_path!r}"
+                ) from None
+            except OSError as exc:
+                raise ModelInstallError("cannot safely open the --from-dir root") from exc
+            try:
+                os.close(parent_fd)
+            except BaseException:
+                _cleanup_preserving_primary(
+                    lambda fd=child_fd: os.close(fd),
+                    action="closing child --from-dir directory descriptor",
+                )
+                parent_fd = None
+                raise
+            parent_fd = child_fd
+    except BaseException:
+        if parent_fd is not None:
+            _cleanup_preserving_primary(
+                lambda: os.close(parent_fd), action="closing --from-dir directory descriptor"
+            )
+        raise
+    assert parent_fd is not None
+    return parent_fd
+
+
 def _open_verified_source_file(from_dir_real: Path, relative_path: str) -> int:
     """Open one regular ``--from-dir`` source through no-follow descriptors.
 
@@ -508,12 +543,7 @@ def _open_verified_source_file(from_dir_real: Path, relative_path: str) -> int:
     components = relative_path.split("/")
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     source_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-    try:
-        parent_fd = os.open(from_dir_real, directory_flags)
-    except FileNotFoundError:
-        raise ModelInstallError(f"--from-dir is missing required file {relative_path!r}") from None
-    except OSError as exc:
-        raise ModelInstallError("cannot safely open the --from-dir root") from exc
+    parent_fd = _open_source_root(from_dir_real, relative_path)
     source_fd: int | None = None
     try:
         for component in components[:-1]:
