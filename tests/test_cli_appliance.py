@@ -291,6 +291,58 @@ def test_run_appliance_model_install_prints_sanitised_cleanup_notes(
     assert "secret" not in out
 
 
+@pytest.mark.parametrize(
+    "action",
+    [
+        "closing cached model file descriptor",
+        "closing child destination root descriptor",
+        "closing child destination directory descriptor",
+        "closing child --from-dir directory descriptor",
+        "closing destination directory descriptor",
+        "closing destination root descriptor",
+        "closing live destination directory descriptor",
+        "closing live destination root descriptor",
+        "closing model download client",
+        "closing temporary model file descriptor",
+        "closing --from-dir directory descriptor",
+        "closing --from-dir source descriptor",
+        "removing temporary model file",
+    ],
+)
+def test_appliance_cleanup_note_allowlist_matches_model_install_actions(
+    action: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every model-installer cleanup action prints only its identifier error type."""
+    failure = ModelInstallError("failure")
+    failure.add_note(f"cleanup failed while {action}: OSError")
+    cli._print_appliance_cleanup_notes(failure)  # pyright: ignore[reportPrivateUsage]
+
+    assert capsys.readouterr().out == (
+        f"model install warning: cleanup failed while {action}: OSError\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "cleanup failed while arbitrary action: OSError",
+        "cleanup failed while closing destination root descriptor: OSError: secret",
+        "cleanup failed while closing destination root descriptor: OSError-unsafe",
+        "cleanup failed while closing destination root descriptor",
+        "https://example.invalid/?token=secret",
+    ],
+)
+def test_appliance_cleanup_note_suppresses_unrecognised_or_malformed_text(
+    note: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The cleanup-note channel never accepts prefixes or arbitrary text."""
+    failure = ModelInstallError("failure")
+    failure.add_note(note)
+    cli._print_appliance_cleanup_notes(failure)  # pyright: ignore[reportPrivateUsage]
+
+    assert capsys.readouterr().out == ""
+
+
 def test_run_appliance_model_install_oserror_prints_friendly_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
