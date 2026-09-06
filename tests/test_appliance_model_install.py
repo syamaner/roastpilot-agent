@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import stat
+import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
@@ -137,6 +138,175 @@ def test_second_run_with_valid_files_makes_no_network_call(tmp_path: Path) -> No
     assert calls[0] == 2
     assert summary.network_used is False
     assert {f.source for f in summary.files} == {"cached"}
+
+
+@pytest.mark.parametrize("verify_only", [False, True])
+def test_cached_file_requires_exact_service_readable_mode(
+    tmp_path: Path, verify_only: bool
+) -> None:
+    """A digest match does not override the MCP service's required 0644 mode."""
+    manifest = _make_manifest({"a/file1.bin": b"verified"})
+    target = tmp_path / "dest" / "a" / "file1.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"verified")
+    target.chmod(0o600)
+    client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"verified")))
+
+    with pytest.raises(ModelInstallError, match="service-readable mode 0644"):
+        install_model(
+            tmp_path / "dest",
+            verify_only=verify_only,
+            manifest_files=manifest,
+            repo_id=_REPO_ID,
+            revision=_REVISION,
+            http_client=client,
+        )
+
+    assert target.read_bytes() == b"verified"
+
+
+def test_reclaim_abandoned_part_removes_only_exact_safe_candidate(tmp_path: Path) -> None:
+    """Descriptor-checked stale parts are reclaimed without touching lookalikes."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    stale = tmp_path / ".model.bin.0123456789abcdef0123456789abcdef.part"
+    stale.write_bytes(b"stale")
+    stale.chmod(0o600)
+    lookalike = tmp_path / ".model.bin.not-a-uuid.part"
+    lookalike.write_bytes(b"keep")
+    try:
+        model_install_module._reclaim_abandoned_parts(  # pyright: ignore[reportPrivateUsage]
+            parent_fd, "model.bin"
+        )
+    finally:
+        os.close(parent_fd)
+
+    assert not stale.exists()
+    assert lookalike.read_bytes() == b"keep"
+
+
+def test_reclaim_rejects_unsafe_matching_part_without_deleting_it(tmp_path: Path) -> None:
+    """A matching name is not sufficient authority to delete an unsafe entry."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    stale = tmp_path / ".model.bin.0123456789abcdef0123456789abcdef.part"
+    stale.write_bytes(b"unsafe")
+    stale.chmod(0o644)
+    try:
+        with pytest.raises(ModelInstallError, match="unsafe abandoned"):
+            model_install_module._reclaim_abandoned_parts(  # pyright: ignore[reportPrivateUsage]
+                parent_fd, "model.bin"
+            )
+    finally:
+        os.close(parent_fd)
+
+    assert stale.read_bytes() == b"unsafe"
+
+
+def test_reclaim_rejects_matching_hardlinked_part_without_deleting_it(tmp_path: Path) -> None:
+    """A hardlinked matching part cannot be an abandoned private temp file."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    stale = tmp_path / ".model.bin.0123456789abcdef0123456789abcdef.part"
+    stale.write_bytes(b"unsafe")
+    stale.chmod(0o600)
+    alias = tmp_path / "alias"
+    os.link(stale, alias)
+    try:
+        with pytest.raises(ModelInstallError, match="unsafe abandoned"):
+            model_install_module._reclaim_abandoned_parts(  # pyright: ignore[reportPrivateUsage]
+                parent_fd, "model.bin"
+            )
+    finally:
+        os.close(parent_fd)
+
+    assert stale.exists()
+    assert alias.exists()
+
+
+def test_reclaim_rejects_matching_fifo_without_opening_or_deleting_it(tmp_path: Path) -> None:
+    """A FIFO matching the namespace is opened non-blocking then rejected."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    stale = tmp_path / ".model.bin.0123456789abcdef0123456789abcdef.part"
+    os.mkfifo(stale, 0o600)
+    try:
+        with pytest.raises(ModelInstallError, match="unsafe abandoned"):
+            model_install_module._reclaim_abandoned_parts(  # pyright: ignore[reportPrivateUsage]
+                parent_fd, "model.bin"
+            )
+    finally:
+        os.close(parent_fd)
+
+    assert stat.S_ISFIFO(os.lstat(stale).st_mode)
+
+
+def test_install_reclaims_safe_partial_before_fetching(tmp_path: Path) -> None:
+    """A crash-left safe partial cannot accumulate across a later installation."""
+    manifest = _make_manifest({"a/file1.bin": b"verified"})
+    parent = tmp_path / "dest" / "a"
+    parent.mkdir(parents=True)
+    stale = parent / ".file1.bin.0123456789abcdef0123456789abcdef.part"
+    stale.write_bytes(b"stale")
+    stale.chmod(0o600)
+    client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"verified")))
+
+    summary = install_model(
+        tmp_path / "dest",
+        manifest_files=manifest,
+        repo_id=_REPO_ID,
+        revision=_REVISION,
+        http_client=client,
+    )
+
+    assert summary.files[0].source == "fetched"
+    assert not stale.exists()
+
+
+def test_destination_parent_lock_refuses_contention_then_allows_after_release(
+    tmp_path: Path,
+) -> None:
+    """The advisory lock rejects a concurrent installer and releases on close."""
+    first_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    second_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        model_install_module._lock_destination_parent(first_fd)  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(ModelInstallError, match="another model installation"):
+            model_install_module._lock_destination_parent(second_fd)  # pyright: ignore[reportPrivateUsage]
+        os.close(first_fd)
+        first_fd = -1
+        model_install_module._lock_destination_parent(second_fd)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        if first_fd != -1:
+            os.close(first_fd)
+        os.close(second_fd)
+
+
+def test_reclaim_candidate_identity_swap_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-name replacement between descriptor validation and unlink fails closed."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    stale = tmp_path / ".model.bin.0123456789abcdef0123456789abcdef.part"
+    stale.write_bytes(b"stale")
+    stale.chmod(0o600)
+    original_lstat = os.lstat
+    calls = [0]
+
+    def swap_on_second_lstat(path: str, *, dir_fd: int | None = None) -> os.stat_result:
+        calls[0] += 1
+        if calls[0] == 2:
+            stale.unlink()
+            stale.write_bytes(b"replacement")
+            stale.chmod(0o600)
+        return original_lstat(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "lstat", swap_on_second_lstat)
+    try:
+        with pytest.raises(ModelInstallError, match="changed during reclamation"):
+            model_install_module._reclaim_abandoned_parts(  # pyright: ignore[reportPrivateUsage]
+                parent_fd, "model.bin"
+            )
+    finally:
+        os.close(parent_fd)
+
+    assert stale.read_bytes() == b"replacement"
 
 
 def test_cached_entry_replacement_after_hash_is_rejected(
@@ -2036,6 +2206,48 @@ def test_network_error_aborts_with_no_url_or_env_value_in_message(tmp_path: Path
     assert "huggingface.co" not in message
     assert not (dest / "a" / "file1.bin").exists()
     assert list(dest.rglob("*.part")) == []
+
+
+def test_whole_fetch_deadline_aborts_body_and_removes_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fixed monotonic deadline bounds a trickle body beyond HTTPX's read timeout."""
+    manifest = _make_manifest({"a/file1.bin": b"hello"})
+    clock_values = iter((0.0, 0.0, model_install_module._FETCH_DEADLINE_SECONDS))  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(time, "monotonic", lambda: next(clock_values))
+    client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"hello")))
+    dest = tmp_path / "dest"
+
+    with pytest.raises(ModelInstallError, match="overall model fetch deadline"):
+        install_model(
+            dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
+        )
+
+    assert not (dest / "a" / "file1.bin").exists()
+    assert list(dest.rglob("*.part")) == []
+
+
+def test_whole_fetch_deadline_applies_between_redirect_hops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redirect time consumes the same total budget and prevents the next hop."""
+    calls = [0]
+    clock_values = iter((0.0, 0.0, model_install_module._FETCH_DEADLINE_SECONDS))  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(time, "monotonic", lambda: next(clock_values))
+
+    def redirect(_request: httpx.Request) -> httpx.Response:
+        calls[0] += 1
+        return httpx.Response(302, headers={"location": "https://hf.co/model"})
+
+    client = httpx.Client(transport=httpx.MockTransport(redirect))
+    with pytest.raises(ModelInstallError, match="overall model fetch deadline"):
+        list(
+            model_install_module._iter_https_bytes(  # pyright: ignore[reportPrivateUsage]
+                client, "https://huggingface.co/acme/model", byte_cap=10
+            )
+        )
+
+    assert calls == [1]
 
 
 def test_fchmod_failure_after_digest_verification_removes_temp_file(

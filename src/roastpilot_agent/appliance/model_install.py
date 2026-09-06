@@ -68,12 +68,14 @@ the MCP server's expected root layout with no MCP-side change.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import ipaddress
 import os
 import re
 import stat
 import sys
+import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
@@ -121,6 +123,8 @@ _MAX_MODEL_FILE_BYTES: Final[int] = 150 * 1024 * 1024
 
 _CONNECT_TIMEOUT_SECONDS: Final[float] = 10.0
 _READ_TIMEOUT_SECONDS: Final[float] = 60.0
+#: Whole-file monotonic bound, deliberately conservative for Pi downloads.
+_FETCH_DEADLINE_SECONDS: Final[float] = 15 * 60.0
 
 _CHUNK_SIZE: Final[int] = 1024 * 1024
 
@@ -305,6 +309,8 @@ def _sha256_of_open_file(fd: int, path: Path | str) -> tuple[str, int, int]:
         raise ModelInstallError(f"cached destination {path} is not a regular file")
     if initial.st_uid != os.geteuid() or initial.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise ModelInstallError(f"cached destination {path} is not an owner-only regular file")
+    if stat.S_IMODE(initial.st_mode) != 0o644:
+        raise ModelInstallError(f"cached destination {path} is not service-readable mode 0644")
     if initial.st_size > _MAX_MODEL_FILE_BYTES:
         raise ModelInstallError(
             f"cached destination {path} exceeds the {_MAX_MODEL_FILE_BYTES}-byte per-file cap"
@@ -420,6 +426,69 @@ def _validate_destination_parent_trust(parent_fd: int) -> None:
         stat.S_IWGRP | stat.S_IWOTH
     ):
         raise ModelInstallError("model destination parent is not an owner-only placement boundary")
+
+
+def _lock_destination_parent(parent_fd: int) -> None:
+    """Acquire the per-directory installer lock without waiting on another install."""
+    try:
+        fcntl.flock(parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        raise ModelInstallError(
+            "another model installation is active for this destination"
+        ) from exc
+
+
+def _reclaim_abandoned_parts(parent_fd: int, target_name: str) -> None:
+    """Remove only safe abandoned temporary files for ``target_name``.
+
+    The caller holds the non-blocking advisory lock on ``parent_fd`` for the
+    whole target operation.  Each candidate is still verified through an open
+    no-follow descriptor immediately before unlinking: a malformed or unsafe
+    lookalike is a fail-closed installation error, never a deletion guess.
+    """
+    pattern = re.compile(rf"^\.{re.escape(target_name)}\.[0-9a-f]{{32}}\.part$")
+    try:
+        names = os.listdir(parent_fd)
+    except OSError as exc:
+        raise ModelInstallError("cannot safely inspect abandoned model temporary files") from exc
+    for name in names:
+        if not pattern.fullmatch(name):
+            continue
+        try:
+            entry = os.lstat(name, dir_fd=parent_fd)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+        except OSError as exc:
+            raise ModelInstallError(
+                "abandoned model temporary file changed during reclamation"
+            ) from exc
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or opened.st_nlink != 1
+                or opened.st_size > _MAX_MODEL_FILE_BYTES
+                or entry.st_dev != opened.st_dev
+                or entry.st_ino != opened.st_ino
+            ):
+                raise ModelInstallError("refusing unsafe abandoned model temporary file")
+            current = os.lstat(name, dir_fd=parent_fd)
+            if current.st_dev != opened.st_dev or current.st_ino != opened.st_ino:
+                raise ModelInstallError("abandoned model temporary file changed during reclamation")
+        except BaseException:
+            _cleanup_preserving_primary(
+                lambda fd=fd: os.close(fd),
+                action="closing abandoned temporary model file descriptor",
+            )
+            raise
+        else:
+            os.close(fd)
+        try:
+            os.unlink(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except OSError as exc:
+            raise ModelInstallError("cannot safely reclaim abandoned model temporary file") from exc
 
 
 def _open_verified_source_file(from_dir_real: Path, relative_path: str) -> int:
@@ -637,26 +706,31 @@ def _iter_https_bytes(client: httpx.Client, url: str, *, byte_cap: int) -> Itera
             redirect is malformed, the chain exceeds :data:`_MAX_REDIRECTS`,
             the final response is not ``200``, the response carries a
             ``Content-Encoding`` header or an over-cap declared
-            ``Content-Length``, or a transport/timeout error occurs. The
-            message never contains the request URL (so it can never leak a
-            query string or embedded credential).
+            ``Content-Length``, a transport/timeout error, or the 15-minute
+            whole-file monotonic deadline expires. The message never contains
+            the request URL (so it can never leak a query string or embedded
+            credential).
     """
     current = httpx.URL(url)
-    timeout = httpx.Timeout(
-        connect=_CONNECT_TIMEOUT_SECONDS,
-        read=_READ_TIMEOUT_SECONDS,
-        write=_READ_TIMEOUT_SECONDS,
-        pool=_CONNECT_TIMEOUT_SECONDS,
-    )
+    deadline = time.monotonic() + _FETCH_DEADLINE_SECONDS
     for _attempt in range(_MAX_REDIRECTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ModelInstallError("overall model fetch deadline exceeded")
         _validate_fetch_url(current)
+        hop_timeout = httpx.Timeout(
+            connect=min(_CONNECT_TIMEOUT_SECONDS, remaining),
+            read=min(_READ_TIMEOUT_SECONDS, remaining),
+            write=min(_READ_TIMEOUT_SECONDS, remaining),
+            pool=min(_CONNECT_TIMEOUT_SECONDS, remaining),
+        )
         try:
             with client.stream(
                 "GET",
                 current,
                 headers=_ANONYMOUS_HEADERS,
                 follow_redirects=False,
-                timeout=timeout,
+                timeout=hop_timeout,
             ) as response:
                 _reject_content_encoding(response)
                 if response.has_redirect_location:
@@ -687,7 +761,10 @@ def _iter_https_bytes(client: httpx.Client, url: str, *, byte_cap: int) -> Itera
                 # nothing to transparently decode — using the raw stream
                 # keeps that true even against a future httpx version whose
                 # auto-decoding behavior changes.
-                yield from response.iter_raw()
+                for chunk in response.iter_raw():
+                    if time.monotonic() >= deadline:
+                        raise ModelInstallError("overall model fetch deadline exceeded")
+                    yield chunk
                 return
         except httpx.HTTPError as exc:
             raise ModelInstallError("network error while fetching the model") from exc
@@ -1205,6 +1282,7 @@ def install_model(
             try:
                 if parent_fd is not None:
                     _validate_destination_parent_trust(parent_fd)
+                    _lock_destination_parent(parent_fd)
                 cached = (
                     _open_verified_cached_file(target_name, dir_fd=parent_fd)
                     if parent_fd is not None
@@ -1252,6 +1330,9 @@ def install_model(
                             parent_fd, target_name = _open_destination_parent(
                                 dest_root_fd, manifest_file.relative_path, create=True
                             )
+                            _validate_destination_parent_trust(parent_fd)
+                            _lock_destination_parent(parent_fd)
+                        _reclaim_abandoned_parts(parent_fd, target_name)
                         placed_device, placed_inode = _place_verified(
                             parent_fd,
                             target_name,
@@ -1286,6 +1367,9 @@ def install_model(
                     parent_fd, target_name = _open_destination_parent(
                         dest_root_fd, manifest_file.relative_path, create=True
                     )
+                    _validate_destination_parent_trust(parent_fd)
+                    _lock_destination_parent(parent_fd)
+                _reclaim_abandoned_parts(parent_fd, target_name)
                 placed_device, placed_inode = _place_verified(
                     parent_fd,
                     target_name,

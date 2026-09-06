@@ -56,6 +56,7 @@ _LIVE_TERMINATION_SIGNALS: tuple[int, ...] = (signal.SIGINT, signal.SIGTERM) + (
 _APPLIANCE_CLEANUP_ACTIONS = frozenset(
     {
         "closing cached model file descriptor",
+        "closing abandoned temporary model file descriptor",
         "closing child destination root descriptor",
         "closing child destination directory descriptor",
         "closing child --from-dir directory descriptor",
