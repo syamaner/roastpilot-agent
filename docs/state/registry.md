@@ -10,7 +10,7 @@ deletion `false`; app-pinned required checks `Checks`, `Web (lint + typecheck
 `CLAUDE_HEADLESS_ENABLED` is unset: consumer-OAuth headless Claude CI (the
 hosted `Claude Code Review` job and the `@claude` responder) is retired under
 D-ToS-1, mirroring roastpilot-cloud #411, merged in agent commit
-`299fb5a93d09e54f58d370f7a35e5ce15f278150` (PR #923). A skipped headless job
+`299fb5a93d09e54f58d370f7a35e5ce15f278150` (PR #937). A skipped headless job
 is expected, never a failure. The D108-D118 PR-scoped Claude approval bridge
 mechanism is retained in the codebase but **dormant**: it gates nothing while
 `main` requires zero approving reviews. Restoring it is an operator-owned
@@ -19,8 +19,11 @@ branch-protection decision, not automatic. The merge bar remains CI,
 and wait, `required_conversation_resolution`, independent triage, and
 risk-routed authenticated local Claude assurance. This entry supersedes the
 operative approval wording in the "31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL
-RESTORED (#663 / D108-D118)" record and the earlier 31-Jul "#663 / D108-D118"
-status summary below, both now marked historical.
+RESTORED (#663 / D108-D118)" record, the earlier 31-Jul "#663 / D108-D118"
+status summary, and the residual June instructions to arm or require the
+SHA-scoped `review-gate`, all now marked historical. D108-D118 already retired
+that SHA-scoped mechanism; D-ToS-1 does not first retire it and it must not be
+restored.
 
 **1 Sep 2026 — #702 (D180/D181) closure:** PR #872 merged at
 `fdb354cd7b697261faf55212eee73e9504528281`; the issue is closed and the
@@ -2332,8 +2335,11 @@ Everything else remains exactly as the 24 Jun block records: **roast 4 (#134) is
 config that roast 4 must validate is confirmed live on `main`: MCP pin `0.1.8` (`pyproject.toml:115`),
 `late_maillard_trim` default 65 %/60 s/155 °C (`config.py` `LateMaillardTrim`, default fields ~L126–138), advisor `prompt_version="c3"`
 (`config.py:479`). Operator prerequisite unchanged: a **fresh, non-expiring OpenRouter key** (the
-13 Jun attempt-1 failure mode). Open operator action carried over: arm the `review-gate` required
-check (#159 / D58).
+13 Jun attempt-1 failure mode).
+<!-- historical-evidence: begin -->
+Open operator action carried over: arm the `review-gate` required check (#159 /
+D58).
+<!-- historical-evidence: end -->
 
 **24 Jun 2026 — PRE-ROAST-4 RELIABILITY + CLEANUP BATCH COMPLETE (the measured "after-v2"
 PR-hygiene sample). The next gate remains the operator running roast 4.** Four issues closed as
@@ -2355,11 +2361,13 @@ the pre-open domain reviewer on the branch) and independent D23 triage (author n
   `_stop_unconfirmed` in `start()`. Markers are diagnosis-only — restart still enters
   `operator_recovery_required`. safety-reviewer PASS.
 - **#159 — auto-merge-before-`claude-review` race — FIXED + plan D58 (PR #366, `12d14e1`).** A
+  <!-- historical-evidence: begin -->
   skip-aware `review-gate` commit-status workflow (pending on open → success-only/fail-closed when
   Claude Code Review completes; Dependabot + workflow-editing PRs auto-pass at stamp time).
   **Validated end-to-end on three real PRs this batch** (#366/#367/#368). **OPERATOR ACTION
   OUTSTANDING:** mark `review-gate` a REQUIRED status check on `main` to arm it (build gate + operator
   activates; the mechanism is inert until required). See plan D58.
+  <!-- historical-evidence: end -->
 - **#306 — per-tick MCP console flood — CLOSED via the MCP release lockstep.** Root cause is
   child-side (the MCP SDK's `mcp.server.lowlevel.server` per-request INFO, piped as raw stderr — the
   agent can't filter another process's logger), so NO agent code change. Fixed in
@@ -2378,8 +2386,11 @@ caveat: an independent post-open lens (Augment) still earned its keep twice; shi
 are metric-blind (#306 resolved with zero agent code; the folded coverage gap). Memory
 `pr-flow-improvement-experiment`.
 
-**Still open / next:** **operator activates the `review-gate` required check (#159 / D58)**; everything
-else is OPERATOR-GATED — **roast 4 (#134)** + device SSE (#135), then the post-roast-4 sequence (#323
+**Still open / next:**
+<!-- historical-evidence: begin -->
+**operator activates the `review-gate` required check (#159 / D58)**
+<!-- historical-evidence: end -->
+; everything else is OPERATOR-GATED — **roast 4 (#134)** + device SSE (#135), then the post-roast-4 sequence (#323
 ceiling-override → #228 LAST → M2/D42). Untouched: #318. Nothing else agent-startable until roast 4.
 
 **#300 — roast-data pipeline (D44) — DONE (store → labelled replay fixture).** The store-side

@@ -68,10 +68,6 @@ _CANONICAL_LIVE_STATE_REQUIRED_PHRASES: tuple[str, ...] = (
     "requires zero approving reviews",
     "strict mode",
     "app-pinned",
-    "Checks",
-    "Web (lint + typecheck + unit)",
-    "Web (Playwright snapshots)",
-    "codecov/patch",
     "enforce_admins",
     "required_conversation_resolution",
     "rests on CI",
@@ -79,6 +75,13 @@ _CANONICAL_LIVE_STATE_REQUIRED_PHRASES: tuple[str, ...] = (
     "Codex's exact-current-head review and wait",
     "independent triage",
     "risk-routed authenticated local Claude assurance",
+)
+
+_REQUIRED_CHECK_NAMES: tuple[str, ...] = (
+    "Checks",
+    "Web (lint + typecheck + unit)",
+    "Web (Playwright snapshots)",
+    "codecov/patch",
 )
 
 _SUPERSESSION_MARKER = "[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file:"
@@ -166,6 +169,36 @@ def _present_operatively(text: str, phrase: str, spans: list[tuple[int, int]]) -
     return any(not _within_any_span(m.start(), m.end(), spans) for m in _occurrences(text, phrase))
 
 
+def _exact_markdown_code_name_pattern(name: str) -> re.Pattern[str]:
+    """Return a case-sensitive pattern for an exact, code-formatted check name.
+
+    Whitespace inside an inline-code status name may be soft-wrapped by
+    Markdown, but every non-whitespace character, including punctuation, is
+    literal. Requiring the code delimiters prevents generic prose such as
+    ``required checks`` from standing in for the check actually named
+    ``Checks``.
+    """
+    parts = re.split(r"(\s+)", name)
+    pattern = "".join(r"\s+" if part.isspace() else re.escape(part) for part in parts)
+    return re.compile(rf"`{pattern}`")
+
+
+def _canonical_bullet_bounds(text: str) -> tuple[int, int]:
+    """Return the canonical live-state bullet's operative character range.
+
+    The first following historical marker is a boundary only after proving it
+    lies after the heading. Callers also verify the entire returned range does
+    not overlap any historical block, so wrapping the canonical bullet itself
+    cannot turn a historical statement into an accepted live-state policy.
+    """
+    start = text.index(_CANONICAL_LIVE_STATE_HEADING)
+    marker_index = text.index(_BEGIN_MARKER, start)
+    end = text.rfind("\n", 0, marker_index) + 1
+    if end <= start:
+        raise ValueError("canonical live-state bullet has no following boundary")
+    return start, end
+
+
 def _canonical_live_state_bullet(text: str) -> str:
     """Return the body of AGENTS.md's "Verified live state — 6 Sep 2026" bullet.
 
@@ -178,9 +211,25 @@ def _canonical_live_state_bullet(text: str) -> str:
             marker cannot be found -- this must fail loudly, never silently
             check an empty or wrong substring.
     """
-    start = text.index(_CANONICAL_LIVE_STATE_HEADING)
-    end = text.index(_BEGIN_MARKER, start)
+    start, end = _canonical_bullet_bounds(text)
     return text[start:end]
+
+
+def _is_affirmative_enablement_instruction(text: str) -> bool:
+    """Return whether text affirmatively tells a reader to enable headless CI.
+
+    This deliberately small grammar permits explicit prohibitions (``Do not``
+    and ``Never``) while rejecting an affirmative ``Set ... to true``. It
+    normalizes emphasis, code delimiters, blockquotes, and line wrapping before
+    applying the grammar; it is not a broad natural-language classifier.
+    """
+    normalized = re.sub(r"[`*>]", "", text)
+    normalized = re.sub(r"\s+", " ", normalized)
+    instruction = re.compile(
+        r"(?P<prohibition>do not|never)?\s*set\s+CLAUDE_HEADLESS_ENABLED\s+to\s+['\"]?true['\"]?",
+        re.IGNORECASE,
+    )
+    return any(match.group("prohibition") is None for match in instruction.finditer(normalized))
 
 
 def test_agents_md_forbidden_phrases_are_contained_in_historical_blocks() -> None:
@@ -218,11 +267,21 @@ def test_agents_md_canonical_live_state_bullet_retains_every_gate() -> None:
     the canonical statement itself.
     """
     text = _read_agents_md()
+    spans = _historical_spans(text)
+    start, end = _canonical_bullet_bounds(text)
+    assert not any(span_start < end and start < span_end for span_start, span_end in spans), (
+        "AGENTS.md's canonical live-state bullet must be entirely operative"
+    )
     bullet = _canonical_live_state_bullet(text)
     for phrase in _CANONICAL_LIVE_STATE_REQUIRED_PHRASES:
         assert _occurrences(bullet, phrase), (
             f"{phrase!r} is missing from AGENTS.md's canonical "
             f"'Verified live state — 6 Sep 2026 (D-ToS-1)' bullet"
+        )
+    for check_name in _REQUIRED_CHECK_NAMES:
+        assert _exact_markdown_code_name_pattern(check_name).search(bullet), (
+            f"exact app-pinned status name {check_name!r} is missing from the "
+            "canonical live-state bullet"
         )
 
 
@@ -238,19 +297,26 @@ def test_agents_md_headless_skip_is_documented_and_never_instructed_on() -> None
 
     assert _present_operatively(text, "skipped headless job is expected", spans)
 
-    set_true_pattern = re.compile(
-        r"set[\s>*]+.{0,60}?CLAUDE_HEADLESS_ENABLED.{0,60}?['\"]?true",
-        re.IGNORECASE | re.DOTALL,
-    )
-    for match in set_true_pattern.finditer(text):
-        assert _within_any_span(match.start(), match.end(), spans), (
-            "an operative instruction to set CLAUDE_HEADLESS_ENABLED to true "
-            f"was found in AGENTS.md at character offset {match.start()}"
-        )
+    operative_parts: list[str] = []
+    previous_end = 0
+    for span_start, span_end in spans:
+        operative_parts.append(text[previous_end:span_start])
+        previous_end = span_end
+    operative_parts.append(text[previous_end:])
+    operative = "".join(operative_parts)
+    assert not _is_affirmative_enablement_instruction(operative)
 
-    assert _present_operatively(text, "sole operative authorities", spans)
-    assert "docs/state/registry.md" in text
-    assert "AGENTS.md" in text
+    precedence_start = text.index(
+        "- **Precedence for the GitHub-Claude required-approval description under"
+    )
+    precedence_end = text.index("\n- Mechanism retained", precedence_start)
+    assert not any(
+        span_start < precedence_end and precedence_start < span_end
+        for span_start, span_end in spans
+    ), "the precedence subsection must be entirely operative"
+    precedence = text[precedence_start:precedence_end]
+    assert "AGENTS.md" in precedence
+    assert "docs/state/registry.md" in precedence
 
 
 @pytest.mark.docs
@@ -267,12 +333,32 @@ def test_registry_top_entry_and_legacy_blocks_are_reconciled() -> None:
     spans = _historical_spans(text)
 
     header_index = text.index("## Active Epic")
-    first_entry_match = re.search(r"\*\*(.+?)\*\*", text[header_index:], re.DOTALL)
-    assert first_entry_match is not None
-    first_entry_heading = first_entry_match.group(1)
-    assert "6 Sep 2026" in first_entry_heading
-    assert "D-ToS-1" in first_entry_heading
-    assert _DTOS1_COMMIT_SHA in text[header_index : header_index + 2000]
+    entry_heading = "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    entry_start = text.index(entry_heading, header_index)
+    entry_end = text.index("\n**1 Sep 2026", entry_start)
+    top_entry = text[entry_start:entry_end]
+    overlaps_historical = any(
+        span_start < entry_end and entry_start < span_end for span_start, span_end in spans
+    )
+    assert not overlaps_historical, (
+        "the first dated reconciliation entry must be entirely operative"
+    )
+    for phrase in (
+        _DTOS1_COMMIT_SHA,
+        "PR #937",
+        "requires zero approving reviews",
+        "skipped headless job is expected",
+        "D108-D118 PR-scoped Claude approval bridge",
+        "operator-owned branch-protection decision",
+        "exact-current-head review",
+        "independent triage",
+        "risk-routed authenticated local Claude assurance",
+    ):
+        assert _occurrences(top_entry, phrase), f"top reconciliation entry is missing {phrase!r}"
+    for check_name in _REQUIRED_CHECK_NAMES:
+        assert _exact_markdown_code_name_pattern(check_name).search(top_entry), (
+            f"top reconciliation entry is missing exact check name {check_name!r}"
+        )
 
     assert text.count(_SUPERSESSION_MARKER) >= 2
 
@@ -282,6 +368,18 @@ def test_registry_top_entry_and_legacy_blocks_are_reconciled() -> None:
                 f"{phrase!r} appears operatively (outside a historical-evidence "
                 f"block) in docs/state/registry.md at character offset {match.start()}"
             )
+
+    historical_text = "".join(text[start:end] for start, end in spans)
+    for anchor in (
+        "#663 / D108-D118 is ACTIVE (31 Jul)",
+        "31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL RESTORED (#663 / D108-D118)",
+        "arm the `review-gate` required check (#159 / D58)",
+        "mark `review-gate` a REQUIRED status check on `main` to arm it",
+        "operator activates the `review-gate` required check (#159 / D58)",
+    ):
+        assert _occurrences(historical_text, anchor), (
+            f"historical evidence anchor vanished: {anchor!r}"
+        )
 
 
 def test_historical_span_parser_fails_closed_on_malformed_markers() -> None:
@@ -316,3 +414,14 @@ def test_historical_span_parser_fails_closed_on_malformed_markers() -> None:
         "a\n<!-- historical-evidence: begin -->\nb\n<!-- historical-evidence: end -->\nc\n"
     )
     assert len(_historical_spans(well_formed)) == 1
+
+
+def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> None:
+    """T3 regression: explicit prohibitions stay allowed; enablement does not."""
+    assert not _is_affirmative_enablement_instruction(
+        "Do not set `CLAUDE_HEADLESS_ENABLED` to true."
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "Never set **CLAUDE_HEADLESS_ENABLED**\n> to **true**."
+    )
+    assert _is_affirmative_enablement_instruction("Set **CLAUDE_HEADLESS_ENABLED**\n> to `true`.")
