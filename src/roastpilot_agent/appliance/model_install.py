@@ -301,7 +301,10 @@ def _sha256_of_file(path: Path | str, *, dir_fd: int | None = None) -> tuple[str
             validation cases.
     """
     digest = hashlib.sha256()
-    flags = os.O_RDONLY | os.O_NOFOLLOW
+    # A target can be swapped from the preceding lstat into a FIFO before
+    # this descriptor-relative open.  Non-blocking open ensures fstat below
+    # rejects that non-regular entry without waiting for a writer.
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
         fd = os.open(path, flags, dir_fd=dir_fd)
     except OSError as exc:
@@ -929,6 +932,8 @@ def install_model(
             except FileNotFoundError:
                 parent_fd = None
             try:
+                if parent_fd is not None:
+                    _validate_destination_parent_trust(parent_fd)
                 if parent_fd is not None and _is_already_valid(
                     target_name, manifest_file.sha256, dir_fd=parent_fd
                 ):

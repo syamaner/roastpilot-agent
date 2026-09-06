@@ -170,6 +170,42 @@ def test_cached_entry_replacement_after_hash_is_rejected(
     assert target.read_bytes() == b"replacement"
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFO support")
+def test_cached_fifo_swap_after_lstat_is_rejected_without_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A FIFO substituted before cached open is rejected without being consumed."""
+    manifest = _make_manifest({"a/file1.bin": b"verified"})
+    dest = tmp_path / "dest"
+    target = dest / "a" / "file1.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"verified")
+    original_hash = model_install_module._sha256_of_file  # pyright: ignore[reportPrivateUsage]
+
+    def fail_if_read_attempted(*args: object, **kwargs: object) -> object:
+        pytest.fail("a substituted FIFO must be rejected before any read")
+
+    monkeypatch.setattr(os, "fdopen", fail_if_read_attempted)
+
+    def replace_with_fifo(path: Path | str, *, dir_fd: int | None = None) -> tuple[str, int, int]:
+        target.unlink()
+        os.mkfifo(target)
+        return original_hash(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(model_install_module, "_sha256_of_file", replace_with_fifo)
+
+    with pytest.raises(ModelInstallError, match="not a regular file"):
+        install_model(
+            dest,
+            verify_only=True,
+            manifest_files=manifest,
+            repo_id=_REPO_ID,
+            revision=_REVISION,
+        )
+
+    assert stat.S_ISFIFO(target.stat().st_mode)
+
+
 def test_group_writable_destination_parent_is_rejected_before_placement(tmp_path: Path) -> None:
     """Named temporary placement requires an owner-only parent directory."""
     manifest = _make_manifest({"a/file1.bin": b"payload"})
@@ -189,6 +225,30 @@ def test_group_writable_destination_parent_is_rejected_before_placement(tmp_path
 
     assert calls == [0]
     assert not (parent / "file1.bin").exists()
+
+
+def test_group_writable_destination_parent_is_rejected_before_cached_acceptance(
+    tmp_path: Path,
+) -> None:
+    """Cached verification requires the same owner-only directory boundary."""
+    manifest = _make_manifest({"a/file1.bin": b"payload"})
+    dest = tmp_path / "dest"
+    parent = dest / "a"
+    parent.mkdir(parents=True)
+    target = parent / "file1.bin"
+    target.write_bytes(b"payload")
+    parent.chmod(0o777)
+
+    with pytest.raises(ModelInstallError, match="owner-only placement boundary"):
+        install_model(
+            dest,
+            verify_only=True,
+            manifest_files=manifest,
+            repo_id=_REPO_ID,
+            revision=_REVISION,
+        )
+
+    assert target.read_bytes() == b"payload"
 
 
 def test_verify_only_rejects_an_initially_oversized_cached_file(
