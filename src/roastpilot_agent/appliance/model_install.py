@@ -702,7 +702,7 @@ def _validate_destination_root_trust(parent_fd: int, *, allow_sticky: bool) -> N
     writable_by_others = directory_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
     if directory_stat.st_uid == os.geteuid() and not writable_by_others:
         return
-    if allow_sticky and directory_stat.st_mode & stat.S_ISVTX:
+    if allow_sticky and directory_stat.st_uid == 0 and directory_stat.st_mode & stat.S_ISVTX:
         return
     if directory_stat.st_uid == 0 and not writable_by_others:
         return
@@ -718,14 +718,28 @@ def _open_destination_root(dest: Path, *, create: bool) -> tuple[Path, int]:
         components = dest_path.parts[1:]
         for index, component in enumerate(components):
             created_stat: os.stat_result | None = None
+            child_fd: int | None = None
             try:
                 child_fd = os.open(component, flags, dir_fd=parent_fd)
             except FileNotFoundError:
                 if not create:
                     raise
-                os.mkdir(component, mode=0o755, dir_fd=parent_fd)
-                created_stat = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
-                os.fsync(parent_fd)
+                try:
+                    os.mkdir(component, mode=0o755, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise ModelInstallError(
+                        "cannot safely create the model destination root"
+                    ) from exc
+                else:
+                    try:
+                        created_stat = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+                    except OSError as exc:
+                        raise ModelInstallError(
+                            "model destination root changed while being created"
+                        ) from exc
+                    os.fsync(parent_fd)
                 try:
                     child_fd = os.open(component, flags, dir_fd=parent_fd)
                 except OSError as exc:
@@ -735,6 +749,7 @@ def _open_destination_root(dest: Path, *, create: bool) -> tuple[Path, int]:
             except OSError as exc:
                 raise ModelInstallError("cannot safely open the model destination root") from exc
             try:
+                assert child_fd is not None
                 child_stat = os.fstat(child_fd)
                 if created_stat is not None and (
                     child_stat.st_dev != created_stat.st_dev
@@ -742,15 +757,26 @@ def _open_destination_root(dest: Path, *, create: bool) -> tuple[Path, int]:
                 ):
                     raise ModelInstallError("model destination root changed while being created")
                 _validate_destination_root_trust(child_fd, allow_sticky=index < len(components) - 1)
-                os.close(parent_fd)
+                old_parent_fd = parent_fd
+                try:
+                    os.close(old_parent_fd)
+                except BaseException:
+                    _cleanup_preserving_primary(
+                        lambda fd=child_fd: os.close(fd),
+                        action="closing child destination root descriptor",
+                    )
+                    parent_fd = None
+                    child_fd = None
+                    raise
+                parent_fd = child_fd
+                child_fd = None
             except BaseException:
-                _cleanup_preserving_primary(
-                    lambda fd=child_fd: os.close(fd),
-                    action="closing child destination root descriptor",
-                )
-                parent_fd = None
+                if child_fd is not None:
+                    _cleanup_preserving_primary(
+                        lambda fd=child_fd: os.close(fd),
+                        action="closing child destination root descriptor",
+                    )
                 raise
-            parent_fd = child_fd
         _validate_destination_root_trust(parent_fd, allow_sticky=False)
         return dest_path, parent_fd
     except BaseException:

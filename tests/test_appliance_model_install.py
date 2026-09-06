@@ -1132,6 +1132,169 @@ def test_destination_root_creation_rejects_a_replaced_directory(
     assert dest.is_dir()
 
 
+def test_preexisting_destination_root_symlink_is_rejected(tmp_path: Path) -> None:
+    """An existing destination-root symlink cannot be blessed by resolution."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    dest = tmp_path / "dest"
+    dest.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ModelInstallError, match="cannot safely open the model destination root"):
+        model_install_module._open_destination_root(  # pyright: ignore[reportPrivateUsage]
+            dest, create=False
+        )
+
+
+def test_destination_root_symlink_ancestor_is_rejected(tmp_path: Path) -> None:
+    """No ancestor symlink is followed while opening a destination root."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    ancestor = tmp_path / "ancestor"
+    ancestor.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ModelInstallError, match="cannot safely open the model destination root"):
+        model_install_module._open_destination_root(  # pyright: ignore[reportPrivateUsage]
+            ancestor / "dest", create=True
+        )
+
+
+def test_destination_root_create_race_reopens_an_existing_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A FileExistsError race reopens and validates the entry rather than trusting it."""
+    dest = tmp_path / "dest"
+    original_mkdir = os.mkdir
+
+    def create_then_report_exists(
+        path: Path | str, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> None:
+        original_mkdir(path, mode, dir_fd=dir_fd)
+        if path == dest.name:
+            raise FileExistsError
+
+    monkeypatch.setattr(os, "mkdir", create_then_report_exists)
+    _path, root_fd = model_install_module._open_destination_root(  # pyright: ignore[reportPrivateUsage]
+        dest, create=True
+    )
+    os.close(root_fd)
+    assert dest.is_dir()
+
+
+def test_destination_root_create_race_disappearance_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mkdir-to-stat disappearance is a fail-closed installer error."""
+    dest = tmp_path / "dest"
+    original_stat = os.stat
+
+    def remove_before_stat(path: Path | str, *args: object, **kwargs: object) -> os.stat_result:
+        if path == dest.name and dest.exists():
+            dest.rmdir()
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", remove_before_stat)
+
+    with pytest.raises(ModelInstallError, match="changed while being created"):
+        model_install_module._open_destination_root(  # pyright: ignore[reportPrivateUsage]
+            dest, create=True
+        )
+
+
+@pytest.mark.parametrize(
+    ("owner", "expect_error"),
+    [(0, False), (os.geteuid() + 1, True)],
+)
+def test_sticky_destination_ancestor_requires_root_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: int, expect_error: bool
+) -> None:
+    """Only a root-owned sticky shared ancestor is accepted."""
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    original_fstat = os.fstat
+    actual = original_fstat(fd)
+    synthetic = list(actual)
+    synthetic[stat.ST_MODE] = stat.S_IFDIR | 0o1777
+    synthetic[stat.ST_UID] = owner
+
+    def sticky_stat(candidate_fd: int) -> os.stat_result:
+        if candidate_fd == fd:
+            return os.stat_result(synthetic)
+        return original_fstat(candidate_fd)
+
+    monkeypatch.setattr(os, "fstat", sticky_stat)
+    try:
+        if expect_error:
+            with pytest.raises(ModelInstallError, match="owner-only directory boundary"):
+                model_install_module._validate_destination_root_trust(  # pyright: ignore[reportPrivateUsage]
+                    fd, allow_sticky=True
+                )
+        else:
+            model_install_module._validate_destination_root_trust(  # pyright: ignore[reportPrivateUsage]
+                fd, allow_sticky=True
+            )
+    finally:
+        original_fstat(fd)
+        os.close(fd)
+
+
+@pytest.mark.parametrize("failure", ["identity", "trust"])
+def test_destination_root_rejection_closes_old_parent_and_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Root-walker rejection releases both descriptors exactly once."""
+    dest = tmp_path / "dest"
+    original_open = os.open
+    original_close = os.close
+    original_fstat = os.fstat
+    opened_child_fds: list[int] = []
+    opened_parent_fds: list[int] = []
+    close_calls: list[int] = []
+    close_start: list[int] = []
+
+    def capture_open(
+        path: Path | str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        fd = original_open(path, flags, mode, dir_fd=dir_fd)
+        if path == dest.name:
+            close_start.append(len(close_calls))
+            opened_child_fds.append(fd)
+            if dir_fd is not None:
+                opened_parent_fds.append(dir_fd)
+        return fd
+
+    def capture_close(fd: int) -> None:
+        close_calls.append(fd)
+        original_close(fd)
+
+    def fail_identity(fd: int) -> os.stat_result:
+        current = original_fstat(fd)
+        if failure == "identity" and opened_child_fds and fd == opened_child_fds[0]:
+            synthetic = list(current)
+            synthetic[stat.ST_INO] += 1
+            return os.stat_result(synthetic)
+        return current
+
+    def fail_trust(_fd: int, *, allow_sticky: bool) -> None:
+        if failure == "trust" and opened_child_fds and _fd == opened_child_fds[0]:
+            raise ModelInstallError("simulated trust rejection")
+
+    monkeypatch.setattr(os, "open", capture_open)
+    monkeypatch.setattr(os, "close", capture_close)
+    if failure == "identity":
+        monkeypatch.setattr(os, "fstat", fail_identity)
+    else:
+        monkeypatch.setattr(model_install_module, "_validate_destination_root_trust", fail_trust)
+
+    with pytest.raises(ModelInstallError):
+        model_install_module._open_destination_root(  # pyright: ignore[reportPrivateUsage]
+            dest, create=True
+        )
+
+    assert opened_child_fds and opened_parent_fds
+    final_close_calls = close_calls[close_start[0] :]
+    assert final_close_calls.count(opened_child_fds[0]) == 1
+    assert final_close_calls.count(opened_parent_fds[0]) == 1
+
+
 def test_swapped_destination_parent_cannot_redirect_placement_outside_dest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
