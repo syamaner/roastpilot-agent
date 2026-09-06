@@ -87,6 +87,16 @@ _REQUIRED_CHECK_NAMES: tuple[str, ...] = (
 
 _SUPERSESSION_MARKER = "[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file:"
 _DTOS1_COMMIT_SHA = "299fb5a93d09e54f58d370f7a35e5ce15f278150"
+_RESPONDER_CONDITION = (
+    "${{ vars.CLAUDE_HEADLESS_ENABLED == 'true' && ( "
+    "(github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) || "
+    "(github.event_name == 'pull_request_review_comment' && "
+    "contains(github.event.comment.body, '@claude')) || "
+    "(github.event_name == 'pull_request_review' && "
+    "contains(github.event.review.body, '@claude')) || "
+    "(github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || "
+    "contains(github.event.issue.title, '@claude'))) ) }}"
+)
 
 
 def _read_agents_md() -> str:
@@ -239,6 +249,7 @@ def _is_affirmative_enablement_instruction(text: str) -> bool:
 def _assert_agents_historical_evidence(text: str) -> None:
     """Assert AGENTS forbidden prose and retained historical anchors are contained."""
     spans = _historical_spans(text)
+    _assert_historical_labels(text, spans)
     for phrase in _FORBIDDEN_PHRASES:
         for match in _occurrences(text, phrase):
             assert _within_any_span(match.start(), match.end(), spans), (
@@ -262,6 +273,15 @@ def _assert_canonical_live_policy(text: str) -> None:
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
     bullet = _canonical_live_state_bullet(text)
     assert "CLAUDE_HEADLESS_ENABLED" in bullet, "missing canonical headless token"
+    normalized_bullet = _normalized_visible(bullet)
+    assert "CLAUDE_HEADLESS_ENABLED unset; a skipped headless job is expected" in normalized_bullet
+    assert "Consumer-OAuth headless Claude CI is retired" in normalized_bullet
+    assert re.search(
+        r"(?<![-\w])strict mode, required_conversation_resolution, "
+        r"and enforce_admins remain enabled",
+        normalized_bullet,
+    ), "missing enabled canonical protection clauses"
+    assert not _is_affirmative_enablement_instruction(_operative_text(text, spans))
     for phrase in _CANONICAL_LIVE_STATE_REQUIRED_PHRASES:
         assert _occurrences(bullet, phrase), f"missing canonical policy phrase: {phrase!r}"
     for check_name in _REQUIRED_CHECK_NAMES:
@@ -294,6 +314,15 @@ def _assert_registry_policy(text: str) -> None:
         span_start < entry_end and entry_start < span_end for span_start, span_end in spans
     )
     entry = text[entry_start:entry_end]
+    normalized_entry = _normalized_visible(entry)
+    assert "CLAUDE_HEADLESS_ENABLED is unset" in normalized_entry
+    assert "consumer-OAuth headless Claude CI" in normalized_entry
+    assert "is retired" in normalized_entry
+    assert "A skipped headless job is expected" in normalized_entry
+    assert re.search(r"(?<![-\w])strict mode;", normalized_entry)
+    assert "enforce_admins=true" in normalized_entry
+    assert "required_conversation_resolution=true" in normalized_entry
+    assert not _is_affirmative_enablement_instruction(_operative_text(text, spans))
     for phrase in (
         _DTOS1_COMMIT_SHA,
         "PR #923",
@@ -320,6 +349,7 @@ def _assert_registry_policy(text: str) -> None:
 def _assert_registry_historical_evidence(text: str) -> None:
     """Assert registry forbidden prose and retained legacy anchors stay historical."""
     spans = _historical_spans(text)
+    _assert_historical_labels(text, spans)
     for phrase in _FORBIDDEN_PHRASES:
         for match in _occurrences(text, phrase):
             assert _within_any_span(match.start(), match.end(), spans), (
@@ -345,6 +375,50 @@ def _remove_first_occurrence(text: str, phrase: str) -> str:
     return text[: match.start()] + text[match.end() :]
 
 
+def _normalized_visible(text: str) -> str:
+    """Normalize finite Markdown presentation differences for scoped clauses."""
+    return re.sub(r"\s+", " ", re.sub(r"[`*>]", "", text)).strip()
+
+
+def _operative_text(text: str, spans: list[tuple[int, int]]) -> str:
+    """Return the non-historical portions of a well-formed governed document."""
+    parts: list[str] = []
+    previous_end = 0
+    for start, end in spans:
+        parts.append(text[previous_end:start])
+        previous_end = end
+    parts.append(text[previous_end:])
+    return "".join(parts)
+
+
+def _assert_historical_labels(text: str, spans: list[tuple[int, int]]) -> None:
+    """Assert every historical span starts with a visible dated D-ToS-1 label."""
+    for start, end in spans:
+        body = text[start:end].split("\n", 1)[1]
+        first_visible = next(
+            line.strip().lstrip(">").strip() for line in body.splitlines() if line.strip()
+        )
+        assert re.match(r"^\*\*\[HISTORICAL.*SUPERSEDED 6 Sep 2026.*D-ToS-1", first_visible), (
+            f"historical span at {start} lacks a visible dated D-ToS-1 label"
+        )
+
+
+def _historical_label_line_ranges(text: str, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Return each span's first visible label line range for synthetic mutations."""
+    ranges: list[tuple[int, int]] = []
+    for start, end in spans:
+        cursor = text.index("\n", start) + 1
+        while cursor < end:
+            line_end = text.find("\n", cursor, end)
+            if line_end == -1:
+                line_end = end
+            if text[cursor:line_end].strip():
+                ranges.append((cursor, line_end))
+                break
+            cursor = line_end + 1
+    return ranges
+
+
 def _assert_responder_headless_gate(workflow: object) -> None:
     """Assert parsed responder workflow data retains the true-only headless gate."""
     assert isinstance(workflow, dict)
@@ -357,8 +431,7 @@ def _assert_responder_headless_gate(workflow: object) -> None:
     claude_map = cast(dict[str, object], claude_job)
     condition = claude_map.get("if")
     assert isinstance(condition, str)
-    normalized_condition = re.sub(r"\s+", " ", condition)
-    assert re.match(r"^\$\{\{ vars\.CLAUDE_HEADLESS_ENABLED == 'true' && \(", normalized_condition)
+    assert re.sub(r"\s+", " ", condition) == _RESPONDER_CONDITION
 
 
 def test_agents_md_forbidden_phrases_are_contained_in_historical_blocks() -> None:
@@ -504,6 +577,7 @@ def test_responder_workflow_requires_the_true_only_headless_conjunct() -> None:
         condition.replace("== 'true'", "!= 'true'", 1),
         condition.replace("vars.CLAUDE_HEADLESS_ENABLED == 'true' && ", "", 1),
         condition.replace("== 'true' &&", "== 'true' ||", 1),
+        condition.replace(" }}", " || true }}", 1),
     ):
         with pytest.raises(AssertionError):
             _assert_responder_headless_gate({"jobs": {"claude": {"if": mutated_condition}}})
@@ -556,6 +630,38 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     with pytest.raises(AssertionError):
         _assert_canonical_live_policy(wrapped)
 
+    for original, replacement in (
+        ("strict mode,", "non-strict mode,"),
+        (
+            "`required_conversation_resolution`",
+            "`required_conversation_resolution` remain disabled;",
+        ),
+        ("`enforce_admins`\n  remain enabled", "`enforce_admins` remain disabled"),
+    ):
+        weakened = (
+            agents[:start] + agents[start:end].replace(original, replacement, 1) + agents[end:]
+        )
+        with pytest.raises(AssertionError):
+            _assert_canonical_live_policy(weakened)
+
+    for replacement in ("set", "is active"):
+        weakened = (
+            agents[:start]
+            + agents[start:end].replace(
+                "unset" if replacement == "set" else "is retired", replacement, 1
+            )
+            + agents[end:]
+        )
+        with pytest.raises(AssertionError):
+            _assert_canonical_live_policy(weakened)
+    for instruction in (
+        "Set CLAUDE_HEADLESS_ENABLED=true",
+        "export CLAUDE_HEADLESS_ENABLED='true'",
+        "CLAUDE_HEADLESS_ENABLED=true",
+    ):
+        with pytest.raises(AssertionError):
+            _assert_canonical_live_policy(agents + "\n" + instruction)
+
     registry_entry_start = registry.index(
         "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
     )
@@ -577,8 +683,30 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             + _remove_first_occurrence(registry[registry_entry_start:registry_entry_end], clause)
             + registry[registry_entry_end:]
         )
-        with pytest.raises(AssertionError, match="missing top registry phrase"):
+        with pytest.raises(AssertionError):
             _assert_registry_policy(missing_clause)
+
+    for original, replacement in (
+        ("strict mode;", "non-strict mode;"),
+        ("enforce_admins=true", "enforce_admins=false"),
+        ("required_conversation_resolution=true", "required_conversation_resolution=false"),
+        ("is unset", "is set"),
+        ("is retired", "is active"),
+    ):
+        weakened = (
+            registry[:registry_entry_start]
+            + registry[registry_entry_start:registry_entry_end].replace(original, replacement, 1)
+            + registry[registry_entry_end:]
+        )
+        with pytest.raises(AssertionError):
+            _assert_registry_policy(weakened)
+    for instruction in (
+        "Set CLAUDE_HEADLESS_ENABLED=true",
+        "export CLAUDE_HEADLESS_ENABLED='true'",
+        "CLAUDE_HEADLESS_ENABLED=true",
+    ):
+        with pytest.raises(AssertionError):
+            _assert_registry_policy(registry + "\n" + instruction)
 
     precedence_start = agents.index(
         "- **Precedence for the GitHub-Claude required-approval description under"
@@ -611,3 +739,16 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             _assert_registry_historical_evidence(
                 _remove_first_occurrence(registry, directive) + "\n" + directive
             )
+
+    for document, assertion in (
+        (agents, _assert_agents_historical_evidence),
+        (registry, _assert_registry_historical_evidence),
+    ):
+        for label_start, label_end in _historical_label_line_ranges(
+            document, _historical_spans(document)
+        ):
+            with pytest.raises(AssertionError, match="visible dated D-ToS-1 label"):
+                assertion(document[:label_start] + document[label_end:])
+            hidden_label = "<!-- " + document[label_start:label_end] + " -->"
+            with pytest.raises(AssertionError, match="visible dated D-ToS-1 label"):
+                assertion(document[:label_start] + hidden_label + document[label_end:])
