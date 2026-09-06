@@ -440,6 +440,10 @@ def _historical_label_ranges(text: str, spans: list[tuple[int, int]]) -> list[tu
             if line_end == -1:
                 line_end = end
             if text[cursor:line_end].strip():
+                first_visible = text[cursor:line_end].strip().lstrip(">").strip()
+                assert first_visible.startswith("**["), (
+                    "historical span lacks a complete visible dated D-ToS-1 label"
+                )
                 closing = text.find("]**", cursor, end)
                 assert closing != -1, "historical span lacks a complete visible dated D-ToS-1 label"
                 label_end = closing + len("]**")
@@ -662,6 +666,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
 
     for original, replacement in (
         ("strict mode,", "non-strict mode,"),
+        ("strict mode,", "not strict mode,"),
         (
             "`required_conversation_resolution`",
             "`required_conversation_resolution` remain disabled;",
@@ -726,6 +731,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
 
     for original, replacement in (
         ("strict mode;", "non-strict mode;"),
+        ("strict mode;", "not strict mode;"),
         ("enforce_admins=true", "enforce_admins=false"),
         ("enforce_admins=true", "not enforce_admins=true"),
         ("required_conversation_resolution=true", "required_conversation_resolution=false"),
@@ -816,3 +822,14 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
                     + "\n```"
                     + document[label_end:]
                 )
+            with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
+                assertion(
+                    document[:label_start]
+                    + "```\n"
+                    + document[label_start:label_end]
+                    + "\n```"
+                    + document[label_end:]
+                )
+            with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
+                bold_start = document.index("**", label_start, label_end)
+                assertion(document[:bold_start] + document[bold_start + 2 :])
