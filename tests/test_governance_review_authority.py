@@ -260,12 +260,13 @@ def _is_affirmative_enablement_instruction(text: str) -> bool:
 
     This deliberately small grammar permits explicit prohibitions (``Do not``
     and ``Never``) while rejecting affirmative ``set``, ``export``, and bare
-    assignment forms that assign this exact variable to true. It normalizes
-    emphasis, code delimiters, blockquotes, and line wrapping before applying
-    the grammar; it is not a broad natural-language classifier.
+    assignment forms that assign this exact variable to true. Its finite
+    covered producer set is those plain assignment/export forms and literal
+    ``gh variable set CLAUDE_HEADLESS_ENABLED`` commands; it is not a general
+    shell or natural-language parser.
     """
-    normalized = re.sub(r"[`*>]", "", text)
-    normalized = re.sub(r"\s+", " ", normalized)
+    markdown_clean = re.sub(r"[`*>]", "", text)
+    normalized = re.sub(r"\s+", " ", markdown_clean)
     assignment = re.compile(
         r"(?P<prohibition>\b(?:do not|never)\s+)?"
         r"(?:(?:set|export)\s+)?\bCLAUDE_HEADLESS_ENABLED\b\s*"
@@ -274,12 +275,22 @@ def _is_affirmative_enablement_instruction(text: str) -> bool:
     )
     gh_variable_set = re.compile(
         r"(?P<prohibition>\b(?:do not|never)\s+)?gh\s+variable\s+set\s+"
-        r"CLAUDE_HEADLESS_ENABLED\b(?:\s+(?:-b|--body)(?:\s+|=)['\"]?true['\"]?\b)",
+        r"CLAUDE_HEADLESS_ENABLED\b(?P<tail>[^\n;]*)",
         re.IGNORECASE,
     )
-    return any(
+    explicit_false_body = re.compile(
+        r"^\s+(?:-b|--body)(?:\s+|=)['\"]?false['\"]?(?=\s*(?:$|[.;]))",
+        re.IGNORECASE,
+    )
+    has_assignment = any(
         match.group("prohibition") is None for match in assignment.finditer(normalized)
-    ) or any(match.group("prohibition") is None for match in gh_variable_set.finditer(normalized))
+    )
+    has_gh_enablement = any(
+        match.group("prohibition") is None
+        and explicit_false_body.match(match.group("tail")) is None
+        for match in gh_variable_set.finditer(markdown_clean)
+    )
+    return has_assignment or has_gh_enablement
 
 
 def _assert_agents_historical_evidence(text: str) -> None:
@@ -696,6 +707,23 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
     )
     assert _is_affirmative_enablement_instruction("gh variable set CLAUDE_HEADLESS_ENABLED -b true")
     assert _is_affirmative_enablement_instruction("gh variable set CLAUDE_HEADLESS_ENABLED -b=true")
+    assert _is_affirmative_enablement_instruction("gh variable set CLAUDE_HEADLESS_ENABLED")
+    assert _is_affirmative_enablement_instruction(
+        "printf true | gh variable set CLAUDE_HEADLESS_ENABLED"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "echo true | gh variable set CLAUDE_HEADLESS_ENABLED"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED < enabled.txt"
+    )
+    assert _is_affirmative_enablement_instruction("gh variable set CLAUDE_HEADLESS_ENABLED <<<true")
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body $VALUE"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b truth"
+    )
     assert not _is_affirmative_enablement_instruction("Do not export CLAUDE_HEADLESS_ENABLED=true")
     assert not _is_affirmative_enablement_instruction("Never set CLAUDE_HEADLESS_ENABLED = 'true'")
     assert not _is_affirmative_enablement_instruction("CLAUDE_HEADLESS_ENABLED=false")
@@ -703,14 +731,19 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
     assert not _is_affirmative_enablement_instruction(
         "Do not gh variable set CLAUDE_HEADLESS_ENABLED --body true"
     )
-    assert not _is_affirmative_enablement_instruction(
-        "gh variable set CLAUDE_HEADLESS_ENABLED --body false"
-    )
+    for false_body in (
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body=false",
+        'gh variable set CLAUDE_HEADLESS_ENABLED --body "false"',
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b='false'",
+    ):
+        assert not _is_affirmative_enablement_instruction(false_body)
     assert not _is_affirmative_enablement_instruction(
         "gh variable set OTHER_HEADLESS_ENABLED --body true"
     )
-    assert not _is_affirmative_enablement_instruction(
-        "gh variable set CLAUDE_HEADLESS_ENABLED -b truth"
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false; "
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true"
     )
 
 
@@ -832,6 +865,13 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
         "gh variable set CLAUDE_HEADLESS_ENABLED -b='true'",
         "gh variable set CLAUDE_HEADLESS_ENABLED -b=true",
+        "gh variable set CLAUDE_HEADLESS_ENABLED",
+        "printf true | gh variable set CLAUDE_HEADLESS_ENABLED",
+        "gh variable set CLAUDE_HEADLESS_ENABLED < enabled.txt",
+        "gh variable set CLAUDE_HEADLESS_ENABLED <<<true",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body $VALUE",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false; "
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
     ):
         with pytest.raises(AssertionError):
             _assert_canonical_live_policy(agents + "\n" + instruction)
@@ -905,6 +945,13 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
         "gh variable set CLAUDE_HEADLESS_ENABLED -b='true'",
         "gh variable set CLAUDE_HEADLESS_ENABLED -b=true",
+        "gh variable set CLAUDE_HEADLESS_ENABLED",
+        "echo true | gh variable set CLAUDE_HEADLESS_ENABLED",
+        "gh variable set CLAUDE_HEADLESS_ENABLED < enabled.txt",
+        "gh variable set CLAUDE_HEADLESS_ENABLED <<<true",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body $VALUE",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false; "
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
     ):
         with pytest.raises(AssertionError):
             _assert_registry_policy(registry + "\n" + instruction)
