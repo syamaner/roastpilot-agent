@@ -588,6 +588,129 @@ def test_created_destination_directory_is_fsynced(
     assert fsynced_directory_fds
 
 
+def test_destination_parent_rejects_same_type_replacement_after_mkdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A created intermediate directory must retain its reopened identity."""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    parked = tmp_path / "parked-a"
+    root_fd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY)
+    original_open = os.open
+    opens_of_a = 0
+
+    def replace_before_reopen(
+        path: Path | str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        nonlocal opens_of_a
+        if path == "a":
+            opens_of_a += 1
+            if opens_of_a == 1:
+                (dest / "a").rename(parked)
+                (dest / "a").mkdir(mode=0o700)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", replace_before_reopen)
+    try:
+        with pytest.raises(ModelInstallError, match="changed while being created"):
+            model_install_module._open_destination_parent(  # pyright: ignore[reportPrivateUsage]
+                root_fd, "a/model.bin", create=True
+            )
+    finally:
+        os.close(root_fd)
+
+
+def test_destination_parent_rejects_writable_raced_intermediate(tmp_path: Path) -> None:
+    """A reopened intermediate directory must satisfy the owner-only boundary."""
+    dest = tmp_path / "dest"
+    intermediate = dest / "a"
+    intermediate.mkdir(parents=True)
+    intermediate.chmod(0o777)
+    root_fd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(ModelInstallError, match="owner-only placement boundary"):
+            model_install_module._open_destination_parent(  # pyright: ignore[reportPrivateUsage]
+                root_fd, "a/model.bin", create=True
+            )
+    finally:
+        os.close(root_fd)
+
+
+def test_destination_parent_file_exists_race_reopens_and_validates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A FileExists race is reopened and validated before traversal continues."""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    root_fd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY)
+    original_mkdir = os.mkdir
+
+    def create_then_report_exists(
+        path: Path | str, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> None:
+        original_mkdir(path, mode, dir_fd=dir_fd)
+        if path == "a":
+            raise FileExistsError
+
+    monkeypatch.setattr(os, "mkdir", create_then_report_exists)
+    try:
+        parent_fd, target_name = model_install_module._open_destination_parent(  # pyright: ignore[reportPrivateUsage]
+            root_fd, "a/model.bin", create=True
+        )
+        try:
+            assert target_name == "model.bin"
+        finally:
+            os.close(parent_fd)
+    finally:
+        os.close(root_fd)
+
+
+def test_destination_parent_old_close_failure_closes_child_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An indeterminate parent close does not retry it and releases the child."""
+    dest = tmp_path / "dest"
+    (dest / "a").mkdir(parents=True)
+    root_fd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY)
+    original_open = os.open
+    original_close = os.close
+    child_fds: list[int] = []
+    parent_fds: list[int] = []
+    close_calls: list[int] = []
+    close_start: list[int] = []
+
+    def capture_open(
+        path: Path | str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        fd = original_open(path, flags, mode, dir_fd=dir_fd)
+        if path == "a":
+            close_start.append(len(close_calls))
+            child_fds.append(fd)
+            assert dir_fd is not None
+            parent_fds.append(dir_fd)
+        return fd
+
+    def fail_parent_close(fd: int) -> None:
+        close_calls.append(fd)
+        if parent_fds and fd == parent_fds[0]:
+            raise OSError("simulated destination parent close failure")
+        original_close(fd)
+
+    monkeypatch.setattr(os, "open", capture_open)
+    monkeypatch.setattr(os, "close", fail_parent_close)
+    try:
+        with pytest.raises(OSError, match="simulated destination parent close failure"):
+            model_install_module._open_destination_parent(  # pyright: ignore[reportPrivateUsage]
+                root_fd, "a/model.bin", create=False
+            )
+    finally:
+        original_close(root_fd)
+
+    final_close_calls = close_calls[close_start[0] :]
+    assert final_close_calls.count(child_fds[0]) == 1
+    assert final_close_calls.count(parent_fds[0]) == 1
+
+
 # --- T4: --from-dir missing a file -> error, no fallback to network --------
 
 
