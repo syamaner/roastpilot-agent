@@ -97,6 +97,19 @@ _RESPONDER_CONDITION = (
     "(github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || "
     "contains(github.event.issue.title, '@claude'))) ) }}"
 )
+_HISTORICAL_LABELS = frozenset(
+    {
+        "[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by D-ToS-1.]",
+        "[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by D-ToS-1. "
+        "This wait does not gate merge today; see the precedence subsection above.]",
+        "[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by the D-ToS-1 "
+        "governance reconciliation at the top of this file.]",
+        "[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by the D-ToS-1 "
+        "governance reconciliation recorded at the top of this file. The approval "
+        "requirement this record describes no longer applies.]",
+        "[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this file.]",
+    }
+)
 
 
 def _read_agents_md() -> str:
@@ -274,13 +287,21 @@ def _assert_canonical_live_policy(text: str) -> None:
     bullet = _canonical_live_state_bullet(text)
     assert "CLAUDE_HEADLESS_ENABLED" in bullet, "missing canonical headless token"
     normalized_bullet = _normalized_visible(bullet)
-    assert "CLAUDE_HEADLESS_ENABLED unset; a skipped headless job is expected" in normalized_bullet
-    assert "Consumer-OAuth headless Claude CI is retired" in normalized_bullet
-    assert re.search(
-        r"(?<![-\w])strict mode, required_conversation_resolution, "
-        r"and enforce_admins remain enabled",
-        normalized_bullet,
+    assert (
+        "Consumer-OAuth headless Claude CI is retired (CLAUDE_HEADLESS_ENABLED unset; "
+        "a skipped headless job is expected, never a failure, and never a reason "
+        "to set the variable)." in normalized_bullet
+    )
+    assert (
+        "codecov/patch; strict mode, required_conversation_resolution, and "
+        "enforce_admins remain enabled; "
+        "force-push/deletion off." in normalized_bullet
     ), "missing enabled canonical protection clauses"
+    assert (
+        "The merge bar instead rests on CI, codecov/patch, CodeQL handling, GitHub Codex's "
+        "exact-current-head review and wait, required_conversation_resolution, independent triage, "
+        "and risk-routed authenticated local Claude assurance (below)." in normalized_bullet
+    )
     assert not _is_affirmative_enablement_instruction(_operative_text(text, spans))
     for phrase in _CANONICAL_LIVE_STATE_REQUIRED_PHRASES:
         assert _occurrences(bullet, phrase), f"missing canonical policy phrase: {phrase!r}"
@@ -315,13 +336,22 @@ def _assert_registry_policy(text: str) -> None:
     )
     entry = text[entry_start:entry_end]
     normalized_entry = _normalized_visible(entry)
-    assert "CLAUDE_HEADLESS_ENABLED is unset" in normalized_entry
-    assert "consumer-OAuth headless Claude CI" in normalized_entry
-    assert "is retired" in normalized_entry
-    assert "A skipped headless job is expected" in normalized_entry
-    assert re.search(r"(?<![-\w])strict mode;", normalized_entry)
-    assert "enforce_admins=true" in normalized_entry
-    assert "required_conversation_resolution=true" in normalized_entry
+    assert (
+        "CLAUDE_HEADLESS_ENABLED is unset: consumer-OAuth headless Claude CI "
+        "(the hosted Claude Code Review job and the @claude responder) is retired under D-ToS-1"
+        in normalized_entry
+    )
+    assert "A skipped headless job is expected, never a failure." in normalized_entry
+    assert (
+        "required_approving_review_count=0; strict mode; enforce_admins=true; "
+        "required_conversation_resolution=true; "
+        "force-push/ deletion false;" in normalized_entry
+    )
+    assert (
+        "The merge bar remains CI, codecov/patch, CodeQL handling, GitHub Codex's "
+        "exact-current-head review and wait, required_conversation_resolution, independent triage, "
+        "and risk-routed authenticated local Claude assurance." in normalized_entry
+    )
     assert not _is_affirmative_enablement_instruction(_operative_text(text, spans))
     for phrase in (
         _DTOS1_COMMIT_SHA,
@@ -393,18 +423,15 @@ def _operative_text(text: str, spans: list[tuple[int, int]]) -> str:
 
 def _assert_historical_labels(text: str, spans: list[tuple[int, int]]) -> None:
     """Assert every historical span starts with a visible dated D-ToS-1 label."""
-    for start, end in spans:
-        body = text[start:end].split("\n", 1)[1]
-        first_visible = next(
-            line.strip().lstrip(">").strip() for line in body.splitlines() if line.strip()
-        )
-        assert re.match(r"^\*\*\[HISTORICAL.*SUPERSEDED 6 Sep 2026.*D-ToS-1", first_visible), (
-            f"historical span at {start} lacks a visible dated D-ToS-1 label"
+    for start, end in _historical_label_ranges(text, spans):
+        label = _normalized_visible(text[start:end]).replace("**", "")
+        assert label in _HISTORICAL_LABELS, (
+            "historical span lacks a complete visible dated D-ToS-1 label"
         )
 
 
-def _historical_label_line_ranges(text: str, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    """Return each span's first visible label line range for synthetic mutations."""
+def _historical_label_ranges(text: str, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Return each complete first visible historical-label range for mutations."""
     ranges: list[tuple[int, int]] = []
     for start, end in spans:
         cursor = text.index("\n", start) + 1
@@ -413,7 +440,10 @@ def _historical_label_line_ranges(text: str, spans: list[tuple[int, int]]) -> li
             if line_end == -1:
                 line_end = end
             if text[cursor:line_end].strip():
-                ranges.append((cursor, line_end))
+                closing = text.find("]**", cursor, end)
+                assert closing != -1, "historical span lacks a complete visible dated D-ToS-1 label"
+                label_end = closing + len("]**")
+                ranges.append((cursor, label_end))
                 break
             cursor = line_end + 1
     return ranges
@@ -636,7 +666,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             "`required_conversation_resolution`",
             "`required_conversation_resolution` remain disabled;",
         ),
+        ("`required_conversation_resolution`", "`required_conversation_resolution`=false"),
         ("`enforce_admins`\n  remain enabled", "`enforce_admins` remain disabled"),
+        ("`enforce_admins`\n  remain enabled", "`enforce_admins`=false"),
     ):
         weakened = (
             agents[:start] + agents[start:end].replace(original, replacement, 1) + agents[end:]
@@ -661,6 +693,12 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     ):
         with pytest.raises(AssertionError):
             _assert_canonical_live_policy(agents + "\n" + instruction)
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(
+            agents[:start]
+            + agents[start:end].replace("independent triage", "not independent triage", 1)
+            + agents[end:]
+        )
 
     registry_entry_start = registry.index(
         "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
@@ -689,7 +727,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     for original, replacement in (
         ("strict mode;", "non-strict mode;"),
         ("enforce_admins=true", "enforce_admins=false"),
+        ("enforce_admins=true", "not enforce_admins=true"),
         ("required_conversation_resolution=true", "required_conversation_resolution=false"),
+        ("required_conversation_resolution=true", "not required_conversation_resolution=true"),
         ("is unset", "is set"),
         ("is retired", "is active"),
     ):
@@ -707,6 +747,14 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     ):
         with pytest.raises(AssertionError):
             _assert_registry_policy(registry + "\n" + instruction)
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(
+            registry[:registry_entry_start]
+            + registry[registry_entry_start:registry_entry_end].replace(
+                "independent triage", "not independent triage", 1
+            )
+            + registry[registry_entry_end:]
+        )
 
     precedence_start = agents.index(
         "- **Precedence for the GitHub-Claude required-approval description under"
@@ -744,11 +792,27 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         (agents, _assert_agents_historical_evidence),
         (registry, _assert_registry_historical_evidence),
     ):
-        for label_start, label_end in _historical_label_line_ranges(
+        for label_start, label_end in _historical_label_ranges(
             document, _historical_spans(document)
         ):
-            with pytest.raises(AssertionError, match="visible dated D-ToS-1 label"):
+            with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
                 assertion(document[:label_start] + document[label_end:])
             hidden_label = "<!-- " + document[label_start:label_end] + " -->"
-            with pytest.raises(AssertionError, match="visible dated D-ToS-1 label"):
+            with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
                 assertion(document[:label_start] + hidden_label + document[label_end:])
+            with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
+                assertion(document[: label_end - len("]**")] + document[label_end:])
+            with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
+                assertion(
+                    document[:label_start]
+                    + document[label_start:label_end].replace("6 Sep 2026", "6 September", 1)
+                    + document[label_end:]
+                )
+            with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
+                assertion(
+                    document[:label_start]
+                    + "```text\n"
+                    + document[label_start:label_end]
+                    + "\n```"
+                    + document[label_end:]
+                )
