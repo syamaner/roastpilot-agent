@@ -954,6 +954,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     for original, replacement in (
         ("strict mode;", "strict mode disabled;"),
         ("`Checks`", "`Checks` (optional)"),
+        ("zero approving reviews", "two approving reviews"),
     ):
         with pytest.raises(AssertionError):
             _assert_branch_protection_policy(
