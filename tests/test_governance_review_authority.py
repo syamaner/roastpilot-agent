@@ -473,16 +473,18 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     with pytest.raises(AssertionError, match="missing canonical check"):
         _assert_canonical_live_policy(generic_checks)
 
+    bullet_line_start = agents.rfind("\n", 0, start) + 1
     wrapped = (
-        agents[:start]
+        agents[:bullet_line_start]
         + _BEGIN_MARKER
         + "\n"
-        + agents[start:end]
+        + agents[bullet_line_start:end]
         + _END_MARKER
         + "\n"
         + agents[end:]
     )
-    with pytest.raises((AssertionError, ValueError)):
+    _historical_spans(wrapped)
+    with pytest.raises(AssertionError):
         _assert_canonical_live_policy(wrapped)
 
     registry_entry_start = registry.index(
@@ -537,4 +539,6 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "operator activates the `review-gate` required check (#159 / D58)",
     ):
         with pytest.raises(AssertionError, match="historical evidence anchor vanished"):
-            _assert_registry_historical_evidence(_remove_first_occurrence(registry, directive))
+            _assert_registry_historical_evidence(
+                _remove_first_occurrence(registry, directive) + "\n" + directive
+            )
