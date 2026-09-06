@@ -334,6 +334,7 @@ def _assert_agents_historical_evidence(text: str) -> None:
 def _assert_canonical_live_policy(text: str) -> None:
     """Assert the unique canonical AGENTS policy is entirely operative and complete."""
     spans = _historical_spans(text)
+    _assert_no_nonzero_approval_requirement(text, spans)
     assert text.count(_CANONICAL_LIVE_STATE_HEADING) == 1
     start, end = _canonical_bullet_bounds(text)
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
@@ -372,9 +373,20 @@ def _assert_precedence_policy(text: str) -> None:
     end = text.index("\n- Mechanism retained", start)
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
     precedence = text[start:end]
-    assert _occurrences(precedence, "sole operative authorities")
     for filename in ("AGENTS.md", "docs/state/registry.md"):
         assert filename in precedence, f"missing precedence authority: {filename!r}"
+    assert _normalized_visible(precedence) == _PRECEDENCE_POLICY_SNAPSHOT
+
+
+def _assert_no_nonzero_approval_requirement(text: str, spans: list[tuple[int, int]]) -> None:
+    """Reject finite nonzero approving-review requirements outside historical evidence."""
+    operative = _operative_text(text, spans)
+    nonzero_requirement = re.compile(
+        r"\brequire(?:s|d|ing)?\s+(?:one|two|three|four|five|six|seven|eight|nine|"
+        r"[1-9][0-9]*)\s+approving\s+reviews?\b",
+        re.IGNORECASE,
+    )
+    assert not nonzero_requirement.search(operative)
 
 
 def _assert_branch_protection_policy(text: str) -> None:
@@ -480,6 +492,7 @@ def _assert_registry_735_clarification(text: str) -> None:
 def _assert_registry_policy(text: str) -> None:
     """Assert the first registry reconciliation entry is operative and complete."""
     spans = _historical_spans(text)
+    _assert_no_nonzero_approval_requirement(text, spans)
     _assert_registry_735_clarification(text)
     header_index = text.index("## Active Epic")
     entry_heading = "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
@@ -608,6 +621,19 @@ _REGISTRY_POLICY_SNAPSHOT = _normalized_visible(
     review itself still runs unskipped, all now marked historical. D108-D118
     already retired that SHA-scoped mechanism; D-ToS-1 is unrelated to that
     retirement; it must not be restored."""
+)
+_PRECEDENCE_POLICY_SNAPSHOT = _normalized_visible(
+    """- **Precedence for the GitHub-Claude required-approval description under
+    D-ToS-1 only.** `AGENTS.md` plus `docs/state/registry.md` are the sole
+    operative authorities for whether a GitHub-hosted Claude review currently
+    gates a required approving review on `main`. Where another file's text
+    about that one specific fact conflicts with the verified live state
+    recorded here (for example `.claude/skills/pr-preflight/SKILL.md` or
+    `docs/agent-topology.md`), that other file's conflicting sentence is
+    superseded and historical; those files are not edited by this
+    reconciliation. This narrow precedence does not extend to any other
+    skill, plan, or review rule, and does not override an explicit operator
+    instruction."""
 )
 _BRANCH_PROTECTION_SNAPSHOT = _normalized_visible(
     """- **`main` is branch-protected (13 Jun, enforces this policy at the platform).**
@@ -1065,6 +1091,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "Set CLAUDE_HEADLESS_ENABLED=true",
         "export CLAUDE_HEADLESS_ENABLED='true'",
         "CLAUDE_HEADLESS_ENABLED=true",
+        "requires two approving reviews",
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
         "gh variable set " + "\\\n" + "CLAUDE_HEADLESS_ENABLED --body true",
         'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
@@ -1151,6 +1178,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "Set CLAUDE_HEADLESS_ENABLED=true",
         "export CLAUDE_HEADLESS_ENABLED='true'",
         "CLAUDE_HEADLESS_ENABLED=true",
+        "requires two approving reviews",
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
         "gh variable set " + "\\\n" + "CLAUDE_HEADLESS_ENABLED --body true",
         'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
@@ -1190,6 +1218,13 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         ):
             assertion(document + "\n" + allowed_instruction)
 
+    historical_nonzero = (
+        agents + "\n" + _BEGIN_MARKER + "\nrequires two approving reviews\n" + _END_MARKER
+    )
+    _assert_no_nonzero_approval_requirement(
+        historical_nonzero, _historical_spans(historical_nonzero)
+    )
+
     precedence_start = agents.index(
         "- **Precedence for the GitHub-Claude required-approval description under"
     )
@@ -1202,6 +1237,16 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         )
         with pytest.raises(AssertionError, match="missing precedence authority"):
             _assert_precedence_policy(missing_authority)
+    with pytest.raises(AssertionError):
+        _assert_precedence_policy(
+            agents[:precedence_start]
+            + agents[precedence_start:precedence_end].replace(
+                "are the sole\n  operative authorities",
+                "are not the sole\n  operative authorities",
+                1,
+            )
+            + agents[precedence_end:]
+        )
 
     for anchor in (
         "PR-scoped Claude restoration (#663 / D108-D118",
