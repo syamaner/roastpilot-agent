@@ -28,6 +28,7 @@ the reviewer assertion.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import cast
@@ -110,6 +111,21 @@ _HISTORICAL_LABELS = frozenset(
         "[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this file.]",
     }
 )
+_HISTORICAL_SPAN_HASHES = {
+    "AGENTS.md": (
+        "9c42dbe8b2d6545184500c6df2311c4ed2e2c29baf45c1213f670065eeee161f",
+        "77036173b179ade3a6d6d13be44ae9124621393168f096a3e036e1045e6f51b4",
+        "e9f3e355d73996180c21a363fe6c3bf2f0e97309352155103dc6a21d10c3a734",
+        "2068d33a30d8cf20a6489f65464f653a965fdeccc8ad3251d1f170df3bf61c11",
+    ),
+    "docs/state/registry.md": (
+        "56c29c9419f0a820986b589c491a5b284a547472f62e53df861a93c3f63ba1a0",
+        "4ac05ceba7ebf886296e5de878ce86a97f9a82d8a424e2114728e8787ac9764b",
+        "116690f3909c7ed2e2bb1d8b0f3d22b7e5ffe5eebf58af25eb743225e71d584c",
+        "e077d2f7a0751235a0fa0b3566f5209f9d95f1acc6a5492698a905daa76969da",
+        "54b4487109564e2063ed9f275a69064943cb2042dba95dafec92ba42d331b7f2",
+    ),
+}
 
 
 def _read_agents_md() -> str:
@@ -256,7 +272,14 @@ def _is_affirmative_enablement_instruction(text: str) -> bool:
         r"(?:=\s*|to\s+)['\"]?true['\"]?\b",
         re.IGNORECASE,
     )
-    return any(match.group("prohibition") is None for match in assignment.finditer(normalized))
+    gh_variable_set = re.compile(
+        r"(?P<prohibition>\b(?:do not|never)\s+)?gh\s+variable\s+set\s+"
+        r"CLAUDE_HEADLESS_ENABLED\b(?:\s+(?:-b|--body)(?:\s+|=)['\"]?true['\"]?\b)",
+        re.IGNORECASE,
+    )
+    return any(
+        match.group("prohibition") is None for match in assignment.finditer(normalized)
+    ) or any(match.group("prohibition") is None for match in gh_variable_set.finditer(normalized))
 
 
 def _assert_agents_historical_evidence(text: str) -> None:
@@ -276,6 +299,7 @@ def _assert_agents_historical_evidence(text: str) -> None:
         "D108-D118 are active as of 31 Jul 2026",
     ):
         assert _occurrences(historical_text, anchor), f"missing AGENTS history: {anchor!r}"
+    _assert_historical_span_hashes(text, "AGENTS.md")
 
 
 def _assert_canonical_live_policy(text: str) -> None:
@@ -322,6 +346,14 @@ def _assert_precedence_policy(text: str) -> None:
     assert _occurrences(precedence, "sole operative authorities")
     for filename in ("AGENTS.md", "docs/state/registry.md"):
         assert filename in precedence, f"missing precedence authority: {filename!r}"
+
+
+def _assert_branch_protection_policy(text: str) -> None:
+    """Assert the one earlier current branch-protection bullet is byte-scoped in meaning."""
+    start = text.index("- **`main` is branch-protected")
+    end = text.index("\n- **Precedence for the GitHub-Claude", start)
+    assert text.count("- **`main` is branch-protected") == 1
+    assert _normalized_visible(text[start:end]) == _BRANCH_PROTECTION_SNAPSHOT
 
 
 def _assert_registry_policy(text: str) -> None:
@@ -399,6 +431,7 @@ def _assert_registry_historical_evidence(text: str) -> None:
         assert _occurrences(historical_text, anchor), (
             f"historical evidence anchor vanished: {anchor!r}"
         )
+    _assert_historical_span_hashes(text, "docs/state/registry.md")
 
 
 def _remove_first_occurrence(text: str, phrase: str) -> str:
@@ -449,6 +482,24 @@ _REGISTRY_POLICY_SNAPSHOT = _normalized_visible(
     that SHA-scoped mechanism; D-ToS-1 does not first retire it and it must not be
     restored."""
 )
+_BRANCH_PROTECTION_SNAPSHOT = _normalized_visible(
+    """- **`main` is branch-protected (13 Jun, enforces this policy at the platform).**
+    Required, verified live 6 Sep 2026: app-pinned `Checks`, `Web (lint +
+    typecheck + unit)`, `Web (Playwright snapshots)`, and `codecov/patch`;
+    strict mode; `required_conversation_resolution` (every review thread
+    resolved); and `enforce_admins` (no bypass for owner or agents);
+    force-push/deletion off; repo auto-merge on. **`main` currently requires
+    zero approving reviews** — consumer-OAuth headless Claude CI is retired
+    under D-ToS-1 (`CLAUDE_HEADLESS_ENABLED` unset); see the precedence
+    subsection below for the operative merge-bar description and the
+    retained-but-dormant D108-D118 mechanism. **`claude-review` is
+    intentionally NOT a required check** — it fails by design on PRs that edit a
+    workflow file (the App's workflow-validation guard) and on Dependabot PRs (no
+    secrets), and it passes-on-findings; so the findings gate is GitHub Codex's
+    inline comments + conversation-resolution, not the check itself. Don't
+    re-add it as required (it would deadlock workflow PRs). Green CI alone never
+    means mergeable."""
+)
 
 
 def _operative_text(text: str, spans: list[tuple[int, int]]) -> str:
@@ -469,6 +520,13 @@ def _assert_historical_labels(text: str, spans: list[tuple[int, int]]) -> None:
         assert label in _HISTORICAL_LABELS, (
             "historical span lacks a complete visible dated D-ToS-1 label"
         )
+
+
+def _assert_historical_span_hashes(text: str, filename: str) -> None:
+    """Assert every retained historical span remains byte-exact and ordered."""
+    spans = _historical_spans(text)
+    observed = tuple(hashlib.sha256(text[start:end].encode()).hexdigest() for start, end in spans)
+    assert observed == _HISTORICAL_SPAN_HASHES[filename]
 
 
 def _historical_label_ranges(text: str, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -562,6 +620,7 @@ def test_agents_md_headless_skip_is_documented_and_never_instructed_on() -> None
     operative = "".join(operative_parts)
     assert not _is_affirmative_enablement_instruction(operative)
 
+    _assert_branch_protection_policy(text)
     _assert_precedence_policy(text)
 
 
@@ -626,10 +685,33 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
     assert _is_affirmative_enablement_instruction("CLAUDE_HEADLESS_ENABLED=true")
     assert _is_affirmative_enablement_instruction("export CLAUDE_HEADLESS_ENABLED='true'")
     assert _is_affirmative_enablement_instruction('Set CLAUDE_HEADLESS_ENABLED = "true"')
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"'
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b='true'"
+    )
+    assert _is_affirmative_enablement_instruction("gh variable set CLAUDE_HEADLESS_ENABLED -b true")
+    assert _is_affirmative_enablement_instruction("gh variable set CLAUDE_HEADLESS_ENABLED -b=true")
     assert not _is_affirmative_enablement_instruction("Do not export CLAUDE_HEADLESS_ENABLED=true")
     assert not _is_affirmative_enablement_instruction("Never set CLAUDE_HEADLESS_ENABLED = 'true'")
     assert not _is_affirmative_enablement_instruction("CLAUDE_HEADLESS_ENABLED=false")
     assert not _is_affirmative_enablement_instruction("OTHER_HEADLESS_ENABLED=true")
+    assert not _is_affirmative_enablement_instruction(
+        "Do not gh variable set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh variable set OTHER_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b truth"
+    )
 
 
 def test_responder_workflow_requires_the_true_only_headless_conjunct() -> None:
@@ -746,6 +828,10 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "Set CLAUDE_HEADLESS_ENABLED=true",
         "export CLAUDE_HEADLESS_ENABLED='true'",
         "CLAUDE_HEADLESS_ENABLED=true",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
+        'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b='true'",
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b=true",
     ):
         with pytest.raises(AssertionError):
             _assert_canonical_live_policy(agents + "\n" + instruction)
@@ -815,6 +901,10 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "Set CLAUDE_HEADLESS_ENABLED=true",
         "export CLAUDE_HEADLESS_ENABLED='true'",
         "CLAUDE_HEADLESS_ENABLED=true",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
+        'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b='true'",
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b=true",
     ):
         with pytest.raises(AssertionError):
             _assert_registry_policy(registry + "\n" + instruction)
@@ -858,6 +948,46 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             _assert_registry_historical_evidence(
                 _remove_first_occurrence(registry, directive) + "\n" + directive
             )
+
+    branch_start = agents.index("- **`main` is branch-protected")
+    branch_end = agents.index("\n- **Precedence for the GitHub-Claude", branch_start)
+    for original, replacement in (
+        ("strict mode;", "strict mode disabled;"),
+        ("`Checks`", "`Checks` (optional)"),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_branch_protection_policy(
+                agents[:branch_start]
+                + agents[branch_start:branch_end].replace(original, replacement, 1)
+                + agents[branch_end:]
+            )
+    with pytest.raises(AssertionError):
+        _assert_branch_protection_policy(
+            agents[:branch_end] + agents[branch_start:branch_end] + agents[branch_end:]
+        )
+
+    for document, assertion in (
+        (agents, _assert_agents_historical_evidence),
+        (registry, _assert_registry_historical_evidence),
+    ):
+        for _span_start, span_end in _historical_spans(document):
+            closing_line_start = document.rfind("\n", 0, span_end - 1) + 1
+            with pytest.raises(AssertionError):
+                assertion(document[:closing_line_start] + " \n" + document[closing_line_start:])
+
+    wait_start, wait_end = _historical_spans(agents)[-1]
+    wait_span = agents[wait_start:wait_end]
+    early_close_at = wait_span.index("Opening a normal PR starts Claude")
+    early_close_line_start = wait_span.rfind("\n", 0, early_close_at) + 1
+    wait_without_original_end = wait_span[: wait_span.rfind(_END_MARKER)]
+    shortened_wait = (
+        wait_without_original_end[:early_close_line_start]
+        + _END_MARKER
+        + "\n"
+        + wait_without_original_end[early_close_line_start:]
+    )
+    with pytest.raises(AssertionError):
+        _assert_agents_historical_evidence(agents[:wait_start] + shortened_wait + agents[wait_end:])
 
     for document, assertion in (
         (agents, _assert_agents_historical_evidence),
