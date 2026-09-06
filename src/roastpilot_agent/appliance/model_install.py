@@ -286,7 +286,7 @@ def _resolve_and_validate_source(from_dir_real: Path, relative_path: str) -> Pat
     return final_source
 
 
-def _sha256_of_file(path: Path | str, *, dir_fd: int | None = None) -> str:
+def _sha256_of_file(path: Path | str, *, dir_fd: int | None = None) -> tuple[str, int, int]:
     """Hash one regular file without reading more than the model-file cap.
 
     The descriptor is opened without following a final symlink.  Both its
@@ -337,7 +337,7 @@ def _sha256_of_file(path: Path | str, *, dir_fd: int | None = None) -> str:
         raise
     else:
         os.close(fd)
-    return digest.hexdigest()
+    return digest.hexdigest(), final.st_dev, final.st_ino
 
 
 def _is_already_valid(
@@ -350,7 +350,34 @@ def _is_already_valid(
         return False
     if not stat.S_ISREG(st.st_mode):
         return False
-    return _sha256_of_file(target, dir_fd=dir_fd) == expected_sha256
+    digest_hex, device, inode = _sha256_of_file(target, dir_fd=dir_fd)
+    try:
+        current = os.stat(target, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise ModelInstallError(
+            f"cached destination {target} changed while being verified"
+        ) from exc
+    if not stat.S_ISREG(current.st_mode) or current.st_dev != device or current.st_ino != inode:
+        raise ModelInstallError(f"cached destination {target} changed while being verified")
+    return digest_hex == expected_sha256
+
+
+def _validate_destination_parent_trust(parent_fd: int) -> None:
+    """Require an owner-only directory boundary for temp-name placement.
+
+    POSIX exposes descriptor-relative ``rename`` but not a portable
+    rename-by-inode primitive. The directory containing a named temporary file
+    is therefore a trust boundary: its effective owner must be this process,
+    and group/other users cannot replace the verified ``.part`` name between
+    identity validation and atomic replacement.
+    """
+    directory_stat = os.fstat(parent_fd)
+    if not stat.S_ISDIR(directory_stat.st_mode):
+        raise ModelInstallError("model destination parent is not a directory")
+    if directory_stat.st_uid != os.geteuid() or directory_stat.st_mode & (
+        stat.S_IWGRP | stat.S_IWOTH
+    ):
+        raise ModelInstallError("model destination parent is not an owner-only placement boundary")
 
 
 def _open_verified_source_file(from_dir_real: Path, relative_path: str) -> int:
@@ -690,6 +717,7 @@ def _stream_to_temp(
         ModelInstallError: Streamed bytes exceed the per-file cap.
         OSError: A local filesystem operation fails.
     """
+    _validate_destination_parent_trust(parent_fd)
     tmp_name = f".{target_name}.{uuid.uuid4().hex}.part"
     fd = os.open(
         tmp_name,
@@ -746,6 +774,17 @@ def _place_verified(
         if digest_hex != expected_sha256:
             raise ModelInstallError(f"digest mismatch for {context!r}")
         os.fchmod(tmp_fd, 0o644)
+        verified_temp = os.fstat(tmp_fd)
+        named_temp = os.stat(tmp_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(named_temp.st_mode)
+            or named_temp.st_dev != verified_temp.st_dev
+            or named_temp.st_ino != verified_temp.st_ino
+        ):
+            raise ModelInstallError(
+                f"verified temporary file changed before placement for {context!r}"
+            )
+        _validate_destination_parent_trust(parent_fd)
         fd_to_close = tmp_fd
         tmp_fd = -1
         os.close(fd_to_close)

@@ -139,6 +139,58 @@ def test_second_run_with_valid_files_makes_no_network_call(tmp_path: Path) -> No
     assert {f.source for f in summary.files} == {"cached"}
 
 
+def test_cached_entry_replacement_after_hash_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cached success requires the verified inode to remain named at the target."""
+    manifest = _make_manifest({"a/file1.bin": b"verified"})
+    dest = tmp_path / "dest"
+    target = dest / "a" / "file1.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"verified")
+    original_hash = model_install_module._sha256_of_file  # pyright: ignore[reportPrivateUsage]
+
+    def replace_after_hash(path: Path | str, *, dir_fd: int | None = None) -> tuple[str, int, int]:
+        result = original_hash(path, dir_fd=dir_fd)
+        target.unlink()
+        target.write_bytes(b"replacement")
+        return result
+
+    monkeypatch.setattr(model_install_module, "_sha256_of_file", replace_after_hash)
+
+    with pytest.raises(ModelInstallError, match="changed while being verified"):
+        install_model(
+            dest,
+            verify_only=True,
+            manifest_files=manifest,
+            repo_id=_REPO_ID,
+            revision=_REVISION,
+        )
+
+    assert target.read_bytes() == b"replacement"
+
+
+def test_group_writable_destination_parent_is_rejected_before_placement(tmp_path: Path) -> None:
+    """Named temporary placement requires an owner-only parent directory."""
+    manifest = _make_manifest({"a/file1.bin": b"payload"})
+    dest = tmp_path / "dest"
+    parent = dest / "a"
+    parent.mkdir(parents=True)
+    parent.chmod(0o777)
+    calls = [0]
+    client = httpx.Client(
+        transport=_serving_transport({"a/file1.bin": b"payload"}, call_count=calls)
+    )
+
+    with pytest.raises(ModelInstallError, match="owner-only placement boundary"):
+        install_model(
+            dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
+        )
+
+    assert calls == [0]
+    assert not (parent / "file1.bin").exists()
+
+
 def test_verify_only_rejects_an_initially_oversized_cached_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -792,6 +844,45 @@ def test_swapped_destination_parent_cannot_redirect_placement_outside_dest(
     assert summary.files[0].source == "fetched"
     assert not (outside / "file1.bin").exists()
     assert (parked_parent / "file1.bin").read_bytes() == b"payload"
+
+
+def test_replaced_temporary_entry_before_rename_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Placement never renames a name that no longer names the verified inode."""
+    manifest = _make_manifest({"a/file1.bin": b"payload"})
+    dest = tmp_path / "dest"
+    original_stream_to_temp = model_install_module._stream_to_temp  # pyright: ignore[reportPrivateUsage]
+
+    def replace_temp_entry(
+        parent_fd: int, target_name: str, chunks: Iterable[bytes], *, byte_cap: int
+    ) -> tuple[str, int, str]:
+        tmp_name, tmp_fd, digest_hex = original_stream_to_temp(
+            parent_fd, target_name, chunks, byte_cap=byte_cap
+        )
+        os.unlink(tmp_name, dir_fd=parent_fd)
+        replacement_fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            os.write(replacement_fd, b"replacement")
+        finally:
+            os.close(replacement_fd)
+        return tmp_name, tmp_fd, digest_hex
+
+    monkeypatch.setattr(model_install_module, "_stream_to_temp", replace_temp_entry)
+    client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"payload")))
+
+    with pytest.raises(ModelInstallError, match="temporary file changed before placement"):
+        install_model(
+            dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
+        )
+
+    assert not (dest / "a" / "file1.bin").exists()
+    assert list(dest.rglob("*.part")) == []
 
 
 @pytest.mark.parametrize("bad_repo_id", ["", "no-slash", "a/b/c", "a/", "/b", "a b/c"])
