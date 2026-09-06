@@ -148,15 +148,15 @@ def test_cached_entry_replacement_after_hash_is_rejected(
     target = dest / "a" / "file1.bin"
     target.parent.mkdir(parents=True)
     target.write_bytes(b"verified")
-    original_hash = model_install_module._sha256_of_file  # pyright: ignore[reportPrivateUsage]
+    original_hash = model_install_module._sha256_of_open_file  # pyright: ignore[reportPrivateUsage]
 
-    def replace_after_hash(path: Path | str, *, dir_fd: int | None = None) -> tuple[str, int, int]:
-        result = original_hash(path, dir_fd=dir_fd)
+    def replace_after_hash(fd: int, path: Path | str) -> tuple[str, int, int]:
+        result = original_hash(fd, path)
         target.unlink()
         target.write_bytes(b"replacement")
         return result
 
-    monkeypatch.setattr(model_install_module, "_sha256_of_file", replace_after_hash)
+    monkeypatch.setattr(model_install_module, "_sha256_of_open_file", replace_after_hash)
 
     with pytest.raises(ModelInstallError, match="changed while being verified"):
         install_model(
@@ -170,6 +170,42 @@ def test_cached_entry_replacement_after_hash_is_rejected(
     assert target.read_bytes() == b"replacement"
 
 
+def test_cached_parent_renamed_after_hash_is_not_reported_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cached bytes in a detached parent cannot satisfy the live destination path."""
+    manifest = _make_manifest({"a/file1.bin": b"verified"})
+    dest = tmp_path / "dest"
+    parent = dest / "a"
+    target = parent / "file1.bin"
+    parent.mkdir(parents=True)
+    target.write_bytes(b"verified")
+    parked_parent = tmp_path / "parked-parent"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original_hash = model_install_module._sha256_of_open_file  # pyright: ignore[reportPrivateUsage]
+
+    def rename_parent_after_hash(fd: int, path: Path | str) -> tuple[str, int, int]:
+        result = original_hash(fd, path)
+        parent.rename(parked_parent)
+        parent.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(model_install_module, "_sha256_of_open_file", rename_parent_after_hash)
+
+    with pytest.raises(ModelInstallError, match="cannot safely open destination directory"):
+        install_model(
+            dest,
+            verify_only=True,
+            manifest_files=manifest,
+            repo_id=_REPO_ID,
+            revision=_REVISION,
+        )
+
+    assert (parked_parent / "file1.bin").read_bytes() == b"verified"
+    assert not (outside / "file1.bin").exists()
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFO support")
 def test_cached_fifo_swap_after_lstat_is_rejected_without_reading(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -180,19 +216,19 @@ def test_cached_fifo_swap_after_lstat_is_rejected_without_reading(
     target = dest / "a" / "file1.bin"
     target.parent.mkdir(parents=True)
     target.write_bytes(b"verified")
-    original_hash = model_install_module._sha256_of_file  # pyright: ignore[reportPrivateUsage]
+    original_open = model_install_module._open_cached_file  # pyright: ignore[reportPrivateUsage]
 
     def fail_if_read_attempted(*args: object, **kwargs: object) -> object:
         pytest.fail("a substituted FIFO must be rejected before any read")
 
     monkeypatch.setattr(os, "fdopen", fail_if_read_attempted)
 
-    def replace_with_fifo(path: Path | str, *, dir_fd: int | None = None) -> tuple[str, int, int]:
+    def replace_with_fifo(path: Path | str, *, dir_fd: int | None = None) -> int:
         target.unlink()
         os.mkfifo(target)
-        return original_hash(path, dir_fd=dir_fd)
+        return original_open(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(model_install_module, "_sha256_of_file", replace_with_fifo)
+    monkeypatch.setattr(model_install_module, "_open_cached_file", replace_with_fifo)
 
     with pytest.raises(ModelInstallError, match="not a regular file"):
         install_model(
@@ -395,6 +431,95 @@ def test_placement_cleanup_unlink_failure_preserves_digest_error(
         original_unlink(temporary_file)
 
 
+def test_placement_fsyncs_containing_directory_after_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful atomic placement makes its new directory entry durable."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    original_fsync = os.fsync
+    fsynced_directory_fds: list[int] = []
+
+    def record_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            fsynced_directory_fds.append(fd)
+        original_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    try:
+        model_install_module._place_verified(  # pyright: ignore[reportPrivateUsage]
+            parent_fd,
+            "model.bin",
+            [b"payload"],
+            expected_sha256=hashlib.sha256(b"payload").hexdigest(),
+            byte_cap=8,
+            context="model.bin",
+        )
+    finally:
+        os.close(parent_fd)
+
+    assert fsynced_directory_fds == [parent_fd]
+    assert (tmp_path / "model.bin").read_bytes() == b"payload"
+
+
+def test_directory_fsync_failure_after_replace_propagates_without_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-rename directory-sync failure cannot be reported as success."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    original_fsync = os.fsync
+
+    def fail_directory_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("simulated directory fsync failure")
+        original_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+    try:
+        with pytest.raises(OSError, match="simulated directory fsync failure"):
+            model_install_module._place_verified(  # pyright: ignore[reportPrivateUsage]
+                parent_fd,
+                "model.bin",
+                [b"payload"],
+                expected_sha256=hashlib.sha256(b"payload").hexdigest(),
+                byte_cap=8,
+                context="model.bin",
+            )
+    finally:
+        os.close(parent_fd)
+
+    assert list(tmp_path.glob("*.part")) == []
+
+
+def test_created_destination_directory_is_fsynced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Directory creation is synced before descriptor traversal continues."""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    dest_root_fd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY)
+    original_fsync = os.fsync
+    fsynced_directory_fds: list[int] = []
+
+    def record_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            fsynced_directory_fds.append(fd)
+        original_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    try:
+        parent_fd, _target_name = model_install_module._open_destination_parent(  # pyright: ignore[reportPrivateUsage]
+            dest, "a/model.bin", create=True
+        )
+        try:
+            assert (dest / "a").is_dir()
+        finally:
+            os.close(parent_fd)
+    finally:
+        os.close(dest_root_fd)
+
+    assert fsynced_directory_fds
+
+
 # --- T4: --from-dir missing a file -> error, no fallback to network --------
 
 
@@ -468,6 +593,52 @@ def test_from_dir_copy_places_with_correct_mode(tmp_path: Path) -> None:
     placed = dest / "a" / "file1.bin"
     assert placed.read_bytes() == b"payload"
     assert stat.S_IMODE(placed.stat().st_mode) == 0o644
+
+
+def test_source_descriptor_is_closed_if_final_parent_close_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A final source-parent close failure cannot leak the opened source file."""
+    from_dir = tmp_path / "src"
+    source = from_dir / "a" / "file1.bin"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"payload")
+    original_open = os.open
+    original_close = os.close
+    opened_child_fds: list[int] = []
+    opened_source_fds: list[int] = []
+    source_close_calls: list[int] = []
+
+    def tracking_open(
+        path: Path | str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        fd = original_open(path, flags, mode, dir_fd=dir_fd)
+        if path == "a":
+            opened_child_fds.append(fd)
+        elif path == "file1.bin":
+            opened_source_fds.append(fd)
+        return fd
+
+    def fail_final_parent_close(fd: int) -> None:
+        if opened_source_fds and fd == opened_source_fds[-1]:
+            source_close_calls.append(fd)
+        if opened_child_fds and fd == opened_child_fds[-1]:
+            raise OSError("simulated final parent close failure")
+        original_close(fd)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "close", fail_final_parent_close)
+    try:
+        with pytest.raises(OSError, match="simulated final parent close failure"):
+            model_install_module._open_verified_source_file(  # pyright: ignore[reportPrivateUsage]
+                from_dir, "a/file1.bin"
+            )
+    finally:
+        for fd in opened_child_fds:
+            original_close(fd)
+
+    assert opened_source_fds
+    assert source_close_calls == [opened_source_fds[0]]
 
 
 def test_from_dir_symlinked_subdirectory_escape_is_rejected(tmp_path: Path) -> None:
@@ -897,11 +1068,11 @@ def test_swapped_destination_parent_cannot_redirect_placement_outside_dest(
     monkeypatch.setattr(model_install_module, "_stream_to_temp", swap_parent_then_stream)
     client = httpx.Client(transport=httpx.MockTransport(lambda _r: _ok_response(b"payload")))
 
-    summary = install_model(
-        dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
-    )
+    with pytest.raises(ModelInstallError, match="cannot safely open destination directory"):
+        install_model(
+            dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION, http_client=client
+        )
 
-    assert summary.files[0].source == "fetched"
     assert not (outside / "file1.bin").exists()
     assert (parked_parent / "file1.bin").read_bytes() == b"payload"
 

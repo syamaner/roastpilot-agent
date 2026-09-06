@@ -76,7 +76,6 @@ import stat
 import sys
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -286,7 +285,50 @@ def _resolve_and_validate_source(from_dir_real: Path, relative_path: str) -> Pat
     return final_source
 
 
-def _sha256_of_file(path: Path | str, *, dir_fd: int | None = None) -> tuple[str, int, int]:
+def _open_cached_file(path: Path | str, *, dir_fd: int | None = None) -> int:
+    """Open one cached candidate without following or blocking on unsafe entries."""
+    # A target can be swapped from the preceding lstat into a FIFO before
+    # this descriptor-relative open.  Non-blocking open ensures fstat below
+    # rejects that non-regular entry without waiting for a writer.
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        return os.open(path, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise ModelInstallError(f"cannot safely verify cached destination {path}") from exc
+
+
+def _sha256_of_open_file(fd: int, path: Path | str) -> tuple[str, int, int]:
+    """Hash an already-open regular cached file without exceeding the cap."""
+    digest = hashlib.sha256()
+    initial = os.fstat(fd)
+    if not stat.S_ISREG(initial.st_mode):
+        raise ModelInstallError(f"cached destination {path} is not a regular file")
+    if initial.st_size > _MAX_MODEL_FILE_BYTES:
+        raise ModelInstallError(
+            f"cached destination {path} exceeds the {_MAX_MODEL_FILE_BYTES}-byte per-file cap"
+        )
+    total = 0
+    with os.fdopen(fd, "rb", closefd=False) as fh:
+        while True:
+            chunk = fh.read(min(_CHUNK_SIZE, _MAX_MODEL_FILE_BYTES - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _MAX_MODEL_FILE_BYTES:
+                raise ModelInstallError(
+                    f"cached destination {path} exceeded the "
+                    f"{_MAX_MODEL_FILE_BYTES}-byte per-file cap"
+                )
+            digest.update(chunk)
+    final = os.fstat(fd)
+    if final.st_size != total or final.st_size > _MAX_MODEL_FILE_BYTES:
+        raise ModelInstallError(f"cached destination {path} changed while being verified")
+    return digest.hexdigest(), final.st_dev, final.st_ino
+
+
+def _sha256_of_file(  # pyright: ignore[reportUnusedFunction]
+    path: Path | str, *, dir_fd: int | None = None
+) -> tuple[str, int, int]:
     """Hash one regular file without reading more than the model-file cap.
 
     The descriptor is opened without following a final symlink.  Both its
@@ -300,39 +342,9 @@ def _sha256_of_file(path: Path | str, *, dir_fd: int | None = None) -> tuple[str
         OSError: A local filesystem operation fails outside the fail-closed
             validation cases.
     """
-    digest = hashlib.sha256()
-    # A target can be swapped from the preceding lstat into a FIFO before
-    # this descriptor-relative open.  Non-blocking open ensures fstat below
-    # rejects that non-regular entry without waiting for a writer.
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = _open_cached_file(path, dir_fd=dir_fd)
     try:
-        fd = os.open(path, flags, dir_fd=dir_fd)
-    except OSError as exc:
-        raise ModelInstallError(f"cannot safely verify cached destination {path}") from exc
-    try:
-        initial = os.fstat(fd)
-        if not stat.S_ISREG(initial.st_mode):
-            raise ModelInstallError(f"cached destination {path} is not a regular file")
-        if initial.st_size > _MAX_MODEL_FILE_BYTES:
-            raise ModelInstallError(
-                f"cached destination {path} exceeds the {_MAX_MODEL_FILE_BYTES}-byte per-file cap"
-            )
-        total = 0
-        with os.fdopen(fd, "rb", closefd=False) as fh:
-            while True:
-                chunk = fh.read(min(_CHUNK_SIZE, _MAX_MODEL_FILE_BYTES - total + 1))
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > _MAX_MODEL_FILE_BYTES:
-                    raise ModelInstallError(
-                        f"cached destination {path} exceeded the "
-                        f"{_MAX_MODEL_FILE_BYTES}-byte per-file cap"
-                    )
-                digest.update(chunk)
-        final = os.fstat(fd)
-        if final.st_size != total or final.st_size > _MAX_MODEL_FILE_BYTES:
-            raise ModelInstallError(f"cached destination {path} changed while being verified")
+        result = _sha256_of_open_file(fd, path)
     except BaseException:
         _cleanup_preserving_primary(
             lambda: os.close(fd), action="closing cached model file descriptor"
@@ -340,29 +352,60 @@ def _sha256_of_file(path: Path | str, *, dir_fd: int | None = None) -> tuple[str
         raise
     else:
         os.close(fd)
-    return digest.hexdigest(), final.st_dev, final.st_ino
+    return result
 
 
-def _is_already_valid(
-    target: Path | str, expected_sha256: str, *, dir_fd: int | None = None
-) -> bool:
-    """A regular file already exists at ``target`` with the expected digest."""
+def _open_verified_cached_file(
+    target: Path | str, *, dir_fd: int | None = None
+) -> tuple[str, int, int, int] | None:
+    """Hash and identity-check a cached target while retaining its descriptor.
+
+    The returned descriptor remains open so the caller can bind a subsequent
+    live-path check to the exact bytes that were hashed. The caller owns and
+    must close it on the successful return path.
+    """
     try:
         st = os.lstat(target, dir_fd=dir_fd)
     except FileNotFoundError:
-        return False
+        return None
     if not stat.S_ISREG(st.st_mode):
-        return False
-    digest_hex, device, inode = _sha256_of_file(target, dir_fd=dir_fd)
+        return None
+    fd = _open_cached_file(target, dir_fd=dir_fd)
     try:
-        current = os.stat(target, dir_fd=dir_fd, follow_symlinks=False)
-    except FileNotFoundError as exc:
-        raise ModelInstallError(
-            f"cached destination {target} changed while being verified"
-        ) from exc
-    if not stat.S_ISREG(current.st_mode) or current.st_dev != device or current.st_ino != inode:
-        raise ModelInstallError(f"cached destination {target} changed while being verified")
-    return digest_hex == expected_sha256
+        digest_hex, device, inode = _sha256_of_open_file(fd, target)
+        try:
+            current = os.stat(target, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise ModelInstallError(
+                f"cached destination {target} changed while being verified"
+            ) from exc
+        if not stat.S_ISREG(current.st_mode) or current.st_dev != device or current.st_ino != inode:
+            raise ModelInstallError(f"cached destination {target} changed while being verified")
+        return digest_hex, fd, device, inode
+    except BaseException:
+        _cleanup_preserving_primary(
+            lambda: os.close(fd), action="closing cached model file descriptor"
+        )
+        raise
+
+
+def _is_already_valid(  # pyright: ignore[reportUnusedFunction]
+    target: Path | str, expected_sha256: str, *, dir_fd: int | None = None
+) -> bool:
+    """A regular file already exists at ``target`` with the expected digest."""
+    verified = _open_verified_cached_file(target, dir_fd=dir_fd)
+    if verified is None:
+        return False
+    digest_hex, fd, _device, _inode = verified
+    try:
+        return digest_hex == expected_sha256
+    except BaseException:
+        _cleanup_preserving_primary(
+            lambda: os.close(fd), action="closing cached model file descriptor"
+        )
+        raise
+    else:
+        os.close(fd)
 
 
 def _validate_destination_parent_trust(parent_fd: int) -> None:
@@ -446,15 +489,26 @@ def _open_verified_source_file(from_dir_real: Path, relative_path: str) -> int:
                 f"--from-dir source for {relative_path!r} is not a regular file "
                 "(a symlink, directory, or device is never read)"
             )
-        verified_source_fd = source_fd
-        source_fd = None
-        return verified_source_fd
     except BaseException:
         if source_fd is not None:
             _cleanup_preserving_primary(
                 lambda fd=source_fd: os.close(fd), action="closing --from-dir source descriptor"
             )
         raise
+    else:
+        fd_to_close = parent_fd
+        parent_fd = None
+        try:
+            os.close(fd_to_close)
+        except BaseException:
+            _cleanup_preserving_primary(
+                lambda fd=source_fd: os.close(fd), action="closing --from-dir source descriptor"
+            )
+            source_fd = None
+            raise
+        verified_source_fd = source_fd
+        source_fd = None
+        return verified_source_fd
     finally:
         if parent_fd is not None:
             _cleanup_preserving_primary(
@@ -670,8 +724,12 @@ def _open_destination_parent(
     try:
         for component in components[:-1]:
             if create:
-                with suppress(FileExistsError):
+                try:
                     os.mkdir(component, mode=0o755, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                else:
+                    os.fsync(parent_fd)
             try:
                 child_fd = os.open(component, flags, dir_fd=parent_fd)
             except FileNotFoundError:
@@ -761,7 +819,7 @@ def _place_verified(
     expected_sha256: str,
     byte_cap: int,
     context: str,
-) -> None:
+) -> tuple[int, int]:
     """Stream ``chunks`` to a temp file, verify the digest, then atomically place.
 
     Raises:
@@ -769,6 +827,10 @@ def _place_verified(
             ``expected_sha256`` (the temp file is removed; the final path is
             never written before verification) or streaming itself failed.
         OSError: A local filesystem operation fails.
+
+    Returns:
+        Device and inode of the placed file, for live-path revalidation by the
+        caller before it reports success.
     """
     tmp_name, tmp_fd, digest_hex = _stream_to_temp(
         parent_fd, target_name, chunks, byte_cap=byte_cap
@@ -792,6 +854,8 @@ def _place_verified(
         tmp_fd = -1
         os.close(fd_to_close)
         os.replace(tmp_name, target_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        return verified_temp.st_dev, verified_temp.st_ino
     except BaseException:
         # A chmod/replace failure (e.g. a permission error, or the target's
         # parent disappearing between verification and rename) must not leave
@@ -807,6 +871,58 @@ def _place_verified(
             lambda: os.unlink(tmp_name, dir_fd=parent_fd), action="removing temporary model file"
         )
         raise
+
+
+def _revalidate_live_destination(
+    dest_root_real: Path,
+    relative_path: str,
+    *,
+    parent_fd: int,
+    device: int,
+    inode: int,
+) -> None:
+    """Prove the live destination path still names the verified placement.
+
+    A directory descriptor remains usable after its pathname is renamed away.
+    Reopening the path chain below the destination root and comparing both the
+    parent and final entry prevents a detached-directory placement from being
+    reported as success for the original destination path.
+    """
+    try:
+        live_parent_fd, target_name = _open_destination_parent(
+            dest_root_real, relative_path, create=False
+        )
+    except FileNotFoundError as exc:
+        raise ModelInstallError(
+            f"destination changed before placement could be confirmed for {relative_path!r}"
+        ) from exc
+    try:
+        expected_parent = os.fstat(parent_fd)
+        live_parent = os.fstat(live_parent_fd)
+        _validate_destination_parent_trust(live_parent_fd)
+        try:
+            live_target = os.stat(target_name, dir_fd=live_parent_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise ModelInstallError(
+                f"destination changed before placement could be confirmed for {relative_path!r}"
+            ) from exc
+        if (
+            expected_parent.st_dev != live_parent.st_dev
+            or expected_parent.st_ino != live_parent.st_ino
+            or not stat.S_ISREG(live_target.st_mode)
+            or live_target.st_dev != device
+            or live_target.st_ino != inode
+        ):
+            raise ModelInstallError(
+                f"destination changed before placement could be confirmed for {relative_path!r}"
+            )
+    except BaseException:
+        _cleanup_preserving_primary(
+            lambda: os.close(live_parent_fd), action="closing live destination directory descriptor"
+        )
+        raise
+    else:
+        os.close(live_parent_fd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -934,15 +1050,34 @@ def install_model(
             try:
                 if parent_fd is not None:
                     _validate_destination_parent_trust(parent_fd)
-                if parent_fd is not None and _is_already_valid(
-                    target_name, manifest_file.sha256, dir_fd=parent_fd
-                ):
-                    results.append(
-                        ManifestFileResult(
-                            manifest_file.relative_path, manifest_file.sha256, "cached"
+                cached = (
+                    _open_verified_cached_file(target_name, dir_fd=parent_fd)
+                    if parent_fd is not None
+                    else None
+                )
+                if cached is not None:
+                    cached_digest, cached_fd, cached_device, cached_inode = cached
+                    try:
+                        if cached_digest == manifest_file.sha256:
+                            assert parent_fd is not None
+                            _revalidate_live_destination(
+                                dest_root_real,
+                                manifest_file.relative_path,
+                                parent_fd=parent_fd,
+                                device=cached_device,
+                                inode=cached_inode,
+                            )
+                            results.append(
+                                ManifestFileResult(
+                                    manifest_file.relative_path, manifest_file.sha256, "cached"
+                                )
+                            )
+                            continue
+                    finally:
+                        _cleanup_preserving_primary(
+                            lambda fd=cached_fd: os.close(fd),
+                            action="closing cached model file descriptor",
                         )
-                    )
-                    continue
 
                 if verify_only:
                     raise ModelInstallError(
@@ -961,13 +1096,20 @@ def install_model(
                             parent_fd, target_name = _open_destination_parent(
                                 dest_root_real, manifest_file.relative_path, create=True
                             )
-                        _place_verified(
+                        placed_device, placed_inode = _place_verified(
                             parent_fd,
                             target_name,
                             _iter_open_file_bytes(source_fd),
                             expected_sha256=manifest_file.sha256,
                             byte_cap=_MAX_MODEL_FILE_BYTES,
                             context=manifest_file.relative_path,
+                        )
+                        _revalidate_live_destination(
+                            dest_root_real,
+                            manifest_file.relative_path,
+                            parent_fd=parent_fd,
+                            device=placed_device,
+                            inode=placed_inode,
                         )
                     finally:
                         _cleanup_preserving_primary(
@@ -987,13 +1129,20 @@ def install_model(
                     parent_fd, target_name = _open_destination_parent(
                         dest_root_real, manifest_file.relative_path, create=True
                     )
-                _place_verified(
+                placed_device, placed_inode = _place_verified(
                     parent_fd,
                     target_name,
                     _iter_https_bytes(client, url, byte_cap=_MAX_MODEL_FILE_BYTES),
                     expected_sha256=manifest_file.sha256,
                     byte_cap=_MAX_MODEL_FILE_BYTES,
                     context=manifest_file.relative_path,
+                )
+                _revalidate_live_destination(
+                    dest_root_real,
+                    manifest_file.relative_path,
+                    parent_fd=parent_fd,
+                    device=placed_device,
+                    inode=placed_inode,
                 )
                 results.append(
                     ManifestFileResult(manifest_file.relative_path, manifest_file.sha256, "fetched")
