@@ -2617,12 +2617,15 @@ D35 build. Honest state:
   (#254) curve hydration, #242 (#248) name-keyed rows, #103 (#251) replay-harness
   hardening, #257 Dependabot. **#112 closed** (GAP A shipped via #220; GAP B = live
   FC-detector health is M2/MCP scope, out of E10).
+<!-- historical-evidence: begin -->
+**[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this file.]**
 - **Governance / CI — DONE:** PR review roster = Claude Code Review (+ human reviewers);
   the Augment Code trial ended 28 Jun 2026, and Codex + CodeRabbit were disabled (#246,
   **plan D37**) — a conversation-resolution gate + a re-review-on-every-push bot was a
   non-terminating merge loop. CI Playwright
   image mirrored to GHCR off MCR's anonymous-pull hot path; `mirror-playwright.yml`
   self-refreshes weekly + on bump (#262/#263, **plan D38**).
+<!-- historical-evidence: end -->
 
 **Remaining backlog:**
 - **D35 keystone (epic #221) — pre-FC floor + post-FC loop SHIPPED + hardware-validated
@@ -2808,12 +2811,15 @@ hardening, NOT a start on E11 implementation (still gated):
   safety path (controller e-stop) BEFORE stopping the MCP child, bounded + fail-closed
   (#142). A hard kill (SIGKILL/power loss) is uncatchable → still restart →
   `operator_recovery_required`, never auto-resume.
+<!-- historical-evidence: begin -->
+**[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this file.]**
 - **Governance-as-code:** `main` is branch-protected (required checks + codecov +
   `required_conversation_resolution` + `enforce_admins`, no bypass; auto-merge on).
   `claude-review` posts **blocking inline** findings (`--comment`) but is intentionally
   **NOT a required check** (fails by design on workflow-editing + Dependabot PRs; the
   gate is the inline threads + conversation-resolution). AGENTS.md gained a **Code
   Review Rubric** (#147).
+<!-- historical-evidence: end -->
 - **Demo/operator ergonomics:** one-command launch scripts `scripts/roast-replay.sh`
   (#135 device test) + `scripts/roast-live.sh` (#134), wait-for-ready + rebuild-stale-SPA
   (#150–#152); the **known-good MCP config** at

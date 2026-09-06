@@ -125,6 +125,8 @@ _HISTORICAL_SPAN_HASHES = {
         "116690f3909c7ed2e2bb1d8b0f3d22b7e5ffe5eebf58af25eb743225e71d584c",
         "e077d2f7a0751235a0fa0b3566f5209f9d95f1acc6a5492698a905daa76969da",
         "54b4487109564e2063ed9f275a69064943cb2042dba95dafec92ba42d331b7f2",
+        "479c64d91b64ea090b7d9d8669906c0f093b7eaf544ee7025d910ec821186043",
+        "20c123164558d99a78a5be81fc3ba31a4ee77c0f9a7fdb2b0837bd5c33629256",
     ),
 }
 
@@ -548,6 +550,8 @@ def _assert_registry_historical_evidence(text: str) -> None:
         "mark `review-gate` a REQUIRED status check on `main` to arm it",
         "operator activates the `review-gate` required check (#159 / D58)",
         "the review itself still runs unskipped",
+        "PR review roster = Claude Code Review (+ human reviewers)",
+        "`claude-review` posts **blocking inline** findings (`--comment`)",
     ):
         assert _occurrences(historical_text, anchor), (
             f"historical evidence anchor vanished: {anchor!r}"
