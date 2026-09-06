@@ -9,7 +9,7 @@ deletion `false`; app-pinned required checks `Checks`, `Web (lint + typecheck
 + unit)`, `Web (Playwright snapshots)`, and `codecov/patch`.
 `CLAUDE_HEADLESS_ENABLED` is unset: consumer-OAuth headless Claude CI (the
 hosted `Claude Code Review` job and the `@claude` responder) is retired under
-D-ToS-1, mirroring roastpilot-cloud #411, merged in agent commit
+D-ToS-1, merged in agent commit
 `299fb5a93d09e54f58d370f7a35e5ce15f278150` (PR #923). A skipped headless job
 is expected, never a failure. The D108-D118 PR-scoped Claude approval bridge
 mechanism is retained in the codebase but **dormant**: it gates nothing while
@@ -23,8 +23,8 @@ RESTORED (#663 / D108-D118)" record, the earlier 31-Jul "#663 / D108-D118"
 status summary, and the residual June instructions to arm or require the
 SHA-scoped `review-gate`, plus the 17-Aug #735 statement that the headless
 review itself still runs unskipped, all now marked historical. D108-D118
-already retired that SHA-scoped mechanism; D-ToS-1 does not first retire it and
-it must not be restored.
+already retired that SHA-scoped mechanism; D-ToS-1 is unrelated to that
+retirement; it must not be restored.
 
 **1 Sep 2026 — #702 (D180/D181) closure:** PR #872 merged at
 `fdb354cd7b697261faf55212eee73e9504528281`; the issue is closed and the
