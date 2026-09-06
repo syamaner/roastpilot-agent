@@ -1272,8 +1272,8 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             "requires **no** approving reviews",
             "must have zero approving reviews",
             "needs no approving reviews",
-            "does not need ten approving reviews",
-            "must not have two approving reviews",
+            "does not require two approving reviews",
+            "no longer requires two approving reviews",
             "required_approving_review_count=0",
             "required_approving_review_count = 0",
             "required_approving_review_count: 0",
@@ -1330,8 +1330,8 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     for allowed_requirement in (
         "must have zero approving reviews",
         "needs no approving reviews",
-        "does not need ten approving reviews",
-        "must not have two approving reviews",
+        "does not require two approving reviews",
+        "no longer requires two approving reviews",
     ):
         _assert_no_nonzero_approval_requirement(
             agents + "\n" + allowed_requirement,
