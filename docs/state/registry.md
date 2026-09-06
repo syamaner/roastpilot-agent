@@ -21,9 +21,10 @@ risk-routed authenticated local Claude assurance. This entry supersedes the
 operative approval wording in the "31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL
 RESTORED (#663 / D108-D118)" record, the earlier 31-Jul "#663 / D108-D118"
 status summary, and the residual June instructions to arm or require the
-SHA-scoped `review-gate`, all now marked historical. D108-D118 already retired
-that SHA-scoped mechanism; D-ToS-1 does not first retire it and it must not be
-restored.
+SHA-scoped `review-gate`, plus the 17-Aug #735 statement that the headless
+review itself still runs unskipped, all now marked historical. D108-D118
+already retired that SHA-scoped mechanism; D-ToS-1 does not first retire it and
+it must not be restored.
 
 **1 Sep 2026 — #702 (D180/D181) closure:** PR #872 merged at
 `fdb354cd7b697261faf55212eee73e9504528281`; the issue is closed and the
@@ -364,12 +365,18 @@ coupled bump that resolves Node through venv-contained `nodejs_wheel`, without
 host PATH widening or a runtime download; validation roots are reprovisioned
 after either pin moves.**
 
+<!-- historical-evidence: begin -->
+**[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this file.]**
 **17 Aug 2026 — #735 story-closing implementation complete: `claude-code-review.yml` enables `track_progress`
 only for `opened`/`synchronize`/`ready_for_review`/`reopened` and disables it
 (fail-closed) for `edited` and any other action, because the action does not
 support progress-comment tracking there; `edited` stays in the trigger list
 and the review itself still runs unskipped. This removes the prior
 mark-ready/reopen draft-cycle workaround for metadata edits.**
+<!-- historical-evidence: end -->
+The trigger remains configured, but under D-ToS-1 its headless job skips while
+`CLAUDE_HEADLESS_ENABLED` is unset; the retained `track_progress` implementation
+above is not undone.
 
 **11 Aug 2026 — #781 closed by slice 2: D156/D157 wire the flag-gated post-FC fan destination ceiling and a one-way RUN-scoped release latch: once released it stays released for the rest of the run, surviving every transition including an operator resume, and is cleared only by `start_run`. The load-bearing case is a resume back to pre-first-crack reaching DEVELOPMENT again on a second first-crack edge; the direct recovery-to-DEVELOPMENT resume is separately inert because the floor is unknown there. In practice enforcement also requires the post-FC control loop: with the loop inert, the unknown heat floor releases a climbing bean immediately.**
 

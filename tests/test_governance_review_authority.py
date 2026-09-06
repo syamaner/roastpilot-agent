@@ -119,6 +119,7 @@ _HISTORICAL_SPAN_HASHES = {
         "2068d33a30d8cf20a6489f65464f653a965fdeccc8ad3251d1f170df3bf61c11",
     ),
     "docs/state/registry.md": (
+        "563be152854b3ebcdce0b142fef714c963522680538ccc769407aa050fa1405e",
         "56c29c9419f0a820986b589c491a5b284a547472f62e53df861a93c3f63ba1a0",
         "4ac05ceba7ebf886296e5de878ce86a97f9a82d8a424e2114728e8787ac9764b",
         "116690f3909c7ed2e2bb1d8b0f3d22b7e5ffe5eebf58af25eb743225e71d584c",
@@ -274,8 +275,7 @@ def _is_affirmative_enablement_instruction(text: str) -> bool:
         re.IGNORECASE,
     )
     gh_variable_set = re.compile(
-        r"(?P<prohibition>\b(?:do not|never)\s+)?gh\s+variable\s+set\s+"
-        r"CLAUDE_HEADLESS_ENABLED\b",
+        r"(?P<prohibition>\b(?:do not|never)\s+)?gh\s+variable\s+set\b",
         re.IGNORECASE,
     )
     explicit_false_body = re.compile(
@@ -291,10 +291,17 @@ def _is_affirmative_enablement_instruction(text: str) -> bool:
         line_end = markdown_clean.find("\n", match.end())
         if line_end == -1:
             line_end = len(markdown_clean)
+        command_separator = re.search(r";|&&|\|\|", markdown_clean[match.end() : line_end])
+        if command_separator is not None:
+            line_end = match.end() + command_separator.start()
         next_command_start = (
             gh_matches[index + 1].start() if index + 1 < len(gh_matches) else line_end
         )
-        tail = markdown_clean[match.end() : min(line_end, next_command_start)]
+        command_segment = markdown_clean[match.end() : min(line_end, next_command_start)]
+        target = re.search(r"\bCLAUDE_HEADLESS_ENABLED\b", command_segment)
+        if target is None:
+            continue
+        tail = command_segment[target.end() :]
         if match.group("prohibition") is None and explicit_false_body.fullmatch(tail) is None:
             has_gh_enablement = True
             break
@@ -375,6 +382,14 @@ def _assert_branch_protection_policy(text: str) -> None:
     assert _normalized_visible(text[start:end]) == _BRANCH_PROTECTION_SNAPSHOT
 
 
+def _assert_review_roster_policy(text: str) -> None:
+    """Assert the complete operative Code Review Rubric roster remains live."""
+    start = text.index("**The PR review roster (verified live 6 Sep 2026, D-ToS-1)")
+    end = text.index("\n<!-- historical-evidence: begin -->", start)
+    assert text.count("**The PR review roster (verified live 6 Sep 2026, D-ToS-1)") == 1
+    assert _normalized_visible(text[start:end]) == _REVIEW_ROSTER_SNAPSHOT
+
+
 def _assert_registry_policy(text: str) -> None:
     """Assert the first registry reconciliation entry is operative and complete."""
     spans = _historical_spans(text)
@@ -446,6 +461,7 @@ def _assert_registry_historical_evidence(text: str) -> None:
         "arm the `review-gate` required check (#159 / D58)",
         "mark `review-gate` a REQUIRED status check on `main` to arm it",
         "operator activates the `review-gate` required check (#159 / D58)",
+        "the review itself still runs unskipped",
     ):
         assert _occurrences(historical_text, anchor), (
             f"historical evidence anchor vanished: {anchor!r}"
@@ -461,7 +477,8 @@ def _remove_first_occurrence(text: str, phrase: str) -> str:
 
 def _normalized_visible(text: str) -> str:
     """Normalize finite Markdown presentation differences for scoped clauses."""
-    return re.sub(r"\s+", " ", re.sub(r"[`*>]", "", text)).strip()
+    without_blockquotes = re.sub(r"(?m)^[ \t]*>[ \t]?", "", text)
+    return re.sub(r"\s+", " ", re.sub(r"[`*]", "", without_blockquotes)).strip()
 
 
 _CANONICAL_POLICY_SNAPSHOT = _normalized_visible(
@@ -497,9 +514,10 @@ _REGISTRY_POLICY_SNAPSHOT = _normalized_visible(
     operative approval wording in the "31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL
     RESTORED (#663 / D108-D118)" record, the earlier 31-Jul "#663 / D108-D118"
     status summary, and the residual June instructions to arm or require the
-    SHA-scoped `review-gate`, all now marked historical. D108-D118 already retired
-    that SHA-scoped mechanism; D-ToS-1 does not first retire it and it must not be
-    restored."""
+    SHA-scoped `review-gate`, plus the 17-Aug #735 statement that the headless
+    review itself still runs unskipped, all now marked historical. D108-D118
+    already retired that SHA-scoped mechanism; D-ToS-1 does not first retire it and
+    it must not be restored."""
 )
 _BRANCH_PROTECTION_SNAPSHOT = _normalized_visible(
     """- **`main` is branch-protected (13 Jun, enforces this policy at the platform).**
@@ -518,6 +536,17 @@ _BRANCH_PROTECTION_SNAPSHOT = _normalized_visible(
     inline comments + conversation-resolution, not the check itself. Don't
     re-add it as required (it would deadlock workflow PRs). Green CI alone never
     means mergeable."""
+)
+_REVIEW_ROSTER_SNAPSHOT = _normalized_visible(
+    """**The PR review roster (verified live 6 Sep 2026, D-ToS-1): GitHub `Codex`
+    (exact-current-head review + wait, advisory-but-triaged), risk-routed
+    authenticated local Claude assurance (`safety-reviewer`, `security-reviewer`,
+    `qa`, etc., per the routing table below), independent triage, and any human
+    reviewer.** The hosted headless **Claude Code Review**
+    (`.github/workflows/claude-code-review.yml`, running `/code-review --comment`)
+    job is retired/dormant: it SKIPS while `CLAUDE_HEADLESS_ENABLED` is unset, so
+    it is no longer a live roster member. **CodeRabbit stays disabled (15 Jun) and
+    the Augment Code trial ENDED (28 Jun).**"""
 )
 
 
@@ -640,6 +669,7 @@ def test_agents_md_headless_skip_is_documented_and_never_instructed_on() -> None
     assert not _is_affirmative_enablement_instruction(operative)
 
     _assert_branch_protection_policy(text)
+    _assert_review_roster_policy(text)
     _assert_precedence_policy(text)
 
 
@@ -715,6 +745,18 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
     )
     assert _is_affirmative_enablement_instruction("gh variable set CLAUDE_HEADLESS_ENABLED -b true")
     assert _is_affirmative_enablement_instruction("gh variable set CLAUDE_HEADLESS_ENABLED -b=true")
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --repo owner/repo CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set -R=owner/repo CLAUDE_HEADLESS_ENABLED -b='true'"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --repo='owner/repo' CLAUDE_HEADLESS_ENABLED --body=true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        'gh variable set -R "owner/repo" CLAUDE_HEADLESS_ENABLED -b true'
+    )
     assert _is_affirmative_enablement_instruction("gh variable set CLAUDE_HEADLESS_ENABLED")
     assert _is_affirmative_enablement_instruction(
         "printf true | gh variable set CLAUDE_HEADLESS_ENABLED"
@@ -745,10 +787,15 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
         'gh variable set CLAUDE_HEADLESS_ENABLED --body "false"',
         "gh variable set CLAUDE_HEADLESS_ENABLED -b='false'",
         "gh variable set CLAUDE_HEADLESS_ENABLED --body false.",
+        "gh variable set --repo=owner/repo CLAUDE_HEADLESS_ENABLED --body 'false'",
+        "gh variable set -R owner/repo CLAUDE_HEADLESS_ENABLED -b=false",
     ):
         assert not _is_affirmative_enablement_instruction(false_body)
     assert not _is_affirmative_enablement_instruction(
         "gh variable set OTHER_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh variable set --repo owner/repo OTHER_HEADLESS_ENABLED --body true"
     )
     assert _is_affirmative_enablement_instruction(
         "gh variable set CLAUDE_HEADLESS_ENABLED --body false; "
@@ -761,6 +808,9 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
     assert _is_affirmative_enablement_instruction(
         "Do not gh variable set CLAUDE_HEADLESS_ENABLED --body true; "
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "Never gh variable set --repo owner/repo CLAUDE_HEADLESS_ENABLED --body true"
     )
 
 
@@ -891,6 +941,8 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
         "Do not gh variable set CLAUDE_HEADLESS_ENABLED --body true; "
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
+        "gh variable set --repo owner/repo CLAUDE_HEADLESS_ENABLED --body true",
+        "gh variable set -R=owner/repo CLAUDE_HEADLESS_ENABLED -b='true'",
     ):
         with pytest.raises(AssertionError):
             _assert_canonical_live_policy(agents + "\n" + instruction)
@@ -940,6 +992,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             _assert_registry_policy(missing_clause)
 
     for original, replacement in (
+        ("required_approving_review_count=0", "required_approving_review_count>=0"),
         ("strict mode;", "non-strict mode;"),
         ("strict mode;", "not strict mode;"),
         ("enforce_admins=true", "enforce_admins=false"),
@@ -973,6 +1026,8 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
         "Do not gh variable set CLAUDE_HEADLESS_ENABLED --body true; "
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
+        "gh variable set --repo owner/repo CLAUDE_HEADLESS_ENABLED --body true",
+        "gh variable set -R=owner/repo CLAUDE_HEADLESS_ENABLED -b='true'",
     ):
         with pytest.raises(AssertionError):
             _assert_registry_policy(registry + "\n" + instruction)
@@ -984,6 +1039,17 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             )
             + registry[registry_entry_end:]
         )
+
+    for document, assertion in (
+        (agents, _assert_canonical_live_policy),
+        (registry, _assert_registry_policy),
+    ):
+        for allowed_instruction in (
+            "gh variable set --repo=owner/repo CLAUDE_HEADLESS_ENABLED --body 'false'",
+            "Do not gh variable set -R owner/repo CLAUDE_HEADLESS_ENABLED --body true",
+            "gh variable set --repo owner/repo OTHER_HEADLESS_ENABLED --body true",
+        ):
+            assertion(document + "\n" + allowed_instruction)
 
     precedence_start = agents.index(
         "- **Precedence for the GitHub-Claude required-approval description under"
@@ -1034,6 +1100,22 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         _assert_branch_protection_policy(
             agents[:branch_end] + agents[branch_start:branch_end] + agents[branch_end:]
         )
+
+    roster_start = agents.index("**The PR review roster (verified live 6 Sep 2026, D-ToS-1)")
+    roster_end = agents.index("\n<!-- historical-evidence: begin -->", roster_start)
+    for original, replacement in (
+        ("retired/dormant", "live"),
+        ("no longer a live roster member", "a live roster member"),
+        ("GitHub `Codex`", ""),
+        ("authenticated local Claude assurance", ""),
+        ("independent triage", ""),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_review_roster_policy(
+                agents[:roster_start]
+                + agents[roster_start:roster_end].replace(original, replacement, 1)
+                + agents[roster_end:]
+            )
 
     for document, assertion in (
         (agents, _assert_agents_historical_evidence),
