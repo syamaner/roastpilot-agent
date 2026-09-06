@@ -382,7 +382,7 @@ def _assert_no_nonzero_approval_requirement(text: str, spans: list[tuple[int, in
     """Reject approving-review count requirements except the explicit zero/no forms."""
     operative = re.sub(r"\s+", " ", re.sub(r"\*", "", _operative_text(text, spans)))
     nonzero_requirement = re.compile(
-        r"(?<!no longer )(?<!not )\brequire(?:s|d|ing)?\s+"
+        r"(?<!no longer )(?<!not )\b(?:require(?:s|d|ing)?|must\s+have|needs)\s+"
         r"(?!(?:zero|no)\s+approving\s+reviews?\b)"
         r"(?:at\s+least\s+)?[a-z0-9-]+\s+approving\s+reviews?\b",
         re.IGNORECASE,
@@ -453,8 +453,7 @@ def _assert_preserved_wait_policy(text: str) -> None:
     end = text.index("\n\n<!-- historical-evidence: begin -->", start)
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
     preserved = text[start:end]
-    assert _occurrences(preserved, "this wait does not gate merge")
-    assert _occurrences(preserved, "current verified state")
+    assert _normalized_visible(preserved) == _PRESERVED_WAIT_SNAPSHOT
 
 
 def _assert_claude_review_note_policy(text: str) -> None:
@@ -560,7 +559,7 @@ def _assert_registry_historical_evidence(text: str) -> None:
             assert _within_any_span(match.start(), match.end(), spans), (
                 f"{phrase!r} appears operatively in docs/state/registry.md at {match.start()}"
             )
-    assert text.count(_SUPERSESSION_MARKER) >= 2
+    _assert_registry_supersession_notes(text)
     historical_text = "".join(text[start:end] for start, end in spans)
     for anchor in (
         "#663 / D108-D118 is ACTIVE (31 Jul)",
@@ -582,6 +581,19 @@ def _remove_first_occurrence(text: str, phrase: str) -> str:
     """Remove the first formatting-tolerant occurrence of ``phrase`` from text."""
     match = _occurrences(text, phrase)[0]
     return text[: match.start()] + text[match.end() :]
+
+
+def _assert_registry_supersession_notes(text: str) -> None:
+    """Assert the two operative D-ToS-1 supersession notes remain complete and dormant."""
+    notes = re.findall(
+        r"\[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file:.*?\]",
+        text,
+        re.DOTALL,
+    )
+    assert len(notes) == len(_REGISTRY_SUPERSESSION_NOTE_SNAPSHOTS)
+    assert (
+        tuple(_normalized_visible(note) for note in notes) == _REGISTRY_SUPERSESSION_NOTE_SNAPSHOTS
+    )
 
 
 def _normalized_visible(text: str) -> str:
@@ -705,6 +717,24 @@ _REGISTRY_735_CLARIFICATION_SNAPSHOT = _normalized_visible(
     """The trigger remains configured, but under D-ToS-1 its headless job skips while
     `CLAUDE_HEADLESS_ENABLED` is unset; the retained `track_progress` implementation
     above is not undone."""
+)
+_PRESERVED_WAIT_SNAPSHOT = _normalized_visible(
+    """Preserved as the D108-D118 design/evidence record: this wait does not gate
+    merge under the current verified state (`main` requires zero approving reviews —
+    see the precedence subsection above)."""
+)
+_REGISTRY_SUPERSESSION_NOTE_SNAPSHOTS = (
+    _normalized_visible(
+        """[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file: `main`
+        no longer requires any approving review, and the D108-D118 mechanism below
+        is retained but dormant.]"""
+    ),
+    _normalized_visible(
+        """[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file: `main` no
+        longer requires any approving review. The 31 Jul 2026 "CLAUDE PR-SCOPED
+        APPROVAL RESTORED (#663 / D108-D118)" record immediately below is retained
+        verbatim as historical evidence; it is dormant, not current policy.]"""
+    ),
 )
 
 
@@ -1102,6 +1132,8 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "requires ten approving reviews",
         "requires 10 approving reviews",
         "requires at least two approving reviews",
+        "must have two approving reviews",
+        "needs ten approving reviews",
         "required_approving_review_count=1",
         "required_approving_review_count = 10",
         "required_approving_review_count: 2",
@@ -1197,6 +1229,8 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "requires ten approving reviews",
         "requires 10 approving reviews",
         "requires at least two approving reviews",
+        "must have two approving reviews",
+        "needs ten approving reviews",
         "required_approving_review_count=1",
         "required_approving_review_count = 10",
         "required_approving_review_count: 2",
@@ -1236,6 +1270,10 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         for allowed_instruction in (
             "requires no approving reviews",
             "requires **no** approving reviews",
+            "must have zero approving reviews",
+            "needs no approving reviews",
+            "does not need ten approving reviews",
+            "must not have two approving reviews",
             "required_approving_review_count=0",
             "required_approving_review_count = 0",
             "required_approving_review_count: 0",
@@ -1245,12 +1283,23 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         ):
             assertion(document + "\n" + allowed_instruction)
 
-    historical_nonzero = (
-        agents + "\n" + _BEGIN_MARKER + "\nrequires ten approving reviews\n" + _END_MARKER
-    )
-    _assert_no_nonzero_approval_requirement(
-        historical_nonzero, _historical_spans(historical_nonzero)
-    )
+    for historical_nonzero_requirement in (
+        "requires ten approving reviews",
+        "must have two approving reviews",
+        "needs ten approving reviews",
+    ):
+        historical_nonzero = (
+            agents
+            + "\n"
+            + _BEGIN_MARKER
+            + "\n"
+            + historical_nonzero_requirement
+            + "\n"
+            + _END_MARKER
+        )
+        _assert_no_nonzero_approval_requirement(
+            historical_nonzero, _historical_spans(historical_nonzero)
+        )
     for historical_machine_assignment in (
         "required_approving_review_count=1",
         "required_approving_review_count = 1",
@@ -1268,9 +1317,26 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         _assert_no_nonzero_approval_requirement(
             historical_machine_nonzero, _historical_spans(historical_machine_nonzero)
         )
-    bold_nonzero = agents + "\nrequires **two** approving reviews"
-    with pytest.raises(AssertionError):
-        _assert_no_nonzero_approval_requirement(bold_nonzero, _historical_spans(bold_nonzero))
+    for nonzero_requirement in (
+        "requires **two** approving reviews",
+        "must have two approving reviews",
+        "needs ten approving reviews",
+    ):
+        with pytest.raises(AssertionError):
+            _assert_no_nonzero_approval_requirement(
+                agents + "\n" + nonzero_requirement,
+                _historical_spans(agents + "\n" + nonzero_requirement),
+            )
+    for allowed_requirement in (
+        "must have zero approving reviews",
+        "needs no approving reviews",
+        "does not need ten approving reviews",
+        "must not have two approving reviews",
+    ):
+        _assert_no_nonzero_approval_requirement(
+            agents + "\n" + allowed_requirement,
+            _historical_spans(agents + "\n" + allowed_requirement),
+        )
     for machine_nonzero in (
         "required_approving_review_count=1",
         "required_approving_review_count = 10",
@@ -1416,6 +1482,17 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     preserved_end = agents.index("\n\n<!-- historical-evidence: begin -->", preserved_start)
     with pytest.raises(AssertionError):
         _assert_preserved_wait_policy(agents[:preserved_start] + agents[preserved_end:])
+    with pytest.raises(AssertionError):
+        _assert_preserved_wait_policy(
+            agents[:preserved_end] + " This wait gates merge today." + agents[preserved_end:]
+        )
+
+    for original, replacement in (
+        ("retained but dormant.]", "retained but active.]"),
+        ("it is dormant, not current policy.]", "it is not dormant, current policy.]"),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_registry_supersession_notes(registry.replace(original, replacement, 1))
 
     note_start = agents.index("> Note: `claude-review` is intentionally")
     note_end = agents.index("\n\n## Codex-Led Delivery Topology", note_start)
