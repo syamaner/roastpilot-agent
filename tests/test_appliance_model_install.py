@@ -511,7 +511,7 @@ def test_directory_fsync_failure_after_replace_propagates_without_temp_file(
 
     monkeypatch.setattr(os, "fsync", fail_directory_fsync)
     try:
-        with pytest.raises(OSError, match="simulated directory fsync failure"):
+        with pytest.raises(OSError, match="simulated directory fsync failure") as exc_info:
             model_install_module._place_verified(  # pyright: ignore[reportPrivateUsage]
                 parent_fd,
                 "model.bin",
@@ -524,6 +524,38 @@ def test_directory_fsync_failure_after_replace_propagates_without_temp_file(
         os.close(parent_fd)
 
     assert list(tmp_path.glob("*.part")) == []
+    assert not any(
+        "removing temporary model file" in note for note in getattr(exc_info.value, "__notes__", [])
+    )
+
+
+def test_post_validation_non_regular_target_is_rejected_before_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A target swapped after early validation cannot be overwritten."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    original_stream = model_install_module._stream_to_temp  # pyright: ignore[reportPrivateUsage]
+
+    def stream_then_swap(
+        fd: int, target_name: str, chunks: Iterable[bytes], *, byte_cap: int
+    ) -> tuple[str, int, str]:
+        result = original_stream(fd, target_name, chunks, byte_cap=byte_cap)
+        (tmp_path / target_name).symlink_to(tmp_path / "outside")
+        return result
+
+    monkeypatch.setattr(model_install_module, "_stream_to_temp", stream_then_swap)
+    try:
+        with pytest.raises(ModelInstallError, match="non-regular target"):
+            model_install_module._place_verified(  # pyright: ignore[reportPrivateUsage]
+                parent_fd,
+                "model.bin",
+                [b"payload"],
+                expected_sha256=hashlib.sha256(b"payload").hexdigest(),
+                byte_cap=8,
+                context="model.bin",
+            )
+    finally:
+        os.close(parent_fd)
 
 
 def test_created_destination_directory_is_fsynced(
@@ -1293,6 +1325,49 @@ def test_destination_root_rejection_closes_old_parent_and_child(
     final_close_calls = close_calls[close_start[0] :]
     assert final_close_calls.count(opened_child_fds[0]) == 1
     assert final_close_calls.count(opened_parent_fds[0]) == 1
+
+
+def test_destination_root_old_parent_close_failure_does_not_retry_or_leak_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An indeterminate old-parent close is attempted once and closes the child."""
+    dest = tmp_path / "dest"
+    original_open = os.open
+    original_close = os.close
+    child_fds: list[int] = []
+    parent_fds: list[int] = []
+    close_calls: list[int] = []
+    close_start: list[int] = []
+
+    def capture_open(
+        path: Path | str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        fd = original_open(path, flags, mode, dir_fd=dir_fd)
+        if path == dest.name:
+            close_start.append(len(close_calls))
+            child_fds.append(fd)
+            assert dir_fd is not None
+            parent_fds.append(dir_fd)
+        return fd
+
+    def fail_old_parent_close(fd: int) -> None:
+        close_calls.append(fd)
+        if parent_fds and fd == parent_fds[0]:
+            raise OSError("simulated old parent close failure")
+        original_close(fd)
+
+    monkeypatch.setattr(os, "open", capture_open)
+    monkeypatch.setattr(os, "close", fail_old_parent_close)
+
+    with pytest.raises(OSError, match="simulated old parent close failure"):
+        model_install_module._open_destination_root(  # pyright: ignore[reportPrivateUsage]
+            dest, create=True
+        )
+
+    assert child_fds and parent_fds
+    final_close_calls = close_calls[close_start[0] :]
+    assert final_close_calls.count(child_fds[0]) == 1
+    assert final_close_calls.count(parent_fds[0]) == 1
 
 
 def test_swapped_destination_parent_cannot_redirect_placement_outside_dest(

@@ -809,12 +809,25 @@ def _open_destination_parent(
     parent_fd = os.dup(dest_root_fd)
     try:
         for component in components[:-1]:
+            created_stat: os.stat_result | None = None
+            child_fd: int | None = None
             if create:
                 try:
                     os.mkdir(component, mode=0o755, dir_fd=parent_fd)
                 except FileExistsError:
                     pass
+                except OSError as exc:
+                    raise ModelInstallError(
+                        f"cannot safely create destination directory for {relative_path!r}"
+                    ) from exc
                 else:
+                    try:
+                        created_stat = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+                    except OSError as exc:
+                        raise ModelInstallError(
+                            "destination directory changed while being created "
+                            f"for {relative_path!r}"
+                        ) from exc
                     os.fsync(parent_fd)
             try:
                 child_fd = os.open(component, flags, dir_fd=parent_fd)
@@ -829,15 +842,36 @@ def _open_destination_parent(
                     f"cannot safely open destination directory for {relative_path!r}"
                 ) from exc
             try:
-                os.close(parent_fd)
+                assert child_fd is not None
+                child_stat = os.fstat(child_fd)
+                if created_stat is not None and (
+                    child_stat.st_dev != created_stat.st_dev
+                    or child_stat.st_ino != created_stat.st_ino
+                ):
+                    raise ModelInstallError(
+                        f"destination directory changed while being created for {relative_path!r}"
+                    )
+                _validate_destination_parent_trust(child_fd)
+                old_parent_fd = parent_fd
+                try:
+                    os.close(old_parent_fd)
+                except BaseException:
+                    _cleanup_preserving_primary(
+                        lambda fd=child_fd: os.close(fd),
+                        action="closing child destination directory descriptor",
+                    )
+                    parent_fd = None
+                    child_fd = None
+                    raise
+                parent_fd = child_fd
+                child_fd = None
             except BaseException:
-                _cleanup_preserving_primary(
-                    lambda fd=child_fd: os.close(fd),
-                    action="closing child destination directory descriptor",
-                )
-                parent_fd = None
+                if child_fd is not None:
+                    _cleanup_preserving_primary(
+                        lambda fd=child_fd: os.close(fd),
+                        action="closing child destination directory descriptor",
+                    )
                 raise
-            parent_fd = child_fd
     except BaseException:
         if parent_fd is not None:
             _cleanup_preserving_primary(
@@ -921,6 +955,7 @@ def _place_verified(
     tmp_name, tmp_fd, digest_hex = _stream_to_temp(
         parent_fd, target_name, chunks, byte_cap=byte_cap
     )
+    temp_exists = True
     try:
         if digest_hex != expected_sha256:
             raise ModelInstallError(f"digest mismatch for {context!r}")
@@ -936,10 +971,20 @@ def _place_verified(
                 f"verified temporary file changed before placement for {context!r}"
             )
         _validate_destination_parent_trust(parent_fd)
+        try:
+            existing_target = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(existing_target.st_mode):
+                raise ModelInstallError(
+                    f"refusing to overwrite a non-regular target for {context!r}"
+                )
         fd_to_close = tmp_fd
         tmp_fd = -1
         os.close(fd_to_close)
         os.replace(tmp_name, target_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        temp_exists = False
         os.fsync(parent_fd)
         return verified_temp.st_dev, verified_temp.st_ino
     except BaseException:
@@ -953,9 +998,11 @@ def _place_verified(
             _cleanup_preserving_primary(
                 lambda: os.close(tmp_fd), action="closing temporary model file descriptor"
             )
-        _cleanup_preserving_primary(
-            lambda: os.unlink(tmp_name, dir_fd=parent_fd), action="removing temporary model file"
-        )
+        if temp_exists:
+            _cleanup_preserving_primary(
+                lambda: os.unlink(tmp_name, dir_fd=parent_fd),
+                action="removing temporary model file",
+            )
         raise
 
 
