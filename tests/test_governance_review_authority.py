@@ -219,17 +219,20 @@ def _is_affirmative_enablement_instruction(text: str) -> bool:
     """Return whether text affirmatively tells a reader to enable headless CI.
 
     This deliberately small grammar permits explicit prohibitions (``Do not``
-    and ``Never``) while rejecting an affirmative ``Set ... to true``. It
-    normalizes emphasis, code delimiters, blockquotes, and line wrapping before
-    applying the grammar; it is not a broad natural-language classifier.
+    and ``Never``) while rejecting affirmative ``set``, ``export``, and bare
+    assignment forms that assign this exact variable to true. It normalizes
+    emphasis, code delimiters, blockquotes, and line wrapping before applying
+    the grammar; it is not a broad natural-language classifier.
     """
     normalized = re.sub(r"[`*>]", "", text)
     normalized = re.sub(r"\s+", " ", normalized)
-    instruction = re.compile(
-        r"(?P<prohibition>do not|never)?\s*set\s+CLAUDE_HEADLESS_ENABLED\s+to\s+['\"]?true['\"]?",
+    assignment = re.compile(
+        r"(?P<prohibition>\b(?:do not|never)\s+)?"
+        r"(?:(?:set|export)\s+)?\bCLAUDE_HEADLESS_ENABLED\b\s*"
+        r"(?:=\s*|to\s+)['\"]?true['\"]?\b",
         re.IGNORECASE,
     )
-    return any(match.group("prohibition") is None for match in instruction.finditer(normalized))
+    return any(match.group("prohibition") is None for match in assignment.finditer(normalized))
 
 
 def _assert_agents_historical_evidence(text: str) -> None:
@@ -454,6 +457,13 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
         "Never set **CLAUDE_HEADLESS_ENABLED**\n> to **true**."
     )
     assert _is_affirmative_enablement_instruction("Set **CLAUDE_HEADLESS_ENABLED**\n> to `true`.")
+    assert _is_affirmative_enablement_instruction("CLAUDE_HEADLESS_ENABLED=true")
+    assert _is_affirmative_enablement_instruction("export CLAUDE_HEADLESS_ENABLED='true'")
+    assert _is_affirmative_enablement_instruction('Set CLAUDE_HEADLESS_ENABLED = "true"')
+    assert not _is_affirmative_enablement_instruction("Do not export CLAUDE_HEADLESS_ENABLED=true")
+    assert not _is_affirmative_enablement_instruction("Never set CLAUDE_HEADLESS_ENABLED = 'true'")
+    assert not _is_affirmative_enablement_instruction("CLAUDE_HEADLESS_ENABLED=false")
+    assert not _is_affirmative_enablement_instruction("OTHER_HEADLESS_ENABLED=true")
 
 
 @pytest.mark.docs
