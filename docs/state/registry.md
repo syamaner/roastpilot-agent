@@ -2390,12 +2390,13 @@ caveat: an independent post-open lens (Augment) still earned its keep twice; shi
 are metric-blind (#306 resolved with zero agent code; the folded coverage gap). Memory
 `pr-flow-improvement-experiment`.
 
+**Still open / next:**
 <!-- historical-evidence: begin -->
 **[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this
 file.]**
-**Still open / next:** **operator activates the `review-gate` required check (#159 / D58)**; everything
+**operator activates the `review-gate` required check (#159 / D58)**
 <!-- historical-evidence: end -->
-else is OPERATOR-GATED — **roast 4 (#134)** + device SSE (#135), then the post-roast-4 sequence (#323
+Everything else is OPERATOR-GATED — **roast 4 (#134)** + device SSE (#135), then the post-roast-4 sequence (#323
 ceiling-override → #228 LAST → M2/D42). Untouched: #318. Nothing else agent-startable until roast 4.
 
 **#300 — roast-data pipeline (D44) — DONE (store → labelled replay fixture).** The store-side

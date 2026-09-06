@@ -232,21 +232,112 @@ def _is_affirmative_enablement_instruction(text: str) -> bool:
     return any(match.group("prohibition") is None for match in instruction.finditer(normalized))
 
 
-def _require_phrase(text: str, phrase: str) -> None:
-    """Raise when a formatting-tolerant required phrase is absent."""
-    assert _occurrences(text, phrase), f"missing required phrase: {phrase!r}"
+def _assert_agents_historical_evidence(text: str) -> None:
+    """Assert AGENTS forbidden prose and retained historical anchors are contained."""
+    spans = _historical_spans(text)
+    for phrase in _FORBIDDEN_PHRASES:
+        for match in _occurrences(text, phrase):
+            assert _within_any_span(match.start(), match.end(), spans), (
+                f"{phrase!r} appears operatively in AGENTS.md at {match.start()}"
+            )
+    historical_text = "".join(text[start:end] for start, end in spans)
+    for anchor in (
+        "PR-scoped Claude restoration (#663 / D108-D118",
+        "Activation state — LIVE 31 Jul 2026 (#663 / D108-D118)",
+        "WAIT for Claude's PR-scoped approval before merging",
+        "D108-D118 are active as of 31 Jul 2026",
+    ):
+        assert _occurrences(historical_text, anchor), f"missing AGENTS history: {anchor!r}"
 
 
-def _require_exact_check_name(text: str, check_name: str) -> None:
-    """Raise when an exact, code-formatted required check name is absent."""
-    assert _exact_markdown_code_name_pattern(check_name).search(text), (
-        f"missing exact check name: {check_name!r}"
-    )
-
-
-def _require_range_operative(start: int, end: int, spans: list[tuple[int, int]]) -> None:
-    """Raise when a required live-policy range overlaps historical evidence."""
+def _assert_canonical_live_policy(text: str) -> None:
+    """Assert the unique canonical AGENTS policy is entirely operative and complete."""
+    spans = _historical_spans(text)
+    assert text.count(_CANONICAL_LIVE_STATE_HEADING) == 1
+    start, end = _canonical_bullet_bounds(text)
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    bullet = _canonical_live_state_bullet(text)
+    for phrase in _CANONICAL_LIVE_STATE_REQUIRED_PHRASES:
+        assert _occurrences(bullet, phrase), f"missing canonical policy phrase: {phrase!r}"
+    for check_name in _REQUIRED_CHECK_NAMES:
+        assert _exact_markdown_code_name_pattern(check_name).search(bullet), (
+            f"missing canonical check name: {check_name!r}"
+        )
+
+
+def _assert_precedence_policy(text: str) -> None:
+    """Assert the entire operative precedence bullet names both authorities."""
+    spans = _historical_spans(text)
+    start = text.index("- **Precedence for the GitHub-Claude required-approval description under")
+    end = text.index("\n- Mechanism retained", start)
+    assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    precedence = text[start:end]
+    assert _occurrences(precedence, "sole operative authorities")
+    for filename in ("AGENTS.md", "docs/state/registry.md"):
+        assert filename in precedence, f"missing precedence authority: {filename!r}"
+
+
+def _assert_registry_policy(text: str) -> None:
+    """Assert the first registry reconciliation entry is operative and complete."""
+    spans = _historical_spans(text)
+    header_index = text.index("## Active Epic")
+    entry_heading = "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    entry_start = text.index(entry_heading, header_index)
+    assert not re.search(r"\n\*\*[^\n]+", text[header_index:entry_start])
+    entry_end = text.index("\n**1 Sep 2026", entry_start)
+    assert not any(
+        span_start < entry_end and entry_start < span_end for span_start, span_end in spans
+    )
+    entry = text[entry_start:entry_end]
+    for phrase in (
+        _DTOS1_COMMIT_SHA,
+        "PR #923",
+        "requires zero approving reviews",
+        "strict mode",
+        "enforce_admins=true",
+        "required_conversation_resolution=true",
+        "skipped headless job is expected",
+        "D108-D118 PR-scoped Claude approval bridge",
+        "operator-owned branch-protection decision",
+        "exact-current-head review",
+        "and wait",
+        "CodeQL handling",
+        "independent triage",
+        "risk-routed authenticated local Claude assurance",
+    ):
+        assert _occurrences(entry, phrase), f"missing top registry phrase: {phrase!r}"
+    for check_name in _REQUIRED_CHECK_NAMES:
+        assert _exact_markdown_code_name_pattern(check_name).search(entry), (
+            f"missing top registry check name: {check_name!r}"
+        )
+
+
+def _assert_registry_historical_evidence(text: str) -> None:
+    """Assert registry forbidden prose and retained legacy anchors stay historical."""
+    spans = _historical_spans(text)
+    for phrase in _FORBIDDEN_PHRASES:
+        for match in _occurrences(text, phrase):
+            assert _within_any_span(match.start(), match.end(), spans), (
+                f"{phrase!r} appears operatively in docs/state/registry.md at {match.start()}"
+            )
+    assert text.count(_SUPERSESSION_MARKER) >= 2
+    historical_text = "".join(text[start:end] for start, end in spans)
+    for anchor in (
+        "#663 / D108-D118 is ACTIVE (31 Jul)",
+        "31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL RESTORED (#663 / D108-D118)",
+        "arm the `review-gate` required check (#159 / D58)",
+        "mark `review-gate` a REQUIRED status check on `main` to arm it",
+        "operator activates the `review-gate` required check (#159 / D58)",
+    ):
+        assert _occurrences(historical_text, anchor), (
+            f"historical evidence anchor vanished: {anchor!r}"
+        )
+
+
+def _remove_first_occurrence(text: str, phrase: str) -> str:
+    """Remove the first formatting-tolerant occurrence of ``phrase`` from text."""
+    match = _occurrences(text, phrase)[0]
+    return text[: match.start()] + text[match.end() :]
 
 
 def test_agents_md_forbidden_phrases_are_contained_in_historical_blocks() -> None:
@@ -258,22 +349,7 @@ def test_agents_md_forbidden_phrases_are_contained_in_historical_blocks() -> Non
     ``historical-evidence`` block, never in operative text.
     """
     text = _read_agents_md()
-    spans = _historical_spans(text)
-    for phrase in _FORBIDDEN_PHRASES:
-        for match in _occurrences(text, phrase):
-            assert _within_any_span(match.start(), match.end(), spans), (
-                f"{phrase!r} appears operatively (outside a historical-evidence "
-                f"block) in AGENTS.md at character offset {match.start()}"
-            )
-    historical_text = "".join(text[start:end] for start, end in spans)
-    for anchor in (
-        "PR-scoped Claude restoration (#663 / D108-D118",
-        "Activation state — LIVE 31 Jul 2026 (#663 / D108-D118)",
-        "WAIT for Claude's PR-scoped approval before merging",
-    ):
-        assert _occurrences(historical_text, anchor), (
-            f"AGENTS.md historical evidence anchor vanished: {anchor!r}"
-        )
+    _assert_agents_historical_evidence(text)
 
 
 def test_agents_md_canonical_live_state_bullet_retains_every_gate() -> None:
@@ -293,23 +369,7 @@ def test_agents_md_canonical_live_state_bullet_retains_every_gate() -> None:
     the canonical statement itself.
     """
     text = _read_agents_md()
-    spans = _historical_spans(text)
-    assert text.count(_CANONICAL_LIVE_STATE_HEADING) == 1
-    start, end = _canonical_bullet_bounds(text)
-    assert not any(span_start < end and start < span_end for span_start, span_end in spans), (
-        "AGENTS.md's canonical live-state bullet must be entirely operative"
-    )
-    bullet = _canonical_live_state_bullet(text)
-    for phrase in _CANONICAL_LIVE_STATE_REQUIRED_PHRASES:
-        assert _occurrences(bullet, phrase), (
-            f"{phrase!r} is missing from AGENTS.md's canonical "
-            f"'Verified live state — 6 Sep 2026 (D-ToS-1)' bullet"
-        )
-    for check_name in _REQUIRED_CHECK_NAMES:
-        assert _exact_markdown_code_name_pattern(check_name).search(bullet), (
-            f"exact app-pinned status name {check_name!r} is missing from the "
-            "canonical live-state bullet"
-        )
+    _assert_canonical_live_policy(text)
 
 
 def test_agents_md_headless_skip_is_documented_and_never_instructed_on() -> None:
@@ -333,18 +393,7 @@ def test_agents_md_headless_skip_is_documented_and_never_instructed_on() -> None
     operative = "".join(operative_parts)
     assert not _is_affirmative_enablement_instruction(operative)
 
-    precedence_start = text.index(
-        "- **Precedence for the GitHub-Claude required-approval description under"
-    )
-    precedence_end = text.index("\n- Mechanism retained", precedence_start)
-    assert not any(
-        span_start < precedence_end and precedence_start < span_end
-        for span_start, span_end in spans
-    ), "the precedence subsection must be entirely operative"
-    precedence = text[precedence_start:precedence_end]
-    assert "sole\n  operative authorities" in precedence
-    assert "AGENTS.md" in precedence
-    assert "docs/state/registry.md" in precedence
+    _assert_precedence_policy(text)
 
 
 @pytest.mark.docs
@@ -358,62 +407,8 @@ def test_registry_top_entry_and_legacy_blocks_are_reconciled() -> None:
     """
     registry_path = _REPO_ROOT / "docs" / "state" / "registry.md"
     text = registry_path.read_text(encoding="utf-8")
-    spans = _historical_spans(text)
-
-    header_index = text.index("## Active Epic")
-    entry_heading = "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
-    entry_start = text.index(entry_heading, header_index)
-    assert not re.search(r"\n\*\*[^\n]+", text[header_index:entry_start])
-    entry_end = text.index("\n**1 Sep 2026", entry_start)
-    top_entry = text[entry_start:entry_end]
-    overlaps_historical = any(
-        span_start < entry_end and entry_start < span_end for span_start, span_end in spans
-    )
-    assert not overlaps_historical, (
-        "the first dated reconciliation entry must be entirely operative"
-    )
-    for phrase in (
-        _DTOS1_COMMIT_SHA,
-        "PR #923",
-        "requires zero approving reviews",
-        "strict mode",
-        "enforce_admins=true",
-        "required_conversation_resolution=true",
-        "skipped headless job is expected",
-        "D108-D118 PR-scoped Claude approval bridge",
-        "operator-owned branch-protection decision",
-        "exact-current-head review",
-        "and wait",
-        "CodeQL handling",
-        "independent triage",
-        "risk-routed authenticated local Claude assurance",
-    ):
-        assert _occurrences(top_entry, phrase), f"top reconciliation entry is missing {phrase!r}"
-    for check_name in _REQUIRED_CHECK_NAMES:
-        assert _exact_markdown_code_name_pattern(check_name).search(top_entry), (
-            f"top reconciliation entry is missing exact check name {check_name!r}"
-        )
-
-    assert text.count(_SUPERSESSION_MARKER) >= 2
-
-    for phrase in _FORBIDDEN_PHRASES:
-        for match in _occurrences(text, phrase):
-            assert _within_any_span(match.start(), match.end(), spans), (
-                f"{phrase!r} appears operatively (outside a historical-evidence "
-                f"block) in docs/state/registry.md at character offset {match.start()}"
-            )
-
-    historical_text = "".join(text[start:end] for start, end in spans)
-    for anchor in (
-        "#663 / D108-D118 is ACTIVE (31 Jul)",
-        "31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL RESTORED (#663 / D108-D118)",
-        "arm the `review-gate` required check (#159 / D58)",
-        "mark `review-gate` a REQUIRED status check on `main` to arm it",
-        "operator activates the `review-gate` required check (#159 / D58)",
-    ):
-        assert _occurrences(historical_text, anchor), (
-            f"historical evidence anchor vanished: {anchor!r}"
-        )
+    _assert_registry_policy(text)
+    _assert_registry_historical_evidence(text)
 
 
 def test_historical_span_parser_fails_closed_on_malformed_markers() -> None:
@@ -470,50 +465,76 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     a missing AGENTS historical anchor, and a June directive outside a span.
     """
     agents = _read_agents_md()
-    bullet = _canonical_live_state_bullet(agents)
-    generic_checks = bullet.replace("`Checks`", "required checks")
-    with pytest.raises(AssertionError, match="missing exact check name"):
-        _require_exact_check_name(generic_checks, "Checks")
-
-    wrapped = _BEGIN_MARKER + "\n" + bullet + _END_MARKER + "\n"
-    wrapped_spans = _historical_spans(wrapped)
-    wrapped_start = wrapped.index(_CANONICAL_LIVE_STATE_HEADING)
-    wrapped_end = wrapped.index(_END_MARKER, wrapped_start)
-    with pytest.raises(AssertionError):
-        _require_range_operative(wrapped_start, wrapped_end, wrapped_spans)
-
     registry = (_REPO_ROOT / "docs" / "state" / "registry.md").read_text(encoding="utf-8")
-    entry_end = registry.index("\n**1 Sep 2026")
-    top_entry = registry[:entry_end]
+    start, end = _canonical_bullet_bounds(agents)
+    generic_checks = (
+        agents[:start] + agents[start:end].replace("`Checks`", "required checks", 1) + agents[end:]
+    )
+    with pytest.raises(AssertionError, match="missing canonical check"):
+        _assert_canonical_live_policy(generic_checks)
+
+    wrapped = (
+        agents[:start]
+        + _BEGIN_MARKER
+        + "\n"
+        + agents[start:end]
+        + _END_MARKER
+        + "\n"
+        + agents[end:]
+    )
+    with pytest.raises((AssertionError, ValueError)):
+        _assert_canonical_live_policy(wrapped)
+
+    registry_entry_start = registry.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    registry_entry_end = registry.index("\n**1 Sep 2026", registry_entry_start)
     for clause in (
+        "requires zero approving reviews",
+        "skipped headless job is expected",
         "strict mode",
         "enforce_admins=true",
         "required_conversation_resolution=true",
         "CodeQL handling",
         "exact-current-head review",
         "and wait",
+        "independent triage",
+        "risk-routed authenticated local Claude assurance",
     ):
-        mutated = top_entry.replace(clause, "", 1)
-        with pytest.raises(AssertionError, match="missing required phrase"):
-            _require_phrase(mutated, clause)
+        missing_clause = (
+            registry[:registry_entry_start]
+            + _remove_first_occurrence(registry[registry_entry_start:registry_entry_end], clause)
+            + registry[registry_entry_end:]
+        )
+        with pytest.raises(AssertionError, match="missing top registry phrase"):
+            _assert_registry_policy(missing_clause)
 
     precedence_start = agents.index(
         "- **Precedence for the GitHub-Claude required-approval description under"
     )
     precedence_end = agents.index("\n- Mechanism retained", precedence_start)
-    precedence = agents[precedence_start:precedence_end]
     for filename in ("AGENTS.md", "docs/state/registry.md"):
-        with pytest.raises(AssertionError, match="missing required phrase"):
-            _require_phrase(precedence.replace(filename, "", 1), filename)
-
-    agent_spans = _historical_spans(agents)
-    agent_history = "".join(agents[a:b] for a, b in agent_spans)
-    with pytest.raises(AssertionError, match="missing required phrase"):
-        _require_phrase(
-            agent_history.replace("WAIT for Claude's PR-scoped approval before merging", "", 1),
-            "WAIT for Claude's PR-scoped approval before merging",
+        missing_authority = (
+            agents[:precedence_start]
+            + agents[precedence_start:precedence_end].replace(filename, "", 1)
+            + agents[precedence_end:]
         )
+        with pytest.raises(AssertionError, match="missing precedence authority"):
+            _assert_precedence_policy(missing_authority)
 
-    june_directive = "arm the `review-gate` required check (#159 / D58)"
-    with pytest.raises(AssertionError):
-        assert _within_any_span(0, len(june_directive), _historical_spans(june_directive))
+    for anchor in (
+        "PR-scoped Claude restoration (#663 / D108-D118",
+        "Activation state — LIVE 31 Jul 2026 (#663 / D108-D118)",
+        "WAIT for Claude's PR-scoped approval before merging",
+        "D108-D118 are active as of 31 Jul 2026",
+    ):
+        with pytest.raises(AssertionError, match="missing AGENTS history"):
+            _assert_agents_historical_evidence(agents.replace(anchor, "", 1))
+
+    for directive in (
+        "arm the `review-gate` required check (#159 / D58)",
+        "mark `review-gate` a REQUIRED status check on `main` to arm it",
+        "operator activates the `review-gate` required check (#159 / D58)",
+    ):
+        with pytest.raises(AssertionError, match="historical evidence anchor vanished"):
+            _assert_registry_historical_evidence(_remove_first_occurrence(registry, directive))
