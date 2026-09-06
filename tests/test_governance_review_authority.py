@@ -379,11 +379,12 @@ def _assert_precedence_policy(text: str) -> None:
 
 
 def _assert_no_nonzero_approval_requirement(text: str, spans: list[tuple[int, int]]) -> None:
-    """Reject finite nonzero approving-review requirements outside historical evidence."""
-    operative = _operative_text(text, spans)
+    """Reject approving-review count requirements except the explicit zero/no forms."""
+    operative = re.sub(r"\s+", " ", _operative_text(text, spans))
     nonzero_requirement = re.compile(
-        r"\brequire(?:s|d|ing)?\s+(?:one|two|three|four|five|six|seven|eight|nine|"
-        r"[1-9][0-9]*)\s+approving\s+reviews?\b",
+        r"(?<!no longer )(?<!not )\brequire(?:s|d|ing)?\s+"
+        r"(?!(?:zero|no)\s+approving\s+reviews?\b)"
+        r"(?:at\s+least\s+)?[a-z0-9-]+\s+approving\s+reviews?\b",
         re.IGNORECASE,
     )
     assert not nonzero_requirement.search(operative)
@@ -1092,6 +1093,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "export CLAUDE_HEADLESS_ENABLED='true'",
         "CLAUDE_HEADLESS_ENABLED=true",
         "requires two approving reviews",
+        "requires ten approving reviews",
+        "requires 10 approving reviews",
+        "requires at least two approving reviews",
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
         "gh variable set " + "\\\n" + "CLAUDE_HEADLESS_ENABLED --body true",
         'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
@@ -1179,6 +1183,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "export CLAUDE_HEADLESS_ENABLED='true'",
         "CLAUDE_HEADLESS_ENABLED=true",
         "requires two approving reviews",
+        "requires ten approving reviews",
+        "requires 10 approving reviews",
+        "requires at least two approving reviews",
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
         "gh variable set " + "\\\n" + "CLAUDE_HEADLESS_ENABLED --body true",
         'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
@@ -1212,6 +1219,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         (registry, _assert_registry_policy),
     ):
         for allowed_instruction in (
+            "requires no approving reviews",
             "gh variable set --repo=owner/repo CLAUDE_HEADLESS_ENABLED --body 'false'",
             "Do not gh variable set -R owner/repo CLAUDE_HEADLESS_ENABLED --body true",
             "gh variable set --repo owner/repo OTHER_HEADLESS_ENABLED --body true",
@@ -1219,7 +1227,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             assertion(document + "\n" + allowed_instruction)
 
     historical_nonzero = (
-        agents + "\n" + _BEGIN_MARKER + "\nrequires two approving reviews\n" + _END_MARKER
+        agents + "\n" + _BEGIN_MARKER + "\nrequires ten approving reviews\n" + _END_MARKER
     )
     _assert_no_nonzero_approval_requirement(
         historical_nonzero, _historical_spans(historical_nonzero)
