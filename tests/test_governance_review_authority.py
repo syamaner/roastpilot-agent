@@ -189,12 +189,13 @@ def _phrase_pattern(phrase: str) -> re.Pattern[str]:
 
     Tokens (split on literal spaces in ``phrase``) are joined by a separator
     that accepts any run of whitespace, a Markdown blockquote marker
-    (``>``), or emphasis asterisks (``*``), so a phrase that Markdown has
-    soft-wrapped across a line break -- or that has a word wrapped in
-    ``**bold**`` -- still matches as one occurrence.
+    (``>``), emphasis asterisks (``*``), or inline-code delimiters, so a
+    phrase that Markdown has soft-wrapped across a line break -- or that has
+    a word wrapped in emphasis or inline code -- still matches as one
+    occurrence.
     """
     tokens = phrase.split(" ")
-    return re.compile(r"[\s>*]+".join(re.escape(token) for token in tokens), re.IGNORECASE)
+    return re.compile(r"[\s>`*]+".join(re.escape(token) for token in tokens), re.IGNORECASE)
 
 
 def _occurrences(text: str, phrase: str) -> list[re.Match[str]]:
@@ -379,12 +380,12 @@ def _assert_precedence_policy(text: str) -> None:
 
 
 def _assert_no_nonzero_approval_requirement(text: str, spans: list[tuple[int, int]]) -> None:
-    """Reject approving-review count requirements except the explicit zero/no forms."""
+    """Reject review-count requirements except the explicit zero/no forms."""
     operative = re.sub(r"\s+", " ", re.sub(r"\*", "", _operative_text(text, spans)))
     nonzero_requirement = re.compile(
         r"(?<!no longer )(?<!not )\b(?:require(?:s|d|ing)?|must\s+have|needs)\s+"
-        r"(?!(?:zero|no)\s+approving\s+reviews?\b)"
-        r"(?:at\s+least\s+)?[a-z0-9-]+\s+approving\s+reviews?\b",
+        r"(?!(?:zero|no)\s+(?:approving\s+reviews?|approvals?)\b)"
+        r"(?:at\s+least\s+)?[a-z0-9-]+\s+(?:approving\s+reviews?|approvals?)\b",
         re.IGNORECASE,
     )
     machine_nonzero_requirement = re.compile(
@@ -1134,6 +1135,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "requires at least two approving reviews",
         "must have two approving reviews",
         "needs ten approving reviews",
+        "requires one approval",
+        "must have two approvals",
+        "needs ten approvals",
         "required_approving_review_count=1",
         "required_approving_review_count = 10",
         "required_approving_review_count: 2",
@@ -1231,6 +1235,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "requires at least two approving reviews",
         "must have two approving reviews",
         "needs ten approving reviews",
+        "requires one approval",
+        "must have two approvals",
+        "needs ten approvals",
         "required_approving_review_count=1",
         "required_approving_review_count = 10",
         "required_approving_review_count: 2",
@@ -1274,6 +1281,11 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             "needs no approving reviews",
             "does not require two approving reviews",
             "no longer requires two approving reviews",
+            "requires zero approvals",
+            "must have no approvals",
+            "does not require two approvals",
+            "no longer requires one approval",
+            "approval is required before publication",
             "required_approving_review_count=0",
             "required_approving_review_count = 0",
             "required_approving_review_count: 0",
@@ -1287,6 +1299,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "requires ten approving reviews",
         "must have two approving reviews",
         "needs ten approving reviews",
+        "requires one approval",
+        "must have two approvals",
+        "needs ten approvals",
     ):
         historical_nonzero = (
             agents
@@ -1321,6 +1336,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "requires **two** approving reviews",
         "must have two approving reviews",
         "needs ten approving reviews",
+        "requires one approval",
+        "must have two approvals",
+        "needs ten approvals",
     ):
         with pytest.raises(AssertionError):
             _assert_no_nonzero_approval_requirement(
@@ -1332,6 +1350,11 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "needs no approving reviews",
         "does not require two approving reviews",
         "no longer requires two approving reviews",
+        "requires zero approvals",
+        "must have no approvals",
+        "does not require two approvals",
+        "no longer requires one approval",
+        "approval is required before publication",
     ):
         _assert_no_nonzero_approval_requirement(
             agents + "\n" + allowed_requirement,
@@ -1517,6 +1540,22 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             closing_line_start = document.rfind("\n", 0, span_end - 1) + 1
             with pytest.raises(AssertionError):
                 assertion(document[:closing_line_start] + " \n" + document[closing_line_start:])
+
+    inline_code_wait = "`WAIT` for Claude's PR-scoped approval"
+    for document, assertion in (
+        (agents, _assert_agents_historical_evidence),
+        (registry, _assert_registry_historical_evidence),
+    ):
+        with pytest.raises(AssertionError):
+            assertion(document + "\n" + inline_code_wait)
+    historical_inline_code_wait = _BEGIN_MARKER + "\n" + inline_code_wait + "\n" + _END_MARKER
+    historical_inline_code_wait_spans = _historical_spans(historical_inline_code_wait)
+    assert _occurrences(historical_inline_code_wait, "WAIT for Claude's PR-scoped approval")
+    assert not _present_operatively(
+        historical_inline_code_wait,
+        "WAIT for Claude's PR-scoped approval",
+        historical_inline_code_wait_spans,
+    )
 
     wait_start, wait_end = _historical_spans(agents)[-1]
     wait_span = agents[wait_start:wait_end]
