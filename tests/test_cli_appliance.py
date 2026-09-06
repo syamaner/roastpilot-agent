@@ -295,6 +295,7 @@ def test_run_appliance_model_install_prints_sanitised_cleanup_notes(
     "action",
     [
         "closing cached model file descriptor",
+        "closing abandoned temporary model file descriptor",
         "closing child destination root descriptor",
         "closing child destination directory descriptor",
         "closing child --from-dir directory descriptor",
@@ -338,6 +339,18 @@ def test_appliance_cleanup_note_suppresses_unrecognised_or_malformed_text(
     """The cleanup-note channel never accepts prefixes or arbitrary text."""
     failure = ModelInstallError("failure")
     failure.add_note(note)
+    cli._print_appliance_cleanup_notes(failure)  # pyright: ignore[reportPrivateUsage]
+
+    assert capsys.readouterr().out == ""
+
+
+def test_appliance_cleanup_note_suppresses_non_string_note(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Non-string exception notes cannot reach the operator output channel."""
+    failure = ModelInstallError("failure")
+    failure.__notes__ = [object()]  # type: ignore[attr-defined]
+
     cli._print_appliance_cleanup_notes(failure)  # pyright: ignore[reportPrivateUsage]
 
     assert capsys.readouterr().out == ""

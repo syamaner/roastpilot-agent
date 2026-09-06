@@ -5,6 +5,7 @@ Hardware-free and network-free throughout: every HTTPS fetch goes through
 ``tests/test_bean_sourcing.py``), never a real socket.
 """
 
+import fcntl
 import hashlib
 import json
 import os
@@ -307,6 +308,449 @@ def test_reclaim_candidate_identity_swap_is_rejected(
         os.close(parent_fd)
 
     assert stale.read_bytes() == b"replacement"
+
+
+def test_cached_open_and_post_hash_identity_failures_are_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cached verification translates open and post-hash disappearance races."""
+    target = tmp_path / "cached.bin"
+    target.write_bytes(b"payload")
+    original_open = os.open
+
+    def fail_open(*_args: object, **_kwargs: object) -> int:
+        raise OSError("simulated cached open failure")
+
+    monkeypatch.setattr(os, "open", fail_open)
+    with pytest.raises(ModelInstallError, match="cannot safely verify cached"):
+        model_install_module._open_cached_file(target)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(os, "open", original_open)
+
+    original_stat = os.stat
+
+    def disappear_after_hash(*_args: object, **_kwargs: object) -> os.stat_result:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(os, "stat", disappear_after_hash)
+    with pytest.raises(ModelInstallError, match="changed while being verified"):
+        model_install_module._open_verified_cached_file(target)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(os, "stat", original_stat)
+
+
+def test_cached_hash_rechecks_final_size_and_successfully_closes(tmp_path: Path) -> None:
+    """Direct bounded hashing detects a changed final stat and closes on success."""
+    target = tmp_path / "cached.bin"
+    target.write_bytes(b"payload")
+    digest, _device, _inode = model_install_module._sha256_of_file(  # pyright: ignore[reportPrivateUsage]
+        target
+    )
+    assert digest == hashlib.sha256(b"payload").hexdigest()
+
+
+def test_destination_parent_and_root_reject_non_directory_descriptors(tmp_path: Path) -> None:
+    """Trust validators reject regular-file descriptors before any path operation."""
+    candidate = tmp_path / "not-a-directory"
+    candidate.write_bytes(b"x")
+    fd = os.open(candidate, os.O_RDONLY)
+    try:
+        with pytest.raises(ModelInstallError, match="parent is not a directory"):
+            model_install_module._validate_destination_parent_trust(  # pyright: ignore[reportPrivateUsage]
+                fd
+            )
+        with pytest.raises(ModelInstallError, match="root is not a directory"):
+            model_install_module._validate_destination_root_trust(  # pyright: ignore[reportPrivateUsage]
+                fd, allow_sticky=False
+            )
+    finally:
+        os.close(fd)
+
+
+def test_destination_lock_and_reclaim_filesystem_errors_are_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lock/list/open/unlink failures fail closed without deleting unknown data."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    original_flock = fcntl.flock
+
+    def fail_flock(_fd: int, _flags: int) -> None:
+        raise OSError("busy")
+
+    monkeypatch.setattr(fcntl, "flock", fail_flock)
+    try:
+        with pytest.raises(ModelInstallError, match="another model installation"):
+            model_install_module._lock_destination_parent(parent_fd)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        monkeypatch.setattr(fcntl, "flock", original_flock)
+
+    def fail_listdir(_fd: int) -> list[str]:
+        raise OSError("no list")
+
+    monkeypatch.setattr(os, "listdir", fail_listdir)
+    try:
+        with pytest.raises(ModelInstallError, match="cannot safely inspect"):
+            model_install_module._reclaim_abandoned_parts(  # pyright: ignore[reportPrivateUsage]
+                parent_fd, "model.bin"
+            )
+    finally:
+        os.close(parent_fd)
+
+
+def test_cached_hash_rejects_final_size_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The descriptor's final size must still agree after bounded hashing."""
+    target = tmp_path / "cached.bin"
+    target.write_bytes(b"payload")
+    fd = os.open(target, os.O_RDONLY)
+    original_fstat = os.fstat
+    calls = [0]
+
+    def changed_final_size(candidate_fd: int) -> os.stat_result:
+        result = original_fstat(candidate_fd)
+        calls[0] += 1
+        if candidate_fd == fd and calls[0] == 2:
+            synthetic = list(result)
+            synthetic[stat.ST_SIZE] += 1
+            return os.stat_result(synthetic)
+        return result
+
+    monkeypatch.setattr(os, "fstat", changed_final_size)
+    try:
+        with pytest.raises(ModelInstallError, match="changed while being verified"):
+            model_install_module._sha256_of_open_file(  # pyright: ignore[reportPrivateUsage]
+                fd, target
+            )
+    finally:
+        os.close(fd)
+
+
+def test_reclaim_open_and_unlink_failures_are_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reclamation does not turn a racing open or durable unlink into a raw success."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    name = ".model.bin.0123456789abcdef0123456789abcdef.part"
+    stale = tmp_path / name
+    stale.write_bytes(b"stale")
+    stale.chmod(0o600)
+    original_open = os.open
+
+    def fail_candidate_open(
+        path: Path | str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if path == name:
+            raise OSError("race")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", fail_candidate_open)
+    try:
+        with pytest.raises(ModelInstallError, match="changed during reclamation"):
+            model_install_module._reclaim_abandoned_parts(  # pyright: ignore[reportPrivateUsage]
+                parent_fd, "model.bin"
+            )
+    finally:
+        monkeypatch.setattr(os, "open", original_open)
+
+    def fail_unlink(_path: object, **_kwargs: object) -> None:
+        raise OSError("unlink")
+
+    monkeypatch.setattr(os, "unlink", fail_unlink)
+    try:
+        with pytest.raises(ModelInstallError, match="cannot safely reclaim"):
+            model_install_module._reclaim_abandoned_parts(  # pyright: ignore[reportPrivateUsage]
+                parent_fd, "model.bin"
+            )
+    finally:
+        os.close(parent_fd)
+
+
+def test_source_open_missing_and_root_errors_are_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Source descriptor traversal normalises missing and local-root failures."""
+    with pytest.raises(ModelInstallError, match="from-dir is missing"):
+        model_install_module._open_verified_source_file(  # pyright: ignore[reportPrivateUsage]
+            tmp_path / "missing", "a/file.bin"
+        )
+
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    original_open = os.open
+
+    def fail_root_open(
+        path: Path | str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if path == source_root:
+            raise OSError("permission")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", fail_root_open)
+    with pytest.raises(ModelInstallError, match="cannot safely open the --from-dir root"):
+        model_install_module._open_verified_source_file(  # pyright: ignore[reportPrivateUsage]
+            source_root, "a/file.bin"
+        )
+
+
+def test_source_final_missing_is_typed_after_parent_open(tmp_path: Path) -> None:
+    """A final source disappearance remains the explicit no-fallback error."""
+    source_root = tmp_path / "source"
+    (source_root / "a").mkdir(parents=True)
+    with pytest.raises(ModelInstallError, match="from-dir is missing"):
+        model_install_module._open_verified_source_file(  # pyright: ignore[reportPrivateUsage]
+            source_root, "a/file.bin"
+        )
+
+
+def test_source_parent_close_failure_releases_child_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Traversal closes an opened child if the preceding source parent close fails."""
+    source_root = tmp_path / "source"
+    (source_root / "a").mkdir(parents=True)
+    original_open = os.open
+    original_close = os.close
+    root_fds: list[int] = []
+    child_fds: list[int] = []
+    close_calls: list[int] = []
+
+    def record_open(
+        path: Path | str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        fd = original_open(path, flags, mode, dir_fd=dir_fd)
+        if path == source_root:
+            root_fds.append(fd)
+        elif path == "a":
+            child_fds.append(fd)
+        return fd
+
+    def fail_root_close(fd: int) -> None:
+        close_calls.append(fd)
+        if root_fds and fd == root_fds[0]:
+            raise OSError("source parent close")
+        original_close(fd)
+
+    monkeypatch.setattr(os, "open", record_open)
+    monkeypatch.setattr(os, "close", fail_root_close)
+    try:
+        with pytest.raises(OSError, match="source parent close"):
+            model_install_module._open_verified_source_file(  # pyright: ignore[reportPrivateUsage]
+                source_root, "a/file.bin"
+            )
+    finally:
+        for fd in root_fds:
+            original_close(fd)
+
+    assert child_fds and close_calls.count(child_fds[0]) == 1
+
+
+def test_destination_walkers_normalise_mkdir_and_disappearance_races(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both descriptor walkers map mkdir and post-mkdir disappearance races safely."""
+    root = tmp_path / "root"
+    original_mkdir = os.mkdir
+
+    def fail_root_mkdir(path: Path | str, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+        if path == root.name:
+            raise OSError("mkdir root")
+        original_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", fail_root_mkdir)
+    with pytest.raises(ModelInstallError, match="cannot safely create the model destination root"):
+        model_install_module._open_destination_root(  # pyright: ignore[reportPrivateUsage]
+            root, create=True
+        )
+    monkeypatch.setattr(os, "mkdir", original_mkdir)
+
+    root.mkdir()
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+
+    def fail_parent_mkdir(
+        path: Path | str, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> None:
+        if path == "a":
+            raise OSError("mkdir parent")
+        original_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", fail_parent_mkdir)
+    try:
+        with pytest.raises(ModelInstallError, match="cannot safely create destination directory"):
+            model_install_module._open_destination_parent(  # pyright: ignore[reportPrivateUsage]
+                root_fd, "a/model.bin", create=True
+            )
+    finally:
+        os.close(root_fd)
+
+
+def test_destination_parent_disappearance_after_mkdir_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A just-created component is reopened; disappearance cannot be blessed."""
+    root = tmp_path / "root"
+    root.mkdir()
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    original_open = os.open
+
+    def remove_before_reopen(
+        path: Path | str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if path == "a" and (root / "a").exists():
+            (root / "a").rmdir()
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", remove_before_reopen)
+    try:
+        with pytest.raises(ModelInstallError, match="destination directory disappeared"):
+            model_install_module._open_destination_parent(  # pyright: ignore[reportPrivateUsage]
+                root_fd, "a/model.bin", create=True
+            )
+    finally:
+        os.close(root_fd)
+
+
+def test_destination_parent_creation_stat_and_open_errors_are_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The parent walker never exposes raw stat/open races after mkdir."""
+    root = tmp_path / "root"
+    root.mkdir()
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    original_stat = os.stat
+
+    def fail_created_stat(path: Path | str, *args: object, **kwargs: object) -> os.stat_result:
+        if path == "a":
+            raise OSError("created stat")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", fail_created_stat)
+    try:
+        with pytest.raises(ModelInstallError, match="changed while being created"):
+            model_install_module._open_destination_parent(  # pyright: ignore[reportPrivateUsage]
+                root_fd, "a/model.bin", create=True
+            )
+    finally:
+        monkeypatch.setattr(os, "stat", original_stat)
+        if (root / "a").exists():
+            (root / "a").rmdir()
+
+    original_open = os.open
+
+    def fail_component_open(
+        path: Path | str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if path == "a":
+            raise OSError("component open")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", fail_component_open)
+    try:
+        with pytest.raises(ModelInstallError, match="cannot safely open destination directory"):
+            model_install_module._open_destination_parent(  # pyright: ignore[reportPrivateUsage]
+                root_fd, "a/model.bin", create=False
+            )
+    finally:
+        os.close(root_fd)
+
+
+def test_placement_accepts_existing_regular_target(tmp_path: Path) -> None:
+    """The final overwrite check permits only a regular existing target."""
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    target = tmp_path / "model.bin"
+    target.write_bytes(b"old")
+    try:
+        model_install_module._place_verified(  # pyright: ignore[reportPrivateUsage]
+            parent_fd,
+            "model.bin",
+            [b"new"],
+            expected_sha256=hashlib.sha256(b"new").hexdigest(),
+            byte_cap=8,
+            context="model.bin",
+        )
+    finally:
+        os.close(parent_fd)
+    assert target.read_bytes() == b"new"
+
+
+def test_live_destination_revalidation_normalises_missing_root_and_target(tmp_path: Path) -> None:
+    """Live-path confirmation converts root and final-entry disappearance to typed errors."""
+    dest = tmp_path / "dest"
+    parent = dest / "a"
+    target = parent / "file.bin"
+    parent.mkdir(parents=True)
+    target.write_bytes(b"payload")
+    root_fd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    verified = target.stat()
+    try:
+        target.unlink()
+        with pytest.raises(ModelInstallError, match="destination changed before placement"):
+            model_install_module._revalidate_live_destination(  # pyright: ignore[reportPrivateUsage]
+                dest,
+                "a/file.bin",
+                dest_root_fd=root_fd,
+                parent_fd=parent_fd,
+                device=verified.st_dev,
+                inode=verified.st_ino,
+            )
+        target.write_bytes(b"payload")
+        dest.rename(tmp_path / "parked")
+        with pytest.raises(ModelInstallError, match="destination changed before placement"):
+            model_install_module._revalidate_live_destination(  # pyright: ignore[reportPrivateUsage]
+                dest,
+                "a/file.bin",
+                dest_root_fd=root_fd,
+                parent_fd=parent_fd,
+                device=verified.st_dev,
+                inode=verified.st_ino,
+            )
+    finally:
+        os.close(parent_fd)
+        os.close(root_fd)
+
+
+def test_install_reraises_non_verify_destination_root_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-verify root-opening absence preserves the local filesystem error."""
+
+    def missing_root(_dest: Path, *, create: bool) -> tuple[Path, int]:
+        assert create is True
+        raise FileNotFoundError("simulated root race")
+
+    monkeypatch.setattr(model_install_module, "_open_destination_root", missing_root)
+    manifest = _make_manifest({"a/file.bin": b"payload"})
+    with pytest.raises(FileNotFoundError, match="simulated root race"):
+        install_model(
+            tmp_path / "dest", manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION
+        )
+
+
+def test_from_dir_uses_existing_parent_and_verify_missing_parent_closes_nothing(
+    tmp_path: Path,
+) -> None:
+    """Existing-parent local placement and missing-parent verification take both cleanup arcs."""
+    manifest = _make_manifest({"a/file.bin": b"payload"})
+    from_dir = tmp_path / "source"
+    (from_dir / "a").mkdir(parents=True)
+    (from_dir / "a" / "file.bin").write_bytes(b"payload")
+    dest = tmp_path / "dest"
+    (dest / "a").mkdir(parents=True)
+
+    summary = install_model(
+        dest, from_dir=from_dir, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION
+    )
+    assert summary.files[0].source == "local"
+
+    missing_parent_dest = tmp_path / "missing-parent-dest"
+    missing_parent_dest.mkdir()
+    with pytest.raises(ModelInstallError, match="verification failed"):
+        install_model(
+            missing_parent_dest,
+            verify_only=True,
+            manifest_files=manifest,
+            repo_id=_REPO_ID,
+            revision=_REVISION,
+        )
 
 
 def test_cached_entry_replacement_after_hash_is_rejected(

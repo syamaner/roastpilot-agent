@@ -1390,7 +1390,7 @@ def install_model(
                     ManifestFileResult(manifest_file.relative_path, manifest_file.sha256, "fetched")
                 )
             finally:
-                if parent_fd is not None:
+                if parent_fd is not None:  # pragma: no branch - assigned on normal exit
                     _cleanup_preserving_primary(
                         lambda fd=parent_fd: os.close(fd),
                         action="closing destination directory descriptor",
