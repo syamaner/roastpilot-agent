@@ -345,7 +345,7 @@ def test_registry_top_entry_and_legacy_blocks_are_reconciled() -> None:
     )
     for phrase in (
         _DTOS1_COMMIT_SHA,
-        "PR #937",
+        "PR #923",
         "requires zero approving reviews",
         "skipped headless job is expected",
         "D108-D118 PR-scoped Claude approval bridge",

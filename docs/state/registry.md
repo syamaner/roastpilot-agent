@@ -10,7 +10,7 @@ deletion `false`; app-pinned required checks `Checks`, `Web (lint + typecheck
 `CLAUDE_HEADLESS_ENABLED` is unset: consumer-OAuth headless Claude CI (the
 hosted `Claude Code Review` job and the `@claude` responder) is retired under
 D-ToS-1, mirroring roastpilot-cloud #411, merged in agent commit
-`299fb5a93d09e54f58d370f7a35e5ce15f278150` (PR #937). A skipped headless job
+`299fb5a93d09e54f58d370f7a35e5ce15f278150` (PR #923). A skipped headless job
 is expected, never a failure. The D108-D118 PR-scoped Claude approval bridge
 mechanism is retained in the codebase but **dormant**: it gates nothing while
 `main` requires zero approving reviews. Restoring it is an operator-owned
