@@ -303,6 +303,8 @@ def _sha256_of_open_file(fd: int, path: Path | str) -> tuple[str, int, int]:
     initial = os.fstat(fd)
     if not stat.S_ISREG(initial.st_mode):
         raise ModelInstallError(f"cached destination {path} is not a regular file")
+    if initial.st_uid != os.geteuid() or initial.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ModelInstallError(f"cached destination {path} is not an owner-only regular file")
     if initial.st_size > _MAX_MODEL_FILE_BYTES:
         raise ModelInstallError(
             f"cached destination {path} exceeds the {_MAX_MODEL_FILE_BYTES}-byte per-file cap"
@@ -692,10 +694,77 @@ def _iter_https_bytes(client: httpx.Client, url: str, *, byte_cap: int) -> Itera
     raise ModelInstallError("exceeded the maximum number of redirects while fetching the model")
 
 
+def _validate_destination_root_trust(parent_fd: int, *, allow_sticky: bool) -> None:
+    """Require a trusted directory, allowing only sticky shared ancestors."""
+    directory_stat = os.fstat(parent_fd)
+    if not stat.S_ISDIR(directory_stat.st_mode):
+        raise ModelInstallError("model destination root is not a directory")
+    writable_by_others = directory_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    if directory_stat.st_uid == os.geteuid() and not writable_by_others:
+        return
+    if allow_sticky and directory_stat.st_mode & stat.S_ISVTX:
+        return
+    if directory_stat.st_uid == 0 and not writable_by_others:
+        return
+    raise ModelInstallError("model destination root is not an owner-only directory boundary")
+
+
+def _open_destination_root(dest: Path, *, create: bool) -> tuple[Path, int]:
+    """Open ``dest`` through no-follow descriptors, creating trusted components."""
+    dest_path = Path(os.path.abspath(dest))
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_fd = os.open("/", flags)
+    try:
+        components = dest_path.parts[1:]
+        for index, component in enumerate(components):
+            created_stat: os.stat_result | None = None
+            try:
+                child_fd = os.open(component, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(component, mode=0o755, dir_fd=parent_fd)
+                created_stat = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+                os.fsync(parent_fd)
+                try:
+                    child_fd = os.open(component, flags, dir_fd=parent_fd)
+                except OSError as exc:
+                    raise ModelInstallError(
+                        "cannot safely open the model destination root"
+                    ) from exc
+            except OSError as exc:
+                raise ModelInstallError("cannot safely open the model destination root") from exc
+            try:
+                child_stat = os.fstat(child_fd)
+                if created_stat is not None and (
+                    child_stat.st_dev != created_stat.st_dev
+                    or child_stat.st_ino != created_stat.st_ino
+                ):
+                    raise ModelInstallError("model destination root changed while being created")
+                _validate_destination_root_trust(child_fd, allow_sticky=index < len(components) - 1)
+                os.close(parent_fd)
+            except BaseException:
+                _cleanup_preserving_primary(
+                    lambda fd=child_fd: os.close(fd),
+                    action="closing child destination root descriptor",
+                )
+                parent_fd = None
+                raise
+            parent_fd = child_fd
+        _validate_destination_root_trust(parent_fd, allow_sticky=False)
+        return dest_path, parent_fd
+    except BaseException:
+        if parent_fd is not None:
+            _cleanup_preserving_primary(
+                lambda: os.close(parent_fd), action="closing destination root descriptor"
+            )
+        raise
+
+
 def _open_destination_parent(
-    dest_root_real: Path, relative_path: str, *, create: bool
+    dest_root_fd: int, relative_path: str, *, create: bool
 ) -> tuple[int, str]:
-    """Open a manifest file's parent directory beneath ``dest_root_real``.
+    """Open a manifest file's parent directory beneath ``dest_root_fd``.
 
     Every path component is opened relative to an already-verified directory
     descriptor with ``O_NOFOLLOW``.  Creation, temporary-file placement, and
@@ -711,10 +780,7 @@ def _open_destination_parent(
     _validate_relative_path(relative_path)
     components = relative_path.split("/")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    try:
-        parent_fd = os.open(dest_root_real, flags)
-    except OSError as exc:
-        raise ModelInstallError("cannot safely open the model destination root") from exc
+    parent_fd = os.dup(dest_root_fd)
     try:
         for component in components[:-1]:
             if create:
@@ -868,9 +934,10 @@ def _place_verified(
 
 
 def _revalidate_live_destination(
-    dest_root_real: Path,
+    dest_root_path: Path,
     relative_path: str,
     *,
+    dest_root_fd: int,
     parent_fd: int,
     device: int,
     inode: int,
@@ -882,15 +949,25 @@ def _revalidate_live_destination(
     parent and final entry prevents a detached-directory placement from being
     reported as success for the original destination path.
     """
+    live_root_fd: int | None = None
+    live_parent_fd: int | None = None
     try:
+        try:
+            _live_root_path, live_root_fd = _open_destination_root(dest_root_path, create=False)
+        except FileNotFoundError as exc:
+            raise ModelInstallError(
+                f"destination changed before placement could be confirmed for {relative_path!r}"
+            ) from exc
+        expected_root = os.fstat(dest_root_fd)
+        live_root = os.fstat(live_root_fd)
+        if expected_root.st_dev != live_root.st_dev or expected_root.st_ino != live_root.st_ino:
+            raise ModelInstallError(
+                f"destination changed before placement could be confirmed for {relative_path!r}"
+            )
         live_parent_fd, target_name = _open_destination_parent(
-            dest_root_real, relative_path, create=False
+            live_root_fd, relative_path, create=False
         )
-    except FileNotFoundError as exc:
-        raise ModelInstallError(
-            f"destination changed before placement could be confirmed for {relative_path!r}"
-        ) from exc
-    try:
+        assert live_parent_fd is not None
         expected_parent = os.fstat(parent_fd)
         live_parent = os.fstat(live_parent_fd)
         _validate_destination_parent_trust(live_parent_fd)
@@ -911,12 +988,19 @@ def _revalidate_live_destination(
                 f"destination changed before placement could be confirmed for {relative_path!r}"
             )
     except BaseException:
-        _cleanup_preserving_primary(
-            lambda: os.close(live_parent_fd), action="closing live destination directory descriptor"
-        )
+        if live_parent_fd is not None:
+            _cleanup_preserving_primary(
+                lambda: os.close(live_parent_fd),
+                action="closing live destination directory descriptor",
+            )
         raise
     else:
         os.close(live_parent_fd)
+    finally:
+        if live_root_fd is not None:
+            _cleanup_preserving_primary(
+                lambda: os.close(live_root_fd), action="closing live destination root descriptor"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1014,13 +1098,14 @@ def install_model(
     if not manifest_files:
         raise ModelInstallError("manifest_files must not be empty")
 
-    if verify_only:
-        if not dest.is_dir():
-            raise ModelInstallError(f"destination {dest} does not exist; nothing to verify")
-        dest_root_real = Path(os.path.realpath(dest))
-    else:
-        dest.mkdir(parents=True, exist_ok=True)
-        dest_root_real = Path(os.path.realpath(dest))
+    try:
+        dest_root_path, dest_root_fd = _open_destination_root(dest, create=not verify_only)
+    except FileNotFoundError:
+        if verify_only:
+            raise ModelInstallError(
+                f"destination {dest} does not exist; nothing to verify"
+            ) from None
+        raise
 
     results: list[ManifestFileResult] = []
     network_used = False
@@ -1033,11 +1118,11 @@ def install_model(
     try:
         for manifest_file in manifest_files:
             _validate_digest(manifest_file.sha256, label=manifest_file.relative_path)
-            target = _resolve_and_validate_target(dest_root_real, manifest_file.relative_path)
+            target = _resolve_and_validate_target(dest_root_path, manifest_file.relative_path)
             target_name = manifest_file.relative_path.rsplit("/", maxsplit=1)[-1]
             try:
                 parent_fd, target_name = _open_destination_parent(
-                    dest_root_real, manifest_file.relative_path, create=False
+                    dest_root_fd, manifest_file.relative_path, create=False
                 )
             except FileNotFoundError:
                 parent_fd = None
@@ -1055,8 +1140,9 @@ def install_model(
                         if cached_digest == manifest_file.sha256:
                             assert parent_fd is not None
                             _revalidate_live_destination(
-                                dest_root_real,
+                                dest_root_path,
                                 manifest_file.relative_path,
+                                dest_root_fd=dest_root_fd,
                                 parent_fd=parent_fd,
                                 device=cached_device,
                                 inode=cached_inode,
@@ -1088,7 +1174,7 @@ def install_model(
                     try:
                         if parent_fd is None:
                             parent_fd, target_name = _open_destination_parent(
-                                dest_root_real, manifest_file.relative_path, create=True
+                                dest_root_fd, manifest_file.relative_path, create=True
                             )
                         placed_device, placed_inode = _place_verified(
                             parent_fd,
@@ -1099,8 +1185,9 @@ def install_model(
                             context=manifest_file.relative_path,
                         )
                         _revalidate_live_destination(
-                            dest_root_real,
+                            dest_root_path,
                             manifest_file.relative_path,
+                            dest_root_fd=dest_root_fd,
                             parent_fd=parent_fd,
                             device=placed_device,
                             inode=placed_inode,
@@ -1121,7 +1208,7 @@ def install_model(
                 url = _build_url(repo_id, revision, manifest_file.relative_path)
                 if parent_fd is None:
                     parent_fd, target_name = _open_destination_parent(
-                        dest_root_real, manifest_file.relative_path, create=True
+                        dest_root_fd, manifest_file.relative_path, create=True
                     )
                 placed_device, placed_inode = _place_verified(
                     parent_fd,
@@ -1132,8 +1219,9 @@ def install_model(
                     context=manifest_file.relative_path,
                 )
                 _revalidate_live_destination(
-                    dest_root_real,
+                    dest_root_path,
                     manifest_file.relative_path,
+                    dest_root_fd=dest_root_fd,
                     parent_fd=parent_fd,
                     device=placed_device,
                     inode=placed_inode,
@@ -1148,7 +1236,12 @@ def install_model(
                         action="closing destination directory descriptor",
                     )
     finally:
-        if owned_client:
-            _cleanup_preserving_primary(client.close, action="closing model download client")
+        try:
+            if owned_client:
+                _cleanup_preserving_primary(client.close, action="closing model download client")
+        finally:
+            _cleanup_preserving_primary(
+                lambda: os.close(dest_root_fd), action="closing destination root descriptor"
+            )
 
-    return ModelInstallSummary(dest=dest_root_real, files=tuple(results), network_used=network_used)
+    return ModelInstallSummary(dest=dest_root_path, files=tuple(results), network_used=network_used)

@@ -287,6 +287,42 @@ def test_group_writable_destination_parent_is_rejected_before_cached_acceptance(
     assert target.read_bytes() == b"payload"
 
 
+def test_group_writable_cached_file_is_rejected_from_its_open_descriptor(tmp_path: Path) -> None:
+    """Cached acceptance rejects a regular file writable by another principal."""
+    manifest = _make_manifest({"a/file1.bin": b"payload"})
+    dest = tmp_path / "dest"
+    target = dest / "a" / "file1.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"payload")
+    same_inode_alias = tmp_path / "same-inode-alias"
+    os.link(target, same_inode_alias)
+    target.chmod(0o664)
+
+    with pytest.raises(ModelInstallError, match="owner-only regular file"):
+        install_model(
+            dest,
+            verify_only=True,
+            manifest_files=manifest,
+            repo_id=_REPO_ID,
+            revision=_REVISION,
+        )
+
+    assert os.path.samefile(target, same_inode_alias)
+
+
+def test_cached_file_with_untrusted_effective_owner_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cached ownership policy is bound to fstat, not the target pathname."""
+    target = tmp_path / "cached.bin"
+    target.write_bytes(b"payload")
+    untrusted_uid = target.stat().st_uid + 1
+    monkeypatch.setattr(os, "geteuid", lambda: untrusted_uid)
+
+    with pytest.raises(ModelInstallError, match="owner-only regular file"):
+        model_install_module._sha256_of_file(target)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_verify_only_rejects_an_initially_oversized_cached_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -508,7 +544,7 @@ def test_created_destination_directory_is_fsynced(
     monkeypatch.setattr(os, "fsync", record_fsync)
     try:
         parent_fd, _target_name = model_install_module._open_destination_parent(  # pyright: ignore[reportPrivateUsage]
-            dest, "a/model.bin", create=True
+            dest_root_fd, "a/model.bin", create=True
         )
         try:
             assert (dest / "a").is_dir()
@@ -825,10 +861,8 @@ def test_cached_continue_propagates_parent_close_failure(
     original_open_parent = model_install_module._open_destination_parent  # pyright: ignore[reportPrivateUsage]
     original_close = os.close
 
-    def capture_parent(
-        dest_root_real: Path, relative_path: str, *, create: bool
-    ) -> tuple[int, str]:
-        result = original_open_parent(dest_root_real, relative_path, create=create)
+    def capture_parent(dest_root_fd: int, relative_path: str, *, create: bool) -> tuple[int, str]:
+        result = original_open_parent(dest_root_fd, relative_path, create=create)
         captured_parent_fds.append(result[0])
         return result
 
@@ -862,10 +896,8 @@ def test_primary_error_survives_parent_close_failure(
     original_open_parent = model_install_module._open_destination_parent  # pyright: ignore[reportPrivateUsage]
     original_close = os.close
 
-    def capture_parent(
-        dest_root_real: Path, relative_path: str, *, create: bool
-    ) -> tuple[int, str]:
-        result = original_open_parent(dest_root_real, relative_path, create=create)
+    def capture_parent(dest_root_fd: int, relative_path: str, *, create: bool) -> tuple[int, str]:
+        result = original_open_parent(dest_root_fd, relative_path, create=create)
         captured_parent_fds.append(result[0])
         return result
 
@@ -1045,6 +1077,61 @@ def test_symlinked_subdirectory_escape_is_rejected(tmp_path: Path) -> None:
         install_model(dest, manifest_files=manifest, repo_id=_REPO_ID, revision=_REVISION)
 
 
+def test_destination_root_creation_rejects_a_swapped_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlink substituted after root mkdir is never opened or accepted."""
+    dest = tmp_path / "dest"
+    parked = tmp_path / "parked-dest"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original_mkdir = os.mkdir
+
+    def create_then_swap(path: Path | str, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+        original_mkdir(path, mode, dir_fd=dir_fd)
+        if path == dest.name:
+            dest.rename(parked)
+            dest.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(os, "mkdir", create_then_swap)
+
+    with pytest.raises(ModelInstallError, match="cannot safely open the model destination root"):
+        model_install_module._open_destination_root(  # pyright: ignore[reportPrivateUsage]
+            dest, create=True
+        )
+
+    assert parked.is_dir()
+    assert not (outside / "a").exists()
+
+
+def test_destination_root_creation_rejects_a_replaced_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-type untrusted root replacement cannot cross the trust boundary."""
+    dest = tmp_path / "dest"
+    parked = tmp_path / "parked-dest"
+    original_mkdir = os.mkdir
+
+    def create_then_replace(
+        path: Path | str, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> None:
+        original_mkdir(path, mode, dir_fd=dir_fd)
+        if path == dest.name:
+            dest.rename(parked)
+            dest.mkdir(mode=0o777)
+            dest.chmod(0o777)
+
+    monkeypatch.setattr(os, "mkdir", create_then_replace)
+
+    with pytest.raises(ModelInstallError, match="owner-only directory boundary"):
+        model_install_module._open_destination_root(  # pyright: ignore[reportPrivateUsage]
+            dest, create=True
+        )
+
+    assert parked.is_dir()
+    assert dest.is_dir()
+
+
 def test_swapped_destination_parent_cannot_redirect_placement_outside_dest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1106,6 +1193,7 @@ def test_live_destination_revalidation_rejects_replaced_target(tmp_path: Path) -
     parent.mkdir(parents=True)
     target.write_bytes(b"payload")
     target_fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+    dest_root_fd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY)
     parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         verified = os.fstat(target_fd)
@@ -1117,6 +1205,7 @@ def test_live_destination_revalidation_rejects_replaced_target(tmp_path: Path) -
             model_install_module._revalidate_live_destination(  # pyright: ignore[reportPrivateUsage]
                 dest,
                 "a/file1.bin",
+                dest_root_fd=dest_root_fd,
                 parent_fd=parent_fd,
                 device=verified.st_dev,
                 inode=verified.st_ino,
@@ -1125,7 +1214,42 @@ def test_live_destination_revalidation_rejects_replaced_target(tmp_path: Path) -
         try:
             os.close(parent_fd)
         finally:
-            os.close(target_fd)
+            try:
+                os.close(target_fd)
+            finally:
+                os.close(dest_root_fd)
+
+
+def test_live_destination_revalidation_rejects_replaced_root(tmp_path: Path) -> None:
+    """A detached destination root cannot be reported as the requested path."""
+    dest = tmp_path / "dest"
+    parent = dest / "a"
+    target = parent / "file1.bin"
+    parent.mkdir(parents=True)
+    target.write_bytes(b"payload")
+    dest_root_fd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    verified = target.stat()
+    parked = tmp_path / "parked-dest"
+    dest.rename(parked)
+    dest.mkdir(mode=0o700)
+    try:
+        with pytest.raises(
+            ModelInstallError, match="destination changed before placement could be confirmed"
+        ):
+            model_install_module._revalidate_live_destination(  # pyright: ignore[reportPrivateUsage]
+                dest,
+                "a/file1.bin",
+                dest_root_fd=dest_root_fd,
+                parent_fd=parent_fd,
+                device=verified.st_dev,
+                inode=verified.st_ino,
+            )
+    finally:
+        try:
+            os.close(parent_fd)
+        finally:
+            os.close(dest_root_fd)
 
 
 def test_replaced_temporary_entry_before_rename_is_rejected(
