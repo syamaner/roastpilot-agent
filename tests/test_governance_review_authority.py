@@ -232,6 +232,23 @@ def _is_affirmative_enablement_instruction(text: str) -> bool:
     return any(match.group("prohibition") is None for match in instruction.finditer(normalized))
 
 
+def _require_phrase(text: str, phrase: str) -> None:
+    """Raise when a formatting-tolerant required phrase is absent."""
+    assert _occurrences(text, phrase), f"missing required phrase: {phrase!r}"
+
+
+def _require_exact_check_name(text: str, check_name: str) -> None:
+    """Raise when an exact, code-formatted required check name is absent."""
+    assert _exact_markdown_code_name_pattern(check_name).search(text), (
+        f"missing exact check name: {check_name!r}"
+    )
+
+
+def _require_range_operative(start: int, end: int, spans: list[tuple[int, int]]) -> None:
+    """Raise when a required live-policy range overlaps historical evidence."""
+    assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+
+
 def test_agents_md_forbidden_phrases_are_contained_in_historical_blocks() -> None:
     """T1 (AC1, AC2): every phrase-set-P occurrence in AGENTS.md is historical.
 
@@ -248,6 +265,15 @@ def test_agents_md_forbidden_phrases_are_contained_in_historical_blocks() -> Non
                 f"{phrase!r} appears operatively (outside a historical-evidence "
                 f"block) in AGENTS.md at character offset {match.start()}"
             )
+    historical_text = "".join(text[start:end] for start, end in spans)
+    for anchor in (
+        "PR-scoped Claude restoration (#663 / D108-D118",
+        "Activation state — LIVE 31 Jul 2026 (#663 / D108-D118)",
+        "WAIT for Claude's PR-scoped approval before merging",
+    ):
+        assert _occurrences(historical_text, anchor), (
+            f"AGENTS.md historical evidence anchor vanished: {anchor!r}"
+        )
 
 
 def test_agents_md_canonical_live_state_bullet_retains_every_gate() -> None:
@@ -268,6 +294,7 @@ def test_agents_md_canonical_live_state_bullet_retains_every_gate() -> None:
     """
     text = _read_agents_md()
     spans = _historical_spans(text)
+    assert text.count(_CANONICAL_LIVE_STATE_HEADING) == 1
     start, end = _canonical_bullet_bounds(text)
     assert not any(span_start < end and start < span_end for span_start, span_end in spans), (
         "AGENTS.md's canonical live-state bullet must be entirely operative"
@@ -315,6 +342,7 @@ def test_agents_md_headless_skip_is_documented_and_never_instructed_on() -> None
         for span_start, span_end in spans
     ), "the precedence subsection must be entirely operative"
     precedence = text[precedence_start:precedence_end]
+    assert "sole\n  operative authorities" in precedence
     assert "AGENTS.md" in precedence
     assert "docs/state/registry.md" in precedence
 
@@ -335,6 +363,7 @@ def test_registry_top_entry_and_legacy_blocks_are_reconciled() -> None:
     header_index = text.index("## Active Epic")
     entry_heading = "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
     entry_start = text.index(entry_heading, header_index)
+    assert not re.search(r"\n\*\*[^\n]+", text[header_index:entry_start])
     entry_end = text.index("\n**1 Sep 2026", entry_start)
     top_entry = text[entry_start:entry_end]
     overlaps_historical = any(
@@ -347,10 +376,15 @@ def test_registry_top_entry_and_legacy_blocks_are_reconciled() -> None:
         _DTOS1_COMMIT_SHA,
         "PR #923",
         "requires zero approving reviews",
+        "strict mode",
+        "enforce_admins=true",
+        "required_conversation_resolution=true",
         "skipped headless job is expected",
         "D108-D118 PR-scoped Claude approval bridge",
         "operator-owned branch-protection decision",
         "exact-current-head review",
+        "and wait",
+        "CodeQL handling",
         "independent triage",
         "risk-routed authenticated local Claude assurance",
     ):
@@ -425,3 +459,61 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
         "Never set **CLAUDE_HEADLESS_ENABLED**\n> to **true**."
     )
     assert _is_affirmative_enablement_instruction("Set **CLAUDE_HEADLESS_ENABLED**\n> to `true`.")
+
+
+@pytest.mark.docs
+def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> None:
+    """Exercise focused synthetic failure modes without mutating governed files.
+
+    These cases cover a generic lower-case check mention, an historical-wrapped
+    canonical bullet, each retained registry clause, missing precedence names,
+    a missing AGENTS historical anchor, and a June directive outside a span.
+    """
+    agents = _read_agents_md()
+    bullet = _canonical_live_state_bullet(agents)
+    generic_checks = bullet.replace("`Checks`", "required checks")
+    with pytest.raises(AssertionError, match="missing exact check name"):
+        _require_exact_check_name(generic_checks, "Checks")
+
+    wrapped = _BEGIN_MARKER + "\n" + bullet + _END_MARKER + "\n"
+    wrapped_spans = _historical_spans(wrapped)
+    wrapped_start = wrapped.index(_CANONICAL_LIVE_STATE_HEADING)
+    wrapped_end = wrapped.index(_END_MARKER, wrapped_start)
+    with pytest.raises(AssertionError):
+        _require_range_operative(wrapped_start, wrapped_end, wrapped_spans)
+
+    registry = (_REPO_ROOT / "docs" / "state" / "registry.md").read_text(encoding="utf-8")
+    entry_end = registry.index("\n**1 Sep 2026")
+    top_entry = registry[:entry_end]
+    for clause in (
+        "strict mode",
+        "enforce_admins=true",
+        "required_conversation_resolution=true",
+        "CodeQL handling",
+        "exact-current-head review",
+        "and wait",
+    ):
+        mutated = top_entry.replace(clause, "", 1)
+        with pytest.raises(AssertionError, match="missing required phrase"):
+            _require_phrase(mutated, clause)
+
+    precedence_start = agents.index(
+        "- **Precedence for the GitHub-Claude required-approval description under"
+    )
+    precedence_end = agents.index("\n- Mechanism retained", precedence_start)
+    precedence = agents[precedence_start:precedence_end]
+    for filename in ("AGENTS.md", "docs/state/registry.md"):
+        with pytest.raises(AssertionError, match="missing required phrase"):
+            _require_phrase(precedence.replace(filename, "", 1), filename)
+
+    agent_spans = _historical_spans(agents)
+    agent_history = "".join(agents[a:b] for a, b in agent_spans)
+    with pytest.raises(AssertionError, match="missing required phrase"):
+        _require_phrase(
+            agent_history.replace("WAIT for Claude's PR-scoped approval before merging", "", 1),
+            "WAIT for Claude's PR-scoped approval before merging",
+        )
+
+    june_directive = "arm the `review-gate` required check (#159 / D58)"
+    with pytest.raises(AssertionError):
+        assert _within_any_span(0, len(june_directive), _historical_spans(june_directive))

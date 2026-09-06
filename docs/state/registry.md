@@ -2337,6 +2337,8 @@ config that roast 4 must validate is confirmed live on `main`: MCP pin `0.1.8` (
 (`config.py:479`). Operator prerequisite unchanged: a **fresh, non-expiring OpenRouter key** (the
 13 Jun attempt-1 failure mode).
 <!-- historical-evidence: begin -->
+**[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this
+file.]**
 Open operator action carried over: arm the `review-gate` required check (#159 /
 D58).
 <!-- historical-evidence: end -->
@@ -2362,6 +2364,8 @@ the pre-open domain reviewer on the branch) and independent D23 triage (author n
   `operator_recovery_required`. safety-reviewer PASS.
 - **#159 — auto-merge-before-`claude-review` race — FIXED + plan D58 (PR #366, `12d14e1`).** A
   <!-- historical-evidence: begin -->
+  **[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this
+  file.]**
   skip-aware `review-gate` commit-status workflow (pending on open → success-only/fail-closed when
   Claude Code Review completes; Dependabot + workflow-editing PRs auto-pass at stamp time).
   **Validated end-to-end on three real PRs this batch** (#366/#367/#368). **OPERATOR ACTION
@@ -2386,11 +2390,12 @@ caveat: an independent post-open lens (Augment) still earned its keep twice; shi
 are metric-blind (#306 resolved with zero agent code; the folded coverage gap). Memory
 `pr-flow-improvement-experiment`.
 
-**Still open / next:**
 <!-- historical-evidence: begin -->
-**operator activates the `review-gate` required check (#159 / D58)**
+**[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this
+file.]**
+**Still open / next:** **operator activates the `review-gate` required check (#159 / D58)**; everything
 <!-- historical-evidence: end -->
-; everything else is OPERATOR-GATED — **roast 4 (#134)** + device SSE (#135), then the post-roast-4 sequence (#323
+else is OPERATOR-GATED — **roast 4 (#134)** + device SSE (#135), then the post-roast-4 sequence (#323
 ceiling-override → #228 LAST → M2/D42). Untouched: #318. Nothing else agent-startable until roast 4.
 
 **#300 — roast-data pipeline (D44) — DONE (store → labelled replay fixture).** The store-side
