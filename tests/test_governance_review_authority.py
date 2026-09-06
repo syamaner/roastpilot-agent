@@ -62,11 +62,16 @@ _CANONICAL_LIVE_STATE_HEADING = "**Verified live state — 6 Sep 2026 (D-ToS-1).
 # The complete retained gate list (contract §2.2 phrase set R, scoped to the
 # canonical bullet): Codex review AND wait, independent triage, local Claude
 # assurance, CI, CodeQL, conversation resolution, strict/app-pinned
-# checks/admin enforcement, and zero approving reviews.
+# checks/admin enforcement (including the four exact app-pinned check
+# names), and zero approving reviews.
 _CANONICAL_LIVE_STATE_REQUIRED_PHRASES: tuple[str, ...] = (
     "requires zero approving reviews",
     "strict mode",
     "app-pinned",
+    "Checks",
+    "Web (lint + typecheck + unit)",
+    "Web (Playwright snapshots)",
+    "codecov/patch",
     "enforce_admins",
     "required_conversation_resolution",
     "rests on CI",
@@ -202,13 +207,15 @@ def test_agents_md_canonical_live_state_bullet_retains_every_gate() -> None:
     This is the G3 fail-open guard, scoped precisely to the one operative
     statement of the current merge bar (the "Verified live state — 6 Sep
     2026 (D-ToS-1)" bullet, up to its historical-evidence begin marker): CI,
-    `codecov/patch`, CodeQL, Codex's exact-current-head review AND wait,
+    the four exact app-pinned check names (`Checks`,
+    `Web (lint + typecheck + unit)`, `Web (Playwright snapshots)`,
+    `codecov/patch`), CodeQL, Codex's exact-current-head review AND wait,
     `required_conversation_resolution`, independent triage, risk-routed
-    authenticated local Claude assurance, strict/app-pinned checks, admin
-    enforcement, and zero approving reviews must all remain stated there as
-    current policy. Scoping to this one bullet (rather than the whole
-    document) means an unrelated mention elsewhere can never mask a real
-    regression in the canonical statement itself.
+    authenticated local Claude assurance, strict mode, admin enforcement,
+    and zero approving reviews must all remain stated there as current
+    policy. Scoping to this one bullet (rather than the whole document)
+    means an unrelated mention elsewhere can never mask a real regression in
+    the canonical statement itself.
     """
     text = _read_agents_md()
     bullet = _canonical_live_state_bullet(text)
@@ -232,7 +239,7 @@ def test_agents_md_headless_skip_is_documented_and_never_instructed_on() -> None
     assert _present_operatively(text, "skipped headless job is expected", spans)
 
     set_true_pattern = re.compile(
-        r"set[\s>]+.{0,60}?CLAUDE_HEADLESS_ENABLED.{0,60}?['\"]?true",
+        r"set[\s>*]+.{0,60}?CLAUDE_HEADLESS_ENABLED.{0,60}?['\"]?true",
         re.IGNORECASE | re.DOTALL,
     )
     for match in set_true_pattern.finditer(text):
