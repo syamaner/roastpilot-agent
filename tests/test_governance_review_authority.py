@@ -387,7 +387,12 @@ def _assert_no_nonzero_approval_requirement(text: str, spans: list[tuple[int, in
         r"(?:at\s+least\s+)?[a-z0-9-]+\s+approving\s+reviews?\b",
         re.IGNORECASE,
     )
+    machine_nonzero_requirement = re.compile(
+        r"\brequired_approving_review_count\b\s*(?:=|:)\s*[1-9][0-9]*\b",
+        re.IGNORECASE,
+    )
     assert not nonzero_requirement.search(operative)
+    assert not machine_nonzero_requirement.search(operative)
 
 
 def _assert_branch_protection_policy(text: str) -> None:
@@ -1097,6 +1102,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "requires ten approving reviews",
         "requires 10 approving reviews",
         "requires at least two approving reviews",
+        "required_approving_review_count=1",
+        "required_approving_review_count = 10",
+        "required_approving_review_count: 2",
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
         "gh variable set " + "\\\n" + "CLAUDE_HEADLESS_ENABLED --body true",
         'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
@@ -1188,6 +1196,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "requires ten approving reviews",
         "requires 10 approving reviews",
         "requires at least two approving reviews",
+        "required_approving_review_count=1",
+        "required_approving_review_count = 10",
+        "required_approving_review_count: 2",
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
         "gh variable set " + "\\\n" + "CLAUDE_HEADLESS_ENABLED --body true",
         'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
@@ -1223,6 +1234,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         for allowed_instruction in (
             "requires no approving reviews",
             "requires **no** approving reviews",
+            "required_approving_review_count = 0",
             "gh variable set --repo=owner/repo CLAUDE_HEADLESS_ENABLED --body 'false'",
             "Do not gh variable set -R owner/repo CLAUDE_HEADLESS_ENABLED --body true",
             "gh variable set --repo owner/repo OTHER_HEADLESS_ENABLED --body true",
@@ -1235,9 +1247,25 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     _assert_no_nonzero_approval_requirement(
         historical_nonzero, _historical_spans(historical_nonzero)
     )
+    historical_machine_nonzero = (
+        agents + "\n" + _BEGIN_MARKER + "\nrequired_approving_review_count: 1\n" + _END_MARKER
+    )
+    _assert_no_nonzero_approval_requirement(
+        historical_machine_nonzero, _historical_spans(historical_machine_nonzero)
+    )
     bold_nonzero = agents + "\nrequires **two** approving reviews"
     with pytest.raises(AssertionError):
         _assert_no_nonzero_approval_requirement(bold_nonzero, _historical_spans(bold_nonzero))
+    for machine_nonzero in (
+        "required_approving_review_count=1",
+        "required_approving_review_count = 10",
+        "required_approving_review_count: 2",
+    ):
+        with pytest.raises(AssertionError):
+            _assert_no_nonzero_approval_requirement(
+                agents + "\n" + machine_nonzero,
+                _historical_spans(agents + "\n" + machine_nonzero),
+            )
 
     precedence_start = agents.index(
         "- **Precedence for the GitHub-Claude required-approval description under"
