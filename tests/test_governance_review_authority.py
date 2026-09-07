@@ -277,14 +277,16 @@ def _is_affirmative_enablement_instruction(text: str) -> bool:
         r"(?:=\s*|to\s+)['\"]?true['\"]?\b",
         re.IGNORECASE,
     )
-    repo_flag = r"(?:(?:-R|--repo)(?:\s+|=)(?:['\"][^'\"]+['\"]|[^\s;|&]+)\s+)"
+    repo_selector = r"(?:-R|--repo)(?:\s+|=)(?:['\"][^'\"]+['\"]|[^\s;|&]+)"
+    repo_flag = rf"(?:{repo_selector}\s+)"
     gh_variable_set = re.compile(
         r"(?P<prohibition>\b(?:do not|never)\s+)?gh\s+"
         rf"(?:{repo_flag})?variable\s+(?:{repo_flag})?set\b",
         re.IGNORECASE,
     )
     explicit_false_body = re.compile(
-        rf"^\s+(?:{repo_flag})?(?:-b|--body)(?:\s+|=)['\"]?false['\"]?[.!?]?\s*$",
+        rf"^\s+(?:{repo_flag})?(?:-b|--body)(?:\s+|=)['\"]?false['\"]?"
+        rf"(?:\s+{repo_selector})?[.!?]?\s*$",
         re.IGNORECASE,
     )
     has_assignment = any(
@@ -1052,6 +1054,8 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
         "gh variable --repo=owner/repo set CLAUDE_HEADLESS_ENABLED -b='false'",
         "gh variable set CLAUDE_HEADLESS_ENABLED -R owner/repo --body false",
         "gh variable set CLAUDE_HEADLESS_ENABLED --repo=owner/repo -b='false'",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false --repo owner/repo",
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b=false -R owner/repo",
     ):
         assert not _is_affirmative_enablement_instruction(false_body)
     assert _is_affirmative_enablement_instruction(
@@ -1059,6 +1063,15 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
     )
     assert _is_affirmative_enablement_instruction(
         "gh variable set CLAUDE_HEADLESS_ENABLED --repo=owner/repo -b='true'"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true --repo owner/repo"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b=true -R owner/repo"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false --unlisted owner/repo"
     )
     assert not _is_affirmative_enablement_instruction(
         "gh variable set OTHER_HEADLESS_ENABLED --body true"
