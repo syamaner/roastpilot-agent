@@ -1905,6 +1905,16 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         matching_fence_outside_range, start_boundary, end_boundary
     )
 
+    escaped_fence_before_range = "\\```\ncanonical start\ncanonical end"
+    start_boundary = escaped_fence_before_range.index("canonical start")
+    end_boundary = escaped_fence_before_range.index("canonical end")
+    escaped_run = escaped_fence_before_range.index("```")
+    assert escaped_fence_before_range.startswith("\\```")
+    assert escaped_run < start_boundary < end_boundary
+    _assert_canonical_range_is_outside_markdown_fences(
+        escaped_fence_before_range, start_boundary, end_boundary
+    )
+
     non_whitespace_fence_tail = "```\n``` content\ncanonical start\ncanonical end\n```\n"
     start_boundary = non_whitespace_fence_tail.index("canonical start")
     end_boundary = non_whitespace_fence_tail.index("canonical end")
@@ -1963,6 +1973,17 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     _assert_fixed_policy_range_is_not_indented_code(mid_line_tab, start_boundary, end_boundary)
 
     _assert_policy_range_is_outside_code_spans(agents, start, end)
+
+    escaped_unmatched_code_span = "\\`\ncanonical start\ncanonical end"
+    start_boundary = escaped_unmatched_code_span.index("canonical start")
+    end_boundary = escaped_unmatched_code_span.index("canonical end")
+    escaped_run = escaped_unmatched_code_span.index("`")
+    assert escaped_unmatched_code_span.startswith("\\`")
+    assert escaped_run < start_boundary < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_code_spans(
+            escaped_unmatched_code_span, start_boundary, end_boundary
+        )
 
     double_backtick_wrap = "``\ncanonical start\ncanonical end\n``"
     start_boundary = double_backtick_wrap.index("canonical start")
