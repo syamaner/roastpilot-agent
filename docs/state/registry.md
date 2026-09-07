@@ -2,6 +2,30 @@
 
 ## Active Epic
 
+**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).** Verified live
+`main` branch protection: `required_approving_review_count=0`; strict mode;
+`enforce_admins=true`; `required_conversation_resolution=true`; force-push/
+deletion `false`; app-pinned required checks `Checks`, `Web (lint + typecheck
++ unit)`, `Web (Playwright snapshots)`, and `codecov/patch`.
+`CLAUDE_HEADLESS_ENABLED` is unset: consumer-OAuth headless Claude CI (the
+hosted `Claude Code Review` job and the `@claude` responder) is retired under
+D-ToS-1, merged in agent commit
+`299fb5a93d09e54f58d370f7a35e5ce15f278150` (PR #923). A skipped headless job
+is expected, never a failure. The D108-D118 PR-scoped Claude approval bridge
+mechanism is retained in the codebase but **dormant**: it gates nothing while
+`main` requires zero approving reviews. Restoring it is an operator-owned
+branch-protection decision, not automatic. The merge bar remains CI,
+`codecov/patch`, CodeQL handling, GitHub Codex's exact-current-head review
+and wait, `required_conversation_resolution`, independent triage, and
+risk-routed authenticated local Claude assurance. This entry supersedes the
+operative approval wording in the "31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL
+RESTORED (#663 / D108-D118)" record, the earlier 31-Jul "#663 / D108-D118"
+status summary, and the residual June instructions to arm or require the
+SHA-scoped `review-gate`, plus the 17-Aug #735 statement that the headless
+review itself still runs unskipped, all now marked historical. D108-D118
+already retired that SHA-scoped mechanism; D-ToS-1 is unrelated to that
+retirement; it must not be restored.
+
 **1 Sep 2026 — #702 (D180/D181) closure:** PR #872 merged at
 `fdb354cd7b697261faf55212eee73e9504528281`; the issue is closed and the
 project item is Done. Main CI run `33542699280` and CodeQL run `33542699137`
@@ -341,12 +365,18 @@ coupled bump that resolves Node through venv-contained `nodejs_wheel`, without
 host PATH widening or a runtime download; validation roots are reprovisioned
 after either pin moves.**
 
+<!-- historical-evidence: begin -->
+**[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this file.]**
 **17 Aug 2026 — #735 story-closing implementation complete: `claude-code-review.yml` enables `track_progress`
 only for `opened`/`synchronize`/`ready_for_review`/`reopened` and disables it
 (fail-closed) for `edited` and any other action, because the action does not
 support progress-comment tracking there; `edited` stays in the trigger list
 and the review itself still runs unskipped. This removes the prior
 mark-ready/reopen draft-cycle workaround for metadata edits.**
+<!-- historical-evidence: end -->
+The trigger remains configured, but under D-ToS-1 its headless job skips while
+`CLAUDE_HEADLESS_ENABLED` is unset; the retained `track_progress` implementation
+above is not undone.
 
 **11 Aug 2026 — #781 closed by slice 2: D156/D157 wire the flag-gated post-FC fan destination ceiling and a one-way RUN-scoped release latch: once released it stays released for the rest of the run, surviving every transition including an operator resume, and is cleared only by `start_run`. The load-bearing case is a resume back to pre-first-crack reaching DEVELOPMENT again on a second first-crack edge; the direct recovery-to-DEVELOPMENT resume is separately inert because the floor is unknown there. In practice enforcement also requires the post-FC control loop: with the loop inert, the unknown heat floor releases a climbing bean immediately.**
 
@@ -1004,11 +1034,20 @@ mark-ready/reopen draft-cycle workaround for metadata edits.**
 > **Review + process.** PR size is a **reviewability guide, not a hard cap** (#661,
 > 26 Jul) — a cohesive single-slice story stays one PR. `security-reviewer` is now
 > wired into the `review-branch` roster (#598/#678); **#680** tracks two fail-opens
-> found in that workflow post-merge. **#663 / D108-D118 is ACTIVE (31 Jul):** the
+> found in that workflow post-merge.
+> [Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file: `main`
+> no longer requires any approving review, and the D108-D118 mechanism below
+> is retained but dormant.]
+> <!-- historical-evidence: begin -->
+> **[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by the D-ToS-1
+> governance reconciliation at the top of this file.]**
+> **#663 / D108-D118 is ACTIVE (31 Jul):** the
 > PR-scoped Claude approval bridge and bounded solo-maintainer privileged override are
 > on `main`; live adversarial proofs passed; `main` now requires one stale-dismissing
 > approval. The temporary 25-Jul Claude outage exception is closed. The retired
-> SHA-scoped `review-gate` must not be restored. **#683 CodeQL triage is down from
+> SHA-scoped `review-gate` must not be restored.
+> <!-- historical-evidence: end -->
+> **#683 CodeQL triage is down from
 > 3,532 alerts to one open first-party alert** (`js/prototype-pollution-utility` in
 > `web/src/pages/config/configState.ts`); the fixture-provenance, workflow-permission,
 > Python logging, and digest batches are complete, but #683 stays open for that final
@@ -1247,6 +1286,17 @@ recovery evidence. It does not prove advisor use or hardware behaviour; #742
 was not merged or closed at that pre-merge point, then subsequently merged and
 closed via PR #851.
 
+[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file: `main` no
+longer requires any approving review. The 31 Jul 2026 "CLAUDE PR-SCOPED
+APPROVAL RESTORED (#663 / D108-D118)" record immediately below is retained
+verbatim as historical evidence; it is dormant, not current policy.]
+
+<!-- historical-evidence: begin -->
+
+**[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by the D-ToS-1
+governance reconciliation recorded at the top of this file. The approval
+requirement this record describes no longer applies.]**
+
 **31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL RESTORED (#663 / D108-D118).** The
 25-Jul operator-authorized outage exception is closed. The trusted bridge merged in
 #679 and the bounded privileged-PR override merged in #688. The pre-activation
@@ -1344,6 +1394,8 @@ Strict required-status mode, stale-review dismissal, admin enforcement, and
 disabled protected-base force-push/deletion are load-bearing for D110: a normal
 base-tip advance cannot merge a behind head, and the required head update
 dismisses approval and starts fresh review.
+
+<!-- historical-evidence: end -->
 
 **25 Jul 2026 — #665 MCP/pytest shutdown hardening completed (D104).** Three CI runs reached
 the complete pytest summary and then failed to exit, exposing lifecycle ownership bugs rather than
@@ -2290,8 +2342,13 @@ Everything else remains exactly as the 24 Jun block records: **roast 4 (#134) is
 config that roast 4 must validate is confirmed live on `main`: MCP pin `0.1.8` (`pyproject.toml:115`),
 `late_maillard_trim` default 65 %/60 s/155 °C (`config.py` `LateMaillardTrim`, default fields ~L126–138), advisor `prompt_version="c3"`
 (`config.py:479`). Operator prerequisite unchanged: a **fresh, non-expiring OpenRouter key** (the
-13 Jun attempt-1 failure mode). Open operator action carried over: arm the `review-gate` required
-check (#159 / D58).
+13 Jun attempt-1 failure mode).
+<!-- historical-evidence: begin -->
+**[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this
+file.]**
+Open operator action carried over: arm the `review-gate` required check (#159 /
+D58).
+<!-- historical-evidence: end -->
 
 **24 Jun 2026 — PRE-ROAST-4 RELIABILITY + CLEANUP BATCH COMPLETE (the measured "after-v2"
 PR-hygiene sample). The next gate remains the operator running roast 4.** Four issues closed as
@@ -2313,11 +2370,15 @@ the pre-open domain reviewer on the branch) and independent D23 triage (author n
   `_stop_unconfirmed` in `start()`. Markers are diagnosis-only — restart still enters
   `operator_recovery_required`. safety-reviewer PASS.
 - **#159 — auto-merge-before-`claude-review` race — FIXED + plan D58 (PR #366, `12d14e1`).** A
+  <!-- historical-evidence: begin -->
+  **[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this
+  file.]**
   skip-aware `review-gate` commit-status workflow (pending on open → success-only/fail-closed when
   Claude Code Review completes; Dependabot + workflow-editing PRs auto-pass at stamp time).
   **Validated end-to-end on three real PRs this batch** (#366/#367/#368). **OPERATOR ACTION
   OUTSTANDING:** mark `review-gate` a REQUIRED status check on `main` to arm it (build gate + operator
   activates; the mechanism is inert until required). See plan D58.
+  <!-- historical-evidence: end -->
 - **#306 — per-tick MCP console flood — CLOSED via the MCP release lockstep.** Root cause is
   child-side (the MCP SDK's `mcp.server.lowlevel.server` per-request INFO, piped as raw stderr — the
   agent can't filter another process's logger), so NO agent code change. Fixed in
@@ -2336,8 +2397,13 @@ caveat: an independent post-open lens (Augment) still earned its keep twice; shi
 are metric-blind (#306 resolved with zero agent code; the folded coverage gap). Memory
 `pr-flow-improvement-experiment`.
 
-**Still open / next:** **operator activates the `review-gate` required check (#159 / D58)**; everything
-else is OPERATOR-GATED — **roast 4 (#134)** + device SSE (#135), then the post-roast-4 sequence (#323
+**Still open / next:**
+<!-- historical-evidence: begin -->
+**[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this
+file.]**
+**operator activates the `review-gate` required check (#159 / D58)**
+<!-- historical-evidence: end -->
+Everything else is OPERATOR-GATED — **roast 4 (#134)** + device SSE (#135), then the post-roast-4 sequence (#323
 ceiling-override → #228 LAST → M2/D42). Untouched: #318. Nothing else agent-startable until roast 4.
 
 **#300 — roast-data pipeline (D44) — DONE (store → labelled replay fixture).** The store-side
@@ -2551,12 +2617,15 @@ D35 build. Honest state:
   (#254) curve hydration, #242 (#248) name-keyed rows, #103 (#251) replay-harness
   hardening, #257 Dependabot. **#112 closed** (GAP A shipped via #220; GAP B = live
   FC-detector health is M2/MCP scope, out of E10).
+<!-- historical-evidence: begin -->
+**[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this file.]**
 - **Governance / CI — DONE:** PR review roster = Claude Code Review (+ human reviewers);
   the Augment Code trial ended 28 Jun 2026, and Codex + CodeRabbit were disabled (#246,
   **plan D37**) — a conversation-resolution gate + a re-review-on-every-push bot was a
   non-terminating merge loop. CI Playwright
   image mirrored to GHCR off MCR's anonymous-pull hot path; `mirror-playwright.yml`
   self-refreshes weekly + on bump (#262/#263, **plan D38**).
+<!-- historical-evidence: end -->
 
 **Remaining backlog:**
 - **D35 keystone (epic #221) — pre-FC floor + post-FC loop SHIPPED + hardware-validated
@@ -2742,12 +2811,15 @@ hardening, NOT a start on E11 implementation (still gated):
   safety path (controller e-stop) BEFORE stopping the MCP child, bounded + fail-closed
   (#142). A hard kill (SIGKILL/power loss) is uncatchable → still restart →
   `operator_recovery_required`, never auto-resume.
+<!-- historical-evidence: begin -->
+**[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this file.]**
 - **Governance-as-code:** `main` is branch-protected (required checks + codecov +
   `required_conversation_resolution` + `enforce_admins`, no bypass; auto-merge on).
   `claude-review` posts **blocking inline** findings (`--comment`) but is intentionally
   **NOT a required check** (fails by design on workflow-editing + Dependabot PRs; the
   gate is the inline threads + conversation-resolution). AGENTS.md gained a **Code
   Review Rubric** (#147).
+<!-- historical-evidence: end -->
 - **Demo/operator ergonomics:** one-command launch scripts `scripts/roast-replay.sh`
   (#135 device test) + `scripts/roast-live.sh` (#134), wait-for-ready + rebuild-stale-SPA
   (#150–#152); the **known-good MCP config** at
