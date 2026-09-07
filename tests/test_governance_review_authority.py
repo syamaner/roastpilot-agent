@@ -1035,6 +1035,12 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
         "gh variable -R owner/repo list CLAUDE_HEADLESS_ENABLED --body true"
     )
     assert not _is_affirmative_enablement_instruction(
+        "gh --unlisted owner/repo variable set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh variable --unlisted owner/repo set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
         "gh variable set\nunconnected prose\nCLAUDE_HEADLESS_ENABLED --body true"
     )
     assert _is_affirmative_enablement_instruction(
