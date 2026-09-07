@@ -277,8 +277,10 @@ def _is_affirmative_enablement_instruction(text: str) -> bool:
         r"(?:=\s*|to\s+)['\"]?true['\"]?\b",
         re.IGNORECASE,
     )
+    repo_flag = r"(?:(?:-R|--repo)(?:\s+|=)(?:['\"][^'\"]+['\"]|[^\s;|&]+)\s+)"
     gh_variable_set = re.compile(
-        r"(?P<prohibition>\b(?:do not|never)\s+)?gh\s+variable\s+set\b",
+        r"(?P<prohibition>\b(?:do not|never)\s+)?gh\s+"
+        rf"(?:{repo_flag})?variable\s+(?:{repo_flag})?set\b",
         re.IGNORECASE,
     )
     explicit_false_body = re.compile(
@@ -972,6 +974,18 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
     assert _is_affirmative_enablement_instruction(
         'gh variable set -R "owner/repo" CLAUDE_HEADLESS_ENABLED -b true'
     )
+    assert _is_affirmative_enablement_instruction(
+        "gh -R owner/repo variable set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh --repo=owner/repo variable set CLAUDE_HEADLESS_ENABLED -b='true'"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable -R owner/repo set CLAUDE_HEADLESS_ENABLED --body=true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        'gh variable --repo "owner/repo" set CLAUDE_HEADLESS_ENABLED -b true'
+    )
     assert _is_affirmative_enablement_instruction("gh variable set CLAUDE_HEADLESS_ENABLED")
     assert _is_affirmative_enablement_instruction(
         "printf true | gh variable set CLAUDE_HEADLESS_ENABLED"
@@ -1004,6 +1018,8 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
         "gh variable set CLAUDE_HEADLESS_ENABLED --body false.",
         "gh variable set --repo=owner/repo CLAUDE_HEADLESS_ENABLED --body 'false'",
         "gh variable set -R owner/repo CLAUDE_HEADLESS_ENABLED -b=false",
+        "gh -R owner/repo variable set CLAUDE_HEADLESS_ENABLED --body false",
+        "gh variable --repo=owner/repo set CLAUDE_HEADLESS_ENABLED -b='false'",
     ):
         assert not _is_affirmative_enablement_instruction(false_body)
     assert not _is_affirmative_enablement_instruction(
@@ -1011,6 +1027,12 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
     )
     assert not _is_affirmative_enablement_instruction(
         "gh variable set --repo owner/repo OTHER_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh --repo owner/repo variable set OTHER_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh variable -R owner/repo list CLAUDE_HEADLESS_ENABLED --body true"
     )
     assert not _is_affirmative_enablement_instruction(
         "gh variable set\nunconnected prose\nCLAUDE_HEADLESS_ENABLED --body true"
@@ -1029,6 +1051,12 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
     )
     assert not _is_affirmative_enablement_instruction(
         "Never gh variable set --repo owner/repo CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "Do not gh --repo owner/repo variable set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "Never gh variable -R owner/repo set CLAUDE_HEADLESS_ENABLED --body true"
     )
 
 
@@ -1179,6 +1207,10 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
         "gh variable set --repo owner/repo CLAUDE_HEADLESS_ENABLED --body true",
         "gh variable set -R=owner/repo CLAUDE_HEADLESS_ENABLED -b='true'",
+        "gh -R owner/repo variable set CLAUDE_HEADLESS_ENABLED --body true",
+        "gh --repo=owner/repo variable set CLAUDE_HEADLESS_ENABLED -b='true'",
+        "gh variable -R owner/repo set CLAUDE_HEADLESS_ENABLED --body=true",
+        'gh variable --repo "owner/repo" set CLAUDE_HEADLESS_ENABLED -b true',
     ):
         with pytest.raises(AssertionError):
             _assert_canonical_live_policy(agents + "\n" + instruction)
@@ -1282,6 +1314,10 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
         "gh variable set --repo owner/repo CLAUDE_HEADLESS_ENABLED --body true",
         "gh variable set -R=owner/repo CLAUDE_HEADLESS_ENABLED -b='true'",
+        "gh -R owner/repo variable set CLAUDE_HEADLESS_ENABLED --body true",
+        "gh --repo=owner/repo variable set CLAUDE_HEADLESS_ENABLED -b='true'",
+        "gh variable -R owner/repo set CLAUDE_HEADLESS_ENABLED --body=true",
+        'gh variable --repo "owner/repo" set CLAUDE_HEADLESS_ENABLED -b true',
     ):
         with pytest.raises(AssertionError):
             _assert_registry_policy(registry + "\n" + instruction)
@@ -1316,6 +1352,10 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             "required_approving_review_count = 0",
             "required_approving_review_count: 0",
             "gh variable set --repo=owner/repo CLAUDE_HEADLESS_ENABLED --body 'false'",
+            "gh -R owner/repo variable set CLAUDE_HEADLESS_ENABLED --body false",
+            "Never gh variable --repo=owner/repo set CLAUDE_HEADLESS_ENABLED -b true",
+            "gh --repo owner/repo variable set OTHER_HEADLESS_ENABLED --body true",
+            "gh variable -R owner/repo list CLAUDE_HEADLESS_ENABLED --body true",
             "Do not gh variable set -R owner/repo CLAUDE_HEADLESS_ENABLED --body true",
             "gh variable set --repo owner/repo OTHER_HEADLESS_ENABLED --body true",
         ):
