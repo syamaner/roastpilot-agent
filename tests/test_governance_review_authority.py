@@ -1817,6 +1817,14 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         quoted_fence_before_range, start_boundary, end_boundary
     )
 
+    nested_blockquote_fence = ">> ```\ncanonical start\ncanonical end"
+    start_boundary = nested_blockquote_fence.index("canonical start")
+    end_boundary = nested_blockquote_fence.index("canonical end")
+    assert nested_blockquote_fence.index("```") < start_boundary < end_boundary
+    _assert_canonical_range_is_outside_markdown_fences(
+        nested_blockquote_fence, start_boundary, end_boundary
+    )
+
     quoted_start_outside_end_inside = "> canonical start\n> ```\n> canonical end\n> ```\n"
     start_boundary = quoted_start_outside_end_inside.index("canonical start")
     opening_fence = quoted_start_outside_end_inside.index("```")
@@ -1971,6 +1979,15 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     end_boundary = mid_line_tab.index("canonical end")
     assert mid_line_tab.index("\t") > start_boundary
     _assert_fixed_policy_range_is_not_indented_code(mid_line_tab, start_boundary, end_boundary)
+
+    # Tab-stop column arithmetic is deliberately deferred to follow-up #942.
+    two_spaces_then_tab = "  \tcanonical start\ncanonical end"
+    start_boundary = two_spaces_then_tab.index("canonical start")
+    end_boundary = two_spaces_then_tab.index("canonical end")
+    assert two_spaces_then_tab.startswith("  \t")
+    _assert_fixed_policy_range_is_not_indented_code(
+        two_spaces_then_tab, start_boundary, end_boundary
+    )
 
     _assert_policy_range_is_outside_code_spans(agents, start, end)
 
