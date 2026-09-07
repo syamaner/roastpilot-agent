@@ -1487,6 +1487,27 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         closed_comment_before_range, start_boundary, end_boundary
     )
 
+    orphan_close_before_pair = "-->\n<!-- valid -->\n" + agents
+    mutated_start, mutated_end = _canonical_bullet_bounds(orphan_close_before_pair)
+    orphan_close = orphan_close_before_pair.index("-->")
+    opening_comment = orphan_close_before_pair.index("<!--")
+    closing_comment = orphan_close_before_pair.index("-->", orphan_close + len("-->"))
+    assert orphan_close < opening_comment < closing_comment < mutated_start < mutated_end
+    _assert_canonical_live_policy(orphan_close_before_pair)
+
+    malformed_browser_terminator = agents[:start] + "<!-- malformed --!>" + agents[start:]
+    mutated_start, mutated_end = _canonical_bullet_bounds(malformed_browser_terminator)
+    opening_comment = mutated_start - len("<!-- malformed --!>")
+    malformed_terminator = malformed_browser_terminator.index("--!>", opening_comment)
+    assert opening_comment < malformed_terminator < mutated_start < mutated_end
+    assert (
+        _normalized_visible(malformed_browser_terminator[mutated_start:mutated_end])
+        == _CANONICAL_POLICY_SNAPSHOT
+    )
+    _assert_historical_span_hashes(malformed_browser_terminator, "AGENTS.md")
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(malformed_browser_terminator)
+
     adjacent_empty_comments = "<!----><!---->\ncanonical start\ncanonical end"
     start_boundary = adjacent_empty_comments.index("canonical start")
     end_boundary = adjacent_empty_comments.index("canonical end")
