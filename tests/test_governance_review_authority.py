@@ -409,6 +409,42 @@ def _assert_policy_range_is_outside_processing_instructions(
         next_boundary = next(boundaries, None)
 
 
+def _assert_policy_range_is_outside_declarations(text: str, start: int, end: int) -> None:
+    """Reject a non-nesting CommonMark Type-4 declaration span at policy boundaries."""
+    boundaries = iter(sorted((start, end)))
+    next_boundary = next(boundaries, None)
+    declaration_open = False
+    declaration_opener = re.compile(r"<![A-Z]")
+    scan_start = 0
+    while True:
+        opening_match = declaration_opener.search(text, scan_start)
+        opening_start = opening_match.start() if opening_match else -1
+        closing_start = text.find(">", scan_start)
+        if opening_start == closing_start == -1:
+            break
+        if closing_start == -1 or (opening_start != -1 and opening_start < closing_start):
+            marker_start = opening_start
+            marker_length = len("<!")
+            opening = True
+        else:
+            marker_start = closing_start
+            marker_length = len(">")
+            opening = False
+
+        while next_boundary is not None and next_boundary <= marker_start:
+            assert not declaration_open
+            next_boundary = next(boundaries, None)
+        if opening and not declaration_open:
+            declaration_open = True
+        elif not opening and declaration_open:
+            declaration_open = False
+        scan_start = marker_start + marker_length
+
+    while next_boundary is not None:
+        assert not declaration_open
+        next_boundary = next(boundaries, None)
+
+
 def _assert_policy_range_is_outside_code_spans(text: str, start: int, end: int) -> None:
     """Reject non-nesting exact-run Markdown code-span state at policy boundaries."""
     boundaries = iter(sorted((start, end)))
@@ -436,6 +472,7 @@ def _assert_fixed_operative_range_is_visible(text: str, start: int, end: int) ->
     _assert_fixed_policy_range_is_not_indented_code(text, start, end)
     _assert_policy_range_is_outside_raw_text_blocks(text, start, end)
     _assert_policy_range_is_outside_processing_instructions(text, start, end)
+    _assert_policy_range_is_outside_declarations(text, start, end)
     _assert_policy_range_is_outside_code_spans(text, start, end)
 
 
@@ -1592,6 +1629,68 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         _assert_policy_range_is_outside_processing_instructions(
             unterminated_processing_instruction, start_boundary, end_boundary
         )
+
+    declaration_canonical = (
+        agents[:canonical_line_start] + "<!DOCTYPE\n" + agents[canonical_line_start:] + "\n>\n"
+    )
+    declaration_start, declaration_end = _canonical_bullet_bounds(declaration_canonical)
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_declarations(
+            declaration_canonical, declaration_start, declaration_end
+        )
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(declaration_canonical)
+
+    declaration_registry = (
+        registry[:registry_header] + "<!DOCTYPE\n" + registry[registry_header:] + "\n>\n"
+    )
+    declaration_start = declaration_registry.index("## Active Epic")
+    declaration_end = declaration_registry.index("\n**1 Sep 2026", declaration_start)
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_declarations(
+            declaration_registry, declaration_start, declaration_end
+        )
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(declaration_registry)
+
+    closed_declaration_before_range = "<!DOCTYPE html>\ncanonical start\ncanonical end"
+    start_boundary = closed_declaration_before_range.index("canonical start")
+    end_boundary = closed_declaration_before_range.index("canonical end")
+    assert (
+        closed_declaration_before_range.index("<!")
+        < closed_declaration_before_range.index(">")
+        < start_boundary
+    )
+    _assert_policy_range_is_outside_declarations(
+        closed_declaration_before_range, start_boundary, end_boundary
+    )
+
+    unterminated_declaration = "<!DOCTYPE\ncanonical start\ncanonical end"
+    start_boundary = unterminated_declaration.index("canonical start")
+    end_boundary = unterminated_declaration.index("canonical end")
+    assert unterminated_declaration.index("<!") < start_boundary < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_declarations(
+            unterminated_declaration, start_boundary, end_boundary
+        )
+
+    lowercase_declaration_non_opener = "<!doctype\ncanonical start\ncanonical end"
+    start_boundary = lowercase_declaration_non_opener.index("canonical start")
+    end_boundary = lowercase_declaration_non_opener.index("canonical end")
+    assert lowercase_declaration_non_opener.startswith("<!d")
+    _assert_policy_range_is_outside_declarations(
+        lowercase_declaration_non_opener, start_boundary, end_boundary
+    )
+
+    first_declaration_terminator = "<!A> >\ncanonical start\ncanonical end"
+    start_boundary = first_declaration_terminator.index("canonical start")
+    end_boundary = first_declaration_terminator.index("canonical end")
+    first_terminator = first_declaration_terminator.index(">")
+    second_terminator = first_declaration_terminator.index(">", first_terminator + 1)
+    assert first_terminator < second_terminator < start_boundary < end_boundary
+    _assert_policy_range_is_outside_declarations(
+        first_declaration_terminator, start_boundary, end_boundary
+    )
 
     closed_raw_text_before_range = "<pre></pre>\ncanonical start\ncanonical end"
     start_boundary = closed_raw_text_before_range.index("canonical start")
