@@ -291,18 +291,35 @@ def _assert_canonical_range_is_outside_markdown_fences(text: str, start: int, en
 
 
 def _assert_policy_range_is_outside_html_comments(text: str, start: int, end: int) -> None:
-    """Reject a non-nested HTML comment state covering either policy boundary."""
+    """Reject a non-nested HTML comment state covering either policy boundary.
+
+    The exact GFM ``-->`` terminator is intentional; browser ``--!>`` handling
+    is outside this source-state guard.
+    """
     boundaries = iter(sorted((start, end)))
     next_boundary = next(boundaries, None)
     comment_open = False
-    for marker in re.finditer(r"<!--|-->", text):
-        while next_boundary is not None and next_boundary <= marker.start():
+    scan_start = 0
+    while True:
+        opening_start = text.find("<!--", scan_start)
+        closing_start = text.find("-->", scan_start)
+        if opening_start == closing_start == -1:
+            break
+        if closing_start == -1 or (opening_start != -1 and opening_start < closing_start):
+            marker_start = opening_start
+            marker = "<!--"
+        else:
+            marker_start = closing_start
+            marker = "-->"
+
+        while next_boundary is not None and next_boundary <= marker_start:
             assert not comment_open
             next_boundary = next(boundaries, None)
-        if marker.group() == "<!--" and not comment_open:
+        if marker == "<!--" and not comment_open:
             comment_open = True
-        elif marker.group() == "-->" and comment_open:
+        elif marker == "-->" and comment_open:
             comment_open = False
+        scan_start = marker_start + len(marker)
 
     while next_boundary is not None:
         assert not comment_open
@@ -1468,6 +1485,18 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     )
     _assert_policy_range_is_outside_html_comments(
         closed_comment_before_range, start_boundary, end_boundary
+    )
+
+    adjacent_empty_comments = "<!----><!---->\ncanonical start\ncanonical end"
+    start_boundary = adjacent_empty_comments.index("canonical start")
+    end_boundary = adjacent_empty_comments.index("canonical end")
+    first_opening = adjacent_empty_comments.index("<!--")
+    first_closing = adjacent_empty_comments.index("-->")
+    second_opening = adjacent_empty_comments.index("<!--", first_opening + len("<!--"))
+    second_closing = adjacent_empty_comments.index("-->", first_closing + len("-->"))
+    assert first_opening < first_closing < second_opening < second_closing < start_boundary
+    _assert_policy_range_is_outside_html_comments(
+        adjacent_empty_comments, start_boundary, end_boundary
     )
 
     # Intentionally fail-closed raw scanner independence, not HTML-in-Markdown parsing.
