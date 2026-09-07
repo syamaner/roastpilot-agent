@@ -6189,6 +6189,7 @@ def test_docs_reading_tests_carry_the_exact_docs_marker_and_nothing_else() -> No
         _REPO / "tests" / "test_agent_worktree_controls.py",
         _REPO / "tests" / "test_capture_agent_usage.py",
         _REPO / "tests" / "test_config.py",
+        _REPO / "tests" / "test_governance_review_authority.py",
         _REPO / "tests" / "test_pytest_governance.py",
         _REPO / "tests" / "test_worktree_gate_recipe.py",
     }

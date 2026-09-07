@@ -211,17 +211,39 @@ clean.
 - Re-run the checks after any fix; only merge once CI is green *and* every
   comment is resolved or consciously dismissed.
 - **`main` is branch-protected (13 Jun, enforces this policy at the platform).**
-  Required: the CI checks + `codecov/patch`,
-  `required_conversation_resolution` (every review thread resolved), and
-  `enforce_admins` (no bypass for owner or agents); force-push/deletion off; repo
-  auto-merge on. See the live PR-scoped Claude approval policy below. **`claude-review` is
+  Required, verified live 6 Sep 2026: app-pinned `Checks`, `Web (lint +
+  typecheck + unit)`, `Web (Playwright snapshots)`, and `codecov/patch`;
+  strict mode; `required_conversation_resolution` (every review thread
+  resolved); and `enforce_admins` (no bypass for owner or agents);
+  force-push/deletion off; repo auto-merge on. **`main` currently requires
+  zero approving reviews** — consumer-OAuth headless Claude CI is retired
+  under D-ToS-1 (`CLAUDE_HEADLESS_ENABLED` unset); see the precedence
+  subsection below for the operative merge-bar description and the
+  retained-but-dormant D108-D118 mechanism. **`claude-review` is
   intentionally NOT a required check** — it fails by design on PRs that edit a
   workflow file (the App's workflow-validation guard) and on Dependabot PRs (no
-  secrets), and it passes-on-findings; so the findings gate is its **inline
-  comments** (`--comment`) + conversation-resolution, not the check itself. Don't
+  secrets), and it passes-on-findings; so the findings gate is GitHub Codex's
+  inline comments + conversation-resolution, not the check itself. Don't
   re-add it as required (it would deadlock workflow PRs). Green CI alone never
   means mergeable.
-- **PR-scoped Claude restoration (#663 / D108-D118; activation follows the mechanism
+- **Precedence for the GitHub-Claude required-approval description under
+  D-ToS-1 only.** `AGENTS.md` plus `docs/state/registry.md` are the sole
+  operative authorities for whether a GitHub-hosted Claude review currently
+  gates a required approving review on `main`. Where another file's text
+  about that one specific fact conflicts with the verified live state
+  recorded here (for example `.claude/skills/pr-preflight/SKILL.md` or
+  `docs/agent-topology.md`), that other file's conflicting sentence is
+  superseded and historical; those files are not edited by this
+  reconciliation. This narrow precedence does not extend to any other
+  skill, plan, or review rule, and does not override an explicit operator
+  instruction.
+- Mechanism retained but **dormant**: the design in this bullet gates nothing
+  today under the verified 6 Sep 2026 state (`main` requires zero approving
+  reviews). Restoring it is an operator-owned branch-protection decision, not
+  an automatic consequence of this record.
+  <!-- historical-evidence: begin -->
+  **[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by D-ToS-1.]**
+  **PR-scoped Claude restoration (#663 / D108-D118; activation follows the mechanism
   PR).** `review-gate` remains permanently retired: commit statuses cannot prove
   PR-specific review coverage, distinguish two PRs sharing a head SHA, or bind a
   draft review to the intended PR generation. The trusted
@@ -233,7 +255,21 @@ clean.
   every code push; Claude's inline findings remain separately gated by
   conversation resolution. A human approval satisfies GitHub's numeric platform
   rule but is an explicit operator override, not evidence that Claude ran.
-- **Activation state — LIVE 31 Jul 2026 (#663 / D108-D118).**
+  <!-- historical-evidence: end -->
+- **Verified live state — 6 Sep 2026 (D-ToS-1).** `main` currently requires
+  **zero** approving reviews. Required, app-pinned: `Checks`, `Web (lint +
+  typecheck + unit)`, `Web (Playwright snapshots)`, and `codecov/patch`;
+  strict mode, `required_conversation_resolution`, and `enforce_admins`
+  remain enabled; force-push/deletion off. Consumer-OAuth headless Claude CI
+  is retired (`CLAUDE_HEADLESS_ENABLED` unset; a skipped headless job is
+  expected, never a failure, and never a reason to set the variable). The
+  merge bar instead rests on CI, `codecov/patch`, CodeQL handling, GitHub
+  Codex's exact-current-head review and wait, `required_conversation_resolution`,
+  independent triage, and risk-routed authenticated local Claude assurance
+  (below).
+  <!-- historical-evidence: begin -->
+  **[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by D-ToS-1.]**
+  **Activation state — LIVE 31 Jul 2026 (#663 / D108-D118).**
   The live required status set is `Checks`, `Web (lint + typecheck + unit)`,
   `Web (Playwright snapshots)`, and `codecov/patch`, all app-pinned; strict mode,
   `required_conversation_resolution`, and `enforce_admins` remain enabled.
@@ -242,8 +278,10 @@ clean.
   `main` requires one approving review and dismisses stale approvals. The trusted
   bridge is on `main`, and the live PR-scoping, draft/ready, stale-push, rerun,
   privileged-override, ordinary-rejection, and exact-current-head proofs passed.
-  The 25-Jul outage exception is closed. Never restore enforcement by re-requiring
-  the known-unsafe SHA-scoped `review-gate`.
+  The 25-Jul outage exception is closed.
+  <!-- historical-evidence: end -->
+  Never restore enforcement by re-requiring the known-unsafe SHA-scoped
+  `review-gate`.
 - **Independent triage when work is delivered by an agent team (D23).** PR
   review feedback (the GitHub review roster below, codecov, and any selected
   local review) is adjudicated by the lead/orchestrator or the `pr-triage`
@@ -352,14 +390,33 @@ checklist before you open.
 
 ## Code Review Rubric
 
-**The PR review roster (operator, 30 Jun 2026): `Claude Code Review` + `Codex`
-(advisory-but-triaged) + any human reviewer.** The automated **Claude Code Review**
-(`.github/workflows/claude-code-review.yml`, running `/code-review --comment`), the
-**Codex** connector, and any human reviewer follow this rubric. **CodeRabbit stays
-disabled (15 Jun) and the Augment Code trial ENDED (28 Jun).**
+**The PR review roster (verified live 6 Sep 2026, D-ToS-1): GitHub `Codex`
+(exact-current-head review + wait, advisory-but-triaged), risk-routed
+authenticated local Claude assurance (`safety-reviewer`, `security-reviewer`,
+`qa`, etc., per the routing table below), independent triage, and any human
+reviewer.** The hosted headless **Claude Code Review**
+(`.github/workflows/claude-code-review.yml`, running `/code-review --comment`)
+job is retired/dormant: it SKIPS while `CLAUDE_HEADLESS_ENABLED` is unset, so
+it is no longer a live roster member. **CodeRabbit stays disabled (15 Jun) and
+the Augment Code trial ENDED (28 Jun).**
+<!-- historical-evidence: begin -->
+**[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by D-ToS-1.]**
 D108-D118 are active as of 31 Jul 2026. The temporary 25-Jul outage exception is
 closed; the PR-scoped approval, applicable shift-left domain reviewers, and
 independent triage are required lenses.
+<!-- historical-evidence: end -->
+The applicable shift-left domain reviewers and independent triage remain
+required lenses; only the GitHub Claude PR-scoped approval left the live set
+(it is retained but dormant — see above).
+
+Preserved as the D108-D118 design/evidence record: this wait does not gate
+merge under the current verified state (`main` requires zero approving
+reviews — see the precedence subsection above).
+
+<!-- historical-evidence: begin -->
+
+**[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by D-ToS-1. This wait
+does not gate merge today; see the precedence subsection above.]**
 
 **WAIT for Claude's PR-scoped approval before merging (D108 amended by D109-D118;
 active 31 Jul 2026).** The required evidence is a `github-actions[bot]` approval whose
@@ -480,6 +537,8 @@ Dependabot PRs. Operate the gate as follows:
   privileged PRs, use only the D118 dispatch above so the counting approval itself
   carries the operator and reason.
 
+<!-- historical-evidence: end -->
+
 **Codex (`chatgpt-codex-connector[bot]`) was RE-ENABLED 30 Jun** after its 15-Jun
 disable, because on real PRs it catches bugs the other lenses miss (on the Config UI
 build it found a roast-breaking config regression that the Opus `safety-reviewer`
@@ -524,9 +583,11 @@ different mechanisms: the automatic trigger does not fire until ready, while an 
 comment runs but cannot produce a clean verdict there. Neither makes the draft a place to
 converge to clean. Draft = fold locally and let the runner
 gates (`ci.yml`, tests, `ruff`, `pyright`) run; ready = the automatic Codex review fires on
-that head, then once-on-final-commit applies to any later push. Opening a draft does still
-run `claude-review` (`on: opened`), fine, it is not a required check; unlike Codex, that
-workflow is not suppressed on draft, so its findings there are real and worth folding.
+that head, then once-on-final-commit applies to any later push. Opening a draft still
+triggers the `claude-review` workflow's `on: opened` event, but under D-ToS-1 the job
+itself SKIPS while `CLAUDE_HEADLESS_ENABLED` is unset — it is not a required check, and a
+skipped run posts no findings to fold. Unlike Codex, this job is not draft-suppressed by
+GitHub; it is gated off by the headless retirement instead.
 
 **WAIT for Codex's verdict before merging (operator rule, 12 Jul — the #518 lesson):**
 Codex is often DELAYED relative to CI, and green-CI auto-merge can land a PR before its
@@ -632,7 +693,11 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
 
 > Note: `claude-review` is intentionally **not** a required status check — it fails
 > by design on PRs that edit a workflow file (the App's workflow-validation guard),
-> and it passes even when it finds bugs. The real findings-gate is these inline
+> and it passes even when it finds bugs. It additionally SKIPS while
+> `vars.CLAUDE_HEADLESS_ENABLED` is unset (`.github/workflows/claude-code-review.yml:27-41`);
+> a skipped headless job is expected, never a failure, and never a reason to set the
+> variable or re-trigger. `.github/workflows/claude.yml:14-26`'s `@claude` responder is
+> gated off the same way. The real findings-gate is GitHub Codex's inline
 > threads + `required_conversation_resolution`; the required checks are CI + codecov.
 
 ## Codex-Led Delivery Topology
@@ -755,10 +820,9 @@ Codex parent remains the orchestrator whichever family implements.
 
 ### Minimum sufficient local review
 
-This routing changes only additional local/pre-open model review. The GitHub
-Claude exact-head approval, ready-head Codex review and wait, branch protection,
-conversation resolution, CI, CodeQL handling, and `codecov/patch` rules above
-remain unchanged.
+This routing changes only additional local/pre-open model review. Ready-head
+Codex review and wait, branch protection, conversation resolution, CI, CodeQL
+handling, and `codecov/patch` rules above remain unchanged.
 
 - Ordinary slice: deterministic gates plus one independent, diff-focused review;
   do not run the full Claude roster.

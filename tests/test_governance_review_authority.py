@@ -1,0 +1,3115 @@
+"""Governance regression coverage for the D-ToS-1 reconciliation (#938).
+
+This module guards the reconciliation of the GitHub-Claude review-gate
+description in ``AGENTS.md`` and ``docs/state/registry.md`` with the live,
+verified 6 Sep 2026 state: consumer-OAuth headless Claude CI is retired under
+D-ToS-1 (merged in agent commit ``299fb5a93d09e54f58d370f7a35e5ce15f278150``,
+PR #923) and ``main`` currently requires zero approving reviews. The D108-D118
+PR-scoped Claude approval bridge mechanism is retained but dormant.
+
+The closed grammar (contract §2.2) splits each governed file's text into two
+mutually exclusive classes: HISTORICAL/DORMANT blocks, delimited by literal
+``<!-- historical-evidence: begin/end -->`` HTML-comment markers on their own
+line, and OPERATIVE text (everything else). A forbidden phrase set (P) may
+only appear inside a historical block; a required phrase set (R) must appear
+at least once in operative text. The parser in this module fails closed on
+any malformed marker structure (unclosed, orphaned, nested, or reversed)
+rather than silently reporting zero historical blocks.
+
+T5 (the D-ToS-1 headless-gate mechanism still matches its documented
+description) has split witnesses. The ``claude-code-review.yml`` reviewer
+job's exact ``if:`` condition (the Dependabot-author guard AND the
+`CLAUDE_HEADLESS_ENABLED` conjunct) remains asserted, byte-for-byte, by the existing, unchanged
+``tests/test_claude_review_approval.py::test_track_progress_disabled_only_for_unsupported_pull_request_actions``
+regression test. This module adds the distinct ``claude.yml`` responder-job
+conjunct witness, including in-memory negative controls; it does not duplicate
+the reviewer assertion.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from pathlib import Path
+from typing import cast
+
+import pytest
+import yaml
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_AGENTS_MD_PATH = _REPO_ROOT / "AGENTS.md"
+
+_BEGIN_MARKER = "<!-- historical-evidence: begin -->"
+_END_MARKER = "<!-- historical-evidence: end -->"
+
+# Phrase set P (contract §2.2): forbidden anywhere outside a historical
+# block, case-insensitive, in AGENTS.md and docs/state/registry.md.
+_FORBIDDEN_PHRASES: tuple[str, ...] = (
+    "requires one approving review",
+    "one approval with stale dismissal",
+    "stale-dismissing approval",
+    "WAIT for Claude's PR-scoped approval",
+    "Activation state — LIVE",
+    "D108-D118 are active",
+    "is ACTIVE (31 Jul)",
+)
+
+# The single canonical operative statement of the current merge bar. T2 is
+# scoped exactly to this bullet's body (heading through the historical
+# marker that follows it) so that an unrelated prose fragment elsewhere in
+# the document can never silently satisfy the retained-requirements guard.
+_CANONICAL_LIVE_STATE_HEADING = "**Verified live state — 6 Sep 2026 (D-ToS-1).**"
+
+# The complete retained gate list (contract §2.2 phrase set R, scoped to the
+# canonical bullet): Codex review AND wait, independent triage, local Claude
+# assurance, CI, CodeQL, conversation resolution, strict/app-pinned
+# checks/admin enforcement (including the four exact app-pinned check
+# names), and zero approving reviews.
+_CANONICAL_LIVE_STATE_REQUIRED_PHRASES: tuple[str, ...] = (
+    "CLAUDE_HEADLESS_ENABLED",
+    "requires zero approving reviews",
+    "strict mode",
+    "app-pinned",
+    "enforce_admins",
+    "required_conversation_resolution",
+    "rests on CI",
+    "CodeQL handling",
+    "Codex's exact-current-head review and wait",
+    "independent triage",
+    "risk-routed authenticated local Claude assurance",
+)
+
+_REQUIRED_OPERATIVE_AGENTS_SENTENCES: tuple[str, ...] = (
+    "Never restore enforcement by re-requiring the known-unsafe SHA-scoped\n  `review-gate`.",
+    "The applicable shift-left domain reviewers and independent triage remain\n"
+    "required lenses; only the GitHub Claude PR-scoped approval left the live set\n"
+    "(it is retained but dormant — see above).",
+)
+
+_REQUIRED_CHECK_NAMES: tuple[str, ...] = (
+    "Checks",
+    "Web (lint + typecheck + unit)",
+    "Web (Playwright snapshots)",
+    "codecov/patch",
+)
+
+_SUPERSESSION_MARKER = "[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file:"
+_DTOS1_COMMIT_SHA = "299fb5a93d09e54f58d370f7a35e5ce15f278150"
+_RESPONDER_CONDITION = (
+    "${{ vars.CLAUDE_HEADLESS_ENABLED == 'true' && ( "
+    "(github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) || "
+    "(github.event_name == 'pull_request_review_comment' && "
+    "contains(github.event.comment.body, '@claude')) || "
+    "(github.event_name == 'pull_request_review' && "
+    "contains(github.event.review.body, '@claude')) || "
+    "(github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || "
+    "contains(github.event.issue.title, '@claude'))) ) }}"
+)
+_REVIEWER_CONDITION = (
+    "${{ github.event.pull_request.user.login != 'dependabot[bot]' && "
+    "vars.CLAUDE_HEADLESS_ENABLED == 'true' }}"
+)
+_HISTORICAL_LABELS = frozenset(
+    {
+        "[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by D-ToS-1.]",
+        "[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by D-ToS-1. "
+        "This wait does not gate merge today; see the precedence subsection above.]",
+        "[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by the D-ToS-1 "
+        "governance reconciliation at the top of this file.]",
+        "[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by the D-ToS-1 "
+        "governance reconciliation recorded at the top of this file. The approval "
+        "requirement this record describes no longer applies.]",
+        "[HISTORICAL — SUPERSEDED 6 Sep 2026 by the D-ToS-1 entry at the top of this file.]",
+    }
+)
+_HISTORICAL_SPAN_HASHES = {
+    "AGENTS.md": (
+        "9c42dbe8b2d6545184500c6df2311c4ed2e2c29baf45c1213f670065eeee161f",
+        "77036173b179ade3a6d6d13be44ae9124621393168f096a3e036e1045e6f51b4",
+        "e9f3e355d73996180c21a363fe6c3bf2f0e97309352155103dc6a21d10c3a734",
+        "2068d33a30d8cf20a6489f65464f653a965fdeccc8ad3251d1f170df3bf61c11",
+    ),
+    "docs/state/registry.md": (
+        "563be152854b3ebcdce0b142fef714c963522680538ccc769407aa050fa1405e",
+        "56c29c9419f0a820986b589c491a5b284a547472f62e53df861a93c3f63ba1a0",
+        "4ac05ceba7ebf886296e5de878ce86a97f9a82d8a424e2114728e8787ac9764b",
+        "116690f3909c7ed2e2bb1d8b0f3d22b7e5ffe5eebf58af25eb743225e71d584c",
+        "e077d2f7a0751235a0fa0b3566f5209f9d95f1acc6a5492698a905daa76969da",
+        "54b4487109564e2063ed9f275a69064943cb2042dba95dafec92ba42d331b7f2",
+        "479c64d91b64ea090b7d9d8669906c0f093b7eaf544ee7025d910ec821186043",
+        "20c123164558d99a78a5be81fc3ba31a4ee77c0f9a7fdb2b0837bd5c33629256",
+    ),
+}
+
+
+def _read_agents_md() -> str:
+    """Return the full text of the repository's ``AGENTS.md``."""
+    return _AGENTS_MD_PATH.read_text(encoding="utf-8")
+
+
+def _historical_spans(text: str) -> list[tuple[int, int]]:
+    """Return the character spans of every well-formed historical block.
+
+    A marker line counts when, after stripping surrounding whitespace and at
+    most one leading Markdown blockquote marker (``>``), it equals exactly
+    ``<!-- historical-evidence: begin -->`` or ``... end -->``. Markers must
+    be balanced, non-nested, non-overlapping, and appear begin-before-end in
+    file order.
+
+    Args:
+        text: The full document text to scan.
+
+    Returns:
+        A list of ``(start, end)`` character-offset pairs, one per
+        begin/end pair, each spanning from the start of the begin marker's
+        line to the end of the end marker's line (inclusive of both marker
+        lines).
+
+    Raises:
+        ValueError: If a begin marker is never closed, an end marker has no
+            matching begin, a begin marker appears while another is already
+            open (nesting), or the structure is otherwise malformed. This is
+            a deliberate fail-closed design: a malformed document must never
+            be silently treated as containing zero historical blocks.
+    """
+    spans: list[tuple[int, int]] = []
+    open_start: int | None = None
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        unquoted = stripped[1:].strip() if stripped.startswith(">") else stripped
+        is_begin = stripped == _BEGIN_MARKER or unquoted == _BEGIN_MARKER
+        is_end = stripped == _END_MARKER or unquoted == _END_MARKER
+        if is_begin:
+            if open_start is not None:
+                raise ValueError(f"nested historical-evidence begin marker at offset {pos}")
+            open_start = pos
+        elif is_end:
+            if open_start is None:
+                raise ValueError(f"orphan historical-evidence end marker at offset {pos}")
+            spans.append((open_start, pos + len(line)))
+            open_start = None
+        pos += len(line)
+    if open_start is not None:
+        raise ValueError("unclosed historical-evidence begin marker")
+    return spans
+
+
+def _phrase_pattern(phrase: str) -> re.Pattern[str]:
+    """Build a case-insensitive regex for ``phrase`` tolerant of Markdown formatting.
+
+    Tokens (split on literal spaces in ``phrase``) are joined by a separator
+    that accepts any run of whitespace, a Markdown blockquote marker
+    (``>``), emphasis asterisks (``*``), or inline-code delimiters, so a
+    phrase that Markdown has soft-wrapped across a line break -- or that has
+    a word wrapped in emphasis or inline code -- still matches as one
+    occurrence.
+    """
+    tokens = phrase.split(" ")
+    return re.compile(r"[\s>`*]+".join(re.escape(token) for token in tokens), re.IGNORECASE)
+
+
+def _occurrences(text: str, phrase: str) -> list[re.Match[str]]:
+    """Return every match of ``phrase`` in ``text`` (see `_phrase_pattern`)."""
+    return list(_phrase_pattern(phrase).finditer(text))
+
+
+def _within_any_span(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
+    """Return whether the half-open range ``[start, end)`` sits inside one span."""
+    return any(span_start <= start and end <= span_end for span_start, span_end in spans)
+
+
+def _present_operatively(text: str, phrase: str, spans: list[tuple[int, int]]) -> bool:
+    """Return whether ``phrase`` occurs at least once outside every span in ``spans``."""
+    return any(not _within_any_span(m.start(), m.end(), spans) for m in _occurrences(text, phrase))
+
+
+def _exact_markdown_code_name_pattern(name: str) -> re.Pattern[str]:
+    """Return a case-sensitive pattern for an exact, code-formatted check name.
+
+    Whitespace inside an inline-code status name may be soft-wrapped by
+    Markdown, but every non-whitespace character, including punctuation, is
+    literal. Requiring the code delimiters prevents generic prose such as
+    ``required checks`` from standing in for the check actually named
+    ``Checks``.
+    """
+    parts = re.split(r"(\s+)", name)
+    pattern = "".join(r"\s+" if part.isspace() else re.escape(part) for part in parts)
+    return re.compile(rf"`{pattern}`")
+
+
+def _canonical_bullet_bounds(text: str) -> tuple[int, int]:
+    """Return the canonical live-state bullet's operative character range.
+
+    The first following historical marker is a boundary only after proving it
+    lies after the heading. Callers also verify the entire returned range does
+    not overlap any historical block, so wrapping the canonical bullet itself
+    cannot turn a historical statement into an accepted live-state policy.
+    """
+    start = text.index(_CANONICAL_LIVE_STATE_HEADING)
+    marker_index = text.index(_BEGIN_MARKER, start)
+    end = text.rfind("\n", 0, marker_index) + 1
+    if end <= start:
+        raise ValueError("canonical live-state bullet has no following boundary")
+    return start, end
+
+
+def _canonical_live_state_bullet(text: str) -> str:
+    """Return the body of AGENTS.md's "Verified live state — 6 Sep 2026" bullet.
+
+    The body runs from the bullet's bold heading through (but not including)
+    the historical marker that immediately follows it, so the returned text
+    is entirely operative.
+
+    Raises:
+        ValueError: If the heading or a following historical-evidence begin
+            marker cannot be found -- this must fail loudly, never silently
+            check an empty or wrong substring.
+    """
+    start, end = _canonical_bullet_bounds(text)
+    return text[start:end]
+
+
+def _assert_canonical_range_is_outside_markdown_fences(text: str, start: int, end: int) -> None:
+    """Reject a fenced-code state that covers either canonical-policy boundary."""
+    boundaries = iter(sorted((start, end)))
+    next_boundary = next(boundaries, None)
+    active_fence: tuple[str, int] | None = None
+    line_start = 0
+    for line in text.splitlines(keepends=True):
+        while next_boundary is not None and next_boundary <= line_start:
+            assert active_fence is None
+            next_boundary = next(boundaries, None)
+
+        fence_match = re.match(r"^[ \t]*(?:>[ \t]?)?(?P<run>`{3,}|~{3,})(?P<tail>[^\r\n]*)$", line)
+        if fence_match:
+            run = fence_match.group("run")
+            delimiter = run[0]
+            if active_fence is None:
+                active_fence = (delimiter, len(run))
+            elif (
+                delimiter == active_fence[0]
+                and len(run) >= active_fence[1]
+                and not fence_match.group("tail").strip()
+            ):
+                active_fence = None
+
+        line_start += len(line)
+
+    while next_boundary is not None:
+        assert active_fence is None
+        next_boundary = next(boundaries, None)
+
+
+def _assert_policy_range_is_outside_html_comments(text: str, start: int, end: int) -> None:
+    """Reject a non-nested HTML comment state covering either policy boundary.
+
+    The exact GFM ``-->`` terminator is intentional; browser ``--!>`` handling
+    is outside this source-state guard.
+    """
+    boundaries = iter(sorted((start, end)))
+    next_boundary = next(boundaries, None)
+    comment_open = False
+    scan_start = 0
+    while True:
+        opening_start = text.find("<!--", scan_start)
+        closing_start = text.find("-->", scan_start)
+        if opening_start == closing_start == -1:
+            break
+        if closing_start == -1 or (opening_start != -1 and opening_start < closing_start):
+            marker_start = opening_start
+            marker = "<!--"
+        else:
+            marker_start = closing_start
+            marker = "-->"
+
+        while next_boundary is not None and next_boundary <= marker_start:
+            assert not comment_open
+            next_boundary = next(boundaries, None)
+        if marker == "<!--" and not comment_open:
+            comment_open = True
+        elif marker == "-->" and comment_open:
+            comment_open = False
+        scan_start = marker_start + len(marker)
+
+    while next_boundary is not None:
+        assert not comment_open
+        next_boundary = next(boundaries, None)
+
+
+def _assert_fixed_policy_range_is_not_indented_code(text: str, start: int, end: int) -> None:
+    """Reject literal-tab or four-space GFM code indentation on policy-carrier lines."""
+    line_start = text.rfind("\n", 0, start) + 1
+    for line in text[line_start:end].splitlines():
+        assert not line.startswith(("    ", "\t"))
+        blockquote_prefix = re.match(r"^[ \t]*>[ \t]?", line)
+        if blockquote_prefix:
+            line = line[blockquote_prefix.end() :]
+        assert not line.startswith(("    ", "\t"))
+
+
+def _assert_policy_range_is_outside_raw_text_blocks(text: str, start: int, end: int) -> None:
+    """Reject Type-1 GFM raw-text source state covering either policy boundary."""
+    boundaries = iter(sorted((start, end)))
+    next_boundary = next(boundaries, None)
+    active_tag: str | None = None
+    token_pattern = re.compile(
+        r"<(?:(?P<closing>/)(?P<close_tag>pre|script|style|textarea)\s*|"
+        r"(?P<open_tag>pre|script|style|textarea)\b[^>]*)>",
+        re.IGNORECASE,
+    )
+    for token in token_pattern.finditer(text):
+        while next_boundary is not None and next_boundary <= token.start():
+            assert active_tag is None
+            next_boundary = next(boundaries, None)
+        if token.group("closing"):
+            closing_tag = token.group("close_tag")
+            if active_tag == closing_tag.casefold():
+                active_tag = None
+        elif active_tag is None:
+            opening_tag = token.group("open_tag")
+            active_tag = opening_tag.casefold()
+
+    while next_boundary is not None:
+        assert active_tag is None
+        next_boundary = next(boundaries, None)
+
+
+def _assert_policy_range_is_outside_processing_instructions(
+    text: str, start: int, end: int
+) -> None:
+    """Reject a non-nesting CommonMark processing-instruction span at policy boundaries."""
+    boundaries = iter(sorted((start, end)))
+    next_boundary = next(boundaries, None)
+    processing_instruction_open = False
+    scan_start = 0
+    while True:
+        opening_start = text.find("<?", scan_start)
+        closing_start = text.find("?>", scan_start)
+        if opening_start == closing_start == -1:
+            break
+        if closing_start == -1 or (opening_start != -1 and opening_start < closing_start):
+            marker_start = opening_start
+            marker = "<?"
+        else:
+            marker_start = closing_start
+            marker = "?>"
+
+        while next_boundary is not None and next_boundary <= marker_start:
+            assert not processing_instruction_open
+            next_boundary = next(boundaries, None)
+        if marker == "<?" and not processing_instruction_open:
+            processing_instruction_open = True
+        elif marker == "?>" and processing_instruction_open:
+            processing_instruction_open = False
+        scan_start = marker_start + len(marker)
+
+    while next_boundary is not None:
+        assert not processing_instruction_open
+        next_boundary = next(boundaries, None)
+
+
+def _assert_policy_range_is_outside_declarations(text: str, start: int, end: int) -> None:
+    """Reject a non-nesting CommonMark Type-4 declaration span at policy boundaries."""
+    boundaries = iter(sorted((start, end)))
+    next_boundary = next(boundaries, None)
+    declaration_open = False
+    declaration_opener = re.compile(r"<![A-Z]")
+    scan_start = 0
+    while True:
+        opening_match = declaration_opener.search(text, scan_start)
+        opening_start = opening_match.start() if opening_match else -1
+        closing_start = text.find(">", scan_start)
+        if opening_start == closing_start == -1:
+            break
+        if closing_start == -1 or (opening_start != -1 and opening_start < closing_start):
+            marker_start = opening_start
+            marker_length = len("<!")
+            opening = True
+        else:
+            marker_start = closing_start
+            marker_length = len(">")
+            opening = False
+
+        while next_boundary is not None and next_boundary <= marker_start:
+            assert not declaration_open
+            next_boundary = next(boundaries, None)
+        if opening and not declaration_open:
+            declaration_open = True
+        elif not opening and declaration_open:
+            declaration_open = False
+        scan_start = marker_start + marker_length
+
+    while next_boundary is not None:
+        assert not declaration_open
+        next_boundary = next(boundaries, None)
+
+
+def _assert_policy_range_is_outside_code_spans(text: str, start: int, end: int) -> None:
+    """Reject non-nesting exact-run Markdown code-span state at policy boundaries."""
+    boundaries = iter(sorted((start, end)))
+    next_boundary = next(boundaries, None)
+    active_run_length: int | None = None
+    for run in re.finditer(r"`+", text):
+        while next_boundary is not None and next_boundary <= run.start():
+            assert active_run_length is None
+            next_boundary = next(boundaries, None)
+        run_length = len(run.group())
+        if active_run_length is None:
+            active_run_length = run_length
+        elif run_length == active_run_length:
+            active_run_length = None
+
+    while next_boundary is not None:
+        assert active_run_length is None
+        next_boundary = next(boundaries, None)
+
+
+def _assert_fixed_operative_range_is_visible(text: str, start: int, end: int) -> None:
+    """Assert one bounded operative carrier is not hidden by supported source markup."""
+    _assert_canonical_range_is_outside_markdown_fences(text, start, end)
+    _assert_policy_range_is_outside_html_comments(text, start, end)
+    _assert_fixed_policy_range_is_not_indented_code(text, start, end)
+    _assert_policy_range_is_outside_raw_text_blocks(text, start, end)
+    _assert_policy_range_is_outside_processing_instructions(text, start, end)
+    _assert_policy_range_is_outside_declarations(text, start, end)
+    _assert_policy_range_is_outside_code_spans(text, start, end)
+
+
+def _is_affirmative_enablement_instruction(text: str) -> bool:
+    """Return whether text affirmatively tells a reader to enable headless CI.
+
+    This deliberately small grammar permits explicit prohibitions (``Do not``
+    and ``Never``) while rejecting affirmative ``set``, ``export``, and bare
+    assignment forms that assign this exact variable to true. Its finite
+    covered producer set is those plain assignment/export forms and literal
+    ``gh variable set CLAUDE_HEADLESS_ENABLED`` commands; it is not a general
+    shell or natural-language parser.
+    """
+    markdown_clean = re.sub(r"[`*>]", "", text)
+    normalized = re.sub(r"\s+", " ", markdown_clean)
+    assignment = re.compile(
+        r"(?P<prohibition>\b(?:do not|never)\s+)?"
+        r"(?:(?:set|export)\s+)?\bCLAUDE_HEADLESS_ENABLED\b\s*"
+        r"(?:=\s*|to\s+)['\"]?true['\"]?\b",
+        re.IGNORECASE,
+    )
+    repo_selector = r"(?:-R|--repo)(?:\s+|=)(?:['\"][^'\"]+['\"]|[^\s;|&]+)"
+    repo_flag = rf"(?:{repo_selector}\s+)"
+    gh_variable_set = re.compile(
+        r"(?P<prohibition>\b(?:do not|never)\s+)?gh\s+"
+        rf"(?:{repo_flag})?variable\s+(?:{repo_flag})?set\b",
+        re.IGNORECASE,
+    )
+    explicit_false_body = re.compile(
+        rf"^\s+(?:{repo_flag})?(?:-b|--body)(?:\s+|=)['\"]?false['\"]?"
+        rf"(?:\s+{repo_selector})?[.!?]?\s*$",
+        re.IGNORECASE,
+    )
+    has_assignment = any(
+        match.group("prohibition") is None for match in assignment.finditer(normalized)
+    )
+    gh_scan = re.sub(r"\\[ \t]*\r?\n[ \t]*", " ", markdown_clean)
+    gh_matches = list(gh_variable_set.finditer(gh_scan))
+    has_gh_enablement = False
+    for index, match in enumerate(gh_matches):
+        line_end = gh_scan.find("\n", match.end())
+        if line_end == -1:
+            line_end = len(gh_scan)
+        command_separator = re.search(r";|&&|\|\|", gh_scan[match.end() : line_end])
+        if command_separator is not None:
+            line_end = match.end() + command_separator.start()
+        next_command_start = (
+            gh_matches[index + 1].start() if index + 1 < len(gh_matches) else line_end
+        )
+        command_segment = gh_scan[match.end() : min(line_end, next_command_start)]
+        target = re.search(
+            r"(?:(?P<quote>['\"])\bCLAUDE_HEADLESS_ENABLED\b(?P=quote)|"
+            r"\bCLAUDE_HEADLESS_ENABLED\b)",
+            command_segment,
+        )
+        if target is None:
+            continue
+        command_without_target = command_segment[: target.start()] + command_segment[target.end() :]
+        if (
+            match.group("prohibition") is None
+            and explicit_false_body.fullmatch(command_without_target) is None
+        ):
+            has_gh_enablement = True
+            break
+    return has_assignment or has_gh_enablement
+
+
+def _assert_agents_historical_evidence(text: str) -> None:
+    """Assert AGENTS forbidden prose and retained historical anchors are contained."""
+    spans = _historical_spans(text)
+    _assert_historical_labels(text, spans)
+    for phrase in _FORBIDDEN_PHRASES:
+        for match in _occurrences(text, phrase):
+            assert _within_any_span(match.start(), match.end(), spans), (
+                f"{phrase!r} appears operatively in AGENTS.md at {match.start()}"
+            )
+    historical_text = "".join(text[start:end] for start, end in spans)
+    for anchor in (
+        "PR-scoped Claude restoration (#663 / D108-D118",
+        "Activation state — LIVE 31 Jul 2026 (#663 / D108-D118)",
+        "WAIT for Claude's PR-scoped approval before merging",
+        "D108-D118 are active as of 31 Jul 2026",
+    ):
+        assert _occurrences(historical_text, anchor), f"missing AGENTS history: {anchor!r}"
+    _assert_historical_span_hashes(text, "AGENTS.md")
+
+
+def _assert_required_agents_sentence_is_operative(text: str, sentence: str) -> None:
+    """Assert one exact current AGENTS sentence occurs uniquely outside historical evidence."""
+    spans = _historical_spans(text)
+    assert text.count(sentence) == 1
+    start = text.index(sentence)
+    assert not _within_any_span(start, start + len(sentence), spans)
+    _assert_fixed_operative_range_is_visible(text, start, start + len(sentence))
+
+
+def _assert_canonical_live_policy(text: str) -> None:
+    """Assert the unique canonical AGENTS policy is entirely operative and complete."""
+    spans = _historical_spans(text)
+    _assert_no_nonzero_approval_requirement(text, spans)
+    assert text.count(_CANONICAL_LIVE_STATE_HEADING) == 1
+    start, end = _canonical_bullet_bounds(text)
+    assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    _assert_fixed_operative_range_is_visible(text, start, end)
+    bullet = _canonical_live_state_bullet(text)
+    assert "CLAUDE_HEADLESS_ENABLED" in bullet, "missing canonical headless token"
+    normalized_bullet = _normalized_visible(bullet)
+    assert (
+        "Consumer-OAuth headless Claude CI is retired (CLAUDE_HEADLESS_ENABLED unset; "
+        "a skipped headless job is expected, never a failure, and never a reason "
+        "to set the variable)." in normalized_bullet
+    )
+    assert (
+        "codecov/patch; strict mode, required_conversation_resolution, and "
+        "enforce_admins remain enabled; "
+        "force-push/deletion off." in normalized_bullet
+    ), "missing enabled canonical protection clauses"
+    assert (
+        "The merge bar instead rests on CI, codecov/patch, CodeQL handling, GitHub Codex's "
+        "exact-current-head review and wait, required_conversation_resolution, independent triage, "
+        "and risk-routed authenticated local Claude assurance (below)." in normalized_bullet
+    )
+    assert normalized_bullet == _CANONICAL_POLICY_SNAPSHOT
+    assert not _is_affirmative_enablement_instruction(_operative_text(text, spans))
+    for phrase in _CANONICAL_LIVE_STATE_REQUIRED_PHRASES:
+        assert _occurrences(bullet, phrase), f"missing canonical policy phrase: {phrase!r}"
+    for check_name in _REQUIRED_CHECK_NAMES:
+        assert _exact_markdown_code_name_pattern(check_name).search(bullet), (
+            f"missing canonical check name: {check_name!r}"
+        )
+
+
+def _assert_precedence_policy(text: str) -> None:
+    """Assert the entire operative precedence bullet names both authorities."""
+    spans = _historical_spans(text)
+    start = text.index("- **Precedence for the GitHub-Claude required-approval description under")
+    end = text.index("\n- Mechanism retained", start)
+    assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    _assert_fixed_operative_range_is_visible(text, start, end)
+    precedence = text[start:end]
+    for filename in ("AGENTS.md", "docs/state/registry.md"):
+        assert filename in precedence, f"missing precedence authority: {filename!r}"
+    assert _normalized_visible(precedence) == _PRECEDENCE_POLICY_SNAPSHOT
+
+
+def _assert_no_nonzero_approval_requirement(text: str, spans: list[tuple[int, int]]) -> None:
+    """Reject review-count requirements except the explicit zero/no forms."""
+    operative = re.sub(r"\s+", " ", re.sub(r"[`*]", "", _operative_text(text, spans)))
+    nonzero_requirement = re.compile(
+        r"(?<!no longer )(?<!not )\b(?:require(?:s|d|ing)?|must\s+have|needs)\s+"
+        r"(?!(?:zero|no)\s+(?:approving\s+reviews?|approvals?)\b)"
+        r"(?:at\s+least\s+)?[a-z0-9-]+\s+(?:approving\s+reviews?|approvals?)\b",
+        re.IGNORECASE,
+    )
+    machine_nonzero_requirement = re.compile(
+        r"\brequired_approving_review_count\b\s*(?:=|:)\s*[1-9][0-9]*\b",
+        re.IGNORECASE,
+    )
+    assert not nonzero_requirement.search(operative)
+    assert not machine_nonzero_requirement.search(operative)
+
+
+def _assert_branch_protection_policy(text: str) -> None:
+    """Assert the one earlier current branch-protection bullet is byte-scoped in meaning."""
+    start = text.index("- **`main` is branch-protected")
+    end = text.index("\n- **Precedence for the GitHub-Claude", start)
+    assert text.count("- **`main` is branch-protected") == 1
+    _assert_fixed_operative_range_is_visible(text, start, end)
+    assert _normalized_visible(text[start:end]) == _BRANCH_PROTECTION_SNAPSHOT
+
+
+def _assert_review_roster_policy(text: str) -> None:
+    """Assert the complete operative Code Review Rubric roster remains live."""
+    start = text.index("**The PR review roster (verified live 6 Sep 2026, D-ToS-1)")
+    end = text.index("\n<!-- historical-evidence: begin -->", start)
+    assert text.count("**The PR review roster (verified live 6 Sep 2026, D-ToS-1)") == 1
+    _assert_fixed_operative_range_is_visible(text, start, end)
+    assert _normalized_visible(text[start:end]) == _REVIEW_ROSTER_SNAPSHOT
+
+
+def _assert_minimum_sufficient_review_policy(text: str) -> None:
+    """Assert the complete operative local-review section excludes retired Claude approval."""
+    start = text.index("### Minimum sufficient local review")
+    end = text.index("\n\n### Codex project agents", start)
+    _assert_fixed_operative_range_is_visible(text, start, end)
+    section = text[start:end]
+    assert _normalized_visible(section) == _MINIMUM_SUFFICIENT_REVIEW_SNAPSHOT
+    assert not _occurrences(section, "GitHub Claude exact-head approval")
+    assert not _occurrences(section, "Claude exact-head approval")
+
+
+def _assert_draft_phase_policy(text: str) -> None:
+    """Assert draft opening triggers a skipped headless job, not findings to fold."""
+    start = text.index("**Draft phase vs ready phase")
+    end = text.index("\n\n**WAIT for Codex's verdict before merging", start)
+    _assert_fixed_operative_range_is_visible(text, start, end)
+    paragraph = text[start:end]
+    assert _normalized_visible(paragraph) == _DRAFT_PHASE_SNAPSHOT
+    assert not _occurrences(paragraph, "findings there are real and worth folding")
+
+
+def _assert_retained_mechanism_policy(text: str) -> None:
+    """Assert the operative retained-mechanism bullet remains dormant and operator-owned."""
+    spans = _historical_spans(text)
+    start = text.index("- Mechanism retained but")
+    end = text.index("\n  <!-- historical-evidence: begin -->", start)
+    assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    _assert_fixed_operative_range_is_visible(text, start, end)
+    mechanism = text[start:end]
+    assert _occurrences(mechanism, "dormant")
+    assert _occurrences(mechanism, "gates nothing today")
+    assert _occurrences(mechanism, "operator-owned branch-protection decision")
+    assert not _occurrences(mechanism, "not dormant")
+    assert not _occurrences(mechanism, "not operator-owned branch-protection decision")
+    assert _normalized_visible(mechanism) == _RETAINED_MECHANISM_SNAPSHOT
+
+
+def _assert_preserved_wait_policy(text: str) -> None:
+    """Assert the operative preservation sentence keeps the wait non-gating."""
+    spans = _historical_spans(text)
+    heading = "Preserved as the D108-D118 design/evidence record:"
+    assert text.count(heading) == 1
+    start = text.index(heading)
+    end = text.index("\n\n<!-- historical-evidence: begin -->", start)
+    assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    _assert_fixed_operative_range_is_visible(text, start, end)
+    preserved = text[start:end]
+    assert _normalized_visible(preserved) == _PRESERVED_WAIT_SNAPSHOT
+
+
+def _assert_claude_review_note_policy(text: str) -> None:
+    """Assert the operative Claude-review note documents both headless skips."""
+    spans = _historical_spans(text)
+    heading = "> Note: `claude-review` is intentionally"
+    assert text.count(heading) == 1
+    start = text.index(heading)
+    end = text.index("\n\n## Codex-Led Delivery Topology", start)
+    assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    _assert_fixed_operative_range_is_visible(text, start, end)
+    note = text[start:end]
+    normalized_note = _normalized_visible(note)
+    assert "not a required status check" in normalized_note
+    assert (
+        "The real findings-gate is GitHub Codex's inline threads + "
+        "required_conversation_resolution" in normalized_note
+    )
+    for required in (
+        ".github/workflows/claude-code-review.yml:27-41",
+        ".github/workflows/claude.yml:14-26",
+        "a skipped headless job is expected, never a failure, and never a reason "
+        "to set the variable or re-trigger",
+    ):
+        assert _occurrences(note, required), f"missing operative Claude-review note: {required!r}"
+    assert normalized_note == _CLAUDE_REVIEW_NOTE_SNAPSHOT
+
+
+def _assert_registry_735_clarification(text: str) -> None:
+    """Assert the #735 clarification is operative and preserves D-ToS-1 skip semantics."""
+    spans = _historical_spans(text)
+    _span_start, span_end = next(
+        (start, end)
+        for start, end in spans
+        if "#735 story-closing implementation complete" in text[start:end]
+    )
+    clarification_end = text.index("\n\n**11 Aug 2026", span_end)
+    _assert_fixed_operative_range_is_visible(text, span_end, clarification_end)
+    clarification = text[span_end:clarification_end]
+    assert _normalized_visible(clarification) == _REGISTRY_735_CLARIFICATION_SNAPSHOT
+    assert "the review itself still runs unskipped" not in clarification
+
+
+def _assert_registry_policy(text: str) -> None:
+    """Assert the first registry reconciliation entry is operative and complete."""
+    spans = _historical_spans(text)
+    _assert_no_nonzero_approval_requirement(text, spans)
+    _assert_registry_735_clarification(text)
+    header_index = text.index("## Active Epic")
+    entry_heading = "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    entry_start = text.index(entry_heading, header_index)
+    assert not text[header_index + len("## Active Epic") : entry_start].strip()
+    entry_end = text.index("\n**1 Sep 2026", entry_start)
+    assert not any(
+        span_start < entry_end and entry_start < span_end for span_start, span_end in spans
+    )
+    _assert_fixed_operative_range_is_visible(text, header_index, entry_end)
+    entry = text[entry_start:entry_end]
+    normalized_entry = _normalized_visible(entry)
+    assert (
+        "CLAUDE_HEADLESS_ENABLED is unset: consumer-OAuth headless Claude CI "
+        "(the hosted Claude Code Review job and the @claude responder) is retired under D-ToS-1"
+        in normalized_entry
+    )
+    assert "A skipped headless job is expected, never a failure." in normalized_entry
+    assert (
+        "required_approving_review_count=0; strict mode; enforce_admins=true; "
+        "required_conversation_resolution=true; "
+        "force-push/ deletion false;" in normalized_entry
+    )
+    assert (
+        "The merge bar remains CI, codecov/patch, CodeQL handling, GitHub Codex's "
+        "exact-current-head review and wait, required_conversation_resolution, independent triage, "
+        "and risk-routed authenticated local Claude assurance." in normalized_entry
+    )
+    assert normalized_entry == _REGISTRY_POLICY_SNAPSHOT
+    assert not _is_affirmative_enablement_instruction(_operative_text(text, spans))
+    for phrase in (
+        _DTOS1_COMMIT_SHA,
+        "PR #923",
+        "requires zero approving reviews",
+        "strict mode",
+        "enforce_admins=true",
+        "required_conversation_resolution=true",
+        "skipped headless job is expected",
+        "D108-D118 PR-scoped Claude approval bridge",
+        "operator-owned branch-protection decision",
+        "exact-current-head review",
+        "and wait",
+        "CodeQL handling",
+        "independent triage",
+        "risk-routed authenticated local Claude assurance",
+    ):
+        assert _occurrences(entry, phrase), f"missing top registry phrase: {phrase!r}"
+    for check_name in _REQUIRED_CHECK_NAMES:
+        assert _exact_markdown_code_name_pattern(check_name).search(entry), (
+            f"missing top registry check name: {check_name!r}"
+        )
+
+
+def _assert_registry_historical_evidence(text: str) -> None:
+    """Assert registry forbidden prose and retained legacy anchors stay historical."""
+    spans = _historical_spans(text)
+    _assert_historical_labels(text, spans)
+    for phrase in _FORBIDDEN_PHRASES:
+        for match in _occurrences(text, phrase):
+            assert _within_any_span(match.start(), match.end(), spans), (
+                f"{phrase!r} appears operatively in docs/state/registry.md at {match.start()}"
+            )
+    _assert_registry_supersession_notes(text)
+    historical_text = "".join(text[start:end] for start, end in spans)
+    for anchor in (
+        "#663 / D108-D118 is ACTIVE (31 Jul)",
+        "31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL RESTORED (#663 / D108-D118)",
+        "arm the `review-gate` required check (#159 / D58)",
+        "mark `review-gate` a REQUIRED status check on `main` to arm it",
+        "operator activates the `review-gate` required check (#159 / D58)",
+        "the review itself still runs unskipped",
+        "PR review roster = Claude Code Review (+ human reviewers)",
+        "`claude-review` posts **blocking inline** findings (`--comment`)",
+    ):
+        assert _occurrences(historical_text, anchor), (
+            f"historical evidence anchor vanished: {anchor!r}"
+        )
+    _assert_historical_span_hashes(text, "docs/state/registry.md")
+
+
+def _remove_first_occurrence(text: str, phrase: str) -> str:
+    """Remove the first formatting-tolerant occurrence of ``phrase`` from text."""
+    match = _occurrences(text, phrase)[0]
+    return text[: match.start()] + text[match.end() :]
+
+
+def _assert_registry_supersession_notes(text: str) -> None:
+    """Assert the two operative D-ToS-1 supersession notes remain complete and dormant."""
+    notes = list(
+        re.finditer(
+            r"\[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file:.*?\]",
+            text,
+            re.DOTALL,
+        )
+    )
+    assert len(notes) == len(_REGISTRY_SUPERSESSION_NOTE_SNAPSHOTS)
+    spans = _historical_spans(text)
+    assert all(
+        not (span_start < note.end() and note.start() < span_end)
+        for note in notes
+        for span_start, span_end in spans
+    )
+    for note in notes:
+        _assert_fixed_operative_range_is_visible(text, note.start(), note.end())
+    assert (
+        tuple(_normalized_visible(note.group()) for note in notes)
+        == _REGISTRY_SUPERSESSION_NOTE_SNAPSHOTS
+    )
+
+
+def _normalized_visible(text: str) -> str:
+    """Normalize finite Markdown presentation differences for scoped clauses."""
+    without_blockquotes = re.sub(r"(?m)^[ \t]*>[ \t]?", "", text)
+    return re.sub(r"\s+", " ", re.sub(r"[`*]", "", without_blockquotes)).strip()
+
+
+_CANONICAL_POLICY_SNAPSHOT = _normalized_visible(
+    """**Verified live state — 6 Sep 2026 (D-ToS-1).** `main` currently requires
+    **zero** approving reviews. Required, app-pinned: `Checks`, `Web (lint +
+    typecheck + unit)`, `Web (Playwright snapshots)`, and `codecov/patch`;
+    strict mode, `required_conversation_resolution`, and `enforce_admins`
+    remain enabled; force-push/deletion off. Consumer-OAuth headless Claude CI
+    is retired (`CLAUDE_HEADLESS_ENABLED` unset; a skipped headless job is
+    expected, never a failure, and never a reason to set the variable). The
+    merge bar instead rests on CI, `codecov/patch`, CodeQL handling, GitHub
+    Codex's exact-current-head review and wait, `required_conversation_resolution`,
+    independent triage, and risk-routed authenticated local Claude assurance
+    (below)."""
+)
+_REGISTRY_POLICY_SNAPSHOT = _normalized_visible(
+    """**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).** Verified live
+    `main` branch protection: `required_approving_review_count=0`; strict mode;
+    `enforce_admins=true`; `required_conversation_resolution=true`; force-push/
+    deletion `false`; app-pinned required checks `Checks`, `Web (lint + typecheck
+    + unit)`, `Web (Playwright snapshots)`, and `codecov/patch`.
+    `CLAUDE_HEADLESS_ENABLED` is unset: consumer-OAuth headless Claude CI (the
+    hosted `Claude Code Review` job and the `@claude` responder) is retired under
+    D-ToS-1, merged in agent commit
+    `299fb5a93d09e54f58d370f7a35e5ce15f278150` (PR #923). A skipped headless job
+    is expected, never a failure. The D108-D118 PR-scoped Claude approval bridge
+    mechanism is retained in the codebase but **dormant**: it gates nothing while
+    `main` requires zero approving reviews. Restoring it is an operator-owned
+    branch-protection decision, not automatic. The merge bar remains CI,
+    `codecov/patch`, CodeQL handling, GitHub Codex's exact-current-head review
+    and wait, `required_conversation_resolution`, independent triage, and
+    risk-routed authenticated local Claude assurance. This entry supersedes the
+    operative approval wording in the "31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL
+    RESTORED (#663 / D108-D118)" record, the earlier 31-Jul "#663 / D108-D118"
+    status summary, and the residual June instructions to arm or require the
+    SHA-scoped `review-gate`, plus the 17-Aug #735 statement that the headless
+    review itself still runs unskipped, all now marked historical. D108-D118
+    already retired that SHA-scoped mechanism; D-ToS-1 is unrelated to that
+    retirement; it must not be restored."""
+)
+_PRECEDENCE_POLICY_SNAPSHOT = _normalized_visible(
+    """- **Precedence for the GitHub-Claude required-approval description under
+    D-ToS-1 only.** `AGENTS.md` plus `docs/state/registry.md` are the sole
+    operative authorities for whether a GitHub-hosted Claude review currently
+    gates a required approving review on `main`. Where another file's text
+    about that one specific fact conflicts with the verified live state
+    recorded here (for example `.claude/skills/pr-preflight/SKILL.md` or
+    `docs/agent-topology.md`), that other file's conflicting sentence is
+    superseded and historical; those files are not edited by this
+    reconciliation. This narrow precedence does not extend to any other
+    skill, plan, or review rule, and does not override an explicit operator
+    instruction."""
+)
+_BRANCH_PROTECTION_SNAPSHOT = _normalized_visible(
+    """- **`main` is branch-protected (13 Jun, enforces this policy at the platform).**
+    Required, verified live 6 Sep 2026: app-pinned `Checks`, `Web (lint +
+    typecheck + unit)`, `Web (Playwright snapshots)`, and `codecov/patch`;
+    strict mode; `required_conversation_resolution` (every review thread
+    resolved); and `enforce_admins` (no bypass for owner or agents);
+    force-push/deletion off; repo auto-merge on. **`main` currently requires
+    zero approving reviews** — consumer-OAuth headless Claude CI is retired
+    under D-ToS-1 (`CLAUDE_HEADLESS_ENABLED` unset); see the precedence
+    subsection below for the operative merge-bar description and the
+    retained-but-dormant D108-D118 mechanism. **`claude-review` is
+    intentionally NOT a required check** — it fails by design on PRs that edit a
+    workflow file (the App's workflow-validation guard) and on Dependabot PRs (no
+    secrets), and it passes-on-findings; so the findings gate is GitHub Codex's
+    inline comments + conversation-resolution, not the check itself. Don't
+    re-add it as required (it would deadlock workflow PRs). Green CI alone never
+    means mergeable."""
+)
+_REVIEW_ROSTER_SNAPSHOT = _normalized_visible(
+    """**The PR review roster (verified live 6 Sep 2026, D-ToS-1): GitHub `Codex`
+    (exact-current-head review + wait, advisory-but-triaged), risk-routed
+    authenticated local Claude assurance (`safety-reviewer`, `security-reviewer`,
+    `qa`, etc., per the routing table below), independent triage, and any human
+    reviewer.** The hosted headless **Claude Code Review**
+    (`.github/workflows/claude-code-review.yml`, running `/code-review --comment`)
+    job is retired/dormant: it SKIPS while `CLAUDE_HEADLESS_ENABLED` is unset, so
+    it is no longer a live roster member. **CodeRabbit stays disabled (15 Jun) and
+    the Augment Code trial ENDED (28 Jun).**"""
+)
+_MINIMUM_SUFFICIENT_REVIEW_SNAPSHOT = _normalized_visible(
+    """### Minimum sufficient local review
+
+    This routing changes only additional local/pre-open model review. Ready-head
+    Codex review and wait, branch protection, conversation resolution, CI, CodeQL
+    handling, and `codecov/patch` rules above remain unchanged.
+
+    - Ordinary slice: deterministic gates plus one independent, diff-focused review;
+    do not run the full Claude roster.
+    - Safety, controller, recovery, state-transition, command-path, or enum change:
+    `safety-reviewer` is mandatory.
+    - External input, parsing, credentials, provider calls, or a new endpoint:
+    `security-reviewer` is mandatory. A provider path that can contend with the
+    roast loop also triggers `safety-reviewer`.
+    - UI, interaction, replay, or visual-state change: `ui-reviewer`.
+    - MCP or relevant dependency-contract change: `mcp-contract-checker`.
+    - Roast behavioural integration or decision-trace change: `sim-roast-runner`.
+    - Test diff over 600 lines, new test architecture, weak acceptance coverage, or
+    a concrete test-quality concern: `qa`.
+    - Story completion, epic completion, or suspected plan drift:
+    `product-auditor`.
+    - Substantive findings needing disposition: `pr-triage`.
+
+    A reviewer predicted by the ratified contract may be added to by the actual
+    diff, never silently removed. Do not ask multiple reviewers to inspect the same
+    concern unless the consequence is high or the first reviewer reports
+    uncertainty. Do not invoke `pr-triage` without findings or `product-auditor` on
+    every slice. Model review does not repeat lint, formatting, typecheck, tests, or
+    coverage. Give each reviewer only the contract, relevant diff/tests, and the
+    minimum supporting context for its lens. The unchanged legacy `review-branch`
+    workflow is dormant and unavailable during the D158 pilot: its Claude-coordinator
+    fan-out violates the Codex-parent-only crossing and depth-one topology. A future
+    refactor or retirement decision is outside this PR.
+    Before relying on a selected independent reviewer, verify that its CLI or
+    service is authenticated and usable. If it is unavailable, stop and ask the
+    operator; do not silently substitute self-review or another same-family lens."""
+)
+_DRAFT_PHASE_SNAPSHOT = _normalized_visible(
+    """**Draft phase vs ready phase (the shift-left reconciliation, D103-adjacent; corrected 27
+    Jul 2026).** The once-on-final-commit rule above governs the **post-ready** phase: a
+    marked-ready PR heading to merge, where re-triggering across pushes is re-litigation
+    churn. Codex itself does not review a PR while it sits in **draft**: GitHub's Codex
+    connector fires automatically only at the ready transition (opened ready, or a draft
+    marked ready), confirmed against roastpilot-cloud PR #150 (27 Jul 2026), where Codex
+    produced no review during the draft phase and then reviewed automatically the moment the
+    PR was marked ready. Under the D158 pilot, the pre-ready fold is the
+    minimum-sufficient independent review selected by the Codex parent and run locally under
+    `pr-preflight`; it is not the former fixed local-Codex step. A GitHub-side `@codex review`
+    comment left on a draft is a different thing again, and is NOT simply inert: D105 observed
+    on 19 Jul 2026 that it does run and does post findings-reviews, but never completes the
+    clean-verdict flow on a draft, so a draft waiting on a clean signal waits forever. Both facts
+    hold, because they describe different mechanisms: the automatic trigger does not fire until
+    ready, while an explicit comment runs but cannot produce a clean verdict there. Neither makes
+    the draft a place to converge to clean. Draft = fold locally and let the runner gates
+    (`ci.yml`, tests, `ruff`, `pyright`) run; ready = the automatic Codex review fires on that
+    head, then once-on-final-commit applies to any later push. Opening a draft still triggers the
+    `claude-review` workflow's `on: opened` event, but under D-ToS-1 the job itself SKIPS while
+    `CLAUDE_HEADLESS_ENABLED` is unset — it is not a required check, and a skipped run posts no
+    findings to fold. Unlike Codex, this job is not draft-suppressed by GitHub; it is gated off by
+    the headless retirement instead."""
+)
+_REGISTRY_735_CLARIFICATION_SNAPSHOT = _normalized_visible(
+    """The trigger remains configured, but under D-ToS-1 its headless job skips while
+    `CLAUDE_HEADLESS_ENABLED` is unset; the retained `track_progress` implementation
+    above is not undone."""
+)
+_PRESERVED_WAIT_SNAPSHOT = _normalized_visible(
+    """Preserved as the D108-D118 design/evidence record: this wait does not gate
+    merge under the current verified state (`main` requires zero approving reviews —
+    see the precedence subsection above)."""
+)
+_RETAINED_MECHANISM_SNAPSHOT = _normalized_visible(
+    """- Mechanism retained but **dormant**: the design in this bullet gates nothing
+    today under the verified 6 Sep 2026 state (`main` requires zero approving
+    reviews). Restoring it is an operator-owned branch-protection decision, not
+    an automatic consequence of this record."""
+)
+_CLAUDE_REVIEW_NOTE_SNAPSHOT = _normalized_visible(
+    """> Note: `claude-review` is intentionally **not** a required status check — it fails
+    by design on PRs that edit a workflow file (the App's workflow-validation guard),
+    and it passes even when it finds bugs. It additionally SKIPS while
+    `vars.CLAUDE_HEADLESS_ENABLED` is unset (`.github/workflows/claude-code-review.yml:27-41`);
+    a skipped headless job is expected, never a failure, and never a reason to set the
+    variable or re-trigger. `.github/workflows/claude.yml:14-26`'s `@claude` responder is
+    gated off the same way. The real findings-gate is GitHub Codex's inline
+    threads + `required_conversation_resolution`; the required checks are CI + codecov."""
+)
+_REGISTRY_SUPERSESSION_NOTE_SNAPSHOTS = (
+    _normalized_visible(
+        """[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file: `main`
+        no longer requires any approving review, and the D108-D118 mechanism below
+        is retained but dormant.]"""
+    ),
+    _normalized_visible(
+        """[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file: `main` no
+        longer requires any approving review. The 31 Jul 2026 "CLAUDE PR-SCOPED
+        APPROVAL RESTORED (#663 / D108-D118)" record immediately below is retained
+        verbatim as historical evidence; it is dormant, not current policy.]"""
+    ),
+)
+
+
+def _operative_text(text: str, spans: list[tuple[int, int]]) -> str:
+    """Return the non-historical portions of a well-formed governed document."""
+    parts: list[str] = []
+    previous_end = 0
+    for start, end in spans:
+        parts.append(text[previous_end:start])
+        previous_end = end
+    parts.append(text[previous_end:])
+    return "".join(parts)
+
+
+def _assert_historical_labels(text: str, spans: list[tuple[int, int]]) -> None:
+    """Assert every historical span starts with a visible dated D-ToS-1 label."""
+    for start, end in _historical_label_ranges(text, spans):
+        label = _normalized_visible(text[start:end]).replace("**", "")
+        assert label in _HISTORICAL_LABELS, (
+            "historical span lacks a complete visible dated D-ToS-1 label"
+        )
+
+
+def _assert_historical_span_hashes(text: str, filename: str) -> None:
+    """Assert every retained historical span remains byte-exact and ordered."""
+    spans = _historical_spans(text)
+    observed = tuple(hashlib.sha256(text[start:end].encode()).hexdigest() for start, end in spans)
+    assert observed == _HISTORICAL_SPAN_HASHES[filename]
+
+
+def _historical_label_ranges(text: str, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Return each complete first visible historical-label range for mutations."""
+    ranges: list[tuple[int, int]] = []
+    for start, end in spans:
+        cursor = text.index("\n", start) + 1
+        while cursor < end:
+            line_end = text.find("\n", cursor, end)
+            if line_end == -1:
+                line_end = end
+            if text[cursor:line_end].strip():
+                first_visible = text[cursor:line_end].strip().lstrip(">").strip()
+                assert first_visible.startswith("**["), (
+                    "historical span lacks a complete visible dated D-ToS-1 label"
+                )
+                closing = text.find("]**", cursor, end)
+                assert closing != -1, "historical span lacks a complete visible dated D-ToS-1 label"
+                label_end = closing + len("]**")
+                ranges.append((cursor, label_end))
+                break
+            cursor = line_end + 1
+    return ranges
+
+
+def _assert_responder_headless_gate(workflow: object) -> None:
+    """Assert parsed responder workflow data retains the true-only headless gate."""
+    assert isinstance(workflow, dict)
+    workflow_map = cast(dict[str, object], workflow)
+    jobs = workflow_map.get("jobs")
+    assert isinstance(jobs, dict)
+    jobs_map = cast(dict[str, object], jobs)
+    assert set(jobs_map) == {"claude"}
+    claude_job = jobs_map.get("claude")
+    assert isinstance(claude_job, dict)
+    claude_map = cast(dict[str, object], claude_job)
+    condition = claude_map.get("if")
+    assert isinstance(condition, str)
+    assert re.sub(r"\s+", " ", condition) == _RESPONDER_CONDITION
+
+
+def _assert_reviewer_workflow_job_set(workflow: object) -> None:
+    """Assert the reviewer workflow retains only its documented retired job."""
+    assert isinstance(workflow, dict)
+    workflow_map = cast(dict[str, object], workflow)
+    jobs = workflow_map.get("jobs")
+    assert isinstance(jobs, dict)
+    assert set(cast(dict[str, object], jobs)) == {"claude-review"}
+
+
+def _assert_workflow_citation_contains_condition(
+    workflow_text: str, start_line: int, end_line: int, condition: str
+) -> None:
+    """Assert an inclusive cited workflow range contains its complete normalized condition."""
+    cited_range = "\n".join(workflow_text.splitlines()[start_line - 1 : end_line])
+    assert re.sub(r"\s+", " ", condition) in re.sub(r"\s+", " ", cited_range)
+
+
+def test_agents_md_forbidden_phrases_are_contained_in_historical_blocks() -> None:
+    """T1 (AC1, AC2): every phrase-set-P occurrence in AGENTS.md is historical.
+
+    A phrase in `_FORBIDDEN_PHRASES` asserts, in the present tense, that a
+    GitHub Claude approval currently gates merge. Under the verified 6 Sep
+    2026 state that is false, so every occurrence must sit strictly inside a
+    ``historical-evidence`` block, never in operative text.
+    """
+    text = _read_agents_md()
+    _assert_agents_historical_evidence(text)
+
+
+def test_agents_md_canonical_live_state_bullet_retains_every_gate() -> None:
+    """T2 (AC3): the canonical live-state bullet still requires every retained gate.
+
+    This is the G3 fail-open guard, scoped precisely to the one operative
+    statement of the current merge bar (the "Verified live state — 6 Sep
+    2026 (D-ToS-1)" bullet, up to its historical-evidence begin marker): CI,
+    the four exact app-pinned check names (`Checks`,
+    `Web (lint + typecheck + unit)`, `Web (Playwright snapshots)`,
+    `codecov/patch`), CodeQL, Codex's exact-current-head review AND wait,
+    `required_conversation_resolution`, independent triage, risk-routed
+    authenticated local Claude assurance, strict mode, admin enforcement,
+    and zero approving reviews must all remain stated there as current
+    policy. Scoping to this one bullet (rather than the whole document)
+    means an unrelated mention elsewhere can never mask a real regression in
+    the canonical statement itself.
+    """
+    text = _read_agents_md()
+    _assert_canonical_live_policy(text)
+
+
+def test_agents_md_headless_skip_is_documented_and_never_instructed_on() -> None:
+    """T3 (AC2, AC3): the headless skip is explained; the var is never told to be set.
+
+    Also verifies the E8 precedence subsection names both governed files as
+    the operative authorities for the GitHub-Claude required-approval
+    description under D-ToS-1.
+    """
+    text = _read_agents_md()
+    spans = _historical_spans(text)
+
+    assert _present_operatively(text, "skipped headless job is expected", spans)
+
+    operative_parts: list[str] = []
+    previous_end = 0
+    for span_start, span_end in spans:
+        operative_parts.append(text[previous_end:span_start])
+        previous_end = span_end
+    operative_parts.append(text[previous_end:])
+    operative = "".join(operative_parts)
+    assert not _is_affirmative_enablement_instruction(operative)
+
+    _assert_branch_protection_policy(text)
+    _assert_review_roster_policy(text)
+    _assert_minimum_sufficient_review_policy(text)
+    _assert_draft_phase_policy(text)
+    _assert_retained_mechanism_policy(text)
+    _assert_preserved_wait_policy(text)
+    _assert_claude_review_note_policy(text)
+    _assert_precedence_policy(text)
+    for sentence in _REQUIRED_OPERATIVE_AGENTS_SENTENCES:
+        _assert_required_agents_sentence_is_operative(text, sentence)
+
+
+@pytest.mark.docs
+def test_registry_top_entry_and_legacy_blocks_are_reconciled() -> None:
+    """T4 (AC1, AC4): the registry's top entry and legacy blocks are reconciled.
+
+    The first dated ``## Active Epic`` entry must be the 6 Sep 2026 D-ToS-1
+    record citing the exact merged commit; both superseded legacy blocks must
+    carry a dated supersession marker; and every phrase-set-P occurrence in
+    the file must sit inside a historical block, exactly as for AGENTS.md.
+    """
+    registry_path = _REPO_ROOT / "docs" / "state" / "registry.md"
+    text = registry_path.read_text(encoding="utf-8")
+    _assert_registry_policy(text)
+    _assert_registry_historical_evidence(text)
+
+
+def test_historical_span_parser_fails_closed_on_malformed_markers() -> None:
+    """T6 (AC1, AC4): the delimiter parser rejects every malformed synthetic input.
+
+    Each case must raise, never silently degrade to "no historical blocks
+    found" -- that would let a forbidden phrase read as historical while
+    actually remaining unguarded.
+    """
+    unclosed_begin = "before\n<!-- historical-evidence: begin -->\nmiddle\n"
+    with pytest.raises(ValueError, match="unclosed"):
+        _historical_spans(unclosed_begin)
+
+    orphan_end = "before\n<!-- historical-evidence: end -->\nafter\n"
+    with pytest.raises(ValueError, match="orphan"):
+        _historical_spans(orphan_end)
+
+    nested_begin = (
+        "<!-- historical-evidence: begin -->\n"
+        "<!-- historical-evidence: begin -->\n"
+        "<!-- historical-evidence: end -->\n"
+        "<!-- historical-evidence: end -->\n"
+    )
+    with pytest.raises(ValueError, match="nested"):
+        _historical_spans(nested_begin)
+
+    reversed_order = "<!-- historical-evidence: end -->\n<!-- historical-evidence: begin -->\n"
+    with pytest.raises(ValueError, match="orphan"):
+        _historical_spans(reversed_order)
+
+    well_formed = (
+        "a\n<!-- historical-evidence: begin -->\nb\n<!-- historical-evidence: end -->\nc\n"
+    )
+    assert len(_historical_spans(well_formed)) == 1
+
+
+def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> None:
+    """T3 regression: explicit prohibitions stay allowed; enablement does not."""
+    assert not _is_affirmative_enablement_instruction(
+        "Do not set `CLAUDE_HEADLESS_ENABLED` to true."
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "Never set **CLAUDE_HEADLESS_ENABLED**\n> to **true**."
+    )
+    assert _is_affirmative_enablement_instruction("Set **CLAUDE_HEADLESS_ENABLED**\n> to `true`.")
+    assert _is_affirmative_enablement_instruction("CLAUDE_HEADLESS_ENABLED=true")
+    assert _is_affirmative_enablement_instruction("export CLAUDE_HEADLESS_ENABLED='true'")
+    assert _is_affirmative_enablement_instruction('Set CLAUDE_HEADLESS_ENABLED = "true"')
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set " + "\\\n" + "CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"'
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b='true'"
+    )
+    assert _is_affirmative_enablement_instruction("gh variable set CLAUDE_HEADLESS_ENABLED -b true")
+    assert _is_affirmative_enablement_instruction("gh variable set CLAUDE_HEADLESS_ENABLED -b=true")
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --repo owner/repo CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set -R=owner/repo CLAUDE_HEADLESS_ENABLED -b='true'"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --repo='owner/repo' CLAUDE_HEADLESS_ENABLED --body=true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        'gh variable set -R "owner/repo" CLAUDE_HEADLESS_ENABLED -b true'
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh -R owner/repo variable set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh --repo=owner/repo variable set CLAUDE_HEADLESS_ENABLED -b='true'"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable -R owner/repo set CLAUDE_HEADLESS_ENABLED --body=true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        'gh variable --repo "owner/repo" set CLAUDE_HEADLESS_ENABLED -b true'
+    )
+    assert _is_affirmative_enablement_instruction("gh variable set CLAUDE_HEADLESS_ENABLED")
+    assert _is_affirmative_enablement_instruction(
+        "printf true | gh variable set CLAUDE_HEADLESS_ENABLED"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "echo true | gh variable set CLAUDE_HEADLESS_ENABLED"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED < enabled.txt"
+    )
+    assert _is_affirmative_enablement_instruction("gh variable set CLAUDE_HEADLESS_ENABLED <<<true")
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body $VALUE"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b truth"
+    )
+    assert not _is_affirmative_enablement_instruction("Do not export CLAUDE_HEADLESS_ENABLED=true")
+    assert not _is_affirmative_enablement_instruction("Never set CLAUDE_HEADLESS_ENABLED = 'true'")
+    assert not _is_affirmative_enablement_instruction("CLAUDE_HEADLESS_ENABLED=false")
+    assert not _is_affirmative_enablement_instruction("OTHER_HEADLESS_ENABLED=true")
+    assert not _is_affirmative_enablement_instruction(
+        "Do not gh variable set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    for false_body in (
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body=false",
+        'gh variable set CLAUDE_HEADLESS_ENABLED --body "false"',
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b='false'",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false.",
+        "gh variable set --repo=owner/repo CLAUDE_HEADLESS_ENABLED --body 'false'",
+        "gh variable set -R owner/repo CLAUDE_HEADLESS_ENABLED -b=false",
+        "gh -R owner/repo variable set CLAUDE_HEADLESS_ENABLED --body false",
+        "gh variable --repo=owner/repo set CLAUDE_HEADLESS_ENABLED -b='false'",
+        "gh variable set CLAUDE_HEADLESS_ENABLED -R owner/repo --body false",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --repo=owner/repo -b='false'",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false --repo owner/repo",
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b=false -R owner/repo",
+        "gh variable set --body false CLAUDE_HEADLESS_ENABLED",
+        "gh variable set -b=false CLAUDE_HEADLESS_ENABLED",
+        "gh variable set --repo=owner/repo --body false CLAUDE_HEADLESS_ENABLED",
+        "gh variable set -R owner/repo -b=false CLAUDE_HEADLESS_ENABLED",
+        "gh variable set --body false CLAUDE_HEADLESS_ENABLED --repo owner/repo",
+        "gh variable set -b=false CLAUDE_HEADLESS_ENABLED -R=owner/repo",
+        "gh variable set --body false 'CLAUDE_HEADLESS_ENABLED'",
+        'gh variable set "CLAUDE_HEADLESS_ENABLED" -b=false',
+    ):
+        assert not _is_affirmative_enablement_instruction(false_body)
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED -R owner/repo --body true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED --repo=owner/repo -b='true'"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true --repo owner/repo"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b=true -R owner/repo"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false --unlisted owner/repo"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --body true CLAUDE_HEADLESS_ENABLED"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --unlisted owner/repo --body false CLAUDE_HEADLESS_ENABLED"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --repo owner/repo CLAUDE_HEADLESS_ENABLED"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --body false CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --body true CLAUDE_HEADLESS_ENABLED --repo owner/repo"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set -b=true CLAUDE_HEADLESS_ENABLED -R=owner/repo"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --body false CLAUDE_HEADLESS_ENABLED --unlisted owner/repo"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --body false CLAUDE_HEADLESS_ENABLED -b=false"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --body true 'CLAUDE_HEADLESS_ENABLED'"
+    )
+    assert _is_affirmative_enablement_instruction(
+        'gh variable set "CLAUDE_HEADLESS_ENABLED" -b=true'
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --body false 'CLAUDE_HEADLESS_ENABLED\""
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --body false 'CLAUDE_HEADLESS_ENABLED"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh variable set OTHER_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh variable set --repo owner/repo OTHER_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh --repo owner/repo variable set OTHER_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh variable -R owner/repo list CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh --unlisted owner/repo variable set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh variable --unlisted owner/repo set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "gh variable set\nunconnected prose\nCLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false; "
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false. "
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "Do not gh variable set CLAUDE_HEADLESS_ENABLED --body true; "
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "Never gh variable set --repo owner/repo CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "Do not gh --repo owner/repo variable set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+    assert not _is_affirmative_enablement_instruction(
+        "Never gh variable -R owner/repo set CLAUDE_HEADLESS_ENABLED --body true"
+    )
+
+
+def test_responder_workflow_requires_the_true_only_headless_conjunct() -> None:
+    """T5 responder witness: parsed data and in-memory mutations share one guard."""
+    responder_path = _REPO_ROOT / ".github" / "workflows" / "claude.yml"
+    workflow = yaml.safe_load(responder_path.read_text(encoding="utf-8"))
+    _assert_responder_headless_gate(workflow)
+
+    assert isinstance(workflow, dict)
+    workflow_map = cast(dict[str, object], workflow)
+    jobs = workflow_map["jobs"]
+    assert isinstance(jobs, dict)
+    jobs_map = cast(dict[str, object], jobs)
+    claude_job = jobs_map["claude"]
+    assert isinstance(claude_job, dict)
+    claude_map = cast(dict[str, object], claude_job)
+    condition = claude_map["if"]
+    assert isinstance(condition, str)
+    for mutated_condition in (
+        condition.replace("== 'true'", "!= 'true'", 1),
+        condition.replace("vars.CLAUDE_HEADLESS_ENABLED == 'true' && ", "", 1),
+        condition.replace("== 'true' &&", "== 'true' ||", 1),
+        condition.replace(" }}", " || true }}", 1),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_responder_headless_gate({"jobs": {"claude": {"if": mutated_condition}}})
+    with pytest.raises(AssertionError):
+        _assert_responder_headless_gate(
+            {"jobs": {"claude": {"if": condition}, "claude-extra": {"if": "true"}}}
+        )
+
+
+def test_reviewer_workflow_retains_only_the_documented_job() -> None:
+    """T5 reviewer witness: the unchanged condition test retains a singleton job surface."""
+    reviewer_path = _REPO_ROOT / ".github" / "workflows" / "claude-code-review.yml"
+    workflow = yaml.safe_load(reviewer_path.read_text(encoding="utf-8"))
+    _assert_reviewer_workflow_job_set(workflow)
+
+    assert isinstance(workflow, dict)
+    workflow_map = cast(dict[str, object], workflow)
+    jobs = workflow_map["jobs"]
+    assert isinstance(jobs, dict)
+    jobs_map = cast(dict[str, object], jobs)
+    with pytest.raises(AssertionError):
+        _assert_reviewer_workflow_job_set(
+            {"jobs": {**jobs_map, "claude-review-extra": {"if": "true"}}}
+        )
+
+
+def test_claude_workflow_citations_cover_complete_headless_conditions() -> None:
+    """Assert the two operative workflow citations cover their complete ``if`` values."""
+    reviewer_text = (_REPO_ROOT / ".github" / "workflows" / "claude-code-review.yml").read_text(
+        encoding="utf-8"
+    )
+    responder_text = (_REPO_ROOT / ".github" / "workflows" / "claude.yml").read_text(
+        encoding="utf-8"
+    )
+    _assert_workflow_citation_contains_condition(reviewer_text, 27, 41, _REVIEWER_CONDITION)
+    _assert_workflow_citation_contains_condition(responder_text, 14, 26, _RESPONDER_CONDITION)
+
+    with pytest.raises(AssertionError):
+        _assert_workflow_citation_contains_condition(reviewer_text, 27, 40, _REVIEWER_CONDITION)
+    with pytest.raises(AssertionError):
+        _assert_workflow_citation_contains_condition(responder_text, 14, 25, _RESPONDER_CONDITION)
+
+
+@pytest.mark.docs
+def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> None:
+    """Exercise focused synthetic failure modes without mutating governed files.
+
+    These cases cover a generic lower-case check mention, an historical-wrapped
+    canonical bullet, each retained registry clause, missing precedence names,
+    a missing AGENTS historical anchor, and a June directive outside a span.
+    """
+    agents = _read_agents_md()
+    registry = (_REPO_ROOT / "docs" / "state" / "registry.md").read_text(encoding="utf-8")
+    start, end = _canonical_bullet_bounds(agents)
+
+    for sentence in _REQUIRED_OPERATIVE_AGENTS_SENTENCES:
+        with pytest.raises(AssertionError):
+            _assert_required_agents_sentence_is_operative(agents.replace(sentence, "", 1), sentence)
+
+        sentence_start = agents.index(sentence)
+        wrapped_sentence = (
+            agents[:sentence_start]
+            + _BEGIN_MARKER
+            + "\n"
+            + sentence
+            + "\n"
+            + _END_MARKER
+            + agents[sentence_start + len(sentence) :]
+        )
+        _historical_spans(wrapped_sentence)
+        with pytest.raises(AssertionError):
+            _assert_required_agents_sentence_is_operative(wrapped_sentence, sentence)
+
+        sentence_line_start = agents.rfind("\n", 0, sentence_start) + 1
+        sentence_line_end = agents.find("\n", sentence_start + len(sentence))
+        fenced_sentence = (
+            agents[:sentence_line_start]
+            + "```\n"
+            + agents[sentence_line_start : sentence_line_end + 1]
+            + "```\n"
+            + agents[sentence_line_end + 1 :]
+        )
+        assert sentence in fenced_sentence
+        with pytest.raises(AssertionError):
+            _assert_required_agents_sentence_is_operative(fenced_sentence, sentence)
+
+        commented_sentence = (
+            agents[:sentence_line_start]
+            + "<!--"
+            + agents[sentence_line_start : sentence_line_end + 1]
+            + "-->\n"
+            + agents[sentence_line_end + 1 :]
+        )
+        assert sentence in commented_sentence
+        with pytest.raises(AssertionError):
+            _assert_required_agents_sentence_is_operative(commented_sentence, sentence)
+
+        indented_sentence = agents[:sentence_line_start] + "    " + agents[sentence_line_start:]
+        assert sentence in indented_sentence
+        with pytest.raises(AssertionError):
+            _assert_required_agents_sentence_is_operative(indented_sentence, sentence)
+
+        _assert_required_agents_sentence_is_operative(
+            "    unrelated indentation\n" + agents, sentence
+        )
+
+    canonical_line_start = agents.rfind("\n", 0, start) + 1
+    raw_text_canonical = (
+        agents[:canonical_line_start] + "<pre>\n" + agents[canonical_line_start:] + "\n</pre>\n"
+    )
+    raw_start, raw_end = _canonical_bullet_bounds(raw_text_canonical)
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_raw_text_blocks(raw_text_canonical, raw_start, raw_end)
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(raw_text_canonical)
+
+    registry_header = registry.index("## Active Epic")
+    raw_text_registry = (
+        registry[:registry_header] + "<pre>\n" + registry[registry_header:] + "\n</pre>\n"
+    )
+    raw_start = raw_text_registry.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    raw_end = raw_text_registry.index("\n**1 Sep 2026", raw_start)
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_raw_text_blocks(raw_text_registry, raw_start, raw_end)
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(raw_text_registry)
+
+    processing_instruction_canonical = (
+        agents[:canonical_line_start] + "<?\n" + agents[canonical_line_start:] + "\n?>\n"
+    )
+    pi_start, pi_end = _canonical_bullet_bounds(processing_instruction_canonical)
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_processing_instructions(
+            processing_instruction_canonical, pi_start, pi_end
+        )
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(processing_instruction_canonical)
+
+    processing_instruction_registry = (
+        registry[:registry_header] + "<?\n" + registry[registry_header:] + "\n?>\n"
+    )
+    pi_start = processing_instruction_registry.index("## Active Epic")
+    pi_end = processing_instruction_registry.index("\n**1 Sep 2026", pi_start)
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_processing_instructions(
+            processing_instruction_registry, pi_start, pi_end
+        )
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(processing_instruction_registry)
+
+    closed_processing_instruction_before_range = "<?pi?>\ncanonical start\ncanonical end"
+    start_boundary = closed_processing_instruction_before_range.index("canonical start")
+    end_boundary = closed_processing_instruction_before_range.index("canonical end")
+    assert (
+        closed_processing_instruction_before_range.index("<?")
+        < closed_processing_instruction_before_range.index("?>")
+        < start_boundary
+    )
+    _assert_policy_range_is_outside_processing_instructions(
+        closed_processing_instruction_before_range, start_boundary, end_boundary
+    )
+
+    unterminated_processing_instruction = "<?pi\ncanonical start\ncanonical end"
+    start_boundary = unterminated_processing_instruction.index("canonical start")
+    end_boundary = unterminated_processing_instruction.index("canonical end")
+    assert unterminated_processing_instruction.index("<?") < start_boundary < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_processing_instructions(
+            unterminated_processing_instruction, start_boundary, end_boundary
+        )
+
+    declaration_canonical = (
+        agents[:canonical_line_start] + "<!DOCTYPE\n" + agents[canonical_line_start:] + "\n>\n"
+    )
+    declaration_start, declaration_end = _canonical_bullet_bounds(declaration_canonical)
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_declarations(
+            declaration_canonical, declaration_start, declaration_end
+        )
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(declaration_canonical)
+
+    declaration_registry = (
+        registry[:registry_header] + "<!DOCTYPE\n" + registry[registry_header:] + "\n>\n"
+    )
+    declaration_start = declaration_registry.index("## Active Epic")
+    declaration_end = declaration_registry.index("\n**1 Sep 2026", declaration_start)
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_declarations(
+            declaration_registry, declaration_start, declaration_end
+        )
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(declaration_registry)
+
+    closed_declaration_before_range = "<!DOCTYPE html>\ncanonical start\ncanonical end"
+    start_boundary = closed_declaration_before_range.index("canonical start")
+    end_boundary = closed_declaration_before_range.index("canonical end")
+    assert (
+        closed_declaration_before_range.index("<!")
+        < closed_declaration_before_range.index(">")
+        < start_boundary
+    )
+    _assert_policy_range_is_outside_declarations(
+        closed_declaration_before_range, start_boundary, end_boundary
+    )
+
+    unterminated_declaration = "<!DOCTYPE\ncanonical start\ncanonical end"
+    start_boundary = unterminated_declaration.index("canonical start")
+    end_boundary = unterminated_declaration.index("canonical end")
+    assert unterminated_declaration.index("<!") < start_boundary < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_declarations(
+            unterminated_declaration, start_boundary, end_boundary
+        )
+
+    lowercase_declaration_non_opener = "<!doctype\ncanonical start\ncanonical end"
+    start_boundary = lowercase_declaration_non_opener.index("canonical start")
+    end_boundary = lowercase_declaration_non_opener.index("canonical end")
+    assert lowercase_declaration_non_opener.startswith("<!d")
+    _assert_policy_range_is_outside_declarations(
+        lowercase_declaration_non_opener, start_boundary, end_boundary
+    )
+
+    first_declaration_terminator = "<!A>\ncanonical start\ncanonical end\n>"
+    start_boundary = first_declaration_terminator.index("canonical start")
+    end_boundary = first_declaration_terminator.index("canonical end")
+    first_terminator = first_declaration_terminator.index(">")
+    second_terminator = first_declaration_terminator.index(">", first_terminator + 1)
+    assert first_terminator < start_boundary < end_boundary < second_terminator
+    _assert_policy_range_is_outside_declarations(
+        first_declaration_terminator, start_boundary, end_boundary
+    )
+
+    closed_raw_text_before_range = "<pre></pre>\ncanonical start\ncanonical end"
+    start_boundary = closed_raw_text_before_range.index("canonical start")
+    end_boundary = closed_raw_text_before_range.index("canonical end")
+    assert (
+        closed_raw_text_before_range.index("<pre>")
+        < closed_raw_text_before_range.index("</pre>")
+        < start_boundary
+    )
+    _assert_fixed_operative_range_is_visible(
+        closed_raw_text_before_range, start_boundary, end_boundary
+    )
+
+    matching_raw_text_outside_range = "<style>outside</style>\ncanonical start\ncanonical end"
+    start_boundary = matching_raw_text_outside_range.index("canonical start")
+    end_boundary = matching_raw_text_outside_range.index("canonical end")
+    assert (
+        matching_raw_text_outside_range.index("<style>")
+        < matching_raw_text_outside_range.index("</style>")
+        < start_boundary
+    )
+    _assert_fixed_operative_range_is_visible(
+        matching_raw_text_outside_range, start_boundary, end_boundary
+    )
+
+    mismatched_raw_text_close = "<pre>\n</script>\ncanonical start\ncanonical end"
+    start_boundary = mismatched_raw_text_close.index("canonical start")
+    end_boundary = mismatched_raw_text_close.index("canonical end")
+    assert (
+        mismatched_raw_text_close.index("<pre>")
+        < mismatched_raw_text_close.index("</script>")
+        < start_boundary
+    )
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_raw_text_blocks(
+            mismatched_raw_text_close, start_boundary, end_boundary
+        )
+
+    mixed_case_raw_text = "<ScRiPt>\ncanonical start\ncanonical end\n</sCrIpT>"
+    start_boundary = mixed_case_raw_text.index("canonical start")
+    end_boundary = mixed_case_raw_text.index("canonical end")
+    assert (
+        mixed_case_raw_text.index("<ScRiPt>")
+        < start_boundary
+        < end_boundary
+        < mixed_case_raw_text.index("</sCrIpT>")
+    )
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_raw_text_blocks(
+            mixed_case_raw_text, start_boundary, end_boundary
+        )
+
+    same_tag_nested_open = "<pre>\n<pre>\ncanonical before\n</pre>\ncanonical after"
+    before_boundary = same_tag_nested_open.index("canonical before")
+    after_boundary = same_tag_nested_open.index("canonical after")
+    lone_close = same_tag_nested_open.index("</pre>")
+    assert same_tag_nested_open.index("<pre>") < before_boundary < lone_close < after_boundary
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_raw_text_blocks(
+            same_tag_nested_open, before_boundary, before_boundary + len("canonical before")
+        )
+    _assert_policy_range_is_outside_raw_text_blocks(
+        same_tag_nested_open, after_boundary, after_boundary + len("canonical after")
+    )
+
+    different_tag_nested_open = "<pre>\n<script>\ncanonical before\n</pre>\ncanonical after"
+    before_boundary = different_tag_nested_open.index("canonical before")
+    after_boundary = different_tag_nested_open.index("canonical after")
+    lone_close = different_tag_nested_open.index("</pre>")
+    assert different_tag_nested_open.index("<pre>") < before_boundary < lone_close < after_boundary
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_raw_text_blocks(
+            different_tag_nested_open, before_boundary, before_boundary + len("canonical before")
+        )
+    _assert_policy_range_is_outside_raw_text_blocks(
+        different_tag_nested_open, after_boundary, after_boundary + len("canonical after")
+    )
+
+    mixed_case_closed_before_range = "<PrE>\n</pRe>\ncanonical start\ncanonical end"
+    start_boundary = mixed_case_closed_before_range.index("canonical start")
+    end_boundary = mixed_case_closed_before_range.index("canonical end")
+    assert (
+        mixed_case_closed_before_range.index("<PrE>")
+        < mixed_case_closed_before_range.index("</pRe>")
+        < start_boundary
+    )
+    _assert_policy_range_is_outside_raw_text_blocks(
+        mixed_case_closed_before_range, start_boundary, end_boundary
+    )
+
+    registry_spans = _historical_spans(registry)
+    registry_735_span_end = next(
+        span_end
+        for span_start, span_end in registry_spans
+        if "#735 story-closing implementation complete" in registry[span_start:span_end]
+    )
+    registry_735_end = registry.index("\n\n**11 Aug 2026", registry_735_span_end)
+    precedence_heading = "- **Precedence for the GitHub-Claude required-approval description under"
+    roster_heading = "**The PR review roster (verified live 6 Sep 2026, D-ToS-1)"
+    retained_heading = "- Mechanism retained but"
+    preserved_heading = "Preserved as the D108-D118 design/evidence record:"
+    visible_carriers = (
+        (
+            agents,
+            _assert_precedence_policy,
+            agents.index(precedence_heading),
+            agents.index("\n- Mechanism retained"),
+        ),
+        (
+            agents,
+            _assert_branch_protection_policy,
+            agents.index("- **`main` is branch-protected"),
+            agents.index("\n- **Precedence for the GitHub-Claude"),
+        ),
+        (
+            agents,
+            _assert_review_roster_policy,
+            agents.index(roster_heading),
+            agents.index("\n<!-- historical-evidence: begin -->", agents.index(roster_heading)),
+        ),
+        (
+            agents,
+            _assert_minimum_sufficient_review_policy,
+            agents.index("### Minimum sufficient local review"),
+            agents.index("\n\n### Codex project agents"),
+        ),
+        (
+            agents,
+            _assert_draft_phase_policy,
+            agents.index("**Draft phase vs ready phase"),
+            agents.index("\n\n**WAIT for Codex's verdict before merging"),
+        ),
+        (
+            agents,
+            _assert_retained_mechanism_policy,
+            agents.index(retained_heading),
+            agents.index("\n  <!-- historical-evidence: begin -->", agents.index(retained_heading)),
+        ),
+        (
+            agents,
+            _assert_preserved_wait_policy,
+            agents.index(preserved_heading),
+            agents.index(
+                "\n\n<!-- historical-evidence: begin -->",
+                agents.index(preserved_heading),
+            ),
+        ),
+        (
+            agents,
+            _assert_claude_review_note_policy,
+            agents.index("> Note: `claude-review` is intentionally"),
+            agents.index("\n\n## Codex-Led Delivery Topology"),
+        ),
+        (
+            registry,
+            _assert_registry_735_clarification,
+            registry.index("The trigger remains configured", registry_735_span_end),
+            registry_735_end,
+        ),
+    )
+    for document, assertion, carrier_start, carrier_end in visible_carriers:
+        carrier_line_start = document.rfind("\n", 0, carrier_start) + 1
+        fenced = document[:carrier_line_start] + "```\n" + document[carrier_line_start:] + "\n```\n"
+        with pytest.raises(AssertionError):
+            assertion(fenced)
+
+        commented = (
+            document[:carrier_line_start] + "<!--" + document[carrier_line_start:] + "\n-->\n"
+        )
+        with pytest.raises(AssertionError):
+            assertion(commented)
+
+        indented = (
+            document[:carrier_line_start]
+            + "".join(
+                f"    {line}" for line in document[carrier_line_start:carrier_end].splitlines(True)
+            )
+            + document[carrier_end:]
+        )
+        with pytest.raises(AssertionError):
+            assertion(indented)
+
+        assertion("    unrelated indentation\n" + document)
+
+    registry_entry_start = registry.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    registry_entry_end = registry.index("\n**1 Sep 2026", registry_entry_start)
+    for document, assertion, policy_start, policy_end in (
+        (agents, _assert_canonical_live_policy, start, end),
+        (registry, _assert_registry_policy, registry_entry_start, registry_entry_end),
+    ):
+        start_line_start = document.rfind("\n", 0, policy_start) + 1
+        whole_range_indented = (
+            document[:start_line_start]
+            + "".join(
+                f"    {line}" for line in document[start_line_start:policy_end].splitlines(True)
+            )
+            + document[policy_end:]
+        )
+        with pytest.raises(AssertionError):
+            assertion(whole_range_indented)
+
+        with pytest.raises(AssertionError):
+            assertion(document[:start_line_start] + "    " + document[start_line_start:])
+
+        end_line_start = document.rfind("\n", 0, policy_end - 1) + 1
+        with pytest.raises(AssertionError):
+            assertion(document[:end_line_start] + "    " + document[end_line_start:])
+
+        assertion("    unrelated indentation\n" + document)
+
+    registry_heading_start = registry.index("## Active Epic")
+    registry_heading_indented = (
+        registry[:registry_heading_start] + "    " + registry[registry_heading_start:]
+    )
+    assert registry_heading_indented.index("## Active Epic") == registry_heading_start + 4
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(registry_heading_indented)
+
+    generic_checks = (
+        agents[:start] + agents[start:end].replace("`Checks`", "required checks", 1) + agents[end:]
+    )
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(generic_checks)
+
+    for original, replacement in (
+        ("`Checks`", "`Checks` (optional)"),
+        ("app-pinned", "not app-pinned"),
+        ("**zero** approving reviews", "**not zero** approving reviews"),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_canonical_live_policy(
+                agents[:start] + agents[start:end].replace(original, replacement, 1) + agents[end:]
+            )
+
+    missing_headless_token = (
+        agents[:start]
+        + _remove_first_occurrence(agents[start:end], "`CLAUDE_HEADLESS_ENABLED`")
+        + agents[end:]
+    )
+    with pytest.raises(AssertionError, match="missing canonical headless token"):
+        _assert_canonical_live_policy(missing_headless_token)
+
+    lower_case_headless_token = (
+        agents[:start]
+        + agents[start:end].replace("CLAUDE_HEADLESS_ENABLED", "claude_headless_enabled", 1)
+        + agents[end:]
+    )
+    with pytest.raises(AssertionError, match="missing canonical headless token"):
+        _assert_canonical_live_policy(lower_case_headless_token)
+
+    bullet_line_start = agents.rfind("\n", 0, start) + 1
+    wrapped = (
+        agents[:bullet_line_start]
+        + _BEGIN_MARKER
+        + "\n"
+        + agents[bullet_line_start:end]
+        + _END_MARKER
+        + "\n"
+        + agents[end:]
+    )
+    _historical_spans(wrapped)
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(wrapped)
+
+    fenced_before_heading = agents[:bullet_line_start] + "```\n" + agents[bullet_line_start:]
+    fenced_heading_start = fenced_before_heading.index(_CANONICAL_LIVE_STATE_HEADING)
+    retained_end = fenced_before_heading.index(_END_MARKER, fenced_heading_start) + len(_END_MARKER)
+    fenced_through_retained_history = (
+        fenced_before_heading[:retained_end] + "\n```\n" + fenced_before_heading[retained_end:]
+    )
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(fenced_through_retained_history)
+
+    start_outside_end_inside = "canonical start\n```\ncanonical end\n```\n"
+    start_boundary = start_outside_end_inside.index("canonical start")
+    opening_fence = start_outside_end_inside.index("```")
+    closing_fence = start_outside_end_inside.rindex("```")
+    end_boundary = closing_fence - 1
+    assert start_boundary < opening_fence < end_boundary < closing_fence
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            start_outside_end_inside, start_boundary, end_boundary
+        )
+
+    start_inside_end_outside = "```\ncanonical start\n```\ncanonical end"
+    start_boundary = start_inside_end_outside.index("canonical start")
+    end_boundary = len(start_inside_end_outside)
+    opening_fence = start_inside_end_outside.index("```")
+    closing_fence = start_inside_end_outside.rindex("```")
+    assert opening_fence < start_boundary < closing_fence < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            start_inside_end_outside, start_boundary, end_boundary
+        )
+
+    quoted_fence_wrap = "> ```\n> canonical start\n> canonical end"
+    start_boundary = quoted_fence_wrap.index("canonical start")
+    end_boundary = quoted_fence_wrap.index("canonical end")
+    opening_fence = quoted_fence_wrap.index("```")
+    assert opening_fence < start_boundary < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            quoted_fence_wrap, start_boundary, end_boundary
+        )
+
+    quoted_fence_before_range = "> ```\n> ignored\n> ```\ncanonical start\ncanonical end"
+    start_boundary = quoted_fence_before_range.index("canonical start")
+    end_boundary = quoted_fence_before_range.index("canonical end")
+    opening_fence = quoted_fence_before_range.index("```")
+    closing_fence = quoted_fence_before_range.rindex("```")
+    assert opening_fence < closing_fence < start_boundary < end_boundary
+    _assert_canonical_range_is_outside_markdown_fences(
+        quoted_fence_before_range, start_boundary, end_boundary
+    )
+
+    nested_blockquote_fence = ">> ```\ncanonical start\ncanonical end"
+    start_boundary = nested_blockquote_fence.index("canonical start")
+    end_boundary = nested_blockquote_fence.index("canonical end")
+    assert nested_blockquote_fence.index("```") < start_boundary < end_boundary
+    _assert_canonical_range_is_outside_markdown_fences(
+        nested_blockquote_fence, start_boundary, end_boundary
+    )
+
+    quoted_start_outside_end_inside = "> canonical start\n> ```\n> canonical end\n> ```\n"
+    start_boundary = quoted_start_outside_end_inside.index("canonical start")
+    opening_fence = quoted_start_outside_end_inside.index("```")
+    closing_fence = quoted_start_outside_end_inside.rindex("```")
+    end_boundary = quoted_start_outside_end_inside.rfind("\n", 0, closing_fence) + 1
+    assert start_boundary < opening_fence < end_boundary < closing_fence
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            quoted_start_outside_end_inside, start_boundary, end_boundary
+        )
+
+    quoted_start_inside_end_outside = "> ```\n> canonical start\n> ```\n> canonical end"
+    start_boundary = quoted_start_inside_end_outside.index("canonical start")
+    end_boundary = len(quoted_start_inside_end_outside)
+    opening_fence = quoted_start_inside_end_outside.index("```")
+    closing_fence = quoted_start_inside_end_outside.rindex("```")
+    assert opening_fence < start_boundary < closing_fence < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            quoted_start_inside_end_outside, start_boundary, end_boundary
+        )
+
+    tilde_wraps_both_boundaries = "~~~\ncanonical start\ncanonical end\n~~~\n"
+    start_boundary = tilde_wraps_both_boundaries.index("canonical start")
+    end_boundary = tilde_wraps_both_boundaries.index("canonical end")
+    opening_fence = tilde_wraps_both_boundaries.index("~~~")
+    closing_fence = tilde_wraps_both_boundaries.rindex("~~~")
+    assert opening_fence < start_boundary < end_boundary < closing_fence
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            tilde_wraps_both_boundaries, start_boundary, end_boundary
+        )
+
+    tilde_start_outside_end_inside = "canonical start\n~~~\ncanonical end\n~~~\n"
+    start_boundary = tilde_start_outside_end_inside.index("canonical start")
+    opening_fence = tilde_start_outside_end_inside.index("~~~")
+    closing_fence = tilde_start_outside_end_inside.rindex("~~~")
+    end_boundary = closing_fence - 1
+    assert start_boundary < opening_fence < end_boundary < closing_fence
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            tilde_start_outside_end_inside, start_boundary, end_boundary
+        )
+
+    tilde_start_inside_end_outside = "~~~\ncanonical start\n~~~\ncanonical end"
+    start_boundary = tilde_start_inside_end_outside.index("canonical start")
+    end_boundary = len(tilde_start_inside_end_outside)
+    opening_fence = tilde_start_inside_end_outside.index("~~~")
+    closing_fence = tilde_start_inside_end_outside.rindex("~~~")
+    assert opening_fence < start_boundary < closing_fence < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            tilde_start_inside_end_outside, start_boundary, end_boundary
+        )
+
+    mismatched_fence_classes = "```\n~~~\ncanonical start\ncanonical end"
+    start_boundary = mismatched_fence_classes.index("canonical start")
+    end_boundary = mismatched_fence_classes.index("canonical end")
+    opening_fence = mismatched_fence_classes.index("```")
+    closing_fence = mismatched_fence_classes.index("~~~")
+    assert opening_fence < closing_fence < start_boundary < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            mismatched_fence_classes, start_boundary, end_boundary
+        )
+
+    four_backtick_wrap = "````\n```\ncanonical start\ncanonical end\n````\n"
+    start_boundary = four_backtick_wrap.index("canonical start")
+    end_boundary = four_backtick_wrap.index("canonical end")
+    opening_fence = four_backtick_wrap.index("````")
+    shorter_content_run = four_backtick_wrap.index("```\n", opening_fence + 1)
+    closing_fence = four_backtick_wrap.rindex("````")
+    assert opening_fence < shorter_content_run < start_boundary < end_boundary < closing_fence
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            four_backtick_wrap, start_boundary, end_boundary
+        )
+
+    matching_fence_outside_range = "````\nignored\n````\ncanonical start\ncanonical end"
+    start_boundary = matching_fence_outside_range.index("canonical start")
+    end_boundary = matching_fence_outside_range.index("canonical end")
+    opening_fence = matching_fence_outside_range.index("````")
+    closing_fence = matching_fence_outside_range.rindex("````")
+    assert opening_fence < closing_fence < start_boundary < end_boundary
+    _assert_canonical_range_is_outside_markdown_fences(
+        matching_fence_outside_range, start_boundary, end_boundary
+    )
+
+    escaped_fence_before_range = "\\```\ncanonical start\ncanonical end"
+    start_boundary = escaped_fence_before_range.index("canonical start")
+    end_boundary = escaped_fence_before_range.index("canonical end")
+    escaped_run = escaped_fence_before_range.index("```")
+    assert escaped_fence_before_range.startswith("\\```")
+    assert escaped_run < start_boundary < end_boundary
+    _assert_canonical_range_is_outside_markdown_fences(
+        escaped_fence_before_range, start_boundary, end_boundary
+    )
+
+    non_whitespace_fence_tail = "```\n``` content\ncanonical start\ncanonical end\n```\n"
+    start_boundary = non_whitespace_fence_tail.index("canonical start")
+    end_boundary = non_whitespace_fence_tail.index("canonical end")
+    opening_fence = non_whitespace_fence_tail.index("```")
+    non_closing_run = non_whitespace_fence_tail.index("``` content")
+    closing_fence = non_whitespace_fence_tail.rindex("```")
+    assert opening_fence < non_closing_run < start_boundary < end_boundary < closing_fence
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            non_whitespace_fence_tail, start_boundary, end_boundary
+        )
+
+    backtick_then_tilde_exploit = "```\n~~~\n```\n~~~\ncanonical start\ncanonical end"
+    start_boundary = backtick_then_tilde_exploit.index("canonical start")
+    end_boundary = backtick_then_tilde_exploit.index("canonical end")
+    backtick_open = backtick_then_tilde_exploit.index("```")
+    tilde_content = backtick_then_tilde_exploit.index("~~~")
+    backtick_close = backtick_then_tilde_exploit.index("```", backtick_open + len("```"))
+    tilde_open = backtick_then_tilde_exploit.index("~~~", tilde_content + len("~~~"))
+    assert (
+        backtick_open < tilde_content < backtick_close < tilde_open < start_boundary < end_boundary
+    )
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            backtick_then_tilde_exploit, start_boundary, end_boundary
+        )
+
+    tilde_then_backtick_exploit = "~~~\n```\n~~~\n```\ncanonical start\ncanonical end"
+    start_boundary = tilde_then_backtick_exploit.index("canonical start")
+    end_boundary = tilde_then_backtick_exploit.index("canonical end")
+    tilde_open = tilde_then_backtick_exploit.index("~~~")
+    backtick_content = tilde_then_backtick_exploit.index("```")
+    tilde_close = tilde_then_backtick_exploit.index("~~~", tilde_open + len("~~~"))
+    backtick_open = tilde_then_backtick_exploit.index("```", backtick_content + len("```"))
+    assert (
+        tilde_open < backtick_content < tilde_close < backtick_open < start_boundary < end_boundary
+    )
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            tilde_then_backtick_exploit, start_boundary, end_boundary
+        )
+
+    tab_indented_carrier = "\tcanonical start\ncanonical end"
+    start_boundary = tab_indented_carrier.index("canonical start")
+    end_boundary = tab_indented_carrier.index("canonical end")
+    assert tab_indented_carrier.index("\t") < start_boundary < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_fixed_policy_range_is_not_indented_code(
+            tab_indented_carrier, start_boundary, end_boundary
+        )
+
+    mid_line_tab = "canonical\tstart\ncanonical end"
+    start_boundary = mid_line_tab.index("canonical")
+    end_boundary = mid_line_tab.index("canonical end")
+    assert mid_line_tab.index("\t") > start_boundary
+    _assert_fixed_policy_range_is_not_indented_code(mid_line_tab, start_boundary, end_boundary)
+
+    # Tab-stop column arithmetic is deliberately deferred to follow-up #942.
+    two_spaces_then_tab = "  \tcanonical start\ncanonical end"
+    start_boundary = two_spaces_then_tab.index("canonical start")
+    end_boundary = two_spaces_then_tab.index("canonical end")
+    assert two_spaces_then_tab.startswith("  \t")
+    _assert_fixed_policy_range_is_not_indented_code(
+        two_spaces_then_tab, start_boundary, end_boundary
+    )
+
+    one_level_blockquote_indented = ">     canonical start\ncanonical end"
+    start_boundary = one_level_blockquote_indented.index("canonical start")
+    end_boundary = one_level_blockquote_indented.index("canonical end")
+    assert one_level_blockquote_indented.startswith(">     ")
+    with pytest.raises(AssertionError):
+        _assert_fixed_policy_range_is_not_indented_code(
+            one_level_blockquote_indented, start_boundary, end_boundary
+        )
+
+    nested_blockquote_indented = ">>     canonical start\ncanonical end"
+    start_boundary = nested_blockquote_indented.index("canonical start")
+    end_boundary = nested_blockquote_indented.index("canonical end")
+    assert nested_blockquote_indented.startswith(">>     ")
+    _assert_fixed_policy_range_is_not_indented_code(
+        nested_blockquote_indented, start_boundary, end_boundary
+    )
+
+    one_level_mixed_indentation = ">  \tcanonical start\ncanonical end"
+    start_boundary = one_level_mixed_indentation.index("canonical start")
+    end_boundary = one_level_mixed_indentation.index("canonical end")
+    assert one_level_mixed_indentation.startswith(">  \t")
+    _assert_fixed_policy_range_is_not_indented_code(
+        one_level_mixed_indentation, start_boundary, end_boundary
+    )
+
+    _assert_policy_range_is_outside_code_spans(agents, start, end)
+
+    escaped_unmatched_code_span = "\\`\ncanonical start\ncanonical end"
+    start_boundary = escaped_unmatched_code_span.index("canonical start")
+    end_boundary = escaped_unmatched_code_span.index("canonical end")
+    escaped_run = escaped_unmatched_code_span.index("`")
+    assert escaped_unmatched_code_span.startswith("\\`")
+    assert escaped_run < start_boundary < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_code_spans(
+            escaped_unmatched_code_span, start_boundary, end_boundary
+        )
+
+    double_backtick_wrap = "``\ncanonical start\ncanonical end\n``"
+    start_boundary = double_backtick_wrap.index("canonical start")
+    end_boundary = double_backtick_wrap.index("canonical end")
+    opening_span = double_backtick_wrap.index("``")
+    closing_span = double_backtick_wrap.rindex("``")
+    assert opening_span < start_boundary < end_boundary < closing_span
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_code_spans(
+            double_backtick_wrap, start_boundary, end_boundary
+        )
+
+    mismatched_code_span = "``\ncanonical start\ncanonical end\n`"
+    start_boundary = mismatched_code_span.index("canonical start")
+    end_boundary = mismatched_code_span.index("canonical end")
+    opening_span = mismatched_code_span.index("``")
+    mismatched_closer = mismatched_code_span.rindex("`")
+    assert opening_span < start_boundary < end_boundary < mismatched_closer
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_code_spans(
+            mismatched_code_span, start_boundary, end_boundary
+        )
+
+    paired_code_span_before_range = "``ignored``\ncanonical start\ncanonical end"
+    start_boundary = paired_code_span_before_range.index("canonical start")
+    end_boundary = paired_code_span_before_range.index("canonical end")
+    opening_span = paired_code_span_before_range.index("``")
+    closing_span = paired_code_span_before_range.index("``", opening_span + 2)
+    assert opening_span < closing_span < start_boundary < end_boundary
+    _assert_policy_range_is_outside_code_spans(
+        paired_code_span_before_range, start_boundary, end_boundary
+    )
+
+    unmatched_code_span = "``\ncanonical start\ncanonical end"
+    start_boundary = unmatched_code_span.index("canonical start")
+    end_boundary = unmatched_code_span.index("canonical end")
+    assert unmatched_code_span.index("``") < start_boundary < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_code_spans(
+            unmatched_code_span, start_boundary, end_boundary
+        )
+
+    code_span_start_outside_end_inside = "canonical start\n``\ncanonical end\n``"
+    start_boundary = code_span_start_outside_end_inside.index("canonical start")
+    opening_span = code_span_start_outside_end_inside.index("``")
+    closing_span = code_span_start_outside_end_inside.rindex("``")
+    end_boundary = closing_span - 1
+    assert start_boundary < opening_span < end_boundary < closing_span
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_code_spans(
+            code_span_start_outside_end_inside, start_boundary, end_boundary
+        )
+
+    code_span_start_inside_end_outside = "``\ncanonical start\n``\ncanonical end"
+    start_boundary = code_span_start_inside_end_outside.index("canonical start")
+    end_boundary = len(code_span_start_inside_end_outside)
+    opening_span = code_span_start_inside_end_outside.index("``")
+    closing_span = code_span_start_inside_end_outside.rindex("``")
+    assert opening_span < start_boundary < closing_span < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_code_spans(
+            code_span_start_inside_end_outside, start_boundary, end_boundary
+        )
+
+    closed_comment_before_range = "<!-- closed -->\ncanonical start\ncanonical end"
+    start_boundary = closed_comment_before_range.index("canonical start")
+    end_boundary = closed_comment_before_range.index("canonical end")
+    assert (
+        closed_comment_before_range.index("<!--")
+        < closed_comment_before_range.index("-->")
+        < start_boundary
+    )
+    _assert_policy_range_is_outside_html_comments(
+        closed_comment_before_range, start_boundary, end_boundary
+    )
+
+    orphan_close_before_pair = "-->\n<!-- valid -->\n" + agents
+    mutated_start, mutated_end = _canonical_bullet_bounds(orphan_close_before_pair)
+    orphan_close = orphan_close_before_pair.index("-->")
+    opening_comment = orphan_close_before_pair.index("<!--")
+    closing_comment = orphan_close_before_pair.index("-->", orphan_close + len("-->"))
+    assert orphan_close < opening_comment < closing_comment < mutated_start < mutated_end
+    _assert_canonical_live_policy(orphan_close_before_pair)
+
+    malformed_browser_terminator = agents[:start] + "<!-- malformed --!>" + agents[start:]
+    mutated_start, mutated_end = _canonical_bullet_bounds(malformed_browser_terminator)
+    opening_comment = mutated_start - len("<!-- malformed --!>")
+    malformed_terminator = malformed_browser_terminator.index("--!>", opening_comment)
+    assert opening_comment < malformed_terminator < mutated_start < mutated_end
+    assert (
+        _normalized_visible(malformed_browser_terminator[mutated_start:mutated_end])
+        == _CANONICAL_POLICY_SNAPSHOT
+    )
+    _assert_historical_span_hashes(malformed_browser_terminator, "AGENTS.md")
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(malformed_browser_terminator)
+
+    adjacent_empty_comments = "<!----><!---->\ncanonical start\ncanonical end"
+    start_boundary = adjacent_empty_comments.index("canonical start")
+    end_boundary = adjacent_empty_comments.index("canonical end")
+    first_opening = adjacent_empty_comments.index("<!--")
+    first_closing = adjacent_empty_comments.index("-->")
+    second_opening = adjacent_empty_comments.index("<!--", first_opening + len("<!--"))
+    second_closing = adjacent_empty_comments.index("-->", first_closing + len("-->"))
+    assert first_opening < first_closing < second_opening < second_closing < start_boundary
+    _assert_policy_range_is_outside_html_comments(
+        adjacent_empty_comments, start_boundary, end_boundary
+    )
+
+    # Intentionally fail-closed raw scanner independence, not HTML-in-Markdown parsing.
+    comment_in_closed_fence = "```\n<!--\n```\ncanonical start\ncanonical end"
+    start_boundary = comment_in_closed_fence.index("canonical start")
+    end_boundary = comment_in_closed_fence.index("canonical end")
+    opening_fence = comment_in_closed_fence.index("```")
+    comment_opening = comment_in_closed_fence.index("<!--")
+    closing_fence = comment_in_closed_fence.rindex("```")
+    assert opening_fence < comment_opening < closing_fence < start_boundary < end_boundary
+    _assert_canonical_range_is_outside_markdown_fences(
+        comment_in_closed_fence, start_boundary, end_boundary
+    )
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_html_comments(
+            comment_in_closed_fence, start_boundary, end_boundary
+        )
+
+    non_nested_comment = "<!-- outer <!-- inner -->\ncanonical start\ncanonical end"
+    start_boundary = non_nested_comment.index("canonical start")
+    end_boundary = non_nested_comment.index("canonical end")
+    outer_opening = non_nested_comment.index("<!--")
+    inner_opening = non_nested_comment.index("<!--", outer_opening + len("<!--"))
+    closing_comment = non_nested_comment.index("-->")
+    assert outer_opening < inner_opening < closing_comment < start_boundary < end_boundary
+    _assert_policy_range_is_outside_html_comments(non_nested_comment, start_boundary, end_boundary)
+
+    canonical_comment_wrap = agents[:start] + "<!--" + agents[start:]
+    mutated_start, mutated_end = _canonical_bullet_bounds(canonical_comment_wrap)
+    opening_comment = mutated_start - len("<!--")
+    closing_comment = canonical_comment_wrap.index("-->", mutated_start)
+    assert opening_comment < mutated_start < mutated_end < closing_comment
+    assert (
+        _normalized_visible(canonical_comment_wrap[mutated_start:mutated_end])
+        == _CANONICAL_POLICY_SNAPSHOT
+    )
+    _assert_historical_span_hashes(canonical_comment_wrap, "AGENTS.md")
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(canonical_comment_wrap)
+
+    for original, replacement in (
+        ("strict mode,", "non-strict mode,"),
+        ("strict mode,", "not strict mode,"),
+        (
+            "`required_conversation_resolution`",
+            "`required_conversation_resolution` remain disabled;",
+        ),
+        ("`required_conversation_resolution`", "`required_conversation_resolution`=false"),
+        ("`enforce_admins`\n  remain enabled", "`enforce_admins` remain disabled"),
+        ("`enforce_admins`\n  remain enabled", "`enforce_admins`=false"),
+    ):
+        weakened = (
+            agents[:start] + agents[start:end].replace(original, replacement, 1) + agents[end:]
+        )
+        with pytest.raises(AssertionError):
+            _assert_canonical_live_policy(weakened)
+
+    for replacement in ("set", "is active"):
+        weakened = (
+            agents[:start]
+            + agents[start:end].replace(
+                "unset" if replacement == "set" else "is retired", replacement, 1
+            )
+            + agents[end:]
+        )
+        with pytest.raises(AssertionError):
+            _assert_canonical_live_policy(weakened)
+    for instruction in (
+        "Set CLAUDE_HEADLESS_ENABLED=true",
+        "export CLAUDE_HEADLESS_ENABLED='true'",
+        "CLAUDE_HEADLESS_ENABLED=true",
+        "requires two approving reviews",
+        "requires **two** approving reviews",
+        "requires ten approving reviews",
+        "requires 10 approving reviews",
+        "requires at least two approving reviews",
+        "must have two approving reviews",
+        "needs ten approving reviews",
+        "requires one approval",
+        "must have two approvals",
+        "needs ten approvals",
+        "requires `two` approving reviews",
+        "requires `two approving` reviews",
+        "must `have two` approvals",
+        "required_approving_review_count=1",
+        "required_approving_review_count = 10",
+        "required_approving_review_count: 2",
+        "`required_approving_review_count`: 1",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
+        "gh variable set " + "\\\n" + "CLAUDE_HEADLESS_ENABLED --body true",
+        'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b='true'",
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b=true",
+        "gh variable set CLAUDE_HEADLESS_ENABLED",
+        "printf true | gh variable set CLAUDE_HEADLESS_ENABLED",
+        "gh variable set CLAUDE_HEADLESS_ENABLED < enabled.txt",
+        "gh variable set CLAUDE_HEADLESS_ENABLED <<<true",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body $VALUE",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false; "
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
+        "Do not gh variable set CLAUDE_HEADLESS_ENABLED --body true; "
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
+        "gh variable set --repo owner/repo CLAUDE_HEADLESS_ENABLED --body true",
+        "gh variable set -R=owner/repo CLAUDE_HEADLESS_ENABLED -b='true'",
+        "gh -R owner/repo variable set CLAUDE_HEADLESS_ENABLED --body true",
+        "gh --repo=owner/repo variable set CLAUDE_HEADLESS_ENABLED -b='true'",
+        "gh variable -R owner/repo set CLAUDE_HEADLESS_ENABLED --body=true",
+        'gh variable --repo "owner/repo" set CLAUDE_HEADLESS_ENABLED -b true',
+    ):
+        with pytest.raises(AssertionError):
+            _assert_canonical_live_policy(agents + "\n" + instruction)
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(
+            agents[:start]
+            + agents[start:end].replace("independent triage", "not independent triage", 1)
+            + agents[end:]
+        )
+
+    registry_entry_start = registry.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    registry_entry_end = registry.index("\n**1 Sep 2026", registry_entry_start)
+    next_record_line_end = registry.index("\n", registry_entry_end + 1)
+
+    registry_comment_wrap = (
+        registry[:registry_entry_start] + "<!--" + registry[registry_entry_start:]
+    )
+    mutated_start = registry_comment_wrap.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    mutated_end = registry_comment_wrap.index("\n**1 Sep 2026", mutated_start)
+    opening_comment = mutated_start - len("<!--")
+    closing_comment = registry_comment_wrap.index("-->", mutated_start)
+    assert opening_comment < mutated_start < mutated_end < closing_comment
+    assert (
+        _normalized_visible(registry_comment_wrap[mutated_start:mutated_end])
+        == _REGISTRY_POLICY_SNAPSHOT
+    )
+    _assert_historical_span_hashes(registry_comment_wrap, "docs/state/registry.md")
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(registry_comment_wrap)
+
+    for newer_entry in (
+        "**7 Sep 2026 — newer entry.**\n",
+        "> 7 Sep 2026 — newer entry.\n",
+        "- 7 Sep 2026 — newer entry.\n",
+        "1. 7 Sep 2026 — newer entry.\n",
+        "### 7 Sep 2026 — newer entry\n",
+    ):
+        registry_with_pre_entry = (
+            registry[:registry_entry_start] + newer_entry + registry[registry_entry_start:]
+        )
+        mutated_start = registry_with_pre_entry.index(
+            "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+        )
+        mutated_end = registry_with_pre_entry.index("\n**1 Sep 2026", mutated_start)
+        assert registry_with_pre_entry[
+            registry_with_pre_entry.index("## Active Epic") + len("## Active Epic") : mutated_start
+        ].strip()
+        assert (
+            _normalized_visible(registry_with_pre_entry[mutated_start:mutated_end])
+            == _REGISTRY_POLICY_SNAPSHOT
+        )
+        _assert_historical_span_hashes(registry_with_pre_entry, "docs/state/registry.md")
+        with pytest.raises(AssertionError):
+            _assert_registry_policy(registry_with_pre_entry)
+
+    registry_backtick_wrap = (
+        registry[:registry_entry_start]
+        + "```\n"
+        + registry[registry_entry_start : next_record_line_end + 1]
+        + "```\n"
+        + registry[next_record_line_end + 1 :]
+    )
+    mutated_start = registry_backtick_wrap.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    mutated_end = registry_backtick_wrap.index("\n**1 Sep 2026", mutated_start)
+    opening_fence = registry_backtick_wrap.index("```")
+    closing_fence = registry_backtick_wrap.index("```", opening_fence + len("```"))
+    assert opening_fence < mutated_start < mutated_end < closing_fence
+    assert (
+        _normalized_visible(registry_backtick_wrap[mutated_start:mutated_end])
+        == _REGISTRY_POLICY_SNAPSHOT
+    )
+    _assert_historical_span_hashes(registry_backtick_wrap, "docs/state/registry.md")
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(registry_backtick_wrap)
+
+    registry_start_outside_end_inside = (
+        registry[:registry_entry_end]
+        + "\n```\n"
+        + registry[registry_entry_end : next_record_line_end + 1]
+        + "```\n"
+        + registry[next_record_line_end + 1 :]
+    )
+    mutated_start = registry_start_outside_end_inside.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    mutated_end = registry_start_outside_end_inside.index("\n**1 Sep 2026", mutated_start)
+    opening_fence = registry_start_outside_end_inside.index("```")
+    closing_fence = registry_start_outside_end_inside.index("```", opening_fence + len("```"))
+    assert mutated_start < opening_fence < mutated_end < closing_fence
+    assert (
+        _normalized_visible(registry_start_outside_end_inside[mutated_start:mutated_end])
+        == _REGISTRY_POLICY_SNAPSHOT
+    )
+    _assert_historical_span_hashes(registry_start_outside_end_inside, "docs/state/registry.md")
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(registry_start_outside_end_inside)
+
+    registry_start_inside_end_outside = (
+        registry[:registry_entry_start]
+        + "```\n"
+        + registry[registry_entry_start : registry.index("\n", registry_entry_start)]
+        + "\n```\n"
+        + registry[registry.index("\n", registry_entry_start) + 1 :]
+    )
+    mutated_start = registry_start_inside_end_outside.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    mutated_end = registry_start_inside_end_outside.index("\n**1 Sep 2026", mutated_start)
+    opening_fence = registry_start_inside_end_outside.index("```")
+    closing_fence = registry_start_inside_end_outside.index("```", opening_fence + len("```"))
+    assert opening_fence < mutated_start < closing_fence < mutated_end
+    assert (
+        _normalized_visible(registry_start_inside_end_outside[mutated_start:mutated_end])
+        == _REGISTRY_POLICY_SNAPSHOT
+    )
+    _assert_historical_span_hashes(registry_start_inside_end_outside, "docs/state/registry.md")
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(registry_start_inside_end_outside)
+
+    registry_tilde_wrap = (
+        registry[:registry_entry_start]
+        + "~~~\n"
+        + registry[registry_entry_start : next_record_line_end + 1]
+        + "~~~\n"
+        + registry[next_record_line_end + 1 :]
+    )
+    mutated_start = registry_tilde_wrap.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    mutated_end = registry_tilde_wrap.index("\n**1 Sep 2026", mutated_start)
+    opening_fence = registry_tilde_wrap.index("~~~")
+    closing_fence = registry_tilde_wrap.index("~~~", opening_fence + len("~~~"))
+    assert opening_fence < mutated_start < mutated_end < closing_fence
+    assert (
+        _normalized_visible(registry_tilde_wrap[mutated_start:mutated_end])
+        == _REGISTRY_POLICY_SNAPSHOT
+    )
+    _assert_historical_span_hashes(registry_tilde_wrap, "docs/state/registry.md")
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(registry_tilde_wrap)
+
+    for original, replacement in (
+        ("`Checks`", "`Checks` (optional)"),
+        ("app-pinned", "not app-pinned"),
+        ("zero approving reviews", "not zero approving reviews"),
+        ("**dormant**", "**active**"),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_registry_policy(
+                registry[:registry_entry_start]
+                + registry[registry_entry_start:registry_entry_end].replace(
+                    original, replacement, 1
+                )
+                + registry[registry_entry_end:]
+            )
+    for clause in (
+        "requires zero approving reviews",
+        "skipped headless job is expected",
+        "strict mode",
+        "enforce_admins=true",
+        "required_conversation_resolution=true",
+        "CodeQL handling",
+        "exact-current-head review",
+        "and wait",
+        "independent triage",
+        "risk-routed authenticated local Claude assurance",
+    ):
+        missing_clause = (
+            registry[:registry_entry_start]
+            + _remove_first_occurrence(registry[registry_entry_start:registry_entry_end], clause)
+            + registry[registry_entry_end:]
+        )
+        with pytest.raises(AssertionError):
+            _assert_registry_policy(missing_clause)
+
+    for original, replacement in (
+        ("required_approving_review_count=0", "required_approving_review_count>=0"),
+        ("strict mode;", "non-strict mode;"),
+        ("strict mode;", "not strict mode;"),
+        ("enforce_admins=true", "enforce_admins=false"),
+        ("enforce_admins=true", "not enforce_admins=true"),
+        ("required_conversation_resolution=true", "required_conversation_resolution=false"),
+        ("required_conversation_resolution=true", "not required_conversation_resolution=true"),
+        ("is unset", "is set"),
+        ("is retired", "is active"),
+    ):
+        weakened = (
+            registry[:registry_entry_start]
+            + registry[registry_entry_start:registry_entry_end].replace(original, replacement, 1)
+            + registry[registry_entry_end:]
+        )
+        with pytest.raises(AssertionError):
+            _assert_registry_policy(weakened)
+    for instruction in (
+        "Set CLAUDE_HEADLESS_ENABLED=true",
+        "export CLAUDE_HEADLESS_ENABLED='true'",
+        "CLAUDE_HEADLESS_ENABLED=true",
+        "requires two approving reviews",
+        "requires **two** approving reviews",
+        "requires ten approving reviews",
+        "requires 10 approving reviews",
+        "requires at least two approving reviews",
+        "must have two approving reviews",
+        "needs ten approving reviews",
+        "requires one approval",
+        "must have two approvals",
+        "needs ten approvals",
+        "requires `two` approving reviews",
+        "requires `two approving` reviews",
+        "must `have two` approvals",
+        "required_approving_review_count=1",
+        "required_approving_review_count = 10",
+        "required_approving_review_count: 2",
+        "`required_approving_review_count`: 1",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
+        "gh variable set " + "\\\n" + "CLAUDE_HEADLESS_ENABLED --body true",
+        'gh variable set CLAUDE_HEADLESS_ENABLED --body="true"',
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b='true'",
+        "gh variable set CLAUDE_HEADLESS_ENABLED -b=true",
+        "gh variable set CLAUDE_HEADLESS_ENABLED",
+        "echo true | gh variable set CLAUDE_HEADLESS_ENABLED",
+        "gh variable set CLAUDE_HEADLESS_ENABLED < enabled.txt",
+        "gh variable set CLAUDE_HEADLESS_ENABLED <<<true",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body $VALUE",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body false; "
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
+        "Do not gh variable set CLAUDE_HEADLESS_ENABLED --body true; "
+        "gh variable set CLAUDE_HEADLESS_ENABLED --body true",
+        "gh variable set --repo owner/repo CLAUDE_HEADLESS_ENABLED --body true",
+        "gh variable set -R=owner/repo CLAUDE_HEADLESS_ENABLED -b='true'",
+        "gh -R owner/repo variable set CLAUDE_HEADLESS_ENABLED --body true",
+        "gh --repo=owner/repo variable set CLAUDE_HEADLESS_ENABLED -b='true'",
+        "gh variable -R owner/repo set CLAUDE_HEADLESS_ENABLED --body=true",
+        'gh variable --repo "owner/repo" set CLAUDE_HEADLESS_ENABLED -b true',
+    ):
+        with pytest.raises(AssertionError):
+            _assert_registry_policy(registry + "\n" + instruction)
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(
+            registry[:registry_entry_start]
+            + registry[registry_entry_start:registry_entry_end].replace(
+                "independent triage", "not independent triage", 1
+            )
+            + registry[registry_entry_end:]
+        )
+
+    for document, assertion in (
+        (agents, _assert_canonical_live_policy),
+        (registry, _assert_registry_policy),
+    ):
+        for allowed_instruction in (
+            "requires no approving reviews",
+            "requires **no** approving reviews",
+            "must have zero approving reviews",
+            "needs no approving reviews",
+            "does not require two approving reviews",
+            "no longer requires two approving reviews",
+            "requires zero approvals",
+            "must have no approvals",
+            "requires `zero` approving reviews",
+            "must have `no` approvals",
+            "does not require two approvals",
+            "no longer requires one approval",
+            "approval is required before publication",
+            "required_approving_review_count=0",
+            "required_approving_review_count = 0",
+            "required_approving_review_count: 0",
+            "gh variable set --repo=owner/repo CLAUDE_HEADLESS_ENABLED --body 'false'",
+            "gh -R owner/repo variable set CLAUDE_HEADLESS_ENABLED --body false",
+            "Never gh variable --repo=owner/repo set CLAUDE_HEADLESS_ENABLED -b true",
+            "gh --repo owner/repo variable set OTHER_HEADLESS_ENABLED --body true",
+            "gh variable -R owner/repo list CLAUDE_HEADLESS_ENABLED --body true",
+            "Do not gh variable set -R owner/repo CLAUDE_HEADLESS_ENABLED --body true",
+            "gh variable set --repo owner/repo OTHER_HEADLESS_ENABLED --body true",
+        ):
+            assertion(document + "\n" + allowed_instruction)
+
+    for historical_nonzero_requirement in (
+        "requires ten approving reviews",
+        "must have two approving reviews",
+        "needs ten approving reviews",
+        "requires one approval",
+        "must have two approvals",
+        "needs ten approvals",
+        "requires `two` approving reviews",
+        "requires `two approving` reviews",
+        "must `have two` approvals",
+    ):
+        historical_nonzero = (
+            agents
+            + "\n"
+            + _BEGIN_MARKER
+            + "\n"
+            + historical_nonzero_requirement
+            + "\n"
+            + _END_MARKER
+        )
+        _assert_no_nonzero_approval_requirement(
+            historical_nonzero, _historical_spans(historical_nonzero)
+        )
+    for historical_machine_assignment in (
+        "required_approving_review_count=1",
+        "required_approving_review_count = 1",
+        "required_approving_review_count: 1",
+    ):
+        historical_machine_nonzero = (
+            agents
+            + "\n"
+            + _BEGIN_MARKER
+            + "\n"
+            + historical_machine_assignment
+            + "\n"
+            + _END_MARKER
+        )
+        _assert_no_nonzero_approval_requirement(
+            historical_machine_nonzero, _historical_spans(historical_machine_nonzero)
+        )
+    for nonzero_requirement in (
+        "requires **two** approving reviews",
+        "must have two approving reviews",
+        "needs ten approving reviews",
+        "requires one approval",
+        "must have two approvals",
+        "needs ten approvals",
+        "requires `two` approving reviews",
+        "requires `two approving` reviews",
+        "must `have two` approvals",
+    ):
+        with pytest.raises(AssertionError):
+            _assert_no_nonzero_approval_requirement(
+                agents + "\n" + nonzero_requirement,
+                _historical_spans(agents + "\n" + nonzero_requirement),
+            )
+    for allowed_requirement in (
+        "must have zero approving reviews",
+        "needs no approving reviews",
+        "does not require two approving reviews",
+        "no longer requires two approving reviews",
+        "requires zero approvals",
+        "must have no approvals",
+        "requires `zero` approving reviews",
+        "must have `no` approvals",
+        "does not require two approvals",
+        "no longer requires one approval",
+        "approval is required before publication",
+    ):
+        _assert_no_nonzero_approval_requirement(
+            agents + "\n" + allowed_requirement,
+            _historical_spans(agents + "\n" + allowed_requirement),
+        )
+    for machine_nonzero in (
+        "required_approving_review_count=1",
+        "required_approving_review_count = 10",
+        "required_approving_review_count: 2",
+        "`required_approving_review_count`: 1",
+    ):
+        with pytest.raises(AssertionError):
+            _assert_no_nonzero_approval_requirement(
+                agents + "\n" + machine_nonzero,
+                _historical_spans(agents + "\n" + machine_nonzero),
+            )
+
+    precedence_start = agents.index(
+        "- **Precedence for the GitHub-Claude required-approval description under"
+    )
+    precedence_end = agents.index("\n- Mechanism retained", precedence_start)
+    for filename in ("AGENTS.md", "docs/state/registry.md"):
+        missing_authority = (
+            agents[:precedence_start]
+            + agents[precedence_start:precedence_end].replace(f"`{filename}`", "", 1)
+            + agents[precedence_end:]
+        )
+        with pytest.raises(AssertionError, match="missing precedence authority"):
+            _assert_precedence_policy(missing_authority)
+    with pytest.raises(AssertionError):
+        _assert_precedence_policy(
+            agents[:precedence_start]
+            + agents[precedence_start:precedence_end].replace(
+                "are the sole\n  operative authorities",
+                "are not the sole\n  operative authorities",
+                1,
+            )
+            + agents[precedence_end:]
+        )
+
+    for anchor in (
+        "PR-scoped Claude restoration (#663 / D108-D118",
+        "Activation state — LIVE 31 Jul 2026 (#663 / D108-D118)",
+        "WAIT for Claude's PR-scoped approval before merging",
+        "D108-D118 are active as of 31 Jul 2026",
+    ):
+        with pytest.raises(AssertionError, match="missing AGENTS history"):
+            _assert_agents_historical_evidence(agents.replace(anchor, "", 1))
+
+    for directive in (
+        "arm the `review-gate` required check (#159 / D58)",
+        "mark `review-gate` a REQUIRED status check on `main` to arm it",
+        "operator activates the `review-gate` required check (#159 / D58)",
+    ):
+        with pytest.raises(AssertionError, match="historical evidence anchor vanished"):
+            _assert_registry_historical_evidence(
+                _remove_first_occurrence(registry, directive) + "\n" + directive
+            )
+
+    branch_start = agents.index("- **`main` is branch-protected")
+    branch_end = agents.index("\n- **Precedence for the GitHub-Claude", branch_start)
+    for original, replacement in (
+        ("strict mode;", "strict mode disabled;"),
+        ("`Checks`", "`Checks` (optional)"),
+        ("zero approving reviews", "two approving reviews"),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_branch_protection_policy(
+                agents[:branch_start]
+                + agents[branch_start:branch_end].replace(original, replacement, 1)
+                + agents[branch_end:]
+            )
+    with pytest.raises(AssertionError):
+        _assert_branch_protection_policy(
+            agents[:branch_end] + agents[branch_start:branch_end] + agents[branch_end:]
+        )
+
+    roster_start = agents.index("**The PR review roster (verified live 6 Sep 2026, D-ToS-1)")
+    roster_end = agents.index("\n<!-- historical-evidence: begin -->", roster_start)
+    for original, replacement in (
+        ("retired/dormant", "live"),
+        ("no longer a live roster member", "a live roster member"),
+        ("GitHub `Codex`", ""),
+        ("authenticated local Claude assurance", ""),
+        ("independent triage", ""),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_review_roster_policy(
+                agents[:roster_start]
+                + agents[roster_start:roster_end].replace(original, replacement, 1)
+                + agents[roster_end:]
+            )
+
+    review_start = agents.index("### Minimum sufficient local review")
+    review_end = agents.index("\n\n- Ordinary slice:", review_start)
+    with pytest.raises(AssertionError):
+        _assert_minimum_sufficient_review_policy(
+            agents[:review_start]
+            + agents[review_start:review_end].replace(
+                "Ready-head\nCodex review and wait", "GitHub Claude exact-head approval", 1
+            )
+            + agents[review_end:]
+        )
+    ordinary_slice_end = agents.index("\n- Safety,", review_start)
+    with pytest.raises(AssertionError):
+        _assert_minimum_sufficient_review_policy(
+            agents[:ordinary_slice_end]
+            + " GitHub Claude exact-head approval is required."
+            + agents[ordinary_slice_end:]
+        )
+
+    draft_start = agents.index("**Draft phase vs ready phase")
+    draft_end = agents.index("\n\n**WAIT for Codex's verdict before merging", draft_start)
+    with pytest.raises(AssertionError):
+        _assert_draft_phase_policy(
+            agents[:draft_start]
+            + agents[draft_start:draft_end].replace(
+                "a\nskipped run posts no findings to fold",
+                "findings there are real and worth folding",
+                1,
+            )
+            + agents[draft_end:]
+        )
+
+    with pytest.raises(AssertionError):
+        _assert_registry_735_clarification(
+            registry.replace("The trigger remains configured", "", 1)
+        )
+    with pytest.raises(AssertionError):
+        _assert_registry_735_clarification(
+            registry.replace(
+                "its headless job skips while\n`CLAUDE_HEADLESS_ENABLED` is unset",
+                "the review itself still runs unskipped",
+                1,
+            )
+        )
+
+    mechanism_start = agents.index("- Mechanism retained but")
+    mechanism_end = agents.index("\n  <!-- historical-evidence: begin -->", mechanism_start)
+    for original, replacement in (
+        ("dormant", ""),
+        ("dormant", "not dormant"),
+        ("operator-owned branch-protection decision", ""),
+        ("operator-owned branch-protection decision", "not operator-owned"),
+        ("gates nothing\n  today", "gates merge today"),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_retained_mechanism_policy(
+                agents[:mechanism_start]
+                + agents[mechanism_start:mechanism_end].replace(original, replacement, 1)
+                + agents[mechanism_end:]
+            )
+    with pytest.raises(AssertionError):
+        _assert_retained_mechanism_policy(
+            agents[:mechanism_end]
+            + " This dormant mechanism gates merge today."
+            + agents[mechanism_end:]
+        )
+
+    preserved_start = agents.index("Preserved as the D108-D118 design/evidence record:")
+    preserved_end = agents.index("\n\n<!-- historical-evidence: begin -->", preserved_start)
+    with pytest.raises(AssertionError):
+        _assert_preserved_wait_policy(agents[:preserved_start] + agents[preserved_end:])
+    with pytest.raises(AssertionError):
+        _assert_preserved_wait_policy(
+            agents[:preserved_end] + " This wait gates merge today." + agents[preserved_end:]
+        )
+
+    for original, replacement in (
+        ("retained but dormant.]", "retained but active.]"),
+        ("it is dormant, not current policy.]", "it is not dormant, current policy.]"),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_registry_supersession_notes(registry.replace(original, replacement, 1))
+    supersession_start = registry.index(_SUPERSESSION_MARKER)
+    supersession_end = registry.index("]", supersession_start) + 1
+    with pytest.raises(AssertionError):
+        _assert_registry_supersession_notes(
+            registry[:supersession_start]
+            + _BEGIN_MARKER
+            + "\n"
+            + registry[supersession_start:supersession_end]
+            + "\n"
+            + _END_MARKER
+            + registry[supersession_end:]
+        )
+
+    supersession_notes = list(
+        re.finditer(
+            r"\[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file:.*?\]",
+            registry,
+            re.DOTALL,
+        )
+    )
+    assert len(supersession_notes) == len(_REGISTRY_SUPERSESSION_NOTE_SNAPSHOTS)
+    for note in supersession_notes:
+        note_line_start = registry.rfind("\n", 0, note.start()) + 1
+        note_line_end = registry.find("\n", note.end())
+        fenced_note = (
+            registry[:note_line_start]
+            + "```\n"
+            + registry[note_line_start : note_line_end + 1]
+            + "```\n"
+            + registry[note_line_end + 1 :]
+        )
+        assert note.group() in fenced_note
+        with pytest.raises(AssertionError):
+            _assert_registry_supersession_notes(fenced_note)
+
+        commented_note = (
+            registry[:note_line_start]
+            + "<!--"
+            + registry[note_line_start : note_line_end + 1]
+            + "-->\n"
+            + registry[note_line_end + 1 :]
+        )
+        assert note.group() in commented_note
+        with pytest.raises(AssertionError):
+            _assert_registry_supersession_notes(commented_note)
+
+        note_lines = registry[note_line_start : note_line_end + 1].splitlines(True)
+        indented_note = (
+            registry[:note_line_start]
+            + "".join(f"    {line}" for line in note_lines)
+            + registry[note_line_end + 1 :]
+        )
+        with pytest.raises(AssertionError):
+            _assert_registry_supersession_notes(indented_note)
+
+        _assert_registry_supersession_notes("    unrelated indentation\n" + registry)
+
+    note_start = agents.index("> Note: `claude-review` is intentionally")
+    note_end = agents.index("\n\n## Codex-Led Delivery Topology", note_start)
+    with pytest.raises(AssertionError):
+        _assert_claude_review_note_policy(agents[:note_start] + agents[note_end:])
+    for citation in (
+        ".github/workflows/claude-code-review.yml:27-41",
+        ".github/workflows/claude.yml:14-26",
+    ):
+        with pytest.raises(AssertionError):
+            _assert_claude_review_note_policy(agents.replace(citation, "", 1))
+    with pytest.raises(AssertionError):
+        _assert_claude_review_note_policy(
+            agents.replace("**not** a required status check", "a required status check", 1)
+        )
+    with pytest.raises(AssertionError):
+        _assert_claude_review_note_policy(
+            agents[:note_end]
+            + "\n> `claude-review` is a required status check."
+            + agents[note_end:]
+        )
+
+    for document, assertion in (
+        (agents, _assert_agents_historical_evidence),
+        (registry, _assert_registry_historical_evidence),
+    ):
+        for _span_start, span_end in _historical_spans(document):
+            closing_line_start = document.rfind("\n", 0, span_end - 1) + 1
+            with pytest.raises(AssertionError):
+                assertion(document[:closing_line_start] + " \n" + document[closing_line_start:])
+
+    inline_code_wait = "`WAIT` for Claude's PR-scoped approval"
+    for document, assertion in (
+        (agents, _assert_agents_historical_evidence),
+        (registry, _assert_registry_historical_evidence),
+    ):
+        with pytest.raises(AssertionError):
+            assertion(document + "\n" + inline_code_wait)
+    historical_inline_code_wait = _BEGIN_MARKER + "\n" + inline_code_wait + "\n" + _END_MARKER
+    historical_inline_code_wait_spans = _historical_spans(historical_inline_code_wait)
+    assert _occurrences(historical_inline_code_wait, "WAIT for Claude's PR-scoped approval")
+    assert not _present_operatively(
+        historical_inline_code_wait,
+        "WAIT for Claude's PR-scoped approval",
+        historical_inline_code_wait_spans,
+    )
+
+    wait_start, wait_end = _historical_spans(agents)[-1]
+    wait_span = agents[wait_start:wait_end]
+    early_close_at = wait_span.index("Opening a normal PR starts Claude")
+    early_close_line_start = wait_span.rfind("\n", 0, early_close_at) + 1
+    wait_without_original_end = wait_span[: wait_span.rfind(_END_MARKER)]
+    shortened_wait = (
+        wait_without_original_end[:early_close_line_start]
+        + _END_MARKER
+        + "\n"
+        + wait_without_original_end[early_close_line_start:]
+    )
+    with pytest.raises(AssertionError):
+        _assert_agents_historical_evidence(agents[:wait_start] + shortened_wait + agents[wait_end:])
+
+    for document, assertion in (
+        (agents, _assert_agents_historical_evidence),
+        (registry, _assert_registry_historical_evidence),
+    ):
+        for label_start, label_end in _historical_label_ranges(
+            document, _historical_spans(document)
+        ):
+            with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
+                assertion(document[:label_start] + document[label_end:])
+            hidden_label = "<!-- " + document[label_start:label_end] + " -->"
+            with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
+                assertion(document[:label_start] + hidden_label + document[label_end:])
+            with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
+                assertion(document[: label_end - len("]**")] + document[label_end:])
+            with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
+                assertion(
+                    document[:label_start]
+                    + document[label_start:label_end].replace("6 Sep 2026", "6 September", 1)
+                    + document[label_end:]
+                )
+            with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
+                assertion(
+                    document[:label_start]
+                    + "```text\n"
+                    + document[label_start:label_end]
+                    + "\n```"
+                    + document[label_end:]
+                )
+            with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
+                assertion(
+                    document[:label_start]
+                    + "```\n"
+                    + document[label_start:label_end]
+                    + "\n```"
+                    + document[label_end:]
+                )
+            with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
+                bold_start = document.index("**", label_start, label_end)
+                assertion(document[:bold_start] + document[bold_start + 2 :])
