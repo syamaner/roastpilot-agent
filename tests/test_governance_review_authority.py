@@ -263,27 +263,49 @@ def _assert_canonical_range_is_outside_markdown_fences(text: str, start: int, en
     """Reject a fenced-code state that covers either canonical-policy boundary."""
     boundaries = iter(sorted((start, end)))
     next_boundary = next(boundaries, None)
-    active_run_lengths: dict[str, int | None] = {"`": None, "~": None}
+    active_fence: tuple[str, int] | None = None
     line_start = 0
     for line in text.splitlines(keepends=True):
         while next_boundary is not None and next_boundary <= line_start:
-            assert all(length is None for length in active_run_lengths.values())
+            assert active_fence is None
             next_boundary = next(boundaries, None)
 
         fence_match = re.match(r"^[ \t]*(?P<run>`{3,}|~{3,})(?P<tail>[^\r\n]*)$", line)
         if fence_match:
             run = fence_match.group("run")
             delimiter = run[0]
-            active_run_length = active_run_lengths[delimiter]
-            if active_run_length is None:
-                active_run_lengths[delimiter] = len(run)
-            elif len(run) >= active_run_length and not fence_match.group("tail").strip():
-                active_run_lengths[delimiter] = None
+            if active_fence is None:
+                active_fence = (delimiter, len(run))
+            elif (
+                delimiter == active_fence[0]
+                and len(run) >= active_fence[1]
+                and not fence_match.group("tail").strip()
+            ):
+                active_fence = None
 
         line_start += len(line)
 
     while next_boundary is not None:
-        assert all(length is None for length in active_run_lengths.values())
+        assert active_fence is None
+        next_boundary = next(boundaries, None)
+
+
+def _assert_policy_range_is_outside_html_comments(text: str, start: int, end: int) -> None:
+    """Reject a non-nested HTML comment state covering either policy boundary."""
+    boundaries = iter(sorted((start, end)))
+    next_boundary = next(boundaries, None)
+    comment_open = False
+    for marker in re.finditer(r"<!--|-->", text):
+        while next_boundary is not None and next_boundary <= marker.start():
+            assert not comment_open
+            next_boundary = next(boundaries, None)
+        if marker.group() == "<!--" and not comment_open:
+            comment_open = True
+        elif marker.group() == "-->" and comment_open:
+            comment_open = False
+
+    while next_boundary is not None:
+        assert not comment_open
         next_boundary = next(boundaries, None)
 
 
@@ -379,6 +401,7 @@ def _assert_canonical_live_policy(text: str) -> None:
     start, end = _canonical_bullet_bounds(text)
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
     _assert_canonical_range_is_outside_markdown_fences(text, start, end)
+    _assert_policy_range_is_outside_html_comments(text, start, end)
     bullet = _canonical_live_state_bullet(text)
     assert "CLAUDE_HEADLESS_ENABLED" in bullet, "missing canonical headless token"
     normalized_bullet = _normalized_visible(bullet)
@@ -545,12 +568,13 @@ def _assert_registry_policy(text: str) -> None:
     header_index = text.index("## Active Epic")
     entry_heading = "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
     entry_start = text.index(entry_heading, header_index)
-    assert not re.search(r"\n\*\*[^\n]+", text[header_index:entry_start])
+    assert not text[header_index + len("## Active Epic") : entry_start].strip()
     entry_end = text.index("\n**1 Sep 2026", entry_start)
     assert not any(
         span_start < entry_end and entry_start < span_end for span_start, span_end in spans
     )
     _assert_canonical_range_is_outside_markdown_fences(text, entry_start, entry_end)
+    _assert_policy_range_is_outside_html_comments(text, entry_start, entry_end)
     entry = text[entry_start:entry_end]
     normalized_entry = _normalized_visible(entry)
     assert (
@@ -1392,6 +1416,61 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         matching_fence_outside_range, start_boundary, end_boundary
     )
 
+    backtick_then_tilde_exploit = "```\n~~~\n```\n~~~\ncanonical start\ncanonical end"
+    start_boundary = backtick_then_tilde_exploit.index("canonical start")
+    end_boundary = backtick_then_tilde_exploit.index("canonical end")
+    backtick_open = backtick_then_tilde_exploit.index("```")
+    tilde_content = backtick_then_tilde_exploit.index("~~~")
+    backtick_close = backtick_then_tilde_exploit.index("```", backtick_open + len("```"))
+    tilde_open = backtick_then_tilde_exploit.index("~~~", tilde_content + len("~~~"))
+    assert (
+        backtick_open < tilde_content < backtick_close < tilde_open < start_boundary < end_boundary
+    )
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            backtick_then_tilde_exploit, start_boundary, end_boundary
+        )
+
+    tilde_then_backtick_exploit = "~~~\n```\n~~~\n```\ncanonical start\ncanonical end"
+    start_boundary = tilde_then_backtick_exploit.index("canonical start")
+    end_boundary = tilde_then_backtick_exploit.index("canonical end")
+    tilde_open = tilde_then_backtick_exploit.index("~~~")
+    backtick_content = tilde_then_backtick_exploit.index("```")
+    tilde_close = tilde_then_backtick_exploit.index("~~~", tilde_open + len("~~~"))
+    backtick_open = tilde_then_backtick_exploit.index("```", backtick_content + len("```"))
+    assert (
+        tilde_open < backtick_content < tilde_close < backtick_open < start_boundary < end_boundary
+    )
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            tilde_then_backtick_exploit, start_boundary, end_boundary
+        )
+
+    closed_comment_before_range = "<!-- closed -->\ncanonical start\ncanonical end"
+    start_boundary = closed_comment_before_range.index("canonical start")
+    end_boundary = closed_comment_before_range.index("canonical end")
+    assert (
+        closed_comment_before_range.index("<!--")
+        < closed_comment_before_range.index("-->")
+        < start_boundary
+    )
+    _assert_policy_range_is_outside_html_comments(
+        closed_comment_before_range, start_boundary, end_boundary
+    )
+
+    canonical_comment_wrap = agents[:start] + "<!--" + agents[start:]
+    mutated_start, mutated_end = _canonical_bullet_bounds(canonical_comment_wrap)
+    opening_comment = mutated_start - len("<!--")
+    closing_comment = canonical_comment_wrap.index("-->", mutated_start)
+    assert opening_comment < mutated_start < mutated_end < closing_comment
+    assert (
+        _normalized_visible(canonical_comment_wrap[mutated_start:mutated_end])
+        == _CANONICAL_POLICY_SNAPSHOT
+    )
+    _assert_historical_span_hashes(canonical_comment_wrap, "AGENTS.md")
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(canonical_comment_wrap)
+
     for original, replacement in (
         ("strict mode,", "non-strict mode,"),
         ("strict mode,", "not strict mode,"),
@@ -1475,6 +1554,49 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     )
     registry_entry_end = registry.index("\n**1 Sep 2026", registry_entry_start)
     next_record_line_end = registry.index("\n", registry_entry_end + 1)
+
+    registry_comment_wrap = (
+        registry[:registry_entry_start] + "<!--" + registry[registry_entry_start:]
+    )
+    mutated_start = registry_comment_wrap.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    mutated_end = registry_comment_wrap.index("\n**1 Sep 2026", mutated_start)
+    opening_comment = mutated_start - len("<!--")
+    closing_comment = registry_comment_wrap.index("-->", mutated_start)
+    assert opening_comment < mutated_start < mutated_end < closing_comment
+    assert (
+        _normalized_visible(registry_comment_wrap[mutated_start:mutated_end])
+        == _REGISTRY_POLICY_SNAPSHOT
+    )
+    _assert_historical_span_hashes(registry_comment_wrap, "docs/state/registry.md")
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(registry_comment_wrap)
+
+    for newer_entry in (
+        "**7 Sep 2026 — newer entry.**\n",
+        "> 7 Sep 2026 — newer entry.\n",
+        "- 7 Sep 2026 — newer entry.\n",
+        "1. 7 Sep 2026 — newer entry.\n",
+        "### 7 Sep 2026 — newer entry\n",
+    ):
+        registry_with_pre_entry = (
+            registry[:registry_entry_start] + newer_entry + registry[registry_entry_start:]
+        )
+        mutated_start = registry_with_pre_entry.index(
+            "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+        )
+        mutated_end = registry_with_pre_entry.index("\n**1 Sep 2026", mutated_start)
+        assert registry_with_pre_entry[
+            registry_with_pre_entry.index("## Active Epic") + len("## Active Epic") : mutated_start
+        ].strip()
+        assert (
+            _normalized_visible(registry_with_pre_entry[mutated_start:mutated_end])
+            == _REGISTRY_POLICY_SNAPSHOT
+        )
+        _assert_historical_span_hashes(registry_with_pre_entry, "docs/state/registry.md")
+        with pytest.raises(AssertionError):
+            _assert_registry_policy(registry_with_pre_entry)
 
     registry_backtick_wrap = (
         registry[:registry_entry_start]
