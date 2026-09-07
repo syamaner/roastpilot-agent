@@ -261,12 +261,30 @@ def _canonical_live_state_bullet(text: str) -> str:
 
 def _assert_canonical_range_is_outside_markdown_fences(text: str, start: int, end: int) -> None:
     """Reject a fenced-code state that covers either canonical-policy boundary."""
-    for delimiter in ("```", "~~~"):
-        fence_positions = [
-            match.start() for match in re.finditer(rf"(?m)^[ \t]*{re.escape(delimiter)}", text)
-        ]
-        assert sum(position < start for position in fence_positions) % 2 == 0
-        assert sum(position < end for position in fence_positions) % 2 == 0
+    boundaries = iter(sorted((start, end)))
+    next_boundary = next(boundaries, None)
+    active_run_lengths: dict[str, int | None] = {"`": None, "~": None}
+    line_start = 0
+    for line in text.splitlines(keepends=True):
+        while next_boundary is not None and next_boundary <= line_start:
+            assert all(length is None for length in active_run_lengths.values())
+            next_boundary = next(boundaries, None)
+
+        fence_match = re.match(r"^[ \t]*(?P<run>`{3,}|~{3,})(?P<tail>[^\r\n]*)$", line)
+        if fence_match:
+            run = fence_match.group("run")
+            delimiter = run[0]
+            active_run_length = active_run_lengths[delimiter]
+            if active_run_length is None:
+                active_run_lengths[delimiter] = len(run)
+            elif len(run) >= active_run_length and not fence_match.group("tail").strip():
+                active_run_lengths[delimiter] = None
+
+        line_start += len(line)
+
+    while next_boundary is not None:
+        assert all(length is None for length in active_run_lengths.values())
+        next_boundary = next(boundaries, None)
 
 
 def _is_affirmative_enablement_instruction(text: str) -> bool:
@@ -532,6 +550,7 @@ def _assert_registry_policy(text: str) -> None:
     assert not any(
         span_start < entry_end and entry_start < span_end for span_start, span_end in spans
     )
+    _assert_canonical_range_is_outside_markdown_fences(text, entry_start, entry_end)
     entry = text[entry_start:entry_end]
     normalized_entry = _normalized_visible(entry)
     assert (
@@ -1351,6 +1370,28 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             mismatched_fence_classes, start_boundary, end_boundary
         )
 
+    four_backtick_wrap = "````\n```\ncanonical start\ncanonical end\n````\n"
+    start_boundary = four_backtick_wrap.index("canonical start")
+    end_boundary = four_backtick_wrap.index("canonical end")
+    opening_fence = four_backtick_wrap.index("````")
+    shorter_content_run = four_backtick_wrap.index("```\n", opening_fence + 1)
+    closing_fence = four_backtick_wrap.rindex("````")
+    assert opening_fence < shorter_content_run < start_boundary < end_boundary < closing_fence
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            four_backtick_wrap, start_boundary, end_boundary
+        )
+
+    matching_fence_outside_range = "````\nignored\n````\ncanonical start\ncanonical end"
+    start_boundary = matching_fence_outside_range.index("canonical start")
+    end_boundary = matching_fence_outside_range.index("canonical end")
+    opening_fence = matching_fence_outside_range.index("````")
+    closing_fence = matching_fence_outside_range.rindex("````")
+    assert opening_fence < closing_fence < start_boundary < end_boundary
+    _assert_canonical_range_is_outside_markdown_fences(
+        matching_fence_outside_range, start_boundary, end_boundary
+    )
+
     for original, replacement in (
         ("strict mode,", "non-strict mode,"),
         ("strict mode,", "not strict mode,"),
@@ -1433,6 +1474,96 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
     )
     registry_entry_end = registry.index("\n**1 Sep 2026", registry_entry_start)
+    next_record_line_end = registry.index("\n", registry_entry_end + 1)
+
+    registry_backtick_wrap = (
+        registry[:registry_entry_start]
+        + "```\n"
+        + registry[registry_entry_start : next_record_line_end + 1]
+        + "```\n"
+        + registry[next_record_line_end + 1 :]
+    )
+    mutated_start = registry_backtick_wrap.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    mutated_end = registry_backtick_wrap.index("\n**1 Sep 2026", mutated_start)
+    opening_fence = registry_backtick_wrap.index("```")
+    closing_fence = registry_backtick_wrap.index("```", opening_fence + len("```"))
+    assert opening_fence < mutated_start < mutated_end < closing_fence
+    assert (
+        _normalized_visible(registry_backtick_wrap[mutated_start:mutated_end])
+        == _REGISTRY_POLICY_SNAPSHOT
+    )
+    _assert_historical_span_hashes(registry_backtick_wrap, "docs/state/registry.md")
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(registry_backtick_wrap)
+
+    registry_start_outside_end_inside = (
+        registry[:registry_entry_end]
+        + "\n```\n"
+        + registry[registry_entry_end : next_record_line_end + 1]
+        + "```\n"
+        + registry[next_record_line_end + 1 :]
+    )
+    mutated_start = registry_start_outside_end_inside.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    mutated_end = registry_start_outside_end_inside.index("\n**1 Sep 2026", mutated_start)
+    opening_fence = registry_start_outside_end_inside.index("```")
+    closing_fence = registry_start_outside_end_inside.index("```", opening_fence + len("```"))
+    assert mutated_start < opening_fence < mutated_end < closing_fence
+    assert (
+        _normalized_visible(registry_start_outside_end_inside[mutated_start:mutated_end])
+        == _REGISTRY_POLICY_SNAPSHOT
+    )
+    _assert_historical_span_hashes(registry_start_outside_end_inside, "docs/state/registry.md")
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(registry_start_outside_end_inside)
+
+    registry_start_inside_end_outside = (
+        registry[:registry_entry_start]
+        + "```\n"
+        + registry[registry_entry_start : registry.index("\n", registry_entry_start)]
+        + "\n```\n"
+        + registry[registry.index("\n", registry_entry_start) + 1 :]
+    )
+    mutated_start = registry_start_inside_end_outside.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    mutated_end = registry_start_inside_end_outside.index("\n**1 Sep 2026", mutated_start)
+    opening_fence = registry_start_inside_end_outside.index("```")
+    closing_fence = registry_start_inside_end_outside.index("```", opening_fence + len("```"))
+    assert opening_fence < mutated_start < closing_fence < mutated_end
+    assert (
+        _normalized_visible(registry_start_inside_end_outside[mutated_start:mutated_end])
+        == _REGISTRY_POLICY_SNAPSHOT
+    )
+    _assert_historical_span_hashes(registry_start_inside_end_outside, "docs/state/registry.md")
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(registry_start_inside_end_outside)
+
+    registry_tilde_wrap = (
+        registry[:registry_entry_start]
+        + "~~~\n"
+        + registry[registry_entry_start : next_record_line_end + 1]
+        + "~~~\n"
+        + registry[next_record_line_end + 1 :]
+    )
+    mutated_start = registry_tilde_wrap.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    mutated_end = registry_tilde_wrap.index("\n**1 Sep 2026", mutated_start)
+    opening_fence = registry_tilde_wrap.index("~~~")
+    closing_fence = registry_tilde_wrap.index("~~~", opening_fence + len("~~~"))
+    assert opening_fence < mutated_start < mutated_end < closing_fence
+    assert (
+        _normalized_visible(registry_tilde_wrap[mutated_start:mutated_end])
+        == _REGISTRY_POLICY_SNAPSHOT
+    )
+    _assert_historical_span_hashes(registry_tilde_wrap, "docs/state/registry.md")
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(registry_tilde_wrap)
+
     for original, replacement in (
         ("`Checks`", "`Checks` (optional)"),
         ("app-pinned", "not app-pinned"),
