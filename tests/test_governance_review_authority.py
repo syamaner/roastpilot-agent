@@ -1682,12 +1682,12 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         lowercase_declaration_non_opener, start_boundary, end_boundary
     )
 
-    first_declaration_terminator = "<!A> >\ncanonical start\ncanonical end"
+    first_declaration_terminator = "<!A>\ncanonical start\ncanonical end\n>"
     start_boundary = first_declaration_terminator.index("canonical start")
     end_boundary = first_declaration_terminator.index("canonical end")
     first_terminator = first_declaration_terminator.index(">")
     second_terminator = first_declaration_terminator.index(">", first_terminator + 1)
-    assert first_terminator < second_terminator < start_boundary < end_boundary
+    assert first_terminator < start_boundary < end_boundary < second_terminator
     _assert_policy_range_is_outside_declarations(
         first_declaration_terminator, start_boundary, end_boundary
     )
