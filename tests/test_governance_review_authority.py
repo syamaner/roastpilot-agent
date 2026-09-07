@@ -79,6 +79,13 @@ _CANONICAL_LIVE_STATE_REQUIRED_PHRASES: tuple[str, ...] = (
     "risk-routed authenticated local Claude assurance",
 )
 
+_REQUIRED_OPERATIVE_AGENTS_SENTENCES: tuple[str, ...] = (
+    "Never restore enforcement by re-requiring the known-unsafe SHA-scoped\n  `review-gate`.",
+    "The applicable shift-left domain reviewers and independent triage remain\n"
+    "required lenses; only the GitHub Claude PR-scoped approval left the live set\n"
+    "(it is retained but dormant — see above).",
+)
+
 _REQUIRED_CHECK_NAMES: tuple[str, ...] = (
     "Checks",
     "Web (lint + typecheck + unit)",
@@ -408,6 +415,14 @@ def _assert_agents_historical_evidence(text: str) -> None:
     ):
         assert _occurrences(historical_text, anchor), f"missing AGENTS history: {anchor!r}"
     _assert_historical_span_hashes(text, "AGENTS.md")
+
+
+def _assert_required_agents_sentence_is_operative(text: str, sentence: str) -> None:
+    """Assert one exact current AGENTS sentence occurs uniquely outside historical evidence."""
+    spans = _historical_spans(text)
+    assert text.count(sentence) == 1
+    start = text.index(sentence)
+    assert not _within_any_span(start, start + len(sentence), spans)
 
 
 def _assert_canonical_live_policy(text: str) -> None:
@@ -1005,6 +1020,8 @@ def test_agents_md_headless_skip_is_documented_and_never_instructed_on() -> None
     _assert_preserved_wait_policy(text)
     _assert_claude_review_note_policy(text)
     _assert_precedence_policy(text)
+    for sentence in _REQUIRED_OPERATIVE_AGENTS_SENTENCES:
+        _assert_required_agents_sentence_is_operative(text, sentence)
 
 
 @pytest.mark.docs
@@ -1290,6 +1307,25 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     agents = _read_agents_md()
     registry = (_REPO_ROOT / "docs" / "state" / "registry.md").read_text(encoding="utf-8")
     start, end = _canonical_bullet_bounds(agents)
+
+    for sentence in _REQUIRED_OPERATIVE_AGENTS_SENTENCES:
+        with pytest.raises(AssertionError):
+            _assert_required_agents_sentence_is_operative(agents.replace(sentence, "", 1), sentence)
+
+        sentence_start = agents.index(sentence)
+        wrapped_sentence = (
+            agents[:sentence_start]
+            + _BEGIN_MARKER
+            + "\n"
+            + sentence
+            + "\n"
+            + _END_MARKER
+            + agents[sentence_start + len(sentence) :]
+        )
+        _historical_spans(wrapped_sentence)
+        with pytest.raises(AssertionError):
+            _assert_required_agents_sentence_is_operative(wrapped_sentence, sentence)
+
     generic_checks = (
         agents[:start] + agents[start:end].replace("`Checks`", "required checks", 1) + agents[end:]
     )
