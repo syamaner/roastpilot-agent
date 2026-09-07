@@ -440,6 +440,7 @@ def _assert_required_agents_sentence_is_operative(text: str, sentence: str) -> N
     assert text.count(sentence) == 1
     start = text.index(sentence)
     assert not _within_any_span(start, start + len(sentence), spans)
+    _assert_fixed_operative_range_is_visible(text, start, start + len(sentence))
 
 
 def _assert_canonical_live_policy(text: str) -> None:
@@ -1400,6 +1401,39 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         _historical_spans(wrapped_sentence)
         with pytest.raises(AssertionError):
             _assert_required_agents_sentence_is_operative(wrapped_sentence, sentence)
+
+        sentence_line_start = agents.rfind("\n", 0, sentence_start) + 1
+        sentence_line_end = agents.find("\n", sentence_start + len(sentence))
+        fenced_sentence = (
+            agents[:sentence_line_start]
+            + "```\n"
+            + agents[sentence_line_start : sentence_line_end + 1]
+            + "```\n"
+            + agents[sentence_line_end + 1 :]
+        )
+        assert sentence in fenced_sentence
+        with pytest.raises(AssertionError):
+            _assert_required_agents_sentence_is_operative(fenced_sentence, sentence)
+
+        commented_sentence = (
+            agents[:sentence_line_start]
+            + "<!--"
+            + agents[sentence_line_start : sentence_line_end + 1]
+            + "-->\n"
+            + agents[sentence_line_end + 1 :]
+        )
+        assert sentence in commented_sentence
+        with pytest.raises(AssertionError):
+            _assert_required_agents_sentence_is_operative(commented_sentence, sentence)
+
+        indented_sentence = agents[:sentence_line_start] + "    " + agents[sentence_line_start:]
+        assert sentence in indented_sentence
+        with pytest.raises(AssertionError):
+            _assert_required_agents_sentence_is_operative(indented_sentence, sentence)
+
+        _assert_required_agents_sentence_is_operative(
+            "    unrelated indentation\n" + agents, sentence
+        )
 
     registry_spans = _historical_spans(registry)
     registry_735_span_end = next(
