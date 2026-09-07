@@ -724,6 +724,8 @@ def _assert_registry_supersession_notes(text: str) -> None:
         for note in notes
         for span_start, span_end in spans
     )
+    for note in notes:
+        _assert_fixed_operative_range_is_visible(text, note.start(), note.end())
     assert (
         tuple(_normalized_visible(note.group()) for note in notes)
         == _REGISTRY_SUPERSESSION_NOTE_SNAPSHOTS
@@ -2430,6 +2432,50 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             + _END_MARKER
             + registry[supersession_end:]
         )
+
+    supersession_notes = list(
+        re.finditer(
+            r"\[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file:.*?\]",
+            registry,
+            re.DOTALL,
+        )
+    )
+    assert len(supersession_notes) == len(_REGISTRY_SUPERSESSION_NOTE_SNAPSHOTS)
+    for note in supersession_notes:
+        note_line_start = registry.rfind("\n", 0, note.start()) + 1
+        note_line_end = registry.find("\n", note.end())
+        fenced_note = (
+            registry[:note_line_start]
+            + "```\n"
+            + registry[note_line_start : note_line_end + 1]
+            + "```\n"
+            + registry[note_line_end + 1 :]
+        )
+        assert note.group() in fenced_note
+        with pytest.raises(AssertionError):
+            _assert_registry_supersession_notes(fenced_note)
+
+        commented_note = (
+            registry[:note_line_start]
+            + "<!--"
+            + registry[note_line_start : note_line_end + 1]
+            + "-->\n"
+            + registry[note_line_end + 1 :]
+        )
+        assert note.group() in commented_note
+        with pytest.raises(AssertionError):
+            _assert_registry_supersession_notes(commented_note)
+
+        note_lines = registry[note_line_start : note_line_end + 1].splitlines(True)
+        indented_note = (
+            registry[:note_line_start]
+            + "".join(f"    {line}" for line in note_lines)
+            + registry[note_line_end + 1 :]
+        )
+        with pytest.raises(AssertionError):
+            _assert_registry_supersession_notes(indented_note)
+
+        _assert_registry_supersession_notes("    unrelated indentation\n" + registry)
 
     note_start = agents.index("> Note: `claude-review` is intentionally")
     note_end = agents.index("\n\n## Codex-Led Delivery Topology", note_start)
