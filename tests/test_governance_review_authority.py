@@ -343,11 +343,39 @@ def _assert_fixed_policy_range_is_not_indented_code(text: str, start: int, end: 
     assert all(not line.startswith("    ") for line in text[line_start:end].splitlines())
 
 
+def _assert_policy_range_is_outside_raw_text_blocks(text: str, start: int, end: int) -> None:
+    """Reject Type-1 GFM raw-text source state covering either policy boundary."""
+    boundaries = iter(sorted((start, end)))
+    next_boundary = next(boundaries, None)
+    active_tag: str | None = None
+    token_pattern = re.compile(
+        r"<(?:(?P<closing>/)(?P<close_tag>pre|script|style|textarea)\s*|"
+        r"(?P<open_tag>pre|script|style|textarea)\b[^>]*)>",
+        re.IGNORECASE,
+    )
+    for token in token_pattern.finditer(text):
+        while next_boundary is not None and next_boundary <= token.start():
+            assert active_tag is None
+            next_boundary = next(boundaries, None)
+        if token.group("closing"):
+            closing_tag = token.group("close_tag")
+            if active_tag == closing_tag.casefold():
+                active_tag = None
+        elif active_tag is None:
+            opening_tag = token.group("open_tag")
+            active_tag = opening_tag.casefold()
+
+    while next_boundary is not None:
+        assert active_tag is None
+        next_boundary = next(boundaries, None)
+
+
 def _assert_fixed_operative_range_is_visible(text: str, start: int, end: int) -> None:
     """Assert one bounded operative carrier is not hidden by supported source markup."""
     _assert_canonical_range_is_outside_markdown_fences(text, start, end)
     _assert_policy_range_is_outside_html_comments(text, start, end)
     _assert_fixed_policy_range_is_not_indented_code(text, start, end)
+    _assert_policy_range_is_outside_raw_text_blocks(text, start, end)
 
 
 def _is_affirmative_enablement_instruction(text: str) -> bool:
@@ -1435,6 +1463,71 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
 
         _assert_required_agents_sentence_is_operative(
             "    unrelated indentation\n" + agents, sentence
+        )
+
+    canonical_line_start = agents.rfind("\n", 0, start) + 1
+    raw_text_canonical = (
+        agents[:canonical_line_start] + "<pre>\n" + agents[canonical_line_start:] + "\n</pre>\n"
+    )
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(raw_text_canonical)
+
+    registry_header = registry.index("## Active Epic")
+    raw_text_registry = (
+        registry[:registry_header] + "<pre>\n" + registry[registry_header:] + "\n</pre>\n"
+    )
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(raw_text_registry)
+
+    closed_raw_text_before_range = "<pre></pre>\ncanonical start\ncanonical end"
+    start_boundary = closed_raw_text_before_range.index("canonical start")
+    end_boundary = closed_raw_text_before_range.index("canonical end")
+    assert (
+        closed_raw_text_before_range.index("<pre>")
+        < closed_raw_text_before_range.index("</pre>")
+        < start_boundary
+    )
+    _assert_fixed_operative_range_is_visible(
+        closed_raw_text_before_range, start_boundary, end_boundary
+    )
+
+    matching_raw_text_outside_range = "<style>outside</style>\ncanonical start\ncanonical end"
+    start_boundary = matching_raw_text_outside_range.index("canonical start")
+    end_boundary = matching_raw_text_outside_range.index("canonical end")
+    assert (
+        matching_raw_text_outside_range.index("<style>")
+        < matching_raw_text_outside_range.index("</style>")
+        < start_boundary
+    )
+    _assert_fixed_operative_range_is_visible(
+        matching_raw_text_outside_range, start_boundary, end_boundary
+    )
+
+    mismatched_raw_text_close = "<pre>\n</script>\ncanonical start\ncanonical end"
+    start_boundary = mismatched_raw_text_close.index("canonical start")
+    end_boundary = mismatched_raw_text_close.index("canonical end")
+    assert (
+        mismatched_raw_text_close.index("<pre>")
+        < mismatched_raw_text_close.index("</script>")
+        < start_boundary
+    )
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_raw_text_blocks(
+            mismatched_raw_text_close, start_boundary, end_boundary
+        )
+
+    mixed_case_raw_text = "<ScRiPt>\ncanonical start\ncanonical end\n</sCrIpT>"
+    start_boundary = mixed_case_raw_text.index("canonical start")
+    end_boundary = mixed_case_raw_text.index("canonical end")
+    assert (
+        mixed_case_raw_text.index("<ScRiPt>")
+        < start_boundary
+        < end_boundary
+        < mixed_case_raw_text.index("</sCrIpT>")
+    )
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_raw_text_blocks(
+            mixed_case_raw_text, start_boundary, end_boundary
         )
 
     registry_spans = _historical_spans(registry)
