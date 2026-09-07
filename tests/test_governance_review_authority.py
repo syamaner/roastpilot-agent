@@ -443,6 +443,7 @@ def _assert_retained_mechanism_policy(text: str) -> None:
     assert _occurrences(mechanism, "operator-owned branch-protection decision")
     assert not _occurrences(mechanism, "not dormant")
     assert not _occurrences(mechanism, "not operator-owned branch-protection decision")
+    assert _normalized_visible(mechanism) == _RETAINED_MECHANISM_SNAPSHOT
 
 
 def _assert_preserved_wait_policy(text: str) -> None:
@@ -479,6 +480,7 @@ def _assert_claude_review_note_policy(text: str) -> None:
         "to set the variable or re-trigger",
     ):
         assert _occurrences(note, required), f"missing operative Claude-review note: {required!r}"
+    assert normalized_note == _CLAUDE_REVIEW_NOTE_SNAPSHOT
 
 
 def _assert_registry_735_clarification(text: str) -> None:
@@ -723,6 +725,22 @@ _PRESERVED_WAIT_SNAPSHOT = _normalized_visible(
     """Preserved as the D108-D118 design/evidence record: this wait does not gate
     merge under the current verified state (`main` requires zero approving reviews —
     see the precedence subsection above)."""
+)
+_RETAINED_MECHANISM_SNAPSHOT = _normalized_visible(
+    """- Mechanism retained but **dormant**: the design in this bullet gates nothing
+    today under the verified 6 Sep 2026 state (`main` requires zero approving
+    reviews). Restoring it is an operator-owned branch-protection decision, not
+    an automatic consequence of this record."""
+)
+_CLAUDE_REVIEW_NOTE_SNAPSHOT = _normalized_visible(
+    """> Note: `claude-review` is intentionally **not** a required status check — it fails
+    by design on PRs that edit a workflow file (the App's workflow-validation guard),
+    and it passes even when it finds bugs. It additionally SKIPS while
+    `vars.CLAUDE_HEADLESS_ENABLED` is unset (`.github/workflows/claude-code-review.yml:27-41`);
+    a skipped headless job is expected, never a failure, and never a reason to set the
+    variable or re-trigger. `.github/workflows/claude.yml:14-26`'s `@claude` responder is
+    gated off the same way. The real findings-gate is GitHub Codex's inline
+    threads + `required_conversation_resolution`; the required checks are CI + codecov."""
 )
 _REGISTRY_SUPERSESSION_NOTE_SNAPSHOTS = (
     _normalized_visible(
@@ -1516,6 +1534,12 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
                 + agents[mechanism_start:mechanism_end].replace(original, replacement, 1)
                 + agents[mechanism_end:]
             )
+    with pytest.raises(AssertionError):
+        _assert_retained_mechanism_policy(
+            agents[:mechanism_end]
+            + " This dormant mechanism gates merge today."
+            + agents[mechanism_end:]
+        )
 
     preserved_start = agents.index("Preserved as the D108-D118 design/evidence record:")
     preserved_end = agents.index("\n\n<!-- historical-evidence: begin -->", preserved_start)
@@ -1546,6 +1570,12 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     with pytest.raises(AssertionError):
         _assert_claude_review_note_policy(
             agents.replace("**not** a required status check", "a required status check", 1)
+        )
+    with pytest.raises(AssertionError):
+        _assert_claude_review_note_policy(
+            agents[:note_end]
+            + "\n> `claude-review` is a required status check."
+            + agents[note_end:]
         )
 
     for document, assertion in (
