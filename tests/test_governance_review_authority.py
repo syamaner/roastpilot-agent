@@ -592,14 +592,23 @@ def _remove_first_occurrence(text: str, phrase: str) -> str:
 
 def _assert_registry_supersession_notes(text: str) -> None:
     """Assert the two operative D-ToS-1 supersession notes remain complete and dormant."""
-    notes = re.findall(
-        r"\[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file:.*?\]",
-        text,
-        re.DOTALL,
+    notes = list(
+        re.finditer(
+            r"\[Superseded 6 Sep 2026 by the D-ToS-1 entry at the top of this file:.*?\]",
+            text,
+            re.DOTALL,
+        )
     )
     assert len(notes) == len(_REGISTRY_SUPERSESSION_NOTE_SNAPSHOTS)
+    spans = _historical_spans(text)
+    assert all(
+        not (span_start < note.end() and note.start() < span_end)
+        for note in notes
+        for span_start, span_end in spans
+    )
     assert (
-        tuple(_normalized_visible(note) for note in notes) == _REGISTRY_SUPERSESSION_NOTE_SNAPSHOTS
+        tuple(_normalized_visible(note.group()) for note in notes)
+        == _REGISTRY_SUPERSESSION_NOTE_SNAPSHOTS
     )
 
 
@@ -1660,6 +1669,18 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     ):
         with pytest.raises(AssertionError):
             _assert_registry_supersession_notes(registry.replace(original, replacement, 1))
+    supersession_start = registry.index(_SUPERSESSION_MARKER)
+    supersession_end = registry.index("]", supersession_start) + 1
+    with pytest.raises(AssertionError):
+        _assert_registry_supersession_notes(
+            registry[:supersession_start]
+            + _BEGIN_MARKER
+            + "\n"
+            + registry[supersession_start:supersession_end]
+            + "\n"
+            + _END_MARKER
+            + registry[supersession_end:]
+        )
 
     note_start = agents.index("> Note: `claude-review` is intentionally")
     note_end = agents.index("\n\n## Codex-Led Delivery Topology", note_start)
