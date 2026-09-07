@@ -259,6 +259,13 @@ def _canonical_live_state_bullet(text: str) -> str:
     return text[start:end]
 
 
+def _assert_canonical_range_is_outside_markdown_fences(text: str, start: int, end: int) -> None:
+    """Reject a fenced-code state that covers either canonical-policy boundary."""
+    fence_positions = [match.start() for match in re.finditer(r"(?m)^[ \t]*```", text)]
+    assert sum(position < start for position in fence_positions) % 2 == 0
+    assert sum(position < end for position in fence_positions) % 2 == 0
+
+
 def _is_affirmative_enablement_instruction(text: str) -> bool:
     """Return whether text affirmatively tells a reader to enable headless CI.
 
@@ -306,7 +313,11 @@ def _is_affirmative_enablement_instruction(text: str) -> bool:
             gh_matches[index + 1].start() if index + 1 < len(gh_matches) else line_end
         )
         command_segment = gh_scan[match.end() : min(line_end, next_command_start)]
-        target = re.search(r"\bCLAUDE_HEADLESS_ENABLED\b", command_segment)
+        target = re.search(
+            r"(?:(?P<quote>['\"])\bCLAUDE_HEADLESS_ENABLED\b(?P=quote)|"
+            r"\bCLAUDE_HEADLESS_ENABLED\b)",
+            command_segment,
+        )
         if target is None:
             continue
         command_without_target = command_segment[: target.start()] + command_segment[target.end() :]
@@ -346,6 +357,7 @@ def _assert_canonical_live_policy(text: str) -> None:
     assert text.count(_CANONICAL_LIVE_STATE_HEADING) == 1
     start, end = _canonical_bullet_bounds(text)
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    _assert_canonical_range_is_outside_markdown_fences(text, start, end)
     bullet = _canonical_live_state_bullet(text)
     assert "CLAUDE_HEADLESS_ENABLED" in bullet, "missing canonical headless token"
     normalized_bullet = _normalized_visible(bullet)
@@ -860,6 +872,7 @@ def _assert_responder_headless_gate(workflow: object) -> None:
     jobs = workflow_map.get("jobs")
     assert isinstance(jobs, dict)
     jobs_map = cast(dict[str, object], jobs)
+    assert set(jobs_map) == {"claude"}
     claude_job = jobs_map.get("claude")
     assert isinstance(claude_job, dict)
     claude_map = cast(dict[str, object], claude_job)
@@ -1074,6 +1087,8 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
         "gh variable set -R owner/repo -b=false CLAUDE_HEADLESS_ENABLED",
         "gh variable set --body false CLAUDE_HEADLESS_ENABLED --repo owner/repo",
         "gh variable set -b=false CLAUDE_HEADLESS_ENABLED -R=owner/repo",
+        "gh variable set --body false 'CLAUDE_HEADLESS_ENABLED'",
+        'gh variable set "CLAUDE_HEADLESS_ENABLED" -b=false',
     ):
         assert not _is_affirmative_enablement_instruction(false_body)
     assert _is_affirmative_enablement_instruction(
@@ -1114,6 +1129,18 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
     )
     assert _is_affirmative_enablement_instruction(
         "gh variable set --body false CLAUDE_HEADLESS_ENABLED -b=false"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --body true 'CLAUDE_HEADLESS_ENABLED'"
+    )
+    assert _is_affirmative_enablement_instruction(
+        'gh variable set "CLAUDE_HEADLESS_ENABLED" -b=true'
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --body false 'CLAUDE_HEADLESS_ENABLED\""
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set --body false 'CLAUDE_HEADLESS_ENABLED"
     )
     assert not _is_affirmative_enablement_instruction(
         "gh variable set OTHER_HEADLESS_ENABLED --body true"
@@ -1183,6 +1210,10 @@ def test_responder_workflow_requires_the_true_only_headless_conjunct() -> None:
     ):
         with pytest.raises(AssertionError):
             _assert_responder_headless_gate({"jobs": {"claude": {"if": mutated_condition}}})
+    with pytest.raises(AssertionError):
+        _assert_responder_headless_gate(
+            {"jobs": {"claude": {"if": condition}, "claude-extra": {"if": "true"}}}
+        )
 
 
 @pytest.mark.docs
@@ -1241,6 +1272,15 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     _historical_spans(wrapped)
     with pytest.raises(AssertionError):
         _assert_canonical_live_policy(wrapped)
+
+    fenced_before_heading = agents[:bullet_line_start] + "```\n" + agents[bullet_line_start:]
+    fenced_heading_start = fenced_before_heading.index(_CANONICAL_LIVE_STATE_HEADING)
+    retained_end = fenced_before_heading.index(_END_MARKER, fenced_heading_start) + len(_END_MARKER)
+    fenced_through_retained_history = (
+        fenced_before_heading[:retained_end] + "\n```\n" + fenced_before_heading[retained_end:]
+    )
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(fenced_through_retained_history)
 
     for original, replacement in (
         ("strict mode,", "non-strict mode,"),
