@@ -1282,6 +1282,28 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     with pytest.raises(AssertionError):
         _assert_canonical_live_policy(fenced_through_retained_history)
 
+    start_outside_end_inside = "canonical start\n```\ncanonical end\n```\n"
+    start_boundary = start_outside_end_inside.index("canonical start")
+    opening_fence = start_outside_end_inside.index("```")
+    closing_fence = start_outside_end_inside.rindex("```")
+    end_boundary = closing_fence - 1
+    assert start_boundary < opening_fence < end_boundary < closing_fence
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            start_outside_end_inside, start_boundary, end_boundary
+        )
+
+    start_inside_end_outside = "```\ncanonical start\n```\ncanonical end"
+    start_boundary = start_inside_end_outside.index("canonical start")
+    end_boundary = len(start_inside_end_outside)
+    opening_fence = start_inside_end_outside.index("```")
+    closing_fence = start_inside_end_outside.rindex("```")
+    assert opening_fence < start_boundary < closing_fence < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            start_inside_end_outside, start_boundary, end_boundary
+        )
+
     for original, replacement in (
         ("strict mode,", "non-strict mode,"),
         ("strict mode,", "not strict mode,"),
