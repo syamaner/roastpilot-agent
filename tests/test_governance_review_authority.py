@@ -338,10 +338,16 @@ def _assert_policy_range_is_outside_html_comments(text: str, start: int, end: in
 
 
 def _assert_fixed_policy_range_is_not_indented_code(text: str, start: int, end: int) -> None:
-    """Reject four-space GFM code indentation at either fixed policy boundary."""
-    for boundary in (start, end - 1):
-        line_start = text.rfind("\n", 0, boundary) + 1
-        assert not text[line_start:boundary].startswith("    ")
+    """Reject four-space GFM code indentation on a fixed policy carrier's lines."""
+    line_start = text.rfind("\n", 0, start) + 1
+    assert all(not line.startswith("    ") for line in text[line_start:end].splitlines())
+
+
+def _assert_fixed_operative_range_is_visible(text: str, start: int, end: int) -> None:
+    """Assert one bounded operative carrier is not hidden by supported source markup."""
+    _assert_canonical_range_is_outside_markdown_fences(text, start, end)
+    _assert_policy_range_is_outside_html_comments(text, start, end)
+    _assert_fixed_policy_range_is_not_indented_code(text, start, end)
 
 
 def _is_affirmative_enablement_instruction(text: str) -> bool:
@@ -443,9 +449,7 @@ def _assert_canonical_live_policy(text: str) -> None:
     assert text.count(_CANONICAL_LIVE_STATE_HEADING) == 1
     start, end = _canonical_bullet_bounds(text)
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
-    _assert_canonical_range_is_outside_markdown_fences(text, start, end)
-    _assert_policy_range_is_outside_html_comments(text, start, end)
-    _assert_fixed_policy_range_is_not_indented_code(text, start, end)
+    _assert_fixed_operative_range_is_visible(text, start, end)
     bullet = _canonical_live_state_bullet(text)
     assert "CLAUDE_HEADLESS_ENABLED" in bullet, "missing canonical headless token"
     normalized_bullet = _normalized_visible(bullet)
@@ -480,6 +484,7 @@ def _assert_precedence_policy(text: str) -> None:
     start = text.index("- **Precedence for the GitHub-Claude required-approval description under")
     end = text.index("\n- Mechanism retained", start)
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    _assert_fixed_operative_range_is_visible(text, start, end)
     precedence = text[start:end]
     for filename in ("AGENTS.md", "docs/state/registry.md"):
         assert filename in precedence, f"missing precedence authority: {filename!r}"
@@ -508,6 +513,7 @@ def _assert_branch_protection_policy(text: str) -> None:
     start = text.index("- **`main` is branch-protected")
     end = text.index("\n- **Precedence for the GitHub-Claude", start)
     assert text.count("- **`main` is branch-protected") == 1
+    _assert_fixed_operative_range_is_visible(text, start, end)
     assert _normalized_visible(text[start:end]) == _BRANCH_PROTECTION_SNAPSHOT
 
 
@@ -516,6 +522,7 @@ def _assert_review_roster_policy(text: str) -> None:
     start = text.index("**The PR review roster (verified live 6 Sep 2026, D-ToS-1)")
     end = text.index("\n<!-- historical-evidence: begin -->", start)
     assert text.count("**The PR review roster (verified live 6 Sep 2026, D-ToS-1)") == 1
+    _assert_fixed_operative_range_is_visible(text, start, end)
     assert _normalized_visible(text[start:end]) == _REVIEW_ROSTER_SNAPSHOT
 
 
@@ -523,6 +530,7 @@ def _assert_minimum_sufficient_review_policy(text: str) -> None:
     """Assert the complete operative local-review section excludes retired Claude approval."""
     start = text.index("### Minimum sufficient local review")
     end = text.index("\n\n### Codex project agents", start)
+    _assert_fixed_operative_range_is_visible(text, start, end)
     section = text[start:end]
     assert _normalized_visible(section) == _MINIMUM_SUFFICIENT_REVIEW_SNAPSHOT
     assert not _occurrences(section, "GitHub Claude exact-head approval")
@@ -533,6 +541,7 @@ def _assert_draft_phase_policy(text: str) -> None:
     """Assert draft opening triggers a skipped headless job, not findings to fold."""
     start = text.index("**Draft phase vs ready phase")
     end = text.index("\n\n**WAIT for Codex's verdict before merging", start)
+    _assert_fixed_operative_range_is_visible(text, start, end)
     paragraph = text[start:end]
     assert _normalized_visible(paragraph) == _DRAFT_PHASE_SNAPSHOT
     assert not _occurrences(paragraph, "findings there are real and worth folding")
@@ -544,6 +553,7 @@ def _assert_retained_mechanism_policy(text: str) -> None:
     start = text.index("- Mechanism retained but")
     end = text.index("\n  <!-- historical-evidence: begin -->", start)
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    _assert_fixed_operative_range_is_visible(text, start, end)
     mechanism = text[start:end]
     assert _occurrences(mechanism, "dormant")
     assert _occurrences(mechanism, "gates nothing today")
@@ -561,6 +571,7 @@ def _assert_preserved_wait_policy(text: str) -> None:
     start = text.index(heading)
     end = text.index("\n\n<!-- historical-evidence: begin -->", start)
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    _assert_fixed_operative_range_is_visible(text, start, end)
     preserved = text[start:end]
     assert _normalized_visible(preserved) == _PRESERVED_WAIT_SNAPSHOT
 
@@ -573,6 +584,7 @@ def _assert_claude_review_note_policy(text: str) -> None:
     start = text.index(heading)
     end = text.index("\n\n## Codex-Led Delivery Topology", start)
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
+    _assert_fixed_operative_range_is_visible(text, start, end)
     note = text[start:end]
     normalized_note = _normalized_visible(note)
     assert "not a required status check" in normalized_note
@@ -599,6 +611,7 @@ def _assert_registry_735_clarification(text: str) -> None:
         if "#735 story-closing implementation complete" in text[start:end]
     )
     clarification_end = text.index("\n\n**11 Aug 2026", span_end)
+    _assert_fixed_operative_range_is_visible(text, span_end, clarification_end)
     clarification = text[span_end:clarification_end]
     assert _normalized_visible(clarification) == _REGISTRY_735_CLARIFICATION_SNAPSHOT
     assert "the review itself still runs unskipped" not in clarification
@@ -617,9 +630,7 @@ def _assert_registry_policy(text: str) -> None:
     assert not any(
         span_start < entry_end and entry_start < span_end for span_start, span_end in spans
     )
-    _assert_canonical_range_is_outside_markdown_fences(text, entry_start, entry_end)
-    _assert_policy_range_is_outside_html_comments(text, entry_start, entry_end)
-    _assert_fixed_policy_range_is_not_indented_code(text, entry_start, entry_end)
+    _assert_fixed_operative_range_is_visible(text, entry_start, entry_end)
     entry = text[entry_start:entry_end]
     normalized_entry = _normalized_visible(entry)
     assert (
@@ -1389,6 +1400,100 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         _historical_spans(wrapped_sentence)
         with pytest.raises(AssertionError):
             _assert_required_agents_sentence_is_operative(wrapped_sentence, sentence)
+
+    registry_spans = _historical_spans(registry)
+    registry_735_span_end = next(
+        span_end
+        for span_start, span_end in registry_spans
+        if "#735 story-closing implementation complete" in registry[span_start:span_end]
+    )
+    registry_735_end = registry.index("\n\n**11 Aug 2026", registry_735_span_end)
+    precedence_heading = "- **Precedence for the GitHub-Claude required-approval description under"
+    roster_heading = "**The PR review roster (verified live 6 Sep 2026, D-ToS-1)"
+    retained_heading = "- Mechanism retained but"
+    preserved_heading = "Preserved as the D108-D118 design/evidence record:"
+    visible_carriers = (
+        (
+            agents,
+            _assert_precedence_policy,
+            agents.index(precedence_heading),
+            agents.index("\n- Mechanism retained"),
+        ),
+        (
+            agents,
+            _assert_branch_protection_policy,
+            agents.index("- **`main` is branch-protected"),
+            agents.index("\n- **Precedence for the GitHub-Claude"),
+        ),
+        (
+            agents,
+            _assert_review_roster_policy,
+            agents.index(roster_heading),
+            agents.index("\n<!-- historical-evidence: begin -->", agents.index(roster_heading)),
+        ),
+        (
+            agents,
+            _assert_minimum_sufficient_review_policy,
+            agents.index("### Minimum sufficient local review"),
+            agents.index("\n\n### Codex project agents"),
+        ),
+        (
+            agents,
+            _assert_draft_phase_policy,
+            agents.index("**Draft phase vs ready phase"),
+            agents.index("\n\n**WAIT for Codex's verdict before merging"),
+        ),
+        (
+            agents,
+            _assert_retained_mechanism_policy,
+            agents.index(retained_heading),
+            agents.index("\n  <!-- historical-evidence: begin -->", agents.index(retained_heading)),
+        ),
+        (
+            agents,
+            _assert_preserved_wait_policy,
+            agents.index(preserved_heading),
+            agents.index(
+                "\n\n<!-- historical-evidence: begin -->",
+                agents.index(preserved_heading),
+            ),
+        ),
+        (
+            agents,
+            _assert_claude_review_note_policy,
+            agents.index("> Note: `claude-review` is intentionally"),
+            agents.index("\n\n## Codex-Led Delivery Topology"),
+        ),
+        (
+            registry,
+            _assert_registry_735_clarification,
+            registry.index("The trigger remains configured", registry_735_span_end),
+            registry_735_end,
+        ),
+    )
+    for document, assertion, carrier_start, carrier_end in visible_carriers:
+        carrier_line_start = document.rfind("\n", 0, carrier_start) + 1
+        fenced = document[:carrier_line_start] + "```\n" + document[carrier_line_start:] + "\n```\n"
+        with pytest.raises(AssertionError):
+            assertion(fenced)
+
+        commented = (
+            document[:carrier_line_start] + "<!--" + document[carrier_line_start:] + "\n-->\n"
+        )
+        with pytest.raises(AssertionError):
+            assertion(commented)
+
+        indented = (
+            document[:carrier_line_start]
+            + "".join(
+                f"    {line}" for line in document[carrier_line_start:carrier_end].splitlines(True)
+            )
+            + document[carrier_end:]
+        )
+        with pytest.raises(AssertionError):
+            assertion(indented)
+
+        assertion("    unrelated indentation\n" + document)
 
     registry_entry_start = registry.index(
         "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
