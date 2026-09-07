@@ -284,7 +284,7 @@ def _is_affirmative_enablement_instruction(text: str) -> bool:
         re.IGNORECASE,
     )
     explicit_false_body = re.compile(
-        r"^\s+(?:-b|--body)(?:\s+|=)['\"]?false['\"]?[.!?]?\s*$",
+        rf"^\s+(?:{repo_flag})?(?:-b|--body)(?:\s+|=)['\"]?false['\"]?[.!?]?\s*$",
         re.IGNORECASE,
     )
     has_assignment = any(
@@ -415,13 +415,13 @@ def _assert_review_roster_policy(text: str) -> None:
 
 
 def _assert_minimum_sufficient_review_policy(text: str) -> None:
-    """Assert the operative local-review gate list excludes retired Claude approval."""
+    """Assert the complete operative local-review section excludes retired Claude approval."""
     start = text.index("### Minimum sufficient local review")
-    paragraph_end = text.index("\n\n- Ordinary slice:", start)
-    paragraph = text[start:paragraph_end]
-    assert _normalized_visible(paragraph) == _MINIMUM_SUFFICIENT_REVIEW_SNAPSHOT
-    assert not _occurrences(paragraph, "GitHub Claude exact-head approval")
-    assert not _occurrences(paragraph, "Claude exact-head approval")
+    end = text.index("\n\n### Codex project agents", start)
+    section = text[start:end]
+    assert _normalized_visible(section) == _MINIMUM_SUFFICIENT_REVIEW_SNAPSHOT
+    assert not _occurrences(section, "GitHub Claude exact-head approval")
+    assert not _occurrences(section, "Claude exact-head approval")
 
 
 def _assert_draft_phase_policy(text: str) -> None:
@@ -692,7 +692,37 @@ _MINIMUM_SUFFICIENT_REVIEW_SNAPSHOT = _normalized_visible(
 
     This routing changes only additional local/pre-open model review. Ready-head
     Codex review and wait, branch protection, conversation resolution, CI, CodeQL
-    handling, and `codecov/patch` rules above remain unchanged."""
+    handling, and `codecov/patch` rules above remain unchanged.
+
+    - Ordinary slice: deterministic gates plus one independent, diff-focused review;
+    do not run the full Claude roster.
+    - Safety, controller, recovery, state-transition, command-path, or enum change:
+    `safety-reviewer` is mandatory.
+    - External input, parsing, credentials, provider calls, or a new endpoint:
+    `security-reviewer` is mandatory. A provider path that can contend with the
+    roast loop also triggers `safety-reviewer`.
+    - UI, interaction, replay, or visual-state change: `ui-reviewer`.
+    - MCP or relevant dependency-contract change: `mcp-contract-checker`.
+    - Roast behavioural integration or decision-trace change: `sim-roast-runner`.
+    - Test diff over 600 lines, new test architecture, weak acceptance coverage, or
+    a concrete test-quality concern: `qa`.
+    - Story completion, epic completion, or suspected plan drift:
+    `product-auditor`.
+    - Substantive findings needing disposition: `pr-triage`.
+
+    A reviewer predicted by the ratified contract may be added to by the actual
+    diff, never silently removed. Do not ask multiple reviewers to inspect the same
+    concern unless the consequence is high or the first reviewer reports
+    uncertainty. Do not invoke `pr-triage` without findings or `product-auditor` on
+    every slice. Model review does not repeat lint, formatting, typecheck, tests, or
+    coverage. Give each reviewer only the contract, relevant diff/tests, and the
+    minimum supporting context for its lens. The unchanged legacy `review-branch`
+    workflow is dormant and unavailable during the D158 pilot: its Claude-coordinator
+    fan-out violates the Codex-parent-only crossing and depth-one topology. A future
+    refactor or retirement decision is outside this PR.
+    Before relying on a selected independent reviewer, verify that its CLI or
+    service is authenticated and usable. If it is unavailable, stop and ask the
+    operator; do not silently substitute self-review or another same-family lens."""
 )
 _DRAFT_PHASE_SNAPSHOT = _normalized_visible(
     """**Draft phase vs ready phase (the shift-left reconciliation, D103-adjacent; corrected 27
@@ -1020,8 +1050,16 @@ def test_enablement_detector_distinguishes_prohibitions_from_instructions() -> N
         "gh variable set -R owner/repo CLAUDE_HEADLESS_ENABLED -b=false",
         "gh -R owner/repo variable set CLAUDE_HEADLESS_ENABLED --body false",
         "gh variable --repo=owner/repo set CLAUDE_HEADLESS_ENABLED -b='false'",
+        "gh variable set CLAUDE_HEADLESS_ENABLED -R owner/repo --body false",
+        "gh variable set CLAUDE_HEADLESS_ENABLED --repo=owner/repo -b='false'",
     ):
         assert not _is_affirmative_enablement_instruction(false_body)
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED -R owner/repo --body true"
+    )
+    assert _is_affirmative_enablement_instruction(
+        "gh variable set CLAUDE_HEADLESS_ENABLED --repo=owner/repo -b='true'"
+    )
     assert not _is_affirmative_enablement_instruction(
         "gh variable set OTHER_HEADLESS_ENABLED --body true"
     )
@@ -1537,6 +1575,13 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
                 "Ready-head\nCodex review and wait", "GitHub Claude exact-head approval", 1
             )
             + agents[review_end:]
+        )
+    ordinary_slice_end = agents.index("\n- Safety,", review_start)
+    with pytest.raises(AssertionError):
+        _assert_minimum_sufficient_review_policy(
+            agents[:ordinary_slice_end]
+            + " GitHub Claude exact-head approval is required."
+            + agents[ordinary_slice_end:]
         )
 
     draft_start = agents.index("**Draft phase vs ready phase")
