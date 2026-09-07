@@ -340,7 +340,12 @@ def _assert_policy_range_is_outside_html_comments(text: str, start: int, end: in
 def _assert_fixed_policy_range_is_not_indented_code(text: str, start: int, end: int) -> None:
     """Reject literal-tab or four-space GFM code indentation on policy-carrier lines."""
     line_start = text.rfind("\n", 0, start) + 1
-    assert all(not line.startswith(("    ", "\t")) for line in text[line_start:end].splitlines())
+    for line in text[line_start:end].splitlines():
+        assert not line.startswith(("    ", "\t"))
+        blockquote_prefix = re.match(r"^[ \t]*>[ \t]?", line)
+        if blockquote_prefix:
+            line = line[blockquote_prefix.end() :]
+        assert not line.startswith(("    ", "\t"))
 
 
 def _assert_policy_range_is_outside_raw_text_blocks(text: str, start: int, end: int) -> None:
@@ -680,7 +685,7 @@ def _assert_registry_policy(text: str) -> None:
     assert not any(
         span_start < entry_end and entry_start < span_end for span_start, span_end in spans
     )
-    _assert_fixed_operative_range_is_visible(text, entry_start, entry_end)
+    _assert_fixed_operative_range_is_visible(text, header_index, entry_end)
     entry = text[entry_start:entry_end]
     normalized_entry = _normalized_visible(entry)
     assert (
@@ -1720,6 +1725,14 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
 
         assertion("    unrelated indentation\n" + document)
 
+    registry_heading_start = registry.index("## Active Epic")
+    registry_heading_indented = (
+        registry[:registry_heading_start] + "    " + registry[registry_heading_start:]
+    )
+    assert registry_heading_indented.index("## Active Epic") == registry_heading_start + 4
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(registry_heading_indented)
+
     generic_checks = (
         agents[:start] + agents[start:end].replace("`Checks`", "required checks", 1) + agents[end:]
     )
@@ -1987,6 +2000,31 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     assert two_spaces_then_tab.startswith("  \t")
     _assert_fixed_policy_range_is_not_indented_code(
         two_spaces_then_tab, start_boundary, end_boundary
+    )
+
+    one_level_blockquote_indented = ">     canonical start\ncanonical end"
+    start_boundary = one_level_blockquote_indented.index("canonical start")
+    end_boundary = one_level_blockquote_indented.index("canonical end")
+    assert one_level_blockquote_indented.startswith(">     ")
+    with pytest.raises(AssertionError):
+        _assert_fixed_policy_range_is_not_indented_code(
+            one_level_blockquote_indented, start_boundary, end_boundary
+        )
+
+    nested_blockquote_indented = ">>     canonical start\ncanonical end"
+    start_boundary = nested_blockquote_indented.index("canonical start")
+    end_boundary = nested_blockquote_indented.index("canonical end")
+    assert nested_blockquote_indented.startswith(">>     ")
+    _assert_fixed_policy_range_is_not_indented_code(
+        nested_blockquote_indented, start_boundary, end_boundary
+    )
+
+    one_level_mixed_indentation = ">  \tcanonical start\ncanonical end"
+    start_boundary = one_level_mixed_indentation.index("canonical start")
+    end_boundary = one_level_mixed_indentation.index("canonical end")
+    assert one_level_mixed_indentation.startswith(">  \t")
+    _assert_fixed_policy_range_is_not_indented_code(
+        one_level_mixed_indentation, start_boundary, end_boundary
     )
 
     _assert_policy_range_is_outside_code_spans(agents, start, end)
