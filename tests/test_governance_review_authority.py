@@ -281,7 +281,7 @@ def _assert_canonical_range_is_outside_markdown_fences(text: str, start: int, en
             assert active_fence is None
             next_boundary = next(boundaries, None)
 
-        fence_match = re.match(r"^[ \t]*(?P<run>`{3,}|~{3,})(?P<tail>[^\r\n]*)$", line)
+        fence_match = re.match(r"^[ \t]*(?:>[ \t]?)?(?P<run>`{3,}|~{3,})(?P<tail>[^\r\n]*)$", line)
         if fence_match:
             run = fence_match.group("run")
             delimiter = run[0]
@@ -338,9 +338,9 @@ def _assert_policy_range_is_outside_html_comments(text: str, start: int, end: in
 
 
 def _assert_fixed_policy_range_is_not_indented_code(text: str, start: int, end: int) -> None:
-    """Reject four-space GFM code indentation on a fixed policy carrier's lines."""
+    """Reject literal-tab or four-space GFM code indentation on policy-carrier lines."""
     line_start = text.rfind("\n", 0, start) + 1
-    assert all(not line.startswith("    ") for line in text[line_start:end].splitlines())
+    assert all(not line.startswith(("    ", "\t")) for line in text[line_start:end].splitlines())
 
 
 def _assert_policy_range_is_outside_raw_text_blocks(text: str, start: int, end: int) -> None:
@@ -370,12 +370,33 @@ def _assert_policy_range_is_outside_raw_text_blocks(text: str, start: int, end: 
         next_boundary = next(boundaries, None)
 
 
+def _assert_policy_range_is_outside_code_spans(text: str, start: int, end: int) -> None:
+    """Reject non-nesting exact-run Markdown code-span state at policy boundaries."""
+    boundaries = iter(sorted((start, end)))
+    next_boundary = next(boundaries, None)
+    active_run_length: int | None = None
+    for run in re.finditer(r"`+", text):
+        while next_boundary is not None and next_boundary <= run.start():
+            assert active_run_length is None
+            next_boundary = next(boundaries, None)
+        run_length = len(run.group())
+        if active_run_length is None:
+            active_run_length = run_length
+        elif run_length == active_run_length:
+            active_run_length = None
+
+    while next_boundary is not None:
+        assert active_run_length is None
+        next_boundary = next(boundaries, None)
+
+
 def _assert_fixed_operative_range_is_visible(text: str, start: int, end: int) -> None:
     """Assert one bounded operative carrier is not hidden by supported source markup."""
     _assert_canonical_range_is_outside_markdown_fences(text, start, end)
     _assert_policy_range_is_outside_html_comments(text, start, end)
     _assert_fixed_policy_range_is_not_indented_code(text, start, end)
     _assert_policy_range_is_outside_raw_text_blocks(text, start, end)
+    _assert_policy_range_is_outside_code_spans(text, start, end)
 
 
 def _is_affirmative_enablement_instruction(text: str) -> bool:
@@ -1717,7 +1738,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
 
     missing_headless_token = (
         agents[:start]
-        + _remove_first_occurrence(agents[start:end], "CLAUDE_HEADLESS_ENABLED")
+        + _remove_first_occurrence(agents[start:end], "`CLAUDE_HEADLESS_ENABLED`")
         + agents[end:]
     )
     with pytest.raises(AssertionError, match="missing canonical headless token"):
@@ -1774,6 +1795,48 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     with pytest.raises(AssertionError):
         _assert_canonical_range_is_outside_markdown_fences(
             start_inside_end_outside, start_boundary, end_boundary
+        )
+
+    quoted_fence_wrap = "> ```\n> canonical start\n> canonical end"
+    start_boundary = quoted_fence_wrap.index("canonical start")
+    end_boundary = quoted_fence_wrap.index("canonical end")
+    opening_fence = quoted_fence_wrap.index("```")
+    assert opening_fence < start_boundary < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            quoted_fence_wrap, start_boundary, end_boundary
+        )
+
+    quoted_fence_before_range = "> ```\n> ignored\n> ```\ncanonical start\ncanonical end"
+    start_boundary = quoted_fence_before_range.index("canonical start")
+    end_boundary = quoted_fence_before_range.index("canonical end")
+    opening_fence = quoted_fence_before_range.index("```")
+    closing_fence = quoted_fence_before_range.rindex("```")
+    assert opening_fence < closing_fence < start_boundary < end_boundary
+    _assert_canonical_range_is_outside_markdown_fences(
+        quoted_fence_before_range, start_boundary, end_boundary
+    )
+
+    quoted_start_outside_end_inside = "> canonical start\n> ```\n> canonical end\n> ```\n"
+    start_boundary = quoted_start_outside_end_inside.index("canonical start")
+    opening_fence = quoted_start_outside_end_inside.index("```")
+    closing_fence = quoted_start_outside_end_inside.rindex("```")
+    end_boundary = quoted_start_outside_end_inside.rfind("\n", 0, closing_fence) + 1
+    assert start_boundary < opening_fence < end_boundary < closing_fence
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            quoted_start_outside_end_inside, start_boundary, end_boundary
+        )
+
+    quoted_start_inside_end_outside = "> ```\n> canonical start\n> ```\n> canonical end"
+    start_boundary = quoted_start_inside_end_outside.index("canonical start")
+    end_boundary = len(quoted_start_inside_end_outside)
+    opening_fence = quoted_start_inside_end_outside.index("```")
+    closing_fence = quoted_start_inside_end_outside.rindex("```")
+    assert opening_fence < start_boundary < closing_fence < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            quoted_start_inside_end_outside, start_boundary, end_boundary
         )
 
     tilde_wraps_both_boundaries = "~~~\ncanonical start\ncanonical end\n~~~\n"
@@ -1882,6 +1945,86 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     with pytest.raises(AssertionError):
         _assert_canonical_range_is_outside_markdown_fences(
             tilde_then_backtick_exploit, start_boundary, end_boundary
+        )
+
+    tab_indented_carrier = "\tcanonical start\ncanonical end"
+    start_boundary = tab_indented_carrier.index("canonical start")
+    end_boundary = tab_indented_carrier.index("canonical end")
+    assert tab_indented_carrier.index("\t") < start_boundary < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_fixed_policy_range_is_not_indented_code(
+            tab_indented_carrier, start_boundary, end_boundary
+        )
+
+    mid_line_tab = "canonical\tstart\ncanonical end"
+    start_boundary = mid_line_tab.index("canonical")
+    end_boundary = mid_line_tab.index("canonical end")
+    assert mid_line_tab.index("\t") > start_boundary
+    _assert_fixed_policy_range_is_not_indented_code(mid_line_tab, start_boundary, end_boundary)
+
+    _assert_policy_range_is_outside_code_spans(agents, start, end)
+
+    double_backtick_wrap = "``\ncanonical start\ncanonical end\n``"
+    start_boundary = double_backtick_wrap.index("canonical start")
+    end_boundary = double_backtick_wrap.index("canonical end")
+    opening_span = double_backtick_wrap.index("``")
+    closing_span = double_backtick_wrap.rindex("``")
+    assert opening_span < start_boundary < end_boundary < closing_span
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_code_spans(
+            double_backtick_wrap, start_boundary, end_boundary
+        )
+
+    mismatched_code_span = "``\ncanonical start\ncanonical end\n`"
+    start_boundary = mismatched_code_span.index("canonical start")
+    end_boundary = mismatched_code_span.index("canonical end")
+    opening_span = mismatched_code_span.index("``")
+    mismatched_closer = mismatched_code_span.rindex("`")
+    assert opening_span < start_boundary < end_boundary < mismatched_closer
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_code_spans(
+            mismatched_code_span, start_boundary, end_boundary
+        )
+
+    paired_code_span_before_range = "``ignored``\ncanonical start\ncanonical end"
+    start_boundary = paired_code_span_before_range.index("canonical start")
+    end_boundary = paired_code_span_before_range.index("canonical end")
+    opening_span = paired_code_span_before_range.index("``")
+    closing_span = paired_code_span_before_range.index("``", opening_span + 2)
+    assert opening_span < closing_span < start_boundary < end_boundary
+    _assert_policy_range_is_outside_code_spans(
+        paired_code_span_before_range, start_boundary, end_boundary
+    )
+
+    unmatched_code_span = "``\ncanonical start\ncanonical end"
+    start_boundary = unmatched_code_span.index("canonical start")
+    end_boundary = unmatched_code_span.index("canonical end")
+    assert unmatched_code_span.index("``") < start_boundary < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_code_spans(
+            unmatched_code_span, start_boundary, end_boundary
+        )
+
+    code_span_start_outside_end_inside = "canonical start\n``\ncanonical end\n``"
+    start_boundary = code_span_start_outside_end_inside.index("canonical start")
+    opening_span = code_span_start_outside_end_inside.index("``")
+    closing_span = code_span_start_outside_end_inside.rindex("``")
+    end_boundary = closing_span - 1
+    assert start_boundary < opening_span < end_boundary < closing_span
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_code_spans(
+            code_span_start_outside_end_inside, start_boundary, end_boundary
+        )
+
+    code_span_start_inside_end_outside = "``\ncanonical start\n``\ncanonical end"
+    start_boundary = code_span_start_inside_end_outside.index("canonical start")
+    end_boundary = len(code_span_start_inside_end_outside)
+    opening_span = code_span_start_inside_end_outside.index("``")
+    closing_span = code_span_start_inside_end_outside.rindex("``")
+    assert opening_span < start_boundary < closing_span < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_code_spans(
+            code_span_start_inside_end_outside, start_boundary, end_boundary
         )
 
     closed_comment_before_range = "<!-- closed -->\ncanonical start\ncanonical end"
@@ -2410,7 +2553,7 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     for filename in ("AGENTS.md", "docs/state/registry.md"):
         missing_authority = (
             agents[:precedence_start]
-            + agents[precedence_start:precedence_end].replace(filename, "", 1)
+            + agents[precedence_start:precedence_end].replace(f"`{filename}`", "", 1)
             + agents[precedence_end:]
         )
         with pytest.raises(AssertionError, match="missing precedence authority"):
