@@ -105,6 +105,10 @@ _RESPONDER_CONDITION = (
     "(github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || "
     "contains(github.event.issue.title, '@claude'))) ) }}"
 )
+_REVIEWER_CONDITION = (
+    "${{ github.event.pull_request.user.login != 'dependabot[bot]' && "
+    "vars.CLAUDE_HEADLESS_ENABLED == 'true' }}"
+)
 _HISTORICAL_LABELS = frozenset(
     {
         "[HISTORICAL — RETAINED EVIDENCE, SUPERSEDED 6 Sep 2026 by D-ToS-1.]",
@@ -333,6 +337,13 @@ def _assert_policy_range_is_outside_html_comments(text: str, start: int, end: in
         next_boundary = next(boundaries, None)
 
 
+def _assert_fixed_policy_range_is_not_indented_code(text: str, start: int, end: int) -> None:
+    """Reject four-space GFM code indentation at either fixed policy boundary."""
+    for boundary in (start, end - 1):
+        line_start = text.rfind("\n", 0, boundary) + 1
+        assert not text[line_start:boundary].startswith("    ")
+
+
 def _is_affirmative_enablement_instruction(text: str) -> bool:
     """Return whether text affirmatively tells a reader to enable headless CI.
 
@@ -434,6 +445,7 @@ def _assert_canonical_live_policy(text: str) -> None:
     assert not any(span_start < end and start < span_end for span_start, span_end in spans)
     _assert_canonical_range_is_outside_markdown_fences(text, start, end)
     _assert_policy_range_is_outside_html_comments(text, start, end)
+    _assert_fixed_policy_range_is_not_indented_code(text, start, end)
     bullet = _canonical_live_state_bullet(text)
     assert "CLAUDE_HEADLESS_ENABLED" in bullet, "missing canonical headless token"
     normalized_bullet = _normalized_visible(bullet)
@@ -607,6 +619,7 @@ def _assert_registry_policy(text: str) -> None:
     )
     _assert_canonical_range_is_outside_markdown_fences(text, entry_start, entry_end)
     _assert_policy_range_is_outside_html_comments(text, entry_start, entry_end)
+    _assert_fixed_policy_range_is_not_indented_code(text, entry_start, entry_end)
     entry = text[entry_start:entry_end]
     normalized_entry = _normalized_visible(entry)
     assert (
@@ -959,6 +972,23 @@ def _assert_responder_headless_gate(workflow: object) -> None:
     assert re.sub(r"\s+", " ", condition) == _RESPONDER_CONDITION
 
 
+def _assert_reviewer_workflow_job_set(workflow: object) -> None:
+    """Assert the reviewer workflow retains only its documented retired job."""
+    assert isinstance(workflow, dict)
+    workflow_map = cast(dict[str, object], workflow)
+    jobs = workflow_map.get("jobs")
+    assert isinstance(jobs, dict)
+    assert set(cast(dict[str, object], jobs)) == {"claude-review"}
+
+
+def _assert_workflow_citation_contains_condition(
+    workflow_text: str, start_line: int, end_line: int, condition: str
+) -> None:
+    """Assert an inclusive cited workflow range contains its complete normalized condition."""
+    cited_range = "\n".join(workflow_text.splitlines()[start_line - 1 : end_line])
+    assert re.sub(r"\s+", " ", condition) in re.sub(r"\s+", " ", cited_range)
+
+
 def test_agents_md_forbidden_phrases_are_contained_in_historical_blocks() -> None:
     """T1 (AC1, AC2): every phrase-set-P occurrence in AGENTS.md is historical.
 
@@ -1296,6 +1326,40 @@ def test_responder_workflow_requires_the_true_only_headless_conjunct() -> None:
         )
 
 
+def test_reviewer_workflow_retains_only_the_documented_job() -> None:
+    """T5 reviewer witness: the unchanged condition test retains a singleton job surface."""
+    reviewer_path = _REPO_ROOT / ".github" / "workflows" / "claude-code-review.yml"
+    workflow = yaml.safe_load(reviewer_path.read_text(encoding="utf-8"))
+    _assert_reviewer_workflow_job_set(workflow)
+
+    assert isinstance(workflow, dict)
+    workflow_map = cast(dict[str, object], workflow)
+    jobs = workflow_map["jobs"]
+    assert isinstance(jobs, dict)
+    jobs_map = cast(dict[str, object], jobs)
+    with pytest.raises(AssertionError):
+        _assert_reviewer_workflow_job_set(
+            {"jobs": {**jobs_map, "claude-review-extra": {"if": "true"}}}
+        )
+
+
+def test_claude_workflow_citations_cover_complete_headless_conditions() -> None:
+    """Assert the two operative workflow citations cover their complete ``if`` values."""
+    reviewer_text = (_REPO_ROOT / ".github" / "workflows" / "claude-code-review.yml").read_text(
+        encoding="utf-8"
+    )
+    responder_text = (_REPO_ROOT / ".github" / "workflows" / "claude.yml").read_text(
+        encoding="utf-8"
+    )
+    _assert_workflow_citation_contains_condition(reviewer_text, 27, 41, _REVIEWER_CONDITION)
+    _assert_workflow_citation_contains_condition(responder_text, 14, 26, _RESPONDER_CONDITION)
+
+    with pytest.raises(AssertionError):
+        _assert_workflow_citation_contains_condition(reviewer_text, 27, 40, _REVIEWER_CONDITION)
+    with pytest.raises(AssertionError):
+        _assert_workflow_citation_contains_condition(responder_text, 14, 25, _RESPONDER_CONDITION)
+
+
 @pytest.mark.docs
 def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> None:
     """Exercise focused synthetic failure modes without mutating governed files.
@@ -1325,6 +1389,34 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         _historical_spans(wrapped_sentence)
         with pytest.raises(AssertionError):
             _assert_required_agents_sentence_is_operative(wrapped_sentence, sentence)
+
+    registry_entry_start = registry.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    registry_entry_end = registry.index("\n**1 Sep 2026", registry_entry_start)
+    for document, assertion, policy_start, policy_end in (
+        (agents, _assert_canonical_live_policy, start, end),
+        (registry, _assert_registry_policy, registry_entry_start, registry_entry_end),
+    ):
+        start_line_start = document.rfind("\n", 0, policy_start) + 1
+        whole_range_indented = (
+            document[:start_line_start]
+            + "".join(
+                f"    {line}" for line in document[start_line_start:policy_end].splitlines(True)
+            )
+            + document[policy_end:]
+        )
+        with pytest.raises(AssertionError):
+            assertion(whole_range_indented)
+
+        with pytest.raises(AssertionError):
+            assertion(document[:start_line_start] + "    " + document[start_line_start:])
+
+        end_line_start = document.rfind("\n", 0, policy_end - 1) + 1
+        with pytest.raises(AssertionError):
+            assertion(document[:end_line_start] + "    " + document[end_line_start:])
+
+        assertion("    unrelated indentation\n" + document)
 
     generic_checks = (
         agents[:start] + agents[start:end].replace("`Checks`", "required checks", 1) + agents[end:]
