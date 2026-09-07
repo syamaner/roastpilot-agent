@@ -1469,6 +1469,9 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     raw_text_canonical = (
         agents[:canonical_line_start] + "<pre>\n" + agents[canonical_line_start:] + "\n</pre>\n"
     )
+    raw_start, raw_end = _canonical_bullet_bounds(raw_text_canonical)
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_raw_text_blocks(raw_text_canonical, raw_start, raw_end)
     with pytest.raises(AssertionError):
         _assert_canonical_live_policy(raw_text_canonical)
 
@@ -1476,6 +1479,12 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     raw_text_registry = (
         registry[:registry_header] + "<pre>\n" + registry[registry_header:] + "\n</pre>\n"
     )
+    raw_start = raw_text_registry.index(
+        "**6 Sep 2026 — D-ToS-1 governance reconciliation (#938).**"
+    )
+    raw_end = raw_text_registry.index("\n**1 Sep 2026", raw_start)
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_raw_text_blocks(raw_text_registry, raw_start, raw_end)
     with pytest.raises(AssertionError):
         _assert_registry_policy(raw_text_registry)
 
@@ -1529,6 +1538,44 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         _assert_policy_range_is_outside_raw_text_blocks(
             mixed_case_raw_text, start_boundary, end_boundary
         )
+
+    same_tag_nested_open = "<pre>\n<pre>\ncanonical before\n</pre>\ncanonical after"
+    before_boundary = same_tag_nested_open.index("canonical before")
+    after_boundary = same_tag_nested_open.index("canonical after")
+    lone_close = same_tag_nested_open.index("</pre>")
+    assert same_tag_nested_open.index("<pre>") < before_boundary < lone_close < after_boundary
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_raw_text_blocks(
+            same_tag_nested_open, before_boundary, before_boundary + len("canonical before")
+        )
+    _assert_policy_range_is_outside_raw_text_blocks(
+        same_tag_nested_open, after_boundary, after_boundary + len("canonical after")
+    )
+
+    different_tag_nested_open = "<pre>\n<script>\ncanonical before\n</pre>\ncanonical after"
+    before_boundary = different_tag_nested_open.index("canonical before")
+    after_boundary = different_tag_nested_open.index("canonical after")
+    lone_close = different_tag_nested_open.index("</pre>")
+    assert different_tag_nested_open.index("<pre>") < before_boundary < lone_close < after_boundary
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_raw_text_blocks(
+            different_tag_nested_open, before_boundary, before_boundary + len("canonical before")
+        )
+    _assert_policy_range_is_outside_raw_text_blocks(
+        different_tag_nested_open, after_boundary, after_boundary + len("canonical after")
+    )
+
+    mixed_case_closed_before_range = "<PrE>\n</pRe>\ncanonical start\ncanonical end"
+    start_boundary = mixed_case_closed_before_range.index("canonical start")
+    end_boundary = mixed_case_closed_before_range.index("canonical end")
+    assert (
+        mixed_case_closed_before_range.index("<PrE>")
+        < mixed_case_closed_before_range.index("</pRe>")
+        < start_boundary
+    )
+    _assert_policy_range_is_outside_raw_text_blocks(
+        mixed_case_closed_before_range, start_boundary, end_boundary
+    )
 
     registry_spans = _historical_spans(registry)
     registry_735_span_end = next(
