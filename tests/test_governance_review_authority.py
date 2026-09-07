@@ -375,6 +375,40 @@ def _assert_policy_range_is_outside_raw_text_blocks(text: str, start: int, end: 
         next_boundary = next(boundaries, None)
 
 
+def _assert_policy_range_is_outside_processing_instructions(
+    text: str, start: int, end: int
+) -> None:
+    """Reject a non-nesting CommonMark processing-instruction span at policy boundaries."""
+    boundaries = iter(sorted((start, end)))
+    next_boundary = next(boundaries, None)
+    processing_instruction_open = False
+    scan_start = 0
+    while True:
+        opening_start = text.find("<?", scan_start)
+        closing_start = text.find("?>", scan_start)
+        if opening_start == closing_start == -1:
+            break
+        if closing_start == -1 or (opening_start != -1 and opening_start < closing_start):
+            marker_start = opening_start
+            marker = "<?"
+        else:
+            marker_start = closing_start
+            marker = "?>"
+
+        while next_boundary is not None and next_boundary <= marker_start:
+            assert not processing_instruction_open
+            next_boundary = next(boundaries, None)
+        if marker == "<?" and not processing_instruction_open:
+            processing_instruction_open = True
+        elif marker == "?>" and processing_instruction_open:
+            processing_instruction_open = False
+        scan_start = marker_start + len(marker)
+
+    while next_boundary is not None:
+        assert not processing_instruction_open
+        next_boundary = next(boundaries, None)
+
+
 def _assert_policy_range_is_outside_code_spans(text: str, start: int, end: int) -> None:
     """Reject non-nesting exact-run Markdown code-span state at policy boundaries."""
     boundaries = iter(sorted((start, end)))
@@ -401,6 +435,7 @@ def _assert_fixed_operative_range_is_visible(text: str, start: int, end: int) ->
     _assert_policy_range_is_outside_html_comments(text, start, end)
     _assert_fixed_policy_range_is_not_indented_code(text, start, end)
     _assert_policy_range_is_outside_raw_text_blocks(text, start, end)
+    _assert_policy_range_is_outside_processing_instructions(text, start, end)
     _assert_policy_range_is_outside_code_spans(text, start, end)
 
 
@@ -1513,6 +1548,50 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         _assert_policy_range_is_outside_raw_text_blocks(raw_text_registry, raw_start, raw_end)
     with pytest.raises(AssertionError):
         _assert_registry_policy(raw_text_registry)
+
+    processing_instruction_canonical = (
+        agents[:canonical_line_start] + "<?\n" + agents[canonical_line_start:] + "\n?>\n"
+    )
+    pi_start, pi_end = _canonical_bullet_bounds(processing_instruction_canonical)
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_processing_instructions(
+            processing_instruction_canonical, pi_start, pi_end
+        )
+    with pytest.raises(AssertionError):
+        _assert_canonical_live_policy(processing_instruction_canonical)
+
+    processing_instruction_registry = (
+        registry[:registry_header] + "<?\n" + registry[registry_header:] + "\n?>\n"
+    )
+    pi_start = processing_instruction_registry.index("## Active Epic")
+    pi_end = processing_instruction_registry.index("\n**1 Sep 2026", pi_start)
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_processing_instructions(
+            processing_instruction_registry, pi_start, pi_end
+        )
+    with pytest.raises(AssertionError):
+        _assert_registry_policy(processing_instruction_registry)
+
+    closed_processing_instruction_before_range = "<?pi?>\ncanonical start\ncanonical end"
+    start_boundary = closed_processing_instruction_before_range.index("canonical start")
+    end_boundary = closed_processing_instruction_before_range.index("canonical end")
+    assert (
+        closed_processing_instruction_before_range.index("<?")
+        < closed_processing_instruction_before_range.index("?>")
+        < start_boundary
+    )
+    _assert_policy_range_is_outside_processing_instructions(
+        closed_processing_instruction_before_range, start_boundary, end_boundary
+    )
+
+    unterminated_processing_instruction = "<?pi\ncanonical start\ncanonical end"
+    start_boundary = unterminated_processing_instruction.index("canonical start")
+    end_boundary = unterminated_processing_instruction.index("canonical end")
+    assert unterminated_processing_instruction.index("<?") < start_boundary < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_processing_instructions(
+            unterminated_processing_instruction, start_boundary, end_boundary
+        )
 
     closed_raw_text_before_range = "<pre></pre>\ncanonical start\ncanonical end"
     start_boundary = closed_raw_text_before_range.index("canonical start")
