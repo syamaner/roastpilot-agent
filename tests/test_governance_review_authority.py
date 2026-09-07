@@ -261,9 +261,12 @@ def _canonical_live_state_bullet(text: str) -> str:
 
 def _assert_canonical_range_is_outside_markdown_fences(text: str, start: int, end: int) -> None:
     """Reject a fenced-code state that covers either canonical-policy boundary."""
-    fence_positions = [match.start() for match in re.finditer(r"(?m)^[ \t]*```", text)]
-    assert sum(position < start for position in fence_positions) % 2 == 0
-    assert sum(position < end for position in fence_positions) % 2 == 0
+    for delimiter in ("```", "~~~"):
+        fence_positions = [
+            match.start() for match in re.finditer(rf"(?m)^[ \t]*{re.escape(delimiter)}", text)
+        ]
+        assert sum(position < start for position in fence_positions) % 2 == 0
+        assert sum(position < end for position in fence_positions) % 2 == 0
 
 
 def _is_affirmative_enablement_instruction(text: str) -> bool:
@@ -1302,6 +1305,50 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     with pytest.raises(AssertionError):
         _assert_canonical_range_is_outside_markdown_fences(
             start_inside_end_outside, start_boundary, end_boundary
+        )
+
+    tilde_wraps_both_boundaries = "~~~\ncanonical start\ncanonical end\n~~~\n"
+    start_boundary = tilde_wraps_both_boundaries.index("canonical start")
+    end_boundary = tilde_wraps_both_boundaries.index("canonical end")
+    opening_fence = tilde_wraps_both_boundaries.index("~~~")
+    closing_fence = tilde_wraps_both_boundaries.rindex("~~~")
+    assert opening_fence < start_boundary < end_boundary < closing_fence
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            tilde_wraps_both_boundaries, start_boundary, end_boundary
+        )
+
+    tilde_start_outside_end_inside = "canonical start\n~~~\ncanonical end\n~~~\n"
+    start_boundary = tilde_start_outside_end_inside.index("canonical start")
+    opening_fence = tilde_start_outside_end_inside.index("~~~")
+    closing_fence = tilde_start_outside_end_inside.rindex("~~~")
+    end_boundary = closing_fence - 1
+    assert start_boundary < opening_fence < end_boundary < closing_fence
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            tilde_start_outside_end_inside, start_boundary, end_boundary
+        )
+
+    tilde_start_inside_end_outside = "~~~\ncanonical start\n~~~\ncanonical end"
+    start_boundary = tilde_start_inside_end_outside.index("canonical start")
+    end_boundary = len(tilde_start_inside_end_outside)
+    opening_fence = tilde_start_inside_end_outside.index("~~~")
+    closing_fence = tilde_start_inside_end_outside.rindex("~~~")
+    assert opening_fence < start_boundary < closing_fence < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            tilde_start_inside_end_outside, start_boundary, end_boundary
+        )
+
+    mismatched_fence_classes = "```\n~~~\ncanonical start\ncanonical end"
+    start_boundary = mismatched_fence_classes.index("canonical start")
+    end_boundary = mismatched_fence_classes.index("canonical end")
+    opening_fence = mismatched_fence_classes.index("```")
+    closing_fence = mismatched_fence_classes.index("~~~")
+    assert opening_fence < closing_fence < start_boundary < end_boundary
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            mismatched_fence_classes, start_boundary, end_boundary
         )
 
     for original, replacement in (
