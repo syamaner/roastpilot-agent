@@ -1416,6 +1416,18 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
         matching_fence_outside_range, start_boundary, end_boundary
     )
 
+    non_whitespace_fence_tail = "```\n``` content\ncanonical start\ncanonical end\n```\n"
+    start_boundary = non_whitespace_fence_tail.index("canonical start")
+    end_boundary = non_whitespace_fence_tail.index("canonical end")
+    opening_fence = non_whitespace_fence_tail.index("```")
+    non_closing_run = non_whitespace_fence_tail.index("``` content")
+    closing_fence = non_whitespace_fence_tail.rindex("```")
+    assert opening_fence < non_closing_run < start_boundary < end_boundary < closing_fence
+    with pytest.raises(AssertionError):
+        _assert_canonical_range_is_outside_markdown_fences(
+            non_whitespace_fence_tail, start_boundary, end_boundary
+        )
+
     backtick_then_tilde_exploit = "```\n~~~\n```\n~~~\ncanonical start\ncanonical end"
     start_boundary = backtick_then_tilde_exploit.index("canonical start")
     end_boundary = backtick_then_tilde_exploit.index("canonical end")
@@ -1457,6 +1469,31 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
     _assert_policy_range_is_outside_html_comments(
         closed_comment_before_range, start_boundary, end_boundary
     )
+
+    # Intentionally fail-closed raw scanner independence, not HTML-in-Markdown parsing.
+    comment_in_closed_fence = "```\n<!--\n```\ncanonical start\ncanonical end"
+    start_boundary = comment_in_closed_fence.index("canonical start")
+    end_boundary = comment_in_closed_fence.index("canonical end")
+    opening_fence = comment_in_closed_fence.index("```")
+    comment_opening = comment_in_closed_fence.index("<!--")
+    closing_fence = comment_in_closed_fence.rindex("```")
+    assert opening_fence < comment_opening < closing_fence < start_boundary < end_boundary
+    _assert_canonical_range_is_outside_markdown_fences(
+        comment_in_closed_fence, start_boundary, end_boundary
+    )
+    with pytest.raises(AssertionError):
+        _assert_policy_range_is_outside_html_comments(
+            comment_in_closed_fence, start_boundary, end_boundary
+        )
+
+    non_nested_comment = "<!-- outer <!-- inner -->\ncanonical start\ncanonical end"
+    start_boundary = non_nested_comment.index("canonical start")
+    end_boundary = non_nested_comment.index("canonical end")
+    outer_opening = non_nested_comment.index("<!--")
+    inner_opening = non_nested_comment.index("<!--", outer_opening + len("<!--"))
+    closing_comment = non_nested_comment.index("-->")
+    assert outer_opening < inner_opening < closing_comment < start_boundary < end_boundary
+    _assert_policy_range_is_outside_html_comments(non_nested_comment, start_boundary, end_boundary)
 
     canonical_comment_wrap = agents[:start] + "<!--" + agents[start:]
     mutated_start, mutated_end = _canonical_bullet_bounds(canonical_comment_wrap)
