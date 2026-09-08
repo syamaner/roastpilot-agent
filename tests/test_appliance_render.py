@@ -11,6 +11,7 @@ consumption contract is covered in
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import stat
 import subprocess
@@ -32,6 +33,8 @@ from roastpilot_agent.appliance.render import (
     render_service_unit,
     render_template_text,
 )
+
+_MCP_CONFIG_AVAILABLE = importlib.util.find_spec("coffee_roaster_mcp.config") is not None
 
 
 def _unit_directives(text: str) -> dict[str, str]:
@@ -495,11 +498,13 @@ def test_render_mcp_yaml_pi_inference_values_are_exact() -> None:
     assert audio["input_device"] == audio_device
 
 
+@pytest.mark.skipif(
+    not _MCP_CONFIG_AVAILABLE, reason="coffee-roaster-mcp optional dependency is absent"
+)
 def test_rendered_mcp_yaml_loads_through_the_mcp_public_config_loader(tmp_path: Path) -> None:
     """T9: MCP's typed loader accepts every ratified rendered config key."""
-    config_module = pytest.importorskip(
-        "coffee_roaster_mcp.config", reason="coffee-roaster-mcp optional dependency is absent"
-    )
+    from coffee_roaster_mcp.config import load_config
+
     model_dir = Path("/var/lib/roastpilot-agent/models-loader-test")
     serial_port = Path("/dev/serial/by-id/hottop-loader-test")
     audio_device = "USB PnP Audio Device loader test"
@@ -515,7 +520,7 @@ def test_rendered_mcp_yaml_loads_through_the_mcp_public_config_loader(tmp_path: 
         encoding="utf-8",
     )
 
-    loaded = config_module.load_config(yaml_path, environ={})
+    loaded = load_config(yaml_path, environ={})
 
     assert loaded.transport.type == "stdio"
     assert loaded.roaster.driver == "hottop_kn8828b_2k_plus"
