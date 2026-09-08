@@ -228,16 +228,18 @@ def test_render_service_unit_hardening_present_and_absent() -> None:
     assert "DeviceAllow" not in directives
 
 
-def test_render_service_unit_no_resume_flag_in_exec_start_or_exec_start_pre() -> None:
-    """No ExecStartPre directive exists, and ExecStart carries no resume/start-run flag."""
+def test_render_service_unit_has_only_the_permitted_service_start_command() -> None:
+    """T11: exactly one safe service section and no alternate start mechanism."""
     text = render_service_unit(_inputs())
     directives = _unit_directives(text)
+    assert sum(raw.strip() == "[Service]" for raw in text.splitlines()) == 1
     assert sum(raw.startswith("ExecStart=") for raw in text.splitlines()) == 1
     assert "ExecStartPre" not in directives
+    assert "Environment" not in directives
     assert "KillMode" not in directives
-    exec_start = directives["ExecStart"]
-    for forbidden in ("--resume", "resume", "--continue", "start-run", " run-start"):
-        assert forbidden not in exec_start
+    assert directives["ExecStart"] == (
+        "%h/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port 9001"
+    )
 
 
 def test_render_service_unit_binds_all_interfaces() -> None:
@@ -312,7 +314,15 @@ def test_audio_device_is_yaml_encoded_without_key_injection() -> None:
 
 
 def test_render_mcp_yaml_pi_inference_values_are_exact() -> None:
-    text = render_mcp_yaml(_inputs(model_dir=Path("/opt/roastpilot/models")))
+    serial_port = Path("/dev/serial/by-id/hottop-custom")
+    audio_device = "USB PnP Audio Device custom"
+    text = render_mcp_yaml(
+        _inputs(
+            model_dir=Path("/opt/roastpilot/models"),
+            serial_port=serial_port,
+            audio_device=audio_device,
+        )
+    )
     parsed = yaml.safe_load(text)
 
     first_crack = parsed["first_crack"]
@@ -326,10 +336,14 @@ def test_render_mcp_yaml_pi_inference_values_are_exact() -> None:
     assert first_crack["min_positive_windows"] == 3
     assert first_crack["confirmation_window_seconds"] == 30.0
 
+    roaster = parsed["roaster"]
+    assert roaster["port"] == str(serial_port)
+
     audio = parsed["audio"]
     assert audio["window_seconds"] == 10.0
     assert audio["overlap"] == 0.3
     assert audio["source"] == "microphone"
+    assert audio["input_device"] == audio_device
 
 
 def test_render_mcp_yaml_repo_id_and_revision_come_from_the_manifest_not_inputs() -> None:
