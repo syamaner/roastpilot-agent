@@ -69,6 +69,16 @@ def _inputs(**overrides: object) -> ApplianceRenderInputs:
     return ApplianceRenderInputs(**defaults)  # type: ignore[arg-type]
 
 
+def _add_unknown_env_template_token(text: str) -> str:
+    """Corrupt an env template with one token outside its closed set."""
+    return text + "\nunknown=@@EVIL@@\n"
+
+
+def _remove_required_env_template_token(text: str) -> str:
+    """Corrupt an env template by removing its required PORT substitution."""
+    return text.replace("PORT=@@PORT@@\n", "")
+
+
 # --- render_template_text: closed-token strictness (T13, G18) --------------
 
 
@@ -190,8 +200,8 @@ def test_render_appliance_files_aborts_when_required_template_token_is_absent(
 @pytest.mark.parametrize(
     ("mutation", "error"),
     [
-        (lambda text: text + "\nunknown=@@EVIL@@\n", "unknown token"),
-        (lambda text: text.replace("PORT=@@PORT@@\n", ""), "missing required token"),
+        (_add_unknown_env_template_token, "unknown token"),
+        (_remove_required_env_template_token, "missing required token"),
     ],
 )
 def test_render_appliance_files_aborts_on_env_template_token_corruption(
