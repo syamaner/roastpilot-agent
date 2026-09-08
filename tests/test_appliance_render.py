@@ -34,7 +34,7 @@ from roastpilot_agent.appliance.render import (
     render_template_text,
 )
 
-_MCP_CONFIG_AVAILABLE = importlib.util.find_spec("coffee_roaster_mcp.config") is not None
+_MCP_CONFIG_AVAILABLE = importlib.util.find_spec("coffee_roaster_mcp") is not None
 
 
 def _unit_directives(text: str) -> dict[str, str]:
