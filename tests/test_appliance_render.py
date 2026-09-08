@@ -314,6 +314,13 @@ def test_render_service_unit_rejects_empty_identity() -> None:
         render_service_unit(_inputs(operator_user=" ", operator_group="pi"))
 
 
+@pytest.mark.parametrize("field", ["operator_user", "operator_group"])
+def test_render_service_unit_rejects_exactly_empty_identity(field: str) -> None:
+    """Both systemd identity fields fail closed before account lookup when empty."""
+    with pytest.raises(ApplianceRenderError, match="non-empty"):
+        render_service_unit(_inputs(**{field: ""}))
+
+
 def test_render_service_unit_rejects_alternate_named_uid_zero_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
