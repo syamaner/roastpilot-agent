@@ -42,10 +42,12 @@ case "$name" in
   hostnamectl) if [ "${1:-}" = --static ]; then cat "$FAKE_HOSTNAME"; else [ "$1" = set-hostname ]; printf '%s\\n' "$2" > "$FAKE_HOSTNAME"; fi ;;
   pipx)
     if [ "${1:-}" = list ]; then
-      [ -e "$FAKE_PIPX_STATE" ] && cat "$FAKE_PIPX_STATE" || printf '{"venvs": {}}\\n'
+      if [ -n "${FAKE_PIPX_JSON:-}" ]; then cat "$FAKE_PIPX_JSON"; elif [ -e "$FAKE_PIPX_STATE" ]; then cat "$FAKE_PIPX_STATE"; else printf '{"venvs": {}}\\n'; fi
     elif [ "${1:-}" = install ]; then
       shift; [ "${1:-}" = -- ] && shift
-      printf '%s\\n' '{"venvs": {"roastpilot-agent": {"metadata": {"main_package": {"package_version": "1.0", "package_or_url": "roastpilot-agent[pi]"}}}}}' > "$FAKE_PIPX_STATE"
+      package="$1"; version="${package##*==}"
+      [ "$version" = "$package" ] && version=default
+      printf '{"venvs":{"roastpilot-agent":{"metadata":{"main_package":{"package_version":"%s","package_or_url":"%s"}}}}}\\n' "$version" "$package" > "$FAKE_PIPX_STATE"
     elif [ "${1:-}" = uninstall ]; then rm -f "$FAKE_PIPX_STATE"; fi ;;
   roastpilot-agent)
     if [ "$1 $2 $3" = "appliance model install" ]; then
@@ -61,7 +63,7 @@ case "$name" in
   cp) /bin/cp "$@" ;;
   grep) /usr/bin/grep "$@" ;;
   tr) /usr/bin/tr "$@" ;;
-  apt-get|usermod|systemctl) : ;;
+  apt-get|chown|usermod|systemctl) : ;;
 esac
 """
     )
@@ -76,6 +78,7 @@ esac
         "install",
         "mkdir",
         "chmod",
+        "chown",
         "cp",
         "apt-get",
         "usermod",
@@ -101,12 +104,16 @@ esac
 
 
 def _run(
-    environment: dict[str, str], *args: str, yes: bool = True, stdin: str | None = "input"
+    environment: dict[str, str],
+    *args: str,
+    yes: bool = True,
+    stdin: str | None = "input",
+    script: Path = INSTALLER,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             "bash",
-            str(INSTALLER),
+            str(script),
             *(["--yes"] if yes else []),
             "--serial-port",
             "/dev/ttyUSB0",
@@ -235,3 +242,186 @@ def test_truncated_or_mutated_script_has_no_privileged_effect(
     escaped = _run(environment | {"ROASTPILOT_INSTALL_ROOT": "/tmp/root/../escape"})
     assert escaped.returncode != 0
     assert not log.exists()
+
+
+@pytest.mark.serial  # Real subprocesses share one fake-command state and install root.
+def test_pipx_selectors_are_exact_and_fail_closed(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A1: inspect structured pipx state and replace only differing selections."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "agent.whl"
+    wheel.write_text("wheel")
+    absent = _run(environment, "--set-hostname", "roastpilot")
+    assert absent.returncode == 0
+    assert "pipx <install> <--> <roastpilot-agent[pi]>" in log.read_text()
+
+    existing = _run(environment, "--set-hostname", "roastpilot")
+    assert existing.returncode == 0
+    assert "pipx <install>" not in log.read_text().split("pipx <list>")[-1]
+
+    exact_version = _run(environment, "--set-hostname", "roastpilot", "--version", "default")
+    assert exact_version.returncode == 0
+    differing_version = _run(environment, "--set-hostname", "roastpilot", "--version", "2.0")
+    assert differing_version.returncode == 0
+    assert "pipx <uninstall> <--> <roastpilot-agent>" in log.read_text()
+    assert "pipx <install> <--> <roastpilot-agent[pi]==2.0>" in log.read_text()
+
+    exact_wheel = _run(environment, "--set-hostname", "roastpilot", "--wheel", str(wheel))
+    assert exact_wheel.returncode == 0
+    differing_wheel = tmp_path / "different.whl"
+    differing_wheel.write_text("different")
+    replaced = _run(environment, "--set-hostname", "roastpilot", "--wheel", str(differing_wheel))
+    assert replaced.returncode == 0
+    assert f"<{differing_wheel}>" in log.read_text()
+
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("not-json")
+    before = log.read_text()
+    failed = _run(environment | {"FAKE_PIPX_JSON": str(malformed)}, "--set-hostname", "roastpilot")
+    assert failed.returncode != 0
+    after = log.read_text()[len(before) :]
+    assert "roastpilot-agent <appliance" not in after and "pipx <uninstall>" not in after
+
+
+@pytest.mark.serial  # Real subprocesses share one fake-command state and install root.
+def test_rooted_staging_and_hostile_inputs_do_not_escape(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """Destination and inert-input guards reject escapes before install effects."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_ROOT"])
+    completed = _run(environment, "--set-hostname", "roastpilot")
+    assert completed.returncode == 0
+    assert all(str(root) in line for line in log.read_text().splitlines() if "--output-dir" in line)
+
+    escaped = _run(environment | {"ROASTPILOT_INSTALL_ROOT": str(root / ".." / "escape")})
+    assert escaped.returncode != 0
+    os_release = tmp_path / "hostile-release"
+    sentinel = tmp_path / "sentinel"
+    os_release.write_text(f"ID=$(touch {sentinel})\n")
+    before = log.read_text()
+    hostile = _run(
+        environment | {"ROASTPILOT_INSTALL_OS_RELEASE": str(os_release)},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert hostile.returncode != 0 and not sentinel.exists()
+    assert "sudo" not in log.read_text()[len(before) :]
+
+
+@pytest.mark.serial  # Each mutation executes the real harness in a fresh test root.
+@pytest.mark.parametrize(
+    ("needle", "replacement", "arguments", "environment_key", "oracle"),
+    [
+        ('[[ "$(id -u)" != "0" ]] || die "never run pipx as root"', ":", (), "root", "proceeds"),
+        (
+            'if [[ "$(uname -m)" != "aarch64" && "$ALLOW_UNSUPPORTED_ARCH" != 1 ]]; then',
+            "if false; then",
+            (),
+            "arch",
+            "proceeds",
+        ),
+        (
+            'if [[ "$INSTALL_ASSUME_YES" != 1 && "${ROASTPILOT_INSTALL_ASSUME_YES:-}" != 1 && ! -t 0 ]]; then',
+            "if false; then",
+            (),
+            "non_tty",
+            "proceeds",
+        ),
+        ("set -euo pipefail", "set -uo pipefail", (), "model_failure", "unit_written"),
+        (
+            "if ! id -nG \"$USER\" | tr ' ' '\\n' | grep -Fxq dialout || ! id -nG \"$USER\" | tr ' ' '\\n' | grep -Fxq audio; then",
+            "if true; then",
+            (),
+            "second_run",
+            "usermod",
+        ),
+        (
+            "printf '%s\\n' \"Installed: unit enabled; model verified.\"",
+            "printf '%s\\n' \"$API_KEY\"",
+            ("--api-key", "mutation-secret"),
+            "secret",
+            "secret_leaked",
+        ),
+    ],
+)
+def test_contract_mutation_oracles_detect_removed_guards(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    needle: str,
+    replacement: str,
+    arguments: tuple[str, ...],
+    environment_key: str,
+    oracle: str,
+) -> None:
+    """G8-G13/G23: each targeted script mutation changes a behavioural oracle."""
+    fake_bin, environment, log, _ = installer_harness
+    mutated = tmp_path / f"mutated-{environment_key}.sh"
+    mutated.write_text(INSTALLER.read_text().replace(needle, replacement, 1))
+    mutated.chmod(0o755)
+    run_environment = environment
+    yes = True
+    if environment_key == "root":
+        root_id = fake_bin / "id"
+        root_id.unlink()
+        root_id.write_text("#!/bin/sh\necho 0\n")
+        root_id.chmod(0o755)
+    elif environment_key == "arch":
+        arch = fake_bin / "uname"
+        arch.unlink()
+        arch.write_text("#!/bin/sh\necho x86_64\n")
+        arch.chmod(0o755)
+    elif environment_key == "non_tty":
+        yes = False
+    elif environment_key == "model_failure":
+        agent = fake_bin / "roastpilot-agent"
+        agent.write_text(
+            agent.read_text().replace(
+                'if [ "$1 $2 $3" = "appliance model install" ]; then',
+                'if [ "${FAKE_MODEL_FAIL:-}" = 1 ] && '
+                '[ "$1 $2 $3" = "appliance model install" ]; then exit 9; '
+                'elif [ "$1 $2 $3" = "appliance model install" ]; then',
+            )
+        )
+        run_environment = environment | {"FAKE_MODEL_FAIL": "1"}
+    elif environment_key == "second_run":
+        assert _run(run_environment, "--set-hostname", "roastpilot").returncode == 0
+        log.write_text("")
+    result = _run(
+        run_environment,
+        "--set-hostname",
+        "roastpilot",
+        *arguments,
+        yes=yes,
+        stdin=None if not yes else "input",
+        script=mutated,
+    )
+    if oracle == "proceeds":
+        assert result.returncode == 0
+    elif oracle == "unit_written":
+        assert (
+            Path(environment["ROASTPILOT_INSTALL_ROOT"])
+            / "etc/systemd/system/roastpilot-agent.service"
+        ).exists()
+    elif oracle == "usermod":
+        assert "usermod" in log.read_text()
+    else:
+        assert "mutation-secret" in result.stdout
+
+
+@pytest.mark.serial  # The truncated copy must use an isolated fake-command log.
+def test_trailing_main_mutation_is_detected_by_truncation_oracle(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """G12: moving a privileged effect above the trailing entry point is observable."""
+    _, environment, log, _ = installer_harness
+    mutated = tmp_path / "moved-main.sh"
+    mutated.write_text(INSTALLER.read_text().replace('main "$@"', 'run_privileged true\nmain "$@"'))
+    truncated = tmp_path / "moved-main-truncated.sh"
+    truncated.write_text(mutated.read_text().rsplit('main "$@"', 1)[0])
+    result = subprocess.run(
+        ["bash", str(truncated)], env=environment, text=True, capture_output=True, check=False
+    )
+    assert result.returncode == 0
+    assert "sudo <--> <true>" in log.read_text()

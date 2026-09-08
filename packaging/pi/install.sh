@@ -220,17 +220,22 @@ resolve_appliance_executable() {
 }
 
 install_model_and_render() {
-    local model_dir stage_dir operator_group
+    local model_dir stage_dir stage_parent operator_group
     model_dir="$(rooted_path /var/lib/roastpilot-agent/models)"
     validate_destination "$model_dir"
-    stage_dir="$(mktemp -d)"
+    stage_parent="$(rooted_path /tmp)"
+    validate_destination "$stage_parent"
+    operator_group="$(id -gn)" || die "cannot determine operator primary group"
+    run_privileged mkdir -p -- "$stage_parent"
+    run_privileged chown "$USER:$operator_group" -- "$stage_parent"
+    run_privileged chmod 0700 -- "$stage_parent"
+    stage_dir="$(mktemp -d "$stage_parent/roastpilot-install.XXXXXX")"
     STAGE_DIR="$stage_dir"
     if [[ -n "$MODEL_FROM_DIR" ]]; then
         run_privileged "$APPLIANCE_EXECUTABLE" appliance model install --dest "$model_dir" --from-dir "$MODEL_FROM_DIR"
     else
         run_privileged "$APPLIANCE_EXECUTABLE" appliance model install --dest "$model_dir"
     fi
-    operator_group="$(id -gn)" || die "cannot determine operator primary group"
     "$APPLIANCE_EXECUTABLE" appliance render --output-dir "$stage_dir" --port "$PORT" \
         --operator-user "$USER" --operator-group "$operator_group" --operator-home "$HOME" --serial-port "$SERIAL_PORT" \
         --audio-device "$AUDIO_DEVICE"
