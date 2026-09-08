@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from importlib import resources
@@ -237,7 +238,9 @@ def _validate_path(value: Path, *, field: str, device: bool = False) -> str:
     if not path.is_absolute() or ".." in path.parts:
         raise ApplianceRenderError(f"{field} must be an absolute path without '..'")
     if any(
-        character.isspace() or character in ('"', "'", "#", "$", "%", "=", "\\")
+        character.isspace()
+        or unicodedata.category(character) in {"Cf", "Zl", "Zp"}
+        or character in ('"', "'", "#", "$", "%", "=", "\\")
         for character in text
     ):
         raise ApplianceRenderError(f"{field} contains an unsafe structural character")

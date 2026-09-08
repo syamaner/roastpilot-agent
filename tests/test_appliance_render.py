@@ -410,6 +410,19 @@ def test_absolute_paths_reject_structural_characters(
     assert not output_dir.exists() or list(output_dir.iterdir()) == []
 
 
+@pytest.mark.parametrize("character", ["\u200e", "\u2028", "\u2029"])
+def test_absolute_paths_reject_unicode_format_and_separator_characters(
+    character: str, tmp_path: Path
+) -> None:
+    """Unicode format and line-separator code points cannot enter path values."""
+    output_dir = tmp_path / "out"
+    unsafe_path = Path(f"/var/lib/roastpilot-agent/model{character}s")
+
+    with pytest.raises(ApplianceRenderError, match="unsafe structural"):
+        render_appliance_files(output_dir, _inputs(model_dir=unsafe_path))
+    assert not output_dir.exists() or list(output_dir.iterdir()) == []
+
+
 def test_absolute_path_with_lexical_parent_part_is_rejected_without_normalisation(
     tmp_path: Path,
 ) -> None:
@@ -552,6 +565,7 @@ def test_render_mcp_yaml_contains_no_recording_enabling_key() -> None:
 def test_render_mcp_yaml_is_one_primary_audio_stream() -> None:
     text = render_mcp_yaml(_inputs())
     parsed = yaml.safe_load(text)
+    assert set(parsed) == {"transport", "roaster", "first_crack", "audio"}
     assert isinstance(parsed["audio"], dict)
     assert "devices" not in parsed
 
