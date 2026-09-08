@@ -41,7 +41,7 @@ case "$name" in
     if [ "${1:-}" = -u ]; then echo 1000
     elif [ "${1:-}" = -un ]; then echo operator
     elif [ "${1:-}" = -gn ]; then echo operators
-    else echo 'dialout audio'; fi ;;
+    else cat "$FAKE_GROUPS"; fi ;;
   getent) printf 'operator:x:1000:1000::%s:/bin/sh\\n' "$FAKE_OPERATOR_HOME" ;;
   uname) echo aarch64 ;;
   hostnamectl)
@@ -85,7 +85,8 @@ case "$name" in
   cp) /bin/cp "$@" ;;
   grep) /usr/bin/grep "$@" ;;
   tr) /usr/bin/tr "$@" ;;
-  apt-get|chown|usermod|systemctl) : ;;
+  usermod) printf 'dialout audio\n' > "$FAKE_GROUPS" ;;
+  apt-get|chown|systemctl) : ;;
 esac
 """
     )
@@ -115,11 +116,14 @@ esac
     agent = fake_bin / "roastpilot-agent"
     agent.write_text(fake.read_text())
     agent.chmod(0o755)
+    groups = tmp_path / "groups"
+    groups.write_text("dialout\n")
     environment = os.environ | {
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
         "FAKE_LOG": str(log),
         "FAKE_HOSTNAME": str(hostname),
         "FAKE_PIPX_STATE": str(tmp_path / "pipx-state"),
+        "FAKE_GROUPS": str(groups),
         "ROASTPILOT_INSTALL_ROOT": str(tmp_path / "root"),
         "ROASTPILOT_INSTALL_OS_RELEASE": str(os_release),
         "HOME": str(tmp_path / "home"),
@@ -212,12 +216,38 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     assert f"chown <operator:operators> <--> <{env_file}>" in commands
     assert f"chown <operator:operators> <--> <{var_dir}>" in commands
     assert f"chmod <0700> <--> <{var_dir}>" in commands
-    before = env_file.read_bytes()
+    yaml_file = root / "etc/roastpilot-agent/coffee-roaster-mcp.yaml"
+    unit_file = root / "etc/systemd/system/roastpilot-agent.service"
+    prior_file = root / "var/lib/roastpilot-agent/prior-static-hostname"
+    snapshots = {
+        path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        for path in (env_file, yaml_file, unit_file, prior_file)
+    }
+    assert commands.count("usermod <-aG> <dialout,audio> <--> <operator>") == 1
+    assert (
+        commands.count("MODEL_FETCH <" + str(root / "var/lib/roastpilot-agent/models") + ">") == 1
+    )
+    hostname_before = (root.parent / "hostname").read_bytes()
     second = _run(environment, "--set-hostname", "roastpilot", "--api-key", key)
     assert second.returncode == 0, second.stderr + log.read_text()
-    assert env_file.read_bytes() == before
+    assert {
+        path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode)) for path in snapshots
+    } == snapshots
+    assert (root.parent / "hostname").read_bytes() == hostname_before
     second_commands = log.read_text().splitlines()[len(commands) :]
-    assert not any("usermod" in line or "pipx <install>" in line for line in second_commands)
+    assert not any(
+        "usermod" in line or "pipx <install>" in line or "pipx <uninstall>" in line
+        for line in second_commands
+    )
+    assert not any("MODEL_FETCH" in line or "set-hostname" in line for line in second_commands)
+    assert (
+        sum(
+            line.startswith("roastpilot-agent <appliance> <model> <install>")
+            for line in second_commands
+        )
+        == 1
+    )
+    assert not any("systemctl <start>" in line for line in second_commands)
 
 
 @pytest.mark.serial  # The subprocess installer shares fake PATH command state.
@@ -281,9 +311,18 @@ def test_hostname_consent_start_and_failure_abort_before_service_enable(
     assert not (failed_root / "etc/systemd/system/roastpilot-agent.service").exists()
     failure_events = _delta(log, failure_start)
     assert not any("systemctl" in line for line in failure_events)
+    assert not any(
+        "<etc/roastpilot-agent/roastpilot-agent.env>" in line
+        or "<etc/roastpilot-agent/coffee-roaster-mcp.yaml>" in line
+        or "<etc/systemd/system/roastpilot-agent.service>" in line
+        for line in failure_events
+    )
+    stage = failed_root / "tmp/roastpilot-install.fake"
+    assert f"rm <-rf> <--> <{stage}>" in failure_events
+    assert not stage.exists()
 
 
-@pytest.mark.serial
+@pytest.mark.serial  # A truncated subprocess must not share fake command state.
 def test_truncated_or_mutated_script_has_no_privileged_effect(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -372,6 +411,37 @@ def test_rooted_staging_and_hostile_inputs_do_not_escape(
     )
     assert hostile.returncode != 0 and not sentinel.exists()
     assert "sudo" not in log.read_text()[len(before) :]
+
+
+@pytest.mark.serial  # A hostile destination is exercised in its own fake root.
+def test_destination_symlink_aborts_before_final_writes(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A symlinked destination component never receives installer output."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_ROOT"])
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root.mkdir()
+    (root / "etc").symlink_to(outside, target_is_directory=True)
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    assert not list(outside.iterdir())
+    assert not any("systemctl" in line for line in log.read_text().splitlines())
+
+
+@pytest.mark.serial  # Hostile arguments run only through the isolated fake PATH.
+def test_hostile_values_are_inert_and_rejected_before_writes(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """Caller identity, key, and wheel values cannot become shell syntax."""
+    _, environment, log, _ = installer_harness
+    sentinel = tmp_path / "sentinel"
+    hostile = f"$(touch {sentinel})"
+    rejected_key = _run(environment | {"HOME": hostile, "USER": "root"}, "--api-key", "bad\nkey")
+    assert rejected_key.returncode != 0 and not log.exists() and not sentinel.exists()
+    wheel = _run(environment, "--wheel", "--bad")
+    assert wheel.returncode != 0 and (not log.exists() or "sudo" not in log.read_text())
 
 
 @pytest.mark.serial  # This checks one complete subprocess staging lifecycle.

@@ -159,12 +159,12 @@ preflight() {
 }
 
 resolve_operator_identity() {
-    local account record_name ignored operator_home
+    local account record_name operator_home
     INVOKING_USER="$(id -un)" || die "cannot determine invoking user"
     INVOKING_GROUP="$(id -gn)" || die "cannot determine invoking group"
     [[ "$INVOKING_USER" =~ ^[a-z_][a-z0-9_-]*$ && "$INVOKING_GROUP" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "unsafe operator identity"
     account="$(getent passwd "$INVOKING_USER")" || die "cannot determine invoking home"
-    IFS=: read -r record_name ignored ignored ignored ignored operator_home ignored <<< "$account"
+    IFS=: read -r record_name _ _ _ _ operator_home _ <<< "$account"
     [[ "$record_name" == "$INVOKING_USER" && "$operator_home" == /* && "$operator_home" != *"/../"* ]] || die "unsafe operator home"
     INVOKING_HOME="$operator_home"
 }
