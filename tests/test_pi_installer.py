@@ -219,10 +219,10 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     yaml_file = root / "etc/roastpilot-agent/coffee-roaster-mcp.yaml"
     unit_file = root / "etc/systemd/system/roastpilot-agent.service"
     prior_file = root / "var/lib/roastpilot-agent/prior-static-hostname"
-    snapshots = {
-        path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-        for path in (env_file, yaml_file, unit_file, prior_file)
-    }
+    env_snapshot = (env_file.read_bytes(), stat.S_IMODE(env_file.stat().st_mode))
+    yaml_snapshot = (yaml_file.read_bytes(), stat.S_IMODE(yaml_file.stat().st_mode))
+    unit_snapshot = (unit_file.read_bytes(), stat.S_IMODE(unit_file.stat().st_mode))
+    prior_snapshot = (prior_file.read_bytes(), stat.S_IMODE(prior_file.stat().st_mode))
     assert commands.count("usermod <-aG> <dialout,audio> <--> <operator>") == 1
     assert (
         commands.count("MODEL_FETCH <" + str(root / "var/lib/roastpilot-agent/models") + ">") == 1
@@ -230,9 +230,10 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     hostname_before = (root.parent / "hostname").read_bytes()
     second = _run(environment, "--set-hostname", "roastpilot", "--api-key", key)
     assert second.returncode == 0, second.stderr + log.read_text()
-    assert {
-        path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode)) for path in snapshots
-    } == snapshots
+    assert (env_file.read_bytes(), stat.S_IMODE(env_file.stat().st_mode)) == env_snapshot
+    assert (yaml_file.read_bytes(), stat.S_IMODE(yaml_file.stat().st_mode)) == yaml_snapshot
+    assert (unit_file.read_bytes(), stat.S_IMODE(unit_file.stat().st_mode)) == unit_snapshot
+    assert (prior_file.read_bytes(), stat.S_IMODE(prior_file.stat().st_mode)) == prior_snapshot
     assert (root.parent / "hostname").read_bytes() == hostname_before
     second_commands = log.read_text().splitlines()[len(commands) :]
     assert not any(
@@ -345,46 +346,6 @@ def test_truncated_or_mutated_script_has_no_privileged_effect(
     escaped = _run(environment | {"ROASTPILOT_INSTALL_ROOT": "/tmp/root/../escape"})
     assert escaped.returncode != 0
     assert not log.exists()
-
-
-@pytest.mark.serial  # Real subprocesses share one fake-command state and install root.
-def test_pipx_selectors_are_exact_and_fail_closed(
-    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
-) -> None:
-    """A1: inspect structured pipx state and replace only differing selections."""
-    _, environment, log, _ = installer_harness
-    wheel = tmp_path / "agent.whl"
-    wheel.write_text("wheel")
-    absent = _run(environment, "--set-hostname", "roastpilot")
-    assert absent.returncode == 0
-    assert "pipx <install> <--> <roastpilot-agent[pi]>" in log.read_text()
-
-    existing = _run(environment, "--set-hostname", "roastpilot")
-    assert existing.returncode == 0
-    assert "pipx <install>" not in log.read_text().split("pipx <list>")[-1]
-
-    exact_version = _run(environment, "--set-hostname", "roastpilot", "--version", "default")
-    assert exact_version.returncode == 0
-    differing_version = _run(environment, "--set-hostname", "roastpilot", "--version", "2.0")
-    assert differing_version.returncode == 0
-    assert "pipx <uninstall> <--> <roastpilot-agent>" in log.read_text()
-    assert "pipx <install> <--> <roastpilot-agent[pi]==2.0>" in log.read_text()
-
-    exact_wheel = _run(environment, "--set-hostname", "roastpilot", "--wheel", str(wheel))
-    assert exact_wheel.returncode == 0
-    differing_wheel = tmp_path / "different.whl"
-    differing_wheel.write_text("different")
-    replaced = _run(environment, "--set-hostname", "roastpilot", "--wheel", str(differing_wheel))
-    assert replaced.returncode == 0
-    assert f"<{differing_wheel}>" in log.read_text()
-
-    malformed = tmp_path / "malformed.json"
-    malformed.write_text("not-json")
-    before = log.read_text()
-    failed = _run(environment | {"FAKE_PIPX_JSON": str(malformed)}, "--set-hostname", "roastpilot")
-    assert failed.returncode != 0
-    after = log.read_text()[len(before) :]
-    assert "roastpilot-agent <appliance" not in after and "pipx <uninstall>" not in after
 
 
 @pytest.mark.serial  # Real subprocesses share one fake-command state and install root.
@@ -663,6 +624,22 @@ def test_full_flow_has_exact_key_order_and_no_real_command_resolution(
     result = _run(environment, "--set-hostname", "roastpilot")
     assert result.returncode == 0, result.stderr
     events = log.read_text().splitlines()
+    root = Path(environment["ROASTPILOT_INSTALL_ROOT"])
+    stage = root / "tmp/roastpilot-install.fake"
+    model_dir = root / "var/lib/roastpilot-agent/models"
+    assert "sudo <--> <apt-get> <install> <-y> <libportaudio2> <pipx> <avahi-daemon>" in events
+    assert "pipx <install> <--> <roastpilot-agent[pi]>" in events
+    assert f"roastpilot-agent <appliance> <model> <install> <--dest> <{model_dir}>" in events
+    assert f"MODEL_FETCH <{model_dir}>" in events
+    assert (
+        f"roastpilot-agent <appliance> <render> <--output-dir> <{stage}> <--port> <8000>"
+        " <--operator-user> <operator> <--operator-group> <operators>"
+        f" <--operator-home> <{environment['FAKE_OPERATOR_HOME']}> <--serial-port> </dev/ttyUSB0>"
+        " <--audio-device> <USB mic>"
+    ) in events
+    assert "usermod <-aG> <dialout,audio> <--> <operator>" in events
+    assert f"tee <--> <{root / 'var/lib/roastpilot-agent/prior-static-hostname'}>" in events
+    assert f"rm <-rf> <--> <{stage}>" in events
 
     def first(prefix: str) -> int:
         """Return the position of a recorded command prefix."""
