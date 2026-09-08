@@ -783,7 +783,8 @@ def test_render_appliance_files_rejects_uninspectable_artifact_destination_befor
     def failing_lstat(
         path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
     ) -> os.stat_result:
-        if Path(path) == bad_destination:
+        filesystem_path = os.fspath(path)
+        if isinstance(filesystem_path, str) and Path(filesystem_path) == bad_destination:
             raise OSError("simulated destination inspection failure")
         return real_lstat(path)
 
