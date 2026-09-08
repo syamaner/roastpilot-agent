@@ -163,6 +163,26 @@ def test_render_appliance_files_aborts_on_mcp_yaml_template_corruption(
     assert not output_dir.exists() or list(output_dir.iterdir()) == []
 
 
+def test_render_appliance_files_aborts_when_required_template_token_is_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T13: a missing known service token fails before any output is emitted."""
+    import roastpilot_agent.appliance.render as render_module
+
+    real_read_template = render_module._read_template  # pyright: ignore[reportPrivateUsage]
+
+    def fake_read_template(name: str) -> str:
+        if name == render_module._SERVICE_TEMPLATE_NAME:  # pyright: ignore[reportPrivateUsage]
+            return real_read_template(name).replace("Group=@@OPERATOR_GROUP@@\n", "")
+        return real_read_template(name)
+
+    monkeypatch.setattr(render_module, "_read_template", fake_read_template)
+    output_dir = tmp_path / "out"
+    with pytest.raises(ApplianceRenderError, match="missing required token"):
+        render_appliance_files(output_dir, _inputs())
+    assert not output_dir.exists() or list(output_dir.iterdir()) == []
+
+
 def test_render_appliance_files_aborts_before_writing_on_malformed_last_template(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -286,6 +306,24 @@ def test_render_env_file_substitutes_port_db_and_mcp_config() -> None:
 def test_render_rejects_invalid_port(port: object) -> None:
     with pytest.raises(ApplianceRenderError, match="integer"):
         render_env_file(_inputs(port=port))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("db_path", Path("/tmp/trace=unsafe.sqlite3")),
+        ("mcp_config_path", Path("/etc/roastpilot-agent/config#unsafe.yaml")),
+        ("model_dir", Path("/var/lib/roastpilot-agent/models=unsafe")),
+    ],
+)
+def test_absolute_paths_reject_structural_characters(
+    field: str, value: Path, tmp_path: Path
+) -> None:
+    """Absolute paths still reject env/YAML structural characters fail-closed."""
+    output_dir = tmp_path / "out"
+    with pytest.raises(ApplianceRenderError, match="unsafe structural"):
+        render_appliance_files(output_dir, _inputs(**{field: value}))
+    assert not output_dir.exists() or list(output_dir.iterdir()) == []
 
 
 @pytest.mark.parametrize(
@@ -482,3 +520,39 @@ def test_render_appliance_files_leaves_no_files_on_first_commit_failure(
     with pytest.raises(OSError, match="first commit failure"):
         render_appliance_files(output_dir, _inputs())
     assert list(output_dir.iterdir()) == []
+
+
+def test_render_appliance_files_mixed_rollback_restores_old_and_removes_new(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A late commit failure preserves old targets and removes newly created ones."""
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    old_service = output_dir / "roastpilot-agent.service"
+    old_service.write_text("old service", encoding="utf-8")
+    old_mode = 0o640
+    os.chmod(old_service, old_mode)
+
+    real_replace = os.replace
+    calls = {"commits": 0}
+
+    def flaky_replace(
+        src: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        dst: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    ) -> None:
+        if str(src).endswith(".part"):
+            calls["commits"] += 1
+            if calls["commits"] == 3:
+                raise OSError("simulated mixed commit failure")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky_replace)
+    with pytest.raises(OSError, match="mixed commit failure"):
+        render_appliance_files(output_dir, _inputs())
+
+    assert old_service.read_text(encoding="utf-8") == "old service"
+    assert stat.S_IMODE(old_service.stat().st_mode) == old_mode
+    assert not (output_dir / "roastpilot-agent.env").exists()
+    assert not (output_dir / "coffee-roaster-mcp.appliance.yaml").exists()
+    assert not list(output_dir.glob(".*.part"))
+    assert not list(output_dir.glob(".*.backup"))
