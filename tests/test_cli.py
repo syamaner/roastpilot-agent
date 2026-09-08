@@ -1000,10 +1000,19 @@ def test_serve_first_signal_cancels_non_returning_server_before_ordered_teardown
     async def _no_advisor_readout(_service: object) -> None:
         return None
 
-    monkeypatch.setattr(config_store, "load_app_config", lambda: (AppConfig(), set()))
-    monkeypatch.setattr(live, "forward_coffee_env", lambda _config: None)
+    def _load_config() -> tuple[AppConfig, set[str]]:
+        return AppConfig(), set()
+
+    def _forward_coffee_env(_config: AppConfig) -> None:
+        return None
+
+    def _create_app(*_args: object, **_kwargs: object) -> object:
+        return object()
+
+    monkeypatch.setattr(config_store, "load_app_config", _load_config)
+    monkeypatch.setattr(live, "forward_coffee_env", _forward_coffee_env)
     monkeypatch.setattr(live, "build_live_service", _fake_build)
-    monkeypatch.setattr(api, "create_app", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(api, "create_app", _create_app)
     monkeypatch.setattr(cli, "_SignalManagedServer", _NonReturningServer)
     monkeypatch.setattr(cli, "_emit_runtime_readout", _no_runtime_readout)
     monkeypatch.setattr(cli, "_emit_advisor_readout", _no_advisor_readout)
