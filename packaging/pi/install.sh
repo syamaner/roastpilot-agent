@@ -97,7 +97,7 @@ parse_arguments() {
             --serial-port) SERIAL_PORT="${2:?--serial-port needs a path}"; shift ;;
             --audio-device) AUDIO_DEVICE="${2:?--audio-device needs a value}"; shift ;;
             --set-hostname) REQUESTED_HOSTNAME="${2:?--set-hostname needs a value}"; shift ;;
-            --help) usage; return 0 ;;
+            --help) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
         shift
@@ -272,6 +272,10 @@ install_rendered_files() {
     unit_file="$(rooted_path /etc/systemd/system/roastpilot-agent.service)"
     prior_file="$var_dir/prior-static-hostname"
     prepare_destination_parents "$env_file" "$yaml_file" "$unit_file" "$prior_file" "$var_dir/models"
+    # The service runs as the invoking operator and owns only its database
+    # parent.  Configuration and unit paths remain root-owned.
+    run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$var_dir"
+    run_privileged chmod 0700 -- "$var_dir"
     # The renderer deliberately leaves this blank; inserting it only through
     # stdin keeps the key out of command arguments, logs, and the unit.
     if [[ -n "$API_KEY" ]]; then
@@ -280,6 +284,7 @@ install_rendered_files() {
         run_privileged install -m 0600 -- "$STAGE_DIR/roastpilot-agent.env" "$env_file"
     fi
     run_privileged chmod 0600 -- "$env_file"
+    run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$env_file"
     run_privileged install -m 0644 -- "$STAGE_DIR/coffee-roaster-mcp.appliance.yaml" "$yaml_file"
     run_privileged install -m 0644 -- "$STAGE_DIR/roastpilot-agent.service" "$unit_file"
     if ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq dialout || ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq audio; then

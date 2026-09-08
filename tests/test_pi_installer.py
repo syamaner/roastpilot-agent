@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -48,7 +49,8 @@ case "$name" in
     else [ "$1" = set-hostname ]; printf '%s\\n' "$2" > "$FAKE_HOSTNAME"; fi ;;
   pipx)
     if [ "${1:-}" = list ]; then
-      if [ -n "${FAKE_PIPX_JSON:-}" ]; then cat "$FAKE_PIPX_JSON"
+      if [ "${FAKE_PIPX_LIST_FAIL:-}" = 1 ]; then exit 17
+      elif [ -n "${FAKE_PIPX_JSON:-}" ]; then cat "$FAKE_PIPX_JSON"
       elif [ -e "$FAKE_PIPX_STATE" ]; then cat "$FAKE_PIPX_STATE"
       else printf '{"venvs": {}}\\n'; fi
     elif [ "${1:-}" = install ]; then
@@ -62,8 +64,11 @@ case "$name" in
   roastpilot-agent)
     if [ "$1 $2 $3" = "appliance model install" ]; then
       shift 3; while [ "$#" -gt 0 ]; do [ "$1" = --dest ] && {
-        mkdir -p "$2/onnx/int8"; : > "$2/onnx/int8/model_quantized.onnx"
-        : > "$2/onnx/int8/preprocessor_config.json"; }; shift; done
+        if [ ! -e "$2/onnx/int8/model_quantized.onnx" ]; then
+          printf 'MODEL_FETCH <%s>\n' "$2" >> "$FAKE_LOG"
+          mkdir -p "$2/onnx/int8"; : > "$2/onnx/int8/model_quantized.onnx"
+          : > "$2/onnx/int8/preprocessor_config.json"
+        fi; }; shift; done
     else
       out=''; while [ "$#" -gt 0 ]; do [ "$1" = --output-dir ] && { out="$2"; shift; }; shift; done
       mkdir -p "$out"; printf 'OPENROUTER_API_KEY=\\n' > "$out/roastpilot-agent.env"
@@ -150,7 +155,33 @@ def _run(
     )
 
 
-@pytest.mark.serial
+def _delta(log: Path, start: int) -> list[str]:
+    """Return fake-command records emitted after one installer invocation."""
+    return log.read_text()[start:].splitlines()
+
+
+def _pipx_state(path: Path, version: str, package: str) -> None:
+    """Write the canonical pipx list representation accepted by install.sh."""
+    path.write_text(
+        json.dumps(
+            {
+                "venvs": {
+                    "roastpilot-agent": {
+                        "metadata": {
+                            "main_package": {
+                                "package_version": version,
+                                "package_or_url": package,
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        + "\n"
+    )
+
+
+@pytest.mark.serial  # The subprocess installer shares fake PATH command state.
 def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -176,6 +207,11 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
         line.split(" ", 1)[0] for line in commands
     ].index("pipx")
     assert not any("systemctl <start> <roastpilot-agent>" in line for line in commands)
+    var_dir = root / "var/lib/roastpilot-agent"
+    assert stat.S_IMODE(var_dir.stat().st_mode) == 0o700
+    assert f"chown <operator:operators> <--> <{env_file}>" in commands
+    assert f"chown <operator:operators> <--> <{var_dir}>" in commands
+    assert f"chmod <0700> <--> <{var_dir}>" in commands
     before = env_file.read_bytes()
     second = _run(environment, "--set-hostname", "roastpilot", "--api-key", key)
     assert second.returncode == 0, second.stderr + log.read_text()
@@ -184,7 +220,7 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     assert not any("usermod" in line or "pipx <install>" in line for line in second_commands)
 
 
-@pytest.mark.serial
+@pytest.mark.serial  # The subprocess installer shares fake PATH command state.
 def test_preflight_failures_happen_before_privileged_commands(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -212,7 +248,7 @@ def test_preflight_failures_happen_before_privileged_commands(
     assert no_tty.returncode != 0
 
 
-@pytest.mark.serial
+@pytest.mark.serial  # The subprocess installer shares fake PATH command state.
 def test_hostname_consent_start_and_failure_abort_before_service_enable(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -237,11 +273,14 @@ def test_hostname_consent_start_and_failure_abort_before_service_enable(
         )
     )
     failed_root = Path(environment["ROASTPILOT_INSTALL_ROOT"]).parent / "failed-root"
+    failure_start = len(log.read_text())
     failed = _run(
         failing | {"ROASTPILOT_INSTALL_ROOT": str(failed_root)}, "--set-hostname", "roastpilot"
     )
     assert failed.returncode != 0
     assert not (failed_root / "etc/systemd/system/roastpilot-agent.service").exists()
+    failure_events = _delta(log, failure_start)
+    assert not any("systemctl" in line for line in failure_events)
 
 
 @pytest.mark.serial
@@ -466,8 +505,10 @@ def test_trailing_main_mutation_is_detected_by_truncation_oracle(
 ) -> None:
     """G12: moving a privileged effect above the trailing entry point is observable."""
     _, environment, log, _ = installer_harness
+    source = INSTALLER.read_text()
+    assert source.count('main "$@"') == 1
     mutated = tmp_path / "moved-main.sh"
-    mutated.write_text(INSTALLER.read_text().replace('main "$@"', 'run_privileged true\nmain "$@"'))
+    mutated.write_text(source.replace('main "$@"', 'run_privileged true\nmain "$@"'))
     truncated = tmp_path / "moved-main-truncated.sh"
     truncated.write_text(mutated.read_text().rsplit('main "$@"', 1)[0])
     result = subprocess.run(
@@ -475,3 +516,135 @@ def test_trailing_main_mutation_is_detected_by_truncation_oracle(
     )
     assert result.returncode == 0
     assert "sudo <--> <true>" in log.read_text()
+
+
+@pytest.mark.serial  # Each parametrized subprocess receives a fresh fake state.
+@pytest.mark.parametrize(
+    ("selector", "initial", "expected"),
+    [
+        ((), None, ("install",)),
+        ((), ("default", "roastpilot-agent[pi]"), ()),
+        (("--version", "1.2"), ("1.2", "roastpilot-agent[pi]==1.2"), ()),
+        (("--version", "2.0"), ("1.2", "roastpilot-agent[pi]==1.2"), ("uninstall", "install")),
+        (("--wheel", "WHEEL"), ("default", "WHEEL"), ()),
+        (("--wheel", "OTHER"), ("default", "WHEEL"), ("uninstall", "install")),
+    ],
+)
+def test_pipx_selector_deltas_are_isolated(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    selector: tuple[str, ...],
+    initial: tuple[str, str] | None,
+    expected: tuple[str, ...],
+) -> None:
+    """A1: each canonical pipx selector has an isolated exact mutation delta."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "agent.whl"
+    other = tmp_path / "other.whl"
+    wheel.write_text("wheel")
+    other.write_text("other")
+    selector = tuple(
+        str(wheel) if item == "WHEEL" else str(other) if item == "OTHER" else item
+        for item in selector
+    )
+    if initial is not None:
+        version, package = initial
+        package = str(wheel) if package == "WHEEL" else package
+        _pipx_state(Path(environment["FAKE_PIPX_STATE"]), version, package)
+    result = _run(environment, "--set-hostname", "roastpilot", *selector)
+    assert result.returncode == 0, result.stderr
+    pipx_actions = [
+        line.split()[1].strip("<>")
+        for line in log.read_text().splitlines()
+        if line.startswith("pipx ")
+    ]
+    assert tuple(action for action in pipx_actions if action != "list") == expected
+
+
+@pytest.mark.serial  # Failure behaviour needs an isolated fake command log.
+@pytest.mark.parametrize("state", ["fail", "malformed", "bad-metadata"])
+def test_invalid_pipx_state_fails_before_destructive_or_privileged_work(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], state: str
+) -> None:
+    """A1: inspection failures do not uninstall, render, or mutate privileged files."""
+    _, environment, log, _ = installer_harness
+    if state == "fail":
+        environment = environment | {"FAKE_PIPX_LIST_FAIL": "1"}
+    else:
+        source = Path(environment["FAKE_PIPX_STATE"])
+        source.write_text(
+            "not-json" if state == "malformed" else '{"venvs":{"roastpilot-agent":{}}}\n'
+        )
+    result = _run(environment, "--set-hostname", "roastpilot", "--version", "2.0")
+    assert result.returncode != 0
+    events = log.read_text()
+    assert "pipx <uninstall>" not in events
+    assert "roastpilot-agent <appliance" not in events
+    assert "roastpilot-agent <appliance" not in events
+    assert "systemctl" not in events
+
+
+@pytest.mark.serial  # This executes a full ordered fake-install lifecycle.
+def test_full_flow_has_exact_key_order_and_no_real_command_resolution(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """T16: all mutation-capable names resolve to fakes and core effects order."""
+    fake_bin, environment, log, _ = installer_harness
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode == 0, result.stderr
+    events = log.read_text().splitlines()
+
+    def first(prefix: str) -> int:
+        """Return the position of a recorded command prefix."""
+        return next(i for i, line in enumerate(events) if line.startswith(prefix))
+
+    assert (
+        first("apt-get")
+        < first("pipx <install>")
+        < first("roastpilot-agent <appliance> <model> <install>")
+    )
+    assert first("roastpilot-agent <appliance> <render>") < first("systemctl <daemon-reload>")
+    assert any("systemctl <enable> <roastpilot-agent>" in line for line in events)
+    assert any("systemctl <enable> <--now> <avahi-daemon>" in line for line in events)
+    assert not any("systemctl <start> <roastpilot-agent>" in line for line in events)
+    for command in (
+        "sudo",
+        "apt-get",
+        "pipx",
+        "roastpilot-agent",
+        "install",
+        "tee",
+        "chmod",
+        "chown",
+        "mkdir",
+        "mktemp",
+        "rm",
+        "usermod",
+        "hostnamectl",
+        "systemctl",
+    ):
+        resolved = subprocess.run(
+            ["bash", "-c", f"command -v {command}"],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert Path(resolved.stdout.strip()).parent == fake_bin
+
+
+@pytest.mark.serial  # Help executes the installer parser in a dedicated process.
+def test_help_exits_before_required_arguments_or_preflight(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Help is a non-mutating successful parser path."""
+    _, environment, log, _ = installer_harness
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--help"],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0 and "Usage:" in result.stdout
+    assert not log.exists()
