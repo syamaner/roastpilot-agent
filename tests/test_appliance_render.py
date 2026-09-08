@@ -541,6 +541,25 @@ def test_service_consumed_paths_reject_private_tmp_roots_before_output(
     assert not output_dir.exists() or list(output_dir.iterdir()) == []
 
 
+@pytest.mark.parametrize("root", ["//tmp", "//var/tmp"])
+@pytest.mark.parametrize(
+    "field",
+    ["operator_home", "db_path", "mcp_config_path", "model_dir"],
+)
+def test_service_consumed_paths_reject_double_slash_private_tmp_roots_before_output(
+    root: str, field: str, tmp_path: Path
+) -> None:
+    """Leading ``//`` spellings cannot bypass the PrivateTmp root guard."""
+    output_dir = tmp_path / "staging-under-tmp-is-allowed"
+    unsafe_path = Path(root) / "roastpilot-agent" / field
+    assert str(unsafe_path).startswith("//")
+
+    with pytest.raises(ApplianceRenderError, match="PrivateTmp"):
+        render_appliance_files(output_dir, _inputs(**{field: unsafe_path}))
+
+    assert not output_dir.exists() or list(output_dir.iterdir()) == []
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

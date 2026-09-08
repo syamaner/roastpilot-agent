@@ -251,9 +251,7 @@ def _validate_path(
         raise ApplianceRenderError(f"{field} contains an unsafe structural character")
     if device and not text.startswith("/dev/"):
         raise ApplianceRenderError(f"{field} must name a device below /dev")
-    if service_consumed and (
-        path.parts[:2] == ("/", "tmp") or path.parts[:3] == ("/", "var", "tmp")
-    ):
+    if service_consumed and (path.parts[1:2] == ("tmp",) or path.parts[1:3] == ("var", "tmp")):
         raise ApplianceRenderError(
             f"{field} must not be rooted under /tmp or /var/tmp with PrivateTmp=true"
         )
