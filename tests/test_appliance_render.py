@@ -385,6 +385,55 @@ def test_render_mcp_yaml_pi_inference_values_are_exact() -> None:
     assert audio["input_device"] == audio_device
 
 
+def test_rendered_mcp_yaml_loads_through_the_mcp_public_config_loader(tmp_path: Path) -> None:
+    """T9: MCP's typed loader accepts every ratified rendered config key."""
+    config_module = pytest.importorskip(
+        "coffee_roaster_mcp.config", reason="coffee-roaster-mcp optional dependency is absent"
+    )
+    model_dir = Path("/var/lib/roastpilot-agent/models-loader-test")
+    serial_port = Path("/dev/serial/by-id/hottop-loader-test")
+    audio_device = "USB PnP Audio Device loader test"
+    yaml_path = tmp_path / "coffee-roaster-mcp.appliance.yaml"
+    yaml_path.write_text(
+        render_mcp_yaml(
+            _inputs(
+                model_dir=model_dir,
+                serial_port=serial_port,
+                audio_device=audio_device,
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = config_module.load_config(yaml_path, environ={})
+
+    assert loaded.transport.type == "stdio"
+    assert loaded.roaster.driver == "hottop_kn8828b_2k_plus"
+    assert loaded.roaster.port == str(serial_port)
+    assert loaded.roaster.baudrate == 115200
+    assert loaded.roaster.temperature_unit == "auto"
+    assert loaded.roaster.command_interval_seconds == 0.3
+    assert loaded.first_crack.mode == "audio"
+    assert loaded.first_crack.repo_id == REPO_ID
+    assert loaded.first_crack.revision == REVISION
+    assert loaded.first_crack.precision == "int8"
+    assert loaded.first_crack.local_model_dir == model_dir
+    assert loaded.first_crack.onnx_threads == 2
+    assert loaded.first_crack.confidence_threshold == 0.90
+    assert loaded.first_crack.min_positive_windows == 3
+    assert loaded.first_crack.confirmation_window_seconds == 30.0
+    assert loaded.first_crack.allow_manual_override is True
+    assert loaded.audio.source == "microphone"
+    assert loaded.audio.input_device == audio_device
+    assert loaded.audio.sample_rate == 16000
+    assert loaded.audio.wav_path is None
+    assert loaded.audio.replay_mode == "realtime"
+    assert loaded.audio.window_seconds == 10.0
+    assert loaded.audio.overlap == 0.3
+    assert loaded.audio.hop_seconds is None
+    assert loaded.recording.enabled is False
+
+
 def test_render_mcp_yaml_repo_id_and_revision_come_from_the_manifest_not_inputs() -> None:
     """The manifest is the single source of truth; ApplianceRenderInputs has no override."""
     import dataclasses
