@@ -91,9 +91,9 @@ def test_appliance_render_parser_defaults(tmp_path: Path) -> None:
     assert args.operator_group is None
     assert args.operator_home == Path.home()
     assert args.json_output is False
-    assert isinstance(args.db_path, Path)
-    assert isinstance(args.mcp_config_path, Path)
-    assert isinstance(args.model_dir, Path)
+    assert args.db_path == Path("/var/lib/roastpilot-agent/roastpilot.sqlite3")
+    assert args.mcp_config_path == Path("/etc/roastpilot-agent/coffee-roaster-mcp.yaml")
+    assert args.model_dir == Path("/var/lib/roastpilot-agent/models")
     assert args.serial_port == Path("/dev/ttyUSB0")
     assert args.audio_device == "USB PnP"
 
