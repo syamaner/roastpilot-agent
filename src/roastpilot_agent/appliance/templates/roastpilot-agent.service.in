@@ -1,0 +1,40 @@
+# roastpilot-agent systemd unit (issue #138, E11-S2)
+#
+# D6: the agent spawns the coffee-roaster-mcp stdio child itself — this is the
+# ONLY system unit the appliance installs. A restart lands in the controller's
+# existing operator_recovery_required recovery flow: this unit intentionally
+# passes no flag, environment variable, or ExecStartPre that could resume,
+# start, or continue a run (AGENTS.md Architecture Invariant: "Restart never
+# auto-resumes heat or fan").
+[Unit]
+Description=RoastPilot agent (native Pi appliance)
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@@OPERATOR_USER@@
+Group=@@OPERATOR_GROUP@@
+# No leading '-': a missing env file fails the unit loudly instead of
+# starting a half-configured appliance (fail closed).
+EnvironmentFile=/etc/roastpilot-agent/roastpilot-agent.env
+# The operator home is validated at render time; %h would resolve to the
+# system manager's home, not User=. ${PORT} comes from EnvironmentFile, so
+# changing PORT and restarting changes the bind port without unit regeneration.
+ExecStart=@@OPERATOR_HOME@@/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}
+WorkingDirectory=~
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+
+# Hardening. PrivateDevices, DeviceAllow restrictions, and ProtectHome are
+# intentionally OMITTED here: the appliance needs the Hottop's USB serial
+# (dialout group) and the USB microphone (audio group) — enabling those
+# protections would silently kill first-crack audio capture or the roaster
+# link.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

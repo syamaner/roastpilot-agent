@@ -1,0 +1,53 @@
+# coffee-roaster-mcp — Pi appliance profile (issue #138, E11-S2)
+#
+# This is the `pi_inference` first-crack profile — tuned for the Pi 5's
+# ~2.5 s/window ONNX latency and fewer free cores than the Mac/library-default
+# profile (torch-free-pi-appliance.md:109-116; docs/examples/
+# coffee-roaster-mcp.known-good.yaml documents that other, Mac-only profile —
+# do not conflate the two). Point the agent's spawned MCP child at this file
+# via COFFEE_ROASTER_MCP_CONFIG (the appliance env file sets this for you).
+#
+# The renderer requires install-time serial/audio values; it does not ship
+# example devices that could be mistaken for live hardware configuration.
+transport:
+  type: stdio
+
+roaster:
+  driver: hottop_kn8828b_2k_plus
+  port: @@SERIAL_PORT@@
+  baudrate: 115200
+  temperature_unit: auto    # auto-detect the Hottop's unit; the agent works in Celsius throughout
+  command_interval_seconds: 0.3
+
+session:
+  auto_t0_detection_enabled: true
+  auto_t0_drop_threshold_c: 15.0
+  ror_window_seconds: 60
+  ror_min_sample_seconds: 10
+
+first_crack:
+  mode: audio
+  repo_id: @@FC_REPO_ID@@
+  revision: @@FC_REVISION@@
+  precision: int8
+  local_model_dir: @@MODEL_DIR@@
+  onnx_threads: 2                    # Pi 5: leaves cores for the MCP process and the agent/UI
+  confidence_threshold: 0.90
+  min_positive_windows: 3
+  confirmation_window_seconds: 30.0
+  allow_manual_override: true
+
+audio:
+  source: microphone
+  input_device: @@AUDIO_DEVICE@@
+  sample_rate: 16000
+  wav_path: null
+  replay_mode: realtime
+  window_seconds: 10.0      # the model is trained on 10 s windows — required
+  overlap: 0.3               # 7 s hop (Pi profile) — do NOT use the Mac/library-default profile's 0.7
+  hop_seconds: null
+
+# `recording` is intentionally OMITTED: coffee-roaster-mcp==0.2.0's
+# RecordingConfig.enabled defaults to false, so an appliance install never
+# silently starts capturing audio. Add a `recording:` block by hand only if
+# you want it.

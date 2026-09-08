@@ -236,6 +236,22 @@ def test_wheel_contains_bundled_spa_index_html(built_wheel: Path) -> None:
         )
 
 
+def test_wheel_contains_appliance_templates(built_wheel: Path) -> None:
+    """T15: the appliance systemd unit / env / MCP-YAML templates ship in the
+    wheel (issue #138, E11-S2 slice 2) — package data under a package
+    directory, following the same default-inclusion path the SPA's
+    `_web_dist` test above exercises for a force-included directory."""
+    with zipfile.ZipFile(built_wheel) as archive:
+        names = set(archive.namelist())
+    expected = {
+        "roastpilot_agent/appliance/templates/roastpilot-agent.service.in",
+        "roastpilot_agent/appliance/templates/roastpilot-agent.env.in",
+        "roastpilot_agent/appliance/templates/coffee-roaster-mcp.appliance.yaml.in",
+    }
+    missing = expected - names
+    assert not missing, f"appliance templates missing from wheel: {missing}"
+
+
 def test_wheel_installs_into_clean_venv_and_serves_spa(built_wheel: Path, tmp_path: Path) -> None:
     """A clean-venv install of the wheel exposes the CLI and serves the SPA.
 

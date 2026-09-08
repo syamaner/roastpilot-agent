@@ -17,6 +17,7 @@ Two run modes plus the scaffold default:
 import argparse
 import asyncio
 import contextlib
+import getpass
 import json
 import logging
 import os
@@ -908,7 +909,7 @@ async def _serve_live(
         raise RuntimeError("live serve requires an asyncio task")
 
     def _cancel_live_task(_signum: int, _frame: FrameType | None) -> None:
-        """Cancel startup safely until Uvicorn's graceful handler is bound."""
+        """Cancel live serving so ordered teardown starts before systemd's deadline."""
         live_task.cancel()
 
     signal_guard.bind_graceful_handler(_cancel_live_task)
@@ -1016,10 +1017,13 @@ async def _serve_live(
             access_log=access_log,
         )
         server = _SignalManagedServer(uv)
-        signal_guard.bind_graceful_handler(server.handle_exit)
+        # Keep the signal-to-task-cancellation handler installed above.  Do not
+        # rebind it to Uvicorn's graceful-drain handler: an unbounded server
+        # drain would delay the safety-critical ordered teardown until after
+        # systemd's finite stop deadline.
         # _lifespan runs recover_on_start (restart → recovery) on startup and
-        # service.shutdown() on teardown; we stop the MCP child after the
-        # server returns (graceful shutdown / SIGINT) and close the store.
+        # service.shutdown() on teardown; cancellation reaches the finally
+        # block immediately, while the MCP child is still alive for heat-off.
         await server.serve()
     finally:
         await _finish_live_teardown(service, mcp, store, exit_guard)
@@ -1175,16 +1179,43 @@ async def _serve_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Appliance-wide (system-service) defaults for ``appliance render`` — FHS
+#: ``/var/lib``/``/etc`` locations, distinct from ``appliance model
+#: install``'s interactive XDG-home default (used by a developer running the
+#: subcommand directly, outside the systemd unit context).
+_DEFAULT_APPLIANCE_DB_PATH = Path("/var/lib/roastpilot-agent/roastpilot.sqlite3")
+_DEFAULT_APPLIANCE_MCP_CONFIG_PATH = Path("/etc/roastpilot-agent/coffee-roaster-mcp.yaml")
+_DEFAULT_APPLIANCE_MODEL_DIR = Path("/var/lib/roastpilot-agent/models")
+
+
+def _appliance_port(value: str) -> int:
+    """Parse one valid non-privileged TCP port for ``appliance render``."""
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("port must be an integer in 1024..65535") from exc
+    if not 1024 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be an integer in 1024..65535")
+    return port
+
+
+def _appliance_output_dir(value: str) -> Path:
+    """Parse one non-empty appliance-render staging directory."""
+    if not value:
+        raise argparse.ArgumentTypeError("output directory must be non-empty")
+    return Path(value)
+
+
 def _build_appliance_parser() -> argparse.ArgumentParser:
     """Build the parser for the ``roastpilot-agent appliance ...`` command tree.
 
-    Issue #138 (E11-S2), PR slice 1: only ``appliance model install`` exists
-    so far. This is kept as its own parser tree, dispatched directly from
+    Issue #138 (E11-S2). PR slice 1 added ``appliance model install``; PR
+    slice 2 adds ``appliance render`` (the systemd unit / env file / MCP YAML
+    templates). This is kept as its own parser tree, dispatched directly from
     :func:`main` ahead of :func:`_build_parser`, rather than folded into that
     parser's single ``action`` positional — the existing ``serve``/``--replay``/
     ``--version`` surface (and its tests) is untouched by this addition.
-    Later slices add sibling subcommands (e.g. ``appliance render``) under the
-    same tree.
+    Slice 3's shell installer drives both subcommands; it is out of scope here.
     """
     parser = argparse.ArgumentParser(
         prog="roastpilot-agent appliance",
@@ -1231,6 +1262,101 @@ def _build_appliance_parser() -> argparse.ArgumentParser:
         help="only verify an existing destination; never place or fetch anything",
     )
     install_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="print a machine-readable summary instead of plain text",
+    )
+
+    render_parser = subparsers.add_parser(
+        "render",
+        help="Render the systemd unit, env file, and pi_inference MCP YAML",
+    )
+    render_parser.add_argument(
+        "--output-dir",
+        dest="output_dir",
+        metavar="DIR",
+        type=_appliance_output_dir,
+        required=True,
+        help=(
+            "staging directory for the rendered files (not /etc — the shell "
+            "installer copies them to their final system locations)"
+        ),
+    )
+    render_parser.add_argument(
+        "--port",
+        type=_appliance_port,
+        default=8000,
+        help="non-privileged HTTP bind port, 1024..65535 (default 8000)",
+    )
+    render_parser.add_argument(
+        "--operator-user",
+        dest="operator_user",
+        default=getpass.getuser(),
+        help="systemd unit User= — the non-root operator account (default: current user)",
+    )
+    render_parser.add_argument(
+        "--operator-group",
+        dest="operator_group",
+        default=None,
+        help="systemd unit Group= (default: same as --operator-user)",
+    )
+    render_parser.add_argument(
+        "--operator-home",
+        dest="operator_home",
+        metavar="PATH",
+        type=Path,
+        default=Path.home(),
+        help="operator home containing .local/bin/roastpilot-agent (default: current home)",
+    )
+    render_parser.add_argument(
+        "--db-path",
+        dest="db_path",
+        metavar="PATH",
+        type=Path,
+        default=_DEFAULT_APPLIANCE_DB_PATH,
+        help=f"ROASTPILOT_DB rendered into the env file (default {_DEFAULT_APPLIANCE_DB_PATH})",
+    )
+    render_parser.add_argument(
+        "--mcp-config-path",
+        dest="mcp_config_path",
+        metavar="PATH",
+        type=Path,
+        default=_DEFAULT_APPLIANCE_MCP_CONFIG_PATH,
+        help=(
+            "COFFEE_ROASTER_MCP_CONFIG rendered into the env file — where the "
+            f"rendered MCP YAML will be installed (default "
+            f"{_DEFAULT_APPLIANCE_MCP_CONFIG_PATH})"
+        ),
+    )
+    render_parser.add_argument(
+        "--model-dir",
+        dest="model_dir",
+        metavar="DIR",
+        type=Path,
+        default=_DEFAULT_APPLIANCE_MODEL_DIR,
+        help=(
+            "first_crack.local_model_dir rendered into the MCP YAML — must "
+            "match 'appliance model install --dest' (default "
+            f"{_DEFAULT_APPLIANCE_MODEL_DIR})"
+        ),
+    )
+    render_parser.add_argument(
+        "--serial-port",
+        dest="serial_port",
+        metavar="PATH",
+        type=Path,
+        required=True,
+        help="Hottop USB serial device below /dev (required; never defaulted)",
+    )
+    render_parser.add_argument(
+        "--audio-device",
+        dest="audio_device",
+        metavar="SUBSTRING",
+        required=True,
+        help="USB audio input device-name substring (required; never defaulted)",
+    )
+    render_parser.add_argument(
         "--json",
         dest="json_output",
         action="store_true",
@@ -1323,6 +1449,56 @@ def _print_appliance_cleanup_notes(exc: BaseException) -> None:
             print(f"model install warning: cleanup failed while {action}: {error_type}")
 
 
+def _run_appliance_render(args: argparse.Namespace) -> int:
+    """Run ``appliance render``: write the unit/env/MCP-YAML templates (AC2/AC6/AC7).
+
+    Args:
+        args: Parsed ``appliance render`` namespace.
+
+    Returns:
+        ``0`` on success (all three files rendered and written); ``1`` if
+        rendering failed closed for any reason (nothing is written on that
+        path — see :func:`roastpilot_agent.appliance.render.render_appliance_files`).
+    """
+    from roastpilot_agent.appliance.render import (
+        ApplianceRenderError,
+        ApplianceRenderInputs,
+        render_appliance_files,
+    )
+
+    parsed_operator_group = cast(str | None, args.operator_group)
+    operator_group = (
+        cast(str, args.operator_user) if parsed_operator_group is None else parsed_operator_group
+    )
+    inputs = ApplianceRenderInputs(
+        port=cast(int, args.port),
+        operator_user=cast(str, args.operator_user),
+        operator_group=operator_group,
+        operator_home=cast(Path, args.operator_home),
+        db_path=cast(Path, args.db_path),
+        mcp_config_path=cast(Path, args.mcp_config_path),
+        model_dir=cast(Path, args.model_dir),
+        serial_port=cast(Path, args.serial_port),
+        audio_device=cast(str, args.audio_device),
+    )
+    try:
+        result = render_appliance_files(cast(Path, args.output_dir), inputs)
+    except ApplianceRenderError as exc:
+        print(f"appliance render failed: {exc}")
+        return 1
+    except OSError as exc:
+        print(f"appliance render failed: destination is unusable — {exc}")
+        return 1
+    if args.json_output:
+        print(json.dumps(result.to_json_dict()))
+        return 0
+    print(f"rendered appliance files at {result.output_dir}")
+    print(f"  {result.service_path}")
+    print(f"  {result.env_path}")
+    print(f"  {result.mcp_yaml_path}")
+    return 0
+
+
 def _run_appliance_cli(argv: Sequence[str]) -> int:
     """Dispatch a parsed ``appliance ...`` command line to its handler.
 
@@ -1337,6 +1513,8 @@ def _run_appliance_cli(argv: Sequence[str]) -> int:
     args = parser.parse_args(argv)
     if args.appliance_command == "model" and args.model_command == "install":
         return _run_appliance_model_install(args)
+    if args.appliance_command == "render":
+        return _run_appliance_render(args)
     parser.print_help()  # pragma: no cover - unreachable while both subparsers are required=True
     return 2  # pragma: no cover - unreachable while both subparsers are required=True
 
@@ -1366,12 +1544,10 @@ def main() -> int:
                         _serve_live(args, exit_guard=exit_guard, signal_guard=signal_guard)
                     )
                 except asyncio.CancelledError:
-                    # A first signal during startup uses the temporary
-                    # task-cancellation handler. Ordered teardown (when a live
-                    # service was already established) has completed before
-                    # this reaches the process boundary; preserve the same
-                    # conventional SIGINT/SIGTERM result as the later Uvicorn
-                    # graceful-shutdown path.
+                    # The first live signal cancels the serving task. Its
+                    # cancellation-shielded ordered teardown has completed
+                    # before this reaches the process boundary, so preserve
+                    # the conventional SIGINT/SIGTERM result here.
                     _propagate_live_termination(signal_guard.received_signal)
                     raise  # pragma: no cover - defensive non-signal cancellation passthrough
             # Leave the guard before the final sticky check. A signal arriving

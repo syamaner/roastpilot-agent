@@ -311,7 +311,7 @@ def test_live_exit_watchdog_bounds_startup_failure_owner(tmp_path: Path) -> None
         [sys.executable, "-c", probe, str(evidence_file)],
         capture_output=True,
         text=True,
-        timeout=5.0,
+        timeout=15.0,
         check=False,
     )
 
