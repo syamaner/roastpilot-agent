@@ -770,6 +770,43 @@ def test_render_appliance_files_rejects_symlink_artifact_destination_before_stag
     assert not list(output_dir.glob(".*.backup"))
 
 
+def test_render_appliance_files_rejects_uninspectable_artifact_destination_before_staging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An ``lstat`` failure leaves the complete output set untouched."""
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    bad_destination = output_dir / SERVICE_OUTPUT_FILENAME
+    real_lstat = os.lstat
+    replace_calls = 0
+
+    def failing_lstat(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    ) -> os.stat_result:
+        if Path(path) == bad_destination:
+            raise OSError("simulated destination inspection failure")
+        return real_lstat(path)
+
+    def fail_if_replaced(
+        _: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        __: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    ) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+        raise AssertionError("destination validation must precede replacement")
+
+    monkeypatch.setattr(os, "lstat", failing_lstat)
+    monkeypatch.setattr(os, "replace", fail_if_replaced)
+
+    with pytest.raises(ApplianceRenderError, match="could not inspect destination"):
+        render_appliance_files(output_dir, _inputs())
+
+    assert list(output_dir.iterdir()) == []
+    assert replace_calls == 0
+    assert not list(output_dir.glob(".*.part"))
+    assert not list(output_dir.glob(".*.backup"))
+
+
 def test_render_module_has_no_direct_control_path_imports() -> None:
     """The renderer is a packaging helper, not a roaster-control dependency."""
     import ast
