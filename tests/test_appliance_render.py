@@ -15,6 +15,7 @@ import grp
 import importlib.util
 import os
 import pwd
+import shutil
 import stat
 import subprocess
 import sys
@@ -448,13 +449,13 @@ def test_render_env_file_substitutes_port_db_and_mcp_config() -> None:
     text = render_env_file(
         _inputs(
             port=1234,
-            db_path=Path("/tmp/x/db.sqlite3"),
-            mcp_config_path=Path("/tmp/x/mcp.yaml"),
+            db_path=Path("/var/lib/roastpilot-agent/db.sqlite3"),
+            mcp_config_path=Path("/etc/roastpilot-agent/mcp.yaml"),
         )
     )
     assert "PORT=1234" in text
-    assert "ROASTPILOT_DB=/tmp/x/db.sqlite3" in text
-    assert "COFFEE_ROASTER_MCP_CONFIG=/tmp/x/mcp.yaml" in text
+    assert "ROASTPILOT_DB=/var/lib/roastpilot-agent/db.sqlite3" in text
+    assert "COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/mcp.yaml" in text
 
 
 @pytest.mark.parametrize("port", [False, 0, -1, 1023, 65536, "9001"])
@@ -513,6 +514,24 @@ def test_absolute_path_with_lexical_parent_part_is_rejected_without_normalisatio
     assert not output_dir.exists() or list(output_dir.iterdir()) == []
 
 
+@pytest.mark.parametrize("root", ["/tmp", "/var/tmp"])
+@pytest.mark.parametrize(
+    "field",
+    ["operator_home", "db_path", "mcp_config_path", "model_dir"],
+)
+def test_service_consumed_paths_reject_private_tmp_roots_before_output(
+    root: str, field: str, tmp_path: Path
+) -> None:
+    """PrivateTmp makes temporary roots unusable for service-consumed paths."""
+    output_dir = tmp_path / "staging-under-tmp-is-allowed"
+    unsafe_path = Path(root) / "roastpilot-agent" / field
+
+    with pytest.raises(ApplianceRenderError, match="PrivateTmp"):
+        render_appliance_files(output_dir, _inputs(**{field: unsafe_path}))
+
+    assert not output_dir.exists() or list(output_dir.iterdir()) == []
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -562,6 +581,13 @@ def test_render_mcp_yaml_pi_inference_values_are_exact() -> None:
     assert first_crack["min_positive_windows"] == 3
     assert first_crack["confirmation_window_seconds"] == 30.0
 
+    assert parsed["session"] == {
+        "auto_t0_detection_enabled": True,
+        "auto_t0_drop_threshold_c": 15.0,
+        "ror_window_seconds": 60,
+        "ror_min_sample_seconds": 10,
+    }
+
     roaster = parsed["roaster"]
     assert roaster["port"] == str(serial_port)
 
@@ -602,6 +628,10 @@ def test_rendered_mcp_yaml_loads_through_the_mcp_public_config_loader(tmp_path: 
     assert loaded.roaster.baudrate == 115200
     assert loaded.roaster.temperature_unit == "auto"
     assert loaded.roaster.command_interval_seconds == 0.3
+    assert loaded.session.auto_t0_detection_enabled is True
+    assert loaded.session.auto_t0_drop_threshold_c == 15.0
+    assert loaded.session.ror_window_seconds == 60
+    assert loaded.session.ror_min_sample_seconds == 10
     assert loaded.first_crack.mode == "audio"
     assert loaded.first_crack.repo_id == REPO_ID
     assert loaded.first_crack.revision == REVISION
@@ -638,15 +668,57 @@ def test_render_mcp_yaml_contains_no_recording_enabling_key() -> None:
     text = render_mcp_yaml(_inputs())
     parsed = yaml.safe_load(text)
     assert "recording" not in parsed
-    assert "enabled: true" not in text.lower()
 
 
 def test_render_mcp_yaml_is_one_primary_audio_stream() -> None:
     text = render_mcp_yaml(_inputs())
     parsed = yaml.safe_load(text)
-    assert set(parsed) == {"transport", "roaster", "first_crack", "audio"}
+    assert set(parsed) == {"transport", "roaster", "session", "first_crack", "audio"}
     assert isinstance(parsed["audio"], dict)
     assert "devices" not in parsed
+
+
+def test_appliance_mcp_session_base_inherits_and_saved_values_override_in_child(
+    tmp_path: Path,
+) -> None:
+    """A3 base values pass through child rendering unless saved fields override them."""
+    from roastpilot_agent.config import MCPConfig, MCPDeviceConfig
+    from roastpilot_agent.mcp_client import MCPServerProcess
+
+    source = tmp_path / "appliance.yaml"
+    source.write_text(render_mcp_yaml(_inputs()), encoding="utf-8")
+    expected_base = {
+        "auto_t0_detection_enabled": True,
+        "auto_t0_drop_threshold_c": 15.0,
+        "ror_window_seconds": 60,
+        "ror_min_sample_seconds": 10,
+    }
+
+    for device_config, expected_auto_t0 in (
+        (MCPDeviceConfig(mcp_yaml_source_path=source), expected_base),
+        (
+            MCPDeviceConfig(
+                mcp_yaml_source_path=source,
+                auto_t0_detection_enabled=False,
+                auto_t0_drop_threshold_c=21.5,
+            ),
+            {
+                **expected_base,
+                "auto_t0_detection_enabled": False,
+                "auto_t0_drop_threshold_c": 21.5,
+            },
+        ),
+    ):
+        process = MCPServerProcess(MCPConfig(), device_config=device_config)
+        try:
+            params = process.build_server_parameters()
+            assert params.env is not None
+            child_yaml = Path(params.env["COFFEE_ROASTER_MCP_CONFIG"])
+            child_config = yaml.safe_load(child_yaml.read_text(encoding="utf-8"))
+            assert child_config["session"] == expected_auto_t0
+        finally:
+            if process._rendered_yaml_dir is not None:  # pyright: ignore[reportPrivateUsage]
+                shutil.rmtree(process._rendered_yaml_dir, ignore_errors=True)  # pyright: ignore[reportPrivateUsage]
 
 
 # --- render_appliance_files: end-to-end write behaviour ---------------------

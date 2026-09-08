@@ -41,6 +41,26 @@ def test_appliance_render_parser_requires_output_dir() -> None:
     assert exc_info.value.code == 2
 
 
+def test_appliance_render_parser_rejects_empty_output_dir(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An empty argument must not be converted to the current directory."""
+    with pytest.raises(SystemExit) as exc_info:
+        cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
+            [
+                "render",
+                "--output-dir",
+                "",
+                "--serial-port",
+                "/dev/ttyUSB0",
+                "--audio-device",
+                "USB PnP",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "output directory must be non-empty" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "arguments", [["--serial-port", "/dev/ttyUSB0"], ["--audio-device", "USB PnP"]]
 )

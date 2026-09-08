@@ -1196,6 +1196,13 @@ def _appliance_port(value: str) -> int:
     return port
 
 
+def _appliance_output_dir(value: str) -> Path:
+    """Parse one non-empty appliance-render staging directory."""
+    if not value:
+        raise argparse.ArgumentTypeError("output directory must be non-empty")
+    return Path(value)
+
+
 def _build_appliance_parser() -> argparse.ArgumentParser:
     """Build the parser for the ``roastpilot-agent appliance ...`` command tree.
 
@@ -1266,7 +1273,7 @@ def _build_appliance_parser() -> argparse.ArgumentParser:
         "--output-dir",
         dest="output_dir",
         metavar="DIR",
-        type=Path,
+        type=_appliance_output_dir,
         required=True,
         help=(
             "staging directory for the rendered files (not /etc — the shell "

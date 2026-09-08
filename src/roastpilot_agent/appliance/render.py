@@ -234,7 +234,9 @@ def _validate_plain_value(value: object, *, field: str) -> str:
     return value
 
 
-def _validate_path(value: Path, *, field: str, device: bool = False) -> str:
+def _validate_path(
+    value: Path, *, field: str, device: bool = False, service_consumed: bool = False
+) -> str:
     """Validate a path used in an env file or YAML scalar before rendering."""
     text = _validate_plain_value(str(value), field=field)
     path = Path(text)
@@ -249,6 +251,12 @@ def _validate_path(value: Path, *, field: str, device: bool = False) -> str:
         raise ApplianceRenderError(f"{field} contains an unsafe structural character")
     if device and not text.startswith("/dev/"):
         raise ApplianceRenderError(f"{field} must name a device below /dev")
+    if service_consumed and (
+        path.parts[:2] == ("/", "tmp") or path.parts[:3] == ("/", "var", "tmp")
+    ):
+        raise ApplianceRenderError(
+            f"{field} must not be rooted under /tmp or /var/tmp with PrivateTmp=true"
+        )
     return text
 
 
@@ -313,7 +321,9 @@ def render_service_unit(inputs: ApplianceRenderInputs) -> str:
             ``"root"``, or the template fails closed-token validation.
     """
     _validate_operator_identity(inputs.operator_user, inputs.operator_group)
-    operator_home = _validate_path(inputs.operator_home, field="operator_home")
+    operator_home = _validate_path(
+        inputs.operator_home, field="operator_home", service_consumed=True
+    )
     template_text = _read_template(_SERVICE_TEMPLATE_NAME)
     tokens = {
         "OPERATOR_USER": inputs.operator_user,
@@ -340,8 +350,10 @@ def render_env_file(inputs: ApplianceRenderInputs) -> str:
         ApplianceRenderError: The template fails closed-token validation.
     """
     port = _validate_port(inputs.port)
-    db_path = _validate_path(inputs.db_path, field="db_path")
-    mcp_config_path = _validate_path(inputs.mcp_config_path, field="mcp_config_path")
+    db_path = _validate_path(inputs.db_path, field="db_path", service_consumed=True)
+    mcp_config_path = _validate_path(
+        inputs.mcp_config_path, field="mcp_config_path", service_consumed=True
+    )
     template_text = _read_template(_ENV_TEMPLATE_NAME)
     tokens = {
         "PORT": str(port),
@@ -370,7 +382,7 @@ def render_mcp_yaml(inputs: ApplianceRenderInputs) -> str:
     Raises:
         ApplianceRenderError: The template fails closed-token validation.
     """
-    model_dir = _validate_path(inputs.model_dir, field="model_dir")
+    model_dir = _validate_path(inputs.model_dir, field="model_dir", service_consumed=True)
     serial_port = _validate_path(inputs.serial_port, field="serial_port", device=True)
     audio_device = _validate_plain_value(inputs.audio_device, field="audio_device")
     template_text = _read_template(_MCP_YAML_TEMPLATE_NAME)

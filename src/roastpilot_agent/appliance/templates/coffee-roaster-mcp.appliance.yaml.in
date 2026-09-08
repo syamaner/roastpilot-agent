@@ -19,6 +19,12 @@ roaster:
   temperature_unit: auto    # auto-detect the Hottop's unit; the agent works in Celsius throughout
   command_interval_seconds: 0.3
 
+session:
+  auto_t0_detection_enabled: true
+  auto_t0_drop_threshold_c: 15.0
+  ror_window_seconds: 60
+  ror_min_sample_seconds: 10
+
 first_crack:
   mode: audio
   repo_id: @@FC_REPO_ID@@
