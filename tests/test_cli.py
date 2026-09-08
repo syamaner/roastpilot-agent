@@ -982,6 +982,10 @@ def test_serve_first_signal_cancels_non_returning_server_before_ordered_teardown
         def __init__(self, _config: uvicorn.Config) -> None:
             pass
 
+        def handle_exit(self, _signum: int, _frame: object | None = None) -> None:
+            """Model Uvicorn's drain request without cancelling ``serve``."""
+            order.append("server-handle-exit")
+
         async def serve(self) -> None:
             server_started.set()
             try:
@@ -1028,8 +1032,19 @@ def test_serve_first_signal_cancels_non_returning_server_before_ordered_teardown
         )
         await server_started.wait()
         guard._handle(signum, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
+        except TimeoutError:
+            pytest.fail(
+                "first live signal did not cancel the server task; "
+                "the Uvicorn graceful handler may have been rebound"
+            )
+        finally:
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
 
     asyncio.run(_run())
     assert order == [
@@ -1040,16 +1055,6 @@ def test_serve_first_signal_cancels_non_returning_server_before_ordered_teardown
         "unconfirmed:False",
         "store.close",
     ]
-
-
-def test_serve_live_never_rebinds_to_uvicorn_graceful_handler() -> None:
-    """The live cancellation binding cannot regress to Uvicorn's unbounded drain."""
-    source = Path(cli.__file__).read_text(encoding="utf-8")
-    serve_live_source = source[
-        source.index("async def _serve_live(") : source.index("async def _teardown_live(")
-    ]
-
-    assert "bind_graceful_handler(server.handle_exit)" not in serve_live_source
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])

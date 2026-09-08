@@ -1544,12 +1544,10 @@ def main() -> int:
                         _serve_live(args, exit_guard=exit_guard, signal_guard=signal_guard)
                     )
                 except asyncio.CancelledError:
-                    # A first signal during startup uses the temporary
-                    # task-cancellation handler. Ordered teardown (when a live
-                    # service was already established) has completed before
-                    # this reaches the process boundary; preserve the same
-                    # conventional SIGINT/SIGTERM result as the later Uvicorn
-                    # graceful-shutdown path.
+                    # The first live signal cancels the serving task. Its
+                    # cancellation-shielded ordered teardown has completed
+                    # before this reaches the process boundary, so preserve
+                    # the conventional SIGINT/SIGTERM result here.
                     _propagate_live_termination(signal_guard.received_signal)
                     raise  # pragma: no cover - defensive non-signal cancellation passthrough
             # Leave the guard before the final sticky check. A signal arriving
