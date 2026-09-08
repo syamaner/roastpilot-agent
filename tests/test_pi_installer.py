@@ -1,5 +1,4 @@
 """Hardware-free behavioural contract tests for the Pi installer (#138, slice 3)."""
-# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -37,29 +36,47 @@ for arg in "$@"; do printf ' <%s>' "$arg" >> "$FAKE_LOG"; done
 printf '\\n' >> "$FAKE_LOG"
 case "$name" in
   sudo) shift; [ "${1:-}" = -- ] && shift; exec "$@" ;;
-  id) if [ "${1:-}" = -u ]; then echo 1000; elif [ "${1:-}" = -gn ]; then echo operators; else echo 'dialout audio'; fi ;;
+  id)
+    if [ "${1:-}" = -u ]; then echo 1000
+    elif [ "${1:-}" = -un ]; then echo operator
+    elif [ "${1:-}" = -gn ]; then echo operators
+    else echo 'dialout audio'; fi ;;
+  getent) printf 'operator:x:1000:1000::%s:/bin/sh\\n' "$FAKE_OPERATOR_HOME" ;;
   uname) echo aarch64 ;;
-  hostnamectl) if [ "${1:-}" = --static ]; then cat "$FAKE_HOSTNAME"; else [ "$1" = set-hostname ]; printf '%s\\n' "$2" > "$FAKE_HOSTNAME"; fi ;;
+  hostnamectl)
+    if [ "${1:-}" = --static ]; then cat "$FAKE_HOSTNAME"
+    else [ "$1" = set-hostname ]; printf '%s\\n' "$2" > "$FAKE_HOSTNAME"; fi ;;
   pipx)
     if [ "${1:-}" = list ]; then
-      if [ -n "${FAKE_PIPX_JSON:-}" ]; then cat "$FAKE_PIPX_JSON"; elif [ -e "$FAKE_PIPX_STATE" ]; then cat "$FAKE_PIPX_STATE"; else printf '{"venvs": {}}\\n'; fi
+      if [ -n "${FAKE_PIPX_JSON:-}" ]; then cat "$FAKE_PIPX_JSON"
+      elif [ -e "$FAKE_PIPX_STATE" ]; then cat "$FAKE_PIPX_STATE"
+      else printf '{"venvs": {}}\\n'; fi
     elif [ "${1:-}" = install ]; then
       shift; [ "${1:-}" = -- ] && shift
       package="$1"; version="${package##*==}"
       [ "$version" = "$package" ] && version=default
-      printf '{"venvs":{"roastpilot-agent":{"metadata":{"main_package":{"package_version":"%s","package_or_url":"%s"}}}}}\\n' "$version" "$package" > "$FAKE_PIPX_STATE"
+      printf '{"venvs":{"roastpilot-agent":{"metadata":' > "$FAKE_PIPX_STATE"
+      printf '{"main_package":{"package_version":"%s",' "$version" >> "$FAKE_PIPX_STATE"
+      printf '"package_or_url":"%s"}}}}}\\n' "$package" >> "$FAKE_PIPX_STATE"
     elif [ "${1:-}" = uninstall ]; then rm -f "$FAKE_PIPX_STATE"; fi ;;
   roastpilot-agent)
     if [ "$1 $2 $3" = "appliance model install" ]; then
-      shift 3; while [ "$#" -gt 0 ]; do [ "$1" = --dest ] && { mkdir -p "$2/onnx/int8"; : > "$2/onnx/int8/model_quantized.onnx"; : > "$2/onnx/int8/preprocessor_config.json"; }; shift; done
+      shift 3; while [ "$#" -gt 0 ]; do [ "$1" = --dest ] && {
+        mkdir -p "$2/onnx/int8"; : > "$2/onnx/int8/model_quantized.onnx"
+        : > "$2/onnx/int8/preprocessor_config.json"; }; shift; done
     else
       out=''; while [ "$#" -gt 0 ]; do [ "$1" = --output-dir ] && { out="$2"; shift; }; shift; done
-      mkdir -p "$out"; printf 'OPENROUTER_API_KEY=\\n' > "$out/roastpilot-agent.env"; : > "$out/coffee-roaster-mcp.appliance.yaml"; : > "$out/roastpilot-agent.service"
+      mkdir -p "$out"; printf 'OPENROUTER_API_KEY=\\n' > "$out/roastpilot-agent.env"
+      : > "$out/coffee-roaster-mcp.appliance.yaml"; : > "$out/roastpilot-agent.service"
     fi ;;
   tee) [ "${1:-}" = -- ] && shift; mkdir -p "$(dirname "$1")"; cat > "$1" ;;
-  install) mode=0644; [ "${1:-}" = -m ] && { mode="$2"; shift 2; }; [ "${1:-}" = -- ] && shift; cp "$1" "$2"; chmod "$mode" "$2" ;;
+  install) mode=0644; [ "${1:-}" = -m ] && { mode="$2"; shift 2; }
+    [ "${1:-}" = -- ] && shift; cp "$1" "$2"; chmod "$mode" "$2" ;;
   mkdir) /bin/mkdir "$@" ;;
   chmod) [ "${2:-}" = -- ] && { mode="$1"; shift 2; /bin/chmod "$mode" "$@"; } || /bin/chmod "$@" ;;
+  mktemp) shift; [ "${1:-}" = -- ] && shift; dir="${1%XXXXXX}fake"
+    mkdir -p "$dir"; printf '%s\\n' "$dir" ;;
+  rm) /bin/rm "$@" ;;
   cp) /bin/cp "$@" ;;
   grep) /usr/bin/grep "$@" ;;
   tr) /usr/bin/tr "$@" ;;
@@ -71,6 +88,7 @@ esac
     for name in (
         "sudo",
         "id",
+        "getent",
         "uname",
         "hostnamectl",
         "pipx",
@@ -78,6 +96,8 @@ esac
         "install",
         "mkdir",
         "chmod",
+        "mktemp",
+        "rm",
         "chown",
         "cp",
         "apt-get",
@@ -98,6 +118,7 @@ esac
         "ROASTPILOT_INSTALL_ROOT": str(tmp_path / "root"),
         "ROASTPILOT_INSTALL_OS_RELEASE": str(os_release),
         "HOME": str(tmp_path / "home"),
+        "FAKE_OPERATOR_HOME": str(tmp_path / "operator-home"),
         "USER": "operator",
     }
     return fake_bin, environment, log, hostname
@@ -175,7 +196,10 @@ def test_preflight_failures_happen_before_privileged_commands(
     root_id.chmod(0o755)
     root = _run(environment)
     assert root.returncode != 0 and not log.exists()
-    root_id.write_text("#!/bin/sh\necho 1000\n")
+    root_id.write_text(
+        '#!/bin/sh\ncase "$1" in -u) echo 1000 ;; -un) echo operator ;; '
+        "-gn) echo operators ;; *) echo 'dialout audio' ;; esac\n"
+    )
     arch = fake_bin / "uname"
     arch.unlink()
     arch.write_text("#!/bin/sh\necho x86_64\n")
@@ -208,7 +232,8 @@ def test_hostname_consent_start_and_failure_abort_before_service_enable(
     fake_agent.resolve().write_text(
         source.replace(
             'if [ "$1 $2 $3" = "appliance model install" ]; then',
-            'if [ "${FAKE_MODEL_FAIL:-}" = 1 ]; then exit 9; elif [ "$1 $2 $3" = "appliance model install" ]; then',
+            'if [ "${FAKE_MODEL_FAIL:-}" = 1 ]; then exit 9; '
+            'elif [ "$1 $2 $3" = "appliance model install" ]; then',
         )
     )
     failed_root = Path(environment["ROASTPILOT_INSTALL_ROOT"]).parent / "failed-root"
@@ -310,6 +335,24 @@ def test_rooted_staging_and_hostile_inputs_do_not_escape(
     assert "sudo" not in log.read_text()[len(before) :]
 
 
+@pytest.mark.serial  # This checks one complete subprocess staging lifecycle.
+def test_staging_only_mutates_and_cleans_the_unique_directory(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """The installer never changes a shared tmp parent and removes its exact stage."""
+    _, environment, log, _ = installer_harness
+    assert _run(environment, "--set-hostname", "roastpilot").returncode == 0
+    root = Path(environment["ROASTPILOT_INSTALL_ROOT"])
+    stage_parent = root / "tmp"
+    events = log.read_text()
+    assert f"chown <operator:operators> <--> <{stage_parent}>" not in events
+    assert f"chmod <0700> <--> <{stage_parent}>" not in events
+    stage = stage_parent / "roastpilot-install.fake"
+    assert f"chown <operator:operators> <--> <{stage}>" in events
+    assert f"chmod <0700> <--> <{stage}>" in events
+    assert not stage.exists()
+
+
 @pytest.mark.serial  # Each mutation executes the real harness in a fresh test root.
 @pytest.mark.parametrize(
     ("needle", "replacement", "arguments", "environment_key", "oracle"),
@@ -323,7 +366,8 @@ def test_rooted_staging_and_hostile_inputs_do_not_escape(
             "proceeds",
         ),
         (
-            'if [[ "$INSTALL_ASSUME_YES" != 1 && "${ROASTPILOT_INSTALL_ASSUME_YES:-}" != 1 && ! -t 0 ]]; then',
+            'if [[ "$INSTALL_ASSUME_YES" != 1 && '
+            '"${ROASTPILOT_INSTALL_ASSUME_YES:-}" != 1 && ! -t 0 ]]; then',
             "if false; then",
             (),
             "non_tty",
@@ -331,7 +375,8 @@ def test_rooted_staging_and_hostile_inputs_do_not_escape(
         ),
         ("set -euo pipefail", "set -uo pipefail", (), "model_failure", "unit_written"),
         (
-            "if ! id -nG \"$USER\" | tr ' ' '\\n' | grep -Fxq dialout || ! id -nG \"$USER\" | tr ' ' '\\n' | grep -Fxq audio; then",
+            "if ! id -nG \"$INVOKING_USER\" | tr ' ' '\\n' | grep -Fxq dialout "
+            "|| ! id -nG \"$INVOKING_USER\" | tr ' ' '\\n' | grep -Fxq audio; then",
             "if true; then",
             (),
             "second_run",
@@ -357,15 +402,20 @@ def test_contract_mutation_oracles_detect_removed_guards(
 ) -> None:
     """G8-G13/G23: each targeted script mutation changes a behavioural oracle."""
     fake_bin, environment, log, _ = installer_harness
+    source = INSTALLER.read_text()
+    assert source.count(needle) == 1
     mutated = tmp_path / f"mutated-{environment_key}.sh"
-    mutated.write_text(INSTALLER.read_text().replace(needle, replacement, 1))
+    mutated.write_text(source.replace(needle, replacement, 1))
     mutated.chmod(0o755)
     run_environment = environment
     yes = True
     if environment_key == "root":
         root_id = fake_bin / "id"
         root_id.unlink()
-        root_id.write_text("#!/bin/sh\necho 0\n")
+        root_id.write_text(
+            '#!/bin/sh\ncase "$1" in -u) echo 0 ;; -un) echo operator ;; '
+            "-gn) echo operators ;; *) echo 'dialout audio' ;; esac\n"
+        )
         root_id.chmod(0o755)
     elif environment_key == "arch":
         arch = fake_bin / "uname"

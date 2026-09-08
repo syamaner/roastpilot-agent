@@ -158,6 +158,17 @@ preflight() {
     fi
 }
 
+resolve_operator_identity() {
+    local account record_name ignored operator_home
+    INVOKING_USER="$(id -un)" || die "cannot determine invoking user"
+    INVOKING_GROUP="$(id -gn)" || die "cannot determine invoking group"
+    [[ "$INVOKING_USER" =~ ^[a-z_][a-z0-9_-]*$ && "$INVOKING_GROUP" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "unsafe operator identity"
+    account="$(getent passwd "$INVOKING_USER")" || die "cannot determine invoking home"
+    IFS=: read -r record_name ignored ignored ignored ignored operator_home ignored <<< "$account"
+    [[ "$record_name" == "$INVOKING_USER" && "$operator_home" == /* && "$operator_home" != *"/../"* ]] || die "unsafe operator home"
+    INVOKING_HOME="$operator_home"
+}
+
 installed_pipx_state() {
     local state
     state="$(pipx list --json)" || die "cannot inspect pipx state"
@@ -220,16 +231,16 @@ resolve_appliance_executable() {
 }
 
 install_model_and_render() {
-    local model_dir stage_dir stage_parent operator_group
+    local model_dir stage_dir stage_parent
     model_dir="$(rooted_path /var/lib/roastpilot-agent/models)"
     validate_destination "$model_dir"
     stage_parent="$(rooted_path /tmp)"
     validate_destination "$stage_parent"
-    operator_group="$(id -gn)" || die "cannot determine operator primary group"
     run_privileged mkdir -p -- "$stage_parent"
-    run_privileged chown "$USER:$operator_group" -- "$stage_parent"
-    run_privileged chmod 0700 -- "$stage_parent"
-    stage_dir="$(mktemp -d "$stage_parent/roastpilot-install.XXXXXX")"
+    stage_dir="$(run_privileged mktemp -d -- "$stage_parent/roastpilot-install.XXXXXX")"
+    [[ "$stage_dir" == "$stage_parent/roastpilot-install."* ]] || die "unsafe staging directory"
+    run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$stage_dir"
+    run_privileged chmod 0700 -- "$stage_dir"
     STAGE_DIR="$stage_dir"
     if [[ -n "$MODEL_FROM_DIR" ]]; then
         run_privileged "$APPLIANCE_EXECUTABLE" appliance model install --dest "$model_dir" --from-dir "$MODEL_FROM_DIR"
@@ -237,7 +248,7 @@ install_model_and_render() {
         run_privileged "$APPLIANCE_EXECUTABLE" appliance model install --dest "$model_dir"
     fi
     "$APPLIANCE_EXECUTABLE" appliance render --output-dir "$stage_dir" --port "$PORT" \
-        --operator-user "$USER" --operator-group "$operator_group" --operator-home "$HOME" --serial-port "$SERIAL_PORT" \
+        --operator-user "$INVOKING_USER" --operator-group "$INVOKING_GROUP" --operator-home "$INVOKING_HOME" --serial-port "$SERIAL_PORT" \
         --audio-device "$AUDIO_DEVICE"
 }
 
@@ -271,8 +282,8 @@ install_rendered_files() {
     run_privileged chmod 0600 -- "$env_file"
     run_privileged install -m 0644 -- "$STAGE_DIR/coffee-roaster-mcp.appliance.yaml" "$yaml_file"
     run_privileged install -m 0644 -- "$STAGE_DIR/roastpilot-agent.service" "$unit_file"
-    if ! id -nG "$USER" | tr ' ' '\n' | grep -Fxq dialout || ! id -nG "$USER" | tr ' ' '\n' | grep -Fxq audio; then
-        run_privileged usermod -aG dialout,audio -- "$USER"
+    if ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq dialout || ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq audio; then
+        run_privileged usermod -aG dialout,audio -- "$INVOKING_USER"
     fi
     if [[ -n "$REQUESTED_HOSTNAME" ]]; then
         prior_hostname="$(hostnamectl --static)"
@@ -299,10 +310,11 @@ summary() {
 }
 
 main() {
-    local STAGE_DIR=""
-    trap '[[ -z "${STAGE_DIR:-}" ]] || rm -rf -- "$STAGE_DIR"' EXIT
+    STAGE_DIR=""
+    trap '[[ -z "${STAGE_DIR:-}" ]] || run_privileged rm -rf -- "$STAGE_DIR"' EXIT
     parse_arguments "$@"
     preflight
+    resolve_operator_identity
     run_privileged apt-get install -y libportaudio2 pipx avahi-daemon
     install_application
     resolve_appliance_executable
