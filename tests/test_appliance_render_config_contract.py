@@ -23,7 +23,11 @@ from pathlib import Path
 import pytest
 
 from roastpilot_agent import cli
-from roastpilot_agent.appliance.render import ApplianceRenderInputs, render_env_file
+from roastpilot_agent.appliance.render import (
+    ApplianceRenderInputs,
+    render_env_file,
+    render_service_unit,
+)
 from roastpilot_agent.config import AppConfig
 from roastpilot_agent.live import forward_coffee_env
 
@@ -65,6 +69,27 @@ def test_env_file_key_set_is_exactly_the_recognised_four() -> None:
     """G21: renaming any key to an invented name changes this set and fails."""
     pairs = _render()
     assert set(pairs) == _EXPECTED_ENV_KEYS
+
+
+def test_service_consumes_the_exact_port_variable_rendered_in_the_env_file() -> None:
+    """PORT is an env-file value, not a second service-template port literal."""
+    inputs = ApplianceRenderInputs(
+        port=9123,
+        operator_user="pi",
+        operator_group="pi",
+        db_path=Path("/var/lib/roastpilot-agent/roastpilot.sqlite3"),
+        mcp_config_path=Path("/etc/roastpilot-agent/coffee-roaster-mcp.yaml"),
+        model_dir=Path("/var/lib/roastpilot-agent/models"),
+        serial_port=Path("/dev/serial/by-id/hottop"),
+        audio_device="USB PnP Audio Device",
+    )
+    pairs = _parse_dotenv(render_env_file(inputs))
+    service = render_service_unit(inputs)
+
+    assert pairs["PORT"] == "9123"
+    assert "EnvironmentFile=/etc/roastpilot-agent/roastpilot-agent.env" in service
+    assert "ExecStart=%h/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}" in service
+    assert "--port 9123" not in service
 
 
 def test_app_config_loads_with_no_error_from_the_rendered_env(

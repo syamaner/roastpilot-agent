@@ -238,7 +238,7 @@ def test_render_service_unit_has_only_the_permitted_service_start_command() -> N
     assert "Environment" not in directives
     assert "KillMode" not in directives
     assert directives["ExecStart"] == (
-        "%h/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port 9001"
+        "%h/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}"
     )
 
 
@@ -247,7 +247,7 @@ def test_render_service_unit_binds_all_interfaces() -> None:
     text = render_service_unit(_inputs())
     directives = _unit_directives(text)
     assert "--host 0.0.0.0" in directives["ExecStart"]
-    assert directives["ExecStart"].endswith("serve --host 0.0.0.0 --port 9001")
+    assert directives["ExecStart"].endswith("serve --host 0.0.0.0 --port ${PORT}")
 
 
 def test_cli_serve_host_default_is_still_localhost() -> None:

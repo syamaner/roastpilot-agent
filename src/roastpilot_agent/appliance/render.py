@@ -33,7 +33,7 @@ convention already used by the committed
 
 **Never auto-resumes heat or fan.** The rendered systemd unit carries no
 ``ExecStartPre``, and its ``ExecStart`` is exactly ``roastpilot-agent serve
---host 0.0.0.0 --port <rendered port>`` — no resume/start-run flag exists on ``serve``
+--host 0.0.0.0 --port ${PORT}`` — no resume/start-run flag exists on ``serve``
 to begin with, and none is introduced here. A restarted service still lands in
 the controller's existing ``operator_recovery_required`` flow.
 """
@@ -71,7 +71,7 @@ _IDENTITY_PATTERN: Final[re.Pattern[str]] = re.compile(r"[a-z_][a-z0-9_-]{0,31}"
 
 #: Per-template closed token sets. Any token supplied outside this set, or any
 #: ``@@TOKEN@@`` left unsubstituted in a template's own set, aborts rendering.
-_SERVICE_TOKENS: Final[frozenset[str]] = frozenset({"OPERATOR_USER", "OPERATOR_GROUP", "PORT"})
+_SERVICE_TOKENS: Final[frozenset[str]] = frozenset({"OPERATOR_USER", "OPERATOR_GROUP"})
 _ENV_TOKENS: Final[frozenset[str]] = frozenset({"PORT", "DB_PATH", "MCP_CONFIG_PATH"})
 _MCP_YAML_TOKENS: Final[frozenset[str]] = frozenset(
     {"FC_REPO_ID", "FC_REVISION", "MODEL_DIR", "SERIAL_PORT", "AUDIO_DEVICE"}
@@ -87,8 +87,8 @@ class ApplianceRenderInputs:
     """Operator-/install-time values substituted into the appliance templates.
 
     Attributes:
-        port: HTTP bind port for the appliance's ``serve``, rendered directly
-            into both the unit and environment file.
+        port: HTTP bind port for the appliance's ``serve``, rendered into the
+            environment file that systemd consumes at service start.
         operator_user: The systemd unit's ``User=`` — the non-root operator
             account the appliance runs as. Never ``"root"`` (rejected).
         operator_group: The systemd unit's ``Group=``.
@@ -284,7 +284,6 @@ def render_service_unit(inputs: ApplianceRenderInputs) -> str:
     tokens = {
         "OPERATOR_USER": inputs.operator_user,
         "OPERATOR_GROUP": inputs.operator_group,
-        "PORT": str(_validate_port(inputs.port)),
     }
     return render_template_text(
         template_text, tokens, known_tokens=_SERVICE_TOKENS, template_name=_SERVICE_TEMPLATE_NAME
