@@ -374,7 +374,8 @@ def test_render_service_unit_restart_and_timeouts_present() -> None:
     directives = _unit_directives(text)
     assert directives["Restart"] == "on-failure"
     assert directives["RestartSec"]
-    assert directives["TimeoutStopSec"]
+    assert directives["KillMode"] == "mixed"
+    assert directives["TimeoutStopSec"] == "30"
 
 
 def test_render_service_unit_hardening_present_and_absent() -> None:
@@ -395,7 +396,7 @@ def test_render_service_unit_has_only_the_permitted_service_start_command() -> N
     assert sum(raw.startswith("ExecStart=") for raw in text.splitlines()) == 1
     assert "ExecStartPre" not in directives
     assert "Environment" not in directives
-    assert "KillMode" not in directives
+    assert directives["KillMode"] == "mixed"
     assert directives["ExecStart"] == (
         "/home/pi/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}"
     )
@@ -412,6 +413,7 @@ def test_render_service_unit_has_only_the_permitted_service_start_command() -> N
         "WorkingDirectory",
         "Restart",
         "RestartSec",
+        "KillMode",
         "TimeoutStopSec",
         "NoNewPrivileges",
         "PrivateTmp",

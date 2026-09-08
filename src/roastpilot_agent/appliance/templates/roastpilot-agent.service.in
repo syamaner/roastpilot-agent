@@ -25,6 +25,7 @@ ExecStart=@@OPERATOR_HOME@@/.local/bin/roastpilot-agent serve --host 0.0.0.0 --p
 WorkingDirectory=~
 Restart=on-failure
 RestartSec=5
+KillMode=mixed
 TimeoutStopSec=30
 
 # Hardening. PrivateDevices, DeviceAllow restrictions, and ProtectHome are

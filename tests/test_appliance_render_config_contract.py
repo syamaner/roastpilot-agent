@@ -125,17 +125,15 @@ def test_app_config_loads_with_no_error_from_the_rendered_env(
     assert isinstance(config, AppConfig)
 
 
-def test_rendered_db_path_reaches_the_real_cli_resolver(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_rendered_db_path_reaches_the_real_cli_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
     """``ROASTPILOT_DB`` is read directly by ``cli._resolve_live_store_path``,
     never through the ``AppConfig`` pydantic model — proven by calling the
     real resolver, not by asserting on ``AppConfig`` (which has no ``db``
-    field at all). Uses a writable ``tmp_path`` rather than the real appliance
-    default (``/var/lib/...``, root-owned on a real install) so this test is
-    hardware/host-permission independent — the resolver's behaviour under
-    test is the same regardless of which path value it is handed."""
-    db_path = tmp_path / "roastpilot-agent" / "roastpilot.sqlite3"
+    field at all). Uses an appliance-style path under the existing ``/var/lib``
+    directory, so the resolver remains hardware- and filesystem-permission
+    independent while respecting the rendered service's ``PrivateTmp=true``
+    constraint."""
+    db_path = Path("/var/lib/roastpilot-agent-config-contract.sqlite3")
     pairs = _render(db_path=db_path)
     monkeypatch.delenv("ROASTPILOT_DB", raising=False)
     monkeypatch.setenv("ROASTPILOT_DB", pairs["ROASTPILOT_DB"])
