@@ -17,6 +17,7 @@ Two run modes plus the scaffold default:
 import argparse
 import asyncio
 import contextlib
+import getpass
 import json
 import logging
 import os
@@ -1175,16 +1176,25 @@ async def _serve_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Appliance-wide (system-service) defaults for ``appliance render`` — FHS
+#: ``/var/lib``/``/etc`` locations, distinct from ``appliance model
+#: install``'s interactive XDG-home default (used by a developer running the
+#: subcommand directly, outside the systemd unit context).
+_DEFAULT_APPLIANCE_DB_PATH = Path("/var/lib/roastpilot-agent/roastpilot.sqlite3")
+_DEFAULT_APPLIANCE_MCP_CONFIG_PATH = Path("/etc/roastpilot-agent/coffee-roaster-mcp.yaml")
+_DEFAULT_APPLIANCE_MODEL_DIR = Path("/var/lib/roastpilot-agent/models")
+
+
 def _build_appliance_parser() -> argparse.ArgumentParser:
     """Build the parser for the ``roastpilot-agent appliance ...`` command tree.
 
-    Issue #138 (E11-S2), PR slice 1: only ``appliance model install`` exists
-    so far. This is kept as its own parser tree, dispatched directly from
+    Issue #138 (E11-S2). PR slice 1 added ``appliance model install``; PR
+    slice 2 adds ``appliance render`` (the systemd unit / env file / MCP YAML
+    templates). This is kept as its own parser tree, dispatched directly from
     :func:`main` ahead of :func:`_build_parser`, rather than folded into that
     parser's single ``action`` positional — the existing ``serve``/``--replay``/
     ``--version`` surface (and its tests) is untouched by this addition.
-    Later slices add sibling subcommands (e.g. ``appliance render``) under the
-    same tree.
+    Slice 3's shell installer drives both subcommands; it is out of scope here.
     """
     parser = argparse.ArgumentParser(
         prog="roastpilot-agent appliance",
@@ -1231,6 +1241,78 @@ def _build_appliance_parser() -> argparse.ArgumentParser:
         help="only verify an existing destination; never place or fetch anything",
     )
     install_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="print a machine-readable summary instead of plain text",
+    )
+
+    render_parser = subparsers.add_parser(
+        "render",
+        help="Render the systemd unit, env file, and pi_inference MCP YAML",
+    )
+    render_parser.add_argument(
+        "--output-dir",
+        dest="output_dir",
+        metavar="DIR",
+        type=Path,
+        required=True,
+        help=(
+            "staging directory for the rendered files (not /etc — the shell "
+            "installer copies them to their final system locations)"
+        ),
+    )
+    render_parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="HTTP bind port rendered into the env file (default 8000)",
+    )
+    render_parser.add_argument(
+        "--operator-user",
+        dest="operator_user",
+        default=getpass.getuser(),
+        help="systemd unit User= — the non-root operator account (default: current user)",
+    )
+    render_parser.add_argument(
+        "--operator-group",
+        dest="operator_group",
+        default=None,
+        help="systemd unit Group= (default: same as --operator-user)",
+    )
+    render_parser.add_argument(
+        "--db-path",
+        dest="db_path",
+        metavar="PATH",
+        type=Path,
+        default=_DEFAULT_APPLIANCE_DB_PATH,
+        help=f"ROASTPILOT_DB rendered into the env file (default {_DEFAULT_APPLIANCE_DB_PATH})",
+    )
+    render_parser.add_argument(
+        "--mcp-config-path",
+        dest="mcp_config_path",
+        metavar="PATH",
+        type=Path,
+        default=_DEFAULT_APPLIANCE_MCP_CONFIG_PATH,
+        help=(
+            "COFFEE_ROASTER_MCP_CONFIG rendered into the env file — where the "
+            f"rendered MCP YAML will be installed (default "
+            f"{_DEFAULT_APPLIANCE_MCP_CONFIG_PATH})"
+        ),
+    )
+    render_parser.add_argument(
+        "--model-dir",
+        dest="model_dir",
+        metavar="DIR",
+        type=Path,
+        default=_DEFAULT_APPLIANCE_MODEL_DIR,
+        help=(
+            "first_crack.local_model_dir rendered into the MCP YAML — must "
+            "match 'appliance model install --dest' (default "
+            f"{_DEFAULT_APPLIANCE_MODEL_DIR})"
+        ),
+    )
+    render_parser.add_argument(
         "--json",
         dest="json_output",
         action="store_true",
@@ -1323,6 +1405,50 @@ def _print_appliance_cleanup_notes(exc: BaseException) -> None:
             print(f"model install warning: cleanup failed while {action}: {error_type}")
 
 
+def _run_appliance_render(args: argparse.Namespace) -> int:
+    """Run ``appliance render``: write the unit/env/MCP-YAML templates (AC2/AC6/AC7).
+
+    Args:
+        args: Parsed ``appliance render`` namespace.
+
+    Returns:
+        ``0`` on success (all three files rendered and written); ``1`` if
+        rendering failed closed for any reason (nothing is written on that
+        path — see :func:`roastpilot_agent.appliance.render.render_appliance_files`).
+    """
+    from roastpilot_agent.appliance.render import (
+        ApplianceRenderError,
+        ApplianceRenderInputs,
+        render_appliance_files,
+    )
+
+    operator_group = cast(str | None, args.operator_group) or cast(str, args.operator_user)
+    inputs = ApplianceRenderInputs(
+        port=cast(int, args.port),
+        operator_user=cast(str, args.operator_user),
+        operator_group=operator_group,
+        db_path=cast(Path, args.db_path),
+        mcp_config_path=cast(Path, args.mcp_config_path),
+        model_dir=cast(Path, args.model_dir),
+    )
+    try:
+        result = render_appliance_files(cast(Path, args.output_dir), inputs)
+    except ApplianceRenderError as exc:
+        print(f"appliance render failed: {exc}")
+        return 1
+    except OSError as exc:
+        print(f"appliance render failed: destination is unusable — {exc}")
+        return 1
+    if args.json_output:
+        print(json.dumps(result.to_json_dict()))
+        return 0
+    print(f"rendered appliance files at {result.output_dir}")
+    print(f"  {result.service_path}")
+    print(f"  {result.env_path}")
+    print(f"  {result.mcp_yaml_path}")
+    return 0
+
+
 def _run_appliance_cli(argv: Sequence[str]) -> int:
     """Dispatch a parsed ``appliance ...`` command line to its handler.
 
@@ -1337,6 +1463,8 @@ def _run_appliance_cli(argv: Sequence[str]) -> int:
     args = parser.parse_args(argv)
     if args.appliance_command == "model" and args.model_command == "install":
         return _run_appliance_model_install(args)
+    if args.appliance_command == "render":
+        return _run_appliance_render(args)
     parser.print_help()  # pragma: no cover - unreachable while both subparsers are required=True
     return 2  # pragma: no cover - unreachable while both subparsers are required=True
 
