@@ -54,6 +54,7 @@ def _render(**overrides: object) -> dict[str, str]:
         "port": 9001,
         "operator_user": "pi",
         "operator_group": "pi",
+        "operator_home": Path("/home/pi"),
         "db_path": Path("/var/lib/roastpilot-agent/roastpilot.sqlite3"),
         "mcp_config_path": Path("/etc/roastpilot-agent/coffee-roaster-mcp.yaml"),
         "model_dir": Path("/var/lib/roastpilot-agent/models"),
@@ -77,6 +78,7 @@ def test_service_consumes_the_exact_port_variable_rendered_in_the_env_file() -> 
         port=9123,
         operator_user="pi",
         operator_group="pi",
+        operator_home=Path("/home/pi"),
         db_path=Path("/var/lib/roastpilot-agent/roastpilot.sqlite3"),
         mcp_config_path=Path("/etc/roastpilot-agent/coffee-roaster-mcp.yaml"),
         model_dir=Path("/var/lib/roastpilot-agent/models"),
@@ -88,7 +90,10 @@ def test_service_consumes_the_exact_port_variable_rendered_in_the_env_file() -> 
 
     assert pairs["PORT"] == "9123"
     assert "EnvironmentFile=/etc/roastpilot-agent/roastpilot-agent.env" in service
-    assert "ExecStart=%h/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}" in service
+    assert (
+        "ExecStart=/home/pi/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}"
+        in service
+    )
     assert "--port 9123" not in service
 
 

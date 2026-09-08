@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -55,6 +57,7 @@ def _inputs(**overrides: object) -> ApplianceRenderInputs:
         "port": 9001,
         "operator_user": "pi",
         "operator_group": "pi",
+        "operator_home": Path("/home/pi"),
         "db_path": Path("/var/lib/roastpilot-agent/roastpilot.sqlite3"),
         "mcp_config_path": Path("/etc/roastpilot-agent/coffee-roaster-mcp.yaml"),
         "model_dir": Path("/var/lib/roastpilot-agent/models"),
@@ -212,6 +215,20 @@ def test_render_service_unit_user_and_group_substituted() -> None:
     assert "Group=dialout" in text
 
 
+def test_render_service_unit_uses_the_validated_operator_home() -> None:
+    text = render_service_unit(_inputs(operator_home=Path("/home/alice")))
+    assert (
+        "ExecStart=/home/alice/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}"
+        in text
+    )
+
+
+@pytest.mark.parametrize("operator_home", [Path("relative-home"), Path("/home/pi#unsafe")])
+def test_render_service_unit_rejects_unsafe_operator_home(operator_home: Path) -> None:
+    with pytest.raises(ApplianceRenderError):
+        render_service_unit(_inputs(operator_home=operator_home))
+
+
 def test_render_service_unit_never_root() -> None:
     with pytest.raises(ApplianceRenderError, match="root"):
         render_service_unit(_inputs(operator_user="root", operator_group="pi"))
@@ -259,8 +276,9 @@ def test_render_service_unit_has_only_the_permitted_service_start_command() -> N
     assert "Environment" not in directives
     assert "KillMode" not in directives
     assert directives["ExecStart"] == (
-        "%h/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}"
+        "/home/pi/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}"
     )
+    assert directives["WorkingDirectory"] == "~"
 
 
 def test_render_service_unit_binds_all_interfaces() -> None:
@@ -490,6 +508,60 @@ def test_render_appliance_files_creates_output_dir(tmp_path: Path) -> None:
     output_dir = tmp_path / "nested" / "out"
     result = render_appliance_files(output_dir, _inputs())
     assert result.output_dir.is_dir()
+    assert result.output_dir == output_dir.resolve()
+
+
+def test_render_appliance_files_rejects_symlink_output_dir(tmp_path: Path) -> None:
+    """A final-component symlink cannot redirect rendered appliance files."""
+    real_output_dir = tmp_path / "real-output"
+    real_output_dir.mkdir()
+    output_link = tmp_path / "output-link"
+    output_link.symlink_to(real_output_dir, target_is_directory=True)
+
+    with pytest.raises(ApplianceRenderError, match="must not be a symlink"):
+        render_appliance_files(output_link, _inputs())
+
+    assert list(real_output_dir.iterdir()) == []
+
+
+def test_render_module_has_no_direct_control_path_imports() -> None:
+    """The renderer is a packaging helper, not a roaster-control dependency."""
+    import ast
+
+    import roastpilot_agent.appliance.render as render_module
+
+    tree = ast.parse(Path(render_module.__file__).read_text(encoding="utf-8"))
+    imported_modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported_modules.add(node.module)
+        elif isinstance(node, ast.Import):
+            imported_modules.update(alias.name for alias in node.names)
+    forbidden = {
+        "roastpilot_agent.controller",
+        "roastpilot_agent.safety",
+        "roastpilot_agent.mcp_client",
+    }
+    assert imported_modules.isdisjoint(forbidden)
+
+
+def test_render_module_never_transitively_imports_control_path() -> None:
+    """A fresh interpreter proves renderer imports do not reach roast control."""
+    script = (
+        "import sys\n"
+        "import roastpilot_agent.appliance.render\n"
+        "loaded = {m for m in sys.modules if m.startswith('roastpilot_agent.')}\n"
+        "forbidden = {\n"
+        "    'roastpilot_agent.controller',\n"
+        "    'roastpilot_agent.safety',\n"
+        "    'roastpilot_agent.mcp_client',\n"
+        "}\n"
+        "print(','.join(sorted(loaded & forbidden)))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "", result.stderr
 
 
 def test_stage_write_removes_temp_file_on_mid_write_failure(

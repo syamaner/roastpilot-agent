@@ -18,11 +18,11 @@ Group=@@OPERATOR_GROUP@@
 # No leading '-': a missing env file fails the unit loudly instead of
 # starting a half-configured appliance (fail closed).
 EnvironmentFile=/etc/roastpilot-agent/roastpilot-agent.env
-# %h resolves to the User= account's home directory (systemd >= 235) so this
-# unit does not need to know the operator's home at render time. ${PORT} comes
-# from EnvironmentFile, so changing PORT and restarting changes the bind port
-# without a unit regeneration or daemon-reload.
-ExecStart=%h/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}
+# The operator home is validated at render time; %h would resolve to the
+# system manager's home, not User=. ${PORT} comes from EnvironmentFile, so
+# changing PORT and restarting changes the bind port without unit regeneration.
+ExecStart=@@OPERATOR_HOME@@/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}
+WorkingDirectory=~
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30

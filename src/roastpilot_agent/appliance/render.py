@@ -71,7 +71,9 @@ _IDENTITY_PATTERN: Final[re.Pattern[str]] = re.compile(r"[a-z_][a-z0-9_-]{0,31}"
 
 #: Per-template closed token sets. Any token supplied outside this set, or any
 #: ``@@TOKEN@@`` left unsubstituted in a template's own set, aborts rendering.
-_SERVICE_TOKENS: Final[frozenset[str]] = frozenset({"OPERATOR_USER", "OPERATOR_GROUP"})
+_SERVICE_TOKENS: Final[frozenset[str]] = frozenset(
+    {"OPERATOR_USER", "OPERATOR_GROUP", "OPERATOR_HOME"}
+)
 _ENV_TOKENS: Final[frozenset[str]] = frozenset({"PORT", "DB_PATH", "MCP_CONFIG_PATH"})
 _MCP_YAML_TOKENS: Final[frozenset[str]] = frozenset(
     {"FC_REPO_ID", "FC_REVISION", "MODEL_DIR", "SERIAL_PORT", "AUDIO_DEVICE"}
@@ -92,6 +94,8 @@ class ApplianceRenderInputs:
         operator_user: The systemd unit's ``User=`` — the non-root operator
             account the appliance runs as. Never ``"root"`` (rejected).
         operator_group: The systemd unit's ``Group=``.
+        operator_home: The operator account's absolute home directory, used to
+            locate the operator-installed executable.
         db_path: Persistent SQLite decision-trace path (``ROASTPILOT_DB``).
         mcp_config_path: Path the rendered ``pi_inference`` MCP YAML will be
             installed at (``COFFEE_ROASTER_MCP_CONFIG``).
@@ -106,6 +110,7 @@ class ApplianceRenderInputs:
     port: int
     operator_user: str
     operator_group: str
+    operator_home: Path
     db_path: Path
     mcp_config_path: Path
     model_dir: Path
@@ -269,8 +274,7 @@ def render_service_unit(inputs: ApplianceRenderInputs) -> str:
     """Render the systemd unit (AC2, AC7): fully substituted, ready to write.
 
     Args:
-        inputs: The render-time values (only ``operator_user``/
-            ``operator_group`` are used here).
+        inputs: The render-time values for the operator identity and home.
 
     Returns:
         The rendered unit file text.
@@ -280,10 +284,12 @@ def render_service_unit(inputs: ApplianceRenderInputs) -> str:
             ``"root"``, or the template fails closed-token validation.
     """
     _validate_operator_identity(inputs.operator_user, inputs.operator_group)
+    operator_home = _validate_path(inputs.operator_home, field="operator_home")
     template_text = _read_template(_SERVICE_TEMPLATE_NAME)
     tokens = {
         "OPERATOR_USER": inputs.operator_user,
         "OPERATOR_GROUP": inputs.operator_group,
+        "OPERATOR_HOME": operator_home,
     }
     return render_template_text(
         template_text, tokens, known_tokens=_SERVICE_TOKENS, template_name=_SERVICE_TEMPLATE_NAME
@@ -402,10 +408,13 @@ def render_appliance_files(
     env_text = render_env_file(inputs)
     mcp_yaml_text = render_mcp_yaml(inputs)
 
+    if output_dir.is_symlink():
+        raise ApplianceRenderError("output_dir must not be a symlink")
     output_dir.mkdir(parents=True, exist_ok=True)
-    service_path = output_dir / SERVICE_OUTPUT_FILENAME
-    env_path = output_dir / ENV_OUTPUT_FILENAME
-    mcp_yaml_path = output_dir / MCP_YAML_OUTPUT_FILENAME
+    resolved_output_dir = output_dir.resolve(strict=True)
+    service_path = resolved_output_dir / SERVICE_OUTPUT_FILENAME
+    env_path = resolved_output_dir / ENV_OUTPUT_FILENAME
+    mcp_yaml_path = resolved_output_dir / MCP_YAML_OUTPUT_FILENAME
 
     planned = (
         (service_path, service_text, 0o644),
@@ -444,7 +453,7 @@ def render_appliance_files(
         raise
 
     return RenderedApplianceFiles(
-        output_dir=output_dir,
+        output_dir=resolved_output_dir,
         service_path=service_path,
         env_path=env_path,
         mcp_yaml_path=mcp_yaml_path,

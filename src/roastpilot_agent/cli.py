@@ -1292,6 +1292,14 @@ def _build_appliance_parser() -> argparse.ArgumentParser:
         help="systemd unit Group= (default: same as --operator-user)",
     )
     render_parser.add_argument(
+        "--operator-home",
+        dest="operator_home",
+        metavar="PATH",
+        type=Path,
+        default=Path.home(),
+        help="operator home containing .local/bin/roastpilot-agent (default: current home)",
+    )
+    render_parser.add_argument(
         "--db-path",
         dest="db_path",
         metavar="PATH",
@@ -1453,6 +1461,7 @@ def _run_appliance_render(args: argparse.Namespace) -> int:
         port=cast(int, args.port),
         operator_user=cast(str, args.operator_user),
         operator_group=operator_group,
+        operator_home=cast(Path, args.operator_home),
         db_path=cast(Path, args.db_path),
         mcp_config_path=cast(Path, args.mcp_config_path),
         model_dir=cast(Path, args.model_dir),

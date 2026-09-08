@@ -89,6 +89,7 @@ def test_appliance_render_parser_defaults(tmp_path: Path) -> None:
     assert args.output_dir == tmp_path
     assert args.port == 8000
     assert args.operator_group is None
+    assert args.operator_home == Path.home()
     assert args.json_output is False
     assert isinstance(args.db_path, Path)
     assert isinstance(args.mcp_config_path, Path)
@@ -109,6 +110,8 @@ def test_appliance_render_parser_all_flags(tmp_path: Path) -> None:
             "alice",
             "--operator-group",
             "dialout",
+            "--operator-home",
+            str(tmp_path / "alice-home"),
             "--db-path",
             str(tmp_path / "db.sqlite3"),
             "--mcp-config-path",
@@ -126,6 +129,7 @@ def test_appliance_render_parser_all_flags(tmp_path: Path) -> None:
     assert args.port == 9001
     assert args.operator_user == "alice"
     assert args.operator_group == "dialout"
+    assert args.operator_home == tmp_path / "alice-home"
     assert args.db_path == tmp_path / "db.sqlite3"
     assert args.mcp_config_path == tmp_path / "mcp.yaml"
     assert args.model_dir == tmp_path / "models"
@@ -159,6 +163,8 @@ def test_run_appliance_render_success_plain_text(
             str(output_dir),
             "--operator-user",
             "pi",
+            "--operator-home",
+            str(tmp_path / "pi-home"),
             "--serial-port",
             "/dev/ttyUSB0",
             "--audio-device",
@@ -173,6 +179,7 @@ def test_run_appliance_render_success_plain_text(
     assert isinstance(inputs, ApplianceRenderInputs)
     assert inputs.operator_user == "pi"
     assert inputs.operator_group == "pi"  # defaults to operator_user when unset
+    assert inputs.operator_home == tmp_path / "pi-home"
     out = capsys.readouterr().out
     assert str(output_dir) in out
     assert str(result.service_path) in out
