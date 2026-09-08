@@ -734,6 +734,42 @@ def test_render_appliance_files_rejects_directory_artifact_destination_before_st
     assert not list(output_dir.glob(".*.backup"))
 
 
+def test_render_appliance_files_rejects_symlink_artifact_destination_before_staging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A symlink to a regular file is rejected without following its target."""
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    target = tmp_path / "real-service"
+    target_bytes = b"existing target bytes"
+    target.write_bytes(target_bytes)
+    linked_destination = output_dir / SERVICE_OUTPUT_FILENAME
+    linked_destination.symlink_to(target)
+    replace_calls = 0
+
+    def fail_if_replaced(
+        _: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        __: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    ) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+        raise AssertionError("destination validation must precede replacement")
+
+    monkeypatch.setattr(os, "replace", fail_if_replaced)
+
+    with pytest.raises(ApplianceRenderError, match="regular file"):
+        render_appliance_files(output_dir, _inputs())
+
+    assert linked_destination.is_symlink()
+    assert linked_destination.resolve() == target
+    assert target.read_bytes() == target_bytes
+    assert not (output_dir / ENV_OUTPUT_FILENAME).exists()
+    assert not (output_dir / MCP_YAML_OUTPUT_FILENAME).exists()
+    assert replace_calls == 0
+    assert not list(output_dir.glob(".*.part"))
+    assert not list(output_dir.glob(".*.backup"))
+
+
 def test_render_module_has_no_direct_control_path_imports() -> None:
     """The renderer is a packaging helper, not a roaster-control dependency."""
     import ast
