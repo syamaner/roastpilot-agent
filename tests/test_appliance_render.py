@@ -457,10 +457,16 @@ def test_render_env_file_substitutes_port_db_and_mcp_config() -> None:
     assert "COFFEE_ROASTER_MCP_CONFIG=/tmp/x/mcp.yaml" in text
 
 
-@pytest.mark.parametrize("port", [False, 0, -1, 65536, "9001"])
+@pytest.mark.parametrize("port", [False, 0, -1, 1023, 65536, "9001"])
 def test_render_rejects_invalid_port(port: object) -> None:
     with pytest.raises(ApplianceRenderError, match="integer"):
         render_env_file(_inputs(port=port))
+
+
+@pytest.mark.parametrize("port", [1024, 65535])
+def test_render_accepts_non_privileged_port_boundaries(port: int) -> None:
+    """The renderer accepts both inclusive non-privileged port boundaries."""
+    assert f"PORT={port}" in render_env_file(_inputs(port=port))
 
 
 @pytest.mark.parametrize(
@@ -688,6 +694,24 @@ def test_render_appliance_files_rejects_symlink_output_dir(tmp_path: Path) -> No
         render_appliance_files(output_link, _inputs())
 
     assert list(real_output_dir.iterdir()) == []
+
+
+def test_render_appliance_files_rejects_lexical_parent_output_dir_before_symlink(
+    tmp_path: Path,
+) -> None:
+    """A lexical parent segment cannot reach a later symlinked output tree."""
+    redirected_tree = tmp_path / "redirected"
+    redirected_tree.mkdir()
+    redirect = tmp_path / "redirect"
+    redirect.symlink_to(redirected_tree, target_is_directory=True)
+    requested_output_dir = tmp_path / "missing" / ".." / "redirect" / "out"
+    assert ".." in requested_output_dir.parts
+
+    with pytest.raises(ApplianceRenderError, match="must not contain"):
+        render_appliance_files(requested_output_dir, _inputs())
+
+    assert not (tmp_path / "missing").exists()
+    assert list(redirected_tree.iterdir()) == []
 
 
 def test_render_appliance_files_rejects_symlinked_output_ancestor(tmp_path: Path) -> None:

@@ -1186,13 +1186,13 @@ _DEFAULT_APPLIANCE_MODEL_DIR = Path("/var/lib/roastpilot-agent/models")
 
 
 def _appliance_port(value: str) -> int:
-    """Parse one valid non-boolean TCP port for ``appliance render``."""
+    """Parse one valid non-privileged TCP port for ``appliance render``."""
     try:
         port = int(value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("port must be an integer in 1..65535") from exc
-    if not 1 <= port <= 65535:
-        raise argparse.ArgumentTypeError("port must be an integer in 1..65535")
+        raise argparse.ArgumentTypeError("port must be an integer in 1024..65535") from exc
+    if not 1024 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be an integer in 1024..65535")
     return port
 
 
@@ -1277,7 +1277,7 @@ def _build_appliance_parser() -> argparse.ArgumentParser:
         "--port",
         type=_appliance_port,
         default=8000,
-        help="HTTP bind port rendered into the env file (default 8000)",
+        help="non-privileged HTTP bind port, 1024..65535 (default 8000)",
     )
     render_parser.add_argument(
         "--operator-user",
@@ -1456,7 +1456,10 @@ def _run_appliance_render(args: argparse.Namespace) -> int:
         render_appliance_files,
     )
 
-    operator_group = cast(str | None, args.operator_group) or cast(str, args.operator_user)
+    parsed_operator_group = cast(str | None, args.operator_group)
+    operator_group = (
+        cast(str, args.operator_user) if parsed_operator_group is None else parsed_operator_group
+    )
     inputs = ApplianceRenderInputs(
         port=cast(int, args.port),
         operator_user=cast(str, args.operator_user),

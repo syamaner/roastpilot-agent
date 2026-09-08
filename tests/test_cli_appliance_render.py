@@ -54,8 +54,10 @@ def test_appliance_render_parser_requires_both_hardware_inputs(
     assert exc_info.value.code == 2
 
 
-@pytest.mark.parametrize("port", ["0", "65536", "not-a-port"])
-def test_appliance_render_parser_rejects_invalid_ports(tmp_path: Path, port: str) -> None:
+@pytest.mark.parametrize("port", ["0", "1023", "65536", "not-a-port"])
+def test_appliance_render_parser_rejects_invalid_ports(
+    tmp_path: Path, port: str, capsys: pytest.CaptureFixture[str]
+) -> None:
     with pytest.raises(SystemExit) as exc_info:
         cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
             [
@@ -71,6 +73,37 @@ def test_appliance_render_parser_rejects_invalid_ports(tmp_path: Path, port: str
             ]
         )
     assert exc_info.value.code == 2
+    assert "1024..65535" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("port", ["1024", "65535"])
+def test_appliance_render_parser_accepts_non_privileged_port_boundaries(
+    tmp_path: Path, port: str
+) -> None:
+    args = cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
+        [
+            "render",
+            "--output-dir",
+            str(tmp_path),
+            "--port",
+            port,
+            "--serial-port",
+            "/dev/ttyUSB0",
+            "--audio-device",
+            "USB PnP",
+        ]
+    )
+    assert args.port == int(port)
+
+
+def test_appliance_render_parser_port_help_states_non_privileged_range(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
+            ["render", "--help"]
+        )
+    assert "1024..65535" in capsys.readouterr().out
 
 
 def test_appliance_render_parser_defaults(tmp_path: Path) -> None:
@@ -249,6 +282,37 @@ def test_run_appliance_render_explicit_operator_group_not_overridden(
     inputs = seen["inputs"]
     assert isinstance(inputs, ApplianceRenderInputs)
     assert inputs.operator_group == "dialout"
+
+
+def test_run_appliance_render_explicit_empty_operator_group_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Only an omitted group defaults; an explicit empty value reaches validation."""
+
+    def reject_empty_group(_: Path, inputs: ApplianceRenderInputs) -> RenderedApplianceFiles:
+        if inputs.operator_group == "":
+            raise ApplianceRenderError("operator_group must be non-empty")
+        raise AssertionError("explicit empty group was silently overridden")
+
+    monkeypatch.setattr(render_module, "render_appliance_files", reject_empty_group)
+    args = cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
+        [
+            "render",
+            "--output-dir",
+            str(tmp_path),
+            "--operator-user",
+            "alice",
+            "--operator-group",
+            "",
+            "--serial-port",
+            "/dev/ttyUSB0",
+            "--audio-device",
+            "USB PnP",
+        ]
+    )
+
+    assert cli._run_appliance_render(args) == 1  # pyright: ignore[reportPrivateUsage]
+    assert "operator_group must be non-empty" in capsys.readouterr().out
 
 
 def test_run_appliance_render_success_json(

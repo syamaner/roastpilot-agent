@@ -253,9 +253,9 @@ def _validate_path(value: Path, *, field: str, device: bool = False) -> str:
 
 
 def _validate_port(port: object) -> int:
-    """Validate one appliance HTTP port as a non-boolean TCP port number."""
-    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
-        raise ApplianceRenderError("port must be an integer in 1..65535")
+    """Validate one non-privileged appliance HTTP port."""
+    if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
+        raise ApplianceRenderError("port must be an integer in 1024..65535")
     return port
 
 
@@ -457,6 +457,8 @@ def render_appliance_files(
     env_text = render_env_file(inputs)
     mcp_yaml_text = render_mcp_yaml(inputs)
 
+    if ".." in output_dir.parts:
+        raise ApplianceRenderError("output_dir must not contain '..'")
     if output_dir.is_symlink():
         raise ApplianceRenderError("output_dir must not be a symlink")
     absolute_output_dir = output_dir if output_dir.is_absolute() else Path.cwd() / output_dir
