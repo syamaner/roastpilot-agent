@@ -560,6 +560,23 @@ def test_service_consumed_paths_reject_double_slash_private_tmp_roots_before_out
     assert not output_dir.exists() or list(output_dir.iterdir()) == []
 
 
+@pytest.mark.parametrize("root", [Path("/tmp"), Path("/var/tmp")])
+@pytest.mark.parametrize("field", ["operator_home", "db_path", "mcp_config_path", "model_dir"])
+def test_service_consumed_paths_reject_existing_symlink_ancestor_to_private_tmp_before_output(
+    field: str, root: Path, tmp_path: Path
+) -> None:
+    """Existing symlink ancestors cannot redirect service paths into PrivateTmp roots."""
+    output_dir = tmp_path / "render-output"
+    safe_looking_root = tmp_path / "safe-looking-root"
+    safe_looking_root.symlink_to(root, target_is_directory=True)
+    redirected_path = safe_looking_root / "roastpilot-agent" / field
+
+    with pytest.raises(ApplianceRenderError, match="PrivateTmp"):
+        render_appliance_files(output_dir, _inputs(**{field: redirected_path}))
+
+    assert not output_dir.exists() or list(output_dir.iterdir()) == []
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

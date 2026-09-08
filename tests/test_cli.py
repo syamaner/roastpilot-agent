@@ -941,6 +941,109 @@ def test_serve_first_signal_tears_down_then_propagates(
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_serve_first_signal_cancels_non_returning_server_before_ordered_teardown(
+    signum: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live signal cancels a draining server before the safety teardown chain."""
+    from roastpilot_agent import api, config_store, live
+    from roastpilot_agent.config import AppConfig
+
+    order: list[str] = []
+    server_started = asyncio.Event()
+
+    class _Service:
+        async def safe_shutdown_heat_off(self) -> bool:
+            order.append("heat-off")
+            return True
+
+        async def shutdown(self) -> None:
+            order.append("service.shutdown")
+
+        async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+            order.append(f"unconfirmed:{stop_unconfirmed}")
+
+    class _MCP:
+        stop_unconfirmed = False
+        call_tool = staticmethod(_make_call_tool(_runtime_config_payload(roaster_driver="mock")))
+
+        async def stop(self) -> None:
+            order.append("mcp.stop")
+
+    class _Store:
+        async def initialize(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            order.append("store.close")
+
+    class _NonReturningServer:
+        def __init__(self, _config: uvicorn.Config) -> None:
+            pass
+
+        async def serve(self) -> None:
+            server_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                order.append("server-cancelled")
+                raise
+
+    async def _fake_build(_config: AppConfig, *, store_path: Path) -> tuple[_Service, _MCP, _Store]:
+        del store_path
+        return _Service(), _MCP(), _Store()
+
+    async def _no_runtime_readout(_call_tool: object) -> None:
+        return None
+
+    async def _no_advisor_readout(_service: object) -> None:
+        return None
+
+    monkeypatch.setattr(config_store, "load_app_config", lambda: (AppConfig(), set()))
+    monkeypatch.setattr(live, "forward_coffee_env", lambda _config: None)
+    monkeypatch.setattr(live, "build_live_service", _fake_build)
+    monkeypatch.setattr(api, "create_app", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(cli, "_SignalManagedServer", _NonReturningServer)
+    monkeypatch.setattr(cli, "_emit_runtime_readout", _no_runtime_readout)
+    monkeypatch.setattr(cli, "_emit_advisor_readout", _no_advisor_readout)
+    args = cli._build_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
+        ["serve", "--port", "0", "--db", str(tmp_path / "live.sqlite3")]
+    )
+
+    async def _run() -> None:
+        guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+        task = asyncio.create_task(
+            cli._serve_live(args, exit_guard=None, signal_guard=guard),  # type: ignore[arg-type]
+            name="live-serve-under-test",
+        )
+        await server_started.wait()
+        guard._handle(signum, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_run())
+    assert order == [
+        "server-cancelled",
+        "heat-off",
+        "service.shutdown",
+        "mcp.stop",
+        "unconfirmed:False",
+        "store.close",
+    ]
+
+
+def test_serve_live_never_rebinds_to_uvicorn_graceful_handler() -> None:
+    """The live cancellation binding cannot regress to Uvicorn's unbounded drain."""
+    source = Path(cli.__file__).read_text(encoding="utf-8")
+    serve_live_source = source[
+        source.index("async def _serve_live(") : source.index("async def _teardown_live(")
+    ]
+
+    assert "bind_graceful_handler(server.handle_exit)" not in serve_live_source
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
 def test_serve_startup_signal_tears_down_then_translates_cancellation(
     signum: int,
     tmp_path: Path,

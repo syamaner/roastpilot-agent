@@ -909,7 +909,7 @@ async def _serve_live(
         raise RuntimeError("live serve requires an asyncio task")
 
     def _cancel_live_task(_signum: int, _frame: FrameType | None) -> None:
-        """Cancel startup safely until Uvicorn's graceful handler is bound."""
+        """Cancel live serving so ordered teardown starts before systemd's deadline."""
         live_task.cancel()
 
     signal_guard.bind_graceful_handler(_cancel_live_task)
@@ -1017,10 +1017,13 @@ async def _serve_live(
             access_log=access_log,
         )
         server = _SignalManagedServer(uv)
-        signal_guard.bind_graceful_handler(server.handle_exit)
+        # Keep the signal-to-task-cancellation handler installed above.  Do not
+        # rebind it to Uvicorn's graceful-drain handler: an unbounded server
+        # drain would delay the safety-critical ordered teardown until after
+        # systemd's finite stop deadline.
         # _lifespan runs recover_on_start (restart → recovery) on startup and
-        # service.shutdown() on teardown; we stop the MCP child after the
-        # server returns (graceful shutdown / SIGINT) and close the store.
+        # service.shutdown() on teardown; cancellation reaches the finally
+        # block immediately, while the MCP child is still alive for heat-off.
         await server.serve()
     finally:
         await _finish_live_teardown(service, mcp, store, exit_guard)
