@@ -11,6 +11,7 @@ consumption contract is covered in
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
@@ -409,8 +410,6 @@ def test_stage_write_removes_temp_file_on_mid_write_failure(
 ) -> None:
     """A rare mid-write OSError (e.g. a permission change) removes the
     temp file rather than leaving a stray ``.part`` behind."""
-    import os
-
     import roastpilot_agent.appliance.render as render_module
 
     def failing_chmod(path: object, mode: object) -> None:
@@ -439,12 +438,13 @@ def test_render_appliance_files_rolls_back_preexisting_set_on_third_commit_failu
         path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
         for path in output_dir.iterdir()
     }
-    import os
-
     real_replace = os.replace
     calls = {"commits": 0}
 
-    def flaky_replace(src: object, dst: object) -> None:
+    def flaky_replace(
+        src: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        dst: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    ) -> None:
         if str(src).endswith(".part"):
             calls["commits"] += 1
             if calls["commits"] == 3:
@@ -467,11 +467,12 @@ def test_render_appliance_files_leaves_no_files_on_first_commit_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A first-time replacement failure leaves neither artifacts nor staging files."""
-    import os
-
     real_replace = os.replace
 
-    def failing_replace(src: object, dst: object) -> None:
+    def failing_replace(
+        src: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        dst: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    ) -> None:
         if str(src).endswith(".part"):
             raise OSError("simulated first commit failure")
         real_replace(src, dst)
