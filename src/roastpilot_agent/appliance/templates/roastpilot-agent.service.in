@@ -19,10 +19,9 @@ Group=@@OPERATOR_GROUP@@
 # starting a half-configured appliance (fail closed).
 EnvironmentFile=/etc/roastpilot-agent/roastpilot-agent.env
 # %h resolves to the User= account's home directory (systemd >= 235) so this
-# unit does not need to know the operator's home at render time. ${PORT} is
-# substituted from EnvironmentFile at service start, so the port stays
-# editable there (roastpilot-agent.env) without re-rendering this unit.
-ExecStart=%h/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}
+# unit does not need to know the operator's home at render time. The validated
+# install-time port is rendered directly below.
+ExecStart=%h/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port @@PORT@@
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30

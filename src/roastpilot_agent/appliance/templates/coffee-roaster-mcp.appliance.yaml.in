@@ -7,14 +7,14 @@
 # do not conflate the two). Point the agent's spawned MCP child at this file
 # via COFFEE_ROASTER_MCP_CONFIG (the appliance env file sets this for you).
 #
-# EDIT the two placeholders below for your hardware before starting the
-# service.
+# The renderer requires install-time serial/audio values; it does not ship
+# example devices that could be mistaken for live hardware configuration.
 transport:
   type: stdio
 
 roaster:
   driver: hottop_kn8828b_2k_plus
-  port: /dev/ttyUSB0        # EDIT: your Hottop's USB serial port — `ls /dev/ttyUSB*` or `/dev/serial/by-id/*`
+  port: @@SERIAL_PORT@@
   baudrate: 115200
   temperature_unit: auto    # auto-detect the Hottop's unit; the agent works in Celsius throughout
   command_interval_seconds: 0.3
@@ -33,7 +33,7 @@ first_crack:
 
 audio:
   source: microphone
-  input_device: "USB PnP"   # EDIT: your USB mic's device-name substring (coffee-roaster-mcp's mic-check lists devices)
+  input_device: @@AUDIO_DEVICE@@
   sample_rate: 16000
   wav_path: null
   replay_mode: realtime

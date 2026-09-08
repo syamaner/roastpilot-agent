@@ -1185,6 +1185,17 @@ _DEFAULT_APPLIANCE_MCP_CONFIG_PATH = Path("/etc/roastpilot-agent/coffee-roaster-
 _DEFAULT_APPLIANCE_MODEL_DIR = Path("/var/lib/roastpilot-agent/models")
 
 
+def _appliance_port(value: str) -> int:
+    """Parse one valid non-boolean TCP port for ``appliance render``."""
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("port must be an integer in 1..65535") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be an integer in 1..65535")
+    return port
+
+
 def _build_appliance_parser() -> argparse.ArgumentParser:
     """Build the parser for the ``roastpilot-agent appliance ...`` command tree.
 
@@ -1264,7 +1275,7 @@ def _build_appliance_parser() -> argparse.ArgumentParser:
     )
     render_parser.add_argument(
         "--port",
-        type=int,
+        type=_appliance_port,
         default=8000,
         help="HTTP bind port rendered into the env file (default 8000)",
     )
@@ -1311,6 +1322,21 @@ def _build_appliance_parser() -> argparse.ArgumentParser:
             "match 'appliance model install --dest' (default "
             f"{_DEFAULT_APPLIANCE_MODEL_DIR})"
         ),
+    )
+    render_parser.add_argument(
+        "--serial-port",
+        dest="serial_port",
+        metavar="PATH",
+        type=Path,
+        required=True,
+        help="Hottop USB serial device below /dev (required; never defaulted)",
+    )
+    render_parser.add_argument(
+        "--audio-device",
+        dest="audio_device",
+        metavar="SUBSTRING",
+        required=True,
+        help="USB audio input device-name substring (required; never defaulted)",
     )
     render_parser.add_argument(
         "--json",
@@ -1430,6 +1456,8 @@ def _run_appliance_render(args: argparse.Namespace) -> int:
         db_path=cast(Path, args.db_path),
         mcp_config_path=cast(Path, args.mcp_config_path),
         model_dir=cast(Path, args.model_dir),
+        serial_port=cast(Path, args.serial_port),
+        audio_device=cast(str, args.audio_device),
     )
     try:
         result = render_appliance_files(cast(Path, args.output_dir), inputs)

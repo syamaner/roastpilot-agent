@@ -57,6 +57,8 @@ def _inputs(**overrides: object) -> ApplianceRenderInputs:
         "db_path": Path("/var/lib/roastpilot-agent/roastpilot.sqlite3"),
         "mcp_config_path": Path("/etc/roastpilot-agent/coffee-roaster-mcp.yaml"),
         "model_dir": Path("/var/lib/roastpilot-agent/models"),
+        "serial_port": Path("/dev/serial/by-id/hottop"),
+        "audio_device": "USB PnP Audio Device",
     }
     defaults.update(overrides)
     return ApplianceRenderInputs(**defaults)  # type: ignore[arg-type]
@@ -99,6 +101,24 @@ def test_render_template_text_rejects_unknown_token_supplied() -> None:
         )
 
 
+@pytest.mark.parametrize("marker", ["@@unknown@@", "@@NAME", "@@NAME!@@"])
+def test_render_template_text_rejects_all_residual_marker_forms(marker: str) -> None:
+    """T13/G18: malformed, lower-case, and truncated markers fail closed."""
+    with pytest.raises(ApplianceRenderError, match="marker"):
+        render_template_text(marker, {}, known_tokens=frozenset({"NAME"}), template_name="t")
+
+
+def test_render_template_text_rejects_token_marker_in_value() -> None:
+    """T13/G18: a substitution cannot smuggle another token into output."""
+    with pytest.raises(ApplianceRenderError, match="marker"):
+        render_template_text(
+            "hello @@NAME@@",
+            {"NAME": "@@EVIL@@"},
+            known_tokens=frozenset({"NAME"}),
+            template_name="t",
+        )
+
+
 def test_render_appliance_files_aborts_and_writes_nothing_on_bad_template(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -107,7 +127,7 @@ def test_render_appliance_files_aborts_and_writes_nothing_on_bad_template(
 
     def fake_read_template(name: str) -> str:
         if name == render_module._SERVICE_TEMPLATE_NAME:  # pyright: ignore[reportPrivateUsage]
-            return "[Service]\nUser=@@OPERATOR_USER@@\nGroup=@@OPERATOR_GROUP@@\nBad=@@EVIL@@\n"
+            return real_read_template(name) + "\nBad=@@EVIL@@\n"
         return real_read_template(name)
 
     real_read_template = render_module._read_template  # pyright: ignore[reportPrivateUsage]
@@ -132,12 +152,32 @@ def test_render_appliance_files_aborts_on_mcp_yaml_template_corruption(
 
     def fake_read_template(name: str) -> str:
         if name == render_module._MCP_YAML_TEMPLATE_NAME:  # pyright: ignore[reportPrivateUsage]
-            return "first_crack:\n  repo_id: @@FC_REPO_ID@@\n  bogus: @@NOPE@@\n"
+            return real_read_template(name) + "\nbogus: @@NOPE@@\n"
         return real_read_template(name)
 
     monkeypatch.setattr(render_module, "_read_template", fake_read_template)
     output_dir = tmp_path / "out"
     with pytest.raises(ApplianceRenderError, match="unknown token"):
+        render_appliance_files(output_dir, _inputs())
+    assert not output_dir.exists() or list(output_dir.iterdir()) == []
+
+
+def test_render_appliance_files_aborts_before_writing_on_malformed_last_template(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T13/G18: a lower-case marker in the last template leaves no output set."""
+    import roastpilot_agent.appliance.render as render_module
+
+    real_read_template = render_module._read_template  # pyright: ignore[reportPrivateUsage]
+
+    def fake_read_template(name: str) -> str:
+        if name == render_module._MCP_YAML_TEMPLATE_NAME:  # pyright: ignore[reportPrivateUsage]
+            return real_read_template(name) + "\nbogus: @@audio_device@@\n"
+        return real_read_template(name)
+
+    monkeypatch.setattr(render_module, "_read_template", fake_read_template)
+    output_dir = tmp_path / "out"
+    with pytest.raises(ApplianceRenderError, match="marker"):
         render_appliance_files(output_dir, _inputs())
     assert not output_dir.exists() or list(output_dir.iterdir()) == []
 
@@ -192,9 +232,11 @@ def test_render_service_unit_no_resume_flag_in_exec_start_or_exec_start_pre() ->
     """No ExecStartPre directive exists, and ExecStart carries no resume/start-run flag."""
     text = render_service_unit(_inputs())
     directives = _unit_directives(text)
+    assert sum(raw.startswith("ExecStart=") for raw in text.splitlines()) == 1
     assert "ExecStartPre" not in directives
+    assert "KillMode" not in directives
     exec_start = directives["ExecStart"]
-    for forbidden in ("--resume", "resume", "--continue"):
+    for forbidden in ("--resume", "resume", "--continue", "start-run", " run-start"):
         assert forbidden not in exec_start
 
 
@@ -203,7 +245,7 @@ def test_render_service_unit_binds_all_interfaces() -> None:
     text = render_service_unit(_inputs())
     directives = _unit_directives(text)
     assert "--host 0.0.0.0" in directives["ExecStart"]
-    assert "--port ${PORT}" in directives["ExecStart"]
+    assert directives["ExecStart"].endswith("serve --host 0.0.0.0 --port 9001")
 
 
 def test_cli_serve_host_default_is_still_localhost() -> None:
@@ -235,6 +277,35 @@ def test_render_env_file_substitutes_port_db_and_mcp_config() -> None:
     assert "PORT=1234" in text
     assert "ROASTPILOT_DB=/tmp/x/db.sqlite3" in text
     assert "COFFEE_ROASTER_MCP_CONFIG=/tmp/x/mcp.yaml" in text
+
+
+@pytest.mark.parametrize("port", [False, 0, -1, 65536, "9001"])
+def test_render_rejects_invalid_port(port: object) -> None:
+    with pytest.raises(ApplianceRenderError, match="integer"):
+        render_env_file(_inputs(port=port))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("operator_user", "pi\nExecStart=/bin/evil"),
+        ("operator_group", "pi;root"),
+        ("db_path", Path("/tmp/db\nEVIL=yes")),
+        ("mcp_config_path", Path("relative.yaml")),
+        ("serial_port", Path("/tmp/tty")),
+        ("audio_device", "USB\nrecording: {enabled: true}"),
+    ],
+)
+def test_operator_values_reject_systemd_env_and_yaml_injection(
+    field: str, value: object, tmp_path: Path
+) -> None:
+    with pytest.raises(ApplianceRenderError):
+        render_appliance_files(tmp_path / "not-written", _inputs(**{field: value}))
+
+
+def test_audio_device_is_yaml_encoded_without_key_injection() -> None:
+    parsed = yaml.safe_load(render_mcp_yaml(_inputs(audio_device='USB: "PnP" # 1')))
+    assert parsed["audio"]["input_device"] == 'USB: "PnP" # 1'
 
 
 # --- render_mcp_yaml: pi_inference exactness (T9), recording off (T10) -----
@@ -319,7 +390,7 @@ def test_render_appliance_files_creates_output_dir(tmp_path: Path) -> None:
     assert result.output_dir.is_dir()
 
 
-def test_atomic_write_removes_temp_file_on_mid_write_failure(
+def test_stage_write_removes_temp_file_on_mid_write_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A rare mid-write OSError (e.g. a permission change) removes the
@@ -328,14 +399,14 @@ def test_atomic_write_removes_temp_file_on_mid_write_failure(
 
     import roastpilot_agent.appliance.render as render_module
 
-    def failing_replace(src: object, dst: object) -> None:
-        raise OSError("simulated replace failure")
+    def failing_chmod(path: object, mode: object) -> None:
+        raise OSError("simulated chmod failure")
 
-    monkeypatch.setattr(os, "replace", failing_replace)
+    monkeypatch.setattr(os, "chmod", failing_chmod)
     target = tmp_path / "target.txt"
 
-    with pytest.raises(OSError, match="simulated replace failure"):
-        render_module._atomic_write(  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(OSError, match="simulated chmod failure"):
+        render_module._stage_write(  # pyright: ignore[reportPrivateUsage]
             target, "content", mode=0o644
         )
 
@@ -344,27 +415,55 @@ def test_atomic_write_removes_temp_file_on_mid_write_failure(
     assert leftovers == []
 
 
-def test_render_appliance_files_rolls_back_earlier_writes_on_later_failure(
+def test_render_appliance_files_rolls_back_preexisting_set_on_third_commit_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """If the third (MCP-YAML) atomic write fails, the first two files this
-    call already wrote (the unit and the env file) are removed too — no
-    partial artifact set survives."""
-    import roastpilot_agent.appliance.render as render_module
-
+    """A third commit failure restores the old bytes and modes of every file."""
     output_dir = tmp_path / "out"
-    real_atomic_write = render_module._atomic_write  # pyright: ignore[reportPrivateUsage]
-    calls = {"count": 0}
+    render_appliance_files(output_dir, _inputs())
+    old = {
+        path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        for path in output_dir.iterdir()
+    }
+    import os
 
-    def flaky_atomic_write(path: Path, content: str, *, mode: int) -> None:
-        calls["count"] += 1
-        if calls["count"] == 3:
-            raise OSError("simulated disk full")
-        real_atomic_write(path, content, mode=mode)
+    real_replace = os.replace
+    calls = {"commits": 0}
 
-    monkeypatch.setattr(render_module, "_atomic_write", flaky_atomic_write)
+    def flaky_replace(src: object, dst: object) -> None:
+        if str(src).endswith(".part"):
+            calls["commits"] += 1
+            if calls["commits"] == 3:
+                raise OSError("simulated third commit failure")
+        real_replace(src, dst)
 
-    with pytest.raises(OSError, match="simulated disk full"):
+    monkeypatch.setattr(os, "replace", flaky_replace)
+
+    with pytest.raises(OSError, match="simulated third commit failure"):
         render_appliance_files(output_dir, _inputs())
+    assert {
+        path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        for path in output_dir.iterdir()
+    } == old
+    assert not list(output_dir.glob(".*.part"))
+    assert not list(output_dir.glob(".*.backup"))
 
+
+def test_render_appliance_files_leaves_no_files_on_first_commit_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A first-time replacement failure leaves neither artifacts nor staging files."""
+    import os
+
+    real_replace = os.replace
+
+    def failing_replace(src: object, dst: object) -> None:
+        if str(src).endswith(".part"):
+            raise OSError("simulated first commit failure")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    output_dir = tmp_path / "out"
+    with pytest.raises(OSError, match="first commit failure"):
+        render_appliance_files(output_dir, _inputs())
     assert list(output_dir.iterdir()) == []

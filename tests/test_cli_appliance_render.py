@@ -41,9 +41,49 @@ def test_appliance_render_parser_requires_output_dir() -> None:
     assert exc_info.value.code == 2
 
 
+@pytest.mark.parametrize(
+    "arguments", [["--serial-port", "/dev/ttyUSB0"], ["--audio-device", "USB PnP"]]
+)
+def test_appliance_render_parser_requires_both_hardware_inputs(
+    tmp_path: Path, arguments: list[str]
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
+            ["render", "--output-dir", str(tmp_path), *arguments]
+        )
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize("port", ["0", "65536", "not-a-port"])
+def test_appliance_render_parser_rejects_invalid_ports(tmp_path: Path, port: str) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
+            [
+                "render",
+                "--output-dir",
+                str(tmp_path),
+                "--port",
+                port,
+                "--serial-port",
+                "/dev/ttyUSB0",
+                "--audio-device",
+                "USB PnP",
+            ]
+        )
+    assert exc_info.value.code == 2
+
+
 def test_appliance_render_parser_defaults(tmp_path: Path) -> None:
     args = cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
-        ["render", "--output-dir", str(tmp_path)]
+        [
+            "render",
+            "--output-dir",
+            str(tmp_path),
+            "--serial-port",
+            "/dev/ttyUSB0",
+            "--audio-device",
+            "USB PnP",
+        ]
     )
     assert args.appliance_command == "render"
     assert args.output_dir == tmp_path
@@ -53,6 +93,8 @@ def test_appliance_render_parser_defaults(tmp_path: Path) -> None:
     assert isinstance(args.db_path, Path)
     assert isinstance(args.mcp_config_path, Path)
     assert isinstance(args.model_dir, Path)
+    assert args.serial_port == Path("/dev/ttyUSB0")
+    assert args.audio_device == "USB PnP"
 
 
 def test_appliance_render_parser_all_flags(tmp_path: Path) -> None:
@@ -73,6 +115,10 @@ def test_appliance_render_parser_all_flags(tmp_path: Path) -> None:
             str(tmp_path / "mcp.yaml"),
             "--model-dir",
             str(tmp_path / "models"),
+            "--serial-port",
+            "/dev/ttyUSB0",
+            "--audio-device",
+            "USB PnP",
             "--json",
         ]
     )
@@ -83,6 +129,8 @@ def test_appliance_render_parser_all_flags(tmp_path: Path) -> None:
     assert args.db_path == tmp_path / "db.sqlite3"
     assert args.mcp_config_path == tmp_path / "mcp.yaml"
     assert args.model_dir == tmp_path / "models"
+    assert args.serial_port == Path("/dev/ttyUSB0")
+    assert args.audio_device == "USB PnP"
     assert args.json_output is True
 
 
@@ -105,7 +153,17 @@ def test_run_appliance_render_success_plain_text(
 
     monkeypatch.setattr(render_module, "render_appliance_files", fake_render_appliance_files)
     args = cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
-        ["render", "--output-dir", str(output_dir), "--operator-user", "pi"]
+        [
+            "render",
+            "--output-dir",
+            str(output_dir),
+            "--operator-user",
+            "pi",
+            "--serial-port",
+            "/dev/ttyUSB0",
+            "--audio-device",
+            "USB PnP",
+        ]
     )
     exit_code = cli._run_appliance_render(args)  # pyright: ignore[reportPrivateUsage]
 
@@ -133,7 +191,17 @@ def test_run_appliance_render_operator_group_defaults_to_operator_user(
 
     monkeypatch.setattr(render_module, "render_appliance_files", fake_render_appliance_files)
     args = cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
-        ["render", "--output-dir", str(tmp_path), "--operator-user", "alice"]
+        [
+            "render",
+            "--output-dir",
+            str(tmp_path),
+            "--operator-user",
+            "alice",
+            "--serial-port",
+            "/dev/ttyUSB0",
+            "--audio-device",
+            "USB PnP",
+        ]
     )
     cli._run_appliance_render(args)  # pyright: ignore[reportPrivateUsage]
 
@@ -163,6 +231,10 @@ def test_run_appliance_render_explicit_operator_group_not_overridden(
             "alice",
             "--operator-group",
             "dialout",
+            "--serial-port",
+            "/dev/ttyUSB0",
+            "--audio-device",
+            "USB PnP",
         ]
     )
     cli._run_appliance_render(args)  # pyright: ignore[reportPrivateUsage]
@@ -185,7 +257,18 @@ def test_run_appliance_render_success_json(
 
     monkeypatch.setattr(render_module, "render_appliance_files", fake_render_appliance_files)
     args = cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
-        ["render", "--output-dir", str(output_dir), "--operator-user", "pi", "--json"]
+        [
+            "render",
+            "--output-dir",
+            str(output_dir),
+            "--operator-user",
+            "pi",
+            "--serial-port",
+            "/dev/ttyUSB0",
+            "--audio-device",
+            "USB PnP",
+            "--json",
+        ]
     )
     exit_code = cli._run_appliance_render(args)  # pyright: ignore[reportPrivateUsage]
 
@@ -204,7 +287,17 @@ def test_run_appliance_render_failure_prints_message_and_returns_1(
 
     monkeypatch.setattr(render_module, "render_appliance_files", fake_render_appliance_files)
     args = cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
-        ["render", "--output-dir", str(tmp_path), "--operator-user", "root"]
+        [
+            "render",
+            "--output-dir",
+            str(tmp_path),
+            "--operator-user",
+            "root",
+            "--serial-port",
+            "/dev/ttyUSB0",
+            "--audio-device",
+            "USB PnP",
+        ]
     )
     exit_code = cli._run_appliance_render(args)  # pyright: ignore[reportPrivateUsage]
 
@@ -224,7 +317,17 @@ def test_run_appliance_render_oserror_prints_friendly_message(
 
     monkeypatch.setattr(render_module, "render_appliance_files", fake_render_appliance_files)
     args = cli._build_appliance_parser().parse_args(  # pyright: ignore[reportPrivateUsage]
-        ["render", "--output-dir", str(tmp_path), "--operator-user", "pi"]
+        [
+            "render",
+            "--output-dir",
+            str(tmp_path),
+            "--operator-user",
+            "pi",
+            "--serial-port",
+            "/dev/ttyUSB0",
+            "--audio-device",
+            "USB PnP",
+        ]
     )
     exit_code = cli._run_appliance_render(args)  # pyright: ignore[reportPrivateUsage]
 
@@ -259,6 +362,10 @@ def test_main_dispatches_appliance_render(
             str(output_dir),
             "--operator-user",
             "pi",
+            "--serial-port",
+            "/dev/ttyUSB0",
+            "--audio-device",
+            "USB PnP",
             "--json",
         ],
     )

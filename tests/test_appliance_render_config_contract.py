@@ -53,6 +53,8 @@ def _render(**overrides: object) -> dict[str, str]:
         "db_path": Path("/var/lib/roastpilot-agent/roastpilot.sqlite3"),
         "mcp_config_path": Path("/etc/roastpilot-agent/coffee-roaster-mcp.yaml"),
         "model_dir": Path("/var/lib/roastpilot-agent/models"),
+        "serial_port": Path("/dev/serial/by-id/hottop"),
+        "audio_device": "USB PnP Audio Device",
     }
     defaults.update(overrides)
     inputs = ApplianceRenderInputs(**defaults)  # type: ignore[arg-type]

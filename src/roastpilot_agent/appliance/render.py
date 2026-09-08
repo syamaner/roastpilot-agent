@@ -33,13 +33,14 @@ convention already used by the committed
 
 **Never auto-resumes heat or fan.** The rendered systemd unit carries no
 ``ExecStartPre``, and its ``ExecStart`` is exactly ``roastpilot-agent serve
---host 0.0.0.0 --port ${PORT}`` — no resume/start-run flag exists on ``serve``
+--host 0.0.0.0 --port <rendered port>`` — no resume/start-run flag exists on ``serve``
 to begin with, and none is introduced here. A restarted service still lands in
 the controller's existing ``operator_recovery_required`` flow.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import uuid
@@ -66,12 +67,15 @@ ENV_OUTPUT_FILENAME: Final[str] = "roastpilot-agent.env"
 MCP_YAML_OUTPUT_FILENAME: Final[str] = "coffee-roaster-mcp.appliance.yaml"
 
 _TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"@@([A-Z0-9_]+)@@")
+_IDENTITY_PATTERN: Final[re.Pattern[str]] = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 
 #: Per-template closed token sets. Any token supplied outside this set, or any
 #: ``@@TOKEN@@`` left unsubstituted in a template's own set, aborts rendering.
-_SERVICE_TOKENS: Final[frozenset[str]] = frozenset({"OPERATOR_USER", "OPERATOR_GROUP"})
+_SERVICE_TOKENS: Final[frozenset[str]] = frozenset({"OPERATOR_USER", "OPERATOR_GROUP", "PORT"})
 _ENV_TOKENS: Final[frozenset[str]] = frozenset({"PORT", "DB_PATH", "MCP_CONFIG_PATH"})
-_MCP_YAML_TOKENS: Final[frozenset[str]] = frozenset({"FC_REPO_ID", "FC_REVISION", "MODEL_DIR"})
+_MCP_YAML_TOKENS: Final[frozenset[str]] = frozenset(
+    {"FC_REPO_ID", "FC_REVISION", "MODEL_DIR", "SERIAL_PORT", "AUDIO_DEVICE"}
+)
 
 
 class ApplianceRenderError(RuntimeError):
@@ -83,9 +87,8 @@ class ApplianceRenderInputs:
     """Operator-/install-time values substituted into the appliance templates.
 
     Attributes:
-        port: HTTP bind port for the appliance's ``serve`` (rendered into the
-            env file; the unit reads it back via systemd's ``${PORT}``
-            expansion, not a value baked into the unit itself).
+        port: HTTP bind port for the appliance's ``serve``, rendered directly
+            into both the unit and environment file.
         operator_user: The systemd unit's ``User=`` — the non-root operator
             account the appliance runs as. Never ``"root"`` (rejected).
         operator_group: The systemd unit's ``Group=``.
@@ -96,6 +99,8 @@ class ApplianceRenderInputs:
             placed at (``appliance model install``'s ``--dest``) — rendered
             into the MCP YAML's ``first_crack.local_model_dir`` so the two
             commands agree on one location.
+        serial_port: Hottop USB serial device below ``/dev``.
+        audio_device: USB audio input device-name substring.
     """
 
     port: int
@@ -104,6 +109,8 @@ class ApplianceRenderInputs:
     db_path: Path
     mcp_config_path: Path
     model_dir: Path
+    serial_port: Path
+    audio_device: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,18 +183,66 @@ def render_template_text(
         raise ApplianceRenderError(
             f"{template_name}: unknown token(s) supplied: {sorted(unknown_supplied)}"
         )
+    if "@@" in _TOKEN_PATTERN.sub("", template_text):
+        raise ApplianceRenderError(
+            f"{template_name}: malformed, truncated, or unsubstituted token marker"
+        )
+    template_tokens = {match.group(1) for match in _TOKEN_PATTERN.finditer(template_text)}
+    unknown_template = template_tokens - known_tokens
+    if unknown_template:
+        raise ApplianceRenderError(
+            f"{template_name}: template contains unknown token(s): {sorted(unknown_template)}"
+        )
+    missing_template = known_tokens - template_tokens
+    if missing_template:
+        raise ApplianceRenderError(
+            f"{template_name}: template is missing required token(s): {sorted(missing_template)}"
+        )
+    missing_values = known_tokens - set(tokens)
+    if missing_values:
+        raise ApplianceRenderError(
+            f"{template_name}: missing substitution for token(s): {sorted(missing_values)}"
+        )
 
     def _substitute(match: re.Match[str]) -> str:
         name = match.group(1)
-        if name not in known_tokens:
-            raise ApplianceRenderError(
-                f"{template_name}: template contains unknown token @@{name}@@"
-            )
-        if name not in tokens:
-            raise ApplianceRenderError(f"{template_name}: missing substitution for @@{name}@@")
         return tokens[name]
 
-    return _TOKEN_PATTERN.sub(_substitute, template_text)
+    rendered = _TOKEN_PATTERN.sub(_substitute, template_text)
+    if "@@" in rendered:
+        raise ApplianceRenderError(
+            f"{template_name}: malformed, truncated, or unsubstituted token marker"
+        )
+    return rendered
+
+
+def _validate_plain_value(value: object, *, field: str) -> str:
+    """Return a non-empty operator value with control and token markers rejected."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ApplianceRenderError(f"{field} must be non-empty and have no surrounding whitespace")
+    if "@@" in value or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ApplianceRenderError(f"{field} contains an unsafe control or token marker")
+    return value
+
+
+def _validate_path(value: Path, *, field: str, device: bool = False) -> str:
+    """Validate a path used in an env file or YAML scalar before rendering."""
+    text = _validate_plain_value(str(value), field=field)
+    path = Path(text)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ApplianceRenderError(f"{field} must be an absolute path without '..'")
+    if any(character.isspace() or character in ('"', "'", "#", "=", "\\") for character in text):
+        raise ApplianceRenderError(f"{field} contains an unsafe structural character")
+    if device and not text.startswith("/dev/"):
+        raise ApplianceRenderError(f"{field} must name a device below /dev")
+    return text
+
+
+def _validate_port(port: object) -> int:
+    """Validate one appliance HTTP port as a non-boolean TCP port number."""
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ApplianceRenderError("port must be an integer in 1..65535")
+    return port
 
 
 def _validate_operator_identity(operator_user: str, operator_group: str) -> None:
@@ -197,9 +252,13 @@ def _validate_operator_identity(operator_user: str, operator_group: str) -> None
     operator (never root)". This is enforced here, not only documented in the
     template, so a caller cannot accidentally render a root-owned unit.
     """
-    if not operator_user.strip() or not operator_group.strip():
-        raise ApplianceRenderError("operator_user and operator_group must be non-empty")
-    if operator_user.strip() == "root" or operator_group.strip() == "root":
+    user = _validate_plain_value(operator_user, field="operator_user")
+    group = _validate_plain_value(operator_group, field="operator_group")
+    if not _IDENTITY_PATTERN.fullmatch(user) or not _IDENTITY_PATTERN.fullmatch(group):
+        raise ApplianceRenderError(
+            "operator_user and operator_group must be safe Linux identity names"
+        )
+    if user == "root" or group == "root":
         raise ApplianceRenderError(
             "refusing to render a systemd unit with User/Group 'root' — "
             "the appliance must run as a non-root operator account"
@@ -225,6 +284,7 @@ def render_service_unit(inputs: ApplianceRenderInputs) -> str:
     tokens = {
         "OPERATOR_USER": inputs.operator_user,
         "OPERATOR_GROUP": inputs.operator_group,
+        "PORT": str(_validate_port(inputs.port)),
     }
     return render_template_text(
         template_text, tokens, known_tokens=_SERVICE_TOKENS, template_name=_SERVICE_TEMPLATE_NAME
@@ -245,11 +305,14 @@ def render_env_file(inputs: ApplianceRenderInputs) -> str:
     Raises:
         ApplianceRenderError: The template fails closed-token validation.
     """
+    port = _validate_port(inputs.port)
+    db_path = _validate_path(inputs.db_path, field="db_path")
+    mcp_config_path = _validate_path(inputs.mcp_config_path, field="mcp_config_path")
     template_text = _read_template(_ENV_TEMPLATE_NAME)
     tokens = {
-        "PORT": str(inputs.port),
-        "DB_PATH": str(inputs.db_path),
-        "MCP_CONFIG_PATH": str(inputs.mcp_config_path),
+        "PORT": str(port),
+        "DB_PATH": db_path,
+        "MCP_CONFIG_PATH": mcp_config_path,
     }
     return render_template_text(
         template_text, tokens, known_tokens=_ENV_TOKENS, template_name=_ENV_TEMPLATE_NAME
@@ -273,23 +336,28 @@ def render_mcp_yaml(inputs: ApplianceRenderInputs) -> str:
     Raises:
         ApplianceRenderError: The template fails closed-token validation.
     """
+    model_dir = _validate_path(inputs.model_dir, field="model_dir")
+    serial_port = _validate_path(inputs.serial_port, field="serial_port", device=True)
+    audio_device = _validate_plain_value(inputs.audio_device, field="audio_device")
     template_text = _read_template(_MCP_YAML_TEMPLATE_NAME)
     tokens = {
         "FC_REPO_ID": REPO_ID,
         "FC_REVISION": REVISION,
-        "MODEL_DIR": str(inputs.model_dir),
+        "MODEL_DIR": json.dumps(model_dir),
+        "SERIAL_PORT": json.dumps(serial_port),
+        "AUDIO_DEVICE": json.dumps(audio_device),
     }
     return render_template_text(
         template_text, tokens, known_tokens=_MCP_YAML_TOKENS, template_name=_MCP_YAML_TEMPLATE_NAME
     )
 
 
-def _atomic_write(path: Path, content: str, *, mode: int) -> None:
-    """Write ``content`` to ``path`` atomically with an exact octal ``mode``.
+def _stage_write(path: Path, content: str, *, mode: int) -> Path:
+    """Stage ``content`` beside ``path`` with an exact octal ``mode``.
 
     Streams to a same-directory temp file, ``fsync``s, ``chmod``s to the exact
-    requested mode, then ``os.replace``s into place — the temp file is removed
-    on any failure so a half-written artifact is never left at ``path``.
+    requested mode, without replacing the destination. The temp file is
+    removed on failure so no half-written artifact reaches ``path``.
     """
     tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.part")
     fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -299,7 +367,7 @@ def _atomic_write(path: Path, content: str, *, mode: int) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp_path, mode)
-        os.replace(tmp_path, path)
+        return tmp_path
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
@@ -345,17 +413,35 @@ def render_appliance_files(
         (env_path, env_text, 0o600),
         (mcp_yaml_path, mcp_yaml_text, 0o644),
     )
-    written: list[Path] = []
+    staged: list[tuple[Path, Path]] = []
     try:
         for path, text, mode in planned:
-            _atomic_write(path, text, mode=mode)
-            written.append(path)
+            staged.append((path, _stage_write(path, text, mode=mode)))
+        backups: dict[Path, Path] = {}
+        committed: list[Path] = []
+        try:
+            for path, stage_path in staged:
+                if path.exists():
+                    backup_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.backup")
+                    os.replace(path, backup_path)
+                    backups[path] = backup_path
+                os.replace(stage_path, path)
+                committed.append(path)
+        except BaseException:
+            for path in reversed(committed):
+                path.unlink(missing_ok=True)
+                backup = backups.pop(path, None)
+                if backup is not None:
+                    os.replace(backup, path)
+            for path, backup in backups.items():
+                path.unlink(missing_ok=True)
+                os.replace(backup, path)
+            raise
+        for backup in backups.values():
+            backup.unlink(missing_ok=True)
     except BaseException:
-        # A rare mid-write OSError (e.g. disk full after the first file):
-        # remove whatever this call itself just wrote rather than leave a
-        # partial artifact set behind.
-        for path in written:
-            path.unlink(missing_ok=True)
+        for _, stage_path in staged:
+            stage_path.unlink(missing_ok=True)
         raise
 
     return RenderedApplianceFiles(
