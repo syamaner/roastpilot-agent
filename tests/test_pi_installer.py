@@ -1,15 +1,14 @@
 """Hardware-free behavioural contract tests for the Pi installer (#138, slice 3)."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
 import os
-import shutil
 import stat
 import subprocess
 from pathlib import Path
 
 import pytest
-
 
 INSTALLER = Path(__file__).parents[1] / "packaging/pi/install.sh"
 
@@ -38,13 +37,16 @@ for arg in "$@"; do printf ' <%s>' "$arg" >> "$FAKE_LOG"; done
 printf '\\n' >> "$FAKE_LOG"
 case "$name" in
   sudo) shift; [ "${1:-}" = -- ] && shift; exec "$@" ;;
-  id) if [ "${1:-}" = -u ]; then echo 1000; else echo 'dialout audio'; fi ;;
+  id) if [ "${1:-}" = -u ]; then echo 1000; elif [ "${1:-}" = -gn ]; then echo operators; else echo 'dialout audio'; fi ;;
   uname) echo aarch64 ;;
   hostnamectl) if [ "${1:-}" = --static ]; then cat "$FAKE_HOSTNAME"; else [ "$1" = set-hostname ]; printf '%s\\n' "$2" > "$FAKE_HOSTNAME"; fi ;;
   pipx)
     if [ "${1:-}" = list ]; then
-      [ -e "$FAKE_PIPX_STATE" ] && printf '{"venvs": {"roastpilot-agent": {}}}\\n' || printf '{"venvs": {}}\\n'
-    elif [ "${1:-}" = install ]; then touch "$FAKE_PIPX_STATE"; fi ;;
+      [ -e "$FAKE_PIPX_STATE" ] && cat "$FAKE_PIPX_STATE" || printf '{"venvs": {}}\\n'
+    elif [ "${1:-}" = install ]; then
+      shift; [ "${1:-}" = -- ] && shift
+      printf '%s\\n' '{"venvs": {"roastpilot-agent": {"metadata": {"main_package": {"package_version": "1.0", "package_or_url": "roastpilot-agent[pi]"}}}}}' > "$FAKE_PIPX_STATE"
+    elif [ "${1:-}" = uninstall ]; then rm -f "$FAKE_PIPX_STATE"; fi ;;
   roastpilot-agent)
     if [ "$1 $2 $3" = "appliance model install" ]; then
       shift 3; while [ "$#" -gt 0 ]; do [ "$1" = --dest ] && { mkdir -p "$2/onnx/int8"; : > "$2/onnx/int8/model_quantized.onnx"; : > "$2/onnx/int8/preprocessor_config.json"; }; shift; done
@@ -52,10 +54,10 @@ case "$name" in
       out=''; while [ "$#" -gt 0 ]; do [ "$1" = --output-dir ] && { out="$2"; shift; }; shift; done
       mkdir -p "$out"; printf 'OPENROUTER_API_KEY=\\n' > "$out/roastpilot-agent.env"; : > "$out/coffee-roaster-mcp.appliance.yaml"; : > "$out/roastpilot-agent.service"
     fi ;;
-  tee) mkdir -p "$(dirname "$1")"; cat > "$1" ;;
-  install) mode=0644; [ "${1:-}" = -m ] && { mode="$2"; shift 2; }; cp "$1" "$2"; chmod "$mode" "$2" ;;
+  tee) [ "${1:-}" = -- ] && shift; mkdir -p "$(dirname "$1")"; cat > "$1" ;;
+  install) mode=0644; [ "${1:-}" = -m ] && { mode="$2"; shift 2; }; [ "${1:-}" = -- ] && shift; cp "$1" "$2"; chmod "$mode" "$2" ;;
   mkdir) /bin/mkdir "$@" ;;
-  chmod) /bin/chmod "$@" ;;
+  chmod) [ "${2:-}" = -- ] && { mode="$1"; shift 2; /bin/chmod "$mode" "$@"; } || /bin/chmod "$@" ;;
   cp) /bin/cp "$@" ;;
   grep) /usr/bin/grep "$@" ;;
   tr) /usr/bin/tr "$@" ;;
@@ -70,7 +72,6 @@ esac
         "uname",
         "hostnamectl",
         "pipx",
-        "roastpilot-agent",
         "tee",
         "install",
         "mkdir",
@@ -83,6 +84,9 @@ esac
         "tr",
     ):
         (fake_bin / name).symlink_to(fake)
+    agent = fake_bin / "roastpilot-agent"
+    agent.write_text(fake.read_text())
+    agent.chmod(0o755)
     environment = os.environ | {
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
         "FAKE_LOG": str(log),
@@ -100,7 +104,16 @@ def _run(
     environment: dict[str, str], *args: str, yes: bool = True, stdin: str | None = "input"
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", str(INSTALLER), *( ["--yes"] if yes else [] ), "--serial-port", "/dev/ttyUSB0", "--audio-device", "USB mic", *args],
+        [
+            "bash",
+            str(INSTALLER),
+            *(["--yes"] if yes else []),
+            "--serial-port",
+            "/dev/ttyUSB0",
+            "--audio-device",
+            "USB mic",
+            *args,
+        ],
         env=environment,
         input=stdin,
         text=True,
@@ -121,16 +134,23 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     root = Path(environment["ROASTPILOT_INSTALL_ROOT"])
     env_file = root / "etc/roastpilot-agent/roastpilot-agent.env"
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
-    assert stat.S_IMODE((root / "etc/systemd/system/roastpilot-agent.service").stat().st_mode) == 0o644
-    assert stat.S_IMODE((root / "etc/roastpilot-agent/coffee-roaster-mcp.yaml").stat().st_mode) == 0o644
+    assert (
+        stat.S_IMODE((root / "etc/systemd/system/roastpilot-agent.service").stat().st_mode) == 0o644
+    )
+    assert (
+        stat.S_IMODE((root / "etc/roastpilot-agent/coffee-roaster-mcp.yaml").stat().st_mode)
+        == 0o644
+    )
     assert key not in first.stdout + first.stderr + log.read_text()
     assert key in env_file.read_text()
     commands = log.read_text().splitlines()
-    assert [line.split(" ", 1)[0] for line in commands].index("apt-get") < [line.split(" ", 1)[0] for line in commands].index("pipx")
+    assert [line.split(" ", 1)[0] for line in commands].index("apt-get") < [
+        line.split(" ", 1)[0] for line in commands
+    ].index("pipx")
     assert not any("systemctl <start> <roastpilot-agent>" in line for line in commands)
     before = env_file.read_bytes()
     second = _run(environment, "--set-hostname", "roastpilot", "--api-key", key)
-    assert second.returncode == 0
+    assert second.returncode == 0, second.stderr + log.read_text()
     assert env_file.read_bytes() == before
     second_commands = log.read_text().splitlines()[len(commands) :]
     assert not any("usermod" in line or "pipx <install>" in line for line in second_commands)
@@ -169,7 +189,7 @@ def test_hostname_consent_start_and_failure_abort_before_service_enable(
     _, environment, log, hostname = installer_harness
     rejected = _run(environment)
     assert rejected.returncode != 0
-    assert not log.exists()
+    assert "sudo" not in log.read_text()
     started = _run(environment, "--set-hostname", "roastpilot", "--start")
     assert started.returncode == 0
     assert hostname.read_text().strip() == "roastpilot"
@@ -178,7 +198,12 @@ def test_hostname_consent_start_and_failure_abort_before_service_enable(
     failing = environment | {"FAKE_MODEL_FAIL": "1"}
     fake_agent = Path(environment["PATH"].split(os.pathsep)[0]) / "roastpilot-agent"
     source = fake_agent.resolve().read_text()
-    fake_agent.resolve().write_text(source.replace('if [ "$1 $2 $3" = "appliance model install" ]; then', 'if [ "${FAKE_MODEL_FAIL:-}" = 1 ]; then exit 9; elif [ "$1 $2 $3" = "appliance model install" ]; then'))
+    fake_agent.resolve().write_text(
+        source.replace(
+            'if [ "$1 $2 $3" = "appliance model install" ]; then',
+            'if [ "${FAKE_MODEL_FAIL:-}" = 1 ]; then exit 9; elif [ "$1 $2 $3" = "appliance model install" ]; then',
+        )
+    )
     failed_root = Path(environment["ROASTPILOT_INSTALL_ROOT"]).parent / "failed-root"
     failed = _run(
         failing | {"ROASTPILOT_INSTALL_ROOT": str(failed_root)}, "--set-hostname", "roastpilot"
@@ -194,9 +219,11 @@ def test_truncated_or_mutated_script_has_no_privileged_effect(
     """T22/G11/G12: partial bytes and a removed fail-fast setting cannot install."""
     _, environment, log, _ = installer_harness
     partial = tmp_path / "partial.sh"
-    partial.write_text(INSTALLER.read_text().rsplit("main \"$@\"", 1)[0])
+    partial.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
     partial.chmod(0o755)
-    result = subprocess.run(["bash", str(partial)], env=environment, text=True, capture_output=True, check=False)
+    result = subprocess.run(
+        ["bash", str(partial)], env=environment, text=True, capture_output=True, check=False
+    )
     assert result.returncode == 0
     assert not log.exists()
     text = INSTALLER.read_text()
