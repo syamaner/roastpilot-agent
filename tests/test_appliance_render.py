@@ -44,7 +44,7 @@ _MCP_CONFIG_AVAILABLE = importlib.util.find_spec("coffee_roaster_mcp") is not No
 
 
 @pytest.fixture(autouse=True)
-def _non_root_identity_database(monkeypatch: pytest.MonkeyPatch) -> None:
+def non_root_identity_database(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make ordinary rendering tests independent of host account inventory."""
 
     def get_non_root_user(_: str) -> SimpleNamespace:
