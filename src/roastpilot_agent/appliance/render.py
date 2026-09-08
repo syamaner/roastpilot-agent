@@ -40,9 +40,12 @@ the controller's existing ``operator_recovery_required`` flow.
 
 from __future__ import annotations
 
+import grp
 import json
 import os
+import pwd
 import re
+import stat
 import unicodedata
 import uuid
 from dataclasses import dataclass
@@ -257,11 +260,13 @@ def _validate_port(port: object) -> int:
 
 
 def _validate_operator_identity(operator_user: str, operator_group: str) -> None:
-    """Reject an empty or ``root`` operator identity before any rendering.
+    """Reject unsafe, unresolved, or root-privileged operator identities.
 
     AC2 requires the systemd unit's ``User=``/``Group=`` to be "the invoking
     operator (never root)". This is enforced here, not only documented in the
-    template, so a caller cannot accidentally render a root-owned unit.
+    template, so a caller cannot accidentally render a root-owned unit. The
+    system account databases are consulted after name validation: alternate
+    names for UID/GID 0 and unresolved names also fail closed.
     """
     user = _validate_plain_value(operator_user, field="operator_user")
     group = _validate_plain_value(operator_group, field="operator_group")
@@ -274,6 +279,24 @@ def _validate_operator_identity(operator_user: str, operator_group: str) -> None
             "refusing to render a systemd unit with User/Group 'root' — "
             "the appliance must run as a non-root operator account"
         )
+    try:
+        user_entry = pwd.getpwnam(user)
+    except (KeyError, OSError) as exc:
+        raise ApplianceRenderError(
+            f"operator_user {user!r} does not resolve to a local account"
+        ) from exc
+    try:
+        group_entry = grp.getgrnam(group)
+    except (KeyError, OSError) as exc:
+        raise ApplianceRenderError(
+            f"operator_group {group!r} does not resolve to a local group"
+        ) from exc
+    if user_entry.pw_uid == 0:
+        raise ApplianceRenderError(
+            "refusing to render a systemd unit with a UID 0 operator account"
+        )
+    if group_entry.gr_gid == 0:
+        raise ApplianceRenderError("refusing to render a systemd unit with a GID 0 operator group")
 
 
 def render_service_unit(inputs: ApplianceRenderInputs) -> str:
@@ -384,6 +407,25 @@ def _stage_write(path: Path, content: str, *, mode: int) -> Path:
         raise
 
 
+def _validate_artifact_destination(path: Path) -> None:
+    """Allow an absent destination, but reject every existing non-regular node.
+
+    ``lstat`` deliberately observes the destination itself rather than a
+    symlink target. This preflight runs before any staging file is created, so
+    a malformed pre-existing output set cannot cause a partial replacement.
+    """
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ApplianceRenderError(f"could not inspect destination {path.name!r}") from exc
+    if not stat.S_ISREG(mode):
+        raise ApplianceRenderError(
+            f"destination {path.name!r} must be an absent path or regular file"
+        )
+
+
 def render_appliance_files(
     output_dir: Path, inputs: ApplianceRenderInputs
 ) -> RenderedApplianceFiles:
@@ -404,8 +446,9 @@ def render_appliance_files(
         The paths of the three files written, all inside ``output_dir``.
 
     Raises:
-        ApplianceRenderError: Any template fails closed-token validation, or
-            the operator identity is empty/``root``.
+        ApplianceRenderError: Any template fails closed-token validation, an
+            operator identity is unsafe, unresolved, or root-privileged, or
+            a pre-existing artifact destination is not a regular file.
         OSError: A local filesystem operation fails (e.g. an unwritable
             ``output_dir``).
     """
@@ -435,6 +478,8 @@ def render_appliance_files(
         (env_path, env_text, 0o600),
         (mcp_yaml_path, mcp_yaml_text, 0o644),
     )
+    for path, _, _ in planned:
+        _validate_artifact_destination(path)
     staged: list[tuple[Path, Path]] = []
     try:
         for path, text, mode in planned:

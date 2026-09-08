@@ -11,19 +11,25 @@ consumption contract is covered in
 
 from __future__ import annotations
 
+import grp
 import importlib.util
 import os
+import pwd
 import stat
 import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from roastpilot_agent.appliance.model_manifest import REPO_ID, REVISION
 from roastpilot_agent.appliance.render import (
+    ENV_OUTPUT_FILENAME,
+    MCP_YAML_OUTPUT_FILENAME,
+    SERVICE_OUTPUT_FILENAME,
     ApplianceRenderError,
     ApplianceRenderInputs,
     RenderedApplianceFiles,
@@ -35,6 +41,20 @@ from roastpilot_agent.appliance.render import (
 )
 
 _MCP_CONFIG_AVAILABLE = importlib.util.find_spec("coffee_roaster_mcp") is not None
+
+
+@pytest.fixture(autouse=True)
+def _non_root_identity_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ordinary rendering tests independent of host account inventory."""
+
+    def get_non_root_user(_: str) -> SimpleNamespace:
+        return SimpleNamespace(pw_uid=1000)
+
+    def get_non_root_group(_: str) -> SimpleNamespace:
+        return SimpleNamespace(gr_gid=1000)
+
+    monkeypatch.setattr(pwd, "getpwnam", get_non_root_user)
+    monkeypatch.setattr(grp, "getgrnam", get_non_root_group)
 
 
 def _unit_directives(text: str) -> dict[str, str]:
@@ -291,6 +311,54 @@ def test_render_service_unit_never_root() -> None:
 def test_render_service_unit_rejects_empty_identity() -> None:
     with pytest.raises(ApplianceRenderError, match="non-empty"):
         render_service_unit(_inputs(operator_user=" ", operator_group="pi"))
+
+
+def test_render_service_unit_rejects_alternate_named_uid_zero_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-root spelling cannot bypass the non-root UID invariant."""
+
+    def get_root_uid_user(_: str) -> SimpleNamespace:
+        return SimpleNamespace(pw_uid=0)
+
+    monkeypatch.setattr(pwd, "getpwnam", get_root_uid_user)
+
+    with pytest.raises(ApplianceRenderError, match="UID 0"):
+        render_service_unit(_inputs(operator_user="administrator"))
+
+
+def test_render_service_unit_rejects_alternate_named_gid_zero_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-root spelling cannot bypass the non-root GID invariant."""
+
+    def get_root_gid_group(_: str) -> SimpleNamespace:
+        return SimpleNamespace(gr_gid=0)
+
+    monkeypatch.setattr(grp, "getgrnam", get_root_gid_group)
+
+    with pytest.raises(ApplianceRenderError, match="GID 0"):
+        render_service_unit(_inputs(operator_group="administrators"))
+
+
+@pytest.mark.parametrize("identity", ["user", "group"])
+def test_render_service_unit_rejects_unresolved_identity(
+    monkeypatch: pytest.MonkeyPatch, identity: str
+) -> None:
+    """Configured account and group names must both resolve locally."""
+
+    def missing_identity(_: str) -> None:
+        raise KeyError("not found")
+
+    if identity == "user":
+        monkeypatch.setattr(pwd, "getpwnam", missing_identity)
+        expected = "operator_user"
+    else:
+        monkeypatch.setattr(grp, "getgrnam", missing_identity)
+        expected = "operator_group"
+
+    with pytest.raises(ApplianceRenderError, match=expected):
+        render_service_unit(_inputs())
 
 
 def test_render_service_unit_environment_file_fails_closed() -> None:
@@ -633,6 +701,37 @@ def test_render_appliance_files_rejects_symlinked_output_ancestor(tmp_path: Path
         render_appliance_files(linked_parent / "out", _inputs())
 
     assert list(real_parent.iterdir()) == []
+
+
+def test_render_appliance_files_rejects_directory_artifact_destination_before_staging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bad fixed target blocks every artifact before staging or replacement."""
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    bad_destination = output_dir / SERVICE_OUTPUT_FILENAME
+    bad_destination.mkdir()
+    replace_calls = 0
+
+    def fail_if_replaced(
+        _: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        __: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    ) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+        raise AssertionError("destination validation must precede replacement")
+
+    monkeypatch.setattr(os, "replace", fail_if_replaced)
+
+    with pytest.raises(ApplianceRenderError, match="regular file"):
+        render_appliance_files(output_dir, _inputs())
+
+    assert bad_destination.is_dir()
+    assert not (output_dir / ENV_OUTPUT_FILENAME).exists()
+    assert not (output_dir / MCP_YAML_OUTPUT_FILENAME).exists()
+    assert replace_calls == 0
+    assert not list(output_dir.glob(".*.part"))
+    assert not list(output_dir.glob(".*.backup"))
 
 
 def test_render_module_has_no_direct_control_path_imports() -> None:

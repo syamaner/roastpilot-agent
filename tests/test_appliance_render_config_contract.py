@@ -18,7 +18,10 @@ drifted name).
 from __future__ import annotations
 
 import argparse
+import grp
+import pwd
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -72,8 +75,19 @@ def test_env_file_key_set_is_exactly_the_recognised_four() -> None:
     assert set(pairs) == _EXPECTED_ENV_KEYS
 
 
-def test_service_consumes_the_exact_port_variable_rendered_in_the_env_file() -> None:
+def test_service_consumes_the_exact_port_variable_rendered_in_the_env_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """PORT is an env-file value, not a second service-template port literal."""
+
+    def get_non_root_user(_: str) -> SimpleNamespace:
+        return SimpleNamespace(pw_uid=1000)
+
+    def get_non_root_group(_: str) -> SimpleNamespace:
+        return SimpleNamespace(gr_gid=1000)
+
+    monkeypatch.setattr(pwd, "getpwnam", get_non_root_user)
+    monkeypatch.setattr(grp, "getgrnam", get_non_root_group)
     inputs = ApplianceRenderInputs(
         port=9123,
         operator_user="pi",
