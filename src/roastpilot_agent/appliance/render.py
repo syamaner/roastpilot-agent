@@ -236,7 +236,10 @@ def _validate_path(value: Path, *, field: str, device: bool = False) -> str:
     path = Path(text)
     if not path.is_absolute() or ".." in path.parts:
         raise ApplianceRenderError(f"{field} must be an absolute path without '..'")
-    if any(character.isspace() or character in ('"', "'", "#", "=", "\\") for character in text):
+    if any(
+        character.isspace() or character in ('"', "'", "#", "$", "%", "=", "\\")
+        for character in text
+    ):
         raise ApplianceRenderError(f"{field} contains an unsafe structural character")
     if device and not text.startswith("/dev/"):
         raise ApplianceRenderError(f"{field} must name a device below /dev")
@@ -410,6 +413,14 @@ def render_appliance_files(
 
     if output_dir.is_symlink():
         raise ApplianceRenderError("output_dir must not be a symlink")
+    absolute_output_dir = output_dir if output_dir.is_absolute() else Path.cwd() / output_dir
+    ancestor = Path(absolute_output_dir.anchor)
+    for part in absolute_output_dir.parts[1:-1]:
+        ancestor /= part
+        if ancestor.is_symlink():
+            raise ApplianceRenderError("output_dir must not have a symlinked ancestor")
+        if not ancestor.exists():
+            break
     output_dir.mkdir(parents=True, exist_ok=True)
     resolved_output_dir = output_dir.resolve(strict=True)
     service_path = resolved_output_dir / SERVICE_OUTPUT_FILENAME

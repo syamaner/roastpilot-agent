@@ -15,6 +15,7 @@ import os
 import stat
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -186,6 +187,36 @@ def test_render_appliance_files_aborts_when_required_template_token_is_absent(
     assert not output_dir.exists() or list(output_dir.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (lambda text: text + "\nunknown=@@EVIL@@\n", "unknown token"),
+        (lambda text: text.replace("PORT=@@PORT@@\n", ""), "missing required token"),
+    ],
+)
+def test_render_appliance_files_aborts_on_env_template_token_corruption(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: Callable[[str], str],
+    error: str,
+) -> None:
+    """T13: invalid env-template token sets fail before any output is emitted."""
+    import roastpilot_agent.appliance.render as render_module
+
+    real_read_template = render_module._read_template  # pyright: ignore[reportPrivateUsage]
+
+    def fake_read_template(name: str) -> str:
+        if name == render_module._ENV_TEMPLATE_NAME:  # pyright: ignore[reportPrivateUsage]
+            return mutation(real_read_template(name))
+        return real_read_template(name)
+
+    monkeypatch.setattr(render_module, "_read_template", fake_read_template)
+    output_dir = tmp_path / "out"
+    with pytest.raises(ApplianceRenderError, match=error):
+        render_appliance_files(output_dir, _inputs())
+    assert not output_dir.exists() or list(output_dir.iterdir()) == []
+
+
 def test_render_appliance_files_aborts_before_writing_on_malformed_last_template(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -223,7 +254,15 @@ def test_render_service_unit_uses_the_validated_operator_home() -> None:
     )
 
 
-@pytest.mark.parametrize("operator_home", [Path("relative-home"), Path("/home/pi#unsafe")])
+@pytest.mark.parametrize(
+    "operator_home",
+    [
+        Path("relative-home"),
+        Path("/home/pi#unsafe"),
+        Path("/home/$OPENROUTER_API_KEY"),
+        Path("/home/pi%h"),
+    ],
+)
 def test_render_service_unit_rejects_unsafe_operator_home(operator_home: Path) -> None:
     with pytest.raises(ApplianceRenderError):
         render_service_unit(_inputs(operator_home=operator_home))
@@ -279,6 +318,23 @@ def test_render_service_unit_has_only_the_permitted_service_start_command() -> N
         "/home/pi/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}"
     )
     assert directives["WorkingDirectory"] == "~"
+    assert set(directives) == {
+        "Description",
+        "After",
+        "Wants",
+        "Type",
+        "User",
+        "Group",
+        "EnvironmentFile",
+        "ExecStart",
+        "WorkingDirectory",
+        "Restart",
+        "RestartSec",
+        "TimeoutStopSec",
+        "NoNewPrivileges",
+        "PrivateTmp",
+        "WantedBy",
+    }
 
 
 def test_render_service_unit_binds_all_interfaces() -> None:
@@ -341,6 +397,19 @@ def test_absolute_paths_reject_structural_characters(
     output_dir = tmp_path / "out"
     with pytest.raises(ApplianceRenderError, match="unsafe structural"):
         render_appliance_files(output_dir, _inputs(**{field: value}))
+    assert not output_dir.exists() or list(output_dir.iterdir()) == []
+
+
+def test_absolute_path_with_lexical_parent_part_is_rejected_without_normalisation(
+    tmp_path: Path,
+) -> None:
+    """A caller cannot erase a lexical ``..`` before render-time validation."""
+    output_dir = tmp_path / "out"
+    path_with_parent_part = Path("/var/lib/roastpilot-agent/models/../other")
+    assert ".." in path_with_parent_part.parts
+
+    with pytest.raises(ApplianceRenderError, match="without '..'"):
+        render_appliance_files(output_dir, _inputs(model_dir=path_with_parent_part))
     assert not output_dir.exists() or list(output_dir.iterdir()) == []
 
 
@@ -522,6 +591,19 @@ def test_render_appliance_files_rejects_symlink_output_dir(tmp_path: Path) -> No
         render_appliance_files(output_link, _inputs())
 
     assert list(real_output_dir.iterdir()) == []
+
+
+def test_render_appliance_files_rejects_symlinked_output_ancestor(tmp_path: Path) -> None:
+    """An existing ancestor symlink cannot redirect a newly-created output directory."""
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(ApplianceRenderError, match="symlinked ancestor"):
+        render_appliance_files(linked_parent / "out", _inputs())
+
+    assert list(real_parent.iterdir()) == []
 
 
 def test_render_module_has_no_direct_control_path_imports() -> None:
