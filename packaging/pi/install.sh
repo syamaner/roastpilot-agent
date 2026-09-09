@@ -68,10 +68,10 @@ recheck_sensitive_destination() {
     # This repeats the unprivileged lexical check at the privilege boundary.
     # It is not an atomic no-follow guarantee, but catches a changed parent or
     # final symlink immediately before each sensitive root write.
-    run_privileged test -d "$parent"
-    run_privileged test ! -L "$parent"
-    run_privileged test ! -L "$destination"
-    run_privileged test ! -d "$destination"
+    run_privileged test -d "$parent" || return 1
+    run_privileged test ! -L "$parent" || return 1
+    run_privileged test ! -L "$destination" || return 1
+    run_privileged test ! -d "$destination" || return 1
 }
 
 validate_no_control_characters() {
@@ -785,9 +785,9 @@ main() {
         discard_configuration_snapshot || cleanup_failed=1
         if [[ "$cleanup_failed" == 1 ]]; then
             printf '%s\n' "install failed: rollback incomplete; manual reconciliation required" >&2
-            return 1
+            exit 1
         fi
-        return "$original_status"
+        exit "$original_status"
     }
     trap cleanup EXIT
     # Test mode is deliberately unprivileged.  Every production lookup starts
