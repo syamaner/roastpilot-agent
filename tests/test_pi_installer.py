@@ -855,7 +855,7 @@ def test_contract_mutation_oracles_detect_removed_guards(
     environment_key: str,
     oracle: str,
 ) -> None:
-    """G8-G13/G23: each targeted script mutation changes a behavioural oracle."""
+    """G8-G13: each targeted script mutation changes a behavioural oracle."""
     fake_bin, environment, log, _ = installer_harness
     source = INSTALLER.read_text()
     assert source.count(needle) == 1
@@ -2042,7 +2042,7 @@ def test_only_inactive_or_failed_service_states_are_admitted(
 
 
 @pytest.mark.serial
-@pytest.mark.parametrize("mode", ["missing", "non-executable"])
+@pytest.mark.parametrize("mode", ["missing", "non-executable", "symlink"])
 def test_missing_or_nonexecutable_mcp_console_fails_before_appliance_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], mode: str
 ) -> None:
@@ -2051,12 +2051,17 @@ def test_missing_or_nonexecutable_mcp_console_fails_before_appliance_effects(
     mcp = Path(environment["FAKE_PIPX_HOME"]) / "venvs/roastpilot-agent/bin/coffee-roaster-mcp"
     if mode == "missing":
         mcp.unlink()
-    else:
+    elif mode == "non-executable":
         mcp.chmod(0o644)
+    else:
+        target = mcp.with_name("coffee-roaster-mcp-real")
+        mcp.rename(target)
+        mcp.symlink_to(target)
     _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
     result = _run(environment, "--set-hostname", "roastpilot")
     assert result.returncode != 0 and "Pi/MCP" in result.stderr
     assert "roastpilot-agent <appliance" not in log.read_text()
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text()
 
 
 @pytest.mark.serial
@@ -2169,6 +2174,10 @@ def test_state_sequence_blocks_prior_uninstall(
     events = log.read_text().splitlines()
     assert events.count("systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>") == 2
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
+    assert any(
+        line.startswith("pipx <uninstall> <--> <roastpilot-agent-roastpilot-stage-")
+        for line in events
+    )
 
 
 @pytest.mark.serial
@@ -2214,7 +2223,7 @@ def test_pre_promotion_state_change_aborts_before_live_mutations(
         for line in events
     )
     assert not any(
-        line.startswith(("chown ", "chmod ")) and "/root/etc/" in line or "/root/var/" in line
+        line.startswith(("chown ", "chmod ")) and ("/root/etc/" in line or "/root/var/" in line)
         for line in events
     )
     assert any(line.startswith("rm <-rf>") and "roastpilot-install" in line for line in events)

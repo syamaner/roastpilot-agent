@@ -355,7 +355,10 @@ replace_application_safely() {
         pipx_command uninstall -- "roastpilot-agent$suffix" || true
         die "staged replacement lacks required Pi/MCP capability"
     fi
-    ensure_agent_inactive
+    if ! ensure_agent_inactive; then
+        pipx_command uninstall -- "roastpilot-agent$suffix" || true
+        die "roastpilot-agent is not safely inactive; end any run safely, stop the service only when idle, then rerun the installer; never restart during a roast"
+    fi
     if ! pipx_command uninstall -- roastpilot-agent; then
         pipx_command uninstall -- "roastpilot-agent$suffix" || true
         die "cannot remove prior application after staging replacement"
@@ -602,7 +605,7 @@ install_rendered_files() {
     unit_file="$(rooted_path /etc/systemd/system/roastpilot-agent.service)"
     prior_file="$var_dir/prior-static-hostname"
     model_dir="$var_dir/models"
-    ensure_agent_inactive
+    require_agent_inactive
     # Pin all mutable renderer output once, before any privileged destination
     # mutation.  The subsequent writes stream only these captured values.
     staged_env="$(capture_staged_file "$STAGE_DIR/roastpilot-agent.env" env)"
@@ -657,12 +660,15 @@ install_rendered_files() {
 
 ensure_agent_inactive() {
     local active_state
-    active_state="$(run_privileged systemctl show -p ActiveState --value roastpilot-agent)" \
-        || die "roastpilot-agent is not safely inactive; end any run safely, stop the service only when idle, then rerun the installer; never restart during a roast"
+    active_state="$(run_privileged systemctl show -p ActiveState --value roastpilot-agent)" || return 1
     case "$active_state" in
         inactive|failed) ;;
-        *) die "roastpilot-agent is not safely inactive; end any run safely, stop the service only when idle, then rerun the installer; never restart during a roast" ;;
+        *) return 1 ;;
     esac
+}
+
+require_agent_inactive() {
+    ensure_agent_inactive || die "roastpilot-agent is not safely inactive; end any run safely, stop the service only when idle, then rerun the installer; never restart during a roast"
 }
 
 enable_services() {
@@ -670,7 +676,7 @@ enable_services() {
     run_privileged systemctl enable --now avahi-daemon
     run_privileged systemctl enable roastpilot-agent
     if [[ "$START_SERVICE" == 1 ]]; then
-        ensure_agent_inactive
+        require_agent_inactive
         run_privileged systemctl start roastpilot-agent
     fi
 }
@@ -715,7 +721,7 @@ main() {
     preflight
     resolve_operator_identity
     preserve_existing_api_key
-    ensure_agent_inactive
+    require_agent_inactive
     run_privileged apt-get install -y libportaudio2 pipx avahi-daemon
     install_application
     resolve_appliance_executable
