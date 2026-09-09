@@ -313,7 +313,7 @@ def _pipx_state(path: Path, version: str, package: str) -> None:
 
 @pytest.mark.serial
 def test_real_renderer_outputs_pass_the_installer_closed_contract(
-    installer_harness: tuple[Path, dict[str, str], Path, Path], monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The committed renderer, not a retyped fixture, satisfies install.sh's validators."""
 
@@ -327,40 +327,70 @@ def test_real_renderer_outputs_pass_the_installer_closed_contract(
 
     monkeypatch.setattr(pwd, "getpwnam", non_root_user)
     monkeypatch.setattr(grp, "getgrnam", non_root_group)
-    _, environment, _, _ = installer_harness
     inputs = ApplianceRenderInputs(
         port=8123,
         operator_user="operator",
         operator_group="operators",
-        operator_home=Path(environment["FAKE_OPERATOR_HOME"]),
+        operator_home=Path("/home/operator"),
         db_path=Path("/var/lib/roastpilot-agent/roastpilot.sqlite3"),
         mcp_config_path=Path("/etc/roastpilot-agent/coffee-roaster-mcp.yaml"),
         model_dir=Path("/var/lib/roastpilot-agent/models"),
         serial_port=Path("/dev/ttyUSB0"),
         audio_device="USB mic",
     )
-    result = _run(
-        environment
-        | {
-            "FAKE_RENDERED_ENV": render_env_file(inputs),
-            "FAKE_RENDERED_YAML": render_mcp_yaml(inputs),
-            "FAKE_RENDERED_UNIT": render_service_unit(inputs),
-        },
-        "--set-hostname",
-        "roastpilot",
-        "--port",
-        "8123",
+    rendered_files = {
+        "env": render_env_file(inputs),
+        "yaml": render_mcp_yaml(inputs),
+        "unit": render_service_unit(inputs),
+    }
+    fixture_paths = {name: tmp_path / f"rendered-{name}" for name in rendered_files}
+    for name, rendered in rendered_files.items():
+        fixture_paths[name].write_bytes(rendered.encode())
+        fixture_paths[name].chmod(0o600)
+
+    installer_bytes = INSTALLER.read_bytes()
+    trailing_main = b'main "$@"\n'
+    assert installer_bytes.endswith(trailing_main)
+    sourceable_installer = tmp_path / "install-functions.sh"
+    sourceable_installer.write_bytes(installer_bytes.removesuffix(trailing_main))
+    sourceable_installer.chmod(0o600)
+
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("ROASTPILOT_")
+    } | {"PATH": "/usr/bin:/bin"}
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            """source "$1"
+PORT="$2"
+SERIAL_PORT="$3"
+AUDIO_DEVICE="$4"
+INVOKING_USER="$5"
+INVOKING_GROUP="$6"
+INVOKING_HOME="$7"
+validate_rendered_env "$(< "$8")"
+validate_rendered_yaml "$(< "$9")"
+validate_rendered_unit "$(< "${10}")"
+""",
+            "installer-contract",
+            str(sourceable_installer),
+            "8123",
+            "/dev/ttyUSB0",
+            "USB mic",
+            "operator",
+            "operators",
+            "/home/operator",
+            str(fixture_paths["env"]),
+            str(fixture_paths["yaml"]),
+            str(fixture_paths["unit"]),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
-    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
-    assert (
-        'port: "/dev/ttyUSB0"'
-        in (root / "etc/roastpilot-agent/coffee-roaster-mcp.yaml").read_text()
-    )
-    assert (
-        "--host 0.0.0.0 --port ${PORT}"
-        in (root / "etc/systemd/system/roastpilot-agent.service").read_text()
-    )
 
 
 def test_installer_model_identity_is_tied_to_the_manifest() -> None:
