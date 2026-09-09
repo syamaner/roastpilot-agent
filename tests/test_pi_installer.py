@@ -164,7 +164,7 @@ UNIT
   install) mode=0644; [ "${1:-}" = -m ] && { mode="$2"; shift 2; }
     [ "${1:-}" = -- ] && shift; cp "$1" "$2"; chmod "$mode" "$2" ;;
   mkdir) /bin/mkdir "$@" ;;
-  chmod) [ "${2:-}" = -- ] && { mode="$1"; shift 2; /bin/chmod "$mode" "$@"; } || /bin/chmod "$@" ;;
+  chmod) [ "${2:-}" = -- ] && { mode="$1"; shift 2; [ "${FAKE_CHMOD_FAIL_TARGET:-}" != "$1" ] || exit 23; /bin/chmod "$mode" "$@"; } || /bin/chmod "$@" ;;
   mktemp) is_dir=0; [ "${1:-}" = -d ] && { is_dir=1; shift; }; [ "${1:-}" = -- ] && shift; dir="${1%XXXXXX}fake"
     if [ "$is_dir" = 1 ]; then mkdir -p "$dir"; else mkdir -p "$(dirname "$dir")"; : > "$dir"; fi; printf '%s\\n' "$dir" ;;
   rm) /bin/rm "$@" ;;
@@ -989,6 +989,19 @@ def test_repair_inputs_are_rejected_before_privileged_work(
 
 
 @pytest.mark.serial
+def test_unsupported_equals_form_api_key_never_echoes_its_value(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Unsupported equals-form keys fail without disclosing their value."""
+    _, environment, log, _ = installer_harness
+    sentinel = "do-not-echo-this-api-key"
+    result = _run(environment, "--set-hostname", "roastpilot", f"--api-key={sentinel}")
+    assert result.returncode != 0
+    output = result.stdout + result.stderr + (log.read_text() if log.exists() else "")
+    assert sentinel not in output
+
+
+@pytest.mark.serial
 def test_secret_template_and_no_key_summary_fail_closed(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -1141,6 +1154,32 @@ def test_root_temp_is_cleaned_after_atomic_write_failure(
 
 
 @pytest.mark.serial
+def test_failed_root_lock_restores_operator_access_in_cleanup(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A lock-transition chmod failure still restores the operator-owned parent."""
+    _, environment, log, _ = installer_harness
+    var_dir = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / "var/lib/roastpilot-agent"
+    result = _run(
+        environment | {"FAKE_CHMOD_FAIL_TARGET": str(var_dir)}, "--set-hostname", "roastpilot"
+    )
+    assert result.returncode != 0
+    events = log.read_text().splitlines()
+    root_lock = next(
+        i for i, line in enumerate(events) if line == f"chown <root:root> <--> <{var_dir}>"
+    )
+    failed_chmod = next(
+        i for i, line in enumerate(events) if line == f"chmod <0700> <--> <{var_dir}>"
+    )
+    cleanup_unlock = next(
+        i
+        for i, line in enumerate(events[failed_chmod + 1 :], failed_chmod + 1)
+        if line == f"chown <operator:operators> <--> <{var_dir}>"
+    )
+    assert root_lock < failed_chmod < cleanup_unlock
+
+
+@pytest.mark.serial
 def test_repaired_input_bounds_and_test_mode_are_fail_closed(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -1157,6 +1196,22 @@ def test_repaired_input_bounds_and_test_mode_are_fail_closed(
     ):
         assert _run(environment, "--set-hostname", "roastpilot", *args).returncode != 0
     assert not log.exists()
+
+
+@pytest.mark.serial
+def test_production_rejects_redirected_test_root_before_privileged_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A production invocation refuses test-root redirection before any effect seam."""
+    _, environment, log, _ = installer_harness
+    redirected_root = tmp_path / "redirected-root"
+    production_environment = environment | {"ROASTPILOT_INSTALL_TEST_ROOT": str(redirected_root)}
+    production_environment.pop("ROASTPILOT_INSTALL_TEST_MODE")
+    result = _run(production_environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    assert "test destination is unavailable in production" in result.stderr
+    assert not log.exists()
+    assert not redirected_root.exists()
 
 
 @pytest.mark.serial  # The fake renderer lifecycle is process-scoped.
@@ -1316,6 +1371,8 @@ audio:
         base.replace(
             "local_model_dir: /var/lib/roastpilot-agent/models", "local_model_dir: /tmp/model"
         ),
+        base.replace("port: /dev/ttyUSB0", "port: /dev/ttyUSB1"),
+        base.replace("input_device: USB mic", "input_device: USB mic two"),
     ):
         start = len(log.read_text()) if log.exists() else 0
         result = _run(
@@ -1323,6 +1380,9 @@ audio:
         )
         assert result.returncode != 0
         assert not (root / "etc/roastpilot-agent/coffee-roaster-mcp.yaml").exists()
+        assert not (
+            root / "var/lib/roastpilot-agent/models/onnx/int8/model_quantized.onnx"
+        ).exists()
         assert not any(str(root / "etc/roastpilot-agent") in line for line in _delta(log, start))
 
 
@@ -1337,6 +1397,21 @@ def test_model_snapshot_digest_failure_precedes_live_destinations(
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     assert not (root / "etc").exists()
     assert not (root / "var/lib/roastpilot-agent/models/onnx/int8/model_quantized.onnx").exists()
+
+
+@pytest.mark.serial
+def test_promoted_model_files_are_mode_0644(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Promoted model destinations are world-readable, root-owned appliance assets."""
+    _, environment, _, _ = installer_harness
+    assert _run(environment, "--set-hostname", "roastpilot").returncode == 0
+    model_dir = (
+        Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+        / "var/lib/roastpilot-agent/models/onnx/int8"
+    )
+    assert stat.S_IMODE((model_dir / "model_quantized.onnx").stat().st_mode) == 0o644
+    assert stat.S_IMODE((model_dir / "preprocessor_config.json").stat().st_mode) == 0o644
 
 
 @pytest.mark.serial  # API-key cases exercise the same subprocess harness.

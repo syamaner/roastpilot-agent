@@ -137,7 +137,7 @@ parse_arguments() {
             --wheel) REQUESTED_WHEEL="${2:?--wheel needs a path}"; shift ;;
             --from-dir) MODEL_FROM_DIR="${2:?--from-dir needs a path}"; shift ;;
             --port) PORT="${2:?--port needs a value}"; shift ;;
-            --api-key) die "--api-key is not supported; use ROASTPILOT_INSTALL_API_KEY" ;;
+            --api-key|--api-key=*) die "--api-key is not supported; use ROASTPILOT_INSTALL_API_KEY" ;;
             --serial-port) SERIAL_PORT="${2:?--serial-port needs a path}"; shift ;;
             --audio-device) AUDIO_DEVICE="${2:?--audio-device needs a value}"; shift ;;
             --set-hostname) REQUESTED_HOSTNAME="${2:?--set-hostname needs a value}"; shift ;;
@@ -303,9 +303,7 @@ resolve_appliance_executable() {
 }
 
 install_model_and_render() {
-    local model_dir stage_dir stage_parent model_stage etc_dir db_path yaml_path
-    model_dir="$(rooted_path /var/lib/roastpilot-agent/models)"
-    validate_destination "$model_dir"
+    local stage_dir stage_parent model_stage
     stage_parent="$(rooted_path /tmp)"
     validate_destination "$stage_parent"
     run_privileged mkdir -p -- "$stage_parent"
@@ -323,13 +321,10 @@ install_model_and_render() {
     fi
     # Do not promote model bytes yet: every renderer output is pinned and
     # checked before the installer mutates an appliance destination.
-    etc_dir="$(rooted_path /etc/roastpilot-agent)"
-    db_path="/var/lib/roastpilot-agent/roastpilot.sqlite3"
-    yaml_path="/etc/roastpilot-agent/coffee-roaster-mcp.yaml"
     "$APPLIANCE_EXECUTABLE" appliance render --output-dir "$stage_dir" --port "$PORT" \
         --operator-user "$INVOKING_USER" --operator-group "$INVOKING_GROUP" --operator-home "$INVOKING_HOME" --serial-port "$SERIAL_PORT" \
         --audio-device "$AUDIO_DEVICE" --model-dir /var/lib/roastpilot-agent/models \
-        --mcp-config-path "$yaml_path" --db-path "$db_path"
+        --mcp-config-path /etc/roastpilot-agent/coffee-roaster-mcp.yaml --db-path /var/lib/roastpilot-agent/roastpilot.sqlite3
 }
 
 promote_model_file() {
@@ -460,9 +455,9 @@ install_rendered_files() {
     validate_destination "$var_dir"
     run_privileged test -d "$var_dir"
     run_privileged test ! -L "$var_dir"
+    LOCKED_VAR_DIR="$var_dir"
     run_privileged chown root:root -- "$var_dir"
     run_privileged chmod 0700 -- "$var_dir"
-    LOCKED_VAR_DIR="$var_dir"
     promote_model_file "$STAGE_DIR/models/onnx/int8/model_quantized.onnx" "$model_dir/onnx/int8/model_quantized.onnx" "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df"
     promote_model_file "$STAGE_DIR/models/onnx/int8/preprocessor_config.json" "$model_dir/onnx/int8/preprocessor_config.json" "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231"
     install_content_atomically "$final_env" "$env_file" 0600 "$INVOKING_USER:$INVOKING_GROUP" roastpilot-env
