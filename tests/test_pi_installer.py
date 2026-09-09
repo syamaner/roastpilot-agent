@@ -238,7 +238,11 @@ UNIT
     [ "${FAKE_SYSTEMCTL_FAIL:-}" != "${1:-}" ] || exit 31
     if [ "${1:-}" = show ]; then
       [ "${2:-}" = -p ] && [ "${3:-}" = ActiveState ] && [ "${4:-}" = --value ] || exit 32
-      if [ "${FAKE_SERVICE_STATE+x}" = x ]; then printf '%s\\n' "$FAKE_SERVICE_STATE"; else echo inactive; fi
+      if [ -n "${FAKE_SERVICE_STATE_SEQUENCE:-}" ]; then
+        count=0; [ ! -e "$FAKE_SERVICE_STATE_COUNTER" ] || count=$(cat "$FAKE_SERVICE_STATE_COUNTER")
+        count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_SERVICE_STATE_COUNTER"
+        /usr/bin/sed -n "${count}p" "$FAKE_SERVICE_STATE_SEQUENCE"
+      elif [ "${FAKE_SERVICE_STATE+x}" = x ]; then printf '%s\\n' "$FAKE_SERVICE_STATE"; else echo inactive; fi
       exit 0
     fi
     if [ "${1:-}" = is-active ]; then
@@ -307,6 +311,7 @@ esac
         "FAKE_PIPX_HOME": str(pipx_home),
         "FAKE_PIPX_ENV_LOG": str(tmp_path / "pipx-environment.log"),
         "FAKE_GROUPS": str(groups),
+        "FAKE_SERVICE_STATE_COUNTER": str(tmp_path / "service-state-counter"),
         "ROASTPILOT_INSTALL_TEST_MODE": "1",
         "ROASTPILOT_INSTALL_TEST_ROOT": str(tmp_path / "root"),
         "ROASTPILOT_INSTALL_OS_RELEASE": str(os_release),
@@ -2142,3 +2147,25 @@ def test_child_processes_do_not_receive_exported_secret_sentinels(
     )
     assert "installer-sentinel" in env_file.read_text()
     assert "installer-sentinel" not in result.stdout + result.stderr + child_env
+
+
+@pytest.mark.serial
+def test_state_sequence_blocks_prior_uninstall(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """The uninstall boundary rechecks state after the initial safe probe."""
+    _, environment, log, _ = installer_harness
+    sequence = tmp_path / "states"
+    sequence.write_text("inactive\nactivating\n")
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+    result = _run(
+        environment | {"FAKE_SERVICE_STATE_SEQUENCE": str(sequence)},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    assert result.returncode != 0 and "never restart during a roast" in result.stderr
+    events = log.read_text().splitlines()
+    assert events.count("systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>") == 2
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
