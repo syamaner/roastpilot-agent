@@ -14,7 +14,9 @@ run_privileged() {
     # This is deliberately the sole privilege seam.  Test mode removes
     # privilege; it never redirects a production privileged command.
     if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" == "1" ]]; then
-        "$@"
+        # `test` is a Bash builtin: force its test-only invocation through PATH
+        # so the fake harness observes the same external-command boundary as sudo.
+        if [[ "${1:-}" == "test" ]]; then /usr/bin/env -- "$@"; else "$@"; fi
     else
         /usr/bin/sudo -- "$@"
     fi

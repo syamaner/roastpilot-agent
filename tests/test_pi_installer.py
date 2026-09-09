@@ -214,7 +214,7 @@ UNIT
   tee) [ "${1:-}" = -- ] && shift; [ "${FAKE_TEE_FAIL:-}" != 1 ] || exit 19; [ "${FAKE_TEE_FAIL_TARGET:-}" != "$1" ] || exit 19; mkdir -p "$(dirname "$1")"; cat > "$1" ;;
   install) mode=0644; [ "${1:-}" = -m ] && { mode="$2"; shift 2; }
     [ "${1:-}" = -- ] && shift; cp "$1" "$2"; chmod "$mode" "$2" ;;
-  test) [ -z "${FAKE_TEST_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_TEST_FAIL_PATH" ] || exit 41; /usr/bin/test "$@" ;;
+  test) [ -z "${FAKE_TEST_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_TEST_FAIL_PATH" ] || exit 41; /bin/test "$@" ;;
   mkdir) /bin/mkdir "$@" ;;
   chmod) [ "${2:-}" = -- ] && { mode="$1"; shift 2; [ "${FAKE_CHMOD_FAIL_TARGET:-}" != "$1" ] || exit 23; /bin/chmod "$mode" "$@"; } || /bin/chmod "$@" ;;
   mktemp) is_dir=0; [ "${1:-}" = -d ] && { is_dir=1; shift; }; [ "${1:-}" = -- ] && shift; dir="${1%XXXXXX}fake"
@@ -2401,9 +2401,16 @@ def test_failed_configuration_generation_restores_the_prior_live_set(
             if event.startswith(("cp ", "rm ")) and "roastpilot-config-rollback" not in event
         ]
         assert reloads[-1] > max(restores)
-        assert any(
-            "test <-f>" in event and "roastpilot-config-rollback" in event for event in events
-        )
+        # Each member is inspected through the privileged seam; this is a
+        # mutation guard against replacing any check with shell-local syntax.
+        for name in ("roastpilot-agent.env", "coffee-roaster-mcp.yaml", "roastpilot-agent.service"):
+            snapshot = next(
+                event.split(" <")[-1].rstrip(">")
+                for event in events
+                    if event.startswith("test <-f>") and event.endswith(f"{name}>")
+            )
+            assert f"test <-f> <{snapshot}>" in events
+            assert f"test <-L> <{snapshot}>" in events
         snapshot_chmod = next(
             event
             for event in events
@@ -2445,7 +2452,9 @@ def test_rollback_failure_still_reloads_and_discards_snapshot(
         "COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
     )
     (etc / "coffee-roaster-mcp.yaml").write_text("old-yaml\n")
-    (unit_dir / "roastpilot-agent.service").write_text("[Service]\nUser=operator\nGroup=operators\n")
+    (unit_dir / "roastpilot-agent.service").write_text(
+        "[Service]\nUser=operator\nGroup=operators\n"
+    )
     before = _live_config_state(root)
     counter = root.parent / "daemon-count"
     result = _run(
@@ -2472,6 +2481,60 @@ def test_rollback_failure_still_reloads_and_discards_snapshot(
         any(word in event for word in ("start", "stop", "restart", "kill", "disable"))
         and "roastpilot-agent" in event
         for event in events
+    )
+
+
+@pytest.mark.serial
+def test_rollback_cp_failure_continues_to_later_members_and_cleanup(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A YAML restore failure cannot skip unit restoration, reload, or snapshot deletion."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    etc, unit_dir = root / "etc/roastpilot-agent", root / "etc/systemd/system"
+    etc.mkdir(parents=True)
+    unit_dir.mkdir(parents=True)
+    env, yaml, unit = (
+        etc / "roastpilot-agent.env",
+        etc / "coffee-roaster-mcp.yaml",
+        unit_dir / "roastpilot-agent.service",
+    )
+    env.write_text(
+        "OPENROUTER_API_KEY=old\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+    )
+    yaml.write_bytes(b"prior-yaml\n")
+    unit.write_bytes(b"[Service]\nUser=operator\nGroup=operators\n")
+    for path, mode in ((env, 0o600), (yaml, 0o640), (unit, 0o644)):
+        path.chmod(mode)
+    before = _live_config_state(root)
+    result = _run(
+        environment | {"FAKE_SYSTEMCTL_FAIL": "enable", "FAKE_CP_FAIL_PATH": str(yaml)},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0 and "manual reconciliation required" in result.stderr
+    events = log.read_text().splitlines()
+    failed_cp = next(
+        i
+        for i, event in enumerate(events)
+        if event.startswith("cp <-p>") and event.endswith(f"> <{yaml}>")
+    )
+    failed_source = events[failed_cp].split("> <")[2]
+    assert "roastpilot-config-rollback" in failed_source
+    unit_cp = next(
+        i
+        for i, event in enumerate(events)
+        if i > failed_cp and event.endswith(f"> <{unit}>") and event.startswith("cp <-p>")
+    )
+    reload = max(i for i, event in enumerate(events) if event == "systemctl <daemon-reload>")
+    assert reload > unit_cp and any(
+        event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event for event in events
+    )
+    assert not list((root / "tmp").glob("roastpilot-config-rollback.*"))
+    assert (
+        _live_config_state(root)["env"] == before["env"]
+        and _live_config_state(root)["unit"] == before["unit"]
+        and _live_config_state(root)["yaml"] != before["yaml"]
     )
 
 
