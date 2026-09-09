@@ -214,6 +214,7 @@ UNIT
   tee) [ "${1:-}" = -- ] && shift; [ "${FAKE_TEE_FAIL:-}" != 1 ] || exit 19; [ "${FAKE_TEE_FAIL_TARGET:-}" != "$1" ] || exit 19; mkdir -p "$(dirname "$1")"; cat > "$1" ;;
   install) mode=0644; [ "${1:-}" = -m ] && { mode="$2"; shift 2; }
     [ "${1:-}" = -- ] && shift; cp "$1" "$2"; chmod "$mode" "$2" ;;
+  test) /usr/bin/test "$@" ;;
   mkdir) /bin/mkdir "$@" ;;
   chmod) [ "${2:-}" = -- ] && { mode="$1"; shift 2; [ "${FAKE_CHMOD_FAIL_TARGET:-}" != "$1" ] || exit 23; /bin/chmod "$mode" "$@"; } || /bin/chmod "$@" ;;
   mktemp) is_dir=0; [ "${1:-}" = -d ] && { is_dir=1; shift; }; [ "${1:-}" = -- ] && shift; dir="${1%XXXXXX}fake"
@@ -275,6 +276,7 @@ esac
         "systemctl",
         "grep",
         "tr",
+        "test",
     ):
         (fake_bin / name).symlink_to(fake)
     agent = fake_bin / "roastpilot-agent"
@@ -2387,6 +2389,22 @@ def test_failed_configuration_generation_restores_the_prior_live_set(
     events = Path(environment["FAKE_LOG"]).read_text().splitlines()
     if failure == "enable":
         assert events.count("systemctl <daemon-reload>") == 2
+        reloads = [i for i, event in enumerate(events) if event == "systemctl <daemon-reload>"]
+        restores = [
+            i
+            for i, event in enumerate(events)
+            if event.startswith(("cp ", "rm ")) and "roastpilot-config-rollback" not in event
+        ]
+        assert reloads[-1] > max(restores)
+        assert any(
+            "test <-f>" in event and "roastpilot-config-rollback" in event for event in events
+        )
+        snapshot_chmod = next(
+            event
+            for event in events
+            if "roastpilot-config-rollback" in event and event.startswith("chmod ")
+        )
+        assert "<0700>" in snapshot_chmod
         assert not any(
             "systemctl <start> <roastpilot-agent>" in event
             or any(word in event for word in ("restart", "try-restart", "stop", "kill"))
@@ -2454,6 +2472,11 @@ def test_matching_existing_unit_identity_allows_maintenance(
     assert committed["env"] is not None and b"PORT=8000" in committed["env"][0]
     assert committed["yaml"] is not None and b"transport:" in committed["yaml"][0]
     assert committed["unit"] is not None and b"Description=RoastPilot" in committed["unit"][0]
+    assert not list(
+        (Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / "tmp").glob(
+            "roastpilot-config-rollback.*"
+        )
+    )
 
 
 @pytest.mark.serial

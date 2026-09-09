@@ -245,6 +245,7 @@ verify_existing_unit_identity() {
     [[ ! -e "$unit_file" && ! -L "$unit_file" ]] && return 0
     [[ -f "$unit_file" && ! -L "$unit_file" && -r "$unit_file" ]] || die "existing managed unit identity is unsafe"
     while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#"${line%%[![:space:]]*}"}"
         case "$line" in
             User=*)
                 ((user_seen++ == 0)) || die "existing managed unit identity is malformed"
@@ -278,24 +279,32 @@ snapshot_live_configuration() {
 }
 
 restore_live_configuration() {
-    local destination name
+    local destination name failed=0
     [[ "${CONFIG_TRANSACTION_ACTIVE:-0}" == 1 ]] || return 0
     for destination in "$@"; do
         name="${destination##*/}"
-        recheck_sensitive_destination "$destination"
-        if [[ -f "$CONFIG_SNAPSHOT_DIR/$name" ]]; then
-            [[ ! -L "$CONFIG_SNAPSHOT_DIR/$name" ]] || die "configuration snapshot is unsafe"
-            run_privileged cp -p -- "$CONFIG_SNAPSHOT_DIR/$name" "$destination"
+        if ! recheck_sensitive_destination "$destination"; then
+            failed=1
+        elif run_privileged test -f "$CONFIG_SNAPSHOT_DIR/$name"; then
+            if run_privileged test -L "$CONFIG_SNAPSHOT_DIR/$name" || ! run_privileged cp -p -- "$CONFIG_SNAPSHOT_DIR/$name" "$destination"; then
+                failed=1
+            fi
+        elif run_privileged test -e "$CONFIG_SNAPSHOT_DIR/$name" || run_privileged test -L "$CONFIG_SNAPSHOT_DIR/$name"; then
+            failed=1
+        elif ! run_privileged rm -f -- "$destination"; then
+            failed=1
         else
-            run_privileged rm -f -- "$destination"
+            :
         fi
     done
-    run_privileged systemctl daemon-reload || die "cannot reload restored appliance configuration"
+    run_privileged systemctl daemon-reload || failed=1
     CONFIG_TRANSACTION_ACTIVE=0
+    return "$failed"
 }
 
 discard_configuration_snapshot() {
-    [[ -z "${CONFIG_SNAPSHOT_DIR:-}" ]] || run_privileged rm -rf -- "$CONFIG_SNAPSHOT_DIR"
+    [[ -z "${CONFIG_SNAPSHOT_DIR:-}" ]] && return 0
+    run_privileged rm -rf -- "$CONFIG_SNAPSHOT_DIR" || return 1
     CONFIG_SNAPSHOT_DIR=""
 }
 
@@ -760,7 +769,8 @@ main() {
     CONFIG_SNAPSHOT_DIR=""
     CONFIG_TRANSACTION_ACTIVE=0
     cleanup() {
-        local temporary
+        local temporary original_status=$? cleanup_failed=0
+        trap - EXIT
         for temporary in "${ROOT_TEMPORARIES[@]:-}"; do
             [[ -z "$temporary" ]] || run_privileged rm -f -- "$temporary" || true
         done
@@ -771,8 +781,13 @@ main() {
             run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$LOCKED_VAR_DIR" || true
             run_privileged chmod 0700 -- "$LOCKED_VAR_DIR" || true
         fi
-        restore_live_configuration "$(rooted_path /etc/roastpilot-agent/roastpilot-agent.env)" "$(rooted_path /etc/roastpilot-agent/coffee-roaster-mcp.yaml)" "$(rooted_path /etc/systemd/system/roastpilot-agent.service)"
-        discard_configuration_snapshot
+        restore_live_configuration "$(rooted_path /etc/roastpilot-agent/roastpilot-agent.env)" "$(rooted_path /etc/roastpilot-agent/coffee-roaster-mcp.yaml)" "$(rooted_path /etc/systemd/system/roastpilot-agent.service)" || cleanup_failed=1
+        discard_configuration_snapshot || cleanup_failed=1
+        if [[ "$cleanup_failed" == 1 ]]; then
+            printf '%s\n' "install failed: rollback incomplete; manual reconciliation required" >&2
+            return 1
+        fi
+        return "$original_status"
     }
     trap cleanup EXIT
     # Test mode is deliberately unprivileged.  Every production lookup starts
