@@ -3,13 +3,24 @@
 
 from __future__ import annotations
 
+import grp
 import json
 import os
+import pwd
 import stat
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+from roastpilot_agent.appliance.model_manifest import MANIFEST_FILES, REVISION
+from roastpilot_agent.appliance.render import (
+    ApplianceRenderInputs,
+    render_env_file,
+    render_mcp_yaml,
+    render_service_unit,
+)
 
 INSTALLER = Path(__file__).parents[1] / "packaging/pi/install.sh"
 
@@ -95,7 +106,7 @@ transport:
   type: stdio
 roaster:
   driver: hottop_kn8828b_2k_plus
-  port: /dev/ttyUSB0
+  port: "/dev/ttyUSB0"
   baudrate: 115200
   temperature_unit: auto
   command_interval_seconds: 0.3
@@ -109,7 +120,7 @@ first_crack:
   repo_id: syamaner/coffee-first-crack-detection
   revision: b349a919c34b6130472da97c01817be404e4f629
   precision: int8
-  local_model_dir: /var/lib/roastpilot-agent/models
+  local_model_dir: "/var/lib/roastpilot-agent/models"
   onnx_threads: 2
   confidence_threshold: 0.90
   min_positive_windows: 3
@@ -117,7 +128,7 @@ first_crack:
   allow_manual_override: true
 audio:
   source: microphone
-  input_device: USB mic
+  input_device: "USB mic"
   sample_rate: 16000
   wav_path: null
   replay_mode: realtime
@@ -300,6 +311,67 @@ def _pipx_state(path: Path, version: str, package: str) -> None:
     )
 
 
+@pytest.mark.serial
+def test_real_renderer_outputs_pass_the_installer_closed_contract(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The committed renderer, not a retyped fixture, satisfies install.sh's validators."""
+
+    def non_root_user(_: str) -> SimpleNamespace:
+        """Supply the fake appliance operator without consulting host accounts."""
+        return SimpleNamespace(pw_uid=1000)
+
+    def non_root_group(_: str) -> SimpleNamespace:
+        """Supply the fake appliance group without consulting host accounts."""
+        return SimpleNamespace(gr_gid=1000)
+
+    monkeypatch.setattr(pwd, "getpwnam", non_root_user)
+    monkeypatch.setattr(grp, "getgrnam", non_root_group)
+    _, environment, _, _ = installer_harness
+    inputs = ApplianceRenderInputs(
+        port=8123,
+        operator_user="operator",
+        operator_group="operators",
+        operator_home=Path(environment["FAKE_OPERATOR_HOME"]),
+        db_path=Path("/var/lib/roastpilot-agent/roastpilot.sqlite3"),
+        mcp_config_path=Path("/etc/roastpilot-agent/coffee-roaster-mcp.yaml"),
+        model_dir=Path("/var/lib/roastpilot-agent/models"),
+        serial_port=Path("/dev/ttyUSB0"),
+        audio_device="USB mic",
+    )
+    result = _run(
+        environment
+        | {
+            "FAKE_RENDERED_ENV": render_env_file(inputs),
+            "FAKE_RENDERED_YAML": render_mcp_yaml(inputs),
+            "FAKE_RENDERED_UNIT": render_service_unit(inputs),
+        },
+        "--set-hostname",
+        "roastpilot",
+        "--port",
+        "8123",
+    )
+    assert result.returncode == 0, result.stderr
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    assert (
+        'port: "/dev/ttyUSB0"'
+        in (root / "etc/roastpilot-agent/coffee-roaster-mcp.yaml").read_text()
+    )
+    assert (
+        "--host 0.0.0.0 --port ${PORT}"
+        in (root / "etc/systemd/system/roastpilot-agent.service").read_text()
+    )
+
+
+def test_installer_model_identity_is_tied_to_the_manifest() -> None:
+    """Installer pin literals stay coupled to the Python manifest source of truth."""
+    source = INSTALLER.read_text()
+    assert REVISION in source
+    for manifest_file in MANIFEST_FILES:
+        assert manifest_file.relative_path in source
+        assert manifest_file.sha256 in source
+
+
 @pytest.mark.serial  # The subprocess installer shares fake PATH command state.
 def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
@@ -343,6 +415,23 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     )
     assert f"chown <operator:operators> <--> <{var_dir}>" in commands
     assert f"chmod <0700> <--> <{var_dir}>" in commands
+    first_root_lock = next(
+        index for index, line in enumerate(commands) if line == f"chmod <0700> <--> <{var_dir}>"
+    )
+    first_root_owner = next(
+        index
+        for index, line in enumerate(commands)
+        if line == f"chown <root:root> <--> <{var_dir}>"
+    )
+    first_model_promotion = next(
+        index
+        for index, line in enumerate(commands)
+        if ".roastpilot-model.fake" in line and line.startswith("tee ")
+    )
+    operator_unlock = max(
+        index for index, line in enumerate(commands) if line == f"chmod <0700> <--> <{var_dir}>"
+    )
+    assert first_root_owner < first_root_lock < first_model_promotion < operator_unlock
     yaml_file = root / "etc/roastpilot-agent/coffee-roaster-mcp.yaml"
     unit_file = root / "etc/systemd/system/roastpilot-agent.service"
     prior_file = root / "var/lib/roastpilot-agent/prior-static-hostname"
@@ -366,6 +455,8 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
         for line in second_commands
     )
     assert not any("set-hostname" in line for line in second_commands)
+    assert f"chown <root:root> <--> <{var_dir}>" in second_commands
+    assert f"chown <operator:operators> <--> <{var_dir}>" in second_commands
     assert (
         sum(
             line.startswith("roastpilot-agent <appliance> <model> <install>")
@@ -842,7 +933,13 @@ def test_repair_inputs_are_rejected_before_privileged_work(
         ("--port", "0"),
         ("--port", "65536"),
         ("--serial-port", "/dev/tty\nUSB0"),
+        ("--serial-port", "/dev/tty#USB0"),
+        ("--serial-port", '/dev/tty"USB0'),
+        ("--serial-port", "/dev/tty\\USB0"),
         ("--audio-device", "mic\rname"),
+        ("--audio-device", "mic#name"),
+        ("--audio-device", 'mic"name'),
+        ("--audio-device", "mic\\name"),
         ("--from-dir", "relative"),
         ("--from-dir", str(source / "..")),
     ):
@@ -924,6 +1021,85 @@ def test_rendered_unit_and_atomic_env_repairs_fail_before_live_writes(
         "roastpilot",
     )
     assert result.returncode != 0 and env_file.read_bytes() == before
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("field", "mutation"),
+    [
+        ("FAKE_RENDERED_ENV", "PORT=8000 #\\\nROASTPILOT_DB=/tmp/evil"),
+        ("FAKE_RENDERED_ENV", "PORT=8000; ROASTPILOT_DB=/tmp/evil"),
+        (
+            "FAKE_RENDERED_UNIT",
+            "KillMode=mixed #\\\nTimeoutStopSec=30",
+        ),
+        ("FAKE_RENDERED_UNIT", "ExecStart=/bin/true # hidden"),
+    ],
+)
+def test_unit_and_env_comment_or_continuation_mutations_fail_closed(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], field: str, mutation: str
+) -> None:
+    """Unit/env validators never erase inline comments, semicolons, or continuations."""
+    _, environment, log, _ = installer_harness
+    start = len(log.read_text()) if log.exists() else 0
+    result = _run(environment | {field: mutation}, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    assert not any("systemctl" in line for line in _delta(log, start))
+
+
+@pytest.mark.serial
+def test_existing_service_dropin_refuses_before_unit_write_or_enable(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """An existing drop-in is a fail-closed active-service-upgrade boundary."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    dropin = root / "etc/systemd/system/roastpilot-agent.service.d"
+    dropin.mkdir(parents=True)
+    start = len(log.read_text()) if log.exists() else 0
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    events = _delta(log, start)
+    assert not any("roastpilot-unit" in line for line in events)
+    assert not any("systemctl <enable> <roastpilot-agent>" in line for line in events)
+
+
+@pytest.mark.serial
+def test_model_digests_cover_stage_root_snapshot_and_destination(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Each pinned model file is checked before, during, and after promotion."""
+    _, environment, log, _ = installer_harness
+    assert _run(environment, "--set-hostname", "roastpilot").returncode == 0
+    digests = [line for line in log.read_text().splitlines() if line.startswith("sha256sum ")]
+    assert len(digests) == 6
+    assert sum("roastpilot-install.fake/models/" in line for line in digests) == 2
+    assert sum(".roastpilot-model.fake" in line for line in digests) == 2
+    assert (
+        sum(
+            "/var/lib/roastpilot-agent/models/onnx/int8/" in line
+            and "roastpilot-install" not in line
+            and ".roastpilot-model" not in line
+            for line in digests
+        )
+        == 2
+    )
+
+
+@pytest.mark.serial
+def test_root_temp_is_cleaned_after_atomic_write_failure(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A failed root-temp write removes both the temp and the staging directory."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment | {"FAKE_TEE_FAIL": "1"}, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    events = log.read_text().splitlines()
+    assert any("rm <-f> <-->" in line and ".roastpilot-model.fake" in line for line in events)
+    assert not list(
+        (root / "var/lib/roastpilot-agent/models/onnx/int8").glob(".roastpilot-model.*")
+    )
 
 
 @pytest.mark.serial

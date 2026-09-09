@@ -147,6 +147,8 @@ parse_arguments() {
     [[ -z "$API_KEY" || "$API_KEY" =~ ^[A-Za-z0-9._:-]+$ ]] || die "API key contains unsafe EnvironmentFile characters"
     validate_no_control_characters "$SERIAL_PORT" "serial port"
     validate_no_control_characters "$AUDIO_DEVICE" "audio device"
+    [[ "$SERIAL_PORT" != *'#'* && "$SERIAL_PORT" != *'"'* && "$SERIAL_PORT" != *\\* ]] || die "serial port contains ambiguous YAML characters"
+    [[ "$AUDIO_DEVICE" != *'#'* && "$AUDIO_DEVICE" != *'"'* && "$AUDIO_DEVICE" != *\\* ]] || die "audio device contains ambiguous YAML characters"
     [[ "$PORT" =~ ^[0-9]+$ && "$PORT" -ge 1024 && "$PORT" -le 65535 ]] || die "port must be a decimal number from 1024 to 65535"
     [[ "$SERIAL_PORT" == /dev/* && "$SERIAL_PORT" != *[[:space:]]* ]] || die "serial port must be an absolute /dev path"
     [[ "$AUDIO_DEVICE" == "${AUDIO_DEVICE#"${AUDIO_DEVICE##[![:space:]]}"}" && "$AUDIO_DEVICE" == "${AUDIO_DEVICE%"${AUDIO_DEVICE##*[![:space:]]}"}" && "$AUDIO_DEVICE" != *'@@'* ]] || die "audio device is unsafe"
@@ -354,7 +356,7 @@ capture_staged_file() {
 validate_rendered_env() {
     local content="$1" expected
     expected=$'OPENROUTER_API_KEY=\nPORT='"$PORT"$'\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml'
-    [[ "$(printf '%s\n' "$content" | normalise_contract)" == "$expected" ]] || die "rendered env violates appliance contract"
+    [[ "$(normalise_unit_env_contract "$content")" == "$expected" ]] || die "rendered env violates appliance contract"
 }
 
 install_content_atomically() {
@@ -371,22 +373,45 @@ install_content_atomically() {
     ROOT_TEMPORARIES=("${ROOT_TEMPORARIES[@]/$temporary}")
 }
 
-normalise_contract() {
+normalise_unit_env_contract() {
+    local content="$1" line normalised=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" != *'#'* && "$line" != *';'* && "$line" != *\\* ]] || die "rendered unit/env contains an unsafe inline mutation"
+        normalised+="$line"$'\n'
+    done <<< "$content"
+    printf '%s' "${normalised%$'\n'}"
+}
+
+normalise_yaml_contract() {
     sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d'
 }
 
 validate_rendered_unit() {
     local unit="$1" expected actual
     expected=$'[Unit]\nDescription=RoastPilot agent (native Pi appliance)\nAfter=network-online.target sound.target\nWants=network-online.target\n[Service]\nType=simple\nUser='"$INVOKING_USER"$'\nGroup='"$INVOKING_GROUP"$'\nEnvironmentFile=/etc/roastpilot-agent/roastpilot-agent.env\nExecStart='"$INVOKING_HOME"$'/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}\nWorkingDirectory=~\nRestart=on-failure\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=30\nNoNewPrivileges=true\nPrivateTmp=true\n[Install]\nWantedBy=multi-user.target'
-    actual="$(printf '%s\n' "$unit" | normalise_contract)"
+    actual="$(normalise_unit_env_contract "$unit")"
     [[ "$actual" == "$expected" ]] || die "rendered unit violates appliance contract"
 }
 
 validate_rendered_yaml() {
     local yaml="$1" expected actual
-    expected=$'transport:\n  type: stdio\nroaster:\n  driver: hottop_kn8828b_2k_plus\n  port: '"$SERIAL_PORT"$'\n  baudrate: 115200\n  temperature_unit: auto\n  command_interval_seconds: 0.3\nsession:\n  auto_t0_detection_enabled: true\n  auto_t0_drop_threshold_c: 15.0\n  ror_window_seconds: 60\n  ror_min_sample_seconds: 10\nfirst_crack:\n  mode: audio\n  repo_id: syamaner/coffee-first-crack-detection\n  revision: b349a919c34b6130472da97c01817be404e4f629\n  precision: int8\n  local_model_dir: /var/lib/roastpilot-agent/models\n  onnx_threads: 2\n  confidence_threshold: 0.90\n  min_positive_windows: 3\n  confirmation_window_seconds: 30.0\n  allow_manual_override: true\naudio:\n  source: microphone\n  input_device: '"$AUDIO_DEVICE"$'\n  sample_rate: 16000\n  wav_path: null\n  replay_mode: realtime\n  window_seconds: 10.0\n  overlap: 0.3\n  hop_seconds: null'
-    actual="$(printf '%s\n' "$yaml" | normalise_contract)"
+    expected=$'transport:\n  type: stdio\nroaster:\n  driver: hottop_kn8828b_2k_plus\n  port: "'"$SERIAL_PORT"$'"\n  baudrate: 115200\n  temperature_unit: auto\n  command_interval_seconds: 0.3\nsession:\n  auto_t0_detection_enabled: true\n  auto_t0_drop_threshold_c: 15.0\n  ror_window_seconds: 60\n  ror_min_sample_seconds: 10\nfirst_crack:\n  mode: audio\n  repo_id: syamaner/coffee-first-crack-detection\n  revision: b349a919c34b6130472da97c01817be404e4f629\n  precision: int8\n  local_model_dir: "/var/lib/roastpilot-agent/models"\n  onnx_threads: 2\n  confidence_threshold: 0.90\n  min_positive_windows: 3\n  confirmation_window_seconds: 30.0\n  allow_manual_override: true\naudio:\n  source: microphone\n  input_device: "'"$AUDIO_DEVICE"$'"\n  sample_rate: 16000\n  wav_path: null\n  replay_mode: realtime\n  window_seconds: 10.0\n  overlap: 0.3\n  hop_seconds: null'
+    actual="$(printf '%s\n' "$yaml" | normalise_yaml_contract)"
     [[ "$actual" == "$expected" ]] || die "rendered MCP YAML violates appliance contract"
+}
+
+build_final_env() {
+    local validated="$1" line final=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            OPENROUTER_API_KEY=) line="OPENROUTER_API_KEY=$API_KEY" ;;
+            PORT="$PORT"|ROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3|COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml) ;;
+            *) die "validated env has an unexpected assignment" ;;
+        esac
+        final+="$line"$'\n'
+    done <<< "$validated"
+    printf '%s' "${final%$'\n'}"
 }
 
 install_rendered_files() {
@@ -409,7 +434,7 @@ install_rendered_files() {
     validate_rendered_unit "$staged_unit"
     validate_model_stage_file "$STAGE_DIR/models/onnx/int8/model_quantized.onnx" "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df"
     validate_model_stage_file "$STAGE_DIR/models/onnx/int8/preprocessor_config.json" "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231"
-    final_env="${staged_env/OPENROUTER_API_KEY=/OPENROUTER_API_KEY=$API_KEY}"
+    final_env="$(build_final_env "$(normalise_unit_env_contract "$staged_env")")"
     prepare_destination_parents "$env_file" "$yaml_file" "$unit_file" "$prior_file" "$model_dir"
     # Keep model placement root-owned while leaf bytes are promoted.
     # This is a directory boundary, not a file destination: require the
@@ -418,7 +443,7 @@ install_rendered_files() {
     run_privileged test -d "$var_dir"
     run_privileged test ! -L "$var_dir"
     run_privileged chown root:root -- "$var_dir"
-    run_privileged chmod 0755 -- "$var_dir"
+    run_privileged chmod 0700 -- "$var_dir"
     promote_model_file "$STAGE_DIR/models/onnx/int8/model_quantized.onnx" "$model_dir/onnx/int8/model_quantized.onnx" "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df"
     promote_model_file "$STAGE_DIR/models/onnx/int8/preprocessor_config.json" "$model_dir/onnx/int8/preprocessor_config.json" "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231"
     install_content_atomically "$final_env" "$env_file" 0600 "$INVOKING_USER:$INVOKING_GROUP" roastpilot-env
