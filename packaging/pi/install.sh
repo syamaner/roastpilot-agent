@@ -242,18 +242,26 @@ resolve_operator_identity() {
 }
 
 verify_existing_unit_identity() {
-    local unit_file dropin_dir line user_seen=0 group_seen=0 unit_user="" unit_group=""
+    local unit_file line section="" user_seen=0 group_seen=0 service_seen=0 unit_user="" unit_group=""
     unit_file="$(rooted_path /etc/systemd/system/roastpilot-agent.service)"
-    dropin_dir="${unit_file}.d"
-    [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
+    verify_no_service_dropins
     [[ ! -e "$unit_file" && ! -L "$unit_file" ]] && return 0
     [[ -f "$unit_file" && ! -L "$unit_file" && -r "$unit_file" ]] || die "existing managed unit identity is unsafe"
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line#"${line%%[![:space:]]*}"}"
-        if [[ "$line" =~ ^User[[:space:]]*=[[:space:]]*([a-z_][a-z0-9_-]*)[[:space:]]*$ ]]; then
+        if [[ "$line" =~ ^\[([A-Za-z][A-Za-z0-9]*)\][[:space:]]*$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            if [[ "$section" == Service ]]; then
+                ((service_seen++ == 0)) || die "existing managed unit identity is malformed"
+            fi
+        elif [[ "$line" == \[* ]]; then
+            die "existing managed unit identity is malformed"
+        elif [[ "$line" =~ ^User[[:space:]]*=[[:space:]]*([a-z_][a-z0-9_-]*)[[:space:]]*$ ]]; then
+            [[ "$section" == Service ]] || die "existing managed unit identity is malformed"
             ((user_seen++ == 0)) || die "existing managed unit identity is malformed"
             unit_user="${BASH_REMATCH[1]}"
         elif [[ "$line" =~ ^Group[[:space:]]*=[[:space:]]*([a-z_][a-z0-9_-]*)[[:space:]]*$ ]]; then
+            [[ "$section" == Service ]] || die "existing managed unit identity is malformed"
             ((group_seen++ == 0)) || die "existing managed unit identity is malformed"
             unit_group="${BASH_REMATCH[1]}"
         elif [[ "$line" =~ ^(User|Group)[[:space:]]*= ]]; then
@@ -262,6 +270,12 @@ verify_existing_unit_identity() {
     done < "$unit_file"
     [[ "$user_seen" == 1 && "$group_seen" == 1 ]] || die "existing managed unit identity is malformed"
     [[ "$unit_user" == "$INVOKING_USER" && "$unit_group" == "$INVOKING_GROUP" ]] || die "existing managed unit identity does not match invoking operator"
+}
+
+verify_no_service_dropins() {
+    local dropin_dir
+    dropin_dir="$(rooted_path /etc/systemd/system/roastpilot-agent.service.d)"
+    [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
 }
 
 snapshot_live_configuration() {
@@ -693,6 +707,10 @@ install_rendered_files() {
     validate_model_stage_file "$STAGE_DIR/models/onnx/int8/preprocessor_config.json" "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231"
     final_env="$(build_final_env "$(normalise_unit_env_contract "$staged_env")")"
     prepare_destination_parents "$env_file" "$yaml_file" "$unit_file" "$prior_file" "$model_dir"
+    validate_destination "$etc_dir"
+    run_privileged test -d "$etc_dir" || die "managed configuration directory is missing"
+    run_privileged test ! -L "$etc_dir" || die "managed configuration directory is unsafe"
+    LOCKED_ETC_DIR="$etc_dir"
     run_privileged chown "root:$INVOKING_GROUP" -- "$etc_dir"
     run_privileged chmod 0750 -- "$etc_dir"
     # Keep model placement root-owned while leaf bytes are promoted.
@@ -714,6 +732,7 @@ install_rendered_files() {
     snapshot_live_configuration "$env_file" "$yaml_file" "$unit_file"
     install_content_atomically "$final_env" "$env_file" 0600 "$INVOKING_USER:$INVOKING_GROUP" roastpilot-env
     install_content_atomically "$staged_yaml" "$yaml_file" 0644 "" roastpilot-yaml
+    verify_no_service_dropins
     install_content_atomically "$staged_unit" "$unit_file" 0644 "" roastpilot-unit
     if [[ -n "$REQUESTED_HOSTNAME" ]]; then
         prior_hostname="$(hostnamectl --static)"
@@ -721,6 +740,8 @@ install_rendered_files() {
             install_content_atomically "$prior_hostname" "$prior_file" 0600 root:root prior-static-hostname
             run_privileged hostnamectl set-hostname "$REQUESTED_HOSTNAME"
             [[ "$(hostnamectl --static)" == "$REQUESTED_HOSTNAME" ]] || die "hostname verification failed"
+            HOSTNAME_CHANGED=1
+            PRIOR_STATIC_HOSTNAME_FILE="$prior_file"
         fi
     fi
     # Do not unlock the parent until the prior-hostname write and verification
@@ -747,7 +768,9 @@ require_agent_inactive() {
 }
 
 enable_services() {
+    verify_no_service_dropins
     run_privileged systemctl daemon-reload
+    verify_no_service_dropins
     run_privileged systemctl enable --now avahi-daemon
     run_privileged systemctl enable roastpilot-agent
     if [[ "$START_SERVICE" == 1 ]]; then
@@ -771,8 +794,11 @@ main() {
     RESTORE_ARTIFACT_DIR=""
     ROOT_TEMPORARIES=()
     LOCKED_VAR_DIR=""
+    LOCKED_ETC_DIR=""
     CONFIG_SNAPSHOT_DIR=""
     CONFIG_TRANSACTION_ACTIVE=0
+    HOSTNAME_CHANGED=0
+    PRIOR_STATIC_HOSTNAME_FILE=""
     cleanup() {
         local temporary original_status=$? cleanup_failed=0
         trap - EXIT
@@ -786,8 +812,15 @@ main() {
             run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$LOCKED_VAR_DIR" || true
             run_privileged chmod 0700 -- "$LOCKED_VAR_DIR" || true
         fi
+        if [[ -n "${LOCKED_ETC_DIR:-}" ]] && run_privileged test -d "$LOCKED_ETC_DIR" && run_privileged test ! -L "$LOCKED_ETC_DIR"; then
+            run_privileged chown "root:$INVOKING_GROUP" -- "$LOCKED_ETC_DIR" || true
+            run_privileged chmod 0750 -- "$LOCKED_ETC_DIR" || true
+        fi
         restore_live_configuration "$(rooted_path /etc/roastpilot-agent/roastpilot-agent.env)" "$(rooted_path /etc/roastpilot-agent/coffee-roaster-mcp.yaml)" "$(rooted_path /etc/systemd/system/roastpilot-agent.service)" || cleanup_failed=1
         discard_configuration_snapshot || cleanup_failed=1
+        if [[ "${HOSTNAME_CHANGED:-0}" == 1 ]]; then
+            printf '%s\n' "install failed after hostname change; restore manually from $PRIOR_STATIC_HOSTNAME_FILE" >&2
+        fi
         if [[ "$cleanup_failed" == 1 ]]; then
             printf '%s\n' "install failed: rollback incomplete; manual reconciliation required" >&2
             exit 1

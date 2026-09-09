@@ -214,7 +214,18 @@ UNIT
   tee) [ "${1:-}" = -- ] && shift; [ "${FAKE_TEE_FAIL:-}" != 1 ] || exit 19; [ "${FAKE_TEE_FAIL_TARGET:-}" != "$1" ] || exit 19; mkdir -p "$(dirname "$1")"; cat > "$1" ;;
   install) mode=0644; [ "${1:-}" = -m ] && { mode="$2"; shift 2; }
     [ "${1:-}" = -- ] && shift; cp "$1" "$2"; chmod "$mode" "$2" ;;
-  test) [ -z "${FAKE_TEST_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_TEST_FAIL_PATH" ] || exit 41; /bin/test "$@" ;;
+  test)
+    [ -z "${FAKE_TEST_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_TEST_FAIL_PATH" ] || exit 41
+    if /bin/test "$@"; then
+      if [ "${1:-}" = -d ] && [ "${!#}" = "${FAKE_MUTATE_AFTER_TEST_D_PATH:-}" ]; then
+        [ -n "${FAKE_MUTATE_AFTER_TEST_D_TARGET:-}" ] || exit 46
+        /bin/rm -rf -- "$FAKE_MUTATE_AFTER_TEST_D_PATH"
+        /bin/ln -s -- "$FAKE_MUTATE_AFTER_TEST_D_TARGET" "$FAKE_MUTATE_AFTER_TEST_D_PATH"
+        printf 'FAKE_TEST_D_MUTATION <%s> <%s>\n' "$FAKE_MUTATE_AFTER_TEST_D_PATH" "$FAKE_MUTATE_AFTER_TEST_D_TARGET" >> "$FAKE_LOG"
+      fi
+      exit 0
+    fi
+    exit 1 ;;
   mkdir) /bin/mkdir "$@" ;;
   chmod) [ "${2:-}" = -- ] && { mode="$1"; shift 2; [ "${FAKE_CHMOD_FAIL_TARGET:-}" != "$1" ] || exit 23; /bin/chmod "$mode" "$@"; } || /bin/chmod "$@" ;;
   mktemp) is_dir=0; [ "${1:-}" = -d ] && { is_dir=1; shift; }; [ "${1:-}" = -- ] && shift; dir="${1%XXXXXX}fake"
@@ -236,6 +247,10 @@ UNIT
   usermod) printf 'dialout audio\n' > "$FAKE_GROUPS" ;;
   apt-get|chown) : ;;
   systemctl)
+    if [ "${1:-}" = daemon-reload ] && [ -n "${FAKE_MUTATE_DROPIN_PATH:-}" ]; then
+      /bin/mkdir -p -- "$FAKE_MUTATE_DROPIN_PATH"
+      printf 'FAKE_DROPIN_MUTATION <%s>\n' "$FAKE_MUTATE_DROPIN_PATH" >> "$FAKE_LOG"
+    fi
     if [ "${1:-}" = enable ] && [ -n "${FAKE_MUTATE_SYMLINK_PATH:-}" ]; then
       [ -n "${FAKE_MUTATE_SYMLINK_TARGET:-}" ] || exit 45
       /bin/rm -f -- "$FAKE_MUTATE_SYMLINK_PATH"
@@ -1342,6 +1357,83 @@ def test_existing_service_dropin_refuses_before_unit_write_or_enable(
         )
         for line in events
     )
+
+
+@pytest.mark.serial
+def test_dropin_recheck_blocks_enablement_after_configuration_promotion(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A drop-in created after promotion is rejected before any enablement command."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    dropin = root / "etc/systemd/system/roastpilot-agent.service.d"
+    result = _run(
+        environment | {"FAKE_MUTATE_DROPIN_PATH": str(dropin)}, "--set-hostname", "roastpilot"
+    )
+    assert result.returncode != 0 and "service drop-ins are not permitted" in result.stderr
+    events = log.read_text().splitlines()
+    assert f"FAKE_DROPIN_MUTATION <{dropin}>" in events
+    assert "systemctl <daemon-reload>" in events
+    assert not any(event.startswith("systemctl <enable>") for event in events)
+
+
+@pytest.mark.serial
+def test_managed_etc_recheck_rejects_a_swapped_parent_before_configuration_promotion(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A swap after the privileged directory probe cannot receive ownership or config writes."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    etc = root / "etc/roastpilot-agent"
+    attacker = tmp_path / "attacker-controlled-etc"
+    attacker.mkdir()
+    result = _run(
+        environment
+        | {
+            "FAKE_MUTATE_AFTER_TEST_D_PATH": str(etc),
+            "FAKE_MUTATE_AFTER_TEST_D_TARGET": str(attacker),
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0 and "managed configuration directory is unsafe" in result.stderr
+    events = log.read_text().splitlines()
+    assert f"FAKE_TEST_D_MUTATION <{etc}> <{attacker}>" in events
+    assert f"test <!> <-L> <{etc}>" in events
+    assert not any(
+        event.startswith(("chown ", "chmod ", "tee ", "mv ")) and f"<{attacker}>" in event
+        for event in events
+    )
+    assert not any(
+        event.startswith(("tee ", "mv ")) and "roastpilot-agent.env" in event for event in events
+    )
+
+
+@pytest.mark.serial
+def test_hostname_change_failure_keeps_hostname_and_names_manual_recovery_file(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A later failure records manual hostname recovery without changing it back automatically."""
+    _, environment, log, hostname = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    prior = root / "var/lib/roastpilot-agent/prior-static-hostname"
+    result = _run(environment | {"FAKE_SYSTEMCTL_FAIL": "enable"}, "--set-hostname", "roastpilot")
+    assert result.returncode == 31
+    assert hostname.read_text().strip() == "roastpilot"
+    assert f"restore manually from {prior}" in result.stderr
+    assert prior.read_text() == "old-host\n"
+    assert "systemctl <enable> <--now> <avahi-daemon>" in log.read_text().splitlines()
+
+
+@pytest.mark.serial
+def test_successful_rollback_preserves_the_original_non_one_failure_status(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A successful rollback returns the original fake systemctl failure status unchanged."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment | {"FAKE_SYSTEMCTL_FAIL": "enable"}, "--set-hostname", "roastpilot")
+    assert result.returncode == 31
+    assert "systemctl <enable> <--now> <avahi-daemon>" in log.read_text().splitlines()
 
 
 @pytest.mark.serial
@@ -2835,6 +2927,9 @@ def test_snapshot_discard_failure_reports_the_retained_path_without_secret_conte
         "[Service]\nUser=operator\nGroup=operators\n Group=other\n",
         "[Service]\nUser=operator\nGroup=operators\nUser = other\n",
         "[Service]\nUser=operator\nGroup=operators\nGroup = other\n",
+        "[Unit]\nUser=operator\n[Service]\nUser=operator\nGroup=operators\n",
+        "[Unit]\nGroup=operators\n[Service]\nUser=operator\nGroup=operators\n",
+        "[Service]\nUser=operator\nGroup=operators\n[Service]\n",
         "[Service]\nUser=operator\n",
     ],
 )
@@ -2864,6 +2959,7 @@ def test_existing_unit_identity_evidence_fails_before_installer_effects(
         "[Service]\nUser=operator\nGroup=operators\n",
         "[Service]\n User=operator\n Group=operators\n",
         "[Service]\n User = operator \n Group = operators\n",
+        "[Unit]\nDescription=managed\n[Service]\n User = operator \n Group = operators\n",
     ],
 )
 def test_matching_existing_unit_identity_allows_maintenance(
