@@ -240,6 +240,7 @@ UNIT
       [ -n "${FAKE_MUTATE_SYMLINK_TARGET:-}" ] || exit 45
       /bin/rm -f -- "$FAKE_MUTATE_SYMLINK_PATH"
       /bin/ln -s -- "$FAKE_MUTATE_SYMLINK_TARGET" "$FAKE_MUTATE_SYMLINK_PATH"
+      printf 'FAKE_SYMLINK_MUTATION <%s> <%s>\n' "$FAKE_MUTATE_SYMLINK_PATH" "$FAKE_MUTATE_SYMLINK_TARGET" >> "$FAKE_LOG"
     fi
     if [ "${1:-}" = daemon-reload ] && [ -n "${FAKE_DAEMON_RELOAD_FAIL_ON:-}" ]; then
       count=0; [ ! -e "$FAKE_DAEMON_RELOAD_COUNTER" ] || count=$(cat "$FAKE_DAEMON_RELOAD_COUNTER")
@@ -2655,7 +2656,7 @@ def test_snapshot_existing_members_are_decided_through_the_privileged_seam(
 def test_rollback_refuses_member_changed_to_symlink_and_continues(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
-    """A member changed to a symlink is not restored while later rollback work proceeds."""
+    """A symlinked snapshot member is not restored while later rollback work proceeds."""
     _, environment, log, _ = installer_harness
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     etc, unit_dir = root / "etc/roastpilot-agent", root / "etc/systemd/system"
@@ -2673,27 +2674,32 @@ def test_rollback_refuses_member_changed_to_symlink_and_continues(
     unit.write_text("[Service]\nUser=operator\nGroup=operators\n")
     target = tmp_path / "mutated-yaml"
     target.write_text("not-a-live-config\n")
+    snapshot_yaml = root / "tmp/roastpilot-config-rollback.fake/coffee-roaster-mcp.yaml"
     result = _run(
         environment
         | {
             "FAKE_SYSTEMCTL_FAIL": "enable",
-            "FAKE_MUTATE_SYMLINK_PATH": str(yaml),
+            "FAKE_MUTATE_SYMLINK_PATH": str(snapshot_yaml),
             "FAKE_MUTATE_SYMLINK_TARGET": str(target),
         },
         "--set-hostname",
         "roastpilot",
     )
     assert result.returncode != 0 and "manual reconciliation required" in result.stderr
-    assert yaml.is_symlink() and yaml.readlink() == target
     events = log.read_text().splitlines()
-    failed_recheck = next(i for i, event in enumerate(events) if event == f"test <!> <-L> <{yaml}>")
-    assert not any(
-        event.startswith("cp <-p>") and event.endswith(f"> <{yaml}>") for event in events
+    assert f"FAKE_SYMLINK_MUTATION <{snapshot_yaml}> <{target}>" in events
+    snapshot_file_test = next(
+        i for i, event in enumerate(events) if event == f"test <-f> <{snapshot_yaml}>"
     )
+    snapshot_link_test = next(
+        i for i, event in enumerate(events) if event == f"test <-L> <{snapshot_yaml}>"
+    )
+    assert snapshot_file_test < snapshot_link_test
+    assert not any(event == f"cp <-p> <--> <{snapshot_yaml}> <{yaml}>" for event in events)
     unit_restore = next(
         i
         for i, event in enumerate(events)
-        if i > failed_recheck and event.startswith("cp <-p>") and event.endswith(f"> <{unit}>")
+        if i > snapshot_link_test and event.startswith("cp <-p>") and event.endswith(f"> <{unit}>")
     )
     reload = max(i for i, event in enumerate(events) if event == "systemctl <daemon-reload>")
     assert reload > unit_restore
