@@ -405,9 +405,12 @@ def _has_roastpilot_agent_lifecycle_mutation(events: list[str]) -> bool:
     return any(
         event.startswith("systemctl ")
         and any(f"<{unit}>" in event for unit in ("roastpilot-agent", "roastpilot-agent.service"))
-        and any(
-            f"<{operation}>" in event
-            for operation in ("start", "stop", "restart", "try-restart", "kill", "disable")
+        and (
+            any(
+                f"<{operation}>" in event
+                for operation in ("start", "stop", "restart", "try-restart", "kill", "disable")
+            )
+            or ("<enable>" in event and "<--now>" in event)
         )
         for event in events
     )
@@ -415,8 +418,18 @@ def _has_roastpilot_agent_lifecycle_mutation(events: list[str]) -> bool:
 
 def test_roastpilot_lifecycle_matcher_catches_service_unit_spelling() -> None:
     """Lifecycle checks must recognise the systemd service-name spelling too."""
+    for operation in ("start", "stop", "restart", "try-restart", "kill", "disable"):
+        assert _has_roastpilot_agent_lifecycle_mutation(
+            [f"systemctl <{operation}> <roastpilot-agent.service>"]
+        )
     assert _has_roastpilot_agent_lifecycle_mutation(
-        ["systemctl <try-restart> <roastpilot-agent.service>"]
+        ["systemctl <enable> <--now> <roastpilot-agent>"]
+    )
+    assert _has_roastpilot_agent_lifecycle_mutation(
+        ["systemctl <enable> <--now> <roastpilot-agent.service>"]
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(
+        ["systemctl <enable> <roastpilot-agent.service>"]
     )
 
 
@@ -1326,8 +1339,12 @@ def test_existing_service_dropin_refuses_before_unit_write_or_enable(
     result = _run(environment, "--set-hostname", "roastpilot")
     assert result.returncode != 0
     events = _delta(log, start)
-    assert not any("roastpilot-unit" in line for line in events)
-    assert not any("systemctl <enable> <roastpilot-agent>" in line for line in events)
+    assert not any(
+        line.startswith(
+            ("apt-get ", "pipx ", "roastpilot-agent ", "tee ", "mv ", "chown ", "chmod ")
+        )
+        for line in events
+    )
 
 
 @pytest.mark.serial
@@ -2621,6 +2638,35 @@ def test_rollback_recheck_failure_is_not_masked_by_later_members(
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize(
+    ("target_kind", "diagnostic"),
+    [
+        ("model", "model promotion destination failed privileged recheck"),
+        ("config", "atomic destination failed privileged recheck"),
+    ],
+)
+def test_privileged_write_recheck_reports_its_failed_destination(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    target_kind: str,
+    diagnostic: str,
+) -> None:
+    """Each privileged write boundary reports the rejected path before failing closed."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    target = (
+        root / "var/lib/roastpilot-agent/models/onnx/int8/model_quantized.onnx"
+        if target_kind == "model"
+        else root / "etc/roastpilot-agent/roastpilot-agent.env"
+    )
+    result = _run(
+        environment | {"FAKE_TEST_FAIL_PATH": str(target)}, "--set-hostname", "roastpilot"
+    )
+    assert result.returncode != 0
+    assert diagnostic in result.stderr and str(target) in result.stderr
+    assert f"test <!> <-L> <{target}>" in log.read_text().splitlines()
+
+
+@pytest.mark.serial
 def test_snapshot_existing_members_are_decided_through_the_privileged_seam(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -2790,8 +2836,9 @@ def test_snapshot_discard_failure_reports_the_retained_path_without_secret_conte
         "[Service]\nUser=operator\n Group=other\n",
         "[Service]\nUser=operator\nGroup=operators\n User=other\n",
         "[Service]\nUser=operator\nGroup=operators\n Group=other\n",
+        "[Service]\nUser=operator\nGroup=operators\nUser = other\n",
+        "[Service]\nUser=operator\nGroup=operators\nGroup = other\n",
         "[Service]\nUser=operator\n",
-        "[Service]\nUser = operator\nGroup=operators\n",
     ],
 )
 def test_existing_unit_identity_evidence_fails_before_installer_effects(
@@ -2819,6 +2866,7 @@ def test_existing_unit_identity_evidence_fails_before_installer_effects(
     [
         "[Service]\nUser=operator\nGroup=operators\n",
         "[Service]\n User=operator\n Group=operators\n",
+        "[Service]\n User = operator \n Group = operators\n",
     ],
 )
 def test_matching_existing_unit_identity_allows_maintenance(

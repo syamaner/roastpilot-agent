@@ -242,24 +242,23 @@ resolve_operator_identity() {
 }
 
 verify_existing_unit_identity() {
-    local unit_file line user_seen=0 group_seen=0 unit_user="" unit_group=""
+    local unit_file dropin_dir line user_seen=0 group_seen=0 unit_user="" unit_group=""
     unit_file="$(rooted_path /etc/systemd/system/roastpilot-agent.service)"
+    dropin_dir="${unit_file}.d"
+    [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
     [[ ! -e "$unit_file" && ! -L "$unit_file" ]] && return 0
     [[ -f "$unit_file" && ! -L "$unit_file" && -r "$unit_file" ]] || die "existing managed unit identity is unsafe"
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line#"${line%%[![:space:]]*}"}"
-        case "$line" in
-            User=*)
-                ((user_seen++ == 0)) || die "existing managed unit identity is malformed"
-                unit_user="${line#User=}"
-                [[ "$unit_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "existing managed unit identity is malformed"
-                ;;
-            Group=*)
-                ((group_seen++ == 0)) || die "existing managed unit identity is malformed"
-                unit_group="${line#Group=}"
-                [[ "$unit_group" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "existing managed unit identity is malformed"
-                ;;
-        esac
+        if [[ "$line" =~ ^User[[:space:]]*=[[:space:]]*([a-z_][a-z0-9_-]*)[[:space:]]*$ ]]; then
+            ((user_seen++ == 0)) || die "existing managed unit identity is malformed"
+            unit_user="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^Group[[:space:]]*=[[:space:]]*([a-z_][a-z0-9_-]*)[[:space:]]*$ ]]; then
+            ((group_seen++ == 0)) || die "existing managed unit identity is malformed"
+            unit_group="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^(User|Group)[[:space:]]*= ]]; then
+            die "existing managed unit identity is malformed"
+        fi
     done < "$unit_file"
     [[ "$user_seen" == 1 && "$group_seen" == 1 ]] || die "existing managed unit identity is malformed"
     [[ "$unit_user" == "$INVOKING_USER" && "$unit_group" == "$INVOKING_GROUP" ]] || die "existing managed unit identity does not match invoking operator"
@@ -577,7 +576,7 @@ promote_model_file() {
     parent="$(dirname -- "$destination")"
     validate_destination "$parent"
     run_privileged mkdir -p -- "$parent"
-    recheck_sensitive_destination "$destination"
+    recheck_sensitive_destination "$destination" || die "model promotion destination failed privileged recheck: $destination"
     temporary="$(run_privileged mktemp -- "$parent/.roastpilot-model.XXXXXX")"
     [[ "$temporary" == "$parent/.roastpilot-model."* ]] || die "unsafe model temporary path"
     ROOT_TEMPORARIES+=("$temporary")
@@ -613,7 +612,7 @@ validate_rendered_env() {
 install_content_atomically() {
     local content="$1" destination="$2" mode="$3" owner="$4" prefix="$5" parent temporary expected actual
     parent="$(dirname -- "$destination")"
-    recheck_sensitive_destination "$destination"
+    recheck_sensitive_destination "$destination" || die "atomic destination failed privileged recheck: $destination"
     temporary="$(run_privileged mktemp -- "$parent/.$prefix.XXXXXX")"
     [[ "$temporary" == "$parent/.$prefix."* ]] || die "unsafe temporary path"
     ROOT_TEMPORARIES+=("$temporary")
@@ -715,7 +714,6 @@ install_rendered_files() {
     snapshot_live_configuration "$env_file" "$yaml_file" "$unit_file"
     install_content_atomically "$final_env" "$env_file" 0600 "$INVOKING_USER:$INVOKING_GROUP" roastpilot-env
     install_content_atomically "$staged_yaml" "$yaml_file" 0644 "" roastpilot-yaml
-    [[ ! -e "${unit_file}.d" && ! -L "${unit_file}.d" ]] || die "service drop-ins are not permitted"
     install_content_atomically "$staged_unit" "$unit_file" 0644 "" roastpilot-unit
     if [[ -n "$REQUESTED_HOSTNAME" ]]; then
         prior_hostname="$(hostnamectl --static)"
