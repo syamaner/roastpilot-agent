@@ -236,6 +236,11 @@ UNIT
   usermod) printf 'dialout audio\n' > "$FAKE_GROUPS" ;;
   apt-get|chown) : ;;
   systemctl)
+    if [ "${1:-}" = enable ] && [ -n "${FAKE_MUTATE_SYMLINK_PATH:-}" ]; then
+      [ -n "${FAKE_MUTATE_SYMLINK_TARGET:-}" ] || exit 45
+      /bin/rm -f -- "$FAKE_MUTATE_SYMLINK_PATH"
+      /bin/ln -s -- "$FAKE_MUTATE_SYMLINK_TARGET" "$FAKE_MUTATE_SYMLINK_PATH"
+    fi
     if [ "${1:-}" = daemon-reload ] && [ -n "${FAKE_DAEMON_RELOAD_FAIL_ON:-}" ]; then
       count=0; [ ! -e "$FAKE_DAEMON_RELOAD_COUNTER" ] || count=$(cat "$FAKE_DAEMON_RELOAD_COUNTER")
       count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_DAEMON_RELOAD_COUNTER"
@@ -391,6 +396,26 @@ def _has_service_mutation(events: list[str]) -> bool:
         line.startswith("systemctl ")
         and line != "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>"
         for line in events
+    )
+
+
+def _has_roastpilot_agent_lifecycle_mutation(events: list[str]) -> bool:
+    """Return whether events mutate either supported RoastPilot unit spelling."""
+    return any(
+        event.startswith("systemctl ")
+        and any(f"<{unit}>" in event for unit in ("roastpilot-agent", "roastpilot-agent.service"))
+        and any(
+            f"<{operation}>" in event
+            for operation in ("start", "stop", "restart", "try-restart", "kill", "disable")
+        )
+        for event in events
+    )
+
+
+def test_roastpilot_lifecycle_matcher_catches_service_unit_spelling() -> None:
+    """Lifecycle checks must recognise the systemd service-name spelling too."""
+    assert _has_roastpilot_agent_lifecycle_mutation(
+        ["systemctl <try-restart> <roastpilot-agent.service>"]
     )
 
 
@@ -2544,22 +2569,7 @@ def test_rollback_cp_failure_continues_to_later_members_and_cleanup(
         and _live_config_state(root)["unit"] == before["unit"]
         and _live_config_state(root)["yaml"] != before["yaml"]
     )
-    assert not any(
-        event.startswith("systemctl ")
-        and "<roastpilot-agent>" in event
-        and any(
-            operation in event
-            for operation in (
-                "<start>",
-                "<stop>",
-                "<restart>",
-                "<try-restart>",
-                "<kill>",
-                "<disable>",
-            )
-        )
-        for event in events
-    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial
@@ -2609,6 +2619,159 @@ def test_rollback_recheck_failure_is_not_masked_by_later_members(
 
 
 @pytest.mark.serial
+def test_snapshot_existing_members_are_decided_through_the_privileged_seam(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Existing configuration members are probed and copied only through sudo's seam."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    etc, unit_dir = root / "etc/roastpilot-agent", root / "etc/systemd/system"
+    etc.mkdir(parents=True)
+    unit_dir.mkdir(parents=True)
+    env, yaml, unit = (
+        etc / "roastpilot-agent.env",
+        etc / "coffee-roaster-mcp.yaml",
+        unit_dir / "roastpilot-agent.service",
+    )
+    env.write_text(
+        "OPENROUTER_API_KEY=old\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+    )
+    yaml.write_text("old-yaml\n")
+    unit.write_text("[Service]\nUser=operator\nGroup=operators\n")
+    result = _run(environment | {"FAKE_SYSTEMCTL_FAIL": "enable"}, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    events = log.read_text().splitlines()
+    for member in (env, yaml, unit):
+        assert f"test <-e> <{member}>" in events
+        assert f"test <-f> <{member}>" in events
+        assert f"test <-L> <{member}>" in events
+        assert any(
+            event.startswith(f"cp <-p> <--> <{member}> <") and "roastpilot-config-rollback" in event
+            for event in events
+        )
+
+
+@pytest.mark.serial
+def test_rollback_refuses_member_changed_to_symlink_and_continues(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A member changed to a symlink is not restored while later rollback work proceeds."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    etc, unit_dir = root / "etc/roastpilot-agent", root / "etc/systemd/system"
+    etc.mkdir(parents=True)
+    unit_dir.mkdir(parents=True)
+    env, yaml, unit = (
+        etc / "roastpilot-agent.env",
+        etc / "coffee-roaster-mcp.yaml",
+        unit_dir / "roastpilot-agent.service",
+    )
+    env.write_text(
+        "OPENROUTER_API_KEY=old\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+    )
+    yaml.write_text("old-yaml\n")
+    unit.write_text("[Service]\nUser=operator\nGroup=operators\n")
+    target = tmp_path / "mutated-yaml"
+    target.write_text("not-a-live-config\n")
+    result = _run(
+        environment
+        | {
+            "FAKE_SYSTEMCTL_FAIL": "enable",
+            "FAKE_MUTATE_SYMLINK_PATH": str(yaml),
+            "FAKE_MUTATE_SYMLINK_TARGET": str(target),
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0 and "manual reconciliation required" in result.stderr
+    assert yaml.is_symlink() and yaml.readlink() == target
+    events = log.read_text().splitlines()
+    failed_recheck = next(i for i, event in enumerate(events) if event == f"test <!> <-L> <{yaml}>")
+    assert not any(
+        event.startswith("cp <-p>") and event.endswith(f"> <{yaml}>") for event in events
+    )
+    unit_restore = next(
+        i
+        for i, event in enumerate(events)
+        if i > failed_recheck and event.startswith("cp <-p>") and event.endswith(f"> <{unit}>")
+    )
+    reload = max(i for i, event in enumerate(events) if event == "systemctl <daemon-reload>")
+    assert reload > unit_restore
+    assert any(
+        event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event for event in events
+    )
+    assert not list((root / "tmp").glob("roastpilot-config-rollback.*"))
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_rollback_removal_failure_for_previously_absent_member_continues(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A failed absent-member removal is retained while later rollback work continues."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    env = root / "etc/roastpilot-agent/roastpilot-agent.env"
+    yaml = root / "etc/roastpilot-agent/coffee-roaster-mcp.yaml"
+    unit = root / "etc/systemd/system/roastpilot-agent.service"
+    result = _run(
+        environment | {"FAKE_SYSTEMCTL_FAIL": "enable", "FAKE_RM_FAIL_PATH": str(env)},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0 and "manual reconciliation required" in result.stderr
+    events = log.read_text().splitlines()
+    failed_removal = next(i for i, event in enumerate(events) if event == f"rm <-f> <--> <{env}>")
+    yaml_removal = next(
+        i
+        for i, event in enumerate(events)
+        if i > failed_removal and event == f"rm <-f> <--> <{yaml}>"
+    )
+    unit_removal = next(
+        i
+        for i, event in enumerate(events)
+        if i > yaml_removal and event == f"rm <-f> <--> <{unit}>"
+    )
+    reload = max(i for i, event in enumerate(events) if event == "systemctl <daemon-reload>")
+    assert reload > unit_removal
+    assert any(
+        event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event for event in events
+    )
+    assert not list((root / "tmp").glob("roastpilot-config-rollback.*"))
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_snapshot_discard_failure_reports_the_retained_path_without_secret_contents(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A final snapshot-delete failure identifies only its path for reconciliation."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    env = root / "etc/roastpilot-agent/roastpilot-agent.env"
+    env.parent.mkdir(parents=True)
+    secret = "old-secret-value"
+    env.write_text(
+        f"OPENROUTER_API_KEY={secret}\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+    )
+    snapshot = root / "tmp/roastpilot-config-rollback.fake"
+    result = _run(
+        environment | {"FAKE_SYSTEMCTL_FAIL": "enable", "FAKE_RM_FAIL_PATH": str(snapshot)},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0 and "manual reconciliation required" in result.stderr
+    assert f"retained configuration snapshot at {snapshot}" in result.stderr
+    assert secret not in result.stdout + result.stderr
+    events = log.read_text().splitlines()
+    assert f"rm <-rf> <--> <{snapshot}>" in events
+    assert env.read_text().startswith(f"OPENROUTER_API_KEY={secret}\n")
+    assert events.count("systemctl <daemon-reload>") == 2
+    assert snapshot.is_dir()
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
 @pytest.mark.parametrize(
     "unit_text",
     [
@@ -2618,6 +2781,8 @@ def test_rollback_recheck_failure_is_not_masked_by_later_members(
         "[Service]\n User=operator\nGroup=operators\n User=operator\n",
         "[Service]\n User=other\nGroup=operators\n",
         "[Service]\nUser=operator\n Group=other\n",
+        "[Service]\nUser=operator\nGroup=operators\n User=other\n",
+        "[Service]\nUser=operator\nGroup=operators\n Group=other\n",
         "[Service]\nUser=operator\n",
         "[Service]\nUser = operator\nGroup=operators\n",
     ],
@@ -2642,17 +2807,24 @@ def test_existing_unit_identity_evidence_fails_before_installer_effects(
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize(
+    "unit_text",
+    [
+        "[Service]\nUser=operator\nGroup=operators\n",
+        "[Service]\n User=operator\n Group=operators\n",
+    ],
+)
 def test_matching_existing_unit_identity_allows_maintenance(
-    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    installer_harness: tuple[Path, dict[str, str], Path, Path], unit_text: str
 ) -> None:
-    """A matching existing unit remains eligible for the normal installer path."""
+    """A matching existing unit, including indentation, remains eligible for maintenance."""
     _, environment, _, _ = installer_harness
     unit = (
         Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
         / "etc/systemd/system/roastpilot-agent.service"
     )
     unit.parent.mkdir(parents=True)
-    unit.write_text("[Service]\nUser=operator\nGroup=operators\n")
+    unit.write_text(unit_text)
     result = _run(environment, "--set-hostname", "roastpilot")
     assert result.returncode == 0, result.stderr
     committed = _live_config_state(Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]))

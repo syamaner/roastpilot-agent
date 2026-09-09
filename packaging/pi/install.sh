@@ -272,8 +272,10 @@ snapshot_live_configuration() {
     run_privileged chmod 0700 -- "$CONFIG_SNAPSHOT_DIR"
     for destination in "$@"; do
         name="${destination##*/}"
-        if [[ -e "$destination" ]]; then
-            [[ -f "$destination" && ! -L "$destination" ]] || die "existing configuration destination is unsafe"
+        if run_privileged test -e "$destination" || run_privileged test -L "$destination"; then
+            if ! run_privileged test -f "$destination" || run_privileged test -L "$destination"; then
+                die "existing configuration destination is unsafe"
+            fi
             run_privileged cp -p -- "$destination" "$CONFIG_SNAPSHOT_DIR/$name"
         fi
     done
@@ -306,7 +308,10 @@ restore_live_configuration() {
 
 discard_configuration_snapshot() {
     [[ -z "${CONFIG_SNAPSHOT_DIR:-}" ]] && return 0
-    run_privileged rm -rf -- "$CONFIG_SNAPSHOT_DIR" || return 1
+    if ! run_privileged rm -rf -- "$CONFIG_SNAPSHOT_DIR"; then
+        printf '%s\n' "install failed: retained configuration snapshot at $CONFIG_SNAPSHOT_DIR" >&2
+        return 1
+    fi
     CONFIG_SNAPSHOT_DIR=""
 }
 
