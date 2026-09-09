@@ -1602,6 +1602,33 @@ def test_pipx_provenance_and_capability_fail_before_appliance_effects(
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
 
 
+@pytest.mark.serial  # Pipx-home variants alter the isolated executable provenance tree.
+def test_pipx_reports_only_canonical_xdg_or_legacy_operator_homes(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Both supported layouts work; malformed reported roots fail before appliance effects."""
+    _, environment, log, _ = installer_harness
+    operator_home = Path(environment["FAKE_OPERATOR_HOME"])
+    xdg = operator_home / ".local/share/pipx"
+    legacy = operator_home / ".local/pipx"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    xdg.rename(legacy)
+    entry = operator_home / ".local/bin/roastpilot-agent"
+    entry.unlink()
+    entry.symlink_to(legacy / "venvs/roastpilot-agent/bin/roastpilot-agent")
+    assert (
+        _run(
+            environment | {"FAKE_PIPX_HOME": str(legacy)}, "--set-hostname", "roastpilot"
+        ).returncode
+        == 0
+    )
+    for reported in ("", "relative", str(legacy / ".." / "pipx")):
+        log.write_text("")
+        result = _run(environment | {"FAKE_PIPX_HOME": reported}, "--set-hostname", "roastpilot")
+        assert result.returncode != 0
+        assert "roastpilot-agent <appliance" not in log.read_text()
+
+
 @pytest.mark.serial  # Reuse and retained-key checks require one fake installation lifecycle.
 def test_rerun_reuses_verified_model_and_retains_a_valid_existing_key(
     installer_harness: tuple[Path, dict[str, str], Path, Path],

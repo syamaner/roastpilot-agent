@@ -344,13 +344,14 @@ install_application() {
 }
 
 resolve_pipx_venv_root() {
-    local pipx_home canonical expected_home
+    local pipx_home canonical xdg_home legacy_home
     pipx_home="$(pipx_command environment --value PIPX_HOME)" || die "cannot determine pipx home"
-    expected_home="$INVOKING_HOME/.local/share/pipx"
+    xdg_home="$INVOKING_HOME/.local/share/pipx"
+    legacy_home="$INVOKING_HOME/.local/pipx"
     [[ -n "$pipx_home" && "$pipx_home" == /* && "$pipx_home" != *$'\n'* && "$pipx_home" != *$'\r'* ]] || die "pipx home is unsafe"
     [[ -d "$pipx_home" && ! -L "$pipx_home" ]] || die "pipx home is unsafe"
     canonical="$(readlink -f -- "$pipx_home")" || die "pipx home is unsafe"
-    [[ "$pipx_home" == "$canonical" && "$canonical" == "$expected_home" && ! -L "$canonical/venvs" && -d "$canonical/venvs" ]] || die "pipx home is outside invoking-user boundary"
+    [[ "$pipx_home" == "$canonical" && ( "$canonical" == "$xdg_home" || "$canonical" == "$legacy_home" ) && ! -L "$canonical/venvs" && -d "$canonical/venvs" ]] || die "pipx home is outside invoking-user boundary"
     PIPX_VENV_ROOT="$canonical/venvs"
 }
 
