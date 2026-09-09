@@ -2407,7 +2407,7 @@ def test_failed_configuration_generation_restores_the_prior_live_set(
             snapshot = next(
                 event.split(" <")[-1].rstrip(">")
                 for event in events
-                    if event.startswith("test <-f>") and event.endswith(f"{name}>")
+                if event.startswith("test <-f>") and event.endswith(f"{name}>")
             )
             assert f"test <-f> <{snapshot}>" in events
             assert f"test <-L> <{snapshot}>" in events
