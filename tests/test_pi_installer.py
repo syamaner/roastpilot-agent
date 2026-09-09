@@ -211,7 +211,7 @@ WantedBy=multi-user.target
 UNIT
       [ -z "${FAKE_RENDERED_UNIT:-}" ] || printf '%s\\n' "$FAKE_RENDERED_UNIT" > "$out/roastpilot-agent.service"
     fi ;;
-  tee) [ "${1:-}" = -- ] && shift; [ "${FAKE_TEE_FAIL:-}" != 1 ] || exit 19; mkdir -p "$(dirname "$1")"; cat > "$1" ;;
+  tee) [ "${1:-}" = -- ] && shift; [ "${FAKE_TEE_FAIL:-}" != 1 ] || exit 19; [ "${FAKE_TEE_FAIL_TARGET:-}" != "$1" ] || exit 19; mkdir -p "$(dirname "$1")"; cat > "$1" ;;
   install) mode=0644; [ "${1:-}" = -m ] && { mode="$2"; shift 2; }
     [ "${1:-}" = -- ] && shift; cp "$1" "$2"; chmod "$mode" "$2" ;;
   mkdir) /bin/mkdir "$@" ;;
@@ -2330,4 +2330,133 @@ def test_initial_service_probe_failures_are_effect_free(
             "systemctl <enable",
             "systemctl <start",
         )
+    )
+
+
+def _live_config_state(root: Path) -> dict[str, tuple[bytes, int] | None]:
+    """Capture the three mutable appliance files and their observable modes."""
+    paths = {
+        "env": root / "etc/roastpilot-agent/roastpilot-agent.env",
+        "yaml": root / "etc/roastpilot-agent/coffee-roaster-mcp.yaml",
+        "unit": root / "etc/systemd/system/roastpilot-agent.service",
+    }
+    return {
+        name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode)) if path.exists() else None
+        for name, path in paths.items()
+    }
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("failure", ["yaml", "unit", "enable"])
+def test_failed_configuration_generation_restores_the_prior_live_set(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], failure: str
+) -> None:
+    """A failure after live promotion restores every prior configuration member."""
+    _, environment, _, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    etc = root / "etc/roastpilot-agent"
+    unit_dir = root / "etc/systemd/system"
+    etc.mkdir(parents=True)
+    unit_dir.mkdir(parents=True)
+    (etc / "roastpilot-agent.env").write_text("old-env\n")
+    (etc / "coffee-roaster-mcp.yaml").write_text("old-yaml\n")
+    (unit_dir / "roastpilot-agent.service").write_text(
+        "[Service]\nUser=operator\nGroup=operators\n"
+    )
+    for path, mode in (
+        (etc / "roastpilot-agent.env", 0o600),
+        (etc / "coffee-roaster-mcp.yaml", 0o640),
+        (unit_dir / "roastpilot-agent.service", 0o644),
+    ):
+        path.chmod(mode)
+    before = _live_config_state(root)
+    extra = (
+        {"FAKE_TEE_FAIL_TARGET": str(etc / ".roastpilot-yaml.fake")}
+        if failure == "yaml"
+        else {"FAKE_TEE_FAIL_TARGET": str(unit_dir / ".roastpilot-unit.fake")}
+        if failure == "unit"
+        else {"FAKE_SYSTEMCTL_FAIL": "enable"}
+    )
+    result = _run(environment | extra, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    assert _live_config_state(root) == before
+
+
+@pytest.mark.serial
+def test_failed_configuration_generation_removes_previously_absent_files(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Rollback removes configuration leaves that did not exist before promotion."""
+    _, environment, _, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    result = _run(environment | {"FAKE_SYSTEMCTL_FAIL": "enable"}, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    assert _live_config_state(root) == {"env": None, "yaml": None, "unit": None}
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    "unit_text",
+    [
+        "[Service]\nUser=other\nGroup=operators\n",
+        "[Service]\nUser=operator\nGroup=other\n",
+        "[Service]\nUser=operator\nGroup=operators\nUser=operator\n",
+        "[Service]\nUser=operator\n",
+        "[Service]\nUser = operator\nGroup=operators\n",
+    ],
+)
+def test_existing_unit_identity_evidence_fails_before_installer_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], unit_text: str
+) -> None:
+    """Existing managed-unit identity evidence must be exact before apt or pipx."""
+    _, environment, log, _ = installer_harness
+    unit = (
+        Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+        / "etc/systemd/system/roastpilot-agent.service"
+    )
+    unit.parent.mkdir(parents=True)
+    unit.write_text(unit_text)
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    assert not any(
+        line.startswith(("apt-get ", "pipx ", "roastpilot-agent "))
+        for line in log.read_text().splitlines()
+    )
+
+
+@pytest.mark.serial
+def test_matching_existing_unit_identity_allows_maintenance(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A matching existing unit remains eligible for the normal installer path."""
+    _, environment, _, _ = installer_harness
+    unit = (
+        Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+        / "etc/systemd/system/roastpilot-agent.service"
+    )
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Service]\nUser=operator\nGroup=operators\n")
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.serial
+def test_symlinked_existing_unit_identity_fails_before_installer_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A symlink cannot provide trusted maintenance identity evidence."""
+    _, environment, log, _ = installer_harness
+    unit = (
+        Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+        / "etc/systemd/system/roastpilot-agent.service"
+    )
+    unit.parent.mkdir(parents=True)
+    target = unit.with_name("other.service")
+    target.write_text("[Service]\nUser=operator\nGroup=operators\n")
+    unit.symlink_to(target)
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    assert not any(
+        line.startswith(("apt-get ", "pipx ", "roastpilot-agent "))
+        for line in log.read_text().splitlines()
     )

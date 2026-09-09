@@ -239,6 +239,65 @@ resolve_operator_identity() {
     INVOKING_HOME="$operator_home"
 }
 
+verify_existing_unit_identity() {
+    local unit_file line user_seen=0 group_seen=0 unit_user="" unit_group=""
+    unit_file="$(rooted_path /etc/systemd/system/roastpilot-agent.service)"
+    [[ ! -e "$unit_file" && ! -L "$unit_file" ]] && return 0
+    [[ -f "$unit_file" && ! -L "$unit_file" && -r "$unit_file" ]] || die "existing managed unit identity is unsafe"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            User=*)
+                ((user_seen++ == 0)) || die "existing managed unit identity is malformed"
+                unit_user="${line#User=}"
+                [[ "$unit_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "existing managed unit identity is malformed"
+                ;;
+            Group=*)
+                ((group_seen++ == 0)) || die "existing managed unit identity is malformed"
+                unit_group="${line#Group=}"
+                [[ "$unit_group" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "existing managed unit identity is malformed"
+                ;;
+        esac
+    done < "$unit_file"
+    [[ "$user_seen" == 1 && "$group_seen" == 1 ]] || die "existing managed unit identity is malformed"
+    [[ "$unit_user" == "$INVOKING_USER" && "$unit_group" == "$INVOKING_GROUP" ]] || die "existing managed unit identity does not match invoking operator"
+}
+
+snapshot_live_configuration() {
+    local destination name
+    CONFIG_SNAPSHOT_DIR="$(run_privileged mktemp -d -- "$(rooted_path /tmp)/roastpilot-config-rollback.XXXXXX")"
+    [[ "$CONFIG_SNAPSHOT_DIR" == "$(rooted_path /tmp)/roastpilot-config-rollback."* ]] || die "unsafe configuration snapshot"
+    run_privileged chmod 0700 -- "$CONFIG_SNAPSHOT_DIR"
+    for destination in "$@"; do
+        name="${destination##*/}"
+        if [[ -e "$destination" ]]; then
+            [[ -f "$destination" && ! -L "$destination" ]] || die "existing configuration destination is unsafe"
+            run_privileged cp -p -- "$destination" "$CONFIG_SNAPSHOT_DIR/$name"
+        fi
+    done
+    CONFIG_TRANSACTION_ACTIVE=1
+}
+
+restore_live_configuration() {
+    local destination name
+    [[ "${CONFIG_TRANSACTION_ACTIVE:-0}" == 1 ]] || return 0
+    for destination in "$@"; do
+        name="${destination##*/}"
+        recheck_sensitive_destination "$destination"
+        if [[ -f "$CONFIG_SNAPSHOT_DIR/$name" ]]; then
+            [[ ! -L "$CONFIG_SNAPSHOT_DIR/$name" ]] || die "configuration snapshot is unsafe"
+            run_privileged cp -p -- "$CONFIG_SNAPSHOT_DIR/$name" "$destination"
+        else
+            run_privileged rm -f -- "$destination"
+        fi
+    done
+    CONFIG_TRANSACTION_ACTIVE=0
+}
+
+discard_configuration_snapshot() {
+    [[ -z "${CONFIG_SNAPSHOT_DIR:-}" ]] || run_privileged rm -rf -- "$CONFIG_SNAPSHOT_DIR"
+    CONFIG_SNAPSHOT_DIR=""
+}
+
 installed_pipx_state() {
     local state
     state="$(pipx_command list --json)" || die "cannot inspect pipx state"
@@ -636,6 +695,7 @@ install_rendered_files() {
     done
     promote_model_file "$STAGE_DIR/models/onnx/int8/model_quantized.onnx" "$model_dir/onnx/int8/model_quantized.onnx" "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df"
     promote_model_file "$STAGE_DIR/models/onnx/int8/preprocessor_config.json" "$model_dir/onnx/int8/preprocessor_config.json" "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231"
+    snapshot_live_configuration "$env_file" "$yaml_file" "$unit_file"
     install_content_atomically "$final_env" "$env_file" 0600 "$INVOKING_USER:$INVOKING_GROUP" roastpilot-env
     install_content_atomically "$staged_yaml" "$yaml_file" 0644 "" roastpilot-yaml
     [[ ! -e "${unit_file}.d" && ! -L "${unit_file}.d" ]] || die "service drop-ins are not permitted"
@@ -696,6 +756,8 @@ main() {
     RESTORE_ARTIFACT_DIR=""
     ROOT_TEMPORARIES=()
     LOCKED_VAR_DIR=""
+    CONFIG_SNAPSHOT_DIR=""
+    CONFIG_TRANSACTION_ACTIVE=0
     cleanup() {
         local temporary
         for temporary in "${ROOT_TEMPORARIES[@]:-}"; do
@@ -708,6 +770,8 @@ main() {
             run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$LOCKED_VAR_DIR" || true
             run_privileged chmod 0700 -- "$LOCKED_VAR_DIR" || true
         fi
+        restore_live_configuration "$(rooted_path /etc/roastpilot-agent/roastpilot-agent.env)" "$(rooted_path /etc/roastpilot-agent/coffee-roaster-mcp.yaml)" "$(rooted_path /etc/systemd/system/roastpilot-agent.service)"
+        discard_configuration_snapshot
     }
     trap cleanup EXIT
     # Test mode is deliberately unprivileged.  Every production lookup starts
@@ -720,6 +784,7 @@ main() {
     parse_arguments "$@"
     preflight
     resolve_operator_identity
+    verify_existing_unit_identity
     preserve_existing_api_key
     require_agent_inactive
     run_privileged apt-get install -y libportaudio2 pipx avahi-daemon
@@ -730,6 +795,8 @@ main() {
     install_model_and_render
     install_rendered_files
     enable_services
+    CONFIG_TRANSACTION_ACTIVE=0
+    discard_configuration_snapshot
     summary
 }
 
