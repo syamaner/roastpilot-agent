@@ -339,11 +339,20 @@ def _run(
         "ROASTPILOT_INSTALL_AUDIO_DEVICE",
         "ROASTPILOT_INSTALL_ASSUME_YES",
     }
+    ambient_secret_names = {
+        "ROASTPILOT_API_KEY",
+        "ROASTPILOT_OPENROUTER_API_KEY",
+    }
+    allow_ambient_secret = environment.get("FAKE_ALLOW_AMBIENT_SECRET") == "1"
     environment = {
         key: value
         for key, value in environment.items()
-        if (key != "OPENROUTER_API_KEY" or environment.get("FAKE_ALLOW_AMBIENT_SECRET") == "1")
-        and (not key.startswith("ROASTPILOT_") or key in allowed_installer_inputs)
+        if (key != "OPENROUTER_API_KEY" or allow_ambient_secret)
+        and (
+            not key.startswith("ROASTPILOT_")
+            or key in allowed_installer_inputs
+            or (allow_ambient_secret and key in ambient_secret_names)
+        )
     }
     return subprocess.run(
         [
@@ -2131,10 +2140,21 @@ def test_child_processes_do_not_receive_exported_secret_sentinels(
     """Only the protected env leaf retains the explicit installer secret."""
     _, environment, _, _ = installer_harness
     secret_log = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]).parent / "secret-env.log"
+    pre_scrub_log = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]).parent / "pre-scrub.log"
+    script = secret_log.with_name("pre-scrub-install.sh")
+    script.write_text(
+        INSTALLER.read_text().replace(
+            "    scrub_child_secrets\n    parse_arguments",
+            '    printf "ROASTPILOT_API_KEY=%s ROASTPILOT_OPENROUTER_API_KEY=%s\\n" "${ROASTPILOT_API_KEY+present}" "${ROASTPILOT_OPENROUTER_API_KEY+present}" > "$FAKE_PRE_SCRUB_LOG"\n    scrub_child_secrets\n    parse_arguments',
+            1,
+        )
+    )
+    script.chmod(0o755)
     result = _run(
         environment
         | {
             "FAKE_SECRET_ENV_LOG": str(secret_log),
+            "FAKE_PRE_SCRUB_LOG": str(pre_scrub_log),
             "FAKE_ALLOW_AMBIENT_SECRET": "1",
             "OPENROUTER_API_KEY": "openrouter-sentinel",
             "OPENROUTER_API_KEY_FILE": "openrouter-file-sentinel",
@@ -2147,8 +2167,13 @@ def test_child_processes_do_not_receive_exported_secret_sentinels(
         },
         "--set-hostname",
         "roastpilot",
+        script=script,
     )
     assert result.returncode == 0
+    assert (
+        pre_scrub_log.read_text()
+        == "ROASTPILOT_API_KEY=present ROASTPILOT_OPENROUTER_API_KEY=present\n"
+    )
     child_env = secret_log.read_text()
     for sentinel in (
         "openrouter-sentinel",
