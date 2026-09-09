@@ -69,27 +69,50 @@ case "$name" in
     if [ -n "${FAKE_PIPX_ENV_LOG:-}" ]; then
       printf 'HOME=<%s> PIPX_HOME=<%s> PIPX_BIN_DIR=<%s> PIPX_DEFAULT_PYTHON=<%s>\\n' "${HOME-UNSET}" "${PIPX_HOME-UNSET}" "${PIPX_BIN_DIR-UNSET}" "${PIPX_DEFAULT_PYTHON-UNSET}" >> "$FAKE_PIPX_ENV_LOG"
     fi
-    if [ "${1:-}" = list ]; then
+    if [ "${1:-}" = environment ]; then
+      [ "${2:-}" = --value ] && [ "${3:-}" = PIPX_HOME ] || exit 18
+      printf '%s\\n' "$FAKE_PIPX_HOME"
+    elif [ "${1:-}" = runpip ]; then
+      [ "${FAKE_PIPX_MCP_MISSING:-}" != 1 ] || exit 24
+    elif [ "${1:-}" = list ]; then
       if [ "${FAKE_PIPX_LIST_FAIL:-}" = 1 ]; then exit 17
       elif [ -n "${FAKE_PIPX_JSON:-}" ]; then cat "$FAKE_PIPX_JSON"
       elif [ -e "$FAKE_PIPX_STATE" ]; then cat "$FAKE_PIPX_STATE"
       else printf '{"venvs": {}}\\n'; fi
     elif [ "${1:-}" = install ]; then
-      shift; [ "${1:-}" = -- ] && shift
+      shift; suffix=''
+      if [ "${1:-}" = --suffix ]; then suffix="$2"; shift 2; fi
+      [ "${1:-}" = -- ] && shift
       package="$1"; version="${package##*==}"
       [ "$version" = "$package" ] && version=default
-      printf '{"venvs":{"roastpilot-agent":{"metadata":' > "$FAKE_PIPX_STATE"
-      printf '{"main_package":{"package_version":"%s",' "$version" >> "$FAKE_PIPX_STATE"
-      printf '"package_or_url":"%s"}}}}}\\n' "$package" >> "$FAKE_PIPX_STATE"
-    elif [ "${1:-}" = uninstall ]; then rm -f "$FAKE_PIPX_STATE"; fi ;;
+      if [ -z "$suffix" ]; then
+        printf '{"venvs":{"roastpilot-agent":{"metadata":' > "$FAKE_PIPX_STATE"
+        printf '{"main_package":{"package_version":"%s",' "$version" >> "$FAKE_PIPX_STATE"
+        printf '"package_or_url":"%s"}}}}}\\n' "$package" >> "$FAKE_PIPX_STATE"
+      fi
+    elif [ "${1:-}" = uninstall ]; then
+      shift; [ "${1:-}" = -- ] && shift
+      [ "${1:-}" != roastpilot-agent ] || rm -f "$FAKE_PIPX_STATE"
+    fi ;;
   roastpilot-agent)
     if [ "$1 $2 $3" = "appliance model install" ]; then
-      shift 3; while [ "$#" -gt 0 ]; do [ "$1" = --dest ] && {
-        if [ ! -e "$2/onnx/int8/model_quantized.onnx" ]; then
-          printf 'MODEL_FETCH <%s>\n' "$2" >> "$FAKE_LOG"
-          mkdir -p "$2/onnx/int8"; printf '%s' "${FAKE_MODEL_BYTES:-MODEL}" > "$2/onnx/int8/model_quantized.onnx"
-          printf CONFIG > "$2/onnx/int8/preprocessor_config.json"
-        fi; }; shift; done
+      shift 3; dest=''; from=''
+      while [ "$#" -gt 0 ]; do
+        [ "$1" = --dest ] && { dest="$2"; shift; }
+        [ "$1" = --from-dir ] && { from="$2"; shift; }
+        shift
+      done
+      if [ ! -e "$dest/onnx/int8/model_quantized.onnx" ]; then
+        mkdir -p "$dest/onnx/int8"
+        if [ -n "$from" ]; then
+          cp "$from/onnx/int8/model_quantized.onnx" "$dest/onnx/int8/model_quantized.onnx"
+          cp "$from/onnx/int8/preprocessor_config.json" "$dest/onnx/int8/preprocessor_config.json"
+        else
+          printf 'MODEL_FETCH <%s>\n' "$dest" >> "$FAKE_LOG"
+          printf '%s' "${FAKE_MODEL_BYTES:-MODEL}" > "$dest/onnx/int8/model_quantized.onnx"
+          printf CONFIG > "$dest/onnx/int8/preprocessor_config.json"
+        fi
+      fi
     else
       out=''; port=8000; while [ "$#" -gt 0 ]; do
         [ "$1" = --output-dir ] && { out="$2"; shift; }
@@ -185,7 +208,13 @@ UNIT
   grep) /usr/bin/grep "$@" ;;
   tr) /usr/bin/tr "$@" ;;
   usermod) printf 'dialout audio\n' > "$FAKE_GROUPS" ;;
-  apt-get|chown|systemctl) : ;;
+  apt-get|chown) : ;;
+  systemctl)
+    [ "${FAKE_SYSTEMCTL_FAIL:-}" != "${1:-}" ] || exit 31
+    if [ "${1:-}" = is-active ]; then
+      [ "${FAKE_SERVICE_ACTIVE:-}" = 1 ] && exit 0
+      exit 3
+    fi ;;
 esac
 """
     )
@@ -218,7 +247,8 @@ esac
     agent.write_text(fake.read_text())
     agent.chmod(0o755)
     operator_home = tmp_path / "operator-home"
-    pipx_agent = operator_home / ".local/pipx/venvs/roastpilot-agent/bin/roastpilot-agent"
+    pipx_home = operator_home / ".local/share/pipx"
+    pipx_agent = pipx_home / "venvs/roastpilot-agent/bin/roastpilot-agent"
     pipx_agent.parent.mkdir(parents=True)
     pipx_agent.write_text(fake.read_text())
     pipx_agent.chmod(0o755)
@@ -236,6 +266,7 @@ esac
         "FAKE_LOG": str(log),
         "FAKE_HOSTNAME": str(hostname),
         "FAKE_PIPX_STATE": str(tmp_path / "pipx-state"),
+        "FAKE_PIPX_HOME": str(pipx_home),
         "FAKE_PIPX_ENV_LOG": str(tmp_path / "pipx-environment.log"),
         "FAKE_GROUPS": str(groups),
         "ROASTPILOT_INSTALL_TEST_MODE": "1",
@@ -548,7 +579,7 @@ def test_hostname_consent_start_and_failure_abort_before_service_enable(
     failing = environment | {"FAKE_MODEL_FAIL": "1"}
     fake_agent = (
         Path(environment["FAKE_OPERATOR_HOME"])
-        / ".local/pipx/venvs/roastpilot-agent/bin/roastpilot-agent"
+        / ".local/share/pipx/venvs/roastpilot-agent/bin/roastpilot-agent"
     )
     source = fake_agent.read_text()
     fake_agent.write_text(
@@ -759,7 +790,7 @@ def test_contract_mutation_oracles_detect_removed_guards(
     elif environment_key == "model_failure":
         agent = (
             Path(environment["FAKE_OPERATOR_HOME"])
-            / ".local/pipx/venvs/roastpilot-agent/bin/roastpilot-agent"
+            / ".local/share/pipx/venvs/roastpilot-agent/bin/roastpilot-agent"
         )
         agent.write_text(
             agent.read_text().replace(
@@ -824,9 +855,17 @@ def test_trailing_main_mutation_is_detected_by_truncation_oracle(
         ((), None, ("install",)),
         ((), ("default", "roastpilot-agent[pi]"), ()),
         (("--version", "1.2"), ("1.2", "roastpilot-agent[pi]==1.2"), ()),
-        (("--version", "2.0"), ("1.2", "roastpilot-agent[pi]==1.2"), ("uninstall", "install")),
-        (("--wheel", "WHEEL"), ("default", "WHEEL"), ()),
-        (("--wheel", "OTHER"), ("default", "WHEEL"), ("uninstall", "install")),
+        (
+            ("--version", "2.0"),
+            ("1.2", "roastpilot-agent[pi]==1.2"),
+            ("install", "uninstall", "install", "uninstall"),
+        ),
+        (("--wheel", "WHEEL"), ("default", "WHEEL_PI"), ()),
+        (
+            ("--wheel", "OTHER"),
+            ("default", "WHEEL_PI"),
+            ("install", "uninstall", "install", "uninstall"),
+        ),
     ],
 )
 def test_pipx_selector_deltas_are_isolated(
@@ -848,7 +887,13 @@ def test_pipx_selector_deltas_are_isolated(
     )
     if initial is not None:
         version, package = initial
-        package = str(wheel) if package == "WHEEL" else package
+        package = (
+            str(wheel)
+            if package == "WHEEL"
+            else f"{wheel}[pi]"
+            if package == "WHEEL_PI"
+            else package
+        )
         _pipx_state(Path(environment["FAKE_PIPX_STATE"]), version, package)
     result = _run(environment, "--set-hostname", "roastpilot", *selector)
     assert result.returncode == 0, result.stderr
@@ -857,7 +902,9 @@ def test_pipx_selector_deltas_are_isolated(
         for line in log.read_text().splitlines()
         if line.startswith("pipx ")
     ]
-    assert tuple(action for action in pipx_actions if action != "list") == expected
+    assert (
+        tuple(action for action in pipx_actions if action in {"install", "uninstall"}) == expected
+    )
 
 
 @pytest.mark.serial  # pipx child environments are process-local fake state.
@@ -876,12 +923,14 @@ def test_pipx_children_use_only_the_resolved_invoking_home(
     assert result.returncode == 0, result.stderr
     records = Path(environment["FAKE_PIPX_ENV_LOG"]).read_text().splitlines()
     expected_home = environment["FAKE_OPERATOR_HOME"]
-    assert records == [
-        f"HOME=<{expected_home}> PIPX_HOME=<UNSET> PIPX_BIN_DIR=<UNSET> "
-        "PIPX_DEFAULT_PYTHON=<UNSET>",
-        f"HOME=<{expected_home}> PIPX_HOME=<UNSET> PIPX_BIN_DIR=<UNSET> "
-        "PIPX_DEFAULT_PYTHON=<UNSET>",
-    ]
+    assert (
+        records
+        == [
+            f"HOME=<{expected_home}> PIPX_HOME=<UNSET> PIPX_BIN_DIR=<UNSET> "
+            "PIPX_DEFAULT_PYTHON=<UNSET>"
+        ]
+        * 4
+    )
 
 
 @pytest.mark.serial  # Failure behaviour needs an isolated fake command log.
@@ -995,7 +1044,10 @@ def test_repair_inputs_are_rejected_before_privileged_work(
     """Repair guards reject unsafe API, device, port, and source inputs."""
     _, environment, log, _ = installer_harness
     source = tmp_path / "models"
-    source.mkdir()
+    source_int8 = source / "onnx/int8"
+    source_int8.mkdir(parents=True)
+    (source_int8 / "model_quantized.onnx").write_text("MODEL")
+    (source_int8 / "preprocessor_config.json").write_text("CONFIG")
     for arguments in (
         ("--api-key", "secret"),
         ("--port", "0"),
@@ -1316,7 +1368,7 @@ def test_appliance_executable_provenance_fails_before_model_or_later_effects(
     fake_bin, environment, log, _ = installer_harness
     operator_home = Path(environment["FAKE_OPERATOR_HOME"])
     expected = operator_home / ".local/bin/roastpilot-agent"
-    resolved = operator_home / ".local/pipx/venvs/roastpilot-agent/bin/roastpilot-agent"
+    resolved = operator_home / ".local/share/pipx/venvs/roastpilot-agent/bin/roastpilot-agent"
     if state == "missing":
         expected.unlink()
     elif state == "outside-venv":
@@ -1526,3 +1578,93 @@ def test_nondefault_port_is_pinned_across_env_and_service(
         "--host 0.0.0.0 --port ${PORT}"
         in (root / "etc/systemd/system/roastpilot-agent.service").read_text()
     )
+
+
+@pytest.mark.serial  # These failure oracles share the fake pipx and service state.
+def test_pipx_provenance_and_capability_fail_before_appliance_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Untrusted pipx roots and base-only environments cannot reach appliance work."""
+    _, environment, log, _ = installer_harness
+    bad_root = _run(
+        environment | {"FAKE_PIPX_HOME": "/tmp/not-the-operator-pipx"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert bad_root.returncode != 0
+    assert "roastpilot-agent <appliance" not in log.read_text()
+    log.write_text("")
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "default", "roastpilot-agent")
+    base_only = _run(environment | {"FAKE_PIPX_MCP_MISSING": "1"}, "--set-hostname", "roastpilot")
+    assert base_only.returncode != 0
+    events = log.read_text()
+    assert "roastpilot-agent <appliance" not in events
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
+
+
+@pytest.mark.serial  # Reuse and retained-key checks require one fake installation lifecycle.
+def test_rerun_reuses_verified_model_and_retains_a_valid_existing_key(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A valid installed model and key make a subsequent offline maintenance run safe."""
+    _, environment, log, _ = installer_harness
+    secret = "kept-private-on-rerun"
+    assert (
+        _run(
+            environment | {"ROASTPILOT_INSTALL_API_KEY": secret}, "--set-hostname", "roastpilot"
+        ).returncode
+        == 0
+    )
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    env_file = root / "etc/roastpilot-agent/roastpilot-agent.env"
+    start = len(log.read_text())
+    rerun = _run(environment, "--set-hostname", "roastpilot")
+    assert rerun.returncode == 0 and secret not in rerun.stdout + rerun.stderr + log.read_text()
+    assert f"OPENROUTER_API_KEY={secret}" in env_file.read_text()
+    events = _delta(log, start)
+    assert not any("MODEL_FETCH" in event for event in events)
+    assert any("<--from-dir>" in event for event in events)
+
+
+@pytest.mark.serial  # Activation failures are asserted through a dedicated fake systemctl log.
+def test_activation_orders_avahi_and_never_restarts_an_active_agent(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Avahi failure blocks agent enablement, while active --start requires a manual restart."""
+    _, environment, log, _ = installer_harness
+    avahi_failed = _run(
+        environment | {"FAKE_SYSTEMCTL_FAIL": "enable"}, "--set-hostname", "roastpilot"
+    )
+    assert avahi_failed.returncode != 0
+    events = log.read_text().splitlines()
+    assert "systemctl <enable> <--now> <avahi-daemon>" in events
+    assert "systemctl <enable> <roastpilot-agent>" not in events
+    log.write_text("")
+    active = _run(
+        environment | {"FAKE_SERVICE_ACTIVE": "1"}, "--set-hostname", "roastpilot", "--start"
+    )
+    assert active.returncode != 0 and "manually restart" in active.stderr
+    active_events = log.read_text()
+    assert "systemctl <is-active> <--quiet> <roastpilot-agent>" in active_events
+    assert "systemctl <start> <roastpilot-agent>" not in active_events
+    assert not any(word in active_events for word in ("restart", "try-restart", "stop", "kill"))
+
+
+@pytest.mark.serial  # A staged replacement must leave the original fake venv untouched on failure.
+def test_failed_staged_replacement_keeps_the_prior_application(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A replacement that cannot prove MCP capability never uninstalls the prior app."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+    failed = _run(
+        environment | {"FAKE_PIPX_MCP_MISSING": "1"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    assert failed.returncode != 0
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text()
+    assert "roastpilot-agent <appliance" not in log.read_text()
+    assert "1.2" in Path(environment["FAKE_PIPX_STATE"]).read_text()

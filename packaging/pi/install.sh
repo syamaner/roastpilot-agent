@@ -267,39 +267,148 @@ except (KeyError, TypeError, json.JSONDecodeError):
 ' "$selector_kind" "$selector_value"
 }
 
+requested_package_spec() {
+    if [[ -n "$REQUESTED_WHEEL" ]]; then
+        printf '%s[pi]\n' "$REQUESTED_WHEEL"
+    elif [[ -n "$REQUESTED_VERSION" ]]; then
+        printf 'roastpilot-agent[pi]==%s\n' "$REQUESTED_VERSION"
+    else
+        printf '%s\n' "roastpilot-agent[pi]"
+    fi
+}
+
+installed_package_spec() {
+    local entry="$1"
+    printf '%s' "$entry" | python3 -c '
+import json, sys
+try:
+    package = json.load(sys.stdin)["metadata"]["main_package"]["package_or_url"]
+    if not isinstance(package, str) or not package or any(c in package for c in "\r\n"):
+        raise ValueError()
+    print(package)
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+' || die "invalid pipx package metadata"
+}
+
+verify_pi_capability() {
+    pipx_command runpip roastpilot-agent show coffee-roaster-mcp >/dev/null \
+        || die "installed roastpilot-agent lacks required Pi/MCP capability"
+}
+
+replace_application_safely() {
+    local prior_spec="$1" package_spec="$2" suffix="-roastpilot-stage-$$"
+    # Prove a separate pipx environment can supply the required dependency
+    # before removing the known-working application environment.
+    if ! pipx_command install --suffix "$suffix" -- "$package_spec"; then
+        die "requested replacement could not be staged"
+    fi
+    if ! pipx_command runpip "roastpilot-agent$suffix" show coffee-roaster-mcp >/dev/null; then
+        pipx_command uninstall -- "roastpilot-agent$suffix" || true
+        die "staged replacement lacks required Pi/MCP capability"
+    fi
+    if ! pipx_command uninstall -- roastpilot-agent; then
+        pipx_command uninstall -- "roastpilot-agent$suffix" || true
+        die "cannot remove prior application after staging replacement"
+    fi
+    if ! pipx_command install -- "$package_spec" || ! pipx_command runpip roastpilot-agent show coffee-roaster-mcp >/dev/null; then
+        pipx_command uninstall -- roastpilot-agent || true
+        pipx_command install -- "$prior_spec" || die "replacement failed and prior application could not be restored"
+        pipx_command uninstall -- "roastpilot-agent$suffix" || true
+        die "replacement failed; prior application was restored"
+    fi
+    pipx_command uninstall -- "roastpilot-agent$suffix" || die "cannot remove staged replacement"
+}
+
 install_application() {
-    local state package_spec match_status
+    local state package_spec match_status prior_spec
     state="$(installed_pipx_state)"
+    package_spec="$(requested_package_spec)"
     if [[ "$state" == "absent" ]]; then
-        if [[ -n "$REQUESTED_WHEEL" ]]; then package_spec="$REQUESTED_WHEEL"
-        elif [[ -n "$REQUESTED_VERSION" ]]; then package_spec="roastpilot-agent[pi]==$REQUESTED_VERSION"
-        else package_spec="roastpilot-agent[pi]"; fi
         pipx_command install -- "$package_spec"
+        verify_pi_capability
         return
     fi
-    [[ -n "$REQUESTED_WHEEL$REQUESTED_VERSION" ]] || return 0
+    if [[ -z "$REQUESTED_WHEEL$REQUESTED_VERSION" ]]; then
+        verify_pi_capability
+        return
+    fi
     if [[ -n "$REQUESTED_WHEEL" ]]; then
-        if pipx_matches "$state" wheel "$REQUESTED_WHEEL"; then return; else match_status=$?; fi
+        if pipx_matches "$state" wheel "${REQUESTED_WHEEL}[pi]"; then verify_pi_capability; return; else match_status=$?; fi
     else
-        if pipx_matches "$state" version "$REQUESTED_VERSION"; then return; else match_status=$?; fi
+        if pipx_matches "$state" version "$REQUESTED_VERSION"; then verify_pi_capability; return; else match_status=$?; fi
     fi
     [[ "$match_status" == 1 ]] || die "invalid pipx package metadata"
-    pipx_command uninstall -- roastpilot-agent
-    if [[ -n "$REQUESTED_WHEEL" ]]; then package_spec="$REQUESTED_WHEEL"; else package_spec="roastpilot-agent[pi]==$REQUESTED_VERSION"; fi
-    pipx_command install -- "$package_spec"
+    prior_spec="$(installed_package_spec "$state")"
+    replace_application_safely "$prior_spec" "$package_spec"
+}
+
+resolve_pipx_venv_root() {
+    local pipx_home canonical expected_home
+    pipx_home="$(pipx_command environment --value PIPX_HOME)" || die "cannot determine pipx home"
+    expected_home="$INVOKING_HOME/.local/share/pipx"
+    [[ -n "$pipx_home" && "$pipx_home" == /* && "$pipx_home" != *$'\n'* && "$pipx_home" != *$'\r'* ]] || die "pipx home is unsafe"
+    [[ -d "$pipx_home" && ! -L "$pipx_home" ]] || die "pipx home is unsafe"
+    canonical="$(readlink -f -- "$pipx_home")" || die "pipx home is unsafe"
+    [[ "$pipx_home" == "$canonical" && "$canonical" == "$expected_home" && ! -L "$canonical/venvs" && -d "$canonical/venvs" ]] || die "pipx home is outside invoking-user boundary"
+    PIPX_VENV_ROOT="$canonical/venvs"
 }
 
 resolve_appliance_executable() {
     local expected resolved expected_venv
-    # pipx's supported default installation is rooted in the invoking account,
-    # never in a caller-controlled PATH.  Resolve its entry point before the
-    # privileged model command and require the matching pipx venv provenance.
+    # Resolve pipx's reported data root rather than assuming a legacy layout.
+    # The entry point must still resolve exactly inside that trusted venv root.
+    resolve_pipx_venv_root
     expected="$INVOKING_HOME/.local/bin/roastpilot-agent"
-    expected_venv="$INVOKING_HOME/.local/pipx/venvs/roastpilot-agent/bin/"
+    expected_venv="$PIPX_VENV_ROOT/roastpilot-agent/bin/"
     [[ -L "$expected" ]] || die "roastpilot-agent pipx entry point is missing"
     resolved="$(readlink -f -- "$expected")" || die "roastpilot-agent path is unsafe"
     [[ "$resolved" == "$expected_venv"* && -f "$resolved" && -x "$resolved" && ! -L "$resolved" ]] || die "roastpilot-agent executable is unsafe"
     APPLIANCE_EXECUTABLE="$resolved"
+}
+
+preserve_existing_api_key() {
+    local env_file content line key_seen=0 preserved_key="" port_seen=0 db_seen=0 config_seen=0
+    [[ -z "$API_KEY" ]] || return 0
+    env_file="$(rooted_path /etc/roastpilot-agent/roastpilot-agent.env)"
+    [[ ! -e "$env_file" ]] && return
+    [[ -f "$env_file" && ! -L "$env_file" ]] || die "existing environment file is unsafe"
+    content="$(cat -- "$env_file")" || die "cannot read existing environment file"
+    content="$(normalise_unit_env_contract "$content")"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            OPENROUTER_API_KEY=*)
+                ((key_seen++ == 0)) || die "existing environment file is malformed"
+                preserved_key="${line#OPENROUTER_API_KEY=}"
+                [[ "$preserved_key" =~ ^[A-Za-z0-9._:-]*$ ]] || die "existing environment file is malformed"
+                ;;
+            PORT=*)
+                ((port_seen++ == 0)) || die "existing environment file is malformed"
+                [[ "${line#PORT=}" =~ ^[0-9]+$ ]] || die "existing environment file is malformed"
+                ;;
+            ROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3)
+                ((db_seen++ == 0)) || die "existing environment file is malformed"
+                ;;
+            COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml)
+                ((config_seen++ == 0)) || die "existing environment file is malformed"
+                ;;
+            *) die "existing environment file is malformed" ;;
+        esac
+    done <<< "$content"
+    [[ "$key_seen" == 1 && "$port_seen" == 1 && "$db_seen" == 1 && "$config_seen" == 1 ]] || die "existing environment file is malformed"
+    API_KEY="$preserved_key"
+}
+
+reuse_installed_model_if_valid() {
+    local model_dir quantized preprocessor quantized_digest preprocessor_digest
+    model_dir="$(rooted_path /var/lib/roastpilot-agent/models)"
+    quantized="$model_dir/onnx/int8/model_quantized.onnx"
+    preprocessor="$model_dir/onnx/int8/preprocessor_config.json"
+    [[ -f "$quantized" && ! -L "$quantized" && -f "$preprocessor" && ! -L "$preprocessor" ]] || return 0
+    quantized_digest="$(sha256sum -- "$quantized")"
+    preprocessor_digest="$(sha256sum -- "$preprocessor")"
+    [[ "${quantized_digest%% *}" == "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df" && "${preprocessor_digest%% *}" == "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231" ]] || return 0
+    MODEL_REUSE_DIR="$model_dir"
 }
 
 install_model_and_render() {
@@ -316,6 +425,8 @@ install_model_and_render() {
     mkdir -p -- "$model_stage"
     if [[ -n "$MODEL_FROM_DIR" ]]; then
         "$APPLIANCE_EXECUTABLE" appliance model install --dest "$model_stage" --from-dir "$MODEL_FROM_DIR"
+    elif [[ -n "$MODEL_REUSE_DIR" ]]; then
+        "$APPLIANCE_EXECUTABLE" appliance model install --dest "$model_stage" --from-dir "$MODEL_REUSE_DIR"
     else
         "$APPLIANCE_EXECUTABLE" appliance model install --dest "$model_stage"
     fi
@@ -484,9 +595,14 @@ install_rendered_files() {
 
 enable_services() {
     run_privileged systemctl daemon-reload
-    run_privileged systemctl enable roastpilot-agent
     run_privileged systemctl enable --now avahi-daemon
-    if [[ "$START_SERVICE" == 1 ]]; then run_privileged systemctl start roastpilot-agent; fi
+    run_privileged systemctl enable roastpilot-agent
+    if [[ "$START_SERVICE" == 1 ]]; then
+        if run_privileged systemctl is-active --quiet roastpilot-agent; then
+            die "roastpilot-agent is already active; manually restart it to apply the new configuration"
+        fi
+        run_privileged systemctl start roastpilot-agent
+    fi
 }
 
 summary() {
@@ -525,9 +641,12 @@ main() {
     parse_arguments "$@"
     preflight
     resolve_operator_identity
+    preserve_existing_api_key
     run_privileged apt-get install -y libportaudio2 pipx avahi-daemon
     install_application
     resolve_appliance_executable
+    MODEL_REUSE_DIR=""
+    reuse_installed_model_if_valid
     install_model_and_render
     install_rendered_files
     enable_services
