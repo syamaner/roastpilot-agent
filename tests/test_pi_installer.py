@@ -47,7 +47,7 @@ name=$(basename "$0")
 printf '%s' "$name" >> "$FAKE_LOG"
 for arg in "$@"; do printf ' <%s>' "$arg" >> "$FAKE_LOG"; done
 printf '\\n' >> "$FAKE_LOG"
-[ -z "${FAKE_SECRET_ENV_LOG:-}" ] || printf '%s <%s> <%s>\\n' "$name" "${OPENROUTER_API_KEY-UNSET}" "${API_KEY-UNSET}" >> "$FAKE_SECRET_ENV_LOG"
+[ -z "${FAKE_SECRET_ENV_LOG:-}" ] || printf '%s OPENROUTER_API_KEY=<%s> OPENROUTER_API_KEY_FILE=<%s> OPENAI_API_KEY=<%s> ANTHROPIC_API_KEY=<%s> ROASTPILOT_API_KEY=<%s> ROASTPILOT_OPENROUTER_API_KEY=<%s> API_KEY=<%s>\\n' "$name" "${OPENROUTER_API_KEY-UNSET}" "${OPENROUTER_API_KEY_FILE-UNSET}" "${OPENAI_API_KEY-UNSET}" "${ANTHROPIC_API_KEY-UNSET}" "${ROASTPILOT_API_KEY-UNSET}" "${ROASTPILOT_OPENROUTER_API_KEY-UNSET}" "${API_KEY-UNSET}" >> "$FAKE_SECRET_ENV_LOG"
 case "$name" in
   sudo) shift; [ "${1:-}" = -- ] && shift; exec "$@" ;;
   id)
@@ -2136,8 +2136,13 @@ def test_child_processes_do_not_receive_exported_secret_sentinels(
         | {
             "FAKE_SECRET_ENV_LOG": str(secret_log),
             "FAKE_ALLOW_AMBIENT_SECRET": "1",
-            "OPENROUTER_API_KEY": "ambient-sentinel",
-            "API_KEY": "exported-sentinel",
+            "OPENROUTER_API_KEY": "openrouter-sentinel",
+            "OPENROUTER_API_KEY_FILE": "openrouter-file-sentinel",
+            "OPENAI_API_KEY": "openai-sentinel",
+            "ANTHROPIC_API_KEY": "anthropic-sentinel",
+            "ROASTPILOT_API_KEY": "roastpilot-api-sentinel",
+            "ROASTPILOT_OPENROUTER_API_KEY": "roastpilot-openrouter-sentinel",
+            "API_KEY": "exported-api-sentinel",
             "ROASTPILOT_INSTALL_API_KEY": "installer-sentinel",
         },
         "--set-hostname",
@@ -2145,7 +2150,16 @@ def test_child_processes_do_not_receive_exported_secret_sentinels(
     )
     assert result.returncode == 0
     child_env = secret_log.read_text()
-    assert "ambient-sentinel" not in child_env and "exported-sentinel" not in child_env
+    for sentinel in (
+        "openrouter-sentinel",
+        "openrouter-file-sentinel",
+        "openai-sentinel",
+        "anthropic-sentinel",
+        "roastpilot-api-sentinel",
+        "roastpilot-openrouter-sentinel",
+        "exported-api-sentinel",
+    ):
+        assert sentinel not in child_env
     env_file = (
         Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
         / "etc/roastpilot-agent/roastpilot-agent.env"
