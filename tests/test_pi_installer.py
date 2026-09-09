@@ -236,6 +236,11 @@ UNIT
   apt-get|chown) : ;;
   systemctl)
     [ "${FAKE_SYSTEMCTL_FAIL:-}" != "${1:-}" ] || exit 31
+    if [ "${1:-}" = show ]; then
+      [ "${2:-}" = -p ] && [ "${3:-}" = ActiveState ] && [ "${4:-}" = --value ] || exit 32
+      if [ "${FAKE_SERVICE_STATE+x}" = x ]; then printf '%s\\n' "$FAKE_SERVICE_STATE"; else echo inactive; fi
+      exit 0
+    fi
     if [ "${1:-}" = is-active ]; then
       [ "${FAKE_SERVICE_ACTIVE:-}" = 1 ] && exit 0
       exit 3
@@ -363,7 +368,7 @@ def _has_service_mutation(events: list[str]) -> bool:
     """Return whether events contain service work beyond the read-only active probe."""
     return any(
         line.startswith("systemctl ")
-        and line != "systemctl <is-active> <--quiet> <roastpilot-agent>"
+        and line != "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>"
         for line in events
     )
 
@@ -1752,11 +1757,11 @@ def test_activation_orders_avahi_and_never_restarts_an_active_agent(
     assert "systemctl <enable> <roastpilot-agent>" not in events
     log.write_text("")
     active = _run(
-        environment | {"FAKE_SERVICE_ACTIVE": "1"}, "--set-hostname", "roastpilot", "--start"
+        environment | {"FAKE_SERVICE_STATE": "active"}, "--set-hostname", "roastpilot", "--start"
     )
-    assert active.returncode != 0 and "manually restart" in active.stderr
+    assert active.returncode != 0 and "never restart during a roast" in active.stderr
     active_events = log.read_text()
-    assert "systemctl <is-active> <--quiet> <roastpilot-agent>" in active_events
+    assert "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>" in active_events
     assert "systemctl <start> <roastpilot-agent>" not in active_events
     assert not any(word in active_events for word in ("restart", "try-restart", "stop", "kill"))
 
@@ -2009,11 +2014,26 @@ def test_active_agent_without_start_fails_before_appliance_changes(
 ) -> None:
     """Maintenance never rewrites appliance state while the agent is active."""
     _, environment, log, _ = installer_harness
-    result = _run(environment | {"FAKE_SERVICE_ACTIVE": "1"}, "--set-hostname", "roastpilot")
-    assert result.returncode != 0 and "manually restart" in result.stderr
+    result = _run(environment | {"FAKE_SERVICE_STATE": "active"}, "--set-hostname", "roastpilot")
+    assert result.returncode != 0 and "never restart during a roast" in result.stderr
     events = log.read_text().splitlines()
-    assert "systemctl <is-active> <--quiet> <roastpilot-agent>" in events
+    assert "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>" in events
     assert not any(line.startswith(("apt-get ", "pipx ", "roastpilot-agent ")) for line in events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("state", ["activating", "deactivating", "reloading", "", "garbled"])
+def test_only_inactive_or_failed_service_states_are_admitted(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], state: str
+) -> None:
+    """Transient, malformed, and active states fail closed before installer effects."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment | {"FAKE_SERVICE_STATE": state}, "--set-hostname", "roastpilot")
+    assert result.returncode != 0 and "never restart during a roast" in result.stderr
+    assert not any(
+        line.startswith(("apt-get ", "pipx ", "roastpilot-agent "))
+        for line in log.read_text().splitlines()
+    )
 
 
 @pytest.mark.serial

@@ -355,6 +355,7 @@ replace_application_safely() {
         pipx_command uninstall -- "roastpilot-agent$suffix" || true
         die "staged replacement lacks required Pi/MCP capability"
     fi
+    ensure_agent_inactive
     if ! pipx_command uninstall -- roastpilot-agent; then
         pipx_command uninstall -- "roastpilot-agent$suffix" || true
         die "cannot remove prior application after staging replacement"
@@ -601,6 +602,7 @@ install_rendered_files() {
     unit_file="$(rooted_path /etc/systemd/system/roastpilot-agent.service)"
     prior_file="$var_dir/prior-static-hostname"
     model_dir="$var_dir/models"
+    ensure_agent_inactive
     # Pin all mutable renderer output once, before any privileged destination
     # mutation.  The subsequent writes stream only these captured values.
     staged_env="$(capture_staged_file "$STAGE_DIR/roastpilot-agent.env" env)"
@@ -654,9 +656,13 @@ install_rendered_files() {
 }
 
 ensure_agent_inactive() {
-    if run_privileged systemctl is-active --quiet roastpilot-agent; then
-        die "roastpilot-agent is already active; manually restart it to apply the new configuration"
-    fi
+    local active_state
+    active_state="$(run_privileged systemctl show -p ActiveState --value roastpilot-agent)" \
+        || die "roastpilot-agent is not safely inactive; end any run safely, stop the service only when idle, then rerun the installer; never restart during a roast"
+    case "$active_state" in
+        inactive|failed) ;;
+        *) die "roastpilot-agent is not safely inactive; end any run safely, stop the service only when idle, then rerun the installer; never restart during a roast" ;;
+    esac
 }
 
 enable_services() {
@@ -664,6 +670,7 @@ enable_services() {
     run_privileged systemctl enable --now avahi-daemon
     run_privileged systemctl enable roastpilot-agent
     if [[ "$START_SERVICE" == 1 ]]; then
+        ensure_agent_inactive
         run_privileged systemctl start roastpilot-agent
     fi
 }
