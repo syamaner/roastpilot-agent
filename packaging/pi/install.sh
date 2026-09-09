@@ -297,7 +297,7 @@ verify_pi_capability() {
 }
 
 replace_application_safely() {
-    local prior_spec="$1" package_spec="$2" suffix="-roastpilot-stage-$$"
+    local prior_spec="$1" package_spec="$2" suffix="-roastpilot-stage-$$" restoration_failed=0
     # Prove a separate pipx environment can supply the required dependency
     # before removing the known-working application environment.
     if ! pipx_command install --suffix "$suffix" -- "$package_spec"; then
@@ -313,8 +313,12 @@ replace_application_safely() {
     fi
     if ! pipx_command install -- "$package_spec" || ! pipx_command runpip roastpilot-agent show coffee-roaster-mcp >/dev/null; then
         pipx_command uninstall -- roastpilot-agent || true
-        pipx_command install -- "$prior_spec" || die "replacement failed and prior application could not be restored"
+        if ! pipx_command install -- "$prior_spec" \
+            || ! pipx_command runpip roastpilot-agent show coffee-roaster-mcp >/dev/null; then
+            restoration_failed=1
+        fi
         pipx_command uninstall -- "roastpilot-agent$suffix" || true
+        [[ "$restoration_failed" == 0 ]] || die "replacement failed and prior application could not be restored"
         die "replacement failed; prior application was restored"
     fi
     pipx_command uninstall -- "roastpilot-agent$suffix" || die "cannot remove staged replacement"

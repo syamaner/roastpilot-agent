@@ -73,6 +73,14 @@ case "$name" in
       [ "${2:-}" = --value ] && [ "${3:-}" = PIPX_HOME ] || exit 18
       printf '%s\\n' "$FAKE_PIPX_HOME"
     elif [ "${1:-}" = runpip ]; then
+      venv="${2:-}"
+      if [[ "$venv" == *-roastpilot-stage-* ]]; then
+        [ "${FAKE_PIPX_FAIL_STAGE_VERIFY:-}" != 1 ] || exit 24
+      elif [ -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] && [ "$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")" = 1 ]; then
+        [ "${FAKE_PIPX_FAIL_FINAL_VERIFY:-}" != 1 ] || exit 24
+      elif [ -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] && [ "$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")" -ge 2 ]; then
+        [ "${FAKE_PIPX_FAIL_RESTORE_VERIFY:-}" != 1 ] || exit 24
+      fi
       [ "${FAKE_PIPX_MCP_MISSING:-}" != 1 ] || exit 24
     elif [ "${1:-}" = list ]; then
       if [ "${FAKE_PIPX_LIST_FAIL:-}" = 1 ]; then exit 17
@@ -85,13 +93,22 @@ case "$name" in
       [ "${1:-}" = -- ] && shift
       package="$1"; version="${package##*==}"
       [ "$version" = "$package" ] && version=default
-      if [ -z "$suffix" ]; then
+      if [ -n "$suffix" ]; then
+        [ "${FAKE_PIPX_FAIL_STAGE_INSTALL:-}" != 1 ] || exit 25
+      else
+        count=0; [ ! -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] || count=$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")
+        count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_PIPX_NORMAL_INSTALL_COUNT"
+        if [ "$count" = 1 ]; then [ "${FAKE_PIPX_FAIL_FINAL_INSTALL:-}" != 1 ] || exit 25
+        else [ "${FAKE_PIPX_FAIL_RESTORE_INSTALL:-}" != 1 ] || exit 25; fi
         printf '{"venvs":{"roastpilot-agent":{"metadata":' > "$FAKE_PIPX_STATE"
         printf '{"main_package":{"package_version":"%s",' "$version" >> "$FAKE_PIPX_STATE"
         printf '"package_or_url":"%s"}}}}}\\n' "$package" >> "$FAKE_PIPX_STATE"
       fi
     elif [ "${1:-}" = uninstall ]; then
       shift; [ "${1:-}" = -- ] && shift
+      if [[ "${1:-}" == *-roastpilot-stage-* ]]; then
+        [ "${FAKE_PIPX_FAIL_STAGE_CLEANUP:-}" != 1 ] || exit 26
+      fi
       [ "${1:-}" != roastpilot-agent ] || rm -f "$FAKE_PIPX_STATE"
     fi ;;
   roastpilot-agent)
@@ -266,6 +283,7 @@ esac
         "FAKE_LOG": str(log),
         "FAKE_HOSTNAME": str(hostname),
         "FAKE_PIPX_STATE": str(tmp_path / "pipx-state"),
+        "FAKE_PIPX_NORMAL_INSTALL_COUNT": str(tmp_path / "pipx-normal-install-count"),
         "FAKE_PIPX_HOME": str(pipx_home),
         "FAKE_PIPX_ENV_LOG": str(tmp_path / "pipx-environment.log"),
         "FAKE_GROUPS": str(groups),
@@ -1650,7 +1668,12 @@ def test_rerun_reuses_verified_model_and_retains_a_valid_existing_key(
     assert f"OPENROUTER_API_KEY={secret}" in env_file.read_text()
     events = _delta(log, start)
     assert not any("MODEL_FETCH" in event for event in events)
-    assert any("<--from-dir>" in event for event in events)
+    model_dir = root / "var/lib/roastpilot-agent/models"
+    assert any(
+        f"<--from-dir> <{model_dir}>" in event
+        for event in events
+        if event.startswith("roastpilot-agent <appliance> <model>")
+    )
 
 
 @pytest.mark.serial  # Activation failures are asserted through a dedicated fake systemctl log.
@@ -1695,3 +1718,200 @@ def test_failed_staged_replacement_keeps_the_prior_application(
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text()
     assert "roastpilot-agent <appliance" not in log.read_text()
     assert "1.2" in Path(environment["FAKE_PIPX_STATE"]).read_text()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("failure", ["FAKE_PIPX_FAIL_STAGE_INSTALL", "FAKE_PIPX_FAIL_STAGE_VERIFY"])
+def test_replacement_staging_failures_preserve_the_prior_normal_environment(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], failure: str
+) -> None:
+    """A failed staged replacement never removes the usable normal environment."""
+    _, environment, log, _ = installer_harness
+    state = Path(environment["FAKE_PIPX_STATE"])
+    _pipx_state(state, "1.2", "roastpilot-agent[pi]==1.2")
+    result = _run(environment | {failure: "1"}, "--set-hostname", "roastpilot", "--version", "2.0")
+    assert result.returncode != 0
+    events = log.read_text().splitlines()
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
+    assert '"package_version": "1.2"' in state.read_text()
+    assert not any(line.startswith("roastpilot-agent <appliance>") for line in events)
+    assert "Installed: unit enabled; model verified." not in result.stdout
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("failure", ["FAKE_PIPX_FAIL_FINAL_INSTALL", "FAKE_PIPX_FAIL_FINAL_VERIFY"])
+def test_failed_final_replacement_restores_and_reverifies_the_prior_application(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], failure: str
+) -> None:
+    """A failed final replacement restores the exact prior package before appliance work."""
+    _, environment, log, _ = installer_harness
+    state = Path(environment["FAKE_PIPX_STATE"])
+    prior_package = "roastpilot-agent[pi]==1.2"
+    _pipx_state(state, "1.2", prior_package)
+    result = _run(environment | {failure: "1"}, "--set-hostname", "roastpilot", "--version", "2.0")
+    assert result.returncode != 0
+    events = log.read_text().splitlines()
+    assert json.loads(state.read_text())["venvs"]["roastpilot-agent"]["metadata"][
+        "main_package"
+    ] == {
+        "package_version": "1.2",
+        "package_or_url": prior_package,
+    }
+    normal_uninstalls = [
+        line for line in events if line == "pipx <uninstall> <--> <roastpilot-agent>"
+    ]
+    assert len(normal_uninstalls) == 2
+    assert f"pipx <install> <--> <{prior_package}>" in events
+    assert sum(
+        line == "pipx <runpip> <roastpilot-agent> <show> <coffee-roaster-mcp>" for line in events
+    ) == (1 if failure == "FAKE_PIPX_FAIL_FINAL_INSTALL" else 2)
+    assert any("roastpilot-stage-" in line and "<uninstall>" in line for line in events)
+    assert not any(line.startswith("roastpilot-agent <appliance>") for line in events)
+    assert "Installed: unit enabled; model verified." not in result.stdout
+
+
+@pytest.mark.serial
+def test_failed_restoration_cleans_the_stage_and_fails_before_appliance_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A restoration failure is fatal but still attempts staged-environment cleanup."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+    result = _run(
+        environment | {"FAKE_PIPX_FAIL_FINAL_INSTALL": "1", "FAKE_PIPX_FAIL_RESTORE_INSTALL": "1"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    assert result.returncode != 0
+    events = log.read_text().splitlines()
+    assert any("roastpilot-stage-" in line and "<uninstall>" in line for line in events)
+    assert not any(line.startswith("roastpilot-agent <appliance>") for line in events)
+    assert "Installed: unit enabled; model verified." not in result.stdout
+
+
+@pytest.mark.serial
+def test_staged_cleanup_failure_is_fatal_before_appliance_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """An unremovable staged venv cannot be silently retained after replacement."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+    result = _run(
+        environment | {"FAKE_PIPX_FAIL_STAGE_CLEANUP": "1"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    assert result.returncode != 0
+    events = log.read_text().splitlines()
+    assert any(
+        line.startswith("pipx <uninstall>") and "roastpilot-stage-" in line for line in events
+    )
+    assert not any(line.startswith("roastpilot-agent <appliance>") for line in events)
+    assert "Installed: unit enabled; model verified." not in result.stdout
+
+
+@pytest.mark.serial
+def test_fresh_local_wheel_install_includes_pi_extra_and_verifies_mcp(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A fresh local wheel is installed with the Pi extra before appliance work."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "roastpilot-agent.whl"
+    wheel.write_text("wheel")
+    result = _run(environment, "--set-hostname", "roastpilot", "--wheel", str(wheel))
+    assert result.returncode == 0, result.stderr
+    events = log.read_text().splitlines()
+    assert f"pipx <install> <--> <{wheel}[pi]>" in events
+    assert "pipx <runpip> <roastpilot-agent> <show> <coffee-roaster-mcp>" in events
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    "content",
+    [
+        "OPENROUTER_API_KEY=candidate-key\\nOPENROUTER_API_KEY=two\\nPORT=8000\\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\\n",
+        "OPENROUTER_API_KEY=candidate-key\\nPORT=8000\\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\\nUNEXPECTED=value\\n",
+        "OPENROUTER_API_KEY=candidate-key\\nPORT=8000\\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\\n",
+        "OPENROUTER_API_KEY=candidate key\\nPORT=8000\\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\\n",
+    ],
+)
+def test_malformed_existing_environment_fails_before_installer_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], content: str
+) -> None:
+    """Malformed retained-key inputs are rejected before apt, pipx, or rendering."""
+    _, environment, log, _ = installer_harness
+    env_file = (
+        Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+        / "etc/roastpilot-agent/roastpilot-agent.env"
+    )
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text(content)
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    output = result.stdout + result.stderr + (log.read_text() if log.exists() else "")
+    assert "candidate-key" not in output
+    assert not any(
+        line.startswith(("apt-get ", "pipx ", "roastpilot-agent ", "systemctl "))
+        for line in log.read_text().splitlines()
+    )
+
+
+@pytest.mark.serial
+def test_unsafe_existing_environment_file_fails_before_installer_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A retained-key symlink is never followed into the installation lifecycle."""
+    _, environment, log, _ = installer_harness
+    env_file = (
+        Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+        / "etc/roastpilot-agent/roastpilot-agent.env"
+    )
+    env_file.parent.mkdir(parents=True)
+    target = tmp_path / "candidate-key-target"
+    target.write_text("OPENROUTER_API_KEY=candidate-key\\n")
+    env_file.symlink_to(target)
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    output = result.stdout + result.stderr + (log.read_text() if log.exists() else "")
+    assert "candidate-key" not in output
+    assert not any(
+        line.startswith(("apt-get ", "pipx ", "roastpilot-agent ", "systemctl "))
+        for line in log.read_text().splitlines()
+    )
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("mutation", ["bad-digest", "missing-peer", "symlink", "incomplete"])
+def test_only_complete_verified_installed_models_are_reused(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], mutation: str
+) -> None:
+    """Invalid installed model trees fall back to the normal verified fetch path."""
+    _, environment, log, _ = installer_harness
+    assert _run(environment, "--set-hostname", "roastpilot").returncode == 0
+    model_dir = (
+        Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / "var/lib/roastpilot-agent/models"
+    )
+    quantized = model_dir / "onnx/int8/model_quantized.onnx"
+    preprocessor = model_dir / "onnx/int8/preprocessor_config.json"
+    if mutation == "bad-digest":
+        quantized.write_text("WRONG")
+    elif mutation == "missing-peer":
+        preprocessor.unlink()
+    elif mutation == "symlink":
+        quantized.unlink()
+        quantized.symlink_to(preprocessor)
+    else:
+        quantized.write_text("MODEL-partial")
+    start = len(log.read_text())
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode == (1 if mutation == "symlink" else 0), result.stderr
+    events = _delta(log, start)
+    model_install = next(
+        line for line in events if line.startswith("roastpilot-agent <appliance> <model>")
+    )
+    assert "<--from-dir>" not in model_install
+    assert any(line.startswith("MODEL_FETCH") for line in events)
