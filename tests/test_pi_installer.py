@@ -66,6 +66,11 @@ case "$name" in
       else cat "$FAKE_HOSTNAME"; fi
     else [ "$1" = set-hostname ]; printf '%s\\n' "$2" > "$FAKE_HOSTNAME"; fi ;;
   pipx)
+    if [ -n "${FAKE_PIPX_ENV_LOG:-}" ]; then
+      printf 'HOME=<%s> PIPX_HOME=<%s> PIPX_BIN_DIR=<%s> PIPX_DEFAULT_PYTHON=<%s>\\n' \\
+        "${HOME-UNSET}" "${PIPX_HOME-UNSET}" "${PIPX_BIN_DIR-UNSET}" "${PIPX_DEFAULT_PYTHON-UNSET}" \
+        >> "$FAKE_PIPX_ENV_LOG"
+    fi
     if [ "${1:-}" = list ]; then
       if [ "${FAKE_PIPX_LIST_FAIL:-}" = 1 ]; then exit 17
       elif [ -n "${FAKE_PIPX_JSON:-}" ]; then cat "$FAKE_PIPX_JSON"
@@ -233,6 +238,7 @@ esac
         "FAKE_LOG": str(log),
         "FAKE_HOSTNAME": str(hostname),
         "FAKE_PIPX_STATE": str(tmp_path / "pipx-state"),
+        "FAKE_PIPX_ENV_LOG": str(tmp_path / "pipx-environment.log"),
         "FAKE_GROUPS": str(groups),
         "ROASTPILOT_INSTALL_TEST_MODE": "1",
         "ROASTPILOT_INSTALL_TEST_ROOT": str(tmp_path / "root"),
@@ -562,6 +568,9 @@ def test_hostname_consent_start_and_failure_abort_before_service_enable(
     assert failed.returncode != 0
     assert not (failed_root / "etc/systemd/system/roastpilot-agent.service").exists()
     failure_events = _delta(log, failure_start)
+    assert not any(
+        line.startswith("roastpilot-agent <appliance> <render>") for line in failure_events
+    )
     assert not any("systemctl" in line for line in failure_events)
     assert not any(
         "<etc/roastpilot-agent/roastpilot-agent.env>" in line
@@ -779,6 +788,10 @@ def test_contract_mutation_oracles_detect_removed_guards(
         assert result.returncode == 0
     elif oracle == "fails":
         assert result.returncode != 0
+        assert any(
+            line.startswith("roastpilot-agent <appliance> <render>")
+            for line in log.read_text().splitlines()
+        )
     elif oracle == "usermod":
         assert "usermod" in log.read_text()
     else:
@@ -845,6 +858,30 @@ def test_pipx_selector_deltas_are_isolated(
         if line.startswith("pipx ")
     ]
     assert tuple(action for action in pipx_actions if action != "list") == expected
+
+
+@pytest.mark.serial
+def test_pipx_children_use_only_the_resolved_invoking_home(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Every pipx subprocess receives the resolved home without ambient routing."""
+    _, environment, _, _ = installer_harness
+    hostile_environment = environment | {
+        "HOME": "/hostile/home",
+        "PIPX_HOME": "/hostile/pipx-home",
+        "PIPX_BIN_DIR": "/hostile/pipx-bin",
+        "PIPX_DEFAULT_PYTHON": "/hostile/python",
+    }
+    result = _run(hostile_environment, "--set-hostname", "roastpilot")
+    assert result.returncode == 0, result.stderr
+    records = Path(environment["FAKE_PIPX_ENV_LOG"]).read_text().splitlines()
+    expected_home = environment["FAKE_OPERATOR_HOME"]
+    assert records == [
+        f"HOME=<{expected_home}> PIPX_HOME=<UNSET> PIPX_BIN_DIR=<UNSET> "
+        "PIPX_DEFAULT_PYTHON=<UNSET>",
+        f"HOME=<{expected_home}> PIPX_HOME=<UNSET> PIPX_BIN_DIR=<UNSET> "
+        "PIPX_DEFAULT_PYTHON=<UNSET>",
+    ]
 
 
 @pytest.mark.serial  # Failure behaviour needs an isolated fake command log.
@@ -1268,6 +1305,34 @@ def test_pipx_null_path_and_malicious_path_are_fail_closed_or_ignored(
     result = _run(environment, "--set-hostname", "roastpilot")
     assert result.returncode == 0, result.stderr
     assert "PATH_SHADOW" not in result.stdout + result.stderr + log.read_text()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("state", ["missing", "outside-venv", "not-executable"])
+def test_appliance_executable_provenance_fails_before_model_or_later_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], state: str
+) -> None:
+    """A bad pipx entry point cannot reach model, render, or service installation."""
+    fake_bin, environment, log, _ = installer_harness
+    operator_home = Path(environment["FAKE_OPERATOR_HOME"])
+    expected = operator_home / ".local/bin/roastpilot-agent"
+    resolved = operator_home / ".local/pipx/venvs/roastpilot-agent/bin/roastpilot-agent"
+    if state == "missing":
+        expected.unlink()
+    elif state == "outside-venv":
+        expected.unlink()
+        expected.symlink_to(fake_bin / "roastpilot-agent")
+    else:
+        resolved.chmod(0o644)
+
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    events = log.read_text().splitlines()
+    assert not any(line.startswith("roastpilot-agent <appliance>") for line in events)
+    assert not any(
+        line.startswith(("mkdir ", "mktemp ", "chown ", "chmod ", "tee ", "systemctl "))
+        for line in events
+    )
 
 
 @pytest.mark.serial
