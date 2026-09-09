@@ -359,6 +359,15 @@ def _delta(log: Path, start: int) -> list[str]:
     return log.read_text()[start:].splitlines()
 
 
+def _has_service_mutation(events: list[str]) -> bool:
+    """Return whether events contain service work beyond the read-only active probe."""
+    return any(
+        line.startswith("systemctl ")
+        and line != "systemctl <is-active> <--quiet> <roastpilot-agent>"
+        for line in events
+    )
+
+
 def _pipx_state(path: Path, version: str, package: str) -> None:
     """Write the canonical pipx list representation accepted by install.sh."""
     path.write_text(
@@ -633,7 +642,7 @@ def test_hostname_consent_start_and_failure_abort_before_service_enable(
     assert not any(
         line.startswith("roastpilot-agent <appliance> <render>") for line in failure_events
     )
-    assert not any("systemctl" in line for line in failure_events)
+    assert not _has_service_mutation(failure_events)
     assert not any(
         "<etc/roastpilot-agent/roastpilot-agent.env>" in line
         or "<etc/roastpilot-agent/coffee-roaster-mcp.yaml>" in line
@@ -712,7 +721,7 @@ def test_destination_symlink_aborts_before_final_writes(
     result = _run(environment, "--set-hostname", "roastpilot")
     assert result.returncode != 0
     assert not list(outside.iterdir())
-    assert not any("systemctl" in line for line in log.read_text().splitlines())
+    assert not _has_service_mutation(log.read_text().splitlines())
 
 
 @pytest.mark.serial  # Hostile arguments run only through the isolated fake PATH.
@@ -985,7 +994,7 @@ def test_pipx_children_use_only_the_resolved_invoking_home(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
     """Every pipx subprocess receives the resolved home without ambient routing."""
-    _, environment, _, _ = installer_harness
+    _, environment, log, _ = installer_harness
     hostile_environment = environment | {
         "HOME": "/hostile/home",
         "PIPX_HOME": "/hostile/pipx-home",
@@ -996,14 +1005,13 @@ def test_pipx_children_use_only_the_resolved_invoking_home(
     assert result.returncode == 0, result.stderr
     records = Path(environment["FAKE_PIPX_ENV_LOG"]).read_text().splitlines()
     expected_home = environment["FAKE_OPERATOR_HOME"]
-    assert (
-        records
-        == [
-            f"HOME=<{expected_home}> PIPX_HOME=<UNSET> PIPX_BIN_DIR=<UNSET> "
-            "PIPX_DEFAULT_PYTHON=<UNSET>"
-        ]
-        * 4
+    expected_record = (
+        f"HOME=<{expected_home}> PIPX_HOME=<UNSET> PIPX_BIN_DIR=<UNSET> PIPX_DEFAULT_PYTHON=<UNSET>"
     )
+    assert records and all(record == expected_record for record in records)
+    pipx_events = [line for line in log.read_text().splitlines() if line.startswith("pipx ")]
+    assert len(records) == len(pipx_events)
+    assert [line.split()[1] for line in pipx_events].count("<environment>") == 2
 
 
 @pytest.mark.serial  # Failure behaviour needs an isolated fake command log.
@@ -1025,7 +1033,7 @@ def test_invalid_pipx_state_fails_before_destructive_or_privileged_work(
     events = log.read_text()
     assert "pipx <uninstall>" not in events
     assert "roastpilot-agent <appliance" not in events
-    assert "systemctl" not in events
+    assert not _has_service_mutation(events.splitlines())
 
 
 @pytest.mark.serial  # Executable provenance mutates the isolated fake command path.
@@ -1250,7 +1258,7 @@ def test_unit_and_env_comment_or_continuation_mutations_fail_closed(
     start = len(log.read_text()) if log.exists() else 0
     result = _run(environment | {field: mutation}, "--set-hostname", "roastpilot")
     assert result.returncode != 0
-    assert not any("systemctl" in line for line in _delta(log, start))
+    assert not _has_service_mutation(_delta(log, start))
 
 
 @pytest.mark.serial
@@ -1398,7 +1406,7 @@ def test_yaml_hash_without_preceding_whitespace_is_not_normalised_away(
         "roastpilot",
     )
     assert result.returncode != 0
-    assert "systemctl" not in (log.read_text() if log.exists() else "")
+    assert not _has_service_mutation((log.read_text() if log.exists() else "").splitlines())
 
 
 @pytest.mark.serial  # This source-only guard has no production command path.
