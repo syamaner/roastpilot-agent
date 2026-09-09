@@ -71,6 +71,7 @@ recheck_sensitive_destination() {
     run_privileged test -d "$parent"
     run_privileged test ! -L "$parent"
     run_privileged test ! -L "$destination"
+    run_privileged test ! -d "$destination"
 }
 
 validate_no_control_characters() {
@@ -143,7 +144,7 @@ parse_arguments() {
     [[ -n "$SERIAL_PORT" ]] || die "--serial-port is required"
     [[ -n "$AUDIO_DEVICE" ]] || die "--audio-device is required"
     validate_no_control_characters "$API_KEY" "API key"
-    [[ "$API_KEY" != *[[:space:]\\\"]* ]] || die "API key contains unsafe EnvironmentFile characters"
+    [[ -z "$API_KEY" || "$API_KEY" =~ ^[A-Za-z0-9._:-]+$ ]] || die "API key contains unsafe EnvironmentFile characters"
     validate_no_control_characters "$SERIAL_PORT" "serial port"
     validate_no_control_characters "$AUDIO_DEVICE" "audio device"
     [[ "$PORT" =~ ^[0-9]+$ && "$PORT" -ge 1024 && "$PORT" -le 65535 ]] || die "port must be a decimal number from 1024 to 65535"
@@ -181,7 +182,7 @@ preflight() {
         value="${line#*=}"
         case "$key" in
             ID|ID_LIKE)
-                if [[ "$value" == \"*\" ]]; then value="${value:1:${#value}-2}"; fi
+                if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then value="${value:1:${#value}-2}"; fi
                 [[ "$value" =~ ^[A-Za-z0-9_[:space:]-]+$ ]] || die "malformed operating system data"
                 if [[ "$key" == ID ]]; then
                     [[ -z "$id" ]] || die "malformed operating system data"
@@ -216,7 +217,7 @@ resolve_operator_identity() {
 
 installed_pipx_state() {
     local state
-    state="$(pipx list --json)" || die "cannot inspect pipx state"
+    state="$(pipx_command list --json)" || die "cannot inspect pipx state"
     printf '%s' "$state" | python3 -c '
 import json, sys
 try:
@@ -231,6 +232,11 @@ try:
 except (ValueError, KeyError, TypeError, json.JSONDecodeError):
     raise SystemExit(1)
 ' || die "invalid pipx state"
+}
+
+pipx_command() {
+    # Ignore ambient pipx routing and always use the resolved invoking home.
+    env -u PIPX_HOME -u PIPX_BIN_DIR -u PIPX_DEFAULT_PYTHON HOME="$INVOKING_HOME" pipx "$@"
 }
 
 pipx_matches() {
@@ -254,7 +260,7 @@ install_application() {
         if [[ -n "$REQUESTED_WHEEL" ]]; then package_spec="$REQUESTED_WHEEL"
         elif [[ -n "$REQUESTED_VERSION" ]]; then package_spec="roastpilot-agent[pi]==$REQUESTED_VERSION"
         else package_spec="roastpilot-agent[pi]"; fi
-        pipx install -- "$package_spec"
+        pipx_command install -- "$package_spec"
         return
     fi
     [[ -n "$REQUESTED_WHEEL$REQUESTED_VERSION" ]] || return 0
@@ -264,9 +270,9 @@ install_application() {
         if pipx_matches "$state" version "$REQUESTED_VERSION"; then return; else match_status=$?; fi
     fi
     [[ "$match_status" == 1 ]] || die "invalid pipx package metadata"
-    pipx uninstall -- roastpilot-agent
+    pipx_command uninstall -- roastpilot-agent
     if [[ -n "$REQUESTED_WHEEL" ]]; then package_spec="$REQUESTED_WHEEL"; else package_spec="roastpilot-agent[pi]==$REQUESTED_VERSION"; fi
-    pipx install -- "$package_spec"
+    pipx_command install -- "$package_spec"
 }
 
 resolve_appliance_executable() {
@@ -283,7 +289,7 @@ resolve_appliance_executable() {
 }
 
 install_model_and_render() {
-    local model_dir stage_dir stage_parent model_stage
+    local model_dir stage_dir stage_parent model_stage etc_dir db_path yaml_path
     model_dir="$(rooted_path /var/lib/roastpilot-agent/models)"
     validate_destination "$model_dir"
     stage_parent="$(rooted_path /tmp)"
@@ -301,102 +307,126 @@ install_model_and_render() {
     else
         "$APPLIANCE_EXECUTABLE" appliance model install --dest "$model_stage"
     fi
-    promote_model_file "$model_stage/onnx/int8/model_quantized.onnx" "$model_dir/onnx/int8/model_quantized.onnx" "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df"
-    promote_model_file "$model_stage/onnx/int8/preprocessor_config.json" "$model_dir/onnx/int8/preprocessor_config.json" "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231"
+    # Do not promote model bytes yet: every renderer output is pinned and
+    # checked before the installer mutates an appliance destination.
+    etc_dir="$(rooted_path /etc/roastpilot-agent)"
+    db_path="/var/lib/roastpilot-agent/roastpilot.sqlite3"
+    yaml_path="/etc/roastpilot-agent/coffee-roaster-mcp.yaml"
     "$APPLIANCE_EXECUTABLE" appliance render --output-dir "$stage_dir" --port "$PORT" \
         --operator-user "$INVOKING_USER" --operator-group "$INVOKING_GROUP" --operator-home "$INVOKING_HOME" --serial-port "$SERIAL_PORT" \
-        --audio-device "$AUDIO_DEVICE"
+        --audio-device "$AUDIO_DEVICE" --model-dir /var/lib/roastpilot-agent/models \
+        --mcp-config-path "$yaml_path" --db-path "$db_path"
 }
 
 promote_model_file() {
     local source="$1" destination="$2" expected="$3" parent temporary actual
     [[ -f "$source" && ! -L "$source" ]] || die "model staging file is unsafe"
-    actual="$(sha256sum -- "$source")"; [[ "${actual%% *}" == "$expected" ]] || die "model staging digest mismatch"
     parent="$(dirname -- "$destination")"
     validate_destination "$parent"
     run_privileged mkdir -p -- "$parent"
     recheck_sensitive_destination "$destination"
     temporary="$(run_privileged mktemp -- "$parent/.roastpilot-model.XXXXXX")"
     [[ "$temporary" == "$parent/.roastpilot-model."* ]] || die "unsafe model temporary path"
-    # Root reads only its own temporary file; the unprivileged reader streams
-    # already-verified bytes through stdin.
+    ROOT_TEMPORARIES+=("$temporary")
+    # The privileged digest is over the root-owned snapshot, never a second
+    # read of mutable staging bytes.
     cat -- "$source" | run_privileged tee -- "$temporary" >/dev/null
     actual="$(run_privileged sha256sum -- "$temporary")"; [[ "${actual%% *}" == "$expected" ]] || die "model promotion digest mismatch"
     run_privileged chmod 0644 -- "$temporary"
     run_privileged mv -f -- "$temporary" "$destination"
+    ROOT_TEMPORARIES=("${ROOT_TEMPORARIES[@]/$temporary}")
     actual="$(run_privileged sha256sum -- "$destination")"; [[ "${actual%% *}" == "$expected" ]] || die "model destination digest mismatch"
 }
 
-validate_rendered_env_template() {
-    local line assignment_count=0
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ "$line" == OPENROUTER_API_KEY=* ]] && ((assignment_count += 1))
-    done < "$STAGE_DIR/roastpilot-agent.env"
-    [[ "$assignment_count" == 1 ]] || die "rendered env must contain exactly one OPENROUTER_API_KEY assignment"
+validate_model_stage_file() {
+    local source="$1" expected="$2" actual
+    [[ -f "$source" && ! -L "$source" ]] || die "model staging file is unsafe"
+    actual="$(sha256sum -- "$source")"
+    [[ "${actual%% *}" == "$expected" ]] || die "model staging digest mismatch"
 }
 
-write_env_with_key() {
-    local env_file="$1" line staged
-    staged="$STAGE_DIR/roastpilot-agent.env.final"
-    (umask 077; : > "$staged")
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ "$line" == OPENROUTER_API_KEY=* ]]; then
-            printf 'OPENROUTER_API_KEY=%s\n' "$API_KEY"
-        else
-            printf '%s\n' "$line"
-        fi
-    done < "$STAGE_DIR/roastpilot-agent.env" > "$staged"
-    install_env_atomically "$staged" "$env_file"
+capture_staged_file() {
+    local path="$1" label="$2"
+    [[ -f "$path" && ! -L "$path" ]] || die "rendered $label is unsafe"
+    cat -- "$path"
 }
 
-install_env_atomically() {
-    local source="$1" destination="$2" parent temporary
+validate_rendered_env() {
+    local content="$1" expected
+    expected=$'OPENROUTER_API_KEY=\nPORT='"$PORT"$'\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml'
+    [[ "$(printf '%s\n' "$content" | normalise_contract)" == "$expected" ]] || die "rendered env violates appliance contract"
+}
+
+install_content_atomically() {
+    local content="$1" destination="$2" mode="$3" owner="$4" prefix="$5" parent temporary
     parent="$(dirname -- "$destination")"
     recheck_sensitive_destination "$destination"
-    temporary="$(run_privileged mktemp -- "$parent/.roastpilot-env.XXXXXX")"
-    [[ "$temporary" == "$parent/.roastpilot-env."* ]] || die "unsafe environment temporary path"
-    cat -- "$source" | run_privileged tee -- "$temporary" >/dev/null
-    run_privileged chmod 0600 -- "$temporary"
-    run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$temporary"
+    temporary="$(run_privileged mktemp -- "$parent/.$prefix.XXXXXX")"
+    [[ "$temporary" == "$parent/.$prefix."* ]] || die "unsafe temporary path"
+    ROOT_TEMPORARIES+=("$temporary")
+    printf '%s\n' "$content" | run_privileged tee -- "$temporary" >/dev/null
+    run_privileged chmod "$mode" -- "$temporary"
+    [[ -z "$owner" ]] || run_privileged chown "$owner" -- "$temporary"
     run_privileged mv -f -- "$temporary" "$destination"
+    ROOT_TEMPORARIES=("${ROOT_TEMPORARIES[@]/$temporary}")
+}
+
+normalise_contract() {
+    sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d'
 }
 
 validate_rendered_unit() {
-    local unit="$STAGE_DIR/roastpilot-agent.service" expected actual
-    [[ -f "$unit" && ! -L "$unit" ]] || die "rendered unit is unsafe"
+    local unit="$1" expected actual
     expected=$'[Unit]\nDescription=RoastPilot agent (native Pi appliance)\nAfter=network-online.target sound.target\nWants=network-online.target\n[Service]\nType=simple\nUser='"$INVOKING_USER"$'\nGroup='"$INVOKING_GROUP"$'\nEnvironmentFile=/etc/roastpilot-agent/roastpilot-agent.env\nExecStart='"$INVOKING_HOME"$'/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}\nWorkingDirectory=~\nRestart=on-failure\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=30\nNoNewPrivileges=true\nPrivateTmp=true\n[Install]\nWantedBy=multi-user.target'
-    actual="$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$unit")"
+    actual="$(printf '%s\n' "$unit" | normalise_contract)"
     [[ "$actual" == "$expected" ]] || die "rendered unit violates appliance contract"
 }
 
+validate_rendered_yaml() {
+    local yaml="$1" expected actual
+    expected=$'transport:\n  type: stdio\nroaster:\n  driver: hottop_kn8828b_2k_plus\n  port: '"$SERIAL_PORT"$'\n  baudrate: 115200\n  temperature_unit: auto\n  command_interval_seconds: 0.3\nsession:\n  auto_t0_detection_enabled: true\n  auto_t0_drop_threshold_c: 15.0\n  ror_window_seconds: 60\n  ror_min_sample_seconds: 10\nfirst_crack:\n  mode: audio\n  repo_id: syamaner/coffee-first-crack-detection\n  revision: b349a919c34b6130472da97c01817be404e4f629\n  precision: int8\n  local_model_dir: /var/lib/roastpilot-agent/models\n  onnx_threads: 2\n  confidence_threshold: 0.90\n  min_positive_windows: 3\n  confirmation_window_seconds: 30.0\n  allow_manual_override: true\naudio:\n  source: microphone\n  input_device: '"$AUDIO_DEVICE"$'\n  sample_rate: 16000\n  wav_path: null\n  replay_mode: realtime\n  window_seconds: 10.0\n  overlap: 0.3\n  hop_seconds: null'
+    actual="$(printf '%s\n' "$yaml" | normalise_contract)"
+    [[ "$actual" == "$expected" ]] || die "rendered MCP YAML violates appliance contract"
+}
+
 install_rendered_files() {
-    local etc_dir var_dir env_file yaml_file unit_file prior_file prior_hostname
+    local etc_dir var_dir env_file yaml_file unit_file prior_file prior_hostname model_dir
+    local staged_env staged_unit staged_yaml final_env
     etc_dir="$(rooted_path /etc/roastpilot-agent)"
     var_dir="$(rooted_path /var/lib/roastpilot-agent)"
     env_file="$etc_dir/roastpilot-agent.env"
     yaml_file="$etc_dir/coffee-roaster-mcp.yaml"
     unit_file="$(rooted_path /etc/systemd/system/roastpilot-agent.service)"
     prior_file="$var_dir/prior-static-hostname"
-    prepare_destination_parents "$env_file" "$yaml_file" "$unit_file" "$prior_file" "$var_dir/models"
-    # The service runs as the invoking operator and owns its database parent
-    # and protected environment file.  Other configuration and the unit stay root-owned.
+    model_dir="$var_dir/models"
+    # Pin all mutable renderer output once, before any privileged destination
+    # mutation.  The subsequent writes stream only these captured values.
+    staged_env="$(capture_staged_file "$STAGE_DIR/roastpilot-agent.env" env)"
+    staged_yaml="$(capture_staged_file "$STAGE_DIR/coffee-roaster-mcp.appliance.yaml" MCP-YAML)"
+    staged_unit="$(capture_staged_file "$STAGE_DIR/roastpilot-agent.service" unit)"
+    validate_rendered_env "$staged_env"
+    validate_rendered_yaml "$staged_yaml"
+    validate_rendered_unit "$staged_unit"
+    validate_model_stage_file "$STAGE_DIR/models/onnx/int8/model_quantized.onnx" "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df"
+    validate_model_stage_file "$STAGE_DIR/models/onnx/int8/preprocessor_config.json" "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231"
+    final_env="${staged_env/OPENROUTER_API_KEY=/OPENROUTER_API_KEY=$API_KEY}"
+    prepare_destination_parents "$env_file" "$yaml_file" "$unit_file" "$prior_file" "$model_dir"
+    # Keep model placement root-owned while leaf bytes are promoted.
+    # This is a directory boundary, not a file destination: require the
+    # existing root itself and every component to be non-symlinked.
+    validate_destination "$var_dir"
+    run_privileged test -d "$var_dir"
+    run_privileged test ! -L "$var_dir"
+    run_privileged chown root:root -- "$var_dir"
+    run_privileged chmod 0755 -- "$var_dir"
+    promote_model_file "$STAGE_DIR/models/onnx/int8/model_quantized.onnx" "$model_dir/onnx/int8/model_quantized.onnx" "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df"
+    promote_model_file "$STAGE_DIR/models/onnx/int8/preprocessor_config.json" "$model_dir/onnx/int8/preprocessor_config.json" "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231"
+    install_content_atomically "$final_env" "$env_file" 0600 "$INVOKING_USER:$INVOKING_GROUP" roastpilot-env
+    install_content_atomically "$staged_yaml" "$yaml_file" 0644 "" roastpilot-yaml
+    [[ ! -e "${unit_file}.d" && ! -L "${unit_file}.d" ]] || die "service drop-ins are not permitted"
+    install_content_atomically "$staged_unit" "$unit_file" 0644 "" roastpilot-unit
     run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$var_dir"
     run_privileged chmod 0700 -- "$var_dir"
-    # The renderer deliberately leaves this blank; inserting it only through
-    # stdin keeps the key out of command arguments, logs, and the unit.
-    validate_rendered_env_template
-    validate_rendered_unit
-    if [[ -n "$API_KEY" ]]; then
-        write_env_with_key "$env_file"
-    else
-        install_env_atomically "$STAGE_DIR/roastpilot-agent.env" "$env_file"
-    fi
-    run_privileged chmod 0600 -- "$env_file"
-    run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$env_file"
-    recheck_sensitive_destination "$yaml_file"
-    run_privileged install -m 0644 -- "$STAGE_DIR/coffee-roaster-mcp.appliance.yaml" "$yaml_file"
-    recheck_sensitive_destination "$unit_file"
-    run_privileged install -m 0644 -- "$STAGE_DIR/roastpilot-agent.service" "$unit_file"
     if ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq dialout || ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq audio; then
         run_privileged usermod -aG dialout,audio -- "$INVOKING_USER"
     fi
@@ -432,7 +462,15 @@ summary() {
 
 main() {
     STAGE_DIR=""
-    trap '[[ -z "${STAGE_DIR:-}" ]] || run_privileged rm -rf -- "$STAGE_DIR"' EXIT
+    ROOT_TEMPORARIES=()
+    cleanup() {
+        local temporary
+        for temporary in "${ROOT_TEMPORARIES[@]:-}"; do
+            [[ -z "$temporary" ]] || run_privileged rm -f -- "$temporary" || true
+        done
+        [[ -z "${STAGE_DIR:-}" ]] || run_privileged rm -rf -- "$STAGE_DIR" || true
+    }
+    trap cleanup EXIT
     # Test mode is deliberately unprivileged.  Every production lookup starts
     # from this closed path before parsing caller-controlled arguments.
     if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" != "1" ]]; then

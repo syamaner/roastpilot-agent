@@ -73,20 +73,59 @@ case "$name" in
       shift 3; while [ "$#" -gt 0 ]; do [ "$1" = --dest ] && {
         if [ ! -e "$2/onnx/int8/model_quantized.onnx" ]; then
           printf 'MODEL_FETCH <%s>\n' "$2" >> "$FAKE_LOG"
-          mkdir -p "$2/onnx/int8"; printf MODEL > "$2/onnx/int8/model_quantized.onnx"
+          mkdir -p "$2/onnx/int8"; printf '%s' "${FAKE_MODEL_BYTES:-MODEL}" > "$2/onnx/int8/model_quantized.onnx"
           printf CONFIG > "$2/onnx/int8/preprocessor_config.json"
         fi; }; shift; done
     else
-      out=''; while [ "$#" -gt 0 ]; do [ "$1" = --output-dir ] && { out="$2"; shift; }; shift; done
+      out=''; port=8000; while [ "$#" -gt 0 ]; do
+        [ "$1" = --output-dir ] && { out="$2"; shift; }
+        [ "$1" = --port ] && { port="$2"; shift; }
+        shift
+      done
       mkdir -p "$out"
-      cat > "$out/roastpilot-agent.env" <<'ENV'
+      cat > "$out/roastpilot-agent.env" <<ENV
 OPENROUTER_API_KEY=
-PORT=8000
-ROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot-agent.sqlite3
+PORT=$port
+ROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3
 COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml
 ENV
       [ -z "${FAKE_RENDERED_ENV:-}" ] || printf '%s\\n' "$FAKE_RENDERED_ENV" > "$out/roastpilot-agent.env"
-      : > "$out/coffee-roaster-mcp.appliance.yaml"; : > "$out/roastpilot-agent.service"
+      cat > "$out/coffee-roaster-mcp.appliance.yaml" <<YAML
+transport:
+  type: stdio
+roaster:
+  driver: hottop_kn8828b_2k_plus
+  port: /dev/ttyUSB0
+  baudrate: 115200
+  temperature_unit: auto
+  command_interval_seconds: 0.3
+session:
+  auto_t0_detection_enabled: true
+  auto_t0_drop_threshold_c: 15.0
+  ror_window_seconds: 60
+  ror_min_sample_seconds: 10
+first_crack:
+  mode: audio
+  repo_id: syamaner/coffee-first-crack-detection
+  revision: b349a919c34b6130472da97c01817be404e4f629
+  precision: int8
+  local_model_dir: /var/lib/roastpilot-agent/models
+  onnx_threads: 2
+  confidence_threshold: 0.90
+  min_positive_windows: 3
+  confirmation_window_seconds: 30.0
+  allow_manual_override: true
+audio:
+  source: microphone
+  input_device: USB mic
+  sample_rate: 16000
+  wav_path: null
+  replay_mode: realtime
+  window_seconds: 10.0
+  overlap: 0.3
+  hop_seconds: null
+YAML
+      [ -z "${FAKE_RENDERED_YAML:-}" ] || printf '%s\n' "$FAKE_RENDERED_YAML" > "$out/coffee-roaster-mcp.appliance.yaml"
       cat > "$out/roastpilot-agent.service" <<UNIT
 [Unit]
 Description=RoastPilot agent (native Pi appliance)
@@ -122,11 +161,11 @@ UNIT
   mv) /bin/mv "$@" ;;
   sha256sum)
     [ "${1:-}" = -- ] && shift
-    case "$1" in
-      *model_quantized.onnx) echo "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df  $1" ;;
-      *preprocessor_config.json) echo "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231  $1" ;;
-      *) if /usr/bin/grep -q MODEL "$1"; then echo "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df  $1"; elif /usr/bin/grep -q CONFIG "$1"; then echo "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231  $1"; else /opt/homebrew/bin/gsha256sum "$@"; fi ;;
-      *) /usr/bin/sha256sum "$@" ;;
+    content=$(cat "$1")
+    case "$content" in
+      MODEL) echo "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df  $1" ;;
+      CONFIG) echo "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231  $1" ;;
+      *) exit 23 ;;
     esac ;;
   grep) /usr/bin/grep "$@" ;;
   tr) /usr/bin/tr "$@" ;;
@@ -288,7 +327,7 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     assert rendered_without_key.splitlines() == [
         "OPENROUTER_API_KEY=",
         "PORT=8000",
-        "ROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot-agent.sqlite3",
+        "ROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3",
         "COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml",
     ]
     commands = log.read_text().splitlines()
@@ -298,7 +337,10 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     assert not any("systemctl <start> <roastpilot-agent>" in line for line in commands)
     var_dir = root / "var/lib/roastpilot-agent"
     assert stat.S_IMODE(var_dir.stat().st_mode) == 0o700
-    assert f"chown <operator:operators> <--> <{env_file}>" in commands
+    assert any(
+        line.startswith("chown <operator:operators> <-->") and ".roastpilot-env.fake" in line
+        for line in commands
+    )
     assert f"chown <operator:operators> <--> <{var_dir}>" in commands
     assert f"chmod <0700> <--> <{var_dir}>" in commands
     yaml_file = root / "etc/roastpilot-agent/coffee-roaster-mcp.yaml"
@@ -724,7 +766,9 @@ def test_full_flow_has_exact_key_order_and_no_real_command_resolution(
         f"roastpilot-agent <appliance> <render> <--output-dir> <{stage}> <--port> <8000>"
         " <--operator-user> <operator> <--operator-group> <operators>"
         f" <--operator-home> <{environment['FAKE_OPERATOR_HOME']}> <--serial-port> </dev/ttyUSB0>"
-        " <--audio-device> <USB mic>"
+        " <--audio-device> <USB mic> <--model-dir> </var/lib/roastpilot-agent/models>"
+        " <--mcp-config-path> </etc/roastpilot-agent/coffee-roaster-mcp.yaml>"
+        " <--db-path> </var/lib/roastpilot-agent/roastpilot.sqlite3>"
     ) in events
     assert "usermod <-aG> <dialout,audio> <--> <operator>" in events
     assert f"tee <--> <{root / 'var/lib/roastpilot-agent/prior-static-hostname'}>" in events
@@ -947,4 +991,112 @@ def test_hostname_and_identity_repairs_are_observable_through_fake_seam(
     assert hostile.returncode != 0
     assert any(
         line.startswith("getent <passwd> <operator>") for line in log.read_text().splitlines()
+    )
+
+
+@pytest.mark.serial  # Renderer mutation cases share the fake command seam.
+def test_closed_renderer_contract_rejects_yaml_mutations_before_etc_writes(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Pinned Pi YAML rejects threshold, recording, and model-path drift."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    base = """transport:
+  type: stdio
+roaster:
+  driver: hottop_kn8828b_2k_plus
+  port: /dev/ttyUSB0
+  baudrate: 115200
+  temperature_unit: auto
+  command_interval_seconds: 0.3
+session:
+  auto_t0_detection_enabled: true
+  auto_t0_drop_threshold_c: 15.0
+  ror_window_seconds: 60
+  ror_min_sample_seconds: 10
+first_crack:
+  mode: audio
+  repo_id: syamaner/coffee-first-crack-detection
+  revision: b349a919c34b6130472da97c01817be404e4f629
+  precision: int8
+  local_model_dir: /var/lib/roastpilot-agent/models
+  onnx_threads: 2
+  confidence_threshold: 0.90
+  min_positive_windows: 3
+  confirmation_window_seconds: 30.0
+  allow_manual_override: true
+audio:
+  source: microphone
+  input_device: USB mic
+  sample_rate: 16000
+  wav_path: null
+  replay_mode: realtime
+  window_seconds: 10.0
+  overlap: 0.3
+  hop_seconds: null"""
+    for replacement in (
+        base.replace("confidence_threshold: 0.90", "confidence_threshold: 0.91"),
+        base + "\nrecording:\n  enabled: true",
+        base.replace(
+            "local_model_dir: /var/lib/roastpilot-agent/models", "local_model_dir: /tmp/model"
+        ),
+    ):
+        start = len(log.read_text()) if log.exists() else 0
+        result = _run(
+            environment | {"FAKE_RENDERED_YAML": replacement}, "--set-hostname", "roastpilot"
+        )
+        assert result.returncode != 0
+        assert not (root / "etc/roastpilot-agent/coffee-roaster-mcp.yaml").exists()
+        assert not any(str(root / "etc/roastpilot-agent") in line for line in _delta(log, start))
+
+
+@pytest.mark.serial  # The fake model source is process-scoped fixture state.
+def test_model_snapshot_digest_failure_precedes_live_destinations(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Unexpected model bytes cannot reach either model or /etc destinations."""
+    _, environment, _, _ = installer_harness
+    result = _run(environment | {"FAKE_MODEL_BYTES": "WRONG"}, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    assert not (root / "etc").exists()
+    assert not (root / "var/lib/roastpilot-agent/models/onnx/int8/model_quantized.onnx").exists()
+
+
+@pytest.mark.serial  # API-key cases exercise the same subprocess harness.
+def test_api_key_allowlist_rejects_environmentfile_metacharacters(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Only portable OpenRouter-token characters can enter EnvironmentFile."""
+    _, environment, log, _ = installer_harness
+    assert (
+        _run(
+            environment | {"ROASTPILOT_INSTALL_API_KEY": "sk-or-v1.valid_key:1"},
+            "--set-hostname",
+            "roastpilot",
+        ).returncode
+        == 0
+    )
+    for key in ("bad key", "bad'key", 'bad"key', "bad\\key", "bad;key", "bad$key"):
+        assert (
+            _run(
+                environment | {"ROASTPILOT_INSTALL_API_KEY": key}, "--set-hostname", "roastpilot"
+            ).returncode
+            != 0
+        )
+    assert not any("bad" in line for line in log.read_text().splitlines())
+
+
+@pytest.mark.serial  # Nondefault port uses the isolated renderer fake.
+def test_nondefault_port_is_pinned_across_env_and_service(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A valid nondefault bind port reaches both closed service inputs."""
+    _, environment, _, _ = installer_harness
+    assert _run(environment, "--set-hostname", "roastpilot", "--port", "8123").returncode == 0
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    assert "PORT=8123\n" in (root / "etc/roastpilot-agent/roastpilot-agent.env").read_text()
+    assert (
+        "--host 0.0.0.0 --port ${PORT}"
+        in (root / "etc/systemd/system/roastpilot-agent.service").read_text()
     )
