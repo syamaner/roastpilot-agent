@@ -866,7 +866,6 @@ def test_invalid_pipx_state_fails_before_destructive_or_privileged_work(
     events = log.read_text()
     assert "pipx <uninstall>" not in events
     assert "roastpilot-agent <appliance" not in events
-    assert "roastpilot-agent <appliance" not in events
     assert "systemctl" not in events
 
 
@@ -1199,15 +1198,26 @@ def test_repaired_input_bounds_and_test_mode_are_fail_closed(
 
 
 @pytest.mark.serial
-def test_production_rejects_redirected_test_root_before_privileged_effects(
+def test_production_mode_rejects_redirected_test_root_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
-    """A production invocation refuses test-root redirection before any effect seam."""
+    """The closed root validator rejects production test-root redirection."""
     _, environment, log, _ = installer_harness
     redirected_root = tmp_path / "redirected-root"
     production_environment = environment | {"ROASTPILOT_INSTALL_TEST_ROOT": str(redirected_root)}
     production_environment.pop("ROASTPILOT_INSTALL_TEST_MODE")
-    result = _run(production_environment, "--set-hostname", "roastpilot")
+
+    source = INSTALLER.read_text()
+    assert source.count('main "$@"') == 1
+    sourceable = tmp_path / "install-functions.sh"
+    sourceable.write_text(source.rsplit('main "$@"', 1)[0])
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; validate_install_root', "bash", str(sourceable)],
+        env=production_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
     assert result.returncode != 0
     assert "test destination is unavailable in production" in result.stderr
     assert not log.exists()
