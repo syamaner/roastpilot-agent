@@ -84,6 +84,12 @@ validate_ascii_input() {
     [[ "$value" =~ ^[\ -~]+$ ]] || die "$description must contain ASCII characters only"
 }
 
+scrub_child_secrets() {
+    unset OPENROUTER_API_KEY OPENROUTER_API_KEY_FILE OPENAI_API_KEY ANTHROPIC_API_KEY
+    unset ROASTPILOT_API_KEY ROASTPILOT_OPENROUTER_API_KEY
+    export -n API_KEY 2>/dev/null || true
+}
+
 validate_from_dir() {
     local candidate="$1" canonical
     validate_no_control_characters "$candidate" "--from-dir"
@@ -125,6 +131,7 @@ parse_arguments() {
     PORT="8000"
     API_KEY="${ROASTPILOT_INSTALL_API_KEY:-}"
     unset ROASTPILOT_INSTALL_API_KEY
+    export -n API_KEY 2>/dev/null || true
     SERIAL_PORT="${ROASTPILOT_INSTALL_SERIAL_PORT:-}"
     AUDIO_DEVICE="${ROASTPILOT_INSTALL_AUDIO_DEVICE:-}"
     REQUESTED_HOSTNAME=""
@@ -294,9 +301,47 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
 ' || die "invalid pipx package metadata"
 }
 
+prepare_restorable_prior() {
+    local state="$1" package version source canonical cache_dir prior_metadata
+    prior_metadata="$(printf '%s' "$state" | python3 -c '
+import json, sys
+try:
+    main = json.load(sys.stdin)["metadata"]["main_package"]
+    package, version = main["package_or_url"], main["package_version"]
+    if not isinstance(package, str) or not isinstance(version, str) or not package or not version:
+        raise ValueError()
+    print(package + "\t" + version)
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+')" || die "invalid pipx package metadata"
+    IFS=$'\t' read -r package version <<< "$prior_metadata"
+    case "$package" in
+        /*"[pi]")
+            source="${package%[[]pi]}"
+            [[ -f "$source" && ! -L "$source" ]] || die "cannot preserve exact prior local wheel"
+            canonical="$(readlink -f -- "$source")" || die "cannot preserve exact prior local wheel"
+            [[ "$source" == "$canonical" ]] || die "cannot preserve exact prior local wheel"
+            cache_dir="$INVOKING_HOME/.cache"
+            mkdir -p -- "$cache_dir"
+            RESTORE_ARTIFACT_DIR="$(mktemp -d -- "$cache_dir/roastpilot-restore.XXXXXX")"
+            cp -- "$source" "$RESTORE_ARTIFACT_DIR/prior.whl"
+            RESTORABLE_PRIOR_SPEC="$RESTORE_ARTIFACT_DIR/prior.whl[pi]"
+            ;;
+        roastpilot-agent|roastpilot-agent\[pi\])
+            [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ ]] || die "cannot preserve exact prior application"
+            RESTORABLE_PRIOR_SPEC="roastpilot-agent[pi]==$version"
+            ;;
+        roastpilot-agent\[pi\]==*) RESTORABLE_PRIOR_SPEC="$package" ;;
+        *) die "cannot preserve exact prior application" ;;
+    esac
+}
+
 verify_pi_capability() {
-    pipx_command runpip roastpilot-agent show coffee-roaster-mcp >/dev/null \
-        || die "installed roastpilot-agent lacks required Pi/MCP capability"
+    local venv_name="${1:-roastpilot-agent}" mcp_executable
+    resolve_pipx_venv_root
+    mcp_executable="$PIPX_VENV_ROOT/$venv_name/bin/coffee-roaster-mcp"
+    [[ -f "$mcp_executable" && -x "$mcp_executable" && ! -L "$mcp_executable" ]] || return 1
+    pipx_command runpip "$venv_name" show coffee-roaster-mcp >/dev/null
 }
 
 replace_application_safely() {
@@ -306,7 +351,7 @@ replace_application_safely() {
     if ! pipx_command install --suffix "$suffix" -- "$package_spec"; then
         die "requested replacement could not be staged"
     fi
-    if ! pipx_command runpip "roastpilot-agent$suffix" show coffee-roaster-mcp >/dev/null; then
+    if ! verify_pi_capability "roastpilot-agent$suffix"; then
         pipx_command uninstall -- "roastpilot-agent$suffix" || true
         die "staged replacement lacks required Pi/MCP capability"
     fi
@@ -314,10 +359,9 @@ replace_application_safely() {
         pipx_command uninstall -- "roastpilot-agent$suffix" || true
         die "cannot remove prior application after staging replacement"
     fi
-    if ! pipx_command install -- "$package_spec" || ! pipx_command runpip roastpilot-agent show coffee-roaster-mcp >/dev/null; then
+    if ! pipx_command install -- "$package_spec" || ! verify_pi_capability; then
         pipx_command uninstall -- roastpilot-agent || true
-        if ! pipx_command install -- "$prior_spec" \
-            || ! pipx_command runpip roastpilot-agent show coffee-roaster-mcp >/dev/null; then
+        if ! pipx_command install -- "$prior_spec" || ! verify_pi_capability; then
             restoration_failed=1
         fi
         pipx_command uninstall -- "roastpilot-agent$suffix" || true
@@ -333,20 +377,21 @@ install_application() {
     package_spec="$(requested_package_spec)"
     if [[ "$state" == "absent" ]]; then
         pipx_command install -- "$package_spec"
-        verify_pi_capability
+        verify_pi_capability || die "installed roastpilot-agent lacks required Pi/MCP capability"
         return
     fi
     if [[ -z "$REQUESTED_WHEEL$REQUESTED_VERSION" ]]; then
-        verify_pi_capability
+        verify_pi_capability || die "installed roastpilot-agent lacks required Pi/MCP capability"
         return
     fi
     if [[ -n "$REQUESTED_WHEEL" ]]; then
-        if pipx_matches "$state" wheel "${REQUESTED_WHEEL}[pi]"; then verify_pi_capability; return; else match_status=$?; fi
+        if pipx_matches "$state" wheel "${REQUESTED_WHEEL}[pi]"; then verify_pi_capability || die "installed roastpilot-agent lacks required Pi/MCP capability"; return; else match_status=$?; fi
     else
-        if pipx_matches "$state" version "$REQUESTED_VERSION"; then verify_pi_capability; return; else match_status=$?; fi
+        if pipx_matches "$state" version "$REQUESTED_VERSION"; then verify_pi_capability || die "installed roastpilot-agent lacks required Pi/MCP capability"; return; else match_status=$?; fi
     fi
     [[ "$match_status" == 1 ]] || die "invalid pipx package metadata"
-    prior_spec="$(installed_package_spec "$state")"
+    prepare_restorable_prior "$state"
+    prior_spec="$RESTORABLE_PRIOR_SPEC"
     replace_application_safely "$prior_spec" "$package_spec"
 }
 
@@ -568,6 +613,8 @@ install_rendered_files() {
     validate_model_stage_file "$STAGE_DIR/models/onnx/int8/preprocessor_config.json" "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231"
     final_env="$(build_final_env "$(normalise_unit_env_contract "$staged_env")")"
     prepare_destination_parents "$env_file" "$yaml_file" "$unit_file" "$prior_file" "$model_dir"
+    run_privileged chown "root:$INVOKING_GROUP" -- "$etc_dir"
+    run_privileged chmod 0750 -- "$etc_dir"
     # Keep model placement root-owned while leaf bytes are promoted.
     # This is a directory boundary, not a file destination: require the
     # existing root itself and every component to be non-symlinked.
@@ -577,6 +624,11 @@ install_rendered_files() {
     LOCKED_VAR_DIR="$var_dir"
     run_privileged chown root:root -- "$var_dir"
     run_privileged chmod 0700 -- "$var_dir"
+    for model_parent in "$model_dir" "$model_dir/onnx" "$model_dir/onnx/int8"; do
+        run_privileged mkdir -p -- "$model_parent"
+        run_privileged chown "root:$INVOKING_GROUP" -- "$model_parent"
+        run_privileged chmod 0750 -- "$model_parent"
+    done
     promote_model_file "$STAGE_DIR/models/onnx/int8/model_quantized.onnx" "$model_dir/onnx/int8/model_quantized.onnx" "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df"
     promote_model_file "$STAGE_DIR/models/onnx/int8/preprocessor_config.json" "$model_dir/onnx/int8/preprocessor_config.json" "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231"
     install_content_atomically "$final_env" "$env_file" 0600 "$INVOKING_USER:$INVOKING_GROUP" roastpilot-env
@@ -601,14 +653,17 @@ install_rendered_files() {
     fi
 }
 
+ensure_agent_inactive() {
+    if run_privileged systemctl is-active --quiet roastpilot-agent; then
+        die "roastpilot-agent is already active; manually restart it to apply the new configuration"
+    fi
+}
+
 enable_services() {
     run_privileged systemctl daemon-reload
     run_privileged systemctl enable --now avahi-daemon
     run_privileged systemctl enable roastpilot-agent
     if [[ "$START_SERVICE" == 1 ]]; then
-        if run_privileged systemctl is-active --quiet roastpilot-agent; then
-            die "roastpilot-agent is already active; manually restart it to apply the new configuration"
-        fi
         run_privileged systemctl start roastpilot-agent
     fi
 }
@@ -625,6 +680,7 @@ summary() {
 
 main() {
     STAGE_DIR=""
+    RESTORE_ARTIFACT_DIR=""
     ROOT_TEMPORARIES=()
     LOCKED_VAR_DIR=""
     cleanup() {
@@ -633,6 +689,7 @@ main() {
             [[ -z "$temporary" ]] || run_privileged rm -f -- "$temporary" || true
         done
         [[ -z "${STAGE_DIR:-}" ]] || run_privileged rm -rf -- "$STAGE_DIR" || true
+        [[ -z "${RESTORE_ARTIFACT_DIR:-}" ]] || rm -rf -- "$RESTORE_ARTIFACT_DIR" || true
         # Never follow an untrusted child when recovering a locked parent.
         if [[ -n "${LOCKED_VAR_DIR:-}" ]] && run_privileged test -d "$LOCKED_VAR_DIR" && run_privileged test ! -L "$LOCKED_VAR_DIR"; then
             run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$LOCKED_VAR_DIR" || true
@@ -646,10 +703,12 @@ main() {
         PATH=/usr/sbin:/usr/bin:/sbin:/bin
         export PATH
     fi
+    scrub_child_secrets
     parse_arguments "$@"
     preflight
     resolve_operator_identity
     preserve_existing_api_key
+    ensure_agent_inactive
     run_privileged apt-get install -y libportaudio2 pipx avahi-daemon
     install_application
     resolve_appliance_executable

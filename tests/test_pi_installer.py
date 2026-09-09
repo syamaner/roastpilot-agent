@@ -100,6 +100,12 @@ case "$name" in
         count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_PIPX_NORMAL_INSTALL_COUNT"
         if [ "$count" = 1 ]; then [ "${FAKE_PIPX_FAIL_FINAL_INSTALL:-}" != 1 ] || exit 25
         else [ "${FAKE_PIPX_FAIL_RESTORE_INSTALL:-}" != 1 ] || exit 25; fi
+      fi
+      venv_bin="$FAKE_PIPX_HOME/venvs/roastpilot-agent$suffix/bin"
+      mkdir -p "$venv_bin"
+      cp "$FAKE_PIPX_MCP_TEMPLATE" "$venv_bin/coffee-roaster-mcp"
+      chmod 0755 "$venv_bin/coffee-roaster-mcp"
+      if [ -z "$suffix" ]; then
         printf '{"venvs":{"roastpilot-agent":{"metadata":' > "$FAKE_PIPX_STATE"
         printf '{"main_package":{"package_version":"%s",' "$version" >> "$FAKE_PIPX_STATE"
         printf '"package_or_url":"%s"}}}}}\\n' "$package" >> "$FAKE_PIPX_STATE"
@@ -269,6 +275,12 @@ esac
     pipx_agent.parent.mkdir(parents=True)
     pipx_agent.write_text(fake.read_text())
     pipx_agent.chmod(0o755)
+    pipx_mcp = pipx_agent.with_name("coffee-roaster-mcp")
+    pipx_mcp.write_text("#!/bin/sh\nexit 0\n")
+    pipx_mcp.chmod(0o755)
+    pipx_mcp_template = tmp_path / "coffee-roaster-mcp-template"
+    pipx_mcp_template.write_text(pipx_mcp.read_text())
+    pipx_mcp_template.chmod(0o755)
     pipx_bin = operator_home / ".local/bin"
     pipx_bin.mkdir(parents=True)
     (pipx_bin / "roastpilot-agent").symlink_to(pipx_agent)
@@ -283,6 +295,7 @@ esac
         "FAKE_LOG": str(log),
         "FAKE_HOSTNAME": str(hostname),
         "FAKE_PIPX_STATE": str(tmp_path / "pipx-state"),
+        "FAKE_PIPX_MCP_TEMPLATE": str(pipx_mcp_template),
         "FAKE_PIPX_NORMAL_INSTALL_COUNT": str(tmp_path / "pipx-normal-install-count"),
         "FAKE_PIPX_HOME": str(pipx_home),
         "FAKE_PIPX_ENV_LOG": str(tmp_path / "pipx-environment.log"),
@@ -1980,3 +1993,49 @@ def test_only_complete_verified_installed_models_are_reused(
     )
     assert "<--from-dir>" not in model_install
     assert any(line.startswith("MODEL_FETCH") for line in events)
+
+
+@pytest.mark.serial
+def test_active_agent_without_start_fails_before_appliance_changes(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Maintenance never rewrites appliance state while the agent is active."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment | {"FAKE_SERVICE_ACTIVE": "1"}, "--set-hostname", "roastpilot")
+    assert result.returncode != 0 and "manually restart" in result.stderr
+    events = log.read_text().splitlines()
+    assert "systemctl <is-active> <--quiet> <roastpilot-agent>" in events
+    assert not any(line.startswith(("apt-get ", "pipx ", "roastpilot-agent ")) for line in events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("mode", ["missing", "non-executable"])
+def test_missing_or_nonexecutable_mcp_console_fails_before_appliance_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], mode: str
+) -> None:
+    """Package metadata alone cannot prove the installed MCP console is usable."""
+    _, environment, log, _ = installer_harness
+    mcp = Path(environment["FAKE_PIPX_HOME"]) / "venvs/roastpilot-agent/bin/coffee-roaster-mcp"
+    if mode == "missing":
+        mcp.unlink()
+    else:
+        mcp.chmod(0o644)
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0 and "Pi/MCP" in result.stderr
+    assert "roastpilot-agent <appliance" not in log.read_text()
+
+
+@pytest.mark.serial
+def test_unavailable_prior_local_wheel_is_not_replaced(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """Replacement refuses before uninstalling an application without an exact restore artifact."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "prior.whl"
+    wheel.write_text("wheel")
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
+    wheel.unlink()
+    result = _run(environment, "--set-hostname", "roastpilot", "--version", "2.0")
+    assert result.returncode != 0 and "cannot preserve exact prior local wheel" in result.stderr
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text()
