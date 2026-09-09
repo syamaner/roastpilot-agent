@@ -39,13 +39,19 @@ case "$name" in
   sudo) shift; [ "${1:-}" = -- ] && shift; exec "$@" ;;
   id)
     if [ "${1:-}" = -u ]; then echo 1000
-    elif [ "${1:-}" = -un ]; then echo operator
-    elif [ "${1:-}" = -gn ]; then echo operators
+    elif [ "${1:-}" = -un ]; then echo "${FAKE_ID_USER:-operator}"
+    elif [ "${1:-}" = -gn ]; then echo "${FAKE_ID_GROUP:-operators}"
     else cat "$FAKE_GROUPS"; fi ;;
-  getent) printf 'operator:x:1000:1000::%s:/bin/sh\\n' "$FAKE_OPERATOR_HOME" ;;
+  getent) if [ -n "${FAKE_GETENT_RECORD:-}" ]; then
+      printf '%s\\n' "$FAKE_GETENT_RECORD"
+    else
+      printf 'operator:x:1000:1000::%s:/bin/sh\\n' "$FAKE_OPERATOR_HOME"
+    fi ;;
   uname) echo aarch64 ;;
   hostnamectl)
-    if [ "${1:-}" = --static ]; then cat "$FAKE_HOSTNAME"
+    if [ "${1:-}" = --static ]; then
+      if [ "${FAKE_HOSTNAME_VERIFY_FAIL:-}" = 1 ]; then echo wrong-host
+      else cat "$FAKE_HOSTNAME"; fi
     else [ "$1" = set-hostname ]; printf '%s\\n' "$2" > "$FAKE_HOSTNAME"; fi ;;
   pipx)
     if [ "${1:-}" = list ]; then
@@ -71,7 +77,8 @@ case "$name" in
         fi; }; shift; done
     else
       out=''; while [ "$#" -gt 0 ]; do [ "$1" = --output-dir ] && { out="$2"; shift; }; shift; done
-      mkdir -p "$out"; printf 'OPENROUTER_API_KEY=\\n' > "$out/roastpilot-agent.env"
+      mkdir -p "$out"
+      printf '%s\\n' "${FAKE_RENDERED_ENV:-OPENROUTER_API_KEY=}" > "$out/roastpilot-agent.env"
       : > "$out/coffee-roaster-mcp.appliance.yaml"; : > "$out/roastpilot-agent.service"
     fi ;;
   tee) [ "${1:-}" = -- ] && shift; mkdir -p "$(dirname "$1")"; cat > "$1" ;;
@@ -116,9 +123,21 @@ esac
     agent = fake_bin / "roastpilot-agent"
     agent.write_text(fake.read_text())
     agent.chmod(0o755)
+    operator_home = tmp_path / "operator-home"
+    pipx_agent = operator_home / ".local/pipx/venvs/roastpilot-agent/bin/roastpilot-agent"
+    pipx_agent.parent.mkdir(parents=True)
+    pipx_agent.write_text(fake.read_text())
+    pipx_agent.chmod(0o755)
+    pipx_bin = operator_home / ".local/bin"
+    pipx_bin.mkdir(parents=True)
+    (pipx_bin / "roastpilot-agent").symlink_to(pipx_agent)
     groups = tmp_path / "groups"
     groups.write_text("dialout\n")
-    environment = os.environ | {
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key != "OPENROUTER_API_KEY" and not key.startswith("ROASTPILOT_")
+    } | {
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
         "FAKE_LOG": str(log),
         "FAKE_HOSTNAME": str(hostname),
@@ -127,7 +146,7 @@ esac
         "ROASTPILOT_INSTALL_ROOT": str(tmp_path / "root"),
         "ROASTPILOT_INSTALL_OS_RELEASE": str(os_release),
         "HOME": str(tmp_path / "home"),
-        "FAKE_OPERATOR_HOME": str(tmp_path / "operator-home"),
+        "FAKE_OPERATOR_HOME": str(operator_home),
         "USER": "operator",
     }
     return fake_bin, environment, log, hostname
@@ -140,6 +159,21 @@ def _run(
     stdin: str | None = "input",
     script: Path = INSTALLER,
 ) -> subprocess.CompletedProcess[str]:
+    allowed_installer_inputs = {
+        "ROASTPILOT_INSTALL_ROOT",
+        "ROASTPILOT_INSTALL_OS_RELEASE",
+        "ROASTPILOT_INSTALL_WHEEL",
+        "ROASTPILOT_INSTALL_API_KEY",
+        "ROASTPILOT_INSTALL_SERIAL_PORT",
+        "ROASTPILOT_INSTALL_AUDIO_DEVICE",
+        "ROASTPILOT_INSTALL_ASSUME_YES",
+    }
+    environment = {
+        key: value
+        for key, value in environment.items()
+        if key != "OPENROUTER_API_KEY"
+        and (not key.startswith("ROASTPILOT_") or key in allowed_installer_inputs)
+    }
     return subprocess.run(
         [
             "bash",
@@ -192,7 +226,7 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     """T16/T17/T24: ordered fake effects, convergence, modes, and no key leak."""
     _, environment, log, _ = installer_harness
     key = "not-for-output"
-    first = _run(environment, "--set-hostname", "roastpilot", "--api-key", key)
+    first = _run(environment | {"ROASTPILOT_INSTALL_API_KEY": key}, "--set-hostname", "roastpilot")
     assert first.returncode == 0, first.stderr
     root = Path(environment["ROASTPILOT_INSTALL_ROOT"])
     env_file = root / "etc/roastpilot-agent/roastpilot-agent.env"
@@ -228,7 +262,7 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
         commands.count("MODEL_FETCH <" + str(root / "var/lib/roastpilot-agent/models") + ">") == 1
     )
     hostname_before = (root.parent / "hostname").read_bytes()
-    second = _run(environment, "--set-hostname", "roastpilot", "--api-key", key)
+    second = _run(environment | {"ROASTPILOT_INSTALL_API_KEY": key}, "--set-hostname", "roastpilot")
     assert second.returncode == 0, second.stderr + log.read_text()
     assert (env_file.read_bytes(), stat.S_IMODE(env_file.stat().st_mode)) == env_snapshot
     assert (yaml_file.read_bytes(), stat.S_IMODE(yaml_file.stat().st_mode)) == yaml_snapshot
@@ -294,9 +328,12 @@ def test_hostname_consent_start_and_failure_abort_before_service_enable(
     assert "systemctl <start> <roastpilot-agent>" in log.read_text()
     # A model failure aborts before rendered files and service enable are reached.
     failing = environment | {"FAKE_MODEL_FAIL": "1"}
-    fake_agent = Path(environment["PATH"].split(os.pathsep)[0]) / "roastpilot-agent"
-    source = fake_agent.resolve().read_text()
-    fake_agent.resolve().write_text(
+    fake_agent = (
+        Path(environment["FAKE_OPERATOR_HOME"])
+        / ".local/pipx/venvs/roastpilot-agent/bin/roastpilot-agent"
+    )
+    source = fake_agent.read_text()
+    fake_agent.write_text(
         source.replace(
             'if [ "$1 $2 $3" = "appliance model install" ]; then',
             'if [ "${FAKE_MODEL_FAIL:-}" = 1 ]; then exit 9; '
@@ -399,7 +436,9 @@ def test_hostile_values_are_inert_and_rejected_before_writes(
     _, environment, log, _ = installer_harness
     sentinel = tmp_path / "sentinel"
     hostile = f"$(touch {sentinel})"
-    rejected_key = _run(environment | {"HOME": hostile, "USER": "root"}, "--api-key", "bad\nkey")
+    rejected_key = _run(
+        environment | {"HOME": hostile, "USER": "root", "ROASTPILOT_INSTALL_API_KEY": "bad\nkey"}
+    )
     assert rejected_key.returncode != 0 and not log.exists() and not sentinel.exists()
     wheel = _run(environment, "--wheel", "--bad")
     assert wheel.returncode != 0 and (not log.exists() or "sudo" not in log.read_text())
@@ -455,7 +494,7 @@ def test_staging_only_mutates_and_cleans_the_unique_directory(
         (
             "printf '%s\\n' \"Installed: unit enabled; model verified.\"",
             "printf '%s\\n' \"$API_KEY\"",
-            ("--api-key", "mutation-secret"),
+            (),
             "secret",
             "secret_leaked",
         ),
@@ -495,7 +534,10 @@ def test_contract_mutation_oracles_detect_removed_guards(
     elif environment_key == "non_tty":
         yes = False
     elif environment_key == "model_failure":
-        agent = fake_bin / "roastpilot-agent"
+        agent = (
+            Path(environment["FAKE_OPERATOR_HOME"])
+            / ".local/pipx/venvs/roastpilot-agent/bin/roastpilot-agent"
+        )
         agent.write_text(
             agent.read_text().replace(
                 'if [ "$1 $2 $3" = "appliance model install" ]; then',
@@ -508,6 +550,8 @@ def test_contract_mutation_oracles_detect_removed_guards(
     elif environment_key == "second_run":
         assert _run(run_environment, "--set-hostname", "roastpilot").returncode == 0
         log.write_text("")
+    elif environment_key == "secret":
+        run_environment = environment | {"ROASTPILOT_INSTALL_API_KEY": "mutation-secret"}
     result = _run(
         run_environment,
         "--set-hostname",
@@ -695,3 +739,122 @@ def test_help_exits_before_required_arguments_or_preflight(
     )
     assert result.returncode == 0 and "Usage:" in result.stdout
     assert not log.exists()
+
+
+@pytest.mark.serial
+def test_repair_inputs_are_rejected_before_privileged_work(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """Repair guards reject unsafe API, device, port, and source inputs."""
+    _, environment, log, _ = installer_harness
+    source = tmp_path / "models"
+    source.mkdir()
+    for arguments in (
+        ("--api-key", "secret"),
+        ("--port", "0"),
+        ("--port", "65536"),
+        ("--serial-port", "/dev/tty\nUSB0"),
+        ("--audio-device", "mic\rname"),
+        ("--from-dir", "relative"),
+        ("--from-dir", str(source / "..")),
+    ):
+        result = _run(environment, "--set-hostname", "roastpilot", *arguments)
+        assert result.returncode != 0
+    linked = tmp_path / "linked-models"
+    linked.symlink_to(source, target_is_directory=True)
+    assert (
+        _run(environment, "--set-hostname", "roastpilot", "--from-dir", str(linked)).returncode != 0
+    )
+    assert not log.exists()
+    accepted = _run(environment, "--set-hostname", "roastpilot", "--from-dir", str(source))
+    assert accepted.returncode == 0
+    assert f"<--from-dir> <{source}>" in log.read_text()
+
+
+@pytest.mark.serial
+def test_secret_template_and_no_key_summary_fail_closed(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """The placeholder path is redacted and malformed templates never install a destination."""
+    _, environment, log, _ = installer_harness
+    no_key = _run(environment, "--set-hostname", "roastpilot")
+    assert no_key.returncode == 0
+    assert "service was not started" in no_key.stdout
+    assert "OpenRouter key" in no_key.stdout
+    root = Path(environment["ROASTPILOT_INSTALL_ROOT"])
+    env_file = root / "etc/roastpilot-agent/roastpilot-agent.env"
+    key_install = _run(
+        environment | {"ROASTPILOT_INSTALL_API_KEY": "kept-out-of-argv"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert key_install.returncode == 0
+    events = log.read_text().splitlines()
+    install_index = next(
+        index
+        for index, event in enumerate(events)
+        if event == f"install <-m> <0600> <--> </dev/null> <{env_file}>"
+    )
+    tee_index = next(
+        index for index, event in enumerate(events) if event == f"tee <--> <{env_file}>"
+    )
+    assert install_index < tee_index
+    before = env_file.read_bytes()
+    bad = _run(
+        environment | {"FAKE_RENDERED_ENV": "OPENROUTER_API_KEY=\nOPENROUTER_API_KEY=two"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert bad.returncode != 0 and env_file.read_bytes() == before
+    assert "two" not in bad.stdout + bad.stderr + log.read_text()
+
+
+@pytest.mark.serial
+def test_pipx_null_path_and_malicious_path_are_fail_closed_or_ignored(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Explicit null metadata fails, while PATH cannot select the root-run executable."""
+    fake_bin, environment, log, _ = installer_harness
+    null = _run(
+        environment | {"FAKE_PIPX_JSON": '{"venvs":{"roastpilot-agent":null}}'},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert null.returncode != 0 and "roastpilot-agent <appliance" not in log.read_text()
+    log.unlink()
+    shadow = fake_bin / "roastpilot-agent"
+    shadow.write_text("#!/bin/sh\necho PATH_SHADOW >&2\nexit 97\n")
+    shadow.chmod(0o755)
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode == 0, result.stderr
+    assert "PATH_SHADOW" not in result.stdout + result.stderr + log.read_text()
+
+
+@pytest.mark.serial
+def test_hostname_and_identity_repairs_are_observable_through_fake_seam(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Hostname validation, post-set verification, and hostile identity data fail closed."""
+    _, environment, log, _ = installer_harness
+    for hostname in ("Roastpilot", "roastpilot-", "other"):
+        assert _run(environment, "--set-hostname", hostname).returncode != 0
+    installed = _run(environment, "--set-hostname", "roastpilot")
+    assert installed.returncode == 0
+    events = log.read_text().splitlines()
+    root = Path(environment["ROASTPILOT_INSTALL_ROOT"])
+    prior = root / "var/lib/roastpilot-agent/prior-static-hostname"
+    assert prior.read_text() == "old-host\n"
+    assert stat.S_IMODE(prior.stat().st_mode) == 0o600
+    assert f"chown <operator:operators> <--> <{prior}>" in events
+    Path(environment["FAKE_HOSTNAME"]).write_text("old-host\n")
+    verify = _run(environment | {"FAKE_HOSTNAME_VERIFY_FAIL": "1"}, "--set-hostname", "roastpilot")
+    assert verify.returncode != 0 and "hostname verification failed" in verify.stderr
+    hostile = _run(
+        environment | {"FAKE_GETENT_RECORD": "operator:x:1000:1000::relative:/bin/sh"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert hostile.returncode != 0
+    assert any(
+        line.startswith("getent <passwd> <operator>") for line in log.read_text().splitlines()
+    )
