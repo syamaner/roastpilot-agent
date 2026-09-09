@@ -11,12 +11,17 @@ die() {
 }
 
 run_privileged() {
-    # The installer refuses root, so this is deliberately the sole sudo seam.
-    sudo -- "$@"
+    # This is deliberately the sole privilege seam.  Test mode removes
+    # privilege; it never redirects a production privileged command.
+    if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" == "1" ]]; then
+        "$@"
+    else
+        /usr/bin/sudo -- "$@"
+    fi
 }
 
 rooted_path() {
-    local install_root="${ROASTPILOT_INSTALL_ROOT:-/}"
+    local install_root="${ROASTPILOT_INSTALL_TEST_ROOT:-/}"
     local absolute_path="$1"
     [[ "$absolute_path" == /* ]] || die "internal destination is not absolute"
     if [[ "$install_root" == "/" ]]; then
@@ -27,7 +32,13 @@ rooted_path() {
 }
 
 validate_install_root() {
-    local install_root="${ROASTPILOT_INSTALL_ROOT:-/}"
+    local install_root="${ROASTPILOT_INSTALL_TEST_ROOT:-/}"
+    if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" != "1" ]]; then
+        [[ -z "${ROASTPILOT_INSTALL_TEST_ROOT:-}" && -z "${ROASTPILOT_INSTALL_ROOT:-}" ]] || die "test destination is unavailable in production"
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin
+        export PATH
+        return
+    fi
     [[ "$install_root" == /* && "/${install_root#/}/" != *"/../"* ]] || die "invalid install root"
     [[ "$install_root" != *$'\n'* && "$install_root" != *$'\r'* ]] || die "invalid install root"
 }
@@ -107,6 +118,7 @@ parse_arguments() {
     MODEL_FROM_DIR=""
     PORT="8000"
     API_KEY="${ROASTPILOT_INSTALL_API_KEY:-}"
+    unset ROASTPILOT_INSTALL_API_KEY
     SERIAL_PORT="${ROASTPILOT_INSTALL_SERIAL_PORT:-}"
     AUDIO_DEVICE="${ROASTPILOT_INSTALL_AUDIO_DEVICE:-}"
     REQUESTED_HOSTNAME=""
@@ -131,9 +143,12 @@ parse_arguments() {
     [[ -n "$SERIAL_PORT" ]] || die "--serial-port is required"
     [[ -n "$AUDIO_DEVICE" ]] || die "--audio-device is required"
     validate_no_control_characters "$API_KEY" "API key"
+    [[ "$API_KEY" != *[[:space:]\\\"]* ]] || die "API key contains unsafe EnvironmentFile characters"
     validate_no_control_characters "$SERIAL_PORT" "serial port"
     validate_no_control_characters "$AUDIO_DEVICE" "audio device"
-    [[ "$PORT" =~ ^[0-9]+$ && "$PORT" -ge 1 && "$PORT" -le 65535 ]] || die "port must be a decimal number from 1 to 65535"
+    [[ "$PORT" =~ ^[0-9]+$ && "$PORT" -ge 1024 && "$PORT" -le 65535 ]] || die "port must be a decimal number from 1024 to 65535"
+    [[ "$SERIAL_PORT" == /dev/* && "$SERIAL_PORT" != *[[:space:]]* ]] || die "serial port must be an absolute /dev path"
+    [[ "$AUDIO_DEVICE" == "${AUDIO_DEVICE#"${AUDIO_DEVICE##[![:space:]]}"}" && "$AUDIO_DEVICE" == "${AUDIO_DEVICE%"${AUDIO_DEVICE##*[![:space:]]}"}" && "$AUDIO_DEVICE" != *'@@'* ]] || die "audio device is unsafe"
     [[ -z "$REQUESTED_VERSION" || -z "$REQUESTED_WHEEL" ]] || die "choose --version or --wheel"
     [[ -z "$REQUESTED_VERSION" || "$REQUESTED_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ ]] || die "invalid version selector"
     if [[ -n "$REQUESTED_WHEEL" ]]; then
@@ -268,7 +283,7 @@ resolve_appliance_executable() {
 }
 
 install_model_and_render() {
-    local model_dir stage_dir stage_parent
+    local model_dir stage_dir stage_parent model_stage
     model_dir="$(rooted_path /var/lib/roastpilot-agent/models)"
     validate_destination "$model_dir"
     stage_parent="$(rooted_path /tmp)"
@@ -279,14 +294,37 @@ install_model_and_render() {
     run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$stage_dir"
     run_privileged chmod 0700 -- "$stage_dir"
     STAGE_DIR="$stage_dir"
+    model_stage="$stage_dir/models"
+    mkdir -p -- "$model_stage"
     if [[ -n "$MODEL_FROM_DIR" ]]; then
-        run_privileged "$APPLIANCE_EXECUTABLE" appliance model install --dest "$model_dir" --from-dir "$MODEL_FROM_DIR"
+        "$APPLIANCE_EXECUTABLE" appliance model install --dest "$model_stage" --from-dir "$MODEL_FROM_DIR"
     else
-        run_privileged "$APPLIANCE_EXECUTABLE" appliance model install --dest "$model_dir"
+        "$APPLIANCE_EXECUTABLE" appliance model install --dest "$model_stage"
     fi
+    promote_model_file "$model_stage/onnx/int8/model_quantized.onnx" "$model_dir/onnx/int8/model_quantized.onnx" "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df"
+    promote_model_file "$model_stage/onnx/int8/preprocessor_config.json" "$model_dir/onnx/int8/preprocessor_config.json" "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231"
     "$APPLIANCE_EXECUTABLE" appliance render --output-dir "$stage_dir" --port "$PORT" \
         --operator-user "$INVOKING_USER" --operator-group "$INVOKING_GROUP" --operator-home "$INVOKING_HOME" --serial-port "$SERIAL_PORT" \
         --audio-device "$AUDIO_DEVICE"
+}
+
+promote_model_file() {
+    local source="$1" destination="$2" expected="$3" parent temporary actual
+    [[ -f "$source" && ! -L "$source" ]] || die "model staging file is unsafe"
+    actual="$(sha256sum -- "$source")"; [[ "${actual%% *}" == "$expected" ]] || die "model staging digest mismatch"
+    parent="$(dirname -- "$destination")"
+    validate_destination "$parent"
+    run_privileged mkdir -p -- "$parent"
+    recheck_sensitive_destination "$destination"
+    temporary="$(run_privileged mktemp -- "$parent/.roastpilot-model.XXXXXX")"
+    [[ "$temporary" == "$parent/.roastpilot-model."* ]] || die "unsafe model temporary path"
+    # Root reads only its own temporary file; the unprivileged reader streams
+    # already-verified bytes through stdin.
+    cat -- "$source" | run_privileged tee -- "$temporary" >/dev/null
+    actual="$(run_privileged sha256sum -- "$temporary")"; [[ "${actual%% *}" == "$expected" ]] || die "model promotion digest mismatch"
+    run_privileged chmod 0644 -- "$temporary"
+    run_privileged mv -f -- "$temporary" "$destination"
+    actual="$(run_privileged sha256sum -- "$destination")"; [[ "${actual%% *}" == "$expected" ]] || die "model destination digest mismatch"
 }
 
 validate_rendered_env_template() {
@@ -298,16 +336,37 @@ validate_rendered_env_template() {
 }
 
 write_env_with_key() {
-    local env_file="$1" line
-    recheck_sensitive_destination "$env_file"
-    run_privileged install -m 0600 -- /dev/null "$env_file"
+    local env_file="$1" line staged
+    staged="$STAGE_DIR/roastpilot-agent.env.final"
+    (umask 077; : > "$staged")
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" == OPENROUTER_API_KEY=* ]]; then
             printf 'OPENROUTER_API_KEY=%s\n' "$API_KEY"
         else
             printf '%s\n' "$line"
         fi
-    done < "$STAGE_DIR/roastpilot-agent.env" | run_privileged tee -- "$env_file" >/dev/null
+    done < "$STAGE_DIR/roastpilot-agent.env" > "$staged"
+    install_env_atomically "$staged" "$env_file"
+}
+
+install_env_atomically() {
+    local source="$1" destination="$2" parent temporary
+    parent="$(dirname -- "$destination")"
+    recheck_sensitive_destination "$destination"
+    temporary="$(run_privileged mktemp -- "$parent/.roastpilot-env.XXXXXX")"
+    [[ "$temporary" == "$parent/.roastpilot-env."* ]] || die "unsafe environment temporary path"
+    cat -- "$source" | run_privileged tee -- "$temporary" >/dev/null
+    run_privileged chmod 0600 -- "$temporary"
+    run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$temporary"
+    run_privileged mv -f -- "$temporary" "$destination"
+}
+
+validate_rendered_unit() {
+    local unit="$STAGE_DIR/roastpilot-agent.service" expected actual
+    [[ -f "$unit" && ! -L "$unit" ]] || die "rendered unit is unsafe"
+    expected=$'[Unit]\nDescription=RoastPilot agent (native Pi appliance)\nAfter=network-online.target sound.target\nWants=network-online.target\n[Service]\nType=simple\nUser='"$INVOKING_USER"$'\nGroup='"$INVOKING_GROUP"$'\nEnvironmentFile=/etc/roastpilot-agent/roastpilot-agent.env\nExecStart='"$INVOKING_HOME"$'/.local/bin/roastpilot-agent serve --host 0.0.0.0 --port ${PORT}\nWorkingDirectory=~\nRestart=on-failure\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=30\nNoNewPrivileges=true\nPrivateTmp=true\n[Install]\nWantedBy=multi-user.target'
+    actual="$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$unit")"
+    [[ "$actual" == "$expected" ]] || die "rendered unit violates appliance contract"
 }
 
 install_rendered_files() {
@@ -326,11 +385,11 @@ install_rendered_files() {
     # The renderer deliberately leaves this blank; inserting it only through
     # stdin keeps the key out of command arguments, logs, and the unit.
     validate_rendered_env_template
+    validate_rendered_unit
     if [[ -n "$API_KEY" ]]; then
         write_env_with_key "$env_file"
     else
-        recheck_sensitive_destination "$env_file"
-        run_privileged install -m 0600 -- "$STAGE_DIR/roastpilot-agent.env" "$env_file"
+        install_env_atomically "$STAGE_DIR/roastpilot-agent.env" "$env_file"
     fi
     run_privileged chmod 0600 -- "$env_file"
     run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$env_file"
@@ -374,6 +433,12 @@ summary() {
 main() {
     STAGE_DIR=""
     trap '[[ -z "${STAGE_DIR:-}" ]] || run_privileged rm -rf -- "$STAGE_DIR"' EXIT
+    # Test mode is deliberately unprivileged.  Every production lookup starts
+    # from this closed path before parsing caller-controlled arguments.
+    if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" != "1" ]]; then
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin
+        export PATH
+    fi
     parse_arguments "$@"
     preflight
     resolve_operator_identity
