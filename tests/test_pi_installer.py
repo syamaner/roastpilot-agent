@@ -2392,7 +2392,12 @@ def test_failed_configuration_generation_restores_the_prior_live_set(
     assert result.returncode != 0
     assert _live_config_state(root) == before
     events = Path(environment["FAKE_LOG"]).read_text().splitlines()
+    if failure == "yaml":
+        assert f"tee <--> <{etc / '.roastpilot-yaml.fake'}>" in events
+    elif failure == "unit":
+        assert f"tee <--> <{unit_dir / '.roastpilot-unit.fake'}>" in events
     if failure == "enable":
+        assert "systemctl <enable> <--now> <avahi-daemon>" in events
         assert events.count("systemctl <daemon-reload>") == 2
         reloads = [i for i, event in enumerate(events) if event == "systemctl <daemon-reload>"]
         restores = [
@@ -2409,6 +2414,7 @@ def test_failed_configuration_generation_restores_the_prior_live_set(
                 for event in events
                 if event.startswith("test <-f>") and event.endswith(f"{name}>")
             )
+            assert "roastpilot-config-rollback" in snapshot
             assert f"test <-f> <{snapshot}>" in events
             assert f"test <-L> <{snapshot}>" in events
         snapshot_chmod = next(
@@ -2429,11 +2435,12 @@ def test_failed_configuration_generation_removes_previously_absent_files(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
     """Rollback removes configuration leaves that did not exist before promotion."""
-    _, environment, _, _ = installer_harness
+    _, environment, log, _ = installer_harness
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     result = _run(environment | {"FAKE_SYSTEMCTL_FAIL": "enable"}, "--set-hostname", "roastpilot")
     assert result.returncode != 0
     assert _live_config_state(root) == {"env": None, "yaml": None, "unit": None}
+    assert "systemctl <enable> <--now> <avahi-daemon>" in log.read_text().splitlines()
 
 
 @pytest.mark.serial
@@ -2471,6 +2478,7 @@ def test_rollback_failure_still_reloads_and_discards_snapshot(
     assert "rollback incomplete; manual reconciliation required" in result.stderr
     assert _live_config_state(root) == before
     events = log.read_text().splitlines()
+    assert "systemctl <enable> <--now> <avahi-daemon>" in events
     assert events.count("systemctl <daemon-reload>") == 2
     assert counter.read_text().strip() == "2"
     assert any(
@@ -2536,6 +2544,68 @@ def test_rollback_cp_failure_continues_to_later_members_and_cleanup(
         and _live_config_state(root)["unit"] == before["unit"]
         and _live_config_state(root)["yaml"] != before["yaml"]
     )
+    assert not any(
+        event.startswith("systemctl ")
+        and "<roastpilot-agent>" in event
+        and any(
+            operation in event
+            for operation in (
+                "<start>",
+                "<stop>",
+                "<restart>",
+                "<try-restart>",
+                "<kill>",
+                "<disable>",
+            )
+        )
+        for event in events
+    )
+
+
+@pytest.mark.serial
+def test_rollback_recheck_failure_is_not_masked_by_later_members(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A failed YAML recheck leaves rollback incomplete but continues through the unit."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    etc, unit_dir = root / "etc/roastpilot-agent", root / "etc/systemd/system"
+    etc.mkdir(parents=True)
+    unit_dir.mkdir(parents=True)
+    env, yaml, unit = (
+        etc / "roastpilot-agent.env",
+        etc / "coffee-roaster-mcp.yaml",
+        unit_dir / "roastpilot-agent.service",
+    )
+    env.write_text(
+        "OPENROUTER_API_KEY=old\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+    )
+    yaml.write_bytes(b"prior-yaml\n")
+    unit.write_bytes(b"[Service]\nUser=operator\nGroup=operators\n")
+    for path, mode in ((env, 0o600), (yaml, 0o640), (unit, 0o644)):
+        path.chmod(mode)
+    before = _live_config_state(root)
+    result = _run(environment | {"FAKE_TEST_FAIL_PATH": str(yaml)}, "--set-hostname", "roastpilot")
+    assert result.returncode != 0 and "manual reconciliation required" in result.stderr
+    events = log.read_text().splitlines()
+    failed_rechecks = [i for i, event in enumerate(events) if event == f"test <!> <-L> <{yaml}>"]
+    # The first failure aborts YAML promotion; the second is the rollback
+    # recheck, which must persist despite later successful predicates.
+    assert len(failed_rechecks) == 2
+    failed_recheck = failed_rechecks[-1]
+    unit_restore = next(
+        i
+        for i, event in enumerate(events)
+        if i > failed_recheck and event.startswith("cp <-p>") and event.endswith(f"> <{unit}>")
+    )
+    assert unit_restore > failed_recheck
+    assert any(
+        event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event for event in events
+    )
+    assert not list((root / "tmp").glob("roastpilot-config-rollback.*"))
+    assert _live_config_state(root)["env"] == before["env"]
+    assert _live_config_state(root)["unit"] == before["unit"]
+    assert _live_config_state(root)["yaml"] == before["yaml"]
 
 
 @pytest.mark.serial
