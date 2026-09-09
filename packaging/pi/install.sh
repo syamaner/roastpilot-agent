@@ -162,9 +162,12 @@ parse_arguments() {
     [[ -z "$REQUESTED_VERSION" || -z "$REQUESTED_WHEEL" ]] || die "choose --version or --wheel"
     [[ -z "$REQUESTED_VERSION" || "$REQUESTED_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ ]] || die "invalid version selector"
     if [[ -n "$REQUESTED_WHEEL" ]]; then
+        local canonical_wheel
         [[ "$REQUESTED_WHEEL" == /* && "$REQUESTED_WHEEL" != *"/../"* ]] || die "invalid wheel selector"
         [[ -f "$REQUESTED_WHEEL" && ! -L "$REQUESTED_WHEEL" ]] || die "wheel must be a regular file"
-        REQUESTED_WHEEL="$(readlink -f -- "$REQUESTED_WHEEL")"
+        canonical_wheel="$(readlink -f -- "$REQUESTED_WHEEL")"
+        [[ "$REQUESTED_WHEEL" == "$canonical_wheel" ]] || die "wheel path must be canonical"
+        REQUESTED_WHEEL="$canonical_wheel"
     fi
     if [[ -n "$MODEL_FROM_DIR" ]]; then validate_from_dir "$MODEL_FROM_DIR"; fi
     if [[ -n "$REQUESTED_HOSTNAME" ]]; then

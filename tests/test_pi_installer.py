@@ -716,6 +716,46 @@ def test_hostile_values_are_inert_and_rejected_before_writes(
     assert wheel.returncode != 0 and (not log.exists() or "sudo" not in log.read_text())
 
 
+@pytest.mark.serial
+def test_wheel_with_a_symlinked_parent_is_rejected_before_installer_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A wheel must be canonical, not merely a regular file through a symlinked parent."""
+    _, environment, log, _ = installer_harness
+    real_parent = tmp_path / "real-wheel-parent"
+    real_parent.mkdir()
+    (real_parent / "roastpilot-agent.whl").write_text("wheel")
+    linked_parent = tmp_path / "linked-wheel-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    result = _run(
+        environment,
+        "--set-hostname",
+        "roastpilot",
+        "--wheel",
+        str(linked_parent / "roastpilot-agent.whl"),
+    )
+    assert result.returncode != 0 and "wheel path must be canonical" in result.stderr
+    assert not log.exists()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("identity", "value"), [("FAKE_ID_USER", "Operator"), ("FAKE_ID_GROUP", "operators!")]
+)
+def test_unsafe_operator_identity_fails_before_installer_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], identity: str, value: str
+) -> None:
+    """Invalid invoking account names fail before account lookup or mutable work."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment | {identity: value}, "--set-hostname", "roastpilot")
+    assert result.returncode != 0 and "unsafe operator identity" in result.stderr
+    events = log.read_text().splitlines()
+    assert not any(
+        line.startswith(("getent ", "apt-get ", "pipx ", "roastpilot-agent ", "systemctl "))
+        for line in events
+    )
+
+
 @pytest.mark.serial  # This checks one complete subprocess staging lifecycle.
 def test_staging_only_mutates_and_cleans_the_unique_directory(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
@@ -1786,6 +1826,31 @@ def test_failed_restoration_cleans_the_stage_and_fails_before_appliance_effects(
     )
     assert result.returncode != 0
     events = log.read_text().splitlines()
+    assert any("roastpilot-stage-" in line and "<uninstall>" in line for line in events)
+    assert not any(line.startswith("roastpilot-agent <appliance>") for line in events)
+    assert "Installed: unit enabled; model verified." not in result.stdout
+
+
+@pytest.mark.serial
+def test_failed_restoration_verification_cleans_the_stage_and_fails_closed(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A restored package must re-prove MCP capability before recovery is reported."""
+    _, environment, log, _ = installer_harness
+    prior_package = "roastpilot-agent[pi]==1.2"
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", prior_package)
+    result = _run(
+        environment | {"FAKE_PIPX_FAIL_FINAL_INSTALL": "1", "FAKE_PIPX_FAIL_RESTORE_VERIFY": "1"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    assert result.returncode != 0
+    assert "replacement failed and prior application could not be restored" in result.stderr
+    events = log.read_text().splitlines()
+    assert f"pipx <install> <--> <{prior_package}>" in events
+    assert "pipx <runpip> <roastpilot-agent> <show> <coffee-roaster-mcp>" in events
     assert any("roastpilot-stage-" in line and "<uninstall>" in line for line in events)
     assert not any(line.startswith("roastpilot-agent <appliance>") for line in events)
     assert "Installed: unit enabled; model verified." not in result.stdout
