@@ -2169,3 +2169,117 @@ def test_state_sequence_blocks_prior_uninstall(
     events = log.read_text().splitlines()
     assert events.count("systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>") == 2
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("state", ["inactive", "failed"])
+def test_terminal_inactive_states_admit_normal_runs(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], state: str
+) -> None:
+    """Both documented terminal service states permit a normal safe install."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment | {"FAKE_SERVICE_STATE": state}, "--set-hostname", "roastpilot")
+    assert result.returncode == 0, result.stderr
+    probes = "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>"
+    assert log.read_text().splitlines().count(probes) == 2
+
+
+@pytest.mark.serial
+def test_pre_promotion_state_change_aborts_before_live_mutations(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """An active transition after staging cannot promote or enable appliance state."""
+    _, environment, log, _ = installer_harness
+    sequence = tmp_path / "states"
+    sequence.write_text("inactive\nactive\n")
+    result = _run(
+        environment | {"FAKE_SERVICE_STATE_SEQUENCE": str(sequence)}, "--set-hostname", "roastpilot"
+    )
+    assert result.returncode != 0 and "end any run safely" in result.stderr
+    events = log.read_text().splitlines()
+    probe = "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>"
+    assert events.count(probe) == 2
+    assert not any(
+        line.startswith(
+            (
+                "tee ",
+                "mv ",
+                "hostnamectl <set",
+                "usermod ",
+                "systemctl <daemon",
+                "systemctl <enable",
+                "systemctl <start",
+            )
+        )
+        for line in events
+    )
+    assert not any(
+        line.startswith(("chown ", "chmod ")) and "/root/etc/" in line or "/root/var/" in line
+        for line in events
+    )
+    assert any(line.startswith("rm <-rf>") and "roastpilot-install" in line for line in events)
+    assert "Installed: unit enabled" not in result.stdout
+
+
+@pytest.mark.serial
+def test_final_start_recheck_never_disturbs_a_deactivating_service(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A last-moment transition blocks --start without restart-like commands."""
+    _, environment, log, _ = installer_harness
+    sequence = tmp_path / "states"
+    sequence.write_text("inactive\ninactive\ndeactivating\n")
+    result = _run(
+        environment | {"FAKE_SERVICE_STATE_SEQUENCE": str(sequence)},
+        "--set-hostname",
+        "roastpilot",
+        "--start",
+    )
+    assert result.returncode != 0 and "stop the service only when idle" in result.stderr
+    events = log.read_text().splitlines()
+    probe = "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>"
+    assert events.count(probe) == 3
+    assert "systemctl <enable> <roastpilot-agent>" in events
+    assert not any(
+        "systemctl <start>" in line
+        or any(word in line for word in ("restart", "try-restart", "stop", "kill"))
+        for line in events
+    )
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {"FAKE_SYSTEMCTL_FAIL": "show"},
+        {"FAKE_SERVICE_STATE": ""},
+        {"FAKE_SERVICE_STATE": "bad state"},
+    ],
+)
+def test_initial_service_probe_failures_are_effect_free(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], environment: dict[str, str]
+) -> None:
+    """Transport, empty, and malformed initial state evidence fails closed before apt."""
+    _, base_environment, log, _ = installer_harness
+    result = _run(base_environment | environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0 and "never restart during a roast" in result.stderr
+    events = log.read_text().splitlines()
+    assert events.count("systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>") == 1
+    assert not any(
+        line.startswith(prefix)
+        for line in events
+        for prefix in (
+            "apt-get ",
+            "pipx ",
+            "roastpilot-agent ",
+            "tee ",
+            "mv ",
+            "chown ",
+            "chmod ",
+            "hostnamectl <set",
+            "usermod ",
+            "systemctl <daemon",
+            "systemctl <enable",
+            "systemctl <start",
+        )
+    )
