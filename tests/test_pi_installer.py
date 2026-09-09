@@ -67,9 +67,7 @@ case "$name" in
     else [ "$1" = set-hostname ]; printf '%s\\n' "$2" > "$FAKE_HOSTNAME"; fi ;;
   pipx)
     if [ -n "${FAKE_PIPX_ENV_LOG:-}" ]; then
-      printf 'HOME=<%s> PIPX_HOME=<%s> PIPX_BIN_DIR=<%s> PIPX_DEFAULT_PYTHON=<%s>\\n' \\
-        "${HOME-UNSET}" "${PIPX_HOME-UNSET}" "${PIPX_BIN_DIR-UNSET}" "${PIPX_DEFAULT_PYTHON-UNSET}" \
-        >> "$FAKE_PIPX_ENV_LOG"
+      printf 'HOME=<%s> PIPX_HOME=<%s> PIPX_BIN_DIR=<%s> PIPX_DEFAULT_PYTHON=<%s>\\n' "${HOME-UNSET}" "${PIPX_HOME-UNSET}" "${PIPX_BIN_DIR-UNSET}" "${PIPX_DEFAULT_PYTHON-UNSET}" >> "$FAKE_PIPX_ENV_LOG"
     fi
     if [ "${1:-}" = list ]; then
       if [ "${FAKE_PIPX_LIST_FAIL:-}" = 1 ]; then exit 17
@@ -529,7 +527,7 @@ def test_preflight_failures_happen_before_privileged_commands(
     assert rejected.returncode != 0
     allowed = _run(environment, "--allow-unsupported-arch", "--set-hostname", "roastpilot")
     assert allowed.returncode == 0
-    no_tty = _run(environment, "--set-hostname", "roastpilot", yes=False, stdin=None)
+    no_tty = _run(environment, "--set-hostname", "roastpilot", yes=False, stdin="")
     assert no_tty.returncode != 0
 
 
@@ -603,7 +601,9 @@ def test_truncated_or_mutated_script_has_no_privileged_effect(
     assert "run_privileged()" in text and "sudo --" in text
     assert "ROASTPILOT_INSTALL_TEST_ROOT" in text
     assert "pipx install --force" not in text
-    escaped = _run(environment | {"ROASTPILOT_INSTALL_TEST_ROOT": "/tmp/root/../escape"})
+    escaped = _run(
+        environment | {"ROASTPILOT_INSTALL_TEST_ROOT": str(tmp_path / "root" / ".." / "escape")}
+    )
     assert escaped.returncode != 0
     assert not log.exists()
 
@@ -781,7 +781,7 @@ def test_contract_mutation_oracles_detect_removed_guards(
         "roastpilot",
         *arguments,
         yes=yes,
-        stdin=None if not yes else "input",
+        stdin="" if not yes else "input",
         script=mutated,
     )
     if oracle == "proceeds":
@@ -860,7 +860,7 @@ def test_pipx_selector_deltas_are_isolated(
     assert tuple(action for action in pipx_actions if action != "list") == expected
 
 
-@pytest.mark.serial
+@pytest.mark.serial  # pipx child environments are process-local fake state.
 def test_pipx_children_use_only_the_resolved_invoking_home(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -906,7 +906,7 @@ def test_invalid_pipx_state_fails_before_destructive_or_privileged_work(
     assert "systemctl" not in events
 
 
-@pytest.mark.serial  # This executes a full ordered fake-install lifecycle.
+@pytest.mark.serial  # Executable provenance mutates the isolated fake command path.
 def test_full_flow_has_exact_key_order_and_no_real_command_resolution(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
