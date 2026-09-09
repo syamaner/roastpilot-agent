@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from roastpilot_agent.appliance.model_manifest import MANIFEST_FILES, REVISION
+from roastpilot_agent.appliance.model_manifest import MANIFEST_FILES, REPO_ID, REVISION
 from roastpilot_agent.appliance.render import (
     ApplianceRenderInputs,
     render_env_file,
@@ -171,12 +171,13 @@ UNIT
   cp) /bin/cp "$@" ;;
   mv) /bin/mv "$@" ;;
   sha256sum)
+    if [ "$#" = 0 ]; then cat >/dev/null; echo "content-digest  -"; exit 0; fi
     [ "${1:-}" = -- ] && shift
     content=$(cat "$1")
     case "$content" in
       MODEL) echo "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df  $1" ;;
       CONFIG) echo "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231  $1" ;;
-      *) exit 23 ;;
+      *) echo "content-digest  $1" ;;
     esac ;;
   grep) /usr/bin/grep "$@" ;;
   tr) /usr/bin/tr "$@" ;;
@@ -396,6 +397,7 @@ validate_rendered_unit "$(< "${10}")"
 def test_installer_model_identity_is_tied_to_the_manifest() -> None:
     """Installer pin literals stay coupled to the Python manifest source of truth."""
     source = INSTALLER.read_text()
+    assert REPO_ID in source
     assert REVISION in source
     for manifest_file in MANIFEST_FILES:
         assert manifest_file.relative_path in source
@@ -892,7 +894,7 @@ def test_full_flow_has_exact_key_order_and_no_real_command_resolution(
         " <--db-path> </var/lib/roastpilot-agent/roastpilot.sqlite3>"
     ) in events
     assert "usermod <-aG> <dialout,audio> <--> <operator>" in events
-    assert f"tee <--> <{root / 'var/lib/roastpilot-agent/prior-static-hostname'}>" in events
+    assert any(line.startswith("tee ") and ".prior-static-hostname.fake" in line for line in events)
     assert f"rm <-rf> <--> <{stage}>" in events
 
     def first(prefix: str) -> int:
@@ -1102,7 +1104,9 @@ def test_model_digests_cover_stage_root_snapshot_and_destination(
     _, environment, log, _ = installer_harness
     assert _run(environment, "--set-hostname", "roastpilot").returncode == 0
     digests = [line for line in log.read_text().splitlines() if line.startswith("sha256sum ")]
-    assert len(digests) == 6
+    # Model promotion retains its six checks; captured env/YAML/unit and the
+    # prior hostname each receive an atomic destination readback check.
+    assert len(digests) == 10
     assert sum("roastpilot-install.fake/models/" in line for line in digests) == 2
     assert sum(".roastpilot-model.fake" in line for line in digests) == 2
     assert (
@@ -1114,6 +1118,10 @@ def test_model_digests_cover_stage_root_snapshot_and_destination(
         )
         == 2
     )
+    assert sum("roastpilot-agent.env" in line for line in digests) == 1
+    assert sum("coffee-roaster-mcp.yaml" in line for line in digests) == 1
+    assert sum("roastpilot-agent.service" in line for line in digests) == 1
+    assert sum("prior-static-hostname" in line for line in digests) == 1
 
 
 @pytest.mark.serial
@@ -1144,9 +1152,36 @@ def test_repaired_input_bounds_and_test_mode_are_fail_closed(
         ("--audio-device", " mic"),
         ("--audio-device", "mic "),
         ("--audio-device", "mic@@token"),
+        ("--serial-port", "/dev/ttyéUSB0"),
+        ("--audio-device", "microphoneé"),
     ):
         assert _run(environment, "--set-hostname", "roastpilot", *args).returncode != 0
     assert not log.exists()
+
+
+@pytest.mark.serial  # The fake renderer lifecycle is process-scoped.
+def test_yaml_hash_without_preceding_whitespace_is_not_normalised_away(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A hash inside an unquoted scalar remains contract-significant."""
+    _, environment, log, _ = installer_harness
+    result = _run(
+        environment | {"FAKE_RENDERED_YAML": "transport:\n  type: stdio\n  value: 2#9"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0
+    assert "systemctl" not in (log.read_text() if log.exists() else "")
+
+
+@pytest.mark.serial  # This source-only guard has no production command path.
+def test_production_os_release_override_is_not_a_runtime_input() -> None:
+    """Only root-free test mode may select an alternate os-release fixture."""
+    source = INSTALLER.read_text()
+    assert "local os_release=/etc/os-release" in source
+    assert (
+        'if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" == "1" ]]; then\n        os_release=' in source
+    )
 
 
 @pytest.mark.serial
@@ -1185,7 +1220,7 @@ def test_hostname_and_identity_repairs_are_observable_through_fake_seam(
     prior = root / "var/lib/roastpilot-agent/prior-static-hostname"
     assert prior.read_text() == "old-host\n"
     assert stat.S_IMODE(prior.stat().st_mode) == 0o600
-    assert f"chown <operator:operators> <--> <{prior}>" in events
+    assert not any(line.endswith(f"<{prior}>") and "chown" in line for line in events)
     Path(environment["FAKE_HOSTNAME"]).write_text("old-host\n")
     verify = _run(environment | {"FAKE_HOSTNAME_VERIFY_FAIL": "1"}, "--set-hostname", "roastpilot")
     assert verify.returncode != 0 and "hostname verification failed" in verify.stderr
@@ -1198,6 +1233,41 @@ def test_hostname_and_identity_repairs_are_observable_through_fake_seam(
     assert any(
         line.startswith("getent <passwd> <operator>") for line in log.read_text().splitlines()
     )
+
+
+@pytest.mark.serial  # The fake hostname and root-free parent are shared state.
+def test_hostname_write_stays_inside_locked_parent_and_abort_recovers_access(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Prior-hostname persistence cannot follow a pre-existing symlink or unlock early."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    var_dir = root / "var/lib/roastpilot-agent"
+    var_dir.mkdir(parents=True)
+    outside = root.parent / "outside-prior"
+    outside.write_text("unchanged\n")
+    prior = var_dir / "prior-static-hostname"
+    prior.symlink_to(outside)
+    rejected = _run(environment, "--set-hostname", "roastpilot")
+    assert rejected.returncode != 0
+    assert outside.read_text() == "unchanged\n"
+    assert prior.is_symlink()
+    prior.unlink()
+    log.write_text("")
+    result = _run(environment | {"FAKE_HOSTNAME_VERIFY_FAIL": "1"}, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    events = log.read_text().splitlines()
+    root_lock = next(
+        i for i, line in enumerate(events) if line == f"chown <root:root> <--> <{var_dir}>"
+    )
+    hostname_set = next(
+        i for i, line in enumerate(events) if line == "hostnamectl <set-hostname> <roastpilot>"
+    )
+    operator_unlock = next(
+        i for i, line in enumerate(events) if line == f"chown <operator:operators> <--> <{var_dir}>"
+    )
+    assert root_lock < hostname_set < operator_unlock
+    assert prior.read_text() == "wrong-host\n" and not prior.is_symlink()
 
 
 @pytest.mark.serial  # Renderer mutation cases share the fake command seam.

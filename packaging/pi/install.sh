@@ -79,6 +79,11 @@ validate_no_control_characters() {
     [[ "$value" != *[[:cntrl:]]* ]] || die "$description contains control characters"
 }
 
+validate_ascii_input() {
+    local value="$1" description="$2"
+    [[ "$value" =~ ^[\ -~]+$ ]] || die "$description must contain ASCII characters only"
+}
+
 validate_from_dir() {
     local candidate="$1" canonical
     validate_no_control_characters "$candidate" "--from-dir"
@@ -147,6 +152,8 @@ parse_arguments() {
     [[ -z "$API_KEY" || "$API_KEY" =~ ^[A-Za-z0-9._:-]+$ ]] || die "API key contains unsafe EnvironmentFile characters"
     validate_no_control_characters "$SERIAL_PORT" "serial port"
     validate_no_control_characters "$AUDIO_DEVICE" "audio device"
+    validate_ascii_input "$SERIAL_PORT" "serial port"
+    validate_ascii_input "$AUDIO_DEVICE" "audio device"
     [[ "$SERIAL_PORT" != *'#'* && "$SERIAL_PORT" != *'"'* && "$SERIAL_PORT" != *\\* ]] || die "serial port contains ambiguous YAML characters"
     [[ "$AUDIO_DEVICE" != *'#'* && "$AUDIO_DEVICE" != *'"'* && "$AUDIO_DEVICE" != *\\* ]] || die "audio device contains ambiguous YAML characters"
     [[ "$PORT" =~ ^[0-9]+$ && "$PORT" -ge 1024 && "$PORT" -le 65535 ]] || die "port must be a decimal number from 1024 to 65535"
@@ -172,7 +179,12 @@ preflight() {
     if [[ "$(uname -m)" != "aarch64" && "$ALLOW_UNSUPPORTED_ARCH" != 1 ]]; then
         die "this installer supports aarch64 only; pass --allow-unsupported-arch to override"
     fi
-    local os_release="${ROASTPILOT_INSTALL_OS_RELEASE:-/etc/os-release}"
+    local os_release=/etc/os-release
+    # The alternate source exists solely for the root-free fake-command tests.
+    # Production always reads the host's canonical release data.
+    if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" == "1" ]]; then
+        os_release="${ROASTPILOT_INSTALL_OS_RELEASE:-/etc/os-release}"
+    fi
     # Parse only the two required os-release fields as inert text.  In
     # particular, never source a caller-selected file.
     local line key value id="" id_like=""
@@ -360,17 +372,21 @@ validate_rendered_env() {
 }
 
 install_content_atomically() {
-    local content="$1" destination="$2" mode="$3" owner="$4" prefix="$5" parent temporary
+    local content="$1" destination="$2" mode="$3" owner="$4" prefix="$5" parent temporary expected actual
     parent="$(dirname -- "$destination")"
     recheck_sensitive_destination "$destination"
     temporary="$(run_privileged mktemp -- "$parent/.$prefix.XXXXXX")"
     [[ "$temporary" == "$parent/.$prefix."* ]] || die "unsafe temporary path"
     ROOT_TEMPORARIES+=("$temporary")
+    expected="$(printf '%s\n' "$content" | sha256sum)"
+    expected="${expected%% *}"
     printf '%s\n' "$content" | run_privileged tee -- "$temporary" >/dev/null
     run_privileged chmod "$mode" -- "$temporary"
     [[ -z "$owner" ]] || run_privileged chown "$owner" -- "$temporary"
     run_privileged mv -f -- "$temporary" "$destination"
     ROOT_TEMPORARIES=("${ROOT_TEMPORARIES[@]/$temporary}")
+    actual="$(run_privileged sha256sum -- "$destination")"
+    [[ "${actual%% *}" == "$expected" ]] || die "atomic destination digest mismatch"
 }
 
 normalise_unit_env_contract() {
@@ -384,7 +400,9 @@ normalise_unit_env_contract() {
 }
 
 normalise_yaml_contract() {
-    sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d'
+    # YAML permits a comment only at line start or after whitespace.  In
+    # particular, retain `2#9` so the closed contract rejects it.
+    sed -e '/^[[:space:]]*#/d' -e 's/[[:space:]][[:space:]]*#.*$//' -e '/^[[:space:]]*$/d'
 }
 
 validate_rendered_unit() {
@@ -444,27 +462,28 @@ install_rendered_files() {
     run_privileged test ! -L "$var_dir"
     run_privileged chown root:root -- "$var_dir"
     run_privileged chmod 0700 -- "$var_dir"
+    LOCKED_VAR_DIR="$var_dir"
     promote_model_file "$STAGE_DIR/models/onnx/int8/model_quantized.onnx" "$model_dir/onnx/int8/model_quantized.onnx" "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df"
     promote_model_file "$STAGE_DIR/models/onnx/int8/preprocessor_config.json" "$model_dir/onnx/int8/preprocessor_config.json" "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231"
     install_content_atomically "$final_env" "$env_file" 0600 "$INVOKING_USER:$INVOKING_GROUP" roastpilot-env
     install_content_atomically "$staged_yaml" "$yaml_file" 0644 "" roastpilot-yaml
     [[ ! -e "${unit_file}.d" && ! -L "${unit_file}.d" ]] || die "service drop-ins are not permitted"
     install_content_atomically "$staged_unit" "$unit_file" 0644 "" roastpilot-unit
-    run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$var_dir"
-    run_privileged chmod 0700 -- "$var_dir"
-    if ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq dialout || ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq audio; then
-        run_privileged usermod -aG dialout,audio -- "$INVOKING_USER"
-    fi
     if [[ -n "$REQUESTED_HOSTNAME" ]]; then
         prior_hostname="$(hostnamectl --static)"
         if [[ "$prior_hostname" != "$REQUESTED_HOSTNAME" ]]; then
-            recheck_sensitive_destination "$prior_file"
-            run_privileged install -m 0600 -- /dev/null "$prior_file"
-            printf '%s\n' "$prior_hostname" | run_privileged tee -- "$prior_file" >/dev/null
-            run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$prior_file"
+            install_content_atomically "$prior_hostname" "$prior_file" 0600 root:root prior-static-hostname
             run_privileged hostnamectl set-hostname "$REQUESTED_HOSTNAME"
             [[ "$(hostnamectl --static)" == "$REQUESTED_HOSTNAME" ]] || die "hostname verification failed"
         fi
+    fi
+    # Do not unlock the parent until the prior-hostname write and verification
+    # have completed under its root-owned boundary.
+    run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$var_dir"
+    run_privileged chmod 0700 -- "$var_dir"
+    LOCKED_VAR_DIR=""
+    if ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq dialout || ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq audio; then
+        run_privileged usermod -aG dialout,audio -- "$INVOKING_USER"
     fi
 }
 
@@ -488,12 +507,18 @@ summary() {
 main() {
     STAGE_DIR=""
     ROOT_TEMPORARIES=()
+    LOCKED_VAR_DIR=""
     cleanup() {
         local temporary
         for temporary in "${ROOT_TEMPORARIES[@]:-}"; do
             [[ -z "$temporary" ]] || run_privileged rm -f -- "$temporary" || true
         done
         [[ -z "${STAGE_DIR:-}" ]] || run_privileged rm -rf -- "$STAGE_DIR" || true
+        # Never follow an untrusted child when recovering a locked parent.
+        if [[ -n "${LOCKED_VAR_DIR:-}" ]] && run_privileged test -d "$LOCKED_VAR_DIR" && run_privileged test ! -L "$LOCKED_VAR_DIR"; then
+            run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$LOCKED_VAR_DIR" || true
+            run_privileged chmod 0700 -- "$LOCKED_VAR_DIR" || true
+        fi
     }
     trap cleanup EXIT
     # Test mode is deliberately unprivileged.  Every production lookup starts
