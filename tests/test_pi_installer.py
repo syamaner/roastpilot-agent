@@ -214,13 +214,13 @@ UNIT
   tee) [ "${1:-}" = -- ] && shift; [ "${FAKE_TEE_FAIL:-}" != 1 ] || exit 19; [ "${FAKE_TEE_FAIL_TARGET:-}" != "$1" ] || exit 19; mkdir -p "$(dirname "$1")"; cat > "$1" ;;
   install) mode=0644; [ "${1:-}" = -m ] && { mode="$2"; shift 2; }
     [ "${1:-}" = -- ] && shift; cp "$1" "$2"; chmod "$mode" "$2" ;;
-  test) /usr/bin/test "$@" ;;
+  test) [ -z "${FAKE_TEST_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_TEST_FAIL_PATH" ] || exit 41; /usr/bin/test "$@" ;;
   mkdir) /bin/mkdir "$@" ;;
   chmod) [ "${2:-}" = -- ] && { mode="$1"; shift 2; [ "${FAKE_CHMOD_FAIL_TARGET:-}" != "$1" ] || exit 23; /bin/chmod "$mode" "$@"; } || /bin/chmod "$@" ;;
   mktemp) is_dir=0; [ "${1:-}" = -d ] && { is_dir=1; shift; }; [ "${1:-}" = -- ] && shift; dir="${1%XXXXXX}fake"
     if [ "$is_dir" = 1 ]; then mkdir -p "$dir"; else mkdir -p "$(dirname "$dir")"; : > "$dir"; fi; printf '%s\\n' "$dir" ;;
-  rm) /bin/rm "$@" ;;
-  cp) /bin/cp "$@" ;;
+  rm) [ -z "${FAKE_RM_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_RM_FAIL_PATH" ] || exit 42; /bin/rm "$@" ;;
+  cp) [ -z "${FAKE_CP_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_CP_FAIL_PATH" ] || exit 43; /bin/cp "$@" ;;
   mv) /bin/mv "$@" ;;
   sha256sum)
     if [ "$#" = 0 ]; then cat >/dev/null; echo "content-digest  -"; exit 0; fi
@@ -236,6 +236,11 @@ UNIT
   usermod) printf 'dialout audio\n' > "$FAKE_GROUPS" ;;
   apt-get|chown) : ;;
   systemctl)
+    if [ "${1:-}" = daemon-reload ] && [ -n "${FAKE_DAEMON_RELOAD_FAIL_ON:-}" ]; then
+      count=0; [ ! -e "$FAKE_DAEMON_RELOAD_COUNTER" ] || count=$(cat "$FAKE_DAEMON_RELOAD_COUNTER")
+      count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_DAEMON_RELOAD_COUNTER"
+      [ "$count" != "$FAKE_DAEMON_RELOAD_FAIL_ON" ] || exit 44
+    fi
     [ "${FAKE_SYSTEMCTL_FAIL:-}" != "${1:-}" ] || exit 31
     if [ "${1:-}" = show ]; then
       [ "${2:-}" = -p ] && [ "${3:-}" = ActiveState ] && [ "${4:-}" = --value ] || exit 32
@@ -2425,12 +2430,61 @@ def test_failed_configuration_generation_removes_previously_absent_files(
 
 
 @pytest.mark.serial
+def test_rollback_failure_still_reloads_and_discards_snapshot(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Rollback remains best-effort when its second daemon reload fails."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    etc = root / "etc/roastpilot-agent"
+    unit_dir = root / "etc/systemd/system"
+    etc.mkdir(parents=True)
+    unit_dir.mkdir(parents=True)
+    (etc / "roastpilot-agent.env").write_text(
+        "OPENROUTER_API_KEY=\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\n"
+        "COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+    )
+    (etc / "coffee-roaster-mcp.yaml").write_text("old-yaml\n")
+    (unit_dir / "roastpilot-agent.service").write_text("[Service]\nUser=operator\nGroup=operators\n")
+    before = _live_config_state(root)
+    counter = root.parent / "daemon-count"
+    result = _run(
+        environment
+        | {
+            "FAKE_SYSTEMCTL_FAIL": "enable",
+            "FAKE_DAEMON_RELOAD_FAIL_ON": "2",
+            "FAKE_DAEMON_RELOAD_COUNTER": str(counter),
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0
+    assert "rollback incomplete; manual reconciliation required" in result.stderr
+    assert _live_config_state(root) == before
+    events = log.read_text().splitlines()
+    assert events.count("systemctl <daemon-reload>") == 2
+    assert counter.read_text().strip() == "2"
+    assert any(
+        event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event for event in events
+    )
+    assert not list((root / "tmp").glob("roastpilot-config-rollback.*"))
+    assert not any(
+        any(word in event for word in ("start", "stop", "restart", "kill", "disable"))
+        and "roastpilot-agent" in event
+        for event in events
+    )
+
+
+@pytest.mark.serial
 @pytest.mark.parametrize(
     "unit_text",
     [
         "[Service]\nUser=other\nGroup=operators\n",
         "[Service]\nUser=operator\nGroup=other\n",
         "[Service]\nUser=operator\nGroup=operators\nUser=operator\n",
+        "[Service]\n User=operator\nGroup=operators\n User=operator\n",
+        "[Service]\n User=other\nGroup=operators\n",
+        "[Service]\nUser=operator\n Group=other\n",
         "[Service]\nUser=operator\n",
         "[Service]\nUser = operator\nGroup=operators\n",
     ],
