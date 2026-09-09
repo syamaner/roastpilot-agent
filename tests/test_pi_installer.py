@@ -47,6 +47,7 @@ name=$(basename "$0")
 printf '%s' "$name" >> "$FAKE_LOG"
 for arg in "$@"; do printf ' <%s>' "$arg" >> "$FAKE_LOG"; done
 printf '\\n' >> "$FAKE_LOG"
+[ -z "${FAKE_SECRET_ENV_LOG:-}" ] || printf '%s <%s> <%s>\\n' "$name" "${OPENROUTER_API_KEY-UNSET}" "${API_KEY-UNSET}" >> "$FAKE_SECRET_ENV_LOG"
 case "$name" in
   sudo) shift; [ "${1:-}" = -- ] && shift; exec "$@" ;;
   id)
@@ -95,6 +96,7 @@ case "$name" in
       [ "$version" = "$package" ] && version=default
       if [ -n "$suffix" ]; then
         [ "${FAKE_PIPX_FAIL_STAGE_INSTALL:-}" != 1 ] || exit 25
+        [ -z "${FAKE_DELETE_PRIOR_WHEEL:-}" ] || rm -f -- "$FAKE_DELETE_PRIOR_WHEEL"
       else
         count=0; [ ! -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] || count=$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")
         count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_PIPX_NORMAL_INSTALL_COUNT"
@@ -330,7 +332,7 @@ def _run(
     environment = {
         key: value
         for key, value in environment.items()
-        if key != "OPENROUTER_API_KEY"
+        if (key != "OPENROUTER_API_KEY" or environment.get("FAKE_ALLOW_AMBIENT_SECRET") == "1")
         and (not key.startswith("ROASTPILOT_") or key in allowed_installer_inputs)
     }
     return subprocess.run(
@@ -2039,3 +2041,78 @@ def test_unavailable_prior_local_wheel_is_not_replaced(
     result = _run(environment, "--set-hostname", "roastpilot", "--version", "2.0")
     assert result.returncode != 0 and "cannot preserve exact prior local wheel" in result.stderr
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text()
+
+
+@pytest.mark.serial
+def test_prior_local_wheel_is_restored_from_the_private_copy_after_source_loss(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A late replacement failure restores bytes copied before the old source vanishes."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "prior.whl"
+    wheel.write_text("wheel")
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
+    result = _run(
+        environment | {"FAKE_DELETE_PRIOR_WHEEL": str(wheel), "FAKE_PIPX_FAIL_FINAL_INSTALL": "1"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    assert result.returncode != 0 and not wheel.exists()
+    assert any(
+        "roastpilot-restore" in event and "prior.whl[pi]" in event
+        for event in log.read_text().splitlines()
+    )
+
+
+@pytest.mark.serial
+def test_restrictive_umask_keeps_owned_directories_traversable(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """Installer-owned directory modes do not inherit an operator's restrictive umask."""
+    _, environment, _, _ = installer_harness
+    script = tmp_path / "umask-install.sh"
+    script.write_text(
+        INSTALLER.read_text().replace("set -euo pipefail", "set -euo pipefail\numask 077", 1)
+    )
+    script.chmod(0o755)
+    assert _run(environment, "--set-hostname", "roastpilot", script=script).returncode == 0
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    assert stat.S_IMODE((root / "etc/roastpilot-agent").stat().st_mode) == 0o750
+    for path in ("models", "models/onnx", "models/onnx/int8"):
+        assert stat.S_IMODE((root / "var/lib/roastpilot-agent" / path).stat().st_mode) == 0o750
+    assert stat.S_IMODE((root / "etc/systemd/system").stat().st_mode) == 0o700
+    assert (
+        stat.S_IMODE((root / "etc/roastpilot-agent/roastpilot-agent.env").stat().st_mode) == 0o600
+    )
+
+
+@pytest.mark.serial
+def test_child_processes_do_not_receive_exported_secret_sentinels(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Only the protected env leaf retains the explicit installer secret."""
+    _, environment, _, _ = installer_harness
+    secret_log = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]).parent / "secret-env.log"
+    result = _run(
+        environment
+        | {
+            "FAKE_SECRET_ENV_LOG": str(secret_log),
+            "FAKE_ALLOW_AMBIENT_SECRET": "1",
+            "OPENROUTER_API_KEY": "ambient-sentinel",
+            "API_KEY": "exported-sentinel",
+            "ROASTPILOT_INSTALL_API_KEY": "installer-sentinel",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode == 0
+    child_env = secret_log.read_text()
+    assert "ambient-sentinel" not in child_env and "exported-sentinel" not in child_env
+    env_file = (
+        Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+        / "etc/roastpilot-agent/roastpilot-agent.env"
+    )
+    assert "installer-sentinel" in env_file.read_text()
+    assert "installer-sentinel" not in result.stdout + result.stderr + child_env
