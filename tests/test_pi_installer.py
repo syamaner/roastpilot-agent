@@ -1462,10 +1462,8 @@ def test_appliance_executable_provenance_fails_before_model_or_later_effects(
     assert result.returncode != 0
     events = log.read_text().splitlines()
     assert not any(line.startswith("roastpilot-agent <appliance>") for line in events)
-    assert not any(
-        line.startswith(("mkdir ", "mktemp ", "chown ", "chmod ", "tee ", "systemctl "))
-        for line in events
-    )
+    assert not any(line.startswith("tee ") for line in events)
+    assert not _has_service_mutation(events)
 
 
 @pytest.mark.serial
