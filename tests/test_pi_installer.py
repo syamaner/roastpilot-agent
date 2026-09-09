@@ -2435,12 +2435,13 @@ def test_failed_configuration_generation_restores_the_prior_live_set(
         # Each member is inspected through the privileged seam; this is a
         # mutation guard against replacing any check with shell-local syntax.
         for name in ("roastpilot-agent.env", "coffee-roaster-mcp.yaml", "roastpilot-agent.service"):
+            expected_snapshot = root / "tmp/roastpilot-config-rollback.fake" / name
             snapshot = next(
                 event.split(" <")[-1].rstrip(">")
                 for event in events
-                if event.startswith("test <-f>") and event.endswith(f"{name}>")
+                if event == f"test <-f> <{expected_snapshot}>"
             )
-            assert "roastpilot-config-rollback" in snapshot
+            assert snapshot == str(expected_snapshot)
             assert f"test <-f> <{snapshot}>" in events
             assert f"test <-L> <{snapshot}>" in events
         snapshot_chmod = next(
