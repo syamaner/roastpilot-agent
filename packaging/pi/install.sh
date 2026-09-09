@@ -290,6 +290,7 @@ restore_live_configuration() {
             run_privileged rm -f -- "$destination"
         fi
     done
+    run_privileged systemctl daemon-reload || die "cannot reload restored appliance configuration"
     CONFIG_TRANSACTION_ACTIVE=0
 }
 

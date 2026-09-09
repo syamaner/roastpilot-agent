@@ -2358,7 +2358,11 @@ def test_failed_configuration_generation_restores_the_prior_live_set(
     unit_dir = root / "etc/systemd/system"
     etc.mkdir(parents=True)
     unit_dir.mkdir(parents=True)
-    (etc / "roastpilot-agent.env").write_text("old-env\n")
+    (etc / "roastpilot-agent.env").write_text(
+        "OPENROUTER_API_KEY=old-key\nPORT=8000\n"
+        "ROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\n"
+        "COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+    )
     (etc / "coffee-roaster-mcp.yaml").write_text("old-yaml\n")
     (unit_dir / "roastpilot-agent.service").write_text(
         "[Service]\nUser=operator\nGroup=operators\n"
@@ -2380,6 +2384,14 @@ def test_failed_configuration_generation_restores_the_prior_live_set(
     result = _run(environment | extra, "--set-hostname", "roastpilot")
     assert result.returncode != 0
     assert _live_config_state(root) == before
+    events = Path(environment["FAKE_LOG"]).read_text().splitlines()
+    if failure == "enable":
+        assert events.count("systemctl <daemon-reload>") == 2
+        assert not any(
+            "systemctl <start> <roastpilot-agent>" in event
+            or any(word in event for word in ("restart", "try-restart", "stop", "kill"))
+            for event in events
+        )
 
 
 @pytest.mark.serial
@@ -2438,6 +2450,10 @@ def test_matching_existing_unit_identity_allows_maintenance(
     unit.write_text("[Service]\nUser=operator\nGroup=operators\n")
     result = _run(environment, "--set-hostname", "roastpilot")
     assert result.returncode == 0, result.stderr
+    committed = _live_config_state(Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]))
+    assert committed["env"] is not None and b"PORT=8000" in committed["env"][0]
+    assert committed["yaml"] is not None and b"transport:" in committed["yaml"][0]
+    assert committed["unit"] is not None and b"Description=RoastPilot" in committed["unit"][0]
 
 
 @pytest.mark.serial
