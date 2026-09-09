@@ -257,10 +257,7 @@ UNIT
       elif [ "${FAKE_SERVICE_STATE+x}" = x ]; then printf '%s\\n' "$FAKE_SERVICE_STATE"; else echo inactive; fi
       exit 0
     fi
-    if [ "${1:-}" = is-active ]; then
-      [ "${FAKE_SERVICE_ACTIVE:-}" = 1 ] && exit 0
-      exit 3
-    fi ;;
+    ;;
 esac
 """
     )
