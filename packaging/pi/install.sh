@@ -47,8 +47,9 @@ validate_install_root() {
         export PATH
         return
     fi
-    [[ -n "$install_root" && "$install_root" != "/" ]] || die "test install root is required"
-    [[ "$install_root" == /* && "/${install_root#/}/" != *"/../"* ]] || die "invalid install root"
+    [[ -n "$install_root" ]] || die "test install root is required"
+    [[ "$install_root" == /* && "$install_root" != / && "$install_root" != // ]] || die "invalid install root"
+    [[ "/${install_root#/}/" != *"/."/* && "/${install_root#/}/" != *"/.."/* && "$install_root" != */. && "$install_root" != */.. ]] || die "invalid install root"
     [[ "$install_root" != *$'\n'* && "$install_root" != *$'\r'* ]] || die "invalid install root"
 }
 
@@ -246,7 +247,7 @@ resolve_operator_identity() {
     [[ "$INVOKING_USER" =~ ^[a-z_][a-z0-9_-]*$ && "$INVOKING_GROUP" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "unsafe operator identity"
     account="$(getent passwd "$INVOKING_USER")" || die "cannot determine invoking home"
     IFS=: read -r record_name _ _ _ _ operator_home _ <<< "$account"
-    [[ "$record_name" == "$INVOKING_USER" && "$operator_home" == /* && "$operator_home" != *"/../"* ]] || die "unsafe operator home"
+    [[ "$record_name" == "$INVOKING_USER" && "$operator_home" == /* && "$operator_home" != / && "$operator_home" != // && "/${operator_home#/}/" != *"/."/* && "/${operator_home#/}/" != *"/.."/* && "$operator_home" != */. && "$operator_home" != */.. ]] || die "unsafe operator home"
     INVOKING_HOME="$operator_home"
 }
 
@@ -508,9 +509,9 @@ install_application() {
     state="$(installed_pipx_state)"
     package_spec="$(requested_package_spec)"
     if [[ "$state" == "absent" ]]; then
+        FRESH_APPLICATION_CLEANUP_REQUIRED=1
         pipx_command install -- "$package_spec"
         APPLICATION_CHANGED=1
-        FRESH_APPLICATION_CLEANUP_REQUIRED=1
         verify_pi_capability || die "installed roastpilot-agent lacks required Pi/MCP capability"
         FRESH_APPLICATION_CLEANUP_REQUIRED=0
         return
@@ -809,7 +810,9 @@ install_rendered_files() {
     run_privileged test ! -L "$var_dir" || die "managed state directory is unsafe: $var_dir"
     run_privileged chmod 0700 -- "$var_dir"
     LOCKED_VAR_DIR=""
-    if ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq dialout || ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq audio; then
+    local groups
+    groups="$(id -nG "$INVOKING_USER")" || die "cannot determine invoking user groups"
+    if [[ " $groups " != *" dialout "* || " $groups " != *" audio "* ]]; then
         run_privileged usermod -aG dialout,audio -- "$INVOKING_USER"
     fi
 }
@@ -890,14 +893,18 @@ main() {
         fi
         if [[ "${RESTORE_ARTIFACT_RETAIN:-0}" == 1 && -n "${RESTORE_ARTIFACT_DIR:-}" ]]; then
             printf '%s\n' "install failed: retain restore artifact directory at $RESTORE_ARTIFACT_DIR for the restored local-wheel application" >&2
-            cleanup_failed=1
         elif [[ -n "${RESTORE_ARTIFACT_DIR:-}" ]] && { [[ "${RESTORE_ARTIFACT_VALIDATED:-0}" != 1 ]] || ! rm -rf -- "$RESTORE_ARTIFACT_DIR"; }; then
             if [[ "${INSTALLATION_COMMITTED:-0}" == 1 ]]; then printf '%s\n' "installation completed; manually remove retained restore artifact directory at $RESTORE_ARTIFACT_DIR" >&2; else printf '%s\n' "install failed: retained restore artifact directory at $RESTORE_ARTIFACT_DIR" >&2; fi
             cleanup_failed=1
         fi
-        if [[ "${FRESH_APPLICATION_CLEANUP_REQUIRED:-0}" == 1 ]] && ! pipx_command uninstall -- roastpilot-agent; then
-            printf '%s\n' "install failed: manually remove incapable roastpilot-agent environment" >&2
-            cleanup_failed=1
+        if [[ "${FRESH_APPLICATION_CLEANUP_REQUIRED:-0}" == 1 ]]; then
+            if ! pipx_command uninstall -- roastpilot-agent; then
+                printf '%s\n' "install failed: manually remove incapable roastpilot-agent environment" >&2
+                cleanup_failed=1
+            else
+                FRESH_APPLICATION_CLEANUP_REQUIRED=0
+                APPLICATION_CHANGED=0
+            fi
         fi
         if ! cleanup_staged_pipx; then
             printf '%s\n' "install failed: retained staged pipx environment at $STAGED_PIPX_VENV" >&2
