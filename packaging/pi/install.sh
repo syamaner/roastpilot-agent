@@ -403,6 +403,7 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             cache_dir="$INVOKING_HOME/.cache"
             mkdir -p -- "$cache_dir"
             RESTORE_ARTIFACT_DIR="$(mktemp -d -- "$cache_dir/roastpilot-restore.XXXXXX")"
+            [[ -f "$source" && ! -L "$source" ]] || die "cannot preserve exact prior local wheel"
             cp -- "$source" "$RESTORE_ARTIFACT_DIR/prior.whl"
             RESTORABLE_PRIOR_SPEC="$RESTORE_ARTIFACT_DIR/prior.whl[pi]"
             ;;
@@ -459,6 +460,7 @@ replace_application_safely() {
         die "replacement failed; prior application was restored"
     fi
     cleanup_staged_pipx || die "cannot remove staged replacement"
+    APPLICATION_CHANGED=1
 }
 
 install_application() {
@@ -468,6 +470,7 @@ install_application() {
     if [[ "$state" == "absent" ]]; then
         pipx_command install -- "$package_spec"
         verify_pi_capability || die "installed roastpilot-agent lacks required Pi/MCP capability"
+        APPLICATION_CHANGED=1
         return
     fi
     if [[ -z "$REQUESTED_WHEEL$REQUESTED_VERSION" ]]; then
@@ -782,6 +785,7 @@ enable_services() {
     verify_no_service_dropins
     run_privileged systemctl daemon-reload
     verify_no_service_dropins
+    AVAHI_ENABLE_ATTEMPTED=1
     run_privileged systemctl enable --now avahi-daemon
     ROASTPILOT_AGENT_ENABLED=1
     run_privileged systemctl enable roastpilot-agent
@@ -814,6 +818,9 @@ main() {
     PRIOR_STATIC_HOSTNAME_FILE=""
     ROASTPILOT_AGENT_ENABLED=0
     STAGED_PIPX_VENV=""
+    AVAHI_ENABLE_ATTEMPTED=0
+    APPLICATION_CHANGED=0
+    POST_COMMIT_SNAPSHOT_FAILURE=0
     cleanup() {
         local temporary original_status=$? cleanup_failed=0
         trap - EXIT
@@ -844,11 +851,13 @@ main() {
                 cleanup_failed=1
             else
                 if ! run_privileged chown --no-dereference "$INVOKING_USER:$INVOKING_GROUP" -- "$LOCKED_VAR_DIR"; then
+                    printf '%s\n' "install failed: restore $LOCKED_VAR_DIR ownership to $INVOKING_USER:$INVOKING_GROUP manually" >&2
                     cleanup_failed=1
                 elif ! run_privileged test -d "$LOCKED_VAR_DIR" || run_privileged test -L "$LOCKED_VAR_DIR"; then
+                    printf '%s\n' "install failed: restore $LOCKED_VAR_DIR mode 0700 manually" >&2
                     cleanup_failed=1
                 else
-                    run_privileged chmod 0700 -- "$LOCKED_VAR_DIR" || cleanup_failed=1
+                    run_privileged chmod 0700 -- "$LOCKED_VAR_DIR" || { printf '%s\n' "install failed: restore $LOCKED_VAR_DIR mode 0700 manually" >&2; cleanup_failed=1; }
                 fi
             fi
         fi
@@ -857,11 +866,13 @@ main() {
                 cleanup_failed=1
             else
                 if ! run_privileged chown --no-dereference "root:$INVOKING_GROUP" -- "$LOCKED_ETC_DIR"; then
+                    printf '%s\n' "install failed: restore $LOCKED_ETC_DIR ownership to root:$INVOKING_GROUP manually" >&2
                     cleanup_failed=1
                 elif ! run_privileged test -d "$LOCKED_ETC_DIR" || run_privileged test -L "$LOCKED_ETC_DIR"; then
+                    printf '%s\n' "install failed: restore $LOCKED_ETC_DIR mode 0750 manually" >&2
                     cleanup_failed=1
                 else
-                    run_privileged chmod 0750 -- "$LOCKED_ETC_DIR" || cleanup_failed=1
+                    run_privileged chmod 0750 -- "$LOCKED_ETC_DIR" || { printf '%s\n' "install failed: restore $LOCKED_ETC_DIR mode 0750 manually" >&2; cleanup_failed=1; }
                 fi
             fi
         fi
@@ -873,8 +884,18 @@ main() {
         if [[ "${ROASTPILOT_AGENT_ENABLED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after enabling roastpilot-agent; the unit may remain enabled; rerun or inspect the installer state manually" >&2
         fi
+        if [[ "${AVAHI_ENABLE_ATTEMPTED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
+            printf '%s\n' "install failed after enabling Avahi; Avahi enablement may remain" >&2
+        fi
+        if [[ "${APPLICATION_CHANGED:-0}" == 1 && "${CONFIG_TRANSACTION_ACTIVE:-0}" == 1 ]]; then
+            printf '%s\n' "install failed after application replacement; application/configuration skew may require manual reconciliation" >&2
+        fi
         if [[ "$cleanup_failed" == 1 ]]; then
-            printf '%s\n' "install failed: rollback incomplete; manual reconciliation required" >&2
+            if [[ "${POST_COMMIT_SNAPSHOT_FAILURE:-0}" == 1 ]]; then
+                printf '%s\n' "installation completed; snapshot cleanup/manual removal is required" >&2
+            else
+                printf '%s\n' "install failed: rollback incomplete; manual reconciliation required" >&2
+            fi
             exit 1
         fi
         exit "$original_status"
@@ -903,7 +924,10 @@ main() {
     enable_services
     CONFIG_TRANSACTION_ACTIVE=0
     LOCKED_ETC_DIR=""
-    discard_configuration_snapshot
+    if ! discard_configuration_snapshot; then
+        POST_COMMIT_SNAPSHOT_FAILURE=1
+        die "installation completed but snapshot cleanup requires manual removal"
+    fi
     summary
 }
 

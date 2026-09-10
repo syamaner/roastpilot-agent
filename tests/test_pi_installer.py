@@ -1030,14 +1030,25 @@ def test_trailing_main_mutation_is_detected_by_truncation_oracle(
     source = INSTALLER.read_text()
     assert source.count('main "$@"') == 1
     mutated = tmp_path / "moved-main.sh"
-    mutated.write_text(source.replace('main "$@"', 'run_privileged true\nmain "$@"'))
+    mutated.write_text(
+        source.replace('main "$@"', 'run_privileged apt-get install -- g12-oracle\nmain "$@"')
+    )
     truncated = tmp_path / "moved-main-truncated.sh"
     truncated.write_text(mutated.read_text().rsplit('main "$@"', 1)[0])
     result = subprocess.run(
         ["bash", str(truncated)], env=environment, text=True, capture_output=True, check=False
     )
     assert result.returncode == 0
-    assert not log.exists()  # Test mode's privilege seam is structurally root-free.
+    assert log.read_text().splitlines() == ["apt-get <install> <--> <g12-oracle>"]
+    unmutated = tmp_path / "unmutated-truncated.sh"
+    unmutated.write_text(source.rsplit('main "$@"', 1)[0])
+    assert (
+        subprocess.run(
+            ["bash", str(unmutated)], env=environment, text=True, capture_output=True
+        ).returncode
+        == 0
+    )
+    assert log.read_text().splitlines() == ["apt-get <install> <--> <g12-oracle>"]
 
 
 @pytest.mark.serial  # Each parametrized subprocess receives a fresh fake state.
@@ -3441,7 +3452,7 @@ def test_success_snapshot_discard_failure_keeps_committed_configuration(
     )
     assert result.returncode == 1
     assert f"retained configuration snapshot at {snapshot}" in result.stderr
-    assert "manual reconciliation required" in result.stderr
+    assert "installation completed; snapshot cleanup/manual removal is required" in result.stderr
     assert snapshot.is_dir()
     assert _live_config_state(root)["env"] is not None
     assert _live_config_state(root)["yaml"] is not None
