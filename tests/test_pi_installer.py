@@ -989,8 +989,7 @@ def test_staging_only_mutates_and_cleans_the_unique_directory(
         ),
         ("set -euo pipefail", "set -uo pipefail", (), "model_failure", "fails"),
         (
-            "if ! id -nG \"$INVOKING_USER\" | tr ' ' '\\n' | grep -Fxq dialout "
-            "|| ! id -nG \"$INVOKING_USER\" | tr ' ' '\\n' | grep -Fxq audio; then",
+            'if [[ " $groups " != *" dialout "* || " $groups " != *" audio "* ]]; then',
             "if true; then",
             (),
             "second_run",
