@@ -3129,6 +3129,44 @@ def test_prior_local_wheel_is_restored_from_the_private_copy_after_source_loss(
 
 
 @pytest.mark.serial
+def test_prior_local_wheel_artifact_is_retained_before_post_reinstall_capability_failure(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A restored local wheel remains available when its immediately following capability check fails."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "prior.whl"
+    wheel.write_text("wheel")
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
+    secret = "must-not-leak-from-retained-wheel"
+    result = _run(
+        environment
+        | {
+            "FAKE_DELETE_PRIOR_WHEEL": str(wheel),
+            "FAKE_PIPX_FAIL_FINAL_INSTALL": "1",
+            "FAKE_PIPX_FAIL_RESTORE_VERIFY": "1",
+            "ROASTPILOT_INSTALL_API_KEY": secret,
+        },
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    artifact = Path(environment["FAKE_OPERATOR_HOME"]) / ".cache/roastpilot-restore.fake"
+    prior_copy = artifact / "prior.whl"
+    events = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert "pipx <runpip> <roastpilot-agent> <show> <coffee-roaster-mcp>" in events
+    assert artifact.is_dir() and prior_copy.is_file()
+    assert (
+        f"retain restore artifact directory at {artifact} for the restored local-wheel application"
+        in result.stderr
+    )
+    assert f"rm <-rf> <--> <{artifact}>" not in events
+    assert secret not in result.stdout + result.stderr + log.read_text()
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
 def test_glob_character_in_validated_temporary_suffix_removes_only_that_exact_entry(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:

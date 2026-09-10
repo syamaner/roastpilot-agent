@@ -494,10 +494,13 @@ replace_application_safely() {
     fi
     if ! pipx_command install -- "$package_spec" || ! verify_pi_capability; then
         pipx_command uninstall -- roastpilot-agent || true
-        if ! pipx_command install -- "$prior_spec" || ! verify_pi_capability; then
+        if ! pipx_command install -- "$prior_spec"; then
             restoration_failed=1
-        elif [[ "$prior_spec" == "${RESTORE_ARTIFACT_DIR:-}/"* ]]; then
-            RESTORE_ARTIFACT_RETAIN=1
+        else
+            if [[ "$prior_spec" == "${RESTORE_ARTIFACT_DIR:-}/"* ]]; then
+                RESTORE_ARTIFACT_RETAIN=1
+            fi
+            verify_pi_capability || restoration_failed=1
         fi
         cleanup_staged_pipx || true
         [[ "$restoration_failed" == 0 ]] || die "replacement failed and prior application could not be restored"
