@@ -2211,6 +2211,38 @@ def test_repaired_input_bounds_and_test_mode_are_fail_closed(
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize("audio_device", ("AA", "111", "mmm"))
+def test_repeated_character_audio_devices_are_accepted_without_edge_whitespace(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], audio_device: str
+) -> None:
+    """Audio-device trimming accepts repeated characters but rejects edge whitespace."""
+    _, environment, log, _ = installer_harness
+    accepted = _run(
+        environment,
+        "--set-hostname",
+        "roastpilot",
+        "--audio-device",
+        audio_device,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    render = next(
+        event
+        for event in log.read_text().splitlines()
+        if event.startswith("roastpilot-agent <appliance> <render>")
+    )
+    assert f"<--audio-device={audio_device}>" in render
+    for unsafe_device in (f" {audio_device}", f"{audio_device} ", f"{audio_device}\n"):
+        rejected = _run(
+            environment,
+            "--set-hostname",
+            "roastpilot",
+            "--audio-device",
+            unsafe_device,
+        )
+        assert rejected.returncode != 0
+
+
+@pytest.mark.serial
 def test_production_mode_rejects_redirected_test_root_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -3812,11 +3844,14 @@ def test_rollback_recheck_failure_is_not_masked_by_later_members(
     assert result.returncode != 0 and "manual reconciliation required" in result.stderr
     assert f"cannot restore configuration member at {yaml}" in result.stderr
     events = log.read_text().splitlines()
-    failed_rechecks = [i for i, event in enumerate(events) if event == f"test <!> <-L> <{yaml}>"]
-    # The fourth probe is the snapshot's confirmed-absence check, the fifth
-    # and sixth allow promotion, and the seventh is the rollback recheck.
-    assert len(failed_rechecks) == 3
-    failed_recheck = failed_rechecks[-1]
+    yaml_symlink_checks = [
+        i for i, event in enumerate(events) if event == f"test <!> <-L> <{yaml}>"
+    ]
+    # The snapshot validation and pre-write recheck precede the injected
+    # seventh probe; the final check is the rollback recheck.
+    assert len(yaml_symlink_checks) == 3
+    assert f"FAKE_TEST_FAILURE <{yaml}>" in events
+    failed_recheck = yaml_symlink_checks[-1]
     unit_restore = next(
         i
         for i, event in enumerate(events)
@@ -3965,10 +4000,19 @@ def test_snapshot_member_probe_failure_is_not_treated_as_absence(
         "COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
     )
     env.write_text(original)
-    result = _run(environment | {"FAKE_TEST_FAIL_PATH": str(env)}, "--set-hostname", "roastpilot")
+    result = _run(
+        environment
+        | {
+            "FAKE_TEST_FAIL_PATH": str(env),
+            "FAKE_TEST_FAIL_ON_COUNT": "1",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
     events = log.read_text().splitlines()
     assert result.returncode != 0
     assert f"FAKE_TEST_FAILURE <{env}>" in events
+    assert Path(environment["FAKE_TEST_FAIL_COUNT_FILE"]).read_text() == "3\n"
     assert f"cannot inspect existing configuration destination at {env}" in result.stderr
     assert env.read_text() == original
     assert not any(
