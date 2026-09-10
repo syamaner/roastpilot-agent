@@ -250,7 +250,7 @@ resolve_operator_identity() {
     [[ "$INVOKING_USER" =~ ^[a-z_][a-z0-9_-]*$ && "$INVOKING_GROUP" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "unsafe operator identity"
     account="$(getent passwd "$INVOKING_USER")" || die "cannot determine invoking home"
     IFS=: read -r record_name _ _ _ _ operator_home _ <<< "$account"
-    [[ "$record_name" == "$INVOKING_USER" && "$operator_home" == /* && "$operator_home" != / && "$operator_home" != // && "/${operator_home#/}/" != *"/."/* && "/${operator_home#/}/" != *"/.."/* && "$operator_home" != */. && "$operator_home" != */.. ]] || die "unsafe operator home"
+    [[ "$record_name" == "$INVOKING_USER" && "$operator_home" == /* && "$operator_home" != / && "$operator_home" != // && "/${operator_home#/}/" != *"/."/* && "/${operator_home#/}/" != *"/.."/* && "$operator_home" != */. && "$operator_home" != */.. && "$operator_home" != *[[:space:]]* && "$operator_home" != *['"'\#\$%=\\]* && "$operator_home" != *'@@'* ]] || die "unsafe operator home"
     INVOKING_HOME="$operator_home"
 }
 
@@ -421,8 +421,19 @@ requested_package_spec() {
     fi
 }
 
+create_restore_artifact_dir() {
+    local cache_dir restore_root
+    cache_dir="$INVOKING_HOME/.cache"
+    mkdir -p -- "$cache_dir"
+    RESTORE_ARTIFACT_DIR="$(mktemp -d -- "$cache_dir/roastpilot-restore.XXXXXX")"
+    RESTORE_ARTIFACT_VALIDATED=0
+    restore_root="$cache_dir/roastpilot-restore."
+    is_expected_mktemp_path "$RESTORE_ARTIFACT_DIR" "$restore_root" || die "retained untrusted restore artifact directory at $RESTORE_ARTIFACT_DIR"
+    RESTORE_ARTIFACT_VALIDATED=1
+}
+
 prepare_restorable_prior() {
-    local state="$1" package version source source_basename canonical cache_dir restore_root reported_version installed_prefix prior_metadata
+    local state="$1" package version source source_basename wheel_tail canonical requirements reported_version installed_prefix prior_metadata
     prior_metadata="$(printf '%s' "$state" | python3 -c '
 import json, sys
 try:
@@ -442,38 +453,66 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             canonical="$(readlink -f -- "$source")" || die "cannot preserve exact prior local wheel"
             [[ "$source" == "$canonical" ]] || die "cannot preserve exact prior local wheel"
             source_basename="${source##*/}"
-            [[ "$source_basename" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*-[A-Za-z0-9][A-Za-z0-9._+!-]*-[A-Za-z0-9][A-Za-z0-9._-]*-[A-Za-z0-9][A-Za-z0-9._-]*-[A-Za-z0-9][A-Za-z0-9._-]*\.whl$ ]] || die "cannot preserve exact prior local wheel"
-            cache_dir="$INVOKING_HOME/.cache"
-            mkdir -p -- "$cache_dir"
-            RESTORE_ARTIFACT_DIR="$(mktemp -d -- "$cache_dir/roastpilot-restore.XXXXXX")"
-            RESTORE_ARTIFACT_VALIDATED=0
-            restore_root="$cache_dir/roastpilot-restore."
-            is_expected_mktemp_path "$RESTORE_ARTIFACT_DIR" "$restore_root" || die "retained untrusted restore artifact directory at $RESTORE_ARTIFACT_DIR"
-            RESTORE_ARTIFACT_VALIDATED=1
+            case "$source_basename" in
+                "roastpilot_agent-$version-"*) wheel_tail="${source_basename#"roastpilot_agent-$version-"}" ;;
+                "roastpilot-agent-$version-"*) wheel_tail="${source_basename#"roastpilot-agent-$version-"}" ;;
+                *) die "cannot preserve exact prior local wheel" ;;
+            esac
+            [[ "$wheel_tail" =~ ^([0-9][A-Za-z0-9._-]*-)?(py|cp)[A-Za-z0-9._-]*-[A-Za-z0-9][A-Za-z0-9._-]*-[A-Za-z0-9][A-Za-z0-9._-]*\.whl$ ]] || die "cannot preserve exact prior local wheel"
+            create_restore_artifact_dir
             [[ -f "$source" && ! -L "$source" ]] || die "cannot preserve exact prior local wheel"
             cp -- "$source" "$RESTORE_ARTIFACT_DIR/$source_basename"
             RESTORABLE_PRIOR_SPEC="$RESTORE_ARTIFACT_DIR/${source_basename}[pi]"
             ;;
         roastpilot-agent|roastpilot-agent\[pi\])
             [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ ]] || die "cannot preserve exact prior application"
+            create_restore_artifact_dir
+            requirements="$RESTORE_ARTIFACT_DIR/requirements.txt"
+            pipx_command runpip roastpilot-agent freeze --all > "$requirements" || die "cannot preserve exact prior application"
+            grep -Fx "roastpilot-agent==$version" "$requirements" >/dev/null || die "cannot preserve exact prior application"
+            pipx_command runpip roastpilot-agent wheel --wheel-dir "$RESTORE_ARTIFACT_DIR" -r "$requirements" || die "cannot preserve exact prior application"
+            compgen -G "$RESTORE_ARTIFACT_DIR/*.whl" >/dev/null || die "cannot preserve exact prior application"
             RESTORABLE_PRIOR_SPEC="roastpilot-agent[pi]==$version"
+            RESTORABLE_PRIOR_PIP_ARGS="--no-index --find-links=$RESTORE_ARTIFACT_DIR"
             ;;
         roastpilot-agent\[pi\]==*)
             installed_prefix='roastpilot-agent[pi]=='
             reported_version="${package#"$installed_prefix"}"
             [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ && "$reported_version" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ && "$reported_version" == "$version" ]] || die "cannot preserve exact prior application"
+            create_restore_artifact_dir
+            requirements="$RESTORE_ARTIFACT_DIR/requirements.txt"
+            pipx_command runpip roastpilot-agent freeze --all > "$requirements" || die "cannot preserve exact prior application"
+            grep -Fx "roastpilot-agent==$version" "$requirements" >/dev/null || die "cannot preserve exact prior application"
+            pipx_command runpip roastpilot-agent wheel --wheel-dir "$RESTORE_ARTIFACT_DIR" -r "$requirements" || die "cannot preserve exact prior application"
+            compgen -G "$RESTORE_ARTIFACT_DIR/*.whl" >/dev/null || die "cannot preserve exact prior application"
             RESTORABLE_PRIOR_SPEC="roastpilot-agent[pi]==$version"
+            RESTORABLE_PRIOR_PIP_ARGS="--no-index --find-links=$RESTORE_ARTIFACT_DIR"
             ;;
         *) die "cannot preserve exact prior application" ;;
     esac
 }
 
 verify_pi_capability() {
-    local venv_name="${1:-roastpilot-agent}" mcp_executable
+    local venv_name="${1:-roastpilot-agent}" mcp_executable metadata line version="" version_seen=0
     probe_pipx_venv_root || return 1
     mcp_executable="$PIPX_VENV_ROOT/$venv_name/bin/coffee-roaster-mcp"
     [[ -f "$mcp_executable" && -x "$mcp_executable" && ! -L "$mcp_executable" ]] || return 1
-    pipx_command runpip "$venv_name" show coffee-roaster-mcp >/dev/null
+    metadata="$(pipx_command runpip "$venv_name" show coffee-roaster-mcp)" || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            "Version: "*) ((version_seen++ == 0)) || return 1; version="${line#Version: }" ;;
+        esac
+    done <<< "$metadata"
+    [[ "$version_seen" == 1 && "$version" == "0.2.0" ]]
+}
+
+install_restorable_prior() {
+    local prior_spec="$1"
+    if [[ -n "${RESTORABLE_PRIOR_PIP_ARGS:-}" ]]; then
+        pipx_command install --pip-args "$RESTORABLE_PRIOR_PIP_ARGS" -- "$prior_spec"
+    else
+        pipx_command install -- "$prior_spec"
+    fi
 }
 
 cleanup_staged_pipx() {
@@ -514,7 +553,7 @@ replace_application_safely() {
     APPLICATION_CHANGED=1
     if ! pipx_command install -- "$package_spec" || ! verify_pi_capability; then
         pipx_command uninstall -- roastpilot-agent || true
-        if ! pipx_command install -- "$prior_spec"; then
+        if ! install_restorable_prior "$prior_spec"; then
             restoration_failed=1
         else
             if [[ "$prior_spec" == "${RESTORE_ARTIFACT_DIR:-}/"* ]]; then
@@ -890,10 +929,12 @@ summary() {
 }
 
 main() {
+    set +x
     STAGE_DIR=""
     STAGE_DIR_VALIDATED=0
     RESTORE_ARTIFACT_DIR=""
     RESTORE_ARTIFACT_VALIDATED=0
+    RESTORABLE_PRIOR_PIP_ARGS=""
     ROOT_TEMPORARIES=()
     LOCKED_VAR_DIR=""
     LOCKED_ETC_DIR=""

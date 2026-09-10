@@ -101,6 +101,26 @@ case "$name" in
         [ "${FAKE_PIPX_FAIL_RESTORE_VERIFY:-}" != 1 ] || exit 24
       fi
       [ "${FAKE_PIPX_MCP_MISSING:-}" != 1 ] || exit 24
+      case "${3:-}" in
+        show)
+          mcp_version="${FAKE_PIPX_MCP_VERSION:-0.2.0}"
+          if [[ "$venv" == *-roastpilot-stage-* ]] && [ -n "${FAKE_PIPX_STAGE_MCP_VERSION:-}" ]; then
+            mcp_version="$FAKE_PIPX_STAGE_MCP_VERSION"
+            printf 'FAKE_STAGE_MCP_VERSION <%s>\\n' "$mcp_version" >> "$FAKE_LOG"
+          elif [ -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] && [ "$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")" -ge 2 ] && [ -n "${FAKE_PIPX_RESTORE_MCP_VERSION:-}" ]; then
+            mcp_version="$FAKE_PIPX_RESTORE_MCP_VERSION"
+            printf 'FAKE_RESTORE_MCP_VERSION <%s>\\n' "$mcp_version" >> "$FAKE_LOG"
+          fi
+          printf 'Name: coffee-roaster-mcp\\nVersion: %s\\n' "$mcp_version" ;;
+        freeze)
+          printf 'roastpilot-agent==%s\\ncoffee-roaster-mcp==%s\\n' "${FAKE_PIPX_FREEZE_VERSION:-1.2}" "${FAKE_PIPX_MCP_VERSION:-0.2.0}" ;;
+        wheel)
+          [ "${FAKE_PIPX_FAIL_WHEELHOUSE:-}" != 1 ] || { printf 'FAKE_PIPX_WHEELHOUSE_FAILURE\\n' >> "$FAKE_LOG"; exit 54; }
+          shift 3
+          [ "${1:-}" = --wheel-dir ] || exit 55
+          mkdir -p "$2"
+          printf wheel > "$2/roastpilot_agent-1.2-py3-none-any.whl" ;;
+      esac
     elif [ "${1:-}" = list ]; then
       if [ "${FAKE_PIPX_LIST_FAIL:-}" = 1 ]; then exit 17
       elif [ -n "${FAKE_PIPX_JSON:-}" ]; then cat "$FAKE_PIPX_JSON"
@@ -109,6 +129,8 @@ case "$name" in
     elif [ "${1:-}" = install ]; then
       shift; suffix=''
       if [ "${1:-}" = --suffix ]; then suffix="$2"; shift 2; fi
+      pip_args=''
+      if [ "${1:-}" = --pip-args ]; then pip_args="$2"; shift 2; fi
       [ "${1:-}" = -- ] && shift
       package="$1"; version="${package##*==}"
       [ "$version" = "$package" ] && version=default
@@ -122,6 +144,9 @@ case "$name" in
         [ "${FAKE_PIPX_FAIL_STAGE_INSTALL:-}" != 1 ] || exit 25
         [ -z "${FAKE_DELETE_PRIOR_WHEEL:-}" ] || rm -f -- "$FAKE_DELETE_PRIOR_WHEEL"
       else
+        if [ -n "$pip_args" ]; then
+          case "$pip_args" in --no-index\\ --find-links=*) printf 'FAKE_OFFLINE_RESTORE <%s>\\n' "$pip_args" >> "$FAKE_LOG" ;; *) exit 56 ;; esac
+        fi
         count=0; [ ! -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] || count=$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")
         count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_PIPX_NORMAL_INSTALL_COUNT"
         if [ "$count" = 1 ]; then [ "${FAKE_PIPX_FAIL_FINAL_INSTALL:-}" != 1 ] || exit 25
@@ -440,6 +465,7 @@ def _run(
     yes: bool = True,
     stdin: str | None = "input",
     script: Path = INSTALLER,
+    xtrace: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     allowed_installer_inputs = {
         "ROASTPILOT_INSTALL_TEST_MODE",
@@ -469,6 +495,7 @@ def _run(
     return subprocess.run(
         [
             "bash",
+            *(["-x"] if xtrace else []),
             str(script),
             *(["--yes"] if yes else []),
             "--serial-port",
@@ -1137,7 +1164,7 @@ def test_trailing_main_mutation_is_detected_by_truncation_oracle(
         (("--wheel", "WHEEL"), ("default", "WHEEL_PI"), ()),
         (
             ("--wheel", "OTHER"),
-            ("default", "WHEEL_PI"),
+            ("1.2", "WHEEL_PI"),
             ("install", "uninstall", "install", "uninstall"),
         ),
     ],
@@ -2732,7 +2759,8 @@ def test_failed_final_replacement_restores_and_reverifies_the_prior_application(
         line for line in events if line == "pipx <uninstall> <--> <roastpilot-agent>"
     ]
     assert len(normal_uninstalls) == 2
-    assert f"pipx <install> <--> <{prior_package}>" in events
+    assert any(event.endswith(f"<{prior_package}>") and "<--pip-args>" in event for event in events)
+    assert any(event.startswith("FAKE_OFFLINE_RESTORE <") for event in events)
     assert sum(
         line == "pipx <runpip> <roastpilot-agent> <show> <coffee-roaster-mcp>" for line in events
     ) == (1 if failure == "FAKE_PIPX_FAIL_FINAL_INSTALL" else 2)
@@ -2781,7 +2809,8 @@ def test_failed_restoration_verification_cleans_the_stage_and_fails_closed(
     assert result.returncode != 0
     assert "replacement failed and prior application could not be restored" in result.stderr
     events = log.read_text().splitlines()
-    assert f"pipx <install> <--> <{prior_package}>" in events
+    assert any(event.endswith(f"<{prior_package}>") and "<--pip-args>" in event for event in events)
+    assert any(event.startswith("FAKE_OFFLINE_RESTORE <") for event in events)
     assert "pipx <runpip> <roastpilot-agent> <show> <coffee-roaster-mcp>" in events
     assert any("roastpilot-stage-" in line and "<uninstall>" in line for line in events)
     assert not any(line.startswith("roastpilot-agent <appliance>") for line in events)
@@ -2918,6 +2947,28 @@ def test_unsafe_existing_environment_file_fails_before_installer_effects(
 
 
 @pytest.mark.serial
+def test_xtrace_is_disabled_before_preserving_an_existing_api_key(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Shell tracing cannot disclose a retained API-key fixture during parsing."""
+    _, environment, log, _ = installer_harness
+    env_file = (
+        Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+        / "etc/roastpilot-agent/roastpilot-agent.env"
+    )
+    env_file.parent.mkdir(parents=True)
+    fixture_value = "xtrace-retained-fixture"
+    env_file.write_text(
+        f"OPENROUTER_API_KEY={fixture_value}\nPORT=8000\n"
+        "ROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\n"
+        "COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+    )
+    result = _run(environment, "--set-hostname", "roastpilot", xtrace=True)
+    assert result.returncode == 0, result.stderr
+    assert fixture_value not in result.stdout + result.stderr + log.read_text()
+
+
+@pytest.mark.serial
 @pytest.mark.parametrize("mutation", ["bad-digest", "missing-peer", "symlink", "incomplete"])
 def test_only_complete_verified_installed_models_are_reused(
     installer_harness: tuple[Path, dict[str, str], Path, Path], mutation: str
@@ -3011,6 +3062,118 @@ def test_unavailable_prior_local_wheel_is_not_replaced(
     wheel.write_text("wheel")
     _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
     wheel.unlink()
+    result = _run(environment, "--set-hostname", "roastpilot", "--version", "2.0")
+    assert result.returncode != 0 and "cannot preserve exact prior local wheel" in result.stderr
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text()
+
+
+@pytest.mark.serial
+def test_indexed_prior_wheelhouse_failure_aborts_before_uninstall(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """An indexed prior must have a captured wheelhouse before replacement starts."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+    result = _run(
+        environment | {"FAKE_PIPX_FAIL_WHEELHOUSE": "1"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    events = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert "FAKE_PIPX_WHEELHOUSE_FAILURE" in events
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("mcp_version", ("0.1.9", "0.2.1"))
+def test_mcp_version_must_match_the_e11_pin_before_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], mcp_version: str
+) -> None:
+    """A console entry point is insufficient unless the MCP distribution is E11-pinned."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+    result = _run(
+        environment | {"FAKE_PIPX_MCP_VERSION": mcp_version}, "--set-hostname", "roastpilot"
+    )
+    assert result.returncode != 0 and "Pi/MCP" in result.stderr
+    assert "pipx <runpip> <roastpilot-agent> <show> <coffee-roaster-mcp>" in log.read_text()
+    assert "roastpilot-agent <appliance" not in log.read_text()
+
+
+@pytest.mark.serial
+def test_staged_and_restored_mcp_versions_must_match_the_e11_pin(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Capability verification applies the same MCP pin to stage and rollback venvs."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+    staged = _run(
+        environment | {"FAKE_PIPX_STAGE_MCP_VERSION": "0.1.9"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    staged_events = log.read_text().splitlines()
+    assert (
+        staged.returncode != 0
+        and "staged replacement lacks required Pi/MCP capability" in staged.stderr
+    )
+    assert "FAKE_STAGE_MCP_VERSION <0.1.9>" in staged_events
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in staged_events
+
+    start = len(log.read_text())
+    restored = _run(
+        environment
+        | {
+            "FAKE_PIPX_FAIL_FINAL_INSTALL": "1",
+            "FAKE_PIPX_RESTORE_MCP_VERSION": "0.1.9",
+        },
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    restored_events = _delta(log, start)
+    assert restored.returncode != 0 and "prior application could not be restored" in restored.stderr
+    assert "FAKE_RESTORE_MCP_VERSION <0.1.9>" in restored_events
+
+
+@pytest.mark.serial
+def test_build_tagged_prior_wheel_is_preserved_for_rollback(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A valid PEP 427 build tag remains an exact local rollback artifact."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "roastpilot_agent-1.2-1build-py3-none-any.whl"
+    wheel.write_text("wheel")
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
+    result = _run(
+        environment | {"FAKE_PIPX_FAIL_FINAL_INSTALL": "1"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    assert result.returncode != 0
+    assert any(
+        "roastpilot-restore" in event and wheel.name in event
+        for event in log.read_text().splitlines()
+    )
+
+
+@pytest.mark.serial
+def test_malformed_build_tagged_prior_wheel_is_rejected_before_uninstall(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A non-numeric PEP 427 build tag cannot become a rollback selector."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "roastpilot_agent-1.2-build-py3-none-any.whl"
+    wheel.write_text("wheel")
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
     result = _run(environment, "--set-hostname", "roastpilot", "--version", "2.0")
     assert result.returncode != 0 and "cannot preserve exact prior local wheel" in result.stderr
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text()
@@ -4399,6 +4562,11 @@ def test_preupdate_hostname_query_failure_stops_before_hostname_or_service_effec
         "operator:x:1000:1000::/home/operator/.:/bin/sh",
         "operator:x:1000:1000::/home/operator/..:/bin/sh",
         "operator:x:1000:1000::relative:/bin/sh",
+        "operator:x:1000:1000::/home/operator name:/bin/sh",
+        "operator:x:1000:1000::/home/operator#name:/bin/sh",
+        "operator:x:1000:1000::/home/$operator:/bin/sh",
+        "operator:x:1000:1000::/home/operator%h:/bin/sh",
+        "operator:x:1000:1000::/home/operator@@token:/bin/sh",
     ],
 )
 def test_unsafe_getent_identity_and_home_shapes_fail_before_installer_effects(
