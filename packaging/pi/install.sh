@@ -237,6 +237,8 @@ preflight() {
         local static_hostname
         static_hostname="$(hostnamectl --static)" || die "cannot determine static hostname"
         [[ "$static_hostname" == "roastpilot" ]] || die "hostname is not roastpilot; re-run with --set-hostname roastpilot"
+    else
+        PRE_UPDATE_HOSTNAME="$(hostnamectl --static)" || die "cannot determine static hostname before update"
     fi
 }
 
@@ -791,7 +793,7 @@ install_rendered_files() {
     verify_no_service_dropins
     install_content_atomically "$staged_unit" "$unit_file" 0644 "" roastpilot-unit
     if [[ -n "$REQUESTED_HOSTNAME" ]]; then
-        prior_hostname="$(hostnamectl --static)" || die "cannot determine static hostname before update"
+        prior_hostname="$PRE_UPDATE_HOSTNAME"
         if [[ "$prior_hostname" != "$REQUESTED_HOSTNAME" ]]; then
             install_content_atomically "$prior_hostname" "$prior_file" 0600 root:root prior-static-hostname
             HOSTNAME_CHANGED=1
@@ -867,6 +869,7 @@ main() {
     CONFIG_TRANSACTION_ACTIVE=0
     HOSTNAME_CHANGED=0
     PRIOR_STATIC_HOSTNAME_FILE=""
+    PRE_UPDATE_HOSTNAME=""
     ROASTPILOT_AGENT_ENABLED=0
     STAGED_PIPX_VENV=""
     AVAHI_ENABLE_ATTEMPTED=0

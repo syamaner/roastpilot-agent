@@ -4035,6 +4035,60 @@ def test_exact_mktemp_prefix_with_empty_suffix_is_not_cleanup_eligible(
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize("site", ["stage", "snapshot", "restore", "model", "env"])
+def test_every_mktemp_site_rejects_an_exact_prefix_without_suffix(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, site: str
+) -> None:
+    """Every temporary class requires a non-empty single-component mktemp suffix."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    if site == "stage":
+        template = root / "tmp/roastpilot-install.XXXXXX"
+    elif site == "snapshot":
+        template = root / "tmp/roastpilot-config-rollback.XXXXXX"
+    elif site == "restore":
+        wheel = tmp_path / "prior.whl"
+        wheel.write_text("wheel")
+        _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
+        template = Path(environment["FAKE_OPERATOR_HOME"]) / ".cache/roastpilot-restore.XXXXXX"
+    elif site == "model":
+        template = root / "var/lib/roastpilot-agent/models/onnx/int8/.roastpilot-model.XXXXXX"
+    else:
+        template = root / "etc/roastpilot-agent/.roastpilot-env.XXXXXX"
+    candidate = Path(str(template).removesuffix("XXXXXX"))
+    result = _run(
+        environment | {"FAKE_MKTEMP_TEMPLATE": str(template), "FAKE_MKTEMP_RESULT": str(candidate)},
+        "--set-hostname",
+        "roastpilot",
+        *(("--version", "2.0") if site == "restore" else ()),
+    )
+    assert result.returncode != 0
+    events = log.read_text().splitlines()
+    assert f"FAKE_MKTEMP_RESULT <{candidate}>" in events
+    assert not any(
+        event.startswith(("rm ", "mv ")) and f"<{candidate}>" in event for event in events
+    )
+
+
+@pytest.mark.serial
+def test_preupdate_hostname_query_failure_stops_before_hostname_or_service_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """The pre-update hostname query failure is distinct and has no follow-on mutations."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment | {"FAKE_HOSTNAME_QUERY_FAIL": "1"}, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    assert "cannot determine static hostname before update" in result.stderr
+    events = log.read_text().splitlines()
+    assert "FAKE_HOSTNAME_QUERY_FAILURE" in events
+    assert not any(event.startswith("hostnamectl <set-hostname>") for event in events)
+    assert not any(
+        event.startswith(("apt-get ", "pipx ", "systemctl <enable>")) for event in events
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
 def test_untrusted_configuration_snapshot_path_is_retained_never_recursively_deleted(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
