@@ -3750,9 +3750,9 @@ def test_rollback_cp_failure_continues_to_later_members_and_cleanup(
         etc / "coffee-roaster-mcp.yaml",
         unit_dir / "roastpilot-agent.service",
     )
-    secret = "rollback-env-secret"
+    rollback_fixture_value = "rollback-fixture-value"
     env.write_text(
-        f"OPENROUTER_API_KEY={secret}\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+        f"OPENROUTER_API_KEY={rollback_fixture_value}\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
     )
     yaml.write_bytes(b"prior-yaml\n")
     unit.write_bytes(b"[Service]\nUser=operator\nGroup=operators\n")
@@ -3805,7 +3805,7 @@ def test_rollback_cp_failure_continues_to_later_members_and_cleanup(
         else after["unit"] == before["unit"]
     )
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
-    assert secret not in result.stdout + result.stderr + log.read_text()
+    assert rollback_fixture_value not in result.stdout + result.stderr + log.read_text()
 
 
 @pytest.mark.serial
@@ -4128,9 +4128,9 @@ def test_snapshot_discard_failure_reports_the_retained_path_without_secret_conte
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     env = root / "etc/roastpilot-agent/roastpilot-agent.env"
     env.parent.mkdir(parents=True)
-    secret = "old-secret-value"
+    snapshot_fixture_value = "snapshot-fixture-value"
     env.write_text(
-        f"OPENROUTER_API_KEY={secret}\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+        f"OPENROUTER_API_KEY={snapshot_fixture_value}\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
     )
     snapshot = root / "tmp/roastpilot-config-rollback.fake"
     result = _run(
@@ -4140,10 +4140,10 @@ def test_snapshot_discard_failure_reports_the_retained_path_without_secret_conte
     )
     assert result.returncode != 0 and "manual reconciliation required" in result.stderr
     assert f"retained configuration snapshot at {snapshot}" in result.stderr
-    assert secret not in result.stdout + result.stderr
+    assert snapshot_fixture_value not in result.stdout + result.stderr
     events = log.read_text().splitlines()
     assert f"rm <-rf> <--> <{snapshot}>" in events
-    assert env.read_text().startswith(f"OPENROUTER_API_KEY={secret}\n")
+    assert env.read_text().startswith(f"OPENROUTER_API_KEY={snapshot_fixture_value}\n")
     assert events.count("systemctl <daemon-reload>") == 2
     assert snapshot.is_dir()
 
