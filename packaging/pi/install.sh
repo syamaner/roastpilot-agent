@@ -180,6 +180,7 @@ parse_arguments() {
     [[ -z "$REQUESTED_VERSION" || "$REQUESTED_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ ]] || die "invalid version selector"
     if [[ -n "$REQUESTED_WHEEL" ]]; then
         local canonical_wheel
+        validate_no_control_characters "$REQUESTED_WHEEL" "wheel selector"
         [[ "$REQUESTED_WHEEL" == /* && "$REQUESTED_WHEEL" != *"/../"* ]] || die "invalid wheel selector"
         [[ -f "$REQUESTED_WHEEL" && ! -L "$REQUESTED_WHEEL" ]] || die "wheel must be a regular file"
         canonical_wheel="$(readlink -f -- "$REQUESTED_WHEEL")"

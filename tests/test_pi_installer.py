@@ -1074,7 +1074,7 @@ def test_contract_mutation_oracles_detect_removed_guards(
             for line in log.read_text().splitlines()
         )
     elif oracle == "usermod":
-        assert "usermod" in log.read_text()
+        assert "usermod <-aG> <dialout,audio> <--> <operator>" in log.read_text().splitlines()
     else:
         assert "mutation-secret" in result.stdout
 
@@ -4130,6 +4130,56 @@ def test_preupdate_hostname_query_failure_stops_before_hostname_or_service_effec
         event.startswith(("apt-get ", "pipx ", "systemctl <enable>")) for event in events
     )
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    "record",
+    [
+        "other:x:1000:1000::/home/operator:/bin/sh",
+        "operator:x:1000:1000::/:/bin/sh",
+        "operator:x:1000:1000:://:/bin/sh",
+        "operator:x:1000:1000::/home/./operator:/bin/sh",
+        "operator:x:1000:1000::/home/../operator:/bin/sh",
+        "operator:x:1000:1000::/home/operator/.:/bin/sh",
+        "operator:x:1000:1000::/home/operator/..:/bin/sh",
+        "operator:x:1000:1000::relative:/bin/sh",
+    ],
+)
+def test_unsafe_getent_identity_and_home_shapes_fail_before_installer_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], record: str
+) -> None:
+    """Every guarded passwd identity/home shape is rejected before installer mutations."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment | {"FAKE_GETENT_RECORD": record}, "--set-hostname", "roastpilot")
+    assert result.returncode != 0 and "unsafe operator home" in result.stderr
+    assert not any(
+        event.startswith(("apt-get ", "pipx ", "roastpilot-agent ", "systemctl <enable>"))
+        for event in log.read_text().splitlines()
+    )
+
+
+@pytest.mark.serial
+def test_missing_dialout_with_audio_still_issues_the_exact_group_repair(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Membership repair uses the exact combined dialout/audio usermod invocation."""
+    _, environment, log, _ = installer_harness
+    Path(environment["FAKE_GROUPS"]).write_text("audio\n")
+    assert _run(environment, "--set-hostname", "roastpilot").returncode == 0
+    assert "usermod <-aG> <dialout,audio> <--> <operator>" in log.read_text().splitlines()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("wheel", ["/tmp/wheel\n.whl", "/tmp/wheel\r.whl"])
+def test_wheel_control_characters_fail_before_path_or_installer_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], wheel: str
+) -> None:
+    """Wheel selectors reject control bytes before filesystem or installer work."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment, "--set-hostname", "roastpilot", "--wheel", wheel)
+    assert result.returncode != 0 and "wheel selector contains control characters" in result.stderr
+    assert not log.exists()
 
 
 @pytest.mark.serial
