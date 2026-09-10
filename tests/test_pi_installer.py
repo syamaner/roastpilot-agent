@@ -594,6 +594,7 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     first = _run(environment | {"ROASTPILOT_INSTALL_API_KEY": key}, "--set-hostname", "roastpilot")
     assert first.returncode == 0, first.stderr
     assert "install failed after hostname change" not in first.stderr
+    assert "unit may remain enabled" not in first.stderr
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     env_file = root / "etc/roastpilot-agent/roastpilot-agent.env"
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
@@ -628,6 +629,9 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     )
     assert f"chown <--no-dereference> <operator:operators> <--> <{var_dir}>" in commands
     assert f"chmod <0700> <--> <{var_dir}>" in commands
+    etc_dir = root / "etc/roastpilot-agent"
+    assert commands.count(f"chown <--no-dereference> <root:operators> <--> <{etc_dir}>") == 1
+    assert commands.count(f"chmod <0750> <--> <{etc_dir}>") == 1
     first_root_lock = next(
         index for index, line in enumerate(commands) if line == f"chmod <0700> <--> <{var_dir}>"
     )
@@ -1759,6 +1763,60 @@ def test_failed_registered_temporary_removal_requires_manual_reconciliation_with
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize("retained", ["stage", "restore"])
+def test_retained_cleanup_directory_requires_manual_reconciliation_and_continues(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, retained: str
+) -> None:
+    """Each cleanup directory removal is accounted for without exposing staged secrets."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    wheel = tmp_path / "prior.whl"
+    secret = "cleanup-directory-secret"
+    wheel.write_text(secret)
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
+    stage = root / "tmp/roastpilot-install.fake"
+    restore = Path(environment["FAKE_OPERATOR_HOME"]) / ".cache/roastpilot-restore.fake"
+    target, diagnostic = (
+        (stage, f"retained staging directory at {stage}")
+        if retained == "stage"
+        else (restore, f"retained restore artifact directory at {restore}")
+    )
+    temporary = root / "etc/roastpilot-agent/.roastpilot-env.fake"
+    result = _run(
+        environment
+        | {
+            "ROASTPILOT_INSTALL_API_KEY": secret,
+            "FAKE_TEE_FAIL_TARGET": str(temporary),
+            "FAKE_RM_FAIL_PATH": str(target),
+        },
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    assert result.returncode == 1
+    assert diagnostic in result.stderr
+    assert "rollback incomplete; manual reconciliation required" in result.stderr
+    events = log.read_text().splitlines()
+    assert f"rm <-rf> <--> <{target}>" in events
+    assert f"rm <-rf> <--> <{stage}>" in events
+    assert f"rm <-rf> <--> <{restore}>" in events
+    assert target.exists()
+    last_directory_removal = max(
+        i
+        for i, event in enumerate(events)
+        if event in (f"rm <-rf> <--> <{stage}>", f"rm <-rf> <--> <{restore}>")
+    )
+    reload = max(i for i, event in enumerate(events) if event == "systemctl <daemon-reload>")
+    assert reload > last_directory_removal
+    assert any(
+        event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event for event in events
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+    assert secret not in result.stdout + result.stderr + log.read_text()
+
+
+@pytest.mark.serial
 def test_failed_root_lock_restores_operator_access_in_cleanup(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -2757,13 +2815,14 @@ def test_final_start_recheck_never_disturbs_a_deactivating_service(
         "--start",
     )
     assert result.returncode != 0 and "stop the service only when idle" in result.stderr
+    assert "unit may remain enabled; rerun or inspect the installer state manually" in result.stderr
     events = log.read_text().splitlines()
     probe = "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>"
     assert events.count(probe) == 3
     assert "systemctl <enable> <roastpilot-agent>" in events
     assert not any(
         "systemctl <start>" in line
-        or any(word in line for word in ("restart", "try-restart", "stop", "kill"))
+        or any(word in line for word in ("restart", "try-restart", "stop", "kill", "disable"))
         for line in events
     )
 
@@ -2960,10 +3019,11 @@ def test_rollback_failure_still_reloads_and_discards_snapshot(
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize("failed_member", ["yaml", "unit"])
 def test_rollback_cp_failure_continues_to_later_members_and_cleanup(
-    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    installer_harness: tuple[Path, dict[str, str], Path, Path], failed_member: str
 ) -> None:
-    """A YAML restore failure cannot skip unit restoration, reload, or snapshot deletion."""
+    """A failed configuration restore member cannot skip reload or snapshot deletion."""
     _, environment, log, _ = installer_harness
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     etc, unit_dir = root / "etc/roastpilot-agent", root / "etc/systemd/system"
@@ -2982,35 +3042,38 @@ def test_rollback_cp_failure_continues_to_later_members_and_cleanup(
     for path, mode in ((env, 0o600), (yaml, 0o640), (unit, 0o644)):
         path.chmod(mode)
     before = _live_config_state(root)
+    failed = yaml if failed_member == "yaml" else unit
     result = _run(
-        environment | {"FAKE_SYSTEMCTL_FAIL": "enable", "FAKE_CP_FAIL_PATH": str(yaml)},
+        environment | {"FAKE_SYSTEMCTL_FAIL": "enable", "FAKE_CP_FAIL_PATH": str(failed)},
         "--set-hostname",
         "roastpilot",
     )
     assert result.returncode != 0 and "manual reconciliation required" in result.stderr
-    assert f"cannot restore configuration member at {yaml}" in result.stderr
+    assert f"cannot restore configuration member at {failed}" in result.stderr
     events = log.read_text().splitlines()
     failed_cp = next(
         i
         for i, event in enumerate(events)
-        if event.startswith("cp <-p>") and event.endswith(f"> <{yaml}>")
+        if event.startswith("cp <-p>") and event.endswith(f"> <{failed}>")
     )
     failed_source = events[failed_cp].split("> <")[2]
     assert "roastpilot-config-rollback" in failed_source
-    unit_cp = next(
-        i
-        for i, event in enumerate(events)
-        if i > failed_cp and event.endswith(f"> <{unit}>") and event.startswith("cp <-p>")
-    )
     reload = max(i for i, event in enumerate(events) if event == "systemctl <daemon-reload>")
-    assert reload > unit_cp and any(
+    assert reload > failed_cp and any(
         event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event for event in events
     )
     assert not list((root / "tmp").glob("roastpilot-config-rollback.*"))
+    after = _live_config_state(root)
+    assert after["env"] == before["env"]
     assert (
-        _live_config_state(root)["env"] == before["env"]
-        and _live_config_state(root)["unit"] == before["unit"]
-        and _live_config_state(root)["yaml"] != before["yaml"]
+        after["yaml"] != before["yaml"]
+        if failed_member == "yaml"
+        else after["yaml"] == before["yaml"]
+    )
+    assert (
+        after["unit"] != before["unit"]
+        if failed_member == "unit"
+        else after["unit"] == before["unit"]
     )
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 

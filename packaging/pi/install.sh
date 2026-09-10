@@ -380,20 +380,6 @@ requested_package_spec() {
     fi
 }
 
-installed_package_spec() {
-    local entry="$1"
-    printf '%s' "$entry" | python3 -c '
-import json, sys
-try:
-    package = json.load(sys.stdin)["metadata"]["main_package"]["package_or_url"]
-    if not isinstance(package, str) or not package or any(c in package for c in "\r\n"):
-        raise ValueError()
-    print(package)
-except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-    raise SystemExit(1)
-' || die "invalid pipx package metadata"
-}
-
 prepare_restorable_prior() {
     local state="$1" package version source canonical cache_dir prior_metadata
     prior_metadata="$(printf '%s' "$state" | python3 -c '
@@ -789,6 +775,7 @@ enable_services() {
     verify_no_service_dropins
     run_privileged systemctl enable --now avahi-daemon
     run_privileged systemctl enable roastpilot-agent
+    ROASTPILOT_AGENT_ENABLED=1
     if [[ "$START_SERVICE" == 1 ]]; then
         require_agent_inactive
         run_privileged systemctl start roastpilot-agent
@@ -815,6 +802,7 @@ main() {
     CONFIG_TRANSACTION_ACTIVE=0
     HOSTNAME_CHANGED=0
     PRIOR_STATIC_HOSTNAME_FILE=""
+    ROASTPILOT_AGENT_ENABLED=0
     cleanup() {
         local temporary original_status=$? cleanup_failed=0
         trap - EXIT
@@ -825,8 +813,14 @@ main() {
                 cleanup_failed=1
             fi
         done
-        [[ -z "${STAGE_DIR:-}" ]] || run_privileged rm -rf -- "$STAGE_DIR" || true
-        [[ -z "${RESTORE_ARTIFACT_DIR:-}" ]] || rm -rf -- "$RESTORE_ARTIFACT_DIR" || true
+        if [[ -n "${STAGE_DIR:-}" ]] && ! run_privileged rm -rf -- "$STAGE_DIR"; then
+            printf '%s\n' "install failed: retained staging directory at $STAGE_DIR" >&2
+            cleanup_failed=1
+        fi
+        if [[ -n "${RESTORE_ARTIFACT_DIR:-}" ]] && ! rm -rf -- "$RESTORE_ARTIFACT_DIR"; then
+            printf '%s\n' "install failed: retained restore artifact directory at $RESTORE_ARTIFACT_DIR" >&2
+            cleanup_failed=1
+        fi
         # Never follow an untrusted child when recovering a locked parent.
         if [[ -n "${LOCKED_VAR_DIR:-}" ]]; then
             if ! run_privileged test -d "$LOCKED_VAR_DIR" || run_privileged test -L "$LOCKED_VAR_DIR"; then
@@ -859,6 +853,9 @@ main() {
         if [[ "${HOSTNAME_CHANGED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after hostname change; restore manually from $PRIOR_STATIC_HOSTNAME_FILE" >&2
         fi
+        if [[ "${ROASTPILOT_AGENT_ENABLED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
+            printf '%s\n' "install failed after enabling roastpilot-agent; the unit may remain enabled; rerun or inspect the installer state manually" >&2
+        fi
         if [[ "$cleanup_failed" == 1 ]]; then
             printf '%s\n' "install failed: rollback incomplete; manual reconciliation required" >&2
             exit 1
@@ -887,8 +884,9 @@ main() {
     install_model_and_render
     install_rendered_files
     enable_services
-    CONFIG_TRANSACTION_ACTIVE=0
     discard_configuration_snapshot
+    CONFIG_TRANSACTION_ACTIVE=0
+    LOCKED_ETC_DIR=""
     summary
 }
 
