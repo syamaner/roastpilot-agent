@@ -711,7 +711,7 @@ install_rendered_files() {
     run_privileged test -d "$etc_dir" || die "managed configuration directory is missing: $etc_dir"
     run_privileged test ! -L "$etc_dir" || die "managed configuration directory is unsafe: $etc_dir"
     LOCKED_ETC_DIR="$etc_dir"
-    run_privileged chown "root:$INVOKING_GROUP" -- "$etc_dir"
+    run_privileged chown --no-dereference "root:$INVOKING_GROUP" -- "$etc_dir"
     run_privileged test -d "$etc_dir" || die "managed configuration directory is missing: $etc_dir"
     run_privileged test ! -L "$etc_dir" || die "managed configuration directory is unsafe: $etc_dir"
     run_privileged chmod 0750 -- "$etc_dir"
@@ -722,7 +722,7 @@ install_rendered_files() {
     run_privileged test -d "$var_dir" || die "managed state directory is missing: $var_dir"
     run_privileged test ! -L "$var_dir" || die "managed state directory is unsafe: $var_dir"
     LOCKED_VAR_DIR="$var_dir"
-    run_privileged chown root:root -- "$var_dir"
+    run_privileged chown --no-dereference root:root -- "$var_dir"
     run_privileged test -d "$var_dir" || die "managed state directory is missing: $var_dir"
     run_privileged test ! -L "$var_dir" || die "managed state directory is unsafe: $var_dir"
     run_privileged chmod 0700 -- "$var_dir"
@@ -730,7 +730,7 @@ install_rendered_files() {
         run_privileged mkdir -p -- "$model_parent"
         run_privileged test -d "$model_parent" || die "model directory is missing: $model_parent"
         run_privileged test ! -L "$model_parent" || die "model directory is unsafe: $model_parent"
-        run_privileged chown "root:$INVOKING_GROUP" -- "$model_parent"
+        run_privileged chown --no-dereference "root:$INVOKING_GROUP" -- "$model_parent"
         run_privileged test -d "$model_parent" || die "model directory is missing: $model_parent"
         run_privileged test ! -L "$model_parent" || die "model directory is unsafe: $model_parent"
         run_privileged chmod 0750 -- "$model_parent"
@@ -754,7 +754,7 @@ install_rendered_files() {
     fi
     # Do not unlock the parent until the prior-hostname write and verification
     # have completed under its root-owned boundary.
-    run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$var_dir"
+    run_privileged chown --no-dereference "$INVOKING_USER:$INVOKING_GROUP" -- "$var_dir"
     run_privileged chmod 0700 -- "$var_dir"
     LOCKED_VAR_DIR=""
     if ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq dialout || ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq audio; then
@@ -811,7 +811,11 @@ main() {
         local temporary original_status=$? cleanup_failed=0
         trap - EXIT
         for temporary in "${ROOT_TEMPORARIES[@]:-}"; do
-            [[ -z "$temporary" ]] || run_privileged rm -f -- "$temporary" || true
+            [[ -z "$temporary" ]] && continue
+            if ! run_privileged rm -f -- "$temporary"; then
+                printf '%s\n' "install failed: retained temporary at $temporary" >&2
+                cleanup_failed=1
+            fi
         done
         [[ -z "${STAGE_DIR:-}" ]] || run_privileged rm -rf -- "$STAGE_DIR" || true
         [[ -z "${RESTORE_ARTIFACT_DIR:-}" ]] || rm -rf -- "$RESTORE_ARTIFACT_DIR" || true
@@ -820,7 +824,7 @@ main() {
             if ! run_privileged test -d "$LOCKED_VAR_DIR" || run_privileged test -L "$LOCKED_VAR_DIR"; then
                 cleanup_failed=1
             else
-                run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$LOCKED_VAR_DIR" || cleanup_failed=1
+                run_privileged chown --no-dereference "$INVOKING_USER:$INVOKING_GROUP" -- "$LOCKED_VAR_DIR" || cleanup_failed=1
                 run_privileged chmod 0700 -- "$LOCKED_VAR_DIR" || cleanup_failed=1
             fi
         fi
@@ -828,7 +832,7 @@ main() {
             if ! run_privileged test -d "$LOCKED_ETC_DIR" || run_privileged test -L "$LOCKED_ETC_DIR"; then
                 cleanup_failed=1
             else
-                run_privileged chown "root:$INVOKING_GROUP" -- "$LOCKED_ETC_DIR" || cleanup_failed=1
+                run_privileged chown --no-dereference "root:$INVOKING_GROUP" -- "$LOCKED_ETC_DIR" || cleanup_failed=1
                 run_privileged chmod 0750 -- "$LOCKED_ETC_DIR" || cleanup_failed=1
             fi
         fi

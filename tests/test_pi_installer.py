@@ -625,7 +625,7 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
         line.startswith("chown <operator:operators> <-->") and ".roastpilot-env.fake" in line
         for line in commands
     )
-    assert f"chown <operator:operators> <--> <{var_dir}>" in commands
+    assert f"chown <--no-dereference> <operator:operators> <--> <{var_dir}>" in commands
     assert f"chmod <0700> <--> <{var_dir}>" in commands
     first_root_lock = next(
         index for index, line in enumerate(commands) if line == f"chmod <0700> <--> <{var_dir}>"
@@ -633,7 +633,7 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     first_root_owner = next(
         index
         for index, line in enumerate(commands)
-        if line == f"chown <root:root> <--> <{var_dir}>"
+        if line == f"chown <--no-dereference> <root:root> <--> <{var_dir}>"
     )
     first_model_promotion = next(
         index
@@ -667,8 +667,8 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
         for line in second_commands
     )
     assert not any("set-hostname" in line for line in second_commands)
-    assert f"chown <root:root> <--> <{var_dir}>" in second_commands
-    assert f"chown <operator:operators> <--> <{var_dir}>" in second_commands
+    assert f"chown <--no-dereference> <root:root> <--> <{var_dir}>" in second_commands
+    assert f"chown <--no-dereference> <operator:operators> <--> <{var_dir}>" in second_commands
     assert (
         sum(
             line.startswith("roastpilot-agent <appliance> <model> <install>")
@@ -1504,9 +1504,12 @@ def test_directory_recheck_blocks_post_ownership_swap_before_mode_or_promotion(
     _, environment, log, _ = installer_harness
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     path, ownership = {
-        "etc": (root / "etc/roastpilot-agent", "chown <root:operators>"),
-        "var": (root / "var/lib/roastpilot-agent", "chown <root:root>"),
-        "model": (root / "var/lib/roastpilot-agent/models/onnx", "chown <root:operators>"),
+        "etc": (root / "etc/roastpilot-agent", "chown <--no-dereference> <root:operators>"),
+        "var": (root / "var/lib/roastpilot-agent", "chown <--no-dereference> <root:root>"),
+        "model": (
+            root / "var/lib/roastpilot-agent/models/onnx",
+            "chown <--no-dereference> <root:operators>",
+        ),
     }[boundary]
     attacker = tmp_path / f"attacker-{boundary}"
     attacker.mkdir()
@@ -1612,6 +1615,39 @@ def test_root_temp_is_cleaned_after_atomic_write_failure(
 
 
 @pytest.mark.serial
+def test_failed_registered_temporary_removal_requires_manual_reconciliation_without_secret_leak(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A retained secret-bearing temporary fails cleanup but does not stop later rollback work."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    temporary = root / "etc/roastpilot-agent/.roastpilot-env.fake"
+    secret = "must-not-appear-in-cleanup-output"
+    result = _run(
+        environment
+        | {
+            "ROASTPILOT_INSTALL_API_KEY": secret,
+            "FAKE_TEE_FAIL_TARGET": str(temporary),
+            "FAKE_RM_FAIL_PATH": str(temporary),
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode == 1
+    assert f"retained temporary at {temporary}" in result.stderr
+    assert "rollback incomplete; manual reconciliation required" in result.stderr
+    events = log.read_text().splitlines()
+    assert f"tee <--> <{temporary}>" in events
+    assert f"rm <-f> <--> <{temporary}>" in events
+    assert temporary.exists()
+    assert any(event == "systemctl <daemon-reload>" for event in events)
+    assert any(
+        event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event for event in events
+    )
+    assert secret not in result.stdout + result.stderr + log.read_text()
+
+
+@pytest.mark.serial
 def test_failed_root_lock_restores_operator_access_in_cleanup(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -1626,7 +1662,9 @@ def test_failed_root_lock_restores_operator_access_in_cleanup(
     assert result.returncode != 0
     events = log.read_text().splitlines()
     root_lock = next(
-        i for i, line in enumerate(events) if line == f"chown <root:root> <--> <{var_dir}>"
+        i
+        for i, line in enumerate(events)
+        if line == f"chown <--no-dereference> <root:root> <--> <{var_dir}>"
     )
     failed_chmod = next(
         i for i, line in enumerate(events) if line == f"chmod <0700> <--> <{var_dir}>"
@@ -1634,7 +1672,7 @@ def test_failed_root_lock_restores_operator_access_in_cleanup(
     cleanup_unlock = next(
         i
         for i, line in enumerate(events[failed_chmod + 1 :], failed_chmod + 1)
-        if line == f"chown <operator:operators> <--> <{var_dir}>"
+        if line == f"chown <--no-dereference> <operator:operators> <--> <{var_dir}>"
     )
     assert root_lock < failed_chmod < cleanup_unlock
     assert stat.S_IMODE(var_dir.stat().st_mode) == 0o700
@@ -1668,7 +1706,7 @@ def test_cleanup_managed_directory_restore_failure_requires_manual_reconciliatio
     )
     events = log.read_text().splitlines()
     failed = (
-        f"chown <operator:operators> <--> <{var_dir}>"
+        f"chown <--no-dereference> <operator:operators> <--> <{var_dir}>"
         if failure == "chown"
         else f"chmod <0700> <--> <{var_dir}>"
     )
@@ -1858,13 +1896,17 @@ def test_hostname_write_stays_inside_locked_parent_and_abort_recovers_access(
     assert result.returncode != 0
     events = log.read_text().splitlines()
     root_lock = next(
-        i for i, line in enumerate(events) if line == f"chown <root:root> <--> <{var_dir}>"
+        i
+        for i, line in enumerate(events)
+        if line == f"chown <--no-dereference> <root:root> <--> <{var_dir}>"
     )
     hostname_set = next(
         i for i, line in enumerate(events) if line == "hostnamectl <set-hostname> <roastpilot>"
     )
     operator_unlock = next(
-        i for i, line in enumerate(events) if line == f"chown <operator:operators> <--> <{var_dir}>"
+        i
+        for i, line in enumerate(events)
+        if line == f"chown <--no-dereference> <operator:operators> <--> <{var_dir}>"
     )
     assert root_lock < hostname_set < operator_unlock
     assert prior.read_text() == "old-host\n" and not prior.is_symlink()
