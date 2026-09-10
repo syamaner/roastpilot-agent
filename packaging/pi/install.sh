@@ -40,13 +40,14 @@ is_expected_mktemp_path() {
 }
 
 validate_install_root() {
-    local install_root="${ROASTPILOT_INSTALL_TEST_ROOT:-/}"
+    local install_root="${ROASTPILOT_INSTALL_TEST_ROOT:-}"
     if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" != "1" ]]; then
         [[ -z "${ROASTPILOT_INSTALL_TEST_ROOT:-}" && -z "${ROASTPILOT_INSTALL_ROOT:-}" ]] || die "test destination is unavailable in production"
         PATH=/usr/sbin:/usr/bin:/sbin:/bin
         export PATH
         return
     fi
+    [[ -n "$install_root" && "$install_root" != "/" ]] || die "test install root is required"
     [[ "$install_root" == /* && "/${install_root#/}/" != *"/../"* ]] || die "invalid install root"
     [[ "$install_root" != *$'\n'* && "$install_root" != *$'\r'* ]] || die "invalid install root"
 }
@@ -343,6 +344,7 @@ discard_configuration_snapshot() {
     if ! run_privileged rm -rf -- "$CONFIG_SNAPSHOT_DIR"; then
         if [[ "${POST_COMMIT_SNAPSHOT_FAILURE:-0}" == 1 ]]; then
             printf '%s\n' "installation completed; retained configuration snapshot at $CONFIG_SNAPSHOT_DIR" >&2
+            printf '%s\n' "installation completed; manually remove the retained secret-bearing configuration snapshot" >&2
         else
             printf '%s\n' "install failed: retained configuration snapshot at $CONFIG_SNAPSHOT_DIR" >&2
         fi
@@ -458,14 +460,22 @@ cleanup_staged_pipx() {
     STAGED_PIPX_VENV=""
 }
 
+remove_root_temporary() {
+    local target="$1" temporary retained=()
+    for temporary in "${ROOT_TEMPORARIES[@]:-}"; do
+        [[ "$temporary" == "$target" ]] || retained+=("$temporary")
+    done
+    ROOT_TEMPORARIES=("${retained[@]:-}")
+}
+
 replace_application_safely() {
     local prior_spec="$1" package_spec="$2" suffix="-roastpilot-stage-$$" restoration_failed=0
     # Prove a separate pipx environment can supply the required dependency
     # before removing the known-working application environment.
+    STAGED_PIPX_VENV="roastpilot-agent$suffix"
     if ! pipx_command install --suffix "$suffix" -- "$package_spec"; then
         die "requested replacement could not be staged"
     fi
-    STAGED_PIPX_VENV="roastpilot-agent$suffix"
     if ! verify_pi_capability "roastpilot-agent$suffix"; then
         cleanup_staged_pipx || true
         die "staged replacement lacks required Pi/MCP capability"
@@ -482,6 +492,8 @@ replace_application_safely() {
         pipx_command uninstall -- roastpilot-agent || true
         if ! pipx_command install -- "$prior_spec" || ! verify_pi_capability; then
             restoration_failed=1
+        elif [[ "$prior_spec" == "${RESTORE_ARTIFACT_DIR:-}/"* ]]; then
+            RESTORE_ARTIFACT_RETAIN=1
         fi
         cleanup_staged_pipx || true
         [[ "$restoration_failed" == 0 ]] || die "replacement failed and prior application could not be restored"
@@ -497,8 +509,10 @@ install_application() {
     package_spec="$(requested_package_spec)"
     if [[ "$state" == "absent" ]]; then
         pipx_command install -- "$package_spec"
-        verify_pi_capability || die "installed roastpilot-agent lacks required Pi/MCP capability"
         APPLICATION_CHANGED=1
+        FRESH_APPLICATION_CLEANUP_REQUIRED=1
+        verify_pi_capability || die "installed roastpilot-agent lacks required Pi/MCP capability"
+        FRESH_APPLICATION_CLEANUP_REQUIRED=0
         return
     fi
     if [[ -z "$REQUESTED_WHEEL$REQUESTED_VERSION" ]]; then
@@ -632,7 +646,7 @@ promote_model_file() {
     actual="$(run_privileged sha256sum -- "$temporary")"; [[ "${actual%% *}" == "$expected" ]] || die "model promotion digest mismatch"
     run_privileged chmod 0644 -- "$temporary"
     run_privileged mv -f -- "$temporary" "$destination"
-    ROOT_TEMPORARIES=("${ROOT_TEMPORARIES[@]/$temporary}")
+    remove_root_temporary "$temporary"
     actual="$(run_privileged sha256sum -- "$destination")"; [[ "${actual%% *}" == "$expected" ]] || die "model destination digest mismatch"
 }
 
@@ -669,7 +683,7 @@ install_content_atomically() {
     run_privileged chmod "$mode" -- "$temporary"
     [[ -z "$owner" ]] || run_privileged chown "$owner" -- "$temporary"
     run_privileged mv -f -- "$temporary" "$destination"
-    ROOT_TEMPORARIES=("${ROOT_TEMPORARIES[@]/$temporary}")
+    remove_root_temporary "$temporary"
     actual="$(run_privileged sha256sum -- "$destination")"
     [[ "${actual%% *}" == "$expected" ]] || die "atomic destination digest mismatch"
 }
@@ -776,13 +790,14 @@ install_rendered_files() {
     verify_no_service_dropins
     install_content_atomically "$staged_unit" "$unit_file" 0644 "" roastpilot-unit
     if [[ -n "$REQUESTED_HOSTNAME" ]]; then
-        prior_hostname="$(hostnamectl --static)"
+        prior_hostname="$(hostnamectl --static)" || die "cannot determine static hostname before update"
         if [[ "$prior_hostname" != "$REQUESTED_HOSTNAME" ]]; then
             install_content_atomically "$prior_hostname" "$prior_file" 0600 root:root prior-static-hostname
             HOSTNAME_CHANGED=1
             PRIOR_STATIC_HOSTNAME_FILE="$prior_file"
             run_privileged hostnamectl set-hostname "$REQUESTED_HOSTNAME"
-            [[ "$(hostnamectl --static)" == "$REQUESTED_HOSTNAME" ]] || die "hostname verification failed"
+            prior_hostname="$(hostnamectl --static)" || die "cannot verify hostname after update"
+            [[ "$prior_hostname" == "$REQUESTED_HOSTNAME" ]] || die "hostname verification failed"
         fi
     fi
     # Do not unlock the parent until the prior-hostname write and verification
@@ -853,6 +868,9 @@ main() {
     STAGED_PIPX_VENV=""
     AVAHI_ENABLE_ATTEMPTED=0
     APPLICATION_CHANGED=0
+    FRESH_APPLICATION_CLEANUP_REQUIRED=0
+    INSTALLATION_COMMITTED=0
+    RESTORE_ARTIFACT_RETAIN=0
     POST_COMMIT_SNAPSHOT_FAILURE=0
     cleanup() {
         local temporary original_status=$? cleanup_failed=0
@@ -866,12 +884,19 @@ main() {
         done
         if [[ -n "${STAGE_DIR:-}" ]]; then
             if [[ "${STAGE_DIR_VALIDATED:-0}" != 1 ]] || ! run_privileged rm -rf -- "$STAGE_DIR"; then
-                printf '%s\n' "install failed: retained staging directory at $STAGE_DIR" >&2
+                if [[ "${INSTALLATION_COMMITTED:-0}" == 1 ]]; then printf '%s\n' "installation completed; manually remove retained staging directory at $STAGE_DIR" >&2; else printf '%s\n' "install failed: retained staging directory at $STAGE_DIR" >&2; fi
                 cleanup_failed=1
             fi
         fi
-        if [[ -n "${RESTORE_ARTIFACT_DIR:-}" ]] && { [[ "${RESTORE_ARTIFACT_VALIDATED:-0}" != 1 ]] || ! rm -rf -- "$RESTORE_ARTIFACT_DIR"; }; then
-            printf '%s\n' "install failed: retained restore artifact directory at $RESTORE_ARTIFACT_DIR" >&2
+        if [[ "${RESTORE_ARTIFACT_RETAIN:-0}" == 1 && -n "${RESTORE_ARTIFACT_DIR:-}" ]]; then
+            printf '%s\n' "install failed: retain restore artifact directory at $RESTORE_ARTIFACT_DIR for the restored local-wheel application" >&2
+            cleanup_failed=1
+        elif [[ -n "${RESTORE_ARTIFACT_DIR:-}" ]] && { [[ "${RESTORE_ARTIFACT_VALIDATED:-0}" != 1 ]] || ! rm -rf -- "$RESTORE_ARTIFACT_DIR"; }; then
+            if [[ "${INSTALLATION_COMMITTED:-0}" == 1 ]]; then printf '%s\n' "installation completed; manually remove retained restore artifact directory at $RESTORE_ARTIFACT_DIR" >&2; else printf '%s\n' "install failed: retained restore artifact directory at $RESTORE_ARTIFACT_DIR" >&2; fi
+            cleanup_failed=1
+        fi
+        if [[ "${FRESH_APPLICATION_CLEANUP_REQUIRED:-0}" == 1 ]] && ! pipx_command uninstall -- roastpilot-agent; then
+            printf '%s\n' "install failed: manually remove incapable roastpilot-agent environment" >&2
             cleanup_failed=1
         fi
         if ! cleanup_staged_pipx; then
@@ -911,24 +936,26 @@ main() {
                 fi
             fi
         fi
-        restore_live_configuration "$(rooted_path /etc/roastpilot-agent/roastpilot-agent.env)" "$(rooted_path /etc/roastpilot-agent/coffee-roaster-mcp.yaml)" "$(rooted_path /etc/systemd/system/roastpilot-agent.service)" || cleanup_failed=1
-        discard_configuration_snapshot || cleanup_failed=1
-        if [[ "${POST_COMMIT_SNAPSHOT_FAILURE:-0}" != 1 && "${HOSTNAME_CHANGED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
+        if [[ "${INSTALLATION_COMMITTED:-0}" != 1 ]]; then
+            restore_live_configuration "$(rooted_path /etc/roastpilot-agent/roastpilot-agent.env)" "$(rooted_path /etc/roastpilot-agent/coffee-roaster-mcp.yaml)" "$(rooted_path /etc/systemd/system/roastpilot-agent.service)" || cleanup_failed=1
+            discard_configuration_snapshot || cleanup_failed=1
+        fi
+        if [[ "${INSTALLATION_COMMITTED:-0}" != 1 && "${HOSTNAME_CHANGED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after hostname change; restore manually from $PRIOR_STATIC_HOSTNAME_FILE" >&2
         fi
-        if [[ "${POST_COMMIT_SNAPSHOT_FAILURE:-0}" != 1 && "${ROASTPILOT_AGENT_ENABLED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
+        if [[ "${INSTALLATION_COMMITTED:-0}" != 1 && "${ROASTPILOT_AGENT_ENABLED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after enabling roastpilot-agent; the unit may remain enabled; rerun or inspect the installer state manually" >&2
         fi
-        if [[ "${POST_COMMIT_SNAPSHOT_FAILURE:-0}" != 1 && "${AVAHI_ENABLE_ATTEMPTED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
+        if [[ "${INSTALLATION_COMMITTED:-0}" != 1 && "${AVAHI_ENABLE_ATTEMPTED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after enabling Avahi; Avahi enablement may remain" >&2
         fi
-        if [[ "${POST_COMMIT_SNAPSHOT_FAILURE:-0}" != 1 && "${APPLICATION_CHANGED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
+        if [[ "${INSTALLATION_COMMITTED:-0}" != 1 && "${APPLICATION_CHANGED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after application replacement; application/configuration skew may require manual reconciliation" >&2
         fi
         if [[ "$cleanup_failed" == 1 ]]; then
             if [[ "${POST_COMMIT_SNAPSHOT_FAILURE:-0}" == 1 ]]; then
                 printf '%s\n' "installation completed; manually remove the retained secret-bearing configuration snapshot" >&2
-            else
+            elif [[ "${INSTALLATION_COMMITTED:-0}" != 1 ]]; then
                 printf '%s\n' "install failed: rollback incomplete; manual reconciliation required" >&2
             fi
             exit 1
@@ -959,6 +986,7 @@ main() {
     enable_services
     CONFIG_TRANSACTION_ACTIVE=0
     LOCKED_ETC_DIR=""
+    INSTALLATION_COMMITTED=1
     POST_COMMIT_SNAPSHOT_FAILURE=1
     if ! discard_configuration_snapshot; then
         exit 1

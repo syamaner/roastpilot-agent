@@ -70,6 +70,9 @@ case "$name" in
       if [ "${FAKE_HOSTNAME_VERIFY_FAIL:-}" = 1 ] && [ -e "$FAKE_HOSTNAME_SET_MARKER" ]; then
         printf 'FAKE_HOSTNAME_VERIFY_FAILURE\n' >> "$FAKE_LOG"
         echo wrong-host
+      elif [ "${FAKE_HOSTNAME_VERIFY_QUERY_FAIL:-}" = 1 ] && [ -e "$FAKE_HOSTNAME_SET_MARKER" ]; then
+        printf 'FAKE_HOSTNAME_VERIFY_QUERY_FAILURE\n' >> "$FAKE_LOG"
+        exit 51
       else cat "$FAKE_HOSTNAME"; fi
     else
       [ "$1" = set-hostname ]
@@ -105,6 +108,12 @@ case "$name" in
       package="$1"; version="${package##*==}"
       [ "$version" = "$package" ] && version=default
       if [ -n "$suffix" ]; then
+        if [ "${FAKE_PIPX_FAIL_STAGE_AFTER_CREATE:-}" = 1 ]; then
+          venv_bin="$FAKE_PIPX_HOME/venvs/roastpilot-agent$suffix/bin"
+          mkdir -p "$venv_bin"
+          printf 'FAKE_STAGE_PARTIAL_CREATION <%s>\n' "$venv_bin" >> "$FAKE_LOG"
+          exit 52
+        fi
         [ "${FAKE_PIPX_FAIL_STAGE_INSTALL:-}" != 1 ] || exit 25
         [ -z "${FAKE_DELETE_PRIOR_WHEEL:-}" ] || rm -f -- "$FAKE_DELETE_PRIOR_WHEEL"
       else
@@ -127,7 +136,10 @@ case "$name" in
       if [[ "${1:-}" == *-roastpilot-stage-* ]]; then
         [ "${FAKE_PIPX_FAIL_STAGE_CLEANUP:-}" != 1 ] || exit 26
       fi
-      [ "${1:-}" != roastpilot-agent ] || rm -f "$FAKE_PIPX_STATE"
+      if [ "${1:-}" = roastpilot-agent ]; then
+        [ "${FAKE_PIPX_FAIL_FRESH_CLEANUP:-}" != 1 ] || exit 53
+        rm -f "$FAKE_PIPX_STATE"
+      fi
     fi ;;
   roastpilot-agent)
     if [ "$1 $2 $3" = "appliance model install" ]; then
@@ -756,7 +768,10 @@ def test_hostname_consent_start_and_failure_abort_before_service_enable(
     _, environment, log, hostname = installer_harness
     rejected = _run(environment)
     assert rejected.returncode != 0
-    assert "sudo" not in log.read_text()
+    assert not any(
+        event.startswith(("apt-get ", "pipx ", "roastpilot-agent ", "systemctl <enable>"))
+        for event in log.read_text().splitlines()
+    )
     started = _run(environment, "--set-hostname", "roastpilot", "--start")
     assert started.returncode == 0
     assert hostname.read_text().strip() == "roastpilot"
@@ -848,7 +863,10 @@ def test_rooted_staging_and_hostile_inputs_do_not_escape(
         "roastpilot",
     )
     assert hostile.returncode != 0 and not sentinel.exists()
-    assert "sudo" not in log.read_text()[len(before) :]
+    assert not any(
+        event.startswith(("apt-get ", "pipx ", "roastpilot-agent ", "systemctl <enable>"))
+        for event in _delta(log, len(before))
+    )
 
 
 @pytest.mark.serial  # A hostile destination is exercised in its own fake root.
@@ -881,7 +899,11 @@ def test_hostile_values_are_inert_and_rejected_before_writes(
     )
     assert rejected_key.returncode != 0 and not log.exists() and not sentinel.exists()
     wheel = _run(environment, "--wheel", "--bad")
-    assert wheel.returncode != 0 and (not log.exists() or "sudo" not in log.read_text())
+    assert wheel.returncode != 0
+    assert not log.exists() or not any(
+        event.startswith(("apt-get ", "pipx ", "roastpilot-agent ", "systemctl <enable>"))
+        for event in log.read_text().splitlines()
+    )
 
 
 @pytest.mark.serial
@@ -3095,10 +3117,41 @@ def test_prior_local_wheel_is_restored_from_the_private_copy_after_source_loss(
         "2.0",
     )
     assert result.returncode != 0 and not wheel.exists()
-    assert any(
-        "roastpilot-restore" in event and "prior.whl[pi]" in event
-        for event in log.read_text().splitlines()
+    events = log.read_text().splitlines()
+    assert any("roastpilot-restore" in event and "prior.whl[pi]" in event for event in events)
+    artifact = Path(environment["FAKE_OPERATOR_HOME"]) / ".cache/roastpilot-restore.fake"
+    assert artifact.is_dir()
+    assert (
+        f"retain restore artifact directory at {artifact} for the restored local-wheel application"
+        in result.stderr
     )
+    assert f"rm <-rf> <--> <{artifact}>" not in events
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_glob_character_in_validated_temporary_suffix_removes_only_that_exact_entry(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Exact temporary deregistration cannot glob-remove neighbouring live cleanup entries."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    parent = root / "var/lib/roastpilot-agent/models/onnx/int8"
+    temporary = parent / ".roastpilot-model.*"
+    result = _run(
+        environment
+        | {
+            "FAKE_MKTEMP_TEMPLATE": str(parent / ".roastpilot-model.XXXXXX"),
+            "FAKE_MKTEMP_RESULT": str(temporary),
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode == 0
+    events = log.read_text().splitlines()
+    assert f"FAKE_MKTEMP_RESULT <{temporary}>" in events
+    assert any(event.startswith("mv ") and f"<{temporary}>" in event for event in events)
+    assert f"rm <-f> <--> <{temporary}>" not in events
 
 
 @pytest.mark.serial
@@ -3846,6 +3899,139 @@ def test_success_snapshot_discard_failure_keeps_committed_configuration(
         for event in events
     )
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("cleanup_kind", ["stage", "restore"])
+def test_post_commit_cleanup_failure_reports_only_the_retained_target(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, cleanup_kind: str
+) -> None:
+    """Committed installs never borrow rollback diagnostics for later artifact cleanup."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    if cleanup_kind == "stage":
+        target = root / "tmp/roastpilot-install.fake"
+        invocation = ("--set-hostname", "roastpilot")
+    else:
+        wheel = tmp_path / "prior.whl"
+        wheel.write_text("wheel")
+        _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
+        target = Path(environment["FAKE_OPERATOR_HOME"]) / ".cache/roastpilot-restore.fake"
+        invocation = ("--set-hostname", "roastpilot", "--version", "2.0")
+    result = _run(environment | {"FAKE_RM_FAIL_PATH": str(target)}, *invocation)
+    assert result.returncode == 1
+    retained_name = "staging" if cleanup_kind == "stage" else "restore artifact"
+    assert (
+        f"installation completed; manually remove retained {retained_name} directory at {target}"
+        in result.stderr
+    )
+    for diagnostic in (
+        "install failed after hostname change",
+        "install failed after enabling roastpilot-agent",
+        "install failed after enabling Avahi",
+        "application/configuration skew",
+        "rollback incomplete",
+    ):
+        assert diagnostic not in result.stderr
+    events = log.read_text().splitlines()
+    assert f"rm <-rf> <--> <{target}>" in events
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_fresh_incapable_application_is_removed_or_named_for_manual_cleanup(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], cleanup_fails: bool
+) -> None:
+    """A fresh incapable install is never left silently wedged in pipx."""
+    _, environment, log, _ = installer_harness
+    result = _run(
+        environment
+        | {"FAKE_PIPX_MCP_MISSING": "1"}
+        | ({"FAKE_PIPX_FAIL_FRESH_CLEANUP": "1"} if cleanup_fails else {}),
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0
+    events = log.read_text().splitlines()
+    assert "pipx <uninstall> <--> <roastpilot-agent>" in events
+    assert (
+        "manually remove incapable roastpilot-agent environment" in result.stderr
+    ) is cleanup_fails
+    assert not any(event.startswith("roastpilot-agent <appliance>") for event in events)
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_partial_staged_venv_is_registered_before_failed_stage_install(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A staged-install failure after filesystem creation still invokes staged cleanup."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+    result = _run(
+        environment | {"FAKE_PIPX_FAIL_STAGE_AFTER_CREATE": "1"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    assert result.returncode != 0
+    events = log.read_text().splitlines()
+    assert any(event.startswith("FAKE_STAGE_PARTIAL_CREATION") for event in events)
+    assert any("roastpilot-stage-" in event and "<uninstall>" in event for event in events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("root", ["", "relative", "/"])
+def test_test_mode_requires_a_nonempty_nonhost_install_root_before_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], root: str
+) -> None:
+    """Test mode cannot fall through to host paths without its explicit fake root."""
+    _, environment, log, _ = installer_harness
+    result = _run(
+        environment | {"ROASTPILOT_INSTALL_TEST_ROOT": root}, "--set-hostname", "roastpilot"
+    )
+    assert result.returncode != 0
+    assert (
+        "test install root is required" in result.stderr or "invalid install root" in result.stderr
+    )
+    assert not log.exists()
+
+
+@pytest.mark.serial
+def test_second_hostname_query_failure_has_a_distinct_fail_closed_diagnostic(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """The post-update hostname query failure is not misreported as a value mismatch."""
+    _, environment, log, _ = installer_harness
+    result = _run(
+        environment | {"FAKE_HOSTNAME_VERIFY_QUERY_FAIL": "1"}, "--set-hostname", "roastpilot"
+    )
+    assert result.returncode != 0
+    assert "cannot verify hostname after update" in result.stderr
+    assert "hostname verification failed" not in result.stderr
+    assert "FAKE_HOSTNAME_VERIFY_QUERY_FAILURE" in log.read_text().splitlines()
+
+
+@pytest.mark.serial
+def test_exact_mktemp_prefix_with_empty_suffix_is_not_cleanup_eligible(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """The mktemp validator requires a real suffix, not merely an exact prefix match."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    prefix = root / "tmp/roastpilot-install."
+    result = _run(
+        environment
+        | {"FAKE_MKTEMP_TEMPLATE": str(prefix) + "XXXXXX", "FAKE_MKTEMP_RESULT": str(prefix)},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0
+    events = log.read_text().splitlines()
+    assert f"FAKE_MKTEMP_RESULT <{prefix}>" in events
+    assert f"rm <-rf> <--> <{prefix}>" not in events
 
 
 @pytest.mark.serial
