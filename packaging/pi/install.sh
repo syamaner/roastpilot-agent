@@ -708,10 +708,12 @@ install_rendered_files() {
     final_env="$(build_final_env "$(normalise_unit_env_contract "$staged_env")")"
     prepare_destination_parents "$env_file" "$yaml_file" "$unit_file" "$prior_file" "$model_dir"
     validate_destination "$etc_dir"
-    run_privileged test -d "$etc_dir" || die "managed configuration directory is missing"
-    run_privileged test ! -L "$etc_dir" || die "managed configuration directory is unsafe"
+    run_privileged test -d "$etc_dir" || die "managed configuration directory is missing: $etc_dir"
+    run_privileged test ! -L "$etc_dir" || die "managed configuration directory is unsafe: $etc_dir"
     LOCKED_ETC_DIR="$etc_dir"
     run_privileged chown "root:$INVOKING_GROUP" -- "$etc_dir"
+    run_privileged test -d "$etc_dir" || die "managed configuration directory is missing: $etc_dir"
+    run_privileged test ! -L "$etc_dir" || die "managed configuration directory is unsafe: $etc_dir"
     run_privileged chmod 0750 -- "$etc_dir"
     # Keep model placement root-owned while leaf bytes are promoted.
     # This is a directory boundary, not a file destination: require the
@@ -721,6 +723,8 @@ install_rendered_files() {
     run_privileged test ! -L "$var_dir" || die "managed state directory is unsafe: $var_dir"
     LOCKED_VAR_DIR="$var_dir"
     run_privileged chown root:root -- "$var_dir"
+    run_privileged test -d "$var_dir" || die "managed state directory is missing: $var_dir"
+    run_privileged test ! -L "$var_dir" || die "managed state directory is unsafe: $var_dir"
     run_privileged chmod 0700 -- "$var_dir"
     for model_parent in "$model_dir" "$model_dir/onnx" "$model_dir/onnx/int8"; do
         run_privileged mkdir -p -- "$model_parent"

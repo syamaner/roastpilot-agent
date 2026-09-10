@@ -225,9 +225,13 @@ UNIT
     if /bin/test "$@"; then
       if [ "${1:-}" = -d ] && [ "${!#}" = "${FAKE_MUTATE_AFTER_TEST_D_PATH:-}" ]; then
         [ -n "${FAKE_MUTATE_AFTER_TEST_D_TARGET:-}" ] || exit 46
-        /bin/rm -rf -- "$FAKE_MUTATE_AFTER_TEST_D_PATH"
-        /bin/ln -s -- "$FAKE_MUTATE_AFTER_TEST_D_TARGET" "$FAKE_MUTATE_AFTER_TEST_D_PATH"
-        printf 'FAKE_TEST_D_MUTATION <%s> <%s>\n' "$FAKE_MUTATE_AFTER_TEST_D_PATH" "$FAKE_MUTATE_AFTER_TEST_D_TARGET" >> "$FAKE_LOG"
+        count=0; [ ! -e "$FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE" ] || count=$(cat "$FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE")
+        count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE"
+        if [ -z "${FAKE_MUTATE_AFTER_TEST_D_ON_COUNT:-}" ] || [ "$count" = "$FAKE_MUTATE_AFTER_TEST_D_ON_COUNT" ]; then
+          /bin/rm -rf -- "$FAKE_MUTATE_AFTER_TEST_D_PATH"
+          /bin/ln -s -- "$FAKE_MUTATE_AFTER_TEST_D_TARGET" "$FAKE_MUTATE_AFTER_TEST_D_PATH"
+          printf 'FAKE_TEST_D_MUTATION <%s> <%s> <%s>\n' "$FAKE_MUTATE_AFTER_TEST_D_PATH" "$FAKE_MUTATE_AFTER_TEST_D_TARGET" "$count" >> "$FAKE_LOG"
+        fi
       fi
       exit 0
     fi
@@ -336,6 +340,7 @@ esac
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
         "FAKE_LOG": str(log),
         "FAKE_HOSTNAME": str(hostname),
+        "FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE": str(tmp_path / "test-d-mutation-count"),
         "FAKE_HOSTNAME_SET_MARKER": str(tmp_path / "hostname-set"),
         "FAKE_PIPX_STATE": str(tmp_path / "pipx-state"),
         "FAKE_PIPX_MCP_TEMPLATE": str(pipx_mcp_template),
@@ -1405,7 +1410,7 @@ def test_managed_etc_recheck_rejects_a_swapped_parent_before_configuration_promo
     )
     assert result.returncode != 0 and "managed configuration directory is unsafe" in result.stderr
     events = log.read_text().splitlines()
-    assert f"FAKE_TEST_D_MUTATION <{etc}> <{attacker}>" in events
+    assert f"FAKE_TEST_D_MUTATION <{etc}> <{attacker}> <1>" in events
     assert f"test <!> <-L> <{etc}>" in events
     assert not any(
         event.startswith(("chown ", "chmod ", "tee ", "mv ")) and f"<{attacker}>" in event
@@ -1439,7 +1444,7 @@ def test_managed_state_recheck_rejects_a_swapped_parent_before_ownership_change(
         result.returncode != 0 and f"managed state directory is unsafe: {var_dir}" in result.stderr
     )
     events = log.read_text().splitlines()
-    assert f"FAKE_TEST_D_MUTATION <{var_dir}> <{attacker}>" in events
+    assert f"FAKE_TEST_D_MUTATION <{var_dir}> <{attacker}> <1>" in events
     assert f"test <!> <-L> <{var_dir}>" in events
     assert not any(
         event.startswith(("chown ", "chmod ", "tee ", "mv ")) and f"<{attacker}>" in event
@@ -1468,11 +1473,56 @@ def test_model_parent_recheck_rejects_a_swapped_parent_before_promotion(
     )
     assert result.returncode != 0 and f"model directory is unsafe: {model_parent}" in result.stderr
     events = log.read_text().splitlines()
-    assert f"FAKE_TEST_D_MUTATION <{model_parent}> <{attacker}>" in events
+    assert f"FAKE_TEST_D_MUTATION <{model_parent}> <{attacker}> <1>" in events
     assert f"test <!> <-L> <{model_parent}>" in events
     assert not any(
         event.startswith(("chown ", "chmod ", "tee ", "mv ")) and f"<{attacker}>" in event
         for event in events
+    )
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("boundary", ["etc", "var", "model"])
+def test_directory_recheck_blocks_post_ownership_swap_before_mode_or_promotion(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, boundary: str
+) -> None:
+    """The second directory probe catches a swap after ownership but before mode changes."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    path, ownership = {
+        "etc": (root / "etc/roastpilot-agent", "chown <root:operators>"),
+        "var": (root / "var/lib/roastpilot-agent", "chown <root:root>"),
+        "model": (root / "var/lib/roastpilot-agent/models/onnx", "chown <root:operators>"),
+    }[boundary]
+    attacker = tmp_path / f"attacker-{boundary}"
+    attacker.mkdir()
+    result = _run(
+        environment
+        | {
+            "FAKE_MUTATE_AFTER_TEST_D_PATH": str(path),
+            "FAKE_MUTATE_AFTER_TEST_D_TARGET": str(attacker),
+            "FAKE_MUTATE_AFTER_TEST_D_ON_COUNT": "2",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0 and str(path) in result.stderr
+    events = log.read_text().splitlines()
+    ownership_index = next(
+        i for i, event in enumerate(events) if event == f"{ownership} <--> <{path}>"
+    )
+    mutation_index = next(
+        i
+        for i, event in enumerate(events)
+        if event == f"FAKE_TEST_D_MUTATION <{path}> <{attacker}> <2>"
+    )
+    assert ownership_index < mutation_index
+    assert f"test <!> <-L> <{path}>" in events
+    assert not any(event.startswith("chmod ") and f"<{attacker}>" in event for event in events)
+    assert not any(
+        i > mutation_index
+        and event.startswith(("tee ", "mv ", "roastpilot-agent <appliance> <model>"))
+        for i, event in enumerate(events)
     )
 
 
