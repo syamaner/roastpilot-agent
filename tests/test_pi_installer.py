@@ -1417,6 +1417,66 @@ def test_managed_etc_recheck_rejects_a_swapped_parent_before_configuration_promo
 
 
 @pytest.mark.serial
+def test_managed_state_recheck_rejects_a_swapped_parent_before_ownership_change(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A state-parent swap is rejected before it receives ownership or mode changes."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    var_dir = root / "var/lib/roastpilot-agent"
+    attacker = tmp_path / "attacker-controlled-state"
+    attacker.mkdir()
+    result = _run(
+        environment
+        | {
+            "FAKE_MUTATE_AFTER_TEST_D_PATH": str(var_dir),
+            "FAKE_MUTATE_AFTER_TEST_D_TARGET": str(attacker),
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert (
+        result.returncode != 0 and f"managed state directory is unsafe: {var_dir}" in result.stderr
+    )
+    events = log.read_text().splitlines()
+    assert f"FAKE_TEST_D_MUTATION <{var_dir}> <{attacker}>" in events
+    assert f"test <!> <-L> <{var_dir}>" in events
+    assert not any(
+        event.startswith(("chown ", "chmod ", "tee ", "mv ")) and f"<{attacker}>" in event
+        for event in events
+    )
+
+
+@pytest.mark.serial
+def test_model_parent_recheck_rejects_a_swapped_parent_before_promotion(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A model-parent swap is rejected before ownership, mode, or model promotion work."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    model_parent = root / "var/lib/roastpilot-agent/models/onnx"
+    attacker = tmp_path / "attacker-controlled-models"
+    attacker.mkdir()
+    result = _run(
+        environment
+        | {
+            "FAKE_MUTATE_AFTER_TEST_D_PATH": str(model_parent),
+            "FAKE_MUTATE_AFTER_TEST_D_TARGET": str(attacker),
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0 and f"model directory is unsafe: {model_parent}" in result.stderr
+    events = log.read_text().splitlines()
+    assert f"FAKE_TEST_D_MUTATION <{model_parent}> <{attacker}>" in events
+    assert f"test <!> <-L> <{model_parent}>" in events
+    assert not any(
+        event.startswith(("chown ", "chmod ", "tee ", "mv ")) and f"<{attacker}>" in event
+        for event in events
+    )
+
+
+@pytest.mark.serial
 def test_hostname_change_failure_keeps_hostname_and_names_manual_recovery_file(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:

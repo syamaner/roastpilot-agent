@@ -717,14 +717,18 @@ install_rendered_files() {
     # This is a directory boundary, not a file destination: require the
     # existing root itself and every component to be non-symlinked.
     validate_destination "$var_dir"
-    run_privileged test -d "$var_dir"
-    run_privileged test ! -L "$var_dir"
+    run_privileged test -d "$var_dir" || die "managed state directory is missing: $var_dir"
+    run_privileged test ! -L "$var_dir" || die "managed state directory is unsafe: $var_dir"
     LOCKED_VAR_DIR="$var_dir"
     run_privileged chown root:root -- "$var_dir"
     run_privileged chmod 0700 -- "$var_dir"
     for model_parent in "$model_dir" "$model_dir/onnx" "$model_dir/onnx/int8"; do
         run_privileged mkdir -p -- "$model_parent"
+        run_privileged test -d "$model_parent" || die "model directory is missing: $model_parent"
+        run_privileged test ! -L "$model_parent" || die "model directory is unsafe: $model_parent"
         run_privileged chown "root:$INVOKING_GROUP" -- "$model_parent"
+        run_privileged test -d "$model_parent" || die "model directory is missing: $model_parent"
+        run_privileged test ! -L "$model_parent" || die "model directory is unsafe: $model_parent"
         run_privileged chmod 0750 -- "$model_parent"
     done
     promote_model_file "$STAGE_DIR/models/onnx/int8/model_quantized.onnx" "$model_dir/onnx/int8/model_quantized.onnx" "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df"
