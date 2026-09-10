@@ -33,6 +33,12 @@ rooted_path() {
     fi
 }
 
+is_expected_mktemp_path() {
+    local candidate="$1" prefix="$2" suffix
+    suffix="${candidate#"$prefix"}"
+    [[ "$candidate" == "$prefix"* && -n "$suffix" && "$suffix" != */* ]]
+}
+
 validate_install_root() {
     local install_root="${ROASTPILOT_INSTALL_TEST_ROOT:-/}"
     if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" != "1" ]]; then
@@ -225,8 +231,10 @@ preflight() {
     if [[ "$INSTALL_ASSUME_YES" != 1 && "${ROASTPILOT_INSTALL_ASSUME_YES:-}" != 1 && ! -t 0 ]]; then
         die "stdin is not a TTY; pass --yes or set ROASTPILOT_INSTALL_ASSUME_YES=1"
     fi
-    if [[ -z "$REQUESTED_HOSTNAME" && "$(hostnamectl --static)" != "roastpilot" ]]; then
-        die "hostname is not roastpilot; re-run with --set-hostname roastpilot"
+    if [[ -z "$REQUESTED_HOSTNAME" ]]; then
+        local static_hostname
+        static_hostname="$(hostnamectl --static)" || die "cannot determine static hostname"
+        [[ "$static_hostname" == "roastpilot" ]] || die "hostname is not roastpilot; re-run with --set-hostname roastpilot"
     fi
 }
 
@@ -279,12 +287,11 @@ verify_no_service_dropins() {
 }
 
 snapshot_live_configuration() {
-    local destination name snapshot_root snapshot_suffix
+    local destination name snapshot_root
     CONFIG_SNAPSHOT_DIR="$(run_privileged mktemp -d -- "$(rooted_path /tmp)/roastpilot-config-rollback.XXXXXX")"
     CONFIG_SNAPSHOT_VALIDATED=0
     snapshot_root="$(rooted_path /tmp)/roastpilot-config-rollback."
-    snapshot_suffix="${CONFIG_SNAPSHOT_DIR#"$snapshot_root"}"
-    [[ "$CONFIG_SNAPSHOT_DIR" == "$snapshot_root"* && -n "$snapshot_suffix" && "$snapshot_suffix" != */* ]] || die "retained untrusted configuration snapshot at $CONFIG_SNAPSHOT_DIR"
+    is_expected_mktemp_path "$CONFIG_SNAPSHOT_DIR" "$snapshot_root" || die "retained untrusted configuration snapshot at $CONFIG_SNAPSHOT_DIR"
     CONFIG_SNAPSHOT_VALIDATED=1
     run_privileged chmod 0700 -- "$CONFIG_SNAPSHOT_DIR"
     for destination in "$@"; do
@@ -334,7 +341,11 @@ discard_configuration_snapshot() {
         return 1
     fi
     if ! run_privileged rm -rf -- "$CONFIG_SNAPSHOT_DIR"; then
-        printf '%s\n' "install failed: retained configuration snapshot at $CONFIG_SNAPSHOT_DIR" >&2
+        if [[ "${POST_COMMIT_SNAPSHOT_FAILURE:-0}" == 1 ]]; then
+            printf '%s\n' "installation completed; retained configuration snapshot at $CONFIG_SNAPSHOT_DIR" >&2
+        else
+            printf '%s\n' "install failed: retained configuration snapshot at $CONFIG_SNAPSHOT_DIR" >&2
+        fi
         return 1
     fi
     CONFIG_SNAPSHOT_DIR=""
@@ -389,7 +400,7 @@ requested_package_spec() {
 }
 
 prepare_restorable_prior() {
-    local state="$1" package version source canonical cache_dir restore_root restore_suffix prior_metadata
+    local state="$1" package version source canonical cache_dir restore_root reported_version installed_prefix prior_metadata
     prior_metadata="$(printf '%s' "$state" | python3 -c '
 import json, sys
 try:
@@ -413,8 +424,7 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             RESTORE_ARTIFACT_DIR="$(mktemp -d -- "$cache_dir/roastpilot-restore.XXXXXX")"
             RESTORE_ARTIFACT_VALIDATED=0
             restore_root="$cache_dir/roastpilot-restore."
-            restore_suffix="${RESTORE_ARTIFACT_DIR#"$restore_root"}"
-            [[ "$RESTORE_ARTIFACT_DIR" == "$restore_root"* && -n "$restore_suffix" && "$restore_suffix" != */* ]] || die "retained untrusted restore artifact directory at $RESTORE_ARTIFACT_DIR"
+            is_expected_mktemp_path "$RESTORE_ARTIFACT_DIR" "$restore_root" || die "retained untrusted restore artifact directory at $RESTORE_ARTIFACT_DIR"
             RESTORE_ARTIFACT_VALIDATED=1
             [[ -f "$source" && ! -L "$source" ]] || die "cannot preserve exact prior local wheel"
             cp -- "$source" "$RESTORE_ARTIFACT_DIR/prior.whl"
@@ -424,7 +434,12 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ ]] || die "cannot preserve exact prior application"
             RESTORABLE_PRIOR_SPEC="roastpilot-agent[pi]==$version"
             ;;
-        roastpilot-agent\[pi\]==*) RESTORABLE_PRIOR_SPEC="$package" ;;
+        roastpilot-agent\[pi\]==*)
+            installed_prefix='roastpilot-agent[pi]=='
+            reported_version="${package#"$installed_prefix"}"
+            [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ && "$reported_version" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ && "$reported_version" == "$version" ]] || die "cannot preserve exact prior application"
+            RESTORABLE_PRIOR_SPEC="roastpilot-agent[pi]==$version"
+            ;;
         *) die "cannot preserve exact prior application" ;;
     esac
 }
@@ -530,7 +545,7 @@ preserve_existing_api_key() {
     local env_file content line key_seen=0 preserved_key="" port_seen=0 db_seen=0 config_seen=0
     [[ -z "$API_KEY" ]] || return 0
     env_file="$(rooted_path /etc/roastpilot-agent/roastpilot-agent.env)"
-    [[ ! -e "$env_file" ]] && return
+    [[ ! -e "$env_file" && ! -L "$env_file" ]] && return
     [[ -f "$env_file" && ! -L "$env_file" ]] || die "existing environment file is unsafe"
     content="$(cat -- "$env_file")" || die "cannot read existing environment file"
     content="$(normalise_unit_env_contract "$content")"
@@ -564,21 +579,22 @@ reuse_installed_model_if_valid() {
     quantized="$model_dir/onnx/int8/model_quantized.onnx"
     preprocessor="$model_dir/onnx/int8/preprocessor_config.json"
     [[ -f "$quantized" && ! -L "$quantized" && -f "$preprocessor" && ! -L "$preprocessor" ]] || return 0
-    quantized_digest="$(sha256sum -- "$quantized")"
-    preprocessor_digest="$(sha256sum -- "$preprocessor")"
+    quantized_digest="$(sha256sum -- "$quantized")" || return 0
+    preprocessor_digest="$(sha256sum -- "$preprocessor")" || return 0
     [[ "${quantized_digest%% *}" == "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df" && "${preprocessor_digest%% *}" == "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231" ]] || return 0
     MODEL_REUSE_DIR="$model_dir"
 }
 
 install_model_and_render() {
-    local stage_dir stage_parent model_stage
+    local stage_dir stage_parent stage_prefix model_stage
     stage_parent="$(rooted_path /tmp)"
     validate_destination "$stage_parent"
     run_privileged mkdir -p -- "$stage_parent"
     stage_dir="$(run_privileged mktemp -d -- "$stage_parent/roastpilot-install.XXXXXX")"
-    STAGE_DIR="$stage_dir"
     STAGE_DIR_VALIDATED=0
-    [[ "$stage_dir" == "$stage_parent/roastpilot-install."* ]] || die "unsafe staging directory"
+    STAGE_DIR="$stage_dir"
+    stage_prefix="$stage_parent/roastpilot-install."
+    is_expected_mktemp_path "$stage_dir" "$stage_prefix" || die "unsafe staging directory"
     STAGE_DIR_VALIDATED=1
     run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$stage_dir"
     run_privileged chmod 0700 -- "$stage_dir"
@@ -595,19 +611,20 @@ install_model_and_render() {
     # checked before the installer mutates an appliance destination.
     "$APPLIANCE_EXECUTABLE" appliance render --output-dir "$stage_dir" --port "$PORT" \
         --operator-user "$INVOKING_USER" --operator-group "$INVOKING_GROUP" --operator-home "$INVOKING_HOME" --serial-port "$SERIAL_PORT" \
-        --audio-device "$AUDIO_DEVICE" --model-dir /var/lib/roastpilot-agent/models \
+        "--audio-device=$AUDIO_DEVICE" --model-dir /var/lib/roastpilot-agent/models \
         --mcp-config-path /etc/roastpilot-agent/coffee-roaster-mcp.yaml --db-path /var/lib/roastpilot-agent/roastpilot.sqlite3
 }
 
 promote_model_file() {
-    local source="$1" destination="$2" expected="$3" parent temporary actual
+    local source="$1" destination="$2" expected="$3" parent temporary temporary_prefix actual
     [[ -f "$source" && ! -L "$source" ]] || die "model staging file is unsafe"
     parent="$(dirname -- "$destination")"
     validate_destination "$parent"
     run_privileged mkdir -p -- "$parent"
     recheck_sensitive_destination "$destination" || die "model promotion destination failed privileged recheck: $destination"
     temporary="$(run_privileged mktemp -- "$parent/.roastpilot-model.XXXXXX")"
-    [[ "$temporary" == "$parent/.roastpilot-model."* ]] || die "retained untrusted model temporary at $temporary"
+    temporary_prefix="$parent/.roastpilot-model."
+    is_expected_mktemp_path "$temporary" "$temporary_prefix" || die "retained untrusted model temporary at $temporary"
     ROOT_TEMPORARIES+=("$temporary")
     # The privileged digest is over the root-owned snapshot, never a second
     # read of mutable staging bytes.
@@ -639,11 +656,12 @@ validate_rendered_env() {
 }
 
 install_content_atomically() {
-    local content="$1" destination="$2" mode="$3" owner="$4" prefix="$5" parent temporary expected actual
+    local content="$1" destination="$2" mode="$3" owner="$4" prefix="$5" parent temporary temporary_prefix expected actual
     parent="$(dirname -- "$destination")"
     recheck_sensitive_destination "$destination" || die "atomic destination failed privileged recheck: $destination"
     temporary="$(run_privileged mktemp -- "$parent/.$prefix.XXXXXX")"
-    [[ "$temporary" == "$parent/.$prefix."* ]] || die "retained untrusted $prefix temporary at $temporary"
+    temporary_prefix="$parent/.$prefix."
+    is_expected_mktemp_path "$temporary" "$temporary_prefix" || die "retained untrusted $prefix temporary at $temporary"
     ROOT_TEMPORARIES+=("$temporary")
     expected="$(printf '%s\n' "$content" | sha256sum)"
     expected="${expected%% *}"
@@ -895,16 +913,16 @@ main() {
         fi
         restore_live_configuration "$(rooted_path /etc/roastpilot-agent/roastpilot-agent.env)" "$(rooted_path /etc/roastpilot-agent/coffee-roaster-mcp.yaml)" "$(rooted_path /etc/systemd/system/roastpilot-agent.service)" || cleanup_failed=1
         discard_configuration_snapshot || cleanup_failed=1
-        if [[ "${HOSTNAME_CHANGED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
+        if [[ "${POST_COMMIT_SNAPSHOT_FAILURE:-0}" != 1 && "${HOSTNAME_CHANGED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after hostname change; restore manually from $PRIOR_STATIC_HOSTNAME_FILE" >&2
         fi
-        if [[ "${ROASTPILOT_AGENT_ENABLED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
+        if [[ "${POST_COMMIT_SNAPSHOT_FAILURE:-0}" != 1 && "${ROASTPILOT_AGENT_ENABLED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after enabling roastpilot-agent; the unit may remain enabled; rerun or inspect the installer state manually" >&2
         fi
-        if [[ "${AVAHI_ENABLE_ATTEMPTED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
+        if [[ "${POST_COMMIT_SNAPSHOT_FAILURE:-0}" != 1 && "${AVAHI_ENABLE_ATTEMPTED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after enabling Avahi; Avahi enablement may remain" >&2
         fi
-        if [[ "${APPLICATION_CHANGED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
+        if [[ "${POST_COMMIT_SNAPSHOT_FAILURE:-0}" != 1 && "${APPLICATION_CHANGED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after application replacement; application/configuration skew may require manual reconciliation" >&2
         fi
         if [[ "$cleanup_failed" == 1 ]]; then
@@ -941,10 +959,11 @@ main() {
     enable_services
     CONFIG_TRANSACTION_ACTIVE=0
     LOCKED_ETC_DIR=""
+    POST_COMMIT_SNAPSHOT_FAILURE=1
     if ! discard_configuration_snapshot; then
-        POST_COMMIT_SNAPSHOT_FAILURE=1
         exit 1
     fi
+    POST_COMMIT_SNAPSHOT_FAILURE=0
     summary
 }
 

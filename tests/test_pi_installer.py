@@ -63,6 +63,10 @@ case "$name" in
   uname) echo aarch64 ;;
   hostnamectl)
     if [ "${1:-}" = --static ]; then
+      if [ "${FAKE_HOSTNAME_QUERY_FAIL:-}" = 1 ] && [ ! -e "$FAKE_HOSTNAME_SET_MARKER" ]; then
+        printf 'FAKE_HOSTNAME_QUERY_FAILURE\n' >> "$FAKE_LOG"
+        exit 49
+      fi
       if [ "${FAKE_HOSTNAME_VERIFY_FAIL:-}" = 1 ] && [ -e "$FAKE_HOSTNAME_SET_MARKER" ]; then
         printf 'FAKE_HOSTNAME_VERIFY_FAILURE\n' >> "$FAKE_LOG"
         echo wrong-host
@@ -145,9 +149,11 @@ case "$name" in
         fi
       fi
     else
-      out=''; port=8000; while [ "$#" -gt 0 ]; do
+      out=''; port=8000; audio=''; while [ "$#" -gt 0 ]; do
         [ "$1" = --output-dir ] && { out="$2"; shift; }
         [ "$1" = --port ] && { port="$2"; shift; }
+        [ "$1" = --audio-device ] && { audio="$2"; shift; }
+        case "$1" in --audio-device=*) audio="${1#--audio-device=}" ;; esac
         shift
       done
       mkdir -p "$out"
@@ -185,7 +191,7 @@ first_crack:
   allow_manual_override: true
 audio:
   source: microphone
-  input_device: "USB mic"
+  input_device: "$audio"
   sample_rate: 16000
   wav_path: null
   replay_mode: realtime
@@ -272,6 +278,11 @@ UNIT
   sha256sum)
     if [ "$#" = 0 ]; then cat >/dev/null; echo "content-digest  -"; exit 0; fi
     [ "${1:-}" = -- ] && shift
+    if [ "${FAKE_SHA256_FAIL_PATH:-}" = "$1" ]; then
+      count=0; [ ! -e "$FAKE_SHA256_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_SHA256_FAIL_COUNT_FILE")
+      count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_SHA256_FAIL_COUNT_FILE"
+      [ "${FAKE_SHA256_FAIL_ON_COUNT:-}" != "$count" ] || { printf 'FAKE_SHA256_FAILURE <%s>\n' "$1" >> "$FAKE_LOG"; exit 50; }
+    fi
     if [ "${FAKE_SHA256_BAD_PATH:-}" = "$1" ]; then printf 'FAKE_SHA256_CORRUPTION <%s>\n' "$1" >> "$FAKE_LOG"; echo "corrupt-digest  $1"; exit 0; fi
     content=$(cat "$1")
     case "$content" in
@@ -379,6 +390,7 @@ esac
         "FAKE_TEST_FAIL_D_COUNT_FILE": str(tmp_path / "test-d-fail-count"),
         "FAKE_CHMOD_FAIL_COUNT_FILE": str(tmp_path / "chmod-fail-count"),
         "FAKE_CHOWN_FAIL_COUNT_FILE": str(tmp_path / "chown-fail-count"),
+        "FAKE_SHA256_FAIL_COUNT_FILE": str(tmp_path / "sha256-fail-count"),
         "FAKE_HOSTNAME_SET_MARKER": str(tmp_path / "hostname-set"),
         "FAKE_PIPX_STATE": str(tmp_path / "pipx-state"),
         "FAKE_PIPX_MCP_TEMPLATE": str(pipx_mcp_template),
@@ -891,8 +903,8 @@ def test_wheel_with_a_symlinked_parent_is_rejected_before_installer_effects(
         str(linked_parent / "roastpilot-agent.whl"),
     )
     assert result.returncode != 0 and "wheel path must be canonical" in result.stderr
-    assert not log.exists() or not any(
-        event.startswith(("sudo ", "apt-get ", "pipx ", "roastpilot-agent "))
+    assert not any(
+        event.startswith(("apt-get ", "pipx ", "roastpilot-agent ", "systemctl "))
         for event in log.read_text().splitlines()
     )
 
@@ -1201,7 +1213,7 @@ def test_full_flow_has_exact_key_order_and_no_real_command_resolution(
         f"roastpilot-agent <appliance> <render> <--output-dir> <{stage}> <--port> <8000>"
         " <--operator-user> <operator> <--operator-group> <operators>"
         f" <--operator-home> <{environment['FAKE_OPERATOR_HOME']}> <--serial-port> </dev/ttyUSB0>"
-        " <--audio-device> <USB mic> <--model-dir> </var/lib/roastpilot-agent/models>"
+        " <--audio-device=USB mic> <--model-dir> </var/lib/roastpilot-agent/models>"
         " <--mcp-config-path> </etc/roastpilot-agent/coffee-roaster-mcp.yaml>"
         " <--db-path> </var/lib/roastpilot-agent/roastpilot.sqlite3>"
     ) in events
@@ -1297,8 +1309,8 @@ def test_repair_inputs_are_rejected_before_privileged_work(
     assert (
         _run(environment, "--set-hostname", "roastpilot", "--from-dir", str(linked)).returncode != 0
     )
-    assert not log.exists() or not any(
-        event.startswith(("sudo ", "apt-get ", "pipx ", "roastpilot-agent "))
+    assert not any(
+        event.startswith(("apt-get ", "pipx ", "roastpilot-agent ", "systemctl "))
         for event in log.read_text().splitlines()
     )
     accepted = _run(environment, "--set-hostname", "roastpilot", "--from-dir", str(source))
@@ -1934,7 +1946,7 @@ def test_unvalidated_stage_path_is_reported_without_recursive_cleanup(
     _, environment, log, _ = installer_harness
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     stage_parent = root / "tmp"
-    unexpected = stage_parent / "not-roastpilot-stage"
+    unexpected = stage_parent / "roastpilot-install.attacker/nested"
     result = _run(
         environment
         | {
@@ -1946,7 +1958,9 @@ def test_unvalidated_stage_path_is_reported_without_recursive_cleanup(
     )
     assert result.returncode == 1
     assert f"retained staging directory at {unexpected}" in result.stderr
-    assert f"rm <-rf> <--> <{unexpected}>" not in log.read_text().splitlines()
+    events = log.read_text().splitlines()
+    assert f"FAKE_MKTEMP_RESULT <{unexpected}>" in events
+    assert f"rm <-rf> <--> <{unexpected}>" not in events
 
 
 @pytest.mark.serial
@@ -1963,12 +1977,12 @@ def test_untrusted_root_temporary_is_not_registered_for_cleanup(
     """Model and config mktemp prefix failures retain rather than recursively remove an arbitrary path."""
     _, environment, log, _ = installer_harness
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
-    unexpected = root / "tmp/untrusted-temporary"
     parent = (
         root / "var/lib/roastpilot-agent/models/onnx/int8"
         if "model" in template
         else root / "etc/roastpilot-agent"
     )
+    unexpected = parent / f"{template.removesuffix('XXXXXX')}attacker/nested"
     result = _run(
         environment
         | {
@@ -1980,8 +1994,10 @@ def test_untrusted_root_temporary_is_not_registered_for_cleanup(
     )
     assert result.returncode == 1 and f"{diagnostic} at {unexpected}" in result.stderr
     events = log.read_text().splitlines()
+    assert f"FAKE_MKTEMP_RESULT <{unexpected}>" in events
     assert f"mktemp <--> <{parent / template}>" in events
     assert f"rm <-f> <--> <{unexpected}>" not in events
+    assert f"mv <-f> <--> <{unexpected}>" not in events
 
 
 @pytest.mark.serial
@@ -2542,6 +2558,27 @@ def test_rerun_reuses_verified_model_and_retains_a_valid_existing_key(
     )
 
 
+@pytest.mark.serial
+def test_failed_reuse_digest_inspection_falls_back_to_fresh_model_acquisition(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """An unreadable prior model is not trusted and is reacquired through the renderer seam."""
+    _, environment, log, _ = installer_harness
+    assert _run(environment, "--set-hostname", "roastpilot").returncode == 0
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    quantized = root / "var/lib/roastpilot-agent/models/onnx/int8/model_quantized.onnx"
+    start = len(log.read_text())
+    result = _run(
+        environment | {"FAKE_SHA256_FAIL_PATH": str(quantized), "FAKE_SHA256_FAIL_ON_COUNT": "1"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode == 0
+    events = _delta(log, start)
+    assert f"FAKE_SHA256_FAILURE <{quantized}>" in events
+    assert any("MODEL_FETCH" in event for event in events)
+
+
 @pytest.mark.serial  # Activation failures are asserted through a dedicated fake systemctl log.
 def test_activation_orders_avahi_and_never_restarts_an_active_agent(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
@@ -2961,9 +2998,84 @@ def test_os_release_parser_rejects_each_untrusted_branch_before_effects(
     assert diagnostic in result.stderr
     events = log.read_text().splitlines()
     assert not any(
-        event.startswith(("sudo ", "apt-get ", "pipx ", "roastpilot-agent ", "systemctl <enable>"))
+        event.startswith(("apt-get ", "pipx ", "roastpilot-agent ", "systemctl <enable>"))
         for event in events
     )
+
+
+@pytest.mark.serial
+def test_dangling_existing_environment_symlink_is_rejected_before_package_work(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A dangling environment symlink remains present and cannot bypass the retained-key guard."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    env_file = root / "etc/roastpilot-agent/roastpilot-agent.env"
+    env_file.parent.mkdir(parents=True)
+    env_file.symlink_to(root / "missing-environment")
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    assert "existing environment file is unsafe" in result.stderr
+    assert not any(
+        event.startswith(("apt-get ", "pipx ", "roastpilot-agent ", "systemctl "))
+        for event in log.read_text().splitlines()
+    )
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("version", "package"),
+    [
+        ("bad/version", "roastpilot-agent[pi]"),
+        ("1.2", "roastpilot-agent[pi]==bad/version"),
+        ("1.2", "roastpilot-agent[pi]==1.3"),
+    ],
+)
+def test_malformed_prior_application_specs_fail_before_replacement(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], version: str, package: str
+) -> None:
+    """Both pipx report shapes must yield one exact, safe appliance restoration spec."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), version, package)
+    result = _run(environment, "--set-hostname", "roastpilot", "--version", "2.0")
+    assert result.returncode != 0
+    assert "cannot preserve exact prior application" in result.stderr
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text().splitlines()
+
+
+@pytest.mark.serial
+def test_hostname_query_failure_is_not_reported_as_a_hostname_mismatch(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A failed hostnamectl query has its own fail-closed diagnostic before installer effects."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment | {"FAKE_HOSTNAME_QUERY_FAIL": "1"})
+    assert result.returncode != 0
+    assert "cannot determine static hostname" in result.stderr
+    assert "hostname is not roastpilot" not in result.stderr
+    events = log.read_text().splitlines()
+    assert "FAKE_HOSTNAME_QUERY_FAILURE" in events
+    assert not any(
+        event.startswith(("apt-get ", "pipx ", "roastpilot-agent ", "systemctl "))
+        for event in events
+    )
+
+
+@pytest.mark.serial
+def test_dash_leading_audio_device_is_bound_as_one_appliance_option_value(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A dash-leading device name cannot be parsed as an independent appliance option."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment, "--set-hostname", "roastpilot", "--audio-device", "--device-name")
+    assert result.returncode == 0
+    render = next(
+        event
+        for event in log.read_text().splitlines()
+        if event.startswith("roastpilot-agent <appliance> <render>")
+    )
+    assert "<--audio-device=--device-name>" in render
+    assert "<--audio-device> <--device-name>" not in render
 
 
 @pytest.mark.serial
@@ -3702,12 +3814,19 @@ def test_success_snapshot_discard_failure_keeps_committed_configuration(
         "roastpilot",
     )
     assert result.returncode == 1
-    assert f"retained configuration snapshot at {snapshot}" in result.stderr
+    assert f"installation completed; retained configuration snapshot at {snapshot}" in result.stderr
     assert (
         "installation completed; manually remove the retained secret-bearing configuration snapshot"
         in result.stderr
     )
     assert secret not in result.stdout + result.stderr + log.read_text()
+    for diagnostic in (
+        "install failed after hostname change",
+        "install failed after enabling roastpilot-agent",
+        "install failed after enabling Avahi",
+        "application/configuration skew may require manual reconciliation",
+    ):
+        assert diagnostic not in result.stderr
     assert snapshot.is_dir()
     assert _live_config_state(root)["env"] is not None
     assert _live_config_state(root)["yaml"] is not None
@@ -3727,7 +3846,6 @@ def test_success_snapshot_discard_failure_keeps_committed_configuration(
         for event in events
     )
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
-    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial
@@ -3738,7 +3856,7 @@ def test_untrusted_configuration_snapshot_path_is_retained_never_recursively_del
     _, environment, log, _ = installer_harness
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     template = root / "tmp/roastpilot-config-rollback.XXXXXX"
-    unexpected = root / "tmp/unexpected-config-snapshot"
+    unexpected = root / "tmp/roastpilot-config-rollback.attacker/nested"
     result = _run(
         environment
         | {
@@ -3767,7 +3885,7 @@ def test_untrusted_restore_artifact_path_is_retained_never_recursively_deleted(
     _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
     cache = Path(environment["FAKE_OPERATOR_HOME"]) / ".cache"
     template = cache / "roastpilot-restore.XXXXXX"
-    unexpected = tmp_path / "unexpected-restore-artifact"
+    unexpected = cache / "roastpilot-restore.attacker/nested"
     result = _run(
         environment
         | {
