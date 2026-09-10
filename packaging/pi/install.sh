@@ -816,13 +816,21 @@ main() {
         [[ -z "${STAGE_DIR:-}" ]] || run_privileged rm -rf -- "$STAGE_DIR" || true
         [[ -z "${RESTORE_ARTIFACT_DIR:-}" ]] || rm -rf -- "$RESTORE_ARTIFACT_DIR" || true
         # Never follow an untrusted child when recovering a locked parent.
-        if [[ -n "${LOCKED_VAR_DIR:-}" ]] && run_privileged test -d "$LOCKED_VAR_DIR" && run_privileged test ! -L "$LOCKED_VAR_DIR"; then
-            run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$LOCKED_VAR_DIR" || true
-            run_privileged chmod 0700 -- "$LOCKED_VAR_DIR" || true
+        if [[ -n "${LOCKED_VAR_DIR:-}" ]]; then
+            if ! run_privileged test -d "$LOCKED_VAR_DIR" || run_privileged test -L "$LOCKED_VAR_DIR"; then
+                cleanup_failed=1
+            else
+                run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$LOCKED_VAR_DIR" || cleanup_failed=1
+                run_privileged chmod 0700 -- "$LOCKED_VAR_DIR" || cleanup_failed=1
+            fi
         fi
-        if [[ -n "${LOCKED_ETC_DIR:-}" ]] && run_privileged test -d "$LOCKED_ETC_DIR" && run_privileged test ! -L "$LOCKED_ETC_DIR"; then
-            run_privileged chown "root:$INVOKING_GROUP" -- "$LOCKED_ETC_DIR" || true
-            run_privileged chmod 0750 -- "$LOCKED_ETC_DIR" || true
+        if [[ -n "${LOCKED_ETC_DIR:-}" ]]; then
+            if ! run_privileged test -d "$LOCKED_ETC_DIR" || run_privileged test -L "$LOCKED_ETC_DIR"; then
+                cleanup_failed=1
+            else
+                run_privileged chown "root:$INVOKING_GROUP" -- "$LOCKED_ETC_DIR" || cleanup_failed=1
+                run_privileged chmod 0750 -- "$LOCKED_ETC_DIR" || cleanup_failed=1
+            fi
         fi
         restore_live_configuration "$(rooted_path /etc/roastpilot-agent/roastpilot-agent.env)" "$(rooted_path /etc/roastpilot-agent/coffee-roaster-mcp.yaml)" "$(rooted_path /etc/systemd/system/roastpilot-agent.service)" || cleanup_failed=1
         discard_configuration_snapshot || cleanup_failed=1

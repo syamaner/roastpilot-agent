@@ -237,7 +237,13 @@ UNIT
     fi
     exit 1 ;;
   mkdir) /bin/mkdir "$@" ;;
-  chmod) [ "${2:-}" = -- ] && { mode="$1"; shift 2; [ "${FAKE_CHMOD_FAIL_TARGET:-}" != "$1" ] || exit 23; /bin/chmod "$mode" "$@"; } || /bin/chmod "$@" ;;
+  chmod) [ "${2:-}" = -- ] && { mode="$1"; shift 2;
+    if [ "${FAKE_CHMOD_FAIL_TARGET:-}" = "$1" ]; then
+      count=0; [ ! -e "$FAKE_CHMOD_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_CHMOD_FAIL_COUNT_FILE")
+      count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_CHMOD_FAIL_COUNT_FILE"
+      [ -n "${FAKE_CHMOD_FAIL_ON_COUNT:-}" ] && [ "$count" != "$FAKE_CHMOD_FAIL_ON_COUNT" ] || exit 23
+    fi
+    /bin/chmod "$mode" "$@"; } || /bin/chmod "$@" ;;
   mktemp) is_dir=0; [ "${1:-}" = -d ] && { is_dir=1; shift; }; [ "${1:-}" = -- ] && shift; dir="${1%XXXXXX}fake"
     if [ "$is_dir" = 1 ]; then mkdir -p "$dir"; else mkdir -p "$(dirname "$dir")"; : > "$dir"; fi; printf '%s\\n' "$dir" ;;
   rm) [ -z "${FAKE_RM_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_RM_FAIL_PATH" ] || exit 42; /bin/rm "$@" ;;
@@ -255,7 +261,13 @@ UNIT
   grep) /usr/bin/grep "$@" ;;
   tr) /usr/bin/tr "$@" ;;
   usermod) printf 'dialout audio\n' > "$FAKE_GROUPS" ;;
-  apt-get|chown) : ;;
+  chown)
+    if [ "${FAKE_CHOWN_FAIL_TARGET:-}" = "${!#}" ]; then
+      count=0; [ ! -e "$FAKE_CHOWN_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_CHOWN_FAIL_COUNT_FILE")
+      count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_CHOWN_FAIL_COUNT_FILE"
+      [ -n "${FAKE_CHOWN_FAIL_ON_COUNT:-}" ] && [ "$count" != "$FAKE_CHOWN_FAIL_ON_COUNT" ] || exit 47
+    fi ;;
+  apt-get) : ;;
   systemctl)
     if [ "${1:-}" = daemon-reload ] && [ -n "${FAKE_MUTATE_DROPIN_PATH:-}" ]; then
       /bin/mkdir -p -- "$FAKE_MUTATE_DROPIN_PATH"
@@ -341,6 +353,8 @@ esac
         "FAKE_LOG": str(log),
         "FAKE_HOSTNAME": str(hostname),
         "FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE": str(tmp_path / "test-d-mutation-count"),
+        "FAKE_CHMOD_FAIL_COUNT_FILE": str(tmp_path / "chmod-fail-count"),
+        "FAKE_CHOWN_FAIL_COUNT_FILE": str(tmp_path / "chown-fail-count"),
         "FAKE_HOSTNAME_SET_MARKER": str(tmp_path / "hostname-set"),
         "FAKE_PIPX_STATE": str(tmp_path / "pipx-state"),
         "FAKE_PIPX_MCP_TEMPLATE": str(pipx_mcp_template),
@@ -1605,7 +1619,9 @@ def test_failed_root_lock_restores_operator_access_in_cleanup(
     _, environment, log, _ = installer_harness
     var_dir = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / "var/lib/roastpilot-agent"
     result = _run(
-        environment | {"FAKE_CHMOD_FAIL_TARGET": str(var_dir)}, "--set-hostname", "roastpilot"
+        environment | {"FAKE_CHMOD_FAIL_TARGET": str(var_dir), "FAKE_CHMOD_FAIL_ON_COUNT": "1"},
+        "--set-hostname",
+        "roastpilot",
     )
     assert result.returncode != 0
     events = log.read_text().splitlines()
@@ -1621,6 +1637,46 @@ def test_failed_root_lock_restores_operator_access_in_cleanup(
         if line == f"chown <operator:operators> <--> <{var_dir}>"
     )
     assert root_lock < failed_chmod < cleanup_unlock
+    assert stat.S_IMODE(var_dir.stat().st_mode) == 0o700
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("failure", "status"),
+    [("chown", 47), ("chmod", 23)],
+)
+def test_cleanup_managed_directory_restore_failure_requires_manual_reconciliation(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], failure: str, status: int
+) -> None:
+    """A failed managed-directory cleanup member remains visible after later cleanup work."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    var_dir = root / "var/lib/roastpilot-agent"
+    injection = (
+        {"FAKE_CHOWN_FAIL_TARGET": str(var_dir), "FAKE_CHOWN_FAIL_ON_COUNT": "2"}
+        if failure == "chown"
+        else {"FAKE_CHMOD_FAIL_TARGET": str(var_dir), "FAKE_CHMOD_FAIL_ON_COUNT": "2"}
+    )
+    result = _run(
+        environment | injection | {"FAKE_HOSTNAME_VERIFY_FAIL": "1"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert (
+        result.returncode == 1
+        and "rollback incomplete; manual reconciliation required" in result.stderr
+    )
+    events = log.read_text().splitlines()
+    failed = (
+        f"chown <operator:operators> <--> <{var_dir}>"
+        if failure == "chown"
+        else f"chmod <0700> <--> <{var_dir}>"
+    )
+    assert failed in events
+    assert any(
+        event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event for event in events
+    )
+    assert "FAKE_HOSTNAME_VERIFY_FAILURE" in events
 
 
 @pytest.mark.serial
