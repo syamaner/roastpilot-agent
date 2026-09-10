@@ -85,6 +85,11 @@ case "$name" in
     fi
     if [ "${1:-}" = environment ]; then
       [ "${2:-}" = --value ] && [ "${3:-}" = PIPX_HOME ] || exit 18
+      if [ "${FAKE_PIPX_FAIL_FINAL_ROOT_PROBE:-}" = 1 ] && [ -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] && [ "$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")" = 1 ]; then
+        printf 'FAKE_FINAL_ROOT_PROBE_FAILURE\\n' >> "$FAKE_LOG"
+        printf '%s\\n' "$FAKE_PIPX_HOME/untrusted"
+        exit 0
+      fi
       printf '%s\\n' "$FAKE_PIPX_HOME"
     elif [ "${1:-}" = runpip ]; then
       venv="${2:-}"
@@ -1138,8 +1143,8 @@ def test_pipx_selector_deltas_are_isolated(
 ) -> None:
     """A1: each canonical pipx selector has an isolated exact mutation delta."""
     _, environment, log, _ = installer_harness
-    wheel = tmp_path / "agent.whl"
-    other = tmp_path / "other.whl"
+    wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
+    other = tmp_path / "roastpilot_agent-2.0-py3-none-any.whl"
     wheel.write_text("wheel")
     other.write_text("other")
     selector = tuple(
@@ -2062,7 +2067,7 @@ def test_retained_cleanup_directory_requires_manual_reconciliation_and_continues
     """Each cleanup directory removal is accounted for without exposing staged secrets."""
     _, environment, log, _ = installer_harness
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
-    wheel = tmp_path / "prior.whl"
+    wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
     secret = "cleanup-directory-secret"
     wheel.write_text(secret)
     _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
@@ -2961,7 +2966,7 @@ def test_unavailable_prior_local_wheel_is_not_replaced(
 ) -> None:
     """Replacement refuses before uninstalling an application without an exact restore artifact."""
     _, environment, log, _ = installer_harness
-    wheel = tmp_path / "prior.whl"
+    wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
     wheel.write_text("wheel")
     _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
     wheel.unlink()
@@ -2976,7 +2981,7 @@ def test_prior_local_wheel_adjacent_recheck_blocks_a_post_canonicalisation_delet
 ) -> None:
     """The source is rechecked after canonicalisation before any replacement action."""
     _, environment, log, _ = installer_harness
-    wheel = tmp_path / "prior.whl"
+    wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
     wheel.write_text("wheel")
     _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
     result = _run(
@@ -3105,7 +3110,7 @@ def test_prior_local_wheel_is_restored_from_the_private_copy_after_source_loss(
 ) -> None:
     """A late replacement failure restores bytes copied before the old source vanishes."""
     _, environment, log, _ = installer_harness
-    wheel = tmp_path / "prior.whl"
+    wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
     wheel.write_text("wheel")
     _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
     result = _run(
@@ -3117,13 +3122,17 @@ def test_prior_local_wheel_is_restored_from_the_private_copy_after_source_loss(
     )
     assert result.returncode != 0 and not wheel.exists()
     events = log.read_text().splitlines()
-    assert any("roastpilot-restore" in event and "prior.whl[pi]" in event for event in events)
+    assert any(
+        "roastpilot-restore" in event and "roastpilot_agent-1.2-py3-none-any.whl[pi]" in event
+        for event in events
+    )
     artifact = Path(environment["FAKE_OPERATOR_HOME"]) / ".cache/roastpilot-restore.fake"
     assert artifact.is_dir()
     assert (
         f"retain restore artifact directory at {artifact} for the restored local-wheel application"
         in result.stderr
     )
+    assert "application/configuration skew" not in result.stderr
     assert f"rm <-rf> <--> <{artifact}>" not in events
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
@@ -3134,7 +3143,7 @@ def test_prior_local_wheel_artifact_is_retained_before_post_reinstall_capability
 ) -> None:
     """A restored local wheel remains available when its immediately following capability check fails."""
     _, environment, log, _ = installer_harness
-    wheel = tmp_path / "prior.whl"
+    wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
     wheel.write_text("wheel")
     _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
     secret = "must-not-leak-from-retained-wheel"
@@ -3152,7 +3161,7 @@ def test_prior_local_wheel_artifact_is_retained_before_post_reinstall_capability
         "2.0",
     )
     artifact = Path(environment["FAKE_OPERATOR_HOME"]) / ".cache/roastpilot-restore.fake"
-    prior_copy = artifact / "prior.whl"
+    prior_copy = artifact / "roastpilot_agent-1.2-py3-none-any.whl"
     events = log.read_text().splitlines()
     assert result.returncode != 0
     assert "pipx <runpip> <roastpilot-agent> <show> <coffee-roaster-mcp>" in events
@@ -3161,9 +3170,68 @@ def test_prior_local_wheel_artifact_is_retained_before_post_reinstall_capability
         f"retain restore artifact directory at {artifact} for the restored local-wheel application"
         in result.stderr
     )
+    assert "application/configuration skew may require manual reconciliation" in result.stderr
+    assert "rollback incomplete; manual reconciliation required" not in result.stderr
     assert f"rm <-rf> <--> <{artifact}>" not in events
     assert secret not in result.stdout + result.stderr + log.read_text()
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_final_root_probe_failure_restores_prior_local_wheel_before_exit(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A final resolver failure enters restoration instead of terminating the transaction."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
+    secret = "retained-wheel-secret"
+    wheel.write_text(secret)
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
+    result = _run(
+        environment
+        | {
+            "FAKE_DELETE_PRIOR_WHEEL": str(wheel),
+            "FAKE_PIPX_FAIL_FINAL_ROOT_PROBE": "1",
+            "ROASTPILOT_INSTALL_API_KEY": secret,
+        },
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    artifact = Path(environment["FAKE_OPERATOR_HOME"]) / ".cache/roastpilot-restore.fake"
+    preserved = artifact / wheel.name
+    events = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert "FAKE_FINAL_ROOT_PROBE_FAILURE" in events
+    assert any(
+        event == f"pipx <install> <--> <{artifact / (wheel.name + '[pi]')}>" for event in events
+    )
+    assert artifact.is_dir() and preserved.is_file()
+    assert (
+        f"retain restore artifact directory at {artifact} for the restored local-wheel application"
+        in result.stderr
+    )
+    assert "application/configuration skew" not in result.stderr
+    assert any("roastpilot-stage-" in event and "<uninstall>" in event for event in events)
+    assert f"rm <-rf> <--> <{artifact}>" not in events
+    assert secret not in result.stdout + result.stderr + log.read_text()
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_non_wheel_prior_local_basename_is_rejected_before_uninstall(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """An arbitrary copied basename cannot become a pipx restoration selector."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "prior.whl"
+    wheel.write_text("wheel")
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
+    result = _run(environment, "--set-hostname", "roastpilot", "--version", "2.0")
+    assert result.returncode != 0
+    assert "cannot preserve exact prior local wheel" in result.stderr
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text()
 
 
 @pytest.mark.serial
@@ -3995,7 +4063,7 @@ def test_post_commit_cleanup_failure_reports_only_the_retained_target(
         target = root / "tmp/roastpilot-install.fake"
         invocation = ("--set-hostname", "roastpilot")
     else:
-        wheel = tmp_path / "prior.whl"
+        wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
         wheel.write_text("wheel")
         _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
         target = Path(environment["FAKE_OPERATOR_HOME"]) / ".cache/roastpilot-restore.fake"
@@ -4129,7 +4197,7 @@ def test_every_mktemp_site_rejects_an_exact_prefix_without_suffix(
     elif site == "snapshot":
         template = root / "tmp/roastpilot-config-rollback.XXXXXX"
     elif site == "restore":
-        wheel = tmp_path / "prior.whl"
+        wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
         wheel.write_text("wheel")
         _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
         template = Path(environment["FAKE_OPERATOR_HOME"]) / ".cache/roastpilot-restore.XXXXXX"
@@ -4252,7 +4320,7 @@ def test_untrusted_restore_artifact_path_is_retained_never_recursively_deleted(
 ) -> None:
     """A fake user-cache mktemp escape cannot become a cleanup delete target."""
     _, environment, log, _ = installer_harness
-    wheel = tmp_path / "prior.whl"
+    wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
     wheel.write_text("wheel")
     _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
     cache = Path(environment["FAKE_OPERATOR_HOME"]) / ".cache"

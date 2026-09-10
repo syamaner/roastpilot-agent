@@ -406,7 +406,7 @@ requested_package_spec() {
 }
 
 prepare_restorable_prior() {
-    local state="$1" package version source canonical cache_dir restore_root reported_version installed_prefix prior_metadata
+    local state="$1" package version source source_basename canonical cache_dir restore_root reported_version installed_prefix prior_metadata
     prior_metadata="$(printf '%s' "$state" | python3 -c '
 import json, sys
 try:
@@ -425,6 +425,8 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             [[ -f "$source" && ! -L "$source" ]] || die "cannot preserve exact prior local wheel"
             canonical="$(readlink -f -- "$source")" || die "cannot preserve exact prior local wheel"
             [[ "$source" == "$canonical" ]] || die "cannot preserve exact prior local wheel"
+            source_basename="${source##*/}"
+            [[ "$source_basename" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*-[A-Za-z0-9][A-Za-z0-9._+!-]*-[A-Za-z0-9][A-Za-z0-9._-]*-[A-Za-z0-9][A-Za-z0-9._-]*-[A-Za-z0-9][A-Za-z0-9._-]*\.whl$ ]] || die "cannot preserve exact prior local wheel"
             cache_dir="$INVOKING_HOME/.cache"
             mkdir -p -- "$cache_dir"
             RESTORE_ARTIFACT_DIR="$(mktemp -d -- "$cache_dir/roastpilot-restore.XXXXXX")"
@@ -433,8 +435,8 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             is_expected_mktemp_path "$RESTORE_ARTIFACT_DIR" "$restore_root" || die "retained untrusted restore artifact directory at $RESTORE_ARTIFACT_DIR"
             RESTORE_ARTIFACT_VALIDATED=1
             [[ -f "$source" && ! -L "$source" ]] || die "cannot preserve exact prior local wheel"
-            cp -- "$source" "$RESTORE_ARTIFACT_DIR/prior.whl"
-            RESTORABLE_PRIOR_SPEC="$RESTORE_ARTIFACT_DIR/prior.whl[pi]"
+            cp -- "$source" "$RESTORE_ARTIFACT_DIR/$source_basename"
+            RESTORABLE_PRIOR_SPEC="$RESTORE_ARTIFACT_DIR/${source_basename}[pi]"
             ;;
         roastpilot-agent|roastpilot-agent\[pi\])
             [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ ]] || die "cannot preserve exact prior application"
@@ -452,7 +454,7 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
 
 verify_pi_capability() {
     local venv_name="${1:-roastpilot-agent}" mcp_executable
-    resolve_pipx_venv_root
+    probe_pipx_venv_root || return 1
     mcp_executable="$PIPX_VENV_ROOT/$venv_name/bin/coffee-roaster-mcp"
     [[ -f "$mcp_executable" && -x "$mcp_executable" && ! -L "$mcp_executable" ]] || return 1
     pipx_command runpip "$venv_name" show coffee-roaster-mcp >/dev/null
@@ -482,6 +484,7 @@ replace_application_safely() {
     fi
     if ! verify_pi_capability "roastpilot-agent$suffix"; then
         cleanup_staged_pipx || true
+        [[ -z "${PIPX_VENV_ROOT_ERROR:-}" ]] || die "$PIPX_VENV_ROOT_ERROR"
         die "staged replacement lacks required Pi/MCP capability"
     fi
     if ! ensure_agent_inactive; then
@@ -492,6 +495,7 @@ replace_application_safely() {
         cleanup_staged_pipx || true
         die "cannot remove prior application after staging replacement"
     fi
+    APPLICATION_CHANGED=1
     if ! pipx_command install -- "$package_spec" || ! verify_pi_capability; then
         pipx_command uninstall -- roastpilot-agent || true
         if ! pipx_command install -- "$prior_spec"; then
@@ -500,7 +504,11 @@ replace_application_safely() {
             if [[ "$prior_spec" == "${RESTORE_ARTIFACT_DIR:-}/"* ]]; then
                 RESTORE_ARTIFACT_RETAIN=1
             fi
-            verify_pi_capability || restoration_failed=1
+            if verify_pi_capability; then
+                APPLICATION_CHANGED=0
+            else
+                restoration_failed=1
+            fi
         fi
         cleanup_staged_pipx || true
         [[ "$restoration_failed" == 0 ]] || die "replacement failed and prior application could not be restored"
@@ -537,16 +545,21 @@ install_application() {
     replace_application_safely "$prior_spec" "$package_spec"
 }
 
-resolve_pipx_venv_root() {
+probe_pipx_venv_root() {
     local pipx_home canonical xdg_home legacy_home
-    pipx_home="$(pipx_command environment --value PIPX_HOME)" || die "cannot determine pipx home"
+    PIPX_VENV_ROOT_ERROR=""
+    pipx_home="$(pipx_command environment --value PIPX_HOME)" || { PIPX_VENV_ROOT_ERROR="cannot determine pipx home"; return 1; }
     xdg_home="$INVOKING_HOME/.local/share/pipx"
     legacy_home="$INVOKING_HOME/.local/pipx"
-    [[ -n "$pipx_home" && "$pipx_home" == /* && "$pipx_home" != *$'\n'* && "$pipx_home" != *$'\r'* ]] || die "pipx home is unsafe"
-    [[ -d "$pipx_home" && ! -L "$pipx_home" ]] || die "pipx home is unsafe"
-    canonical="$(readlink -f -- "$pipx_home")" || die "pipx home is unsafe"
-    [[ "$pipx_home" == "$canonical" && ( "$canonical" == "$xdg_home" || "$canonical" == "$legacy_home" ) && ! -L "$canonical/venvs" && -d "$canonical/venvs" ]] || die "pipx home is outside invoking-user boundary"
+    [[ -n "$pipx_home" && "$pipx_home" == /* && "$pipx_home" != *$'\n'* && "$pipx_home" != *$'\r'* ]] || { PIPX_VENV_ROOT_ERROR="pipx home is unsafe"; return 1; }
+    [[ -d "$pipx_home" && ! -L "$pipx_home" ]] || { PIPX_VENV_ROOT_ERROR="pipx home is unsafe"; return 1; }
+    canonical="$(readlink -f -- "$pipx_home")" || { PIPX_VENV_ROOT_ERROR="pipx home is unsafe"; return 1; }
+    [[ "$pipx_home" == "$canonical" && ( "$canonical" == "$xdg_home" || "$canonical" == "$legacy_home" ) && ! -L "$canonical/venvs" && -d "$canonical/venvs" ]] || { PIPX_VENV_ROOT_ERROR="pipx home is outside invoking-user boundary"; return 1; }
     PIPX_VENV_ROOT="$canonical/venvs"
+}
+
+resolve_pipx_venv_root() {
+    probe_pipx_venv_root || die "$PIPX_VENV_ROOT_ERROR"
 }
 
 resolve_appliance_executable() {
