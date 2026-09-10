@@ -738,10 +738,10 @@ install_rendered_files() {
         prior_hostname="$(hostnamectl --static)"
         if [[ "$prior_hostname" != "$REQUESTED_HOSTNAME" ]]; then
             install_content_atomically "$prior_hostname" "$prior_file" 0600 root:root prior-static-hostname
-            run_privileged hostnamectl set-hostname "$REQUESTED_HOSTNAME"
-            [[ "$(hostnamectl --static)" == "$REQUESTED_HOSTNAME" ]] || die "hostname verification failed"
             HOSTNAME_CHANGED=1
             PRIOR_STATIC_HOSTNAME_FILE="$prior_file"
+            run_privileged hostnamectl set-hostname "$REQUESTED_HOSTNAME"
+            [[ "$(hostnamectl --static)" == "$REQUESTED_HOSTNAME" ]] || die "hostname verification failed"
         fi
     fi
     # Do not unlock the parent until the prior-hostname write and verification

@@ -63,9 +63,15 @@ case "$name" in
   uname) echo aarch64 ;;
   hostnamectl)
     if [ "${1:-}" = --static ]; then
-      if [ "${FAKE_HOSTNAME_VERIFY_FAIL:-}" = 1 ]; then echo wrong-host
+      if [ "${FAKE_HOSTNAME_VERIFY_FAIL:-}" = 1 ] && [ -e "$FAKE_HOSTNAME_SET_MARKER" ]; then
+        printf 'FAKE_HOSTNAME_VERIFY_FAILURE\n' >> "$FAKE_LOG"
+        echo wrong-host
       else cat "$FAKE_HOSTNAME"; fi
-    else [ "$1" = set-hostname ]; printf '%s\\n' "$2" > "$FAKE_HOSTNAME"; fi ;;
+    else
+      [ "$1" = set-hostname ]
+      printf '%s\\n' "$2" > "$FAKE_HOSTNAME"
+      : > "$FAKE_HOSTNAME_SET_MARKER"
+    fi ;;
   pipx)
     if [ -n "${FAKE_PIPX_ENV_LOG:-}" ]; then
       printf 'HOME=<%s> PIPX_HOME=<%s> PIPX_BIN_DIR=<%s> PIPX_DEFAULT_PYTHON=<%s>\\n' "${HOME-UNSET}" "${PIPX_HOME-UNSET}" "${PIPX_BIN_DIR-UNSET}" "${PIPX_DEFAULT_PYTHON-UNSET}" >> "$FAKE_PIPX_ENV_LOG"
@@ -330,6 +336,7 @@ esac
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
         "FAKE_LOG": str(log),
         "FAKE_HOSTNAME": str(hostname),
+        "FAKE_HOSTNAME_SET_MARKER": str(tmp_path / "hostname-set"),
         "FAKE_PIPX_STATE": str(tmp_path / "pipx-state"),
         "FAKE_PIPX_MCP_TEMPLATE": str(pipx_mcp_template),
         "FAKE_PIPX_NORMAL_INSTALL_COUNT": str(tmp_path / "pipx-normal-install-count"),
@@ -1641,8 +1648,16 @@ def test_hostname_and_identity_repairs_are_observable_through_fake_seam(
     assert stat.S_IMODE(prior.stat().st_mode) == 0o600
     assert not any(line.endswith(f"<{prior}>") and "chown" in line for line in events)
     Path(environment["FAKE_HOSTNAME"]).write_text("old-host\n")
+    Path(environment["FAKE_HOSTNAME_SET_MARKER"]).unlink()
+    start = len(log.read_text())
     verify = _run(environment | {"FAKE_HOSTNAME_VERIFY_FAIL": "1"}, "--set-hostname", "roastpilot")
     assert verify.returncode != 0 and "hostname verification failed" in verify.stderr
+    assert f"restore manually from {prior}" in verify.stderr
+    assert prior.read_text() == "old-host\n"
+    assert Path(environment["FAKE_HOSTNAME"]).read_text().strip() == "roastpilot"
+    verify_events = _delta(log, start)
+    assert "FAKE_HOSTNAME_VERIFY_FAILURE" in verify_events
+    assert "hostnamectl <set-hostname> <roastpilot>" in verify_events
     hostile = _run(
         environment | {"FAKE_GETENT_RECORD": "operator:x:1000:1000::relative:/bin/sh"},
         "--set-hostname",
@@ -1686,7 +1701,7 @@ def test_hostname_write_stays_inside_locked_parent_and_abort_recovers_access(
         i for i, line in enumerate(events) if line == f"chown <operator:operators> <--> <{var_dir}>"
     )
     assert root_lock < hostname_set < operator_unlock
-    assert prior.read_text() == "wrong-host\n" and not prior.is_symlink()
+    assert prior.read_text() == "old-host\n" and not prior.is_symlink()
 
 
 @pytest.mark.serial  # Renderer mutation cases share the fake command seam.
