@@ -593,6 +593,7 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     key = "not-for-output"
     first = _run(environment | {"ROASTPILOT_INSTALL_API_KEY": key}, "--set-hostname", "roastpilot")
     assert first.returncode == 0, first.stderr
+    assert "install failed after hostname change" not in first.stderr
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     env_file = root / "etc/roastpilot-agent/roastpilot-agent.env"
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
@@ -1540,6 +1541,116 @@ def test_directory_recheck_blocks_post_ownership_swap_before_mode_or_promotion(
         i > mutation_index
         and event.startswith(("tee ", "mv ", "roastpilot-agent <appliance> <model>"))
         for i, event in enumerate(events)
+    )
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("phase", "probe_count"), [("before-ownership", "4"), ("after-ownership", "5")]
+)
+def test_successful_var_unlock_rechecks_after_each_privileged_boundary(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    phase: str,
+    probe_count: str,
+) -> None:
+    """A swapped state directory cannot reach the unlock chmod on either side of chown."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    var_dir = root / "var/lib/roastpilot-agent"
+    attacker = tmp_path / f"attacker-unlock-{phase}"
+    attacker.mkdir()
+    result = _run(
+        environment
+        | {
+            "FAKE_MUTATE_AFTER_TEST_D_PATH": str(var_dir),
+            "FAKE_MUTATE_AFTER_TEST_D_TARGET": str(attacker),
+            "FAKE_MUTATE_AFTER_TEST_D_ON_COUNT": probe_count,
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert (
+        result.returncode != 0 and f"managed state directory is unsafe: {var_dir}" in result.stderr
+    )
+    events = log.read_text().splitlines()
+    mutation = next(
+        i
+        for i, event in enumerate(events)
+        if event == f"FAKE_TEST_D_MUTATION <{var_dir}> <{attacker}> <{probe_count}>"
+    )
+    operator_chowns = [
+        i
+        for i, event in enumerate(events)
+        if event == f"chown <--no-dereference> <operator:operators> <--> <{var_dir}>"
+    ]
+    if phase == "before-ownership":
+        assert not operator_chowns
+    else:
+        assert operator_chowns == [next(i for i in operator_chowns if i < mutation)]
+    assert f"test <!> <-L> <{var_dir}>" in events
+    assert not any(
+        i > mutation and event == f"chmod <0700> <--> <{var_dir}>" for i, event in enumerate(events)
+    )
+    assert not any(
+        event.startswith(("chmod ", "tee ", "mv ")) and f"<{attacker}>" in event for event in events
+    )
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("boundary", "owner", "mode", "probe_count"),
+    [
+        ("var/lib/roastpilot-agent", "operator:operators", "0700", "5"),
+        ("etc/roastpilot-agent", "root:operators", "0750", "6"),
+    ],
+)
+def test_cleanup_rechecks_after_ownership_before_restoring_mode(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    boundary: str,
+    owner: str,
+    mode: str,
+    probe_count: str,
+) -> None:
+    """A cleanup swap after chown is visible, skips chmod, and does not halt remaining rollback."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    path = root / boundary
+    attacker = tmp_path / f"attacker-cleanup-{path.name}"
+    attacker.mkdir()
+    result = _run(
+        environment
+        | {
+            "FAKE_HOSTNAME_VERIFY_FAIL": "1",
+            "FAKE_MUTATE_AFTER_TEST_D_PATH": str(path),
+            "FAKE_MUTATE_AFTER_TEST_D_TARGET": str(attacker),
+            "FAKE_MUTATE_AFTER_TEST_D_ON_COUNT": probe_count,
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode == 1
+    assert "rollback incomplete; manual reconciliation required" in result.stderr
+    events = log.read_text().splitlines()
+    chown = max(
+        i
+        for i, event in enumerate(events)
+        if event == f"chown <--no-dereference> <{owner}> <--> <{path}>"
+    )
+    mutation = next(
+        i
+        for i, event in enumerate(events)
+        if event == f"FAKE_TEST_D_MUTATION <{path}> <{attacker}> <{probe_count}>"
+    )
+    assert chown < mutation
+    assert f"test <!> <-L> <{path}>" in events
+    assert not any(
+        i > mutation and event == f"chmod <{mode}> <--> <{path}>" for i, event in enumerate(events)
+    )
+    assert any(event == "systemctl <daemon-reload>" for event in events)
+    assert any(
+        event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event for event in events
     )
 
 
@@ -2877,6 +2988,7 @@ def test_rollback_cp_failure_continues_to_later_members_and_cleanup(
         "roastpilot",
     )
     assert result.returncode != 0 and "manual reconciliation required" in result.stderr
+    assert f"cannot restore configuration member at {yaml}" in result.stderr
     events = log.read_text().splitlines()
     failed_cp = next(
         i
@@ -2928,6 +3040,7 @@ def test_rollback_recheck_failure_is_not_masked_by_later_members(
     before = _live_config_state(root)
     result = _run(environment | {"FAKE_TEST_FAIL_PATH": str(yaml)}, "--set-hostname", "roastpilot")
     assert result.returncode != 0 and "manual reconciliation required" in result.stderr
+    assert f"cannot restore configuration member at {yaml}" in result.stderr
     events = log.read_text().splitlines()
     failed_rechecks = [i for i, event in enumerate(events) if event == f"test <!> <-L> <{yaml}>"]
     # The first failure aborts YAML promotion; the second is the rollback
@@ -3045,6 +3158,7 @@ def test_rollback_refuses_member_changed_to_symlink_and_continues(
         "roastpilot",
     )
     assert result.returncode != 0 and "manual reconciliation required" in result.stderr
+    assert f"cannot restore configuration member at {yaml}" in result.stderr
     events = log.read_text().splitlines()
     assert f"FAKE_SYMLINK_MUTATION <{snapshot_yaml}> <{target}>" in events
     snapshot_file_test = next(
@@ -3085,6 +3199,7 @@ def test_rollback_removal_failure_for_previously_absent_member_continues(
         "roastpilot",
     )
     assert result.returncode != 0 and "manual reconciliation required" in result.stderr
+    assert f"cannot restore configuration member at {env}" in result.stderr
     events = log.read_text().splitlines()
     failed_removal = next(i for i, event in enumerate(events) if event == f"rm <-f> <--> <{env}>")
     yaml_removal = next(

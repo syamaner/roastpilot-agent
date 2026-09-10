@@ -301,14 +301,18 @@ restore_live_configuration() {
     for destination in "$@"; do
         name="${destination##*/}"
         if ! recheck_sensitive_destination "$destination"; then
+            printf '%s\n' "install failed: cannot restore configuration member at $destination" >&2
             failed=1
         elif run_privileged test -f "$CONFIG_SNAPSHOT_DIR/$name"; then
             if run_privileged test -L "$CONFIG_SNAPSHOT_DIR/$name" || ! run_privileged cp -p -- "$CONFIG_SNAPSHOT_DIR/$name" "$destination"; then
+                printf '%s\n' "install failed: cannot restore configuration member at $destination" >&2
                 failed=1
             fi
         elif run_privileged test -e "$CONFIG_SNAPSHOT_DIR/$name" || run_privileged test -L "$CONFIG_SNAPSHOT_DIR/$name"; then
+            printf '%s\n' "install failed: cannot restore configuration member at $destination" >&2
             failed=1
         elif ! run_privileged rm -f -- "$destination"; then
+            printf '%s\n' "install failed: cannot restore configuration member at $destination" >&2
             failed=1
         else
             :
@@ -754,7 +758,11 @@ install_rendered_files() {
     fi
     # Do not unlock the parent until the prior-hostname write and verification
     # have completed under its root-owned boundary.
+    run_privileged test -d "$var_dir" || die "managed state directory is missing: $var_dir"
+    run_privileged test ! -L "$var_dir" || die "managed state directory is unsafe: $var_dir"
     run_privileged chown --no-dereference "$INVOKING_USER:$INVOKING_GROUP" -- "$var_dir"
+    run_privileged test -d "$var_dir" || die "managed state directory is missing: $var_dir"
+    run_privileged test ! -L "$var_dir" || die "managed state directory is unsafe: $var_dir"
     run_privileged chmod 0700 -- "$var_dir"
     LOCKED_VAR_DIR=""
     if ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq dialout || ! id -nG "$INVOKING_USER" | tr ' ' '\n' | grep -Fxq audio; then
@@ -824,21 +832,31 @@ main() {
             if ! run_privileged test -d "$LOCKED_VAR_DIR" || run_privileged test -L "$LOCKED_VAR_DIR"; then
                 cleanup_failed=1
             else
-                run_privileged chown --no-dereference "$INVOKING_USER:$INVOKING_GROUP" -- "$LOCKED_VAR_DIR" || cleanup_failed=1
-                run_privileged chmod 0700 -- "$LOCKED_VAR_DIR" || cleanup_failed=1
+                if ! run_privileged chown --no-dereference "$INVOKING_USER:$INVOKING_GROUP" -- "$LOCKED_VAR_DIR"; then
+                    cleanup_failed=1
+                elif ! run_privileged test -d "$LOCKED_VAR_DIR" || run_privileged test -L "$LOCKED_VAR_DIR"; then
+                    cleanup_failed=1
+                else
+                    run_privileged chmod 0700 -- "$LOCKED_VAR_DIR" || cleanup_failed=1
+                fi
             fi
         fi
         if [[ -n "${LOCKED_ETC_DIR:-}" ]]; then
             if ! run_privileged test -d "$LOCKED_ETC_DIR" || run_privileged test -L "$LOCKED_ETC_DIR"; then
                 cleanup_failed=1
             else
-                run_privileged chown --no-dereference "root:$INVOKING_GROUP" -- "$LOCKED_ETC_DIR" || cleanup_failed=1
-                run_privileged chmod 0750 -- "$LOCKED_ETC_DIR" || cleanup_failed=1
+                if ! run_privileged chown --no-dereference "root:$INVOKING_GROUP" -- "$LOCKED_ETC_DIR"; then
+                    cleanup_failed=1
+                elif ! run_privileged test -d "$LOCKED_ETC_DIR" || run_privileged test -L "$LOCKED_ETC_DIR"; then
+                    cleanup_failed=1
+                else
+                    run_privileged chmod 0750 -- "$LOCKED_ETC_DIR" || cleanup_failed=1
+                fi
             fi
         fi
         restore_live_configuration "$(rooted_path /etc/roastpilot-agent/roastpilot-agent.env)" "$(rooted_path /etc/roastpilot-agent/coffee-roaster-mcp.yaml)" "$(rooted_path /etc/systemd/system/roastpilot-agent.service)" || cleanup_failed=1
         discard_configuration_snapshot || cleanup_failed=1
-        if [[ "${HOSTNAME_CHANGED:-0}" == 1 ]]; then
+        if [[ "${HOSTNAME_CHANGED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after hostname change; restore manually from $PRIOR_STATIC_HOSTNAME_FILE" >&2
         fi
         if [[ "$cleanup_failed" == 1 ]]; then
