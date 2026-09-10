@@ -2699,6 +2699,7 @@ def test_failed_final_replacement_restores_and_reverifies_the_prior_application(
     assert any("roastpilot-stage-" in line and "<uninstall>" in line for line in events)
     assert not any(line.startswith("roastpilot-agent <appliance>") for line in events)
     assert "Installed: unit enabled; model verified." not in result.stdout
+    assert "application/configuration skew may require manual reconciliation" not in result.stderr
 
 
 @pytest.mark.serial
@@ -4107,6 +4108,9 @@ def test_fresh_incapable_application_is_removed_or_named_for_manual_cleanup(
     assert "pipx <uninstall> <--> <roastpilot-agent>" in events
     assert (
         "manually remove incapable roastpilot-agent environment" in result.stderr
+    ) is cleanup_fails
+    assert (
+        "application/configuration skew may require manual reconciliation" in result.stderr
     ) is cleanup_fails
     assert not any(event.startswith("roastpilot-agent <appliance>") for event in events)
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
