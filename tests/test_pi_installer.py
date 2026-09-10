@@ -221,6 +221,11 @@ UNIT
   install) mode=0644; [ "${1:-}" = -m ] && { mode="$2"; shift 2; }
     [ "${1:-}" = -- ] && shift; cp "$1" "$2"; chmod "$mode" "$2" ;;
   test)
+    if [ "${1:-}" = -d ] && [ "${FAKE_TEST_FAIL_D_PATH:-}" = "${!#}" ]; then
+      count=0; [ ! -e "$FAKE_TEST_FAIL_D_COUNT_FILE" ] || count=$(cat "$FAKE_TEST_FAIL_D_COUNT_FILE")
+      count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_TEST_FAIL_D_COUNT_FILE"
+      [ "${FAKE_TEST_FAIL_D_ON_COUNT:-}" != "$count" ] || exit 48
+    fi
     [ -z "${FAKE_TEST_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_TEST_FAIL_PATH" ] || exit 41
     if /bin/test "$@"; then
       if [ "${1:-}" = -d ] && [ "${!#}" = "${FAKE_MUTATE_AFTER_TEST_D_PATH:-}" ]; then
@@ -245,8 +250,22 @@ UNIT
     fi
     /bin/chmod "$mode" "$@"; } || /bin/chmod "$@" ;;
   mktemp) is_dir=0; [ "${1:-}" = -d ] && { is_dir=1; shift; }; [ "${1:-}" = -- ] && shift; dir="${1%XXXXXX}fake"
-    [ "${FAKE_MKTEMP_TEMPLATE:-}" != "$1" ] || dir="$FAKE_MKTEMP_RESULT"
+    if [ "${FAKE_MKTEMP_TEMPLATE:-}" = "$1" ]; then
+      dir="$FAKE_MKTEMP_RESULT"
+      printf 'FAKE_MKTEMP_RESULT <%s>\\n' "$dir" >> "$FAKE_LOG"
+    fi
     if [ "$is_dir" = 1 ]; then mkdir -p "$dir"; else mkdir -p "$(dirname "$dir")"; : > "$dir"; fi; printf '%s\\n' "$dir" ;;
+  readlink)
+    result=$(/usr/bin/readlink "$@")
+    printf '%s\\n' "$result"
+    if [ "${FAKE_MUTATE_AFTER_READLINK_PATH:-}" = "${!#}" ]; then
+      [ -n "${FAKE_MUTATE_AFTER_READLINK_REPLACEMENT:-}" ] || /bin/rm -f -- "$FAKE_MUTATE_AFTER_READLINK_PATH"
+      if [ -n "${FAKE_MUTATE_AFTER_READLINK_REPLACEMENT:-}" ]; then
+        /bin/rm -f -- "$FAKE_MUTATE_AFTER_READLINK_PATH"
+        /bin/cp -- "$FAKE_MUTATE_AFTER_READLINK_REPLACEMENT" "$FAKE_MUTATE_AFTER_READLINK_PATH"
+      fi
+      printf 'FAKE_READLINK_MUTATION <%s>\\n' "$FAKE_MUTATE_AFTER_READLINK_PATH" >> "$FAKE_LOG"
+    fi ;;
   rm) [ -z "${FAKE_RM_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_RM_FAIL_PATH" ] || exit 42; /bin/rm "$@" ;;
   cp) [ -z "${FAKE_CP_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_CP_FAIL_PATH" ] || exit 43; /bin/cp "$@" ;;
   mv) /bin/mv "$@" ;;
@@ -314,6 +333,7 @@ esac
         "mkdir",
         "chmod",
         "mktemp",
+        "readlink",
         "rm",
         "chown",
         "cp",
@@ -356,6 +376,7 @@ esac
         "FAKE_LOG": str(log),
         "FAKE_HOSTNAME": str(hostname),
         "FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE": str(tmp_path / "test-d-mutation-count"),
+        "FAKE_TEST_FAIL_D_COUNT_FILE": str(tmp_path / "test-d-fail-count"),
         "FAKE_CHMOD_FAIL_COUNT_FILE": str(tmp_path / "chmod-fail-count"),
         "FAKE_CHOWN_FAIL_COUNT_FILE": str(tmp_path / "chown-fail-count"),
         "FAKE_HOSTNAME_SET_MARKER": str(tmp_path / "hostname-set"),
@@ -870,7 +891,10 @@ def test_wheel_with_a_symlinked_parent_is_rejected_before_installer_effects(
         str(linked_parent / "roastpilot-agent.whl"),
     )
     assert result.returncode != 0 and "wheel path must be canonical" in result.stderr
-    assert not log.exists()
+    assert not log.exists() or not any(
+        event.startswith(("sudo ", "apt-get ", "pipx ", "roastpilot-agent "))
+        for event in log.read_text().splitlines()
+    )
 
 
 @pytest.mark.serial
@@ -1273,7 +1297,10 @@ def test_repair_inputs_are_rejected_before_privileged_work(
     assert (
         _run(environment, "--set-hostname", "roastpilot", "--from-dir", str(linked)).returncode != 0
     )
-    assert not log.exists()
+    assert not log.exists() or not any(
+        event.startswith(("sudo ", "apt-get ", "pipx ", "roastpilot-agent "))
+        for event in log.read_text().splitlines()
+    )
     accepted = _run(environment, "--set-hostname", "roastpilot", "--from-dir", str(source))
     assert accepted.returncode == 0
     assert f"<--from-dir> <{source}>" in log.read_text()
@@ -1671,6 +1698,94 @@ def test_cleanup_rechecks_after_ownership_before_restoring_mode(
     assert any(
         event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event for event in events
     )
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("boundary", "owner", "mode", "entry_probe", "entry_failure"),
+    [
+        ("var/lib/roastpilot-agent", "operator:operators", "0700", "4", "missing"),
+        ("var/lib/roastpilot-agent", "operator:operators", "0700", "4", "symlink"),
+        ("etc/roastpilot-agent", "root:operators", "0750", "5", "missing"),
+        ("etc/roastpilot-agent", "root:operators", "0750", "5", "symlink"),
+    ],
+)
+def test_locked_cleanup_entry_failure_names_the_exact_manual_reconciliation_target(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    boundary: str,
+    owner: str,
+    mode: str,
+    entry_probe: str,
+    entry_failure: str,
+) -> None:
+    """A missing locked directory at cleanup reports its intended restoration state."""
+    _, environment, log, _ = installer_harness
+    path = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / boundary
+    injection = (
+        {"FAKE_TEST_FAIL_D_PATH": str(path), "FAKE_TEST_FAIL_D_ON_COUNT": entry_probe}
+        if entry_failure == "missing"
+        else {
+            "FAKE_MUTATE_AFTER_TEST_D_PATH": str(path),
+            "FAKE_MUTATE_AFTER_TEST_D_TARGET": str(path.parent),
+            "FAKE_MUTATE_AFTER_TEST_D_ON_COUNT": entry_probe,
+        }
+    )
+    result = _run(
+        environment | injection | {"FAKE_HOSTNAME_VERIFY_FAIL": "1"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode == 1
+    assert (
+        f"install failed: reconcile {path} manually (expected directory owned by {owner} with mode {mode})"
+        in result.stderr
+    )
+    assert "rollback incomplete; manual reconciliation required" in result.stderr
+    events = log.read_text().splitlines()
+    if entry_failure == "symlink":
+        assert f"FAKE_TEST_D_MUTATION <{path}> <{path.parent}> <{entry_probe}>" in events
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("boundary", "owner", "mode", "failure"),
+    [
+        ("var/lib/roastpilot-agent", "operator:operators", "0700", "chown"),
+        ("var/lib/roastpilot-agent", "operator:operators", "0700", "chmod"),
+        ("etc/roastpilot-agent", "root:operators", "0750", "chown"),
+        ("etc/roastpilot-agent", "root:operators", "0750", "chmod"),
+    ],
+)
+def test_locked_cleanup_chown_and_chmod_failures_keep_specific_manual_diagnostics(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    boundary: str,
+    owner: str,
+    mode: str,
+    failure: str,
+) -> None:
+    """Both locked parents retain their owner/mode diagnostics on cleanup failure."""
+    _, environment, log, _ = installer_harness
+    path = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / boundary
+    injection = (
+        {"FAKE_CHOWN_FAIL_TARGET": str(path), "FAKE_CHOWN_FAIL_ON_COUNT": "2"}
+        if failure == "chown"
+        else {"FAKE_CHMOD_FAIL_TARGET": str(path), "FAKE_CHMOD_FAIL_ON_COUNT": "2"}
+    )
+    result = _run(
+        environment | injection | {"FAKE_HOSTNAME_VERIFY_FAIL": "1"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode == 1
+    message = (
+        f"install failed: restore {path} ownership to {owner} manually"
+        if failure == "chown"
+        else f"install failed: restore {path} mode {mode} manually"
+    )
+    assert message in result.stderr
+    assert "rollback incomplete; manual reconciliation required" in result.stderr
+    assert not _has_roastpilot_agent_lifecycle_mutation(log.read_text().splitlines())
 
 
 @pytest.mark.serial
@@ -2437,6 +2552,8 @@ def test_activation_orders_avahi_and_never_restarts_an_active_agent(
         environment | {"FAKE_SYSTEMCTL_FAIL": "enable"}, "--set-hostname", "roastpilot"
     )
     assert avahi_failed.returncode != 0
+    assert "install failed after enabling Avahi; Avahi enablement may remain" in avahi_failed.stderr
+    assert "install failed after enabling roastpilot-agent" not in avahi_failed.stderr
     events = log.read_text().splitlines()
     assert "systemctl <enable> <--now> <avahi-daemon>" in events
     assert "systemctl <enable> <roastpilot-agent>" not in events
@@ -2793,6 +2910,60 @@ def test_unavailable_prior_local_wheel_is_not_replaced(
     result = _run(environment, "--set-hostname", "roastpilot", "--version", "2.0")
     assert result.returncode != 0 and "cannot preserve exact prior local wheel" in result.stderr
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text()
+
+
+@pytest.mark.serial
+def test_prior_local_wheel_adjacent_recheck_blocks_a_post_canonicalisation_delete(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """The source is rechecked after canonicalisation before any replacement action."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "prior.whl"
+    wheel.write_text("wheel")
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
+    result = _run(
+        environment | {"FAKE_MUTATE_AFTER_READLINK_PATH": str(wheel)},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    assert result.returncode != 0
+    assert "cannot preserve exact prior local wheel" in result.stderr
+    events = log.read_text().splitlines()
+    assert f"FAKE_READLINK_MUTATION <{wheel}>" in events
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("release", "diagnostic"),
+    [
+        ("ID debian\n", "malformed operating system data: missing ="),
+        ('ID="debian;rm"\n', "malformed operating system data: unsafe ID value"),
+        ("ID=debian\nID=debian\n", "malformed operating system data: duplicate ID"),
+        (
+            "ID=debian\nID_LIKE=debian\nID_LIKE=debian\n",
+            "malformed operating system data: duplicate ID_LIKE",
+        ),
+        ("ID=fedora\nID_LIKE=rpm\n", "unsupported OS/package manager"),
+    ],
+)
+def test_os_release_parser_rejects_each_untrusted_branch_before_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], release: str, diagnostic: str
+) -> None:
+    """Real newline release fixtures fail closed before package or service work."""
+    _, environment, log, _ = installer_harness
+    Path(environment["ROASTPILOT_INSTALL_OS_RELEASE"]).write_text(release)
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    assert diagnostic in result.stderr
+    events = log.read_text().splitlines()
+    assert not any(
+        event.startswith(("sudo ", "apt-get ", "pipx ", "roastpilot-agent ", "systemctl <enable>"))
+        for event in events
+    )
 
 
 @pytest.mark.serial
@@ -3524,12 +3695,19 @@ def test_success_snapshot_discard_failure_keeps_committed_configuration(
     _, environment, log, _ = installer_harness
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     snapshot = root / "tmp/roastpilot-config-rollback.fake"
+    secret = "completion-secret-must-not-leak"
     result = _run(
-        environment | {"FAKE_RM_FAIL_PATH": str(snapshot)}, "--set-hostname", "roastpilot"
+        environment | {"FAKE_RM_FAIL_PATH": str(snapshot), "ROASTPILOT_INSTALL_API_KEY": secret},
+        "--set-hostname",
+        "roastpilot",
     )
     assert result.returncode == 1
     assert f"retained configuration snapshot at {snapshot}" in result.stderr
-    assert "installation completed; snapshot cleanup/manual removal is required" in result.stderr
+    assert (
+        "installation completed; manually remove the retained secret-bearing configuration snapshot"
+        in result.stderr
+    )
+    assert secret not in result.stdout + result.stderr + log.read_text()
     assert snapshot.is_dir()
     assert _live_config_state(root)["env"] is not None
     assert _live_config_state(root)["yaml"] is not None
@@ -3550,6 +3728,114 @@ def test_success_snapshot_discard_failure_keeps_committed_configuration(
     )
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_untrusted_configuration_snapshot_path_is_retained_never_recursively_deleted(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A fake mktemp escape cannot become a privileged recursive-delete target."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    template = root / "tmp/roastpilot-config-rollback.XXXXXX"
+    unexpected = root / "tmp/unexpected-config-snapshot"
+    result = _run(
+        environment
+        | {
+            "FAKE_MKTEMP_TEMPLATE": str(template),
+            "FAKE_MKTEMP_RESULT": str(unexpected),
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0
+    assert f"retained untrusted configuration snapshot at {unexpected}" in result.stderr
+    events = log.read_text().splitlines()
+    assert f"FAKE_MKTEMP_RESULT <{unexpected}>" in events
+    assert f"rm <-rf> <--> <{unexpected}>" not in events
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_untrusted_restore_artifact_path_is_retained_never_recursively_deleted(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A fake user-cache mktemp escape cannot become a cleanup delete target."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "prior.whl"
+    wheel.write_text("wheel")
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
+    cache = Path(environment["FAKE_OPERATOR_HOME"]) / ".cache"
+    template = cache / "roastpilot-restore.XXXXXX"
+    unexpected = tmp_path / "unexpected-restore-artifact"
+    result = _run(
+        environment
+        | {
+            "FAKE_MKTEMP_TEMPLATE": str(template),
+            "FAKE_MKTEMP_RESULT": str(unexpected),
+        },
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    assert result.returncode != 0
+    assert f"retained untrusted restore artifact directory at {unexpected}" in result.stderr
+    events = log.read_text().splitlines()
+    assert f"FAKE_MKTEMP_RESULT <{unexpected}>" in events
+    assert f"rm <-rf> <--> <{unexpected}>" not in events
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("failure", "expected_event"),
+    [
+        ("model", "FAKE_SHA256_CORRUPTION"),
+        ("config", "tee <-->"),
+        ("agent-enable", "systemctl <enable> <roastpilot-agent>"),
+    ],
+)
+def test_application_change_warns_of_configuration_skew_for_later_failures(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], failure: str, expected_event: str
+) -> None:
+    """Every later failure after installation identifies possible app/config skew."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    if failure == "model":
+        injection = {
+            "FAKE_SHA256_BAD_PATH": str(
+                root / "tmp/roastpilot-install.fake/models/onnx/int8/model_quantized.onnx"
+            )
+        }
+    elif failure == "config":
+        injection = {
+            "FAKE_TEE_FAIL_TARGET": str(root / "etc/roastpilot-agent/.roastpilot-env.fake")
+        }
+    else:
+        injection = {"FAKE_AGENT_ENABLE_FAIL": "1"}
+    result = _run(environment | injection, "--set-hostname", "roastpilot")
+    assert result.returncode != 0
+    assert (
+        "install failed after application replacement; application/configuration skew may require manual reconciliation"
+        in result.stderr
+    )
+    events = log.read_text().splitlines()
+    assert any(expected_event in event for event in events)
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_success_has_no_application_skew_or_avahi_residue_warning(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A completed installation does not emit failure-only residue diagnostics."""
+    _, environment, _, _ = installer_harness
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode == 0
+    assert "application/configuration skew may require manual reconciliation" not in result.stderr
+    assert "install failed after enabling Avahi; Avahi enablement may remain" not in result.stderr
 
 
 @pytest.mark.serial

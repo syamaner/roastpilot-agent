@@ -203,18 +203,18 @@ preflight() {
     [[ -r "$os_release" ]] || die "unsupported operating system"
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ -z "$line" || "$line" == \#* ]] && continue
-        [[ "$line" == *=* ]] || die "malformed operating system data"
+        [[ "$line" == *=* ]] || die "malformed operating system data: missing ="
         key="${line%%=*}"
         value="${line#*=}"
         case "$key" in
             ID|ID_LIKE)
                 if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then value="${value:1:${#value}-2}"; fi
-                [[ "$value" =~ ^[A-Za-z0-9_[:space:]-]+$ ]] || die "malformed operating system data"
+                [[ "$value" =~ ^[A-Za-z0-9_[:space:]-]+$ ]] || die "malformed operating system data: unsafe $key value"
                 if [[ "$key" == ID ]]; then
-                    [[ -z "$id" ]] || die "malformed operating system data"
+                    [[ -z "$id" ]] || die "malformed operating system data: duplicate ID"
                     id="$value"
                 else
-                    [[ -z "$id_like" ]] || die "malformed operating system data"
+                    [[ -z "$id_like" ]] || die "malformed operating system data: duplicate ID_LIKE"
                     id_like="$value"
                 fi
                 ;;
@@ -279,9 +279,13 @@ verify_no_service_dropins() {
 }
 
 snapshot_live_configuration() {
-    local destination name
+    local destination name snapshot_root snapshot_suffix
     CONFIG_SNAPSHOT_DIR="$(run_privileged mktemp -d -- "$(rooted_path /tmp)/roastpilot-config-rollback.XXXXXX")"
-    [[ "$CONFIG_SNAPSHOT_DIR" == "$(rooted_path /tmp)/roastpilot-config-rollback."* ]] || die "unsafe configuration snapshot"
+    CONFIG_SNAPSHOT_VALIDATED=0
+    snapshot_root="$(rooted_path /tmp)/roastpilot-config-rollback."
+    snapshot_suffix="${CONFIG_SNAPSHOT_DIR#"$snapshot_root"}"
+    [[ "$CONFIG_SNAPSHOT_DIR" == "$snapshot_root"* && -n "$snapshot_suffix" && "$snapshot_suffix" != */* ]] || die "retained untrusted configuration snapshot at $CONFIG_SNAPSHOT_DIR"
+    CONFIG_SNAPSHOT_VALIDATED=1
     run_privileged chmod 0700 -- "$CONFIG_SNAPSHOT_DIR"
     for destination in "$@"; do
         name="${destination##*/}"
@@ -325,6 +329,10 @@ restore_live_configuration() {
 
 discard_configuration_snapshot() {
     [[ -z "${CONFIG_SNAPSHOT_DIR:-}" ]] && return 0
+    if [[ "${CONFIG_SNAPSHOT_VALIDATED:-0}" != 1 ]]; then
+        printf '%s\n' "install failed: retained untrusted configuration snapshot at $CONFIG_SNAPSHOT_DIR" >&2
+        return 1
+    fi
     if ! run_privileged rm -rf -- "$CONFIG_SNAPSHOT_DIR"; then
         printf '%s\n' "install failed: retained configuration snapshot at $CONFIG_SNAPSHOT_DIR" >&2
         return 1
@@ -381,7 +389,7 @@ requested_package_spec() {
 }
 
 prepare_restorable_prior() {
-    local state="$1" package version source canonical cache_dir prior_metadata
+    local state="$1" package version source canonical cache_dir restore_root restore_suffix prior_metadata
     prior_metadata="$(printf '%s' "$state" | python3 -c '
 import json, sys
 try:
@@ -403,6 +411,11 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             cache_dir="$INVOKING_HOME/.cache"
             mkdir -p -- "$cache_dir"
             RESTORE_ARTIFACT_DIR="$(mktemp -d -- "$cache_dir/roastpilot-restore.XXXXXX")"
+            RESTORE_ARTIFACT_VALIDATED=0
+            restore_root="$cache_dir/roastpilot-restore."
+            restore_suffix="${RESTORE_ARTIFACT_DIR#"$restore_root"}"
+            [[ "$RESTORE_ARTIFACT_DIR" == "$restore_root"* && -n "$restore_suffix" && "$restore_suffix" != */* ]] || die "retained untrusted restore artifact directory at $RESTORE_ARTIFACT_DIR"
+            RESTORE_ARTIFACT_VALIDATED=1
             [[ -f "$source" && ! -L "$source" ]] || die "cannot preserve exact prior local wheel"
             cp -- "$source" "$RESTORE_ARTIFACT_DIR/prior.whl"
             RESTORABLE_PRIOR_SPEC="$RESTORE_ARTIFACT_DIR/prior.whl[pi]"
@@ -809,10 +822,12 @@ main() {
     STAGE_DIR=""
     STAGE_DIR_VALIDATED=0
     RESTORE_ARTIFACT_DIR=""
+    RESTORE_ARTIFACT_VALIDATED=0
     ROOT_TEMPORARIES=()
     LOCKED_VAR_DIR=""
     LOCKED_ETC_DIR=""
     CONFIG_SNAPSHOT_DIR=""
+    CONFIG_SNAPSHOT_VALIDATED=0
     CONFIG_TRANSACTION_ACTIVE=0
     HOSTNAME_CHANGED=0
     PRIOR_STATIC_HOSTNAME_FILE=""
@@ -837,7 +852,7 @@ main() {
                 cleanup_failed=1
             fi
         fi
-        if [[ -n "${RESTORE_ARTIFACT_DIR:-}" ]] && ! rm -rf -- "$RESTORE_ARTIFACT_DIR"; then
+        if [[ -n "${RESTORE_ARTIFACT_DIR:-}" ]] && { [[ "${RESTORE_ARTIFACT_VALIDATED:-0}" != 1 ]] || ! rm -rf -- "$RESTORE_ARTIFACT_DIR"; }; then
             printf '%s\n' "install failed: retained restore artifact directory at $RESTORE_ARTIFACT_DIR" >&2
             cleanup_failed=1
         fi
@@ -848,13 +863,14 @@ main() {
         # Never follow an untrusted child when recovering a locked parent.
         if [[ -n "${LOCKED_VAR_DIR:-}" ]]; then
             if ! run_privileged test -d "$LOCKED_VAR_DIR" || run_privileged test -L "$LOCKED_VAR_DIR"; then
+                printf '%s\n' "install failed: reconcile $LOCKED_VAR_DIR manually (expected directory owned by $INVOKING_USER:$INVOKING_GROUP with mode 0700)" >&2
                 cleanup_failed=1
             else
                 if ! run_privileged chown --no-dereference "$INVOKING_USER:$INVOKING_GROUP" -- "$LOCKED_VAR_DIR"; then
                     printf '%s\n' "install failed: restore $LOCKED_VAR_DIR ownership to $INVOKING_USER:$INVOKING_GROUP manually" >&2
                     cleanup_failed=1
                 elif ! run_privileged test -d "$LOCKED_VAR_DIR" || run_privileged test -L "$LOCKED_VAR_DIR"; then
-                    printf '%s\n' "install failed: restore $LOCKED_VAR_DIR mode 0700 manually" >&2
+                    printf '%s\n' "install failed: reconcile $LOCKED_VAR_DIR manually (expected directory owned by $INVOKING_USER:$INVOKING_GROUP with mode 0700)" >&2
                     cleanup_failed=1
                 else
                     run_privileged chmod 0700 -- "$LOCKED_VAR_DIR" || { printf '%s\n' "install failed: restore $LOCKED_VAR_DIR mode 0700 manually" >&2; cleanup_failed=1; }
@@ -863,13 +879,14 @@ main() {
         fi
         if [[ -n "${LOCKED_ETC_DIR:-}" ]]; then
             if ! run_privileged test -d "$LOCKED_ETC_DIR" || run_privileged test -L "$LOCKED_ETC_DIR"; then
+                printf '%s\n' "install failed: reconcile $LOCKED_ETC_DIR manually (expected directory owned by root:$INVOKING_GROUP with mode 0750)" >&2
                 cleanup_failed=1
             else
                 if ! run_privileged chown --no-dereference "root:$INVOKING_GROUP" -- "$LOCKED_ETC_DIR"; then
                     printf '%s\n' "install failed: restore $LOCKED_ETC_DIR ownership to root:$INVOKING_GROUP manually" >&2
                     cleanup_failed=1
                 elif ! run_privileged test -d "$LOCKED_ETC_DIR" || run_privileged test -L "$LOCKED_ETC_DIR"; then
-                    printf '%s\n' "install failed: restore $LOCKED_ETC_DIR mode 0750 manually" >&2
+                    printf '%s\n' "install failed: reconcile $LOCKED_ETC_DIR manually (expected directory owned by root:$INVOKING_GROUP with mode 0750)" >&2
                     cleanup_failed=1
                 else
                     run_privileged chmod 0750 -- "$LOCKED_ETC_DIR" || { printf '%s\n' "install failed: restore $LOCKED_ETC_DIR mode 0750 manually" >&2; cleanup_failed=1; }
@@ -887,12 +904,12 @@ main() {
         if [[ "${AVAHI_ENABLE_ATTEMPTED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after enabling Avahi; Avahi enablement may remain" >&2
         fi
-        if [[ "${APPLICATION_CHANGED:-0}" == 1 && "${CONFIG_TRANSACTION_ACTIVE:-0}" == 1 ]]; then
+        if [[ "${APPLICATION_CHANGED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after application replacement; application/configuration skew may require manual reconciliation" >&2
         fi
         if [[ "$cleanup_failed" == 1 ]]; then
             if [[ "${POST_COMMIT_SNAPSHOT_FAILURE:-0}" == 1 ]]; then
-                printf '%s\n' "installation completed; snapshot cleanup/manual removal is required" >&2
+                printf '%s\n' "installation completed; manually remove the retained secret-bearing configuration snapshot" >&2
             else
                 printf '%s\n' "install failed: rollback incomplete; manual reconciliation required" >&2
             fi
@@ -926,7 +943,7 @@ main() {
     LOCKED_ETC_DIR=""
     if ! discard_configuration_snapshot; then
         POST_COMMIT_SNAPSHOT_FAILURE=1
-        die "installation completed but snapshot cleanup requires manual removal"
+        exit 1
     fi
     summary
 }
