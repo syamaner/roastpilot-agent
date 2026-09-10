@@ -594,7 +594,7 @@ promote_model_file() {
     run_privileged mkdir -p -- "$parent"
     recheck_sensitive_destination "$destination" || die "model promotion destination failed privileged recheck: $destination"
     temporary="$(run_privileged mktemp -- "$parent/.roastpilot-model.XXXXXX")"
-    [[ "$temporary" == "$parent/.roastpilot-model."* ]] || die "unsafe model temporary path"
+    [[ "$temporary" == "$parent/.roastpilot-model."* ]] || die "retained untrusted model temporary at $temporary"
     ROOT_TEMPORARIES+=("$temporary")
     # The privileged digest is over the root-owned snapshot, never a second
     # read of mutable staging bytes.
@@ -630,7 +630,7 @@ install_content_atomically() {
     parent="$(dirname -- "$destination")"
     recheck_sensitive_destination "$destination" || die "atomic destination failed privileged recheck: $destination"
     temporary="$(run_privileged mktemp -- "$parent/.$prefix.XXXXXX")"
-    [[ "$temporary" == "$parent/.$prefix."* ]] || die "unsafe temporary path"
+    [[ "$temporary" == "$parent/.$prefix."* ]] || die "retained untrusted $prefix temporary at $temporary"
     ROOT_TEMPORARIES+=("$temporary")
     expected="$(printf '%s\n' "$content" | sha256sum)"
     expected="${expected%% *}"

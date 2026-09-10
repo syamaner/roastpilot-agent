@@ -253,6 +253,7 @@ UNIT
   sha256sum)
     if [ "$#" = 0 ]; then cat >/dev/null; echo "content-digest  -"; exit 0; fi
     [ "${1:-}" = -- ] && shift
+    if [ "${FAKE_SHA256_BAD_PATH:-}" = "$1" ]; then printf 'FAKE_SHA256_CORRUPTION <%s>\n' "$1" >> "$FAKE_LOG"; echo "corrupt-digest  $1"; exit 0; fi
     content=$(cat "$1")
     case "$content" in
       MODEL) echo "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df  $1" ;;
@@ -1728,6 +1729,47 @@ def test_model_digests_cover_stage_root_snapshot_and_destination(
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize(
+    ("target", "diagnostic"),
+    [
+        ("model-temporary", "model promotion digest mismatch"),
+        ("model-destination", "model destination digest mismatch"),
+        ("env", "atomic destination digest mismatch"),
+        ("yaml", "atomic destination digest mismatch"),
+        ("unit", "atomic destination digest mismatch"),
+    ],
+)
+def test_digest_corruption_is_detected_and_cleaned_up(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], target: str, diagnostic: str
+) -> None:
+    """Each privileged digest comparison rejects an exact fake-corrupted path."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    paths = {
+        "model-temporary": root
+        / "var/lib/roastpilot-agent/models/onnx/int8/.roastpilot-model.fake",
+        "model-destination": root
+        / "var/lib/roastpilot-agent/models/onnx/int8/model_quantized.onnx",
+        "env": root / "etc/roastpilot-agent/roastpilot-agent.env",
+        "yaml": root / "etc/roastpilot-agent/coffee-roaster-mcp.yaml",
+        "unit": root / "etc/systemd/system/roastpilot-agent.service",
+    }
+    secret = "digest-secret"
+    path = paths[target]
+    result = _run(
+        environment | {"ROASTPILOT_INSTALL_API_KEY": secret, "FAKE_SHA256_BAD_PATH": str(path)},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0 and diagnostic in result.stderr
+    events = log.read_text().splitlines()
+    assert f"FAKE_SHA256_CORRUPTION <{path}>" in events
+    assert secret not in result.stdout + result.stderr + log.read_text()
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+    assert any(event.startswith("rm <-rf>") and "roastpilot-install" in event for event in events)
+
+
+@pytest.mark.serial
 def test_root_temp_is_cleaned_after_atomic_write_failure(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -1790,6 +1832,41 @@ def test_unvalidated_stage_path_is_reported_without_recursive_cleanup(
     assert result.returncode == 1
     assert f"retained staging directory at {unexpected}" in result.stderr
     assert f"rm <-rf> <--> <{unexpected}>" not in log.read_text().splitlines()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("template", "diagnostic"),
+    [
+        (".roastpilot-model.XXXXXX", "retained untrusted model temporary"),
+        (".roastpilot-env.XXXXXX", "retained untrusted roastpilot-env temporary"),
+    ],
+)
+def test_untrusted_root_temporary_is_not_registered_for_cleanup(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], template: str, diagnostic: str
+) -> None:
+    """Model and config mktemp prefix failures retain rather than recursively remove an arbitrary path."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    unexpected = root / "tmp/untrusted-temporary"
+    parent = (
+        root / "var/lib/roastpilot-agent/models/onnx/int8"
+        if "model" in template
+        else root / "etc/roastpilot-agent"
+    )
+    result = _run(
+        environment
+        | {
+            "FAKE_MKTEMP_TEMPLATE": str(parent / template),
+            "FAKE_MKTEMP_RESULT": str(unexpected),
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode == 1 and f"{diagnostic} at {unexpected}" in result.stderr
+    events = log.read_text().splitlines()
+    assert f"mktemp <--> <{parent / template}>" in events
+    assert f"rm <-f> <--> <{unexpected}>" not in events
 
 
 @pytest.mark.serial
