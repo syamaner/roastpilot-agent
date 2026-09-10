@@ -249,7 +249,14 @@ UNIT
       count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_TEST_FAIL_D_COUNT_FILE"
       [ "${FAKE_TEST_FAIL_D_ON_COUNT:-}" != "$count" ] || exit 48
     fi
-    [ -z "${FAKE_TEST_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_TEST_FAIL_PATH" ] || exit 41
+    if [ -n "${FAKE_TEST_FAIL_PATH:-}" ] && [ "${!#}" = "$FAKE_TEST_FAIL_PATH" ]; then
+      count=0; [ ! -e "$FAKE_TEST_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_TEST_FAIL_COUNT_FILE")
+      count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_TEST_FAIL_COUNT_FILE"
+      if [ -z "${FAKE_TEST_FAIL_ON_COUNT:-}" ] || [ "$count" = "$FAKE_TEST_FAIL_ON_COUNT" ]; then
+        printf 'FAKE_TEST_FAILURE <%s>\\n' "${!#}" >> "$FAKE_LOG"
+        exit 41
+      fi
+    fi
     if /bin/test "$@"; then
       if [ "${1:-}" = -d ] && [ "${!#}" = "${FAKE_MUTATE_AFTER_TEST_D_PATH:-}" ]; then
         [ -n "${FAKE_MUTATE_AFTER_TEST_D_TARGET:-}" ] || exit 46
@@ -404,6 +411,7 @@ esac
         "FAKE_LOG": str(log),
         "FAKE_HOSTNAME": str(hostname),
         "FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE": str(tmp_path / "test-d-mutation-count"),
+        "FAKE_TEST_FAIL_COUNT_FILE": str(tmp_path / "test-fail-count"),
         "FAKE_TEST_FAIL_D_COUNT_FILE": str(tmp_path / "test-d-fail-count"),
         "FAKE_CHMOD_FAIL_COUNT_FILE": str(tmp_path / "chmod-fail-count"),
         "FAKE_CHOWN_FAIL_COUNT_FILE": str(tmp_path / "chown-fail-count"),
@@ -3791,14 +3799,23 @@ def test_rollback_recheck_failure_is_not_masked_by_later_members(
     for path, mode in ((env, 0o600), (yaml, 0o640), (unit, 0o644)):
         path.chmod(mode)
     before = _live_config_state(root)
-    result = _run(environment | {"FAKE_TEST_FAIL_PATH": str(yaml)}, "--set-hostname", "roastpilot")
+    result = _run(
+        environment
+        | {
+            "FAKE_SYSTEMCTL_FAIL": "enable",
+            "FAKE_TEST_FAIL_PATH": str(yaml),
+            "FAKE_TEST_FAIL_ON_COUNT": "7",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
     assert result.returncode != 0 and "manual reconciliation required" in result.stderr
     assert f"cannot restore configuration member at {yaml}" in result.stderr
     events = log.read_text().splitlines()
     failed_rechecks = [i for i, event in enumerate(events) if event == f"test <!> <-L> <{yaml}>"]
-    # The first failure aborts YAML promotion; the second is the rollback
-    # recheck, which must persist despite later successful predicates.
-    assert len(failed_rechecks) == 2
+    # The fourth probe is the snapshot's confirmed-absence check, the fifth
+    # and sixth allow promotion, and the seventh is the rollback recheck.
+    assert len(failed_rechecks) == 3
     failed_recheck = failed_rechecks[-1]
     unit_restore = next(
         i
@@ -3812,7 +3829,59 @@ def test_rollback_recheck_failure_is_not_masked_by_later_members(
     assert not list((root / "tmp").glob("roastpilot-config-rollback.*"))
     assert _live_config_state(root)["env"] == before["env"]
     assert _live_config_state(root)["unit"] == before["unit"]
-    assert _live_config_state(root)["yaml"] == before["yaml"]
+    assert _live_config_state(root)["yaml"] != before["yaml"]
+
+
+@pytest.mark.serial
+def test_restore_snapshot_probe_failure_continues_later_rollback_and_cleanup(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """An indeterminate snapshot member is retained while later rollback work continues."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    etc, unit_dir = root / "etc/roastpilot-agent", root / "etc/systemd/system"
+    etc.mkdir(parents=True)
+    unit_dir.mkdir(parents=True)
+    env, yaml, unit = (
+        etc / "roastpilot-agent.env",
+        etc / "coffee-roaster-mcp.yaml",
+        unit_dir / "roastpilot-agent.service",
+    )
+    env.write_text(
+        "OPENROUTER_API_KEY=old\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\n"
+        "COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+    )
+    yaml.write_text("prior-yaml\n")
+    unit.write_text("[Service]\nUser=operator\nGroup=operators\n")
+    before = _live_config_state(root)
+    snapshot_yaml = root / "tmp/roastpilot-config-rollback.fake/coffee-roaster-mcp.yaml"
+    result = _run(
+        environment | {"FAKE_SYSTEMCTL_FAIL": "enable", "FAKE_TEST_FAIL_PATH": str(snapshot_yaml)},
+        "--set-hostname",
+        "roastpilot",
+    )
+    events = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert f"FAKE_TEST_FAILURE <{snapshot_yaml}>" in events
+    assert f"cannot restore configuration member at {yaml}" in result.stderr
+    assert "rollback incomplete; manual reconciliation required" in result.stderr
+    assert f"rm <-f> <--> <{yaml}>" not in events
+    assert _live_config_state(root)["yaml"] != before["yaml"]
+    failure = events.index(f"FAKE_TEST_FAILURE <{snapshot_yaml}>")
+    assert any(
+        index > failure and event.startswith("cp <-p>") and event.endswith(f"> <{unit}>")
+        for index, event in enumerate(events)
+    )
+    reload = max(
+        index for index, event in enumerate(events) if event == "systemctl <daemon-reload>"
+    )
+    assert reload > failure
+    assert any(
+        index > reload and event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event
+        for index, event in enumerate(events)
+    )
+    assert not list((root / "tmp").glob("roastpilot-config-rollback.*"))
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial
@@ -3837,7 +3906,11 @@ def test_privileged_write_recheck_reports_its_failed_destination(
         else root / "etc/roastpilot-agent/roastpilot-agent.env"
     )
     result = _run(
-        environment | {"FAKE_TEST_FAIL_PATH": str(target)}, "--set-hostname", "roastpilot"
+        environment
+        | {"FAKE_TEST_FAIL_PATH": str(target)}
+        | ({"FAKE_TEST_FAIL_ON_COUNT": "5"} if target_kind == "config" else {}),
+        "--set-hostname",
+        "roastpilot",
     )
     assert result.returncode != 0
     assert diagnostic in result.stderr and str(target) in result.stderr
@@ -3875,6 +3948,34 @@ def test_snapshot_existing_members_are_decided_through_the_privileged_seam(
             event.startswith(f"cp <-p> <--> <{member}> <") and "roastpilot-config-rollback" in event
             for event in events
         )
+
+
+@pytest.mark.serial
+def test_snapshot_member_probe_failure_is_not_treated_as_absence(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A failed privileged existence probe aborts before a live member can be replaced."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    env = root / "etc/roastpilot-agent/roastpilot-agent.env"
+    env.parent.mkdir(parents=True)
+    original = (
+        "OPENROUTER_API_KEY=old\nPORT=8000\n"
+        "ROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\n"
+        "COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+    )
+    env.write_text(original)
+    result = _run(environment | {"FAKE_TEST_FAIL_PATH": str(env)}, "--set-hostname", "roastpilot")
+    events = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert f"FAKE_TEST_FAILURE <{env}>" in events
+    assert f"cannot inspect existing configuration destination at {env}" in result.stderr
+    assert env.read_text() == original
+    assert not any(
+        event.endswith(f"> <{env}>") and event.startswith(("tee ", "mv ", "rm <-f>", "cp <-p>"))
+        for event in events
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial

@@ -291,8 +291,18 @@ verify_no_service_dropins() {
     [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
 }
 
+privileged_member_presence() {
+    local member="$1"
+    if run_privileged test -e "$member" || run_privileged test -L "$member"; then
+        return 0
+    fi
+    run_privileged test ! -e "$member" || return 2
+    run_privileged test ! -L "$member" || return 2
+    return 1
+}
+
 snapshot_live_configuration() {
-    local destination name snapshot_root
+    local destination name snapshot_root presence_status
     CONFIG_SNAPSHOT_DIR="$(run_privileged mktemp -d -- "$(rooted_path /tmp)/roastpilot-config-rollback.XXXXXX")"
     CONFIG_SNAPSHOT_VALIDATED=0
     snapshot_root="$(rooted_path /tmp)/roastpilot-config-rollback."
@@ -301,18 +311,21 @@ snapshot_live_configuration() {
     run_privileged chmod 0700 -- "$CONFIG_SNAPSHOT_DIR"
     for destination in "$@"; do
         name="${destination##*/}"
-        if run_privileged test -e "$destination" || run_privileged test -L "$destination"; then
-            if ! run_privileged test -f "$destination" || run_privileged test -L "$destination"; then
+        if privileged_member_presence "$destination"; then
+            if ! run_privileged test -f "$destination" || run_privileged test -L "$destination" || ! run_privileged test ! -L "$destination"; then
                 die "existing configuration destination is unsafe"
             fi
             run_privileged cp -p -- "$destination" "$CONFIG_SNAPSHOT_DIR/$name"
+        else
+            presence_status=$?
+            [[ "$presence_status" == 1 ]] || die "cannot inspect existing configuration destination at $destination"
         fi
     done
     CONFIG_TRANSACTION_ACTIVE=1
 }
 
 restore_live_configuration() {
-    local destination name failed=0
+    local destination name failed=0 snapshot_member_presence
     [[ "${CONFIG_TRANSACTION_ACTIVE:-0}" == 1 ]] || return 0
     for destination in "$@"; do
         name="${destination##*/}"
@@ -320,18 +333,21 @@ restore_live_configuration() {
             printf '%s\n' "install failed: cannot restore configuration member at $destination" >&2
             failed=1
         elif run_privileged test -f "$CONFIG_SNAPSHOT_DIR/$name"; then
-            if run_privileged test -L "$CONFIG_SNAPSHOT_DIR/$name" || ! run_privileged cp -p -- "$CONFIG_SNAPSHOT_DIR/$name" "$destination"; then
+            if run_privileged test -L "$CONFIG_SNAPSHOT_DIR/$name" || ! run_privileged test ! -L "$CONFIG_SNAPSHOT_DIR/$name" || ! run_privileged cp -p -- "$CONFIG_SNAPSHOT_DIR/$name" "$destination"; then
                 printf '%s\n' "install failed: cannot restore configuration member at $destination" >&2
                 failed=1
             fi
-        elif run_privileged test -e "$CONFIG_SNAPSHOT_DIR/$name" || run_privileged test -L "$CONFIG_SNAPSHOT_DIR/$name"; then
-            printf '%s\n' "install failed: cannot restore configuration member at $destination" >&2
-            failed=1
-        elif ! run_privileged rm -f -- "$destination"; then
-            printf '%s\n' "install failed: cannot restore configuration member at $destination" >&2
-            failed=1
         else
-            :
+            if privileged_member_presence "$CONFIG_SNAPSHOT_DIR/$name"; then
+                printf '%s\n' "install failed: cannot restore configuration member at $destination" >&2
+                failed=1
+            else
+                snapshot_member_presence=$?
+                if [[ "$snapshot_member_presence" != 1 ]] || ! run_privileged rm -f -- "$destination"; then
+                    printf '%s\n' "install failed: cannot restore configuration member at $destination" >&2
+                    failed=1
+                fi
+            fi
         fi
     done
     run_privileged systemctl daemon-reload || failed=1
