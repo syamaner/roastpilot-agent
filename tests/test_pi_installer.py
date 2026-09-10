@@ -3155,6 +3155,51 @@ def test_glob_character_in_validated_temporary_suffix_removes_only_that_exact_en
 
 
 @pytest.mark.serial
+def test_root_temporary_deregistration_is_exact_under_glob_suffix_mutation(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """Quoted exact comparison retains a glob-matching sibling; the unquoted mutant does not."""
+    _, environment, log, _ = installer_harness
+    target = tmp_path / ".roastpilot-model.*"
+    sibling = tmp_path / ".roastpilot-model.sibling"
+    source = INSTALLER.read_text()
+    harness = """
+ROOT_TEMPORARIES=("$1" "$2")
+remove_root_temporary "$1"
+for temporary in "${ROOT_TEMPORARIES[@]}"; do run_privileged rm -f -- "$temporary"; done
+"""
+    real = tmp_path / "exact-removal.sh"
+    real.write_text(source.replace('main "$@"', harness))
+    real.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(real), str(target), str(sibling)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert f"rm <-f> <--> <{sibling}>" in log.read_text().splitlines()
+    log.write_text("")
+    mutant = tmp_path / "pattern-removal.sh"
+    mutant.write_text(
+        source.replace('[[ "$temporary" == "$target" ]]', "[[ $temporary == $target ]]").replace(
+            'main "$@"', harness
+        )
+    )
+    mutant.chmod(0o755)
+    mutated = subprocess.run(
+        ["bash", str(mutant), str(target), str(sibling)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert mutated.returncode == 0
+    assert f"rm <-f> <--> <{sibling}>" not in log.read_text().splitlines()
+
+
+@pytest.mark.serial
 def test_restrictive_umask_keeps_owned_directories_traversable(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
