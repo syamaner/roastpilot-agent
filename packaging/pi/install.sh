@@ -423,6 +423,12 @@ verify_pi_capability() {
     pipx_command runpip "$venv_name" show coffee-roaster-mcp >/dev/null
 }
 
+cleanup_staged_pipx() {
+    [[ -z "${STAGED_PIPX_VENV:-}" ]] && return 0
+    pipx_command uninstall -- "$STAGED_PIPX_VENV" || return 1
+    STAGED_PIPX_VENV=""
+}
+
 replace_application_safely() {
     local prior_spec="$1" package_spec="$2" suffix="-roastpilot-stage-$$" restoration_failed=0
     # Prove a separate pipx environment can supply the required dependency
@@ -430,16 +436,17 @@ replace_application_safely() {
     if ! pipx_command install --suffix "$suffix" -- "$package_spec"; then
         die "requested replacement could not be staged"
     fi
+    STAGED_PIPX_VENV="roastpilot-agent$suffix"
     if ! verify_pi_capability "roastpilot-agent$suffix"; then
-        pipx_command uninstall -- "roastpilot-agent$suffix" || true
+        cleanup_staged_pipx || true
         die "staged replacement lacks required Pi/MCP capability"
     fi
     if ! ensure_agent_inactive; then
-        pipx_command uninstall -- "roastpilot-agent$suffix" || true
+        cleanup_staged_pipx || true
         die "roastpilot-agent is not safely inactive; end any run safely, stop the service only when idle, then rerun the installer; never restart during a roast"
     fi
     if ! pipx_command uninstall -- roastpilot-agent; then
-        pipx_command uninstall -- "roastpilot-agent$suffix" || true
+        cleanup_staged_pipx || true
         die "cannot remove prior application after staging replacement"
     fi
     if ! pipx_command install -- "$package_spec" || ! verify_pi_capability; then
@@ -447,11 +454,11 @@ replace_application_safely() {
         if ! pipx_command install -- "$prior_spec" || ! verify_pi_capability; then
             restoration_failed=1
         fi
-        pipx_command uninstall -- "roastpilot-agent$suffix" || true
+        cleanup_staged_pipx || true
         [[ "$restoration_failed" == 0 ]] || die "replacement failed and prior application could not be restored"
         die "replacement failed; prior application was restored"
     fi
-    pipx_command uninstall -- "roastpilot-agent$suffix" || die "cannot remove staged replacement"
+    cleanup_staged_pipx || die "cannot remove staged replacement"
 }
 
 install_application() {
@@ -514,9 +521,9 @@ preserve_existing_api_key() {
     while IFS= read -r line || [[ -n "$line" ]]; do
         case "$line" in
             OPENROUTER_API_KEY=*)
-                ((key_seen++ == 0)) || die "existing environment file is malformed"
-                preserved_key="${line#OPENROUTER_API_KEY=}"
-                [[ "$preserved_key" =~ ^[A-Za-z0-9._:-]*$ ]] || die "existing environment file is malformed"
+            ((key_seen++ == 0)) || die "existing environment file has duplicate API key"
+            preserved_key="${line#OPENROUTER_API_KEY=}"
+            [[ "$preserved_key" =~ ^[A-Za-z0-9._:-]*$ ]] || die "existing environment file has unsafe API key characters"
                 ;;
             PORT=*)
                 ((port_seen++ == 0)) || die "existing environment file is malformed"
@@ -528,10 +535,10 @@ preserve_existing_api_key() {
             COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml)
                 ((config_seen++ == 0)) || die "existing environment file is malformed"
                 ;;
-            *) die "existing environment file is malformed" ;;
+            *) die "existing environment file has an unexpected assignment" ;;
         esac
     done <<< "$content"
-    [[ "$key_seen" == 1 && "$port_seen" == 1 && "$db_seen" == 1 && "$config_seen" == 1 ]] || die "existing environment file is malformed"
+    [[ "$key_seen" == 1 && "$port_seen" == 1 && "$db_seen" == 1 && "$config_seen" == 1 ]] || die "existing environment file is missing a required member"
     API_KEY="$preserved_key"
 }
 
@@ -553,10 +560,12 @@ install_model_and_render() {
     validate_destination "$stage_parent"
     run_privileged mkdir -p -- "$stage_parent"
     stage_dir="$(run_privileged mktemp -d -- "$stage_parent/roastpilot-install.XXXXXX")"
+    STAGE_DIR="$stage_dir"
+    STAGE_DIR_VALIDATED=0
     [[ "$stage_dir" == "$stage_parent/roastpilot-install."* ]] || die "unsafe staging directory"
+    STAGE_DIR_VALIDATED=1
     run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$stage_dir"
     run_privileged chmod 0700 -- "$stage_dir"
-    STAGE_DIR="$stage_dir"
     model_stage="$stage_dir/models"
     mkdir -p -- "$model_stage"
     if [[ -n "$MODEL_FROM_DIR" ]]; then
@@ -675,7 +684,7 @@ build_final_env() {
 }
 
 install_rendered_files() {
-    local etc_dir var_dir env_file yaml_file unit_file prior_file prior_hostname model_dir
+    local etc_dir var_dir env_file yaml_file unit_file prior_file prior_hostname model_dir model_parent
     local staged_env staged_unit staged_yaml final_env
     etc_dir="$(rooted_path /etc/roastpilot-agent)"
     var_dir="$(rooted_path /var/lib/roastpilot-agent)"
@@ -774,8 +783,8 @@ enable_services() {
     run_privileged systemctl daemon-reload
     verify_no_service_dropins
     run_privileged systemctl enable --now avahi-daemon
-    run_privileged systemctl enable roastpilot-agent
     ROASTPILOT_AGENT_ENABLED=1
+    run_privileged systemctl enable roastpilot-agent
     if [[ "$START_SERVICE" == 1 ]]; then
         require_agent_inactive
         run_privileged systemctl start roastpilot-agent
@@ -794,6 +803,7 @@ summary() {
 
 main() {
     STAGE_DIR=""
+    STAGE_DIR_VALIDATED=0
     RESTORE_ARTIFACT_DIR=""
     ROOT_TEMPORARIES=()
     LOCKED_VAR_DIR=""
@@ -803,6 +813,7 @@ main() {
     HOSTNAME_CHANGED=0
     PRIOR_STATIC_HOSTNAME_FILE=""
     ROASTPILOT_AGENT_ENABLED=0
+    STAGED_PIPX_VENV=""
     cleanup() {
         local temporary original_status=$? cleanup_failed=0
         trap - EXIT
@@ -813,12 +824,18 @@ main() {
                 cleanup_failed=1
             fi
         done
-        if [[ -n "${STAGE_DIR:-}" ]] && ! run_privileged rm -rf -- "$STAGE_DIR"; then
-            printf '%s\n' "install failed: retained staging directory at $STAGE_DIR" >&2
-            cleanup_failed=1
+        if [[ -n "${STAGE_DIR:-}" ]]; then
+            if [[ "${STAGE_DIR_VALIDATED:-0}" != 1 ]] || ! run_privileged rm -rf -- "$STAGE_DIR"; then
+                printf '%s\n' "install failed: retained staging directory at $STAGE_DIR" >&2
+                cleanup_failed=1
+            fi
         fi
         if [[ -n "${RESTORE_ARTIFACT_DIR:-}" ]] && ! rm -rf -- "$RESTORE_ARTIFACT_DIR"; then
             printf '%s\n' "install failed: retained restore artifact directory at $RESTORE_ARTIFACT_DIR" >&2
+            cleanup_failed=1
+        fi
+        if ! cleanup_staged_pipx; then
+            printf '%s\n' "install failed: retained staged pipx environment at $STAGED_PIPX_VENV" >&2
             cleanup_failed=1
         fi
         # Never follow an untrusted child when recovering a locked parent.
@@ -884,9 +901,9 @@ main() {
     install_model_and_render
     install_rendered_files
     enable_services
-    discard_configuration_snapshot
     CONFIG_TRANSACTION_ACTIVE=0
     LOCKED_ETC_DIR=""
+    discard_configuration_snapshot
     summary
 }
 

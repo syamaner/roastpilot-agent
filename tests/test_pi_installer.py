@@ -245,6 +245,7 @@ UNIT
     fi
     /bin/chmod "$mode" "$@"; } || /bin/chmod "$@" ;;
   mktemp) is_dir=0; [ "${1:-}" = -d ] && { is_dir=1; shift; }; [ "${1:-}" = -- ] && shift; dir="${1%XXXXXX}fake"
+    [ "${FAKE_MKTEMP_TEMPLATE:-}" != "$1" ] || dir="$FAKE_MKTEMP_RESULT"
     if [ "$is_dir" = 1 ]; then mkdir -p "$dir"; else mkdir -p "$(dirname "$dir")"; : > "$dir"; fi; printf '%s\\n' "$dir" ;;
   rm) [ -z "${FAKE_RM_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_RM_FAIL_PATH" ] || exit 42; /bin/rm "$@" ;;
   cp) [ -z "${FAKE_CP_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_CP_FAIL_PATH" ] || exit 43; /bin/cp "$@" ;;
@@ -285,6 +286,7 @@ UNIT
       [ "$count" != "$FAKE_DAEMON_RELOAD_FAIL_ON" ] || exit 44
     fi
     [ "${FAKE_SYSTEMCTL_FAIL:-}" != "${1:-}" ] || exit 31
+    [ "${FAKE_AGENT_ENABLE_FAIL:-}" != 1 ] || [ "${1:-}" != enable ] || [ "${2:-}" != roastpilot-agent ] || exit 31
     if [ "${1:-}" = show ]; then
       [ "${2:-}" = -p ] && [ "${3:-}" = ActiveState ] && [ "${4:-}" = --value ] || exit 32
       if [ -n "${FAKE_SERVICE_STATE_SEQUENCE:-}" ]; then
@@ -1326,12 +1328,13 @@ def test_rendered_unit_and_atomic_env_repairs_fail_before_live_writes(
     env_file = root / "etc/roastpilot-agent/roastpilot-agent.env"
     before = env_file.read_bytes()
     for unit in (
-        "[Service]\\nExecStart=/bin/true",
-        "[Unit]\\nDescription=RoastPilot agent (native Pi appliance)\\n[Service]\\nUser=operator",
+        "[Service]\nExecStart=/bin/true",
+        "[Unit]\nDescription=RoastPilot agent (native Pi appliance)\n[Service]\nUser=operator",
     ):
         start = len(log.read_text())
         result = _run(environment | {"FAKE_RENDERED_UNIT": unit}, "--set-hostname", "roastpilot")
         assert result.returncode != 0
+        assert "rendered unit violates appliance contract" in result.stderr
         assert env_file.read_bytes() == before
         assert not any(
             str(root / "etc/systemd/system/roastpilot-agent.service") in item
@@ -1727,6 +1730,55 @@ def test_root_temp_is_cleaned_after_atomic_write_failure(
     assert not list(
         (root / "var/lib/roastpilot-agent/models/onnx/int8").glob(".roastpilot-model.*")
     )
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(("failure", "status"), [("chown", 47), ("chmod", 23)])
+def test_validated_stage_directory_failures_are_cleanup_accounted(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], failure: str, status: int
+) -> None:
+    """A stage ownership or mode failure still removes the validated staging directory."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    stage = root / "tmp/roastpilot-install.fake"
+    injection = (
+        {"FAKE_CHOWN_FAIL_TARGET": str(stage)}
+        if failure == "chown"
+        else {"FAKE_CHMOD_FAIL_TARGET": str(stage)}
+    )
+    result = _run(environment | injection, "--set-hostname", "roastpilot")
+    assert result.returncode == status
+    events = log.read_text().splitlines()
+    assert (
+        f"chown <operator:operators> <--> <{stage}>"
+        if failure == "chown"
+        else f"chmod <0700> <--> <{stage}>"
+    ) in events
+    assert f"rm <-rf> <--> <{stage}>" in events
+    assert not stage.exists()
+
+
+@pytest.mark.serial
+def test_unvalidated_stage_path_is_reported_without_recursive_cleanup(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A mktemp prefix mismatch remains retained rather than becoming an rm -rf target."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    stage_parent = root / "tmp"
+    unexpected = stage_parent / "not-roastpilot-stage"
+    result = _run(
+        environment
+        | {
+            "FAKE_MKTEMP_TEMPLATE": str(stage_parent / "roastpilot-install.XXXXXX"),
+            "FAKE_MKTEMP_RESULT": str(unexpected),
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode == 1
+    assert f"retained staging directory at {unexpected}" in result.stderr
+    assert f"rm <-rf> <--> <{unexpected}>" not in log.read_text().splitlines()
 
 
 @pytest.mark.serial
@@ -2446,8 +2498,31 @@ def test_staged_cleanup_failure_is_fatal_before_appliance_effects(
     assert any(
         line.startswith("pipx <uninstall>") and "roastpilot-stage-" in line for line in events
     )
+    assert "retained staged pipx environment" in result.stderr
     assert not any(line.startswith("roastpilot-agent <appliance>") for line in events)
     assert "Installed: unit enabled; model verified." not in result.stdout
+
+
+@pytest.mark.serial
+def test_staged_venv_is_cleaned_when_capability_resolution_dies(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A resolver die after staging still uninstalls the marker-owned staged venv."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+    result = _run(
+        environment | {"FAKE_PIPX_HOME": str(tmp_path / "unsafe-pipx")},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    assert result.returncode != 0 and "pipx home is outside invoking-user boundary" in result.stderr
+    events = log.read_text().splitlines()
+    assert any(
+        line.startswith("pipx <uninstall>") and "roastpilot-stage-" in line for line in events
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial
@@ -2467,16 +2542,28 @@ def test_fresh_local_wheel_install_includes_pi_extra_and_verifies_mcp(
 
 @pytest.mark.serial
 @pytest.mark.parametrize(
-    "content",
+    ("content", "diagnostic"),
     [
-        "OPENROUTER_API_KEY=candidate-key\\nOPENROUTER_API_KEY=two\\nPORT=8000\\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\\n",
-        "OPENROUTER_API_KEY=candidate-key\\nPORT=8000\\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\\nUNEXPECTED=value\\n",
-        "OPENROUTER_API_KEY=candidate-key\\nPORT=8000\\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\\n",
-        "OPENROUTER_API_KEY=candidate key\\nPORT=8000\\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\\n",
+        (
+            "OPENROUTER_API_KEY=candidate-key\nOPENROUTER_API_KEY=two\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n",
+            "existing environment file has duplicate API key",
+        ),
+        (
+            "OPENROUTER_API_KEY=candidate-key\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\nUNEXPECTED=value\n",
+            "existing environment file has an unexpected assignment",
+        ),
+        (
+            "OPENROUTER_API_KEY=candidate-key\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\n",
+            "existing environment file is missing a required member",
+        ),
+        (
+            "OPENROUTER_API_KEY=candidate key\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n",
+            "existing environment file has unsafe API key characters",
+        ),
     ],
 )
 def test_malformed_existing_environment_fails_before_installer_effects(
-    installer_harness: tuple[Path, dict[str, str], Path, Path], content: str
+    installer_harness: tuple[Path, dict[str, str], Path, Path], content: str, diagnostic: str
 ) -> None:
     """Malformed retained-key inputs are rejected before apt, pipx, or rendering."""
     _, environment, log, _ = installer_harness
@@ -2488,6 +2575,7 @@ def test_malformed_existing_environment_fails_before_installer_effects(
     env_file.write_text(content)
     result = _run(environment, "--set-hostname", "roastpilot")
     assert result.returncode != 0
+    assert diagnostic in result.stderr
     output = result.stdout + result.stderr + (log.read_text() if log.exists() else "")
     assert "candidate-key" not in output
     assert not any(
@@ -2828,6 +2916,20 @@ def test_final_start_recheck_never_disturbs_a_deactivating_service(
 
 
 @pytest.mark.serial
+def test_agent_enable_failure_warns_without_lifecycle_reversal(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A possibly partial enable is warned about but never automatically reversed."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment | {"FAKE_AGENT_ENABLE_FAIL": "1"}, "--set-hostname", "roastpilot")
+    assert result.returncode == 31
+    assert "unit may remain enabled; rerun or inspect the installer state manually" in result.stderr
+    events = log.read_text().splitlines()
+    assert "systemctl <enable> <roastpilot-agent>" in events
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
 @pytest.mark.parametrize(
     "environment",
     [
@@ -2933,16 +3035,15 @@ def test_failed_configuration_generation_restores_the_prior_live_set(
         assert reloads[-1] > max(restores)
         # Each member is inspected through the privileged seam; this is a
         # mutation guard against replacing any check with shell-local syntax.
-        for name in ("roastpilot-agent.env", "coffee-roaster-mcp.yaml", "roastpilot-agent.service"):
+        for name, destination in (
+            ("roastpilot-agent.env", etc / "roastpilot-agent.env"),
+            ("coffee-roaster-mcp.yaml", etc / "coffee-roaster-mcp.yaml"),
+            ("roastpilot-agent.service", unit_dir / "roastpilot-agent.service"),
+        ):
             expected_snapshot = root / "tmp/roastpilot-config-rollback.fake" / name
-            snapshot = next(
-                event.split(" <")[-1].rstrip(">")
-                for event in events
-                if event == f"test <-f> <{expected_snapshot}>"
-            )
-            assert snapshot == str(expected_snapshot)
-            assert f"test <-f> <{snapshot}>" in events
-            assert f"test <-L> <{snapshot}>" in events
+            assert events.count(f"test <-f> <{expected_snapshot}>") == 1
+            assert events.count(f"test <-L> <{expected_snapshot}>") == 1
+            assert f"cp <-p> <--> <{expected_snapshot}> <{destination}>" in events
         snapshot_chmod = next(
             event
             for event in events
@@ -3019,7 +3120,7 @@ def test_rollback_failure_still_reloads_and_discards_snapshot(
 
 
 @pytest.mark.serial
-@pytest.mark.parametrize("failed_member", ["yaml", "unit"])
+@pytest.mark.parametrize("failed_member", ["env", "yaml", "unit"])
 def test_rollback_cp_failure_continues_to_later_members_and_cleanup(
     installer_harness: tuple[Path, dict[str, str], Path, Path], failed_member: str
 ) -> None:
@@ -3034,17 +3135,23 @@ def test_rollback_cp_failure_continues_to_later_members_and_cleanup(
         etc / "coffee-roaster-mcp.yaml",
         unit_dir / "roastpilot-agent.service",
     )
+    secret = "rollback-env-secret"
     env.write_text(
-        "OPENROUTER_API_KEY=old\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+        f"OPENROUTER_API_KEY={secret}\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
     )
     yaml.write_bytes(b"prior-yaml\n")
     unit.write_bytes(b"[Service]\nUser=operator\nGroup=operators\n")
     for path, mode in ((env, 0o600), (yaml, 0o640), (unit, 0o644)):
         path.chmod(mode)
     before = _live_config_state(root)
-    failed = yaml if failed_member == "yaml" else unit
+    failed = {"env": env, "yaml": yaml, "unit": unit}[failed_member]
     result = _run(
-        environment | {"FAKE_SYSTEMCTL_FAIL": "enable", "FAKE_CP_FAIL_PATH": str(failed)},
+        environment
+        | {
+            "ROASTPILOT_INSTALL_API_KEY": "new-api-key",
+            "FAKE_SYSTEMCTL_FAIL": "enable",
+            "FAKE_CP_FAIL_PATH": str(failed),
+        },
         "--set-hostname",
         "roastpilot",
     )
@@ -3058,13 +3165,20 @@ def test_rollback_cp_failure_continues_to_later_members_and_cleanup(
     )
     failed_source = events[failed_cp].split("> <")[2]
     assert "roastpilot-config-rollback" in failed_source
+    for member in (env, yaml, unit)[("env", "yaml", "unit").index(failed_member) + 1 :]:
+        assert any(
+            i > failed_cp and event.startswith("cp <-p>") and event.endswith(f"> <{member}>")
+            for i, event in enumerate(events)
+        )
     reload = max(i for i, event in enumerate(events) if event == "systemctl <daemon-reload>")
     assert reload > failed_cp and any(
         event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event for event in events
     )
     assert not list((root / "tmp").glob("roastpilot-config-rollback.*"))
     after = _live_config_state(root)
-    assert after["env"] == before["env"]
+    assert (
+        after["env"] != before["env"] if failed_member == "env" else after["env"] == before["env"]
+    )
     assert (
         after["yaml"] != before["yaml"]
         if failed_member == "yaml"
@@ -3076,6 +3190,7 @@ def test_rollback_cp_failure_continues_to_later_members_and_cleanup(
         else after["unit"] == before["unit"]
     )
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
+    assert secret not in result.stdout + result.stderr + log.read_text()
 
 
 @pytest.mark.serial
@@ -3311,6 +3426,41 @@ def test_snapshot_discard_failure_reports_the_retained_path_without_secret_conte
     assert env.read_text().startswith(f"OPENROUTER_API_KEY={secret}\n")
     assert events.count("systemctl <daemon-reload>") == 2
     assert snapshot.is_dir()
+
+
+@pytest.mark.serial
+def test_success_snapshot_discard_failure_keeps_committed_configuration(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A post-enable snapshot cleanup failure cannot replay configuration rollback."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    snapshot = root / "tmp/roastpilot-config-rollback.fake"
+    result = _run(
+        environment | {"FAKE_RM_FAIL_PATH": str(snapshot)}, "--set-hostname", "roastpilot"
+    )
+    assert result.returncode == 1
+    assert f"retained configuration snapshot at {snapshot}" in result.stderr
+    assert "manual reconciliation required" in result.stderr
+    assert snapshot.is_dir()
+    assert _live_config_state(root)["env"] is not None
+    assert _live_config_state(root)["yaml"] is not None
+    assert _live_config_state(root)["unit"] is not None
+    events = log.read_text().splitlines()
+    assert f"rm <-rf> <--> <{snapshot}>" in events
+    assert not any(
+        event.startswith(("cp <-p>", "rm <-f>"))
+        and any(
+            name in event
+            for name in (
+                "roastpilot-agent.env",
+                "coffee-roaster-mcp.yaml",
+                "roastpilot-agent.service",
+            )
+        )
+        for event in events
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
