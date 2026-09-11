@@ -3065,6 +3065,43 @@ def test_model_snapshot_digest_failure_precedes_live_destinations(
 
 
 @pytest.mark.serial
+def test_model_promotion_source_cat_failure_preserves_destination_and_cleans_temp(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A failed staged-model source read trips pipefail before destination promotion."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    source = root / "tmp/roastpilot-install.fake/models/onnx/int8/model_quantized.onnx"
+    destination = root / "var/lib/roastpilot-agent/models/onnx/int8/model_quantized.onnx"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"prior-model")
+    result = _run(
+        environment
+        | {
+            "FAKE_CAT_FAIL_PATH": str(source),
+            "FAKE_CAT_FAIL_ON_COUNT": "1",
+            "FAKE_RECORD_CAT": "1",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    events = log.read_text().splitlines()
+    marker = f"FAKE_CAT_FAILURE <{source}>"
+    assert result.returncode != 0 and marker in events
+    failure = events.index(marker)
+    assert destination.read_bytes() == b"prior-model"
+    assert not any(
+        i > failure and event.startswith("mv ") and f"<{destination}>" in event
+        for i, event in enumerate(events)
+    )
+    assert any(
+        i > failure and event.startswith("rm <-f>") and ".roastpilot-model." in event
+        for i, event in enumerate(events)
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
 def test_promoted_model_files_are_mode_0644(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
