@@ -244,17 +244,19 @@ preflight() {
 }
 
 resolve_operator_identity() {
-    local account record_name primary_gid operator_home effective_home
+    local account record_name primary_gid operator_home effective_home tmp_root var_tmp_root
     INVOKING_USER="$(id -un)" || die "cannot determine invoking user"
     INVOKING_GROUP="$(id -gn)" || die "cannot determine invoking group"
     [[ "$INVOKING_USER" =~ ^[a-z_][a-z0-9_-]*$ && "$INVOKING_GROUP" =~ ^[a-z_][a-z0-9_-]*$ && ${#INVOKING_USER} -le 32 && ${#INVOKING_GROUP} -le 32 ]] || die "unsafe operator identity"
     account="$(getent passwd "$INVOKING_USER")" || die "cannot determine invoking home"
     IFS=: read -r record_name _ _ primary_gid _ operator_home _ <<< "$account"
     [[ "$record_name" == "$INVOKING_USER" && "$primary_gid" =~ ^[0-9]+$ && "$primary_gid" != 0 ]] || die "unsafe operator identity"
-    [[ "$operator_home" == /* && "$operator_home" != / && "$operator_home" != // && "/${operator_home#/}/" != *"/."/* && "/${operator_home#/}/" != *"/.."/* && "$operator_home" != */. && "$operator_home" != */.. && "$operator_home" != /tmp && "$operator_home" != /tmp/* && "$operator_home" != /var/tmp && "$operator_home" != /var/tmp/* && "$operator_home" != *[[:space:]]* && "$operator_home" != *['"'\#\$%=\\]* && "$operator_home" != *'@@'* ]] || die "unsafe operator home"
+    [[ "$operator_home" == /* && "$operator_home" != / && "$operator_home" != // && "/${operator_home#/}/" != *"/."/* && "/${operator_home#/}/" != *"/.."/* && "$operator_home" != */. && "$operator_home" != */.. && "$operator_home" != /tmp && "$operator_home" != /tmp/* && "$operator_home" != /var/tmp && "$operator_home" != /var/tmp/* && "$operator_home" != *[[:space:]]* && "$operator_home" != *"'"* && "$operator_home" != *\"* && "$operator_home" != *\#* && "$operator_home" != *\$* && "$operator_home" != *%* && "$operator_home" != *=* && "$operator_home" != *\\* && "$operator_home" != *'@@'* ]] || die "unsafe operator home"
     python3 -c 'import sys, unicodedata; raise SystemExit(0 if any(unicodedata.category(c) in {"Cf", "Zl", "Zp"} for c in sys.argv[1]) else 1)' "$operator_home" && die "unsafe operator home"
     effective_home="$(readlink -f -- "$operator_home")" || die "unsafe operator home"
-    [[ "$effective_home" != /tmp && "$effective_home" != /tmp/* && "$effective_home" != /var/tmp && "$effective_home" != /var/tmp/* ]] || die "unsafe operator home"
+    tmp_root="$(readlink -f -- /tmp)" || die "unsafe operator home"
+    var_tmp_root="$(readlink -f -- /var/tmp)" || die "unsafe operator home"
+    [[ "$effective_home" != /tmp && "$effective_home" != /tmp/* && "$effective_home" != /var/tmp && "$effective_home" != /var/tmp/* && "$effective_home" != "$tmp_root" && "$effective_home" != "$tmp_root"/* && "$effective_home" != "$var_tmp_root" && "$effective_home" != "$var_tmp_root"/* ]] || die "unsafe operator home"
     INVOKING_HOME="$operator_home"
 }
 

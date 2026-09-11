@@ -104,6 +104,7 @@ case "$name" in
       case "${3:-}" in
         show)
           mcp_version="${FAKE_PIPX_MCP_VERSION:-0.2.0}"
+          mcp_shape=normal
           if [[ "$venv" == *-roastpilot-stage-* ]] && [ -n "${FAKE_PIPX_STAGE_MCP_VERSION:-}" ]; then
             mcp_version="$FAKE_PIPX_STAGE_MCP_VERSION"
             printf 'FAKE_STAGE_MCP_VERSION <%s>\\n' "$mcp_version" >> "$FAKE_LOG"
@@ -111,10 +112,17 @@ case "$name" in
             mcp_version="$FAKE_PIPX_RESTORE_MCP_VERSION"
             printf 'FAKE_RESTORE_MCP_VERSION <%s>\\n' "$mcp_version" >> "$FAKE_LOG"
           fi
-          if [ "${FAKE_PIPX_MCP_VERSION_MISSING:-}" = 1 ]; then
+          if [[ "$venv" == *-roastpilot-stage-* ]] && [ -n "${FAKE_PIPX_STAGE_MCP_SHAPE:-}" ]; then
+            mcp_shape="$FAKE_PIPX_STAGE_MCP_SHAPE"
+            printf 'FAKE_STAGE_MCP_SHAPE <%s>\\n' "$mcp_shape" >> "$FAKE_LOG"
+          elif [ -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] && [ "$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")" -ge 2 ] && [ -n "${FAKE_PIPX_RESTORE_MCP_SHAPE:-}" ]; then
+            mcp_shape="$FAKE_PIPX_RESTORE_MCP_SHAPE"
+            printf 'FAKE_RESTORE_MCP_SHAPE <%s>\\n' "$mcp_shape" >> "$FAKE_LOG"
+          fi
+          if [ "$mcp_shape" = missing ] || [ "${FAKE_PIPX_MCP_VERSION_MISSING:-}" = 1 ]; then
             printf 'FAKE_MCP_VERSION_MISSING\\n' >> "$FAKE_LOG"
             printf 'Name: coffee-roaster-mcp\\n'
-          elif [ "${FAKE_PIPX_MCP_VERSION_DUPLICATE:-}" = 1 ]; then
+          elif [ "$mcp_shape" = duplicate ] || [ "${FAKE_PIPX_MCP_VERSION_DUPLICATE:-}" = 1 ]; then
             printf 'FAKE_MCP_VERSION_DUPLICATE\\n' >> "$FAKE_LOG"
             printf 'Name: coffee-roaster-mcp\\nVersion: %s\\nVersion: %s\\n' "$mcp_version" "$mcp_version"
           else
@@ -3220,6 +3228,63 @@ def test_staged_and_restored_mcp_versions_must_match_the_e11_pin(
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize("shape", ["missing", "duplicate"])
+def test_mcp_show_field_shape_is_checked_in_staged_and_restored_venvs(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], shape: str
+) -> None:
+    """Stage and restoration each reject missing or duplicate MCP version fields."""
+    _, environment, log, _ = installer_harness
+    state = Path(environment["FAKE_PIPX_STATE"])
+    _pipx_state(state, "1.2", "roastpilot-agent[pi]==1.2")
+    staged = _run(
+        environment | {"FAKE_PIPX_STAGE_MCP_SHAPE": shape},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    staged_events = log.read_text().splitlines()
+    assert (
+        staged.returncode != 0
+        and "staged replacement lacks required Pi/MCP capability" in staged.stderr
+    )
+    assert f"FAKE_STAGE_MCP_SHAPE <{shape}>" in staged_events
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in staged_events
+    assert any("roastpilot-stage-" in event and "<uninstall>" in event for event in staged_events)
+    assert not _has_roastpilot_agent_lifecycle_mutation(staged_events)
+
+    start = len(log.read_text())
+    restored = _run(
+        environment | {"FAKE_PIPX_FAIL_FINAL_INSTALL": "1", "FAKE_PIPX_RESTORE_MCP_SHAPE": shape},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    restored_events = _delta(log, start)
+    assert restored.returncode != 0 and "prior application could not be restored" in restored.stderr
+    assert f"FAKE_RESTORE_MCP_SHAPE <{shape}>" in restored_events
+    normal_uninstalls = [
+        index
+        for index, event in enumerate(restored_events)
+        if event == "pipx <uninstall> <--> <roastpilot-agent>"
+    ]
+    assert len(normal_uninstalls) == 2
+    restore_install = next(
+        index
+        for index, event in enumerate(restored_events)
+        if event.startswith("pipx <install>") and event.endswith("<roastpilot-agent[pi]==1.2>")
+    )
+    assert normal_uninstalls[1] < restore_install
+    assert any(
+        index > restore_install and event == f"FAKE_RESTORE_MCP_SHAPE <{shape}>"
+        for index, event in enumerate(restored_events)
+    )
+    assert any("roastpilot-stage-" in event and "<uninstall>" in event for event in restored_events)
+    assert not _has_roastpilot_agent_lifecycle_mutation(restored_events)
+
+
+@pytest.mark.serial
 def test_build_tagged_prior_wheel_is_preserved_for_rollback(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -4720,6 +4785,51 @@ def test_unsafe_getent_identity_and_home_shapes_fail_before_installer_effects(
         event.startswith(("apt-get ", "pipx ", "roastpilot-agent ", "systemctl <enable>"))
         for event in log.read_text().splitlines()
     )
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("unsafe", ["'", "\u200b", "\u2028", "\u2029"])
+def test_unsafe_operator_home_characters_fail_before_canonicalisation(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, unsafe: str
+) -> None:
+    """Quoted and Unicode-format homes are rejected before their path can be resolved."""
+    _, environment, log, _ = installer_harness
+    candidate = tmp_path / f"operator{unsafe}home"
+    candidate.mkdir()
+    result = _run(
+        environment | {"FAKE_GETENT_RECORD": f"operator:x:1000:1000::{candidate}:/bin/sh"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    events = log.read_text().splitlines()
+    assert result.returncode != 0 and "unsafe operator home" in result.stderr
+    assert not any(
+        event.startswith("readlink <-f>") and event.endswith(f"<{candidate}>") for event in events
+    )
+    assert not any(event.startswith(("apt-get ", "pipx ")) for event in events)
+
+
+@pytest.mark.serial
+def test_operator_home_symlink_to_canonical_temporary_root_is_rejected(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A lexically safe home cannot resolve beneath either canonical temporary root."""
+    _, environment, log, _ = installer_harness
+    temporary_target = Path("/private/tmp") / f"roastpilot-home-target-{tmp_path.name}"
+    temporary_target.mkdir(exist_ok=True)
+    candidate = tmp_path / "safe-looking-home"
+    candidate.symlink_to(temporary_target)
+    result = _run(
+        environment | {"FAKE_GETENT_RECORD": f"operator:x:1000:1000::{candidate}:/bin/sh"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    events = log.read_text().splitlines()
+    assert result.returncode != 0 and "unsafe operator home" in result.stderr
+    assert any(
+        event.startswith("readlink <-f>") and event.endswith(f"<{candidate}>") for event in events
+    )
+    assert not any(event.startswith(("apt-get ", "pipx ")) for event in events)
 
 
 @pytest.mark.serial
