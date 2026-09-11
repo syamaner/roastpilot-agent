@@ -10,6 +10,7 @@ import pwd
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -381,7 +382,7 @@ UNIT
     case "$content" in
       MODEL) echo "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df  $1" ;;
       CONFIG) echo "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231  $1" ;;
-      *) checksum=$(printf '%s' "$content" | python3 -c 'import sys, zlib; print(f"{zlib.crc32(sys.stdin.buffer.read()) & 0xffffffff:08x}")'); echo "content-digest-$checksum  ${1:--}" ;;
+      *) checksum=$(printf '%s' "$content" | "$FAKE_HARNESS_PYTHON" -c 'import sys, zlib; print(f"{zlib.crc32(sys.stdin.buffer.read()) & 0xffffffff:08x}")'); echo "content-digest-$checksum  ${1:--}" ;;
     esac ;;
   grep)
     if [ "${1:-}" = -Fx ] && [ "${FAKE_GREP_OUTER_ERROR:-}" = 1 ]; then
@@ -491,6 +492,8 @@ esac
     (pipx_bin / "roastpilot-agent").symlink_to(pipx_agent)
     groups = tmp_path / "groups"
     groups.write_text("dialout\n")
+    harness_python = Path(sys.executable).resolve()
+    assert harness_python.is_absolute() and harness_python.is_file()
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -513,6 +516,7 @@ esac
         "FAKE_PIPX_ENV_LOG": str(tmp_path / "pipx-environment.log"),
         "FAKE_GROUPS": str(groups),
         "FAKE_SERVICE_STATE_COUNTER": str(tmp_path / "service-state-counter"),
+        "FAKE_HARNESS_PYTHON": str(harness_python),
         "ROASTPILOT_INSTALL_TEST_MODE": "1",
         "ROASTPILOT_INSTALL_TEST_ROOT": str(install_root),
         "ROASTPILOT_INSTALL_TEST_COMMAND_DIR": str(fake_bin),
@@ -2110,7 +2114,7 @@ def test_model_digests_cover_stage_root_snapshot_and_destination(
 
 
 @pytest.mark.serial
-def test_fake_sha256sum_distinguishes_non_model_content(
+def test_fake_sha256sum_uses_bound_interpreter_and_distinguishes_non_model_content(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
     """The harness digest oracle cannot make atomic-content comparisons vacuous."""
@@ -2120,11 +2124,11 @@ def test_fake_sha256sum_distinguishes_non_model_content(
     first.write_bytes(b"first distinct bytes\n")
     second.write_bytes(b"second distinct bytes\n")
 
-    def fake_digest(path: Path) -> str:
+    def fake_digest(path: Path, digest_environment: dict[str, str] = environment) -> str:
         """Return the fake sha256sum token for one test-owned file."""
         result = subprocess.run(
             [str(fake_bin / "sha256sum"), "--", str(path)],
-            env=environment,
+            env=digest_environment,
             text=True,
             capture_output=True,
             check=False,
@@ -2132,7 +2136,16 @@ def test_fake_sha256sum_distinguishes_non_model_content(
         assert result.returncode == 0
         return result.stdout.split()[0]
 
-    assert fake_digest(first) != fake_digest(second)
+    hostile_bin = tmp_path / "hostile-bin"
+    hostile_bin.mkdir()
+    hostile_marker = tmp_path / "hostile-python-ran"
+    hostile_python = hostile_bin / "python3"
+    hostile_python.write_text(f"#!/bin/sh\nprintf hostile > {hostile_marker}\nexit 99\n")
+    hostile_python.chmod(0o755)
+    hostile_environment = environment | {"PATH": f"{hostile_bin}{os.pathsep}{environment['PATH']}"}
+    assert Path(environment["FAKE_HARNESS_PYTHON"]).is_absolute()
+    assert fake_digest(first, hostile_environment) != fake_digest(second, hostile_environment)
+    assert not hostile_marker.exists()
 
 
 @pytest.mark.serial
