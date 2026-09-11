@@ -10,6 +10,7 @@ import pwd
 import shutil
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -5013,14 +5014,6 @@ def test_symlinked_test_temporary_root_is_canonicalised_before_home_comparison(
             {"FAKE_GETENT_RECORD": "operator:x:1000:0::/home/operator:/bin/sh"},
             "unsafe operator identity",
         ),
-        (
-            {"FAKE_GETENT_RECORD": "operator:x:1000:1000::/tmp/operator:/bin/sh"},
-            "unsafe operator home",
-        ),
-        (
-            {"FAKE_GETENT_RECORD": "operator:x:1000:1000::/var/tmp/operator:/bin/sh"},
-            "unsafe operator home",
-        ),
     ],
 )
 def test_renderer_identity_preconditions_fail_before_effects(
@@ -5035,6 +5028,54 @@ def test_renderer_identity_preconditions_fail_before_effects(
     assert result.returncode != 0 and diagnostic in result.stderr
     assert any(event.startswith(("id ", "getent ")) for event in events)
     assert not any(event.startswith(("apt-get ", "pipx ", "roastpilot-agent ")) for event in events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("temporary_root", ["/tmp", "/var/tmp"])
+def test_operator_home_temporary_root_boundary_differs_by_mode(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, temporary_root: str
+) -> None:
+    """Test mode admits host temporary homes outside fake roots; production rejects them."""
+    _, environment, log, _ = installer_harness
+    try:
+        home = Path(tempfile.mkdtemp(prefix="roastpilot-identity-", dir=temporary_root))
+    except PermissionError:
+        pytest.skip(f"sandbox does not permit a test-owned directory under {temporary_root}")
+    try:
+        record = f"operator:x:1000:1000::{home}:/bin/sh"
+        source = INSTALLER.read_text()
+        sourceable = tmp_path / "install-functions.sh"
+        sourceable.write_text(source.rsplit('main "$@"', 1)[0])
+        test_mode = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; resolve_operator_identity; printf "%s" "$INVOKING_HOME"',
+                "bash",
+                str(sourceable),
+            ],
+            env=environment | {"FAKE_GETENT_RECORD": record},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert test_mode.returncode == 0 and test_mode.stdout == str(home)
+        production = environment | {"FAKE_GETENT_RECORD": record}
+        production.pop("ROASTPILOT_INSTALL_TEST_MODE")
+        rejected = subprocess.run(
+            ["bash", "-c", 'source "$1"; resolve_operator_identity', "bash", str(sourceable)],
+            env=production,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert rejected.returncode != 0 and "unsafe operator home" in rejected.stderr
+        assert not any(
+            event.startswith(("apt-get ", "pipx ", "systemctl "))
+            for event in log.read_text().splitlines()
+        )
+    finally:
+        shutil.rmtree(home)
 
 
 @pytest.mark.serial
