@@ -2084,6 +2084,8 @@ def test_locked_cleanup_entry_failure_names_the_exact_manual_reconciliation_targ
     events = log.read_text().splitlines()
     if entry_failure == "symlink":
         assert f"FAKE_TEST_D_MUTATION <{path}> <{path.parent}> <{entry_probe}>" in events
+    else:
+        assert events.count(f"FAKE_TEST_D_FAILURE <{path}> <{entry_probe}>") == 1
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
