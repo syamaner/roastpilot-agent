@@ -1872,7 +1872,7 @@ def test_directory_recheck_blocks_post_ownership_swap_before_mode_or_promotion(
         if event == f"FAKE_TEST_D_MUTATION <{path}> <{attacker}> <2>"
     )
     assert ownership_index < mutation_index
-    assert f"test <!> <-L> <{path}>" in events
+    assert f"test <-L> <{path}>" in events
     assert not any(event.startswith("chmod ") and f"<{attacker}>" in event for event in events)
     assert not any(
         i > mutation_index
@@ -1925,7 +1925,7 @@ def test_successful_var_unlock_rechecks_after_each_privileged_boundary(
         assert not operator_chowns
     else:
         assert operator_chowns == [next(i for i in operator_chowns if i < mutation)]
-    assert f"test <!> <-L> <{var_dir}>" in events
+    assert f"test <-L> <{var_dir}>" in events
     assert not any(
         i > mutation and event == f"chmod <0700> <--> <{var_dir}>" for i, event in enumerate(events)
     )
@@ -1981,7 +1981,7 @@ def test_cleanup_rechecks_after_ownership_before_restoring_mode(
         if event == f"FAKE_TEST_D_MUTATION <{path}> <{attacker}> <{probe_count}>"
     )
     assert chown < mutation
-    assert f"test <!> <-L> <{path}>" in events
+    assert f"test <-L> <{path}>" in events
     assert not any(
         i > mutation and event == f"chmod <{mode}> <--> <{path}>" for i, event in enumerate(events)
     )
@@ -4739,7 +4739,7 @@ def test_rollback_recheck_failure_is_not_masked_by_later_members(
         | {
             "FAKE_SYSTEMCTL_FAIL": "enable",
             "FAKE_TEST_FAIL_PATH": str(yaml),
-            "FAKE_TEST_FAIL_ON_COUNT": "7",
+            "FAKE_TEST_FAIL_ON_COUNT": "8",
         },
         "--set-hostname",
         "roastpilot",
@@ -4747,11 +4747,9 @@ def test_rollback_recheck_failure_is_not_masked_by_later_members(
     assert result.returncode != 0 and "manual reconciliation required" in result.stderr
     assert f"cannot restore configuration member at {yaml}" in result.stderr
     events = log.read_text().splitlines()
-    yaml_symlink_checks = [
-        i for i, event in enumerate(events) if event == f"test <!> <-L> <{yaml}>"
-    ]
+    yaml_symlink_checks = [i for i, event in enumerate(events) if event == f"test <-L> <{yaml}>"]
     # The snapshot validation and pre-write recheck precede the injected
-    # seventh probe; the final check is the rollback recheck.
+    # eighth probe; the final check is the rollback recheck.
     assert len(yaml_symlink_checks) == 3
     assert f"FAKE_TEST_FAILURE <{yaml}>" in events
     failed_recheck = yaml_symlink_checks[-1]
@@ -4853,7 +4851,7 @@ def test_privileged_write_recheck_reports_its_failed_destination(
     assert result.returncode != 0
     assert diagnostic in result.stderr and str(target) in result.stderr
     events = log.read_text().splitlines()
-    assert f"test <!> <-L> <{target}>" in events
+    assert f"test <-L> <{target}>" in events
     assert f"FAKE_TEST_FAILURE <{target}>" in events
 
 
