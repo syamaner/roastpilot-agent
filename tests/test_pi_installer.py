@@ -3734,7 +3734,10 @@ def test_root_temporary_deregistration_is_exact_under_glob_suffix_mutation(
     harness = """
 ROOT_TEMPORARIES=("$1" "$2")
 remove_root_temporary "$1"
-for temporary in "${ROOT_TEMPORARIES[@]}"; do run_privileged rm -f -- "$temporary"; done
+for temporary in "${ROOT_TEMPORARIES[@]:-}"; do
+    [[ -z "$temporary" ]] && continue
+    run_privileged rm -f -- "$temporary"
+done
 """
     real = tmp_path / "exact-removal.sh"
     real.write_text(source.replace('main "$@"', harness))
