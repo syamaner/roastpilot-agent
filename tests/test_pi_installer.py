@@ -1731,7 +1731,7 @@ def test_managed_etc_recheck_rejects_a_swapped_parent_before_configuration_promo
     assert result.returncode != 0 and "managed configuration directory is unsafe" in result.stderr
     events = log.read_text().splitlines()
     assert f"FAKE_TEST_D_MUTATION <{etc}> <{attacker}> <1>" in events
-    assert f"test <!> <-L> <{etc}>" in events
+    assert f"test <-L> <{etc}>" in events
     assert not any(
         event.startswith(("chown ", "chmod ", "tee ", "mv ")) and f"<{attacker}>" in event
         for event in events
@@ -1739,6 +1739,7 @@ def test_managed_etc_recheck_rejects_a_swapped_parent_before_configuration_promo
     assert not any(
         event.startswith(("tee ", "mv ")) and "roastpilot-agent.env" in event for event in events
     )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial
@@ -1765,7 +1766,7 @@ def test_managed_state_recheck_rejects_a_swapped_parent_before_ownership_change(
     )
     events = log.read_text().splitlines()
     assert f"FAKE_TEST_D_MUTATION <{var_dir}> <{attacker}> <1>" in events
-    assert f"test <!> <-L> <{var_dir}>" in events
+    assert f"test <-L> <{var_dir}>" in events
     assert not any(
         event.startswith(("chown ", "chmod ", "tee ", "mv ")) and f"<{attacker}>" in event
         for event in events
@@ -1794,7 +1795,7 @@ def test_model_parent_recheck_rejects_a_swapped_parent_before_promotion(
     assert result.returncode != 0 and f"model directory is unsafe: {model_parent}" in result.stderr
     events = log.read_text().splitlines()
     assert f"FAKE_TEST_D_MUTATION <{model_parent}> <{attacker}> <1>" in events
-    assert f"test <!> <-L> <{model_parent}>" in events
+    assert f"test <-L> <{model_parent}>" in events
     assert not any(
         event.startswith(("chown ", "chmod ", "tee ", "mv ")) and f"<{attacker}>" in event
         for event in events
