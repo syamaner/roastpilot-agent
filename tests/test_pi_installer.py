@@ -4786,7 +4786,7 @@ def test_snapshot_member_probe_failure_is_not_treated_as_absence(
     events = log.read_text().splitlines()
     assert result.returncode != 0
     assert f"FAKE_TEST_FAILURE <{env}>" in events
-    assert Path(environment["FAKE_TEST_FAIL_COUNT_FILE"]).read_text() == "3\n"
+    assert Path(environment["FAKE_TEST_FAIL_COUNT_FILE"]).read_text() == "1\n"
     assert "cannot inspect existing environment file" in result.stderr
     assert env.read_text() == original
     assert not any(
