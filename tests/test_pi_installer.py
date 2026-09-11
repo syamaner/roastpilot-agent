@@ -316,6 +316,14 @@ UNIT
   install) mode=0644; [ "${1:-}" = -m ] && { mode="$2"; shift 2; }
     [ "${1:-}" = -- ] && shift; cp "$1" "$2"; chmod "$mode" "$2" ;;
   test)
+    if [ "${1:-}" = -L ] && [ "${FAKE_TEST_L_FAIL_PATH:-}" = "${!#}" ]; then
+      count=0; [ ! -e "$FAKE_TEST_L_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_TEST_L_FAIL_COUNT_FILE")
+      count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_TEST_L_FAIL_COUNT_FILE"
+      if [ "${FAKE_TEST_L_FAIL_ON_COUNT:-}" = "$count" ]; then
+        printf 'FAKE_TEST_L_FAILURE <%s> <%s>\\n' "${!#}" "$count" >> "$FAKE_LOG"
+        exit 41
+      fi
+    fi
     if [ "${1:-}" = -d ] && [ "${FAKE_TEST_FAIL_D_PATH:-}" = "${!#}" ]; then
       count=0; [ ! -e "$FAKE_TEST_FAIL_D_COUNT_FILE" ] || count=$(cat "$FAKE_TEST_FAIL_D_COUNT_FILE")
       count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_TEST_FAIL_D_COUNT_FILE"
@@ -510,6 +518,7 @@ esac
         "FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE": str(tmp_path / "test-d-mutation-count"),
         "FAKE_TEST_FAIL_COUNT_FILE": str(tmp_path / "test-fail-count"),
         "FAKE_TEST_FAIL_D_COUNT_FILE": str(tmp_path / "test-d-fail-count"),
+        "FAKE_TEST_L_FAIL_COUNT_FILE": str(tmp_path / "test-l-fail-count"),
         "FAKE_CHMOD_FAIL_COUNT_FILE": str(tmp_path / "chmod-fail-count"),
         "FAKE_CHOWN_FAIL_COUNT_FILE": str(tmp_path / "chown-fail-count"),
         "FAKE_CAT_FAIL_COUNT_FILE": str(tmp_path / "cat-fail-count"),
@@ -5915,6 +5924,52 @@ def test_existing_privileged_reads_fail_closed_before_installer_effects(
     assert marker in events
     assert not any(
         event.startswith(("roastpilot-agent ", "tee ", "mv ", "chmod ", "systemctl "))
+        for event in events[events.index(marker) + 1 :]
+    )
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("relative", "content", "diagnostic"),
+    [
+        (
+            "etc/systemd/system/roastpilot-agent.service",
+            "[Service]\nUser=operator\nGroup=operators\n",
+            "existing managed unit identity is unsafe",
+        ),
+        (
+            "etc/roastpilot-agent/roastpilot-agent.env",
+            "OPENROUTER_API_KEY=retained\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n",
+            "existing environment file is unsafe",
+        ),
+    ],
+)
+def test_indeterminate_direct_member_symlink_probe_fails_closed(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    relative: str,
+    content: str,
+    diagnostic: str,
+) -> None:
+    """A direct helper positive symlink probe cannot be treated as ordinary false."""
+    _, environment, log, _ = installer_harness
+    target = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / relative
+    target.parent.mkdir(parents=True)
+    target.write_text(content)
+    result = _run(
+        environment
+        | {
+            "FAKE_TEST_L_FAIL_PATH": str(target),
+            "FAKE_TEST_L_FAIL_ON_COUNT": "1",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    events = log.read_text().splitlines()
+    marker = f"FAKE_TEST_L_FAILURE <{target}> <1>"
+    assert result.returncode != 0 and diagnostic in result.stderr
+    assert marker in events
+    assert not any(
+        event.startswith(("cat ", "tee ", "mv ", "chmod "))
         for event in events[events.index(marker) + 1 :]
     )
 
