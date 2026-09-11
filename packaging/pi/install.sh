@@ -353,10 +353,9 @@ verify_no_service_dropins() {
 }
 
 privileged_member_presence() {
-    local member="$1"
-    if run_privileged test -e "$member" || run_privileged test -L "$member"; then
-        return 0
-    fi
+    local member="$1" status
+    if run_privileged test -e "$member"; then return 0; else status=$?; [[ "$status" == 1 ]] || return 2; fi
+    if run_privileged test -L "$member"; then return 0; else status=$?; [[ "$status" == 1 ]] || return 2; fi
     run_privileged test ! -e "$member" || return 2
     run_privileged test ! -L "$member" || return 2
     return 1
@@ -632,7 +631,7 @@ remove_root_temporary() {
 }
 
 replace_application_safely() {
-    local prior_spec="$1" package_spec="$2" suffix="-roastpilot-stage-$$" restoration_failed=0
+    local prior_spec="$1" package_spec="$2" suffix="-roastpilot-stage-$$" restoration_failed=0 status
     # Prove a separate pipx environment can supply the required dependency
     # before removing the known-working application environment.
     STAGED_PIPX_VENV="roastpilot-agent$suffix"
@@ -649,9 +648,11 @@ replace_application_safely() {
         die "roastpilot-agent is not safely inactive; end any run safely, stop the service only when idle, then rerun the installer; never restart during a roast"
     fi
     APPLICATION_CHANGED=1
-    if ! pipx_command uninstall -- roastpilot-agent; then
+    if pipx_command uninstall -- roastpilot-agent; then :; else
+        status=$?
         cleanup_staged_pipx || true
-        die "cannot remove prior application after staging replacement"
+        printf '%s\n' "install failed: cannot remove prior application after staging replacement" >&2
+        return "$status"
     fi
     if ! pipx_command install -- "$package_spec" || ! verify_pi_capability; then
         pipx_command uninstall -- roastpilot-agent || true
