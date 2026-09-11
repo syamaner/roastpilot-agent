@@ -369,8 +369,12 @@ UNIT
       *) echo "content-digest  $1" ;;
     esac ;;
   grep)
-    if [ "${FAKE_GREP_ERROR:-}" = 1 ]; then
-      printf 'FAKE_GREP_ERROR\n' >> "$FAKE_LOG"
+    if [ "${1:-}" = -Fx ] && [ "${FAKE_GREP_OUTER_ERROR:-}" = 1 ]; then
+      printf 'FAKE_GREP_OUTER_ERROR\n' >> "$FAKE_LOG"
+      exit 2
+    fi
+    if [ "${1:-}" = -Fvx ] && [ "${FAKE_GREP_INNER_ERROR:-}" = 1 ]; then
+      printf 'FAKE_GREP_INNER_ERROR\n' >> "$FAKE_LOG"
       exit 2
     fi
     /usr/bin/grep "$@" ;;
@@ -3591,16 +3595,26 @@ def test_local_wheelhouse_capture_failure_aborts_before_uninstall(
 
 
 @pytest.mark.serial
-def test_direct_reference_grep_error_aborts_before_uninstall(
-    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+@pytest.mark.parametrize(
+    ("injection", "marker"),
+    [
+        ({"FAKE_GREP_OUTER_ERROR": "1"}, "FAKE_GREP_OUTER_ERROR"),
+        ({"FAKE_GREP_INNER_ERROR": "1"}, "FAKE_GREP_INNER_ERROR"),
+    ],
+)
+def test_direct_reference_outer_or_inner_grep_error_aborts_before_uninstall(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    injection: dict[str, str],
+    marker: str,
 ) -> None:
-    """A grep read error cannot be treated as an absent direct reference."""
+    """Both direct-reference grep branches fail closed before prior removal."""
     _, environment, log, _ = installer_harness
     wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
     wheel.write_text("wheel")
     _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
     result = _run(
-        environment | {"FAKE_PIPX_FREEZE_DIRECT_REFERENCE": str(wheel), "FAKE_GREP_ERROR": "1"},
+        environment | {"FAKE_PIPX_FREEZE_DIRECT_REFERENCE": str(wheel)} | injection,
         "--set-hostname",
         "roastpilot",
         "--version",
@@ -3608,7 +3622,7 @@ def test_direct_reference_grep_error_aborts_before_uninstall(
     )
     events = log.read_text().splitlines()
     assert result.returncode != 0 and "cannot preserve exact prior application" in result.stderr
-    assert "FAKE_GREP_ERROR" in events
+    assert marker in events
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
 
 
