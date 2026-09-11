@@ -254,8 +254,13 @@ resolve_operator_identity() {
     [[ "$operator_home" == /* && "$operator_home" != / && "$operator_home" != // && "/${operator_home#/}/" != *"/."/* && "/${operator_home#/}/" != *"/.."/* && "$operator_home" != */. && "$operator_home" != */.. && "$operator_home" != /tmp && "$operator_home" != /tmp/* && "$operator_home" != /var/tmp && "$operator_home" != /var/tmp/* && "$operator_home" != *[[:space:]]* && "$operator_home" != *"'"* && "$operator_home" != *\"* && "$operator_home" != *\#* && "$operator_home" != *\$* && "$operator_home" != *%* && "$operator_home" != *=* && "$operator_home" != *\\* && "$operator_home" != *'@@'* ]] || die "unsafe operator home"
     python3 -c 'import sys, unicodedata; raise SystemExit(1 if any(unicodedata.category(c) in {"Cf", "Zl", "Zp"} for c in sys.argv[1]) else 0)' "$operator_home" || die "unsafe operator home"
     effective_home="$(readlink -f -- "$operator_home")" || die "unsafe operator home"
-    tmp_root="$(readlink -f -- /tmp)" || die "unsafe operator home"
-    var_tmp_root="$(readlink -f -- /var/tmp)" || die "unsafe operator home"
+    if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" == "1" ]]; then
+        tmp_root="$(rooted_path /tmp)"
+        var_tmp_root="$(rooted_path /var/tmp)"
+    else
+        tmp_root="$(readlink -f -- /tmp)" || die "unsafe operator home"
+        var_tmp_root="$(readlink -f -- /var/tmp)" || die "unsafe operator home"
+    fi
     [[ "$effective_home" != /tmp && "$effective_home" != /tmp/* && "$effective_home" != /var/tmp && "$effective_home" != /var/tmp/* && "$effective_home" != "$tmp_root" && "$effective_home" != "$tmp_root"/* && "$effective_home" != "$var_tmp_root" && "$effective_home" != "$var_tmp_root"/* ]] || die "unsafe operator home"
     INVOKING_HOME="$operator_home"
 }
