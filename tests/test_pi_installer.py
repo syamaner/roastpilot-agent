@@ -5002,6 +5002,42 @@ def test_snapshot_member_probe_failure_is_not_treated_as_absence(
 
 
 @pytest.mark.serial
+def test_snapshot_unsafe_existing_yaml_is_not_treated_as_absence(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A live YAML symlink fails snapshotting without changing retained members."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    etc, unit_dir = root / "etc/roastpilot-agent", root / "etc/systemd/system"
+    etc.mkdir(parents=True)
+    unit_dir.mkdir(parents=True)
+    env, yaml, unit = (
+        etc / "roastpilot-agent.env",
+        etc / "coffee-roaster-mcp.yaml",
+        unit_dir / "roastpilot-agent.service",
+    )
+    env.write_bytes(
+        b"OPENROUTER_API_KEY=secret\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+    )
+    unit.write_bytes(b"[Service]\nUser=operator\nGroup=operators\n")
+    target = tmp_path / "unsafe-yaml"
+    target.write_bytes(b"unsafe\n")
+    yaml.symlink_to(target)
+    before = (env.read_bytes(), unit.read_bytes())
+    result = _run(environment, "--set-hostname", "roastpilot")
+    events = log.read_text().splitlines()
+    assert result.returncode != 0 and "destination traverses a symlink" in result.stderr
+    assert env.read_bytes() == before[0] and unit.read_bytes() == before[1] and yaml.is_symlink()
+    assert not any(
+        event.startswith(("tee ", "mv ", "rm <-f>"))
+        and any(str(path) in event for path in (env, yaml, unit))
+        for event in events
+    )
+    assert not list((root / "tmp").glob("roastpilot-config-rollback.*"))
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
 def test_rollback_refuses_member_changed_to_symlink_and_continues(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
