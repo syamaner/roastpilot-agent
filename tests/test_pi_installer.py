@@ -2604,7 +2604,7 @@ def test_port_range_endpoints_are_inclusive_and_reach_rendered_environment(
     installer_harness: tuple[Path, dict[str, str], Path, Path], port: str
 ) -> None:
     """Both inclusive port endpoints survive validation and reach rendered output."""
-    _, environment, _, _ = installer_harness
+    _, environment, log, _ = installer_harness
     result = _run(environment, "--set-hostname", "roastpilot", "--port", port)
     assert result.returncode == 0, result.stderr
     env_file = (
@@ -2670,6 +2670,8 @@ def test_upfront_test_command_ownership_rejects_earlier_chmod_shadow_without_exe
         "roastpilot",
     )
     assert result.returncode != 0
+    assert "model source digest mismatch" in result.stderr
+    assert any(line.startswith("MODEL_FETCH <") for line in log.read_text().splitlines())
     assert "install failed: test command directory does not own chmod" in result.stderr
     assert not rogue_marker.exists()
     assert not log.exists()
@@ -5980,13 +5982,18 @@ def test_existing_privileged_reads_fail_closed_before_installer_effects(
     target = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / relative
     target.parent.mkdir(parents=True)
     target.write_text(content)
-    injected = environment | {"FAKE_CAT_FAIL_PATH": str(target), "FAKE_CAT_FAIL_ON_COUNT": "1"}
+    injected = environment | {
+        "FAKE_CAT_FAIL_PATH": str(target),
+        "FAKE_CAT_FAIL_ON_COUNT": "1",
+        "FAKE_RECORD_CAT": "1",
+    }
     result = _run(injected, "--set-hostname", "roastpilot")
     events = log.read_text().splitlines()
     assert result.returncode != 0
     assert diagnostic in result.stderr
     marker = f"FAKE_CAT_FAILURE <{target}>"
     assert marker in events
+    assert f"cat <--> <{target}>" in events
     assert not any(
         event.startswith(("roastpilot-agent ", "tee ", "mv ", "chmod ", "systemctl "))
         for event in events[events.index(marker) + 1 :]
