@@ -2638,7 +2638,7 @@ def test_port_range_endpoints_are_inclusive_and_reach_rendered_environment(
     installer_harness: tuple[Path, dict[str, str], Path, Path], port: str
 ) -> None:
     """Both inclusive port endpoints survive validation and reach rendered output."""
-    _, environment, log, _ = installer_harness
+    _, environment, _, _ = installer_harness
     result = _run(environment, "--set-hostname", "roastpilot", "--port", port)
     assert result.returncode == 0, result.stderr
     env_file = (
