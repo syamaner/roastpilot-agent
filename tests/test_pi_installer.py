@@ -1632,9 +1632,9 @@ def test_all_systemd_dropin_locations_refuse_before_unit_write_or_enable(
     dropin = root / relative
     if as_symlink:
         target = tmp_path / "dropin-target"
-        target.mkdir()
         dropin.parent.mkdir(parents=True)
         dropin.symlink_to(target, target_is_directory=True)
+        assert not target.exists() and dropin.is_symlink()
     else:
         dropin.mkdir(parents=True)
     start = len(log.read_text()) if log.exists() else 0
@@ -2565,8 +2565,8 @@ def test_additional_systemd_override_locations_fail_before_effects(
     target.parent.mkdir(parents=True)
     if as_symlink:
         external = tmp_path / "external-unit"
-        external.write_text("[Service]\n")
         target.symlink_to(external)
+        assert not external.exists() and target.is_symlink()
     else:
         target.write_text("[Service]\n")
     result = _run(environment, "--set-hostname", "roastpilot")
