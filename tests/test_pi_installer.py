@@ -111,7 +111,15 @@ case "$name" in
             mcp_version="$FAKE_PIPX_RESTORE_MCP_VERSION"
             printf 'FAKE_RESTORE_MCP_VERSION <%s>\\n' "$mcp_version" >> "$FAKE_LOG"
           fi
-          printf 'Name: coffee-roaster-mcp\\nVersion: %s\\n' "$mcp_version" ;;
+          if [ "${FAKE_PIPX_MCP_VERSION_MISSING:-}" = 1 ]; then
+            printf 'FAKE_MCP_VERSION_MISSING\\n' >> "$FAKE_LOG"
+            printf 'Name: coffee-roaster-mcp\\n'
+          elif [ "${FAKE_PIPX_MCP_VERSION_DUPLICATE:-}" = 1 ]; then
+            printf 'FAKE_MCP_VERSION_DUPLICATE\\n' >> "$FAKE_LOG"
+            printf 'Name: coffee-roaster-mcp\\nVersion: %s\\nVersion: %s\\n' "$mcp_version" "$mcp_version"
+          else
+            printf 'Name: coffee-roaster-mcp\\nVersion: %s\\n' "$mcp_version"
+          fi ;;
         freeze)
           printf 'roastpilot-agent==%s\\ncoffee-roaster-mcp==%s\\n' "${FAKE_PIPX_FREEZE_VERSION:-1.2}" "${FAKE_PIPX_MCP_VERSION:-0.2.0}" ;;
         wheel)
@@ -705,9 +713,9 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
         "COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml",
     ]
     commands = log.read_text().splitlines()
-    assert [line.split(" ", 1)[0] for line in commands].index("apt-get") < [
-        line.split(" ", 1)[0] for line in commands
-    ].index("pipx")
+    assert commands.index("apt-get <install> <-y> <libportaudio2> <pipx> <avahi-daemon>") < next(
+        index for index, command in enumerate(commands) if command.startswith("pipx <install>")
+    )
     assert not any("systemctl <start> <roastpilot-agent>" in line for line in commands)
     var_dir = root / "var/lib/roastpilot-agent"
     assert stat.S_IMODE(var_dir.stat().st_mode) == 0o700
@@ -2969,6 +2977,23 @@ def test_xtrace_is_disabled_before_preserving_an_existing_api_key(
 
 
 @pytest.mark.serial
+def test_xtrace_is_disabled_before_reading_an_inherited_installer_api_key(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Inherited installer credentials are not disclosed by a bash -x invocation."""
+    _, environment, log, _ = installer_harness
+    fixture_value = "xtrace-inherited-fixture"
+    result = _run(
+        environment | {"ROASTPILOT_INSTALL_API_KEY": fixture_value},
+        "--set-hostname",
+        "roastpilot",
+        xtrace=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert fixture_value not in result.stdout + result.stderr + log.read_text()
+
+
+@pytest.mark.serial
 @pytest.mark.parametrize("mutation", ["bad-digest", "missing-peer", "symlink", "incomplete"])
 def test_only_complete_verified_installed_models_are_reused(
     installer_harness: tuple[Path, dict[str, str], Path, Path], mutation: str
@@ -3101,6 +3126,27 @@ def test_mcp_version_must_match_the_e11_pin_before_effects(
     assert result.returncode != 0 and "Pi/MCP" in result.stderr
     assert "pipx <runpip> <roastpilot-agent> <show> <coffee-roaster-mcp>" in log.read_text()
     assert "roastpilot-agent <appliance" not in log.read_text()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("injection", "marker"),
+    [
+        ("FAKE_PIPX_MCP_VERSION_MISSING", "FAKE_MCP_VERSION_MISSING"),
+        ("FAKE_PIPX_MCP_VERSION_DUPLICATE", "FAKE_MCP_VERSION_DUPLICATE"),
+    ],
+)
+def test_mcp_show_requires_exactly_one_version_field(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], injection: str, marker: str
+) -> None:
+    """Missing or ambiguous pip-show version evidence fails before appliance work."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+    result = _run(environment | {injection: "1"}, "--set-hostname", "roastpilot")
+    events = log.read_text().splitlines()
+    assert result.returncode != 0 and "Pi/MCP" in result.stderr
+    assert marker in events
+    assert not any(event.startswith(("apt-get ", "roastpilot-agent ")) for event in events)
 
 
 @pytest.mark.serial
@@ -3409,7 +3455,8 @@ def test_final_root_probe_failure_restores_prior_local_wheel_before_exit(
     assert result.returncode != 0
     assert "FAKE_FINAL_ROOT_PROBE_FAILURE" in events
     assert any(
-        event == f"pipx <install> <--> <{artifact / (wheel.name + '[pi]')}>" for event in events
+        event.endswith(f"<{artifact / (wheel.name + '[pi]')}>") and "<--pip-args>" in event
+        for event in events
     )
     assert artifact.is_dir() and preserved.is_file()
     assert (
@@ -4575,11 +4622,45 @@ def test_unsafe_getent_identity_and_home_shapes_fail_before_installer_effects(
     """Every guarded passwd identity/home shape is rejected before installer mutations."""
     _, environment, log, _ = installer_harness
     result = _run(environment | {"FAKE_GETENT_RECORD": record}, "--set-hostname", "roastpilot")
-    assert result.returncode != 0 and "unsafe operator home" in result.stderr
+    assert result.returncode != 0 and "unsafe operator" in result.stderr
     assert not any(
         event.startswith(("apt-get ", "pipx ", "roastpilot-agent ", "systemctl <enable>"))
         for event in log.read_text().splitlines()
     )
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("override", "diagnostic"),
+    [
+        ({"FAKE_ID_USER": "a" * 33}, "unsafe operator identity"),
+        ({"FAKE_ID_GROUP": "a" * 33}, "unsafe operator identity"),
+        (
+            {"FAKE_GETENT_RECORD": "operator:x:1000:0::/home/operator:/bin/sh"},
+            "unsafe operator identity",
+        ),
+        (
+            {"FAKE_GETENT_RECORD": "operator:x:1000:1000::/tmp/operator:/bin/sh"},
+            "unsafe operator home",
+        ),
+        (
+            {"FAKE_GETENT_RECORD": "operator:x:1000:1000::/var/tmp/operator:/bin/sh"},
+            "unsafe operator home",
+        ),
+    ],
+)
+def test_renderer_identity_preconditions_fail_before_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    override: dict[str, str],
+    diagnostic: str,
+) -> None:
+    """Renderer-only identity constraints are enforced before package mutation."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment | override, "--set-hostname", "roastpilot")
+    events = log.read_text().splitlines()
+    assert result.returncode != 0 and diagnostic in result.stderr
+    assert any(event.startswith(("id ", "getent ")) for event in events)
+    assert not any(event.startswith(("apt-get ", "pipx ", "roastpilot-agent ")) for event in events)
 
 
 @pytest.mark.serial

@@ -244,13 +244,14 @@ preflight() {
 }
 
 resolve_operator_identity() {
-    local account record_name operator_home
+    local account record_name primary_gid operator_home
     INVOKING_USER="$(id -un)" || die "cannot determine invoking user"
     INVOKING_GROUP="$(id -gn)" || die "cannot determine invoking group"
-    [[ "$INVOKING_USER" =~ ^[a-z_][a-z0-9_-]*$ && "$INVOKING_GROUP" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "unsafe operator identity"
+    [[ "$INVOKING_USER" =~ ^[a-z_][a-z0-9_-]*$ && "$INVOKING_GROUP" =~ ^[a-z_][a-z0-9_-]*$ && ${#INVOKING_USER} -le 32 && ${#INVOKING_GROUP} -le 32 ]] || die "unsafe operator identity"
     account="$(getent passwd "$INVOKING_USER")" || die "cannot determine invoking home"
-    IFS=: read -r record_name _ _ _ _ operator_home _ <<< "$account"
-    [[ "$record_name" == "$INVOKING_USER" && "$operator_home" == /* && "$operator_home" != / && "$operator_home" != // && "/${operator_home#/}/" != *"/."/* && "/${operator_home#/}/" != *"/.."/* && "$operator_home" != */. && "$operator_home" != */.. && "$operator_home" != *[[:space:]]* && "$operator_home" != *['"'\#\$%=\\]* && "$operator_home" != *'@@'* ]] || die "unsafe operator home"
+    IFS=: read -r record_name _ _ primary_gid _ operator_home _ <<< "$account"
+    [[ "$record_name" == "$INVOKING_USER" && "$primary_gid" =~ ^[0-9]+$ && "$primary_gid" != 0 ]] || die "unsafe operator identity"
+    [[ "$operator_home" == /* && "$operator_home" != / && "$operator_home" != // && "/${operator_home#/}/" != *"/."/* && "/${operator_home#/}/" != *"/.."/* && "$operator_home" != */. && "$operator_home" != */.. && "$operator_home" != /tmp && "$operator_home" != /tmp/* && "$operator_home" != /var/tmp && "$operator_home" != /var/tmp/* && "$operator_home" != *[[:space:]]* && "$operator_home" != *['"'\#\$%=\\]* && "$operator_home" != *'@@'* ]] || die "unsafe operator home"
     INVOKING_HOME="$operator_home"
 }
 
@@ -432,8 +433,18 @@ create_restore_artifact_dir() {
     RESTORE_ARTIFACT_VALIDATED=1
 }
 
+capture_prior_wheelhouse() {
+    local version="$1" requirements
+    requirements="$RESTORE_ARTIFACT_DIR/requirements.txt"
+    pipx_command runpip roastpilot-agent freeze --all > "$requirements" || die "cannot preserve exact prior application"
+    grep -Fx "roastpilot-agent==$version" "$requirements" >/dev/null || die "cannot preserve exact prior application"
+    pipx_command runpip roastpilot-agent wheel --wheel-dir "$RESTORE_ARTIFACT_DIR" -r "$requirements" || die "cannot preserve exact prior application"
+    compgen -G "$RESTORE_ARTIFACT_DIR/*.whl" >/dev/null || die "cannot preserve exact prior application"
+    RESTORABLE_PRIOR_PIP_ARGS="--no-index --find-links=$RESTORE_ARTIFACT_DIR"
+}
+
 prepare_restorable_prior() {
-    local state="$1" package version source source_basename wheel_tail canonical requirements reported_version installed_prefix prior_metadata
+    local state="$1" package version source source_basename wheel_tail canonical reported_version installed_prefix prior_metadata
     prior_metadata="$(printf '%s' "$state" | python3 -c '
 import json, sys
 try:
@@ -462,31 +473,22 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             create_restore_artifact_dir
             [[ -f "$source" && ! -L "$source" ]] || die "cannot preserve exact prior local wheel"
             cp -- "$source" "$RESTORE_ARTIFACT_DIR/$source_basename"
+            capture_prior_wheelhouse "$version"
             RESTORABLE_PRIOR_SPEC="$RESTORE_ARTIFACT_DIR/${source_basename}[pi]"
             ;;
         roastpilot-agent|roastpilot-agent\[pi\])
             [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ ]] || die "cannot preserve exact prior application"
             create_restore_artifact_dir
-            requirements="$RESTORE_ARTIFACT_DIR/requirements.txt"
-            pipx_command runpip roastpilot-agent freeze --all > "$requirements" || die "cannot preserve exact prior application"
-            grep -Fx "roastpilot-agent==$version" "$requirements" >/dev/null || die "cannot preserve exact prior application"
-            pipx_command runpip roastpilot-agent wheel --wheel-dir "$RESTORE_ARTIFACT_DIR" -r "$requirements" || die "cannot preserve exact prior application"
-            compgen -G "$RESTORE_ARTIFACT_DIR/*.whl" >/dev/null || die "cannot preserve exact prior application"
+            capture_prior_wheelhouse "$version"
             RESTORABLE_PRIOR_SPEC="roastpilot-agent[pi]==$version"
-            RESTORABLE_PRIOR_PIP_ARGS="--no-index --find-links=$RESTORE_ARTIFACT_DIR"
             ;;
         roastpilot-agent\[pi\]==*)
             installed_prefix='roastpilot-agent[pi]=='
             reported_version="${package#"$installed_prefix"}"
             [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ && "$reported_version" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ && "$reported_version" == "$version" ]] || die "cannot preserve exact prior application"
             create_restore_artifact_dir
-            requirements="$RESTORE_ARTIFACT_DIR/requirements.txt"
-            pipx_command runpip roastpilot-agent freeze --all > "$requirements" || die "cannot preserve exact prior application"
-            grep -Fx "roastpilot-agent==$version" "$requirements" >/dev/null || die "cannot preserve exact prior application"
-            pipx_command runpip roastpilot-agent wheel --wheel-dir "$RESTORE_ARTIFACT_DIR" -r "$requirements" || die "cannot preserve exact prior application"
-            compgen -G "$RESTORE_ARTIFACT_DIR/*.whl" >/dev/null || die "cannot preserve exact prior application"
+            capture_prior_wheelhouse "$version"
             RESTORABLE_PRIOR_SPEC="roastpilot-agent[pi]==$version"
-            RESTORABLE_PRIOR_PIP_ARGS="--no-index --find-links=$RESTORE_ARTIFACT_DIR"
             ;;
         *) die "cannot preserve exact prior application" ;;
     esac
@@ -504,6 +506,13 @@ verify_pi_capability() {
         esac
     done <<< "$metadata"
     [[ "$version_seen" == 1 && "$version" == "0.2.0" ]]
+}
+
+require_pi_capability() {
+    local diagnostic="$1"
+    verify_pi_capability && return 0
+    [[ -z "${PIPX_VENV_ROOT_ERROR:-}" ]] || die "$PIPX_VENV_ROOT_ERROR"
+    die "$diagnostic"
 }
 
 install_restorable_prior() {
@@ -581,23 +590,30 @@ install_application() {
         FRESH_APPLICATION_CLEANUP_REQUIRED=1
         pipx_command install -- "$package_spec"
         APPLICATION_CHANGED=1
-        verify_pi_capability || die "installed roastpilot-agent lacks required Pi/MCP capability"
+        require_pi_capability "installed roastpilot-agent lacks required Pi/MCP capability"
         FRESH_APPLICATION_CLEANUP_REQUIRED=0
         return
     fi
     if [[ -z "$REQUESTED_WHEEL$REQUESTED_VERSION" ]]; then
-        verify_pi_capability || die "installed roastpilot-agent lacks required Pi/MCP capability"
+        require_pi_capability "installed roastpilot-agent lacks required Pi/MCP capability"
         return
     fi
     if [[ -n "$REQUESTED_WHEEL" ]]; then
-        if pipx_matches "$state" wheel "${REQUESTED_WHEEL}[pi]"; then verify_pi_capability || die "installed roastpilot-agent lacks required Pi/MCP capability"; return; else match_status=$?; fi
+        if pipx_matches "$state" wheel "${REQUESTED_WHEEL}[pi]"; then require_pi_capability "installed roastpilot-agent lacks required Pi/MCP capability"; return; else match_status=$?; fi
     else
-        if pipx_matches "$state" version "$REQUESTED_VERSION"; then verify_pi_capability || die "installed roastpilot-agent lacks required Pi/MCP capability"; return; else match_status=$?; fi
+        if pipx_matches "$state" version "$REQUESTED_VERSION"; then require_pi_capability "installed roastpilot-agent lacks required Pi/MCP capability"; return; else match_status=$?; fi
     fi
     [[ "$match_status" == 1 ]] || die "invalid pipx package metadata"
     prepare_restorable_prior "$state"
     prior_spec="$RESTORABLE_PRIOR_SPEC"
     replace_application_safely "$prior_spec" "$package_spec"
+}
+
+verify_existing_pi_capability_before_package_install() {
+    local state
+    state="$(installed_pipx_state)"
+    [[ "$state" == "absent" || -n "$REQUESTED_WHEEL$REQUESTED_VERSION" ]] && return 0
+    require_pi_capability "installed roastpilot-agent lacks required Pi/MCP capability"
 }
 
 probe_pipx_venv_root() {
@@ -1060,6 +1076,7 @@ main() {
     verify_existing_unit_identity
     preserve_existing_api_key
     require_agent_inactive
+    verify_existing_pi_capability_before_package_install
     run_privileged apt-get install -y libportaudio2 pipx avahi-daemon
     install_application
     resolve_appliance_executable
