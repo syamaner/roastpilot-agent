@@ -4751,21 +4751,29 @@ def test_rollback_recheck_failure_is_not_masked_by_later_members(
     # The snapshot validation and pre-write recheck precede the injected
     # eighth probe; the final check is the rollback recheck.
     assert len(yaml_symlink_checks) == 3
-    assert f"FAKE_TEST_FAILURE <{yaml}>" in events
-    failed_recheck = yaml_symlink_checks[-1]
+    marker = f"FAKE_TEST_FAILURE <{yaml}>"
+    assert events.count(marker) == 1
+    failed_recheck = events.index(marker)
     unit_restore = next(
         i
         for i, event in enumerate(events)
         if i > failed_recheck and event.startswith("cp <-p>") and event.endswith(f"> <{unit}>")
     )
     assert unit_restore > failed_recheck
+    reload = next(
+        i
+        for i, event in enumerate(events)
+        if i > failed_recheck and event == "systemctl <daemon-reload>"
+    )
     assert any(
-        event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event for event in events
+        i > reload and event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event
+        for i, event in enumerate(events)
     )
     assert not list((root / "tmp").glob("roastpilot-config-rollback.*"))
     assert _live_config_state(root)["env"] == before["env"]
     assert _live_config_state(root)["unit"] == before["unit"]
     assert _live_config_state(root)["yaml"] != before["yaml"]
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial
@@ -4851,8 +4859,17 @@ def test_privileged_write_recheck_reports_its_failed_destination(
     assert result.returncode != 0
     assert diagnostic in result.stderr and str(target) in result.stderr
     events = log.read_text().splitlines()
-    assert f"test <-L> <{target}>" in events
-    assert f"FAKE_TEST_FAILURE <{target}>" in events
+    marker = f"FAKE_TEST_FAILURE <{target}>"
+    assert events.count(marker) == 1
+    failure = events.index(marker)
+    assert any(i < failure and event == f"test <-L> <{target}>" for i, event in enumerate(events))
+    assert not any(
+        i > failure
+        and event.startswith(("mv ", "tee ", "chown ", "chmod "))
+        and f"<{target}>" in event
+        for i, event in enumerate(events)
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial
