@@ -5003,7 +5003,7 @@ def test_snapshot_member_probe_failure_is_not_treated_as_absence(
 
 @pytest.mark.serial
 def test_snapshot_unsafe_existing_yaml_is_not_treated_as_absence(
-    installer_harness: tuple[Path, dict[str, str], Path, Path]
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
     """A live non-regular YAML member fails snapshotting without replacement."""
     _, environment, log, _ = installer_harness
@@ -5024,13 +5024,58 @@ def test_snapshot_unsafe_existing_yaml_is_not_treated_as_absence(
     before = (env.read_bytes(), unit.read_bytes())
     result = _run(environment, "--set-hostname", "roastpilot")
     events = log.read_text().splitlines()
-    assert result.returncode != 0 and "existing configuration destination is unsafe" in result.stderr
+    assert (
+        result.returncode != 0 and "existing configuration destination is unsafe" in result.stderr
+    )
     assert str(yaml) in result.stderr
     assert env.read_bytes() == before[0] and unit.read_bytes() == before[1] and yaml.is_dir()
     assert not any(
         event.startswith(("tee ", "mv ", "rm <-f>"))
         and any(str(path) in event for path in (env, yaml, unit))
         for event in events
+    )
+    assert not list((root / "tmp").glob("roastpilot-config-rollback.*"))
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_snapshot_indeterminate_existing_yaml_is_not_treated_as_absence(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """An indeterminate YAML presence probe aborts snapshotting without live mutation."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    etc, unit_dir = root / "etc/roastpilot-agent", root / "etc/systemd/system"
+    etc.mkdir(parents=True)
+    unit_dir.mkdir(parents=True)
+    env, yaml, unit = (
+        etc / "roastpilot-agent.env",
+        etc / "coffee-roaster-mcp.yaml",
+        unit_dir / "roastpilot-agent.service",
+    )
+    env.write_bytes(
+        b"OPENROUTER_API_KEY=secret\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+    )
+    yaml.write_bytes(b"prior-yaml\n")
+    unit.write_bytes(b"[Service]\nUser=operator\nGroup=operators\n")
+    before = (env.read_bytes(), yaml.read_bytes(), unit.read_bytes())
+    result = _run(
+        environment | {"FAKE_TEST_FAIL_PATH": str(yaml), "FAKE_TEST_FAIL_ON_COUNT": "1"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    events = log.read_text().splitlines()
+    marker = f"FAKE_TEST_FAILURE <{yaml}>"
+    assert result.returncode != 0
+    assert f"cannot inspect existing configuration destination at {yaml}" in result.stderr
+    assert events.count(marker) == 1
+    marker_index = events.index(marker)
+    assert (env.read_bytes(), yaml.read_bytes(), unit.read_bytes()) == before
+    assert not any(
+        i > marker_index
+        and event.startswith(("rm <-f>", "tee ", "mv ", "cp <-p>"))
+        and any(str(path) in event for path in (env, yaml, unit))
+        for i, event in enumerate(events)
     )
     assert not list((root / "tmp").glob("roastpilot-config-rollback.*"))
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
