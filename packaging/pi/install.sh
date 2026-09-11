@@ -252,7 +252,7 @@ resolve_operator_identity() {
     IFS=: read -r record_name _ _ primary_gid _ operator_home _ <<< "$account"
     [[ "$record_name" == "$INVOKING_USER" && "$primary_gid" =~ ^[0-9]+$ && "$primary_gid" != 0 ]] || die "unsafe operator identity"
     [[ "$operator_home" == /* && "$operator_home" != / && "$operator_home" != // && "/${operator_home#/}/" != *"/."/* && "/${operator_home#/}/" != *"/.."/* && "$operator_home" != */. && "$operator_home" != */.. && "$operator_home" != /tmp && "$operator_home" != /tmp/* && "$operator_home" != /var/tmp && "$operator_home" != /var/tmp/* && "$operator_home" != *[[:space:]]* && "$operator_home" != *"'"* && "$operator_home" != *\"* && "$operator_home" != *\#* && "$operator_home" != *\$* && "$operator_home" != *%* && "$operator_home" != *=* && "$operator_home" != *\\* && "$operator_home" != *'@@'* ]] || die "unsafe operator home"
-    python3 -c 'import sys, unicodedata; raise SystemExit(0 if any(unicodedata.category(c) in {"Cf", "Zl", "Zp"} for c in sys.argv[1]) else 1)' "$operator_home" && die "unsafe operator home"
+    python3 -c 'import sys, unicodedata; raise SystemExit(1 if any(unicodedata.category(c) in {"Cf", "Zl", "Zp"} for c in sys.argv[1]) else 0)' "$operator_home" || die "unsafe operator home"
     effective_home="$(readlink -f -- "$operator_home")" || die "unsafe operator home"
     tmp_root="$(readlink -f -- /tmp)" || die "unsafe operator home"
     var_tmp_root="$(readlink -f -- /var/tmp)" || die "unsafe operator home"

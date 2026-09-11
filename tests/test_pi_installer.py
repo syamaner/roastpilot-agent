@@ -4815,10 +4815,8 @@ def test_operator_home_symlink_to_canonical_temporary_root_is_rejected(
 ) -> None:
     """A lexically safe home cannot resolve beneath either canonical temporary root."""
     _, environment, log, _ = installer_harness
-    temporary_target = Path("/private/tmp") / f"roastpilot-home-target-{tmp_path.name}"
-    temporary_target.mkdir(exist_ok=True)
     candidate = tmp_path / "safe-looking-home"
-    candidate.symlink_to(temporary_target)
+    candidate.symlink_to("/tmp")
     result = _run(
         environment | {"FAKE_GETENT_RECORD": f"operator:x:1000:1000::{candidate}:/bin/sh"},
         "--set-hostname",
