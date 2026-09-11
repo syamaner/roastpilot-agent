@@ -46,9 +46,11 @@ def installer_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Path, Path]
         """#!/usr/bin/env bash
 set -eu
 name=$(basename "$0")
-printf '%s' "$name" >> "$FAKE_LOG"
-for arg in "$@"; do printf ' <%s>' "$arg" >> "$FAKE_LOG"; done
-printf '\\n' >> "$FAKE_LOG"
+if [ "$name" != cat ] || [ "${FAKE_RECORD_CAT:-}" = 1 ]; then
+  printf '%s' "$name" >> "$FAKE_LOG"
+  for arg in "$@"; do printf ' <%s>' "$arg" >> "$FAKE_LOG"; done
+  printf '\\n' >> "$FAKE_LOG"
+fi
 [ -z "${FAKE_SECRET_ENV_LOG:-}" ] || printf '%s OPENROUTER_API_KEY=<%s> OPENROUTER_API_KEY_FILE=<%s> OPENAI_API_KEY=<%s> ANTHROPIC_API_KEY=<%s> ROASTPILOT_API_KEY=<%s> ROASTPILOT_OPENROUTER_API_KEY=<%s> ROASTPILOT_INSTALL_API_KEY=<%s> API_KEY=<%s>\\n' "$name" "${OPENROUTER_API_KEY-UNSET}" "${OPENROUTER_API_KEY_FILE-UNSET}" "${OPENAI_API_KEY-UNSET}" "${ANTHROPIC_API_KEY-UNSET}" "${ROASTPILOT_API_KEY-UNSET}" "${ROASTPILOT_OPENROUTER_API_KEY-UNSET}" "${ROASTPILOT_INSTALL_API_KEY-UNSET}" "${API_KEY-UNSET}" >> "$FAKE_SECRET_ENV_LOG"
 [ "${FAKE_REQUIRE_LC_ALL_C:-}" != 1 ] || { [ "${LC_ALL:-}" = C ] || { printf 'FAKE_LC_ALL_NOT_C <%s>\\n' "${LC_ALL-UNSET}" >> "$FAKE_LOG"; exit 58; }; printf 'FAKE_LC_ALL_C\\n' >> "$FAKE_LOG"; }
 case "$name" in
@@ -203,6 +205,10 @@ case "$name" in
         [ "${FAKE_PIPX_FAIL_STAGE_CLEANUP:-}" != 1 ] || exit 26
       fi
       if [ "${1:-}" = roastpilot-agent ]; then
+        if [ "${FAKE_PIPX_FAIL_PRIOR_UNINSTALL:-}" = 1 ] && [ -e "$FAKE_PIPX_STATE" ]; then
+          printf 'FAKE_PRIOR_UNINSTALL_FAILURE\n' >> "$FAKE_LOG"
+          exit 61
+        fi
         [ "${FAKE_PIPX_FAIL_FRESH_CLEANUP:-}" != 1 ] || exit 53
         if [ ! -e "$FAKE_PIPX_STATE" ] && [ "${FAKE_PIPX_UNINSTALL_ABSENT_FAIL:-}" = 1 ]; then
           printf 'FAKE_PIPX_UNINSTALL_ABSENT\n' >> "$FAKE_LOG"
@@ -359,6 +365,7 @@ UNIT
     fi ;;
   rm) [ -z "${FAKE_RM_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_RM_FAIL_PATH" ] || exit 42; /bin/rm "$@" ;;
   cp) [ -z "${FAKE_CP_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_CP_FAIL_PATH" ] || exit 43; /bin/cp "$@" ;;
+  cat) /bin/cat "$@" ;;
   mv) /bin/mv "$@" ;;
   sha256sum)
     if [ "$#" = 0 ]; then cat >/dev/null; echo "content-digest  -"; exit 0; fi
@@ -453,6 +460,7 @@ esac
         "rm",
         "chown",
         "cp",
+        "cat",
         "mv",
         "sha256sum",
         "apt-get",
@@ -820,7 +828,8 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     var_dir = root / "var/lib/roastpilot-agent"
     assert stat.S_IMODE(var_dir.stat().st_mode) == 0o700
     assert any(
-        line.startswith("chown <operator:operators> <-->") and ".roastpilot-env.fake" in line
+        line.startswith("chown <--no-dereference> <operator:operators> <-->")
+        and ".roastpilot-env.fake" in line
         for line in commands
     )
     assert f"chown <--no-dereference> <operator:operators> <--> <{var_dir}>" in commands
@@ -1559,7 +1568,8 @@ def test_rendered_unit_and_atomic_env_repairs_fail_before_live_writes(
         assert "rendered unit violates appliance contract" in result.stderr
         assert env_file.read_bytes() == before
         assert not any(
-            str(root / "etc/systemd/system/roastpilot-agent.service") in item
+            item.startswith(("tee ", "mv "))
+            and str(root / "etc/systemd/system/roastpilot-agent.service") in item
             for item in _delta(log, start)
         )
     result = _run(
@@ -5724,3 +5734,180 @@ def test_symlinked_existing_unit_identity_fails_before_installer_effects(
         line.startswith(("apt-get ", "pipx ", "roastpilot-agent "))
         for line in log.read_text().splitlines()
     )
+
+
+@pytest.mark.serial
+def test_existing_managed_unit_identity_uses_privileged_cat_and_accepts_indentation(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """The existing-unit identity reader uses the privileged seam, not shell input."""
+    _, environment, log, _ = installer_harness
+    unit = (
+        Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+        / "etc/systemd/system/roastpilot-agent.service"
+    )
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Service]\n  User = operator \n\tGroup=operators\n")
+
+    result = _run(environment | {"FAKE_RECORD_CAT": "1"}, "--set-hostname", "roastpilot")
+
+    assert result.returncode == 0, result.stderr
+    assert f"cat <--> <{unit}>" in log.read_text().splitlines()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("target", "diagnostic", "existing_managed_unit"),
+    [
+        (
+            "etc/systemd/system/roastpilot-agent.service",
+            "cannot inspect existing managed unit identity",
+            True,
+        ),
+        (
+            "etc/systemd/system/roastpilot-agent.service.d",
+            "cannot inspect service drop-ins",
+            False,
+        ),
+        (
+            "etc/systemd/system.control/roastpilot-agent.service",
+            "cannot inspect service unit overrides",
+            False,
+        ),
+    ],
+)
+def test_indeterminate_privileged_systemd_presence_fails_before_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    target: str,
+    diagnostic: str,
+    existing_managed_unit: bool,
+) -> None:
+    """An inconclusive privileged member probe is never interpreted as absence."""
+    _, environment, log, _ = installer_harness
+    member = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / target
+    if existing_managed_unit:
+        member.parent.mkdir(parents=True)
+        member.write_text("[Service]\n User=operator\n Group = operators\n")
+
+    result = _run(
+        environment
+        | {
+            "FAKE_TEST_FAIL_PATH": str(member),
+            "FAKE_TEST_FAIL_ON_COUNT": "1",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+
+    events = log.read_text().splitlines()
+    assert result.returncode != 0 and diagnostic in result.stderr
+    assert f"FAKE_TEST_FAILURE <{member}>" in events
+    assert not any(
+        event.startswith(("apt-get ", "pipx ", "roastpilot-agent ", "tee ", "mv ", "chown "))
+        for event in events
+    )
+
+
+@pytest.mark.serial
+def test_systemd_dropin_presence_matrix_remains_exact_under_tristate_probes(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """All 36 drop-in paths receive both positive and negative privileged probes."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode == 0, result.stderr
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    roots = (
+        "etc/systemd/system.control",
+        "run/systemd/system.control",
+        "run/systemd/transient",
+        "run/systemd/generator.early",
+        "etc/systemd/system",
+        "etc/systemd/system.attached",
+        "run/systemd/system",
+        "run/systemd/system.attached",
+        "run/systemd/generator",
+        "usr/local/lib/systemd/system",
+        "usr/lib/systemd/system",
+        "run/systemd/generator.late",
+    )
+    expected = {
+        root / systemd_root / name
+        for systemd_root in roots
+        for name in ("roastpilot-agent.service.d", "roastpilot-.service.d", "service.d")
+    }
+    events = log.read_text().splitlines()
+    observed_positive = {
+        path
+        for path in expected
+        if f"test <-e> <{path}>" in events and f"test <-L> <{path}>" in events
+    }
+    observed_negative = {
+        path
+        for path in expected
+        if f"test <!> <-e> <{path}>" in events and f"test <!> <-L> <{path}>" in events
+    }
+    assert observed_positive == expected
+    assert observed_negative == expected
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("has_prior_destination", [False, True])
+def test_atomic_content_staging_rejects_temporary_digest_before_promotion(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], has_prior_destination: bool
+) -> None:
+    """A staged configuration digest mismatch cannot replace the live environment file."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    destination = root / "etc/roastpilot-agent/roastpilot-agent.env"
+    prior = (
+        b"OPENROUTER_API_KEY=prior\nPORT=8000\n"
+        b"ROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\n"
+        b"COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+    )
+    if has_prior_destination:
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(prior)
+    temporary = destination.parent / ".roastpilot-env.fake"
+
+    result = _run(
+        environment | {"FAKE_SHA256_BAD_PATH": str(temporary)},
+        "--set-hostname",
+        "roastpilot",
+    )
+
+    events = log.read_text().splitlines()
+    assert result.returncode != 0 and "atomic temporary digest mismatch" in result.stderr
+    assert f"FAKE_SHA256_CORRUPTION <{temporary}>" in events
+    chown = f"chown <--no-dereference> <operator:operators> <--> <{temporary}>"
+    digest = f"sha256sum <--> <{temporary}>"
+    assert chown in events and digest in events
+    assert (
+        events.index(chown)
+        < events.index(digest)
+        < events.index(f"FAKE_SHA256_CORRUPTION <{temporary}>")
+    )
+    assert not any(event.startswith("mv ") and f"<{destination}>" in event for event in events)
+    assert destination.read_bytes() == prior if has_prior_destination else not destination.exists()
+
+
+@pytest.mark.serial
+def test_prior_application_uninstall_failure_preserves_status_and_reports_skew(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A failed prior uninstall preserves its status and names the recovery risk."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+
+    result = _run(
+        environment | {"FAKE_PIPX_FAIL_PRIOR_UNINSTALL": "1"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+
+    assert result.returncode == 61
+    assert "FAKE_PRIOR_UNINSTALL_FAILURE" in log.read_text().splitlines()
+    assert "cannot remove prior application after staging replacement" in result.stderr
+    assert "application/configuration skew may require manual reconciliation" in result.stderr
