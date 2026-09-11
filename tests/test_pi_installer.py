@@ -381,7 +381,7 @@ UNIT
     case "$content" in
       MODEL) echo "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df  $1" ;;
       CONFIG) echo "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231  $1" ;;
-      *) checksum=$(printf '%s' "$content" | cksum); checksum=${checksum%% *}; echo "content-digest-$checksum  ${1:--}" ;;
+      *) checksum=$(printf '%s' "$content" | python3 -c 'import sys, zlib; print(f"{zlib.crc32(sys.stdin.buffer.read()) & 0xffffffff:08x}")'); echo "content-digest-$checksum  ${1:--}" ;;
     esac ;;
   grep)
     if [ "${1:-}" = -Fx ] && [ "${FAKE_GREP_OUTER_ERROR:-}" = 1 ]; then
