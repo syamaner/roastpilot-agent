@@ -251,12 +251,20 @@ resolve_operator_identity() {
     account="$(getent passwd "$INVOKING_USER")" || die "cannot determine invoking home"
     IFS=: read -r record_name _ _ primary_gid _ operator_home _ <<< "$account"
     [[ "$record_name" == "$INVOKING_USER" && "$primary_gid" =~ ^[0-9]+$ && "$primary_gid" != 0 ]] || die "unsafe operator identity"
-    [[ "$operator_home" == /* && "$operator_home" != / && "$operator_home" != // && "/${operator_home#/}/" != *"/."/* && "/${operator_home#/}/" != *"/.."/* && "$operator_home" != */. && "$operator_home" != */.. && "$operator_home" != /tmp && "$operator_home" != /tmp/* && "$operator_home" != /var/tmp && "$operator_home" != /var/tmp/* && "$operator_home" != *[[:space:]]* && "$operator_home" != *"'"* && "$operator_home" != *\"* && "$operator_home" != *\#* && "$operator_home" != *\$* && "$operator_home" != *%* && "$operator_home" != *=* && "$operator_home" != *\\* && "$operator_home" != *'@@'* ]] || die "unsafe operator home"
+    [[ "$operator_home" == /* && "$operator_home" != / && "$operator_home" != // && "/${operator_home#/}/" != *"/."/* && "/${operator_home#/}/" != *"/.."/* && "$operator_home" != */. && "$operator_home" != */.. && "$operator_home" != *[[:space:]]* && "$operator_home" != *"'"* && "$operator_home" != *\"* && "$operator_home" != *\#* && "$operator_home" != *\$* && "$operator_home" != *%* && "$operator_home" != *=* && "$operator_home" != *\\* && "$operator_home" != *'@@'* ]] || die "unsafe operator home"
+    if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" != "1" ]]; then
+        [[ "$operator_home" != /tmp && "$operator_home" != /tmp/* && "$operator_home" != /var/tmp && "$operator_home" != /var/tmp/* ]] || die "unsafe operator home"
+    fi
     python3 -c 'import sys, unicodedata; raise SystemExit(1 if any(unicodedata.category(c) in {"Cf", "Zl", "Zp"} for c in sys.argv[1]) else 0)' "$operator_home" || die "unsafe operator home"
     effective_home="$(readlink -f -- "$operator_home")" || die "unsafe operator home"
     if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" == "1" ]]; then
         tmp_root="$(rooted_path /tmp)"
         var_tmp_root="$(rooted_path /var/tmp)"
+        # A materialised test root is canonicalised before comparison.  A
+        # not-yet-created fake destination remains lexical until the normal
+        # installer path creates it, while an existing symlink cannot hide it.
+        [[ ! -e "$tmp_root" ]] || tmp_root="$(readlink -f -- "$tmp_root")" || die "unsafe operator home"
+        [[ ! -e "$var_tmp_root" ]] || var_tmp_root="$(readlink -f -- "$var_tmp_root")" || die "unsafe operator home"
     else
         tmp_root="$(readlink -f -- /tmp)" || die "unsafe operator home"
         var_tmp_root="$(readlink -f -- /var/tmp)" || die "unsafe operator home"
@@ -269,9 +277,14 @@ verify_existing_unit_identity() {
     local unit_file line section="" user_seen=0 group_seen=0 service_seen=0 unit_user="" unit_group=""
     unit_file="$(rooted_path /etc/systemd/system/roastpilot-agent.service)"
     verify_no_service_dropins
-    [[ ! -e "$unit_file" && ! -L "$unit_file" ]] && return 0
+    if [[ ! -e "$unit_file" && ! -L "$unit_file" ]]; then
+        MANAGED_UNIT_WAS_ABSENT=1
+        return 0
+    fi
+    MANAGED_UNIT_WAS_ABSENT=0
     [[ -f "$unit_file" && ! -L "$unit_file" && -r "$unit_file" ]] || die "existing managed unit identity is unsafe"
     while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" != *\\* ]] || die "existing managed unit identity is malformed"
         line="${line#"${line%%[![:space:]]*}"}"
         if [[ "$line" =~ ^\[([A-Za-z][A-Za-z0-9]*)\][[:space:]]*$ ]]; then
             section="${BASH_REMATCH[1]}"
@@ -450,10 +463,15 @@ capture_prior_wheelhouse() {
     if [[ -n "$source" ]]; then
         if grep -Fx "roastpilot-agent @ file://$source" "$requirements" >/dev/null; then
             rewritten="$RESTORE_ARTIFACT_DIR/requirements.rewritten"
-            grep -Fvx "roastpilot-agent @ file://$source" "$requirements" > "$rewritten" || true
+            if grep -Fvx "roastpilot-agent @ file://$source" "$requirements" > "$rewritten"; then :; else
+                grep_status=$?
+                [[ "$grep_status" == 1 ]] || die "cannot preserve exact prior application"
+            fi
             printf 'roastpilot-agent @ file://%s\n' "$copied" >> "$rewritten"
             mv -- "$rewritten" "$requirements"
         else
+            grep_status=$?
+            [[ "$grep_status" == 1 ]] || die "cannot preserve exact prior application"
             grep -Fx "roastpilot-agent==$version" "$requirements" >/dev/null || die "cannot preserve exact prior application"
         fi
     else
@@ -556,7 +574,8 @@ remove_root_temporary() {
     for temporary in "${ROOT_TEMPORARIES[@]:-}"; do
         [[ "$temporary" == "$target" ]] || retained+=("$temporary")
     done
-    ROOT_TEMPORARIES=("${retained[@]:-}")
+    ROOT_TEMPORARIES=()
+    ((${#retained[@]} == 0)) || ROOT_TEMPORARIES=("${retained[@]}")
 }
 
 replace_application_safely() {
@@ -804,7 +823,7 @@ install_content_atomically() {
 normalise_unit_env_contract() {
     local content="$1" line normalised=""
     while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ "$line" != *\\ ]] || die "rendered input contains unsafe inline mutation"
+        [[ "$line" != *\\* ]] || die "rendered input contains unsafe inline mutation"
         [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" != *'#'* && "$line" != *';'* && "$line" != *\\* ]] || die "rendered unit/env contains an unsafe inline mutation"
         normalised+="$line"$'\n'
@@ -984,6 +1003,7 @@ main() {
     PRIOR_STATIC_HOSTNAME_FILE=""
     PRE_UPDATE_HOSTNAME=""
     ROASTPILOT_AGENT_ENABLED=0
+    MANAGED_UNIT_WAS_ABSENT=0
     STAGED_PIPX_VENV=""
     AVAHI_ENABLE_ATTEMPTED=0
     APPLICATION_CHANGED=0
@@ -1015,8 +1035,13 @@ main() {
         fi
         if [[ "${FRESH_APPLICATION_CLEANUP_REQUIRED:-0}" == 1 ]]; then
             if ! pipx_command uninstall -- roastpilot-agent; then
-                printf '%s\n' "install failed: manually remove incapable roastpilot-agent environment" >&2
-                cleanup_failed=1
+                if [[ "$(installed_pipx_state)" == "absent" ]]; then
+                    FRESH_APPLICATION_CLEANUP_REQUIRED=0
+                    APPLICATION_CHANGED=0
+                else
+                    printf '%s\n' "install failed: manually remove incapable roastpilot-agent environment" >&2
+                    cleanup_failed=1
+                fi
             else
                 FRESH_APPLICATION_CLEANUP_REQUIRED=0
                 APPLICATION_CHANGED=0
@@ -1067,7 +1092,11 @@ main() {
             printf '%s\n' "install failed after hostname change; restore manually from $PRIOR_STATIC_HOSTNAME_FILE" >&2
         fi
         if [[ "${INSTALLATION_COMMITTED:-0}" != 1 && "${ROASTPILOT_AGENT_ENABLED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
-            printf '%s\n' "install failed after enabling roastpilot-agent; the unit may remain enabled; rerun or inspect the installer state manually" >&2
+            if [[ "${MANAGED_UNIT_WAS_ABSENT:-0}" == 1 ]]; then
+                printf '%s\n' "install failed after enabling roastpilot-agent; the newly created unit was removed by rollback but enablement may remain dangling; rerun or inspect the installer state manually" >&2
+            else
+                printf '%s\n' "install failed after enabling roastpilot-agent; the unit may remain enabled; rerun or inspect the installer state manually" >&2
+            fi
         fi
         if [[ "${INSTALLATION_COMMITTED:-0}" != 1 && "${AVAHI_ENABLE_ATTEMPTED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after enabling Avahi; Avahi enablement may remain" >&2

@@ -170,7 +170,14 @@ case "$name" in
         fi
         count=0; [ ! -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] || count=$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")
         count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_PIPX_NORMAL_INSTALL_COUNT"
-        if [ "$count" = 1 ]; then [ "${FAKE_PIPX_FAIL_FINAL_INSTALL:-}" != 1 ] || exit 25
+        if [ "$count" = 1 ]; then
+          if [ "${FAKE_PIPX_FAIL_FINAL_AFTER_CREATE:-}" = 1 ]; then
+            mkdir -p "$FAKE_PIPX_HOME/venvs/roastpilot-agent/bin"
+            printf 'FAKE_FRESH_PARTIAL_CREATION\n' >> "$FAKE_LOG"
+            : > "$FAKE_PIPX_STATE"
+            exit 25
+          fi
+          [ "${FAKE_PIPX_FAIL_FINAL_INSTALL:-}" != 1 ] || exit 25
         else [ "${FAKE_PIPX_FAIL_RESTORE_INSTALL:-}" != 1 ] || exit 25; fi
       fi
       venv_bin="$FAKE_PIPX_HOME/venvs/roastpilot-agent$suffix/bin"
@@ -189,6 +196,10 @@ case "$name" in
       fi
       if [ "${1:-}" = roastpilot-agent ]; then
         [ "${FAKE_PIPX_FAIL_FRESH_CLEANUP:-}" != 1 ] || exit 53
+        if [ ! -e "$FAKE_PIPX_STATE" ] && [ "${FAKE_PIPX_UNINSTALL_ABSENT_FAIL:-}" = 1 ]; then
+          printf 'FAKE_PIPX_UNINSTALL_ABSENT\n' >> "$FAKE_LOG"
+          exit 53
+        fi
         rm -f "$FAKE_PIPX_STATE"
       fi
     fi ;;
@@ -356,7 +367,12 @@ UNIT
       CONFIG) echo "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231  $1" ;;
       *) echo "content-digest  $1" ;;
     esac ;;
-  grep) /usr/bin/grep "$@" ;;
+  grep)
+    if [ "${FAKE_GREP_ERROR:-}" = 1 ]; then
+      printf 'FAKE_GREP_ERROR\n' >> "$FAKE_LOG"
+      exit 2
+    fi
+    /usr/bin/grep "$@" ;;
   tr) /usr/bin/tr "$@" ;;
   usermod) printf 'dialout audio\n' > "$FAKE_GROUPS" ;;
   chown)
@@ -367,6 +383,8 @@ UNIT
     fi ;;
   apt-get)
     if [ -n "${FAKE_APT_RESTORES_PIPX_PATH:-}" ]; then
+      [ ! -e "$FAKE_APT_RESTORES_PIPX_PATH" ] || exit 57
+      printf 'FAKE_APT_CONFIRMED_PIPX_ABSENT <%s>\n' "$FAKE_APT_RESTORES_PIPX_PATH" >> "$FAKE_LOG"
       /bin/ln -s "$(/usr/bin/readlink -f -- "$0")" "$FAKE_APT_RESTORES_PIPX_PATH"
       printf 'FAKE_APT_RESTORED_PIPX <%s>\\n' "$FAKE_APT_RESTORES_PIPX_PATH" >> "$FAKE_LOG"
     fi ;;
@@ -433,6 +451,7 @@ esac
     agent.chmod(0o755)
     operator_home = tmp_path / "operator-home"
     pipx_home = operator_home / ".local/share/pipx"
+    install_root = tmp_path / "root"
     pipx_agent = pipx_home / "venvs/roastpilot-agent/bin/roastpilot-agent"
     pipx_agent.parent.mkdir(parents=True)
     pipx_agent.write_text(fake.read_text())
@@ -471,7 +490,7 @@ esac
         "FAKE_GROUPS": str(groups),
         "FAKE_SERVICE_STATE_COUNTER": str(tmp_path / "service-state-counter"),
         "ROASTPILOT_INSTALL_TEST_MODE": "1",
-        "ROASTPILOT_INSTALL_TEST_ROOT": str(tmp_path / "root"),
+        "ROASTPILOT_INSTALL_TEST_ROOT": str(install_root),
         "ROASTPILOT_INSTALL_OS_RELEASE": str(os_release),
         "HOME": str(tmp_path / "home"),
         "FAKE_OPERATOR_HOME": str(operator_home),
@@ -597,6 +616,7 @@ def test_absent_pipx_is_installed_by_apt_before_first_application_install(
     assert result.returncode == 0, result.stderr
     marker = f"FAKE_APT_RESTORED_PIPX <{pipx}>"
     assert marker in events
+    assert f"FAKE_APT_CONFIRMED_PIPX_ABSENT <{pipx}>" in events
     assert events.index(
         "apt-get <install> <-y> <libportaudio2> <pipx> <avahi-daemon>"
     ) < events.index(marker)
@@ -875,6 +895,8 @@ def test_hostname_consent_start_and_failure_abort_before_service_enable(
         )
     )
     failed_root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]).parent / "failed-root"
+    (failed_root / "tmp").mkdir(parents=True)
+    (failed_root / "var/tmp").mkdir(parents=True)
     failure_start = len(log.read_text())
     failed = _run(
         failing | {"ROASTPILOT_INSTALL_TEST_ROOT": str(failed_root)}, "--set-hostname", "roastpilot"
@@ -3540,6 +3562,28 @@ def test_local_wheelhouse_capture_failure_aborts_before_uninstall(
 
 
 @pytest.mark.serial
+def test_direct_reference_grep_error_aborts_before_uninstall(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A grep read error cannot be treated as an absent direct reference."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
+    wheel.write_text("wheel")
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
+    result = _run(
+        environment | {"FAKE_PIPX_FREEZE_DIRECT_REFERENCE": str(wheel), "FAKE_GREP_ERROR": "1"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    events = log.read_text().splitlines()
+    assert result.returncode != 0 and "cannot preserve exact prior application" in result.stderr
+    assert "FAKE_GREP_ERROR" in events
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
+
+
+@pytest.mark.serial
 def test_prior_local_wheel_artifact_is_retained_before_post_reinstall_capability_failure(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -3880,7 +3924,7 @@ def test_final_start_recheck_never_disturbs_a_deactivating_service(
         "--start",
     )
     assert result.returncode != 0 and "stop the service only when idle" in result.stderr
-    assert "unit may remain enabled; rerun or inspect the installer state manually" in result.stderr
+    assert "unit was removed by rollback but enablement may remain dangling" in result.stderr
     events = log.read_text().splitlines()
     probe = "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>"
     assert events.count(probe) == 3
@@ -3900,7 +3944,7 @@ def test_agent_enable_failure_warns_without_lifecycle_reversal(
     _, environment, log, _ = installer_harness
     result = _run(environment | {"FAKE_AGENT_ENABLE_FAIL": "1"}, "--set-hostname", "roastpilot")
     assert result.returncode == 31
-    assert "unit may remain enabled; rerun or inspect the installer state manually" in result.stderr
+    assert "unit was removed by rollback but enablement may remain dangling" in result.stderr
     events = log.read_text().splitlines()
     assert "systemctl <enable> <roastpilot-agent>" in events
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
@@ -4626,6 +4670,38 @@ def test_fresh_incapable_application_is_removed_or_named_for_manual_cleanup(
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize(
+    ("injection", "expected_marker", "manual_cleanup"),
+    [
+        (
+            {"FAKE_PIPX_FAIL_FINAL_INSTALL": "1", "FAKE_PIPX_UNINSTALL_ABSENT_FAIL": "1"},
+            "FAKE_PIPX_UNINSTALL_ABSENT",
+            False,
+        ),
+        ({"FAKE_PIPX_FAIL_FINAL_AFTER_CREATE": "1"}, "FAKE_FRESH_PARTIAL_CREATION", False),
+    ],
+)
+def test_fresh_install_failure_preserves_status_and_cleans_absent_or_partial_environment(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    injection: dict[str, str],
+    expected_marker: str,
+    manual_cleanup: bool,
+) -> None:
+    """Fresh-install failures retain their status while cleaning any possible pipx residue."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment | injection, "--set-hostname", "roastpilot")
+    events = log.read_text().splitlines()
+    assert result.returncode == 25
+    assert expected_marker in events
+    assert "pipx <uninstall> <--> <roastpilot-agent>" in events
+    assert (
+        "manually remove incapable roastpilot-agent environment" in result.stderr
+    ) is manual_cleanup
+    assert "rollback incomplete" not in result.stderr
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
 def test_partial_staged_venv_is_registered_before_failed_stage_install(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4788,7 +4864,7 @@ def test_unsafe_getent_identity_and_home_shapes_fail_before_installer_effects(
 
 
 @pytest.mark.serial
-@pytest.mark.parametrize("unsafe", ["'", "\u200b", "\u2028", "\u2029"])
+@pytest.mark.parametrize("unsafe", ["'", '"', "\u200b", "\u2060", "\u2028", "\u2029"])
 def test_unsafe_operator_home_characters_fail_before_canonicalisation(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, unsafe: str
 ) -> None:
@@ -4828,6 +4904,51 @@ def test_operator_home_symlink_to_canonical_temporary_root_is_rejected(
         event.startswith("readlink <-f>") and event.endswith(f"<{candidate}>") for event in events
     )
     assert not any(event.startswith(("apt-get ", "pipx ")) for event in events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("temporary", ["tmp", "var/tmp"])
+def test_operator_home_symlink_to_each_rooted_temporary_root_is_rejected(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, temporary: str
+) -> None:
+    """Both canonical rooted temporary destinations remain forbidden test homes."""
+    _, environment, log, _ = installer_harness
+    candidate = tmp_path / f"safe-looking-{temporary.replace('/', '-')}-home"
+    candidate.symlink_to(Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / temporary)
+    result = _run(
+        environment | {"FAKE_GETENT_RECORD": f"operator:x:1000:1000::{candidate}:/bin/sh"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0 and "unsafe operator home" in result.stderr
+    assert not any(
+        event.startswith(("apt-get ", "pipx ")) for event in log.read_text().splitlines()
+    )
+
+
+@pytest.mark.serial
+def test_symlinked_test_temporary_root_is_canonicalised_before_home_comparison(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A symlinked rooted /tmp cannot hide a home beneath its effective target."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    target = tmp_path / "real-rooted-tmp"
+    target.mkdir()
+    (root / "tmp").mkdir(parents=True)
+    (root / "tmp").rmdir()
+    (root / "tmp").symlink_to(target)
+    candidate = target / "operator"
+    candidate.mkdir()
+    result = _run(
+        environment | {"FAKE_GETENT_RECORD": f"operator:x:1000:1000::{candidate}:/bin/sh"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0 and "unsafe operator home" in result.stderr
+    assert not any(
+        event.startswith(("apt-get ", "pipx ")) for event in log.read_text().splitlines()
+    )
 
 
 @pytest.mark.serial
@@ -5013,6 +5134,8 @@ def test_success_has_no_application_skew_or_avahi_residue_warning(
         "[Unit]\nGroup=operators\n[Service]\nUser=operator\nGroup=operators\n",
         "[Service]\nUser=operator\nGroup=operators\n[Service]\n",
         "[Service]\nUser=operator\n",
+        "[Service]\n# harmless \\\nUser=operator\nGroup=operators\n",
+        "[Service]\n   \\   \r\nUser=operator\nGroup=operators\n",
     ],
 )
 def test_existing_unit_identity_evidence_fails_before_installer_effects(
@@ -5066,6 +5189,22 @@ def test_matching_existing_unit_identity_allows_maintenance(
             "roastpilot-config-rollback.*"
         )
     )
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("line", ["# comment \\", "   \\   \r"])
+def test_rendered_unit_rejects_backslash_before_comment_or_blank_skipping(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], line: str
+) -> None:
+    """Raw unit lines reject systemd continuations before normalisation can skip them."""
+    _, environment, log, _ = installer_harness
+    result = _run(
+        environment | {"FAKE_RENDERED_UNIT": f"{line}\n[Service]\nUser=operator\nGroup=operators"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0 and "unsafe inline mutation" in result.stderr
+    assert not any(event.startswith("systemctl <enable>") for event in log.read_text().splitlines())
 
 
 @pytest.mark.serial
