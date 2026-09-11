@@ -4844,7 +4844,7 @@ def test_privileged_write_recheck_reports_its_failed_destination(
     result = _run(
         environment
         | {"FAKE_TEST_FAIL_PATH": str(target)}
-        | ({"FAKE_TEST_FAIL_ON_COUNT": "10"} if target_kind == "config" else {}),
+        | ({"FAKE_TEST_FAIL_ON_COUNT": "11"} if target_kind == "config" else {}),
         "--set-hostname",
         "roastpilot",
     )
