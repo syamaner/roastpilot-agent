@@ -2472,6 +2472,29 @@ def test_test_command_directory_rejects_symlink_noncanonical_and_earlier_path_sh
 
 
 @pytest.mark.serial
+def test_upfront_test_command_ownership_rejects_earlier_chmod_shadow_without_execution(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A loop-owned command is rejected before any fake command can run."""
+    _, environment, log, _ = installer_harness
+    rogue_dir = tmp_path / "rogue-chmod-bin"
+    rogue_dir.mkdir()
+    rogue_marker = tmp_path / "rogue-chmod-ran"
+    rogue = rogue_dir / "chmod"
+    rogue.write_text(f"#!/bin/sh\nprintf rogue > {rogue_marker}\nexit 0\n")
+    rogue.chmod(0o755)
+    result = _run(
+        environment | {"PATH": f"{rogue_dir}{os.pathsep}{environment['PATH']}"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0
+    assert "install failed: test command directory does not own chmod" in result.stderr
+    assert not rogue_marker.exists()
+    assert not log.exists()
+
+
+@pytest.mark.serial
 def test_test_mode_requires_one_complete_fake_command_directory_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -2529,14 +2552,23 @@ def test_children_observe_c_locale_before_fake_effects(
         "run/systemd/generator.early/roastpilot-agent.service",
     ],
 )
+@pytest.mark.parametrize("as_symlink", [False, True])
 def test_additional_systemd_override_locations_fail_before_effects(
-    installer_harness: tuple[Path, dict[str, str], Path, Path], relative: str
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    relative: str,
+    as_symlink: bool,
+    tmp_path: Path,
 ) -> None:
     """Every admitted systemd override search location is rejected before package work."""
     _, environment, log, _ = installer_harness
     target = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / relative
     target.parent.mkdir(parents=True)
-    target.write_text("[Service]\n")
+    if as_symlink:
+        external = tmp_path / "external-unit"
+        external.write_text("[Service]\n")
+        target.symlink_to(external)
+    else:
+        target.write_text("[Service]\n")
     result = _run(environment, "--set-hostname", "roastpilot")
     assert (
         result.returncode != 0
@@ -4981,6 +5013,16 @@ def test_runtime_pipx_path_substitution_returns_through_cleanup_without_executin
 ) -> None:
     """A post-validation PATH swap cannot execute a rogue pipx or unwind EXIT cleanup."""
     fake_bin, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    etc = root / "etc/roastpilot-agent"
+    etc.mkdir(parents=True)
+    env_file = etc / "roastpilot-agent.env"
+    original_env = (
+        "OPENROUTER_API_KEY=prior\nPORT=8000\n"
+        "ROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\n"
+        "COFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+    )
+    env_file.write_text(original_env)
     rogue_dir = tmp_path / "later-pipx"
     rogue_dir.mkdir()
     rogue_marker = tmp_path / "rogue-pipx-ran"
@@ -5006,6 +5048,8 @@ def test_runtime_pipx_path_substitution_returns_through_cleanup_without_executin
     assert not rogue_marker.exists()
     assert "install failed: manually remove incapable roastpilot-agent environment" in result.stderr
     assert "install failed: rollback incomplete; manual reconciliation required" in result.stderr
+    assert env_file.read_text() == original_env
+    assert not any("roastpilot-config-rollback" in event for event in events)
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
