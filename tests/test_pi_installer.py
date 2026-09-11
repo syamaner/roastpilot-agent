@@ -1888,13 +1888,16 @@ def test_directory_recheck_blocks_post_ownership_swap_before_mode_or_promotion(
         if event == f"FAKE_TEST_D_MUTATION <{path}> <{attacker}> <2>"
     )
     assert ownership_index < mutation_index
-    assert f"test <-L> <{path}>" in events
+    assert any(
+        i > mutation_index and event == f"test <-L> <{path}>" for i, event in enumerate(events)
+    )
     assert not any(event.startswith("chmod ") and f"<{attacker}>" in event for event in events)
     assert not any(
         i > mutation_index
         and event.startswith(("tee ", "mv ", "roastpilot-agent <appliance> <model>"))
         for i, event in enumerate(events)
     )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial
@@ -1941,10 +1944,11 @@ def test_successful_var_unlock_rechecks_after_each_privileged_boundary(
         assert not operator_chowns
     else:
         assert operator_chowns == [next(i for i in operator_chowns if i < mutation)]
-    assert f"test <-L> <{var_dir}>" in events
+    assert any(i > mutation and event == f"test <-L> <{var_dir}>" for i, event in enumerate(events))
     assert not any(
         i > mutation and event == f"chmod <0700> <--> <{var_dir}>" for i, event in enumerate(events)
     )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
     assert not any(
         event.startswith(("chmod ", "tee ", "mv ")) and f"<{attacker}>" in event for event in events
     )
@@ -1997,7 +2001,7 @@ def test_cleanup_rechecks_after_ownership_before_restoring_mode(
         if event == f"FAKE_TEST_D_MUTATION <{path}> <{attacker}> <{probe_count}>"
     )
     assert chown < mutation
-    assert f"test <-L> <{path}>" in events
+    assert any(i > mutation and event == f"test <-L> <{path}>" for i, event in enumerate(events))
     assert not any(
         i > mutation and event == f"chmod <{mode}> <--> <{path}>" for i, event in enumerate(events)
     )
@@ -2005,6 +2009,7 @@ def test_cleanup_rechecks_after_ownership_before_restoring_mode(
     assert any(
         event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event for event in events
     )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial
