@@ -357,7 +357,11 @@ UNIT
       count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_CHOWN_FAIL_COUNT_FILE"
       [ -n "${FAKE_CHOWN_FAIL_ON_COUNT:-}" ] && [ "$count" != "$FAKE_CHOWN_FAIL_ON_COUNT" ] || exit 47
     fi ;;
-  apt-get) : ;;
+  apt-get)
+    if [ -n "${FAKE_APT_RESTORES_PIPX_PATH:-}" ]; then
+      /bin/ln -s "$(/usr/bin/readlink -f -- "$0")" "$FAKE_APT_RESTORES_PIPX_PATH"
+      printf 'FAKE_APT_RESTORED_PIPX <%s>\\n' "$FAKE_APT_RESTORES_PIPX_PATH" >> "$FAKE_LOG"
+    fi ;;
   systemctl)
     if [ "${1:-}" = daemon-reload ] && [ -n "${FAKE_MUTATE_DROPIN_PATH:-}" ]; then
       /bin/mkdir -p -- "$FAKE_MUTATE_DROPIN_PATH"
@@ -566,6 +570,29 @@ def test_roastpilot_lifecycle_matcher_catches_service_unit_spelling() -> None:
     assert not _has_roastpilot_agent_lifecycle_mutation(
         ["systemctl <enable> <roastpilot-agent.service>"]
     )
+
+
+@pytest.mark.serial
+def test_absent_pipx_is_installed_by_apt_before_first_application_install(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A fresh Pi reaches its first fake-only install after apt supplies pipx."""
+    fake_bin, environment, log, _ = installer_harness
+    pipx = fake_bin / "pipx"
+    pipx.unlink()
+    result = _run(
+        environment | {"FAKE_APT_RESTORES_PIPX_PATH": str(pipx)},
+        "--set-hostname",
+        "roastpilot",
+    )
+    events = log.read_text().splitlines()
+    assert result.returncode == 0, result.stderr
+    marker = f"FAKE_APT_RESTORED_PIPX <{pipx}>"
+    assert marker in events
+    assert events.index(
+        "apt-get <install> <-y> <libportaudio2> <pipx> <avahi-daemon>"
+    ) < events.index(marker)
+    assert any(event.startswith("pipx <install>") for event in events)
 
 
 def _pipx_state(path: Path, version: str, package: str) -> None:
