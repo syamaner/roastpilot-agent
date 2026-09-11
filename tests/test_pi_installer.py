@@ -7,6 +7,7 @@ import grp
 import json
 import os
 import pwd
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -607,8 +608,23 @@ def test_absent_pipx_is_installed_by_apt_before_first_application_install(
     fake_bin, environment, log, _ = installer_harness
     pipx = fake_bin / "pipx"
     pipx.unlink()
+    closed_bin = pipx.parent.parent / "closed-bin"
+    closed_bin.mkdir()
+    for command in ("bash", "basename", "cat", "dirname", "env", "find", "python3", "sed"):
+        executable = shutil.which(command)
+        assert executable is not None
+        (closed_bin / command).symlink_to(executable)
+    closed_environment = environment | {"PATH": f"{fake_bin}{os.pathsep}{closed_bin}"}
+    absent = subprocess.run(
+        [str(closed_bin / "bash"), "-c", "command -v pipx"],
+        env=closed_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert absent.returncode != 0
     result = _run(
-        environment | {"FAKE_APT_RESTORES_PIPX_PATH": str(pipx)},
+        closed_environment | {"FAKE_APT_RESTORES_PIPX_PATH": str(pipx)},
         "--set-hostname",
         "roastpilot",
     )
