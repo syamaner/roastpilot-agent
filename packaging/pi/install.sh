@@ -54,9 +54,9 @@ validate_install_root() {
     [[ -n "$test_command_dir" && "$test_command_dir" == /* && -d "$test_command_dir" && ! -L "$test_command_dir" ]] || die "test command directory is required"
     resolved="$(cd -- "$test_command_dir" && pwd -P)" || die "test command directory is unsafe"
     [[ "$resolved" == "$test_command_dir" ]] || die "test command directory must be canonical"
-    for command in apt-get hostnamectl usermod systemctl roastpilot-agent mkdir chmod chown rm cp mv tee mktemp sha256sum cat; do
+    for command in apt-get hostnamectl usermod systemctl roastpilot-agent mkdir chmod chown rm cp mv tee mktemp sha256sum cat test readlink grep id getent uname; do
         [[ -x "$test_command_dir/$command" ]] || die "test command directory is incomplete"
-        [[ "$(command -v "$command")" == "$test_command_dir/$command" ]] || die "test command directory does not own $command"
+        [[ "$(type -P "$command")" == "$test_command_dir/$command" ]] || die "test command directory does not own $command"
     done
 }
 
@@ -86,9 +86,16 @@ recheck_sensitive_destination() {
     # It is not an atomic no-follow guarantee, but catches a changed parent or
     # final symlink immediately before each sensitive root write.
     run_privileged test -d "$parent" || return 1
-    run_privileged test ! -L "$parent" || return 1
-    run_privileged test ! -L "$destination" || return 1
+    privileged_not_symlink "$parent" || return 1
+    privileged_not_symlink "$destination" || return 1
     run_privileged test ! -d "$destination" || return 1
+}
+
+privileged_not_symlink() {
+    local member="$1" status
+    if run_privileged test -L "$member"; then return 1; else status=$?; fi
+    [[ "$status" == 1 ]] || return 2
+    run_privileged test ! -L "$member"
 }
 
 validate_no_control_characters() {
@@ -306,8 +313,8 @@ verify_existing_unit_identity() {
         return 0
     fi
     MANAGED_UNIT_WAS_ABSENT=0
-    if ! run_privileged test -f "$unit_file" || run_privileged test -L "$unit_file"; then die "existing managed unit identity is unsafe"; fi
-    content="$(run_privileged cat -- "$unit_file")" || die "cannot read existing managed unit identity"
+    if ! run_privileged test -f "$unit_file" || ! privileged_not_symlink "$unit_file"; then die "existing managed unit identity is unsafe"; fi
+    if ! content="$(run_privileged cat -- "$unit_file")"; then die "cannot read existing managed unit identity"; fi
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" != *\\* ]] || die "existing managed unit identity is malformed"
         line="${line#"${line%%[![:space:]]*}"}"
@@ -358,7 +365,7 @@ privileged_member_presence() {
     if run_privileged test -e "$member"; then return 0; else status=$?; [[ "$status" == 1 ]] || return 2; fi
     if run_privileged test -L "$member"; then return 0; else status=$?; [[ "$status" == 1 ]] || return 2; fi
     run_privileged test ! -e "$member" || return 2
-    run_privileged test ! -L "$member" || return 2
+    privileged_not_symlink "$member" || return 2
     return 1
 }
 
@@ -367,7 +374,7 @@ snapshot_live_configuration() {
     snapshot_parent="$(rooted_path /tmp)"
     validate_destination "$snapshot_parent"
     run_privileged test -d "$snapshot_parent" || die "configuration snapshot parent is unsafe"
-    run_privileged test ! -L "$snapshot_parent" || die "configuration snapshot parent is unsafe"
+    privileged_not_symlink "$snapshot_parent" || die "configuration snapshot parent is unsafe"
     CONFIG_SNAPSHOT_DIR="$(run_privileged mktemp -d -- "$(rooted_path /tmp)/roastpilot-config-rollback.XXXXXX")"
     CONFIG_SNAPSHOT_VALIDATED=0
     snapshot_root="$(rooted_path /tmp)/roastpilot-config-rollback."
@@ -377,7 +384,7 @@ snapshot_live_configuration() {
     for destination in "$@"; do
         name="${destination##*/}"
         if privileged_member_presence "$destination"; then
-            if ! run_privileged test -f "$destination" || run_privileged test -L "$destination" || ! run_privileged test ! -L "$destination"; then
+            if ! run_privileged test -f "$destination" || ! privileged_not_symlink "$destination"; then
                 die "existing configuration destination is unsafe"
             fi
             run_privileged cp -p -- "$destination" "$CONFIG_SNAPSHOT_DIR/$name"
@@ -398,7 +405,7 @@ restore_live_configuration() {
             printf '%s\n' "install failed: cannot restore configuration member at $destination" >&2
             failed=1
         elif run_privileged test -f "$CONFIG_SNAPSHOT_DIR/$name"; then
-            if run_privileged test -L "$CONFIG_SNAPSHOT_DIR/$name" || ! run_privileged test ! -L "$CONFIG_SNAPSHOT_DIR/$name" || ! run_privileged cp -p -- "$CONFIG_SNAPSHOT_DIR/$name" "$destination"; then
+            if ! privileged_not_symlink "$CONFIG_SNAPSHOT_DIR/$name" || ! run_privileged cp -p -- "$CONFIG_SNAPSHOT_DIR/$name" "$destination"; then
                 printf '%s\n' "install failed: cannot restore configuration member at $destination" >&2
                 failed=1
             fi
@@ -471,7 +478,11 @@ pipx_command() {
             return 1
         fi
     fi
-    env -u PIPX_HOME -u PIPX_BIN_DIR -u PIPX_DEFAULT_PYTHON HOME="$INVOKING_HOME" pipx "$@"
+    env -u PIPX_HOME -u PIPX_BIN_DIR -u PIPX_DEFAULT_PYTHON \
+        -u PIP_INDEX_URL -u PIP_EXTRA_INDEX_URL -u PIP_TRUSTED_HOST -u PIP_CONFIG_FILE -u PIP_REQUIRE_VIRTUALENV \
+        -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
+        -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
+        HOME="$INVOKING_HOME" pipx "$@"
 }
 
 pipx_matches() {
@@ -751,10 +762,10 @@ preserve_existing_api_key() {
         [[ "$presence_status" == 1 ]] && return
         die "cannot inspect existing environment file"
     fi
-    if ! run_privileged test -f "$env_file" || run_privileged test -L "$env_file"; then
+    if ! run_privileged test -f "$env_file" || ! privileged_not_symlink "$env_file"; then
         die "existing environment file is unsafe"
     fi
-    content="$(run_privileged cat -- "$env_file")" || die "cannot read existing environment file"
+    if ! content="$(run_privileged cat -- "$env_file")"; then die "cannot read existing environment file"; fi
     content="$(normalise_unit_env_contract "$content")"
     while IFS= read -r line || [[ -n "$line" ]]; do
         case "$line" in
@@ -798,7 +809,7 @@ install_model_and_render() {
     validate_destination "$stage_parent"
     run_privileged mkdir -p -- "$stage_parent"
     run_privileged test -d "$stage_parent" || die "model staging parent failed privileged recheck: $stage_parent"
-    run_privileged test ! -L "$stage_parent" || die "model staging parent failed privileged recheck: $stage_parent"
+    privileged_not_symlink "$stage_parent" || die "model staging parent failed privileged recheck: $stage_parent"
     stage_dir="$(run_privileged mktemp -d -- "$stage_parent/roastpilot-install.XXXXXX")"
     STAGE_DIR_VALIDATED=0
     STAGE_DIR="$stage_dir"
@@ -954,30 +965,30 @@ install_rendered_files() {
     prepare_destination_parents "$env_file" "$yaml_file" "$unit_file" "$prior_file" "$model_dir"
     validate_destination "$etc_dir"
     run_privileged test -d "$etc_dir" || die "managed configuration directory is missing: $etc_dir"
-    run_privileged test ! -L "$etc_dir" || die "managed configuration directory is unsafe: $etc_dir"
+    privileged_not_symlink "$etc_dir" || die "managed configuration directory is unsafe: $etc_dir"
     LOCKED_ETC_DIR="$etc_dir"
     run_privileged chown --no-dereference "root:$INVOKING_GROUP" -- "$etc_dir"
     run_privileged test -d "$etc_dir" || die "managed configuration directory is missing: $etc_dir"
-    run_privileged test ! -L "$etc_dir" || die "managed configuration directory is unsafe: $etc_dir"
+    privileged_not_symlink "$etc_dir" || die "managed configuration directory is unsafe: $etc_dir"
     run_privileged chmod 0750 -- "$etc_dir"
     # Keep model placement root-owned while leaf bytes are promoted.
     # This is a directory boundary, not a file destination: require the
     # existing root itself and every component to be non-symlinked.
     validate_destination "$var_dir"
     run_privileged test -d "$var_dir" || die "managed state directory is missing: $var_dir"
-    run_privileged test ! -L "$var_dir" || die "managed state directory is unsafe: $var_dir"
+    privileged_not_symlink "$var_dir" || die "managed state directory is unsafe: $var_dir"
     LOCKED_VAR_DIR="$var_dir"
     run_privileged chown --no-dereference root:root -- "$var_dir"
     run_privileged test -d "$var_dir" || die "managed state directory is missing: $var_dir"
-    run_privileged test ! -L "$var_dir" || die "managed state directory is unsafe: $var_dir"
+    privileged_not_symlink "$var_dir" || die "managed state directory is unsafe: $var_dir"
     run_privileged chmod 0700 -- "$var_dir"
     for model_parent in "$model_dir" "$model_dir/onnx" "$model_dir/onnx/int8"; do
         run_privileged mkdir -p -- "$model_parent"
         run_privileged test -d "$model_parent" || die "model directory is missing: $model_parent"
-        run_privileged test ! -L "$model_parent" || die "model directory is unsafe: $model_parent"
+        privileged_not_symlink "$model_parent" || die "model directory is unsafe: $model_parent"
         run_privileged chown --no-dereference "root:$INVOKING_GROUP" -- "$model_parent"
         run_privileged test -d "$model_parent" || die "model directory is missing: $model_parent"
-        run_privileged test ! -L "$model_parent" || die "model directory is unsafe: $model_parent"
+        privileged_not_symlink "$model_parent" || die "model directory is unsafe: $model_parent"
         run_privileged chmod 0750 -- "$model_parent"
     done
     promote_model_file "$STAGE_DIR/models/onnx/int8/model_quantized.onnx" "$model_dir/onnx/int8/model_quantized.onnx" "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df"
@@ -1001,10 +1012,10 @@ install_rendered_files() {
     # Do not unlock the parent until the prior-hostname write and verification
     # have completed under its root-owned boundary.
     run_privileged test -d "$var_dir" || die "managed state directory is missing: $var_dir"
-    run_privileged test ! -L "$var_dir" || die "managed state directory is unsafe: $var_dir"
+    privileged_not_symlink "$var_dir" || die "managed state directory is unsafe: $var_dir"
     run_privileged chown --no-dereference "$INVOKING_USER:$INVOKING_GROUP" -- "$var_dir"
     run_privileged test -d "$var_dir" || die "managed state directory is missing: $var_dir"
-    run_privileged test ! -L "$var_dir" || die "managed state directory is unsafe: $var_dir"
+    privileged_not_symlink "$var_dir" || die "managed state directory is unsafe: $var_dir"
     run_privileged chmod 0700 -- "$var_dir"
     LOCKED_VAR_DIR=""
     local groups
@@ -1124,14 +1135,14 @@ main() {
         fi
         # Never follow an untrusted child when recovering a locked parent.
         if [[ -n "${LOCKED_VAR_DIR:-}" ]]; then
-            if ! run_privileged test -d "$LOCKED_VAR_DIR" || run_privileged test -L "$LOCKED_VAR_DIR"; then
+            if ! run_privileged test -d "$LOCKED_VAR_DIR" || ! privileged_not_symlink "$LOCKED_VAR_DIR"; then
                 printf '%s\n' "install failed: reconcile $LOCKED_VAR_DIR manually (expected directory owned by $INVOKING_USER:$INVOKING_GROUP with mode 0700)" >&2
                 cleanup_failed=1
             else
                 if ! run_privileged chown --no-dereference "$INVOKING_USER:$INVOKING_GROUP" -- "$LOCKED_VAR_DIR"; then
                     printf '%s\n' "install failed: restore $LOCKED_VAR_DIR ownership to $INVOKING_USER:$INVOKING_GROUP manually" >&2
                     cleanup_failed=1
-                elif ! run_privileged test -d "$LOCKED_VAR_DIR" || run_privileged test -L "$LOCKED_VAR_DIR"; then
+                elif ! run_privileged test -d "$LOCKED_VAR_DIR" || ! privileged_not_symlink "$LOCKED_VAR_DIR"; then
                     printf '%s\n' "install failed: reconcile $LOCKED_VAR_DIR manually (expected directory owned by $INVOKING_USER:$INVOKING_GROUP with mode 0700)" >&2
                     cleanup_failed=1
                 else
@@ -1140,14 +1151,14 @@ main() {
             fi
         fi
         if [[ -n "${LOCKED_ETC_DIR:-}" ]]; then
-            if ! run_privileged test -d "$LOCKED_ETC_DIR" || run_privileged test -L "$LOCKED_ETC_DIR"; then
+            if ! run_privileged test -d "$LOCKED_ETC_DIR" || ! privileged_not_symlink "$LOCKED_ETC_DIR"; then
                 printf '%s\n' "install failed: reconcile $LOCKED_ETC_DIR manually (expected directory owned by root:$INVOKING_GROUP with mode 0750)" >&2
                 cleanup_failed=1
             else
                 if ! run_privileged chown --no-dereference "root:$INVOKING_GROUP" -- "$LOCKED_ETC_DIR"; then
                     printf '%s\n' "install failed: restore $LOCKED_ETC_DIR ownership to root:$INVOKING_GROUP manually" >&2
                     cleanup_failed=1
-                elif ! run_privileged test -d "$LOCKED_ETC_DIR" || run_privileged test -L "$LOCKED_ETC_DIR"; then
+                elif ! run_privileged test -d "$LOCKED_ETC_DIR" || ! privileged_not_symlink "$LOCKED_ETC_DIR"; then
                     printf '%s\n' "install failed: reconcile $LOCKED_ETC_DIR manually (expected directory owned by root:$INVOKING_GROUP with mode 0750)" >&2
                     cleanup_failed=1
                 else

@@ -87,7 +87,7 @@ case "$name" in
     fi ;;
   pipx)
     if [ -n "${FAKE_PIPX_ENV_LOG:-}" ]; then
-      printf 'HOME=<%s> PIPX_HOME=<%s> PIPX_BIN_DIR=<%s> PIPX_DEFAULT_PYTHON=<%s>\\n' "${HOME-UNSET}" "${PIPX_HOME-UNSET}" "${PIPX_BIN_DIR-UNSET}" "${PIPX_DEFAULT_PYTHON-UNSET}" >> "$FAKE_PIPX_ENV_LOG"
+      printf 'HOME=<%s> PIPX_HOME=<%s> PIPX_BIN_DIR=<%s> PIPX_DEFAULT_PYTHON=<%s> PIP_INDEX_URL=<%s> PIP_EXTRA_INDEX_URL=<%s> PIP_TRUSTED_HOST=<%s> PIP_CONFIG_FILE=<%s> PIP_REQUIRE_VIRTUALENV=<%s> HTTP_PROXY=<%s> HTTPS_PROXY=<%s> ALL_PROXY=<%s> NO_PROXY=<%s> http_proxy=<%s> https_proxy=<%s> all_proxy=<%s> no_proxy=<%s>\\n' "${HOME-UNSET}" "${PIPX_HOME-UNSET}" "${PIPX_BIN_DIR-UNSET}" "${PIPX_DEFAULT_PYTHON-UNSET}" "${PIP_INDEX_URL-UNSET}" "${PIP_EXTRA_INDEX_URL-UNSET}" "${PIP_TRUSTED_HOST-UNSET}" "${PIP_CONFIG_FILE-UNSET}" "${PIP_REQUIRE_VIRTUALENV-UNSET}" "${HTTP_PROXY-UNSET}" "${HTTPS_PROXY-UNSET}" "${ALL_PROXY-UNSET}" "${NO_PROXY-UNSET}" "${http_proxy-UNSET}" "${https_proxy-UNSET}" "${all_proxy-UNSET}" "${no_proxy-UNSET}" >> "$FAKE_PIPX_ENV_LOG"
     fi
     if [ "${1:-}" = environment ]; then
       [ "${2:-}" = --value ] && [ "${3:-}" = PIPX_HOME ] || exit 18
@@ -100,7 +100,7 @@ case "$name" in
     elif [ "${1:-}" = runpip ]; then
       venv="${2:-}"
       if [[ "$venv" == *-roastpilot-stage-* ]]; then
-        [ "${FAKE_PIPX_FAIL_STAGE_VERIFY:-}" != 1 ] || exit 24
+        [ "${FAKE_PIPX_FAIL_STAGE_VERIFY:-}" != 1 ] || { printf 'FAKE_STAGE_VERIFY_FAILURE\\n' >> "$FAKE_LOG"; exit 24; }
       elif [ -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] && [ "$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")" = 1 ]; then
         [ "${FAKE_PIPX_FAIL_FINAL_VERIFY:-}" != 1 ] || exit 24
       elif [ -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] && [ "$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")" -ge 2 ]; then
@@ -168,7 +168,7 @@ case "$name" in
           printf 'FAKE_STAGE_PARTIAL_CREATION <%s>\n' "$venv_bin" >> "$FAKE_LOG"
           exit 52
         fi
-        [ "${FAKE_PIPX_FAIL_STAGE_INSTALL:-}" != 1 ] || exit 25
+        [ "${FAKE_PIPX_FAIL_STAGE_INSTALL:-}" != 1 ] || { printf 'FAKE_STAGE_INSTALL_FAILURE\\n' >> "$FAKE_LOG"; exit 25; }
         [ -z "${FAKE_DELETE_PRIOR_WHEEL:-}" ] || rm -f -- "$FAKE_DELETE_PRIOR_WHEEL"
       else
         if [ -n "$pip_args" ]; then
@@ -366,13 +366,22 @@ UNIT
     fi ;;
   rm) [ -z "${FAKE_RM_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_RM_FAIL_PATH" ] || exit 42; /bin/rm "$@" ;;
   cp) [ -z "${FAKE_CP_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_CP_FAIL_PATH" ] || exit 43; /bin/cp "$@" ;;
-  cat) /bin/cat "$@" ;;
+  cat)
+    if [ "${FAKE_CAT_FAIL_PATH:-}" = "${!#}" ]; then
+      count=0; [ ! -e "$FAKE_CAT_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_CAT_FAIL_COUNT_FILE")
+      count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_CAT_FAIL_COUNT_FILE"
+      [ "${FAKE_CAT_FAIL_ON_COUNT:-}" != "$count" ] || { printf 'FAKE_CAT_FAILURE <%s>\\n' "${!#}" >> "$FAKE_LOG"; exit 49; }
+    fi
+    /bin/cat "$@" ;;
   mv) /bin/mv "$@" ;;
   sha256sum)
-    if [ "$#" = 0 ]; then content=$(cat); else
-      [ "${1:-}" = -- ] && shift
-      content=$(cat "$1")
+    if [ "$#" = 0 ]; then
+      checksum=$("$FAKE_HARNESS_PYTHON" -c 'import sys, zlib; print(f"{zlib.crc32(sys.stdin.buffer.read()) & 0xffffffff:08x}")')
+      echo "content-digest-$checksum  -"
+      exit 0
     fi
+    [ "${1:-}" = -- ] && shift
+    content=$(cat "$1")
     if [ "$#" != 0 ] && [ "${FAKE_SHA256_FAIL_PATH:-}" = "$1" ]; then
       count=0; [ ! -e "$FAKE_SHA256_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_SHA256_FAIL_COUNT_FILE")
       count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_SHA256_FAIL_COUNT_FILE"
@@ -382,7 +391,7 @@ UNIT
     case "$content" in
       MODEL) echo "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df  $1" ;;
       CONFIG) echo "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231  $1" ;;
-      *) checksum=$(printf '%s' "$content" | "$FAKE_HARNESS_PYTHON" -c 'import sys, zlib; print(f"{zlib.crc32(sys.stdin.buffer.read()) & 0xffffffff:08x}")'); echo "content-digest-$checksum  ${1:--}" ;;
+      *) checksum=$("$FAKE_HARNESS_PYTHON" -c 'import pathlib, sys, zlib; print(f"{zlib.crc32(pathlib.Path(sys.argv[1]).read_bytes()) & 0xffffffff:08x}")' "$1"); echo "content-digest-$checksum  ${1:--}" ;;
     esac ;;
   grep)
     if [ "${1:-}" = -Fx ] && [ "${FAKE_GREP_OUTER_ERROR:-}" = 1 ]; then
@@ -507,6 +516,7 @@ esac
         "FAKE_TEST_FAIL_D_COUNT_FILE": str(tmp_path / "test-d-fail-count"),
         "FAKE_CHMOD_FAIL_COUNT_FILE": str(tmp_path / "chmod-fail-count"),
         "FAKE_CHOWN_FAIL_COUNT_FILE": str(tmp_path / "chown-fail-count"),
+        "FAKE_CAT_FAIL_COUNT_FILE": str(tmp_path / "cat-fail-count"),
         "FAKE_SHA256_FAIL_COUNT_FILE": str(tmp_path / "sha256-fail-count"),
         "FAKE_HOSTNAME_SET_MARKER": str(tmp_path / "hostname-set"),
         "FAKE_PIPX_STATE": str(tmp_path / "pipx-state"),
@@ -1341,14 +1351,25 @@ def test_pipx_children_use_only_the_resolved_invoking_home(
         "PIPX_HOME": "/hostile/pipx-home",
         "PIPX_BIN_DIR": "/hostile/pipx-bin",
         "PIPX_DEFAULT_PYTHON": "/hostile/python",
+        "PIP_INDEX_URL": "https://hostile.invalid/simple",
+        "PIP_EXTRA_INDEX_URL": "https://hostile.invalid/extra",
+        "PIP_TRUSTED_HOST": "hostile.invalid",
+        "PIP_CONFIG_FILE": "/hostile/pip.conf",
+        "PIP_REQUIRE_VIRTUALENV": "1",
+        "HTTP_PROXY": "http://hostile.invalid:9",
+        "HTTPS_PROXY": "http://hostile.invalid:9",
+        "ALL_PROXY": "http://hostile.invalid:9",
+        "NO_PROXY": "hostile.invalid",
+        "http_proxy": "http://hostile.invalid:9",
+        "https_proxy": "http://hostile.invalid:9",
+        "all_proxy": "http://hostile.invalid:9",
+        "no_proxy": "hostile.invalid",
     }
     result = _run(hostile_environment, "--set-hostname", "roastpilot")
     assert result.returncode == 0, result.stderr
     records = Path(environment["FAKE_PIPX_ENV_LOG"]).read_text().splitlines()
     expected_home = environment["FAKE_OPERATOR_HOME"]
-    expected_record = (
-        f"HOME=<{expected_home}> PIPX_HOME=<UNSET> PIPX_BIN_DIR=<UNSET> PIPX_DEFAULT_PYTHON=<UNSET>"
-    )
+    expected_record = f"HOME=<{expected_home}> PIPX_HOME=<UNSET> PIPX_BIN_DIR=<UNSET> PIPX_DEFAULT_PYTHON=<UNSET> PIP_INDEX_URL=<UNSET> PIP_EXTRA_INDEX_URL=<UNSET> PIP_TRUSTED_HOST=<UNSET> PIP_CONFIG_FILE=<UNSET> PIP_REQUIRE_VIRTUALENV=<UNSET> HTTP_PROXY=<UNSET> HTTPS_PROXY=<UNSET> ALL_PROXY=<UNSET> NO_PROXY=<UNSET> http_proxy=<UNSET> https_proxy=<UNSET> all_proxy=<UNSET> no_proxy=<UNSET>"
     assert records and all(record == expected_record for record in records)
     pipx_events = [line for line in log.read_text().splitlines() if line.startswith("pipx ")]
     assert len(records) == len(pipx_events)
@@ -2144,7 +2165,10 @@ def test_fake_sha256sum_uses_bound_interpreter_and_distinguishes_non_model_conte
     hostile_python.chmod(0o755)
     hostile_environment = environment | {"PATH": f"{hostile_bin}{os.pathsep}{environment['PATH']}"}
     assert Path(environment["FAKE_HARNESS_PYTHON"]).is_absolute()
-    assert fake_digest(first, hostile_environment) != fake_digest(second, hostile_environment)
+    newline = tmp_path / "newline-content"
+    newline.write_bytes(b"x\n")
+    first.write_bytes(b"x")
+    assert fake_digest(first, hostile_environment) != fake_digest(newline, hostile_environment)
     assert not hostile_marker.exists()
 
 
@@ -2590,7 +2614,7 @@ def test_upfront_test_command_ownership_rejects_earlier_chmod_shadow_without_exe
 
 
 @pytest.mark.serial
-@pytest.mark.parametrize("missing_command", ["systemctl", "cat"])
+@pytest.mark.parametrize("missing_command", ["systemctl", "cat", "test"])
 def test_test_mode_requires_one_complete_fake_command_directory_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
     missing_command: str,
@@ -3162,9 +3186,26 @@ def test_failed_staged_replacement_keeps_the_prior_application(
 
 
 @pytest.mark.serial
-@pytest.mark.parametrize("failure", ["FAKE_PIPX_FAIL_STAGE_INSTALL", "FAKE_PIPX_FAIL_STAGE_VERIFY"])
+@pytest.mark.parametrize(
+    ("failure", "marker", "diagnostic"),
+    [
+        (
+            "FAKE_PIPX_FAIL_STAGE_INSTALL",
+            "FAKE_STAGE_INSTALL_FAILURE",
+            "requested replacement could not be staged",
+        ),
+        (
+            "FAKE_PIPX_FAIL_STAGE_VERIFY",
+            "FAKE_STAGE_VERIFY_FAILURE",
+            "staged replacement lacks required Pi/MCP capability",
+        ),
+    ],
+)
 def test_replacement_staging_failures_preserve_the_prior_normal_environment(
-    installer_harness: tuple[Path, dict[str, str], Path, Path], failure: str
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    failure: str,
+    marker: str,
+    diagnostic: str,
 ) -> None:
     """A failed staged replacement never removes the usable normal environment."""
     _, environment, log, _ = installer_harness
@@ -3173,6 +3214,8 @@ def test_replacement_staging_failures_preserve_the_prior_normal_environment(
     result = _run(environment | {failure: "1"}, "--set-hostname", "roastpilot", "--version", "2.0")
     assert result.returncode != 0
     events = log.read_text().splitlines()
+    assert marker in events
+    assert diagnostic in result.stderr
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
     assert '"package_version": "1.2"' in state.read_text()
     assert not any(line.startswith("roastpilot-agent <appliance>") for line in events)
@@ -5828,6 +5871,54 @@ def test_existing_managed_unit_identity_uses_privileged_cat_and_accepts_indentat
 
     assert result.returncode == 0, result.stderr
     assert f"cat <--> <{unit}>" in log.read_text().splitlines()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("kind", "relative", "content", "arguments", "diagnostic"),
+    [
+        (
+            "unit",
+            "etc/systemd/system/roastpilot-agent.service",
+            "[Service]\nUser=operator\nGroup=operators\n",
+            (),
+            "cannot read existing managed unit identity",
+        ),
+        (
+            "environment",
+            "etc/roastpilot-agent/roastpilot-agent.env",
+            "OPENROUTER_API_KEY=retained\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n",
+            (),
+            "cannot read existing environment file",
+        ),
+    ],
+)
+def test_existing_privileged_reads_fail_closed_before_installer_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    kind: str,
+    relative: str,
+    content: str,
+    arguments: tuple[str, ...],
+    diagnostic: str,
+) -> None:
+    """A failed privileged read cannot continue to package or configuration effects."""
+    _, environment, log, _ = installer_harness
+    target = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / relative
+    target.parent.mkdir(parents=True)
+    target.write_text(content)
+    injected = environment | {"FAKE_CAT_FAIL_PATH": str(target), "FAKE_CAT_FAIL_ON_COUNT": "1"}
+    if arguments:
+        injected = injected | {arguments[0]: arguments[1]}
+    result = _run(injected, "--set-hostname", "roastpilot")
+    events = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert diagnostic in result.stderr
+    marker = f"FAKE_CAT_FAILURE <{target}>"
+    assert marker in events
+    assert not any(
+        event.startswith(("roastpilot-agent ", "tee ", "mv ", "chmod ", "systemctl "))
+        for event in events[events.index(marker) + 1 :]
+    )
 
 
 @pytest.mark.serial
