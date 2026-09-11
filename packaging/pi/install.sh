@@ -385,7 +385,7 @@ snapshot_live_configuration() {
         name="${destination##*/}"
         if privileged_member_presence "$destination"; then
             if ! run_privileged test -f "$destination" || ! privileged_not_symlink "$destination"; then
-                die "existing configuration destination is unsafe"
+                die "existing configuration destination is unsafe: $destination"
             fi
             run_privileged cp -p -- "$destination" "$CONFIG_SNAPSHOT_DIR/$name"
         else
