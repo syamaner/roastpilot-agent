@@ -368,19 +368,20 @@ UNIT
   cat) /bin/cat "$@" ;;
   mv) /bin/mv "$@" ;;
   sha256sum)
-    if [ "$#" = 0 ]; then cat >/dev/null; echo "content-digest  -"; exit 0; fi
-    [ "${1:-}" = -- ] && shift
-    if [ "${FAKE_SHA256_FAIL_PATH:-}" = "$1" ]; then
+    if [ "$#" = 0 ]; then content=$(cat); else
+      [ "${1:-}" = -- ] && shift
+      content=$(cat "$1")
+    fi
+    if [ "$#" != 0 ] && [ "${FAKE_SHA256_FAIL_PATH:-}" = "$1" ]; then
       count=0; [ ! -e "$FAKE_SHA256_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_SHA256_FAIL_COUNT_FILE")
       count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_SHA256_FAIL_COUNT_FILE"
       [ "${FAKE_SHA256_FAIL_ON_COUNT:-}" != "$count" ] || { printf 'FAKE_SHA256_FAILURE <%s>\n' "$1" >> "$FAKE_LOG"; exit 50; }
     fi
-    if [ "${FAKE_SHA256_BAD_PATH:-}" = "$1" ]; then printf 'FAKE_SHA256_CORRUPTION <%s>\n' "$1" >> "$FAKE_LOG"; echo "corrupt-digest  $1"; exit 0; fi
-    content=$(cat "$1")
+    if [ "$#" != 0 ] && [ "${FAKE_SHA256_BAD_PATH:-}" = "$1" ]; then printf 'FAKE_SHA256_CORRUPTION <%s>\n' "$1" >> "$FAKE_LOG"; echo "corrupt-digest  $1"; exit 0; fi
     case "$content" in
       MODEL) echo "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df  $1" ;;
       CONFIG) echo "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231  $1" ;;
-      *) echo "content-digest  $1" ;;
+      *) checksum=$(printf '%s' "$content" | cksum); checksum=${checksum%% *}; echo "content-digest-$checksum  ${1:--}" ;;
     esac ;;
   grep)
     if [ "${1:-}" = -Fx ] && [ "${FAKE_GREP_OUTER_ERROR:-}" = 1 ]; then
@@ -392,7 +393,6 @@ UNIT
       exit 2
     fi
     /usr/bin/grep "$@" ;;
-  tr) /usr/bin/tr "$@" ;;
   usermod)
     if [ "${FAKE_USERMOD_FAIL:-}" = 1 ]; then
       printf 'FAKE_USERMOD_FAILURE\n' >> "$FAKE_LOG"
@@ -467,7 +467,6 @@ esac
         "usermod",
         "systemctl",
         "grep",
-        "tr",
         "test",
     ):
         (fake_bin / name).symlink_to(fake)
@@ -2111,6 +2110,32 @@ def test_model_digests_cover_stage_root_snapshot_and_destination(
 
 
 @pytest.mark.serial
+def test_fake_sha256sum_distinguishes_non_model_content(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """The harness digest oracle cannot make atomic-content comparisons vacuous."""
+    fake_bin, environment, _, _ = installer_harness
+    first = tmp_path / "first-content"
+    second = tmp_path / "second-content"
+    first.write_bytes(b"first distinct bytes\n")
+    second.write_bytes(b"second distinct bytes\n")
+
+    def fake_digest(path: Path) -> str:
+        """Return the fake sha256sum token for one test-owned file."""
+        result = subprocess.run(
+            [str(fake_bin / "sha256sum"), "--", str(path)],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0
+        return result.stdout.split()[0]
+
+    assert fake_digest(first) != fake_digest(second)
+
+
+@pytest.mark.serial
 @pytest.mark.parametrize(
     ("target", "diagnostic"),
     [
@@ -2462,6 +2487,35 @@ def test_arbitrarily_long_decimal_port_fails_before_effects(
 
 
 @pytest.mark.serial
+def test_zero_padded_port_fails_before_bash_arithmetic_or_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A zero-padded port is rejected by syntax before Bash can interpret it as octal."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment, "--set-hostname", "roastpilot", "--port", "08000")
+    diagnostic = "install failed: port must be a decimal number from 1024 to 65535"
+    assert result.returncode != 0 and result.stderr.count(diagnostic) == 1
+    assert "value too great for base" not in result.stderr
+    assert not log.exists()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("port", ["1024", "65535"])
+def test_port_range_endpoints_are_inclusive_and_reach_rendered_environment(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], port: str
+) -> None:
+    """Both inclusive port endpoints survive validation and reach rendered output."""
+    _, environment, _, _ = installer_harness
+    result = _run(environment, "--set-hostname", "roastpilot", "--port", port)
+    assert result.returncode == 0, result.stderr
+    env_file = (
+        Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+        / "etc/roastpilot-agent/roastpilot-agent.env"
+    )
+    assert f"PORT={port}\n" in env_file.read_text()
+
+
+@pytest.mark.serial
 def test_test_command_directory_rejects_symlink_noncanonical_and_earlier_path_shadow(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -2523,12 +2577,14 @@ def test_upfront_test_command_ownership_rejects_earlier_chmod_shadow_without_exe
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize("missing_command", ["systemctl", "cat"])
 def test_test_mode_requires_one_complete_fake_command_directory_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
+    missing_command: str,
 ) -> None:
     """A test seam cannot fall through to host-mutating commands."""
     fake_bin, environment, log, _ = installer_harness
-    (fake_bin / "systemctl").unlink()
+    (fake_bin / missing_command).unlink()
     result = _run(environment, "--set-hostname", "roastpilot")
     assert result.returncode != 0 and "test command directory is incomplete" in result.stderr
     assert not log.exists()

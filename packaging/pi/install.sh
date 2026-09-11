@@ -54,7 +54,7 @@ validate_install_root() {
     [[ -n "$test_command_dir" && "$test_command_dir" == /* && -d "$test_command_dir" && ! -L "$test_command_dir" ]] || die "test command directory is required"
     resolved="$(cd -- "$test_command_dir" && pwd -P)" || die "test command directory is unsafe"
     [[ "$resolved" == "$test_command_dir" ]] || die "test command directory must be canonical"
-    for command in apt-get hostnamectl usermod systemctl roastpilot-agent mkdir chmod chown rm cp mv tee mktemp sha256sum; do
+    for command in apt-get hostnamectl usermod systemctl roastpilot-agent mkdir chmod chown rm cp mv tee mktemp sha256sum cat; do
         [[ -x "$test_command_dir/$command" ]] || die "test command directory is incomplete"
         [[ "$(command -v "$command")" == "$test_command_dir/$command" ]] || die "test command directory does not own $command"
     done
@@ -187,7 +187,8 @@ parse_arguments() {
     validate_ascii_input "$AUDIO_DEVICE" "audio device"
     [[ "$SERIAL_PORT" != *'#'* && "$SERIAL_PORT" != *'"'* && "$SERIAL_PORT" != *\\* && "$SERIAL_PORT" != *'@@'* ]] || die "serial port contains ambiguous YAML characters"
     [[ "$AUDIO_DEVICE" != *'#'* && "$AUDIO_DEVICE" != *'"'* && "$AUDIO_DEVICE" != *\\* ]] || die "audio device contains ambiguous YAML characters"
-    [[ "$PORT" =~ ^[0-9]{1,5}$ && "$PORT" -ge 1024 && "$PORT" -le 65535 ]] || die "port must be a decimal number from 1024 to 65535"
+    [[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] || die "port must be a decimal number from 1024 to 65535"
+    (( PORT >= 1024 && PORT <= 65535 )) || die "port must be a decimal number from 1024 to 65535"
     [[ "$SERIAL_PORT" == /dev/* && "$SERIAL_PORT" != *[[:space:]]* ]] || die "serial port must be an absolute /dev path"
     [[ "$AUDIO_DEVICE" == "${AUDIO_DEVICE#"${AUDIO_DEVICE%%[![:space:]]*}"}" && "$AUDIO_DEVICE" == "${AUDIO_DEVICE%"${AUDIO_DEVICE##*[![:space:]]}"}" && "$AUDIO_DEVICE" != *'@@'* ]] || die "audio device is unsafe"
     [[ -z "$REQUESTED_VERSION" || -z "$REQUESTED_WHEEL" ]] || die "choose --version or --wheel"
