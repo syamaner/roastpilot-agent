@@ -3828,13 +3828,13 @@ def test_child_processes_do_not_receive_exported_secret_sentinels(
     secret_log = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]).parent / "secret-env.log"
     pre_scrub_log = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]).parent / "pre-scrub.log"
     script = secret_log.with_name("pre-scrub-install.sh")
-    script.write_text(
-        INSTALLER.read_text().replace(
-            "    scrub_child_secrets\n    parse_arguments",
-            '    printf "ROASTPILOT_API_KEY=%s ROASTPILOT_OPENROUTER_API_KEY=%s\\n" "${ROASTPILOT_API_KEY+present}" "${ROASTPILOT_OPENROUTER_API_KEY+present}" > "$FAKE_PRE_SCRUB_LOG"\n    scrub_child_secrets\n    parse_arguments',
-            1,
-        )
-    )
+    source = INSTALLER.read_text()
+    boundary = "    scrub_child_secrets\n    command -v python3"
+    replacement = '    printf "ROASTPILOT_API_KEY=%s ROASTPILOT_OPENROUTER_API_KEY=%s\\n" "${ROASTPILOT_API_KEY+present}" "${ROASTPILOT_OPENROUTER_API_KEY+present}" > "$FAKE_PRE_SCRUB_LOG"\n    scrub_child_secrets\n    command -v python3'
+    assert boundary in source
+    rewritten = source.replace(boundary, replacement, 1)
+    assert rewritten != source and replacement in rewritten
+    script.write_text(rewritten)
     script.chmod(0o755)
     result = _run(
         environment
