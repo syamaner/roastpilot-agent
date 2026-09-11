@@ -121,7 +121,12 @@ case "$name" in
             printf 'Name: coffee-roaster-mcp\\nVersion: %s\\n' "$mcp_version"
           fi ;;
         freeze)
-          printf 'roastpilot-agent==%s\\ncoffee-roaster-mcp==%s\\n' "${FAKE_PIPX_FREEZE_VERSION:-1.2}" "${FAKE_PIPX_MCP_VERSION:-0.2.0}" ;;
+          if [ -n "${FAKE_PIPX_FREEZE_DIRECT_REFERENCE:-}" ]; then
+            printf 'FAKE_PIPX_FREEZE_DIRECT_REFERENCE <%s>\\n' "$FAKE_PIPX_FREEZE_DIRECT_REFERENCE" >> "$FAKE_LOG"
+            printf 'roastpilot-agent @ file://%s\\ncoffee-roaster-mcp==%s\\n' "$FAKE_PIPX_FREEZE_DIRECT_REFERENCE" "${FAKE_PIPX_MCP_VERSION:-0.2.0}"
+          else
+            printf 'roastpilot-agent==%s\\ncoffee-roaster-mcp==%s\\n' "${FAKE_PIPX_FREEZE_VERSION:-1.2}" "${FAKE_PIPX_MCP_VERSION:-0.2.0}"
+          fi ;;
         wheel)
           [ "${FAKE_PIPX_FAIL_WHEELHOUSE:-}" != 1 ] || { printf 'FAKE_PIPX_WHEELHOUSE_FAILURE\\n' >> "$FAKE_LOG"; exit 54; }
           shift 3
@@ -3385,6 +3390,40 @@ def test_prior_local_wheel_is_restored_from_the_private_copy_after_source_loss(
     assert "application/configuration skew" not in result.stderr
     assert f"rm <-rf> <--> <{artifact}>" not in events
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_local_wheel_direct_reference_is_rewritten_to_the_private_copy(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """PEP-610 provenance is accepted only after it is redirected to the private copy."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
+    wheel.write_text("wheel")
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
+    result = _run(
+        environment
+        | {
+            "FAKE_PIPX_FREEZE_DIRECT_REFERENCE": str(wheel),
+            "FAKE_PIPX_FAIL_FINAL_INSTALL": "1",
+        },
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    artifact = Path(environment["FAKE_OPERATOR_HOME"]) / ".cache/roastpilot-restore.fake"
+    requirements = artifact / "requirements.txt"
+    events = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert f"FAKE_PIPX_FREEZE_DIRECT_REFERENCE <{wheel}>" in events
+    assert f"file://{artifact / wheel.name}" in requirements.read_text()
+    assert str(wheel) not in requirements.read_text()
+    assert any(
+        event.endswith(f"<{artifact / (wheel.name + '[pi]')}>")
+        and f"<--pip-args> <--no-index --find-links={artifact}>" in event
+        for event in events
+    )
 
 
 @pytest.mark.serial
