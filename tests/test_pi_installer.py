@@ -381,18 +381,14 @@ UNIT
       exit 0
     fi
     [ "${1:-}" = -- ] && shift
-    content=$(cat "$1")
     if [ "$#" != 0 ] && [ "${FAKE_SHA256_FAIL_PATH:-}" = "$1" ]; then
       count=0; [ ! -e "$FAKE_SHA256_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_SHA256_FAIL_COUNT_FILE")
       count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_SHA256_FAIL_COUNT_FILE"
       [ "${FAKE_SHA256_FAIL_ON_COUNT:-}" != "$count" ] || { printf 'FAKE_SHA256_FAILURE <%s>\n' "$1" >> "$FAKE_LOG"; exit 50; }
     fi
     if [ "$#" != 0 ] && [ "${FAKE_SHA256_BAD_PATH:-}" = "$1" ]; then printf 'FAKE_SHA256_CORRUPTION <%s>\n' "$1" >> "$FAKE_LOG"; echo "corrupt-digest  $1"; exit 0; fi
-    case "$content" in
-      MODEL) echo "022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df  $1" ;;
-      CONFIG) echo "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231  $1" ;;
-      *) checksum=$("$FAKE_HARNESS_PYTHON" -c 'import pathlib, sys, zlib; print(f"{zlib.crc32(pathlib.Path(sys.argv[1]).read_bytes()) & 0xffffffff:08x}")' "$1"); echo "content-digest-$checksum  ${1:--}" ;;
-    esac ;;
+    checksum=$("$FAKE_HARNESS_PYTHON" -c 'import pathlib, sys, zlib; data = pathlib.Path(sys.argv[1]).read_bytes(); print("022092cddd4c2cd740670c0a85786460699bc1b4f03e20f508182768d21545df" if data == b"MODEL" else "8d04ba5a9c6fca5d39d0de2b1fd05ecf79deb589fbba279728bbebac39934231" if data == b"CONFIG" else f"content-digest-{zlib.crc32(data) & 0xffffffff:08x}")' "$1")
+    echo "$checksum  ${1:--}" ;;
   grep)
     if [ "${1:-}" = -Fx ] && [ "${FAKE_GREP_OUTER_ERROR:-}" = 1 ]; then
       printf 'FAKE_GREP_OUTER_ERROR\n' >> "$FAKE_LOG"
@@ -2169,6 +2165,13 @@ def test_fake_sha256sum_uses_bound_interpreter_and_distinguishes_non_model_conte
     newline.write_bytes(b"x\n")
     first.write_bytes(b"x")
     assert fake_digest(first, hostile_environment) != fake_digest(newline, hostile_environment)
+    model = tmp_path / "model-content"
+    model_newline = tmp_path / "model-newline-content"
+    model.write_bytes(b"MODEL")
+    model_newline.write_bytes(b"MODEL\n")
+    assert fake_digest(model, hostile_environment) != fake_digest(
+        model_newline, hostile_environment
+    )
     assert not hostile_marker.exists()
 
 
@@ -5875,20 +5878,18 @@ def test_existing_managed_unit_identity_uses_privileged_cat_and_accepts_indentat
 
 @pytest.mark.serial
 @pytest.mark.parametrize(
-    ("kind", "relative", "content", "arguments", "diagnostic"),
+    ("kind", "relative", "content", "diagnostic"),
     [
         (
             "unit",
             "etc/systemd/system/roastpilot-agent.service",
             "[Service]\nUser=operator\nGroup=operators\n",
-            (),
             "cannot read existing managed unit identity",
         ),
         (
             "environment",
             "etc/roastpilot-agent/roastpilot-agent.env",
             "OPENROUTER_API_KEY=retained\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n",
-            (),
             "cannot read existing environment file",
         ),
     ],
@@ -5898,17 +5899,14 @@ def test_existing_privileged_reads_fail_closed_before_installer_effects(
     kind: str,
     relative: str,
     content: str,
-    arguments: tuple[str, ...],
     diagnostic: str,
 ) -> None:
-    """A failed privileged read cannot continue to package or configuration effects."""
+    """A failed privileged read prevents later configuration or service effects."""
     _, environment, log, _ = installer_harness
     target = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / relative
     target.parent.mkdir(parents=True)
     target.write_text(content)
     injected = environment | {"FAKE_CAT_FAIL_PATH": str(target), "FAKE_CAT_FAIL_ON_COUNT": "1"}
-    if arguments:
-        injected = injected | {arguments[0]: arguments[1]}
     result = _run(injected, "--set-hostname", "roastpilot")
     events = log.read_text().splitlines()
     assert result.returncode != 0
