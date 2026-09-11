@@ -187,7 +187,7 @@ parse_arguments() {
     validate_ascii_input "$AUDIO_DEVICE" "audio device"
     [[ "$SERIAL_PORT" != *'#'* && "$SERIAL_PORT" != *'"'* && "$SERIAL_PORT" != *\\* && "$SERIAL_PORT" != *'@@'* ]] || die "serial port contains ambiguous YAML characters"
     [[ "$AUDIO_DEVICE" != *'#'* && "$AUDIO_DEVICE" != *'"'* && "$AUDIO_DEVICE" != *\\* ]] || die "audio device contains ambiguous YAML characters"
-    [[ "$PORT" =~ ^[0-9]+$ && "$PORT" -ge 1024 && "$PORT" -le 65535 ]] || die "port must be a decimal number from 1024 to 65535"
+    [[ "$PORT" =~ ^[0-9]{1,5}$ && "$PORT" -ge 1024 && "$PORT" -le 65535 ]] || die "port must be a decimal number from 1024 to 65535"
     [[ "$SERIAL_PORT" == /dev/* && "$SERIAL_PORT" != *[[:space:]]* ]] || die "serial port must be an absolute /dev path"
     [[ "$AUDIO_DEVICE" == "${AUDIO_DEVICE#"${AUDIO_DEVICE%%[![:space:]]*}"}" && "$AUDIO_DEVICE" == "${AUDIO_DEVICE%"${AUDIO_DEVICE##*[![:space:]]}"}" && "$AUDIO_DEVICE" != *'@@'* ]] || die "audio device is unsafe"
     [[ -z "$REQUESTED_VERSION" || -z "$REQUESTED_WHEEL" ]] || die "choose --version or --wheel"
@@ -295,15 +295,18 @@ resolve_operator_identity() {
 }
 
 verify_existing_unit_identity() {
-    local unit_file line section="" user_seen=0 group_seen=0 service_seen=0 unit_user="" unit_group=""
+    local unit_file line content presence_status section="" user_seen=0 group_seen=0 service_seen=0 unit_user="" unit_group=""
     unit_file="$(rooted_path /etc/systemd/system/roastpilot-agent.service)"
     verify_no_service_dropins
-    if [[ ! -e "$unit_file" && ! -L "$unit_file" ]]; then
+    if privileged_member_presence "$unit_file"; then :; else
+        presence_status=$?
+        [[ "$presence_status" == 1 ]] || die "cannot inspect existing managed unit identity"
         MANAGED_UNIT_WAS_ABSENT=1
         return 0
     fi
     MANAGED_UNIT_WAS_ABSENT=0
-    [[ -f "$unit_file" && ! -L "$unit_file" && -r "$unit_file" ]] || die "existing managed unit identity is unsafe"
+    if ! run_privileged test -f "$unit_file" || run_privileged test -L "$unit_file"; then die "existing managed unit identity is unsafe"; fi
+    content="$(run_privileged cat -- "$unit_file")" || die "cannot read existing managed unit identity"
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" != *\\* ]] || die "existing managed unit identity is malformed"
         line="${line#"${line%%[![:space:]]*}"}"
@@ -325,27 +328,27 @@ verify_existing_unit_identity() {
         elif [[ "$line" =~ ^(User|Group)[[:space:]]*= ]]; then
             die "existing managed unit identity is malformed"
         fi
-    done < "$unit_file"
+    done <<< "$content"
     [[ "$user_seen" == 1 && "$group_seen" == 1 ]] || die "existing managed unit identity is malformed"
     [[ "$unit_user" == "$INVOKING_USER" && "$unit_group" == "$INVOKING_GROUP" ]] || die "existing managed unit identity does not match invoking operator"
 }
 
 verify_no_service_dropins() {
-    local systemd_root dropin_dir unit_file
+    local systemd_root dropin_dir unit_file presence_status
     # These are the system-mode unit search roots.  Systemd applies all three
     # supported drop-in names at every root, including dash-truncated names.
     for systemd_root in /etc/systemd/system.control /run/systemd/system.control /run/systemd/transient /run/systemd/generator.early /etc/systemd/system /etc/systemd/system.attached /run/systemd/system /run/systemd/system.attached /run/systemd/generator /usr/local/lib/systemd/system /usr/lib/systemd/system /run/systemd/generator.late; do
         dropin_dir="$(rooted_path "$systemd_root/roastpilot-agent.service.d")"
-        [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
+        if privileged_member_presence "$dropin_dir"; then die "service drop-ins are not permitted"; else presence_status=$?; [[ "$presence_status" == 1 ]] || die "cannot inspect service drop-ins"; fi
         dropin_dir="$(rooted_path "$systemd_root/roastpilot-.service.d")"
-        [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
+        if privileged_member_presence "$dropin_dir"; then die "service drop-ins are not permitted"; else presence_status=$?; [[ "$presence_status" == 1 ]] || die "cannot inspect service drop-ins"; fi
         dropin_dir="$(rooted_path "$systemd_root/service.d")"
-        [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
+        if privileged_member_presence "$dropin_dir"; then die "service drop-ins are not permitted"; else presence_status=$?; [[ "$presence_status" == 1 ]] || die "cannot inspect service drop-ins"; fi
     done
     # Only these higher-precedence roots can override the managed unit.
     for systemd_root in /etc/systemd/system.control /run/systemd/system.control /run/systemd/transient /run/systemd/generator.early; do
         unit_file="$(rooted_path "$systemd_root/roastpilot-agent.service")"
-        [[ ! -e "$unit_file" && ! -L "$unit_file" ]] || die "service unit overrides are not permitted"
+        if privileged_member_presence "$unit_file"; then die "service unit overrides are not permitted"; else presence_status=$?; [[ "$presence_status" == 1 ]] || die "cannot inspect service unit overrides"; fi
     done
 }
 
@@ -645,11 +648,11 @@ replace_application_safely() {
         cleanup_staged_pipx || true
         die "roastpilot-agent is not safely inactive; end any run safely, stop the service only when idle, then rerun the installer; never restart during a roast"
     fi
+    APPLICATION_CHANGED=1
     if ! pipx_command uninstall -- roastpilot-agent; then
         cleanup_staged_pipx || true
         die "cannot remove prior application after staging replacement"
     fi
-    APPLICATION_CHANGED=1
     if ! pipx_command install -- "$package_spec" || ! verify_pi_capability; then
         pipx_command uninstall -- roastpilot-agent || true
         if ! install_restorable_prior "$prior_spec"; then
@@ -871,7 +874,9 @@ install_content_atomically() {
     expected="${expected%% *}"
     printf '%s\n' "$content" | run_privileged tee -- "$temporary" >/dev/null
     run_privileged chmod "$mode" -- "$temporary"
-    [[ -z "$owner" ]] || run_privileged chown "$owner" -- "$temporary"
+    [[ -z "$owner" ]] || run_privileged chown --no-dereference "$owner" -- "$temporary"
+    actual="$(run_privileged sha256sum -- "$temporary")"
+    [[ "${actual%% *}" == "$expected" ]] || die "atomic temporary digest mismatch"
     run_privileged mv -f -- "$temporary" "$destination"
     remove_root_temporary "$temporary"
     actual="$(run_privileged sha256sum -- "$destination")"
