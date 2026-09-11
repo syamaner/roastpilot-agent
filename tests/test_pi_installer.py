@@ -49,7 +49,8 @@ name=$(basename "$0")
 printf '%s' "$name" >> "$FAKE_LOG"
 for arg in "$@"; do printf ' <%s>' "$arg" >> "$FAKE_LOG"; done
 printf '\\n' >> "$FAKE_LOG"
-[ -z "${FAKE_SECRET_ENV_LOG:-}" ] || printf '%s OPENROUTER_API_KEY=<%s> OPENROUTER_API_KEY_FILE=<%s> OPENAI_API_KEY=<%s> ANTHROPIC_API_KEY=<%s> ROASTPILOT_API_KEY=<%s> ROASTPILOT_OPENROUTER_API_KEY=<%s> API_KEY=<%s>\\n' "$name" "${OPENROUTER_API_KEY-UNSET}" "${OPENROUTER_API_KEY_FILE-UNSET}" "${OPENAI_API_KEY-UNSET}" "${ANTHROPIC_API_KEY-UNSET}" "${ROASTPILOT_API_KEY-UNSET}" "${ROASTPILOT_OPENROUTER_API_KEY-UNSET}" "${API_KEY-UNSET}" >> "$FAKE_SECRET_ENV_LOG"
+[ -z "${FAKE_SECRET_ENV_LOG:-}" ] || printf '%s OPENROUTER_API_KEY=<%s> OPENROUTER_API_KEY_FILE=<%s> OPENAI_API_KEY=<%s> ANTHROPIC_API_KEY=<%s> ROASTPILOT_API_KEY=<%s> ROASTPILOT_OPENROUTER_API_KEY=<%s> ROASTPILOT_INSTALL_API_KEY=<%s> API_KEY=<%s>\\n' "$name" "${OPENROUTER_API_KEY-UNSET}" "${OPENROUTER_API_KEY_FILE-UNSET}" "${OPENAI_API_KEY-UNSET}" "${ANTHROPIC_API_KEY-UNSET}" "${ROASTPILOT_API_KEY-UNSET}" "${ROASTPILOT_OPENROUTER_API_KEY-UNSET}" "${ROASTPILOT_INSTALL_API_KEY-UNSET}" "${API_KEY-UNSET}" >> "$FAKE_SECRET_ENV_LOG"
+[ "${FAKE_REQUIRE_LC_ALL_C:-}" != 1 ] || { [ "${LC_ALL:-}" = C ] || { printf 'FAKE_LC_ALL_NOT_C <%s>\\n' "${LC_ALL-UNSET}" >> "$FAKE_LOG"; exit 58; }; printf 'FAKE_LC_ALL_C\\n' >> "$FAKE_LOG"; }
 case "$name" in
   sudo) shift; [ "${1:-}" = -- ] && shift; exec "$@" ;;
   id)
@@ -497,6 +498,7 @@ esac
         "FAKE_SERVICE_STATE_COUNTER": str(tmp_path / "service-state-counter"),
         "ROASTPILOT_INSTALL_TEST_MODE": "1",
         "ROASTPILOT_INSTALL_TEST_ROOT": str(install_root),
+        "ROASTPILOT_INSTALL_TEST_COMMAND_DIR": str(fake_bin),
         "ROASTPILOT_INSTALL_OS_RELEASE": str(os_release),
         "HOME": str(tmp_path / "home"),
         "FAKE_OPERATOR_HOME": str(operator_home),
@@ -517,6 +519,7 @@ def _run(
         "ROASTPILOT_INSTALL_TEST_MODE",
         "ROASTPILOT_INSTALL_TEST_ROOT",
         "ROASTPILOT_INSTALL_OS_RELEASE",
+        "ROASTPILOT_INSTALL_TEST_COMMAND_DIR",
         "ROASTPILOT_INSTALL_WHEEL",
         "ROASTPILOT_INSTALL_API_KEY",
         "ROASTPILOT_INSTALL_SERIAL_PORT",
@@ -2341,6 +2344,82 @@ def test_repaired_input_bounds_and_test_mode_are_fail_closed(
 
 
 @pytest.mark.serial
+def test_test_mode_requires_one_complete_fake_command_directory_before_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A test seam cannot fall through to host-mutating commands."""
+    fake_bin, environment, log, _ = installer_harness
+    (fake_bin / "systemctl").unlink()
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0 and "test command directory is incomplete" in result.stderr
+    assert not log.exists()
+
+
+@pytest.mark.serial
+def test_missing_python3_in_closed_test_path_fails_before_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """The validation interpreter is preflighted through the intentionally closed PATH."""
+    fake_bin, environment, log, _ = installer_harness
+    closed = tmp_path / "closed"
+    closed.mkdir()
+    for command in ("bash", "basename", "cat", "dirname", "env"):
+        executable = shutil.which(command)
+        assert executable is not None
+        (closed / command).symlink_to(executable)
+    result = _run(
+        environment | {"PATH": f"{fake_bin}{os.pathsep}{closed}"}, "--set-hostname", "roastpilot"
+    )
+    assert (
+        result.returncode != 0 and "python3 is required for installer validation" in result.stderr
+    )
+    assert not log.exists()
+
+
+@pytest.mark.serial
+def test_children_observe_c_locale_before_fake_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Locale normalisation is an installer boundary, not an optional host-locale accident."""
+    _, environment, log, _ = installer_harness
+    result = _run(
+        environment | {"LC_ALL": "not-C", "FAKE_REQUIRE_LC_ALL_C": "1"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "FAKE_LC_ALL_C" in log.read_text().splitlines()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "etc/systemd/system.control/roastpilot-agent.service.d",
+        "run/systemd/system.control/roastpilot-agent.service.d",
+        "etc/systemd/system/service.d",
+        "run/systemd/system/service.d",
+        "usr/lib/systemd/system/service.d",
+        "run/systemd/transient/roastpilot-agent.service",
+        "run/systemd/generator.early/roastpilot-agent.service",
+    ],
+)
+def test_additional_systemd_override_locations_fail_before_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], relative: str
+) -> None:
+    """Every admitted systemd override search location is rejected before package work."""
+    _, environment, log, _ = installer_harness
+    target = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / relative
+    target.mkdir(parents=True)
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0 and "service" in result.stderr
+    assert not any(
+        event.startswith(("apt-get ", "pipx ", "roastpilot-agent "))
+        for event in log.read_text().splitlines()
+    )
+
+
+@pytest.mark.serial
 @pytest.mark.parametrize("audio_device", ("AA", "111", "mmm"))
 def test_repeated_character_audio_devices_are_accepted_without_edge_whitespace(
     installer_harness: tuple[Path, dict[str, str], Path, Path], audio_device: str
@@ -2606,7 +2685,10 @@ audio:
         assert not (
             root / "var/lib/roastpilot-agent/models/onnx/int8/model_quantized.onnx"
         ).exists()
-        assert not any(str(root / "etc/roastpilot-agent") in line for line in _delta(log, start))
+        assert not any(
+            str(root / "etc/roastpilot-agent") in line and not line.startswith("test ")
+            for line in _delta(log, start)
+        )
 
 
 @pytest.mark.serial  # The fake model source is process-scoped fixture state.
@@ -3869,6 +3951,7 @@ def test_child_processes_do_not_receive_exported_secret_sentinels(
         "anthropic-sentinel",
         "roastpilot-api-sentinel",
         "roastpilot-openrouter-sentinel",
+        "installer-sentinel",
         "exported-api-sentinel",
     ):
         assert sentinel not in child_env
@@ -4400,7 +4483,7 @@ def test_privileged_write_recheck_reports_its_failed_destination(
     result = _run(
         environment
         | {"FAKE_TEST_FAIL_PATH": str(target)}
-        | ({"FAKE_TEST_FAIL_ON_COUNT": "5"} if target_kind == "config" else {}),
+        | ({"FAKE_TEST_FAIL_ON_COUNT": "10"} if target_kind == "config" else {}),
         "--set-hostname",
         "roastpilot",
     )
@@ -4472,7 +4555,7 @@ def test_snapshot_member_probe_failure_is_not_treated_as_absence(
     assert result.returncode != 0
     assert f"FAKE_TEST_FAILURE <{env}>" in events
     assert Path(environment["FAKE_TEST_FAIL_COUNT_FILE"]).read_text() == "3\n"
-    assert f"cannot inspect existing configuration destination at {env}" in result.stderr
+    assert "cannot inspect existing environment file" in result.stderr
     assert env.read_text() == original
     assert not any(
         event.endswith(f"> <{env}>") and event.startswith(("tee ", "mv ", "rm <-f>", "cp <-p>"))
@@ -5062,6 +5145,8 @@ def test_operator_home_temporary_root_boundary_differs_by_mode(
         assert test_mode.returncode == 0 and test_mode.stdout == str(home)
         production = environment | {"FAKE_GETENT_RECORD": record}
         production.pop("ROASTPILOT_INSTALL_TEST_MODE")
+        production.pop("ROASTPILOT_INSTALL_TEST_ROOT")
+        production.pop("ROASTPILOT_INSTALL_TEST_COMMAND_DIR")
         rejected = subprocess.run(
             ["bash", "-c", 'source "$1"; resolve_operator_identity', "bash", str(sourceable)],
             env=production,

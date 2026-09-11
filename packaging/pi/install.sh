@@ -40,9 +40,9 @@ is_expected_mktemp_path() {
 }
 
 validate_install_root() {
-    local install_root="${ROASTPILOT_INSTALL_TEST_ROOT:-}"
+    local install_root="${ROASTPILOT_INSTALL_TEST_ROOT:-}" test_command_dir="${ROASTPILOT_INSTALL_TEST_COMMAND_DIR:-}" command resolved
     if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" != "1" ]]; then
-        [[ -z "${ROASTPILOT_INSTALL_TEST_ROOT:-}" && -z "${ROASTPILOT_INSTALL_ROOT:-}" ]] || die "test destination is unavailable in production"
+        [[ -z "${ROASTPILOT_INSTALL_TEST_ROOT:-}" && -z "${ROASTPILOT_INSTALL_ROOT:-}" && -z "$test_command_dir" ]] || die "test destination is unavailable in production"
         PATH=/usr/sbin:/usr/bin:/sbin:/bin
         export PATH
         return
@@ -51,6 +51,13 @@ validate_install_root() {
     [[ "$install_root" == /* && "$install_root" != / && "$install_root" != // ]] || die "invalid install root"
     [[ "/${install_root#/}/" != *"/."/* && "/${install_root#/}/" != *"/.."/* && "$install_root" != */. && "$install_root" != */.. ]] || die "invalid install root"
     [[ "$install_root" != *$'\n'* && "$install_root" != *$'\r'* ]] || die "invalid install root"
+    [[ -n "$test_command_dir" && "$test_command_dir" == /* && -d "$test_command_dir" && ! -L "$test_command_dir" ]] || die "test command directory is required"
+    resolved="$(cd -- "$test_command_dir" && pwd -P)" || die "test command directory is unsafe"
+    [[ "$resolved" == "$test_command_dir" ]] || die "test command directory must be canonical"
+    for command in apt-get hostnamectl usermod systemctl roastpilot-agent mkdir chmod chown rm cp mv tee mktemp sha256sum; do
+        [[ -x "$test_command_dir/$command" ]] || die "test command directory is incomplete"
+        [[ "$(command -v "$command")" == "$test_command_dir/$command" ]] || die "test command directory does not own $command"
+    done
 }
 
 validate_destination() {
@@ -178,7 +185,7 @@ parse_arguments() {
     validate_no_control_characters "$AUDIO_DEVICE" "audio device"
     validate_ascii_input "$SERIAL_PORT" "serial port"
     validate_ascii_input "$AUDIO_DEVICE" "audio device"
-    [[ "$SERIAL_PORT" != *'#'* && "$SERIAL_PORT" != *'"'* && "$SERIAL_PORT" != *\\* ]] || die "serial port contains ambiguous YAML characters"
+    [[ "$SERIAL_PORT" != *'#'* && "$SERIAL_PORT" != *'"'* && "$SERIAL_PORT" != *\\* && "$SERIAL_PORT" != *'@@'* ]] || die "serial port contains ambiguous YAML characters"
     [[ "$AUDIO_DEVICE" != *'#'* && "$AUDIO_DEVICE" != *'"'* && "$AUDIO_DEVICE" != *\\* ]] || die "audio device contains ambiguous YAML characters"
     [[ "$PORT" =~ ^[0-9]+$ && "$PORT" -ge 1024 && "$PORT" -le 65535 ]] || die "port must be a decimal number from 1024 to 65535"
     [[ "$SERIAL_PORT" == /dev/* && "$SERIAL_PORT" != *[[:space:]]* ]] || die "serial port must be an absolute /dev path"
@@ -324,10 +331,20 @@ verify_existing_unit_identity() {
 }
 
 verify_no_service_dropins() {
-    local systemd_root dropin_dir
+    local systemd_root dropin_dir unit_file
     for systemd_root in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system; do
         dropin_dir="$(rooted_path "$systemd_root/roastpilot-agent.service.d")"
         [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
+        dropin_dir="$(rooted_path "$systemd_root/service.d")"
+        [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
+    done
+    for systemd_root in /etc/systemd/system.control /run/systemd/system.control; do
+        dropin_dir="$(rooted_path "$systemd_root/roastpilot-agent.service.d")"
+        [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
+    done
+    for systemd_root in /run/systemd/transient /run/systemd/generator.early; do
+        unit_file="$(rooted_path "$systemd_root/roastpilot-agent.service")"
+        [[ ! -e "$unit_file" && ! -L "$unit_file" ]] || die "service unit overrides are not permitted"
     done
 }
 
@@ -342,7 +359,11 @@ privileged_member_presence() {
 }
 
 snapshot_live_configuration() {
-    local destination name snapshot_root presence_status
+    local destination name snapshot_root snapshot_parent presence_status
+    snapshot_parent="$(rooted_path /tmp)"
+    validate_destination "$snapshot_parent"
+    run_privileged test -d "$snapshot_parent" || die "configuration snapshot parent is unsafe"
+    run_privileged test ! -L "$snapshot_parent" || die "configuration snapshot parent is unsafe"
     CONFIG_SNAPSHOT_DIR="$(run_privileged mktemp -d -- "$(rooted_path /tmp)/roastpilot-config-rollback.XXXXXX")"
     CONFIG_SNAPSHOT_VALIDATED=0
     snapshot_root="$(rooted_path /tmp)/roastpilot-config-rollback."
@@ -414,8 +435,14 @@ discard_configuration_snapshot() {
 }
 
 installed_pipx_state() {
+    local state status
+    state="$(inspect_pipx_state)" || { status=$?; [[ "$status" == 2 ]] && die "cannot inspect pipx state"; die "invalid pipx state"; }
+    printf '%s\n' "$state"
+}
+
+inspect_pipx_state() {
     local state
-    state="$(pipx_command list --json)" || die "cannot inspect pipx state"
+    state="$(pipx_command list --json)" || return 2
     printf '%s' "$state" | python3 -c '
 import json, sys
 try:
@@ -429,11 +456,14 @@ try:
     print(json.dumps(entry))
 except (ValueError, KeyError, TypeError, json.JSONDecodeError):
     raise SystemExit(1)
-' || die "invalid pipx state"
+' || return 3
 }
 
 pipx_command() {
     # Ignore ambient pipx routing and always use the resolved invoking home.
+    if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" == 1 ]]; then
+        [[ "$(command -v pipx 2>/dev/null || true)" == "${ROASTPILOT_INSTALL_TEST_COMMAND_DIR}/pipx" ]] || die "test command directory does not own pipx"
+    fi
     env -u PIPX_HOME -u PIPX_BIN_DIR -u PIPX_DEFAULT_PYTHON HOME="$INVOKING_HOME" pipx "$@"
 }
 
@@ -704,12 +734,18 @@ resolve_appliance_executable() {
 }
 
 preserve_existing_api_key() {
-    local env_file content line key_seen=0 preserved_key="" port_seen=0 db_seen=0 config_seen=0
+    local env_file content presence_status line key_seen=0 preserved_key="" port_seen=0 db_seen=0 config_seen=0
     [[ -z "$API_KEY" ]] || return 0
     env_file="$(rooted_path /etc/roastpilot-agent/roastpilot-agent.env)"
-    [[ ! -e "$env_file" && ! -L "$env_file" ]] && return
-    [[ -f "$env_file" && ! -L "$env_file" ]] || die "existing environment file is unsafe"
-    content="$(cat -- "$env_file")" || die "cannot read existing environment file"
+    if privileged_member_presence "$env_file"; then :; else
+        presence_status=$?
+        [[ "$presence_status" == 1 ]] && return
+        die "cannot inspect existing environment file"
+    fi
+    if ! run_privileged test -f "$env_file" || run_privileged test -L "$env_file"; then
+        die "existing environment file is unsafe"
+    fi
+    content="$(run_privileged cat -- "$env_file")" || die "cannot read existing environment file"
     content="$(normalise_unit_env_contract "$content")"
     while IFS= read -r line || [[ -n "$line" ]]; do
         case "$line" in
@@ -795,7 +831,7 @@ promote_model_file() {
     run_privileged chmod 0644 -- "$temporary"
     run_privileged mv -f -- "$temporary" "$destination"
     remove_root_temporary "$temporary"
-    actual="$(run_privileged sha256sum -- "$destination")"; [[ "${actual%% *}" == "$expected" ]] || die "model destination digest mismatch"
+    actual="$(run_privileged sha256sum -- "$destination")"; [[ "${actual%% *}" == "$expected" ]] || die "model destination digest mismatch at $destination; manual reconciliation required"
 }
 
 validate_model_stage_file() {
@@ -962,6 +998,7 @@ install_rendered_files() {
     groups="$(id -nG "$INVOKING_USER")" || die "cannot determine invoking user groups"
     if [[ " $groups " != *" dialout "* || " $groups " != *" audio "* ]]; then
         run_privileged usermod -aG dialout,audio -- "$INVOKING_USER"
+        USERMOD_GROUPS_CHANGED=1
     fi
 }
 
@@ -988,6 +1025,7 @@ enable_services() {
     run_privileged systemctl enable roastpilot-agent
     if [[ "$START_SERVICE" == 1 ]]; then
         require_agent_inactive
+        START_SERVICE_ATTEMPTED=1
         run_privileged systemctl start roastpilot-agent
     fi
 }
@@ -1029,8 +1067,10 @@ main() {
     INSTALLATION_COMMITTED=0
     RESTORE_ARTIFACT_RETAIN=0
     POST_COMMIT_SNAPSHOT_FAILURE=0
+    USERMOD_GROUPS_CHANGED=0
+    START_SERVICE_ATTEMPTED=0
     cleanup() {
-        local temporary original_status=$? cleanup_failed=0
+        local temporary state original_status=$? cleanup_failed=0
         trap - EXIT
         for temporary in "${ROOT_TEMPORARIES[@]:-}"; do
             [[ -z "$temporary" ]] && continue
@@ -1053,7 +1093,7 @@ main() {
         fi
         if [[ "${FRESH_APPLICATION_CLEANUP_REQUIRED:-0}" == 1 ]]; then
             if ! pipx_command uninstall -- roastpilot-agent; then
-                if [[ "$(installed_pipx_state)" == "absent" ]]; then
+                if state="$(inspect_pipx_state)" && [[ "$state" == "absent" ]]; then
                     FRESH_APPLICATION_CLEANUP_REQUIRED=0
                     APPLICATION_CHANGED=0
                 else
@@ -1118,6 +1158,12 @@ main() {
         fi
         if [[ "${INSTALLATION_COMMITTED:-0}" != 1 && "${AVAHI_ENABLE_ATTEMPTED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after enabling Avahi; Avahi enablement may remain" >&2
+        fi
+        if [[ "${INSTALLATION_COMMITTED:-0}" != 1 && "${USERMOD_GROUPS_CHANGED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
+            printf '%s\n' "install failed after supplementary-group change; dialout/audio membership may remain" >&2
+        fi
+        if [[ "${INSTALLATION_COMMITTED:-0}" != 1 && "${START_SERVICE_ATTEMPTED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
+            printf '%s\n' "install failed after --start; service may be running against rolled-back configuration" >&2
         fi
         if [[ "${INSTALLATION_COMMITTED:-0}" != 1 && "${APPLICATION_CHANGED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             printf '%s\n' "install failed after application replacement; application/configuration skew may require manual reconciliation" >&2
