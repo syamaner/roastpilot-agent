@@ -4159,7 +4159,9 @@ def test_privileged_write_recheck_reports_its_failed_destination(
     )
     assert result.returncode != 0
     assert diagnostic in result.stderr and str(target) in result.stderr
-    assert f"test <!> <-L> <{target}>" in log.read_text().splitlines()
+    events = log.read_text().splitlines()
+    assert f"test <!> <-L> <{target}>" in events
+    assert f"FAKE_TEST_FAILURE <{target}>" in events
 
 
 @pytest.mark.serial

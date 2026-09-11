@@ -434,10 +434,21 @@ create_restore_artifact_dir() {
 }
 
 capture_prior_wheelhouse() {
-    local version="$1" requirements
+    local version="$1" source="${2:-}" copied="${3:-}" requirements rewritten
     requirements="$RESTORE_ARTIFACT_DIR/requirements.txt"
     pipx_command runpip roastpilot-agent freeze --all > "$requirements" || die "cannot preserve exact prior application"
-    grep -Fx "roastpilot-agent==$version" "$requirements" >/dev/null || die "cannot preserve exact prior application"
+    if [[ -n "$source" ]]; then
+        if grep -Fx "roastpilot-agent @ file://$source" "$requirements" >/dev/null; then
+            rewritten="$RESTORE_ARTIFACT_DIR/requirements.rewritten"
+            grep -Fvx "roastpilot-agent @ file://$source" "$requirements" > "$rewritten" || true
+            printf 'roastpilot-agent @ file://%s\n' "$copied" >> "$rewritten"
+            mv -- "$rewritten" "$requirements"
+        else
+            grep -Fx "roastpilot-agent==$version" "$requirements" >/dev/null || die "cannot preserve exact prior application"
+        fi
+    else
+        grep -Fx "roastpilot-agent==$version" "$requirements" >/dev/null || die "cannot preserve exact prior application"
+    fi
     pipx_command runpip roastpilot-agent wheel --wheel-dir "$RESTORE_ARTIFACT_DIR" -r "$requirements" || die "cannot preserve exact prior application"
     compgen -G "$RESTORE_ARTIFACT_DIR/*.whl" >/dev/null || die "cannot preserve exact prior application"
     RESTORABLE_PRIOR_PIP_ARGS="--no-index --find-links=$RESTORE_ARTIFACT_DIR"
@@ -473,7 +484,7 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             create_restore_artifact_dir
             [[ -f "$source" && ! -L "$source" ]] || die "cannot preserve exact prior local wheel"
             cp -- "$source" "$RESTORE_ARTIFACT_DIR/$source_basename"
-            capture_prior_wheelhouse "$version"
+            capture_prior_wheelhouse "$version" "$source" "$RESTORE_ARTIFACT_DIR/$source_basename"
             RESTORABLE_PRIOR_SPEC="$RESTORE_ARTIFACT_DIR/${source_basename}[pi]"
             ;;
         roastpilot-agent|roastpilot-agent\[pi\])
@@ -611,6 +622,7 @@ install_application() {
 
 verify_existing_pi_capability_before_package_install() {
     local state
+    command -v pipx >/dev/null 2>&1 || return 0
     state="$(installed_pipx_state)"
     [[ "$state" == "absent" || -n "$REQUESTED_WHEEL$REQUESTED_VERSION" ]] && return 0
     require_pi_capability "installed roastpilot-agent lacks required Pi/MCP capability"
@@ -782,6 +794,7 @@ install_content_atomically() {
 normalise_unit_env_contract() {
     local content="$1" line normalised=""
     while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" != *\\ ]] || return 1
         [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" != *'#'* && "$line" != *';'* && "$line" != *\\* ]] || die "rendered unit/env contains an unsafe inline mutation"
         normalised+="$line"$'\n'
