@@ -311,6 +311,16 @@ PrivateTmp=true
 WantedBy=multi-user.target
 UNIT
       [ -z "${FAKE_RENDERED_UNIT:-}" ] || printf '%s\\n' "$FAKE_RENDERED_UNIT" > "$out/roastpilot-agent.service"
+      if [ -n "${FAKE_RENDERED_DIRECTORY:-}" ]; then
+        /bin/rm -f -- "$out/$FAKE_RENDERED_DIRECTORY"
+        /bin/mkdir -- "$out/$FAKE_RENDERED_DIRECTORY"
+        printf 'FAKE_RENDERED_DIRECTORY <%s>\\n' "$FAKE_RENDERED_DIRECTORY" >> "$FAKE_LOG"
+      fi
+      if [ "${FAKE_MODEL_STAGE_DIRECTORY:-}" = 1 ]; then
+        /bin/rm -f -- "$out/models/onnx/int8/model_quantized.onnx"
+        /bin/mkdir -- "$out/models/onnx/int8/model_quantized.onnx"
+        printf 'FAKE_MODEL_STAGE_DIRECTORY\\n' >> "$FAKE_LOG"
+      fi
     fi ;;
   tee) [ "${1:-}" = -- ] && shift; [ "${FAKE_TEE_FAIL:-}" != 1 ] || exit 19; [ "${FAKE_TEE_FAIL_TARGET:-}" != "$1" ] || exit 19; mkdir -p "$(dirname "$1")"; cat > "$1" ;;
   install) mode=0644; [ "${1:-}" = -m ] && { mode="$2"; shift 2; }
@@ -3106,6 +3116,50 @@ def test_model_promotion_source_cat_failure_preserves_destination_and_cleans_tem
     assert any(
         i > failure and event.startswith("rm <-f>") and ".roastpilot-model." in event
         for i, event in enumerate(events)
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("injection", "marker", "diagnostic"),
+    [
+        (
+            {"FAKE_MODEL_STAGE_DIRECTORY": "1"},
+            "FAKE_MODEL_STAGE_DIRECTORY",
+            "model staging file is unsafe",
+        ),
+        (
+            {"FAKE_RENDERED_DIRECTORY": "roastpilot-agent.env"},
+            "FAKE_RENDERED_DIRECTORY <roastpilot-agent.env>",
+            "rendered env is unsafe",
+        ),
+        (
+            {"FAKE_RENDERED_DIRECTORY": "coffee-roaster-mcp.appliance.yaml"},
+            "FAKE_RENDERED_DIRECTORY <coffee-roaster-mcp.appliance.yaml>",
+            "rendered MCP-YAML is unsafe",
+        ),
+        (
+            {"FAKE_RENDERED_DIRECTORY": "roastpilot-agent.service"},
+            "FAKE_RENDERED_DIRECTORY <roastpilot-agent.service>",
+            "rendered unit is unsafe",
+        ),
+    ],
+)
+def test_unsafe_staged_members_fail_before_live_promotion(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    injection: dict[str, str],
+    marker: str,
+    diagnostic: str,
+) -> None:
+    """Non-regular staged members are rejected before any appliance destination write."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    result = _run(environment | injection, "--set-hostname", "roastpilot")
+    events = log.read_text().splitlines()
+    assert result.returncode != 0 and diagnostic in result.stderr and marker in events
+    assert not any(
+        event.startswith(("tee ", "mv ")) and str(root / "etc") in event for event in events
     )
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
