@@ -1069,6 +1069,8 @@ summary() {
 
 main() {
     set +x
+    # The validation interpreter must not inherit caller-selected Python roots.
+    unset PYTHONHOME PYTHONPATH
     LC_ALL=C
     export LC_ALL
     STAGE_DIR=""

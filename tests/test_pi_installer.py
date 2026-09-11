@@ -87,7 +87,7 @@ case "$name" in
     fi ;;
   pipx)
     if [ -n "${FAKE_PIPX_ENV_LOG:-}" ]; then
-      printf 'HOME=<%s> PIPX_HOME=<%s> PIPX_BIN_DIR=<%s> PIPX_DEFAULT_PYTHON=<%s> PIP_INDEX_URL=<%s> PIP_EXTRA_INDEX_URL=<%s> PIP_TRUSTED_HOST=<%s> PIP_CONFIG_FILE=<%s> PIP_REQUIRE_VIRTUALENV=<%s> HTTP_PROXY=<%s> HTTPS_PROXY=<%s> ALL_PROXY=<%s> NO_PROXY=<%s> http_proxy=<%s> https_proxy=<%s> all_proxy=<%s> no_proxy=<%s>\\n' "${HOME-UNSET}" "${PIPX_HOME-UNSET}" "${PIPX_BIN_DIR-UNSET}" "${PIPX_DEFAULT_PYTHON-UNSET}" "${PIP_INDEX_URL-UNSET}" "${PIP_EXTRA_INDEX_URL-UNSET}" "${PIP_TRUSTED_HOST-UNSET}" "${PIP_CONFIG_FILE-UNSET}" "${PIP_REQUIRE_VIRTUALENV-UNSET}" "${HTTP_PROXY-UNSET}" "${HTTPS_PROXY-UNSET}" "${ALL_PROXY-UNSET}" "${NO_PROXY-UNSET}" "${http_proxy-UNSET}" "${https_proxy-UNSET}" "${all_proxy-UNSET}" "${no_proxy-UNSET}" >> "$FAKE_PIPX_ENV_LOG"
+      printf 'HOME=<%s> PIPX_HOME=<%s> PIPX_BIN_DIR=<%s> PIPX_DEFAULT_PYTHON=<%s> PIP_INDEX_URL=<%s> PIP_EXTRA_INDEX_URL=<%s> PIP_TRUSTED_HOST=<%s> PIP_CONFIG_FILE=<%s> PIP_REQUIRE_VIRTUALENV=<%s> HTTP_PROXY=<%s> HTTPS_PROXY=<%s> ALL_PROXY=<%s> NO_PROXY=<%s> http_proxy=<%s> https_proxy=<%s> all_proxy=<%s> no_proxy=<%s> XDG_DATA_HOME=<%s> XDG_CONFIG_HOME=<%s> PIP_FIND_LINKS=<%s> PIP_NO_INDEX=<%s> PIP_PROXY=<%s> PIP_CERT=<%s> PIP_CLIENT_CERT=<%s> PIP_PRE=<%s> PIP_TARGET=<%s> PIPX_GLOBAL_HOME=<%s> PYTHONPATH=<%s> PYTHONHOME=<%s>\\n' "${HOME-UNSET}" "${PIPX_HOME-UNSET}" "${PIPX_BIN_DIR-UNSET}" "${PIPX_DEFAULT_PYTHON-UNSET}" "${PIP_INDEX_URL-UNSET}" "${PIP_EXTRA_INDEX_URL-UNSET}" "${PIP_TRUSTED_HOST-UNSET}" "${PIP_CONFIG_FILE-UNSET}" "${PIP_REQUIRE_VIRTUALENV-UNSET}" "${HTTP_PROXY-UNSET}" "${HTTPS_PROXY-UNSET}" "${ALL_PROXY-UNSET}" "${NO_PROXY-UNSET}" "${http_proxy-UNSET}" "${https_proxy-UNSET}" "${all_proxy-UNSET}" "${no_proxy-UNSET}" "${XDG_DATA_HOME-UNSET}" "${XDG_CONFIG_HOME-UNSET}" "${PIP_FIND_LINKS-UNSET}" "${PIP_NO_INDEX-UNSET}" "${PIP_PROXY-UNSET}" "${PIP_CERT-UNSET}" "${PIP_CLIENT_CERT-UNSET}" "${PIP_PRE-UNSET}" "${PIP_TARGET-UNSET}" "${PIPX_GLOBAL_HOME-UNSET}" "${PYTHONPATH-UNSET}" "${PYTHONHOME-UNSET}" >> "$FAKE_PIPX_ENV_LOG"
     fi
     if [ "${1:-}" = environment ]; then
       [ "${2:-}" = --value ] && [ "${3:-}" = PIPX_HOME ] || exit 18
@@ -1369,12 +1369,24 @@ def test_pipx_children_use_only_the_resolved_invoking_home(
         "https_proxy": "http://hostile.invalid:9",
         "all_proxy": "http://hostile.invalid:9",
         "no_proxy": "hostile.invalid",
+        "XDG_DATA_HOME": "/hostile/data",
+        "XDG_CONFIG_HOME": "/hostile/config",
+        "PIP_FIND_LINKS": "/hostile/wheels",
+        "PIP_NO_INDEX": "1",
+        "PIP_PROXY": "hostile",
+        "PIP_CERT": "/hostile/cert",
+        "PIP_CLIENT_CERT": "/hostile/client-cert",
+        "PIP_PRE": "1",
+        "PIP_TARGET": "/hostile/target",
+        "PIPX_GLOBAL_HOME": "/hostile/global",
+        "PYTHONPATH": "/hostile/pythonpath",
+        "PYTHONHOME": sys.prefix,
     }
     result = _run(hostile_environment, "--set-hostname", "roastpilot")
     assert result.returncode == 0, result.stderr
     records = Path(environment["FAKE_PIPX_ENV_LOG"]).read_text().splitlines()
     expected_home = environment["FAKE_OPERATOR_HOME"]
-    expected_record = f"HOME=<{expected_home}> PIPX_HOME=<UNSET> PIPX_BIN_DIR=<UNSET> PIPX_DEFAULT_PYTHON=<UNSET> PIP_INDEX_URL=<UNSET> PIP_EXTRA_INDEX_URL=<UNSET> PIP_TRUSTED_HOST=<UNSET> PIP_CONFIG_FILE=<UNSET> PIP_REQUIRE_VIRTUALENV=<UNSET> HTTP_PROXY=<UNSET> HTTPS_PROXY=<UNSET> ALL_PROXY=<UNSET> NO_PROXY=<UNSET> http_proxy=<UNSET> https_proxy=<UNSET> all_proxy=<UNSET> no_proxy=<UNSET>"
+    expected_record = f"HOME=<{expected_home}> PIPX_HOME=<UNSET> PIPX_BIN_DIR=<UNSET> PIPX_DEFAULT_PYTHON=<UNSET> PIP_INDEX_URL=<UNSET> PIP_EXTRA_INDEX_URL=<UNSET> PIP_TRUSTED_HOST=<UNSET> PIP_CONFIG_FILE=<UNSET> PIP_REQUIRE_VIRTUALENV=<UNSET> HTTP_PROXY=<UNSET> HTTPS_PROXY=<UNSET> ALL_PROXY=<UNSET> NO_PROXY=<UNSET> http_proxy=<UNSET> https_proxy=<UNSET> all_proxy=<UNSET> no_proxy=<UNSET> XDG_DATA_HOME=<UNSET> XDG_CONFIG_HOME=<UNSET> PIP_FIND_LINKS=<UNSET> PIP_NO_INDEX=<UNSET> PIP_PROXY=<UNSET> PIP_CERT=<UNSET> PIP_CLIENT_CERT=<UNSET> PIP_PRE=<UNSET> PIP_TARGET=<UNSET> PIPX_GLOBAL_HOME=<UNSET> PYTHONPATH=<UNSET> PYTHONHOME=<UNSET>"
     assert records and all(record == expected_record for record in records)
     pipx_events = [line for line in log.read_text().splitlines() if line.startswith("pipx ")]
     assert len(records) == len(pipx_events)
