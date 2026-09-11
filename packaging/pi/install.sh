@@ -94,6 +94,13 @@ validate_ascii_input() {
     [[ "$value" =~ ^[\ -~]+$ ]] || die "$description must contain ASCII characters only"
 }
 
+validate_path_selector() {
+    local value="$1" description="$2"
+    validate_no_control_characters "$value" "$description"
+    [[ "$value" != *"'"* && "$value" != *\"* ]] || die "$description contains unsafe quote characters"
+    python3 -c 'import sys, unicodedata; raise SystemExit(1 if any(unicodedata.category(c) in {"Cf", "Zl", "Zp"} for c in sys.argv[1]) else 0)' "$value" || die "$description contains unsafe Unicode characters"
+}
+
 scrub_child_secrets() {
     unset OPENROUTER_API_KEY OPENROUTER_API_KEY_FILE OPENAI_API_KEY ANTHROPIC_API_KEY
     unset ROASTPILOT_API_KEY ROASTPILOT_OPENROUTER_API_KEY
@@ -180,14 +187,17 @@ parse_arguments() {
     [[ -z "$REQUESTED_VERSION" || "$REQUESTED_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ ]] || die "invalid version selector"
     if [[ -n "$REQUESTED_WHEEL" ]]; then
         local canonical_wheel
-        validate_no_control_characters "$REQUESTED_WHEEL" "wheel selector"
+        validate_path_selector "$REQUESTED_WHEEL" "wheel selector"
         [[ "$REQUESTED_WHEEL" == /* && "$REQUESTED_WHEEL" != *"/../"* ]] || die "invalid wheel selector"
         [[ -f "$REQUESTED_WHEEL" && ! -L "$REQUESTED_WHEEL" ]] || die "wheel must be a regular file"
         canonical_wheel="$(readlink -f -- "$REQUESTED_WHEEL")"
         [[ "$REQUESTED_WHEEL" == "$canonical_wheel" ]] || die "wheel path must be canonical"
         REQUESTED_WHEEL="$canonical_wheel"
     fi
-    if [[ -n "$MODEL_FROM_DIR" ]]; then validate_from_dir "$MODEL_FROM_DIR"; fi
+    if [[ -n "$MODEL_FROM_DIR" ]]; then
+        validate_path_selector "$MODEL_FROM_DIR" "--from-dir"
+        validate_from_dir "$MODEL_FROM_DIR"
+    fi
     if [[ -n "$REQUESTED_HOSTNAME" ]]; then
         is_dns_label "$REQUESTED_HOSTNAME" || die "hostname must be a lowercase DNS label"
         [[ "$REQUESTED_HOSTNAME" == "roastpilot" ]] || die "only --set-hostname roastpilot is supported"
@@ -196,6 +206,7 @@ parse_arguments() {
 
 preflight() {
     validate_install_root
+    command -v python3 >/dev/null 2>&1 || die "python3 is required for installer validation"
     [[ "$(id -u)" != "0" ]] || die "never run pipx as root"
     if [[ "$(uname -m)" != "aarch64" && "$ALLOW_UNSUPPORTED_ARCH" != 1 ]]; then
         die "this installer supports aarch64 only; pass --allow-unsupported-arch to override"
@@ -269,7 +280,10 @@ resolve_operator_identity() {
         tmp_root="$(readlink -f -- /tmp)" || die "unsafe operator home"
         var_tmp_root="$(readlink -f -- /var/tmp)" || die "unsafe operator home"
     fi
-    [[ "$effective_home" != /tmp && "$effective_home" != /tmp/* && "$effective_home" != /var/tmp && "$effective_home" != /var/tmp/* && "$effective_home" != "$tmp_root" && "$effective_home" != "$tmp_root"/* && "$effective_home" != "$var_tmp_root" && "$effective_home" != "$var_tmp_root"/* ]] || die "unsafe operator home"
+    if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" != "1" ]]; then
+        [[ "$effective_home" != /tmp && "$effective_home" != /tmp/* && "$effective_home" != /var/tmp && "$effective_home" != /var/tmp/* ]] || die "unsafe operator home"
+    fi
+    [[ "$effective_home" != "$tmp_root" && "$effective_home" != "$tmp_root"/* && "$effective_home" != "$var_tmp_root" && "$effective_home" != "$var_tmp_root"/* ]] || die "unsafe operator home"
     INVOKING_HOME="$operator_home"
 }
 
@@ -310,9 +324,11 @@ verify_existing_unit_identity() {
 }
 
 verify_no_service_dropins() {
-    local dropin_dir
-    dropin_dir="$(rooted_path /etc/systemd/system/roastpilot-agent.service.d)"
-    [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
+    local systemd_root dropin_dir
+    for systemd_root in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system; do
+        dropin_dir="$(rooted_path "$systemd_root/roastpilot-agent.service.d")"
+        [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
+    done
 }
 
 privileged_member_presence() {
@@ -457,7 +473,7 @@ create_restore_artifact_dir() {
 }
 
 capture_prior_wheelhouse() {
-    local version="$1" source="${2:-}" copied="${3:-}" requirements rewritten
+    local version="$1" source="${2:-}" copied="${3:-}" requirements rewritten grep_status
     requirements="$RESTORE_ARTIFACT_DIR/requirements.txt"
     pipx_command runpip roastpilot-agent freeze --all > "$requirements" || die "cannot preserve exact prior application"
     if [[ -n "$source" ]]; then
@@ -988,6 +1004,8 @@ summary() {
 
 main() {
     set +x
+    LC_ALL=C
+    export LC_ALL
     STAGE_DIR=""
     STAGE_DIR_VALIDATED=0
     RESTORE_ARTIFACT_DIR=""
@@ -1093,7 +1111,7 @@ main() {
         fi
         if [[ "${INSTALLATION_COMMITTED:-0}" != 1 && "${ROASTPILOT_AGENT_ENABLED:-0}" == 1 && ( "$original_status" -ne 0 || "$cleanup_failed" == 1 ) ]]; then
             if [[ "${MANAGED_UNIT_WAS_ABSENT:-0}" == 1 ]]; then
-                printf '%s\n' "install failed after enabling roastpilot-agent; the newly created unit was removed by rollback but enablement may remain dangling; rerun or inspect the installer state manually" >&2
+                printf '%s\n' "install failed after enabling roastpilot-agent; the newly created unit may have been removed by rollback but enablement may remain dangling; rerun or inspect the installer state manually" >&2
             else
                 printf '%s\n' "install failed after enabling roastpilot-agent; the unit may remain enabled; rerun or inspect the installer state manually" >&2
             fi
@@ -1122,6 +1140,7 @@ main() {
         export PATH
     fi
     scrub_child_secrets
+    command -v python3 >/dev/null 2>&1 || die "python3 is required for installer validation"
     parse_arguments "$@"
     preflight
     resolve_operator_identity

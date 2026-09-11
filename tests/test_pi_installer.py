@@ -572,13 +572,13 @@ def _has_roastpilot_agent_lifecycle_mutation(events: list[str]) -> bool:
     return any(
         event.startswith("systemctl ")
         and any(f"<{unit}>" in event for unit in ("roastpilot-agent", "roastpilot-agent.service"))
-        and (
-            any(
-                f"<{operation}>" in event
-                for operation in ("start", "stop", "restart", "try-restart", "kill", "disable")
-            )
-            or ("<enable>" in event and "<--now>" in event)
-        )
+        and event
+        not in {
+            "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>",
+            "systemctl <daemon-reload>",
+            "systemctl <enable> <roastpilot-agent>",
+            "systemctl <enable> <roastpilot-agent.service>",
+        }
         for event in events
     )
 
@@ -598,6 +598,16 @@ def test_roastpilot_lifecycle_matcher_catches_service_unit_spelling() -> None:
     assert not _has_roastpilot_agent_lifecycle_mutation(
         ["systemctl <enable> <roastpilot-agent.service>"]
     )
+    for operation in (
+        "reload-or-restart",
+        "try-reload-or-restart",
+        "force-reload",
+        "isolate",
+        "reset-failed",
+    ):
+        assert _has_roastpilot_agent_lifecycle_mutation(
+            [f"systemctl <{operation}> <roastpilot-agent>"]
+        )
 
 
 @pytest.mark.serial
@@ -1570,13 +1580,16 @@ def test_unit_and_env_comment_or_continuation_mutations_fail_closed(
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize(
+    "systemd_root", ["etc/systemd/system", "run/systemd/system", "usr/lib/systemd/system"]
+)
 def test_existing_service_dropin_refuses_before_unit_write_or_enable(
-    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    installer_harness: tuple[Path, dict[str, str], Path, Path], systemd_root: str
 ) -> None:
     """An existing drop-in is a fail-closed active-service-upgrade boundary."""
     _, environment, log, _ = installer_harness
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
-    dropin = root / "etc/systemd/system/roastpilot-agent.service.d"
+    dropin = root / systemd_root / "roastpilot-agent.service.d"
     dropin.mkdir(parents=True)
     start = len(log.read_text()) if log.exists() else 0
     result = _run(environment, "--set-hostname", "roastpilot")
@@ -3943,7 +3956,9 @@ def test_final_start_recheck_never_disturbs_a_deactivating_service(
         "--start",
     )
     assert result.returncode != 0 and "stop the service only when idle" in result.stderr
-    assert "unit was removed by rollback but enablement may remain dangling" in result.stderr
+    assert (
+        "unit may have been removed by rollback but enablement may remain dangling" in result.stderr
+    )
     events = log.read_text().splitlines()
     probe = "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>"
     assert events.count(probe) == 3
@@ -3963,7 +3978,9 @@ def test_agent_enable_failure_warns_without_lifecycle_reversal(
     _, environment, log, _ = installer_harness
     result = _run(environment | {"FAKE_AGENT_ENABLE_FAIL": "1"}, "--set-hostname", "roastpilot")
     assert result.returncode == 31
-    assert "unit was removed by rollback but enablement may remain dangling" in result.stderr
+    assert (
+        "unit may have been removed by rollback but enablement may remain dangling" in result.stderr
+    )
     events = log.read_text().splitlines()
     assert "systemctl <enable> <roastpilot-agent>" in events
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
@@ -4946,17 +4963,19 @@ def test_operator_home_symlink_to_each_rooted_temporary_root_is_rejected(
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize("temporary", ["tmp", "var/tmp"])
 def test_symlinked_test_temporary_root_is_canonicalised_before_home_comparison(
-    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, temporary: str
 ) -> None:
-    """A symlinked rooted /tmp cannot hide a home beneath its effective target."""
+    """A symlinked rooted temporary directory cannot hide a home beneath its target."""
     _, environment, log, _ = installer_harness
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
-    target = tmp_path / "real-rooted-tmp"
+    target = tmp_path / f"real-rooted-{temporary.replace('/', '-')}"
     target.mkdir()
-    (root / "tmp").mkdir(parents=True)
-    (root / "tmp").rmdir()
-    (root / "tmp").symlink_to(target)
+    rooted_temporary = root / temporary
+    rooted_temporary.mkdir(parents=True)
+    rooted_temporary.rmdir()
+    rooted_temporary.symlink_to(target)
     candidate = target / "operator"
     candidate.mkdir()
     result = _run(
@@ -5024,6 +5043,20 @@ def test_wheel_control_characters_fail_before_path_or_installer_effects(
     _, environment, log, _ = installer_harness
     result = _run(environment, "--set-hostname", "roastpilot", "--wheel", wheel)
     assert result.returncode != 0 and "wheel selector contains control characters" in result.stderr
+    assert not log.exists()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("option", "value"), [("--wheel", '/tmp/quote".whl'), ("--from-dir", "/tmp/models\u2060")]
+)
+def test_local_path_selectors_reject_quotes_or_unicode_before_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], option: str, value: str
+) -> None:
+    """Local source selectors fail closed before path inspection or installer effects."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment, "--set-hostname", "roastpilot", option, value)
+    assert result.returncode != 0 and "unsafe" in result.stderr
     assert not log.exists()
 
 
