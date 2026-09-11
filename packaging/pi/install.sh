@@ -244,7 +244,7 @@ preflight() {
 }
 
 resolve_operator_identity() {
-    local account record_name primary_gid operator_home
+    local account record_name primary_gid operator_home effective_home
     INVOKING_USER="$(id -un)" || die "cannot determine invoking user"
     INVOKING_GROUP="$(id -gn)" || die "cannot determine invoking group"
     [[ "$INVOKING_USER" =~ ^[a-z_][a-z0-9_-]*$ && "$INVOKING_GROUP" =~ ^[a-z_][a-z0-9_-]*$ && ${#INVOKING_USER} -le 32 && ${#INVOKING_GROUP} -le 32 ]] || die "unsafe operator identity"
@@ -252,6 +252,9 @@ resolve_operator_identity() {
     IFS=: read -r record_name _ _ primary_gid _ operator_home _ <<< "$account"
     [[ "$record_name" == "$INVOKING_USER" && "$primary_gid" =~ ^[0-9]+$ && "$primary_gid" != 0 ]] || die "unsafe operator identity"
     [[ "$operator_home" == /* && "$operator_home" != / && "$operator_home" != // && "/${operator_home#/}/" != *"/."/* && "/${operator_home#/}/" != *"/.."/* && "$operator_home" != */. && "$operator_home" != */.. && "$operator_home" != /tmp && "$operator_home" != /tmp/* && "$operator_home" != /var/tmp && "$operator_home" != /var/tmp/* && "$operator_home" != *[[:space:]]* && "$operator_home" != *['"'\#\$%=\\]* && "$operator_home" != *'@@'* ]] || die "unsafe operator home"
+    [[ "$operator_home" != *$'\u200b'* && "$operator_home" != *$'\u2028'* && "$operator_home" != *$'\u2029'* ]] || die "unsafe operator home"
+    effective_home="$(readlink -f -- "$operator_home")" || die "unsafe operator home"
+    [[ "$effective_home" != /tmp && "$effective_home" != /tmp/* && "$effective_home" != /var/tmp && "$effective_home" != /var/tmp/* ]] || die "unsafe operator home"
     INVOKING_HOME="$operator_home"
 }
 
@@ -794,7 +797,7 @@ install_content_atomically() {
 normalise_unit_env_contract() {
     local content="$1" line normalised=""
     while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ "$line" != *\\ ]] || return 1
+        [[ "$line" != *\\ ]] || die "rendered input contains unsafe inline mutation"
         [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" != *'#'* && "$line" != *';'* && "$line" != *\\* ]] || die "rendered unit/env contains an unsafe inline mutation"
         normalised+="$line"$'\n'

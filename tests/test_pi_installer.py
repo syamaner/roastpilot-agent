@@ -125,7 +125,7 @@ case "$name" in
             printf 'FAKE_PIPX_FREEZE_DIRECT_REFERENCE <%s>\\n' "$FAKE_PIPX_FREEZE_DIRECT_REFERENCE" >> "$FAKE_LOG"
             printf 'roastpilot-agent @ file://%s\\ncoffee-roaster-mcp==%s\\n' "$FAKE_PIPX_FREEZE_DIRECT_REFERENCE" "${FAKE_PIPX_MCP_VERSION:-0.2.0}"
           else
-            printf 'roastpilot-agent==%s\\ncoffee-roaster-mcp==%s\\n' "${FAKE_PIPX_FREEZE_VERSION:-1.2}" "${FAKE_PIPX_MCP_VERSION:-0.2.0}"
+            printf 'roastpilot-agent==1.2\\ncoffee-roaster-mcp==%s\\n' "${FAKE_PIPX_MCP_VERSION:-0.2.0}"
           fi ;;
         wheel)
           [ "${FAKE_PIPX_FAIL_WHEELHOUSE:-}" != 1 ] || { printf 'FAKE_PIPX_WHEELHOUSE_FAILURE\\n' >> "$FAKE_LOG"; exit 54; }
@@ -327,11 +327,7 @@ UNIT
     result=$(/usr/bin/readlink "$@")
     printf '%s\\n' "$result"
     if [ "${FAKE_MUTATE_AFTER_READLINK_PATH:-}" = "${!#}" ]; then
-      [ -n "${FAKE_MUTATE_AFTER_READLINK_REPLACEMENT:-}" ] || /bin/rm -f -- "$FAKE_MUTATE_AFTER_READLINK_PATH"
-      if [ -n "${FAKE_MUTATE_AFTER_READLINK_REPLACEMENT:-}" ]; then
-        /bin/rm -f -- "$FAKE_MUTATE_AFTER_READLINK_PATH"
-        /bin/cp -- "$FAKE_MUTATE_AFTER_READLINK_REPLACEMENT" "$FAKE_MUTATE_AFTER_READLINK_PATH"
-      fi
+      /bin/rm -f -- "$FAKE_MUTATE_AFTER_READLINK_PATH"
       printf 'FAKE_READLINK_MUTATION <%s>\\n' "$FAKE_MUTATE_AFTER_READLINK_PATH" >> "$FAKE_LOG"
     fi ;;
   rm) [ -z "${FAKE_RM_FAIL_PATH:-}" ] || [ "${!#}" != "$FAKE_RM_FAIL_PATH" ] || exit 42; /bin/rm "$@" ;;
@@ -1483,6 +1479,7 @@ def test_rendered_unit_and_atomic_env_repairs_fail_before_live_writes(
             "FAKE_RENDERED_UNIT",
             "KillMode=mixed #\\\nTimeoutStopSec=30",
         ),
+        ("FAKE_RENDERED_UNIT", "# standalone continuation\\\nKillMode=mixed"),
         ("FAKE_RENDERED_UNIT", "ExecStart=/bin/true # hidden"),
     ],
 )
@@ -1494,6 +1491,8 @@ def test_unit_and_env_comment_or_continuation_mutations_fail_closed(
     start = len(log.read_text()) if log.exists() else 0
     result = _run(environment | {field: mutation}, "--set-hostname", "roastpilot")
     assert result.returncode != 0
+    if mutation.startswith("# standalone"):
+        assert "rendered input contains unsafe inline mutation" in result.stderr
     assert not _has_service_mutation(_delta(log, start))
 
 
@@ -3427,6 +3426,28 @@ def test_local_wheel_direct_reference_is_rewritten_to_the_private_copy(
 
 
 @pytest.mark.serial
+def test_local_wheelhouse_capture_failure_aborts_before_uninstall(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A local prior wheel still requires a complete offline dependency wheelhouse."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
+    wheel.write_text("wheel")
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", f"{wheel}[pi]")
+    result = _run(
+        environment | {"FAKE_PIPX_FAIL_WHEELHOUSE": "1"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    events = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert "FAKE_PIPX_WHEELHOUSE_FAILURE" in events
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
+
+
+@pytest.mark.serial
 def test_prior_local_wheel_artifact_is_retained_before_post_reinstall_capability_failure(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -4652,9 +4673,13 @@ def test_preupdate_hostname_query_failure_stops_before_hostname_or_service_effec
         "operator:x:1000:1000::relative:/bin/sh",
         "operator:x:1000:1000::/home/operator name:/bin/sh",
         "operator:x:1000:1000::/home/operator#name:/bin/sh",
+        "operator:x:1000:1000::/home/operator'name:/bin/sh",
         "operator:x:1000:1000::/home/$operator:/bin/sh",
         "operator:x:1000:1000::/home/operator%h:/bin/sh",
         "operator:x:1000:1000::/home/operator@@token:/bin/sh",
+        "operator:x:1000:1000::/home/operator\u200b:/bin/sh",
+        "operator:x:1000:1000::/home/operator\u2028:/bin/sh",
+        "operator:x:1000:1000::/home/operator\u2029:/bin/sh",
     ],
 )
 def test_unsafe_getent_identity_and_home_shapes_fail_before_installer_effects(
