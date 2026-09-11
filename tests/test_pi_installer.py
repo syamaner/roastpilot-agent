@@ -192,6 +192,11 @@ case "$name" in
         printf '{"main_package":{"package_version":"%s",' "$version" >> "$FAKE_PIPX_STATE"
         printf '"package_or_url":"%s"}}}}}\\n' "$package" >> "$FAKE_PIPX_STATE"
       fi
+      if [ "${FAKE_PIPX_REMOVE_SELF_ON:-}" = install ] && [ ! -e "${FAKE_PIPX_REMOVE_SELF_MARKER:-/nonexistent}" ]; then
+        /bin/rm -f -- "$0"
+        : > "$FAKE_PIPX_REMOVE_SELF_MARKER"
+        printf 'FAKE_PIPX_SELF_REMOVED <%s>\n' "$0" >> "$FAKE_LOG"
+      fi
     elif [ "${1:-}" = uninstall ]; then
       shift; [ "${1:-}" = -- ] && shift
       if [[ "${1:-}" == *-roastpilot-stage-* ]]; then
@@ -381,7 +386,12 @@ UNIT
     fi
     /usr/bin/grep "$@" ;;
   tr) /usr/bin/tr "$@" ;;
-  usermod) printf 'dialout audio\n' > "$FAKE_GROUPS" ;;
+  usermod)
+    if [ "${FAKE_USERMOD_FAIL:-}" = 1 ]; then
+      printf 'FAKE_USERMOD_FAILURE\n' >> "$FAKE_LOG"
+      exit 59
+    fi
+    printf 'dialout audio\n' > "$FAKE_GROUPS" ;;
   chown)
     if [ "${FAKE_CHOWN_FAIL_TARGET:-}" = "${!#}" ]; then
       count=0; [ ! -e "$FAKE_CHOWN_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_CHOWN_FAIL_COUNT_FILE")
@@ -1102,7 +1112,7 @@ def test_staging_only_mutates_and_cleans_the_unique_directory(
     assert f"chown <operator:operators> <--> <{stage_parent}>" not in events
     assert f"chmod <0700> <--> <{stage_parent}>" not in events
     stage = stage_parent / "roastpilot-install.fake"
-    assert f"chown <operator:operators> <--> <{stage}>" in events
+    assert f"chown <--no-dereference> <operator:operators> <--> <{stage}>" in events
     assert f"chmod <0700> <--> <{stage}>" in events
     assert not stage.exists()
 
@@ -1589,19 +1599,50 @@ def test_unit_and_env_comment_or_continuation_mutations_fail_closed(
 
 @pytest.mark.serial
 @pytest.mark.parametrize(
-    "systemd_root", ["etc/systemd/system", "run/systemd/system", "usr/lib/systemd/system"]
+    "relative",
+    [
+        f"{root}/{name}"
+        for root in (
+            "etc/systemd/system.control",
+            "run/systemd/system.control",
+            "run/systemd/transient",
+            "run/systemd/generator.early",
+            "etc/systemd/system",
+            "etc/systemd/system.attached",
+            "run/systemd/system",
+            "run/systemd/system.attached",
+            "run/systemd/generator",
+            "usr/local/lib/systemd/system",
+            "usr/lib/systemd/system",
+            "run/systemd/generator.late",
+        )
+        for name in ("roastpilot-agent.service.d", "roastpilot-.service.d", "service.d")
+    ],
 )
-def test_existing_service_dropin_refuses_before_unit_write_or_enable(
-    installer_harness: tuple[Path, dict[str, str], Path, Path], systemd_root: str
+@pytest.mark.parametrize("as_symlink", [False, True])
+def test_all_systemd_dropin_locations_refuse_before_unit_write_or_enable(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    relative: str,
+    as_symlink: bool,
+    tmp_path: Path,
 ) -> None:
     """An existing drop-in is a fail-closed active-service-upgrade boundary."""
     _, environment, log, _ = installer_harness
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
-    dropin = root / systemd_root / "roastpilot-agent.service.d"
-    dropin.mkdir(parents=True)
+    dropin = root / relative
+    if as_symlink:
+        target = tmp_path / "dropin-target"
+        target.mkdir()
+        dropin.parent.mkdir(parents=True)
+        dropin.symlink_to(target, target_is_directory=True)
+    else:
+        dropin.mkdir(parents=True)
     start = len(log.read_text()) if log.exists() else 0
     result = _run(environment, "--set-hostname", "roastpilot")
-    assert result.returncode != 0
+    assert (
+        result.returncode != 0
+        and "install failed: service drop-ins are not permitted" in result.stderr
+    )
     events = _delta(log, start)
     assert not any(
         line.startswith(
@@ -1719,6 +1760,37 @@ def test_model_parent_recheck_rejects_a_swapped_parent_before_promotion(
         event.startswith(("chown ", "chmod ", "tee ", "mv ")) and f"<{attacker}>" in event
         for event in events
     )
+
+
+@pytest.mark.serial
+def test_model_staging_parent_recheck_blocks_mktemp_model_render_and_configuration(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A swapped staging parent fails before staging or any appliance destination effect."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    stage_parent = root / "tmp"
+    attacker = tmp_path / "attacker-controlled-stage-parent"
+    attacker.mkdir()
+    result = _run(
+        environment
+        | {
+            "FAKE_MUTATE_AFTER_TEST_D_PATH": str(stage_parent),
+            "FAKE_MUTATE_AFTER_TEST_D_TARGET": str(attacker),
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    events = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert f"model staging parent failed privileged recheck: {stage_parent}" in result.stderr
+    assert f"FAKE_TEST_D_MUTATION <{stage_parent}> <{attacker}> <1>" in events
+    assert not any(
+        event.startswith("mktemp ") and "roastpilot-install" in event for event in events
+    )
+    assert not any(event.startswith("roastpilot-agent <appliance>") for event in events)
+    assert not any("roastpilot-config-rollback" in event for event in events)
+    assert not any(event.startswith(("tee ", "mv ")) and "/etc/" in event for event in events)
 
 
 @pytest.mark.serial
@@ -2097,7 +2169,7 @@ def test_validated_stage_directory_failures_are_cleanup_accounted(
     assert result.returncode == status
     events = log.read_text().splitlines()
     assert (
-        f"chown <operator:operators> <--> <{stage}>"
+        f"chown <--no-dereference> <operator:operators> <--> <{stage}>"
         if failure == "chown"
         else f"chmod <0700> <--> <{stage}>"
     ) in events
@@ -2344,6 +2416,62 @@ def test_repaired_input_bounds_and_test_mode_are_fail_closed(
 
 
 @pytest.mark.serial
+def test_ambiguous_serial_port_double_at_has_an_exact_diagnostic(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """The YAML-sensitive serial selector fails before the fake command seam."""
+    _, environment, log, _ = installer_harness
+    result = _run(
+        environment,
+        "--set-hostname",
+        "roastpilot",
+        "--serial-port",
+        "/dev/tty@@USB0",
+    )
+    assert result.returncode != 0
+    assert "install failed: serial port contains ambiguous YAML characters" in result.stderr
+    assert not log.exists()
+
+
+@pytest.mark.serial
+def test_test_command_directory_rejects_symlink_noncanonical_and_earlier_path_shadow(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """The test command boundary cannot be redirected or shadowed after validation begins."""
+    fake_bin, environment, _, _ = installer_harness
+    linked = tmp_path / "linked-fake-bin"
+    linked.symlink_to(fake_bin, target_is_directory=True)
+    symlinked = _run(
+        environment | {"ROASTPILOT_INSTALL_TEST_COMMAND_DIR": str(linked)},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert symlinked.returncode != 0
+    assert "install failed: test command directory is required" in symlinked.stderr
+    noncanonical = _run(
+        environment | {"ROASTPILOT_INSTALL_TEST_COMMAND_DIR": f"{fake_bin}/./"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert noncanonical.returncode != 0
+    assert "install failed: test command directory must be canonical" in noncanonical.stderr
+    rogue_dir = tmp_path / "rogue-bin"
+    rogue_dir.mkdir()
+    rogue_marker = tmp_path / "rogue-pipx-ran"
+    rogue = rogue_dir / "pipx"
+    rogue.write_text(f"#!/bin/sh\nprintf rogue > {rogue_marker}\nexit 0\n")
+    rogue.chmod(0o755)
+    shadowed = _run(
+        environment | {"PATH": f"{rogue_dir}{os.pathsep}{environment['PATH']}"},
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert shadowed.returncode != 0
+    assert "install failed: test command directory does not own pipx" in shadowed.stderr
+    assert not rogue_marker.exists()
+
+
+@pytest.mark.serial
 def test_test_mode_requires_one_complete_fake_command_directory_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -2395,11 +2523,8 @@ def test_children_observe_c_locale_before_fake_effects(
 @pytest.mark.parametrize(
     "relative",
     [
-        "etc/systemd/system.control/roastpilot-agent.service.d",
-        "run/systemd/system.control/roastpilot-agent.service.d",
-        "etc/systemd/system/service.d",
-        "run/systemd/system/service.d",
-        "usr/lib/systemd/system/service.d",
+        "etc/systemd/system.control/roastpilot-agent.service",
+        "run/systemd/system.control/roastpilot-agent.service",
         "run/systemd/transient/roastpilot-agent.service",
         "run/systemd/generator.early/roastpilot-agent.service",
     ],
@@ -2410,9 +2535,13 @@ def test_additional_systemd_override_locations_fail_before_effects(
     """Every admitted systemd override search location is rejected before package work."""
     _, environment, log, _ = installer_harness
     target = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / relative
-    target.mkdir(parents=True)
+    target.parent.mkdir(parents=True)
+    target.write_text("[Service]\n")
     result = _run(environment, "--set-hostname", "roastpilot")
-    assert result.returncode != 0 and "service" in result.stderr
+    assert (
+        result.returncode != 0
+        and "install failed: service unit overrides are not permitted" in result.stderr
+    )
     assert not any(
         event.startswith(("apt-get ", "pipx ", "roastpilot-agent "))
         for event in log.read_text().splitlines()
@@ -4528,6 +4657,49 @@ def test_snapshot_existing_members_are_decided_through_the_privileged_seam(
 
 
 @pytest.mark.serial
+def test_configuration_snapshot_parent_recheck_blocks_snapshot_members_and_live_writes(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A /tmp swap at snapshot creation is observed and fails before config mutation."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    snapshot_parent = root / "tmp"
+    attacker = tmp_path / "attacker-controlled-snapshot-parent"
+    attacker.mkdir()
+    result = _run(
+        environment
+        | {
+            "FAKE_MUTATE_AFTER_TEST_D_PATH": str(snapshot_parent),
+            "FAKE_MUTATE_AFTER_TEST_D_TARGET": str(attacker),
+            "FAKE_MUTATE_AFTER_TEST_D_ON_COUNT": "2",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    events = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert "configuration snapshot parent is unsafe" in result.stderr
+    assert f"FAKE_TEST_D_MUTATION <{snapshot_parent}> <{attacker}> <2>" in events
+    assert not any(
+        "roastpilot-config-rollback" in event and event.startswith(("mktemp ", "cp "))
+        for event in events
+    )
+    assert not any(
+        event.startswith(("tee ", "mv "))
+        and any(
+            name in event
+            for name in (
+                "roastpilot-agent.env",
+                "coffee-roaster-mcp.yaml",
+                "roastpilot-agent.service",
+            )
+        )
+        for event in events
+    )
+    assert any(event.startswith("rm <-rf>") and "roastpilot-install" in event for event in events)
+
+
+@pytest.mark.serial
 def test_snapshot_member_probe_failure_is_not_treated_as_absence(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4800,6 +4972,40 @@ def test_fresh_incapable_application_is_removed_or_named_for_manual_cleanup(
         "application/configuration skew may require manual reconciliation" in result.stderr
     ) is cleanup_fails
     assert not any(event.startswith("roastpilot-agent <appliance>") for event in events)
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_runtime_pipx_path_substitution_returns_through_cleanup_without_executing_rogue(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A post-validation PATH swap cannot execute a rogue pipx or unwind EXIT cleanup."""
+    fake_bin, environment, log, _ = installer_harness
+    rogue_dir = tmp_path / "later-pipx"
+    rogue_dir.mkdir()
+    rogue_marker = tmp_path / "rogue-pipx-ran"
+    rogue = rogue_dir / "pipx"
+    rogue.write_text(f"#!/bin/sh\nprintf rogue > {rogue_marker}\nexit 0\n")
+    rogue.chmod(0o755)
+    removal_marker = tmp_path / "pipx-self-removed"
+    result = _run(
+        environment
+        | {
+            "PATH": f"{fake_bin}{os.pathsep}{rogue_dir}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_PIPX_REMOVE_SELF_ON": "install",
+            "FAKE_PIPX_REMOVE_SELF_MARKER": str(removal_marker),
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    events = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert removal_marker.exists()
+    assert f"FAKE_PIPX_SELF_REMOVED <{fake_bin / 'pipx'}>" in events
+    assert "install failed: test command directory does not own pipx" in result.stderr
+    assert not rogue_marker.exists()
+    assert "install failed: manually remove incapable roastpilot-agent environment" in result.stderr
+    assert "install failed: rollback incomplete; manual reconciliation required" in result.stderr
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
@@ -5172,6 +5378,49 @@ def test_missing_dialout_with_audio_still_issues_the_exact_group_repair(
     Path(environment["FAKE_GROUPS"]).write_text("audio\n")
     assert _run(environment, "--set-hostname", "roastpilot").returncode == 0
     assert "usermod <-aG> <dialout,audio> <--> <operator>" in log.read_text().splitlines()
+
+
+@pytest.mark.serial
+def test_failed_usermod_reports_possible_supplementary_group_residue_without_lifecycle_reversal(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A partial usermod is named for reconciliation without touching the service."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment | {"FAKE_USERMOD_FAIL": "1"}, "--set-hostname", "roastpilot")
+    events = log.read_text().splitlines()
+    assert result.returncode == 59
+    assert "FAKE_USERMOD_FAILURE" in events
+    assert (
+        "install failed after supplementary-group change; dialout/audio membership may remain"
+        in result.stderr
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_failed_start_reports_possible_running_service_without_lifecycle_reversal(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A failed explicit start is named without attempting a compensating stop."""
+    _, environment, log, _ = installer_harness
+    result = _run(
+        environment | {"FAKE_SYSTEMCTL_FAIL": "start"},
+        "--set-hostname",
+        "roastpilot",
+        "--start",
+    )
+    events = log.read_text().splitlines()
+    assert result.returncode == 31
+    assert "systemctl <start> <roastpilot-agent>" in events
+    assert (
+        "install failed after --start; service may be running against rolled-back configuration"
+        in result.stderr
+    )
+    assert not any(
+        event.startswith(f"systemctl <{operation}>")
+        for operation in ("stop", "restart", "try-restart", "kill", "disable")
+        for event in events
+    )
 
 
 @pytest.mark.serial

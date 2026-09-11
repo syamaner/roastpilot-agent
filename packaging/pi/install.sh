@@ -332,17 +332,18 @@ verify_existing_unit_identity() {
 
 verify_no_service_dropins() {
     local systemd_root dropin_dir unit_file
-    for systemd_root in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system; do
+    # These are the system-mode unit search roots.  Systemd applies all three
+    # supported drop-in names at every root, including dash-truncated names.
+    for systemd_root in /etc/systemd/system.control /run/systemd/system.control /run/systemd/transient /run/systemd/generator.early /etc/systemd/system /etc/systemd/system.attached /run/systemd/system /run/systemd/system.attached /run/systemd/generator /usr/local/lib/systemd/system /usr/lib/systemd/system /run/systemd/generator.late; do
         dropin_dir="$(rooted_path "$systemd_root/roastpilot-agent.service.d")"
+        [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
+        dropin_dir="$(rooted_path "$systemd_root/roastpilot-.service.d")"
         [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
         dropin_dir="$(rooted_path "$systemd_root/service.d")"
         [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
     done
-    for systemd_root in /etc/systemd/system.control /run/systemd/system.control; do
-        dropin_dir="$(rooted_path "$systemd_root/roastpilot-agent.service.d")"
-        [[ ! -e "$dropin_dir" && ! -L "$dropin_dir" ]] || die "service drop-ins are not permitted"
-    done
-    for systemd_root in /run/systemd/transient /run/systemd/generator.early; do
+    # Only these higher-precedence roots can override the managed unit.
+    for systemd_root in /etc/systemd/system.control /run/systemd/system.control /run/systemd/transient /run/systemd/generator.early; do
         unit_file="$(rooted_path "$systemd_root/roastpilot-agent.service")"
         [[ ! -e "$unit_file" && ! -L "$unit_file" ]] || die "service unit overrides are not permitted"
     done
@@ -462,7 +463,10 @@ except (ValueError, KeyError, TypeError, json.JSONDecodeError):
 pipx_command() {
     # Ignore ambient pipx routing and always use the resolved invoking home.
     if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" == 1 ]]; then
-        [[ "$(command -v pipx 2>/dev/null || true)" == "${ROASTPILOT_INSTALL_TEST_COMMAND_DIR}/pipx" ]] || die "test command directory does not own pipx"
+        if [[ "$(command -v pipx 2>/dev/null || true)" != "${ROASTPILOT_INSTALL_TEST_COMMAND_DIR}/pipx" ]]; then
+            printf '%s\n' "install failed: test command directory does not own pipx" >&2
+            return 1
+        fi
     fi
     env -u PIPX_HOME -u PIPX_BIN_DIR -u PIPX_DEFAULT_PYTHON HOME="$INVOKING_HOME" pipx "$@"
 }
@@ -788,14 +792,16 @@ install_model_and_render() {
     stage_parent="$(rooted_path /tmp)"
     validate_destination "$stage_parent"
     run_privileged mkdir -p -- "$stage_parent"
+    run_privileged test -d "$stage_parent" || die "model staging parent failed privileged recheck: $stage_parent"
+    run_privileged test ! -L "$stage_parent" || die "model staging parent failed privileged recheck: $stage_parent"
     stage_dir="$(run_privileged mktemp -d -- "$stage_parent/roastpilot-install.XXXXXX")"
     STAGE_DIR_VALIDATED=0
     STAGE_DIR="$stage_dir"
     stage_prefix="$stage_parent/roastpilot-install."
     is_expected_mktemp_path "$stage_dir" "$stage_prefix" || die "unsafe staging directory"
     STAGE_DIR_VALIDATED=1
-    run_privileged chown "$INVOKING_USER:$INVOKING_GROUP" -- "$stage_dir"
     run_privileged chmod 0700 -- "$stage_dir"
+    run_privileged chown --no-dereference "$INVOKING_USER:$INVOKING_GROUP" -- "$stage_dir"
     model_stage="$stage_dir/models"
     mkdir -p -- "$model_stage"
     if [[ -n "$MODEL_FROM_DIR" ]]; then
@@ -997,8 +1003,8 @@ install_rendered_files() {
     local groups
     groups="$(id -nG "$INVOKING_USER")" || die "cannot determine invoking user groups"
     if [[ " $groups " != *" dialout "* || " $groups " != *" audio "* ]]; then
-        run_privileged usermod -aG dialout,audio -- "$INVOKING_USER"
         USERMOD_GROUPS_CHANGED=1
+        run_privileged usermod -aG dialout,audio -- "$INVOKING_USER"
     fi
 }
 
