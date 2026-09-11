@@ -471,6 +471,8 @@ except (ValueError, KeyError, TypeError, json.JSONDecodeError):
 }
 
 pipx_command() {
+    local name
+    local -a test_environment=()
     # Ignore ambient pipx routing and always use the resolved invoking home.
     if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" == 1 ]]; then
         if [[ "$(command -v pipx 2>/dev/null || true)" != "${ROASTPILOT_INSTALL_TEST_COMMAND_DIR}/pipx" ]]; then
@@ -478,11 +480,12 @@ pipx_command() {
             return 1
         fi
     fi
-    env -u PIPX_HOME -u PIPX_BIN_DIR -u PIPX_DEFAULT_PYTHON \
-        -u PIP_INDEX_URL -u PIP_EXTRA_INDEX_URL -u PIP_TRUSTED_HOST -u PIP_CONFIG_FILE -u PIP_REQUIRE_VIRTUALENV \
-        -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
-        -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
-        HOME="$INVOKING_HOME" pipx "$@"
+    if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" == 1 ]]; then
+        for name in $(compgen -e); do
+            [[ "$name" == FAKE_* ]] && test_environment+=("$name=${!name}")
+        done
+    fi
+    /usr/bin/env -i HOME="$INVOKING_HOME" PATH="$PATH" LC_ALL=C "${test_environment[@]}" pipx "$@"
 }
 
 pipx_matches() {

@@ -327,7 +327,7 @@ UNIT
     if [ "${1:-}" = -d ] && [ "${FAKE_TEST_FAIL_D_PATH:-}" = "${!#}" ]; then
       count=0; [ ! -e "$FAKE_TEST_FAIL_D_COUNT_FILE" ] || count=$(cat "$FAKE_TEST_FAIL_D_COUNT_FILE")
       count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_TEST_FAIL_D_COUNT_FILE"
-      [ "${FAKE_TEST_FAIL_D_ON_COUNT:-}" != "$count" ] || exit 48
+      [ "${FAKE_TEST_FAIL_D_ON_COUNT:-}" != "$count" ] || { printf 'FAKE_TEST_D_FAILURE <%s> <%s>\\n' "${!#}" "$count" >> "$FAKE_LOG"; exit 48; }
     fi
     if [ -n "${FAKE_TEST_FAIL_PATH:-}" ] && [ "${!#}" = "$FAKE_TEST_FAIL_PATH" ]; then
       count=0; [ ! -e "$FAKE_TEST_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_TEST_FAIL_COUNT_FILE")
