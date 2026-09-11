@@ -1826,6 +1826,7 @@ def test_model_parent_recheck_rejects_a_swapped_parent_before_promotion(
         event.startswith(("chown ", "chmod ", "tee ", "mv ")) and f"<{attacker}>" in event
         for event in events
     )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial
@@ -2703,8 +2704,6 @@ def test_upfront_test_command_ownership_rejects_earlier_chmod_shadow_without_exe
         "roastpilot",
     )
     assert result.returncode != 0
-    assert "model source digest mismatch" in result.stderr
-    assert any(line.startswith("MODEL_FETCH <") for line in log.read_text().splitlines())
     assert "install failed: test command directory does not own chmod" in result.stderr
     assert not rogue_marker.exists()
     assert not log.exists()
@@ -3075,9 +3074,11 @@ def test_model_snapshot_digest_failure_precedes_live_destinations(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
     """Unexpected model bytes cannot reach either model or /etc destinations."""
-    _, environment, _, _ = installer_harness
+    _, environment, log, _ = installer_harness
     result = _run(environment | {"FAKE_MODEL_BYTES": "WRONG"}, "--set-hostname", "roastpilot")
     assert result.returncode != 0
+    assert "model staging digest mismatch" in result.stderr
+    assert any(line.startswith("MODEL_FETCH <") for line in log.read_text().splitlines())
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     assert not (root / "etc").exists()
     assert not (root / "var/lib/roastpilot-agent/models/onnx/int8/model_quantized.onnx").exists()
@@ -5117,7 +5118,7 @@ def test_snapshot_unsafe_existing_yaml_is_not_treated_as_absence(
         unit_dir / "roastpilot-agent.service",
     )
     env.write_bytes(
-        b"OPENROUTER_API_KEY=secret\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+        b"OPENROUTER_API_KEY=fixture-value\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
     )
     unit.write_bytes(b"[Service]\nUser=operator\nGroup=operators\n")
     yaml.mkdir()
@@ -5154,7 +5155,7 @@ def test_snapshot_indeterminate_existing_yaml_is_not_treated_as_absence(
         unit_dir / "roastpilot-agent.service",
     )
     env.write_bytes(
-        b"OPENROUTER_API_KEY=secret\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
+        b"OPENROUTER_API_KEY=fixture-value\nPORT=8000\nROASTPILOT_DB=/var/lib/roastpilot-agent/roastpilot.sqlite3\nCOFFEE_ROASTER_MCP_CONFIG=/etc/roastpilot-agent/coffee-roaster-mcp.yaml\n"
     )
     yaml.write_bytes(b"prior-yaml\n")
     unit.write_bytes(b"[Service]\nUser=operator\nGroup=operators\n")
