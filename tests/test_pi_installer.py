@@ -2084,9 +2084,9 @@ def test_model_digests_cover_stage_root_snapshot_and_destination(
     _, environment, log, _ = installer_harness
     assert _run(environment, "--set-hostname", "roastpilot").returncode == 0
     digests = [line for line in log.read_text().splitlines() if line.startswith("sha256sum ")]
-    # Model promotion retains its six checks; captured env/YAML/unit and the
-    # prior hostname each receive an atomic destination readback check.
-    assert len(digests) == 10
+    # Model promotion retains its six checks; each atomic content member is
+    # checked both while staged and after destination promotion.
+    assert len(digests) == 14
     assert sum("roastpilot-install.fake/models/" in line for line in digests) == 2
     assert sum(".roastpilot-model.fake" in line for line in digests) == 2
     assert (
@@ -2101,7 +2101,13 @@ def test_model_digests_cover_stage_root_snapshot_and_destination(
     assert sum("roastpilot-agent.env" in line for line in digests) == 1
     assert sum("coffee-roaster-mcp.yaml" in line for line in digests) == 1
     assert sum("roastpilot-agent.service" in line for line in digests) == 1
-    assert sum("prior-static-hostname" in line for line in digests) == 1
+    assert sum("prior-static-hostname" in line for line in digests) == 2
+    for temporary in (
+        ".roastpilot-env.fake",
+        ".roastpilot-yaml.fake",
+        ".roastpilot-unit.fake",
+    ):
+        assert sum(temporary in line for line in digests) == 1
 
 
 @pytest.mark.serial
