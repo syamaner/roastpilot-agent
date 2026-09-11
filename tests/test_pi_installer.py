@@ -2434,6 +2434,18 @@ def test_ambiguous_serial_port_double_at_has_an_exact_diagnostic(
 
 
 @pytest.mark.serial
+def test_arbitrarily_long_decimal_port_fails_before_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Port validation bounds decimal length before Bash evaluates arithmetic."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment, "--set-hostname", "roastpilot", "--port", "9" * 10000)
+    assert result.returncode != 0
+    assert "install failed: port must be a decimal number from 1024 to 65535" in result.stderr
+    assert not log.exists()
+
+
+@pytest.mark.serial
 def test_test_command_directory_rejects_symlink_noncanonical_and_earlier_path_shadow(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
