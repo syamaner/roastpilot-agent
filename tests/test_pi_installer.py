@@ -1992,6 +1992,55 @@ def test_cleanup_rechecks_after_ownership_before_restoring_mode(
 
 @pytest.mark.serial
 @pytest.mark.parametrize(
+    ("boundary", "owner", "mode", "probe_count"),
+    [
+        ("var/lib/roastpilot-agent", "operator:operators", "0700", "4"),
+        ("var/lib/roastpilot-agent", "operator:operators", "0700", "5"),
+        ("etc/roastpilot-agent", "root:operators", "0750", "5"),
+        ("etc/roastpilot-agent", "root:operators", "0750", "6"),
+    ],
+)
+def test_indeterminate_locked_cleanup_symlink_probe_fails_closed_and_continues_rollback(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    boundary: str,
+    owner: str,
+    mode: str,
+    probe_count: str,
+) -> None:
+    """An indeterminate locked-parent symlink probe skips chmod but completes later cleanup."""
+    _, environment, log, _ = installer_harness
+    path = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / boundary
+    result = _run(
+        environment
+        | {
+            "FAKE_HOSTNAME_VERIFY_FAIL": "1",
+            "FAKE_TEST_L_FAIL_PATH": str(path),
+            "FAKE_TEST_L_FAIL_ON_COUNT": probe_count,
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    events = log.read_text().splitlines()
+    marker = f"FAKE_TEST_L_FAILURE <{path}> <{probe_count}>"
+    assert events.count(marker) == 1
+    marker_index = events.index(marker)
+    assert result.returncode == 1
+    assert (
+        f"install failed: reconcile {path} manually (expected directory owned by {owner} with mode {mode})"
+        in result.stderr
+    )
+    assert "rollback incomplete; manual reconciliation required" in result.stderr
+    assert not any(event == f"chmod <{mode}> <--> <{path}>" for event in events[marker_index + 1 :])
+    assert any(event == "systemctl <daemon-reload>" for event in events[marker_index + 1 :])
+    assert any(
+        event.startswith("rm <-rf>") and "roastpilot-config-rollback" in event
+        for event in events[marker_index + 1 :]
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
     ("boundary", "owner", "mode", "entry_probe", "entry_failure"),
     [
         ("var/lib/roastpilot-agent", "operator:operators", "0700", "4", "missing"),
