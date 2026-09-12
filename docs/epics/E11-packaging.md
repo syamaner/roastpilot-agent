@@ -27,7 +27,7 @@ child, per D6), mDNS, and a deployment doc. **No Docker image; no PyTorch on the
 >
 > **D27 E11-S1 dependency/publication gate — ✅ CLEARED:** the published torch-free
 > `coffee-roaster-mcp==0.2.0` release permits the exact `[pi]` pin delivered here.
-> E11-S2 and E11-S3 remain not started. E11-S3 (the Pi soak) still depends on the
+> E11-S2 is complete; E11-S3 remains not started. E11-S3 (the Pi soak) still depends on the
 > recording bundle that shipped in MCP 0.1.10/0.1.11 (see below); prove the harness
 > on real hardware and devices before making any hardware-readiness or acceptance claim.
 
@@ -80,18 +80,19 @@ Acceptance criteria:
 
 Acceptance criteria:
 
-- [ ] **One-line installer** (`curl … | bash`, idempotent): `apt install
+- [x] **One-line installer** (`curl … | bash`, idempotent): `apt install
   libportaudio2`; `pipx install roastpilot-agent[pi]`; place the **bundled/pinned FC
   model** locally (offline — a roast never waits on a live HF pull; verify checksum);
   add the operator to `dialout`+`audio`; write the systemd unit; enable **avahi/mDNS**.
-- [ ] **systemd unit:** one service, agent spawns MCP stdio child; restart lands in
+- [x] **systemd unit:** one service, agent spawns MCP stdio child; restart lands in
   the recovery flow (**never auto-resumes heat/fan**); `journalctl` logs.
-- [ ] **Headless UX:** power on → autostart → reach the UI at
+- [x] **Headless UX:** power on → autostart → reach the UI at
   `http://roastpilot.local:<port>` from any device on the LAN (no local display).
-- [ ] **Deployment doc:** Pi 5 + **official 27 W PSU + active cooler** prereqs (the
+- [x] **Deployment doc:** Pi 5 + **official 27 W PSU + active cooler** prereqs (the
   FC inference is CPU-heavy), config (env: OpenRouter key, port), data location,
   upgrade (`pipx upgrade`), log access, the mDNS access story. Follows the plan's
-  accuracy boundaries (no "fully autonomous"/"production-ready" pre-hardware-validation).
+  accuracy boundaries: it makes no autonomous-operation or release-suitability claim
+  before the outstanding hardware evidence.
 
 ### E11-S3 — Pi 5 dual-mic recording + FC-detection CPU soak (overflow validation)
 
@@ -141,10 +142,10 @@ sample-locked, which is fine for FC training).
 | Story | Title | Status |
 |-------|-------|--------|
 | E11-S1 | Wheel with bundled SPA + the `[pi]` extra | done — base-wheel, `[pi]`, and native hosted ARM64 package smokes delivered 5 Sep 2026; hosted-runner evidence is not Pi hardware validation |
-| E11-S2 | Native installer, systemd unit, bundled model, deploy doc | not started |
+| E11-S2 | Native installer, systemd unit, bundled model, deploy doc | done — native installer, managed service/configuration, pinned local model, and deployment guide delivered 12 Sep 2026; package and documentation evidence is not Pi or physical-device validation |
 | E11-S3 | Pi 5 dual-mic recording + FC-detection CPU soak (overflow validation) | not started |
 
-Epic status: **in progress — E11-S1 is done; E11-S2 and E11-S3 are not started.**
+Epic status: **in progress — E11-S1 and E11-S2 are done; E11-S3 is not started.**
 The **operator manual tests** (D28) are
 both Done — **#135 ✅** (device SSE) and **#134 ✅ validated by roast 6** (27 Jun).
 **E11-S1 is complete:** a hatchling custom build hook (`hatch_build.py`) runs the
@@ -167,3 +168,14 @@ logged:** the recording bundle it soaks shipped in MCP 0.1.10/0.1.11
 (#180/#162/#181/#178; agent pinned 0.1.11), so the Mac side is validated and the Pi-5 CPU
 soak is the open work. Re-sliced for native-only + torch-free + bundled-model distribution
 (D27, 11 Jun 2026); manual-test gate recorded as D28 (13 Jun 2026), cleared 28 Jun 2026.
+
+**E11-S2 is complete (12 Sep 2026):** the native installer, managed systemd
+unit and configuration, pinned local model installation, and
+`docs/deployment/pi-appliance.md` are delivered. The guide documents explicit
+`--set-hostname roastpilot` consent, inactive-only maintenance, rollback
+messages, local data/configuration paths, air-gapped model sources, logs, mDNS,
+and the trusted-home-LAN boundary. It does not turn hosted, mocked, package, or
+documentation evidence into Pi or physical-device evidence. D191/D192
+characterisation, independent Pi evidence review, complete-appliance
+validation, and separately authorised supervised live-roast acceptance remain
+outstanding. E11-S3 remains the unstarted Pi soak.
