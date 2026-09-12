@@ -560,6 +560,7 @@ def _run(
     stdin: str | None = "input",
     script: Path = INSTALLER,
     xtrace: bool = False,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     allowed_installer_inputs = {
         "ROASTPILOT_INSTALL_TEST_MODE",
@@ -604,6 +605,7 @@ def _run(
         text=True,
         capture_output=True,
         check=False,
+        cwd=cwd,
     )
 
 
@@ -635,6 +637,19 @@ def _has_roastpilot_agent_lifecycle_mutation(events: list[str]) -> bool:
         }
         for event in events
     )
+
+
+def _assert_symlink_probe_stops_before_negative_confirmation(
+    events: list[str], mutation: int, path: Path
+) -> None:
+    """Assert a post-mutation positive symlink probe fails before its negative confirmation."""
+    positive = next(
+        i for i, event in enumerate(events) if i > mutation and event == f"test <-L> <{path}>"
+    )
+    assert not any(
+        i > mutation and event == f"test <!> <-L> <{path}>" for i, event in enumerate(events)
+    )
+    assert positive > mutation
 
 
 def test_roastpilot_lifecycle_matcher_catches_service_unit_spelling() -> None:
@@ -1146,7 +1161,7 @@ def test_staging_only_mutates_and_cleans_the_unique_directory(
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     stage_parent = root / "tmp"
     events = log.read_text()
-    assert f"chown <operator:operators> <--> <{stage_parent}>" not in events
+    assert f"chown <--no-dereference> <operator:operators> <--> <{stage_parent}>" not in events
     assert f"chmod <0700> <--> <{stage_parent}>" not in events
     stage = stage_parent / "roastpilot-install.fake"
     assert f"chown <--no-dereference> <operator:operators> <--> <{stage}>" in events
@@ -1753,7 +1768,7 @@ def test_managed_etc_recheck_rejects_a_swapped_parent_before_configuration_promo
     assert result.returncode != 0 and "managed configuration directory is unsafe" in result.stderr
     events = log.read_text().splitlines()
     mutation = events.index(f"FAKE_TEST_D_MUTATION <{etc}> <{attacker}> <1>")
-    assert any(i > mutation and event == f"test <-L> <{etc}>" for i, event in enumerate(events))
+    _assert_symlink_probe_stops_before_negative_confirmation(events, mutation, etc)
     assert not any(
         event.startswith(("chown ", "chmod ", "tee ", "mv ")) and f"<{attacker}>" in event
         for event in events
@@ -1789,7 +1804,7 @@ def test_managed_state_recheck_rejects_a_swapped_parent_before_ownership_change(
     )
     events = log.read_text().splitlines()
     mutation = events.index(f"FAKE_TEST_D_MUTATION <{var_dir}> <{attacker}> <1>")
-    assert any(i > mutation and event == f"test <-L> <{var_dir}>" for i, event in enumerate(events))
+    _assert_symlink_probe_stops_before_negative_confirmation(events, mutation, var_dir)
     assert not any(
         event.startswith(("chown ", "chmod ", "tee ", "mv ")) and f"<{attacker}>" in event
         for event in events
@@ -1819,9 +1834,7 @@ def test_model_parent_recheck_rejects_a_swapped_parent_before_promotion(
     assert result.returncode != 0 and f"model directory is unsafe: {model_parent}" in result.stderr
     events = log.read_text().splitlines()
     mutation = events.index(f"FAKE_TEST_D_MUTATION <{model_parent}> <{attacker}> <1>")
-    assert any(
-        i > mutation and event == f"test <-L> <{model_parent}>" for i, event in enumerate(events)
-    )
+    _assert_symlink_probe_stops_before_negative_confirmation(events, mutation, model_parent)
     assert not any(
         event.startswith(("chown ", "chmod ", "tee ", "mv ")) and f"<{attacker}>" in event
         for event in events
@@ -1899,9 +1912,7 @@ def test_directory_recheck_blocks_post_ownership_swap_before_mode_or_promotion(
         if event == f"FAKE_TEST_D_MUTATION <{path}> <{attacker}> <2>"
     )
     assert ownership_index < mutation_index
-    assert any(
-        i > mutation_index and event == f"test <-L> <{path}>" for i, event in enumerate(events)
-    )
+    _assert_symlink_probe_stops_before_negative_confirmation(events, mutation_index, path)
     assert not any(event.startswith("chmod ") and f"<{attacker}>" in event for event in events)
     assert not any(
         i > mutation_index
@@ -1955,7 +1966,7 @@ def test_successful_var_unlock_rechecks_after_each_privileged_boundary(
         assert not operator_chowns
     else:
         assert operator_chowns == [next(i for i in operator_chowns if i < mutation)]
-    assert any(i > mutation and event == f"test <-L> <{var_dir}>" for i, event in enumerate(events))
+    _assert_symlink_probe_stops_before_negative_confirmation(events, mutation, var_dir)
     assert not any(
         i > mutation and event == f"chmod <0700> <--> <{var_dir}>" for i, event in enumerate(events)
     )
@@ -2012,7 +2023,7 @@ def test_cleanup_rechecks_after_ownership_before_restoring_mode(
         if event == f"FAKE_TEST_D_MUTATION <{path}> <{attacker}> <{probe_count}>"
     )
     assert chown < mutation
-    assert any(i > mutation and event == f"test <-L> <{path}>" for i, event in enumerate(events))
+    _assert_symlink_probe_stops_before_negative_confirmation(events, mutation, path)
     assert not any(
         i > mutation and event == f"chmod <{mode}> <--> <{path}>" for i, event in enumerate(events)
     )
@@ -2687,15 +2698,41 @@ def test_test_command_directory_rejects_symlink_noncanonical_and_earlier_path_sh
 
 
 @pytest.mark.serial
-def test_upfront_test_command_ownership_rejects_earlier_chmod_shadow_without_execution(
-    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+@pytest.mark.parametrize(
+    "command",
+    (
+        "apt-get",
+        "hostnamectl",
+        "usermod",
+        "systemctl",
+        "roastpilot-agent",
+        "mkdir",
+        "chmod",
+        "chown",
+        "rm",
+        "cp",
+        "mv",
+        "tee",
+        "mktemp",
+        "sha256sum",
+        "cat",
+        "test",
+        "readlink",
+        "grep",
+        "id",
+        "getent",
+        "uname",
+    ),
+)
+def test_upfront_test_command_ownership_rejects_rogue_command_without_execution(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, command: str
 ) -> None:
-    """A loop-owned command is rejected before any fake command can run."""
+    """Every required fake command is owned before any command can run."""
     _, environment, log, _ = installer_harness
-    rogue_dir = tmp_path / "rogue-chmod-bin"
+    rogue_dir = tmp_path / f"rogue-{command}-bin"
     rogue_dir.mkdir()
-    rogue_marker = tmp_path / "rogue-chmod-ran"
-    rogue = rogue_dir / "chmod"
+    rogue_marker = tmp_path / f"rogue-{command}-ran"
+    rogue = rogue_dir / command
     rogue.write_text(f"#!/bin/sh\nprintf rogue > {rogue_marker}\nexit 0\n")
     rogue.chmod(0o755)
     result = _run(
@@ -2704,7 +2741,7 @@ def test_upfront_test_command_ownership_rejects_earlier_chmod_shadow_without_exe
         "roastpilot",
     )
     assert result.returncode != 0
-    assert "install failed: test command directory does not own chmod" in result.stderr
+    assert f"install failed: test command directory does not own {command}" in result.stderr
     assert not rogue_marker.exists()
     assert not log.exists()
 
@@ -5300,6 +5337,7 @@ def test_snapshot_discard_failure_reports_the_retained_path_without_secret_conte
     )
     assert result.returncode != 0 and "manual reconciliation required" in result.stderr
     assert f"retained configuration snapshot at {snapshot}" in result.stderr
+    assert "manually remove the retained secret-bearing configuration snapshot" in result.stderr
     assert snapshot_fixture_value not in result.stdout + result.stderr
     events = log.read_text().splitlines()
     assert f"rm <-rf> <--> <{snapshot}>" in events
@@ -5908,6 +5946,34 @@ def test_local_path_selectors_reject_quotes_or_unicode_before_effects(
 
 
 @pytest.mark.serial
+def test_python_validation_and_pipx_state_parsing_ignore_hostile_cwd_modules(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """Local unicode and JSON modules cannot influence isolated installer Python helpers."""
+    _, environment, log, _ = installer_harness
+    wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    cwd = tmp_path / "hostile-cwd"
+    cwd.mkdir()
+    markers: list[Path] = []
+    for module in ("unicodedata", "json"):
+        marker = tmp_path / f"{module}-imported"
+        (cwd / f"{module}.py").write_text(f"open({str(marker)!r}, 'w').write('executed')\n")
+        markers.append(marker)
+    result = _run(
+        environment,
+        "--set-hostname",
+        "roastpilot",
+        "--wheel",
+        str(wheel),
+        cwd=cwd,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not any(marker.exists() for marker in markers)
+    assert "pipx <list> <--json>" in log.read_text().splitlines()
+
+
+@pytest.mark.serial
 def test_untrusted_configuration_snapshot_path_is_retained_never_recursively_deleted(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -5927,6 +5993,7 @@ def test_untrusted_configuration_snapshot_path_is_retained_never_recursively_del
     )
     assert result.returncode != 0
     assert f"retained untrusted configuration snapshot at {unexpected}" in result.stderr
+    assert "manually remove the retained secret-bearing configuration snapshot" in result.stderr
     events = log.read_text().splitlines()
     assert f"FAKE_MKTEMP_RESULT <{unexpected}>" in events
     assert f"rm <-rf> <--> <{unexpected}>" not in events

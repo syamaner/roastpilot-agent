@@ -112,7 +112,7 @@ validate_path_selector() {
     local value="$1" description="$2"
     validate_no_control_characters "$value" "$description"
     [[ "$value" != *"'"* && "$value" != *\"* ]] || die "$description contains unsafe quote characters"
-    python3 -c 'import sys, unicodedata; raise SystemExit(1 if any(unicodedata.category(c) in {"Cf", "Zl", "Zp"} for c in sys.argv[1]) else 0)' "$value" || die "$description contains unsafe Unicode characters"
+    python3 -I -c 'import sys, unicodedata; raise SystemExit(1 if any(unicodedata.category(c) in {"Cf", "Zl", "Zp"} for c in sys.argv[1]) else 0)' "$value" || die "$description contains unsafe Unicode characters"
 }
 
 scrub_child_secrets() {
@@ -281,7 +281,7 @@ resolve_operator_identity() {
     if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" != "1" ]]; then
         [[ "$operator_home" != /tmp && "$operator_home" != /tmp/* && "$operator_home" != /var/tmp && "$operator_home" != /var/tmp/* ]] || die "unsafe operator home"
     fi
-    python3 -c 'import sys, unicodedata; raise SystemExit(1 if any(unicodedata.category(c) in {"Cf", "Zl", "Zp"} for c in sys.argv[1]) else 0)' "$operator_home" || die "unsafe operator home"
+    python3 -I -c 'import sys, unicodedata; raise SystemExit(1 if any(unicodedata.category(c) in {"Cf", "Zl", "Zp"} for c in sys.argv[1]) else 0)' "$operator_home" || die "unsafe operator home"
     effective_home="$(readlink -f -- "$operator_home")" || die "unsafe operator home"
     if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" == "1" ]]; then
         tmp_root="$(rooted_path /tmp)"
@@ -431,6 +431,7 @@ discard_configuration_snapshot() {
     [[ -z "${CONFIG_SNAPSHOT_DIR:-}" ]] && return 0
     if [[ "${CONFIG_SNAPSHOT_VALIDATED:-0}" != 1 ]]; then
         printf '%s\n' "install failed: retained untrusted configuration snapshot at $CONFIG_SNAPSHOT_DIR" >&2
+        printf '%s\n' "install failed: manually remove the retained secret-bearing configuration snapshot" >&2
         return 1
     fi
     if ! run_privileged rm -rf -- "$CONFIG_SNAPSHOT_DIR"; then
@@ -439,6 +440,7 @@ discard_configuration_snapshot() {
             printf '%s\n' "installation completed; manually remove the retained secret-bearing configuration snapshot" >&2
         else
             printf '%s\n' "install failed: retained configuration snapshot at $CONFIG_SNAPSHOT_DIR" >&2
+            printf '%s\n' "install failed: manually remove the retained secret-bearing configuration snapshot" >&2
         fi
         return 1
     fi
@@ -454,7 +456,7 @@ installed_pipx_state() {
 inspect_pipx_state() {
     local state
     state="$(pipx_command list --json)" || return 2
-    printf '%s' "$state" | python3 -c '
+    printf '%s' "$state" | python3 -I -c '
 import json, sys
 try:
     venvs = json.load(sys.stdin)["venvs"]
@@ -490,7 +492,7 @@ pipx_command() {
 
 pipx_matches() {
     local entry="$1" selector_kind="$2" selector_value="$3"
-    printf '%s' "$entry" | python3 -c '
+    printf '%s' "$entry" | python3 -I -c '
 import json, sys
 kind, expected = sys.argv[1:]
 try:
@@ -551,7 +553,7 @@ capture_prior_wheelhouse() {
 
 prepare_restorable_prior() {
     local state="$1" package version source source_basename wheel_tail canonical reported_version installed_prefix prior_metadata
-    prior_metadata="$(printf '%s' "$state" | python3 -c '
+    prior_metadata="$(printf '%s' "$state" | python3 -I -c '
 import json, sys
 try:
     main = json.load(sys.stdin)["metadata"]["main_package"]
