@@ -5967,11 +5967,13 @@ def test_local_path_selectors_reject_quotes_or_unicode_before_effects(
 def test_python_validation_and_pipx_state_parsing_ignore_hostile_cwd_modules(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
-    """Local unicode and JSON modules cannot influence isolated installer Python helpers."""
+    """Every isolated installer Python helper ignores hostile cwd modules."""
     fake_bin, environment, log, _ = installer_harness
     _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
     cwd = tmp_path / "hostile-cwd"
     cwd.mkdir()
+    wheel = tmp_path / "roastpilot-agent.whl"
+    wheel.write_text("wheel")
     markers: list[Path] = []
     for module in ("unicodedata", "json"):
         marker = tmp_path / f"{module}-imported"
@@ -5981,6 +5983,9 @@ def test_python_validation_and_pipx_state_parsing_ignore_hostile_cwd_modules(
     python.write_text(
         "#!/bin/sh\n"
         'case "$*" in\n'
+        f"  *'unicodedata.category'*{wheel}*) printf 'FAKE_PYTHON_VALIDATE_PATH_SELECTOR\\n' >> \"$FAKE_LOG\" ;;\n"
+        "  *'unicodedata.category'*) printf 'FAKE_PYTHON_OPERATOR_HOME_UNICODE\\n' >> \"$FAKE_LOG\" ;;\n"
+        "  *'venvs = json.load(sys.stdin)[\"venvs\"]'*) printf 'FAKE_PYTHON_INSPECT_PIPX_STATE\\n' >> \"$FAKE_LOG\" ;;\n"
         "  *'kind, expected = sys.argv[1:]'*) printf 'FAKE_PYTHON_PIPX_MATCHES\\n' >> \"$FAKE_LOG\" ;;\n"
         "  *'package, version = main['*) printf 'FAKE_PYTHON_PREPARE_RESTORABLE_PRIOR\\n' >> \"$FAKE_LOG\" ;;\n"
         "esac\n"
@@ -5991,13 +5996,16 @@ def test_python_validation_and_pipx_state_parsing_ignore_hostile_cwd_modules(
         environment,
         "--set-hostname",
         "roastpilot",
-        "--version",
-        "2.0",
+        "--wheel",
+        str(wheel),
         cwd=cwd,
     )
     assert result.returncode == 0, result.stderr
     assert not any(marker.exists() for marker in markers)
     events = log.read_text().splitlines()
+    assert events.count("FAKE_PYTHON_VALIDATE_PATH_SELECTOR") == 1
+    assert events.count("FAKE_PYTHON_OPERATOR_HOME_UNICODE") == 1
+    assert events.count("FAKE_PYTHON_INSPECT_PIPX_STATE") == 2
     assert events.count("FAKE_PYTHON_PIPX_MATCHES") == 1
     assert events.count("FAKE_PYTHON_PREPARE_RESTORABLE_PRIOR") == 1
     assert "pipx <runpip> <roastpilot-agent> <freeze> <--all>" in events
@@ -6081,12 +6089,10 @@ def test_fake_model_promotion_mv_failure_cleans_registered_temp_and_blocks_confi
         i > failure and event.startswith("rm <-f>") and ".roastpilot-model." in event
         for i, event in enumerate(events)
     )
-    assert not any(
-        i > failure
-        and event.startswith(("tee ", "mv ", "systemctl <enable>"))
-        and "roastpilot-agent.env" in event
-        for i, event in enumerate(events)
-    )
+    post_failure = events[failure + 1 :]
+    assert "systemctl <enable> <roastpilot-agent>" not in post_failure
+    assert not any(event.startswith("tee ") for event in post_failure)
+    assert not any(event.startswith("mv ") for event in post_failure)
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
