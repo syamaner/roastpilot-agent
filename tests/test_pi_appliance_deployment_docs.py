@@ -40,8 +40,12 @@ def test_new_deployment_artefacts_exclude_prohibited_public_claims() -> None:
         chr(176) + "F",
         "Fahren" + "heit",
     )
-    for artefact in (DEPLOYMENT_DOC, Path(__file__)):
-        content = artefact.read_text(encoding="utf-8").casefold()
+    deployment_content = DEPLOYMENT_DOC.read_text(encoding="utf-8").casefold()
+    test_content = Path(__file__).read_text(encoding="utf-8").casefold()
+    for artefact, content in (
+        (DEPLOYMENT_DOC, deployment_content),
+        (Path(__file__), test_content),
+    ):
         assert all(phrase.casefold() not in content for phrase in prohibited), artefact
 
 

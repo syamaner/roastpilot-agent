@@ -2,17 +2,6 @@
 
 ## Active Epic
 
-**12 Sep 2026 — #138 E11-S2 native installer and deployment-documentation
-completion:** the four planned software/documentation slices are complete. The
-native installer and managed service/configuration paths, pinned local model,
-and `docs/deployment/pi-appliance.md` are delivered; E11-S3 remains not
-started and E11 stays in progress. This is package and documentation evidence,
-not Raspberry Pi, Hottop, microphone, serial-device, or supervised live-roast
-evidence. D191/D192 characterisation, independent Pi evidence review,
-complete-appliance validation, and separately authorised supervised live-roast
-acceptance remain outstanding. #949 remains a separate follow-up for
-concurrent-maintenance serialization.
-
 **6 Sep 2026 — D-ToS-1 governance reconciliation (#938).** Verified live
 `main` branch protection: `required_approving_review_count=0`; strict mode;
 `enforce_admins=true`; `required_conversation_resolution=true`; force-push/
@@ -47,6 +36,17 @@ to main at `44996e047f9b76ec702ecf535448da03b738e859`. D181 narrows and
 corrects D180's final implementation and evidence clauses. This closure
 supersedes the in-progress or stays-open-pending language in all earlier #702
 (D180) entries below, which are now historical.
+
+**12 Sep 2026 — #138 E11-S2 native installer and deployment-documentation
+completion:** the four planned software/documentation slices are complete. The
+native installer and managed service/configuration paths, pinned local model,
+and `docs/deployment/pi-appliance.md` are delivered; E11-S3 remains not
+started and E11 stays in progress. This is package and documentation evidence,
+not Raspberry Pi, Hottop, microphone, serial-device, or supervised live-roast
+evidence. D191/D192 characterisation, independent Pi evidence review,
+complete-appliance validation, and separately authorised supervised live-roast
+acceptance remain outstanding. #949 remains a separate follow-up for
+concurrent-maintenance serialization.
 
 **30 Aug 2026 — #702 (D180) collection-governance addendum:** Following
 `c5342b1`, pytest function collection is pinned to `test_*` and the
