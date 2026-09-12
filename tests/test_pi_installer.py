@@ -361,7 +361,13 @@ UNIT
       exit 0
     fi
     exit 1 ;;
-  mkdir) /bin/mkdir "$@" ;;
+  mkdir)
+    if [ "${FAKE_MKDIR_FAIL_PATH:-}" = "${!#}" ]; then
+      count=0; [ ! -e "$FAKE_MKDIR_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_MKDIR_FAIL_COUNT_FILE")
+      count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_MKDIR_FAIL_COUNT_FILE"
+      [ "${FAKE_MKDIR_FAIL_ON_COUNT:-}" != "$count" ] || { printf 'FAKE_MKDIR_FAILURE <%s> <%s>\n' "${!#}" "$count" >> "$FAKE_LOG"; exit 62; }
+    fi
+    /bin/mkdir "$@" ;;
   chmod) [ "${2:-}" = -- ] && { mode="$1"; shift 2;
     if [ "${FAKE_CHMOD_FAIL_TARGET:-}" = "$1" ]; then
       count=0; [ ! -e "$FAKE_CHMOD_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_CHMOD_FAIL_COUNT_FILE")
@@ -391,7 +397,13 @@ UNIT
       [ "${FAKE_CAT_FAIL_ON_COUNT:-}" != "$count" ] || { printf 'FAKE_CAT_FAILURE <%s>\\n' "${!#}" >> "$FAKE_LOG"; exit 49; }
     fi
     /bin/cat "$@" ;;
-  mv) /bin/mv "$@" ;;
+  mv)
+    if [ "${FAKE_MV_FAIL_PATH:-}" = "${!#}" ]; then
+      count=0; [ ! -e "$FAKE_MV_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_MV_FAIL_COUNT_FILE")
+      count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_MV_FAIL_COUNT_FILE"
+      [ "${FAKE_MV_FAIL_ON_COUNT:-}" != "$count" ] || { printf 'FAKE_MV_FAILURE <%s> <%s>\n' "${!#}" "$count" >> "$FAKE_LOG"; exit 63; }
+    fi
+    /bin/mv "$@" ;;
   sha256sum)
     if [ "$#" = 0 ]; then
       checksum=$("$FAKE_HARNESS_PYTHON" -c 'import sys, zlib; print(f"{zlib.crc32(sys.stdin.buffer.read()) & 0xffffffff:08x}")')
@@ -430,6 +442,9 @@ UNIT
       [ -n "${FAKE_CHOWN_FAIL_ON_COUNT:-}" ] && [ "$count" != "$FAKE_CHOWN_FAIL_ON_COUNT" ] || exit 47
     fi ;;
   apt-get)
+    count=0; [ ! -e "$FAKE_APT_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_APT_FAIL_COUNT_FILE")
+    count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_APT_FAIL_COUNT_FILE"
+    [ "${FAKE_APT_FAIL_ON_COUNT:-}" != "$count" ] || { printf 'FAKE_APT_FAILURE <%s> <%s>\n' "${1:-}" "$count" >> "$FAKE_LOG"; exit 61; }
     if [ -n "${FAKE_APT_RESTORES_PIPX_PATH:-}" ]; then
       [ ! -e "$FAKE_APT_RESTORES_PIPX_PATH" ] || exit 57
       printf 'FAKE_APT_CONFIRMED_PIPX_ABSENT <%s>\n' "$FAKE_APT_RESTORES_PIPX_PATH" >> "$FAKE_LOG"
@@ -531,6 +546,9 @@ esac
         "FAKE_TEST_L_FAIL_COUNT_FILE": str(tmp_path / "test-l-fail-count"),
         "FAKE_CHMOD_FAIL_COUNT_FILE": str(tmp_path / "chmod-fail-count"),
         "FAKE_CHOWN_FAIL_COUNT_FILE": str(tmp_path / "chown-fail-count"),
+        "FAKE_MKDIR_FAIL_COUNT_FILE": str(tmp_path / "mkdir-fail-count"),
+        "FAKE_MV_FAIL_COUNT_FILE": str(tmp_path / "mv-fail-count"),
+        "FAKE_APT_FAIL_COUNT_FILE": str(tmp_path / "apt-fail-count"),
         "FAKE_CAT_FAIL_COUNT_FILE": str(tmp_path / "cat-fail-count"),
         "FAKE_SHA256_FAIL_COUNT_FILE": str(tmp_path / "sha256-fail-count"),
         "FAKE_HOSTNAME_SET_MARKER": str(tmp_path / "hostname-set"),
@@ -5950,9 +5968,8 @@ def test_python_validation_and_pipx_state_parsing_ignore_hostile_cwd_modules(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
     """Local unicode and JSON modules cannot influence isolated installer Python helpers."""
-    _, environment, log, _ = installer_harness
-    wheel = tmp_path / "roastpilot_agent-1.2-py3-none-any.whl"
-    wheel.write_bytes(b"wheel")
+    fake_bin, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
     cwd = tmp_path / "hostile-cwd"
     cwd.mkdir()
     markers: list[Path] = []
@@ -5960,17 +5977,117 @@ def test_python_validation_and_pipx_state_parsing_ignore_hostile_cwd_modules(
         marker = tmp_path / f"{module}-imported"
         (cwd / f"{module}.py").write_text(f"open({str(marker)!r}, 'w').write('executed')\n")
         markers.append(marker)
+    python = fake_bin / "python3"
+    python.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  *'kind, expected = sys.argv[1:]'*) printf 'FAKE_PYTHON_PIPX_MATCHES\\n' >> \"$FAKE_LOG\" ;;\n"
+        "  *'package, version = main['*) printf 'FAKE_PYTHON_PREPARE_RESTORABLE_PRIOR\\n' >> \"$FAKE_LOG\" ;;\n"
+        "esac\n"
+        'exec "$FAKE_HARNESS_PYTHON" "$@"\n'
+    )
+    python.chmod(0o755)
     result = _run(
         environment,
         "--set-hostname",
         "roastpilot",
-        "--wheel",
-        str(wheel),
+        "--version",
+        "2.0",
         cwd=cwd,
     )
     assert result.returncode == 0, result.stderr
     assert not any(marker.exists() for marker in markers)
-    assert "pipx <list> <--json>" in log.read_text().splitlines()
+    events = log.read_text().splitlines()
+    assert events.count("FAKE_PYTHON_PIPX_MATCHES") == 1
+    assert events.count("FAKE_PYTHON_PREPARE_RESTORABLE_PRIOR") == 1
+    assert "pipx <runpip> <roastpilot-agent> <freeze> <--all>" in events
+    assert any(event.startswith("pipx <runpip> <roastpilot-agent> <wheel>") for event in events)
+
+
+@pytest.mark.serial
+def test_fake_apt_failure_preserves_its_status_before_application_or_lifecycle_work(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """An apt failure is observable and cannot reach application or service work."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment | {"FAKE_APT_FAIL_ON_COUNT": "1"}, "--set-hostname", "roastpilot")
+    events = log.read_text().splitlines()
+    marker = "FAKE_APT_FAILURE <install> <1>"
+    assert result.returncode == 61
+    assert events.count(marker) == 1
+    failure = events.index(marker)
+    assert not any(
+        event.startswith(("pipx ", "roastpilot-agent ", "systemctl <enable>"))
+        for event in events[failure + 1 :]
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_fake_stage_parent_mkdir_failure_preserves_status_and_blocks_later_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A privileged staging-parent mkdir failure cannot reach model or service mutation."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    stage_parent = root / "tmp"
+    result = _run(
+        environment
+        | {
+            "FAKE_MKDIR_FAIL_PATH": str(stage_parent),
+            "FAKE_MKDIR_FAIL_ON_COUNT": "1",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    events = log.read_text().splitlines()
+    marker = f"FAKE_MKDIR_FAILURE <{stage_parent}> <1>"
+    assert result.returncode == 62
+    assert events.count(marker) == 1
+    failure = events.index(marker)
+    assert "application/configuration skew may require manual reconciliation" in result.stderr
+    assert not any(
+        event.startswith(("roastpilot-agent <appliance>", "tee ", "mv ", "systemctl <enable>"))
+        for event in events[failure + 1 :]
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+    assert not (stage_parent / "roastpilot-install.fake").exists()
+
+
+@pytest.mark.serial
+def test_fake_model_promotion_mv_failure_cleans_registered_temp_and_blocks_configuration(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A model-promotion rename failure preserves status and cleans its registered temporary."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    destination = root / "var/lib/roastpilot-agent/models/onnx/int8/model_quantized.onnx"
+    result = _run(
+        environment
+        | {
+            "FAKE_MV_FAIL_PATH": str(destination),
+            "FAKE_MV_FAIL_ON_COUNT": "1",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    events = log.read_text().splitlines()
+    marker = f"FAKE_MV_FAILURE <{destination}> <1>"
+    assert result.returncode == 63
+    assert events.count(marker) == 1
+    failure = events.index(marker)
+    assert "application/configuration skew may require manual reconciliation" in result.stderr
+    assert any(
+        i > failure and event.startswith("rm <-f>") and ".roastpilot-model." in event
+        for i, event in enumerate(events)
+    )
+    assert not any(
+        i > failure
+        and event.startswith(("tee ", "mv ", "systemctl <enable>"))
+        and "roastpilot-agent.env" in event
+        for i, event in enumerate(events)
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial
