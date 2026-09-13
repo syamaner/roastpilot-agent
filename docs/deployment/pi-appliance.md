@@ -19,6 +19,7 @@ Have the following operator-specific values before starting:
 - A Hottop serial path such as `/dev/serial/by-id/...`; the installer accepts
   only an absolute `/dev` path.
 - The microphone device substring used by `coffee-roaster-mcp`.
+- `curl`, which both documented download procedures use.
 - An OpenRouter API key if advisory suggestions are wanted. The controller and
   safety policy remain in charge; no key means no advisor suggestions.
 - A port from 1024 through 65535 (the default is `8000`).
@@ -50,6 +51,7 @@ For a safer download, inspect, then run path, keep the script as a file:
 
 ```sh
 curl -fsSLo install-roastpilot-pi.sh https://raw.githubusercontent.com/syamaner/roastpilot-agent/main/packaging/pi/install.sh
+# Inspect with `less` or another trusted local viewer before running:
 less install-roastpilot-pi.sh
 bash install-roastpilot-pi.sh --serial-port /dev/serial/by-id/REPLACE_ME --audio-device 'REPLACE_ME' --set-hostname roastpilot --start
 ```
@@ -73,9 +75,10 @@ or `--wheel /absolute/path/to/roastpilot_agent.whl`; the wheel also has the
 `ROASTPILOT_INSTALL_WHEEL` environment alternative. `--allow-unsupported-arch`
 is an explicit override, not a Pi substitute.
 
-An air-gapped install uses `--from-dir DIR`. `DIR` must be an existing,
-canonical absolute directory, not `/` or a symlink. It is a source tree for
-the model files, not a package-wheel directory.
+For offline model placement, use `--from-dir DIR`. `DIR` must be an existing,
+canonical absolute directory, not `/` or a symlink. It supplies only model
+bytes; `apt` and `pipx` still require their packages and dependencies. It is a
+source tree for the model files, not a package-wheel directory.
 
 ## Configuration
 
@@ -93,6 +96,9 @@ file rather than putting it on a command line. Editing `PORT` requires an
 explicit, safely timed service restart. The rendered MCP configuration holds
 the selected serial device and audio device; rerun the installer with the new
 `--serial-port` or `--audio-device` only while the service is inactive.
+Saved non-null Config UI `mcp_device.serial_port` and `mcp_device.audio_input_device`
+override those base MCP YAML values. When changing devices, update or clear
+those saved overrides as well as rerunning the installer safely.
 
 The service runs `roastpilot-agent serve --host 0.0.0.0 --port ${PORT}` and
 the agent spawns its MCP child over stdio. It installs one service unit, not a
@@ -105,8 +111,9 @@ trace is `/var/lib/roastpilot-agent/roastpilot.sqlite3`, and the local model
 files are below `/var/lib/roastpilot-agent/models`. The generated MCP YAML
 uses the MCP default relative `logs` export directory; because the service unit
 sets `WorkingDirectory=~`, MCP exports are in the operator account's `~/logs`.
-Treat all three locations as appliance data when planning storage, backup,
-replacement, or removal.
+The operator's saved UI/application configuration is
+`~/.roastpilot/config.yaml`. Treat all four locations as appliance data when
+planning storage, backup, replacement, or removal.
 
 ## Model provenance and air-gapped preparation
 
@@ -152,7 +159,7 @@ use, or command to the machine.
 Inspect the service journal with:
 
 ```sh
-journalctl -u roastpilot-agent -f
+sudo journalctl -u roastpilot-agent -f
 ```
 
 Use logs for diagnosis. They are not a substitute for operator observation or

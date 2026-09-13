@@ -37,7 +37,9 @@ def test_pi_appliance_deployment_doc_preserves_install_and_maintenance_contract(
 
     deployment = DEPLOYMENT_DOC.read_text(encoding="utf-8")
     assert "with `apt` and\nPython 3.11 or newer" in deployment
+    assert "`curl`, which both documented download procedures use." in deployment
     assert "--set-hostname roastpilot --start --yes" in deployment
+    assert "Inspect with `less` or another trusted local viewer before running:" in deployment
     assert (
         "/usr/bin/sudo` must be installed, and that operator must be authorised to use it"
         in deployment
@@ -47,15 +49,29 @@ def test_pi_appliance_deployment_doc_preserves_install_and_maintenance_contract(
     assert "use `--start` only for\nan already-safe inactive appliance" in deployment
     assert "otherwise it starts at the next boot" in deployment
     assert "operator may explicitly start it only while no roast is active" in deployment
+    assert (
+        "Saved non-null Config UI `mcp_device.serial_port` and "
+        "`mcp_device.audio_input_device`" in deployment
+    )
+    assert (
+        "update or clear\nthose saved overrides as well as rerunning the installer safely"
+        in deployment
+    )
     assert "MCP default relative `logs` export directory" in deployment
     assert (
         "sets `WorkingDirectory=~`, MCP exports are in the operator account's `~/logs`"
         in deployment
     )
     assert (
-        "Treat all three locations as appliance data when planning storage, backup,\n"
-        "replacement, or removal." in deployment
+        "`~/.roastpilot/config.yaml`. Treat all four locations as appliance data when\n"
+        "planning storage, backup, replacement, or removal." in deployment
     )
+    assert "For offline model placement, use `--from-dir DIR`." in deployment
+    assert (
+        "It supplies only model\nbytes; `apt` and `pipx` still require their packages and "
+        "dependencies." in deployment
+    )
+    assert "sudo journalctl -u roastpilot-agent -f" in deployment
 
 
 @pytest.mark.docs
