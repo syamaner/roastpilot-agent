@@ -10,7 +10,9 @@ Use a Raspberry Pi 5 with the official 27 W USB-C power supply and an active
 cooler. First-crack inference shares the Pi's CPU with the agent, MCP child,
 USB serial link, and microphone, so passive cooling is not an equivalent
 setup. The installer supports an aarch64 Debian-family system with `apt`; run
-it as the intended non-root operator, not as root.
+it as the intended non-root operator, not as root. `/usr/bin/sudo` must be
+installed, and that operator must be authorised to use it: the installer's
+privileged operations use that exact path.
 
 Have the following operator-specific values before starting:
 
@@ -36,7 +38,7 @@ For a one-line install, review the arguments carefully and run this as the
 non-root operator:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/syamaner/roastpilot-agent/main/packaging/pi/install.sh | bash -s -- --serial-port /dev/serial/by-id/REPLACE_ME --audio-device 'REPLACE_ME' --set-hostname roastpilot --start
+curl -fsSL https://raw.githubusercontent.com/syamaner/roastpilot-agent/main/packaging/pi/install.sh | bash -s -- --serial-port /dev/serial/by-id/REPLACE_ME --audio-device 'REPLACE_ME' --set-hostname roastpilot --start --yes
 ```
 
 `--set-hostname roastpilot` is explicit consent to change the static hostname.
@@ -100,8 +102,11 @@ separate MCP daemon.
 
 Persistent state is under `/var/lib/roastpilot-agent/`: the SQLite decision
 trace is `/var/lib/roastpilot-agent/roastpilot.sqlite3`, and the local model
-files are below `/var/lib/roastpilot-agent/models`. Treat both as appliance
-data when planning storage, backup, replacement, or removal.
+files are below `/var/lib/roastpilot-agent/models`. The generated MCP YAML
+uses the MCP default relative `logs` export directory; because the service unit
+sets `WorkingDirectory=~`, MCP exports are in the operator account's `~/logs`.
+Treat all three locations as appliance data when planning storage, backup,
+replacement, or removal.
 
 ## Model provenance and air-gapped preparation
 
@@ -123,12 +128,20 @@ model bytes during that installation.
 
 `pipx upgrade roastpilot-agent` is the generic pipx command, but it does not
 repeat this appliance installer's configuration rendering, model verification,
-or service safeguards. For a managed appliance upgrade, rerun the installer
-while the service is inactive, using `--version` or `--wheel` as appropriate.
-The installer stages a replacement and retains configuration/application
-rollback handling if its replacement path fails; follow any manual
-reconciliation message rather than assuming every external system change was
-reversed.
+or service safeguards. After safely ending any roast and confirming the
+appliance is inactive, stop the service before a managed upgrade:
+
+```sh
+sudo systemctl stop roastpilot-agent
+```
+
+Then rerun the installer, using `--version` or `--wheel` as appropriate. Never
+stop the service during a roast. The installer stages a replacement and retains
+configuration/application rollback handling if its replacement path fails;
+follow any manual reconciliation message rather than assuming every external
+system change was reversed. The unit remains enabled: use `--start` only for
+an already-safe inactive appliance; otherwise it starts at the next boot, or
+an operator may explicitly start it only while no roast is active.
 
 Never treat a successful package operation as a reason to operate a roaster.
 Maintenance does not authorise a live session, serial connection, microphone

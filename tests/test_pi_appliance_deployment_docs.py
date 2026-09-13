@@ -32,6 +32,32 @@ def test_pi_appliance_deployment_doc_has_the_required_sections() -> None:
 
 
 @pytest.mark.docs
+def test_pi_appliance_deployment_doc_preserves_install_and_maintenance_contract() -> None:
+    """T28: piped installation and maintenance retain their safe operator contract."""
+
+    deployment = DEPLOYMENT_DOC.read_text(encoding="utf-8")
+    assert "--set-hostname roastpilot --start --yes" in deployment
+    assert (
+        "/usr/bin/sudo` must be\ninstalled, and that operator must be authorised to use it"
+        in deployment
+    )
+    assert "sudo systemctl stop roastpilot-agent" in deployment
+    assert "Never\nstop the service during a roast." in deployment
+    assert "use `--start` only for\nan already-safe inactive appliance" in deployment
+    assert "otherwise it starts at the next boot" in deployment
+    assert "operator may explicitly start it only while no roast is active" in deployment
+    assert "MCP default relative `logs` export directory" in deployment
+    assert (
+        "sets `WorkingDirectory=~`, MCP exports are in the operator account's `~/logs`"
+        in deployment
+    )
+    assert (
+        "Treat all three locations as appliance data when planning storage, backup,\n"
+        "replacement, or removal." in deployment
+    )
+
+
+@pytest.mark.docs
 def test_new_deployment_artefacts_exclude_prohibited_public_claims() -> None:
     """T26: new guide material preserves the E11 public-text boundary."""
 
