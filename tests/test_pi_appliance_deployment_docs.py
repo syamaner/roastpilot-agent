@@ -8,6 +8,8 @@ import pytest
 
 REPO_ROOT = Path(__file__).parents[1]
 DEPLOYMENT_DOC = REPO_ROOT / "docs/deployment/pi-appliance.md"
+EPIC_DOC = REPO_ROOT / "docs/epics/E11-packaging.md"
+REGISTRY_DOC = REPO_ROOT / "docs/state/registry.md"
 
 
 @pytest.mark.docs
@@ -41,9 +43,29 @@ def test_new_deployment_artefacts_exclude_prohibited_public_claims() -> None:
         "Fahren" + "heit",
     )
     deployment_content = DEPLOYMENT_DOC.read_text(encoding="utf-8").casefold()
+    epic = EPIC_DOC.read_text(encoding="utf-8")
+    registry = REGISTRY_DOC.read_text(encoding="utf-8")
     test_content = Path(__file__).read_text(encoding="utf-8").casefold()
+    e11_s2_heading = "### E11-S2 — Native installer, systemd unit, bundled model, deploy doc"
+    e11_s3_heading = "### E11-S3 — Pi 5 dual-mic recording + FC-detection CPU soak"
+    epic_story = epic[epic.index(e11_s2_heading) : epic.index(e11_s3_heading)].casefold()
+    epic_completion = epic[epic.index("**E11-S2 is complete (12 Sep 2026):") :].casefold()
+    epic_status = next(
+        line.casefold()
+        for line in epic.splitlines()
+        if line.startswith("| E11-S2 | Native installer, systemd unit, bundled model, deploy doc |")
+    )
+    registry_entry = registry[
+        registry.index("**12 Sep 2026 — #138 E11-S2 native installer") : registry.index(
+            "\n\n", registry.index("**12 Sep 2026 — #138 E11-S2 native installer")
+        )
+    ].casefold()
     for artefact, content in (
         (DEPLOYMENT_DOC, deployment_content),
+        (EPIC_DOC, epic_story),
+        (EPIC_DOC, epic_completion),
+        (EPIC_DOC, epic_status),
+        (REGISTRY_DOC, registry_entry),
         (Path(__file__), test_content),
     ):
         assert all(phrase.casefold() not in content for phrase in prohibited), artefact
