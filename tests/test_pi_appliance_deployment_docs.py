@@ -36,9 +36,10 @@ def test_pi_appliance_deployment_doc_preserves_install_and_maintenance_contract(
     """T28: piped installation and maintenance retain their safe operator contract."""
 
     deployment = DEPLOYMENT_DOC.read_text(encoding="utf-8")
+    assert "with `apt` and\nPython 3.11 or newer" in deployment
     assert "--set-hostname roastpilot --start --yes" in deployment
     assert (
-        "/usr/bin/sudo` must be\ninstalled, and that operator must be authorised to use it"
+        "/usr/bin/sudo` must be installed, and that operator must be authorised to use it"
         in deployment
     )
     assert "sudo systemctl stop roastpilot-agent" in deployment
