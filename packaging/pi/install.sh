@@ -1032,10 +1032,28 @@ install_rendered_files() {
 }
 
 ensure_agent_inactive() {
-    local active_state
-    active_state="$(run_privileged systemctl show -p ActiveState --value roastpilot-agent)" || return 1
-    case "$active_state" in
-        inactive|failed) ;;
+    local active_state unit_file_state unit_file_name loaded_unit unit_load_state unit_active_state unit_sub_state unit_description
+    if active_state="$(run_privileged systemctl show -p ActiveState --value roastpilot-agent)"; then
+        case "$active_state" in
+            inactive|failed) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    # `show` does not distinguish a genuinely absent unit from a failed query.
+    # Establish absence only from a successful, strictly parsed unit-file query.
+    unit_file_state="$(run_privileged systemctl list-unit-files --no-legend --no-pager roastpilot-agent.service)" || return 1
+    [[ -z "$unit_file_state" ]] || return 1
+
+    # A transient or loaded unit has no unit file to list.  Its active state
+    # remains safety-relevant, so reject it unless it is conclusively terminal.
+    loaded_unit="$(run_privileged systemctl list-units --all --no-legend --no-pager roastpilot-agent.service)" || return 1
+    [[ -z "$loaded_unit" ]] && return 0
+    [[ "$loaded_unit" != *$'\n'* ]] || return 1
+    IFS=' ' read -r unit_file_name unit_load_state unit_active_state unit_sub_state unit_description <<< "$loaded_unit"
+    [[ "$unit_file_name" == "roastpilot-agent.service" && "$unit_load_state" == "loaded" && -n "$unit_sub_state" && -n "$unit_description" ]] || return 1
+    case "$unit_active_state" in
+        inactive|failed) return 0 ;;
         *) return 1 ;;
     esac
 }

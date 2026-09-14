@@ -74,6 +74,18 @@ def test_pi_appliance_deployment_doc_preserves_install_and_maintenance_contract(
         "update or clear\nthose saved overrides as well as rerunning the installer safely"
         in deployment
     )
+    assert (
+        "review every saved\n`mcp_device` override that should defer to the rendered appliance YAML"
+        in deployment
+    )
+    assert (
+        "serial port, roaster driver, audio input, first-crack, and automatic\nT0 settings"
+        in deployment
+    )
+    assert (
+        "clear the saved override rather than assuming the rendered value\nwill replace it"
+        in deployment
+    )
     assert "MCP default relative `logs` export directory" in deployment
     assert (
         "sets `WorkingDirectory=~`, MCP exports are in the operator account's `~/logs`"
@@ -89,6 +101,12 @@ def test_pi_appliance_deployment_doc_preserves_install_and_maintenance_contract(
         "dependencies." in deployment
     )
     assert "sudo journalctl -u roastpilot-agent -f" in deployment
+    assert "Before a backup, safely end any roast and stop the service." in deployment
+    assert "`/var/lib/roastpilot-agent/` directory as one offline set" in deployment
+    assert "`roastpilot.sqlite3` and any `-wal` and `-shm` sidecars" in deployment
+    assert (
+        "Restore that complete,\nmatched set only while the service remains stopped" in deployment
+    )
     assert (
         "".join(
             (

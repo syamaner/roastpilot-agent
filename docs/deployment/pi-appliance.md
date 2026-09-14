@@ -106,6 +106,11 @@ the selected serial device and audio device; rerun the installer with the new
 Saved non-null Config UI `mcp_device.serial_port` and `mcp_device.audio_input_device`
 override those base MCP YAML values. When changing devices, update or clear
 those saved overrides as well as rerunning the installer safely.
+Before initial start and relevant installer reruns, review every saved
+`mcp_device` override that should defer to the rendered appliance YAML. This
+includes serial port, roaster driver, audio input, first-crack, and automatic
+T0 settings; clear the saved override rather than assuming the rendered value
+will replace it.
 
 The service runs `roastpilot-agent serve --host 0.0.0.0 --port ${PORT}` and
 the agent spawns its MCP child over stdio. It installs one service unit, not a
@@ -121,6 +126,11 @@ sets `WorkingDirectory=~`, MCP exports are in the operator account's `~/logs`.
 The operator's saved UI/application configuration is
 `~/.roastpilot/config.yaml`. Treat all four locations as appliance data when
 planning storage, backup, replacement, or removal.
+Before a backup, safely end any roast and stop the service. Back up the complete
+`/var/lib/roastpilot-agent/` directory as one offline set, including
+`roastpilot.sqlite3` and any `-wal` and `-shm` sidecars. Restore that complete,
+matched set only while the service remains stopped; explicitly start it later
+only while no roast is active.
 
 ## Model provenance and air-gapped preparation
 
