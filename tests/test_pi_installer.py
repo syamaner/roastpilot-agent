@@ -28,6 +28,34 @@ from roastpilot_agent.appliance.render import (
 INSTALLER = Path(__file__).parents[1] / "packaging/pi/install.sh"
 
 
+def _write_fake_process(
+    proc_root: Path,
+    pid: int,
+    parent: int,
+    cmdline: bytes = b"unrelated-process\0",
+    comm: bytes = b"unrelated\n",
+) -> Path:
+    """Create one regular-file-only fake procfs process entry."""
+    process = proc_root / str(pid)
+    process.mkdir(parents=True, exist_ok=True)
+    process.joinpath("stat").write_text(f"{pid} (fake) S {parent} 0 0 0\n")
+    process.joinpath("cmdline").write_bytes(cmdline)
+    process.joinpath("comm").write_bytes(comm)
+    return process
+
+
+def _fake_proc_tree(tmp_path: Path) -> tuple[Path, str]:
+    """Create a closed fake /proc tree without reading the host process table."""
+    proc_root = tmp_path / "fake-proc"
+    proc_root.mkdir()
+    _write_fake_process(proc_root, 1, 0, b"init\0", b"init\n")
+    self_process = _write_fake_process(proc_root, 100, 1, b"installer-probe\0", b"probe\n")
+    self_process.joinpath("mountinfo").write_text(
+        "36 25 0:31 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n"
+    )
+    return proc_root, "100"
+
+
 @pytest.fixture
 def installer_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Path, Path]:
     """Create one recorded-fake PATH and a root-free appliance destination.
@@ -550,6 +578,7 @@ esac
     operator_home = tmp_path / "operator-home"
     pipx_home = operator_home / ".local/share/pipx"
     install_root = tmp_path / "root"
+    proc_root, probe_pid = _fake_proc_tree(tmp_path)
     pipx_agent = pipx_home / "venvs/roastpilot-agent/bin/roastpilot-agent"
     pipx_agent.parent.mkdir(parents=True)
     pipx_agent.write_text(fake.read_text())
@@ -598,6 +627,8 @@ esac
         "ROASTPILOT_INSTALL_TEST_MODE": "1",
         "ROASTPILOT_INSTALL_TEST_ROOT": str(install_root),
         "ROASTPILOT_INSTALL_TEST_COMMAND_DIR": str(fake_bin),
+        "ROASTPILOT_INSTALL_TEST_PROC_ROOT": str(proc_root),
+        "ROASTPILOT_INSTALL_TEST_PROBE_PID": probe_pid,
         "ROASTPILOT_INSTALL_OS_RELEASE": str(os_release),
         "HOME": str(tmp_path / "home"),
         "FAKE_OPERATOR_HOME": str(operator_home),
@@ -620,6 +651,8 @@ def _run(
         "ROASTPILOT_INSTALL_TEST_ROOT",
         "ROASTPILOT_INSTALL_OS_RELEASE",
         "ROASTPILOT_INSTALL_TEST_COMMAND_DIR",
+        "ROASTPILOT_INSTALL_TEST_PROC_ROOT",
+        "ROASTPILOT_INSTALL_TEST_PROBE_PID",
         "ROASTPILOT_INSTALL_WHEEL",
         "ROASTPILOT_INSTALL_API_KEY",
         "ROASTPILOT_INSTALL_SERIAL_PORT",
@@ -6868,3 +6901,342 @@ def test_prior_application_uninstall_failure_preserves_status_and_reports_skew(
     assert "FAKE_PRIOR_UNINSTALL_FAILURE" in log.read_text().splitlines()
     assert "cannot remove prior application after staging replacement" in result.stderr
     assert "application/configuration skew may require manual reconciliation" in result.stderr
+
+
+def _run_process_guard(
+    environment: dict[str, str], tmp_path: Path
+) -> subprocess.CompletedProcess[str]:
+    """Run only the unprivileged process guard against the fixture fake procfs."""
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
+    sourceable.chmod(0o600)
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; validate_install_root; if check_no_live_agent_process; then printf clear; else printf "blocked:%s" "$PROCESS_GUARD_MESSAGE"; fi',
+            "process-guard",
+            str(sourceable),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.serial
+def test_process_guard_clear_excludes_only_probe_ancestor_chain(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T1: unrelated entries admit, while token-bearing self and parent are excluded."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    _write_fake_process(proc, 1, 0, b"roastpilot-agent\0", b"roastpilot-agen\n")
+    _write_fake_process(proc, 100, 1, b"coffee-roaster-mcp\0", b"coffee-roaster-\n").joinpath(
+        "mountinfo"
+    ).write_text("36 25 0:31 / /proc rw - proc proc rw\n")
+    before = {path: path.read_bytes() for path in proc.rglob("*") if path.is_file()}
+    result = _run_process_guard(environment, tmp_path)
+    assert result.returncode == 0 and result.stdout == "clear", result.stderr
+    assert {path: path.read_bytes() for path in proc.rglob("*") if path.is_file()} == before
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("cmdline", "comm"),
+    [
+        (b"roastpilot-agent\0", b"other\n"),
+        (b"ROASTPILOT_AGENT\0", b"other\n"),
+        (b"python\0-m\0coffee_roaster_mcp\0", b"other\n"),
+        (b"tail\0-f\0roastpilot-agent.log\0", b"tail\n"),
+        (b"vim\0notes-coffee-roaster-mcp.txt\0", b"vim\n"),
+        (b"", b"roastpilot-agen\n"),
+        (b"", b"coffee-roaster-\n"),
+    ],
+)
+def test_process_guard_treats_all_family_forms_as_ambiguous_pid_only_matches(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    cmdline: bytes,
+    comm: bytes,
+) -> None:
+    """T3: process-family evidence blocks without leaking argv or asserting identity."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    _write_fake_process(proc, 200, 1, cmdline + b"SECRET_NEVER_PRINT", comm)
+    result = _run_process_guard(environment, tmp_path)
+    assert result.returncode == 0 and result.stdout.startswith(
+        "blocked:possible RoastPilot-related process"
+    )
+    assert "200" in result.stdout
+    assert "SECRET_NEVER_PRINT" not in result.stdout + result.stderr
+    assert "broad matches may include log followers or editors" in result.stdout
+    assert "never stops, restarts, or kills" in result.stdout
+    assert "is running" not in result.stdout
+
+
+@pytest.mark.serial
+def test_process_guard_reports_sorted_capped_pid_set_without_process_bytes(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T3: a large ambiguous set remains PID-only and bounded."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    for pid in range(300, 320):
+        _write_fake_process(proc, pid, 1, b"roastpilot-agent\0private-argv", b"agent\n")
+    result = _run_process_guard(environment, tmp_path)
+    assert result.returncode == 0 and "300 301" in result.stdout and "+4 more" in result.stdout
+    assert "316" not in result.stdout and "private-argv" not in result.stdout
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "hidepid",
+        "subset",
+        "duplicate-mount",
+        "wrong-mount",
+        "missing-pid1",
+        "bad-stat",
+        "missing-ancestor",
+        "ancestor-cycle",
+        "symlink",
+        "oversized",
+    ],
+)
+def test_process_guard_fails_closed_for_unavailable_or_malformed_process_evidence(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, fault: str
+) -> None:
+    """T4: incomplete evidence is never interpreted as an idle process table."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    if fault == "hidepid":
+        (proc / "100/mountinfo").write_text("36 25 0:31 / /proc rw,hidepid=2 - proc proc rw\n")
+    elif fault == "subset":
+        (proc / "100/mountinfo").write_text("36 25 0:31 / /proc rw,subset=pid - proc proc rw\n")
+    elif fault == "duplicate-mount":
+        (proc / "100/mountinfo").write_text(
+            "36 25 0:31 / /proc rw - proc proc rw\n37 25 0:32 / /proc rw - proc proc rw\n"
+        )
+    elif fault == "wrong-mount":
+        (proc / "100/mountinfo").write_text("36 25 0:31 / /not-proc rw - proc proc rw\n")
+    elif fault == "missing-pid1":
+        (proc / "1/cmdline").unlink()
+    elif fault == "bad-stat":
+        (proc / "100/stat").write_text("wrong\n")
+    elif fault == "missing-ancestor":
+        (proc / "100/stat").write_text("100 (fake) S 999 0 0 0\n")
+    elif fault == "ancestor-cycle":
+        (proc / "100/stat").write_text("100 (fake) S 100 0 0 0\n")
+    elif fault == "symlink":
+        target = proc / "outside"
+        target.write_text("unrelated")
+        (proc / "1/cmdline").unlink()
+        (proc / "1/cmdline").symlink_to(target)
+    else:
+        (proc / "1/cmdline").write_bytes(b"x" * (1048577))
+    result = _run_process_guard(environment, tmp_path)
+    assert result.returncode == 0 and result.stdout.startswith(
+        "blocked:cannot confirm that no RoastPilot-related process is running"
+    )
+    assert "never stops, restarts, or kills" in result.stdout
+
+
+@pytest.mark.serial
+def test_process_guard_rejects_excessive_pid_inventory_before_opening_members(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T4: a process-table resource bound rejects an oversized fake inventory."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    for pid in range(1000, 9191):
+        (proc / str(pid)).mkdir()
+    result = _run_process_guard(environment, tmp_path)
+    assert result.returncode == 0 and result.stdout.startswith(
+        "blocked:cannot confirm that no RoastPilot-related process is running"
+    )
+
+
+@pytest.mark.serial
+def test_process_guard_b1_and_b2_block_without_protected_mutation_and_clean_stage(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T2: apt and replacement uninstall remain unreachable; B2 removes its staged venv."""
+    _, environment, log, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    _write_fake_process(proc, 200, 1, b"roastpilot-agent\0", b"agent\n")
+    first = _run(environment, "--set-hostname", "roastpilot")
+    assert first.returncode != 0 and "possible RoastPilot-related process" in first.stderr
+    first_events = log.read_text().splitlines()
+    assert not any(event.startswith("apt-get ") for event in first_events)
+    assert not _has_roastpilot_agent_lifecycle_mutation(first_events)
+
+    log.write_text("")
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
+    replacement = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; validate_install_root; INVOKING_HOME="$2"; replace_application_safely "roastpilot-agent[pi]==1.2" "roastpilot-agent[pi]==2.0"',
+            "replacement-guard",
+            str(sourceable),
+            environment["FAKE_OPERATOR_HOME"],
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    events = log.read_text().splitlines()
+    assert replacement.returncode != 0
+    assert any("<--suffix>" in event and event.startswith("pipx <install>") for event in events)
+    assert any(
+        event.startswith("pipx <uninstall>") and "-roastpilot-stage-" in event for event in events
+    )
+    assert not any(event == "pipx <uninstall> <--> <roastpilot-agent>" for event in events)
+
+
+@pytest.mark.serial
+def test_process_guard_b3_and_b4_precede_configuration_snapshot_and_service_start(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T2: later boundaries refuse before their protected promotion or explicit start."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    _write_fake_process(proc, 200, 1, b"coffee-roaster-mcp\0", b"mcp\n")
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
+    b3 = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; validate_install_root; require_agent_inactive(){ :; }; snapshot_live_configuration(){ printf SNAPSHOT; }; install_rendered_files',
+            "configuration-guard",
+            str(sourceable),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert b3.returncode != 0 and "possible RoastPilot-related process" in b3.stderr
+    assert "SNAPSHOT" not in b3.stdout + b3.stderr
+
+    b4 = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; validate_install_root; verify_no_service_dropins(){ :; }; require_agent_inactive(){ :; }; run_privileged(){ printf " <%s>" "$*"; }; START_SERVICE=1; enable_services',
+            "start-guard",
+            str(sourceable),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert b4.returncode != 0 and "possible RoastPilot-related process" in b4.stderr
+    assert "start roastpilot-agent" not in b4.stdout + b4.stderr
+
+
+@pytest.mark.serial
+def test_process_guard_seams_reject_production_and_malformed_test_inputs_before_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T6: fake procfs routing is unavailable outside the explicit canonical test seam."""
+    _, environment, log, _ = installer_harness
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
+    production = environment.copy()
+    production.pop("ROASTPILOT_INSTALL_TEST_MODE")
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; validate_install_root', "guard", str(sourceable)],
+        env=production,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert (
+        result.returncode != 0 and "test destination is unavailable in production" in result.stderr
+    )
+    bad = _run(
+        environment
+        | {
+            "ROASTPILOT_INSTALL_TEST_PROC_ROOT": "relative",
+            "ROASTPILOT_INSTALL_TEST_PROBE_PID": "0",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert bad.returncode != 0 and not log.exists()
+
+
+@pytest.mark.serial
+def test_process_guard_protocol_parser_rejects_noncanonical_or_ambiguous_output(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T5: only a sorted, bounded PID protocol can carry a possible result."""
+    _, environment, _, _ = installer_harness
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
+    command = [
+        "bash",
+        "-c",
+        'source "$1"; validate_install_root; valid_possible_process_output "$2"',
+        "protocol-guard",
+        str(sourceable),
+    ]
+    valid = "possible " + " ".join(str(pid) for pid in range(1, 17)) + " +2 more"
+    assert subprocess.run(command + [valid], env=environment).returncode == 0
+    for invalid in (
+        "",
+        "clear",
+        "possible 12\\n13",
+        "possible 12 12",
+        "possible 13 12",
+        "possible 012",
+        "possible 12 +0 more",
+        "possible 12 +2 more trailing",
+        "possible " + " ".join(str(pid) for pid in range(1, 18)),
+        "unavailable restricted",
+    ):
+        assert subprocess.run(command + [invalid], env=environment).returncode != 0
+
+
+def test_process_guard_structure_has_closed_protocol_and_four_boundaries() -> None:
+    """T7: source structure retains the unprivileged, bounded four-boundary guard."""
+    source = INSTALLER.read_text()
+    assert "python3 -I -c" in source and "signal.alarm(10)" in source
+    assert (
+        "run_privileged"
+        not in source[
+            source.index("check_no_live_agent_process()") : source.index("remove_root_temporary()")
+        ]
+    )
+    assert "pkill" not in source and "killall" not in source
+    for token in (
+        "roastpilot-agent",
+        "roastpilot_agent",
+        "coffee-roaster-mcp",
+        "coffee_roaster_mcp",
+        "roastpilot-agen",
+        "coffee-roaster-",
+    ):
+        assert token in source
+    assert source.count("require_no_live_agent_process") == 4
+    assert source.index(
+        "verify_existing_pi_capability_before_package_install\n    require_no_live_agent_process"
+    ) < source.index("apt-get install")
+    rendered = source[
+        source.index("install_rendered_files()") : source.index("ensure_agent_inactive()")
+    ]
+    assert rendered.index("require_no_live_agent_process") < rendered.index(
+        "snapshot_live_configuration"
+    )
+    services = source[source.index("enable_services()") : source.index("summary()")]
+    assert services.index("require_no_live_agent_process") < services.index(
+        "systemctl start roastpilot-agent"
+    )

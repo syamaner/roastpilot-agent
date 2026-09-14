@@ -29,6 +29,10 @@ Have the following operator-specific values before starting:
 Before maintenance, make the appliance safely inactive. End a roast safely,
 wait until the service is idle, and do not start, restart, upgrade, or rerun
 the installer during a roast. Run one installer invocation at a time.
+The installer refuses if it sees possible RoastPilot-related processes
+(including ambiguous log-viewer or editor matches) or restricted process
+visibility; it reports only PIDs and never mutates a process. This is a
+point-in-time check only: concurrent-maintenance serialization remains #949.
 
 ## Install
 
