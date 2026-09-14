@@ -78,12 +78,27 @@ def test_pi_appliance_deployment_doc_preserves_install_and_maintenance_contract(
 
 @pytest.mark.docs
 def test_new_deployment_artefacts_exclude_prohibited_public_claims() -> None:
-    """T26: new guide material preserves the E11 public-text boundary."""
+    """T26: slice artefacts exclude specified exact public-accuracy phrases."""
 
+    # Literal matching protects the listed variants; it is not a semantic acceptance audit.
     prohibited = (
         "-".join(("production", "ready")),
         " ".join(("fully", "autonomous")),
         "-".join(("hardware", "validated")),
+        "-".join(("pi", "ready")),
+        " ".join(("pi", "ready")),
+        "-".join(("pi", "readiness")),
+        " ".join(("physical", "validation", "complete")),
+        " ".join(("physical", "validation", "completed")),
+        " ".join(("physical", "validation", "is", "complete")),
+        " ".join(("physical-device", "validation", "complete")),
+        " ".join(("physical-device", "validation", "completed")),
+        " ".join(("physical-device", "validation", "is", "complete")),
+        " ".join(("complete", "physical", "validation")),
+        " ".join(("completed", "physical", "validation")),
+        "-".join(("release", "ready")),
+        " ".join(("ready", "for", "release")),
+        "".join(("%", " deterministic")),
         chr(176) + "F",
         "Fahren" + "heit",
     )
