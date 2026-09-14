@@ -490,7 +490,7 @@ UNIT
       exit 0
     fi
     if [ "${1:-}" = list-units ]; then
-      [ "${2:-}" = --all ] && [ "${3:-}" = --no-legend ] && [ "${4:-}" = --no-pager ] && [ "${5:-}" = roastpilot-agent.service ] || exit 32
+      [ "${2:-}" = --all ] && [ "${3:-}" = --plain ] && [ "${4:-}" = --no-legend ] && [ "${5:-}" = --no-pager ] && [ "${6:-}" = roastpilot-agent.service ] || exit 32
       [ "${FAKE_LOADED_UNIT_QUERY_FAIL:-}" != 1 ] || exit 34
       case "${FAKE_LOADED_UNIT_STATE:-absent}" in
         absent) ;;
@@ -665,7 +665,7 @@ def _has_service_mutation(events: list[str]) -> bool:
         not in {
             "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>",
             "systemctl <list-unit-files> <--no-legend> <--no-pager> <roastpilot-agent.service>",
-            "systemctl <list-units> <--all> <--no-legend> <--no-pager> <roastpilot-agent.service>",
+            "systemctl <list-units> <--all> <--plain> <--no-legend> <--no-pager> <roastpilot-agent.service>",
         }
         for line in events
     )
@@ -4710,7 +4710,7 @@ def test_genuinely_absent_unit_admits_first_install(
         in events
     )
     assert (
-        "systemctl <list-units> <--all> <--no-legend> <--no-pager> <roastpilot-agent.service>"
+        "systemctl <list-units> <--all> <--plain> <--no-legend> <--no-pager> <roastpilot-agent.service>"
         in events
     )
     assert "apt-get <install> <-y> <libportaudio2> <pipx> <avahi-daemon>" in events
@@ -4739,6 +4739,26 @@ def test_terminal_loaded_unit_states_admit_install_after_show_unavailable(
 
 
 @pytest.mark.serial
+def test_whitespace_padded_terminal_loaded_unit_row_admits_install(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """The stable plain table permits harmless surrounding whitespace only."""
+    _, environment, log, _ = installer_harness
+    result = _run(
+        environment
+        | {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "  roastpilot-agent.service loaded inactive dead RoastPilot Agent  ",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "apt-get <install> <-y> <libportaudio2> <pipx> <avahi-daemon>" in log.read_text()
+
+
+@pytest.mark.serial
 @pytest.mark.parametrize(
     "environment",
     [
@@ -4752,6 +4772,8 @@ def test_terminal_loaded_unit_states_admit_install_after_show_unavailable(
             "FAKE_UNIT_FILE_STATE": "absent",
             "FAKE_LOADED_UNIT_STATE": "transitional",
         },
+        {"FAKE_SYSTEMCTL_FAIL": "show", "FAKE_UNIT_FILE_STATE": "present"},
+        {"FAKE_SYSTEMCTL_FAIL": "show", "FAKE_UNIT_FILE_STATE": "   "},
         {"FAKE_SYSTEMCTL_FAIL": "show", "FAKE_UNIT_FILE_QUERY_FAIL": "1"},
         {"FAKE_SYSTEMCTL_FAIL": "show", "FAKE_UNIT_FILE_STATE": "malformed"},
         {
@@ -4763,6 +4785,39 @@ def test_terminal_loaded_unit_states_admit_install_after_show_unavailable(
             "FAKE_SYSTEMCTL_FAIL": "show",
             "FAKE_UNIT_FILE_STATE": "absent",
             "FAKE_LOADED_UNIT_STATE": "malformed",
+        },
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": (
+                "roastpilot-agent.service loaded inactive dead RoastPilot Agent\n"
+                "roastpilot-agent.service loaded active running RoastPilot Agent"
+            ),
+        },
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "● roastpilot-agent.service loaded inactive dead RoastPilot Agent",
+        },
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "roastpilot-agent.service not-found inactive dead RoastPilot Agent",
+        },
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "roastpilot-agent.service loaded inactive dead",
+        },
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "roastpilot-agent.service loaded inactive failed RoastPilot Agent",
+        },
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "roastpilot-agent.service loaded failed dead RoastPilot Agent",
         },
     ],
 )

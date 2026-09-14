@@ -1047,13 +1047,13 @@ ensure_agent_inactive() {
 
     # A transient or loaded unit has no unit file to list.  Its active state
     # remains safety-relevant, so reject it unless it is conclusively terminal.
-    loaded_unit="$(run_privileged systemctl list-units --all --no-legend --no-pager roastpilot-agent.service)" || return 1
+    loaded_unit="$(run_privileged systemctl list-units --all --plain --no-legend --no-pager roastpilot-agent.service)" || return 1
     [[ -z "$loaded_unit" ]] && return 0
     [[ "$loaded_unit" != *$'\n'* ]] || return 1
     IFS=' ' read -r unit_file_name unit_load_state unit_active_state unit_sub_state unit_description <<< "$loaded_unit"
     [[ "$unit_file_name" == "roastpilot-agent.service" && "$unit_load_state" == "loaded" && -n "$unit_sub_state" && -n "$unit_description" ]] || return 1
-    case "$unit_active_state" in
-        inactive|failed) return 0 ;;
+    case "$unit_active_state:$unit_sub_state" in
+        inactive:dead|failed:failed) return 0 ;;
         *) return 1 ;;
     esac
 }
