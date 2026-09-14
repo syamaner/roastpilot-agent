@@ -37,6 +37,17 @@ corrects D180's final implementation and evidence clauses. This closure
 supersedes the in-progress or stays-open-pending language in all earlier #702
 (D180) entries below, which are now historical.
 
+**12 Sep 2026 — #138 E11-S2 native installer and deployment-documentation
+completion:** the four planned software/documentation slices are complete. The
+native installer and managed service/configuration paths, pinned local model,
+and `docs/deployment/pi-appliance.md` are delivered; E11-S3 remains not
+started and E11 stays in progress. This is package and documentation evidence,
+not Raspberry Pi, Hottop, microphone, serial-device, or supervised live-roast
+evidence. D191/D192 characterisation, independent Pi evidence review,
+complete-appliance validation, and separately authorised supervised live-roast
+acceptance remain outstanding. #949 remains a separate follow-up for
+concurrent-maintenance serialization.
+
 **30 Aug 2026 — #702 (D180) collection-governance addendum:** Following
 `c5342b1`, pytest function collection is pinned to `test_*` and the
 docs-reader audit enforces that exact shape. The audit also fails closed on

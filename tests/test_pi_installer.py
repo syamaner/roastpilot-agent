@@ -470,12 +470,47 @@ UNIT
     [ "${FAKE_SYSTEMCTL_FAIL:-}" != "${1:-}" ] || exit 31
     [ "${FAKE_AGENT_ENABLE_FAIL:-}" != 1 ] || [ "${1:-}" != enable ] || [ "${2:-}" != roastpilot-agent ] || exit 31
     if [ "${1:-}" = show ]; then
-      [ "${2:-}" = -p ] && [ "${3:-}" = ActiveState ] && [ "${4:-}" = --value ] || exit 32
+      [ "${2:-}" = -p ] && [ "${4:-}" = --value ] || exit 32
+      if [ "${3:-}" = ActiveState ]; then
+        [ "${FAKE_ACTIVE_STATE_QUERY_FAIL:-}" != 1 ] || exit 35
       if [ -n "${FAKE_SERVICE_STATE_SEQUENCE:-}" ]; then
         count=0; [ ! -e "$FAKE_SERVICE_STATE_COUNTER" ] || count=$(cat "$FAKE_SERVICE_STATE_COUNTER")
         count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_SERVICE_STATE_COUNTER"
         /usr/bin/sed -n "${count}p" "$FAKE_SERVICE_STATE_SEQUENCE"
       elif [ "${FAKE_SERVICE_STATE+x}" = x ]; then printf '%s\\n' "$FAKE_SERVICE_STATE"; else echo inactive; fi
+        exit 0
+      fi
+      exit 32
+    fi
+    if [ "${1:-}" = list-unit-files ]; then
+      [ "${2:-}" = --no-legend ] && [ "${3:-}" = --no-pager ] && [ "${4:-}" = roastpilot-agent.service ] || exit 32
+      [ "${FAKE_UNIT_FILE_QUERY_FAIL:-}" != 1 ] || exit 33
+      case "${FAKE_UNIT_FILE_STATE:-present}" in
+        absent) ;;
+        present) printf '%s\\n' 'roastpilot-agent.service enabled' ;;
+        malformed) printf '%s\\n' 'unexpected unit-file output' ;;
+        *) printf '%s\\n' "${FAKE_UNIT_FILE_STATE}" ;;
+      esac
+      exit 0
+    fi
+    if [ "${1:-}" = list-units ]; then
+      [ "${2:-}" = --all ] && [ "${3:-}" = --plain ] && [ "${4:-}" = --no-legend ] && [ "${5:-}" = --no-pager ] && [ "${6:-}" = roastpilot-agent.service ] || exit 32
+      [ "${FAKE_LOADED_UNIT_QUERY_FAIL:-}" != 1 ] || exit 34
+      case "${FAKE_LOADED_UNIT_STATE:-absent}" in
+        absent) ;;
+        inactive) printf '%s\\n' 'roastpilot-agent.service loaded inactive dead RoastPilot Agent' ;;
+        failed) printf '%s\\n' 'roastpilot-agent.service loaded failed failed RoastPilot Agent' ;;
+        active) printf '%s\\n' 'roastpilot-agent.service loaded active running RoastPilot Agent' ;;
+        transitional) printf '%s\\n' 'roastpilot-agent.service loaded activating start RoastPilot Agent' ;;
+        malformed) printf '%s\\n' 'unexpected loaded-unit output' ;;
+        *) printf '%s\\n' "${FAKE_LOADED_UNIT_STATE}" ;;
+      esac
+      exit 0
+    fi
+    if [ "${1:-}" = list-jobs ]; then
+      [ "${2:-}" = --no-legend ] && [ "${3:-}" = --plain ] && [ "${4:-}" = --no-pager ] && [ "${5:-}" = roastpilot-agent.service ] || exit 32
+      [ "${FAKE_LIST_JOBS_QUERY_FAIL:-}" != 1 ] || exit 36
+      if [ "${FAKE_PENDING_JOB+x}" = x ]; then printf '%s\\n' "$FAKE_PENDING_JOB"; fi
       exit 0
     fi
     ;;
@@ -636,7 +671,13 @@ def _has_service_mutation(events: list[str]) -> bool:
     """Return whether events contain service work beyond the read-only active probe."""
     return any(
         line.startswith("systemctl ")
-        and line != "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>"
+        and line
+        not in {
+            "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>",
+            "systemctl <list-jobs> <--no-legend> <--plain> <--no-pager> <roastpilot-agent.service>",
+            "systemctl <list-unit-files> <--no-legend> <--no-pager> <roastpilot-agent.service>",
+            "systemctl <list-units> <--all> <--plain> <--no-legend> <--no-pager> <roastpilot-agent.service>",
+        }
         for line in events
     )
 
@@ -649,6 +690,9 @@ def _has_roastpilot_agent_lifecycle_mutation(events: list[str]) -> bool:
         and event
         not in {
             "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>",
+            "systemctl <list-jobs> <--no-legend> <--plain> <--no-pager> <roastpilot-agent.service>",
+            "systemctl <list-unit-files> <--no-legend> <--no-pager> <roastpilot-agent.service>",
+            "systemctl <list-units> <--all> <--plain> <--no-legend> <--no-pager> <roastpilot-agent.service>",
             "systemctl <daemon-reload>",
             "systemctl <enable> <roastpilot-agent>",
             "systemctl <enable> <roastpilot-agent.service>",
@@ -684,6 +728,18 @@ def test_roastpilot_lifecycle_matcher_catches_service_unit_spelling() -> None:
     )
     assert not _has_roastpilot_agent_lifecycle_mutation(
         ["systemctl <enable> <roastpilot-agent.service>"]
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(
+        ["systemctl <list-unit-files> <--no-legend> <--no-pager> <roastpilot-agent.service>"]
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(
+        ["systemctl <list-jobs> <--no-legend> <--plain> <--no-pager> <roastpilot-agent.service>"]
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(
+        [
+            "systemctl <list-units> <--all> <--plain> <--no-legend> <--no-pager> "
+            "<roastpilot-agent.service>"
+        ]
     )
     for operation in (
         "reload-or-restart",
@@ -4637,6 +4693,231 @@ def test_initial_service_probe_failures_are_effect_free(
     assert result.returncode != 0 and "never restart during a roast" in result.stderr
     events = log.read_text().splitlines()
     assert events.count("systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>") == 1
+    assert not any(
+        line.startswith(prefix)
+        for line in events
+        for prefix in (
+            "apt-get ",
+            "pipx ",
+            "roastpilot-agent ",
+            "tee ",
+            "mv ",
+            "chown ",
+            "chmod ",
+            "hostnamectl <set",
+            "usermod ",
+            "systemctl <daemon",
+            "systemctl <enable",
+            "systemctl <start",
+        )
+    )
+
+
+@pytest.mark.serial
+def test_genuinely_absent_unit_admits_first_install(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A confirmed absent unit permits the first installation to reach enablement."""
+    _, environment, log, _ = installer_harness
+    result = _run(
+        environment
+        | {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "absent",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode == 0, result.stderr
+    events = log.read_text().splitlines()
+    assert (
+        "systemctl <list-unit-files> <--no-legend> <--no-pager> <roastpilot-agent.service>"
+        in events
+    )
+    assert (
+        "systemctl <list-units> <--all> <--plain> <--no-legend> <--no-pager> <roastpilot-agent.service>"
+        in events
+    )
+    assert "apt-get <install> <-y> <libportaudio2> <pipx> <avahi-daemon>" in events
+    assert "systemctl <enable> <roastpilot-agent>" in events
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("state", ["inactive", "failed"])
+def test_terminal_loaded_unit_states_admit_install_after_show_unavailable(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], state: str
+) -> None:
+    """Terminal loaded-unit states remain safe when the direct state query is unavailable."""
+    _, environment, log, _ = installer_harness
+    result = _run(
+        environment
+        | {
+            "FAKE_ACTIVE_STATE_QUERY_FAIL": "1",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": state,
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode == 0, result.stderr
+    events = log.read_text().splitlines()
+    assert "apt-get <install> <-y> <libportaudio2> <pipx> <avahi-daemon>" in events
+    assert (
+        "systemctl <list-jobs> <--no-legend> <--plain> <--no-pager> <roastpilot-agent.service>"
+        in events
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_whitespace_padded_terminal_loaded_unit_row_admits_install(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """The stable plain table permits harmless surrounding whitespace only."""
+    _, environment, log, _ = installer_harness
+    result = _run(
+        environment
+        | {
+            "FAKE_ACTIVE_STATE_QUERY_FAIL": "1",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "  roastpilot-agent.service loaded inactive dead RoastPilot Agent  ",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode == 0, result.stderr
+    events = log.read_text().splitlines()
+    assert "apt-get <install> <-y> <libportaudio2> <pipx> <avahi-daemon>" in events
+    assert (
+        "systemctl <list-jobs> <--no-legend> <--plain> <--no-pager> <roastpilot-agent.service>"
+        in events
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {"FAKE_PENDING_JOB": "42 roastpilot-agent.service start running"},
+        {"FAKE_PENDING_JOB": " "},
+        {"FAKE_PENDING_JOB": "42 roastpilot-agent.service start running "},
+        {"FAKE_LIST_JOBS_QUERY_FAIL": "1"},
+        {
+            "FAKE_ACTIVE_STATE_QUERY_FAIL": "1",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "inactive",
+            "FAKE_PENDING_JOB": "42 roastpilot-agent.service start running",
+        },
+    ],
+)
+def test_pending_or_unparseable_job_fails_before_privileged_mutation(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], environment: dict[str, str]
+) -> None:
+    """A queued or indeterminate systemd job never permits an installer run."""
+    _, base_environment, log, _ = installer_harness
+    result = _run(base_environment | environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0 and "never restart during a roast" in result.stderr
+    events = log.read_text().splitlines()
+    assert (
+        "systemctl <list-jobs> <--no-legend> <--plain> <--no-pager> <roastpilot-agent.service>"
+        in events
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+    assert not any(
+        line.startswith(prefix)
+        for line in events
+        for prefix in (
+            "apt-get ",
+            "pipx ",
+            "roastpilot-agent ",
+            "tee ",
+            "mv ",
+            "chown ",
+            "chmod ",
+            "hostnamectl <set",
+            "usermod ",
+            "systemctl <daemon",
+            "systemctl <enable",
+            "systemctl <start",
+        )
+    )
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "active",
+        },
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "transitional",
+        },
+        {"FAKE_SYSTEMCTL_FAIL": "show", "FAKE_UNIT_FILE_STATE": "present"},
+        {"FAKE_SYSTEMCTL_FAIL": "show", "FAKE_UNIT_FILE_STATE": "   "},
+        {"FAKE_SYSTEMCTL_FAIL": "show", "FAKE_UNIT_FILE_QUERY_FAIL": "1"},
+        {"FAKE_SYSTEMCTL_FAIL": "show", "FAKE_UNIT_FILE_STATE": "malformed"},
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_QUERY_FAIL": "1",
+        },
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "malformed",
+        },
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": (
+                "roastpilot-agent.service loaded inactive dead RoastPilot Agent\n"
+                "roastpilot-agent.service loaded active running RoastPilot Agent"
+            ),
+        },
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "● roastpilot-agent.service loaded inactive dead RoastPilot Agent",
+        },
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "roastpilot-agent.service not-found inactive dead RoastPilot Agent",
+        },
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "roastpilot-agent.service loaded inactive dead",
+        },
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "roastpilot-agent.service loaded inactive failed RoastPilot Agent",
+        },
+        {
+            "FAKE_SYSTEMCTL_FAIL": "show",
+            "FAKE_UNIT_FILE_STATE": "absent",
+            "FAKE_LOADED_UNIT_STATE": "roastpilot-agent.service loaded failed dead RoastPilot Agent",
+        },
+    ],
+)
+def test_unconfirmed_absence_or_loaded_unit_fails_before_privileged_mutation(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], environment: dict[str, str]
+) -> None:
+    """Only a confirmed absent, unloaded unit may bypass an unavailable active-state query."""
+    _, base_environment, log, _ = installer_harness
+    result = _run(base_environment | environment, "--set-hostname", "roastpilot")
+    assert result.returncode != 0 and "never restart during a roast" in result.stderr
+    events = log.read_text().splitlines()
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
     assert not any(
         line.startswith(prefix)
         for line in events

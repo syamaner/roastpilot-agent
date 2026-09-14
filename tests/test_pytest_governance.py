@@ -740,9 +740,7 @@ def test_e11_packaging_status_is_current_and_honest() -> None:
     epic = (REPO_ROOT / "docs/epics/E11-packaging.md").read_text(encoding="utf-8")
     registry = (REPO_ROOT / "docs/state/registry.md").read_text(encoding="utf-8")
     assert "E11-S1 | Wheel with bundled SPA + the `[pi]` extra | done" in epic
-    assert (
-        "E11-S2 | Native installer, systemd unit, bundled model, deploy doc | not started" in epic
-    )
+    assert "E11-S2 | Native installer, systemd unit, bundled model, deploy doc | done" in epic
     assert (
         "E11-S3 | Pi 5 dual-mic recording + FC-detection CPU soak "
         "(overflow validation) | not started" in epic
