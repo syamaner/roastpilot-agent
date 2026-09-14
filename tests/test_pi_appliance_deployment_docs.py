@@ -38,7 +38,9 @@ def test_pi_appliance_deployment_doc_preserves_install_and_maintenance_contract(
     deployment = DEPLOYMENT_DOC.read_text(encoding="utf-8")
     assert "booted with systemd\nand an active systemd manager" in deployment
     assert "it uses `systemctl` and `hostnamectl`" in deployment
-    assert "requires `apt` and Python 3.11 or newer" in deployment
+    assert (
+        "requires `apt` and `/usr/bin/python3` itself to report Python 3.11 or newer" in deployment
+    )  # noqa: E501
     assert "`curl`, which both documented download procedures use." in deployment
     assert "--set-hostname roastpilot --start --yes" in deployment
     assert "Inspect with `less` or another trusted local viewer before running:" in deployment

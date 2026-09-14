@@ -11,8 +11,8 @@ cooler. First-crack inference shares the Pi's CPU with the agent, MCP child,
 USB serial link, and microphone, so passive cooling is not an equivalent
 setup. The installer supports an aarch64 Debian-family host booted with systemd
 and an active systemd manager: it uses `systemctl` and `hostnamectl`; it also
-requires `apt` and Python 3.11 or newer. Run it as the intended non-root
-operator, not as root.
+requires `apt` and `/usr/bin/python3` itself to report Python 3.11 or newer.
+Run it as the intended non-root operator, not as root.
 `/usr/bin/sudo` must be installed, and that operator must be authorised to use it: the installer's
 privileged operations use that exact path.
 
