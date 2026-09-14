@@ -7175,6 +7175,15 @@ def test_process_guard_seams_reject_production_and_malformed_test_inputs_before_
 
 
 @pytest.mark.serial
+def test_process_guard_production_uses_its_own_python_pid_not_shell_pid() -> None:
+    """T6: production excludes the Python probe itself, while tests retain a fake PID."""
+    source = INSTALLER.read_text()
+    assert 'probe_pid="self"' in source
+    assert 'SELF = str(os.getpid()) if supplied_self == "self" else supplied_self' in source
+    assert "ROOT, supplied_self = sys.argv[1], sys.argv[2]" in source
+
+
+@pytest.mark.serial
 def test_process_guard_protocol_parser_rejects_noncanonical_or_ambiguous_output(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -7210,6 +7219,23 @@ def test_process_guard_structure_has_closed_protocol_and_four_boundaries() -> No
     """T7: source structure retains the unprivileged, bounded four-boundary guard."""
     source = INSTALLER.read_text()
     assert "python3 -I -c" in source and "signal.alarm(10)" in source
+    assert "errno.ENOENT, errno.ESRCH" in source
+    assert "for _ in range(3):" in source and 'if exc.reason == "vanished":' in source
+    assert 'if valid_possible_process_output "$output"; then' in source
+    assert "check_mountinfo()\n    for required" in source
+    assert 'for required in ("stat", "cmdline", "comm"):' in source
+    assert 'probe_pid="self"' in source
+    assert ' -z "$proc_root" && -z "$probe_pid"' in source
+    assert 'print("possible " + " ".join(shown) + suffix)' in source
+    for bounded_component in (
+        "DEADLINE = time.monotonic() + 9.0",
+        "for _ in range(64):",
+        "if len(pids) > 8192:",
+        "1048576",
+        "stat.S_ISREG(mode)",
+        'getattr(os, "O_NOFOLLOW", 0)',
+    ):
+        assert bounded_component in source
     assert (
         "run_privileged"
         not in source[

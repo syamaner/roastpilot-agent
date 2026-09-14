@@ -658,7 +658,10 @@ check_no_live_agent_process() {
         probe_pid="${INSTALL_PROBE_PID:-}"
     else
         proc_root="/proc"
-        probe_pid="$$"
+        # The Python interpreter is itself visible in /proc and its -c argv
+        # contains the family tokens below.  Ask the probe to begin its
+        # exclusion chain at its own PID, rather than at this shell parent.
+        probe_pid="self"
     fi
     read -r -d '' program <<'PY' || true
 import errno
@@ -668,7 +671,8 @@ import stat
 import sys
 import time
 
-ROOT, SELF = sys.argv[1], sys.argv[2]
+ROOT, supplied_self = sys.argv[1], sys.argv[2]
+SELF = str(os.getpid()) if supplied_self == "self" else supplied_self
 DEADLINE = time.monotonic() + 9.0
 TOKENS = (b"roastpilot-agent", b"roastpilot_agent", b"coffee-roaster-mcp", b"coffee_roaster_mcp")
 TRUNCATED = (b"roastpilot-agen", b"coffee-roaster-")
@@ -682,7 +686,7 @@ def expired():
         raise ProbeError("timeout")
 
 def error_reason(exc, vanished=False):
-    if vanished and exc.errno == errno.ENOENT:
+    if vanished and exc.errno in (errno.ENOENT, errno.ESRCH):
         return "vanished"
     if exc.errno in (errno.EACCES, errno.EPERM):
         return "restricted"
