@@ -6952,6 +6952,28 @@ def _run_process_guard_program(
     )
 
 
+def _run_sourced_process_guard(
+    source: str, environment: dict[str, str], tmp_path: Path
+) -> subprocess.CompletedProcess[str]:
+    """Run the shell protocol around one test-only installer source copy."""
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(source.rsplit('main "$@"', 1)[0])
+    sourceable.chmod(0o600)
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; validate_install_root; if check_no_live_agent_process; then printf clear; else printf "blocked:%s" "$PROCESS_GUARD_MESSAGE"; fi',
+            "process-guard",
+            str(sourceable),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 @pytest.mark.serial
 def test_process_guard_arms_default_sigalrm_before_filesystem_validation(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
@@ -7022,6 +7044,49 @@ def test_process_guard_retries_vanished_scandir_entry_and_kills_the_unavailable_
     assert mutant != probe
     rejected = _run_process_guard_program(mutant, environment)
     assert rejected.returncode == 2 and rejected.stdout == "unavailable incomplete\n"
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+def test_process_guard_monotonic_deadline_times_out_and_kills_its_removed_expiry_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """The monotonic deadline emits its exact bounded unavailable protocol result."""
+    _, environment, _, _ = installer_harness
+    original = INSTALLER.read_text()
+    expired_probe = _process_guard_program(original).replace(
+        "DEADLINE = time.monotonic() + 9.0", "DEADLINE = time.monotonic() - 1.0", 1
+    )
+    timed_out = _run_process_guard_program(expired_probe, environment)
+    assert timed_out.returncode == 2 and timed_out.stdout == "unavailable timeout\n"
+
+    no_expiry = expired_probe.replace(
+        'def expired():\n    if time.monotonic() >= DEADLINE:\n        raise ProbeError("timeout")\n',
+        "def expired():\n    return\n",
+        1,
+    )
+    assert no_expiry != expired_probe
+    admitted = _run_process_guard_program(no_expiry, environment)
+    assert admitted.returncode == 0 and admitted.stdout == "clear\n", admitted.stderr
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+def test_process_guard_default_sigalrm_termination_maps_to_generic_refusal_and_kills_alarm_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A real bounded child SIGALRM is converted to the shell's fail-closed message."""
+    _, environment, _, _ = installer_harness
+    original = INSTALLER.read_text()
+    alarmed = original.replace("signal.alarm(10)", "signal.alarm(1)\n    time.sleep(2)", 1)
+    timed_out = _run_sourced_process_guard(alarmed, environment, tmp_path)
+    diagnostic = "cannot confirm that no RoastPilot-related process is running"
+    assert timed_out.returncode == 0 and timed_out.stdout.startswith(f"blocked:{diagnostic}")
+
+    no_alarm = alarmed.replace("signal.alarm(1)\n    time.sleep(2)", "signal.alarm(0)", 1)
+    assert no_alarm != alarmed
+    admitted = _run_sourced_process_guard(no_alarm, environment, tmp_path)
+    assert admitted.returncode == 0 and admitted.stdout == "clear"
     assert INSTALLER.read_text() == original
 
 
@@ -7210,9 +7275,10 @@ def test_process_guard_b3_and_b4_precede_configuration_snapshot_and_service_star
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
     """T2: later boundaries refuse before their protected promotion or explicit start."""
-    _, environment, _, _ = installer_harness
+    _, environment, log, _ = installer_harness
     proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
     _write_fake_process(proc, 200, 1, b"coffee-roaster-mcp\0", b"mcp\n")
+    log.write_text("")
     sourceable = tmp_path / "installer-functions.sh"
     sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
     b3 = subprocess.run(
@@ -7230,6 +7296,39 @@ def test_process_guard_b3_and_b4_precede_configuration_snapshot_and_service_star
     )
     assert b3.returncode != 0 and "possible RoastPilot-related process" in b3.stderr
     assert "SNAPSHOT" not in b3.stdout + b3.stderr
+    b3_events = log.read_text().splitlines()
+    assert not any(event.startswith(("chown ", "chmod ", "mkdir ", "mv ")) for event in b3_events)
+
+    original = INSTALLER.read_text()
+    moved_guard = original.replace(
+        "    require_agent_inactive\n    require_no_live_agent_process\n    # Pin all mutable renderer output once, before any privileged destination\n",
+        "    require_agent_inactive\n    # Pin all mutable renderer output once, before any privileged destination\n",
+        1,
+    ).replace(
+        '    prepare_destination_parents "$env_file" "$yaml_file" "$unit_file" "$prior_file" "$model_dir"\n',
+        '    prepare_destination_parents "$env_file" "$yaml_file" "$unit_file" "$prior_file" "$model_dir"\n    require_no_live_agent_process\n',
+        1,
+    )
+    assert moved_guard != original
+    mutation_source = tmp_path / "moved-b3-guard.sh"
+    mutation_source.write_text(moved_guard.rsplit('main "$@"', 1)[0])
+    log.write_text("")
+    moved = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; validate_install_root; require_agent_inactive(){ :; }; capture_staged_file(){ printf staged; }; validate_rendered_env(){ :; }; validate_rendered_yaml(){ :; }; validate_rendered_unit(){ :; }; validate_model_stage_file(){ :; }; normalise_unit_env_contract(){ printf "%s" "$1"; }; build_final_env(){ printf final; }; prepare_destination_parents(){ run_privileged mkdir -p -- "$1"; }; run_privileged(){ printf "mkdir <%s>\\n" "$*" >> "$FAKE_LOG"; }; STAGE_DIR=/stage; install_rendered_files',
+            "moved-b3-guard",
+            str(mutation_source),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert moved.returncode != 0 and "possible RoastPilot-related process" in moved.stderr
+    assert any(event.startswith("mkdir <mkdir -p") for event in log.read_text().splitlines())
+    assert INSTALLER.read_text() == original
 
     b4 = subprocess.run(
         [
@@ -7402,7 +7501,22 @@ def test_process_guard_structure_has_closed_protocol_and_four_boundaries() -> No
         "coffee-roaster-",
     ):
         assert token in source
-    assert source.count("require_no_live_agent_process") == 4
+    direct_b2 = source[
+        source.index("replace_application_safely()") : source.index("install_application()")
+    ]
+    assert direct_b2.count("check_no_live_agent_process") == 1
+    assert direct_b2.index("if ! check_no_live_agent_process") < direct_b2.index(
+        "pipx_command uninstall -- roastpilot-agent"
+    )
+    wrapped_boundaries = (
+        ("main() {", "apt-get install"),
+        ("install_rendered_files() {", "snapshot_live_configuration"),
+        ("enable_services() {", "systemctl start roastpilot-agent"),
+    )
+    for function, protected_effect in wrapped_boundaries:
+        start = source.index(function)
+        boundary = source[start : source.index(protected_effect, start)]
+        assert boundary.count("require_no_live_agent_process") == 1
     assert source.index(
         "verify_existing_pi_capability_before_package_install\n    require_no_live_agent_process"
     ) < source.index("apt-get install")
