@@ -7048,6 +7048,59 @@ def test_process_guard_retries_vanished_scandir_entry_and_kills_the_unavailable_
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize(
+    ("root_kind", "probe_pid", "diagnostic"),
+    [
+        ("missing", "100", "test process root and probe PID are required"),
+        ("valid", "", "test process root and probe PID are required"),
+        ("slash", "100", "test process root is unsafe"),
+        ("double-slash", "100", "test process root is unsafe"),
+        ("nonexistent", "100", "test process root is unsafe"),
+        ("symlink", "100", "test process root is unsafe"),
+        ("trailing-slash", "100", "test process root must be canonical"),
+    ],
+)
+def test_process_guard_test_seam_rejects_unsafe_proc_roots_before_fake_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    root_kind: str,
+    probe_pid: str,
+    diagnostic: str,
+) -> None:
+    """Every malformed fake-proc root fails closed before any fake command runs."""
+    _, environment, log, _ = installer_harness
+    canonical = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    if root_kind == "missing":
+        root = ""
+    elif root_kind == "valid":
+        root = str(canonical)
+    elif root_kind == "slash":
+        root = "/"
+    elif root_kind == "double-slash":
+        root = "//"
+    elif root_kind == "nonexistent":
+        root = str(tmp_path / "missing-proc")
+    elif root_kind == "symlink":
+        linked = tmp_path / "proc-link"
+        linked.symlink_to(canonical, target_is_directory=True)
+        root = str(linked)
+    else:
+        root = f"{canonical}/"
+    log.write_text("")
+    result = _run(
+        environment
+        | {
+            "ROASTPILOT_INSTALL_TEST_PROC_ROOT": root,
+            "ROASTPILOT_INSTALL_TEST_PROBE_PID": probe_pid,
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0 and diagnostic in result.stderr
+    assert log.read_text() == ""
+
+
+@pytest.mark.serial
 def test_process_guard_monotonic_deadline_times_out_and_kills_its_removed_expiry_mutant(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -7211,6 +7264,32 @@ def test_process_guard_reports_sorted_capped_pid_set_without_process_bytes(
     result = _run_process_guard(environment, tmp_path)
     assert result.returncode == 0 and "300 301" in result.stdout and "+4 more" in result.stdout
     assert "316" not in result.stdout and "private-argv" not in result.stdout
+
+
+@pytest.mark.serial
+def test_process_guard_reports_descendant_of_probe_and_kills_descendant_exclusion_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A matching child of the probe is not an ancestor and must still block."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    _write_fake_process(proc, 200, 100, b"roastpilot-agent\0SECRET_NEVER_PRINT", b"agent\n")
+    original = INSTALLER.read_text()
+    reported = _run_process_guard_program(_process_guard_program(original), environment)
+    assert reported.returncode == 1 and reported.stdout == "possible 200\n"
+    boundary = _run_process_guard(environment, tmp_path)
+    assert boundary.returncode == 0 and "PIDs: 200" in boundary.stdout
+    assert "SECRET_NEVER_PRINT" not in boundary.stdout + boundary.stderr
+
+    mutant = _process_guard_program(original).replace(
+        "        if pid in excluded:\n",
+        "        if pid in excluded or pid_stat(pid) in excluded:\n",
+        1,
+    )
+    assert mutant != _process_guard_program(original)
+    admitted = _run_process_guard_program(mutant, environment)
+    assert admitted.returncode == 0 and admitted.stdout == "clear\n", admitted.stderr
+    assert INSTALLER.read_text() == original
 
 
 @pytest.mark.serial
