@@ -7108,6 +7108,64 @@ def test_process_guard_clear_excludes_only_probe_ancestor_chain(
 
 
 @pytest.mark.serial
+def test_process_guard_rejects_noncyclic_ancestor_chain_over_64_hops_and_kills_bound_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A valid 65-member self-to-parent chain exceeds the ancestor resource bound."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    for pid in range(100, 165):
+        _write_fake_process(proc, pid, 0 if pid == 164 else pid + 1)
+
+    original = INSTALLER.read_text()
+    bounded = _run_process_guard_program(_process_guard_program(original), environment)
+    assert bounded.returncode == 2 and bounded.stdout == "unavailable bound\n"
+    boundary = _run_process_guard(environment, tmp_path)
+    assert boundary.returncode == 0 and boundary.stdout.startswith(
+        "blocked:cannot confirm that no RoastPilot-related process is running"
+    )
+
+    mutant = _process_guard_program(original).replace(
+        '    raise ProbeError("bound")\n\ndef process_entries():',
+        "    return chain\n\ndef process_entries():",
+        1,
+    )
+    assert mutant != _process_guard_program(original)
+    admitted = _run_process_guard_program(mutant, environment)
+    assert admitted.returncode == 0 and admitted.stdout == "clear\n", admitted.stderr
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+def test_process_guard_reports_matching_pid_widths_in_numeric_order_and_kills_lexical_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Matching PIDs remain numeric, ascending, and never disclose process bytes."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    for pid in (9, 10, 99, 101):
+        _write_fake_process(
+            proc,
+            pid,
+            1,
+            b"roastpilot-agent\0SECRET_NEVER_PRINT",
+            b"agent\n",
+        )
+
+    original = INSTALLER.read_text()
+    ordered = _run_process_guard_program(_process_guard_program(original), environment)
+    assert ordered.returncode == 1 and ordered.stdout == "possible 9 10 99 101\n"
+    assert "SECRET_NEVER_PRINT" not in ordered.stdout + ordered.stderr
+
+    mutant = _process_guard_program(original).replace("sorted(pids, key=int)", "sorted(pids)", 1)
+    assert mutant != _process_guard_program(original)
+    lexical = _run_process_guard_program(mutant, environment)
+    assert lexical.returncode == 1 and lexical.stdout == "possible 10 101 9 99\n"
+    assert "SECRET_NEVER_PRINT" not in lexical.stdout + lexical.stderr
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
 @pytest.mark.parametrize(
     ("cmdline", "comm"),
     [
