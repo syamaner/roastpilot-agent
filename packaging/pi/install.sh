@@ -1032,12 +1032,15 @@ install_rendered_files() {
 }
 
 ensure_agent_inactive() {
-    local active_state unit_file_state unit_file_name loaded_unit unit_load_state unit_active_state unit_sub_state unit_description
+    local active_state unit_file_state unit_file_name loaded_unit unit_load_state unit_active_state unit_sub_state unit_description pending_jobs
     if active_state="$(run_privileged systemctl show -p ActiveState --value roastpilot-agent)"; then
         case "$active_state" in
-            inactive|failed) return 0 ;;
+            inactive|failed) ;;
             *) return 1 ;;
         esac
+        pending_jobs="$(run_privileged systemctl list-jobs --no-legend --plain --no-pager roastpilot-agent.service)" || return 1
+        [[ -z "$pending_jobs" ]] || return 1
+        return 0
     fi
 
     # `show` does not distinguish a genuinely absent unit from a failed query.
@@ -1053,9 +1056,11 @@ ensure_agent_inactive() {
     IFS=' ' read -r unit_file_name unit_load_state unit_active_state unit_sub_state unit_description <<< "$loaded_unit"
     [[ "$unit_file_name" == "roastpilot-agent.service" && "$unit_load_state" == "loaded" && -n "$unit_sub_state" && -n "$unit_description" ]] || return 1
     case "$unit_active_state:$unit_sub_state" in
-        inactive:dead|failed:failed) return 0 ;;
+        inactive:dead|failed:failed) ;;
         *) return 1 ;;
     esac
+    pending_jobs="$(run_privileged systemctl list-jobs --no-legend --plain --no-pager roastpilot-agent.service)" || return 1
+    [[ -z "$pending_jobs" ]]
 }
 
 require_agent_inactive() {
