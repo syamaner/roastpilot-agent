@@ -50,6 +50,19 @@ def test_pi_appliance_deployment_doc_preserves_install_and_maintenance_contract(
     )
     assert "sudo systemctl stop roastpilot-agent" in deployment
     assert "Never\nstop the service during a roast." in deployment
+    assert "before the initial `--start`" in deployment
+    assert "first safely end any roast and wait until\nthe appliance is inactive" in deployment
+    assert (
+        "".join(
+            (
+                "stop the\nservice, edit the protected file, and explicitly start it only ",
+                "while no roast",
+            )
+        )
+        in deployment
+    )
+    assert "that start reloads the `EnvironmentFile`" in deployment
+    assert "Never stop or restart the\nservice during a roast." in deployment
     assert "use `--start` only for\nan already-safe inactive appliance" in deployment
     assert "otherwise it starts at the next boot" in deployment
     assert "operator may explicitly start it only while no roast is active" in deployment
@@ -76,6 +89,16 @@ def test_pi_appliance_deployment_doc_preserves_install_and_maintenance_contract(
         "dependencies." in deployment
     )
     assert "sudo journalctl -u roastpilot-agent -f" in deployment
+    assert (
+        "".join(
+            (
+                "configured HTTP port differs from `8000`, repeat it as ",
+                "`--port CURRENT_PORT`",
+            )
+        )
+        in deployment
+    )
+    assert "on every installer rerun; otherwise the installer default overwrites it." in deployment
 
 
 @pytest.mark.docs

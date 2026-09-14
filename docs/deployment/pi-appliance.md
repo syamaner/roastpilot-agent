@@ -94,8 +94,13 @@ The installer writes these managed paths:
 
 The protected environment contains `OPENROUTER_API_KEY`, `PORT`,
 `ROASTPILOT_DB`, and `COFFEE_ROASTER_MCP_CONFIG`. Set the key in that protected
-file rather than putting it on a command line. Editing `PORT` requires an
-explicit, safely timed service restart. The rendered MCP configuration holds
+file rather than putting it on a command line, before the initial `--start`.
+If the service is already running, first safely end any roast and wait until
+the appliance is inactive. Then use the maintenance sequence to stop the
+service, edit the protected file, and explicitly start it only while no roast
+is active; that start reloads the `EnvironmentFile`. Never stop or restart the
+service during a roast. Editing `PORT` requires an explicit, safely timed
+service restart. The rendered MCP configuration holds
 the selected serial device and audio device; rerun the installer with the new
 `--serial-port` or `--audio-device` only while the service is inactive.
 Saved non-null Config UI `mcp_device.serial_port` and `mcp_device.audio_input_device`
@@ -144,7 +149,9 @@ appliance is inactive, stop the service before a managed upgrade:
 sudo systemctl stop roastpilot-agent
 ```
 
-Then rerun the installer, using `--version` or `--wheel` as appropriate. Never
+Then rerun the installer, using `--version` or `--wheel` as appropriate. If
+the configured HTTP port differs from `8000`, repeat it as `--port CURRENT_PORT`
+on every installer rerun; otherwise the installer default overwrites it. Never
 stop the service during a roast. The installer stages a replacement and retains
 configuration/application rollback handling if its replacement path fails;
 follow any manual reconciliation message rather than assuming every external
