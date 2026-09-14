@@ -6925,6 +6925,106 @@ def _run_process_guard(
     )
 
 
+def _process_guard_program(source: str) -> str:
+    """Extract the installer-owned process probe without running the installer."""
+    start = source.index("import errno\n", source.index("check_no_live_agent_process()"))
+    end = source.index("\nPY\n", start)
+    return source[start:end]
+
+
+def _run_process_guard_program(
+    program: str, environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Run an extracted probe only against the closed fake procfs fixture."""
+    return subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            program,
+            environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"],
+            environment["ROASTPILOT_INSTALL_TEST_PROBE_PID"],
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.serial
+def test_process_guard_arms_default_sigalrm_before_filesystem_validation(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """The bounded probe restores default SIGALRM before every root path read."""
+    _, environment, _, _ = installer_harness
+    trace = tmp_path / "probe-order"
+    instrumentation = """\
+import atexit
+events = []
+real_signal = signal.signal
+real_path_functions = {name: getattr(os.path, name) for name in ("isdir", "islink", "realpath")}
+def traced_signal(number, disposition):
+    events.append(f"signal:{'SIG_DFL' if disposition is signal.SIG_DFL else disposition}")
+    return real_signal(number, disposition)
+def traced_alarm(seconds):
+    events.append(f"alarm:{seconds}")
+    return 0
+def traced_path(name):
+    def call(*args, **kwargs):
+        events.append(name)
+        return real_path_functions[name](*args, **kwargs)
+    return call
+signal.signal = traced_signal
+signal.alarm = traced_alarm
+for name in real_path_functions:
+    setattr(os.path, name, traced_path(name))
+atexit.register(lambda: open(os.environ["ROASTPILOT_PROBE_TRACE"], "w").write("\\n".join(events)))
+"""
+    program = _process_guard_program(INSTALLER.read_text()).replace(
+        "ROOT, supplied_self = sys.argv[1], sys.argv[2]\n",
+        "ROOT, supplied_self = sys.argv[1], sys.argv[2]\n" + instrumentation,
+    )
+    result = _run_process_guard_program(
+        program, environment | {"ROASTPILOT_PROBE_TRACE": str(trace)}
+    )
+    assert result.returncode == 0 and result.stdout == "clear\n", result.stderr
+    events = trace.read_text().splitlines()
+    assert events[:5] == ["signal:SIG_DFL", "alarm:10", "isdir", "islink", "realpath"]
+
+
+@pytest.mark.serial
+def test_process_guard_retries_vanished_scandir_entry_and_kills_the_unavailable_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """An ENOENT during entry metadata restarts the scan, not its disposition."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    _write_fake_process(proc, 200, 1, b"unrelated\0", b"unrelated\n")
+    original = INSTALLER.read_text()
+    injected = """\
+                    if entry.name == "200" and not getattr(process_entries, "entry_vanished", False):
+                        process_entries.entry_vanished = True
+                        raise OSError(errno.ENOENT, "entry vanished")
+"""
+    probe = _process_guard_program(original).replace(
+        "                    is_symlink = entry.is_symlink()\n",
+        injected + "                    is_symlink = entry.is_symlink()\n",
+    )
+    recovered = _run_process_guard_program(probe, environment)
+    assert recovered.returncode == 0 and recovered.stdout == "clear\n", recovered.stderr
+
+    mutant = probe.replace(
+        "raise ProbeError(error_reason(exc, True)) from None\n                if is_symlink",
+        "raise ProbeError(error_reason(exc)) from None\n                if is_symlink",
+        1,
+    )
+    assert mutant != probe
+    rejected = _run_process_guard_program(mutant, environment)
+    assert rejected.returncode == 2 and rejected.stdout == "unavailable incomplete\n"
+    assert INSTALLER.read_text() == original
+
+
 @pytest.mark.serial
 def test_process_guard_clear_excludes_only_probe_ancestor_chain(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
@@ -7095,6 +7195,9 @@ def test_process_guard_b1_and_b2_block_without_protected_mutation_and_clean_stag
     )
     events = log.read_text().splitlines()
     assert replacement.returncode != 0
+    assert "possible RoastPilot-related process" in replacement.stderr
+    assert "roastpilot-agent is not safely inactive" not in replacement.stderr
+    assert "staged replacement lacks required Pi/MCP capability" not in replacement.stderr
     assert any("<--suffix>" in event and event.startswith("pipx <install>") for event in events)
     assert any(
         event.startswith("pipx <uninstall>") and "-roastpilot-stage-" in event for event in events
@@ -7221,7 +7324,13 @@ def test_process_guard_protocol_parser_rejects_noncanonical_or_ambiguous_output(
 @pytest.mark.serial
 @pytest.mark.parametrize(
     ("probe_status", "probe_output"),
-    [(0, "clear extra"), (0, "possible 12 12"), (2, "unavailable incomplete"), (3, "clear")],
+    [
+        (0, "clear extra"),
+        (0, "possible 12 12"),
+        (2, "unavailable incomplete"),
+        (2, "clear"),
+        (3, "clear"),
+    ],
 )
 def test_process_guard_rejects_status_and_output_mismatches(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
@@ -7253,6 +7362,13 @@ def test_process_guard_structure_has_closed_protocol_and_four_boundaries() -> No
     """T7: source structure retains the unprivileged, bounded four-boundary guard."""
     source = INSTALLER.read_text()
     assert "python3 -I -c" in source and "signal.alarm(10)" in source
+    main = source[source.index("def main():") : source.index("try:\n    raise SystemExit(main())")]
+    assert (
+        main.index("signal.signal(signal.SIGALRM, signal.SIG_DFL)")
+        < main.index("signal.alarm(10)")
+        < main.index("os.path.isdir(ROOT)")
+    )
+    assert "\n        2)\n" not in source
     assert "errno.ENOENT, errno.ESRCH" in source
     assert "for _ in range(3):" in source and 'if exc.reason == "vanished":' in source
     assert 'if valid_possible_process_output "$output"; then' in source

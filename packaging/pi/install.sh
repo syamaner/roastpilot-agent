@@ -782,7 +782,12 @@ def process_entries():
             for entry in entries:
                 if not entry.name.isdecimal() or entry.name != str(int(entry.name)):
                     continue
-                if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                try:
+                    is_symlink = entry.is_symlink()
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                except OSError as exc:
+                    raise ProbeError(error_reason(exc, True)) from None
+                if is_symlink or not is_directory:
                     raise ProbeError("malformed")
                 pids.append(entry.name)
     except OSError as exc:
@@ -797,7 +802,13 @@ def matches(data, extra=()):
 
 def scan_once(excluded):
     possible = []
-    for pid in process_entries():
+    try:
+        pids = process_entries()
+    except ProbeError as exc:
+        if exc.reason == "vanished":
+            return None
+        raise
+    for pid in pids:
         expired()
         if pid in excluded:
             continue
@@ -813,13 +824,14 @@ def scan_once(excluded):
     return possible
 
 def main():
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    signal.alarm(10)
     if not (SELF.isdecimal() and SELF == str(int(SELF)) and 0 < int(SELF) <= 9999999999):
         raise ProbeError("malformed")
     if not (os.path.isabs(ROOT) and os.path.isdir(ROOT) and not os.path.islink(ROOT) and os.path.realpath(ROOT) == ROOT):
         raise ProbeError("malformed")
     # Default SIGALRM disposition deliberately kills this interpreter.  The
     # calling shell maps that signal termination to an unavailable timeout.
-    signal.alarm(10)
     check_mountinfo()
     for required in ("stat", "cmdline", "comm"):
         read_regular(os.path.join(ROOT, "1", required), 1048576 if required != "comm" else 64)
@@ -858,18 +870,6 @@ PY
             else
                 PROCESS_GUARD_MESSAGE="cannot confirm that no RoastPilot-related process is running; close processes yourself and rerun the installer; the installer never stops, restarts, or kills them; never restart during a roast"
             fi
-            return 1
-            ;;
-        2)
-            if [[ "$output" =~ ^unavailable\ (restricted|incomplete|malformed|bound|timeout)$ ]]; then
-                PROCESS_GUARD_MESSAGE="cannot confirm that no RoastPilot-related process is running; close processes yourself and rerun the installer; the installer never stops, restarts, or kills them; never restart during a roast"
-            else
-                PROCESS_GUARD_MESSAGE="cannot confirm that no RoastPilot-related process is running; close processes yourself and rerun the installer; the installer never stops, restarts, or kills them; never restart during a roast"
-            fi
-            return 1
-            ;;
-        142)
-            PROCESS_GUARD_MESSAGE="cannot confirm that no RoastPilot-related process is running; close processes yourself and rerun the installer; the installer never stops, restarts, or kills them; never restart during a roast"
             return 1
             ;;
         *)
