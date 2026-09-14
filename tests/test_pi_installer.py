@@ -7003,6 +7003,7 @@ def test_process_guard_reports_sorted_capped_pid_set_without_process_bytes(
         "missing-ancestor",
         "ancestor-cycle",
         "symlink",
+        "vanished",
         "oversized",
     ],
 )
@@ -7035,6 +7036,8 @@ def test_process_guard_fails_closed_for_unavailable_or_malformed_process_evidenc
         target.write_text("unrelated")
         (proc / "1/cmdline").unlink()
         (proc / "1/cmdline").symlink_to(target)
+    elif fault == "vanished":
+        (_write_fake_process(proc, 200, 1, b"unrelated\0", b"unrelated\n") / "cmdline").unlink()
     else:
         (proc / "1/cmdline").write_bytes(b"x" * (1048577))
     result = _run_process_guard(environment, tmp_path)
@@ -7213,6 +7216,37 @@ def test_process_guard_protocol_parser_rejects_noncanonical_or_ambiguous_output(
         "unavailable restricted",
     ):
         assert subprocess.run(command + [invalid], env=environment).returncode != 0
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("probe_status", "probe_output"),
+    [(0, "clear extra"), (0, "possible 12 12"), (2, "unavailable incomplete"), (3, "clear")],
+)
+def test_process_guard_rejects_status_and_output_mismatches(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    probe_status: int,
+    probe_output: str,
+) -> None:
+    """T5: the shell rejects a forged or mismatched probe status/output pair."""
+    _, environment, _, _ = installer_harness
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; validate_install_root; python3(){ printf "%s" "$PY_OUTPUT"; return "$PY_STATUS"; }; check_no_live_agent_process',
+            "protocol-status",
+            str(sourceable),
+        ],
+        env=environment | {"PY_STATUS": str(probe_status), "PY_OUTPUT": probe_output},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
 
 
 def test_process_guard_structure_has_closed_protocol_and_four_boundaries() -> None:
