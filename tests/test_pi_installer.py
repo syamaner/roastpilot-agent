@@ -679,6 +679,8 @@ def _has_roastpilot_agent_lifecycle_mutation(events: list[str]) -> bool:
         and event
         not in {
             "systemctl <show> <-p> <ActiveState> <--value> <roastpilot-agent>",
+            "systemctl <list-unit-files> <--no-legend> <--no-pager> <roastpilot-agent.service>",
+            "systemctl <list-units> <--all> <--plain> <--no-legend> <--no-pager> <roastpilot-agent.service>",
             "systemctl <daemon-reload>",
             "systemctl <enable> <roastpilot-agent>",
             "systemctl <enable> <roastpilot-agent.service>",
@@ -714,6 +716,15 @@ def test_roastpilot_lifecycle_matcher_catches_service_unit_spelling() -> None:
     )
     assert not _has_roastpilot_agent_lifecycle_mutation(
         ["systemctl <enable> <roastpilot-agent.service>"]
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(
+        ["systemctl <list-unit-files> <--no-legend> <--no-pager> <roastpilot-agent.service>"]
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(
+        [
+            "systemctl <list-units> <--all> <--plain> <--no-legend> <--no-pager> "
+            "<roastpilot-agent.service>"
+        ]
     )
     for operation in (
         "reload-or-restart",
@@ -4715,6 +4726,7 @@ def test_genuinely_absent_unit_admits_first_install(
     )
     assert "apt-get <install> <-y> <libportaudio2> <pipx> <avahi-daemon>" in events
     assert "systemctl <enable> <roastpilot-agent>" in events
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial
@@ -4829,6 +4841,7 @@ def test_unconfirmed_absence_or_loaded_unit_fails_before_privileged_mutation(
     result = _run(base_environment | environment, "--set-hostname", "roastpilot")
     assert result.returncode != 0 and "never restart during a roast" in result.stderr
     events = log.read_text().splitlines()
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
     assert not any(
         line.startswith(prefix)
         for line in events
