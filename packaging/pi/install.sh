@@ -891,16 +891,16 @@ valid_possible_process_output() {
             ((suffix_seen == 0 && pid_count < 16)) || return 1
             ((10#$part > previous)) || return 1
             previous=$((10#$part))
-            ((pid_count++))
+            ((pid_count += 1))
         elif [[ "$part" =~ ^\+[1-9][0-9]*$ ]]; then
             ((suffix_seen == 0 && pid_count == 16 && index + 1 == ${#parts[@]} - 1)) || return 1
             [[ "${parts[index + 1]}" == "more" ]] || return 1
             suffix_seen=1
-            ((index++))
+            ((index += 1))
         else
             return 1
         fi
-        ((index++))
+        ((index += 1))
     done
     ((pid_count > 0))
 }

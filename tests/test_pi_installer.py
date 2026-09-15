@@ -7697,6 +7697,65 @@ def test_process_guard_protocol_parser_rejects_noncanonical_or_ambiguous_output(
 
 @pytest.mark.serial
 @pytest.mark.parametrize(
+    ("safe_increment", "bare_increment"),
+    [
+        ("((pid_count += 1))", "((pid_count++))"),
+        ("((index += 1))", "((index++))"),
+    ],
+)
+def test_process_guard_parser_completes_valid_protocol_under_errexit_and_kills_increment_mutants(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    safe_increment: str,
+    bare_increment: str,
+) -> None:
+    """T5: valid PID parsing reaches completion under modern Bash errexit semantics."""
+    _, environment, _, _ = installer_harness
+    original = INSTALLER.read_text()
+    valid = "possible " + " ".join(str(pid) for pid in range(1, 17)) + " +2 more"
+
+    def run_parser(source: str) -> subprocess.CompletedProcess[str]:
+        """Source one test-only installer copy and require parser completion."""
+        sourceable = tmp_path / "installer-functions.sh"
+        sourceable.write_text(source.rsplit('main "$@"', 1)[0])
+        return subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; set -e; validate_install_root; valid_possible_process_output "$2"; printf COMPLETE',
+                "protocol-errexit",
+                str(sourceable),
+                valid,
+            ],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    completed = run_parser(original)
+    assert completed.returncode == 0 and completed.stdout == "COMPLETE", completed.stderr
+
+    def assert_errexit_safe(source: str) -> None:
+        """Reject bare post-increments before Bash 4.1+ can abort parsing."""
+        parser = source[
+            source.index("valid_possible_process_output()") : source.index(
+                "require_no_live_agent_process()"
+            )
+        ]
+        assert "((pid_count++))" not in parser
+        assert "((index++))" not in parser
+
+    assert_errexit_safe(original)
+    mutant = original.replace(safe_increment, bare_increment)
+    assert mutant != original
+    with pytest.raises(AssertionError):
+        assert_errexit_safe(mutant)
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
     ("probe_status", "probe_output"),
     [
         (0, "clear extra"),
