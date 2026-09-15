@@ -7696,6 +7696,98 @@ def test_process_guard_seams_reject_production_and_malformed_test_inputs_before_
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize("probe_pid", ["0", "01", "abc", "10000000000"])
+def test_process_guard_test_seam_rejects_malformed_probe_pid_after_valid_proc_root(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    probe_pid: str,
+) -> None:
+    """The fake-proc PID regex is reached only after a valid canonical fake root."""
+    _, environment, log, _ = installer_harness
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
+    log.write_text("")
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; validate_install_root', "probe-pid", str(sourceable)],
+        env=environment | {"ROASTPILOT_INSTALL_TEST_PROBE_PID": probe_pid},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0 and "test process probe PID is unsafe" in result.stderr
+    assert log.read_text() == ""
+
+
+@pytest.mark.serial
+def test_process_guard_production_rejects_only_proc_seams_and_kills_new_clause_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """Production rejects proc seams even when every older test-only variable is absent."""
+    _, environment, log, _ = installer_harness
+    original = INSTALLER.read_text()
+    production = environment.copy()
+    for key in (
+        "ROASTPILOT_INSTALL_TEST_MODE",
+        "ROASTPILOT_INSTALL_TEST_ROOT",
+        "ROASTPILOT_INSTALL_ROOT",
+        "ROASTPILOT_INSTALL_TEST_COMMAND_DIR",
+    ):
+        production.pop(key, None)
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(original.rsplit('main "$@"', 1)[0])
+    log.write_text("")
+    rejected = subprocess.run(
+        ["bash", "-c", 'source "$1"; validate_install_root', "production-proc", str(sourceable)],
+        env=production,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert (
+        rejected.returncode != 0
+        and "test destination is unavailable in production" in rejected.stderr
+    )
+    assert log.read_text() == ""
+
+    clause = ' && -z "$proc_root" && -z "$probe_pid"'
+    assert original.count(clause) == 1
+    mutant = original.replace(clause, "", 1)
+    sourceable.write_text(mutant.rsplit('main "$@"', 1)[0])
+    admitted = subprocess.run(
+        ["bash", "-c", 'source "$1"; validate_install_root', "production-proc", str(sourceable)],
+        env=production,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert admitted.returncode == 0
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("parent", ["01", "10000000000"])
+def test_process_guard_rejects_noncanonical_or_overcap_parent_and_kills_parent_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], parent: str
+) -> None:
+    """Parent fields must be canonical PIDs within the shared ten-digit bound."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    proc.joinpath("100/stat").write_text(f"100 (fake) S {parent} 0 0 0\n")
+    original = INSTALLER.read_text()
+    rejected = _run_process_guard_program(_process_guard_program(original), environment)
+    assert rejected.returncode == 2 and rejected.stdout == "unavailable malformed\n"
+
+    target = (
+        '        if parent != "0" and (parent != str(int(parent)) or int(parent) > 9999999999):\n'
+    )
+    assert _process_guard_program(original).count(target) == 1
+    mutant = _process_guard_program(original).replace(target, "        if False:\n", 1)
+    red = _run_process_guard_program(mutant, environment)
+    assert red.returncode == 2 and red.stdout != "unavailable malformed\n"
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
 def test_process_guard_production_uses_its_own_python_pid_not_shell_pid() -> None:
     """T6: production excludes the Python probe itself, while tests retain a fake PID."""
     source = INSTALLER.read_text()
