@@ -7712,15 +7712,26 @@ def test_process_guard_protocol_parser_rejects_noncanonical_or_ambiguous_output(
     _, environment, _, _ = installer_harness
     sourceable = tmp_path / "installer-functions.sh"
     sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
-    command = [
-        "bash",
-        "-c",
-        'source "$1"; validate_install_root; valid_possible_process_output "$2"',
-        "protocol-guard",
-        str(sourceable),
-    ]
+
+    def run_parser(output: str) -> subprocess.CompletedProcess[str]:
+        """Run the closed parser command without dynamic command composition."""
+        return subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; validate_install_root; valid_possible_process_output "$2"',
+                "protocol-guard",
+                str(sourceable),
+                output,
+            ],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
     valid = "possible " + " ".join(str(pid) for pid in range(1, 17)) + " +2 more"
-    assert subprocess.run(command + [valid], env=environment).returncode == 0
+    assert run_parser(valid).returncode == 0
     for invalid in (
         "",
         "clear",
@@ -7733,7 +7744,7 @@ def test_process_guard_protocol_parser_rejects_noncanonical_or_ambiguous_output(
         "possible " + " ".join(str(pid) for pid in range(1, 18)),
         "unavailable restricted",
     ):
-        assert subprocess.run(command + [invalid], env=environment).returncode != 0
+        assert run_parser(invalid).returncode != 0
 
 
 @pytest.mark.serial
