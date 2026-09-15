@@ -7048,6 +7048,47 @@ def test_process_guard_retries_vanished_scandir_entry_and_kills_the_unavailable_
 
 
 @pytest.mark.serial
+def test_process_guard_exhausted_vanished_retries_fail_closed_and_kill_clear_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T4/M12: three consecutive vanished scans end as exact unavailable/incomplete."""
+    _, environment, _, _ = installer_harness
+    original = INSTALLER.read_text()
+    trace = tmp_path / "vanished-attempts"
+    program = _process_guard_program(original).replace(
+        "ROOT, supplied_self = sys.argv[1], sys.argv[2]\n",
+        """ROOT, supplied_self = sys.argv[1], sys.argv[2]
+import atexit
+attempts = []
+atexit.register(lambda: open(os.environ["ROASTPILOT_VANISHED_TRACE"], "w").write(str(len(attempts))))
+""",
+        1,
+    )
+    start = program.index("def scan_once(excluded):")
+    end = program.index("def main():", start)
+    churning = (
+        program[:start]
+        + "def scan_once(excluded):\n    attempts.append(None)\n    return None\n\n"
+        + program[end:]
+    )
+    exhausted = _run_process_guard_program(
+        churning, environment | {"ROASTPILOT_VANISHED_TRACE": str(trace)}
+    )
+    assert exhausted.returncode == 2 and exhausted.stdout == "unavailable incomplete\n"
+    assert trace.read_text() == "3"
+
+    target = '    raise ProbeError("incomplete")\n\ntry:\n'
+    assert churning.count(target) == 1
+    mutant = churning.replace(target, '    print("clear")\n    return 0\n\ntry:\n', 1)
+    admitted = _run_process_guard_program(
+        mutant, environment | {"ROASTPILOT_VANISHED_TRACE": str(trace)}
+    )
+    assert admitted.returncode == 0 and admitted.stdout == "clear\n"
+    assert trace.read_text() == "3"
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
 @pytest.mark.parametrize(
     ("root_kind", "probe_pid", "diagnostic"),
     [
