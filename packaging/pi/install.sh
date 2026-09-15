@@ -41,8 +41,9 @@ is_expected_mktemp_path() {
 
 validate_install_root() {
     local install_root="${ROASTPILOT_INSTALL_TEST_ROOT:-}" test_command_dir="${ROASTPILOT_INSTALL_TEST_COMMAND_DIR:-}" command resolved
+    local proc_root="${ROASTPILOT_INSTALL_TEST_PROC_ROOT:-}" probe_pid="${ROASTPILOT_INSTALL_TEST_PROBE_PID:-}"
     if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" != "1" ]]; then
-        [[ -z "${ROASTPILOT_INSTALL_TEST_ROOT:-}" && -z "${ROASTPILOT_INSTALL_ROOT:-}" && -z "$test_command_dir" ]] || die "test destination is unavailable in production"
+        [[ -z "${ROASTPILOT_INSTALL_TEST_ROOT:-}" && -z "${ROASTPILOT_INSTALL_ROOT:-}" && -z "$test_command_dir" && -z "$proc_root" && -z "$probe_pid" ]] || die "test destination is unavailable in production"
         PATH=/usr/sbin:/usr/bin:/sbin:/bin
         export PATH
         return
@@ -54,6 +55,13 @@ validate_install_root() {
     [[ -n "$test_command_dir" && "$test_command_dir" == /* && -d "$test_command_dir" && ! -L "$test_command_dir" ]] || die "test command directory is required"
     resolved="$(cd -- "$test_command_dir" && pwd -P)" || die "test command directory is unsafe"
     [[ "$resolved" == "$test_command_dir" ]] || die "test command directory must be canonical"
+    [[ -n "$proc_root" && -n "$probe_pid" ]] || die "test process root and probe PID are required"
+    [[ "$proc_root" == /* && "$proc_root" != / && "$proc_root" != // && -d "$proc_root" && ! -L "$proc_root" ]] || die "test process root is unsafe"
+    resolved="$(cd -- "$proc_root" && pwd -P)" || die "test process root is unsafe"
+    [[ "$resolved" == "$proc_root" ]] || die "test process root must be canonical"
+    [[ "$probe_pid" =~ ^[1-9][0-9]{0,9}$ ]] || die "test process probe PID is unsafe"
+    INSTALL_PROC_ROOT="$proc_root"
+    INSTALL_PROBE_PID="$probe_pid"
     for command in apt-get hostnamectl usermod systemctl roastpilot-agent mkdir chmod chown rm cp mv tee mktemp sha256sum cat test readlink grep id getent uname; do
         [[ -x "$test_command_dir/$command" ]] || die "test command directory is incomplete"
         [[ "$(type -P "$command")" == "$test_command_dir/$command" ]] || die "test command directory does not own $command"
@@ -638,6 +646,269 @@ cleanup_staged_pipx() {
     STAGED_PIPX_VENV=""
 }
 
+check_no_live_agent_process() {
+    # This probe is deliberately unprivileged and read-only.  It reports only
+    # canonical PIDs: argv and comm bytes belong to other principals and may
+    # contain credentials.  A non-clear result is not evidence of a confirmed
+    # agent; broad process-family matches are intentionally ambiguous.
+    local proc_root probe_pid program output status
+    PROCESS_GUARD_MESSAGE=""
+    if [[ "${ROASTPILOT_INSTALL_TEST_MODE:-}" == "1" ]]; then
+        proc_root="${INSTALL_PROC_ROOT:-}"
+        probe_pid="${INSTALL_PROBE_PID:-}"
+    else
+        proc_root="/proc"
+        # The Python interpreter is itself visible in /proc and its -c argv
+        # contains the family tokens below.  Ask the probe to begin its
+        # exclusion chain at its own PID, rather than at this shell parent.
+        probe_pid="self"
+    fi
+    read -r -d '' program <<'PY' || true
+import errno
+import os
+import signal
+import stat
+import sys
+import time
+
+ROOT, supplied_self = sys.argv[1], sys.argv[2]
+SELF = str(os.getpid()) if supplied_self == "self" else supplied_self
+DEADLINE = time.monotonic() + 9.0
+TOKENS = (b"roastpilot-agent", b"roastpilot_agent", b"coffee-roaster-mcp", b"coffee_roaster_mcp")
+TRUNCATED = (b"roastpilot-agen", b"coffee-roaster-")
+
+class ProbeError(Exception):
+    def __init__(self, reason):
+        self.reason = reason
+
+def expired():
+    if time.monotonic() >= DEADLINE:
+        raise ProbeError("timeout")
+
+def error_reason(exc, vanished=False):
+    if vanished and exc.errno in (errno.ENOENT, errno.ESRCH):
+        return "vanished"
+    if exc.errno in (errno.EACCES, errno.EPERM):
+        return "restricted"
+    return "incomplete"
+
+def read_regular(path, limit, vanished=False):
+    expired()
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ProbeError(error_reason(exc, vanished)) from None
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            raise ProbeError("malformed")
+        data = bytearray()
+        while True:
+            expired()
+            part = os.read(fd, min(65536, limit + 1 - len(data)))
+            data.extend(part)
+            if len(data) > limit:
+                raise ProbeError("bound")
+            if not part:
+                return bytes(data)
+    except OSError as exc:
+        raise ProbeError(error_reason(exc, vanished)) from None
+    finally:
+        os.close(fd)
+
+def pid_stat(pid, vanished=False):
+    row = read_regular(os.path.join(ROOT, pid, "stat"), 65536, vanished)
+    try:
+        text = row.decode("ascii")
+        left = text.index(" (")
+        right = text.rfind(")")
+        if left <= 0 or right <= left + 2 or text[right + 1:right + 2] != " ":
+            raise ValueError
+        observed = text[:left]
+        tail = text[right + 2:].split()
+        if observed != pid or not observed.isdecimal() or len(tail) < 2 or len(tail[0]) != 1 or not tail[1].isdecimal():
+            raise ValueError
+        parent = tail[1]
+        if parent != "0" and (parent != str(int(parent)) or int(parent) > 9999999999):
+            raise ValueError
+        return parent
+    except (UnicodeDecodeError, ValueError):
+        raise ProbeError("malformed") from None
+
+def check_mountinfo():
+    data = read_regular(os.path.join(ROOT, SELF, "mountinfo"), 1048576)
+    try:
+        lines = data.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        raise ProbeError("malformed") from None
+    found = 0
+    for line in lines:
+        if line.count(" - ") != 1:
+            raise ProbeError("malformed")
+        before, after = line.split(" - ")
+        fields, post = before.split(), after.split()
+        if len(fields) < 6 or len(post) != 3:
+            raise ProbeError("malformed")
+        if post[0] != "proc" or fields[4] != "/proc":
+            continue
+        found += 1
+        options = fields[5].split(",") + post[2].split(",")
+        for option in options:
+            if option.startswith("subset=") or (option.startswith("hidepid=") and option.split("=", 1)[1] not in ("0", "off")):
+                raise ProbeError("restricted")
+    if found != 1:
+        raise ProbeError("malformed")
+
+def ancestors():
+    chain = set()
+    current = SELF
+    for _ in range(64):
+        if current in chain:
+            raise ProbeError("malformed")
+        chain.add(current)
+        parent = pid_stat(current)
+        if parent == "0":
+            return chain
+        current = parent
+    raise ProbeError("bound")
+
+def process_entries():
+    expired()
+    try:
+        with os.scandir(ROOT) as entries:
+            pids = []
+            for entry in entries:
+                if not entry.name.isdecimal() or entry.name != str(int(entry.name)):
+                    continue
+                try:
+                    is_symlink = entry.is_symlink()
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                except OSError as exc:
+                    raise ProbeError(error_reason(exc, True)) from None
+                if is_symlink or not is_directory:
+                    raise ProbeError("malformed")
+                pids.append(entry.name)
+    except OSError as exc:
+        raise ProbeError(error_reason(exc)) from None
+    if len(pids) > 8192:
+        raise ProbeError("bound")
+    return sorted(pids, key=int)
+
+def matches(data, extra=()):
+    lowered = data.lower()
+    return any(token in lowered for token in TOKENS + extra)
+
+def scan_once(excluded):
+    possible = []
+    try:
+        pids = process_entries()
+    except ProbeError as exc:
+        if exc.reason == "vanished":
+            return None
+        raise
+    for pid in pids:
+        expired()
+        if pid in excluded:
+            continue
+        try:
+            cmdline = read_regular(os.path.join(ROOT, pid, "cmdline"), 1048576, True)
+            comm = read_regular(os.path.join(ROOT, pid, "comm"), 64, True)
+        except ProbeError as exc:
+            if exc.reason == "vanished":
+                return None
+            raise
+        if matches(cmdline) or matches(comm, TRUNCATED):
+            possible.append(pid)
+    return possible
+
+def main():
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    signal.alarm(10)
+    if not (SELF.isdecimal() and SELF == str(int(SELF)) and 0 < int(SELF) <= 9999999999):
+        raise ProbeError("malformed")
+    if not (os.path.isabs(ROOT) and os.path.isdir(ROOT) and not os.path.islink(ROOT) and os.path.realpath(ROOT) == ROOT):
+        raise ProbeError("malformed")
+    # Default SIGALRM disposition deliberately kills this interpreter.  The
+    # calling shell maps that signal termination to an unavailable timeout.
+    check_mountinfo()
+    for required in ("stat", "cmdline", "comm"):
+        read_regular(os.path.join(ROOT, "1", required), 1048576 if required != "comm" else 64)
+    excluded = ancestors()
+    for _ in range(3):
+        found = scan_once(excluded)
+        if found is not None:
+            if found:
+                shown = found[:16]
+                suffix = "" if len(found) <= 16 else f" +{len(found) - 16} more"
+                print("possible " + " ".join(shown) + suffix)
+                return 1
+            print("clear")
+            return 0
+    raise ProbeError("incomplete")
+
+try:
+    raise SystemExit(main())
+except ProbeError as exc:
+    print("unavailable " + exc.reason)
+    raise SystemExit(2)
+PY
+    if output="$(python3 -I -c "$program" "$proc_root" "$probe_pid" 2>/dev/null)"; then
+        status=0
+    else
+        status=$?
+    fi
+    case "$status" in
+        0)
+            [[ "$output" == "clear" ]] || { PROCESS_GUARD_MESSAGE="cannot confirm that no RoastPilot-related process is running; close processes yourself and rerun the installer; the installer never stops, restarts, or kills them; never restart during a roast"; return 1; }
+            return 0
+            ;;
+        1)
+            if valid_possible_process_output "$output"; then
+                PROCESS_GUARD_MESSAGE="possible RoastPilot-related process (PIDs: ${output#possible }); broad matches may include log followers or editors; close processes yourself and rerun the installer; the installer never stops, restarts, or kills them; never restart during a roast"
+            else
+                PROCESS_GUARD_MESSAGE="cannot confirm that no RoastPilot-related process is running; close processes yourself and rerun the installer; the installer never stops, restarts, or kills them; never restart during a roast"
+            fi
+            return 1
+            ;;
+        *)
+            PROCESS_GUARD_MESSAGE="cannot confirm that no RoastPilot-related process is running; close processes yourself and rerun the installer; the installer never stops, restarts, or kills them; never restart during a roast"
+            return 1
+            ;;
+    esac
+}
+
+valid_possible_process_output() {
+    local output="$1" payload part previous=0 pid_count=0 index=0 suffix_seen=0
+    local -a parts
+    [[ "$output" =~ ^possible\ ([1-9][0-9]{0,9})(\ [1-9][0-9]{0,9}){0,15}(\ \+[1-9][0-9]*\ more)?$ ]] || return 1
+    payload="${output#possible }"
+    read -r -a parts <<< "$payload"
+    while ((index < ${#parts[@]})); do
+        part="${parts[index]}"
+        if [[ "$part" =~ ^[1-9][0-9]{0,9}$ ]]; then
+            ((suffix_seen == 0 && pid_count < 16)) || return 1
+            ((10#$part > previous)) || return 1
+            previous=$((10#$part))
+            ((pid_count += 1))
+        elif [[ "$part" =~ ^\+[1-9][0-9]*$ ]]; then
+            ((suffix_seen == 0 && pid_count == 16 && index + 1 == ${#parts[@]} - 1)) || return 1
+            [[ "${parts[index + 1]}" == "more" ]] || return 1
+            suffix_seen=1
+            ((index += 1))
+        else
+            return 1
+        fi
+        ((index += 1))
+    done
+    ((pid_count > 0))
+}
+
+require_no_live_agent_process() {
+    check_no_live_agent_process || die "$PROCESS_GUARD_MESSAGE"
+}
+
 remove_root_temporary() {
     local target="$1" temporary retained=()
     for temporary in "${ROOT_TEMPORARIES[@]:-}"; do
@@ -663,6 +934,10 @@ replace_application_safely() {
     if ! ensure_agent_inactive; then
         cleanup_staged_pipx || true
         die "roastpilot-agent is not safely inactive; end any run safely, stop the service only when idle, then rerun the installer; never restart during a roast"
+    fi
+    if ! check_no_live_agent_process; then
+        cleanup_staged_pipx || true
+        die "$PROCESS_GUARD_MESSAGE"
     fi
     APPLICATION_CHANGED=1
     if pipx_command uninstall -- roastpilot-agent; then :; else
@@ -956,6 +1231,7 @@ install_rendered_files() {
     prior_file="$var_dir/prior-static-hostname"
     model_dir="$var_dir/models"
     require_agent_inactive
+    require_no_live_agent_process
     # Pin all mutable renderer output once, before any privileged destination
     # mutation.  The subsequent writes stream only these captured values.
     staged_env="$(capture_staged_file "$STAGE_DIR/roastpilot-agent.env" env)"
@@ -1077,6 +1353,7 @@ enable_services() {
     run_privileged systemctl enable roastpilot-agent
     if [[ "$START_SERVICE" == 1 ]]; then
         require_agent_inactive
+        require_no_live_agent_process
         START_SERVICE_ATTEMPTED=1
         run_privileged systemctl start roastpilot-agent
     fi
@@ -1248,6 +1525,7 @@ main() {
     preserve_existing_api_key
     require_agent_inactive
     verify_existing_pi_capability_before_package_install
+    require_no_live_agent_process
     run_privileged apt-get install -y libportaudio2 pipx avahi-daemon
     install_application
     resolve_appliance_executable

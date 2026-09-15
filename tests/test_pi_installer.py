@@ -28,6 +28,34 @@ from roastpilot_agent.appliance.render import (
 INSTALLER = Path(__file__).parents[1] / "packaging/pi/install.sh"
 
 
+def _write_fake_process(
+    proc_root: Path,
+    pid: int,
+    parent: int,
+    cmdline: bytes = b"unrelated-process\0",
+    comm: bytes = b"unrelated\n",
+) -> Path:
+    """Create one regular-file-only fake procfs process entry."""
+    process = proc_root / str(pid)
+    process.mkdir(parents=True, exist_ok=True)
+    process.joinpath("stat").write_text(f"{pid} (fake) S {parent} 0 0 0\n")
+    process.joinpath("cmdline").write_bytes(cmdline)
+    process.joinpath("comm").write_bytes(comm)
+    return process
+
+
+def _fake_proc_tree(tmp_path: Path) -> tuple[Path, str]:
+    """Create a closed fake /proc tree without reading the host process table."""
+    proc_root = tmp_path / "fake-proc"
+    proc_root.mkdir()
+    _write_fake_process(proc_root, 1, 0, b"init\0", b"init\n")
+    self_process = _write_fake_process(proc_root, 100, 1, b"installer-probe\0", b"probe\n")
+    self_process.joinpath("mountinfo").write_text(
+        "36 25 0:31 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n"
+    )
+    return proc_root, "100"
+
+
 @pytest.fixture
 def installer_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Path, Path]:
     """Create one recorded-fake PATH and a root-free appliance destination.
@@ -550,6 +578,7 @@ esac
     operator_home = tmp_path / "operator-home"
     pipx_home = operator_home / ".local/share/pipx"
     install_root = tmp_path / "root"
+    proc_root, probe_pid = _fake_proc_tree(tmp_path)
     pipx_agent = pipx_home / "venvs/roastpilot-agent/bin/roastpilot-agent"
     pipx_agent.parent.mkdir(parents=True)
     pipx_agent.write_text(fake.read_text())
@@ -598,6 +627,8 @@ esac
         "ROASTPILOT_INSTALL_TEST_MODE": "1",
         "ROASTPILOT_INSTALL_TEST_ROOT": str(install_root),
         "ROASTPILOT_INSTALL_TEST_COMMAND_DIR": str(fake_bin),
+        "ROASTPILOT_INSTALL_TEST_PROC_ROOT": str(proc_root),
+        "ROASTPILOT_INSTALL_TEST_PROBE_PID": probe_pid,
         "ROASTPILOT_INSTALL_OS_RELEASE": str(os_release),
         "HOME": str(tmp_path / "home"),
         "FAKE_OPERATOR_HOME": str(operator_home),
@@ -620,6 +651,8 @@ def _run(
         "ROASTPILOT_INSTALL_TEST_ROOT",
         "ROASTPILOT_INSTALL_OS_RELEASE",
         "ROASTPILOT_INSTALL_TEST_COMMAND_DIR",
+        "ROASTPILOT_INSTALL_TEST_PROC_ROOT",
+        "ROASTPILOT_INSTALL_TEST_PROBE_PID",
         "ROASTPILOT_INSTALL_WHEEL",
         "ROASTPILOT_INSTALL_API_KEY",
         "ROASTPILOT_INSTALL_SERIAL_PORT",
@@ -6868,3 +6901,1110 @@ def test_prior_application_uninstall_failure_preserves_status_and_reports_skew(
     assert "FAKE_PRIOR_UNINSTALL_FAILURE" in log.read_text().splitlines()
     assert "cannot remove prior application after staging replacement" in result.stderr
     assert "application/configuration skew may require manual reconciliation" in result.stderr
+
+
+def _run_process_guard(
+    environment: dict[str, str], tmp_path: Path
+) -> subprocess.CompletedProcess[str]:
+    """Run only the unprivileged process guard against the fixture fake procfs."""
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
+    sourceable.chmod(0o600)
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; validate_install_root; if check_no_live_agent_process; then printf clear; else printf "blocked:%s" "$PROCESS_GUARD_MESSAGE"; fi',
+            "process-guard",
+            str(sourceable),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _process_guard_program(source: str) -> str:
+    """Extract the installer-owned process probe without running the installer."""
+    start = source.index("import errno\n", source.index("check_no_live_agent_process()"))
+    end = source.index("\nPY\n", start)
+    return source[start:end]
+
+
+def _run_process_guard_program(
+    program: str, environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Run an extracted probe only against the closed fake procfs fixture."""
+    return subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            program,
+            environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"],
+            environment["ROASTPILOT_INSTALL_TEST_PROBE_PID"],
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _run_sourced_process_guard(
+    source: str, environment: dict[str, str], tmp_path: Path
+) -> subprocess.CompletedProcess[str]:
+    """Run the shell protocol around one test-only installer source copy."""
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(source.rsplit('main "$@"', 1)[0])
+    sourceable.chmod(0o600)
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; validate_install_root; if check_no_live_agent_process; then printf clear; else printf "blocked:%s" "$PROCESS_GUARD_MESSAGE"; fi',
+            "process-guard",
+            str(sourceable),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.serial
+def test_process_guard_arms_default_sigalrm_before_filesystem_validation(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """The bounded probe restores default SIGALRM before every root path read."""
+    _, environment, _, _ = installer_harness
+    trace = tmp_path / "probe-order"
+    instrumentation = """\
+import atexit
+events = []
+real_signal = signal.signal
+real_path_functions = {name: getattr(os.path, name) for name in ("isdir", "islink", "realpath")}
+def traced_signal(number, disposition):
+    events.append(f"signal:{'SIG_DFL' if disposition is signal.SIG_DFL else disposition}")
+    return real_signal(number, disposition)
+def traced_alarm(seconds):
+    events.append(f"alarm:{seconds}")
+    return 0
+def traced_path(name):
+    def call(*args, **kwargs):
+        events.append(name)
+        return real_path_functions[name](*args, **kwargs)
+    return call
+signal.signal = traced_signal
+signal.alarm = traced_alarm
+for name in real_path_functions:
+    setattr(os.path, name, traced_path(name))
+atexit.register(lambda: open(os.environ["ROASTPILOT_PROBE_TRACE"], "w").write("\\n".join(events)))
+"""
+    program = _process_guard_program(INSTALLER.read_text()).replace(
+        "ROOT, supplied_self = sys.argv[1], sys.argv[2]\n",
+        "ROOT, supplied_self = sys.argv[1], sys.argv[2]\n" + instrumentation,
+    )
+    result = _run_process_guard_program(
+        program, environment | {"ROASTPILOT_PROBE_TRACE": str(trace)}
+    )
+    assert result.returncode == 0 and result.stdout == "clear\n", result.stderr
+    events = trace.read_text().splitlines()
+    assert events[:5] == ["signal:SIG_DFL", "alarm:10", "isdir", "islink", "realpath"]
+
+
+@pytest.mark.serial
+def test_process_guard_retries_vanished_scandir_entry_and_kills_the_unavailable_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """An ENOENT during entry metadata restarts the scan, not its disposition."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    _write_fake_process(proc, 200, 1, b"unrelated\0", b"unrelated\n")
+    original = INSTALLER.read_text()
+    injected = """\
+                    if entry.name == "200" and not getattr(process_entries, "entry_vanished", False):
+                        process_entries.entry_vanished = True
+                        raise OSError(errno.ENOENT, "entry vanished")
+"""
+    probe = _process_guard_program(original).replace(
+        "                    is_symlink = entry.is_symlink()\n",
+        injected + "                    is_symlink = entry.is_symlink()\n",
+    )
+    recovered = _run_process_guard_program(probe, environment)
+    assert recovered.returncode == 0 and recovered.stdout == "clear\n", recovered.stderr
+
+    mutant = probe.replace(
+        "raise ProbeError(error_reason(exc, True)) from None\n                if is_symlink",
+        "raise ProbeError(error_reason(exc)) from None\n                if is_symlink",
+        1,
+    )
+    assert mutant != probe
+    rejected = _run_process_guard_program(mutant, environment)
+    assert rejected.returncode == 2 and rejected.stdout == "unavailable incomplete\n"
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+def test_process_guard_exhausted_vanished_retries_fail_closed_and_kill_clear_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T4/M12: three consecutive vanished scans end as exact unavailable/incomplete."""
+    _, environment, _, _ = installer_harness
+    original = INSTALLER.read_text()
+    trace = tmp_path / "vanished-attempts"
+    program = _process_guard_program(original).replace(
+        "ROOT, supplied_self = sys.argv[1], sys.argv[2]\n",
+        """ROOT, supplied_self = sys.argv[1], sys.argv[2]
+import atexit
+attempts = []
+atexit.register(lambda: open(os.environ["ROASTPILOT_VANISHED_TRACE"], "w").write(str(len(attempts))))
+""",
+        1,
+    )
+    start = program.index("def scan_once(excluded):")
+    end = program.index("def main():", start)
+    churning = (
+        program[:start]
+        + "def scan_once(excluded):\n    attempts.append(None)\n    return None\n\n"
+        + program[end:]
+    )
+    exhausted = _run_process_guard_program(
+        churning, environment | {"ROASTPILOT_VANISHED_TRACE": str(trace)}
+    )
+    assert exhausted.returncode == 2 and exhausted.stdout == "unavailable incomplete\n"
+    assert trace.read_text() == "3"
+
+    target = '    raise ProbeError("incomplete")\n\ntry:\n'
+    assert churning.count(target) == 1
+    mutant = churning.replace(target, '    print("clear")\n    return 0\n\ntry:\n', 1)
+    admitted = _run_process_guard_program(
+        mutant, environment | {"ROASTPILOT_VANISHED_TRACE": str(trace)}
+    )
+    assert admitted.returncode == 0 and admitted.stdout == "clear\n"
+    assert trace.read_text() == "3"
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("root_kind", "probe_pid", "diagnostic"),
+    [
+        ("missing", "100", "test process root and probe PID are required"),
+        ("valid", "", "test process root and probe PID are required"),
+        ("slash", "100", "test process root is unsafe"),
+        ("double-slash", "100", "test process root is unsafe"),
+        ("nonexistent", "100", "test process root is unsafe"),
+        ("symlink", "100", "test process root is unsafe"),
+        ("trailing-slash", "100", "test process root must be canonical"),
+    ],
+)
+def test_process_guard_test_seam_rejects_unsafe_proc_roots_before_fake_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    root_kind: str,
+    probe_pid: str,
+    diagnostic: str,
+) -> None:
+    """Every malformed fake-proc root fails closed before any fake command runs."""
+    _, environment, log, _ = installer_harness
+    canonical = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    if root_kind == "missing":
+        root = ""
+    elif root_kind == "valid":
+        root = str(canonical)
+    elif root_kind == "slash":
+        root = "/"
+    elif root_kind == "double-slash":
+        root = "//"
+    elif root_kind == "nonexistent":
+        root = str(tmp_path / "missing-proc")
+    elif root_kind == "symlink":
+        linked = tmp_path / "proc-link"
+        linked.symlink_to(canonical, target_is_directory=True)
+        root = str(linked)
+    else:
+        root = f"{canonical}/"
+    log.write_text("")
+    result = _run(
+        environment
+        | {
+            "ROASTPILOT_INSTALL_TEST_PROC_ROOT": root,
+            "ROASTPILOT_INSTALL_TEST_PROBE_PID": probe_pid,
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert result.returncode != 0 and diagnostic in result.stderr
+    assert log.read_text() == ""
+
+
+@pytest.mark.serial
+def test_process_guard_monotonic_deadline_times_out_and_kills_its_removed_expiry_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """The monotonic deadline emits its exact bounded unavailable protocol result."""
+    _, environment, _, _ = installer_harness
+    original = INSTALLER.read_text()
+    expired_probe = _process_guard_program(original).replace(
+        "DEADLINE = time.monotonic() + 9.0", "DEADLINE = time.monotonic() - 1.0", 1
+    )
+    timed_out = _run_process_guard_program(expired_probe, environment)
+    assert timed_out.returncode == 2 and timed_out.stdout == "unavailable timeout\n"
+
+    no_expiry = expired_probe.replace(
+        'def expired():\n    if time.monotonic() >= DEADLINE:\n        raise ProbeError("timeout")\n',
+        "def expired():\n    return\n",
+        1,
+    )
+    assert no_expiry != expired_probe
+    admitted = _run_process_guard_program(no_expiry, environment)
+    assert admitted.returncode == 0 and admitted.stdout == "clear\n", admitted.stderr
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+def test_process_guard_default_sigalrm_termination_maps_to_generic_refusal_and_kills_alarm_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A real bounded child SIGALRM is converted to the shell's fail-closed message."""
+    _, environment, _, _ = installer_harness
+    original = INSTALLER.read_text()
+    alarmed = original.replace("signal.alarm(10)", "signal.alarm(1)\n    time.sleep(2)", 1)
+    timed_out = _run_sourced_process_guard(alarmed, environment, tmp_path)
+    diagnostic = "cannot confirm that no RoastPilot-related process is running"
+    assert timed_out.returncode == 0 and timed_out.stdout.startswith(f"blocked:{diagnostic}")
+
+    no_alarm = alarmed.replace("signal.alarm(1)\n    time.sleep(2)", "signal.alarm(0)", 1)
+    assert no_alarm != alarmed
+    admitted = _run_sourced_process_guard(no_alarm, environment, tmp_path)
+    assert admitted.returncode == 0 and admitted.stdout == "clear"
+    assert INSTALLER.read_text() == original
+
+
+def test_process_guard_probe_forbids_process_control_and_kills_mutant() -> None:
+    """T7/M16: the read-only probe permits only default SIGALRM setup and alarm."""
+    original = INSTALLER.read_text()
+    program = _process_guard_program(original)
+    guard = original[
+        original.index("check_no_live_agent_process()") : original.index("remove_root_temporary()")
+    ]
+
+    def assert_read_only(candidate: str, shell: str) -> None:
+        """Assert that candidate probe text cannot signal, mutate, or control processes."""
+        signal_calls = [line.strip() for line in candidate.splitlines() if "signal." in line]
+        assert signal_calls == [
+            "signal.signal(signal.SIGALRM, signal.SIG_DFL)",
+            "signal.alarm(10)",
+        ]
+        for forbidden in (
+            "os.kill(",
+            "os.killpg(",
+            "signal.pthread_kill(",
+            "pidfd",
+            "subprocess",
+            "os.O_WRONLY",
+            "os.O_RDWR",
+            "os.O_CREAT",
+            "os.O_TRUNC",
+            "os.O_APPEND",
+        ):
+            assert forbidden not in candidate
+        for forbidden in (" kill ", "\nkill ", "sudo", "systemctl", "pkill", "killall"):
+            assert forbidden not in shell
+
+    assert_read_only(program, guard)
+    mutant = program.replace("signal.alarm(10)", "os.kill(os.getpid(), signal.SIGTERM)", 1)
+    assert mutant != program
+    with pytest.raises(AssertionError):
+        assert_read_only(mutant, guard)
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+def test_process_guard_clear_excludes_only_probe_ancestor_chain(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T1: unrelated entries admit, while token-bearing self and parent are excluded."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    _write_fake_process(proc, 1, 0, b"roastpilot-agent\0", b"roastpilot-agen\n")
+    _write_fake_process(proc, 100, 1, b"coffee-roaster-mcp\0", b"coffee-roaster-\n").joinpath(
+        "mountinfo"
+    ).write_text("36 25 0:31 / /proc rw - proc proc rw\n")
+    before = {path: path.read_bytes() for path in proc.rglob("*") if path.is_file()}
+    result = _run_process_guard(environment, tmp_path)
+    assert result.returncode == 0 and result.stdout == "clear", result.stderr
+    assert {path: path.read_bytes() for path in proc.rglob("*") if path.is_file()} == before
+
+
+@pytest.mark.serial
+def test_process_guard_rejects_noncyclic_ancestor_chain_over_64_hops_and_kills_bound_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A valid 65-member self-to-parent chain exceeds the ancestor resource bound."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    for pid in range(100, 165):
+        _write_fake_process(proc, pid, 0 if pid == 164 else pid + 1)
+
+    original = INSTALLER.read_text()
+    bounded = _run_process_guard_program(_process_guard_program(original), environment)
+    assert bounded.returncode == 2 and bounded.stdout == "unavailable bound\n"
+    boundary = _run_process_guard(environment, tmp_path)
+    assert boundary.returncode == 0 and boundary.stdout.startswith(
+        "blocked:cannot confirm that no RoastPilot-related process is running"
+    )
+
+    mutant = _process_guard_program(original).replace(
+        '    raise ProbeError("bound")\n\ndef process_entries():',
+        "    return chain\n\ndef process_entries():",
+        1,
+    )
+    assert mutant != _process_guard_program(original)
+    admitted = _run_process_guard_program(mutant, environment)
+    assert admitted.returncode == 0 and admitted.stdout == "clear\n", admitted.stderr
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+def test_process_guard_reports_matching_pid_widths_in_numeric_order_and_kills_lexical_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Matching PIDs remain numeric, ascending, and never disclose process bytes."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    for pid in (9, 10, 99, 101):
+        _write_fake_process(
+            proc,
+            pid,
+            1,
+            b"roastpilot-agent\0SECRET_NEVER_PRINT",
+            b"agent\n",
+        )
+
+    original = INSTALLER.read_text()
+    ordered = _run_process_guard_program(_process_guard_program(original), environment)
+    assert ordered.returncode == 1 and ordered.stdout == "possible 9 10 99 101\n"
+    assert "SECRET_NEVER_PRINT" not in ordered.stdout + ordered.stderr
+
+    mutant = _process_guard_program(original).replace("sorted(pids, key=int)", "sorted(pids)", 1)
+    assert mutant != _process_guard_program(original)
+    lexical = _run_process_guard_program(mutant, environment)
+    assert lexical.returncode == 1 and lexical.stdout == "possible 10 101 9 99\n"
+    assert "SECRET_NEVER_PRINT" not in lexical.stdout + lexical.stderr
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("cmdline", "comm"),
+    [
+        (b"roastpilot-agent\0", b"other\n"),
+        (b"ROASTPILOT_AGENT\0", b"other\n"),
+        (b"python\0-m\0coffee_roaster_mcp\0", b"other\n"),
+        (b"tail\0-f\0roastpilot-agent.log\0", b"tail\n"),
+        (b"vim\0notes-coffee-roaster-mcp.txt\0", b"vim\n"),
+        (b"", b"roastpilot-agen\n"),
+        (b"", b"coffee-roaster-\n"),
+    ],
+)
+def test_process_guard_treats_all_family_forms_as_ambiguous_pid_only_matches(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    cmdline: bytes,
+    comm: bytes,
+) -> None:
+    """T3: process-family evidence blocks without leaking argv or asserting identity."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    _write_fake_process(proc, 200, 1, cmdline + b"SECRET_NEVER_PRINT", comm)
+    result = _run_process_guard(environment, tmp_path)
+    assert result.returncode == 0 and result.stdout.startswith(
+        "blocked:possible RoastPilot-related process"
+    )
+    assert "200" in result.stdout
+    assert "SECRET_NEVER_PRINT" not in result.stdout + result.stderr
+    assert "broad matches may include log followers or editors" in result.stdout
+    assert "never stops, restarts, or kills" in result.stdout
+    assert "is running" not in result.stdout
+
+
+@pytest.mark.serial
+def test_process_guard_reports_sorted_capped_pid_set_without_process_bytes(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T3: a large ambiguous set remains PID-only and bounded."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    for pid in range(300, 320):
+        _write_fake_process(proc, pid, 1, b"roastpilot-agent\0private-argv", b"agent\n")
+    result = _run_process_guard(environment, tmp_path)
+    assert result.returncode == 0 and "300 301" in result.stdout and "+4 more" in result.stdout
+    assert "316" not in result.stdout and "private-argv" not in result.stdout
+
+
+@pytest.mark.serial
+def test_process_guard_reports_descendant_of_probe_and_kills_descendant_exclusion_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """A matching child of the probe is not an ancestor and must still block."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    _write_fake_process(proc, 200, 100, b"roastpilot-agent\0SECRET_NEVER_PRINT", b"agent\n")
+    original = INSTALLER.read_text()
+    reported = _run_process_guard_program(_process_guard_program(original), environment)
+    assert reported.returncode == 1 and reported.stdout == "possible 200\n"
+    boundary = _run_process_guard(environment, tmp_path)
+    assert boundary.returncode == 0 and "PIDs: 200" in boundary.stdout
+    assert "SECRET_NEVER_PRINT" not in boundary.stdout + boundary.stderr
+
+    mutant = _process_guard_program(original).replace(
+        "        if pid in excluded:\n",
+        "        if pid in excluded or pid_stat(pid) in excluded:\n",
+        1,
+    )
+    assert mutant != _process_guard_program(original)
+    admitted = _run_process_guard_program(mutant, environment)
+    assert admitted.returncode == 0 and admitted.stdout == "clear\n", admitted.stderr
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "hidepid",
+        "subset",
+        "duplicate-mount",
+        "wrong-mount",
+        "missing-pid1",
+        "bad-stat",
+        "missing-ancestor",
+        "ancestor-cycle",
+        "symlink",
+        "vanished",
+        "oversized",
+    ],
+)
+def test_process_guard_fails_closed_for_unavailable_or_malformed_process_evidence(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, fault: str
+) -> None:
+    """T4: incomplete evidence is never interpreted as an idle process table."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    if fault == "hidepid":
+        (proc / "100/mountinfo").write_text("36 25 0:31 / /proc rw,hidepid=2 - proc proc rw\n")
+    elif fault == "subset":
+        (proc / "100/mountinfo").write_text("36 25 0:31 / /proc rw,subset=pid - proc proc rw\n")
+    elif fault == "duplicate-mount":
+        (proc / "100/mountinfo").write_text(
+            "36 25 0:31 / /proc rw - proc proc rw\n37 25 0:32 / /proc rw - proc proc rw\n"
+        )
+    elif fault == "wrong-mount":
+        (proc / "100/mountinfo").write_text("36 25 0:31 / /not-proc rw - proc proc rw\n")
+    elif fault == "missing-pid1":
+        (proc / "1/cmdline").unlink()
+    elif fault == "bad-stat":
+        (proc / "100/stat").write_text("wrong\n")
+    elif fault == "missing-ancestor":
+        (proc / "100/stat").write_text("100 (fake) S 999 0 0 0\n")
+    elif fault == "ancestor-cycle":
+        (proc / "100/stat").write_text("100 (fake) S 100 0 0 0\n")
+    elif fault == "symlink":
+        target = proc / "outside"
+        target.write_text("unrelated")
+        (proc / "1/cmdline").unlink()
+        (proc / "1/cmdline").symlink_to(target)
+    elif fault == "vanished":
+        (_write_fake_process(proc, 200, 1, b"unrelated\0", b"unrelated\n") / "cmdline").unlink()
+    else:
+        (proc / "1/cmdline").write_bytes(b"x" * (1048577))
+    result = _run_process_guard(environment, tmp_path)
+    assert result.returncode == 0 and result.stdout.startswith(
+        "blocked:cannot confirm that no RoastPilot-related process is running"
+    )
+    assert "never stops, restarts, or kills" in result.stdout
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("fault", "expected"),
+    [
+        ("permission", "unavailable restricted\n"),
+        ("entry-query", "unavailable restricted\n"),
+        ("entry-symlink", "unavailable malformed\n"),
+        ("file-symlink", "unavailable incomplete\n"),
+        ("non-regular-file", "unavailable malformed\n"),
+    ],
+)
+def test_process_guard_fails_closed_for_scanned_nonancestor_evidence(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    fault: str,
+    expected: str,
+) -> None:
+    """T4/M11: unreadable or non-regular evidence at PID 200 is never skipped."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    process = _write_fake_process(proc, 200, 1, b"unrelated\0", b"unrelated\n")
+    original = INSTALLER.read_text()
+    program = _process_guard_program(original)
+    restricted_open = """ROOT, supplied_self = sys.argv[1], sys.argv[2]
+real_open = os.open
+def guarded_open(path, flags):
+    if path.endswith("/200/cmdline"):
+        raise OSError(errno.EACCES, "restricted")
+    return real_open(path, flags)
+os.open = guarded_open
+"""
+    if fault == "permission":
+        program = program.replace(
+            "ROOT, supplied_self = sys.argv[1], sys.argv[2]\n", restricted_open, 1
+        )
+    elif fault == "entry-query":
+        program = program.replace(
+            "                    is_directory = entry.is_dir(follow_symlinks=False)\n",
+            '                    raise OSError(errno.EACCES, "restricted")\n',
+            1,
+        )
+    elif fault == "entry-symlink":
+        target = tmp_path / "outside-process"
+        shutil.copytree(process, target)
+        shutil.rmtree(process)
+        process.symlink_to(target, target_is_directory=True)
+    elif fault == "file-symlink":
+        target = proc / "outside-cmdline"
+        target.write_bytes(b"unrelated\0")
+        process.joinpath("cmdline").unlink()
+        process.joinpath("cmdline").symlink_to(target)
+    else:
+        process.joinpath("cmdline").unlink()
+        process.joinpath("cmdline").mkdir()
+    result = _run_process_guard_program(program, environment)
+    assert result.returncode == 2 and result.stdout == expected
+
+
+@pytest.mark.serial
+def test_process_guard_rejects_unreadable_pid_and_kills_skip_evidence_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """T4/M11: changing unreadable evidence to a skipped PID makes the proof RED."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    _write_fake_process(proc, 200, 1, b"unrelated\0", b"unrelated\n")
+    original = INSTALLER.read_text()
+    restricted = _process_guard_program(original).replace(
+        "ROOT, supplied_self = sys.argv[1], sys.argv[2]\n",
+        """ROOT, supplied_self = sys.argv[1], sys.argv[2]
+real_open = os.open
+def guarded_open(path, flags):
+    if path.endswith("/200/cmdline"):
+        raise OSError(errno.EACCES, "restricted")
+    return real_open(path, flags)
+os.open = guarded_open
+""",
+        1,
+    )
+    rejected = _run_process_guard_program(restricted, environment)
+    assert rejected.returncode == 2 and rejected.stdout == "unavailable restricted\n"
+
+    scan_start = restricted.index("def scan_once(excluded):")
+    mutant = restricted[:scan_start] + restricted[scan_start:].replace(
+        '        except ProbeError as exc:\n            if exc.reason == "vanished":\n                return None\n            raise\n',
+        '        except ProbeError as exc:\n            if exc.reason == "vanished":\n                return None\n            continue\n',
+        1,
+    )
+    assert mutant != restricted
+    admitted = _run_process_guard_program(mutant, environment)
+    assert admitted.returncode == 0 and admitted.stdout == "clear\n", admitted.stderr
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+def test_process_guard_rejects_excessive_pid_inventory_before_opening_members(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T4: a process-table resource bound rejects an oversized fake inventory."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    for pid in range(1000, 9191):
+        (proc / str(pid)).mkdir()
+    result = _run_process_guard(environment, tmp_path)
+    assert result.returncode == 0 and result.stdout.startswith(
+        "blocked:cannot confirm that no RoastPilot-related process is running"
+    )
+
+
+@pytest.mark.serial
+def test_process_guard_b1_and_b2_block_without_protected_mutation_and_clean_stage(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T2: apt and replacement uninstall remain unreachable; B2 removes its staged venv."""
+    _, environment, log, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    _write_fake_process(proc, 200, 1, b"roastpilot-agent\0", b"agent\n")
+    first = _run(environment, "--set-hostname", "roastpilot")
+    assert first.returncode != 0 and "possible RoastPilot-related process" in first.stderr
+    first_events = log.read_text().splitlines()
+    assert not any(event.startswith("apt-get ") for event in first_events)
+    assert not _has_roastpilot_agent_lifecycle_mutation(first_events)
+
+    log.write_text("")
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
+    replacement = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; validate_install_root; INVOKING_HOME="$2"; trap \'printf "APPLICATION_CHANGED=%s\\n" "${APPLICATION_CHANGED:-unset}"\' EXIT; replace_application_safely "roastpilot-agent[pi]==1.2" "roastpilot-agent[pi]==2.0"',
+            "replacement-guard",
+            str(sourceable),
+            environment["FAKE_OPERATOR_HOME"],
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    events = log.read_text().splitlines()
+    assert replacement.returncode != 0
+    assert "possible RoastPilot-related process" in replacement.stderr
+    assert "roastpilot-agent is not safely inactive" not in replacement.stderr
+    assert "staged replacement lacks required Pi/MCP capability" not in replacement.stderr
+    assert (
+        "application/configuration skew may require manual reconciliation" not in replacement.stderr
+    )
+    assert "APPLICATION_CHANGED=unset" in replacement.stdout
+    assert any("<--suffix>" in event and event.startswith("pipx <install>") for event in events)
+    assert any(
+        event.startswith("pipx <uninstall>") and "-roastpilot-stage-" in event for event in events
+    )
+    assert not any(event == "pipx <uninstall> <--> <roastpilot-agent>" for event in events)
+
+
+@pytest.mark.serial
+def test_process_guard_b3_and_b4_precede_configuration_snapshot_and_service_start(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T2: later boundaries refuse before their protected promotion or explicit start."""
+    _, environment, log, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    _write_fake_process(proc, 200, 1, b"coffee-roaster-mcp\0", b"mcp\n")
+    log.write_text("")
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
+    b3 = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; validate_install_root; require_agent_inactive(){ :; }; snapshot_live_configuration(){ printf SNAPSHOT; }; install_rendered_files',
+            "configuration-guard",
+            str(sourceable),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert b3.returncode != 0 and "possible RoastPilot-related process" in b3.stderr
+    assert "SNAPSHOT" not in b3.stdout + b3.stderr
+    b3_events = log.read_text().splitlines()
+    assert not any(event.startswith(("chown ", "chmod ", "mkdir ", "mv ")) for event in b3_events)
+
+    original = INSTALLER.read_text()
+    moved_guard = original.replace(
+        "    require_agent_inactive\n    require_no_live_agent_process\n    # Pin all mutable renderer output once, before any privileged destination\n",
+        "    require_agent_inactive\n    # Pin all mutable renderer output once, before any privileged destination\n",
+        1,
+    ).replace(
+        '    prepare_destination_parents "$env_file" "$yaml_file" "$unit_file" "$prior_file" "$model_dir"\n',
+        '    prepare_destination_parents "$env_file" "$yaml_file" "$unit_file" "$prior_file" "$model_dir"\n    require_no_live_agent_process\n',
+        1,
+    )
+    assert not _has_roastpilot_agent_lifecycle_mutation(b3_events)
+    assert moved_guard != original
+    mutation_source = tmp_path / "moved-b3-guard.sh"
+    mutation_source.write_text(moved_guard.rsplit('main "$@"', 1)[0])
+    log.write_text("")
+    moved = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; validate_install_root; require_agent_inactive(){ :; }; capture_staged_file(){ printf staged; }; validate_rendered_env(){ :; }; validate_rendered_yaml(){ :; }; validate_rendered_unit(){ :; }; validate_model_stage_file(){ :; }; normalise_unit_env_contract(){ printf "%s" "$1"; }; build_final_env(){ printf final; }; prepare_destination_parents(){ run_privileged mkdir -p -- "$1"; }; run_privileged(){ printf "mkdir <%s>\\n" "$*" >> "$FAKE_LOG"; }; STAGE_DIR=/stage; install_rendered_files',
+            "moved-b3-guard",
+            str(mutation_source),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert moved.returncode != 0 and "possible RoastPilot-related process" in moved.stderr
+    assert any(event.startswith("mkdir <mkdir -p") for event in log.read_text().splitlines())
+    assert INSTALLER.read_text() == original
+
+    b4 = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; validate_install_root; verify_no_service_dropins(){ :; }; require_agent_inactive(){ :; }; run_privileged(){ printf " <%s>" "$*"; }; START_SERVICE=1; enable_services',
+            "start-guard",
+            str(sourceable),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert b4.returncode != 0 and "possible RoastPilot-related process" in b4.stderr
+    assert "start roastpilot-agent" not in b4.stdout + b4.stderr
+
+
+@pytest.mark.serial
+def test_process_guard_seams_reject_production_and_malformed_test_inputs_before_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T6: fake procfs routing is unavailable outside the explicit canonical test seam."""
+    _, environment, log, _ = installer_harness
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
+    production = environment.copy()
+    production.pop("ROASTPILOT_INSTALL_TEST_MODE")
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; validate_install_root', "guard", str(sourceable)],
+        env=production,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert (
+        result.returncode != 0 and "test destination is unavailable in production" in result.stderr
+    )
+    bad = _run(
+        environment
+        | {
+            "ROASTPILOT_INSTALL_TEST_PROC_ROOT": "relative",
+            "ROASTPILOT_INSTALL_TEST_PROBE_PID": "0",
+        },
+        "--set-hostname",
+        "roastpilot",
+    )
+    assert bad.returncode != 0 and not log.exists()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("probe_pid", ["0", "01", "abc", "10000000000"])
+def test_process_guard_test_seam_rejects_malformed_probe_pid_after_valid_proc_root(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    probe_pid: str,
+) -> None:
+    """The fake-proc PID regex is reached only after a valid canonical fake root."""
+    _, environment, log, _ = installer_harness
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
+    log.write_text("")
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; validate_install_root', "probe-pid", str(sourceable)],
+        env=environment | {"ROASTPILOT_INSTALL_TEST_PROBE_PID": probe_pid},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0 and "test process probe PID is unsafe" in result.stderr
+    assert log.read_text() == ""
+
+
+@pytest.mark.serial
+def test_process_guard_production_rejects_only_proc_seams_and_kills_new_clause_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """Production rejects proc seams even when every older test-only variable is absent."""
+    _, environment, log, _ = installer_harness
+    original = INSTALLER.read_text()
+    production = environment.copy()
+    for key in (
+        "ROASTPILOT_INSTALL_TEST_MODE",
+        "ROASTPILOT_INSTALL_TEST_ROOT",
+        "ROASTPILOT_INSTALL_ROOT",
+        "ROASTPILOT_INSTALL_TEST_COMMAND_DIR",
+    ):
+        production.pop(key, None)
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(original.rsplit('main "$@"', 1)[0])
+    log.write_text("")
+    rejected = subprocess.run(
+        ["bash", "-c", 'source "$1"; validate_install_root', "production-proc", str(sourceable)],
+        env=production,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert (
+        rejected.returncode != 0
+        and "test destination is unavailable in production" in rejected.stderr
+    )
+    assert log.read_text() == ""
+
+    clause = ' && -z "$proc_root" && -z "$probe_pid"'
+    assert original.count(clause) == 1
+    mutant = original.replace(clause, "", 1)
+    sourceable.write_text(mutant.rsplit('main "$@"', 1)[0])
+    admitted = subprocess.run(
+        ["bash", "-c", 'source "$1"; validate_install_root', "production-proc", str(sourceable)],
+        env=production,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert admitted.returncode == 0
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("parent", ["01", "10000000000"])
+def test_process_guard_rejects_noncanonical_or_overcap_parent_and_kills_parent_mutant(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], parent: str
+) -> None:
+    """Parent fields must be canonical PIDs within the shared ten-digit bound."""
+    _, environment, _, _ = installer_harness
+    proc = Path(environment["ROASTPILOT_INSTALL_TEST_PROC_ROOT"])
+    proc.joinpath("100/stat").write_text(f"100 (fake) S {parent} 0 0 0\n")
+    original = INSTALLER.read_text()
+    rejected = _run_process_guard_program(_process_guard_program(original), environment)
+    assert rejected.returncode == 2 and rejected.stdout == "unavailable malformed\n"
+
+    target = (
+        '        if parent != "0" and (parent != str(int(parent)) or int(parent) > 9999999999):\n'
+    )
+    assert _process_guard_program(original).count(target) == 1
+    mutant = _process_guard_program(original).replace(target, "        if False:\n", 1)
+    red = _run_process_guard_program(mutant, environment)
+    assert red.returncode == 2 and red.stdout != "unavailable malformed\n"
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+def test_process_guard_production_uses_its_own_python_pid_not_shell_pid() -> None:
+    """T6: production excludes the Python probe itself, while tests retain a fake PID."""
+    source = INSTALLER.read_text()
+    assert 'probe_pid="self"' in source
+    assert 'SELF = str(os.getpid()) if supplied_self == "self" else supplied_self' in source
+    assert "ROOT, supplied_self = sys.argv[1], sys.argv[2]" in source
+
+
+@pytest.mark.serial
+def test_process_guard_protocol_parser_rejects_noncanonical_or_ambiguous_output(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """T5: only a sorted, bounded PID protocol can carry a possible result."""
+    _, environment, _, _ = installer_harness
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
+
+    def run_parser(output: str) -> subprocess.CompletedProcess[str]:
+        """Run the closed parser command without dynamic command composition."""
+        return subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; validate_install_root; valid_possible_process_output "$2"',
+                "protocol-guard",
+                str(sourceable),
+                output,
+            ],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    valid = "possible " + " ".join(str(pid) for pid in range(1, 17)) + " +2 more"
+    assert run_parser(valid).returncode == 0
+    for invalid in (
+        "",
+        "clear",
+        "possible 12\\n13",
+        "possible 12 12",
+        "possible 13 12",
+        "possible 012",
+        "possible 12 +0 more",
+        "possible 12 +2 more trailing",
+        "possible " + " ".join(str(pid) for pid in range(1, 18)),
+        "unavailable restricted",
+    ):
+        assert run_parser(invalid).returncode != 0
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("safe_increment", "bare_increment"),
+    [
+        ("((pid_count += 1))", "((pid_count++))"),
+        ("((index += 1))", "((index++))"),
+    ],
+)
+def test_process_guard_parser_completes_valid_protocol_under_errexit_and_kills_increment_mutants(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    safe_increment: str,
+    bare_increment: str,
+) -> None:
+    """T5: valid PID parsing reaches completion under modern Bash errexit semantics."""
+    _, environment, _, _ = installer_harness
+    original = INSTALLER.read_text()
+    valid = "possible " + " ".join(str(pid) for pid in range(1, 17)) + " +2 more"
+
+    def run_parser(source: str) -> subprocess.CompletedProcess[str]:
+        """Source one test-only installer copy and require parser completion."""
+        sourceable = tmp_path / "installer-functions.sh"
+        sourceable.write_text(source.rsplit('main "$@"', 1)[0])
+        return subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; set -e; validate_install_root; valid_possible_process_output "$2"; printf COMPLETE',
+                "protocol-errexit",
+                str(sourceable),
+                valid,
+            ],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    completed = run_parser(original)
+    assert completed.returncode == 0 and completed.stdout == "COMPLETE", completed.stderr
+
+    def assert_errexit_safe(source: str) -> None:
+        """Reject bare post-increments before Bash 4.1+ can abort parsing."""
+        parser = source[
+            source.index("valid_possible_process_output()") : source.index(
+                "require_no_live_agent_process()"
+            )
+        ]
+        assert "((pid_count++))" not in parser
+        assert "((index++))" not in parser
+
+    assert_errexit_safe(original)
+    mutant = original.replace(safe_increment, bare_increment)
+    assert mutant != original
+    with pytest.raises(AssertionError):
+        assert_errexit_safe(mutant)
+    assert INSTALLER.read_text() == original
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    ("probe_status", "probe_output"),
+    [
+        (0, "clear extra"),
+        (0, "possible 12 12"),
+        (2, "unavailable incomplete"),
+        (2, "clear"),
+        (3, "clear"),
+    ],
+)
+def test_process_guard_rejects_status_and_output_mismatches(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    probe_status: int,
+    probe_output: str,
+) -> None:
+    """T5: the shell rejects a forged or mismatched probe status/output pair."""
+    _, environment, _, _ = installer_harness
+    sourceable = tmp_path / "installer-functions.sh"
+    sourceable.write_text(INSTALLER.read_text().rsplit('main "$@"', 1)[0])
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; validate_install_root; python3(){ printf "%s" "$PY_OUTPUT"; return "$PY_STATUS"; }; check_no_live_agent_process',
+            "protocol-status",
+            str(sourceable),
+        ],
+        env=environment | {"PY_STATUS": str(probe_status), "PY_OUTPUT": probe_output},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+
+
+def test_process_guard_structure_has_closed_protocol_and_four_boundaries() -> None:
+    """T7: source structure retains the unprivileged, bounded four-boundary guard."""
+    source = INSTALLER.read_text()
+    assert "python3 -I -c" in source and "signal.alarm(10)" in source
+    main = source[source.index("def main():") : source.index("try:\n    raise SystemExit(main())")]
+    assert (
+        main.index("signal.signal(signal.SIGALRM, signal.SIG_DFL)")
+        < main.index("signal.alarm(10)")
+        < main.index("os.path.isdir(ROOT)")
+    )
+    assert "\n        2)\n" not in source
+    assert "errno.ENOENT, errno.ESRCH" in source
+    assert "for _ in range(3):" in source and 'if exc.reason == "vanished":' in source
+    assert 'if valid_possible_process_output "$output"; then' in source
+    assert "check_mountinfo()\n    for required" in source
+    assert 'for required in ("stat", "cmdline", "comm"):' in source
+    assert 'probe_pid="self"' in source
+    assert ' -z "$proc_root" && -z "$probe_pid"' in source
+    assert 'print("possible " + " ".join(shown) + suffix)' in source
+    for bounded_component in (
+        "DEADLINE = time.monotonic() + 9.0",
+        "for _ in range(64):",
+        "if len(pids) > 8192:",
+        "1048576",
+        "stat.S_ISREG(mode)",
+        'getattr(os, "O_NOFOLLOW", 0)',
+    ):
+        assert bounded_component in source
+    assert (
+        "run_privileged"
+        not in source[
+            source.index("check_no_live_agent_process()") : source.index("remove_root_temporary()")
+        ]
+    )
+    assert "pkill" not in source and "killall" not in source
+    for token in (
+        "roastpilot-agent",
+        "roastpilot_agent",
+        "coffee-roaster-mcp",
+        "coffee_roaster_mcp",
+        "roastpilot-agen",
+        "coffee-roaster-",
+    ):
+        assert token in source
+    direct_b2 = source[
+        source.index("replace_application_safely()") : source.index("install_application()")
+    ]
+    assert direct_b2.count("check_no_live_agent_process") == 1
+    assert direct_b2.index("if ! check_no_live_agent_process") < direct_b2.index(
+        "pipx_command uninstall -- roastpilot-agent"
+    )
+    wrapped_boundaries = (
+        ("main() {", "apt-get install"),
+        ("install_rendered_files() {", "snapshot_live_configuration"),
+        ("enable_services() {", "systemctl start roastpilot-agent"),
+    )
+    for function, protected_effect in wrapped_boundaries:
+        start = source.index(function)
+        boundary = source[start : source.index(protected_effect, start)]
+        assert boundary.count("require_no_live_agent_process") == 1
+    assert source.index(
+        "verify_existing_pi_capability_before_package_install\n    require_no_live_agent_process"
+    ) < source.index("apt-get install")
+    rendered = source[
+        source.index("install_rendered_files()") : source.index("ensure_agent_inactive()")
+    ]
+    assert rendered.index("require_no_live_agent_process") < rendered.index(
+        "snapshot_live_configuration"
+    )
+    services = source[source.index("enable_services()") : source.index("summary()")]
+    assert services.index("require_no_live_agent_process") < services.index(
+        "systemctl start roastpilot-agent"
+    )
