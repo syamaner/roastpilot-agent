@@ -6,6 +6,7 @@ source and validated here against the 7 Jun 2026 live-roast exports.
 """
 
 import asyncio
+import importlib.util
 import json
 import logging
 import math
@@ -2159,6 +2160,27 @@ def test_captured_sessions_are_normal_roasts_and_unknown_purpose_is_rejected() -
     invalid = dict(SESSION_STATE_PAYLOAD, session_purpose="unknown")
     with pytest.raises(ValidationError):
         RoastSessionState.model_validate(invalid)
+
+
+@pytest.mark.asyncio
+async def test_capture_script_behaviourally_captures_only_the_fourteen_tools(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The real mock capture includes metadata before normal and cold sessions."""
+    path = Path(__file__).parents[1] / "scripts" / "capture_mcp_fixtures.py"
+    spec = importlib.util.spec_from_file_location("capture_mcp_fixtures_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    setattr(module, "OUT_DIR", tmp_path)
+    await module.capture(resolve_mcp_command(DEFAULT_MCP_COMMAND))
+
+    captured = {item.stem for item in tmp_path.glob("*.json")}
+    assert captured == set(FIXTURE_MIRRORS)
+    lines = capsys.readouterr().out.splitlines()
+    assert next(i for i, line in enumerate(lines) if "set_recording_metadata" in line) < next(
+        i for i, line in enumerate(lines) if "start_roast_session" in line
+    )
 
 
 @pytest.mark.parametrize("tool", sorted(FIXTURE_MIRRORS))
