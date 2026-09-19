@@ -716,8 +716,11 @@ async def test_real_child_process_round_trip() -> None:
 
 
 @pytest.mark.asyncio
-async def test_real_child_process_confirms_cold_session_purpose() -> None:
+async def test_real_child_process_confirms_cold_session_purpose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The pinned mock MCP confirms cold purpose before beans-added activation."""
+    monkeypatch.chdir(tmp_path)
     process = MCPServerProcess()
     await process.start()
     try:
@@ -2139,13 +2142,23 @@ def test_every_tool_has_a_captured_fixture() -> None:
     assert captured == set(FIXTURE_MIRRORS)
 
 
-def test_capture_script_saves_recording_metadata_before_starting_session() -> None:
-    """Keep the 14th fixture in the real-server capture sequence."""
-    capture_script = Path(__file__).parents[1] / "scripts" / "capture_mcp_fixtures.py"
-    source = capture_script.read_text(encoding="utf-8")
+def test_captured_server_info_pins_021_bootstrap_inventory() -> None:
+    """The fixture records published 0.2.1's 14-tool plus finalisation inventory."""
+    payload = json.loads((TOOL_RESULT_FIXTURES / "get_server_info.json").read_text())
+    assert payload["version"] == "0.2.1"
+    tools = set(payload["available_bootstrap_tools"])
+    assert tools == set(FIXTURE_MIRRORS) | {"finalise_cold_characterisation_session"}
 
-    assert '"set_recording_metadata"' in source
-    assert source.index('"set_recording_metadata"') < source.index('"start_roast_session"')
+
+def test_captured_sessions_are_normal_roasts_and_unknown_purpose_is_rejected() -> None:
+    """The additive default remains closed to unknown session purposes."""
+    for name in ("start_roast_session", "get_roast_state"):
+        payload = json.loads((TOOL_RESULT_FIXTURES / f"{name}.json").read_text())
+        state = payload["session"] if name == "start_roast_session" else payload
+        assert state["session_purpose"] == "roast"
+    invalid = dict(SESSION_STATE_PAYLOAD, session_purpose="unknown")
+    with pytest.raises(ValidationError):
+        RoastSessionState.model_validate(invalid)
 
 
 @pytest.mark.parametrize("tool", sorted(FIXTURE_MIRRORS))
