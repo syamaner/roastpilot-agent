@@ -104,6 +104,7 @@ async def capture(command: str) -> None:
                 if session_mapping.get("session_purpose") != "cold_characterisation":
                     raise ValueError("cold start did not confirm cold_characterisation purpose")
                 await cold_process.call_tool("mark_beans_added", {})
+                print("confirmed cold_characterisation start and beans-added")
             finally:
                 await cold_process.stop()
         finally:
