@@ -14,13 +14,10 @@ The relative file paths below are also exactly the paths
 ``coffee-roaster-mcp``'s ``first_crack.local_model_dir`` resolution expects
 (`coffee_roaster_mcp.artifacts.INT8_ONNX_MODEL_FILENAME` /
 ``INT8_FEATURE_EXTRACTOR_FILENAME``: it joins ``local_model_dir`` with the
-artifact's repository-relative POSIX path unchanged). This repo's dev
-dependency group is deliberately pinned to ``coffee-roaster-mcp==0.1.13``,
-never the ``[pi]`` extra's ``0.2.0`` (`pyproject.toml:136-139`), so this was
-confirmed both against the installed ``0.1.13`` package and by a byte-for-byte
-comparison of ``0.2.0``'s downloaded wheel `artifacts.py` (identical to
-``0.1.13``'s — see `model_install.py`'s module docstring). Placement under
-these same relative paths is therefore sufficient to satisfy the MCP server's
+artifact's repository-relative POSIX path unchanged). Both development and
+appliance dependencies are pinned to the published
+``coffee-roaster-mcp==0.2.1`` release (`pyproject.toml`). Placement under these
+same relative paths is therefore sufficient to satisfy the MCP server's
 local-directory layout — no MCP-side change is required.
 """
 

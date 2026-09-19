@@ -52,18 +52,13 @@ the trust model:
 (``onnx/int8/model_quantized.onnx`` / ``onnx/int8/preprocessor_config.json``)
 are exactly the repository-relative paths ``coffee-roaster-mcp``'s
 ``first_crack.local_model_dir`` resolution joins onto that directory
-unchanged. This repository's dev dependency group deliberately stays pinned
-to ``coffee-roaster-mcp==0.1.13`` (never installed alongside the ``[pi]``
-extra's ``0.2.0`` pin — `pyproject.toml:136-139`), so this was verified two
-ways rather than by importing an installed ``0.2.0``: (1) the installed
-``0.1.13`` package's ``artifacts._resolve_local_artifact`` /
+unchanged. Both development and appliance dependencies are pinned to the
+published ``coffee-roaster-mcp==0.2.1`` release (`pyproject.toml`), whose
+``artifacts._resolve_local_artifact`` /
 ``INT8_ONNX_MODEL_FILENAME`` / ``INT8_FEATURE_EXTRACTOR_FILENAME`` join
-``local_model_dir`` onto exactly these relative paths, and (2) a byte-for-byte
-comparison of the downloaded ``coffee_roaster_mcp-0.2.0`` wheel's
-``artifacts.py`` against the installed ``0.1.13`` copy showed the module is
-unchanged between the two releases. Placing files under those same relative
-paths beneath the configured ``local_model_dir`` therefore already satisfies
-the MCP server's expected root layout with no MCP-side change.
+``local_model_dir`` onto exactly these relative paths. Placing files under
+those same relative paths beneath the configured ``local_model_dir`` therefore
+satisfies the MCP server's expected root layout with no MCP-side change.
 """
 
 from __future__ import annotations

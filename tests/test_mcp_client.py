@@ -2139,6 +2139,15 @@ def test_every_tool_has_a_captured_fixture() -> None:
     assert captured == set(FIXTURE_MIRRORS)
 
 
+def test_capture_script_saves_recording_metadata_before_starting_session() -> None:
+    """Keep the 14th fixture in the real-server capture sequence."""
+    capture_script = Path(__file__).parents[1] / "scripts" / "capture_mcp_fixtures.py"
+    source = capture_script.read_text(encoding="utf-8")
+
+    assert '"set_recording_metadata"' in source
+    assert source.index('"set_recording_metadata"') < source.index('"start_roast_session"')
+
+
 @pytest.mark.parametrize("tool", sorted(FIXTURE_MIRRORS))
 def test_captured_fixture_validates_into_mirror(tool: str) -> None:
     payload = json.loads((TOOL_RESULT_FIXTURES / f"{tool}.json").read_text())

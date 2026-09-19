@@ -47,7 +47,7 @@ audio:
   overlap: 0.3               # 7 s hop (Pi profile) — do NOT use the Mac/library-default profile's 0.7
   hop_seconds: null
 
-# `recording` is intentionally OMITTED: coffee-roaster-mcp==0.2.0's
+# `recording` is intentionally OMITTED: coffee-roaster-mcp==0.2.1's
 # RecordingConfig.enabled defaults to false, so an appliance install never
 # silently starts capturing audio. Add a `recording:` block by hand only if
 # you want it.

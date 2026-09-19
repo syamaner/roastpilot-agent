@@ -52,6 +52,12 @@ async def capture(command: str) -> None:
                 save("get_server_info", await process.call_tool("get_server_info", {}))
                 save("get_runtime_config", await process.call_tool("get_runtime_config", {}))
                 # Full normal mock roast, in command order.
+                save(
+                    "set_recording_metadata",
+                    await process.call_tool(
+                        "set_recording_metadata", {"origin": "colombia-huila", "roast_num": 5}
+                    ),
+                )
                 save("start_roast_session", await process.call_tool("start_roast_session", {}))
                 save("set_heat", await process.call_tool("set_heat", {"heat_level_percent": 70}))
                 save("set_fan", await process.call_tool("set_fan", {"fan_level_percent": 40}))
