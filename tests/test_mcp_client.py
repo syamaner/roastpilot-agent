@@ -2172,7 +2172,7 @@ async def test_capture_script_behaviourally_captures_only_the_fourteen_tools(
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    setattr(module, "OUT_DIR", tmp_path)
+    vars(module)["OUT_DIR"] = tmp_path
     await module.capture(resolve_mcp_command(DEFAULT_MCP_COMMAND))
 
     captured = {item.stem for item in tmp_path.glob("*.json")}
