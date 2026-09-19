@@ -22,7 +22,7 @@
     "cooling_started_monotonic_seconds": null,
     "cooling_stopped_at_utc": null,
     "cooling_stopped_monotonic_seconds": null,
-    "created_at_utc": "2026-09-19T15:50:52.210304+00:00",
+    "created_at_utc": "2026-09-19T22:18:59.461139+00:00",
     "development_percent": null,
     "development_time_seconds": null,
     "device_state": null,
@@ -58,10 +58,10 @@
       "total_overflow_count": 0
     },
     "heat_level_percent": 0,
-    "log_dir": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpe7q1q6q1/logs/roasts/af8a44a351d34d1bb19f5b6ccf298cb0",
+    "log_dir": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmp7unbr62q/logs/roasts/252f342044874d24adb03194a670a2b6",
     "phase": "pre_roast",
     "roast_elapsed_seconds": null,
-    "session_id": "af8a44a351d34d1bb19f5b6ccf298cb0",
+    "session_id": "252f342044874d24adb03194a670a2b6",
     "session_purpose": "roast",
     "stopped_at_utc": null,
     "t0_status": {

@@ -1,15 +1,15 @@
 {
   "event": {
     "kind": "beans_dropped",
-    "monotonic_seconds": 0.09217024999998102,
+    "monotonic_seconds": 0.09925058299995726,
     "payload": {
       "cooling_on": true,
       "fan_level_percent": 100,
       "heat_level_percent": 0
     },
-    "recorded_at_utc": "2026-09-19T15:50:52.302476+00:00"
+    "recorded_at_utc": "2026-09-19T22:18:59.560394+00:00"
   },
   "event_count": 4,
   "phase": "cooling",
-  "session_id": "af8a44a351d34d1bb19f5b6ccf298cb0"
+  "session_id": "252f342044874d24adb03194a670a2b6"
 }

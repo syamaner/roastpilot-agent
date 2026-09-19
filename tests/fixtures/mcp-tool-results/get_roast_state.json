@@ -12,8 +12,8 @@
   },
   "bean_ror_c_per_min": null,
   "bean_temp_delta_60s_c": null,
-  "beans_added_at_utc": "2026-09-19T15:50:52.254865+00:00",
-  "beans_added_monotonic_seconds": 0.044561209000221425,
+  "beans_added_at_utc": "2026-09-19T22:18:59.508051+00:00",
+  "beans_added_monotonic_seconds": 0.04691137500049081,
   "beans_dropped_at_utc": null,
   "beans_dropped_monotonic_seconds": null,
   "cooling_on": false,
@@ -21,7 +21,7 @@
   "cooling_started_monotonic_seconds": null,
   "cooling_stopped_at_utc": null,
   "cooling_stopped_monotonic_seconds": null,
-  "created_at_utc": "2026-09-19T15:50:52.210304+00:00",
+  "created_at_utc": "2026-09-19T22:18:59.461139+00:00",
   "development_percent": null,
   "development_time_seconds": null,
   "device_state": {
@@ -38,15 +38,15 @@
       "telemetry_model": "fixed_step_thermal_v1"
     }
   },
-  "elapsed_monotonic_seconds": 0.05,
+  "elapsed_monotonic_seconds": 0.052,
   "env_ror_c_per_min": null,
   "env_temp_delta_60s_c": null,
   "events": [
     {
       "kind": "beans_added",
-      "monotonic_seconds": 0.044561209000221425,
+      "monotonic_seconds": 0.04691137500049081,
       "payload": {},
-      "recorded_at_utc": "2026-09-19T15:50:52.254865+00:00"
+      "recorded_at_utc": "2026-09-19T22:18:59.508051+00:00"
     }
   ],
   "fan_level_percent": 40,
@@ -77,10 +77,10 @@
     "total_overflow_count": 0
   },
   "heat_level_percent": 70,
-  "log_dir": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpe7q1q6q1/logs/roasts/af8a44a351d34d1bb19f5b6ccf298cb0",
+  "log_dir": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmp7unbr62q/logs/roasts/252f342044874d24adb03194a670a2b6",
   "phase": "roasting",
   "roast_elapsed_seconds": 0.005,
-  "session_id": "af8a44a351d34d1bb19f5b6ccf298cb0",
+  "session_id": "252f342044874d24adb03194a670a2b6",
   "session_purpose": "roast",
   "stopped_at_utc": null,
   "t0_status": {

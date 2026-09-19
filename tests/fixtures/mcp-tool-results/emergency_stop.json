@@ -1,7 +1,7 @@
 {
   "event": {
     "kind": "fault",
-    "monotonic_seconds": 0.03901570800007903,
+    "monotonic_seconds": 0.043663458000082755,
     "payload": {
       "cooling_on": true,
       "driver": "mock",
@@ -11,9 +11,9 @@
       "heat_level_percent": 0,
       "reason": "fixture capture"
     },
-    "recorded_at_utc": "2026-09-19T15:50:52.357879+00:00"
+    "recorded_at_utc": "2026-09-19T22:18:59.627909+00:00"
   },
   "event_count": 1,
   "phase": "fault",
-  "session_id": "204abb67ed1b4ffcae7f23a1f3d09349"
+  "session_id": "b345b3830fb2463ab18eea972cdbc1d6"
 }
