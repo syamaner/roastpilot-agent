@@ -599,7 +599,11 @@ esac
     environment = {
         key: value
         for key, value in os.environ.items()
-        if key != "OPENROUTER_API_KEY" and not key.startswith("ROASTPILOT_")
+        if (
+            key != "OPENROUTER_API_KEY"
+            and not key.startswith("FAKE_")
+            and not key.startswith("ROASTPILOT_")
+        )
     } | {
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
         "FAKE_LOG": str(log),
@@ -635,6 +639,21 @@ esac
         "USER": "operator",
     }
     return fake_bin, environment, log, hostname
+
+
+@pytest.mark.serial
+def test_installer_harness_drops_ambient_fake_command_configuration(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    """Keep process-level fake-command controls out of installer subprocesses."""
+    monkeypatch.setenv("FAKE_HOSTNAME_QUERY_FAIL", "1")
+    _, environment, log, _ = request.getfixturevalue("installer_harness")
+
+    assert "FAKE_HOSTNAME_QUERY_FAIL" not in environment
+    result = _run(environment, "--set-hostname", "roastpilot")
+
+    assert result.returncode == 0, result.stderr
+    assert "FAKE_HOSTNAME_QUERY_FAILURE" not in log.read_text().splitlines()
 
 
 def _run(
