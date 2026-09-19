@@ -621,7 +621,7 @@ verify_pi_capability() {
             "Version: "*) ((version_seen++ == 0)) || return 1; version="${line#Version: }" ;;
         esac
     done <<< "$metadata"
-    [[ "$version_seen" == 1 && "$version" == "0.2.0" ]]
+    [[ "$version_seen" == 1 && "$version" == "0.2.1" ]]
 }
 
 require_pi_capability() {

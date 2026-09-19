@@ -247,6 +247,7 @@ class RoastSessionState(MCPMirror):
     ambient_status: AmbientStatus
     events: tuple[EventSnapshot, ...]
     log_dir: str | None
+    session_purpose: Literal["roast", "cold_characterisation"] = "roast"
 
 
 class ServerInfo(MCPMirror):

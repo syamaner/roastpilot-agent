@@ -347,9 +347,8 @@ jobs:
             || { echo "SPA index.html not served from the packaged wheel"; exit 1; }
 
       - name: Install wheel[pi] into a second clean venv
-        # The dev group pins MCP 0.1.13 for mock-driver fixtures, while pi
-        # pins 0.2.0. Keep the two exact pins isolated rather than asking pip
-        # to resolve an intentionally impossible combined environment.
+        # #954 pins dev/mock-driver and pi to the same released MCP 0.2.1
+        # surface. This clean wheel smoke validates the appliance extra.
         run: |
           python -m venv /tmp/wheel-pi-smoke-venv
           /tmp/wheel-pi-smoke-venv/bin/python -m pip install --upgrade pip
@@ -359,11 +358,10 @@ jobs:
 
       - name: Assert wheel[pi] MCP pin and denylist
         run: |
-          /tmp/wheel-pi-smoke-venv/bin/python -c 'from importlib.metadata import distributions, version; import re; raw_names = [distribution.metadata.get("Name") for distribution in distributions()]; pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"); valid = all(isinstance(name, str) and pattern.fullmatch(name) for name in raw_names); names = sorted(re.sub(r"[-_.]+", "-", name).lower() for name in raw_names) if valid else []; print("\n".join(names)); denied = {"torch", "torchaudio", "transformers"}; raise SystemExit(0 if valid and version("coffee-roaster-mcp") == "0.2.0" and denied.isdisjoint(names) else 1)'
+          /tmp/wheel-pi-smoke-venv/bin/python -c 'from importlib.metadata import distributions, version; import re; raw_names = [distribution.metadata.get("Name") for distribution in distributions()]; pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"); valid = all(isinstance(name, str) and pattern.fullmatch(name) for name in raw_names); names = sorted(re.sub(r"[-_.]+", "-", name).lower() for name in raw_names) if valid else []; print("\n".join(names)); denied = {"torch", "torchaudio", "transformers"}; raise SystemExit(0 if valid and version("coffee-roaster-mcp") == "0.2.1" and denied.isdisjoint(names) else 1)'
 
   # E11-S1 (#137): a native arm64 package smoke exercises the appliance extra
-  # in a separate venv. The dev group intentionally pins MCP 0.1.13 for the
-  # mock-driver mirrors, while wheel[pi] pins torch-free MCP 0.2.0.
+  # in a separate venv. #954 aligns its MCP 0.2.1 pin with dev/mock-driver.
   package-arm64:
     name: Package ARM64 (wheel[pi] clean-venv smoke)
     runs-on: ubuntu-24.04-arm
@@ -403,7 +401,7 @@ jobs:
       - name: Assert arm64 MCP appliance dependencies
         run: |
           /tmp/wheel-pi-arm64-smoke-venv/bin/python -c 'import platform; actual = platform.machine(); print(actual); raise SystemExit(0 if actual == "aarch64" else 1)'
-          /tmp/wheel-pi-arm64-smoke-venv/bin/python -c 'from importlib.metadata import distributions, version; import re; raw_names = [distribution.metadata.get("Name") for distribution in distributions()]; pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"); valid = all(isinstance(name, str) and pattern.fullmatch(name) for name in raw_names); names = sorted(re.sub(r"[-_.]+", "-", name).lower() for name in raw_names) if valid else []; print("\n".join(names)); denied = {"torch", "torchaudio", "transformers"}; raise SystemExit(0 if valid and version("coffee-roaster-mcp") == "0.2.0" and denied.isdisjoint(names) else 1)'
+          /tmp/wheel-pi-arm64-smoke-venv/bin/python -c 'from importlib.metadata import distributions, version; import re; raw_names = [distribution.metadata.get("Name") for distribution in distributions()]; pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"); valid = all(isinstance(name, str) and pattern.fullmatch(name) for name in raw_names); names = sorted(re.sub(r"[-_.]+", "-", name).lower() for name in raw_names) if valid else []; print("\n".join(names)); denied = {"torch", "torchaudio", "transformers"}; raise SystemExit(0 if valid and version("coffee-roaster-mcp") == "0.2.1" and denied.isdisjoint(names) else 1)'
 
       - name: CLI smoke (clean wheel[pi] install)
         run: |

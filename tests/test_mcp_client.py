@@ -377,6 +377,7 @@ def test_session_state_mirror_round_trips() -> None:
     assert state.t0_status.status == "detected"
     assert state.first_crack_status.emitted_window_count == 311
     assert state.development_percent == 3.6  # passed through, not recomputed
+    assert state.session_purpose == "roast"
     # #342 (D85): the ambient triad mirrors the MCP's 0.1.12 wire shape byte-for-byte.
     assert state.ambient_status.mode == "yoctopuce"
     assert state.ambient_status.status == "ok"
@@ -709,6 +710,23 @@ async def test_real_child_process_round_trip() -> None:
         info = await client.get_server_info()
         assert info.package_name == "coffee-roaster-mcp"
         assert info.bootstrap_safe is True
+    finally:
+        await process.stop()
+    assert not process.running
+
+
+@pytest.mark.asyncio
+async def test_real_child_process_confirms_cold_session_purpose() -> None:
+    """The pinned mock MCP confirms cold purpose before beans-added activation."""
+    process = MCPServerProcess()
+    await process.start()
+    try:
+        started = StartRoastSessionResult.model_validate(
+            await process.call_tool("start_roast_session", {"purpose": "cold_characterisation"})
+        )
+        assert started.session.session_purpose == "cold_characterisation"
+        marked = EventCommandResult.model_validate(await process.call_tool("mark_beans_added", {}))
+        assert marked.session_id == started.session.session_id
     finally:
         await process.stop()
     assert not process.running

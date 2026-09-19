@@ -691,7 +691,7 @@ def test_package_arm64_isolated_pi_smoke_is_structurally_fail_closed() -> None:
     package_runs = [cast(str, step["run"]) for step in _steps(package) if "run" in step]
     assert any("/tmp/wheel-pi-smoke-venv" in run for run in package_runs)
     assert any('"${wheel_path}[pi]"' in run for run in package_runs)
-    assert any('version("coffee-roaster-mcp") == "0.2.0"' in run for run in package_runs)
+    assert any('version("coffee-roaster-mcp") == "0.2.1"' in run for run in package_runs)
     assert any('denied = {"torch", "torchaudio", "transformers"}' in run for run in package_runs)
     assert any('print("\\n".join(names))' in run for run in package_runs)
     assert any('distribution.metadata.get("Name")' in run for run in package_runs)
@@ -717,7 +717,7 @@ def test_package_arm64_isolated_pi_smoke_is_structurally_fail_closed() -> None:
     assert all("source-build" not in run for run in runs)
     assert any("import platform; actual = platform.machine()" in run for run in runs)
     assert any('actual == "aarch64"' in run for run in runs)
-    assert any('version("coffee-roaster-mcp") == "0.2.0"' in run for run in runs)
+    assert any('version("coffee-roaster-mcp") == "0.2.1"' in run for run in runs)
     assert any('denied = {"torch", "torchaudio", "transformers"}' in run for run in runs)
     assert any('print("\\n".join(names))' in run for run in runs)
     assert any('distribution.metadata.get("Name")' in run for run in runs)
