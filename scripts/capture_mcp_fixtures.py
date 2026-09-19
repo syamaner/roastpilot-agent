@@ -103,8 +103,18 @@ async def capture(command: str) -> None:
                 session_mapping = cast("dict[str, object]", session)
                 if session_mapping.get("session_purpose") != "cold_characterisation":
                     raise ValueError("cold start did not confirm cold_characterisation purpose")
-                await cold_process.call_tool("mark_beans_added", {})
-                print("confirmed cold_characterisation start and beans-added")
+                session_id = session_mapping.get("session_id")
+                if not isinstance(session_id, str) or not session_id:
+                    raise ValueError("cold start did not provide a session id")
+                marked = await cold_process.call_tool("mark_beans_added", {})
+                if not isinstance(marked, dict):
+                    raise TypeError("cold beans-added result must be a mapping")
+                marked_mapping = cast("dict[str, object]", marked)
+                if marked_mapping.get("session_id") != session_id:
+                    raise ValueError("cold beans-added did not confirm the started session")
+                if marked_mapping.get("phase") != "roasting":
+                    raise ValueError("cold beans-added did not enter roasting phase")
+                print("confirmed validated cold_characterisation start and beans-added")
             finally:
                 await cold_process.stop()
         finally:

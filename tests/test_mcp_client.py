@@ -2181,7 +2181,7 @@ async def test_capture_script_behaviourally_captures_only_the_fourteen_tools(
     assert next(i for i, line in enumerate(lines) if "set_recording_metadata" in line) < next(
         i for i, line in enumerate(lines) if "start_roast_session" in line
     )
-    assert "confirmed cold_characterisation start and beans-added" in lines
+    assert "confirmed validated cold_characterisation start and beans-added" in lines
 
 
 @pytest.mark.parametrize("tool", sorted(FIXTURE_MIRRORS))
