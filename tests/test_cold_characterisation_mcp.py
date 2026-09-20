@@ -943,23 +943,36 @@ async def test_claimed_clean_finalisation_rejects_terminal_ordering_and_phase(
 
 
 @pytest.mark.asyncio
-async def test_claimed_clean_finalisation_requires_telemetry_sampler_evidence() -> None:
-    """A completed telemetry stage cannot omit its required reader evidence."""
-    payload = _payload()
-    payload["sampler"] = None
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    ("field", "error"),
+    [
+        ("sampler", ColdFinalisationNotCleanError),
+        ("pre_finalisation_first_crack_status", ColdFinalisationNotCleanError),
+        ("first_crack_runtime", ColdFinalisationNotCleanError),
+        ("recording", ColdFinalisationNotCleanError),
+        ("final_driver_evidence", ColdFinalisationSafetyError),
+    ],
+)
+async def test_clean_finalisation_requires_every_optional_evidence_member(
+    streaming: bool, field: str, error: type[ColdMcpError]
+) -> None:
+    """G7b requires every retained cold finalisation evidence member in both branches."""
+    payload = _streaming_payload() if streaming else _payload()
+    payload[field] = None
     client, _ = _client_for(payload)
-    with pytest.raises(ColdFinalisationNotCleanError):
+    with pytest.raises(error):
         await client.finalise_session("session-id")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("audio_running", "accepted"), [(None, True), (False, True), (True, False)]
+    ("audio_running", "accepted"), [(None, False), (False, False), (True, False)]
 )
 async def test_not_applicable_first_crack_requires_inactive_audio(
     audio_running: bool | None, accepted: bool
 ) -> None:
-    """Not-applicable first-crack teardown cannot retain a running audio reader."""
+    """Not-applicable first-crack teardown requires retained runtime evidence."""
     payload = _payload()
     payload["first_crack_runtime"] = None
     if audio_running is None:

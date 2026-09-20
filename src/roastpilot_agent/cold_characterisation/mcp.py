@@ -395,57 +395,40 @@ def finalisation_is_clean(result: SessionFinalisationResult) -> bool:
         and result.session_phase_after in ("pre_roast", "roasting")
         and result.stages[0].status == "completed"
         and result.sampler is not None
+        and result.pre_finalisation_first_crack_status is not None
+        and result.first_crack_runtime is not None
+        and result.recording is not None
         and (
             (
                 result.stages[1].status == "completed"
-                and result.first_crack_runtime is not None
                 and result.first_crack_runtime.outcome == "stopped"
                 and result.first_crack_runtime.stop_error is None
                 and result.first_crack_runtime.final_status.audio_running is False
             )
             or (
                 result.stages[1].status == "not_applicable"
-                and (
-                    result.first_crack_runtime is None
-                    or (
-                        result.first_crack_runtime.outcome == "not_active"
-                        and result.first_crack_runtime.stop_error is None
-                        and result.first_crack_runtime.final_status.audio_running is False
-                    )
-                )
-                and (
-                    result.pre_finalisation_first_crack_status is None
-                    or result.pre_finalisation_first_crack_status.audio_running is False
-                )
+                and result.first_crack_runtime.outcome == "not_active"
+                and result.first_crack_runtime.stop_error is None
+                and result.first_crack_runtime.final_status.audio_running is False
+                and result.pre_finalisation_first_crack_status.audio_running is False
             )
         )
         and (
             (
                 result.stages[2].status == "completed"
-                and result.recording is not None
                 and result.recording.outcome == "finalised"
                 and result.recording.reason is None
             )
             or (
                 result.stages[2].status == "not_applicable"
-                and (
-                    result.recording is None
-                    or (
-                        result.recording.outcome == "not_configured"
-                        and result.recording.expected is False
-                    )
-                )
+                and result.recording.outcome == "not_configured"
+                and result.recording.expected is False
             )
         )
         and result.stages[3].status == "completed"
         and (result.sampler.thread_alive_after_join is False and result.sampler.last_error is None)
-        and (
-            result.first_crack_runtime is None
-            or (
-                result.first_crack_runtime.capture_running_after_stop is False
-                and result.first_crack_runtime.outcome in ("not_active", "stopped")
-            )
-        )
+        and result.first_crack_runtime.capture_running_after_stop is False
+        and result.first_crack_runtime.outcome in ("not_active", "stopped")
     )
 
 
