@@ -2284,6 +2284,7 @@ async def test_finalisation_only_capture_is_cold_only_and_preserves_normal_fixtu
         "missing_event",
         "non_mapping_event",
         "wrong_event_kind",
+        "blank_start",
     ],
 )
 async def test_finalisation_only_capture_rejects_bad_evidence_without_overwriting_fixture(
@@ -2370,7 +2371,7 @@ async def test_finalisation_only_capture_rejects_bad_evidence_without_overwritin
             if tool == "start_roast_session":
                 return {
                     "session": {
-                        "session_id": "cold-session",
+                        "session_id": "   " if failure == "blank_start" else "cold-session",
                         "session_purpose": "cold_characterisation",
                     }
                 }
@@ -2386,10 +2387,11 @@ async def test_finalisation_only_capture_rejects_bad_evidence_without_overwritin
         await module.capture("fake-mcp", finalisation_only=True)
 
     expected_calls: list[tuple[str, dict[str, object]]] = [
-        ("start_roast_session", {"purpose": "cold_characterisation"}),
-        ("mark_beans_added", {}),
+        ("start_roast_session", {"purpose": "cold_characterisation"})
     ]
-    if failure not in {"missing_event", "non_mapping_event", "wrong_event_kind"}:
+    if failure != "blank_start":
+        expected_calls.append(("mark_beans_added", {}))
+    if failure not in {"missing_event", "non_mapping_event", "wrong_event_kind", "blank_start"}:
         expected_calls.append((finalisation_tool, {"session_id": "cold-session"}))
     assert FakeProcess.instances[0].calls == expected_calls
     assert {name: (tmp_path / name).read_bytes() for name in fixture_bytes} == fixture_bytes

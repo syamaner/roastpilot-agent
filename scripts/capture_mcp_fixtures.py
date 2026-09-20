@@ -136,7 +136,7 @@ def _cold_capture_session_id(cold_start: object) -> str:
     if session_mapping.get("session_purpose") != "cold_characterisation":
         raise ValueError("cold start did not confirm cold_characterisation purpose")
     session_id = session_mapping.get("session_id")
-    if not isinstance(session_id, str) or not session_id:
+    if not isinstance(session_id, str) or not session_id.strip():
         raise ValueError("cold start did not provide a session id")
     return session_id
 
