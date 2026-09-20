@@ -1120,7 +1120,9 @@ async def test_client_maps_malformed_finalisation_to_typed_cold_error() -> None:
     )
 
 
-async def _assert_public_finalisation_validation_failure(payload: object, marker: str) -> None:
+async def _assert_public_finalisation_validation_failure(
+    payload: object, marker: str | None
+) -> None:
     """Assert the public JSON client contains one malformed finalisation payload."""
     client, _ = _client_for(payload)
     with pytest.raises(ColdMcpValidationError) as raised:
@@ -1128,9 +1130,12 @@ async def _assert_public_finalisation_validation_failure(payload: object, marker
     assert str(raised.value) == "MCP response failed cold contract validation"
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
-    assert marker not in str(raised.value)
-    assert marker not in repr(raised.value)
-    assert marker not in "".join(traceback.format_exception(raised.type, raised.value, raised.tb))
+    if marker is not None:
+        assert marker not in str(raised.value)
+        assert marker not in repr(raised.value)
+        assert marker not in "".join(
+            traceback.format_exception(raised.type, raised.value, raised.tb)
+        )
 
 
 @pytest.mark.asyncio
@@ -1163,10 +1168,25 @@ async def test_client_rejects_missing_or_non_list_immutable_json_containers(
         container = cast("dict[str, object]", payload["recording"])
     if missing:
         del container[container_field]
-        container["payload_marker"] = marker
     else:
         container[container_field] = marker
-    await _assert_public_finalisation_validation_failure(payload, marker)
+    await _assert_public_finalisation_validation_failure(payload, None if missing else marker)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("container_field", ["stages", "failures"])
+@pytest.mark.parametrize("missing", [False, True])
+async def test_client_rejects_missing_or_non_list_finalisation_containers(
+    container_field: str, missing: bool
+) -> None:
+    """The finalisation mirror requires JSON lists for both immutable root containers."""
+    marker = f"{container_field}-marker"
+    payload = _payload()
+    if missing:
+        del payload[container_field]
+    else:
+        payload[container_field] = marker
+    await _assert_public_finalisation_validation_failure(payload, None if missing else marker)
 
 
 @pytest.mark.asyncio
