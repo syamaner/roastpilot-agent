@@ -188,6 +188,20 @@ async def test_start_cold_session_requires_confirmed_purpose() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_cold_session_maps_malformed_response_without_leakage() -> None:
+    """Malformed cold-start responses stay inside the fixed validation boundary."""
+    client, caller = _client_for({"secret": "payload-marker"})
+    with pytest.raises(ColdMcpValidationError) as raised:
+        await client.start_cold_session()
+    assert caller.calls == [("start_roast_session", {"purpose": "cold_characterisation"})]
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "payload-marker" not in "".join(
+        traceback.format_exception(raised.type, raised.value, raised.tb)
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("method", "fixture"),
     [
@@ -593,6 +607,24 @@ async def test_rejected_finalisation_retains_evidence_before_purpose_check(reaso
 
 
 @pytest.mark.asyncio
+async def test_rejected_finalisation_for_another_session_is_not_attributed_to_cold_session() -> (
+    None
+):
+    """A rejected response must bind its session identifier before retaining evidence."""
+    payload = _payload()
+    payload["session_id"] = "other-session"
+    payload["status"] = "rejected"
+    payload["clean"] = False
+    payload["rejection_reason"] = "unknown_session"
+    payload["session_purpose"] = None
+    client, _ = _client_for(payload)
+    with pytest.raises(
+        ColdSessionIdentityError, match="MCP did not return the requested cold session"
+    ):
+        await client.finalise_session("session-id")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -639,6 +671,50 @@ async def test_claimed_clean_finalisation_rejects_inconsistent_stage_status(
     payload = _payload()
     stages = cast("list[dict[str, object]]", payload["stages"])
     stages[index]["status"] = status
+    client, _ = _client_for(payload)
+    with pytest.raises(ColdFinalisationNotCleanError):
+        await client.finalise_session("session-id")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("emergency_stop_ordering", "emergency_stop_after_disconnect_attempt"),
+        ("session_phase_after", "complete"),
+    ],
+)
+async def test_claimed_clean_finalisation_rejects_terminal_ordering_and_phase(
+    field: str, value: str
+) -> None:
+    """Clean finalisation retains only the cold-safe ordering and post-phase grammar."""
+    payload = _payload()
+    payload[field] = value
+    client, _ = _client_for(payload)
+    with pytest.raises(ColdFinalisationNotCleanError):
+        await client.finalise_session("session-id")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage_index", "stage_status", "evidence_field", "evidence_value"),
+    [
+        (1, "completed", "outcome", "not_active"),
+        (1, "not_applicable", "outcome", "stopped"),
+        (2, "completed", "outcome", "not_configured"),
+        (2, "not_applicable", "outcome", "finalised"),
+    ],
+)
+async def test_claimed_clean_finalisation_requires_stage_evidence_consistency(
+    stage_index: int, stage_status: str, evidence_field: str, evidence_value: str
+) -> None:
+    """First-crack and recording stage statuses agree with their retained evidence."""
+    payload = _payload()
+    stages = cast("list[dict[str, object]]", payload["stages"])
+    stages[stage_index]["status"] = stage_status
+    section = "first_crack_runtime" if stage_index == 1 else "recording"
+    evidence = cast("dict[str, object]", payload[section])
+    evidence[evidence_field] = evidence_value
     client, _ = _client_for(payload)
     with pytest.raises(ColdFinalisationNotCleanError):
         await client.finalise_session("session-id")

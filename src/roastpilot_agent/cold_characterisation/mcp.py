@@ -386,9 +386,34 @@ def finalisation_is_clean(result: SessionFinalisationResult) -> bool:
         and result.abort_reason is None
         and not result.failures
         and result.session_active_after is False
+        and result.emergency_stop_ordering in ("not_reached", "finalisation_committed_first")
+        and result.session_phase_after in ("pre_roast", "roasting")
         and result.stages[0].status == "completed"
-        and result.stages[1].status in ("completed", "not_applicable")
-        and result.stages[2].status in ("completed", "not_applicable")
+        and (
+            (
+                result.stages[1].status == "completed"
+                and result.first_crack_runtime is not None
+                and result.first_crack_runtime.outcome == "stopped"
+            )
+            or (
+                result.stages[1].status == "not_applicable"
+                and (
+                    result.first_crack_runtime is None
+                    or result.first_crack_runtime.outcome == "not_active"
+                )
+            )
+        )
+        and (
+            (
+                result.stages[2].status == "completed"
+                and result.recording is not None
+                and result.recording.outcome == "finalised"
+            )
+            or (
+                result.stages[2].status == "not_applicable"
+                and (result.recording is None or result.recording.outcome == "not_configured")
+            )
+        )
         and result.stages[3].status == "completed"
         and (
             result.sampler is None
@@ -576,10 +601,10 @@ class ColdCharacterisationMCPClient:
             SessionFinalisationResult,
             await self._call("finalise_cold_characterisation_session", {"session_id": session_id}),
         )
-        if not finalisation_is_clean(result):
-            raise ColdFinalisationNotCleanError("MCP finalisation was not clean", result)
         if result.session_id != session_id:
             raise ColdSessionIdentityError("MCP did not return the requested cold session")
+        if not finalisation_is_clean(result):
+            raise ColdFinalisationNotCleanError("MCP finalisation was not clean", result)
         if result.session_purpose != "cold_characterisation":
             raise ColdSessionPurposeError("MCP did not confirm cold_characterisation purpose")
         if not _finalisation_has_safe_zero(result):

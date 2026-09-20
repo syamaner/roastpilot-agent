@@ -23,6 +23,10 @@ from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from roastpilot_agent.cold_characterisation.mcp import (  # noqa: E402
+    SessionFinalisationResult,
+    finalisation_is_clean,
+)
 from roastpilot_agent.config import MCPConfig  # noqa: E402
 from roastpilot_agent.mcp_client import MCPServerProcess  # noqa: E402
 
@@ -108,12 +112,11 @@ async def capture(command: str, *, finalisation_only: bool = False) -> None:
                 session_id = _cold_capture_session_id(cold_start)
                 marked = await cold_process.call_tool("mark_beans_added", {})
                 _validate_cold_capture_activation(marked, session_id)
-                save(
-                    "finalise_cold_characterisation_session",
-                    await cold_process.call_tool(
-                        "finalise_cold_characterisation_session", {"session_id": session_id}
-                    ),
+                finalisation = await cold_process.call_tool(
+                    "finalise_cold_characterisation_session", {"session_id": session_id}
                 )
+                _validate_cold_capture_finalisation(finalisation)
+                save("finalise_cold_characterisation_session", finalisation)
                 print("confirmed cold_characterisation start, activation, and finalisation")
             finally:
                 await cold_process.stop()
@@ -146,6 +149,13 @@ def _validate_cold_capture_activation(marked: object, session_id: str) -> None:
         raise ValueError("cold beans-added did not confirm the started session")
     if marked_mapping.get("phase") != "roasting":
         raise ValueError("cold beans-added did not enter roasting phase")
+
+
+def _validate_cold_capture_finalisation(finalisation: object) -> None:
+    """Require strict, clean finalisation evidence before overwriting its fixture."""
+    result = SessionFinalisationResult.model_validate(finalisation)
+    if not finalisation_is_clean(result):
+        raise ValueError("cold finalisation was not clean")
 
 
 if __name__ == "__main__":

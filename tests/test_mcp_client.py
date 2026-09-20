@@ -2205,6 +2205,9 @@ async def test_finalisation_only_capture_is_cold_only_and_preserves_normal_fixtu
     spec.loader.exec_module(module)
 
     finalisation_tool = "finalise_cold_characterisation_session"
+    finalisation_payload = json.loads(
+        (TOOL_RESULT_FIXTURES / f"{finalisation_tool}.json").read_text()
+    )
     normal_fixture_bytes = {
         fixture.name: fixture.read_bytes()
         for fixture in TOOL_RESULT_FIXTURES.glob("*.json")
@@ -2242,7 +2245,7 @@ async def test_finalisation_only_capture_is_cold_only_and_preserves_normal_fixtu
             if tool == "mark_beans_added":
                 return {"session_id": "cold-session", "phase": "roasting"}
             if tool == finalisation_tool:
-                return {"finalisation": "captured"}
+                return finalisation_payload
             raise AssertionError(f"unexpected tool call: {tool}")
 
     vars(module)["OUT_DIR"] = tmp_path
@@ -2258,9 +2261,81 @@ async def test_finalisation_only_capture_is_cold_only_and_preserves_normal_fixtu
     assert {
         name: (tmp_path / name).read_bytes() for name in normal_fixture_bytes
     } == normal_fixture_bytes
-    assert json.loads((tmp_path / f"{finalisation_tool}.json").read_text()) == {
-        "finalisation": "captured"
+    assert json.loads((tmp_path / f"{finalisation_tool}.json").read_text()) == finalisation_payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["rejected", "malformed"])
+async def test_finalisation_only_capture_rejects_bad_evidence_without_overwriting_fixture(
+    tmp_path: Path, failure: str
+) -> None:
+    """Rejected or malformed finalisation output preserves every existing fixture byte."""
+    path = Path(__file__).parents[1] / "scripts" / "capture_mcp_fixtures.py"
+    spec = importlib.util.spec_from_file_location("capture_mcp_fixtures_bad_finalisation", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    finalisation_tool = "finalise_cold_characterisation_session"
+    fixture_bytes = {
+        fixture.name: fixture.read_bytes() for fixture in TOOL_RESULT_FIXTURES.glob("*.json")
     }
+    for name, contents in fixture_bytes.items():
+        (tmp_path / name).write_bytes(contents)
+    if failure == "rejected":
+        finalisation: object = json.loads(
+            (TOOL_RESULT_FIXTURES / f"{finalisation_tool}.json").read_text()
+        )
+        rejected = cast("dict[str, object]", finalisation)
+        rejected["status"] = "rejected"
+        rejected["clean"] = False
+        rejected["rejection_reason"] = "unknown_session"
+    else:
+        finalisation = {"malformed": "payload"}
+
+    class FakeProcess:
+        """Cold-only MCP process fake returning invalid finalisation evidence."""
+
+        instances: list["FakeProcess"] = []
+
+        def __init__(self, config: MCPConfig) -> None:
+            self.config = config
+            self.calls: list[tuple[str, dict[str, object]]] = []
+            FakeProcess.instances.append(self)
+
+        async def start(self) -> None:
+            """Record no-op fake process startup."""
+
+        async def stop(self) -> None:
+            """Record no-op fake process shutdown."""
+
+        async def call_tool(self, tool: str, args: dict[str, object]) -> object:
+            """Return the three cold calls, ending in invalid evidence."""
+            self.calls.append((tool, args))
+            if tool == "start_roast_session":
+                return {
+                    "session": {
+                        "session_id": "cold-session",
+                        "session_purpose": "cold_characterisation",
+                    }
+                }
+            if tool == "mark_beans_added":
+                return {"session_id": "cold-session", "phase": "roasting"}
+            if tool == finalisation_tool:
+                return finalisation
+            raise AssertionError(f"unexpected tool call: {tool}")
+
+    vars(module)["OUT_DIR"] = tmp_path
+    vars(module)["MCPServerProcess"] = FakeProcess
+    with pytest.raises((ValidationError, ValueError)):
+        await module.capture("fake-mcp", finalisation_only=True)
+
+    assert FakeProcess.instances[0].calls == [
+        ("start_roast_session", {"purpose": "cold_characterisation"}),
+        ("mark_beans_added", {}),
+        (finalisation_tool, {"session_id": "cold-session"}),
+    ]
+    assert {name: (tmp_path / name).read_bytes() for name in fixture_bytes} == fixture_bytes
 
 
 @pytest.mark.parametrize("tool", sorted(FIXTURE_MIRRORS))
