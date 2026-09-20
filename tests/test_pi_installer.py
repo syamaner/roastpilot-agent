@@ -139,9 +139,14 @@ case "$name" in
         show)
           mcp_version="${FAKE_PIPX_MCP_VERSION:-0.2.1}"
           mcp_shape=normal
-          if [[ "$venv" == *-roastpilot-stage-* ]] && [ -n "${FAKE_PIPX_STAGE_MCP_VERSION:-}" ]; then
-            mcp_version="$FAKE_PIPX_STAGE_MCP_VERSION"
-            printf 'FAKE_STAGE_MCP_VERSION <%s>\\n' "$mcp_version" >> "$FAKE_LOG"
+          if [[ "$venv" == *-roastpilot-stage-* ]]; then
+            if [ -n "${FAKE_PIPX_STAGE_MCP_VERSION:-}" ]; then
+              mcp_version="$FAKE_PIPX_STAGE_MCP_VERSION"
+              printf 'FAKE_STAGE_MCP_VERSION <%s>\\n' "$mcp_version" >> "$FAKE_LOG"
+            fi
+          elif [ ! -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] && [ -n "${FAKE_PIPX_PRIOR_MCP_VERSION:-}" ]; then
+            mcp_version="$FAKE_PIPX_PRIOR_MCP_VERSION"
+            printf 'FAKE_PRIOR_MCP_VERSION <%s>\\n' "$mcp_version" >> "$FAKE_LOG"
           elif [ -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] && [ "$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")" -ge 2 ] && [ -n "${FAKE_PIPX_RESTORE_MCP_VERSION:-}" ]; then
             mcp_version="$FAKE_PIPX_RESTORE_MCP_VERSION"
             printf 'FAKE_RESTORE_MCP_VERSION <%s>\\n' "$mcp_version" >> "$FAKE_LOG"
@@ -3591,7 +3596,7 @@ def test_failed_final_replacement_restores_and_reverifies_the_prior_application(
     assert any(event.startswith("FAKE_OFFLINE_RESTORE <") for event in events)
     assert sum(
         line == "pipx <runpip> <roastpilot-agent> <show> <coffee-roaster-mcp>" for line in events
-    ) == (1 if failure == "FAKE_PIPX_FAIL_FINAL_INSTALL" else 2)
+    ) == (2 if failure == "FAKE_PIPX_FAIL_FINAL_INSTALL" else 3)
     assert any("roastpilot-stage-" in line and "<uninstall>" in line for line in events)
     assert not any(line.startswith("roastpilot-agent <appliance>") for line in events)
     assert "Installed: unit enabled; model verified." not in result.stdout
@@ -4006,6 +4011,33 @@ def test_staged_and_restored_mcp_versions_must_match_the_e11_pin(
     restored_events = _delta(log, start)
     assert restored.returncode != 0 and "prior application could not be restored" in restored.stderr
     assert "FAKE_RESTORE_MCP_VERSION <0.1.9>" in restored_events
+
+
+@pytest.mark.serial
+def test_failed_upgrade_restores_the_captured_prior_mcp_version(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A failed target replacement accepts the exact MCP version captured from its prior venv."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+    result = _run(
+        environment
+        | {
+            "FAKE_PIPX_PRIOR_MCP_VERSION": "0.2.0",
+            "FAKE_PIPX_FAIL_FINAL_INSTALL": "1",
+            "FAKE_PIPX_RESTORE_MCP_VERSION": "0.2.0",
+        },
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    events = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert "replacement failed; prior application was restored" in result.stderr
+    assert "prior application could not be restored" not in result.stderr
+    assert "FAKE_PRIOR_MCP_VERSION <0.2.0>" in events
+    assert "FAKE_RESTORE_MCP_VERSION <0.2.0>" in events
 
 
 @pytest.mark.serial
