@@ -13,10 +13,15 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdCharacterisationMCPClient,
     ColdFinalisationNotCleanError,
     ColdFinalisationSafetyError,
+    ColdMcpError,
+    ColdMcpValidationError,
     ColdModeForbiddenToolError,
+    ColdSessionIdentityError,
+    ColdSessionPhaseError,
     ColdSessionPurposeError,
     RejectionReason,
     SessionFinalisationResult,
+    _finalisation_has_capability_compatible_evidence,  # pyright: ignore[reportPrivateUsage]
     finalisation_is_clean,
 )
 
@@ -42,7 +47,9 @@ _DIMENSIONS = (
 
 def _payload() -> dict[str, object]:
     """Return a mutable copy of the captured published-MCP result."""
-    return cast("dict[str, object]", json.loads(_FINALISATION_FIXTURE.read_text()))
+    payload = cast("dict[str, object]", json.loads(_FINALISATION_FIXTURE.read_text()))
+    payload["session_id"] = "session-id"
+    return payload
 
 
 def _driver(payload: dict[str, object]) -> dict[str, object]:
@@ -74,6 +81,18 @@ class _Caller:
     async def __call__(self, tool: str, args: dict[str, object]) -> object:
         self.calls.append((tool, args))
         return self.result
+
+
+class _MappingCaller:
+    """Deterministic transport whose responses are selected by tool name."""
+
+    def __init__(self, responses: dict[str, object]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def __call__(self, tool: str, args: dict[str, object]) -> object:
+        self.calls.append((tool, args))
+        return self.responses[tool]
 
 
 def _client_for(result: object) -> tuple[ColdCharacterisationMCPClient, _Caller]:
@@ -131,6 +150,66 @@ async def test_start_cold_session_requires_confirmed_purpose() -> None:
     with pytest.raises(ColdSessionPurposeError):
         await client.start_cold_session()
     assert caller.calls == [("start_roast_session", {"purpose": "cold_characterisation"})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("session_id", "other-session", ColdSessionIdentityError),
+        ("session_purpose", "roast", ColdSessionPurposeError),
+    ],
+)
+async def test_finalisation_requires_requested_cold_session_identity(
+    field: str, value: str, error: type[ColdMcpError]
+) -> None:
+    """Finalisation must not accept a clean response for another session or purpose."""
+    payload = _payload()
+    payload[field] = value
+    client, _ = _client_for(payload)
+
+    with pytest.raises(error) as raised:
+        await client.finalise_session("session-id")
+    assert value not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("session_id", "other-session", ColdSessionIdentityError),
+        ("phase", "pre_roast", ColdSessionPhaseError),
+    ],
+)
+async def test_mark_beans_added_requires_established_cold_session_and_activation_phase(
+    field: str, value: str, error: type[ColdMcpError]
+) -> None:
+    """The inference activation event is bound to the started cold session."""
+    session = cast(
+        "dict[str, object]",
+        json.loads((_MCP_TOOL_FIXTURES / "start_roast_session.json").read_text()),
+    )
+    session_state = cast("dict[str, object]", session["session"])
+    session_state["session_purpose"] = "cold_characterisation"
+    expected_session_id = cast(str, session_state["session_id"])
+    marked = cast(
+        "dict[str, object]",
+        json.loads((_MCP_TOOL_FIXTURES / "mark_beans_added.json").read_text()),
+    )
+    marked["session_id"] = expected_session_id
+    marked[field] = value
+    caller = _MappingCaller({"start_roast_session": session, "mark_beans_added": marked})
+    client = ColdCharacterisationMCPClient(caller)
+
+    await client.start_cold_session()
+    with pytest.raises(error) as raised:
+        await client.mark_beans_added()
+    assert value not in str(raised.value)
+    assert caller.calls == [
+        ("start_roast_session", {"purpose": "cold_characterisation"}),
+        ("mark_beans_added", {}),
+    ]
+    assert expected_session_id
 
 
 @pytest.mark.asyncio
@@ -236,6 +315,29 @@ async def test_finalisation_requires_driver_evidence_for_every_capability() -> N
         await client.finalise_session("session-id")
 
 
+def test_capability_evidence_locally_requires_a_read_outcome() -> None:
+    """The capability predicate cannot rely on an earlier safe-zero evaluation."""
+    payload = _payload()
+    final_read = cast("dict[str, object]", payload["final_driver_evidence"])
+    final_read["outcome"] = "unsupported"
+    result = SessionFinalisationResult.model_validate(payload)
+    assert _finalisation_has_capability_compatible_evidence(result) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("field", ["command_loop_running", "serial_open"])
+async def test_both_capabilities_reject_retained_active_driver_state(
+    streaming: bool, field: str
+) -> None:
+    """A final affirmative loop or serial state contradicts clean finalisation."""
+    payload = _streaming_payload() if streaming else _payload()
+    _driver(payload)[field] = True
+    client, _ = _client_for(payload)
+    with pytest.raises(ColdFinalisationSafetyError):
+        await client.finalise_session("session-id")
+
+
 @pytest.mark.parametrize("value", [None, "false", 0])
 def test_capability_is_required_and_strictly_boolean(value: object) -> None:
     """T-G4c: capability cannot default or coerce into the mock branch."""
@@ -311,7 +413,10 @@ def test_clean_gate_requires_all_four_fields(
     payload["status"] = status
     payload["clean"] = clean
     payload["abort_reason"] = abort_reason
-    assert finalisation_is_clean(SessionFinalisationResult.model_validate(payload)) is False
+    assert (
+        finalisation_is_clean(SessionFinalisationResult.model_validate_json(json.dumps(payload)))
+        is False
+    )
 
 
 def test_strict_mirror_rejects_extra_field_and_bad_confirmation() -> None:
@@ -325,6 +430,67 @@ def test_strict_mirror_rejects_extra_field_and_bad_confirmation() -> None:
     cast("dict[str, object]", payload["disconnect"])["serial_closed"] = "skipped"
     with pytest.raises(ValidationError):
         SessionFinalisationResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("clean",), "true"),
+        (("attempt_number",), "1"),
+        (("final_driver_evidence", "evidence", "heat_level_percent"), "0"),
+        (("final_driver_evidence", "evidence", "connected"), "false"),
+    ],
+)
+def test_strict_finalisation_mirror_rejects_scalar_coercion(
+    path: tuple[str, ...], value: object
+) -> None:
+    """Strict finalisation mirrors reject top-level and nested scalar coercion."""
+    payload = _payload()
+    target: dict[str, object] = payload
+    for key in path[:-1]:
+        target = cast("dict[str, object]", target[key])
+    target[path[-1]] = value
+    with pytest.raises(ValidationError):
+        SessionFinalisationResult.model_validate(payload)
+
+
+@pytest.mark.parametrize("stage_count", [0, 3])
+def test_finalisation_requires_exactly_four_ordered_stages(stage_count: int) -> None:
+    """The finalisation stage tuple requires all four ordered stage records."""
+    payload = _payload()
+    payload["stages"] = cast("list[object]", payload["stages"])[:stage_count]
+    with pytest.raises(ValidationError):
+        SessionFinalisationResult.model_validate(payload)
+
+
+def test_finalisation_rejects_out_of_order_four_stage_sequence() -> None:
+    """The four-stage validator rejects even a complete sequence in the wrong order."""
+    payload = _payload()
+    stages = cast("list[object]", payload["stages"])
+    stages[0], stages[1] = stages[1], stages[0]
+    with pytest.raises(ValidationError, match="four-stage order"):
+        SessionFinalisationResult.model_validate_json(json.dumps(payload))
+
+
+def test_finalisation_rejects_unknown_post_finalisation_phase() -> None:
+    """The mirror follows the installed MCP 0.2.1 roast-phase grammar exactly."""
+    payload = _payload()
+    payload["session_phase_after"] = "unknown_phase"
+    with pytest.raises(ValidationError):
+        SessionFinalisationResult.model_validate(payload)
+
+
+@pytest.mark.asyncio
+async def test_client_maps_malformed_finalisation_to_typed_cold_error() -> None:
+    """Client callers receive a fixed typed error instead of a raw Pydantic failure."""
+    payload = _payload()
+    payload["clean"] = "true"
+    client, _ = _client_for(payload)
+    with pytest.raises(
+        ColdMcpValidationError, match="MCP response failed cold contract validation"
+    ) as raised:
+        await client.finalise_session("session-id")
+    assert isinstance(raised.value.__cause__, ValidationError)
 
 
 def test_capability_branch_has_one_predicate_and_no_driver_name_path() -> None:

@@ -5,10 +5,12 @@ client.  Finalisation evidence is parsed strictly because it is a safety gate,
 not forward-compatible roast telemetry.
 """
 
+import json
+from contextlib import suppress
 from enum import Enum
-from typing import Literal, Protocol, TypeAlias
+from typing import Literal, Protocol, TypeAlias, TypeVar, cast
 
-from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, model_validator
+from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, ValidationError, model_validator
 
 from roastpilot_agent.config import MCPDeviceConfig
 from roastpilot_agent.mcp_client import (
@@ -32,6 +34,8 @@ COLD_ALLOWED_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+_ResultT = TypeVar("_ResultT", bound=BaseModel)
+
 
 class ColdMcpError(RuntimeError):
     """Base error for a cold-mode MCP contract violation."""
@@ -45,6 +49,18 @@ class ColdSessionPurposeError(ColdMcpError):
     """Raised when MCP does not confirm a cold-characterisation session."""
 
 
+class ColdSessionIdentityError(ColdMcpError):
+    """Raised when MCP returns a result for a different cold session."""
+
+
+class ColdSessionPhaseError(ColdMcpError):
+    """Raised when MCP does not confirm cold inference activation."""
+
+
+class ColdMcpValidationError(ColdMcpError):
+    """Raised when an MCP response violates the cold boundary schema."""
+
+
 class ColdFinalisationNotCleanError(ColdMcpError):
     """Raised when D195 finalisation is not clean."""
 
@@ -54,25 +70,9 @@ class ColdFinalisationSafetyError(ColdMcpError):
 
 
 class StrictMCPMirror(BaseModel):
-    """Immutable MCP mirror that rejects all unknown fields."""
+    """Immutable MCP mirror that rejects unknown fields and scalar coercion."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-
-RejectionReasonLiteral: TypeAlias = Literal[
-    "unknown_session",
-    "not_latest_session",
-    "session_not_active",
-    "session_purpose_not_eligible",
-    "session_faulted",
-    "command_in_progress",
-    "finalisation_in_progress",
-    "driver_lifecycle_evidence_unsupported",
-    "driver_state_unreadable",
-    "driver_state_malformed",
-    "driver_not_connected",
-    "driver_state_not_safe_zero",
-]
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
 
 class RejectionReason(Enum):
@@ -143,6 +143,21 @@ class DriverCommandStateEvidence(StrictMCPMirror):
     command_loop_error_count: StrictInt | None
     status_packet_count: StrictInt | None
     status_read_error_count: StrictInt | None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_json_dimension_array(cls, value: object) -> object:
+        """Convert the JSON array representation of an immutable dimension tuple."""
+        if not isinstance(value, dict):
+            return value
+        mapping = cast("dict[str, object]", value)
+        raw_dimensions = mapping.get("non_zero_dimensions")
+        if not isinstance(raw_dimensions, list):
+            return mapping
+        dimensions = cast("list[object]", raw_dimensions)
+        normalised = dict(mapping)
+        normalised["non_zero_dimensions"] = tuple(dimensions)
+        return normalised
 
 
 class DriverEvidenceRead(StrictMCPMirror):
@@ -216,6 +231,21 @@ class RecordingFinalisationEvidence(StrictMCPMirror):
     reason: str | None
     artifacts: tuple[RecordingArtifact, ...]
 
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_json_artifact_array(cls, value: object) -> object:
+        """Convert the JSON array representation of immutable artefact records."""
+        if not isinstance(value, dict):
+            return value
+        mapping = cast("dict[str, object]", value)
+        raw_artifacts = mapping.get("artifacts")
+        if not isinstance(raw_artifacts, list):
+            return mapping
+        artifacts = cast("list[object]", raw_artifacts)
+        normalised = dict(mapping)
+        normalised["artifacts"] = tuple(artifacts)
+        return normalised
+
 
 class DisconnectEvidence(StrictMCPMirror):
     """Disconnect attempt and confirmation evidence."""
@@ -271,7 +301,27 @@ class SessionFinalisationResult(StrictMCPMirror):
     recording: RecordingFinalisationEvidence | None
     disconnect: DisconnectEvidence
     session_active_after: bool
-    session_phase_after: str | None
+    session_phase_after: (
+        Literal["pre_roast", "roasting", "development", "dropped", "cooling", "complete", "fault"]
+        | None
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_json_finalisation_containers(cls, value: object) -> object:
+        """Accept JSON container and enum representations without scalar coercion."""
+        if not isinstance(value, dict):
+            return value
+        normalised = dict(cast("dict[str, object]", value))
+        for field in ("stages", "failures"):
+            field_value = normalised.get(field)
+            if isinstance(field_value, list):
+                normalised[field] = tuple(cast("list[object]", field_value))
+        reason = normalised.get("rejection_reason")
+        if isinstance(reason, str):
+            with suppress(ValueError):
+                normalised["rejection_reason"] = RejectionReason(reason)
+        return normalised
 
     @model_validator(mode="after")
     def _require_ordered_stages(self) -> "SessionFinalisationResult":
@@ -348,7 +398,7 @@ def _command_streaming_required(evidence: DriverCommandStateEvidence) -> bool:
 def _finalisation_has_capability_compatible_evidence(result: SessionFinalisationResult) -> bool:
     """Apply the sole AC23 streaming-capability branch to strict evidence."""
     driver_read = result.final_driver_evidence
-    if driver_read is None or driver_read.evidence is None:
+    if driver_read is None or driver_read.outcome != "read" or driver_read.evidence is None:
         return False
     evidence = driver_read.evidence
     counters = (
@@ -363,6 +413,8 @@ def _finalisation_has_capability_compatible_evidence(result: SessionFinalisation
         result.disconnect.command_loop_stopped,
         result.disconnect.serial_closed,
     )
+    if evidence.command_loop_running is True or evidence.serial_open is True:
+        return False
     if _command_streaming_required(evidence):
         return all(counter is not None for counter in counters) and all(
             confirmation == "confirmed" for confirmation in confirmations
@@ -396,6 +448,23 @@ class ColdCharacterisationMCPClient:
             call_tool: Transport supplied by the MCP lifecycle owner.
         """
         self._call_tool = call_tool
+        self._cold_session_id: str | None = None
+
+    @staticmethod
+    def _validate(model: type[_ResultT], payload: object) -> _ResultT:
+        """Validate one MCP result without exposing raw schema failures.
+
+        Args:
+            model: The trusted response mirror to validate against.
+            payload: The untrusted MCP response payload.
+
+        Raises:
+            ColdMcpValidationError: If the response violates the cold contract.
+        """
+        try:
+            return model.model_validate_json(json.dumps(payload))
+        except ValidationError as error:
+            raise ColdMcpValidationError("MCP response failed cold contract validation") from error
 
     async def _call(self, tool: str, args: dict[str, object]) -> object:
         if tool not in COLD_ALLOWED_TOOLS:
@@ -404,29 +473,38 @@ class ColdCharacterisationMCPClient:
 
     async def get_server_info(self) -> ServerInfo:
         """Return the typed MCP server inventory."""
-        return ServerInfo.model_validate(await self._call("get_server_info", {}))
+        return self._validate(ServerInfo, await self._call("get_server_info", {}))
 
     async def get_runtime_config(self) -> RuntimeConfigSnapshot:
         """Return the typed MCP runtime configuration snapshot."""
-        return RuntimeConfigSnapshot.model_validate(await self._call("get_runtime_config", {}))
+        return self._validate(RuntimeConfigSnapshot, await self._call("get_runtime_config", {}))
 
     async def start_cold_session(self) -> StartRoastSessionResult:
         """Start and require confirmation of a cold-characterisation session."""
-        result = StartRoastSessionResult.model_validate(
-            await self._call("start_roast_session", {"purpose": "cold_characterisation"})
+        result = self._validate(
+            StartRoastSessionResult,
+            await self._call("start_roast_session", {"purpose": "cold_characterisation"}),
         )
         if result.session.session_purpose != "cold_characterisation":
             raise ColdSessionPurposeError("MCP did not confirm cold_characterisation purpose")
+        self._cold_session_id = result.session.session_id
         return result
 
     async def get_roast_state(self, session_id: str | None = None) -> RoastSessionState:
         """Return one cold session state, omitting an unspecified identifier."""
         args: dict[str, object] = {} if session_id is None else {"session_id": session_id}
-        return RoastSessionState.model_validate(await self._call("get_roast_state", args))
+        return self._validate(RoastSessionState, await self._call("get_roast_state", args))
 
     async def mark_beans_added(self) -> EventCommandResult:
         """Request the permitted, non-actuating inference-activation event."""
-        return EventCommandResult.model_validate(await self._call("mark_beans_added", {}))
+        if self._cold_session_id is None:
+            raise ColdSessionIdentityError("cold session identity is not established")
+        result = self._validate(EventCommandResult, await self._call("mark_beans_added", {}))
+        if result.session_id != self._cold_session_id:
+            raise ColdSessionIdentityError("MCP did not return the established cold session")
+        if result.phase != "roasting":
+            raise ColdSessionPhaseError("MCP did not confirm cold inference activation")
+        return result
 
     async def finalise_session(self, session_id: str) -> SessionFinalisationResult:
         """Finalise one explicit session and reject any unclean evidence.
@@ -435,13 +513,18 @@ class ColdCharacterisationMCPClient:
             session_id: The explicitly retained MCP session identifier.
 
         Raises:
-            ValidationError: If MCP output is malformed or schema-drifted.
+            ColdMcpValidationError: If MCP output is malformed or schema-drifted.
             ColdFinalisationNotCleanError: If the G5 conjunction is not met.
             ColdFinalisationSafetyError: If G7 or G14 evidence is incomplete.
         """
-        result = SessionFinalisationResult.model_validate(
-            await self._call("finalise_cold_characterisation_session", {"session_id": session_id})
+        result = self._validate(
+            SessionFinalisationResult,
+            await self._call("finalise_cold_characterisation_session", {"session_id": session_id}),
         )
+        if result.session_id != session_id:
+            raise ColdSessionIdentityError("MCP did not return the requested cold session")
+        if result.session_purpose != "cold_characterisation":
+            raise ColdSessionPurposeError("MCP did not confirm cold_characterisation purpose")
         if not finalisation_is_clean(result):
             raise ColdFinalisationNotCleanError("MCP finalisation was not clean")
         if not _finalisation_has_safe_zero(result):
