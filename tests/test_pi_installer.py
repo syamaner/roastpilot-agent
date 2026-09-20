@@ -151,9 +151,14 @@ case "$name" in
             mcp_version="$FAKE_PIPX_RESTORE_MCP_VERSION"
             printf 'FAKE_RESTORE_MCP_VERSION <%s>\\n' "$mcp_version" >> "$FAKE_LOG"
           fi
-          if [[ "$venv" == *-roastpilot-stage-* ]] && [ -n "${FAKE_PIPX_STAGE_MCP_SHAPE:-}" ]; then
-            mcp_shape="$FAKE_PIPX_STAGE_MCP_SHAPE"
-            printf 'FAKE_STAGE_MCP_SHAPE <%s>\\n' "$mcp_shape" >> "$FAKE_LOG"
+          if [[ "$venv" == *-roastpilot-stage-* ]]; then
+            if [ -n "${FAKE_PIPX_STAGE_MCP_SHAPE:-}" ]; then
+              mcp_shape="$FAKE_PIPX_STAGE_MCP_SHAPE"
+              printf 'FAKE_STAGE_MCP_SHAPE <%s>\\n' "$mcp_shape" >> "$FAKE_LOG"
+            fi
+          elif [ ! -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] && [ -n "${FAKE_PIPX_PRIOR_MCP_SHAPE:-}" ]; then
+            mcp_shape="$FAKE_PIPX_PRIOR_MCP_SHAPE"
+            printf 'FAKE_PRIOR_MCP_SHAPE <%s>\\n' "$mcp_shape" >> "$FAKE_LOG"
           elif [ -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] && [ "$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")" -ge 2 ] && [ -n "${FAKE_PIPX_RESTORE_MCP_SHAPE:-}" ]; then
             mcp_shape="$FAKE_PIPX_RESTORE_MCP_SHAPE"
             printf 'FAKE_RESTORE_MCP_SHAPE <%s>\\n' "$mcp_shape" >> "$FAKE_LOG"
@@ -4038,6 +4043,52 @@ def test_failed_upgrade_restores_the_captured_prior_mcp_version(
     assert "prior application could not be restored" not in result.stderr
     assert "FAKE_PRIOR_MCP_VERSION <0.2.0>" in events
     assert "FAKE_RESTORE_MCP_VERSION <0.2.0>" in events
+    assert events.index("FAKE_PRIOR_MCP_VERSION <0.2.0>") < events.index(
+        "pipx <uninstall> <--> <roastpilot-agent>"
+    )
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("shape", ["missing", "duplicate"])
+def test_malformed_prior_mcp_metadata_stops_before_prior_uninstall(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], shape: str
+) -> None:
+    """Untrusted prior MCP metadata cannot authorize replacement of its venv."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+    result = _run(
+        environment | {"FAKE_PIPX_PRIOR_MCP_SHAPE": shape},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    events = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert "cannot determine prior MCP version for restoration" in result.stderr
+    assert f"FAKE_PRIOR_MCP_SHAPE <{shape}>" in events
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
+
+
+@pytest.mark.serial
+def test_malformed_prior_mcp_version_token_stops_before_prior_uninstall(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Prior MCP version metadata must use the installer's conservative token format."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+    result = _run(
+        environment | {"FAKE_PIPX_PRIOR_MCP_VERSION": "0.2.0 invalid"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+    events = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert "cannot determine prior MCP version for restoration" in result.stderr
+    assert "FAKE_PRIOR_MCP_VERSION <0.2.0 invalid>" in events
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
 
 
 @pytest.mark.serial

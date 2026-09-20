@@ -619,11 +619,18 @@ installed_mcp_version() {
         esac
     done <<< "$metadata"
     [[ "$version_seen" == 1 && -n "$version" ]] || return 1
+    [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ ]] || return 1
     printf '%s\n' "$version"
 }
 
 verify_pi_capability() {
-    local venv_name="${1:-roastpilot-agent}" expected_mcp_version="${2:-0.2.1}" mcp_executable version
+    local venv_name="${1:-roastpilot-agent}" expected_mcp_version mcp_executable version
+    if (($# >= 2)); then
+        expected_mcp_version="$2"
+    else
+        expected_mcp_version="0.2.1"
+    fi
+    [[ -n "$expected_mcp_version" ]] || return 1
     probe_pipx_venv_root || return 1
     mcp_executable="$PIPX_VENV_ROOT/$venv_name/bin/coffee-roaster-mcp"
     [[ -f "$mcp_executable" && -x "$mcp_executable" && ! -L "$mcp_executable" ]] || return 1
