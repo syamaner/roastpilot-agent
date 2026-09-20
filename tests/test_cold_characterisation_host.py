@@ -371,6 +371,25 @@ def test_throttle_default_runner_uses_a_closed_invocation(
     assert kwargs.get("shell", False) is False
 
 
+@pytest.mark.parametrize("timeout_seconds", [0.01, 0.1])
+def test_default_runner_retains_a_positive_window_for_short_timeouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout_seconds: float
+) -> None:
+    """Every admitted positive timeout leaves time for an immediately successful child."""
+    process = FakePopen()
+
+    def fake_popen(_argv: list[str], **_kwargs: object) -> FakePopen:
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr("roastpilot_agent.cold_characterisation.host.time.monotonic", lambda: 10.0)
+    reader = _reader(
+        tmp_path, monkeypatch, use_default_runner=True, timeout_seconds=timeout_seconds
+    )
+    assert reader.read_throttled_word() == 0
+    assert process.wait_timeouts == pytest.approx([timeout_seconds / 2.0])
+
+
 def test_default_runner_reads_only_the_bounded_stdout_sentinel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

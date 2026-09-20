@@ -197,7 +197,7 @@ class LinuxHostBoundsReader:
                 stderr=subprocess.DEVNULL,
             )
             deadline = time.monotonic() + timeout
-            cleanup_reserve = min(_CLEANUP_RESERVE_SECONDS, timeout)
+            cleanup_reserve = min(_CLEANUP_RESERVE_SECONDS, timeout / 2.0)
             work_deadline = deadline - cleanup_reserve
             stdout_stream = process.stdout
             if stdout_stream is None:  # pragma: no cover - stdout=PIPE guarantees a stream
