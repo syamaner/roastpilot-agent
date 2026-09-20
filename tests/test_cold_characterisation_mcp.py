@@ -1120,6 +1120,55 @@ async def test_client_maps_malformed_finalisation_to_typed_cold_error() -> None:
     )
 
 
+async def _assert_public_finalisation_validation_failure(payload: object, marker: str) -> None:
+    """Assert the public JSON client contains one malformed finalisation payload."""
+    client, _ = _client_for(payload)
+    with pytest.raises(ColdMcpValidationError) as raised:
+        await client.finalise_session("session-id")
+    assert str(raised.value) == "MCP response failed cold contract validation"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert marker not in str(raised.value)
+    assert marker not in repr(raised.value)
+    assert marker not in "".join(traceback.format_exception(raised.type, raised.value, raised.tb))
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_non_mapping_finalisation_and_nested_container_values() -> None:
+    """Top-level and nested JSON non-mappings fail through the fixed client boundary."""
+    await _assert_public_finalisation_validation_failure(["top-level-marker"], "top-level-marker")
+
+    driver_payload = _payload()
+    final_read = cast("dict[str, object]", driver_payload["final_driver_evidence"])
+    final_read["evidence"] = ["driver-marker"]
+    await _assert_public_finalisation_validation_failure(driver_payload, "driver-marker")
+
+    recording_payload = _payload()
+    recording_payload["recording"] = ["recording-marker"]
+    await _assert_public_finalisation_validation_failure(recording_payload, "recording-marker")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("container_field", ["non_zero_dimensions", "artifacts"])
+@pytest.mark.parametrize("missing", [False, True])
+async def test_client_rejects_missing_or_non_list_immutable_json_containers(
+    container_field: str, missing: bool
+) -> None:
+    """Immutable mirror containers reject missing and non-list JSON representations."""
+    marker = f"{container_field}-marker"
+    payload = _payload()
+    if container_field == "non_zero_dimensions":
+        container = _driver(payload)
+    else:
+        container = cast("dict[str, object]", payload["recording"])
+    if missing:
+        del container[container_field]
+        container["payload_marker"] = marker
+    else:
+        container[container_field] = marker
+    await _assert_public_finalisation_validation_failure(payload, marker)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("payload", [{"bad": {1, 2}}, {"cycle": None}])
 async def test_client_maps_serialisation_failures_to_fixed_typed_cold_error(
