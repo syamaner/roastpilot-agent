@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -11,7 +13,6 @@ from typing import Any, cast
 import pytest
 from pydantic import ValidationError
 
-from roastpilot_agent.cold_characterisation import host as host_module
 from roastpilot_agent.cold_characterisation.host import (
     HOST_MIN_FREE_BYTES_BEFORE,
     HOST_MIN_FREE_BYTES_DURING,
@@ -58,9 +59,10 @@ class FakePopen:
         self.args: list[str] = []
         self.killed = False
         self.reaped = False
-        self.reaper_started = False
+        self.reaper_event = threading.Event()
         self.wait_timeout = wait_timeout
         self.already_exited = already_exited
+        self.wait_timeouts: list[float | None] = []
         if stdout:
             os.write(self._write_fd, stdout)
         if not keep_open:
@@ -80,10 +82,11 @@ class FakePopen:
 
     def wait(self, *, timeout: float | None = None) -> int:
         """Record reaping and return a successful controlled exit."""
+        self.wait_timeouts.append(timeout)
         if self.wait_timeout and timeout is not None:
             raise subprocess.TimeoutExpired(self.args, timeout)
         if self.wait_timeout:
-            self.reaper_started = True
+            self.reaper_event.set()
         self.reaped = True
         return 0
 
@@ -138,11 +141,15 @@ def _reader(
         meminfo_path=configured_meminfo_path,
         vcgencmd_timeout_seconds=timeout_seconds,
     )
-    monkeypatch.setattr(host_module, "_admitted_platform", lambda: "linux")
-    return LinuxHostBoundsReader(
-        config,
-        command_runner=None if use_default_runner else runner or RecordingRunner(_completed()),
+    reader = object.__new__(LinuxHostBoundsReader)
+    object.__setattr__(reader, "_config", config)
+    runner_factory = reader._make_default_command_runner  # pyright: ignore[reportPrivateUsage]
+    object.__setattr__(
+        reader,
+        "_command_runner",
+        runner_factory() if use_default_runner else runner or RecordingRunner(_completed()),
     )
+    return reader
 
 
 def _assert_failure(expected: ColdHostBoundFailure, action: Any) -> None:
@@ -159,9 +166,9 @@ def test_bound_constants_are_literal_ac15_pins() -> None:
     assert HOST_MIN_FREE_BYTES_DURING == 2**30
 
 
-def test_private_platform_helper_reads_the_production_platform() -> None:
-    """The private admission seam defaults to the actual runtime platform."""
-    assert isinstance(host_module._admitted_platform(), str)  # pyright: ignore[reportPrivateUsage]
+def test_closed_failure_enum_has_the_ratified_member_count() -> None:
+    """The public closed failure grammar stays at the ratified 15 members."""
+    assert len(ColdHostBoundFailure) == 15
 
 
 def test_thermal_parses_safe_millidegrees(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -230,7 +237,7 @@ def test_throttle_reads_canonical_lowercase_word(
     reader = _reader(tmp_path, monkeypatch, runner=runner)
     assert reader.read_throttled_word() == 0x100
     assert runner.calls == [[str((tmp_path / "vcgencmd").resolve()), "get_throttled"]]
-    assert reader.sample(tmp_path).throttled_word_hex == "0x100"
+    assert reader.sample(tmp_path).throttled_word_hex == "0x0100"
 
 
 def test_throttle_accepts_uppercase_hex_and_samples_lowercase(
@@ -240,7 +247,7 @@ def test_throttle_accepts_uppercase_hex_and_samples_lowercase(
     reader = _reader(
         tmp_path, monkeypatch, runner=RecordingRunner(_completed(stdout=b"throttled=0x0A00\n"))
     )
-    assert reader.sample(tmp_path).throttled_word_hex == "0xa00"
+    assert reader.sample(tmp_path).throttled_word_hex == "0x0a00"
 
 
 @pytest.mark.parametrize("bit", [0, 1, 2, 3, 16, 17, 18, 19])
@@ -303,6 +310,25 @@ def test_throttle_default_runner_uses_a_closed_invocation(
     assert kwargs.get("shell", False) is False
 
 
+def test_throttle_default_runner_nonzero_exit_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The production runner's nonzero completion maps to its closed failure."""
+    process = FakePopen()
+
+    def fake_popen(_argv: list[str], **_kwargs: object) -> FakePopen:
+        return process
+
+    def nonzero_wait(*, timeout: float | None = None) -> int:
+        process.wait_timeouts.append(timeout)
+        return 1
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(process, "wait", nonzero_wait)
+    reader = _reader(tmp_path, monkeypatch, use_default_runner=True)
+    _assert_failure(ColdHostBoundFailure.THROTTLE_INVOCATION_FAILED, reader.read_throttled_word)
+
+
 @pytest.mark.parametrize("size", [4096, 4097])
 def test_throttle_default_runner_enforces_stdout_cap_before_decode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, size: int
@@ -330,7 +356,7 @@ def test_throttle_default_runner_timeout_kills_and_reaps(
         return process
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    reader = _reader(tmp_path, monkeypatch, use_default_runner=True, timeout_seconds=0.001)
+    reader = _reader(tmp_path, monkeypatch, use_default_runner=True, timeout_seconds=0.101)
     _assert_failure(ColdHostBoundFailure.THROTTLE_TIMEOUT, reader.read_throttled_word)
     assert process.killed is True
     assert process.reaped is True
@@ -346,11 +372,13 @@ def test_throttle_default_runner_post_eof_wait_timeout_uses_one_deadline(
         return process
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    reader = _reader(tmp_path, monkeypatch, use_default_runner=True, timeout_seconds=0.001)
+    monkeypatch.setattr("roastpilot_agent.cold_characterisation.host.time.monotonic", lambda: 10.0)
+    reader = _reader(tmp_path, monkeypatch, use_default_runner=True, timeout_seconds=1.0)
     _assert_failure(ColdHostBoundFailure.THROTTLE_TIMEOUT, reader.read_throttled_word)
     assert process.killed is True
-    assert process.reaper_started is True
+    assert process.reaper_event.wait(0.1)
     assert process.stdout.closed is True
+    assert process.wait_timeouts[:2] == pytest.approx([0.9, 0.1])
 
 
 def test_throttle_default_runner_stdout_read_error_fails_closed(
@@ -410,11 +438,33 @@ def test_throttle_runner_os_error_fails_closed(
 
 
 def test_throttle_runner_unexpected_exception_fails_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Any injected runner exception is contained by the closed invocation failure."""
-    reader = _reader(tmp_path, monkeypatch, runner=RecordingRunner(KeyError("secret")))
-    _assert_failure(ColdHostBoundFailure.THROTTLE_INVOCATION_FAILED, reader.read_throttled_word)
+    secret = "OPENROUTER_API_KEY=not-for-output"
+    reader = _reader(tmp_path, monkeypatch, runner=RecordingRunner(KeyError(secret)))
+    with pytest.raises(ColdHostBoundError) as raised:
+        reader.read_throttled_word()
+    error = raised.value
+    assert error.failure is ColdHostBoundFailure.THROTTLE_INVOCATION_FAILED
+    assert secret not in str(error)
+    assert secret not in repr(error)
+    assert all(secret not in str(argument) for argument in error.args)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert secret not in caplog.text
+
+
+def test_throttle_preserves_an_injected_closed_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typed failure from a trusted test seam remains unchanged."""
+    reader = _reader(
+        tmp_path,
+        monkeypatch,
+        runner=RecordingRunner(ColdHostBoundError(ColdHostBoundFailure.THROTTLE_TIMEOUT)),
+    )
+    _assert_failure(ColdHostBoundFailure.THROTTLE_TIMEOUT, reader.read_throttled_word)
 
 
 def test_throttle_rejects_invalid_binary_paths(
@@ -424,6 +474,31 @@ def test_throttle_rejects_invalid_binary_paths(
     for path in (Path("relative-vcgencmd"), tmp_path / "missing", tmp_path):
         reader = _reader(tmp_path, monkeypatch, command_path=path)
         _assert_failure(ColdHostBoundFailure.THROTTLE_BINARY_MISSING, reader.read_throttled_word)
+
+
+def test_throttle_rejects_an_existing_relative_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An existing cwd-relative regular file cannot satisfy the absolute-path guard."""
+    relative_binary = tmp_path / "relative-vcgencmd"
+    relative_binary.touch()
+    monkeypatch.chdir(tmp_path)
+    reader = _reader(tmp_path, monkeypatch, command_path=Path("relative-vcgencmd"))
+    _assert_failure(ColdHostBoundFailure.THROTTLE_BINARY_MISSING, reader.read_throttled_word)
+
+
+def test_throttle_uses_a_symlink_binarys_resolved_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The trusted configured symlink executes its resolved regular-file target path."""
+    target = tmp_path / "vcgencmd-target"
+    target.touch()
+    linked = tmp_path / "vcgencmd-link"
+    linked.symlink_to(target)
+    runner = RecordingRunner(_completed())
+    reader = _reader(tmp_path, monkeypatch, command_path=linked, runner=runner)
+    assert reader.read_throttled_word() == 0
+    assert runner.calls == [[str(target.resolve()), "get_throttled"]]
 
 
 def test_throttle_stderr_never_reaches_the_error(
@@ -449,6 +524,19 @@ def test_timeout_config_is_finite_positive_and_capped(timeout: float) -> None:
     """The command timeout cannot disable or excessively extend the bound."""
     with pytest.raises(ValidationError):
         HostBoundsConfig(vcgencmd_timeout_seconds=timeout)
+
+
+def test_timeout_config_accepts_the_exact_upper_bound() -> None:
+    """Thirty seconds remains the largest admitted configured deadline."""
+    assert HostBoundsConfig(vcgencmd_timeout_seconds=30.0).vcgencmd_timeout_seconds == 30.0
+
+
+def test_source_paths_must_be_absolute() -> None:
+    """Configured procfs and sysfs source paths cannot be cwd-relative."""
+    with pytest.raises(ValidationError):
+        HostBoundsConfig(thermal_zone_temp_path=Path("relative-source"))
+    with pytest.raises(ValidationError):
+        HostBoundsConfig(meminfo_path=Path("relative-source"))
 
 
 def test_host_config_is_frozen() -> None:
@@ -620,6 +708,7 @@ def test_sample_is_finite_and_populated(tmp_path: Path, monkeypatch: pytest.Monk
     assert sample.free_bytes == HOST_MIN_FREE_BYTES_BEFORE
     assert sample.throttled_word_hex == "0x0"
     assert sample.captured_at_utc
+    assert datetime.fromisoformat(sample.captured_at_utc).tzinfo is UTC
     assert sample.monotonic_seconds >= 0.0
 
 
@@ -647,7 +736,7 @@ def test_sample_is_always_a_during_run_full_sweep(
     "reader_method,failure",
     [
         ("read_thermal_c", ColdHostBoundFailure.THERMAL_UNREADABLE),
-        ("read_throttled_word", ColdHostBoundFailure.THROTTLE_TIMEOUT),
+        ("_read_throttled", ColdHostBoundFailure.THROTTLE_TIMEOUT),
         ("read_mem_available_bytes", ColdHostBoundFailure.MEMINFO_UNREADABLE),
         ("read_free_bytes", ColdHostBoundFailure.DISK_UNREADABLE),
     ],
@@ -683,11 +772,11 @@ def test_sample_rejects_non_finite_temperature() -> None:
         )
 
 
-def test_production_platform_refusal_uses_private_admission_seam(
+def test_production_platform_refusal_uses_sys_platform(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Platform admission is explicit without a public construction override."""
-    monkeypatch.setattr(host_module, "_admitted_platform", lambda: "darwin")
+    """Platform admission directly uses the production platform value."""
+    monkeypatch.setattr("roastpilot_agent.cold_characterisation.host.sys.platform", "darwin")
     _assert_failure(
         ColdHostBoundFailure.PLATFORM_UNSUPPORTED,
         LinuxHostBoundsReader,
