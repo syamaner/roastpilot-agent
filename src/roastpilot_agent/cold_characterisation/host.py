@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import select
 import subprocess
 import sys
 import time
@@ -18,7 +19,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Final, Protocol, TypeAlias
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from roastpilot_agent.config import FINITE_NUMERIC_MODEL_CONFIG
 
@@ -28,10 +29,15 @@ HOST_MIN_FREE_BYTES_BEFORE: Final = 2 * 2**30
 HOST_MIN_FREE_BYTES_DURING: Final = 1 * 2**30
 
 _MAX_THROTTLE_STDOUT_BYTES: Final = 4096
+_MAX_THERMAL_BYTES: Final = 128
+_MAX_MEMINFO_BYTES: Final = 65536
+_MAX_MEM_AVAILABLE_DIGITS: Final = 16
 _THROTTLE_FAILURE_MASK: Final = 0x000F000F
 _THERMAL_PATTERN: Final = re.compile(r"-?[0-9]{1,7}")
 _THROTTLE_PATTERN: Final = re.compile(r"throttled=0x[0-9a-fA-F]{1,8}")
-_MEM_AVAILABLE_PATTERN: Final = re.compile(r"MemAvailable:[ \t]+([0-9]+) kB")
+_MEM_AVAILABLE_PATTERN: Final = re.compile(
+    rf"MemAvailable:[ \t]+([0-9]{{1,{_MAX_MEM_AVAILABLE_DIGITS}}}) kB"
+)
 _CHILD_ENV: Final = {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}
 _HOST_FINITE_NUMERIC_MODEL_CONFIG: Final[ConfigDict] = ConfigDict(
     frozen=True,
@@ -39,6 +45,10 @@ _HOST_FINITE_NUMERIC_MODEL_CONFIG: Final[ConfigDict] = ConfigDict(
 )
 
 CommandRunner: TypeAlias = Callable[[list[str]], subprocess.CompletedProcess[bytes]]
+
+
+class _ThrottleOutputOverflow(RuntimeError):
+    """Signal that bounded stdout exceeded its fixed cap."""
 
 
 class ColdHostBoundFailure(Enum):
@@ -84,7 +94,7 @@ class HostBoundsConfig(BaseModel):
     vcgencmd_path: Path = Path("/usr/bin/vcgencmd")
     thermal_zone_temp_path: Path = Path("/sys/class/thermal/thermal_zone0/temp")
     meminfo_path: Path = Path("/proc/meminfo")
-    vcgencmd_timeout_seconds: float = 5.0
+    vcgencmd_timeout_seconds: float = Field(default=5.0, gt=0.0, le=30.0)
 
 
 class HostBoundSample(BaseModel):
@@ -164,26 +174,63 @@ class LinuxHostBoundsReader:
         timeout = self._config.vcgencmd_timeout_seconds
 
         def run_command(argv: list[str]) -> subprocess.CompletedProcess[bytes]:
-            return subprocess.run(
+            process = subprocess.Popen(
                 argv,
-                check=False,
-                cwd=None,
+                cwd="/",
                 env=_CHILD_ENV,
                 stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=timeout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
             )
+            try:
+                assert process.stdout is not None
+                stdout = self._read_bounded_stdout(process, timeout)
+                returncode = process.wait(timeout=max(0.0, timeout))
+            except BaseException:
+                self._kill_and_reap(process)
+                raise
+            return subprocess.CompletedProcess(argv, returncode, stdout, None)
 
         return run_command
 
+    @staticmethod
+    def _kill_and_reap(process: subprocess.Popen[bytes]) -> None:
+        """Deterministically stop and reap a child after an abnormal observation."""
+        try:
+            if process.poll() is None:
+                process.kill()
+        finally:
+            process.wait()
+
+    @staticmethod
+    def _read_bounded_stdout(process: subprocess.Popen[bytes], timeout: float) -> bytes:
+        """Read no more than the throttle cap plus one sentinel byte before decode."""
+        assert process.stdout is not None
+        stdout = bytearray()
+        deadline = time.monotonic() + timeout
+        descriptor = process.stdout.fileno()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            readable, _, _ = select.select([descriptor], [], [], remaining)
+            if not readable:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            chunk = os.read(descriptor, _MAX_THROTTLE_STDOUT_BYTES + 1 - len(stdout))
+            if not chunk:
+                return bytes(stdout)
+            stdout.extend(chunk)
+            if len(stdout) > _MAX_THROTTLE_STDOUT_BYTES:
+                raise _ThrottleOutputOverflow()
+
     def read_thermal_c(self) -> float:
         """Read and enforce the Celsius thermal bound."""
-        try:
-            raw = self._config.thermal_zone_temp_path.read_text(encoding="ascii")
-        except OSError as error:
-            raise ColdHostBoundError(ColdHostBoundFailure.THERMAL_UNREADABLE) from error
-        except UnicodeDecodeError as error:
-            raise ColdHostBoundError(ColdHostBoundFailure.THERMAL_MALFORMED) from error
+        raw = self._read_ascii_bytes(
+            self._config.thermal_zone_temp_path,
+            _MAX_THERMAL_BYTES,
+            ColdHostBoundFailure.THERMAL_UNREADABLE,
+            ColdHostBoundFailure.THERMAL_MALFORMED,
+        )
         value = raw.removesuffix("\n")
         if _THERMAL_PATTERN.fullmatch(value) is None:
             raise ColdHostBoundError(ColdHostBoundFailure.THERMAL_MALFORMED)
@@ -199,42 +246,53 @@ class LinuxHostBoundsReader:
         command_path = self._validated_vcgencmd_path()
         try:
             result = self._command_runner([str(command_path), "get_throttled"])
-        except subprocess.TimeoutExpired as error:
-            raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_TIMEOUT) from error
-        except OSError as error:
-            raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_INVOCATION_FAILED) from error
-        if result.returncode != 0:
+            returncode = result.returncode
+            stdout = result.stdout
+        except subprocess.TimeoutExpired:
+            raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_TIMEOUT) from None
+        except _ThrottleOutputOverflow:
+            raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_OUTPUT_MALFORMED) from None
+        except (OSError, RuntimeError, ValueError, TypeError):
+            raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_INVOCATION_FAILED) from None
+        if returncode != 0:
             raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_INVOCATION_FAILED)
-        stdout = result.stdout
         if len(stdout) > _MAX_THROTTLE_STDOUT_BYTES:
             raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_OUTPUT_MALFORMED)
         try:
-            output = stdout.decode("ascii").strip()
-        except UnicodeDecodeError as error:
-            raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_OUTPUT_MALFORMED) from error
+            output = stdout.decode("ascii")
+        except (AttributeError, UnicodeDecodeError):
+            raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_OUTPUT_MALFORMED) from None
+        if output.endswith("\n"):
+            output = output[:-1]
         if _THROTTLE_PATTERN.fullmatch(output) is None:
             raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_OUTPUT_MALFORMED)
-        word = int(output.removeprefix("throttled=0x"), 16)
+        try:
+            word = int(output.removeprefix("throttled=0x"), 16)
+        except ValueError:
+            raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_OUTPUT_MALFORMED) from None
         if word & _THROTTLE_FAILURE_MASK:
             raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_BITS_SET)
         return word
 
     def read_mem_available_bytes(self) -> int:
         """Read and enforce the available-memory bound."""
-        try:
-            content = self._config.meminfo_path.read_text(encoding="ascii")
-        except OSError as error:
-            raise ColdHostBoundError(ColdHostBoundFailure.MEMINFO_UNREADABLE) from error
-        except UnicodeDecodeError as error:
-            raise ColdHostBoundError(ColdHostBoundFailure.MEMINFO_MALFORMED) from error
+        content = self._read_ascii_bytes(
+            self._config.meminfo_path,
+            _MAX_MEMINFO_BYTES,
+            ColdHostBoundFailure.MEMINFO_UNREADABLE,
+            ColdHostBoundFailure.MEMINFO_MALFORMED,
+        )
         matches = [
             match.group(1)
-            for line in content.splitlines()
+            for line in content.split("\n")
             if (match := _MEM_AVAILABLE_PATTERN.fullmatch(line))
         ]
         if len(matches) != 1:
             raise ColdHostBoundError(ColdHostBoundFailure.MEMINFO_MALFORMED)
-        available = int(matches[0]) * 1024
+        try:
+            available = int(matches[0]) * 1024
+        except ValueError:
+            raise ColdHostBoundError(ColdHostBoundFailure.MEMINFO_MALFORMED) from None
         if available < HOST_MIN_MEM_AVAILABLE_BYTES:
             raise ColdHostBoundError(ColdHostBoundFailure.MEMINFO_BELOW_BOUND)
         return available
@@ -243,9 +301,9 @@ class LinuxHostBoundsReader:
         """Read free unprivileged disk space using ``f_bavail``."""
         try:
             filesystem = os.statvfs(path)
-        except OSError as error:
-            raise ColdHostBoundError(ColdHostBoundFailure.DISK_UNREADABLE) from error
-        return filesystem.f_bavail * filesystem.f_frsize
+            return filesystem.f_bavail * filesystem.f_frsize
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            raise ColdHostBoundError(ColdHostBoundFailure.DISK_UNREADABLE) from None
 
     def check_start_bounds(self, evidence_root: Path) -> None:
         """Enforce every host bound with the stronger start disk threshold."""
@@ -280,11 +338,35 @@ class LinuxHostBoundsReader:
         configured_path = self._config.vcgencmd_path
         try:
             resolved_path = configured_path.resolve()
-        except OSError as error:
-            raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_BINARY_MISSING) from error
-        if not configured_path.is_absolute() or not resolved_path.is_file():
+        except (OSError, RuntimeError, ValueError):
+            raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_BINARY_MISSING) from None
+        try:
+            is_valid = configured_path.is_absolute() and resolved_path.is_file()
+        except (OSError, RuntimeError, ValueError):
+            raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_BINARY_MISSING) from None
+        if not is_valid:
             raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_BINARY_MISSING)
         return resolved_path
+
+    @staticmethod
+    def _read_ascii_bytes(
+        path: Path,
+        maximum_bytes: int,
+        unreadable_failure: ColdHostBoundFailure,
+        malformed_failure: ColdHostBoundFailure,
+    ) -> str:
+        """Return a bounded strictly-ASCII LF-oriented source or a closed failure."""
+        try:
+            with path.open("rb") as source:
+                raw = source.read(maximum_bytes + 1)
+        except (OSError, RuntimeError, ValueError):
+            raise ColdHostBoundError(unreadable_failure) from None
+        if len(raw) > maximum_bytes:
+            raise ColdHostBoundError(malformed_failure)
+        try:
+            return raw.decode("ascii")
+        except UnicodeDecodeError:
+            raise ColdHostBoundError(malformed_failure) from None
 
     def _read_all(
         self,

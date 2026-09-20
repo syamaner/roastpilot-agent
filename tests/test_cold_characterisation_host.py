@@ -39,6 +39,40 @@ class RecordingRunner:
         return self.result
 
 
+class FakePopen:
+    """Small pipe-backed stand-in for the bounded production runner."""
+
+    def __init__(self, stdout: bytes = b"throttled=0x0\n", *, keep_open: bool = False) -> None:
+        """Expose controlled stdout and lifecycle observations."""
+        read_fd, self._write_fd = os.pipe()
+        self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+        self.args: list[str] = []
+        self.killed = False
+        self.reaped = False
+        if stdout:
+            os.write(self._write_fd, stdout)
+        if not keep_open:
+            os.close(self._write_fd)
+            self._write_fd = -1
+
+    def poll(self) -> None:
+        """Keep the fake live until the runner explicitly reaps it."""
+        return None
+
+    def kill(self) -> None:
+        """Record deterministic termination and unblock a waiting reader."""
+        self.killed = True
+        if self._write_fd >= 0:
+            os.close(self._write_fd)
+            self._write_fd = -1
+
+    def wait(self, *, timeout: float | None = None) -> int:
+        """Record reaping and return a successful controlled exit."""
+        del timeout
+        self.reaped = True
+        return 0
+
+
 def _completed(
     *,
     returncode: int = 0,
@@ -61,6 +95,7 @@ def _reader(
     thermal_path: Path | None = None,
     meminfo_path: Path | None = None,
     use_default_runner: bool = False,
+    timeout_seconds: float = 5.0,
 ) -> LinuxHostBoundsReader:
     """Build a Linux reader with files and seams wholly inside ``tmp_path``."""
     configured_thermal_path = thermal_path or tmp_path / "thermal"
@@ -86,6 +121,7 @@ def _reader(
         vcgencmd_path=binary_path,
         thermal_zone_temp_path=configured_thermal_path,
         meminfo_path=configured_meminfo_path,
+        vcgencmd_timeout_seconds=timeout_seconds,
     )
     return LinuxHostBoundsReader(
         config,
@@ -144,12 +180,8 @@ def test_thermal_non_ascii_source_is_malformed(
 ) -> None:
     """A decoding failure is malformed rather than an acceptable temperature."""
     thermal_path = tmp_path / "thermal"
+    thermal_path.write_bytes(b"\xff")
     reader = _reader(tmp_path, monkeypatch, thermal_path=thermal_path)
-
-    def malformed_read(_path: Path, **_kwargs: object) -> str:
-        raise UnicodeDecodeError("ascii", b"\xff", 0, 1, "invalid")
-
-    monkeypatch.setattr(Path, "read_text", malformed_read)
     _assert_failure(ColdHostBoundFailure.THERMAL_MALFORMED, reader.read_thermal_c)
 
 
@@ -162,6 +194,16 @@ def test_throttle_reads_canonical_lowercase_word(
     assert reader.read_throttled_word() == 0x100
     assert runner.calls == [[str((tmp_path / "vcgencmd").resolve()), "get_throttled"]]
     assert reader.sample(tmp_path).throttled_word_hex == "0x100"
+
+
+def test_throttle_accepts_uppercase_hex_and_samples_lowercase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The closed grammar accepts vcgencmd uppercase hex but canonicalises samples."""
+    reader = _reader(
+        tmp_path, monkeypatch, runner=RecordingRunner(_completed(stdout=b"throttled=0x0A00\n"))
+    )
+    assert reader.sample(tmp_path).throttled_word_hex == "0xa00"
 
 
 @pytest.mark.parametrize("bit", [0, 1, 2, 3, 16, 17, 18, 19])
@@ -203,12 +245,14 @@ def test_throttle_default_runner_uses_a_closed_invocation(
 ) -> None:
     """The production runner uses fixed argv, environment, stdio, and timeout."""
     calls: list[tuple[list[str], dict[str, object]]] = []
+    process = FakePopen()
 
-    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+    def fake_popen(argv: list[str], **kwargs: object) -> FakePopen:
         calls.append((argv, kwargs))
-        return _completed()
+        process.args = argv
+        return process
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     reader = _reader(tmp_path, monkeypatch, use_default_runner=True)
     assert reader.read_throttled_word() == 0
     argv, kwargs = calls[0]
@@ -216,10 +260,43 @@ def test_throttle_default_runner_uses_a_closed_invocation(
     assert argv == [str((tmp_path / "vcgencmd").resolve()), "get_throttled"]
     assert kwargs["env"] == {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}
     assert kwargs["stdin"] is subprocess.DEVNULL
-    assert kwargs["capture_output"] is True
-    assert kwargs["timeout"] == 5.0
-    assert kwargs["cwd"] is None
+    assert kwargs["stdout"] is subprocess.PIPE
+    assert kwargs["stderr"] is subprocess.DEVNULL
+    assert kwargs["cwd"] == "/"
     assert kwargs.get("shell", False) is False
+
+
+@pytest.mark.parametrize("size", [4096, 4097])
+def test_throttle_default_runner_enforces_stdout_cap_before_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, size: int
+) -> None:
+    """Exactly 4096 bytes reaches grammar validation while byte 4097 kills the child."""
+    process = FakePopen(b"x" * size)
+
+    def fake_popen(_argv: list[str], **_kwargs: object) -> FakePopen:
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    reader = _reader(tmp_path, monkeypatch, use_default_runner=True)
+    _assert_failure(ColdHostBoundFailure.THROTTLE_OUTPUT_MALFORMED, reader.read_throttled_word)
+    assert process.killed is (size == 4097)
+    assert process.reaped is True
+
+
+def test_throttle_default_runner_timeout_kills_and_reaps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The configured timeout bounds a silent child and deterministically reaps it."""
+    process = FakePopen(keep_open=True)
+
+    def fake_popen(_argv: list[str], **_kwargs: object) -> FakePopen:
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    reader = _reader(tmp_path, monkeypatch, use_default_runner=True, timeout_seconds=0.001)
+    _assert_failure(ColdHostBoundFailure.THROTTLE_TIMEOUT, reader.read_throttled_word)
+    assert process.killed is True
+    assert process.reaped is True
 
 
 @pytest.mark.parametrize(
@@ -267,7 +344,26 @@ def test_throttle_stderr_never_reaches_the_error(
     )
     with pytest.raises(ColdHostBoundError) as raised:
         reader.read_throttled_word()
-    assert secret.decode("ascii") not in str(raised.value)
+    error = raised.value
+    secret_text = secret.decode("ascii")
+    assert secret_text not in str(error)
+    assert secret_text not in repr(error)
+    assert all(secret_text not in str(argument) for argument in error.args)
+    assert error.__cause__ is None
+
+
+@pytest.mark.parametrize("timeout", [0.0, float("inf")])
+def test_timeout_config_is_finite_positive_and_capped(timeout: float) -> None:
+    """The command timeout cannot disable or excessively extend the bound."""
+    with pytest.raises(ValidationError):
+        HostBoundsConfig(vcgencmd_timeout_seconds=timeout)
+
+
+def test_host_config_is_frozen() -> None:
+    """Source configuration remains immutable after validation."""
+    config = HostBoundsConfig()
+    with pytest.raises(ValidationError):
+        config.vcgencmd_timeout_seconds = 1.0  # type: ignore[misc]
 
 
 def test_memory_accepts_the_exact_floor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -310,12 +406,16 @@ def test_memory_non_ascii_source_is_malformed(
 ) -> None:
     """A decoding failure is malformed rather than an acceptable memory value."""
     meminfo_path = tmp_path / "meminfo"
+    meminfo_path.write_bytes(b"MemAvailable: \xff kB\n")
     reader = _reader(tmp_path, monkeypatch, meminfo_path=meminfo_path)
+    _assert_failure(ColdHostBoundFailure.MEMINFO_MALFORMED, reader.read_mem_available_bytes)
 
-    def malformed_read(_path: Path, **_kwargs: object) -> str:
-        raise UnicodeDecodeError("ascii", b"\xff", 0, 1, "invalid")
 
-    monkeypatch.setattr(Path, "read_text", malformed_read)
+def test_memory_rejects_pathological_decimal_width(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Oversized decimal fields fail before integer conversion can escape the grammar."""
+    reader = _reader(tmp_path, monkeypatch, meminfo="MemAvailable: " + "9" * 5000 + " kB\n")
     _assert_failure(ColdHostBoundFailure.MEMINFO_MALFORMED, reader.read_mem_available_bytes)
 
 
@@ -377,6 +477,15 @@ def test_disk_missing_source_fails_closed(tmp_path: Path, monkeypatch: pytest.Mo
     _assert_failure(ColdHostBoundFailure.DISK_UNREADABLE, lambda: reader.read_free_bytes(tmp_path))
 
 
+def test_disk_real_statvfs_accepts_tmp_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The production statvfs path works against an ordinary temporary filesystem."""
+    reader = _reader(tmp_path, monkeypatch)
+    monkeypatch.undo()
+    assert reader.read_free_bytes(tmp_path) > 0
+
+
 def test_sample_is_finite_and_populated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A clean sweep returns all host values without a soft path."""
     sample = _reader(tmp_path, monkeypatch).sample(tmp_path)
@@ -385,6 +494,35 @@ def test_sample_is_finite_and_populated(tmp_path: Path, monkeypatch: pytest.Monk
     assert sample.free_bytes == HOST_MIN_FREE_BYTES_BEFORE
     assert sample.throttled_word_hex == "0x0"
     assert sample.captured_at_utc
+    assert sample.monotonic_seconds >= 0.0
+
+
+@pytest.mark.parametrize("method_name", ["check_start_bounds", "check_run_bounds", "sample"])
+@pytest.mark.parametrize(
+    "reader_method,failure",
+    [
+        ("read_thermal_c", ColdHostBoundFailure.THERMAL_UNREADABLE),
+        ("read_throttled_word", ColdHostBoundFailure.THROTTLE_TIMEOUT),
+        ("read_mem_available_bytes", ColdHostBoundFailure.MEMINFO_UNREADABLE),
+        ("read_free_bytes", ColdHostBoundFailure.DISK_UNREADABLE),
+    ],
+)
+def test_aggregators_propagate_each_closed_source_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    reader_method: str,
+    failure: ColdHostBoundFailure,
+) -> None:
+    """Start, run, and sampling aggregates preserve every closed source failure."""
+    reader = _reader(tmp_path, monkeypatch)
+
+    def fail(*_args: object) -> object:
+        raise ColdHostBoundError(failure)
+
+    monkeypatch.setattr(reader, reader_method, fail)
+    method = getattr(reader, method_name)
+    _assert_failure(failure, lambda: method(tmp_path))
 
 
 def test_sample_rejects_non_finite_temperature() -> None:
