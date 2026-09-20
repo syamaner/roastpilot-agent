@@ -785,7 +785,11 @@ async def test_disconnect_attempt_must_complete_without_error() -> None:
     [
         ("attempt_count", 0),
         ("first_attempted_at_utc", None),
+        ("first_attempted_at_utc", ""),
+        ("first_attempted_at_utc", "   "),
         ("last_attempted_at_utc", None),
+        ("last_attempted_at_utc", ""),
+        ("last_attempted_at_utc", "   "),
         ("last_returned_without_error", False),
         ("last_error", "disconnect failure"),
         ("connected_false_confirmed", False),
@@ -1001,6 +1005,18 @@ async def test_successful_first_crack_stop_rejects_a_stop_error() -> None:
     runtime = cast("dict[str, object]", payload["first_crack_runtime"])
     runtime["outcome"] = "stopped"
     runtime["stop_error"] = "reader-stop-failed"
+    client, _ = _client_for(payload)
+    with pytest.raises(ColdFinalisationNotCleanError):
+        await client.finalise_session("session-id")
+
+
+@pytest.mark.asyncio
+async def test_not_active_first_crack_runtime_rejects_a_stop_error() -> None:
+    """A not-active first-crack runtime cannot retain a stop failure diagnostic."""
+    payload = _payload()
+    cast("dict[str, object]", payload["first_crack_runtime"])["stop_error"] = "reader-stop-failed"
+    result = SessionFinalisationResult.model_validate(payload)
+    assert finalisation_is_clean(result) is False
     client, _ = _client_for(payload)
     with pytest.raises(ColdFinalisationNotCleanError):
         await client.finalise_session("session-id")

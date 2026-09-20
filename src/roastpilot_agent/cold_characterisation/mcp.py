@@ -409,6 +409,7 @@ def finalisation_is_clean(result: SessionFinalisationResult) -> bool:
                     result.first_crack_runtime is None
                     or (
                         result.first_crack_runtime.outcome == "not_active"
+                        and result.first_crack_runtime.stop_error is None
                         and result.first_crack_runtime.final_status.audio_running is False
                     )
                 )
@@ -521,7 +522,9 @@ def _finalisation_has_clean_disconnect(result: SessionFinalisationResult) -> boo
     return (
         disconnect.attempt_count >= 1
         and disconnect.first_attempted_at_utc is not None
+        and bool(disconnect.first_attempted_at_utc.strip())
         and disconnect.last_attempted_at_utc is not None
+        and bool(disconnect.last_attempted_at_utc.strip())
         and disconnect.last_returned_without_error is True
         and disconnect.last_error is None
         and disconnect.connected_false_confirmed is True
