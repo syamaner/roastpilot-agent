@@ -25,6 +25,7 @@ from anyio import BrokenResourceError, ClosedResourceError
 from pydantic import ValidationError
 
 import roastpilot_agent.mcp_client as mcp_client_module
+from roastpilot_agent.cold_characterisation.mcp import SessionFinalisationResult, StrictMCPMirror
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig
 from roastpilot_agent.mcp_client import (
     AmbientStatus,
@@ -2118,7 +2119,7 @@ TOOL_RESULT_FIXTURES = Path(__file__).parent / "fixtures" / "mcp-tool-results"
 #: scripts/capture_mcp_fixtures.py on coffee-roaster-mcp dependency bumps;
 #: the mcp-contract-checker sub-agent re-derives the upstream surface and
 #: diffs it against these mirrors + fixtures.
-FIXTURE_MIRRORS: dict[str, type[MCPMirror]] = {
+FIXTURE_MIRRORS: dict[str, type[MCPMirror] | type[StrictMCPMirror]] = {
     "get_server_info": ServerInfo,
     "get_runtime_config": RuntimeConfigSnapshot,
     "start_roast_session": StartRoastSessionResult,
@@ -2133,12 +2134,12 @@ FIXTURE_MIRRORS: dict[str, type[MCPMirror]] = {
     "export_roast_log": ExportRoastLogResult,
     "emergency_stop": EventCommandResult,
     "set_recording_metadata": SetRecordingMetadataResult,
+    "finalise_cold_characterisation_session": SessionFinalisationResult,
 }
 
 
 def test_every_tool_has_a_captured_fixture() -> None:
-    """One example per tool result shape (E5-S3 criterion) — exactly the
-    14-tool surface, no strays."""
+    """One example per tool result shape (E5-S3 criterion) — all 15 fixtures, no strays."""
     captured = {path.stem for path in TOOL_RESULT_FIXTURES.glob("*.json")}
     assert captured == set(FIXTURE_MIRRORS)
 
@@ -2148,7 +2149,7 @@ def test_captured_server_info_pins_021_bootstrap_inventory() -> None:
     payload = json.loads((TOOL_RESULT_FIXTURES / "get_server_info.json").read_text())
     assert payload["version"] == "0.2.1"
     tools = set(payload["available_bootstrap_tools"])
-    assert tools == set(FIXTURE_MIRRORS) | {"finalise_cold_characterisation_session"}
+    assert tools == set(FIXTURE_MIRRORS)
 
 
 def test_captured_sessions_are_normal_roasts_and_unknown_purpose_is_rejected() -> None:
@@ -2163,7 +2164,7 @@ def test_captured_sessions_are_normal_roasts_and_unknown_purpose_is_rejected() -
 
 
 @pytest.mark.asyncio
-async def test_capture_script_behaviourally_captures_only_the_fourteen_tools(
+async def test_capture_script_behaviourally_captures_all_fifteen_tools(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The real mock capture includes metadata before normal and cold sessions."""
@@ -2181,7 +2182,227 @@ async def test_capture_script_behaviourally_captures_only_the_fourteen_tools(
     assert next(i for i, line in enumerate(lines) if "set_recording_metadata" in line) < next(
         i for i, line in enumerate(lines) if "start_roast_session" in line
     )
-    assert "confirmed validated cold_characterisation start and beans-added" in lines
+    assert "confirmed cold_characterisation start, activation, and finalisation" in lines
+    finalisation = SessionFinalisationResult.model_validate(
+        json.loads((tmp_path / "finalise_cold_characterisation_session.json").read_text())
+    )
+    assert finalisation.status == "clean"
+    assert finalisation.clean is True
+    assert finalisation.final_driver_evidence is not None
+    assert finalisation.final_driver_evidence.evidence is not None
+    assert finalisation.final_driver_evidence.evidence.command_streaming_required is False
+
+
+@pytest.mark.asyncio
+async def test_finalisation_only_capture_is_cold_only_and_preserves_normal_fixtures(
+    tmp_path: Path,
+) -> None:
+    """Finalisation-only capture never enters the normal roast command sequence."""
+    path = Path(__file__).parents[1] / "scripts" / "capture_mcp_fixtures.py"
+    spec = importlib.util.spec_from_file_location("capture_mcp_fixtures_cold_only", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    finalisation_tool = "finalise_cold_characterisation_session"
+    finalisation_payload = json.loads(
+        (TOOL_RESULT_FIXTURES / f"{finalisation_tool}.json").read_text()
+    )
+    finalisation_payload["session_id"] = "cold-session"
+    normal_fixture_bytes = {
+        fixture.name: fixture.read_bytes()
+        for fixture in TOOL_RESULT_FIXTURES.glob("*.json")
+        if fixture.stem != finalisation_tool
+    }
+    for name, contents in normal_fixture_bytes.items():
+        (tmp_path / name).write_bytes(contents)
+
+    class FakeProcess:
+        """Cold-only MCP process fake recording every attempted tool call."""
+
+        instances: list["FakeProcess"] = []
+
+        def __init__(self, config: MCPConfig) -> None:
+            self.config = config
+            self.calls: list[tuple[str, dict[str, object]]] = []
+            FakeProcess.instances.append(self)
+
+        async def start(self) -> None:
+            """Record no-op fake process startup."""
+
+        async def stop(self) -> None:
+            """Record no-op fake process shutdown."""
+
+        async def call_tool(self, tool: str, args: dict[str, object]) -> object:
+            """Return only the three cold capture results."""
+            self.calls.append((tool, args))
+            if tool == "start_roast_session":
+                return {
+                    "session": {
+                        "session_id": "cold-session",
+                        "session_purpose": "cold_characterisation",
+                    }
+                }
+            if tool == "mark_beans_added":
+                return {
+                    "session_id": "cold-session",
+                    "phase": "roasting",
+                    "event": {"kind": "beans_added"},
+                }
+            if tool == finalisation_tool:
+                return finalisation_payload
+            raise AssertionError(f"unexpected tool call: {tool}")
+
+    vars(module)["OUT_DIR"] = tmp_path
+    vars(module)["MCPServerProcess"] = FakeProcess
+    await module.capture("fake-mcp", finalisation_only=True)
+
+    assert len(FakeProcess.instances) == 1
+    assert FakeProcess.instances[0].calls == [
+        ("start_roast_session", {"purpose": "cold_characterisation"}),
+        ("mark_beans_added", {}),
+        (finalisation_tool, {"session_id": "cold-session"}),
+    ]
+    assert {
+        name: (tmp_path / name).read_bytes() for name in normal_fixture_bytes
+    } == normal_fixture_bytes
+    assert json.loads((tmp_path / f"{finalisation_tool}.json").read_text()) == finalisation_payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "rejected",
+        "malformed",
+        "wrong_session",
+        "wrong_purpose",
+        "nonfinite",
+        "unsafe_driver",
+        "capability",
+        "disconnect",
+        "missing_event",
+        "non_mapping_event",
+        "wrong_event_kind",
+        "blank_start",
+        "first_crack_running",
+        "driver_read_error",
+    ],
+)
+async def test_finalisation_only_capture_rejects_bad_evidence_without_overwriting_fixture(
+    tmp_path: Path, failure: str
+) -> None:
+    """Rejected or malformed finalisation output preserves every existing fixture byte."""
+    path = Path(__file__).parents[1] / "scripts" / "capture_mcp_fixtures.py"
+    spec = importlib.util.spec_from_file_location("capture_mcp_fixtures_bad_finalisation", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    finalisation_tool = "finalise_cold_characterisation_session"
+    fixture_bytes = {
+        fixture.name: fixture.read_bytes() for fixture in TOOL_RESULT_FIXTURES.glob("*.json")
+    }
+    for name, contents in fixture_bytes.items():
+        (tmp_path / name).write_bytes(contents)
+    if failure == "malformed":
+        finalisation: object = {"malformed": "payload"}
+    else:
+        finalisation: object = json.loads(
+            (TOOL_RESULT_FIXTURES / f"{finalisation_tool}.json").read_text()
+        )
+        invalid = cast("dict[str, object]", finalisation)
+        invalid["session_id"] = "cold-session"
+        if failure == "rejected":
+            invalid["status"] = "rejected"
+            invalid["clean"] = False
+            invalid["rejection_reason"] = "unknown_session"
+        elif failure == "wrong_session":
+            invalid["session_id"] = "other-session"
+        elif failure == "wrong_purpose":
+            invalid["session_purpose"] = "roast"
+        elif failure == "nonfinite":
+            invalid["first_started_session_elapsed_seconds"] = float("nan")
+        elif failure == "unsafe_driver":
+            driver_read = cast("dict[str, object]", invalid["final_driver_evidence"])
+            driver = cast("dict[str, object]", driver_read["evidence"])
+            driver["safe_zero"] = False
+        elif failure == "capability":
+            driver_read = cast("dict[str, object]", invalid["final_driver_evidence"])
+            driver = cast("dict[str, object]", driver_read["evidence"])
+            driver["command_streaming_required"] = True
+        elif failure == "first_crack_running":
+            runtime = cast("dict[str, object]", invalid["first_crack_runtime"])
+            final_status = cast("dict[str, object]", runtime["final_status"])
+            final_status["audio_running"] = True
+        elif failure == "driver_read_error":
+            cast("dict[str, object]", invalid["final_driver_evidence"])["error"] = "read failed"
+        else:
+            disconnect = cast("dict[str, object]", invalid["disconnect"])
+            disconnect["last_error"] = "disconnect failure"
+
+    marked: object = {
+        "session_id": "cold-session",
+        "phase": "roasting",
+        "event": {"kind": "beans_added"},
+    }
+    if failure == "missing_event":
+        marked = {"session_id": "cold-session", "phase": "roasting"}
+    elif failure == "non_mapping_event":
+        marked = {"session_id": "cold-session", "phase": "roasting", "event": []}
+    elif failure == "wrong_event_kind":
+        marked = {
+            "session_id": "cold-session",
+            "phase": "roasting",
+            "event": {"kind": "first_crack_detected"},
+        }
+
+    class FakeProcess:
+        """Cold-only MCP process fake returning invalid finalisation evidence."""
+
+        instances: list["FakeProcess"] = []
+
+        def __init__(self, config: MCPConfig) -> None:
+            self.config = config
+            self.calls: list[tuple[str, dict[str, object]]] = []
+            FakeProcess.instances.append(self)
+
+        async def start(self) -> None:
+            """Record no-op fake process startup."""
+
+        async def stop(self) -> None:
+            """Record no-op fake process shutdown."""
+
+        async def call_tool(self, tool: str, args: dict[str, object]) -> object:
+            """Return the three cold calls, ending in invalid evidence."""
+            self.calls.append((tool, args))
+            if tool == "start_roast_session":
+                return {
+                    "session": {
+                        "session_id": "   " if failure == "blank_start" else "cold-session",
+                        "session_purpose": "cold_characterisation",
+                    }
+                }
+            if tool == "mark_beans_added":
+                return marked
+            if tool == finalisation_tool:
+                return finalisation
+            raise AssertionError(f"unexpected tool call: {tool}")
+
+    vars(module)["OUT_DIR"] = tmp_path
+    vars(module)["MCPServerProcess"] = FakeProcess
+    with pytest.raises((ValidationError, ValueError)):
+        await module.capture("fake-mcp", finalisation_only=True)
+
+    expected_calls: list[tuple[str, dict[str, object]]] = [
+        ("start_roast_session", {"purpose": "cold_characterisation"})
+    ]
+    if failure != "blank_start":
+        expected_calls.append(("mark_beans_added", {}))
+    if failure not in {"missing_event", "non_mapping_event", "wrong_event_kind", "blank_start"}:
+        expected_calls.append((finalisation_tool, {"session_id": "cold-session"}))
+    assert FakeProcess.instances[0].calls == expected_calls
+    assert {name: (tmp_path / name).read_bytes() for name in fixture_bytes} == fixture_bytes
 
 
 @pytest.mark.parametrize("tool", sorted(FIXTURE_MIRRORS))
@@ -2190,6 +2411,63 @@ def test_captured_fixture_validates_into_mirror(tool: str) -> None:
     mirror = FIXTURE_MIRRORS[tool]
     instance = mirror.model_validate(payload)
     assert isinstance(instance, mirror)
+
+
+@pytest.mark.parametrize(
+    ("cold_start", "message"),
+    [
+        (None, "cold start result must be a mapping"),
+        ({}, "cold start did not return a session mapping"),
+        ({"session": {}}, "cold start did not confirm cold_characterisation purpose"),
+        (
+            {"session": {"session_purpose": "roast", "session_id": "session"}},
+            "cold start did not confirm cold_characterisation purpose",
+        ),
+        (
+            {"session": {"session_purpose": "cold_characterisation"}},
+            "cold start did not provide a session id",
+        ),
+    ],
+)
+def test_capture_script_rejects_invalid_cold_start_payloads(
+    cold_start: object, message: str
+) -> None:
+    """AC24: capture cannot silently accept a malformed cold start result."""
+    path = Path(__file__).parents[1] / "scripts" / "capture_mcp_fixtures.py"
+    spec = importlib.util.spec_from_file_location("capture_mcp_fixtures_validation", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        module._cold_capture_session_id(cold_start)
+
+
+@pytest.mark.parametrize(
+    "marked",
+    [
+        None,
+        {"session_id": "other", "phase": "roasting"},
+        {"session_id": "session", "phase": "fault"},
+        {"session_id": "session", "phase": "roasting"},
+        {"session_id": "session", "phase": "roasting", "event": []},
+        {
+            "session_id": "session",
+            "phase": "roasting",
+            "event": {"kind": "first_crack_detected"},
+        },
+    ],
+)
+def test_capture_script_rejects_invalid_cold_activation_payloads(marked: object) -> None:
+    """AC24: capture rejects non-mappings, wrong sessions, and unexpected phases."""
+    path = Path(__file__).parents[1] / "scripts" / "capture_mcp_fixtures.py"
+    spec = importlib.util.spec_from_file_location("capture_mcp_fixtures_activation", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    with pytest.raises((TypeError, ValueError)):
+        module._validate_cold_capture_activation(marked, "session")
 
 
 def test_captured_state_is_bootstrap_safe_mock() -> None:

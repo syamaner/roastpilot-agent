@@ -7,7 +7,7 @@ on coffee-roaster-mcp dependency bumps alongside the mcp-contract-checker
 sub-agent.
 
 Usage:
-    python scripts/capture_mcp_fixtures.py [path-to-coffee-roaster-mcp-binary]
+    python scripts/capture_mcp_fixtures.py [--finalisation-only] [path-to-coffee-roaster-mcp-binary]
 
 The binary defaults to whatever `coffee-roaster-mcp` resolves to on PATH;
 pass a scratch-venv binary explicitly to keep the project venv clean.
@@ -23,17 +23,31 @@ from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from roastpilot_agent.cold_characterisation.mcp import (  # noqa: E402
+    SessionFinalisationResult,
+    finalisation_has_required_safety_evidence,
+    finalisation_is_clean,
+)
 from roastpilot_agent.config import MCPConfig  # noqa: E402
 from roastpilot_agent.mcp_client import MCPServerProcess  # noqa: E402
 
 OUT_DIR = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mcp-tool-results"
 
 
-async def capture(command: str) -> None:
+async def capture(command: str, *, finalisation_only: bool = False) -> None:
+    """Capture deterministic MCP tool results from the mock driver.
+
+    Args:
+        command: MCP server executable.
+        finalisation_only: Preserve existing normal-roast fixtures while
+            capturing only the cold-session finalisation result.
+    """
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     config = MCPConfig(command=command, call_timeout_seconds=10.0)
 
     def save(tool: str, payload: object) -> None:
+        if finalisation_only and tool != "finalise_cold_characterisation_session":
+            return
         path = OUT_DIR / f"{tool}.json"
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         print(f"captured {tool} -> {path.name}")
@@ -45,82 +59,120 @@ async def capture(command: str) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         try:
             os.chdir(tmp)
-            process = MCPServerProcess(config)
-            await process.start()
-            try:
-                # Read-only tools first.
-                save("get_server_info", await process.call_tool("get_server_info", {}))
-                save("get_runtime_config", await process.call_tool("get_runtime_config", {}))
-                # Full normal mock roast, in command order.
-                save(
-                    "set_recording_metadata",
-                    await process.call_tool(
-                        "set_recording_metadata", {"origin": "colombia-huila", "roast_num": 5}
-                    ),
-                )
-                save("start_roast_session", await process.call_tool("start_roast_session", {}))
-                save("set_heat", await process.call_tool("set_heat", {"heat_level_percent": 70}))
-                save("set_fan", await process.call_tool("set_fan", {"fan_level_percent": 40}))
-                save("mark_beans_added", await process.call_tool("mark_beans_added", {}))
-                save("get_roast_state", await process.call_tool("get_roast_state", {}))
-                save("mark_first_crack", await process.call_tool("mark_first_crack", {}))
-                save("drop_beans", await process.call_tool("drop_beans", {}))
-                # Pre-delete so a failed capture leaves a visibly missing
-                # fixture (the completeness test then fails loudly) instead of
-                # a stale file from a previous run.
-                (OUT_DIR / "start_cooling.json").unlink(missing_ok=True)
+            if not finalisation_only:
+                process = MCPServerProcess(config)
+                await process.start()
                 try:
-                    save("start_cooling", await process.call_tool("start_cooling", {}))
-                except Exception as exc:  # noqa: BLE001 — capture-or-note, never abort
-                    print(f"start_cooling not capturable in this flow: {exc}")
-                save("stop_cooling", await process.call_tool("stop_cooling", {}))
-                save("export_roast_log", await process.call_tool("export_roast_log", {}))
-                # Emergency stop needs an active session and ends it — capture
-                # it in a fresh second session.
-                await process.call_tool("start_roast_session", {})
-                save(
-                    "emergency_stop",
-                    await process.call_tool("emergency_stop", {"reason": "fixture capture"}),
-                )
-            finally:
-                await process.stop()
-            # Prove the 0.2.1 cold-session lifecycle addition without adding a
-            # new fixture: this remains a 14-tool capture set. It must run
-            # in a fresh child because emergency-stop recovery owns the normal
+                    # Read-only tools first.
+                    save("get_server_info", await process.call_tool("get_server_info", {}))
+                    save("get_runtime_config", await process.call_tool("get_runtime_config", {}))
+                    # Full normal mock roast, in command order.
+                    save(
+                        "set_recording_metadata",
+                        await process.call_tool(
+                            "set_recording_metadata", {"origin": "colombia-huila", "roast_num": 5}
+                        ),
+                    )
+                    save("start_roast_session", await process.call_tool("start_roast_session", {}))
+                    save(
+                        "set_heat", await process.call_tool("set_heat", {"heat_level_percent": 70})
+                    )
+                    save("set_fan", await process.call_tool("set_fan", {"fan_level_percent": 40}))
+                    save("mark_beans_added", await process.call_tool("mark_beans_added", {}))
+                    save("get_roast_state", await process.call_tool("get_roast_state", {}))
+                    save("mark_first_crack", await process.call_tool("mark_first_crack", {}))
+                    save("drop_beans", await process.call_tool("drop_beans", {}))
+                    # Pre-delete so a failed full capture leaves a visibly missing
+                    # fixture (the completeness test then fails loudly) instead of
+                    # a stale file from a previous run.
+                    (OUT_DIR / "start_cooling.json").unlink(missing_ok=True)
+                    try:
+                        save("start_cooling", await process.call_tool("start_cooling", {}))
+                    except Exception as exc:  # noqa: BLE001 — capture-or-note, never abort
+                        print(f"start_cooling not capturable in this flow: {exc}")
+                    save("stop_cooling", await process.call_tool("stop_cooling", {}))
+                    save("export_roast_log", await process.call_tool("export_roast_log", {}))
+                    # Emergency stop needs an active session and ends it — capture
+                    # it in a fresh second session.
+                    await process.call_tool("start_roast_session", {})
+                    save(
+                        "emergency_stop",
+                        await process.call_tool("emergency_stop", {"reason": "fixture capture"}),
+                    )
+                finally:
+                    await process.stop()
+            # Capture the cold-session finalisation separately. It must run in
+            # a fresh child because emergency-stop recovery owns the normal
             # session until that child disconnects.
             cold_process = MCPServerProcess(config)
             await cold_process.start()
             try:
-                cold_start = await cold_process.call_tool(
+                cold_start: object = await cold_process.call_tool(
                     "start_roast_session", {"purpose": "cold_characterisation"}
                 )
-                if not isinstance(cold_start, dict):
-                    raise TypeError("cold start result must be a mapping")
-                cold_start_mapping = cast("dict[str, object]", cold_start)
-                session = cold_start_mapping.get("session")
-                if not isinstance(session, dict):
-                    raise ValueError("cold start did not confirm cold_characterisation purpose")
-                session_mapping = cast("dict[str, object]", session)
-                if session_mapping.get("session_purpose") != "cold_characterisation":
-                    raise ValueError("cold start did not confirm cold_characterisation purpose")
-                session_id = session_mapping.get("session_id")
-                if not isinstance(session_id, str) or not session_id:
-                    raise ValueError("cold start did not provide a session id")
+                session_id = _cold_capture_session_id(cold_start)
                 marked = await cold_process.call_tool("mark_beans_added", {})
-                if not isinstance(marked, dict):
-                    raise TypeError("cold beans-added result must be a mapping")
-                marked_mapping = cast("dict[str, object]", marked)
-                if marked_mapping.get("session_id") != session_id:
-                    raise ValueError("cold beans-added did not confirm the started session")
-                if marked_mapping.get("phase") != "roasting":
-                    raise ValueError("cold beans-added did not enter roasting phase")
-                print("confirmed validated cold_characterisation start and beans-added")
+                _validate_cold_capture_activation(marked, session_id)
+                finalisation = await cold_process.call_tool(
+                    "finalise_cold_characterisation_session", {"session_id": session_id}
+                )
+                _validate_cold_capture_finalisation(finalisation, session_id)
+                save("finalise_cold_characterisation_session", finalisation)
+                print("confirmed cold_characterisation start, activation, and finalisation")
             finally:
                 await cold_process.stop()
         finally:
             os.chdir(previous_cwd)
 
 
+def _cold_capture_session_id(cold_start: object) -> str:
+    """Extract the confirmed cold session identifier from one raw start result."""
+    if not isinstance(cold_start, dict):
+        raise TypeError("cold start result must be a mapping")
+    session = cast("dict[str, object]", cold_start).get("session")
+    if not isinstance(session, dict):
+        raise ValueError("cold start did not return a session mapping")
+    session_mapping = cast("dict[str, object]", session)
+    if session_mapping.get("session_purpose") != "cold_characterisation":
+        raise ValueError("cold start did not confirm cold_characterisation purpose")
+    session_id = session_mapping.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("cold start did not provide a session id")
+    return session_id
+
+
+def _validate_cold_capture_activation(marked: object, session_id: str) -> None:
+    """Validate the raw permitted activation event before finalisation capture."""
+    if not isinstance(marked, dict):
+        raise TypeError("cold beans-added result must be a mapping")
+    marked_mapping = cast("dict[str, object]", marked)
+    if marked_mapping.get("session_id") != session_id:
+        raise ValueError("cold beans-added did not confirm the started session")
+    if marked_mapping.get("phase") != "roasting":
+        raise ValueError("cold beans-added did not enter roasting phase")
+    event = marked_mapping.get("event")
+    if not isinstance(event, dict):
+        raise ValueError("cold beans-added did not return an event mapping")
+    if cast("dict[str, object]", event).get("kind") != "beans_added":
+        raise ValueError("cold beans-added did not confirm beans_added event")
+
+
+def _validate_cold_capture_finalisation(finalisation: object, session_id: str) -> None:
+    """Require strict, clean finalisation evidence before overwriting its fixture."""
+    result = SessionFinalisationResult.model_validate_json(
+        json.dumps(finalisation, allow_nan=False)
+    )
+    if (
+        result.session_id != session_id
+        or result.session_purpose != "cold_characterisation"
+        or not finalisation_is_clean(result)
+        or not finalisation_has_required_safety_evidence(result)
+    ):
+        raise ValueError("cold finalisation was not clean")
+
+
 if __name__ == "__main__":
-    binary = sys.argv[1] if len(sys.argv) > 1 else "coffee-roaster-mcp"
-    asyncio.run(capture(binary))
+    finalisation_only = "--finalisation-only" in sys.argv[1:]
+    arguments = [argument for argument in sys.argv[1:] if argument != "--finalisation-only"]
+    binary = arguments[0] if arguments else "coffee-roaster-mcp"
+    asyncio.run(capture(binary, finalisation_only=finalisation_only))
