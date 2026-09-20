@@ -2208,6 +2208,7 @@ async def test_finalisation_only_capture_is_cold_only_and_preserves_normal_fixtu
     finalisation_payload = json.loads(
         (TOOL_RESULT_FIXTURES / f"{finalisation_tool}.json").read_text()
     )
+    finalisation_payload["session_id"] = "cold-session"
     normal_fixture_bytes = {
         fixture.name: fixture.read_bytes()
         for fixture in TOOL_RESULT_FIXTURES.glob("*.json")
@@ -2265,7 +2266,19 @@ async def test_finalisation_only_capture_is_cold_only_and_preserves_normal_fixtu
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["rejected", "malformed"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "rejected",
+        "malformed",
+        "wrong_session",
+        "wrong_purpose",
+        "nonfinite",
+        "unsafe_driver",
+        "capability",
+        "disconnect",
+    ],
+)
 async def test_finalisation_only_capture_rejects_bad_evidence_without_overwriting_fixture(
     tmp_path: Path, failure: str
 ) -> None:
@@ -2282,16 +2295,35 @@ async def test_finalisation_only_capture_rejects_bad_evidence_without_overwritin
     }
     for name, contents in fixture_bytes.items():
         (tmp_path / name).write_bytes(contents)
-    if failure == "rejected":
+    if failure == "malformed":
+        finalisation: object = {"malformed": "payload"}
+    else:
         finalisation: object = json.loads(
             (TOOL_RESULT_FIXTURES / f"{finalisation_tool}.json").read_text()
         )
-        rejected = cast("dict[str, object]", finalisation)
-        rejected["status"] = "rejected"
-        rejected["clean"] = False
-        rejected["rejection_reason"] = "unknown_session"
-    else:
-        finalisation = {"malformed": "payload"}
+        invalid = cast("dict[str, object]", finalisation)
+        invalid["session_id"] = "cold-session"
+        if failure == "rejected":
+            invalid["status"] = "rejected"
+            invalid["clean"] = False
+            invalid["rejection_reason"] = "unknown_session"
+        elif failure == "wrong_session":
+            invalid["session_id"] = "other-session"
+        elif failure == "wrong_purpose":
+            invalid["session_purpose"] = "roast"
+        elif failure == "nonfinite":
+            invalid["first_started_session_elapsed_seconds"] = float("nan")
+        elif failure == "unsafe_driver":
+            driver_read = cast("dict[str, object]", invalid["final_driver_evidence"])
+            driver = cast("dict[str, object]", driver_read["evidence"])
+            driver["safe_zero"] = False
+        elif failure == "capability":
+            driver_read = cast("dict[str, object]", invalid["final_driver_evidence"])
+            driver = cast("dict[str, object]", driver_read["evidence"])
+            driver["command_streaming_required"] = True
+        else:
+            disconnect = cast("dict[str, object]", invalid["disconnect"])
+            disconnect["last_error"] = "disconnect failure"
 
     class FakeProcess:
         """Cold-only MCP process fake returning invalid finalisation evidence."""

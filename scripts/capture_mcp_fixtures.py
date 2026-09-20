@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roastpilot_agent.cold_characterisation.mcp import (  # noqa: E402
     SessionFinalisationResult,
+    finalisation_has_required_safety_evidence,
     finalisation_is_clean,
 )
 from roastpilot_agent.config import MCPConfig  # noqa: E402
@@ -115,7 +116,7 @@ async def capture(command: str, *, finalisation_only: bool = False) -> None:
                 finalisation = await cold_process.call_tool(
                     "finalise_cold_characterisation_session", {"session_id": session_id}
                 )
-                _validate_cold_capture_finalisation(finalisation)
+                _validate_cold_capture_finalisation(finalisation, session_id)
                 save("finalise_cold_characterisation_session", finalisation)
                 print("confirmed cold_characterisation start, activation, and finalisation")
             finally:
@@ -151,10 +152,17 @@ def _validate_cold_capture_activation(marked: object, session_id: str) -> None:
         raise ValueError("cold beans-added did not enter roasting phase")
 
 
-def _validate_cold_capture_finalisation(finalisation: object) -> None:
+def _validate_cold_capture_finalisation(finalisation: object, session_id: str) -> None:
     """Require strict, clean finalisation evidence before overwriting its fixture."""
-    result = SessionFinalisationResult.model_validate(finalisation)
-    if not finalisation_is_clean(result):
+    result = SessionFinalisationResult.model_validate_json(
+        json.dumps(finalisation, allow_nan=False)
+    )
+    if (
+        result.session_id != session_id
+        or result.session_purpose != "cold_characterisation"
+        or not finalisation_is_clean(result)
+        or not finalisation_has_required_safety_evidence(result)
+    ):
         raise ValueError("cold finalisation was not clean")
 
 

@@ -88,7 +88,7 @@ class ColdFinalisationSafetyError(ColdFinalisationResultError):
 class StrictMCPMirror(BaseModel):
     """Immutable MCP mirror that rejects unknown fields and scalar coercion."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True, allow_inf_nan=False)
 
 
 class RejectionReason(Enum):
@@ -499,6 +499,22 @@ def _finalisation_has_clean_disconnect(result: SessionFinalisationResult) -> boo
     )
 
 
+def finalisation_has_required_safety_evidence(result: SessionFinalisationResult) -> bool:
+    """Whether parsed finalisation evidence satisfies every safety boundary.
+
+    Args:
+        result: Identity-bound, strictly parsed finalisation result.
+
+    Returns:
+        ``True`` only when safe-zero, capability, and disconnect evidence all hold.
+    """
+    return (
+        _finalisation_has_safe_zero(result)
+        and _finalisation_has_capability_compatible_evidence(result)
+        and _finalisation_has_clean_disconnect(result)
+    )
+
+
 class ColdCharacterisationMCPClient:
     """Typed six-tool, non-actuating client for cold characterisation."""
 
@@ -545,12 +561,19 @@ class ColdCharacterisationMCPClient:
 
     async def start_cold_session(self) -> StartRoastSessionResult:
         """Start and require confirmation of a cold-characterisation session."""
-        result = self._validate(
-            StartRoastSessionResult,
-            await self._call("start_roast_session", {"purpose": "cold_characterisation"}),
-        )
-        if result.session.session_purpose != "cold_characterisation":
-            raise ColdSessionPurposeError("MCP did not confirm cold_characterisation purpose")
+        if self._cold_session_id is not None:
+            raise ColdSessionIdentityError("cold session is already established")
+        self._cold_session_id = None
+        try:
+            result = self._validate(
+                StartRoastSessionResult,
+                await self._call("start_roast_session", {"purpose": "cold_characterisation"}),
+            )
+            if result.session.session_purpose != "cold_characterisation":
+                raise ColdSessionPurposeError("MCP did not confirm cold_characterisation purpose")
+        except ColdMcpError:
+            self._cold_session_id = None
+            raise
         self._cold_session_id = result.session.session_id
         return result
 
@@ -604,17 +627,22 @@ class ColdCharacterisationMCPClient:
         if result.session_id != session_id:
             raise ColdSessionIdentityError("MCP did not return the requested cold session")
         if not finalisation_is_clean(result):
+            self._cold_session_id = None
             raise ColdFinalisationNotCleanError("MCP finalisation was not clean", result)
         if result.session_purpose != "cold_characterisation":
             raise ColdSessionPurposeError("MCP did not confirm cold_characterisation purpose")
         if not _finalisation_has_safe_zero(result):
+            self._cold_session_id = None
             raise ColdFinalisationSafetyError("MCP finalisation lacks safe-zero evidence", result)
         if not _finalisation_has_capability_compatible_evidence(result):
+            self._cold_session_id = None
             raise ColdFinalisationSafetyError(
                 "MCP finalisation does not satisfy streaming capability evidence", result
             )
         if not _finalisation_has_clean_disconnect(result):
+            self._cold_session_id = None
             raise ColdFinalisationSafetyError(
                 "MCP finalisation lacks clean disconnect evidence", result
             )
+        self._cold_session_id = None
         return result

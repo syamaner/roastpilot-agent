@@ -104,6 +104,12 @@ def _client_for(result: object) -> tuple[ColdCharacterisationMCPClient, _Caller]
     return client, caller
 
 
+def _unstarted_client_for(result: object) -> tuple[ColdCharacterisationMCPClient, _Caller]:
+    """Build a cold client with no established session identity."""
+    caller = _Caller(result)
+    return ColdCharacterisationMCPClient(caller), caller
+
+
 def _cold_start_payload() -> dict[str, object]:
     """Return a start response that establishes the deterministic cold session."""
     payload = cast(
@@ -180,17 +186,24 @@ async def test_start_cold_session_requires_confirmed_purpose() -> None:
     """G3: a defaulted or wrong session purpose cannot enter cold mode."""
     start_payload = json.loads((_MCP_TOOL_FIXTURES / "start_roast_session.json").read_text())
     start_payload["session"]["session_purpose"] = "roast"
-    client, caller = _client_for(start_payload)
+    client, caller = _unstarted_client_for(start_payload)
 
     with pytest.raises(ColdSessionPurposeError):
         await client.start_cold_session()
     assert caller.calls == [("start_roast_session", {"purpose": "cold_characterisation"})]
+    with pytest.raises(ColdSessionIdentityError):
+        await client.get_roast_state()
+    with pytest.raises(ColdSessionIdentityError):
+        await client.mark_beans_added()
+    with pytest.raises(ColdSessionIdentityError):
+        await client.finalise_session("session-id")
+    assert len(caller.calls) == 1
 
 
 @pytest.mark.asyncio
 async def test_start_cold_session_maps_malformed_response_without_leakage() -> None:
     """Malformed cold-start responses stay inside the fixed validation boundary."""
-    client, caller = _client_for({"secret": "payload-marker"})
+    client, caller = _unstarted_client_for({"secret": "payload-marker"})
     with pytest.raises(ColdMcpValidationError) as raised:
         await client.start_cold_session()
     assert caller.calls == [("start_roast_session", {"purpose": "cold_characterisation"})]
@@ -199,6 +212,45 @@ async def test_start_cold_session_maps_malformed_response_without_leakage() -> N
     assert "payload-marker" not in "".join(
         traceback.format_exception(raised.type, raised.value, raised.tb)
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_payload", [{"secret": "payload-marker"}, None])
+async def test_failed_cold_start_leaves_all_stateful_calls_locally_blocked(
+    start_payload: object,
+) -> None:
+    """A failed cold start cannot leave a usable session identity behind."""
+    client, caller = _unstarted_client_for(start_payload)
+    with pytest.raises(ColdMcpError):
+        await client.start_cold_session()
+    assert len(caller.calls) == 1
+    with pytest.raises(ColdSessionIdentityError):
+        await client.get_roast_state()
+    with pytest.raises(ColdSessionIdentityError):
+        await client.mark_beans_added()
+    with pytest.raises(ColdSessionIdentityError):
+        await client.finalise_session("session-id")
+    assert len(caller.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_second_cold_start_is_refused_before_transport() -> None:
+    """An established cold session cannot be replaced by a second start call."""
+    caller = _MappingCaller({"start_roast_session": _cold_start_payload()})
+    client = ColdCharacterisationMCPClient(caller)
+    await client.start_cold_session()
+    with pytest.raises(ColdSessionIdentityError, match="cold session is already established"):
+        await client.start_cold_session()
+    assert caller.calls == [("start_roast_session", {"purpose": "cold_characterisation"})]
+
+
+@pytest.mark.asyncio
+async def test_unstarted_finalisation_is_refused_without_transport() -> None:
+    """An unstarted client cannot issue a finalisation request."""
+    client, caller = _unstarted_client_for(_payload())
+    with pytest.raises(ColdSessionIdentityError):
+        await client.finalise_session("session-id")
+    assert caller.calls == []
 
 
 @pytest.mark.asyncio
@@ -362,6 +414,9 @@ async def test_real_mock_finalisation_is_accepted_as_non_streaming() -> None:
     assert caller.calls == [
         ("finalise_cold_characterisation_session", {"session_id": "session-id"})
     ]
+    with pytest.raises(ColdSessionIdentityError):
+        await client.mark_beans_added()
+    assert len(caller.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -581,14 +636,58 @@ async def test_disconnect_attempt_must_complete_without_error() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("attempt_count", 0),
+        ("first_attempted_at_utc", None),
+        ("last_attempted_at_utc", None),
+        ("last_returned_without_error", False),
+        ("last_error", "disconnect failure"),
+        ("connected_false_confirmed", False),
+    ],
+)
+async def test_each_disconnect_predicate_independently_fails_closed(
+    field: str, value: object
+) -> None:
+    """Every required disconnect predicate independently rejects finalisation."""
+    payload = _payload()
+    cast("dict[str, object]", payload["disconnect"])[field] = value
+    client, _ = _client_for(payload)
+    with pytest.raises(ColdFinalisationSafetyError, match="clean disconnect evidence"):
+        await client.finalise_session("session-id")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("reason", list(RejectionReason))
 async def test_every_closed_rejection_reason_cannot_be_clean(reason: RejectionReason) -> None:
     """G5: every accepted closed rejection value rejects the finalisation."""
     payload = _payload()
     payload["rejection_reason"] = reason.value
     client, _ = _client_for(payload)
-    with pytest.raises(ColdFinalisationNotCleanError):
+    with pytest.raises(ColdFinalisationNotCleanError) as raised:
         await client.finalise_session("session-id")
+    assert raised.value.result.rejection_reason is reason
+    with pytest.raises(ColdSessionIdentityError):
+        await client.get_roast_state()
+
+
+def test_closed_rejection_reason_grammar_is_exact_and_json_client_round_trips() -> None:
+    """The strict client accepts exactly the twelve ratified rejection values."""
+    assert {reason.value for reason in RejectionReason} == {
+        "unknown_session",
+        "not_latest_session",
+        "session_not_active",
+        "session_purpose_not_eligible",
+        "session_faulted",
+        "command_in_progress",
+        "finalisation_in_progress",
+        "driver_lifecycle_evidence_unsupported",
+        "driver_state_unreadable",
+        "driver_state_malformed",
+        "driver_not_connected",
+        "driver_state_not_safe_zero",
+    }
 
 
 @pytest.mark.asyncio
