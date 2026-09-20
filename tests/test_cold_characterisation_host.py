@@ -301,6 +301,21 @@ def test_throttle_rejects_each_current_and_sticky_guard_bit(
     _assert_failure(ColdHostBoundFailure.THROTTLE_BITS_SET, reader.read_throttled_word)
 
 
+@pytest.mark.parametrize("bit", [4, 15, 20])
+def test_throttle_records_adjacent_unmasked_bits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bit: int
+) -> None:
+    """Only the ratified current/sticky groups gate an otherwise observed throttle word."""
+    word = 1 << bit
+    reader = _reader(
+        tmp_path,
+        monkeypatch,
+        runner=RecordingRunner(_completed(stdout=f"throttled=0x{word:x}\n".encode("ascii"))),
+    )
+    assert reader.read_throttled_word() == word
+    assert reader.sample(tmp_path).throttled_word_hex == f"0x{word:x}"
+
+
 @pytest.mark.parametrize(
     "stdout",
     [
@@ -354,6 +369,29 @@ def test_throttle_default_runner_uses_a_closed_invocation(
     assert kwargs["stderr"] is subprocess.DEVNULL
     assert kwargs["cwd"] == "/"
     assert kwargs.get("shell", False) is False
+
+
+def test_default_runner_reads_only_the_bounded_stdout_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pipe reader never asks the kernel for more than its 4097-byte sentinel."""
+    process = FakePopen()
+    requested_sizes: list[int] = []
+    original_read = os.read
+
+    def fake_popen(_argv: list[str], **_kwargs: object) -> FakePopen:
+        return process
+
+    def recording_read(descriptor: int, size: int) -> bytes:
+        requested_sizes.append(size)
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(os, "read", recording_read)
+    reader = _reader(tmp_path, monkeypatch, use_default_runner=True)
+    assert reader.read_throttled_word() == 0
+    assert requested_sizes
+    assert max(requested_sizes) <= 4097
 
 
 def test_throttle_default_runner_nonzero_exit_fails_closed(
@@ -701,6 +739,39 @@ def test_disk_start_and_run_bounds_are_separate(
     """The weaker run floor cannot accidentally authorise a start."""
     reader = _reader(tmp_path, monkeypatch, free_bytes=HOST_MIN_FREE_BYTES_DURING)
     reader.check_run_bounds(tmp_path)
+    _assert_failure(
+        ColdHostBoundFailure.DISK_BELOW_START_BOUND, lambda: reader.check_start_bounds(tmp_path)
+    )
+
+
+@pytest.mark.parametrize("method_name", ["check_start_bounds", "check_run_bounds", "sample"])
+def test_all_bound_aggregates_pass_the_caller_evidence_root_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method_name: str
+) -> None:
+    """Every aggregate checks disk space at the exact root supplied by its caller."""
+    reader = _reader(tmp_path, monkeypatch)
+    evidence_root = tmp_path / "evidence-root"
+    seen_paths: list[object] = []
+
+    def recording_statvfs(path: object) -> Any:
+        seen_paths.append(path)
+        return SimpleNamespace(
+            f_bavail=HOST_MIN_FREE_BYTES_BEFORE,
+            f_bfree=HOST_MIN_FREE_BYTES_BEFORE,
+            f_frsize=1,
+        )
+
+    monkeypatch.setattr(os, "statvfs", recording_statvfs)
+    getattr(reader, method_name)(evidence_root)
+    assert seen_paths == [evidence_root]
+
+
+def test_sample_accepts_the_during_floor_while_start_refuses_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sampling retains its ratified during-run floor rather than becoming start admission."""
+    reader = _reader(tmp_path, monkeypatch, free_bytes=HOST_MIN_FREE_BYTES_DURING)
+    assert reader.sample(tmp_path).free_bytes == HOST_MIN_FREE_BYTES_DURING
     _assert_failure(
         ColdHostBoundFailure.DISK_BELOW_START_BOUND, lambda: reader.check_start_bounds(tmp_path)
     )
