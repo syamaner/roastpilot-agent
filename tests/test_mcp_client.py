@@ -2139,8 +2139,7 @@ FIXTURE_MIRRORS: dict[str, type[MCPMirror] | type[StrictMCPMirror]] = {
 
 
 def test_every_tool_has_a_captured_fixture() -> None:
-    """One example per tool result shape (E5-S3 criterion) — exactly the
-    14-tool surface, no strays."""
+    """One example per tool result shape (E5-S3 criterion) — all 15 fixtures, no strays."""
     captured = {path.stem for path in TOOL_RESULT_FIXTURES.glob("*.json")}
     assert captured == set(FIXTURE_MIRRORS)
 
@@ -2192,6 +2191,76 @@ async def test_capture_script_behaviourally_captures_all_fifteen_tools(
     assert finalisation.final_driver_evidence is not None
     assert finalisation.final_driver_evidence.evidence is not None
     assert finalisation.final_driver_evidence.evidence.command_streaming_required is False
+
+
+@pytest.mark.asyncio
+async def test_finalisation_only_capture_is_cold_only_and_preserves_normal_fixtures(
+    tmp_path: Path,
+) -> None:
+    """Finalisation-only capture never enters the normal roast command sequence."""
+    path = Path(__file__).parents[1] / "scripts" / "capture_mcp_fixtures.py"
+    spec = importlib.util.spec_from_file_location("capture_mcp_fixtures_cold_only", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    finalisation_tool = "finalise_cold_characterisation_session"
+    normal_fixture_bytes = {
+        fixture.name: fixture.read_bytes()
+        for fixture in TOOL_RESULT_FIXTURES.glob("*.json")
+        if fixture.stem != finalisation_tool
+    }
+    for name, contents in normal_fixture_bytes.items():
+        (tmp_path / name).write_bytes(contents)
+
+    class FakeProcess:
+        """Cold-only MCP process fake recording every attempted tool call."""
+
+        instances: list["FakeProcess"] = []
+
+        def __init__(self, config: MCPConfig) -> None:
+            self.config = config
+            self.calls: list[tuple[str, dict[str, object]]] = []
+            FakeProcess.instances.append(self)
+
+        async def start(self) -> None:
+            """Record no-op fake process startup."""
+
+        async def stop(self) -> None:
+            """Record no-op fake process shutdown."""
+
+        async def call_tool(self, tool: str, args: dict[str, object]) -> object:
+            """Return only the three cold capture results."""
+            self.calls.append((tool, args))
+            if tool == "start_roast_session":
+                return {
+                    "session": {
+                        "session_id": "cold-session",
+                        "session_purpose": "cold_characterisation",
+                    }
+                }
+            if tool == "mark_beans_added":
+                return {"session_id": "cold-session", "phase": "roasting"}
+            if tool == finalisation_tool:
+                return {"finalisation": "captured"}
+            raise AssertionError(f"unexpected tool call: {tool}")
+
+    vars(module)["OUT_DIR"] = tmp_path
+    vars(module)["MCPServerProcess"] = FakeProcess
+    await module.capture("fake-mcp", finalisation_only=True)
+
+    assert len(FakeProcess.instances) == 1
+    assert FakeProcess.instances[0].calls == [
+        ("start_roast_session", {"purpose": "cold_characterisation"}),
+        ("mark_beans_added", {}),
+        (finalisation_tool, {"session_id": "cold-session"}),
+    ]
+    assert {
+        name: (tmp_path / name).read_bytes() for name in normal_fixture_bytes
+    } == normal_fixture_bytes
+    assert json.loads((tmp_path / f"{finalisation_tool}.json").read_text()) == {
+        "finalisation": "captured"
+    }
 
 
 @pytest.mark.parametrize("tool", sorted(FIXTURE_MIRRORS))

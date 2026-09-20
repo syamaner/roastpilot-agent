@@ -61,11 +61,27 @@ class ColdMcpValidationError(ColdMcpError):
     """Raised when an MCP response violates the cold boundary schema."""
 
 
-class ColdFinalisationNotCleanError(ColdMcpError):
+class ColdFinalisationResultError(ColdMcpError):
+    """Base finalisation error retaining parsed evidence for private diagnostics."""
+
+    result: "SessionFinalisationResult"
+
+    def __init__(self, message: str, result: "SessionFinalisationResult") -> None:
+        """Retain parsed finalisation evidence without rendering it publicly.
+
+        Args:
+            message: Fixed public error message.
+            result: Validated finalisation evidence for private diagnostics.
+        """
+        super().__init__(message)
+        self.result = result
+
+
+class ColdFinalisationNotCleanError(ColdFinalisationResultError):
     """Raised when D195 finalisation is not clean."""
 
 
-class ColdFinalisationSafetyError(ColdMcpError):
+class ColdFinalisationSafetyError(ColdFinalisationResultError):
     """Raised when finalisation lacks safe-zero or disconnect evidence."""
 
 
@@ -361,13 +377,16 @@ def finalisation_is_clean(result: SessionFinalisationResult) -> bool:
         result: Strictly parsed MCP finalisation result.
 
     Returns:
-        ``True`` only for the four-field clean conjunction required by G5.
+        ``True`` only for a clean, fully stopped four-stage finalisation.
     """
     return (
         result.status == "clean"
         and result.clean is True
         and result.rejection_reason is None
         and result.abort_reason is None
+        and not result.failures
+        and result.session_active_after is False
+        and all(stage.status in ("completed", "not_applicable") for stage in result.stages)
     )
 
 
@@ -463,8 +482,8 @@ class ColdCharacterisationMCPClient:
         """
         try:
             return model.model_validate_json(json.dumps(payload))
-        except ValidationError as error:
-            raise ColdMcpValidationError("MCP response failed cold contract validation") from error
+        except (RecursionError, TypeError, ValidationError, ValueError):
+            raise ColdMcpValidationError("MCP response failed cold contract validation") from None
 
     async def _call(self, tool: str, args: dict[str, object]) -> object:
         if tool not in COLD_ALLOWED_TOOLS:
@@ -491,9 +510,21 @@ class ColdCharacterisationMCPClient:
         return result
 
     async def get_roast_state(self, session_id: str | None = None) -> RoastSessionState:
-        """Return one cold session state, omitting an unspecified identifier."""
-        args: dict[str, object] = {} if session_id is None else {"session_id": session_id}
-        return self._validate(RoastSessionState, await self._call("get_roast_state", args))
+        """Return the established cold session state after identity confirmation."""
+        expected_session_id = self._cold_session_id
+        if expected_session_id is None or (
+            session_id is not None and session_id != expected_session_id
+        ):
+            raise ColdSessionIdentityError("requested cold session is not established")
+        result = self._validate(
+            RoastSessionState,
+            await self._call("get_roast_state", {"session_id": expected_session_id}),
+        )
+        if result.session_id != expected_session_id:
+            raise ColdSessionIdentityError("MCP did not return the established cold session")
+        if result.session_purpose != "cold_characterisation":
+            raise ColdSessionPurposeError("MCP did not confirm cold_characterisation purpose")
+        return result
 
     async def mark_beans_added(self) -> EventCommandResult:
         """Request the permitted, non-actuating inference-activation event."""
@@ -517,6 +548,8 @@ class ColdCharacterisationMCPClient:
             ColdFinalisationNotCleanError: If the G5 conjunction is not met.
             ColdFinalisationSafetyError: If G7 or G14 evidence is incomplete.
         """
+        if self._cold_session_id != session_id:
+            raise ColdSessionIdentityError("requested cold session is not established")
         result = self._validate(
             SessionFinalisationResult,
             await self._call("finalise_cold_characterisation_session", {"session_id": session_id}),
@@ -526,13 +559,15 @@ class ColdCharacterisationMCPClient:
         if result.session_purpose != "cold_characterisation":
             raise ColdSessionPurposeError("MCP did not confirm cold_characterisation purpose")
         if not finalisation_is_clean(result):
-            raise ColdFinalisationNotCleanError("MCP finalisation was not clean")
+            raise ColdFinalisationNotCleanError("MCP finalisation was not clean", result)
         if not _finalisation_has_safe_zero(result):
-            raise ColdFinalisationSafetyError("MCP finalisation lacks safe-zero evidence")
+            raise ColdFinalisationSafetyError("MCP finalisation lacks safe-zero evidence", result)
         if not _finalisation_has_capability_compatible_evidence(result):
             raise ColdFinalisationSafetyError(
-                "MCP finalisation does not satisfy streaming capability evidence"
+                "MCP finalisation does not satisfy streaming capability evidence", result
             )
         if not _finalisation_has_clean_disconnect(result):
-            raise ColdFinalisationSafetyError("MCP finalisation lacks clean disconnect evidence")
+            raise ColdFinalisationSafetyError(
+                "MCP finalisation lacks clean disconnect evidence", result
+            )
         return result
