@@ -6,11 +6,12 @@ import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
 
+from roastpilot_agent.cold_characterisation import host as host_module
 from roastpilot_agent.cold_characterisation.host import (
     HOST_MIN_FREE_BYTES_BEFORE,
     HOST_MIN_FREE_BYTES_DURING,
@@ -19,6 +20,7 @@ from roastpilot_agent.cold_characterisation.host import (
     ColdHostBoundFailure,
     HostBoundSample,
     HostBoundsConfig,
+    HostBoundsReader,
     LinuxHostBoundsReader,
 )
 
@@ -42,22 +44,32 @@ class RecordingRunner:
 class FakePopen:
     """Small pipe-backed stand-in for the bounded production runner."""
 
-    def __init__(self, stdout: bytes = b"throttled=0x0\n", *, keep_open: bool = False) -> None:
+    def __init__(
+        self,
+        stdout: bytes = b"throttled=0x0\n",
+        *,
+        keep_open: bool = False,
+        wait_timeout: bool = False,
+        already_exited: bool = False,
+    ) -> None:
         """Expose controlled stdout and lifecycle observations."""
         read_fd, self._write_fd = os.pipe()
         self.stdout = os.fdopen(read_fd, "rb", buffering=0)
         self.args: list[str] = []
         self.killed = False
         self.reaped = False
+        self.reaper_started = False
+        self.wait_timeout = wait_timeout
+        self.already_exited = already_exited
         if stdout:
             os.write(self._write_fd, stdout)
         if not keep_open:
             os.close(self._write_fd)
             self._write_fd = -1
 
-    def poll(self) -> None:
+    def poll(self) -> int | None:
         """Keep the fake live until the runner explicitly reaps it."""
-        return None
+        return 0 if self.already_exited else None
 
     def kill(self) -> None:
         """Record deterministic termination and unblock a waiting reader."""
@@ -68,7 +80,10 @@ class FakePopen:
 
     def wait(self, *, timeout: float | None = None) -> int:
         """Record reaping and return a successful controlled exit."""
-        del timeout
+        if self.wait_timeout and timeout is not None:
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        if self.wait_timeout:
+            self.reaper_started = True
         self.reaped = True
         return 0
 
@@ -123,10 +138,10 @@ def _reader(
         meminfo_path=configured_meminfo_path,
         vcgencmd_timeout_seconds=timeout_seconds,
     )
+    monkeypatch.setattr(host_module, "_admitted_platform", lambda: "linux")
     return LinuxHostBoundsReader(
         config,
         command_runner=None if use_default_runner else runner or RecordingRunner(_completed()),
-        platform_name="linux",
     )
 
 
@@ -135,6 +150,18 @@ def _assert_failure(expected: ColdHostBoundFailure, action: Any) -> None:
     with pytest.raises(ColdHostBoundError) as raised:
         action()
     assert raised.value.failure is expected
+
+
+def test_bound_constants_are_literal_ac15_pins() -> None:
+    """AC15 bounds cannot drift from their literal binary-unit values."""
+    assert HOST_MIN_MEM_AVAILABLE_BYTES == 512 * 2**20
+    assert HOST_MIN_FREE_BYTES_BEFORE == 2 * 2**30
+    assert HOST_MIN_FREE_BYTES_DURING == 2**30
+
+
+def test_private_platform_helper_reads_the_production_platform() -> None:
+    """The private admission seam defaults to the actual runtime platform."""
+    assert isinstance(host_module._admitted_platform(), str)  # pyright: ignore[reportPrivateUsage]
 
 
 def test_thermal_parses_safe_millidegrees(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -181,6 +208,16 @@ def test_thermal_non_ascii_source_is_malformed(
     """A decoding failure is malformed rather than an acceptable temperature."""
     thermal_path = tmp_path / "thermal"
     thermal_path.write_bytes(b"\xff")
+    reader = _reader(tmp_path, monkeypatch, thermal_path=thermal_path)
+    _assert_failure(ColdHostBoundFailure.THERMAL_MALFORMED, reader.read_thermal_c)
+
+
+def test_thermal_oversize_source_is_malformed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Thermal input is capped before a large source can be parsed."""
+    thermal_path = tmp_path / "thermal"
+    thermal_path.write_bytes(b"7" * 129)
     reader = _reader(tmp_path, monkeypatch, thermal_path=thermal_path)
     _assert_failure(ColdHostBoundFailure.THERMAL_MALFORMED, reader.read_thermal_c)
 
@@ -299,6 +336,53 @@ def test_throttle_default_runner_timeout_kills_and_reaps(
     assert process.reaped is True
 
 
+def test_throttle_default_runner_post_eof_wait_timeout_uses_one_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child that closes stdout but never exits still fails as a typed timeout."""
+    process = FakePopen(wait_timeout=True)
+
+    def fake_popen(_argv: list[str], **_kwargs: object) -> FakePopen:
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    reader = _reader(tmp_path, monkeypatch, use_default_runner=True, timeout_seconds=0.001)
+    _assert_failure(ColdHostBoundFailure.THROTTLE_TIMEOUT, reader.read_throttled_word)
+    assert process.killed is True
+    assert process.reaper_started is True
+    assert process.stdout.closed is True
+
+
+def test_throttle_default_runner_stdout_read_error_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Descriptor failures are contained and still close, kill, and reap the child."""
+    process = FakePopen()
+
+    def fake_popen(_argv: list[str], **_kwargs: object) -> FakePopen:
+        return process
+
+    def unavailable_read(_descriptor: int, _count: int) -> bytes:
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(os, "read", unavailable_read)
+    reader = _reader(tmp_path, monkeypatch, use_default_runner=True)
+    _assert_failure(ColdHostBoundFailure.THROTTLE_INVOCATION_FAILED, reader.read_throttled_word)
+    assert process.killed is True
+    assert process.reaped is True
+    assert process.stdout.closed is True
+
+
+def test_bounded_cleanup_handles_an_already_exited_child() -> None:
+    """Cleanup skips kill for an exited process and also supports its fixed wait bound."""
+    process = FakePopen(already_exited=True)
+    cleanup = LinuxHostBoundsReader._kill_and_reap  # pyright: ignore[reportPrivateUsage]
+    cleanup(cast(subprocess.Popen[bytes], process))
+    assert process.killed is False
+    assert process.reaped is True
+
+
 @pytest.mark.parametrize(
     "result, failure",
     [
@@ -322,6 +406,14 @@ def test_throttle_runner_os_error_fails_closed(
 ) -> None:
     """A runner-side execution failure does not produce a substitute word."""
     reader = _reader(tmp_path, monkeypatch, runner=RecordingRunner(OSError("unavailable")))
+    _assert_failure(ColdHostBoundFailure.THROTTLE_INVOCATION_FAILED, reader.read_throttled_word)
+
+
+def test_throttle_runner_unexpected_exception_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any injected runner exception is contained by the closed invocation failure."""
+    reader = _reader(tmp_path, monkeypatch, runner=RecordingRunner(KeyError("secret")))
     _assert_failure(ColdHostBoundFailure.THROTTLE_INVOCATION_FAILED, reader.read_throttled_word)
 
 
@@ -352,7 +444,7 @@ def test_throttle_stderr_never_reaches_the_error(
     assert error.__cause__ is None
 
 
-@pytest.mark.parametrize("timeout", [0.0, float("inf")])
+@pytest.mark.parametrize("timeout", [0.0, 30.1, float("inf")])
 def test_timeout_config_is_finite_positive_and_capped(timeout: float) -> None:
     """The command timeout cannot disable or excessively extend the bound."""
     with pytest.raises(ValidationError):
@@ -419,6 +511,18 @@ def test_memory_rejects_pathological_decimal_width(
     _assert_failure(ColdHostBoundFailure.MEMINFO_MALFORMED, reader.read_mem_available_bytes)
 
 
+def test_memory_accepts_realistic_multiline_meminfo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unrelated Linux meminfo lines do not interfere with the exact field match."""
+    reader = _reader(
+        tmp_path,
+        monkeypatch,
+        meminfo="MemTotal: 8192000 kB\nBuffers: 1000 kB\nMemAvailable: 524288 kB\nSwapFree: 0 kB\n",
+    )
+    assert reader.read_mem_available_bytes() == HOST_MIN_MEM_AVAILABLE_BYTES
+
+
 def test_unresolvable_binary_path_is_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -429,6 +533,17 @@ def test_unresolvable_binary_path_is_missing(
         raise OSError("unavailable")
 
     monkeypatch.setattr(Path, "resolve", unavailable_resolve)
+    _assert_failure(ColdHostBoundFailure.THROTTLE_BINARY_MISSING, reader.read_throttled_word)
+
+
+def test_binary_is_file_error_is_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regular-file probing errors do not escape the closed binary failure."""
+    reader = _reader(tmp_path, monkeypatch)
+
+    def unavailable_is_file(_path: Path) -> bool:
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(Path, "is_file", unavailable_is_file)
     _assert_failure(ColdHostBoundFailure.THROTTLE_BINARY_MISSING, reader.read_throttled_word)
 
 
@@ -451,6 +566,17 @@ def test_disk_start_and_run_bounds_are_separate(
     """The weaker run floor cannot accidentally authorise a start."""
     reader = _reader(tmp_path, monkeypatch, free_bytes=HOST_MIN_FREE_BYTES_DURING)
     reader.check_run_bounds(tmp_path)
+    _assert_failure(
+        ColdHostBoundFailure.DISK_BELOW_START_BOUND, lambda: reader.check_start_bounds(tmp_path)
+    )
+
+
+def test_disk_start_exact_floor_passes_and_one_byte_below_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Start admission preserves the inclusive 2 GiB threshold."""
+    _reader(tmp_path, monkeypatch, free_bytes=2 * 2**30).check_start_bounds(tmp_path)
+    reader = _reader(tmp_path, monkeypatch, free_bytes=2 * 2**30 - 1)
     _assert_failure(
         ColdHostBoundFailure.DISK_BELOW_START_BOUND, lambda: reader.check_start_bounds(tmp_path)
     )
@@ -497,6 +623,25 @@ def test_sample_is_finite_and_populated(tmp_path: Path, monkeypatch: pytest.Monk
     assert sample.monotonic_seconds >= 0.0
 
 
+@pytest.mark.parametrize(
+    "thermal,free_bytes,failure",
+    [
+        ("80000\n", HOST_MIN_FREE_BYTES_DURING, ColdHostBoundFailure.THERMAL_EXCEEDED),
+        ("79900\n", HOST_MIN_FREE_BYTES_DURING - 1, ColdHostBoundFailure.DISK_BELOW_RUN_BOUND),
+    ],
+)
+def test_sample_is_always_a_during_run_full_sweep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    thermal: str,
+    free_bytes: int,
+    failure: ColdHostBoundFailure,
+) -> None:
+    """Sampling retains its contractually weaker during-run disk floor and all sources."""
+    reader = _reader(tmp_path, monkeypatch, thermal=thermal, free_bytes=free_bytes)
+    _assert_failure(failure, lambda: reader.sample(tmp_path))
+
+
 @pytest.mark.parametrize("method_name", ["check_start_bounds", "check_run_bounds", "sample"])
 @pytest.mark.parametrize(
     "reader_method,failure",
@@ -538,9 +683,18 @@ def test_sample_rejects_non_finite_temperature() -> None:
         )
 
 
-def test_non_linux_platform_is_refused_without_monkeypatching_sys_platform() -> None:
-    """Platform admission is explicit and does not fabricate a Linux host."""
+def test_production_platform_refusal_uses_private_admission_seam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Platform admission is explicit without a public construction override."""
+    monkeypatch.setattr(host_module, "_admitted_platform", lambda: "darwin")
     _assert_failure(
         ColdHostBoundFailure.PLATFORM_UNSUPPORTED,
-        lambda: LinuxHostBoundsReader(platform_name="darwin"),
+        LinuxHostBoundsReader,
     )
+
+
+def test_reader_satisfies_protocol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The production reader remains assignable to its narrow composition Protocol."""
+    reader: HostBoundsReader = _reader(tmp_path, monkeypatch)
+    assert reader.read_thermal_c() == 79.9
