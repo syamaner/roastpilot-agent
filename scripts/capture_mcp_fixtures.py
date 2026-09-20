@@ -150,6 +150,11 @@ def _validate_cold_capture_activation(marked: object, session_id: str) -> None:
         raise ValueError("cold beans-added did not confirm the started session")
     if marked_mapping.get("phase") != "roasting":
         raise ValueError("cold beans-added did not enter roasting phase")
+    event = marked_mapping.get("event")
+    if not isinstance(event, dict):
+        raise ValueError("cold beans-added did not return an event mapping")
+    if cast("dict[str, object]", event).get("kind") != "beans_added":
+        raise ValueError("cold beans-added did not confirm beans_added event")
 
 
 def _validate_cold_capture_finalisation(finalisation: object, session_id: str) -> None:

@@ -2244,7 +2244,11 @@ async def test_finalisation_only_capture_is_cold_only_and_preserves_normal_fixtu
                     }
                 }
             if tool == "mark_beans_added":
-                return {"session_id": "cold-session", "phase": "roasting"}
+                return {
+                    "session_id": "cold-session",
+                    "phase": "roasting",
+                    "event": {"kind": "beans_added"},
+                }
             if tool == finalisation_tool:
                 return finalisation_payload
             raise AssertionError(f"unexpected tool call: {tool}")
@@ -2277,6 +2281,9 @@ async def test_finalisation_only_capture_is_cold_only_and_preserves_normal_fixtu
         "unsafe_driver",
         "capability",
         "disconnect",
+        "missing_event",
+        "non_mapping_event",
+        "wrong_event_kind",
     ],
 )
 async def test_finalisation_only_capture_rejects_bad_evidence_without_overwriting_fixture(
@@ -2325,6 +2332,22 @@ async def test_finalisation_only_capture_rejects_bad_evidence_without_overwritin
             disconnect = cast("dict[str, object]", invalid["disconnect"])
             disconnect["last_error"] = "disconnect failure"
 
+    marked: object = {
+        "session_id": "cold-session",
+        "phase": "roasting",
+        "event": {"kind": "beans_added"},
+    }
+    if failure == "missing_event":
+        marked = {"session_id": "cold-session", "phase": "roasting"}
+    elif failure == "non_mapping_event":
+        marked = {"session_id": "cold-session", "phase": "roasting", "event": []}
+    elif failure == "wrong_event_kind":
+        marked = {
+            "session_id": "cold-session",
+            "phase": "roasting",
+            "event": {"kind": "first_crack_detected"},
+        }
+
     class FakeProcess:
         """Cold-only MCP process fake returning invalid finalisation evidence."""
 
@@ -2352,7 +2375,7 @@ async def test_finalisation_only_capture_rejects_bad_evidence_without_overwritin
                     }
                 }
             if tool == "mark_beans_added":
-                return {"session_id": "cold-session", "phase": "roasting"}
+                return marked
             if tool == finalisation_tool:
                 return finalisation
             raise AssertionError(f"unexpected tool call: {tool}")
@@ -2362,11 +2385,13 @@ async def test_finalisation_only_capture_rejects_bad_evidence_without_overwritin
     with pytest.raises((ValidationError, ValueError)):
         await module.capture("fake-mcp", finalisation_only=True)
 
-    assert FakeProcess.instances[0].calls == [
+    expected_calls: list[tuple[str, dict[str, object]]] = [
         ("start_roast_session", {"purpose": "cold_characterisation"}),
         ("mark_beans_added", {}),
-        (finalisation_tool, {"session_id": "cold-session"}),
     ]
+    if failure not in {"missing_event", "non_mapping_event", "wrong_event_kind"}:
+        expected_calls.append((finalisation_tool, {"session_id": "cold-session"}))
+    assert FakeProcess.instances[0].calls == expected_calls
     assert {name: (tmp_path / name).read_bytes() for name in fixture_bytes} == fixture_bytes
 
 
@@ -2414,6 +2439,13 @@ def test_capture_script_rejects_invalid_cold_start_payloads(
         None,
         {"session_id": "other", "phase": "roasting"},
         {"session_id": "session", "phase": "fault"},
+        {"session_id": "session", "phase": "roasting"},
+        {"session_id": "session", "phase": "roasting", "event": []},
+        {
+            "session_id": "session",
+            "phase": "roasting",
+            "event": {"kind": "first_crack_detected"},
+        },
     ],
 )
 def test_capture_script_rejects_invalid_cold_activation_payloads(marked: object) -> None:

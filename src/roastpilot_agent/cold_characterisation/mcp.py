@@ -407,6 +407,10 @@ def finalisation_is_clean(result: SessionFinalisationResult) -> bool:
                     result.first_crack_runtime is None
                     or result.first_crack_runtime.outcome == "not_active"
                 )
+                and (
+                    result.pre_finalisation_first_crack_status is None
+                    or result.pre_finalisation_first_crack_status.audio_running is False
+                )
             )
         )
         and (
@@ -417,7 +421,13 @@ def finalisation_is_clean(result: SessionFinalisationResult) -> bool:
             )
             or (
                 result.stages[2].status == "not_applicable"
-                and (result.recording is None or result.recording.outcome == "not_configured")
+                and (
+                    result.recording is None
+                    or (
+                        result.recording.outcome == "not_configured"
+                        and result.recording.expected is False
+                    )
+                )
             )
         )
         and result.stages[3].status == "completed"
@@ -575,6 +585,8 @@ class ColdCharacterisationMCPClient:
             )
             if result.session.session_purpose != "cold_characterisation":
                 raise ColdSessionPurposeError("MCP did not confirm cold_characterisation purpose")
+            if not result.session.session_id.strip():
+                raise ColdSessionIdentityError("MCP did not return a cold session id")
         except ColdMcpError:
             self._cold_session_id = None
             raise
@@ -622,7 +634,7 @@ class ColdCharacterisationMCPClient:
             ColdFinalisationNotCleanError: If the G5 conjunction is not met.
             ColdFinalisationSafetyError: If G7 or G14 evidence is incomplete.
         """
-        if self._cold_session_id != session_id:
+        if not session_id.strip() or self._cold_session_id != session_id:
             raise ColdSessionIdentityError("requested cold session is not established")
         result = self._validate(
             SessionFinalisationResult,

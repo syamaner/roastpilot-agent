@@ -262,6 +262,40 @@ async def test_start_cold_session_requires_confirmed_purpose() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("session_id", ["", "   "])
+async def test_start_cold_session_rejects_blank_identity_and_leaves_stateful_calls_blocked(
+    session_id: str,
+) -> None:
+    """A blank cold-session identity cannot establish observation or activation access."""
+    payload = _cold_start_payload()
+    cast("dict[str, object]", payload["session"])["session_id"] = session_id
+    client, caller = _unstarted_client_for(payload)
+
+    with pytest.raises(ColdSessionIdentityError, match="MCP did not return a cold session id"):
+        await client.start_cold_session()
+    with pytest.raises(ColdSessionIdentityError):
+        await client.get_roast_state()
+    with pytest.raises(ColdSessionIdentityError):
+        await client.mark_beans_added()
+    with pytest.raises(ColdSessionIdentityError):
+        await client.finalise_session("session-id")
+    assert caller.calls == [("start_roast_session", {"purpose": "cold_characterisation"})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_id", ["", "   "])
+async def test_finalise_session_refuses_explicit_blank_identity_before_transport(
+    session_id: str,
+) -> None:
+    """Explicit blank finalisation identifiers cannot reach the cold transport."""
+    client, caller = _client_for(_payload())
+    client._cold_session_id = session_id  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(ColdSessionIdentityError, match="requested cold session is not established"):
+        await client.finalise_session(session_id)
+    assert caller.calls == []
+
+
+@pytest.mark.asyncio
 async def test_start_cold_session_maps_malformed_response_without_leakage() -> None:
     """Malformed cold-start responses stay inside the fixed validation boundary."""
     client, caller = _unstarted_client_for({"secret": "payload-marker"})
@@ -912,6 +946,44 @@ async def test_claimed_clean_finalisation_requires_telemetry_sampler_evidence() 
     client, _ = _client_for(payload)
     with pytest.raises(ColdFinalisationNotCleanError):
         await client.finalise_session("session-id")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("audio_running", "accepted"), [(None, True), (False, True), (True, False)]
+)
+async def test_not_applicable_first_crack_requires_inactive_audio(
+    audio_running: bool | None, accepted: bool
+) -> None:
+    """Not-applicable first-crack teardown cannot retain a running audio reader."""
+    payload = _payload()
+    payload["first_crack_runtime"] = None
+    if audio_running is None:
+        payload["pre_finalisation_first_crack_status"] = None
+    else:
+        pre_status = cast("dict[str, object]", payload["pre_finalisation_first_crack_status"])
+        pre_status["audio_running"] = audio_running
+    client, _ = _client_for(payload)
+    if accepted:
+        assert (await client.finalise_session("session-id")).status == "clean"
+    else:
+        with pytest.raises(ColdFinalisationNotCleanError):
+            await client.finalise_session("session-id")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected", [False, True])
+async def test_not_applicable_recording_requires_no_expected_recording(expected: bool) -> None:
+    """Not-configured recording is clean only when recording was not expected."""
+    payload = _payload()
+    recording = cast("dict[str, object]", payload["recording"])
+    recording["expected"] = expected
+    client, _ = _client_for(payload)
+    if expected:
+        with pytest.raises(ColdFinalisationNotCleanError):
+            await client.finalise_session("session-id")
+    else:
+        assert (await client.finalise_session("session-id")).status == "clean"
 
 
 @pytest.mark.asyncio
