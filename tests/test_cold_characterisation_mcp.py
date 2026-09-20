@@ -972,6 +972,41 @@ async def test_not_applicable_first_crack_requires_inactive_audio(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_outcome", ["not_active", "stopped"])
+@pytest.mark.parametrize("audio_running", [False, True])
+async def test_first_crack_runtime_success_requires_stopped_audio(
+    runtime_outcome: str, audio_running: bool
+) -> None:
+    """Returned first-crack runtime success cannot contradict its final audio status."""
+    payload = _payload()
+    runtime = cast("dict[str, object]", payload["first_crack_runtime"])
+    runtime["outcome"] = runtime_outcome
+    final_status = cast("dict[str, object]", runtime["final_status"])
+    final_status["audio_running"] = audio_running
+    if runtime_outcome == "stopped":
+        cast("list[dict[str, object]]", payload["stages"])[1]["status"] = "completed"
+    client, _ = _client_for(payload)
+    if audio_running:
+        with pytest.raises(ColdFinalisationNotCleanError):
+            await client.finalise_session("session-id")
+    else:
+        assert (await client.finalise_session("session-id")).status == "clean"
+
+
+@pytest.mark.asyncio
+async def test_successful_first_crack_stop_rejects_a_stop_error() -> None:
+    """A stopped first-crack runtime cannot retain a stop failure diagnostic."""
+    payload = _payload()
+    cast("list[dict[str, object]]", payload["stages"])[1]["status"] = "completed"
+    runtime = cast("dict[str, object]", payload["first_crack_runtime"])
+    runtime["outcome"] = "stopped"
+    runtime["stop_error"] = "reader-stop-failed"
+    client, _ = _client_for(payload)
+    with pytest.raises(ColdFinalisationNotCleanError):
+        await client.finalise_session("session-id")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("expected", [False, True])
 async def test_not_applicable_recording_requires_no_expected_recording(expected: bool) -> None:
     """Not-configured recording is clean only when recording was not expected."""
@@ -984,6 +1019,38 @@ async def test_not_applicable_recording_requires_no_expected_recording(expected:
             await client.finalise_session("session-id")
     else:
         assert (await client.finalise_session("session-id")).status == "clean"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [None, "recording-finalise-failed"])
+async def test_finalised_recording_rejects_a_retained_reason(reason: str | None) -> None:
+    """A finalised recording outcome cannot retain an error reason."""
+    payload = _payload()
+    cast("list[dict[str, object]]", payload["stages"])[2]["status"] = "completed"
+    recording = cast("dict[str, object]", payload["recording"])
+    recording["expected"] = True
+    recording["outcome"] = "finalised"
+    recording["reason"] = reason
+    client, _ = _client_for(payload)
+    if reason is None:
+        assert (await client.finalise_session("session-id")).status == "clean"
+    else:
+        with pytest.raises(ColdFinalisationNotCleanError):
+            await client.finalise_session("session-id")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [None, "driver-read-failed"])
+async def test_final_driver_read_requires_no_error(error: str | None) -> None:
+    """A nominal read with retained read error is not trusted safety evidence."""
+    payload = _payload()
+    cast("dict[str, object]", payload["final_driver_evidence"])["error"] = error
+    client, _ = _client_for(payload)
+    if error is None:
+        assert (await client.finalise_session("session-id")).status == "clean"
+    else:
+        with pytest.raises(ColdFinalisationSafetyError, match="safe-zero evidence"):
+            await client.finalise_session("session-id")
 
 
 @pytest.mark.asyncio

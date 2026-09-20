@@ -400,12 +400,17 @@ def finalisation_is_clean(result: SessionFinalisationResult) -> bool:
                 result.stages[1].status == "completed"
                 and result.first_crack_runtime is not None
                 and result.first_crack_runtime.outcome == "stopped"
+                and result.first_crack_runtime.stop_error is None
+                and result.first_crack_runtime.final_status.audio_running is False
             )
             or (
                 result.stages[1].status == "not_applicable"
                 and (
                     result.first_crack_runtime is None
-                    or result.first_crack_runtime.outcome == "not_active"
+                    or (
+                        result.first_crack_runtime.outcome == "not_active"
+                        and result.first_crack_runtime.final_status.audio_running is False
+                    )
                 )
                 and (
                     result.pre_finalisation_first_crack_status is None
@@ -418,6 +423,7 @@ def finalisation_is_clean(result: SessionFinalisationResult) -> bool:
                 result.stages[2].status == "completed"
                 and result.recording is not None
                 and result.recording.outcome == "finalised"
+                and result.recording.reason is None
             )
             or (
                 result.stages[2].status == "not_applicable"
@@ -442,12 +448,26 @@ def finalisation_is_clean(result: SessionFinalisationResult) -> bool:
     )
 
 
+def _trusted_final_driver_evidence(
+    result: SessionFinalisationResult,
+) -> DriverCommandStateEvidence | None:
+    """Return final driver evidence only when its lifecycle read succeeded cleanly."""
+    driver_read = result.final_driver_evidence
+    if (
+        driver_read is None
+        or driver_read.outcome != "read"
+        or driver_read.error is not None
+        or driver_read.evidence is None
+    ):
+        return None
+    return driver_read.evidence
+
+
 def _finalisation_has_safe_zero(result: SessionFinalisationResult) -> bool:
     """Whether D195 final evidence proves all six command dimensions are zero."""
-    driver_read = result.final_driver_evidence
-    if driver_read is None or driver_read.outcome != "read" or driver_read.evidence is None:
+    evidence = _trusted_final_driver_evidence(result)
+    if evidence is None:
         return False
-    evidence = driver_read.evidence
     return (
         evidence.safe_zero is True
         and not evidence.non_zero_dimensions
@@ -468,10 +488,9 @@ def _command_streaming_required(evidence: DriverCommandStateEvidence) -> bool:
 
 def _finalisation_has_capability_compatible_evidence(result: SessionFinalisationResult) -> bool:
     """Apply the sole AC23 streaming-capability branch to strict evidence."""
-    driver_read = result.final_driver_evidence
-    if driver_read is None or driver_read.outcome != "read" or driver_read.evidence is None:
+    evidence = _trusted_final_driver_evidence(result)
+    if evidence is None:
         return False
-    evidence = driver_read.evidence
     counters = (
         evidence.command_send_attempts,
         evidence.command_write_count,

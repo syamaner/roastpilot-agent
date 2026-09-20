@@ -2285,6 +2285,8 @@ async def test_finalisation_only_capture_is_cold_only_and_preserves_normal_fixtu
         "non_mapping_event",
         "wrong_event_kind",
         "blank_start",
+        "first_crack_running",
+        "driver_read_error",
     ],
 )
 async def test_finalisation_only_capture_rejects_bad_evidence_without_overwriting_fixture(
@@ -2329,6 +2331,12 @@ async def test_finalisation_only_capture_rejects_bad_evidence_without_overwritin
             driver_read = cast("dict[str, object]", invalid["final_driver_evidence"])
             driver = cast("dict[str, object]", driver_read["evidence"])
             driver["command_streaming_required"] = True
+        elif failure == "first_crack_running":
+            runtime = cast("dict[str, object]", invalid["first_crack_runtime"])
+            final_status = cast("dict[str, object]", runtime["final_status"])
+            final_status["audio_running"] = True
+        elif failure == "driver_read_error":
+            cast("dict[str, object]", invalid["final_driver_evidence"])["error"] = "read failed"
         else:
             disconnect = cast("dict[str, object]", invalid["disconnect"])
             disconnect["last_error"] = "disconnect failure"
