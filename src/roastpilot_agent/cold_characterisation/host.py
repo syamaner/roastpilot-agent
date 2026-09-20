@@ -176,11 +176,11 @@ class LinuxHostBoundsReader:
         """
         if sys.platform != "linux":
             raise ColdHostBoundError(ColdHostBoundFailure.PLATFORM_UNSUPPORTED)
-        self._config = config or HostBoundsConfig()  # pragma: no cover - Linux only
-        runner = command_runner  # pragma: no cover - Linux only
-        if runner is None:  # pragma: no cover - Linux only
-            runner = self._make_default_command_runner()  # pragma: no cover - Linux only
-        self._command_runner = runner  # pragma: no cover - Linux only
+        self._config = config or HostBoundsConfig()
+        runner = command_runner
+        if runner is None:
+            runner = self._make_default_command_runner()
+        self._command_runner = runner
 
     def _make_default_command_runner(self) -> CommandRunner:
         """Build the only subprocess-backed runner with a closed invocation."""
@@ -300,6 +300,8 @@ class LinuxHostBoundsReader:
             stdout = result.stdout
             if returncode != 0:
                 failure = ColdHostBoundFailure.THROTTLE_INVOCATION_FAILED
+            elif len(stdout) > _MAX_THROTTLE_STDOUT_BYTES:
+                failure = ColdHostBoundFailure.THROTTLE_OUTPUT_MALFORMED
             else:
                 output = stdout.decode("ascii")
         except ColdHostBoundError:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,6 +41,15 @@ class RecordingRunner:
         if isinstance(self.result, BaseException):
             raise self.result
         return self.result
+
+
+class OversizedGrammarBytes(bytes):
+    """Oversized bytes whose decode is grammar-valid only if the cap is bypassed."""
+
+    def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
+        """Return canonical throttle text while retaining the oversized byte length."""
+        del encoding, errors
+        return "throttled=0x0"
 
 
 class FakePopen:
@@ -166,6 +176,33 @@ def test_bound_constants_are_literal_ac15_pins() -> None:
     assert HOST_MIN_FREE_BYTES_DURING == 2**30
 
 
+def test_host_config_defaults_are_exact_contract_pins() -> None:
+    """The standalone config model preserves its exact ratified defaults."""
+    config = HostBoundsConfig()
+    assert config.vcgencmd_path == Path("/usr/bin/vcgencmd")
+    assert config.thermal_zone_temp_path == Path("/sys/class/thermal/thermal_zone0/temp")
+    assert config.meminfo_path == Path("/proc/meminfo")
+    assert config.vcgencmd_timeout_seconds == 5.0
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="real constructor admits Linux only")
+def test_linux_constructor_wires_an_injected_runner() -> None:
+    """The production constructor retains explicit config and runner wiring on Linux."""
+    config = HostBoundsConfig()
+    runner = RecordingRunner(_completed())
+    reader = LinuxHostBoundsReader(config, command_runner=runner)
+    assert reader._config is config  # pyright: ignore[reportPrivateUsage]
+    assert reader._command_runner is runner  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="real constructor admits Linux only")
+def test_linux_constructor_wires_defaults_without_executing_a_child() -> None:
+    """The production constructor builds its default runner without running it."""
+    reader = LinuxHostBoundsReader()
+    assert reader._config == HostBoundsConfig()  # pyright: ignore[reportPrivateUsage]
+    assert callable(reader._command_runner)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_closed_failure_enum_has_the_ratified_member_count() -> None:
     """The public closed failure grammar stays at the ratified 15 members."""
     assert len(ColdHostBoundFailure) == 15
@@ -280,6 +317,15 @@ def test_throttle_rejects_malformed_or_oversized_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stdout: bytes
 ) -> None:
     """Only one bounded ASCII throttle line is admitted."""
+    reader = _reader(tmp_path, monkeypatch, runner=RecordingRunner(_completed(stdout=stdout)))
+    _assert_failure(ColdHostBoundFailure.THROTTLE_OUTPUT_MALFORMED, reader.read_throttled_word)
+
+
+def test_injected_runner_stdout_cap_precedes_grammar_decoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An oversized injected result fails its cap even if its decode would be valid."""
+    stdout = OversizedGrammarBytes(b"x" * 4097)
     reader = _reader(tmp_path, monkeypatch, runner=RecordingRunner(_completed(stdout=stdout)))
     _assert_failure(ColdHostBoundFailure.THROTTLE_OUTPUT_MALFORMED, reader.read_throttled_word)
 
@@ -502,7 +548,7 @@ def test_throttle_uses_a_symlink_binarys_resolved_target(
 
 
 def test_throttle_stderr_never_reaches_the_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Uncontrolled stderr remains absent from the fixed failure message."""
     secret = b"OPENROUTER_API_KEY=not-for-output"
@@ -517,6 +563,7 @@ def test_throttle_stderr_never_reaches_the_error(
     assert secret_text not in repr(error)
     assert all(secret_text not in str(argument) for argument in error.args)
     assert error.__cause__ is None
+    assert secret_text not in caplog.text
 
 
 @pytest.mark.parametrize("timeout", [0.0, 30.1, float("inf")])
