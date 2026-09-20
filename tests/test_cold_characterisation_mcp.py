@@ -15,6 +15,7 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdFinalisationNotCleanError,
     ColdFinalisationSafetyError,
     ColdMcpError,
+    ColdMcpTransportError,
     ColdMcpValidationError,
     ColdModeForbiddenToolError,
     ColdSessionIdentityError,
@@ -25,6 +26,7 @@ from roastpilot_agent.cold_characterisation.mcp import (
     _finalisation_has_capability_compatible_evidence,  # pyright: ignore[reportPrivateUsage]
     finalisation_is_clean,
 )
+from roastpilot_agent.mcp_client import MCPConnectionError, MCPToolError, MCPToolTimeoutError
 
 _MCP_TOOL_FIXTURES = Path(__file__).parent / "fixtures" / "mcp-tool-results"
 _FINALISATION_FIXTURE = _MCP_TOOL_FIXTURES / "finalise_cold_characterisation_session.json"
@@ -94,6 +96,18 @@ class _MappingCaller:
     async def __call__(self, tool: str, args: dict[str, object]) -> object:
         self.calls.append((tool, args))
         return self.responses[tool]
+
+
+class _RaisingCaller:
+    """Recorded transport that exposes only a caller-provided failure."""
+
+    def __init__(self, error: MCPConnectionError) -> None:
+        self.error = error
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def __call__(self, tool: str, args: dict[str, object]) -> object:
+        self.calls.append((tool, args))
+        raise self.error
 
 
 def _client_for(result: object) -> tuple[ColdCharacterisationMCPClient, _Caller]:
@@ -179,6 +193,53 @@ async def test_cold_client_rejects_any_non_allowlisted_tool() -> None:
     with pytest.raises(ColdModeForbiddenToolError):
         await client._call("set_heat_v2", {})  # pyright: ignore[reportPrivateUsage]
     assert caller.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [MCPConnectionError, MCPToolTimeoutError, MCPToolError])
+@pytest.mark.parametrize(
+    ("method", "tool"),
+    [
+        ("get_server_info", "get_server_info"),
+        ("get_runtime_config", "get_runtime_config"),
+        ("start_cold_session", "start_roast_session"),
+        ("get_roast_state", "get_roast_state"),
+        ("mark_beans_added", "mark_beans_added"),
+        ("finalise_session", "finalise_cold_characterisation_session"),
+    ],
+)
+async def test_every_cold_method_contains_transport_failures(
+    method: str, tool: str, error_type: type[MCPConnectionError]
+) -> None:
+    """Transport, server, and timeout failures never expose caller details."""
+    marker = "transport-payload-marker"
+    caller = _RaisingCaller(error_type(marker))
+    client = ColdCharacterisationMCPClient(caller)
+    if method != "start_cold_session":
+        client._cold_session_id = "session-id"  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(ColdMcpTransportError) as raised:
+        if method == "get_server_info":
+            await client.get_server_info()
+        elif method == "get_runtime_config":
+            await client.get_runtime_config()
+        elif method == "start_cold_session":
+            await client.start_cold_session()
+        elif method == "get_roast_state":
+            await client.get_roast_state()
+        elif method == "mark_beans_added":
+            await client.mark_beans_added()
+        else:
+            await client.finalise_session("session-id")
+
+    assert len(caller.calls) == 1
+    assert caller.calls[0][0] == tool
+    assert str(raised.value) == "MCP transport failed in cold mode"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert marker not in str(raised.value)
+    assert marker not in repr(raised.value)
+    assert marker not in "".join(traceback.format_exception(raised.type, raised.value, raised.tb))
 
 
 @pytest.mark.asyncio
@@ -426,6 +487,55 @@ async def test_finalisation_requires_the_started_cold_session_before_transport()
     with pytest.raises(ColdSessionIdentityError, match="requested cold session is not established"):
         await client.finalise_session("other-session")
     assert caller.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("disposition", "expected_error", "identity_cleared"),
+    [
+        ("clean", None, True),
+        ("purpose", ColdSessionPurposeError, True),
+        ("not_clean", ColdFinalisationNotCleanError, True),
+        ("safe_zero", ColdFinalisationSafetyError, True),
+        ("capability", ColdFinalisationSafetyError, True),
+        ("disconnect", ColdFinalisationSafetyError, True),
+        ("malformed", ColdMcpValidationError, False),
+        ("wrong_session", ColdSessionIdentityError, False),
+    ],
+)
+async def test_finalisation_resets_identity_only_after_a_bound_terminal_result(
+    disposition: str, expected_error: type[Exception] | None, identity_cleared: bool
+) -> None:
+    """Only a parsed result bound to the established session terminates it locally."""
+    payload = _payload()
+    if disposition == "purpose":
+        payload["session_purpose"] = "roast"
+    elif disposition == "not_clean":
+        payload["status"] = "partial"
+        payload["clean"] = False
+    elif disposition == "safe_zero":
+        _driver(payload)["safe_zero"] = False
+    elif disposition == "capability":
+        _driver(payload)["command_loop_running"] = True
+    elif disposition == "disconnect":
+        cast("dict[str, object]", payload["disconnect"])["last_error"] = "failed"
+    elif disposition == "malformed":
+        payload["clean"] = "invalid"
+    elif disposition == "wrong_session":
+        payload["session_id"] = "other-session"
+    client, caller = _client_for(payload)
+
+    if expected_error is None:
+        assert (await client.finalise_session("session-id")).status == "clean"
+    else:
+        with pytest.raises(expected_error):
+            await client.finalise_session("session-id")
+
+    assert (client._cold_session_id is None) is identity_cleared  # pyright: ignore[reportPrivateUsage]
+    if identity_cleared:
+        with pytest.raises(ColdSessionIdentityError):
+            await client.get_roast_state()
+        assert len(caller.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -791,6 +901,86 @@ async def test_claimed_clean_finalisation_rejects_terminal_ordering_and_phase(
     payload[field] = value
     client, _ = _client_for(payload)
     with pytest.raises(ColdFinalisationNotCleanError):
+        await client.finalise_session("session-id")
+
+
+@pytest.mark.asyncio
+async def test_claimed_clean_finalisation_requires_telemetry_sampler_evidence() -> None:
+    """A completed telemetry stage cannot omit its required reader evidence."""
+    payload = _payload()
+    payload["sampler"] = None
+    client, _ = _client_for(payload)
+    with pytest.raises(ColdFinalisationNotCleanError):
+        await client.finalise_session("session-id")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command_loop_stopped", "serial_closed"),
+    [("confirmed", "confirmed"), ("confirmed", "not_applicable")],
+)
+async def test_non_streaming_finalisation_accepts_ratified_confirmations(
+    command_loop_stopped: str, serial_closed: str
+) -> None:
+    """The non-streaming branch accepts exactly its ratified confirmation combinations."""
+    payload = _payload()
+    disconnect = cast("dict[str, object]", payload["disconnect"])
+    disconnect["command_loop_stopped"] = command_loop_stopped
+    disconnect["serial_closed"] = serial_closed
+    client, _ = _client_for(payload)
+    assert (await client.finalise_session("session-id")).status == "clean"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "accepted"),
+    [
+        ("emergency_stop_ordering", "not_reached", True),
+        ("emergency_stop_ordering", "finalisation_committed_first", True),
+        ("emergency_stop_ordering", "emergency_stop_before_disconnect_commit", False),
+        ("emergency_stop_ordering", "emergency_stop_after_disconnect_attempt", False),
+        ("session_phase_after", "pre_roast", True),
+        ("session_phase_after", "roasting", True),
+        ("session_phase_after", "development", False),
+        ("session_phase_after", "dropped", False),
+        ("session_phase_after", "cooling", False),
+        ("session_phase_after", "complete", False),
+        ("session_phase_after", "fault", False),
+    ],
+)
+async def test_claimed_clean_finalisation_accepts_only_safe_ordering_and_phase(
+    field: str, value: str, accepted: bool
+) -> None:
+    """All admitted clean ordering and phase values are exercised at the client gate."""
+    payload = _payload()
+    payload[field] = value
+    client, _ = _client_for(payload)
+    if accepted:
+        assert (await client.finalise_session("session-id")).status == "clean"
+    else:
+        with pytest.raises(ColdFinalisationNotCleanError):
+            await client.finalise_session("session-id")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["unsupported", "unreadable", "malformed"])
+async def test_driver_read_outcomes_fail_the_unconditional_safe_zero_gate(outcome: str) -> None:
+    """Non-read driver outcomes cannot bypass the unconditional safe-zero gate."""
+    payload = _payload()
+    final_read = cast("dict[str, object]", payload["final_driver_evidence"])
+    final_read["outcome"] = outcome
+    client, _ = _client_for(payload)
+    with pytest.raises(ColdFinalisationSafetyError, match="safe-zero evidence"):
+        await client.finalise_session("session-id")
+
+
+@pytest.mark.asyncio
+async def test_driver_read_without_evidence_fails_the_unconditional_safe_zero_gate() -> None:
+    """A read outcome without its retained state evidence is not safe-zero proof."""
+    payload = _payload()
+    cast("dict[str, object]", payload["final_driver_evidence"])["evidence"] = None
+    client, _ = _client_for(payload)
+    with pytest.raises(ColdFinalisationSafetyError, match="safe-zero evidence"):
         await client.finalise_session("session-id")
 
 

@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, ValidationErr
 from roastpilot_agent.config import MCPDeviceConfig
 from roastpilot_agent.mcp_client import (
     EventCommandResult,
+    MCPConnectionError,
     RoastSessionState,
     RuntimeConfigSnapshot,
     ServerInfo,
@@ -59,6 +60,10 @@ class ColdSessionPhaseError(ColdMcpError):
 
 class ColdMcpValidationError(ColdMcpError):
     """Raised when an MCP response violates the cold boundary schema."""
+
+
+class ColdMcpTransportError(ColdMcpError):
+    """Raised when the injected MCP transport fails in cold mode."""
 
 
 class ColdFinalisationResultError(ColdMcpError):
@@ -389,6 +394,7 @@ def finalisation_is_clean(result: SessionFinalisationResult) -> bool:
         and result.emergency_stop_ordering in ("not_reached", "finalisation_committed_first")
         and result.session_phase_after in ("pre_roast", "roasting")
         and result.stages[0].status == "completed"
+        and result.sampler is not None
         and (
             (
                 result.stages[1].status == "completed"
@@ -415,13 +421,7 @@ def finalisation_is_clean(result: SessionFinalisationResult) -> bool:
             )
         )
         and result.stages[3].status == "completed"
-        and (
-            result.sampler is None
-            or (
-                result.sampler.thread_alive_after_join is False
-                and result.sampler.last_error is None
-            )
-        )
+        and (result.sampler.thread_alive_after_join is False and result.sampler.last_error is None)
         and (
             result.first_crack_runtime is None
             or (
@@ -549,7 +549,11 @@ class ColdCharacterisationMCPClient:
     async def _call(self, tool: str, args: dict[str, object]) -> object:
         if tool not in COLD_ALLOWED_TOOLS:
             raise ColdModeForbiddenToolError(f"tool not allowed in cold mode: {tool}")
-        return await self._call_tool(tool, args)
+        try:
+            return await self._call_tool(tool, args)
+        except MCPConnectionError:
+            pass
+        raise ColdMcpTransportError("MCP transport failed in cold mode") from None
 
     async def get_server_info(self) -> ServerInfo:
         """Return the typed MCP server inventory."""
@@ -626,23 +630,19 @@ class ColdCharacterisationMCPClient:
         )
         if result.session_id != session_id:
             raise ColdSessionIdentityError("MCP did not return the requested cold session")
+        self._cold_session_id = None
         if not finalisation_is_clean(result):
-            self._cold_session_id = None
             raise ColdFinalisationNotCleanError("MCP finalisation was not clean", result)
         if result.session_purpose != "cold_characterisation":
             raise ColdSessionPurposeError("MCP did not confirm cold_characterisation purpose")
         if not _finalisation_has_safe_zero(result):
-            self._cold_session_id = None
             raise ColdFinalisationSafetyError("MCP finalisation lacks safe-zero evidence", result)
         if not _finalisation_has_capability_compatible_evidence(result):
-            self._cold_session_id = None
             raise ColdFinalisationSafetyError(
                 "MCP finalisation does not satisfy streaming capability evidence", result
             )
         if not _finalisation_has_clean_disconnect(result):
-            self._cold_session_id = None
             raise ColdFinalisationSafetyError(
                 "MCP finalisation lacks clean disconnect evidence", result
             )
-        self._cold_session_id = None
         return result
