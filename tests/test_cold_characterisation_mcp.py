@@ -116,6 +116,26 @@ def _cold_start_payload() -> dict[str, object]:
     return payload
 
 
+def _cold_state_payload() -> dict[str, object]:
+    """Return a state response for the deterministic established cold session."""
+    payload = cast(
+        "dict[str, object]", json.loads((_MCP_TOOL_FIXTURES / "get_roast_state.json").read_text())
+    )
+    payload["session_id"] = "session-id"
+    payload["session_purpose"] = "cold_characterisation"
+    return payload
+
+
+def _cold_marked_payload() -> dict[str, object]:
+    """Return a beans-added event response for the deterministic cold session."""
+    payload = cast(
+        "dict[str, object]",
+        json.loads((_MCP_TOOL_FIXTURES / "mark_beans_added.json").read_text()),
+    )
+    payload["session_id"] = "session-id"
+    return payload
+
+
 def test_cold_tool_surface_is_exact_and_frozen() -> None:
     """G1/G2: the cold client exposes only its six non-actuating methods."""
     public_methods = {
@@ -165,6 +185,81 @@ async def test_start_cold_session_requires_confirmed_purpose() -> None:
     with pytest.raises(ColdSessionPurposeError):
         await client.start_cold_session()
     assert caller.calls == [("start_roast_session", {"purpose": "cold_characterisation"})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "fixture"),
+    [
+        ("get_server_info", "get_server_info.json"),
+        ("get_runtime_config", "get_runtime_config.json"),
+    ],
+)
+async def test_cold_readonly_methods_return_validated_results(method: str, fixture: str) -> None:
+    """The two stateless cold reads return their respective validated mirrors."""
+    payload = json.loads((_MCP_TOOL_FIXTURES / fixture).read_text())
+    client, caller = _client_for(payload)
+    if method == "get_server_info":
+        result = await client.get_server_info()
+    else:
+        result = await client.get_runtime_config()
+    assert result is not None
+    assert caller.calls == [(method, {})]
+
+
+@pytest.mark.asyncio
+async def test_cold_state_and_activation_return_validated_results() -> None:
+    """Established cold state and beans-added activation calls both succeed."""
+    caller = _MappingCaller(
+        {
+            "start_roast_session": _cold_start_payload(),
+            "get_roast_state": _cold_state_payload(),
+            "mark_beans_added": _cold_marked_payload(),
+        }
+    )
+    client = ColdCharacterisationMCPClient(caller)
+    await client.start_cold_session()
+    assert (await client.get_roast_state()).session_id == "session-id"
+    assert (await client.mark_beans_added()).event.kind == "beans_added"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["get_roast_state", "mark_beans_added"])
+async def test_cold_stateful_methods_reject_pre_start_without_transport(method: str) -> None:
+    """Stateful cold reads and activation require a started cold session."""
+    client, caller = _client_for({})
+    client._cold_session_id = None  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(ColdSessionIdentityError):
+        if method == "get_roast_state":
+            await client.get_roast_state()
+        else:
+            await client.mark_beans_added()
+    assert caller.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "payload"),
+    [
+        ("get_server_info", {"secret": "payload-marker"}),
+        ("get_runtime_config", {"secret": "payload-marker"}),
+    ],
+)
+async def test_stateless_cold_methods_map_malformed_payloads_without_leakage(
+    method: str, payload: dict[str, object]
+) -> None:
+    """Malformed stateless responses become fixed typed cold-boundary errors."""
+    client, _ = _client_for(payload)
+    with pytest.raises(ColdMcpValidationError) as raised:
+        if method == "get_server_info":
+            await client.get_server_info()
+        else:
+            await client.get_runtime_config()
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "payload-marker" not in "".join(
+        traceback.format_exception(raised.type, raised.value, raised.tb)
+    )
 
 
 @pytest.mark.asyncio
@@ -224,6 +319,23 @@ async def test_mark_beans_added_requires_established_cold_session_and_activation
 
 
 @pytest.mark.asyncio
+async def test_mark_beans_added_requires_the_beans_added_event_kind() -> None:
+    """The permitted activation command cannot return another event kind."""
+    marked = _cold_marked_payload()
+    event = cast("dict[str, object]", marked["event"])
+    event["kind"] = "first_crack_detected"
+    caller = _MappingCaller(
+        {"start_roast_session": _cold_start_payload(), "mark_beans_added": marked}
+    )
+    client = ColdCharacterisationMCPClient(caller)
+    await client.start_cold_session()
+    with pytest.raises(
+        ColdSessionPhaseError, match="MCP did not confirm cold inference activation"
+    ):
+        await client.mark_beans_added()
+
+
+@pytest.mark.asyncio
 async def test_real_mock_finalisation_is_accepted_as_non_streaming() -> None:
     """T-R4a: captured MCP 0.2.1 mock evidence takes only the typed false branch."""
     client, caller = _client_for(_payload())
@@ -259,11 +371,7 @@ async def test_get_roast_state_requires_the_established_cold_session(
     field: str, value: str, error: type[ColdMcpError]
 ) -> None:
     """Cold state results cannot be accepted from another session or purpose."""
-    state = cast(
-        "dict[str, object]", json.loads((_MCP_TOOL_FIXTURES / "get_roast_state.json").read_text())
-    )
-    state["session_id"] = "session-id"
-    state["session_purpose"] = "cold_characterisation"
+    state = _cold_state_payload()
     state[field] = value
     caller = _MappingCaller(
         {"start_roast_session": _cold_start_payload(), "get_roast_state": state}
@@ -285,6 +393,27 @@ async def test_get_roast_state_rejects_a_request_for_a_different_session_before_
     with pytest.raises(ColdSessionIdentityError, match="requested cold session is not established"):
         await client.get_roast_state("other-session")
     assert caller.calls == [("start_roast_session", {"purpose": "cold_characterisation"})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["get_roast_state", "mark_beans_added"])
+async def test_stateful_cold_methods_map_malformed_payloads_without_leakage(method: str) -> None:
+    """Malformed stateful responses use the same fixed cold validation boundary."""
+    caller = _MappingCaller(
+        {"start_roast_session": _cold_start_payload(), method: {"secret": "payload-marker"}}
+    )
+    client = ColdCharacterisationMCPClient(caller)
+    await client.start_cold_session()
+    with pytest.raises(ColdMcpValidationError) as raised:
+        if method == "get_roast_state":
+            await client.get_roast_state()
+        else:
+            await client.mark_beans_added()
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "payload-marker" not in "".join(
+        traceback.format_exception(raised.type, raised.value, raised.tb)
+    )
 
 
 @pytest.mark.asyncio
@@ -449,6 +578,21 @@ async def test_every_closed_rejection_reason_cannot_be_clean(reason: RejectionRe
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["unknown_session", "session_purpose_not_eligible"])
+async def test_rejected_finalisation_retains_evidence_before_purpose_check(reason: str) -> None:
+    """Real rejection shapes remain finalisation evidence even without cold purpose."""
+    payload = _payload()
+    payload["status"] = "rejected"
+    payload["clean"] = False
+    payload["rejection_reason"] = reason
+    payload["session_purpose"] = None
+    client, _ = _client_for(payload)
+    with pytest.raises(ColdFinalisationNotCleanError) as raised:
+        await client.finalise_session("session-id")
+    assert raised.value.result.rejection_reason is RejectionReason(reason)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -484,12 +628,17 @@ async def test_claimed_clean_finalisation_rejects_failures_and_active_session(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["pending", "incomplete", "failed", "skipped"])
-async def test_claimed_clean_finalisation_rejects_non_clean_stage_status(status: str) -> None:
-    """Every admitted non-clean stage status aborts a claimed-clean result."""
+@pytest.mark.parametrize(
+    ("index", "status"),
+    [(0, "not_applicable"), (3, "not_applicable"), (1, "failed"), (2, "incomplete")],
+)
+async def test_claimed_clean_finalisation_rejects_inconsistent_stage_status(
+    index: int, status: str
+) -> None:
+    """Mandatory stages complete; optional stages only complete or do not apply."""
     payload = _payload()
     stages = cast("list[dict[str, object]]", payload["stages"])
-    stages[0]["status"] = status
+    stages[index]["status"] = status
     client, _ = _client_for(payload)
     with pytest.raises(ColdFinalisationNotCleanError):
         await client.finalise_session("session-id")
@@ -598,6 +747,7 @@ async def test_client_maps_malformed_finalisation_to_typed_cold_error() -> None:
     ) as raised:
         await client.finalise_session("session-id")
     assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
     assert "sentinel-secret" not in str(raised.value)
     assert "sentinel-secret" not in repr(raised.value)
     assert "sentinel-secret" not in "".join(
@@ -618,6 +768,43 @@ async def test_client_maps_serialisation_failures_to_fixed_typed_cold_error(
         await client.finalise_session("session-id")
     assert str(raised.value) == "MCP response failed cold contract validation"
     assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+async def test_client_rejects_non_finite_json_values(value: float) -> None:
+    """Strict JSON serialization rejects non-finite numeric payload values."""
+    payload = _payload()
+    payload["first_started_session_elapsed_seconds"] = value
+    client, _ = _client_for(payload)
+    with pytest.raises(ColdMcpValidationError) as raised:
+        await client.finalise_session("session-id")
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("sampler", "thread_alive_after_join", True),
+        ("sampler", "last_error", "reader failure"),
+        ("first_crack_runtime", "capture_running_after_stop", True),
+        ("first_crack_runtime", "outcome", "capture_still_running"),
+        ("first_crack_runtime", "outcome", "stop_failed"),
+    ],
+)
+async def test_claimed_clean_finalisation_rejects_contradictory_shutdown_evidence(
+    section: str, field: str, value: object
+) -> None:
+    """Read teardown evidence cannot contradict a claimed-clean finalisation."""
+    payload = _payload()
+    evidence = cast("dict[str, object]", payload[section])
+    evidence[field] = value
+    client, _ = _client_for(payload)
+    with pytest.raises(ColdFinalisationNotCleanError):
+        await client.finalise_session("session-id")
 
 
 @pytest.mark.asyncio

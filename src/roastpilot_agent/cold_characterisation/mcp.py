@@ -386,7 +386,24 @@ def finalisation_is_clean(result: SessionFinalisationResult) -> bool:
         and result.abort_reason is None
         and not result.failures
         and result.session_active_after is False
-        and all(stage.status in ("completed", "not_applicable") for stage in result.stages)
+        and result.stages[0].status == "completed"
+        and result.stages[1].status in ("completed", "not_applicable")
+        and result.stages[2].status in ("completed", "not_applicable")
+        and result.stages[3].status == "completed"
+        and (
+            result.sampler is None
+            or (
+                result.sampler.thread_alive_after_join is False
+                and result.sampler.last_error is None
+            )
+        )
+        and (
+            result.first_crack_runtime is None
+            or (
+                result.first_crack_runtime.capture_running_after_stop is False
+                and result.first_crack_runtime.outcome in ("not_active", "stopped")
+            )
+        )
     )
 
 
@@ -481,9 +498,12 @@ class ColdCharacterisationMCPClient:
             ColdMcpValidationError: If the response violates the cold contract.
         """
         try:
-            return model.model_validate_json(json.dumps(payload))
+            result = model.model_validate_json(json.dumps(payload, allow_nan=False))
         except (RecursionError, TypeError, ValidationError, ValueError):
-            raise ColdMcpValidationError("MCP response failed cold contract validation") from None
+            pass
+        else:
+            return result
+        raise ColdMcpValidationError("MCP response failed cold contract validation") from None
 
     async def _call(self, tool: str, args: dict[str, object]) -> object:
         if tool not in COLD_ALLOWED_TOOLS:
@@ -535,6 +555,8 @@ class ColdCharacterisationMCPClient:
             raise ColdSessionIdentityError("MCP did not return the established cold session")
         if result.phase != "roasting":
             raise ColdSessionPhaseError("MCP did not confirm cold inference activation")
+        if result.event.kind != "beans_added":
+            raise ColdSessionPhaseError("MCP did not confirm cold inference activation")
         return result
 
     async def finalise_session(self, session_id: str) -> SessionFinalisationResult:
@@ -554,12 +576,12 @@ class ColdCharacterisationMCPClient:
             SessionFinalisationResult,
             await self._call("finalise_cold_characterisation_session", {"session_id": session_id}),
         )
+        if not finalisation_is_clean(result):
+            raise ColdFinalisationNotCleanError("MCP finalisation was not clean", result)
         if result.session_id != session_id:
             raise ColdSessionIdentityError("MCP did not return the requested cold session")
         if result.session_purpose != "cold_characterisation":
             raise ColdSessionPurposeError("MCP did not confirm cold_characterisation purpose")
-        if not finalisation_is_clean(result):
-            raise ColdFinalisationNotCleanError("MCP finalisation was not clean", result)
         if not _finalisation_has_safe_zero(result):
             raise ColdFinalisationSafetyError("MCP finalisation lacks safe-zero evidence", result)
         if not _finalisation_has_capability_compatible_evidence(result):
