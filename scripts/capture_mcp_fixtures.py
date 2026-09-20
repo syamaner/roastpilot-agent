@@ -19,6 +19,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -42,40 +43,81 @@ async def capture(command: str) -> None:
     # callers (or a second capture()) never inherit a deleted directory.
     previous_cwd = os.getcwd()
     with tempfile.TemporaryDirectory() as tmp:
-        os.chdir(tmp)
-        process = MCPServerProcess(config)
-        await process.start()
         try:
-            # Read-only tools first.
-            save("get_server_info", await process.call_tool("get_server_info", {}))
-            save("get_runtime_config", await process.call_tool("get_runtime_config", {}))
-            # Full mock roast, in command order.
-            save("start_roast_session", await process.call_tool("start_roast_session", {}))
-            save("set_heat", await process.call_tool("set_heat", {"heat_level_percent": 70}))
-            save("set_fan", await process.call_tool("set_fan", {"fan_level_percent": 40}))
-            save("mark_beans_added", await process.call_tool("mark_beans_added", {}))
-            save("get_roast_state", await process.call_tool("get_roast_state", {}))
-            save("mark_first_crack", await process.call_tool("mark_first_crack", {}))
-            save("drop_beans", await process.call_tool("drop_beans", {}))
-            # Pre-delete so a failed capture leaves a visibly missing
-            # fixture (the completeness test then fails loudly) instead of
-            # a stale file from a previous run.
-            (OUT_DIR / "start_cooling.json").unlink(missing_ok=True)
+            os.chdir(tmp)
+            process = MCPServerProcess(config)
+            await process.start()
             try:
-                save("start_cooling", await process.call_tool("start_cooling", {}))
-            except Exception as exc:  # noqa: BLE001 — capture-or-note, never abort
-                print(f"start_cooling not capturable in this flow: {exc}")
-            save("stop_cooling", await process.call_tool("stop_cooling", {}))
-            save("export_roast_log", await process.call_tool("export_roast_log", {}))
-            # Emergency stop needs an active session and ends it — capture
-            # it in a fresh second session.
-            await process.call_tool("start_roast_session", {})
-            save(
-                "emergency_stop",
-                await process.call_tool("emergency_stop", {"reason": "fixture capture"}),
-            )
+                # Read-only tools first.
+                save("get_server_info", await process.call_tool("get_server_info", {}))
+                save("get_runtime_config", await process.call_tool("get_runtime_config", {}))
+                # Full normal mock roast, in command order.
+                save(
+                    "set_recording_metadata",
+                    await process.call_tool(
+                        "set_recording_metadata", {"origin": "colombia-huila", "roast_num": 5}
+                    ),
+                )
+                save("start_roast_session", await process.call_tool("start_roast_session", {}))
+                save("set_heat", await process.call_tool("set_heat", {"heat_level_percent": 70}))
+                save("set_fan", await process.call_tool("set_fan", {"fan_level_percent": 40}))
+                save("mark_beans_added", await process.call_tool("mark_beans_added", {}))
+                save("get_roast_state", await process.call_tool("get_roast_state", {}))
+                save("mark_first_crack", await process.call_tool("mark_first_crack", {}))
+                save("drop_beans", await process.call_tool("drop_beans", {}))
+                # Pre-delete so a failed capture leaves a visibly missing
+                # fixture (the completeness test then fails loudly) instead of
+                # a stale file from a previous run.
+                (OUT_DIR / "start_cooling.json").unlink(missing_ok=True)
+                try:
+                    save("start_cooling", await process.call_tool("start_cooling", {}))
+                except Exception as exc:  # noqa: BLE001 — capture-or-note, never abort
+                    print(f"start_cooling not capturable in this flow: {exc}")
+                save("stop_cooling", await process.call_tool("stop_cooling", {}))
+                save("export_roast_log", await process.call_tool("export_roast_log", {}))
+                # Emergency stop needs an active session and ends it — capture
+                # it in a fresh second session.
+                await process.call_tool("start_roast_session", {})
+                save(
+                    "emergency_stop",
+                    await process.call_tool("emergency_stop", {"reason": "fixture capture"}),
+                )
+            finally:
+                await process.stop()
+            # Prove the 0.2.1 cold-session lifecycle addition without adding a
+            # new fixture: this remains a 14-tool capture set. It must run
+            # in a fresh child because emergency-stop recovery owns the normal
+            # session until that child disconnects.
+            cold_process = MCPServerProcess(config)
+            await cold_process.start()
+            try:
+                cold_start = await cold_process.call_tool(
+                    "start_roast_session", {"purpose": "cold_characterisation"}
+                )
+                if not isinstance(cold_start, dict):
+                    raise TypeError("cold start result must be a mapping")
+                cold_start_mapping = cast("dict[str, object]", cold_start)
+                session = cold_start_mapping.get("session")
+                if not isinstance(session, dict):
+                    raise ValueError("cold start did not confirm cold_characterisation purpose")
+                session_mapping = cast("dict[str, object]", session)
+                if session_mapping.get("session_purpose") != "cold_characterisation":
+                    raise ValueError("cold start did not confirm cold_characterisation purpose")
+                session_id = session_mapping.get("session_id")
+                if not isinstance(session_id, str) or not session_id:
+                    raise ValueError("cold start did not provide a session id")
+                marked = await cold_process.call_tool("mark_beans_added", {})
+                if not isinstance(marked, dict):
+                    raise TypeError("cold beans-added result must be a mapping")
+                marked_mapping = cast("dict[str, object]", marked)
+                if marked_mapping.get("session_id") != session_id:
+                    raise ValueError("cold beans-added did not confirm the started session")
+                if marked_mapping.get("phase") != "roasting":
+                    raise ValueError("cold beans-added did not enter roasting phase")
+                print("confirmed validated cold_characterisation start and beans-added")
+            finally:
+                await cold_process.stop()
         finally:
-            await process.stop()
             os.chdir(previous_cwd)
 
 

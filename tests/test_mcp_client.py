@@ -6,6 +6,7 @@ source and validated here against the 7 Jun 2026 live-roast exports.
 """
 
 import asyncio
+import importlib.util
 import json
 import logging
 import math
@@ -377,6 +378,7 @@ def test_session_state_mirror_round_trips() -> None:
     assert state.t0_status.status == "detected"
     assert state.first_crack_status.emitted_window_count == 311
     assert state.development_percent == 3.6  # passed through, not recomputed
+    assert state.session_purpose == "roast"
     # #342 (D85): the ambient triad mirrors the MCP's 0.1.12 wire shape byte-for-byte.
     assert state.ambient_status.mode == "yoctopuce"
     assert state.ambient_status.status == "ok"
@@ -709,6 +711,26 @@ async def test_real_child_process_round_trip() -> None:
         info = await client.get_server_info()
         assert info.package_name == "coffee-roaster-mcp"
         assert info.bootstrap_safe is True
+    finally:
+        await process.stop()
+    assert not process.running
+
+
+@pytest.mark.asyncio
+async def test_real_child_process_confirms_cold_session_purpose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pinned mock MCP confirms cold purpose before beans-added activation."""
+    monkeypatch.chdir(tmp_path)
+    process = MCPServerProcess()
+    await process.start()
+    try:
+        started = StartRoastSessionResult.model_validate(
+            await process.call_tool("start_roast_session", {"purpose": "cold_characterisation"})
+        )
+        assert started.session.session_purpose == "cold_characterisation"
+        marked = EventCommandResult.model_validate(await process.call_tool("mark_beans_added", {}))
+        assert marked.session_id == started.session.session_id
     finally:
         await process.stop()
     assert not process.running
@@ -2121,6 +2143,47 @@ def test_every_tool_has_a_captured_fixture() -> None:
     assert captured == set(FIXTURE_MIRRORS)
 
 
+def test_captured_server_info_pins_021_bootstrap_inventory() -> None:
+    """The fixture records published 0.2.1's 14-tool plus finalisation inventory."""
+    payload = json.loads((TOOL_RESULT_FIXTURES / "get_server_info.json").read_text())
+    assert payload["version"] == "0.2.1"
+    tools = set(payload["available_bootstrap_tools"])
+    assert tools == set(FIXTURE_MIRRORS) | {"finalise_cold_characterisation_session"}
+
+
+def test_captured_sessions_are_normal_roasts_and_unknown_purpose_is_rejected() -> None:
+    """The additive default remains closed to unknown session purposes."""
+    for name in ("start_roast_session", "get_roast_state"):
+        payload = json.loads((TOOL_RESULT_FIXTURES / f"{name}.json").read_text())
+        state = payload["session"] if name == "start_roast_session" else payload
+        assert state["session_purpose"] == "roast"
+    invalid = dict(SESSION_STATE_PAYLOAD, session_purpose="unknown")
+    with pytest.raises(ValidationError):
+        RoastSessionState.model_validate(invalid)
+
+
+@pytest.mark.asyncio
+async def test_capture_script_behaviourally_captures_only_the_fourteen_tools(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The real mock capture includes metadata before normal and cold sessions."""
+    path = Path(__file__).parents[1] / "scripts" / "capture_mcp_fixtures.py"
+    spec = importlib.util.spec_from_file_location("capture_mcp_fixtures_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    vars(module)["OUT_DIR"] = tmp_path
+    await module.capture(resolve_mcp_command(DEFAULT_MCP_COMMAND))
+
+    captured = {item.stem for item in tmp_path.glob("*.json")}
+    assert captured == set(FIXTURE_MIRRORS)
+    lines = capsys.readouterr().out.splitlines()
+    assert next(i for i, line in enumerate(lines) if "set_recording_metadata" in line) < next(
+        i for i, line in enumerate(lines) if "start_roast_session" in line
+    )
+    assert "confirmed validated cold_characterisation start and beans-added" in lines
+
+
 @pytest.mark.parametrize("tool", sorted(FIXTURE_MIRRORS))
 def test_captured_fixture_validates_into_mirror(tool: str) -> None:
     payload = json.loads((TOOL_RESULT_FIXTURES / f"{tool}.json").read_text())
@@ -2930,7 +2993,7 @@ def test_project_live_ambient_voids_a_partially_populated_triad(absent: str) -> 
     An earlier revision of this PR forwarded a partial triad and deferred this
     case, on the grounds that some ambient probe might legitimately report fewer
     than three members. It cannot: the development dependency group pins
-    ``coffee-roaster-mcp==0.1.13``,
+    ``coffee-roaster-mcp==0.2.1``,
     whose ``build_configured_ambient_reader`` supports exactly one mode, whose
     ``YoctoMeteoAmbientReader.read`` raises for the WHOLE read if any one sensor
     fails, whose ``AmbientReading`` declares all three members as required

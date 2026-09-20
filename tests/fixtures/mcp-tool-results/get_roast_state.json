@@ -12,8 +12,8 @@
   },
   "bean_ror_c_per_min": null,
   "bean_temp_delta_60s_c": null,
-  "beans_added_at_utc": "2026-07-13T01:47:44.759625+00:00",
-  "beans_added_monotonic_seconds": 0.04605691600590944,
+  "beans_added_at_utc": "2026-09-19T22:18:59.508051+00:00",
+  "beans_added_monotonic_seconds": 0.04691137500049081,
   "beans_dropped_at_utc": null,
   "beans_dropped_monotonic_seconds": null,
   "cooling_on": false,
@@ -21,7 +21,7 @@
   "cooling_started_monotonic_seconds": null,
   "cooling_stopped_at_utc": null,
   "cooling_stopped_monotonic_seconds": null,
-  "created_at_utc": "2026-07-13T01:47:44.713572+00:00",
+  "created_at_utc": "2026-09-19T22:18:59.461139+00:00",
   "development_percent": null,
   "development_time_seconds": null,
   "device_state": {
@@ -38,15 +38,15 @@
       "telemetry_model": "fixed_step_thermal_v1"
     }
   },
-  "elapsed_monotonic_seconds": 0.051,
+  "elapsed_monotonic_seconds": 0.052,
   "env_ror_c_per_min": null,
   "env_temp_delta_60s_c": null,
   "events": [
     {
       "kind": "beans_added",
-      "monotonic_seconds": 0.04605691600590944,
+      "monotonic_seconds": 0.04691137500049081,
       "payload": {},
-      "recorded_at_utc": "2026-07-13T01:47:44.759625+00:00"
+      "recorded_at_utc": "2026-09-19T22:18:59.508051+00:00"
     }
   ],
   "fan_level_percent": 40,
@@ -62,6 +62,10 @@
     "dropped_window_count": 0,
     "emitted_window_count": 0,
     "estimated_lost_audio_ms_last_minute": 0.0,
+    "inference_overrun_count": 0,
+    "last_inference_duration_ms": 0.0,
+    "max_consecutive_overflow_count": 0,
+    "max_inference_duration_ms": 0.0,
     "mic_peak_dbfs": null,
     "mic_rms_dbfs": null,
     "mode": "disabled",
@@ -73,10 +77,11 @@
     "total_overflow_count": 0
   },
   "heat_level_percent": 70,
-  "log_dir": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpake8es_3/logs/roasts/98bab46622814d04ae6a2e732b5792ee",
+  "log_dir": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmp7unbr62q/logs/roasts/252f342044874d24adb03194a670a2b6",
   "phase": "roasting",
   "roast_elapsed_seconds": 0.005,
-  "session_id": "98bab46622814d04ae6a2e732b5792ee",
+  "session_id": "252f342044874d24adb03194a670a2b6",
+  "session_purpose": "roast",
   "stopped_at_utc": null,
   "t0_status": {
     "auto_detection_enabled": false,

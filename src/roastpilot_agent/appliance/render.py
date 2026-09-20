@@ -24,7 +24,7 @@ so this module cannot introduce a second, driftable copy of the pinned model
 identity (AGENTS.md class-sweep discipline).
 
 **Recording stays off.** The MCP YAML template omits the ``recording:``
-section entirely. ``coffee-roaster-mcp==0.2.0``'s ``RecordingConfig.enabled``
+section entirely. ``coffee-roaster-mcp==0.2.1``'s ``RecordingConfig.enabled``
 defaults to ``False`` (verified against the installed distribution's
 ``config.py``), so omission is a *proven* off, not a guess — matching the
 convention already used by the committed

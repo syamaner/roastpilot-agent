@@ -610,18 +610,32 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
     esac
 }
 
-verify_pi_capability() {
-    local venv_name="${1:-roastpilot-agent}" mcp_executable metadata line version="" version_seen=0
-    probe_pipx_venv_root || return 1
-    mcp_executable="$PIPX_VENV_ROOT/$venv_name/bin/coffee-roaster-mcp"
-    [[ -f "$mcp_executable" && -x "$mcp_executable" && ! -L "$mcp_executable" ]] || return 1
+installed_mcp_version() {
+    local venv_name="${1:-roastpilot-agent}" metadata line version="" version_seen=0
     metadata="$(pipx_command runpip "$venv_name" show coffee-roaster-mcp)" || return 1
     while IFS= read -r line || [[ -n "$line" ]]; do
         case "$line" in
             "Version: "*) ((version_seen++ == 0)) || return 1; version="${line#Version: }" ;;
         esac
     done <<< "$metadata"
-    [[ "$version_seen" == 1 && "$version" == "0.2.0" ]]
+    [[ "$version_seen" == 1 && -n "$version" ]] || return 1
+    [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ ]] || return 1
+    printf '%s\n' "$version"
+}
+
+verify_pi_capability() {
+    local venv_name="${1:-roastpilot-agent}" expected_mcp_version mcp_executable version
+    if (($# >= 2)); then
+        expected_mcp_version="$2"
+    else
+        expected_mcp_version="0.2.1"
+    fi
+    [[ -n "$expected_mcp_version" ]] || return 1
+    probe_pipx_venv_root || return 1
+    mcp_executable="$PIPX_VENV_ROOT/$venv_name/bin/coffee-roaster-mcp"
+    [[ -f "$mcp_executable" && -x "$mcp_executable" && ! -L "$mcp_executable" ]] || return 1
+    version="$(installed_mcp_version "$venv_name")" || return 1
+    [[ "$version" == "$expected_mcp_version" ]]
 }
 
 require_pi_capability() {
@@ -919,7 +933,7 @@ remove_root_temporary() {
 }
 
 replace_application_safely() {
-    local prior_spec="$1" package_spec="$2" suffix="-roastpilot-stage-$$" restoration_failed=0 status
+    local prior_spec="$1" package_spec="$2" suffix="-roastpilot-stage-$$" restoration_failed=0 status prior_mcp_version
     # Prove a separate pipx environment can supply the required dependency
     # before removing the known-working application environment.
     STAGED_PIPX_VENV="roastpilot-agent$suffix"
@@ -939,6 +953,10 @@ replace_application_safely() {
         cleanup_staged_pipx || true
         die "$PROCESS_GUARD_MESSAGE"
     fi
+    prior_mcp_version="$(installed_mcp_version)" || {
+        cleanup_staged_pipx || true
+        die "cannot determine prior MCP version for restoration"
+    }
     APPLICATION_CHANGED=1
     if pipx_command uninstall -- roastpilot-agent; then :; else
         status=$?
@@ -954,7 +972,7 @@ replace_application_safely() {
             if [[ "$prior_spec" == "${RESTORE_ARTIFACT_DIR:-}/"* ]]; then
                 RESTORE_ARTIFACT_RETAIN=1
             fi
-            if verify_pi_capability; then
+            if verify_pi_capability roastpilot-agent "$prior_mcp_version"; then
                 APPLICATION_CHANGED=0
             else
                 restoration_failed=1

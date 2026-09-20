@@ -105,12 +105,12 @@ def test_pi_extra_is_the_exact_torch_free_mcp_pin() -> None:
             "anthropic<1",
             "pydantic-ai-slim[google]>=1.0,<2",
         ],
-        "pi": ["coffee-roaster-mcp==0.2.0"],
+        "pi": ["coffee-roaster-mcp==0.2.1"],
     }
     pi_requirement = cast(list[str], extras["pi"])
     assert len(pi_requirement) == 1
     assert _requirement_name(pi_requirement[0]) == "coffee-roaster-mcp"
-    assert pi_requirement[0] == "coffee-roaster-mcp==0.2.0"
+    assert pi_requirement[0] == "coffee-roaster-mcp==0.2.1"
 
 
 def test_pi_extra_metadata_preserves_a_lean_base_wheel(built_wheel: Path) -> None:
@@ -121,7 +121,7 @@ def test_pi_extra_metadata_preserves_a_lean_base_wheel(built_wheel: Path) -> Non
         for requirement in requirements
         if requirement.partition(";")[2].strip() == "extra == 'pi'"
     ]
-    assert pi_requirements == ["coffee-roaster-mcp==0.2.0; extra == 'pi'"]
+    assert pi_requirements == ["coffee-roaster-mcp==0.2.1; extra == 'pi'"]
     assert {_requirement_name(requirement) for requirement in pi_requirements} == {
         "coffee-roaster-mcp"
     }

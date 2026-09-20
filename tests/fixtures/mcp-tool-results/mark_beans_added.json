@@ -1,11 +1,11 @@
 {
   "event": {
     "kind": "beans_added",
-    "monotonic_seconds": 0.04605691600590944,
+    "monotonic_seconds": 0.04691137500049081,
     "payload": {},
-    "recorded_at_utc": "2026-07-13T01:47:44.759625+00:00"
+    "recorded_at_utc": "2026-09-19T22:18:59.508051+00:00"
   },
   "event_count": 1,
   "phase": "roasting",
-  "session_id": "98bab46622814d04ae6a2e732b5792ee"
+  "session_id": "252f342044874d24adb03194a670a2b6"
 }
