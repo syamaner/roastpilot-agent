@@ -213,6 +213,24 @@ def test_thermal_parses_safe_millidegrees(tmp_path: Path, monkeypatch: pytest.Mo
     assert _reader(tmp_path, monkeypatch).read_thermal_c() == 79.9
 
 
+def test_thermal_preserves_the_ratified_negative_integer_grammar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Negative millidegrees remain syntactically valid without adding a new bound."""
+    assert _reader(tmp_path, monkeypatch, thermal="-1000\n").read_thermal_c() == -1.0
+
+
+@pytest.mark.parametrize("thermal", ["-", "--1000", "+1000", "-12345678"])
+def test_thermal_rejects_negative_grammar_edges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, thermal: str
+) -> None:
+    """Only one optional minus followed by one-to-seven digits is admitted."""
+    _assert_failure(
+        ColdHostBoundFailure.THERMAL_MALFORMED,
+        lambda: _reader(tmp_path, monkeypatch, thermal=thermal).read_thermal_c(),
+    )
+
+
 @pytest.mark.parametrize("thermal", ["80000", "80100"])
 def test_thermal_rejects_the_limit_and_above(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, thermal: str
@@ -388,6 +406,66 @@ def test_default_runner_retains_a_positive_window_for_short_timeouts(
     )
     assert reader.read_throttled_word() == 0
     assert process.wait_timeouts == pytest.approx([timeout_seconds / 2.0])
+
+
+def test_short_timeout_failure_splits_work_and_cleanup_within_its_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 10ms timeout reserves 5ms for work and 5ms for fail-closed cleanup."""
+    process = FakePopen(wait_timeout=True)
+
+    def fake_popen(_argv: list[str], **_kwargs: object) -> FakePopen:
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr("roastpilot_agent.cold_characterisation.host.time.monotonic", lambda: 10.0)
+    reader = _reader(tmp_path, monkeypatch, use_default_runner=True, timeout_seconds=0.01)
+    _assert_failure(ColdHostBoundFailure.THROTTLE_TIMEOUT, reader.read_throttled_word)
+    assert process.killed is True
+    assert process.reaper_event.wait(0.1)
+    assert process.wait_timeouts[:2] == pytest.approx([0.005, 0.005])
+
+
+def test_post_read_elapsed_deadline_still_cleans_up_as_a_typed_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clock advance after EOF reaches the post-read guard without a wall-clock race."""
+    process = FakePopen()
+    times = iter([10.0, 10.0, 10.0, 10.006, 10.006, 10.006])
+
+    def fake_popen(_argv: list[str], **_kwargs: object) -> FakePopen:
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        "roastpilot_agent.cold_characterisation.host.time.monotonic", lambda: next(times)
+    )
+    reader = _reader(tmp_path, monkeypatch, use_default_runner=True, timeout_seconds=0.01)
+    _assert_failure(ColdHostBoundFailure.THROTTLE_TIMEOUT, reader.read_throttled_word)
+    assert process.killed is True
+    assert process.reaped is True
+    assert process.wait_timeouts == pytest.approx([0.004])
+
+
+def test_stdout_elapsed_deadline_still_cleans_up_as_a_typed_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clock advance before pipe readiness reaches the loop deadline guard deterministically."""
+    process = FakePopen(keep_open=True)
+    times = iter([10.0, 10.006, 10.006, 10.006])
+
+    def fake_popen(_argv: list[str], **_kwargs: object) -> FakePopen:
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        "roastpilot_agent.cold_characterisation.host.time.monotonic", lambda: next(times)
+    )
+    reader = _reader(tmp_path, monkeypatch, use_default_runner=True, timeout_seconds=0.01)
+    _assert_failure(ColdHostBoundFailure.THROTTLE_TIMEOUT, reader.read_throttled_word)
+    assert process.killed is True
+    assert process.reaped is True
+    assert process.wait_timeouts == pytest.approx([0.004])
 
 
 def test_default_runner_reads_only_the_bounded_stdout_sentinel(

@@ -206,7 +206,7 @@ class LinuxHostBoundsReader:
             try:
                 stdout = self._read_bounded_stdout(process, stdout_stream, work_deadline, timeout)
                 remaining = work_deadline - time.monotonic()
-                if remaining <= 0:  # pragma: no cover - selector timeout covers the same deadline
+                if remaining <= 0:
                     raise subprocess.TimeoutExpired(process.args, timeout)
                 returncode = process.wait(timeout=remaining)
             except BaseException:
@@ -252,7 +252,7 @@ class LinuxHostBoundsReader:
                 selector.register(descriptor, selectors.EVENT_READ)
                 while True:
                     remaining = deadline - time.monotonic()
-                    if remaining <= 0:  # pragma: no cover - selector covers this deadline
+                    if remaining <= 0:
                         raise subprocess.TimeoutExpired(process.args, timeout)
                     if not selector.select(remaining):
                         raise subprocess.TimeoutExpired(process.args, timeout)
