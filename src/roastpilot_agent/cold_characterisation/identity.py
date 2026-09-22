@@ -26,7 +26,7 @@ _ALLOWED_CELSIUS_TOKENS: Final = frozenset({"celsius"})
 _ALLOWED_INFERENCE_MODES: Final = frozenset({"audio"})
 _ALLOWED_CREDENTIAL_ENV_NAMES: Final = frozenset({"OPENROUTER_API_KEY"})
 _BOOT_ID_PATTERN: Final = re.compile(
-    r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\n?\Z"
+    r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
 )
 _PRINTABLE_TEXT_PATTERN: Final = re.compile(r"\A[\x20-\x7e\n]*\Z")
 _CREDENTIAL_SHAPE_PATTERN: Final = re.compile(
@@ -117,6 +117,8 @@ class ColdRunIdentity(BaseModel):
     @model_validator(mode="after")
     def _require_packaged_manifest(self) -> ColdRunIdentity:
         """Require packaged constants and closed admissions on every construction path."""
+        if _BOOT_ID_PATTERN.fullmatch(self.boot_id) is None:
+            raise ColdIdentityError(ColdIdentityFailure.BOOT_ID_MALFORMED)
         _admit_identity_inputs(
             coffee_roaster_mcp_version=self.coffee_roaster_mcp_version,
             runtime_config=self.runtime_config,
@@ -330,9 +332,11 @@ def _read_boot_id(path: Path) -> str:
         boot_id = raw.decode("ascii")
     except UnicodeDecodeError as error:
         raise ColdIdentityError(ColdIdentityFailure.BOOT_ID_MALFORMED) from error
+    if boot_id.endswith("\n"):
+        boot_id = boot_id[:-1]
     if _BOOT_ID_PATTERN.fullmatch(boot_id) is None:
         raise ColdIdentityError(ColdIdentityFailure.BOOT_ID_MALFORMED)
-    return boot_id.rstrip("\n")
+    return boot_id
 
 
 def _operator_text_is_safe(text: str) -> bool:

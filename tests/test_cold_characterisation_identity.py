@@ -291,6 +291,39 @@ def test_freeze_refuses_malformed_or_oversized_boot_id(tmp_path: Path, content: 
     )
 
 
+@pytest.mark.parametrize(
+    "boot_id",
+    [
+        "123E4567-E89B-12D3-A456-426614174000",
+        "123e4567-e89b-12d3-a456-426614174000\n",
+        "123e4567-e89b-12d3-a456-42661417400",
+        "123e4567-e89b-12d3-a456-426614174000\nsecond",
+    ],
+)
+def test_model_validate_refuses_noncanonical_stored_boot_id(tmp_path: Path, boot_id: str) -> None:
+    """Reconstruction admits only the normalized boot ID, without filesystem I/O."""
+    payload = _freeze(tmp_path).model_dump(mode="python")
+    payload["boot_id"] = boot_id
+
+    with pytest.raises(ColdIdentityError) as raised:
+        ColdRunIdentity.model_validate(payload)
+
+    assert raised.value.failure is ColdIdentityFailure.BOOT_ID_MALFORMED
+
+
+def test_model_validate_round_trips_normalized_boot_id_without_filesystem_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reconstruction preserves a valid frozen boot ID without rereading its source."""
+    identity = _freeze(tmp_path)
+    monkeypatch.setattr(Path, "open", pytest.fail)
+
+    reconstructed = ColdRunIdentity.model_validate(identity.model_dump(mode="python"))
+
+    assert reconstructed == identity
+    assert reconstructed.boot_id == "123e4567-e89b-12d3-a456-426614174000"
+
+
 def test_freeze_refuses_missing_boot_id(tmp_path: Path) -> None:
     """An unreadable boot source cannot become an unknown identity field."""
     _assert_failure(
