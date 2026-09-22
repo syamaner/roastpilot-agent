@@ -128,6 +128,15 @@ class ColdRunIdentity(BaseModel):
             or self.model_manifest != expected_entries
         ):
             raise ValueError("identity must use packaged identity constants")
+        if not all(
+            math.isfinite(value)
+            for value in (
+                self.runtime_config.command_interval_seconds,
+                self.runtime_config.sample_interval_seconds,
+                self.runtime_config.auto_t0_drop_threshold_c,
+            )
+        ):
+            raise ValueError("runtime configuration identity values must be finite")
         return self
 
 
@@ -194,7 +203,8 @@ def freeze_identity(
         The frozen admitted identity.
 
     Raises:
-        ColdIdentityError: If an identity admission fails closed.
+        ColdIdentityError: If an explicit identity admission fails closed.
+        ValidationError: If the frozen identity model rejects supplied values.
     """
     _admit_identity_inputs(
         coffee_roaster_mcp_version=coffee_roaster_mcp_version,

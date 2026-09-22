@@ -263,6 +263,26 @@ def test_identity_hash_is_canonical_stable_and_sensitive(tmp_path: Path) -> None
     assert digest == digest.lower()
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "command_interval_seconds",
+        "sample_interval_seconds",
+        "auto_t0_drop_threshold_c",
+    ],
+)
+def test_identity_rejects_non_finite_runtime_values_before_hashing(
+    tmp_path: Path, field: str, value: float
+) -> None:
+    """Nested tolerant runtime mirrors cannot carry non-finite identity values."""
+    runtime = _runtime(**{field: value})
+    with pytest.raises(
+        ValidationError, match="runtime configuration identity values must be finite"
+    ):
+        identity_sha256(_freeze(tmp_path, runtime_config=runtime))
+
+
 def test_identity_rejects_non_finite_controller_tick(tmp_path: Path) -> None:
     """The frozen finite model refuses non-finite values before hashing."""
     with pytest.raises(ValidationError):
