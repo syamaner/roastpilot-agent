@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+from enum import Enum
 from pathlib import Path
 from typing import Any, Final, cast
 
@@ -258,6 +259,84 @@ def test_freeze_detaches_from_caller_device_config_and_input_list(tmp_path: Path
 
     assert identity.device_config.recording_devices == ("USB microphone",)
     assert identity_sha256(identity) == digest
+
+
+def test_freeze_projects_every_managed_device_config_field(tmp_path: Path) -> None:
+    """The frozen projection copies every managed field without retaining caller types."""
+    source = MCPDeviceConfig.model_validate(
+        {
+            "serial_port": "/dev/ttyS11",
+            "roaster_driver": "hottop_kn8828b_2k_plus",
+            "audio_input_device": "hw:2,0",
+            "recording_enabled": True,
+            "recording_autocapture": False,
+            "recording_devices": ["USB microphone"],
+            "fc_mode": "manual",
+            "fc_confidence_threshold": 0.75,
+            "auto_t0_detection_enabled": True,
+            "auto_t0_drop_threshold_c": 31.5,
+            "mcp_yaml_source_path": Path("/etc/roastpilot/managed-mcp.yaml"),
+            "ambient_mode": "yoctopuce",
+            "ambient_device": "YOCTO-USB-1234567890ABCDEF",
+            "ambient_poll_interval_seconds": 12.5,
+        }
+    )
+    identity = _freeze(tmp_path, device_config=source)
+
+    assert identity.device_config.model_dump(mode="python") == {
+        "serial_port": "/dev/ttyS11",
+        "roaster_driver": "hottop_kn8828b_2k_plus",
+        "audio_input_device": "hw:2,0",
+        "recording_enabled": True,
+        "recording_autocapture": False,
+        "recording_devices": ("USB microphone",),
+        "fc_mode": "manual",
+        "fc_confidence_threshold": 0.75,
+        "auto_t0_detection_enabled": True,
+        "auto_t0_drop_threshold_c": 31.5,
+        "mcp_yaml_source_path": "/etc/roastpilot/managed-mcp.yaml",
+        "ambient_mode": "yoctopuce",
+        "ambient_device": "YOCTO-USB-1234567890ABCDEF",
+        "ambient_poll_interval_seconds": 12.5,
+    }
+    assert frozenset(type(identity.device_config).model_fields) == _MCP_DEVICE_CONFIG_FIELD_NAMES
+
+
+def test_cold_identity_failure_is_plain_enum_without_member_string_comparisons() -> None:
+    """Closed failures stay plain enum members and are not compared to string literals."""
+    assert issubclass(ColdIdentityFailure, Enum)
+    assert not issubclass(ColdIdentityFailure, str)
+    assert all(not isinstance(member, str) for member in ColdIdentityFailure)
+
+    tree = ast.parse(inspect.getsource(cold_identity))
+
+    def is_failure_member_or_value(node: ast.expr) -> bool:
+        """Recognise direct references to one closed failure member or its value."""
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            return node.value.id == "ColdIdentityFailure"
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == "value"
+            and isinstance(node.value, ast.Attribute)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "ColdIdentityFailure"
+        )
+
+    string_compared_members = [
+        comparison
+        for comparison in ast.walk(tree)
+        if isinstance(comparison, ast.Compare)
+        and any(
+            is_failure_member_or_value(operand)
+            for operand in [comparison.left, *comparison.comparators]
+        )
+        and any(
+            isinstance(operand, ast.Constant) and isinstance(operand.value, str)
+            for operand in [comparison.left, *comparison.comparators]
+        )
+    ]
+
+    assert string_compared_members == []
 
 
 @pytest.mark.parametrize(
