@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import inspect
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 
 import pytest
 from pydantic import ValidationError
@@ -23,6 +23,8 @@ from roastpilot_agent.cold_characterisation.identity import (
 )
 from roastpilot_agent.config import MCPDeviceConfig
 from roastpilot_agent.mcp_client import RuntimeConfigSnapshot, ServerInfo
+
+_MCP_DEVICE_CONFIG_FIELD_NAMES: Final[frozenset[str]] = frozenset(MCPDeviceConfig.model_fields)
 
 
 def _runtime(**changes: object) -> RuntimeConfigSnapshot:
@@ -210,6 +212,108 @@ def test_model_validate_repeats_closed_identity_admissions(
         ColdRunIdentity.model_validate(payload)
 
     assert raised.value.failure is failure
+
+
+def test_direct_reconstruction_rejects_unknown_device_config_key_before_hashing(
+    tmp_path: Path,
+) -> None:
+    """A credential-named unknown device key is structurally unrepresentable."""
+    payload = _freeze(tmp_path).model_dump(mode="json")
+    device_config = cast(dict[str, object], payload["device_config"])
+    device_config["api_key"] = "synthetic-value"
+
+    with pytest.raises(ValidationError, match="api_key"):
+        ColdRunIdentity.model_validate(payload)
+
+
+def test_device_config_round_trip_preserves_identity_and_digest(tmp_path: Path) -> None:
+    """The closed device projection survives JSON reconstruction canonically."""
+    identity = _freeze(tmp_path)
+
+    reconstructed = ColdRunIdentity.model_validate(identity.model_dump(mode="json"))
+
+    assert reconstructed == identity
+    assert identity_sha256(reconstructed) == identity_sha256(identity)
+
+
+def test_managed_device_config_is_frozen_and_recording_devices_are_a_tuple(tmp_path: Path) -> None:
+    """Nested device identity state cannot be reassigned or retain a mutable list."""
+    identity = _freeze(tmp_path)
+
+    with pytest.raises(ValidationError):
+        identity.device_config.serial_port = "changed"
+
+    assert isinstance(identity.device_config.recording_devices, tuple)
+
+
+def test_freeze_detaches_from_caller_device_config_and_input_list(tmp_path: Path) -> None:
+    """Later caller mutations cannot change a frozen identity or its digest."""
+    devices = ["USB microphone"]
+    caller_config = MCPDeviceConfig.model_validate({"recording_devices": devices})
+    identity = _freeze(tmp_path, device_config=caller_config)
+    digest = identity_sha256(identity)
+
+    devices.append("later microphone")
+    caller_config.recording_devices = ("replacement microphone",)
+
+    assert identity.device_config.recording_devices == ("USB microphone",)
+    assert identity_sha256(identity) == digest
+
+
+@pytest.mark.parametrize(
+    "field_names", [set(_MCP_DEVICE_CONFIG_FIELD_NAMES | {"new_field"}), set[str]()]
+)
+def test_freeze_refuses_mcp_device_field_set_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field_names: set[str]
+) -> None:
+    """Added, removed, or renamed upstream managed fields refuse freezing."""
+    monkeypatch.setattr(MCPDeviceConfig, "model_fields", {name: object() for name in field_names})
+
+    _assert_failure(tmp_path, ColdIdentityFailure.DEVICE_CONFIG_FIELD_SET_DRIFTED)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("audio_input_device", "api" + "_key" + "=" + "synthetic-value"),
+        ("audio_input_device", "contains" + chr(1) + "control"),
+        ("audio_input_device", "x" * 513),
+    ],
+)
+def test_freeze_rejects_unsafe_managed_device_text(tmp_path: Path, field: str, value: str) -> None:
+    """Credential-shaped, non-printable, and oversized device strings fail closed."""
+    _assert_failure(
+        tmp_path,
+        ColdIdentityFailure.DEVICE_CONFIG_VALUE_REJECTED,
+        device_config=MCPDeviceConfig.model_validate(
+            {field: value, "recording_devices": ("USB microphone",)}
+        ),
+    )
+
+
+def test_freeze_rejects_unsafe_recording_device_text(tmp_path: Path) -> None:
+    """Every recording-device entry uses the same closed device text screen."""
+    _assert_failure(
+        tmp_path,
+        ColdIdentityFailure.DEVICE_CONFIG_VALUE_REJECTED,
+        device_config=MCPDeviceConfig(
+            recording_devices=("api" + "_key" + "=" + "synthetic-value",)
+        ),
+    )
+
+
+def test_freeze_admits_high_entropy_device_identifiers(tmp_path: Path) -> None:
+    """Legitimate device identifiers do not use the operator-note entropy guard."""
+    identity = _freeze(
+        tmp_path,
+        device_config=MCPDeviceConfig(
+            ambient_device="0123456789abcdef0123456789abcdef01234567",
+            serial_port="/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A10B2C3D-if00-port0",
+            recording_devices=("USB microphone",),
+        ),
+    )
+
+    assert identity.device_config.ambient_device == "0123456789abcdef0123456789abcdef01234567"
 
 
 @pytest.mark.parametrize("version", ["0.2.0", "0.2.2", "0.3.0", "0.2.1.post1", "0.2.10", " 0.2.1"])
