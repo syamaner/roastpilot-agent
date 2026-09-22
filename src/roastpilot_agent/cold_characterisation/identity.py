@@ -116,7 +116,19 @@ class ColdRunIdentity(BaseModel):
 
     @model_validator(mode="after")
     def _require_packaged_manifest(self) -> ColdRunIdentity:
-        """Prevent callers from substituting a re-derived model manifest."""
+        """Require packaged constants and closed admissions on every construction path."""
+        _admit_identity_inputs(
+            coffee_roaster_mcp_version=self.coffee_roaster_mcp_version,
+            runtime_config=self.runtime_config,
+            device_config=MCPDeviceConfig.model_validate(self.device_config),
+            credential_env_var_name=self.credential_env_var_name,
+            operator_texts=(
+                self.stimulus_block,
+                self.operator_host_notes,
+                self.operator_psu_notes,
+                self.operator_cooling_notes,
+            ),
+        )
         expected_entries = tuple(
             ModelManifestEntry(relative_path=item.relative_path, sha256=item.sha256)
             for item in MANIFEST_FILES
@@ -310,7 +322,7 @@ def _read_boot_id(path: Path) -> str:
     try:
         with path.open("rb") as source:
             raw = source.read(_MAX_BOOT_ID_BYTES + 1)
-    except OSError as error:
+    except (OSError, ValueError, RuntimeError) as error:
         raise ColdIdentityError(ColdIdentityFailure.BOOT_ID_UNREADABLE) from error
     if len(raw) > _MAX_BOOT_ID_BYTES:
         raise ColdIdentityError(ColdIdentityFailure.BOOT_ID_UNREADABLE)

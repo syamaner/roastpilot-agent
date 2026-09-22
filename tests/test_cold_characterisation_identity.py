@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
 
 from roastpilot_agent.advisor import AdvisorDescriptor
 from roastpilot_agent.appliance.model_manifest import MANIFEST_FILES, REPO_ID, REVISION
+from roastpilot_agent.cold_characterisation import identity as cold_identity
 from roastpilot_agent.cold_characterisation.identity import (
     REQUIRED_MCP_VERSION,
     ColdIdentityError,
@@ -60,10 +63,12 @@ def _server() -> ServerInfo:
     )
 
 
-def _freeze(tmp_path: Path, **changes: object):
+def _freeze(tmp_path: Path, **changes: object) -> ColdRunIdentity:
     """Freeze a valid identity using only a test-local boot identifier source."""
+    write_boot_id = cast(bool, changes.pop("_write_boot_id", True))
     boot_id_path = tmp_path / "boot_id"
-    boot_id_path.write_text("123e4567-e89b-12d3-a456-426614174000\n", encoding="ascii")
+    if write_boot_id and "boot_id_path" not in changes:
+        boot_id_path.write_text("123e4567-e89b-12d3-a456-426614174000\n", encoding="ascii")
     arguments: dict[str, object] = {
         "run_id": "cold-1",
         "started_at_utc": "2026-09-22T00:00:00Z",
@@ -121,7 +126,42 @@ def test_freeze_records_manifest_and_credential_name_without_its_value(
     assert [(entry.relative_path, entry.sha256) for entry in identity.model_manifest] == [
         (entry.relative_path, entry.sha256) for entry in MANIFEST_FILES
     ]
-    assert "os.environ[" not in inspect.getsource(freeze_identity)
+    tree = ast.parse(inspect.getsource(cold_identity))
+    environment_value_nodes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+        and node.id in {"environ", "getenv"}
+        or isinstance(node, ast.Attribute)
+        and node.attr in {"environ", "getenv"}
+    ]
+    assert environment_value_nodes == []
+
+
+def test_freeze_copies_packaged_manifest_without_model_artifact_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Freezing copies manifest constants and performs only the explicit boot-ID read."""
+    boot_id_path = tmp_path / "boot_id"
+    boot_id_path.write_text("123e4567-e89b-12d3-a456-426614174000\n", encoding="ascii")
+    opened_paths: list[Path] = []
+    original_open = Path.open
+
+    def tracking_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        """Record the explicitly allowed boot-ID file open."""
+        opened_paths.append(path)
+        return cast(Any, original_open)(path, *args, **kwargs)
+
+    def fail_hash(*args: object, **kwargs: object) -> None:
+        """Fail if freezing attempts to hash an artifact instead of copying constants."""
+        pytest.fail("freeze_identity must not hash model artifact files")
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+    monkeypatch.setattr("roastpilot_agent.cold_characterisation.identity.hashlib.sha256", fail_hash)
+
+    _freeze(tmp_path, boot_id_path=boot_id_path, _write_boot_id=False)
+
+    assert opened_paths == [boot_id_path]
 
 
 def test_identity_rejects_substituted_packaged_manifest_constants(tmp_path: Path) -> None:
@@ -130,6 +170,46 @@ def test_identity_rejects_substituted_packaged_manifest_constants(tmp_path: Path
     payload["model_revision"] = "untrusted-revision"
     with pytest.raises(ValidationError, match="packaged identity constants"):
         ColdRunIdentity.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "failure"),
+    [
+        ("coffee_roaster_mcp_version", "0.2.2", ColdIdentityFailure.MCP_VERSION_NOT_PINNED),
+        (
+            "runtime_config",
+            _runtime(temperature_unit="fahrenheit"),
+            ColdIdentityFailure.TEMPERATURE_UNIT_NOT_CELSIUS,
+        ),
+        (
+            "device_config",
+            MCPDeviceConfig(recording_devices=("first", "second")).model_dump(mode="json"),
+            ColdIdentityFailure.RECORDING_DEVICE_NOT_SINGLE,
+        ),
+        (
+            "runtime_config",
+            _runtime(first_crack_mode="disabled"),
+            ColdIdentityFailure.INFERENCE_NOT_ACTIVE_IN_IDENTITY,
+        ),
+        ("credential_env_var_name", "OTHER_TOKEN", ColdIdentityFailure.CREDENTIAL_NAME_NOT_ALLOWED),
+        (
+            "operator_host_notes",
+            "sk-abcdefghijklmnopqrstuvwx",
+            ColdIdentityFailure.OPERATOR_TEXT_REJECTED,
+        ),
+    ],
+)
+def test_model_validate_repeats_closed_identity_admissions(
+    tmp_path: Path, field: str, value: object, failure: ColdIdentityFailure
+) -> None:
+    """Direct reconstruction cannot bypass the same closed identity admissions."""
+    payload = _freeze(tmp_path).model_dump(mode="python")
+    payload[field] = value
+
+    with pytest.raises(ColdIdentityError) as raised:
+        ColdRunIdentity.model_validate(payload)
+
+    assert raised.value.failure is failure
 
 
 @pytest.mark.parametrize("version", ["0.2.0", "0.2.2", "0.3.0", "0.2.1.post1", "0.2.10", " 0.2.1"])
@@ -215,6 +295,15 @@ def test_freeze_refuses_missing_boot_id(tmp_path: Path) -> None:
     """An unreadable boot source cannot become an unknown identity field."""
     _assert_failure(
         tmp_path, ColdIdentityFailure.BOOT_ID_UNREADABLE, boot_id_path=tmp_path / "missing"
+    )
+
+
+def test_freeze_maps_invalid_boot_id_path_to_closed_unreadable_failure(tmp_path: Path) -> None:
+    """Caller-path validation errors cannot escape the closed boot-ID grammar."""
+    _assert_failure(
+        tmp_path,
+        ColdIdentityFailure.BOOT_ID_UNREADABLE,
+        boot_id_path=Path("embedded\x00nul"),
     )
 
 
