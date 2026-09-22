@@ -14,6 +14,7 @@ from roastpilot_agent.cold_characterisation.identity import (
     REQUIRED_MCP_VERSION,
     ColdIdentityError,
     ColdIdentityFailure,
+    ColdRunIdentity,
     freeze_identity,
     identity_sha256,
 )
@@ -121,6 +122,14 @@ def test_freeze_records_manifest_and_credential_name_without_its_value(
         (entry.relative_path, entry.sha256) for entry in MANIFEST_FILES
     ]
     assert "os.environ[" not in inspect.getsource(freeze_identity)
+
+
+def test_identity_rejects_substituted_packaged_manifest_constants(tmp_path: Path) -> None:
+    """The frozen model refuses a caller-substituted packaged identity value."""
+    payload = _freeze(tmp_path).model_dump(mode="python")
+    payload["model_revision"] = "untrusted-revision"
+    with pytest.raises(ValidationError, match="packaged identity constants"):
+        ColdRunIdentity.model_validate(payload)
 
 
 @pytest.mark.parametrize("version", ["0.2.0", "0.2.2", "0.3.0", "0.2.1.post1", "0.2.10", " 0.2.1"])
@@ -231,6 +240,15 @@ def test_freeze_rejects_secret_shaped_or_invalid_operator_text(
 ) -> None:
     """All operator free text raises rather than redacting secret-shaped content."""
     _assert_failure(tmp_path, ColdIdentityFailure.OPERATOR_TEXT_REJECTED, **{field: text})
+
+
+def test_freeze_rejects_high_entropy_operator_text(tmp_path: Path) -> None:
+    """A credential-like high-entropy token is rejected through public admission."""
+    _assert_failure(
+        tmp_path,
+        ColdIdentityFailure.OPERATOR_TEXT_REJECTED,
+        operator_host_notes="abcdefghijklmnopqrstuvwxyz",
+    )
 
 
 def test_identity_hash_is_canonical_stable_and_sensitive(tmp_path: Path) -> None:
