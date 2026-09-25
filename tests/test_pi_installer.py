@@ -7,6 +7,8 @@ import grp
 import json
 import os
 import pwd
+import re
+import select
 import shutil
 import stat
 import subprocess
@@ -76,9 +78,9 @@ def installer_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Path, Path]
 set -eu
 name=$(basename "$0")
 if [ "$name" != cat ] || [ "${FAKE_RECORD_CAT:-}" = 1 ]; then
-  printf '%s' "$name" >> "$FAKE_LOG"
-  for arg in "$@"; do printf ' <%s>' "$arg" >> "$FAKE_LOG"; done
-  printf '\\n' >> "$FAKE_LOG"
+  record=$name
+  for arg in "$@"; do record="$record <$arg>"; done
+  printf '%s\\n' "$record" >> "$FAKE_LOG"
 fi
 [ -z "${FAKE_SECRET_ENV_LOG:-}" ] || printf '%s OPENROUTER_API_KEY=<%s> OPENROUTER_API_KEY_FILE=<%s> OPENAI_API_KEY=<%s> ANTHROPIC_API_KEY=<%s> ROASTPILOT_API_KEY=<%s> ROASTPILOT_OPENROUTER_API_KEY=<%s> ROASTPILOT_INSTALL_API_KEY=<%s> API_KEY=<%s>\\n' "$name" "${OPENROUTER_API_KEY-UNSET}" "${OPENROUTER_API_KEY_FILE-UNSET}" "${OPENAI_API_KEY-UNSET}" "${ANTHROPIC_API_KEY-UNSET}" "${ROASTPILOT_API_KEY-UNSET}" "${ROASTPILOT_OPENROUTER_API_KEY-UNSET}" "${ROASTPILOT_INSTALL_API_KEY-UNSET}" "${API_KEY-UNSET}" >> "$FAKE_SECRET_ENV_LOG"
 [ "${FAKE_REQUIRE_LC_ALL_C:-}" != 1 ] || { [ "${LC_ALL:-}" = C ] || { printf 'FAKE_LC_ALL_NOT_C <%s>\\n' "${LC_ALL-UNSET}" >> "$FAKE_LOG"; exit 58; }; printf 'FAKE_LC_ALL_C\\n' >> "$FAKE_LOG"; }
@@ -727,6 +729,165 @@ def _run(
 def _delta(log: Path, start: int) -> list[str]:
     """Return fake-command records emitted after one installer invocation."""
     return log.read_text()[start:].splitlines()
+
+
+def _installer_fake_script_source() -> str:
+    """Return the generated fake-command shell script source from this module."""
+    source = Path(__file__).read_text()
+    _, opening, remainder = source.partition('fake.write_text(\n        """')
+    assert opening, "installer harness fake-command source opening is missing"
+    script, closing, _ = remainder.partition('"""\n    )')
+    assert closing, "installer harness fake-command source closing is missing"
+    return script
+
+
+def _assert_installer_recorder_uses_complete_write() -> None:
+    """Fail closed unless the generic fake recorder has one complete append."""
+    script = _installer_fake_script_source()
+    assert 'printf \'%s\' "$name" >> "$FAKE_LOG"' not in script, (
+        "installer fake recorder still has an unterminated name append"
+    )
+    assert 'for arg in "$@"; do printf \' <%s>\' "$arg" >> "$FAKE_LOG"; done' not in script, (
+        "installer fake recorder still appends arguments separately"
+    )
+    assert "printf '\\\\n' >> \"$FAKE_LOG\"" not in script, (
+        "installer fake recorder still appends its record newline separately"
+    )
+    assert (
+        "record=$name\n"
+        '  for arg in "$@"; do record="$record <$arg>"; done\n'
+        '  printf \'%s\\\\n\' "$record" >> "$FAKE_LOG"'
+    ) in script, "installer fake recorder has no complete terminated record write"
+
+
+def _wait_for_framing_writer(process: subprocess.Popen[str]) -> None:
+    """Wait a bounded time for a framing writer's deterministic rendezvous."""
+    assert process.stdout is not None
+    readable, _, _ = select.select([process.stdout], [], [], 2.0)
+    assert readable, "framing writer did not reach its bounded rendezvous"
+    assert process.stdout.readline() == "ready\n", "framing writer rendezvous was malformed"
+
+
+def _forced_framing_log(tmp_path: Path, fake_script: Path, *, historical: bool) -> str:
+    """Return one forced two-writer log using the historical or generated recorder."""
+    log = tmp_path / ("historical.log" if historical else "complete.log")
+    writer = tmp_path / ("historical-bin" if historical else "complete-bin") / "tee"
+    writer.parent.mkdir()
+    if historical:
+        writer.write_text(
+            """#!/usr/bin/env bash
+set -eu
+name=$(basename "$0")
+printf '%s' "$name" >> "$FAKE_LOG"
+printf 'ready\\n'
+IFS= read -r _
+printf ' <%s>' source >> "$FAKE_LOG"
+printf '\\n' >> "$FAKE_LOG"
+"""
+        )
+    else:
+        script = fake_script.read_text()
+        recorder = '  printf \'%s\\n\' "$record" >> "$FAKE_LOG"'
+        before, separator, _ = script.partition(f"{recorder}\nfi\n")
+        assert separator, "generated fake recorder has no extractable complete write"
+        writer.write_text(f"{before}  printf 'ready\\n'\n  IFS= read -r _\n{recorder}\nfi\n")
+    writer.chmod(0o755)
+    writer_environment = {"FAKE_LOG": str(log), "PATH": "/usr/bin:/bin"}
+    process = subprocess.Popen(
+        [str(writer), "source"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=writer_environment,
+    )
+    try:
+        _wait_for_framing_writer(process)
+        marker = subprocess.run(
+            ["bash", "-c", "printf 'FAKE_CONCURRENT_MARKER\\n' >> \"$1\"", "marker", str(log)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert marker.returncode == 0, marker.stderr
+        assert process.stdin is not None
+        process.stdin.write("release\n")
+        process.stdin.flush()
+        process.stdin.close()
+        assert process.wait(timeout=2.0) == 0
+    finally:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=2.0)
+    return log.read_text()
+
+
+def _assert_closed_fake_log_grammar(log: str, fake_names: set[str]) -> None:
+    """Fail closed unless every complete fake-log entry satisfies its grammar."""
+    assert log, "empty fake-command log"
+    assert fake_names, "no fake command names were available for grammar checking"
+    record = rf"(?:{'|'.join(re.escape(name) for name in sorted(fake_names))})(?: <[^\n>]*>)*"
+    marker = r"FAKE_[A-Z0-9_]+(?: <[^\n>]*>)*"
+    for raw_line in log.splitlines(keepends=True):
+        assert raw_line.endswith("\n"), f"unterminated fake-command log line: {raw_line!r}"
+        line = raw_line[:-1]
+        assert re.fullmatch(rf"(?:{record}|{marker})", line), (
+            f"offending fake-command log line: {line!r}"
+        )
+
+
+@pytest.mark.serial
+def test_fake_log_framing_is_deterministic_under_two_writers(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Expose the old joined record and prove complete records retain line framing."""
+    fake_bin, _, log, _ = installer_harness
+    _assert_installer_recorder_uses_complete_write()
+
+    historical = _forced_framing_log(log.parent, fake_bin / "tee", historical=True)
+    repaired = _forced_framing_log(log.parent, fake_bin / "tee", historical=False)
+
+    assert historical.splitlines() == ["teeFAKE_CONCURRENT_MARKER", " <source>"]
+    assert repaired.splitlines() == ["FAKE_CONCURRENT_MARKER", "tee <source>"]
+    _assert_closed_fake_log_grammar(repaired, {path.name for path in fake_bin.iterdir()})
+
+
+@pytest.mark.serial
+def test_fake_log_grammar_fails_closed_for_forced_concurrency(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Keep empty, joined, and timeout framing failures visible to the harness."""
+    fake_bin, _, log, _ = installer_harness
+    _assert_installer_recorder_uses_complete_write()
+    fake_names = {path.name for path in fake_bin.iterdir()}
+    _assert_closed_fake_log_grammar(
+        _forced_framing_log(log.parent, fake_bin / "tee", historical=False), fake_names
+    )
+
+    with pytest.raises(AssertionError, match="empty fake-command log"):
+        _assert_closed_fake_log_grammar("", fake_names)
+    with pytest.raises(AssertionError, match="offending fake-command log line"):
+        _assert_closed_fake_log_grammar("tee <source>FAKE_CONCURRENT_MARKER\n", fake_names)
+
+    process = subprocess.Popen(
+        ["bash", "-c", "IFS= read -r _"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        with pytest.raises(AssertionError, match="did not reach its bounded rendezvous"):
+            _wait_for_framing_writer(process)
+    finally:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=2.0)
 
 
 def _has_service_mutation(events: list[str]) -> bool:
@@ -3280,7 +3441,7 @@ def test_model_promotion_source_cat_failure_preserves_destination_and_cleans_tem
     )
     events = log.read_text().splitlines()
     marker = f"FAKE_CAT_FAILURE <{source}>"
-    assert result.returncode != 0 and marker in events
+    assert result.returncode != 0 and result.returncode == 49 and marker in events
     failure = events.index(marker)
     assert destination.read_bytes() == b"prior-model"
     assert not any(
