@@ -33,6 +33,15 @@ _CREDENTIAL_SHAPE_PATTERN: Final = re.compile(
     r"(?:sk-[A-Za-z0-9_-]{16,}|(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+)",
     re.IGNORECASE,
 )
+_REVISION_SECRET_SHAPE_PATTERN: Final = re.compile(
+    r"\A(?:"
+    r"(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)[A-Za-z0-9_-]{16,}"
+    r"|glpat-[A-Za-z0-9_-]{16,}"
+    r"|(?:xoxb-|xoxp-|xoxa-|xoxr-|xoxs-)[A-Za-z0-9_-]{16,}"
+    r"|AKIA[A-Z0-9]{16}"
+    r"|eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}"
+    r")\Z"
+)
 _HIGH_ENTROPY_TOKEN_PATTERN: Final = re.compile(r"[A-Za-z0-9_-]{24,}")
 _COLD_IDENTITY_MODEL_CONFIG: Final[ConfigDict] = cast(
     ConfigDict, {**FINITE_NUMERIC_MODEL_CONFIG, "frozen": True, "extra": "forbid"}
@@ -164,7 +173,7 @@ class AgentBuildProvenance(BaseModel):
 
 
 class EffectiveMCPProfile(BaseModel):
-    """Caller-supplied immutable commitment and comparables for effective MCP configuration."""
+    """Caller-supplied immutable profile commitment and typed comparables."""
 
     model_config = _COLD_IDENTITY_MODEL_CONFIG
 
@@ -180,6 +189,17 @@ class EffectiveMCPProfile(BaseModel):
     audio_hop_seconds: Annotated[float, Field(strict=True, gt=0)] | None
     session_ror_window_seconds: Annotated[int, Field(strict=True, gt=0)]
     session_ror_min_sample_seconds: Annotated[int, Field(strict=True, gt=0)]
+
+    @model_validator(mode="after")
+    def _reject_credential_shaped_revision(self) -> EffectiveMCPProfile:
+        """Reject credential-shaped operator YAML revisions without entropy screening."""
+        # Reuse the operator-text reason because this revision originates in operator YAML.
+        if (
+            _CREDENTIAL_SHAPE_PATTERN.search(self.first_crack_revision) is not None
+            or _REVISION_SECRET_SHAPE_PATTERN.fullmatch(self.first_crack_revision) is not None
+        ):
+            raise ColdIdentityError(ColdIdentityFailure.OPERATOR_TEXT_REJECTED)
+        return self
 
 
 class ColdRunIdentity(BaseModel):
@@ -293,7 +313,7 @@ def freeze_identity(
     operator_cooling_notes: str,
     boot_id_path: Path = BOOT_ID_PATH,
 ) -> ColdRunIdentity:
-    """Freeze a complete admitted cold-run identity without reading a credential.
+    """Freeze a caller-supplied admitted cold-run identity without reading a credential.
 
     Args:
         run_id: The caller-assigned cold session identifier.

@@ -364,10 +364,60 @@ def test_effective_profile_refuses_nonfinite_float_comparables(field: str, value
 def test_effective_profile_admits_revision_tokens_without_operator_entropy_screen() -> None:
     """Pinned revisions use a bounded identifier grammar, not operator free-text screening."""
     assert _effective_mcp_profile(first_crack_revision=_HEX_40).first_crack_revision == _HEX_40
+    assert cold_identity._operator_text_is_safe(_HEX_40) is False  # pyright: ignore[reportPrivateUsage]
     assert _effective_mcp_profile(first_crack_revision="a" * 128).first_crack_revision == "a" * 128
     for value in ("", "a" * 129, "model revision", "model/path", "model:tag", "é"):
         with pytest.raises(ValidationError):
             _effective_mcp_profile(first_crack_revision=value)
+
+
+@pytest.mark.parametrize(
+    "revision",
+    [
+        "sk-abcdefghijklmnop",
+        "ghp_abcdefghijklmnop",
+        "gho_abcdefghijklmnop",
+        "ghu_abcdefghijklmnop",
+        "ghs_abcdefghijklmnop",
+        "ghr_abcdefghijklmnop",
+        "github_pat_abcdefghijklmnop",
+        "glpat-abcdefghijklmnop",
+        "xoxb-abcdefghijklmnop",
+        "xoxp-abcdefghijklmnop",
+        "xoxa-abcdefghijklmnop",
+        "xoxr-abcdefghijklmnop",
+        "xoxs-abcdefghijklmnop",
+        "AKIA1234567890ABCDEF",
+        "eyJabcde.eyJfghij.abcdefgh",
+    ],
+)
+def test_effective_profile_refuses_credential_shaped_revisions(revision: str) -> None:
+    """Credential-shaped revision tokens fail closed without echoing their contents."""
+    with pytest.raises(ColdIdentityError) as raised:
+        _effective_mcp_profile(first_crack_revision=revision)
+
+    assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
+    assert revision not in str(raised.value)
+
+
+def test_nested_identity_refuses_credential_shaped_revision(tmp_path: Path) -> None:
+    """Containing identity reconstruction repeats revision credential-shape admission."""
+    revision = "github_pat_abcdefghijklmnop"
+    payload = _freeze(tmp_path).model_dump(mode="python")
+    profile = cast(dict[str, object], payload["effective_mcp_profile"])
+    profile["first_crack_revision"] = revision
+
+    with pytest.raises(ColdIdentityError) as raised:
+        ColdRunIdentity.model_validate(payload)
+
+    assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
+    assert revision not in str(raised.value)
+
+
+def test_cold_artefact_kind_is_a_plain_enum() -> None:
+    """Cold artefact kinds remain closed plain enums rather than string enums."""
+    assert issubclass(ColdArtefactKind, Enum)
+    assert not issubclass(ColdArtefactKind, str)
 
 
 def test_effective_profile_field_set_excludes_leak_and_duplicate_surfaces() -> None:
