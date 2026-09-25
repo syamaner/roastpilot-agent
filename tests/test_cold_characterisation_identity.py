@@ -395,6 +395,7 @@ def test_effective_profile_admits_revision_tokens_without_operator_entropy_scree
         "xoxs-abcdefghijklmnop",
         "AKIA1234567890ABCDEF",
         "eyJabcde.eyJfghij.abcdefgh",
+        "eyJabcde.eyJfghij." + "a" * 129,
     ],
 )
 def test_effective_profile_refuses_credential_shaped_revisions(revision: str) -> None:
@@ -404,6 +405,8 @@ def test_effective_profile_refuses_credential_shaped_revisions(revision: str) ->
 
     assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
     assert revision not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_nested_identity_refuses_credential_shaped_revision(tmp_path: Path) -> None:
@@ -418,6 +421,8 @@ def test_nested_identity_refuses_credential_shaped_revision(tmp_path: Path) -> N
 
     assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
     assert revision not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_nested_identity_refuses_assignment_shaped_revision(tmp_path: Path) -> None:
@@ -432,12 +437,23 @@ def test_nested_identity_refuses_assignment_shaped_revision(tmp_path: Path) -> N
 
     assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
     assert revision not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_effective_profile_preserves_noncredential_revision_grammar_failure() -> None:
     """Non-credential values outside the bounded grammar still raise ValidationError."""
     with pytest.raises(ValidationError):
         _effective_mcp_profile(first_crack_revision="plain=value")
+
+
+def test_unrelated_profile_failure_does_not_relabel_a_valid_credential_shape() -> None:
+    """Only a revision-field error receives the closed credential-shape reason."""
+    with pytest.raises(ValidationError):
+        _effective_mcp_profile(
+            first_crack_revision="github_pat_abcdefghijklmnop",
+            audio_sample_rate=0,
+        )
 
 
 def test_cold_artefact_kind_is_a_plain_enum() -> None:

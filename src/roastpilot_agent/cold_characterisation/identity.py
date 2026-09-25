@@ -211,12 +211,22 @@ class EffectiveMCPProfile(BaseModel):
             if isinstance(value, Mapping)
             else None
         )
+        profile: EffectiveMCPProfile | None = None
+        validation_error: ValidationError | None = None
         try:
             profile = handler(value)
-        except ValidationError:
-            if isinstance(raw_revision, str) and _revision_has_credential_shape(raw_revision):
-                raise ColdIdentityError(ColdIdentityFailure.OPERATOR_TEXT_REJECTED) from None
-            raise
+        except ValidationError as error:
+            validation_error = error
+        if validation_error is not None:
+            if (
+                isinstance(raw_revision, str)
+                and _revision_has_credential_shape(raw_revision)
+                and _validation_error_is_for_revision(validation_error)
+            ):
+                # Deliberately reuse this reason because the revision originates in operator YAML.
+                raise ColdIdentityError(ColdIdentityFailure.OPERATOR_TEXT_REJECTED)
+            raise validation_error
+        assert profile is not None
         if _revision_has_credential_shape(profile.first_crack_revision):
             raise ColdIdentityError(ColdIdentityFailure.OPERATOR_TEXT_REJECTED)
         return profile
@@ -228,6 +238,11 @@ def _revision_has_credential_shape(revision: str) -> bool:
         _CREDENTIAL_SHAPE_PATTERN.search(revision) is not None
         or _REVISION_SECRET_SHAPE_PATTERN.fullmatch(revision) is not None
     )
+
+
+def _validation_error_is_for_revision(error: ValidationError) -> bool:
+    """Return whether Pydantic rejected the revision field itself."""
+    return any(detail["loc"] == ("first_crack_revision",) for detail in error.errors())
 
 
 class ColdRunIdentity(BaseModel):
