@@ -172,6 +172,9 @@ def test_freeze_requires_and_carries_provenance_and_effective_profile(tmp_path: 
         del incomplete[missing]
         with pytest.raises(ValidationError):
             ColdRunIdentity.model_validate(incomplete)
+    for field in ("build_provenance", "effective_mcp_profile"):
+        with pytest.raises(ValidationError):
+            _freeze(tmp_path, **{field: None})
 
 
 def test_new_models_round_trip_through_json_identity_and_are_frozen(tmp_path: Path) -> None:
@@ -318,6 +321,8 @@ def test_new_model_scalars_are_field_strict_without_model_level_strictness() -> 
         for field_name in model.model_fields:
             if field_name not in enum_fields:
                 assert is_strict(annotations[field_name])
+    artefact_kind = get_type_hints(AgentBuildProvenance, include_extras=True)["artefact_kind"]
+    assert is_strict(artefact_kind) is False
 
 
 def test_dirty_source_tree_is_recorded_frozen_and_hashed(tmp_path: Path) -> None:
@@ -375,6 +380,7 @@ def test_effective_profile_admits_revision_tokens_without_operator_entropy_scree
     "revision",
     [
         "sk-abcdefghijklmnop",
+        "api_key=synthetic-value",
         "ghp_abcdefghijklmnop",
         "gho_abcdefghijklmnop",
         "ghu_abcdefghijklmnop",
@@ -412,6 +418,26 @@ def test_nested_identity_refuses_credential_shaped_revision(tmp_path: Path) -> N
 
     assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
     assert revision not in str(raised.value)
+
+
+def test_nested_identity_refuses_assignment_shaped_revision(tmp_path: Path) -> None:
+    """Nested reconstruction hides assignment-shaped credential values on rejection."""
+    revision = "api_key=synthetic-value"
+    payload = _freeze(tmp_path).model_dump(mode="python")
+    profile = cast(dict[str, object], payload["effective_mcp_profile"])
+    profile["first_crack_revision"] = revision
+
+    with pytest.raises(ColdIdentityError) as raised:
+        ColdRunIdentity.model_validate(payload)
+
+    assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
+    assert revision not in str(raised.value)
+
+
+def test_effective_profile_preserves_noncredential_revision_grammar_failure() -> None:
+    """Non-credential values outside the bounded grammar still raise ValidationError."""
+    with pytest.raises(ValidationError):
+        _effective_mcp_profile(first_crack_revision="plain=value")
 
 
 def test_cold_artefact_kind_is_a_plain_enum() -> None:

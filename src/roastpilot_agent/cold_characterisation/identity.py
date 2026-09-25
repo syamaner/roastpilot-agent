@@ -6,11 +6,19 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Mapping
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Final, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ModelWrapValidatorHandler,
+    ValidationError,
+    model_validator,
+)
 
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import AdvisorDescriptor
@@ -190,16 +198,36 @@ class EffectiveMCPProfile(BaseModel):
     session_ror_window_seconds: Annotated[int, Field(strict=True, gt=0)]
     session_ror_min_sample_seconds: Annotated[int, Field(strict=True, gt=0)]
 
-    @model_validator(mode="after")
-    def _reject_credential_shaped_revision(self) -> EffectiveMCPProfile:
+    @model_validator(mode="wrap")
+    @classmethod
+    def _reject_credential_shaped_revision(
+        cls,
+        value: object,
+        handler: ModelWrapValidatorHandler[EffectiveMCPProfile],
+    ) -> EffectiveMCPProfile:
         """Reject credential-shaped operator YAML revisions without entropy screening."""
-        # Reuse the operator-text reason because this revision originates in operator YAML.
-        if (
-            _CREDENTIAL_SHAPE_PATTERN.search(self.first_crack_revision) is not None
-            or _REVISION_SECRET_SHAPE_PATTERN.fullmatch(self.first_crack_revision) is not None
-        ):
+        raw_revision: object | None = (
+            cast(Mapping[str, object], value).get("first_crack_revision")
+            if isinstance(value, Mapping)
+            else None
+        )
+        try:
+            profile = handler(value)
+        except ValidationError:
+            if isinstance(raw_revision, str) and _revision_has_credential_shape(raw_revision):
+                raise ColdIdentityError(ColdIdentityFailure.OPERATOR_TEXT_REJECTED) from None
+            raise
+        if _revision_has_credential_shape(profile.first_crack_revision):
             raise ColdIdentityError(ColdIdentityFailure.OPERATOR_TEXT_REJECTED)
-        return self
+        return profile
+
+
+def _revision_has_credential_shape(revision: str) -> bool:
+    """Return whether an MCP revision resembles a credential rather than a revision."""
+    return (
+        _CREDENTIAL_SHAPE_PATTERN.search(revision) is not None
+        or _REVISION_SECRET_SHAPE_PATTERN.fullmatch(revision) is not None
+    )
 
 
 class ColdRunIdentity(BaseModel):
