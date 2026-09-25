@@ -447,13 +447,37 @@ def test_effective_profile_preserves_noncredential_revision_grammar_failure() ->
         _effective_mcp_profile(first_crack_revision="plain=value")
 
 
-def test_unrelated_profile_failure_does_not_relabel_a_valid_credential_shape() -> None:
-    """Only a revision-field error receives the closed credential-shape reason."""
-    with pytest.raises(ValidationError):
+def test_unrelated_profile_failure_still_contains_a_credential_shaped_revision() -> None:
+    """Credential-shaped revisions stay closed when another profile field is invalid."""
+    revision = "github_pat_abcdefghijklmnop"
+    with pytest.raises(ColdIdentityError) as raised:
         _effective_mcp_profile(
-            first_crack_revision="github_pat_abcdefghijklmnop",
+            first_crack_revision=revision,
             audio_sample_rate=0,
         )
+
+    assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
+    assert revision not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert not hasattr(raised.value, "errors")
+
+
+def test_missing_profile_field_still_contains_a_credential_shaped_revision() -> None:
+    """Missing fields cannot expose a credential-shaped revision in Pydantic errors."""
+    revision = "github_pat_abcdefghijklmnop"
+    values = _effective_mcp_profile().model_dump(mode="python")
+    values["first_crack_revision"] = revision
+    del values["audio_sample_rate"]
+
+    with pytest.raises(ColdIdentityError) as raised:
+        EffectiveMCPProfile.model_validate(values)
+
+    assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
+    assert revision not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert not hasattr(raised.value, "errors")
 
 
 def test_cold_artefact_kind_is_a_plain_enum() -> None:
