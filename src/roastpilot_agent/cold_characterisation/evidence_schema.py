@@ -25,6 +25,7 @@ MAX_JSON_NODES = 4_096
 MAX_JSON_KEY_BYTES = 256
 MAX_INT_DIGITS = 32
 MAX_COLLECTION_LENGTH = 1_024
+# UTF-8 encoding and JSON parsing allocate before these admitted-data caps apply.
 _RUN_ID_PATTERN = r"\A[0-9]{8}T[0-9]{6}Z-[a-z0-9-]{1,48}\Z"
 _SHA256_PATTERN = r"\A[0-9a-f]{64}\Z"
 _RUN_ID_RUST_PATTERN = _RUN_ID_PATTERN.removesuffix(r"\Z") + r"\z"
@@ -222,7 +223,11 @@ class ColdOperatorAbortReason(enum.Enum):
 
 
 class ColdEvidenceError(RuntimeError):
-    """Closed error which never retains untrusted input or parser details."""
+    """Closed error with a fixed message and schema-owned diagnostic fields.
+
+    Python tracebacks retain execution frames; this type makes no global heap
+    retention claim.
+    """
 
     failure: ColdEvidenceFailure
     field_names: tuple[ColdAudioField, ...]
@@ -285,16 +290,20 @@ def walk_json_value(value: ColdJsonValue) -> None:
     raise failure
 
 
-def _walk_json_value(value: ColdJsonValue, aggregate: list[int]) -> None:
+def _walk_json_value(
+    value: ColdJsonValue,
+    aggregate: list[int],
+    initial_depth: int = 0,
+) -> None:
     """Walk JSON using a caller-owned aggregate counter without serialising it."""
     nodes = 0
-    stack: list[tuple[object, int]] = [(value, 0)]
+    stack: list[tuple[object, int]] = [(value, initial_depth)]
     while stack:
         current, depth = stack.pop()
         nodes += 1
         if nodes > MAX_JSON_NODES:
             raise _closed(ColdEvidenceFailure.JSON_NODE_LIMIT_EXCEEDED)
-        if depth > MAX_JSON_DEPTH:  # pragma: no cover - guarded pushes never exceed depth.
+        if depth > MAX_JSON_DEPTH:
             raise _closed(ColdEvidenceFailure.JSON_DEPTH_EXCEEDED)
         if current is None or type(current) is bool:
             aggregate[0] += 5
@@ -425,7 +434,7 @@ def project_tick_audio(payload: dict[str, ColdJsonValue]) -> ColdTickProjection:
             else:
                 extra[key] = value
         audio = ColdTickAudioSample.model_validate(known, strict=True)
-        walk_json_value(extra)
+        _walk_json_value(extra, [0], initial_depth=1)
         if len(_canonical_json(extra).encode("utf-8")) > MAX_RAW_AUDIO_EXTRA_BYTES:
             raise _closed(ColdEvidenceFailure.RECORD_RAW_AUDIO_EXTRA_TOO_LARGE)
         result = ColdTickProjection(

@@ -146,6 +146,25 @@ def test_projection_is_strict_and_preserves_unknown_keys_losslessly() -> None:
     assert nested == {"list": [1, 2]}
 
 
+def test_projection_extra_depth_matches_its_eventual_record_field_depth() -> None:
+    """A projection extra admits only structures that fit at record-field depth."""
+    deepest: evidence.ColdJsonValue = None
+    for _ in range(evidence.MAX_JSON_DEPTH - 2):
+        deepest = [deepest]
+    payload = _audio_payload()
+    payload["future"] = deepest
+    projection = evidence.project_tick_audio(payload)
+    tick = _tick().model_copy(update={"raw_audio_extra": projection.raw_audio_extra})
+    validated = typing.cast(evidence.ColdTickRecord, evidence.validate_record(tick))
+    assert validated.raw_audio_extra == {"future": deepest}
+
+    too_deep: evidence.ColdJsonValue = [deepest]
+    payload["future"] = too_deep
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.project_tick_audio(payload)
+    assert raised.value.failure is evidence.ColdEvidenceFailure.JSON_DEPTH_EXCEEDED
+
+
 def test_configs_and_rust_patterns_preserve_the_ratified_absolute_grammar() -> None:
     """Schema configs match the strict mirror and Rust patterns keep absolute ends."""
     from roastpilot_agent.cold_characterisation.mcp import StrictMCPMirror
@@ -328,6 +347,37 @@ def test_envelope_and_record_kind_pairing_fail_closed() -> None:
     assert raised.value.failure is evidence.ColdEvidenceFailure.ENVELOPE_KIND_MISMATCHED
 
 
+def test_finalisation_fixture_envelope_is_canonical_and_admitted() -> None:
+    """The published mock finalisation shape fits the retained envelope boundary."""
+    fixture_path = (
+        pathlib.Path(__file__).parent
+        / "fixtures"
+        / "mcp-tool-results"
+        / "finalise_cold_characterisation_session.json"
+    )
+    payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+    canonical = _canonical(payload)
+    envelope = evidence.ColdSealedEnvelope(
+        kind=evidence.ColdEnvelopeKind.FINALISATION,
+        schema_version=1,
+        canonical_json=canonical,
+        canonical_byte_length=len(canonical.encode("utf-8")),
+        sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    )
+    record = evidence.ColdFinalisationRecord(
+        **_common("finalisation"),
+        session_id=payload["session_id"],
+        envelope=envelope,
+        status=evidence.ColdFinalisationStatus(payload["status"]),
+        clean=payload["clean"],
+        observed_command_streaming_required=payload["admission_driver_evidence"]["evidence"][
+            "command_streaming_required"
+        ],
+        applied_branch=evidence.ColdCapabilityBranch.NON_STREAMING,
+    )
+    assert evidence.validate_record(record) == record
+
+
 def test_envelope_nonfinite_and_cap_paths_are_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Envelope JSON is bounded before parsing and rejects non-finite representations."""
     canonical = "NaN"
@@ -370,6 +420,99 @@ def test_designated_ingresses_strip_parser_context_and_attacker_key() -> None:
     assert error.__cause__ is None and error.__context__ is None
     assert error.field_names == ()
     assert "attacker" not in repr(error)
+
+
+@pytest.mark.parametrize(
+    ("record_type", "fields", "failure"),
+    [
+        (
+            evidence.ColdRunHeader,
+            {"identity": _envelope(evidence.ColdEnvelopeKind.FINALISATION)},
+            evidence.ColdEvidenceFailure.ENVELOPE_KIND_MISMATCHED,
+        ),
+        (
+            evidence.ColdFinalisationRecord,
+            {
+                "session_id": "session",
+                "envelope": _envelope(evidence.ColdEnvelopeKind.IDENTITY),
+                "status": evidence.ColdFinalisationStatus.CLEAN,
+                "clean": True,
+                "observed_command_streaming_required": True,
+                "applied_branch": evidence.ColdCapabilityBranch.STREAMING,
+            },
+            evidence.ColdEvidenceFailure.ENVELOPE_KIND_MISMATCHED,
+        ),
+        (
+            evidence.ColdAbortRecord,
+            {
+                "domain": evidence.ColdAbortDomain.OPERATOR,
+                "reason": "operator_stop",
+            },
+            evidence.ColdEvidenceFailure.ABORT_DOMAIN_REASON_MISMATCHED,
+        ),
+        (
+            evidence.ColdAbortRecord,
+            {
+                "domain": evidence.ColdAbortDomain.HOST,
+                "reason": evidence.ColdOperatorAbortReason.OPERATOR_STOP,
+            },
+            evidence.ColdEvidenceFailure.ABORT_DOMAIN_REASON_MISMATCHED,
+        ),
+    ],
+)
+def test_closed_validators_do_not_retain_context_or_input_details(
+    record_type: type[pydantic.BaseModel],
+    fields: dict[str, object],
+    failure: evidence.ColdEvidenceFailure,
+) -> None:
+    """Direct and persistence ingresses keep each closed validator's error inert."""
+    values = _common("header" if record_type is evidence.ColdRunHeader else "abort")
+    if record_type is evidence.ColdFinalisationRecord:
+        values = _common("finalisation")
+    values.update(fields)
+    with pytest.raises(evidence.ColdEvidenceError) as direct:
+        record_type(**values)
+    direct_error = direct.value
+    assert direct_error.failure is failure
+    assert direct_error.args == ("Cold evidence admission failed.",)
+    assert direct_error.__cause__ is None and direct_error.__context__ is None
+    assert not getattr(direct_error, "__notes__", ())
+
+    valid_values = _common("header" if record_type is evidence.ColdRunHeader else "abort")
+    if record_type is evidence.ColdRunHeader:
+        valid_values["identity"] = _envelope(evidence.ColdEnvelopeKind.IDENTITY)
+    elif record_type is evidence.ColdFinalisationRecord:
+        valid_values = _common("finalisation")
+        valid_values.update(
+            {
+                "session_id": "session",
+                "envelope": _envelope(evidence.ColdEnvelopeKind.FINALISATION),
+                "status": evidence.ColdFinalisationStatus.CLEAN,
+                "clean": True,
+                "observed_command_streaming_required": True,
+                "applied_branch": evidence.ColdCapabilityBranch.STREAMING,
+            }
+        )
+    else:
+        valid_values.update(
+            {
+                "domain": evidence.ColdAbortDomain.OPERATOR,
+                "reason": evidence.ColdOperatorAbortReason.OPERATOR_STOP,
+            }
+        )
+    invalid_records = (
+        typing.cast(typing.Any, record_type).model_construct(**values),
+        record_type(**valid_values).model_copy(update=fields),
+    )
+    for invalid in invalid_records:
+        with pytest.raises(evidence.ColdEvidenceError) as ingress:
+            evidence.validate_record(typing.cast(evidence.ColdEvidenceRecord, invalid))
+        ingress_error = ingress.value
+        assert ingress_error.failure is failure
+        assert ingress_error.args == ("Cold evidence admission failed.",)
+        assert ingress_error.__cause__ is None and ingress_error.__context__ is None
+        assert not getattr(ingress_error, "__notes__", ())
+        assert "operator_stop" not in repr(ingress_error)
 
 
 def test_validate_record_revalidates_constructed_nested_data_and_copies_maps() -> None:
@@ -1450,8 +1593,9 @@ def test_scope_and_import_fence_are_closed() -> None:
         and name not in {"ColdJsonValue", "ColdEvidenceRecord"}
     }
     assert public_callables == {"walk_json_value", "project_tick_audio", "validate_record"}
+    module_names = vars(evidence)
     assert not any(
-        name in vars(evidence)
+        name in module_names
         for name in {
             "MAX_CONSECUTIVE_OVERFLOW_N",
             "PEAK_TRAILING_LOST_AUDIO_MS_X",
@@ -1461,6 +1605,7 @@ def test_scope_and_import_fence_are_closed() -> None:
             "HOST_MIN_",
         }
     )
+    assert not any(name.startswith(("HOST_MAX_TEMP", "HOST_MIN_")) for name in module_names)
 
 
 def test_walker_is_structurally_iterative_beyond_python_recursion_depth() -> None:
