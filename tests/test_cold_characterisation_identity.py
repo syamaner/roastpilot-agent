@@ -6,7 +6,7 @@ import ast
 import inspect
 from enum import Enum
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Annotated, Any, Final, cast, get_args, get_origin, get_type_hints
 
 import pytest
 from pydantic import ValidationError
@@ -16,9 +16,12 @@ from roastpilot_agent.appliance.model_manifest import MANIFEST_FILES, REPO_ID, R
 from roastpilot_agent.cold_characterisation import identity as cold_identity
 from roastpilot_agent.cold_characterisation.identity import (
     REQUIRED_MCP_VERSION,
+    AgentBuildProvenance,
+    ColdArtefactKind,
     ColdIdentityError,
     ColdIdentityFailure,
     ColdRunIdentity,
+    EffectiveMCPProfile,
     freeze_identity,
     identity_sha256,
 )
@@ -26,6 +29,40 @@ from roastpilot_agent.config import MCPDeviceConfig
 from roastpilot_agent.mcp_client import RuntimeConfigSnapshot, ServerInfo
 
 _MCP_DEVICE_CONFIG_FIELD_NAMES: Final[frozenset[str]] = frozenset(MCPDeviceConfig.model_fields)
+_HEX_40: Final = "b349a919c34b6130472da97c01817be404e4f629"
+_HEX_64: Final = "a" * 64
+
+
+def _build_provenance(**changes: object) -> AgentBuildProvenance:
+    """Build a valid caller-supplied provenance assertion."""
+    values: dict[str, object] = {
+        "source_revision": _HEX_40,
+        "source_tree_dirty": False,
+        "artefact_kind": ColdArtefactKind.WHEEL,
+        "artefact_sha256": _HEX_64,
+    }
+    values.update(changes)
+    return AgentBuildProvenance.model_validate(values)
+
+
+def _effective_mcp_profile(**changes: object) -> EffectiveMCPProfile:
+    """Build a valid caller-supplied effective MCP profile commitment."""
+    values: dict[str, object] = {
+        "source_sha256": _HEX_64,
+        "source_byte_length": 100,
+        "first_crack_onnx_threads": 2,
+        "first_crack_min_positive_windows": 3,
+        "first_crack_confirmation_window_seconds": 30.0,
+        "first_crack_revision": _HEX_40,
+        "audio_sample_rate": 16000,
+        "audio_window_seconds": 10.0,
+        "audio_overlap": 0.3,
+        "audio_hop_seconds": None,
+        "session_ror_window_seconds": 60,
+        "session_ror_min_sample_seconds": 10,
+    }
+    values.update(changes)
+    return EffectiveMCPProfile.model_validate(values)
 
 
 def _runtime(**changes: object) -> RuntimeConfigSnapshot:
@@ -86,6 +123,8 @@ def _freeze(tmp_path: Path, **changes: object) -> ColdRunIdentity:
         "runtime_config": _runtime(),
         "server_info": _server(),
         "device_config": MCPDeviceConfig(recording_devices=("USB microphone",)),
+        "build_provenance": _build_provenance(),
+        "effective_mcp_profile": _effective_mcp_profile(),
         "audio_device_identity": "USB microphone",
         "serial_port_path": "/dev/ttyUSB0",
         "controller_tick_seconds": 1.0,
@@ -111,6 +150,509 @@ def _assert_failure(tmp_path: Path, failure: ColdIdentityFailure, **changes: obj
     with pytest.raises(ColdIdentityError) as raised:
         _freeze(tmp_path, **changes)
     assert raised.value.failure is failure
+
+
+def _assert_closed_revision_rejection(
+    raised: pytest.ExceptionInfo[ColdIdentityError], revision: str
+) -> None:
+    """Assert a revision refusal cannot expose its untrusted value or raw Pydantic error."""
+    assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
+    assert revision not in str(raised.value)
+    assert revision not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert not hasattr(raised.value, "errors")
+
+
+def test_freeze_requires_and_carries_provenance_and_effective_profile(tmp_path: Path) -> None:
+    """Freezing cannot omit either new immutable identity component."""
+    identity = _freeze(tmp_path)
+
+    assert identity.build_provenance == _build_provenance()
+    assert identity.effective_mcp_profile == _effective_mcp_profile()
+    assert ColdRunIdentity.model_fields["build_provenance"].is_required()
+    assert ColdRunIdentity.model_fields["effective_mcp_profile"].is_required()
+    signature = inspect.signature(freeze_identity)
+    for field in ("build_provenance", "effective_mcp_profile"):
+        parameter = signature.parameters[field]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is inspect.Parameter.empty
+
+    payload = identity.model_dump(mode="python")
+    for missing in ("build_provenance", "effective_mcp_profile"):
+        incomplete = dict(payload)
+        del incomplete[missing]
+        with pytest.raises(ValidationError):
+            ColdRunIdentity.model_validate(incomplete)
+    for field in ("build_provenance", "effective_mcp_profile"):
+        with pytest.raises(ValidationError):
+            _freeze(tmp_path, **{field: None})
+
+
+def test_new_models_round_trip_through_json_identity_and_are_frozen(tmp_path: Path) -> None:
+    """Closed enum JSON values reconstruct while all new state remains immutable."""
+    identity = _freeze(tmp_path)
+    reconstructed = ColdRunIdentity.model_validate(identity.model_dump(mode="json"))
+
+    assert reconstructed == identity
+    assert identity_sha256(reconstructed) == identity_sha256(identity)
+    assert reconstructed.build_provenance.artefact_kind is ColdArtefactKind.WHEEL
+    with pytest.raises(ValidationError):
+        identity.build_provenance.source_tree_dirty = True
+    with pytest.raises(ValidationError):
+        identity.effective_mcp_profile.audio_overlap = 0.2
+    with pytest.raises(ValidationError):
+        identity.build_provenance = _build_provenance()
+    with pytest.raises(ValidationError):
+        identity.effective_mcp_profile = _effective_mcp_profile()
+
+
+@pytest.mark.parametrize("value", ["WHEEL", "Wheel", "editable", "", 1])
+def test_provenance_rejects_unknown_artefact_kind_values(value: object) -> None:
+    """Only the three closed artefact kind values are admitted during reconstruction."""
+    payload = _build_provenance().model_dump(mode="json")
+    payload["artefact_kind"] = value
+    with pytest.raises(ValidationError):
+        AgentBuildProvenance.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("kind", "digest"),
+    [
+        (ColdArtefactKind.WHEEL, _HEX_64),
+        (ColdArtefactKind.SDIST, _HEX_64),
+        (ColdArtefactKind.EDITABLE_SOURCE, None),
+    ],
+)
+def test_provenance_admits_matching_artefact_digest(
+    kind: ColdArtefactKind, digest: str | None
+) -> None:
+    """Packaged and editable provenance assertions have opposite digest requirements."""
+    assert _build_provenance(artefact_kind=kind, artefact_sha256=digest).artefact_kind is kind
+
+
+@pytest.mark.parametrize(
+    ("kind", "digest"),
+    [
+        (ColdArtefactKind.WHEEL, None),
+        (ColdArtefactKind.SDIST, None),
+        (ColdArtefactKind.EDITABLE_SOURCE, _HEX_64),
+    ],
+)
+def test_provenance_refuses_mismatched_artefact_digest(
+    kind: ColdArtefactKind, digest: str | None
+) -> None:
+    """Both directions of the provenance digest guard fail closed."""
+    with pytest.raises(ColdIdentityError) as raised:
+        _build_provenance(artefact_kind=kind, artefact_sha256=digest)
+    assert raised.value.failure is ColdIdentityFailure.PROVENANCE_ARTEFACT_DIGEST_MISMATCHED
+
+
+@pytest.mark.parametrize(
+    "revision",
+    [
+        "a" * 39,
+        "a" * 41,
+        _HEX_40.upper(),
+        "g" + "a" * 39,
+        "main",
+        "abcdef0",
+        f" {_HEX_40}",
+        f"{_HEX_40}\n",
+        f"{_HEX_40}x",
+        1,
+    ],
+)
+def test_provenance_refuses_noncanonical_source_revision(revision: object) -> None:
+    """Build revisions require exactly one lowercase full SHA token."""
+    with pytest.raises(ValidationError):
+        _build_provenance(source_revision=revision)
+
+
+@pytest.mark.parametrize("digest", ["a" * 63, "a" * 65, _HEX_64.upper(), "g" * 64])
+def test_provenance_and_profile_refuse_noncanonical_digests(digest: str) -> None:
+    """Both caller assertions use anchored lowercase digest grammars."""
+    with pytest.raises(ValidationError):
+        _build_provenance(artefact_sha256=digest)
+    with pytest.raises(ValidationError):
+        _effective_mcp_profile(source_sha256=digest)
+
+
+@pytest.mark.parametrize(
+    ("factory", "field", "value"),
+    [
+        (_build_provenance, "source_tree_dirty", 1),
+        (_build_provenance, "source_tree_dirty", "true"),
+        (_effective_mcp_profile, "first_crack_onnx_threads", "2"),
+        (_effective_mcp_profile, "first_crack_onnx_threads", True),
+        (_effective_mcp_profile, "first_crack_confirmation_window_seconds", "0.9"),
+        (_effective_mcp_profile, "source_byte_length", "0"),
+        (_effective_mcp_profile, "session_ror_window_seconds", "60"),
+        (_effective_mcp_profile, "session_ror_window_seconds", 60.0),
+        (_effective_mcp_profile, "session_ror_min_sample_seconds", "10"),
+        (_effective_mcp_profile, "session_ror_min_sample_seconds", 10.0),
+    ],
+)
+def test_new_model_scalar_fields_are_strict(factory: Any, field: str, value: object) -> None:
+    """New scalar inputs refuse coercion at their closed model boundaries."""
+    with pytest.raises(ValidationError):
+        factory(**{field: value})
+
+
+def test_new_model_scalars_are_field_strict_without_model_level_strictness() -> None:
+    """Strictness belongs to new scalar fields while the enum remains JSON-round-trippable."""
+    for model in (AgentBuildProvenance, EffectiveMCPProfile):
+        assert model.model_config.get("frozen") is True
+        assert model.model_config.get("extra") == "forbid"
+        assert model.model_config.get("allow_inf_nan") is False
+        assert "strict" not in model.model_config
+    assert ColdRunIdentity.model_config.get("frozen") is True
+    assert ColdRunIdentity.model_config.get("extra") == "forbid"
+    assert ColdRunIdentity.model_config.get("allow_inf_nan") is False
+    assert "strict" not in ColdRunIdentity.model_config
+
+    def is_strict(annotation: object) -> bool:
+        """Return whether one resolved scalar annotation carries strict field metadata."""
+        if get_origin(annotation) is Annotated:
+            _, *metadata = get_args(annotation)
+            return any(
+                getattr(item, "strict", False) is True
+                or any(
+                    getattr(detail, "strict", False) is True
+                    for detail in getattr(item, "metadata", ())
+                )
+                for item in metadata
+            )
+        return any(is_strict(item) for item in get_args(annotation))
+
+    for model, enum_fields in (
+        (AgentBuildProvenance, {"artefact_kind"}),
+        (EffectiveMCPProfile, set[str]()),
+    ):
+        annotations = get_type_hints(model, include_extras=True)
+        for field_name in model.model_fields:
+            if field_name not in enum_fields:
+                assert is_strict(annotations[field_name])
+    artefact_kind = get_type_hints(AgentBuildProvenance, include_extras=True)["artefact_kind"]
+    assert is_strict(artefact_kind) is False
+
+
+def test_dirty_source_tree_is_recorded_frozen_and_hashed(tmp_path: Path) -> None:
+    """This model-only slice records dirty source state without run-admission enforcement."""
+    identity = _freeze(tmp_path, build_provenance=_build_provenance(source_tree_dirty=True))
+
+    assert identity.build_provenance.source_tree_dirty is True
+    assert identity.model_dump(mode="json")["build_provenance"]["source_tree_dirty"] is True
+    assert len(identity_sha256(identity)) == 64
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_byte_length", -1),
+        ("first_crack_onnx_threads", 0),
+        ("first_crack_min_positive_windows", 0),
+        ("first_crack_confirmation_window_seconds", 0.0),
+        ("audio_sample_rate", 0),
+        ("audio_window_seconds", 0.0),
+        ("audio_overlap", -0.1),
+        ("audio_overlap", 1.0),
+        ("audio_hop_seconds", 0.0),
+        ("session_ror_window_seconds", 0),
+        ("session_ror_min_sample_seconds", 0),
+    ],
+)
+def test_effective_profile_refuses_out_of_range_comparables(field: str, value: object) -> None:
+    """Typed effective configuration comparables use their ratified bounds."""
+    with pytest.raises(ValidationError):
+        _effective_mcp_profile(**{field: value})
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "field", ["first_crack_confirmation_window_seconds", "audio_window_seconds", "audio_overlap"]
+)
+def test_effective_profile_refuses_nonfinite_float_comparables(field: str, value: float) -> None:
+    """Finite profile values cannot carry a non-finite identity representation."""
+    with pytest.raises(ValidationError):
+        _effective_mcp_profile(**{field: value})
+
+
+def test_effective_profile_admits_revision_tokens_without_operator_entropy_screen() -> None:
+    """Pinned revisions use a bounded identifier grammar, not operator free-text screening."""
+    assert _effective_mcp_profile(first_crack_revision=_HEX_40).first_crack_revision == _HEX_40
+    assert cold_identity._operator_text_is_safe(_HEX_40) is False  # pyright: ignore[reportPrivateUsage]
+    assert _effective_mcp_profile(first_crack_revision="a" * 128).first_crack_revision == "a" * 128
+    for value in ("", "model revision", "model/path", "model:tag", "é"):
+        with pytest.raises(ValidationError):
+            _effective_mcp_profile(first_crack_revision=value)
+
+
+@pytest.mark.parametrize(
+    "revision",
+    ["a" * 129, "github_pat_" + "a" * 120],
+)
+def test_effective_profile_refuses_oversized_revision_without_exposing_it(revision: str) -> None:
+    """Overlength benign and credential-shaped revisions use the closed refusal path."""
+    with pytest.raises(ColdIdentityError) as raised:
+        _effective_mcp_profile(first_crack_revision=revision)
+
+    _assert_closed_revision_rejection(raised, revision)
+
+
+def test_effective_profile_keyword_constructor_refuses_credential_shaped_revision() -> None:
+    """Direct keyword construction closes credential-shaped in-bound revisions."""
+    revision = "github_pat_abcdefghijklmnop"
+    values = _effective_mcp_profile().model_dump(mode="python")
+    values["first_crack_revision"] = revision
+
+    with pytest.raises(ColdIdentityError) as raised:
+        EffectiveMCPProfile(**values)
+
+    _assert_closed_revision_rejection(raised, revision)
+
+
+@pytest.mark.parametrize(
+    ("revision", "missing_sibling"),
+    [
+        ("a" * 129, False),
+        ("github_pat_" + "a" * 120, True),
+    ],
+)
+def test_nested_identity_refuses_oversized_revision_before_sibling_errors(
+    tmp_path: Path, revision: str, missing_sibling: bool
+) -> None:
+    """Nested oversized revisions stay closed despite invalid or absent sibling fields."""
+    payload = _freeze(tmp_path).model_dump(mode="python")
+    profile = cast(dict[str, object], payload["effective_mcp_profile"])
+    profile["first_crack_revision"] = revision
+    if missing_sibling:
+        del profile["audio_sample_rate"]
+    else:
+        profile["audio_sample_rate"] = 0
+
+    with pytest.raises(ColdIdentityError) as raised:
+        ColdRunIdentity.model_validate(payload)
+
+    _assert_closed_revision_rejection(raised, revision)
+
+
+def test_oversized_revision_skips_credential_pattern_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The raw size bound prevents credential-pattern work for large direct and nested inputs."""
+    revision = "github_pat_" + "a" * 100_000
+    payload = _freeze(tmp_path).model_dump(mode="python")
+    profile = cast(dict[str, object], payload["effective_mcp_profile"])
+    profile["first_crack_revision"] = revision
+    calls = 0
+
+    def fail_if_called(value: str) -> bool:
+        nonlocal calls
+        calls += 1
+        raise AssertionError(f"credential scan unexpectedly received {len(value)} characters")
+
+    monkeypatch.setattr(cold_identity, "_revision_has_credential_shape", fail_if_called)
+    with pytest.raises(ColdIdentityError) as raised:
+        _effective_mcp_profile(first_crack_revision=revision)
+
+    _assert_closed_revision_rejection(raised, revision)
+    assert calls == 0
+
+    with pytest.raises(ColdIdentityError) as nested_raised:
+        ColdRunIdentity.model_validate(payload)
+
+    _assert_closed_revision_rejection(nested_raised, revision)
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
+    "revision",
+    [
+        "sk-abcdefghijklmnop",
+        "api_key=synthetic-value",
+        "ghp_abcdefghijklmnop",
+        "gho_abcdefghijklmnop",
+        "ghu_abcdefghijklmnop",
+        "ghs_abcdefghijklmnop",
+        "ghr_abcdefghijklmnop",
+        "github_pat_abcdefghijklmnop",
+        "glpat-abcdefghijklmnop",
+        "xoxb-abcdefghijklmnop",
+        "xoxp-abcdefghijklmnop",
+        "xoxa-abcdefghijklmnop",
+        "xoxr-abcdefghijklmnop",
+        "xoxs-abcdefghijklmnop",
+        "AKIA1234567890ABCDEF",
+        "eyJabcde.eyJfghij.abcdefgh",
+        "eyJabcde.eyJfghij." + "a" * 129,
+    ],
+)
+def test_effective_profile_refuses_credential_shaped_revisions(revision: str) -> None:
+    """Credential-shaped revision tokens fail closed without echoing their contents."""
+    with pytest.raises(ColdIdentityError) as raised:
+        _effective_mcp_profile(first_crack_revision=revision)
+
+    assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
+    assert revision not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_nested_identity_refuses_credential_shaped_revision(tmp_path: Path) -> None:
+    """Containing identity reconstruction repeats revision credential-shape admission."""
+    revision = "github_pat_abcdefghijklmnop"
+    payload = _freeze(tmp_path).model_dump(mode="python")
+    profile = cast(dict[str, object], payload["effective_mcp_profile"])
+    profile["first_crack_revision"] = revision
+
+    with pytest.raises(ColdIdentityError) as raised:
+        ColdRunIdentity.model_validate(payload)
+
+    assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
+    assert revision not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_nested_identity_refuses_assignment_shaped_revision(tmp_path: Path) -> None:
+    """Nested reconstruction hides assignment-shaped credential values on rejection."""
+    revision = "api_key=synthetic-value"
+    payload = _freeze(tmp_path).model_dump(mode="python")
+    profile = cast(dict[str, object], payload["effective_mcp_profile"])
+    profile["first_crack_revision"] = revision
+
+    with pytest.raises(ColdIdentityError) as raised:
+        ColdRunIdentity.model_validate(payload)
+
+    assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
+    assert revision not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_effective_profile_preserves_noncredential_revision_grammar_failure() -> None:
+    """Non-credential values outside the bounded grammar still raise ValidationError."""
+    with pytest.raises(ValidationError):
+        _effective_mcp_profile(first_crack_revision="plain=value")
+
+
+def test_unrelated_profile_failure_still_contains_a_credential_shaped_revision() -> None:
+    """Credential-shaped revisions stay closed when another profile field is invalid."""
+    revision = "github_pat_abcdefghijklmnop"
+    with pytest.raises(ColdIdentityError) as raised:
+        _effective_mcp_profile(
+            first_crack_revision=revision,
+            audio_sample_rate=0,
+        )
+
+    assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
+    assert revision not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert not hasattr(raised.value, "errors")
+
+
+def test_missing_profile_field_still_contains_a_credential_shaped_revision() -> None:
+    """Missing fields cannot expose a credential-shaped revision in Pydantic errors."""
+    revision = "github_pat_abcdefghijklmnop"
+    values = _effective_mcp_profile().model_dump(mode="python")
+    values["first_crack_revision"] = revision
+    del values["audio_sample_rate"]
+
+    with pytest.raises(ColdIdentityError) as raised:
+        EffectiveMCPProfile.model_validate(values)
+
+    assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
+    assert revision not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert not hasattr(raised.value, "errors")
+
+
+def test_cold_artefact_kind_is_a_plain_enum() -> None:
+    """Cold artefact kinds remain closed plain enums rather than string enums."""
+    assert issubclass(ColdArtefactKind, Enum)
+    assert not issubclass(ColdArtefactKind, str)
+
+
+def test_effective_profile_field_set_excludes_leak_and_duplicate_surfaces() -> None:
+    """The typed profile remains the ratified twelve-field allow-list."""
+    assert set(EffectiveMCPProfile.model_fields) == {
+        "source_sha256",
+        "source_byte_length",
+        "first_crack_onnx_threads",
+        "first_crack_min_positive_windows",
+        "first_crack_confirmation_window_seconds",
+        "first_crack_revision",
+        "audio_sample_rate",
+        "audio_window_seconds",
+        "audio_overlap",
+        "audio_hop_seconds",
+        "session_ror_window_seconds",
+        "session_ror_min_sample_seconds",
+    }
+    assert "fc_confidence_threshold" in cold_identity.ManagedDeviceIdentity.model_fields
+    assert len(ColdIdentityFailure) == 11
+    with pytest.raises(ValidationError):
+        _effective_mcp_profile(temperature_unit="fahrenheit")
+
+
+def test_profile_float_normalisation_and_identity_digest_sensitivity(tmp_path: Path) -> None:
+    """A float comparable normalises integers and each component changes the digest."""
+    profile = _effective_mcp_profile(audio_window_seconds=10)
+    assert profile.audio_window_seconds == 10.0
+
+    baseline = _freeze(tmp_path)
+    changed_provenance = _freeze(
+        tmp_path, build_provenance=_build_provenance(source_revision="c" * 40)
+    )
+    changed_profile = _freeze(
+        tmp_path, effective_mcp_profile=_effective_mcp_profile(audio_overlap=0.7)
+    )
+    assert identity_sha256(baseline) != identity_sha256(changed_provenance)
+    assert identity_sha256(baseline) != identity_sha256(changed_profile)
+
+
+@pytest.mark.parametrize(
+    ("component", "field", "value"),
+    [
+        ("provenance", "source_revision", "c" * 40),
+        ("provenance", "source_tree_dirty", True),
+        ("provenance", "artefact_kind", ColdArtefactKind.SDIST),
+        ("provenance", "artefact_sha256", "b" * 64),
+        ("profile", "source_sha256", "b" * 64),
+        ("profile", "source_byte_length", 101),
+        ("profile", "first_crack_onnx_threads", 8),
+        ("profile", "first_crack_min_positive_windows", 5),
+        ("profile", "first_crack_confirmation_window_seconds", 20.0),
+        ("profile", "first_crack_revision", "c" * 40),
+        ("profile", "audio_sample_rate", 44100),
+        ("profile", "audio_window_seconds", 12.0),
+        ("profile", "audio_overlap", 0.7),
+        ("profile", "audio_hop_seconds", 1.0),
+        ("profile", "session_ror_window_seconds", 61),
+        ("profile", "session_ror_min_sample_seconds", 11),
+    ],
+)
+def test_each_new_identity_field_changes_canonical_digest(
+    tmp_path: Path, component: str, field: str, value: object
+) -> None:
+    """Every provenance and profile field contributes to the canonical identity digest."""
+    baseline = _freeze(tmp_path)
+    if component == "provenance":
+        values = baseline.build_provenance.model_dump(mode="python")
+        values[field] = value
+        changed = _freeze(tmp_path, build_provenance=AgentBuildProvenance.model_validate(values))
+    else:
+        values = baseline.effective_mcp_profile.model_dump(mode="python")
+        values[field] = value
+        changed = _freeze(
+            tmp_path, effective_mcp_profile=EffectiveMCPProfile.model_validate(values)
+        )
+
+    assert identity_sha256(changed) != identity_sha256(baseline)
 
 
 def test_freeze_records_manifest_and_credential_name_without_its_value(

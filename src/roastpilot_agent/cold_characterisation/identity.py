@@ -6,11 +6,19 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Mapping
 from enum import Enum
 from pathlib import Path
-from typing import Final, Literal, cast
+from typing import Annotated, Final, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ModelWrapValidatorHandler,
+    ValidationError,
+    model_validator,
+)
 
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import AdvisorDescriptor
@@ -32,6 +40,15 @@ _PRINTABLE_TEXT_PATTERN: Final = re.compile(r"\A[\x20-\x7e\n]*\Z")
 _CREDENTIAL_SHAPE_PATTERN: Final = re.compile(
     r"(?:sk-[A-Za-z0-9_-]{16,}|(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+)",
     re.IGNORECASE,
+)
+_REVISION_SECRET_SHAPE_PATTERN: Final = re.compile(
+    r"\A(?:"
+    r"(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)[A-Za-z0-9_-]{16,}"
+    r"|glpat-[A-Za-z0-9_-]{16,}"
+    r"|(?:xoxb-|xoxp-|xoxa-|xoxr-|xoxs-)[A-Za-z0-9_-]{16,}"
+    r"|AKIA[A-Z0-9]{16}"
+    r"|eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}"
+    r")\Z"
 )
 _HIGH_ENTROPY_TOKEN_PATTERN: Final = re.compile(r"[A-Za-z0-9_-]{24,}")
 _COLD_IDENTITY_MODEL_CONFIG: Final[ConfigDict] = cast(
@@ -70,6 +87,7 @@ class ColdIdentityFailure(Enum):
     OPERATOR_TEXT_REJECTED = "operator_text_rejected"
     DEVICE_CONFIG_FIELD_SET_DRIFTED = "device_config_field_set_drifted"
     DEVICE_CONFIG_VALUE_REJECTED = "device_config_value_rejected"
+    PROVENANCE_ARTEFACT_DIGEST_MISMATCHED = "provenance_artefact_digest_mismatched"
 
 
 class ColdIdentityError(RuntimeError):
@@ -135,8 +153,94 @@ class ManagedDeviceIdentity(BaseModel):
         return self
 
 
+class ColdArtefactKind(Enum):
+    """Closed grammar for the build artefact represented by a cold identity."""
+
+    WHEEL = "wheel"
+    SDIST = "sdist"
+    EDITABLE_SOURCE = "editable_source"
+
+
+class AgentBuildProvenance(BaseModel):
+    """Caller-supplied immutable build provenance for a cold identity."""
+
+    model_config = _COLD_IDENTITY_MODEL_CONFIG
+
+    source_revision: Annotated[str, Field(strict=True, pattern=r"\A[0-9a-f]{40}\z")]
+    source_tree_dirty: Annotated[bool, Field(strict=True)]
+    artefact_kind: ColdArtefactKind
+    artefact_sha256: Annotated[str, Field(strict=True, pattern=r"\A[0-9a-f]{64}\z")] | None
+
+    @model_validator(mode="after")
+    def _require_matching_artefact_digest(self) -> AgentBuildProvenance:
+        """Require a digest exactly when the asserted artefact is packaged."""
+        packaged = self.artefact_kind in {ColdArtefactKind.WHEEL, ColdArtefactKind.SDIST}
+        if packaged == (self.artefact_sha256 is None):
+            raise ColdIdentityError(ColdIdentityFailure.PROVENANCE_ARTEFACT_DIGEST_MISMATCHED)
+        return self
+
+
+class EffectiveMCPProfile(BaseModel):
+    """Caller-supplied immutable profile commitment and typed comparables."""
+
+    model_config = _COLD_IDENTITY_MODEL_CONFIG
+
+    source_sha256: Annotated[str, Field(strict=True, pattern=r"\A[0-9a-f]{64}\z")]
+    source_byte_length: Annotated[int, Field(strict=True, ge=0)]
+    first_crack_onnx_threads: Annotated[int, Field(strict=True, ge=1)]
+    first_crack_min_positive_windows: Annotated[int, Field(strict=True, ge=1)]
+    first_crack_confirmation_window_seconds: Annotated[float, Field(strict=True, gt=0)]
+    first_crack_revision: Annotated[str, Field(strict=True, pattern=r"\A[A-Za-z0-9._-]{1,128}\z")]
+    audio_sample_rate: Annotated[int, Field(strict=True, gt=0)]
+    audio_window_seconds: Annotated[float, Field(strict=True, gt=0)]
+    audio_overlap: Annotated[float, Field(strict=True, ge=0.0, lt=1.0)]
+    audio_hop_seconds: Annotated[float, Field(strict=True, gt=0)] | None
+    session_ror_window_seconds: Annotated[int, Field(strict=True, gt=0)]
+    session_ror_min_sample_seconds: Annotated[int, Field(strict=True, gt=0)]
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _reject_credential_shaped_revision(
+        cls,
+        value: object,
+        handler: ModelWrapValidatorHandler[EffectiveMCPProfile],
+    ) -> EffectiveMCPProfile:
+        """Reject credential-shaped operator YAML revisions without entropy screening."""
+        raw_revision: object | None = (
+            cast(Mapping[str, object], value).get("first_crack_revision")
+            if isinstance(value, Mapping)
+            else None
+        )
+        if isinstance(raw_revision, str) and len(raw_revision) > 128:
+            # Deliberately reuse this reason because the revision originates in operator YAML.
+            raise ColdIdentityError(ColdIdentityFailure.OPERATOR_TEXT_REJECTED)
+        profile: EffectiveMCPProfile | None = None
+        validation_error: ValidationError | None = None
+        try:
+            profile = handler(value)
+        except ValidationError as error:
+            validation_error = error
+        if validation_error is not None:
+            if isinstance(raw_revision, str) and _revision_has_credential_shape(raw_revision):
+                # Deliberately reuse this reason because the revision originates in operator YAML.
+                raise ColdIdentityError(ColdIdentityFailure.OPERATOR_TEXT_REJECTED)
+            raise validation_error
+        assert profile is not None
+        if _revision_has_credential_shape(profile.first_crack_revision):
+            raise ColdIdentityError(ColdIdentityFailure.OPERATOR_TEXT_REJECTED)
+        return profile
+
+
+def _revision_has_credential_shape(revision: str) -> bool:
+    """Return whether an MCP revision resembles a credential rather than a revision."""
+    return (
+        _CREDENTIAL_SHAPE_PATTERN.search(revision) is not None
+        or _REVISION_SECRET_SHAPE_PATTERN.fullmatch(revision) is not None
+    )
+
+
 class ColdRunIdentity(BaseModel):
-    """Immutable complete identity for one cold-characterisation run."""
+    """Immutable recorded identity assertions for one cold-characterisation run."""
 
     model_config = _COLD_IDENTITY_MODEL_CONFIG
 
@@ -155,6 +259,8 @@ class ColdRunIdentity(BaseModel):
     runtime_config: RuntimeConfigSnapshot
     server_info: ServerInfo
     device_config: ManagedDeviceIdentity
+    build_provenance: AgentBuildProvenance
+    effective_mcp_profile: EffectiveMCPProfile
     model_repo_id: str
     model_revision: str
     model_manifest: tuple[ModelManifestEntry, ...]
@@ -228,6 +334,8 @@ def freeze_identity(
     runtime_config: RuntimeConfigSnapshot,
     server_info: ServerInfo,
     device_config: MCPDeviceConfig,
+    build_provenance: AgentBuildProvenance,
+    effective_mcp_profile: EffectiveMCPProfile,
     audio_device_identity: str,
     serial_port_path: str,
     controller_tick_seconds: float,
@@ -242,7 +350,7 @@ def freeze_identity(
     operator_cooling_notes: str,
     boot_id_path: Path = BOOT_ID_PATH,
 ) -> ColdRunIdentity:
-    """Freeze a complete admitted cold-run identity without reading a credential.
+    """Freeze a caller-supplied admitted cold-run identity without reading a credential.
 
     Args:
         run_id: The caller-assigned cold session identifier.
@@ -258,6 +366,8 @@ def freeze_identity(
         runtime_config: Already-fetched tolerant MCP runtime mirror.
         server_info: Already-fetched tolerant MCP server mirror.
         device_config: Phase-specific managed MCP device configuration.
+        build_provenance: Caller-supplied immutable build provenance assertion.
+        effective_mcp_profile: Caller-supplied effective MCP configuration commitment.
         audio_device_identity: Primary configured audio-device identity.
         serial_port_path: Configured roaster serial-port path.
         controller_tick_seconds: Controller tick duration.
@@ -313,6 +423,8 @@ def freeze_identity(
         runtime_config=runtime_config,
         server_info=server_info,
         device_config=managed_device_config,
+        build_provenance=build_provenance,
+        effective_mcp_profile=effective_mcp_profile,
         model_repo_id=REPO_ID,
         model_revision=REVISION,
         model_manifest=manifest,
