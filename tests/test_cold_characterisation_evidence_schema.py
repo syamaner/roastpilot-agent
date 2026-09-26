@@ -112,6 +112,10 @@ def test_projection_is_strict_and_preserves_unknown_keys_losslessly() -> None:
     payload["queued_window_count"] = "1"
     with pytest.raises(evidence.ColdEvidenceError):
         evidence.project_tick_audio(payload)
+    with pytest.raises(evidence.ColdEvidenceError):
+        evidence.walk_json_value(typing.cast(evidence.ColdJsonValue, object()))
+    with pytest.raises(evidence.ColdEvidenceError):
+        evidence.project_tick_audio(typing.cast(dict[str, evidence.ColdJsonValue], []))
     with pytest.raises(pydantic.ValidationError):
         evidence.ColdTickAudioSample.model_validate({**_audio_payload(), "extra": 1})
 
@@ -247,6 +251,20 @@ def test_envelope_nonfinite_and_cap_paths_are_closed(monkeypatch: pytest.MonkeyP
     assert raised.value.failure is evidence.ColdEvidenceFailure.ENVELOPE_TOO_LARGE
 
 
+def test_envelope_rejects_noncanonical_valid_json_after_digest_check() -> None:
+    """Canonicality is independently checked after the matching digest is admitted."""
+    canonical = '{"b":1,"a":2}'
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.ColdSealedEnvelope(
+            kind=evidence.ColdEnvelopeKind.IDENTITY,
+            schema_version=1,
+            canonical_json=canonical,
+            canonical_byte_length=len(canonical),
+            sha256=hashlib.sha256(canonical.encode()).hexdigest(),
+        )
+    assert raised.value.failure is evidence.ColdEvidenceFailure.ENVELOPE_NOT_CANONICAL
+
+
 def test_designated_ingresses_strip_parser_context_and_attacker_key() -> None:
     """Projection errors retain only closed diagnostic names and no exception chain."""
     payload = _audio_payload()
@@ -333,6 +351,29 @@ def test_validate_record_rejects_foreign_instance_and_record_caps(
     with pytest.raises(evidence.ColdEvidenceError) as raised:
         evidence.validate_record(tick)
     assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_TOO_LARGE
+
+
+def test_raw_extraction_covers_closed_graph_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Raw extraction copies every admitted scalar/container shape before the adapter."""
+    tick = _tick().model_copy(update={"raw_vendor_data": {"nested": [None, True, 1, 1.5, "text"]}})
+    private_name = "_" + "extract_model"
+    extract = getattr(evidence, private_name)
+    extracted = extract(tick, [0])
+    assert extracted["raw_vendor_data"] == {"nested": [None, True, 1, 1.5, "text"]}
+    monkeypatch.setattr(evidence, "MAX_TEXT_FIELD_BYTES", 1)
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        extract(tick, [0])
+    assert raised.value.failure is evidence.ColdEvidenceFailure.TEXT_FIELD_TOO_LARGE
+    monkeypatch.setattr(evidence, "MAX_TEXT_FIELD_BYTES", 2_048)
+
+    raw_reason = typing.cast(typing.Any, evidence.ColdAbortRecord).model_construct(
+        **_common("abort"),
+        domain=evidence.ColdAbortDomain.OPERATOR,
+        reason="operator_stop",
+    )
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(typing.cast(evidence.ColdEvidenceRecord, raw_reason))
+    assert raised.value.failure is evidence.ColdEvidenceFailure.ABORT_DOMAIN_REASON_MISMATCHED
 
 
 def test_record_union_has_six_closed_streams_and_abort_pairs() -> None:
