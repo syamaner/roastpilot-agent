@@ -274,7 +274,15 @@ def walk_json_value(value: ColdJsonValue) -> None:
     Raises:
         ColdEvidenceError: If a type, resource, key, or finite-number invariant fails.
     """
-    _walk_json_value(value, [0])
+    try:
+        _walk_json_value(value, [0])
+    except ColdEvidenceError:
+        raise
+    except Exception:
+        failure = ColdEvidenceError(ColdEvidenceFailure.JSON_VALUE_TYPE_NOT_ADMITTED)
+    else:
+        return
+    raise failure
 
 
 def _walk_json_value(value: ColdJsonValue, aggregate: list[int]) -> None:
@@ -769,7 +777,7 @@ def _extract_model(value: pydantic.BaseModel, aggregate: list[int]) -> dict[str,
             mapping = typing.cast(dict[object, object], current)
             if len(mapping) > MAX_COLLECTION_LENGTH:
                 raise _closed(ColdEvidenceFailure.JSON_NODE_LIMIT_EXCEEDED)
-            if depth >= MAX_JSON_DEPTH:
+            if depth >= MAX_JSON_DEPTH and len(mapping) > 0:
                 raise _closed(ColdEvidenceFailure.JSON_DEPTH_EXCEEDED)
             if nodes + len(stack) + len(mapping) > MAX_JSON_NODES:
                 raise _closed(ColdEvidenceFailure.JSON_NODE_LIMIT_EXCEEDED)
@@ -791,7 +799,7 @@ def _extract_model(value: pydantic.BaseModel, aggregate: list[int]) -> dict[str,
             items = typing.cast(list[object], current)
             if len(items) > MAX_COLLECTION_LENGTH:
                 raise _closed(ColdEvidenceFailure.JSON_NODE_LIMIT_EXCEEDED)
-            if depth >= MAX_JSON_DEPTH:
+            if depth >= MAX_JSON_DEPTH and len(items) > 0:
                 raise _closed(ColdEvidenceFailure.JSON_DEPTH_EXCEEDED)
             if nodes + len(stack) + len(items) > MAX_JSON_NODES:
                 raise _closed(ColdEvidenceFailure.JSON_NODE_LIMIT_EXCEEDED)

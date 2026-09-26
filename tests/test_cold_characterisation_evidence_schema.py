@@ -376,6 +376,25 @@ def test_raw_extraction_covers_closed_graph_shapes(monkeypatch: pytest.MonkeyPat
     assert raised.value.failure is evidence.ColdEvidenceFailure.ABORT_DOMAIN_REASON_MISMATCHED
 
 
+def test_persisted_raw_empty_container_at_exact_depth_is_admitted() -> None:
+    """An empty raw container at the maximum node depth adds no prohibited child."""
+    nested: evidence.ColdJsonValue = []
+    for _ in range(evidence.MAX_JSON_DEPTH - 2):
+        nested = [nested]
+    tick = _tick().model_copy(update={"raw_vendor_data": {"nested": nested}})
+    validated = typing.cast(evidence.ColdTickRecord, evidence.validate_record(tick))
+    assert validated.raw_vendor_data == {"nested": nested}
+
+
+def test_walker_closes_unencodable_unicode_without_exception_chain() -> None:
+    """Malformed UTF-8 source text cannot leak a Unicode encoder exception."""
+    for value in ("\ud800", {"\ud800": 1}):
+        with pytest.raises(evidence.ColdEvidenceError) as raised:
+            evidence.walk_json_value(typing.cast(evidence.ColdJsonValue, value))
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+
+
 def test_record_union_has_six_closed_streams_and_abort_pairs() -> None:
     """The record vocabulary is six streams and abort reasons remain domain-typed."""
     records: list[evidence.ColdEvidenceRecord] = [
