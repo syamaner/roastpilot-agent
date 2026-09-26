@@ -599,3 +599,134 @@ def test_new_modules_contain_no_actuator_verdict_or_limit_names() -> None:
             assert not any(
                 token in lowered for token in ("verdict", "evaluat", "report", "outcome")
             ), (path.name, identifier)
+
+
+_COLD = "roastpilot_agent.cold_characterisation."
+_STDLIB_ALLOWED = frozenset(
+    {"os", "stat", "hashlib", "json", "math", "enum", "typing", "collections.abc", "pydantic"}
+)
+_MODULE_IMPORT_ALLOW_LIST: dict[str, frozenset[str]] = {
+    "evidence_store.py": frozenset({_COLD + "evidence_schema", _COLD + "mcp"}),
+    "evidence_reader.py": frozenset({_COLD + "evidence_schema", _COLD + "evidence_store"}),
+    "evidence_builders.py": frozenset(
+        {
+            _COLD + "evidence_schema",
+            _COLD + "evidence_store",
+            _COLD + "identity",
+            _COLD + "mcp",
+            _COLD + "host",
+            "roastpilot_agent.mcp_client",
+        }
+    ),
+}
+_RESTRICTED_NAMES: dict[str, frozenset[str]] = {
+    _COLD + "host": frozenset({"HostBoundSample"}),
+    "roastpilot_agent.mcp_client": frozenset({"RoasterDeviceState"}),
+}
+
+
+def _direct_imports(path: Path) -> list[tuple[str, tuple[str, ...]]]:
+    """Return ``(module, imported names)`` for every import statement in a module."""
+    found: list[tuple[str, tuple[str, ...]]] = []
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Import):
+            found.extend((alias.name, ()) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0 and node.module is not None, path.name
+            found.append((node.module, tuple(alias.name for alias in node.names)))
+    return found
+
+
+def test_new_modules_import_only_their_ratified_allow_lists() -> None:
+    """Each new module imports only the ratified stdlib set and its allowed cold modules."""
+    for path in NEW_MODULES:
+        allowed = _STDLIB_ALLOWED | _MODULE_IMPORT_ALLOW_LIST[path.name]
+        for module, names in _direct_imports(path):
+            assert module in allowed, (path.name, module)
+            restricted = _RESTRICTED_NAMES.get(module)
+            if restricted is not None:
+                assert set(names) <= restricted, (path.name, module, names)
+            assert module.split(".")[0] not in {
+                "subprocess",
+                "socket",
+                "shutil",
+                "tempfile",
+                "httpx",
+            }
+
+
+def _reachable_package_modules(
+    roots: tuple[str, ...], *, stop: frozenset[str] = frozenset()
+) -> set[str]:
+    """Statically follow first-party imports from roots, not expanding ``stop`` modules."""
+    source_root = Path(builders.__file__).parents[2]
+
+    def locate(module: str) -> Path | None:
+        candidate = source_root / (module.replace(".", "/") + ".py")
+        if candidate.is_file():
+            return candidate
+        package = source_root / module.replace(".", "/") / "__init__.py"
+        return package if package.is_file() else None
+
+    seen: set[str] = set()
+    pending = list(roots)
+    while pending:
+        module = pending.pop()
+        path = locate(module)
+        if module in seen or path is None:
+            continue
+        seen.add(module)
+        if module in stop:
+            continue
+        for imported, names in _direct_imports_any_level(path, module):
+            if imported.startswith("roastpilot_agent"):
+                pending.append(imported)
+                pending.extend(f"{imported}.{name}" for name in names)
+    return seen
+
+
+def _direct_imports_any_level(path: Path, module: str) -> list[tuple[str, tuple[str, ...]]]:
+    """Resolve absolute and relative imports of one first-party module."""
+    package = module if path.name == "__init__.py" else module.rpartition(".")[0]
+    found: list[tuple[str, tuple[str, ...]]] = []
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Import):
+            found.extend((alias.name, ()) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = package
+            for _ in range(max(node.level - 1, 0)):
+                base = base.rpartition(".")[0]
+            target = (
+                node.module
+                if node.level == 0
+                else ".".join(part for part in (base, node.module or "") if part)
+            )
+            if target:
+                found.append((target, tuple(alias.name for alias in node.names)))
+    return found
+
+
+def test_new_modules_reach_no_orchestration_or_roast_control_module() -> None:
+    """Transitively, the new modules never reach controller, safety, API, store, or CLI code."""
+    roots = tuple(_COLD + path.stem for path in NEW_MODULES)
+    reachable = _reachable_package_modules(roots)
+    forbidden = {
+        "roastpilot_agent.controller",
+        "roastpilot_agent.safety",
+        "roastpilot_agent.api",
+        "roastpilot_agent.store",
+        "roastpilot_agent.cli",
+        "roastpilot_agent.live",
+        "roastpilot_agent.replay",
+        "roastpilot_agent.appliance.model_install",
+    }
+    assert reachable & forbidden == set()
+    assert _COLD + "evidence_store" in reachable
+
+
+def test_advisor_is_reached_only_through_the_allowed_identity_module() -> None:
+    """The advisor type dependency arrives only via the delivered identity module."""
+    roots = tuple(_COLD + path.stem for path in NEW_MODULES)
+    assert "roastpilot_agent.advisor" in _reachable_package_modules(roots)
+    without_identity = _reachable_package_modules(roots, stop=frozenset({_COLD + "identity"}))
+    assert "roastpilot_agent.advisor" not in without_identity
