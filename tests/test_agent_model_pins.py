@@ -31,18 +31,18 @@ _PROJECT_DOC_MAX_BYTES = 131072
 # The single authoritative (model, effort) mapping for every named subagent.
 # Any change to an agent's frontmatter must be reflected here, and vice versa.
 _EXPECTED: dict[str, tuple[str, str]] = {
-    "engineer-be": ("claude-sonnet-5", "high"),
-    "engineer-fe": ("claude-sonnet-5", "high"),
-    "mcp-contract-checker": ("claude-sonnet-5", "medium"),
-    "sim-roast-runner": ("claude-sonnet-5", "medium"),
-    "pr-triage": ("claude-sonnet-5", "high"),
-    "product-auditor": ("claude-sonnet-5", "high"),
-    "qa": ("claude-sonnet-5", "high"),
-    "security-reviewer": ("claude-sonnet-5", "high"),
-    "ui-reviewer": ("claude-sonnet-5", "high"),
-    "safety-reviewer": ("claude-opus-5", "xhigh"),
-    "planning-architect": ("claude-opus-5", "high"),
-    "story-planner": ("claude-opus-5", "high"),
+    "engineer-be": ("claude-opus-5-5", "medium"),
+    "engineer-fe": ("claude-opus-5-5", "medium"),
+    "mcp-contract-checker": ("claude-opus-5-5", "medium"),
+    "sim-roast-runner": ("claude-opus-5-5", "medium"),
+    "pr-triage": ("claude-opus-5-5", "medium"),
+    "product-auditor": ("claude-opus-5-5", "medium"),
+    "qa": ("claude-opus-5-5", "medium"),
+    "security-reviewer": ("claude-opus-5-5", "medium"),
+    "ui-reviewer": ("claude-opus-5-5", "medium"),
+    "safety-reviewer": ("claude-opus-5-5", "high"),
+    "planning-architect": ("claude-opus-5-5", "medium"),
+    "story-planner": ("claude-opus-5-5", "medium"),
 }
 _ALIASES = {"sonnet", "opus", "fable", "haiku", "best", "default"}
 _EXPECTED_CODEX: dict[str, tuple[str, str]] = {
@@ -93,9 +93,9 @@ _SELF_IDENTIFICATION = re.compile(
 
 
 def _model_family(model: str) -> str:
-    """Return the family segment of a full ``claude-<family>-<version>`` pin."""
+    """Return the family segment of a full ``claude-<family>-<major>[-<minor>]`` pin."""
     parts = model.split("-")
-    assert len(parts) == 3 and parts[0] == "claude" and parts[1] in _MODEL_FAMILIES, (
+    assert len(parts) in (3, 4) and parts[0] == "claude" and parts[1] in _MODEL_FAMILIES, (
         f"model {model!r} is not a recognized full pinned id"
     )
     return parts[1]
@@ -131,7 +131,7 @@ def test_self_identification_guard_detects_the_retired_fable_construction() -> N
 
 
 _CANONICAL_PLANNING_SENTENCE = (
-    "- Planning: high-effort `claude-opus-5` roles `planning-architect` for complex,\n"
+    "- Planning: medium-effort `claude-opus-5-5` roles `planning-architect` for complex,\n"
     "  ambiguous, cross-repository, or safety-boundary design and `story-planner`\n"
     "  for the mandatory implementation contract before every delegated slice. Both\n"
     "  remain read-only."
@@ -139,7 +139,7 @@ _CANONICAL_PLANNING_SENTENCE = (
 _CANONICAL_ASSURANCE_SENTENCE = (
     "- Assurance: `qa`, `security-reviewer`, `ui-reviewer`,\n"
     "  `mcp-contract-checker`, and `sim-roast-runner` retain their existing pins and\n"
-    "  lenses. `safety-reviewer` remains the mandatory `claude-opus-5`, `xhigh`\n"
+    "  lenses. `safety-reviewer` remains the mandatory `claude-opus-5-5`, `high`\n"
     "  safety floor."
 )
 
@@ -163,7 +163,7 @@ def test_agents_md_prose_uses_canonical_planning_and_assurance_sentences() -> No
     "decoy",
     [
         ("claude-opus-5", "claude-fable-5"),
-        ("`xhigh`", "`high`"),
+        ("`high`\n  safety", "`medium`\n  safety"),
     ],
 )
 def test_agents_md_canonical_pin_guard_rejects_planning_and_safety_decoys(

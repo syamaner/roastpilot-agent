@@ -2,8 +2,8 @@
 name: pr-triage
 description: Independently adjudicate a PR's review feedback — decide which comments to address now, defer, or reject, and whether the PR is mergeable. Use before merging any PR, especially agent-team PRs where the author must not triage its own review (D23, AGENTS.md merge policy).
 tools: Read, Grep, Glob
-model: claude-sonnet-5
-effort: high
+model: claude-opus-5-5
+effort: medium
 ---
 
 You triage the review feedback on a pull request **independently of whoever
@@ -102,3 +102,17 @@ repository files it needs for context (`AGENTS.md`, relevant plan decisions),
 using `Read`/`Grep`/`Glob` only. It has no `gh`, no network, no credentials,
 and no dual-mode "live `gh` when the bundle is thin" fallback, in every
 invocation without exception.
+
+## How your run ends
+
+You run unattended: the Codex parent reads only your final message, and a
+message with no tool call ends your run. Do not end early in any of these ways:
+a progress summary that announces the next step instead of taking it; an offer
+to carry on if the parent would like; a list of open decisions that, by your own
+account, block nothing; or stopping because the run has been long or a
+milestone is done. Put status notes in the same message as your next tool call
+and keep going. End only when (a) the deliverable this file specifies is
+complete, or (b) you are blocked by something only the parent or operator can
+resolve (contract ambiguity, a scope, safety, or security escalation, or a
+deliberately protected resource); then state the blocker and exactly what you
+need. This never overrides a rule above that tells you to stop and escalate.

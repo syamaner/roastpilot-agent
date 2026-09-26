@@ -5568,7 +5568,7 @@ def test_native_transcript_binds_model_and_effort_to_the_pinned_role(
     planner_content = (FIXTURES / "claude-2.1.233-transcript" / "story-planner.jsonl").read_bytes()
     planner_session_id = json.loads(planner_content.splitlines()[0])["sessionId"]
     planner_pin = usage_cli._native_role_pin(NativeClaudeRole.STORY_PLANNER)  # pyright: ignore[reportPrivateUsage]
-    assert planner_pin.model == "claude-opus-5"
+    assert planner_pin.model == "claude-opus-5-5"
 
     fable_content = planner_content.replace(b'"model":"claude-opus-5"', b'"model":"claude-fable-5"')
     case = tmp_path / "planner"
@@ -5578,7 +5578,7 @@ def test_native_transcript_binds_model_and_effort_to_the_pinned_role(
         case,
         session_id,
         NativeClaudeRole.STORY_PLANNER,
-        planner_pin.effort,
+        "high",  # the effort recorded in the 2.1.233 fixture, not the live pin
         expected_version="2.1.233",
         expected_permission_mode="dontAsk",
     )
@@ -5587,7 +5587,8 @@ def test_native_transcript_binds_model_and_effort_to_the_pinned_role(
     qa_content = (FIXTURES / "claude-2.1.233-transcript" / "qa.jsonl").read_bytes()
     qa_session_id = json.loads(qa_content.splitlines()[0])["sessionId"]
     qa_pin = usage_cli._native_role_pin(NativeClaudeRole.QA)  # pyright: ignore[reportPrivateUsage]
-    assert qa_pin.effort == "high"
+    assert qa_pin.effort == "medium"
+    recorded_qa_effort = "high"  # recorded in the 2.1.233 fixture
 
     changed_effort = qa_content.replace(b'"effort":"high"', b'"effort":"xhigh"')
     case = tmp_path / "qa"
@@ -5598,7 +5599,7 @@ def test_native_transcript_binds_model_and_effort_to_the_pinned_role(
             case,
             session_id,
             NativeClaudeRole.QA,
-            qa_pin.effort,
+            recorded_qa_effort,
             expected_version="2.1.233",
             expected_permission_mode="dontAsk",
         )
@@ -5610,11 +5611,11 @@ def test_native_transcript_binds_model_and_effort_to_the_pinned_role(
         case,
         session_id,
         NativeClaudeRole.QA,
-        qa_pin.effort,
+        recorded_qa_effort,
         expected_version="2.1.233",
         expected_permission_mode="dontAsk",
     )
-    assert usage.model == qa_pin.model == "claude-sonnet-5"
+    assert usage.model == "claude-sonnet-5" != qa_pin.model
 
 
 @pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo", "directory"])
@@ -6963,15 +6964,15 @@ def test_native_roles_reject_before_provider_lookup(
 def test_native_role_roster_pins_and_capabilities_match_committed_frontmatter() -> None:
     """D163 admits exactly the committed native roster with derived capabilities."""
     expected = {
-        "engineer-be": ("claude-sonnet-5", "high", RoleCapability.WRITE),
-        "engineer-fe": ("claude-sonnet-5", "high", RoleCapability.WRITE),
-        "mcp-contract-checker": ("claude-sonnet-5", "medium", RoleCapability.READ_ONLY),
-        "planning-architect": ("claude-opus-5", "high", RoleCapability.READ_ONLY),
-        "pr-triage": ("claude-sonnet-5", "high", RoleCapability.READ_ONLY),
-        "product-auditor": ("claude-sonnet-5", "high", RoleCapability.READ_ONLY),
-        "qa": ("claude-sonnet-5", "high", RoleCapability.READ_ONLY),
-        "sim-roast-runner": ("claude-sonnet-5", "medium", RoleCapability.READ_ONLY),
-        "story-planner": ("claude-opus-5", "high", RoleCapability.READ_ONLY),
+        "engineer-be": ("claude-opus-5-5", "medium", RoleCapability.WRITE),
+        "engineer-fe": ("claude-opus-5-5", "medium", RoleCapability.WRITE),
+        "mcp-contract-checker": ("claude-opus-5-5", "medium", RoleCapability.READ_ONLY),
+        "planning-architect": ("claude-opus-5-5", "medium", RoleCapability.READ_ONLY),
+        "pr-triage": ("claude-opus-5-5", "medium", RoleCapability.READ_ONLY),
+        "product-auditor": ("claude-opus-5-5", "medium", RoleCapability.READ_ONLY),
+        "qa": ("claude-opus-5-5", "medium", RoleCapability.READ_ONLY),
+        "sim-roast-runner": ("claude-opus-5-5", "medium", RoleCapability.READ_ONLY),
+        "story-planner": ("claude-opus-5-5", "medium", RoleCapability.READ_ONLY),
     }
     assert tuple(role.value for role in NativeClaudeRole) == tuple(expected)
     for role in NativeClaudeRole:
@@ -7005,8 +7006,8 @@ def test_native_role_values_union_exclusions_equal_committed_agent_stems() -> No
 @pytest.mark.parametrize(
     ("target", "replacement"),
     [
-        (b"model: claude-sonnet-5", b"model: claude-fable-5"),
-        (b"effort: high", b"effort: unsupported"),
+        (b"model: claude-opus-5-5", b"model: claude-fable-5"),
+        (b"effort: medium", b"effort: unsupported"),
         (b"tools: Read, Grep, Glob, Bash, Edit, Write", b"tools: Read, Grep, Glob, Edit, Edit"),
     ],
 )
@@ -7168,11 +7169,19 @@ def _request(
 
 
 def _native_transcript_bytes(session_id: str = _NATIVE_SESSION_ID) -> bytes:
-    """Return the closed parent fixture bound to one generated session."""
+    """Return the closed parent fixture bound to one session and the live engineer-be pin.
+
+    The fixture was recorded at ``claude-sonnet-5``/``high``; the launch path binds
+    the transcript to the committed pin, so the recorded model and effort are
+    rebound to it exactly like the session id.
+    """
+    pin = usage_cli._native_role_pin(NativeClaudeRole.ENGINEER_BE)  # pyright: ignore[reportPrivateUsage]
     return (
         (FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl")
         .read_bytes()
         .replace(b"11111111-1111-4111-8111-111111111233", session_id.encode())
+        .replace(b'"model":"claude-sonnet-5"', f'"model":"{pin.model}"'.encode())
+        .replace(b'"effort":"high"', f'"effort":"{pin.effort}"'.encode())
     )
 
 
@@ -7416,7 +7425,7 @@ def test_native_command_launches_exact_worker_and_records_immutable_transcript(
         "claude",
         NativeClaudeRole.ENGINEER_BE,
         RoleCapability.WRITE,
-        "high",
+        usage_cli._native_role_pin(NativeClaudeRole.ENGINEER_BE).effort,  # pyright: ignore[reportPrivateUsage]
         _NATIVE_SESSION_ID,
         None,
     )
@@ -7566,9 +7575,11 @@ def test_native_command_rejects_model_mismatch_without_sink_record(
 ) -> None:
     """A complete but differently pinned transcript never becomes an attributed record."""
     project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+    live_model = usage_cli._native_role_pin(NativeClaudeRole.ENGINEER_BE).model  # pyright: ignore[reportPrivateUsage]
     mismatched = _native_transcript_bytes().replace(
-        b'"model":"claude-sonnet-5"', b'"model":"claude-opus-5"'
+        f'"model":"{live_model}"'.encode(), b'"model":"claude-sonnet-5"'
     )
+    assert mismatched != _native_transcript_bytes()
     processes: list[_NativeProcess] = []
     monkeypatch.setattr(
         usage_cli.subprocess,
@@ -12078,6 +12089,22 @@ _READ_ONLY_FIXTURE_BY_ROLE = {
 }
 
 
+def _rebind_rows_to_live_pin(rows: list[dict[str, Any]], role_value: str) -> None:
+    """Rebind recorded ``message.model``/``effort`` rows to the role's committed pin.
+
+    Roles outside the native roster keep their recorded values unchanged.
+    """
+    if role_value not in {role.value for role in NativeClaudeRole}:
+        return
+    pin = usage_cli._native_role_pin(NativeClaudeRole(role_value))  # pyright: ignore[reportPrivateUsage]
+    for row in rows:
+        message = row.get("message")
+        if isinstance(message, dict) and "model" in message:
+            cast(dict[str, Any], message)["model"] = pin.model
+        if "effort" in row:
+            row["effort"] = pin.effort
+
+
 def _read_only_transcript_bytes(
     role_value: str,
     *,
@@ -12092,6 +12119,7 @@ def _read_only_transcript_bytes(
     for row in rows:
         if row.get("sessionId") == original:
             row["sessionId"] = session_id
+    _rebind_rows_to_live_pin(rows, role_value)
     rows[-1]["message"]["content"] = [{"type": "text", "text": text}]
     return _dump_rows(rows)
 
@@ -12119,6 +12147,7 @@ def _read_only_transcript_bytes_rebranded(
             row["sessionId"] = session_id
         if row.get("type") == "agent-setting" and row.get("agentSetting") == source_role:
             row["agentSetting"] = target_role
+    _rebind_rows_to_live_pin(rows, target_role)
     rows[-1]["message"]["content"] = [{"type": "text", "text": text}]
     return _dump_rows(rows)
 

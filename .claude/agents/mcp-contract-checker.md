@@ -2,7 +2,7 @@
 name: mcp-contract-checker
 description: Validates the typed MCP client against the installed coffee-roaster-mcp version. Use on every coffee-roaster-mcp dependency bump and whenever mcp_client.py mirrors or contract fixtures change.
 tools: Read, Grep, Glob, Bash
-model: claude-sonnet-5
+model: claude-opus-5-5
 effort: medium
 ---
 
@@ -110,3 +110,17 @@ command: each `RUN` line carries its own environment.
   per-run `--basetemp`, following **"Per-worktree gate environment (venv,
   pyright, pytest) — added Aug 2026 (#738, #733)"** in the runbook above. The
   full recipe and fail-closed assertions live there.
+
+## How your run ends
+
+You run unattended: the Codex parent reads only your final message, and a
+message with no tool call ends your run. Do not end early in any of these ways:
+a progress summary that announces the next step instead of taking it; an offer
+to carry on if the parent would like; a list of open decisions that, by your own
+account, block nothing; or stopping because the run has been long or a
+milestone is done. Put status notes in the same message as your next tool call
+and keep going. End only when (a) the deliverable this file specifies is
+complete, or (b) you are blocked by something only the parent or operator can
+resolve (contract ambiguity, a scope, safety, or security escalation, or a
+deliberately protected resource); then state the blocker and exactly what you
+need. This never overrides a rule above that tells you to stop and escalate.

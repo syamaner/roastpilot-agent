@@ -768,21 +768,55 @@ its cross-reference to the former AGENTS.md implementation-delegation bullet.
 The Codex parent invokes existing `.claude/agents/` roles selectively; their
 definitions, model pins, and read/write capabilities remain authoritative.
 
-- Planning: high-effort `claude-opus-5` roles `planning-architect` for complex,
+- Planning: medium-effort `claude-opus-5-5` roles `planning-architect` for complex,
   ambiguous, cross-repository, or safety-boundary design and `story-planner`
   for the mandatory implementation contract before every delegated slice. Both
   remain read-only.
-- Implementation capacity: `engineer-be` and `engineer-fe` remain high-effort
-  `claude-sonnet-5` workers when capacity routing selects Claude. They are leaf
+- Implementation capacity: `engineer-be` and `engineer-fe` remain medium-effort
+  `claude-opus-5-5` workers when capacity routing selects Claude. They are leaf
   implementers, never delivery orchestrators.
 - Assurance: `qa`, `security-reviewer`, `ui-reviewer`,
   `mcp-contract-checker`, and `sim-roast-runner` retain their existing pins and
-  lenses. `safety-reviewer` remains the mandatory `claude-opus-5`, `xhigh`
+  lenses. `safety-reviewer` remains the mandatory `claude-opus-5-5`, `high`
   safety floor.
 - Adjudication/audit: `pr-triage` runs only when substantive findings require
   independent disposition. `product-auditor` runs at story completion, epic
   completion, suspected plan drift, or when a finding suggests the contract was
   wrong; it is not a per-slice default.
+
+### Running Claude Opus 5.5 roles
+
+Every `.claude/agents/` role is pinned to `claude-opus-5-5`. These rules follow
+Anthropic's Opus 5.5 prompting guidance and bind both the role files and the
+briefs the parent writes for them.
+
+- **Effort is the thinking control.** Opus 5.5 effort names do not map to Opus 5's:
+  `medium` matches or beats Opus 5 at `high`, and each level thinks more per turn.
+  Roles therefore run at `medium`, with `safety-reviewer` at `high`. Raise a role
+  to `xhigh` or `max` only after a measured quality gain on that role's work, and
+  record the measurement with the pin change. To reduce thinking, lower effort;
+  do not add prompt text for it.
+- **No thinking-substitute instructions.** Role files and briefs never tell a
+  role to "think carefully", "think step by step", or write out its internal
+  reasoning in the reply; the model already thinks, and requests to reproduce
+  its reasoning can be refused (`reasoning_extraction`). Ask for conclusions
+  with `file:line` evidence instead.
+- **A text-only handback is a report, not proof of completion.** Every role
+  file ends with a "How your run ends" section that tells the role not to stop
+  on a summary that announces its next step. The parent still checks each
+  handback against the contract's deliverables; if items are open and no
+  blocker is stated, it sends one continuation naming them, and after two or
+  three continuations on the same slice it stops and escalates rather than
+  looping. A role whose background command or tool call is still running has
+  not finished.
+- **Name the defaults to avoid, not "avoid generic".** For SPA work,
+  `engineer-fe` and `ui-reviewer` carry an explicit list of default styles
+  (cream background, italic heading accents, numbered section labels, monospace
+  labels, pill buttons, gradient hero panels). When a result still looks
+  templated, extend that list with the specific pattern observed.
+- **Dense visuals get element-level screenshots.** `ui-reviewer` judges curves,
+  markers, and badges from full-resolution element captures, not full-page
+  shots alone.
 
 ### Capacity-aware implementation routing
 
