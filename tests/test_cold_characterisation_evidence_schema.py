@@ -6,6 +6,7 @@ import inspect
 import json
 import math
 import pathlib
+import sys
 import typing
 import warnings
 
@@ -14,7 +15,11 @@ import pytest
 
 from roastpilot_agent.cold_characterisation import evidence_schema as evidence
 from roastpilot_agent.cold_characterisation.host import ColdHostBoundFailure, HostBoundSample
-from roastpilot_agent.cold_characterisation.identity import ColdIdentityFailure
+from roastpilot_agent.cold_characterisation.identity import (
+    ColdIdentityFailure,
+    ColdRunIdentity,
+    identity_sha256,
+)
 from roastpilot_agent.cold_characterisation.mcp import (
     FinalisationFirstCrackStatus,
     RejectionReason,
@@ -625,6 +630,48 @@ def test_exact_limits_accept_without_truncation(monkeypatch: pytest.MonkeyPatch)
         sha256=hashlib.sha256(canonical.encode()).hexdigest(),
     )
     assert envelope.canonical_byte_length == evidence.MAX_ENVELOPE_BYTES
+    assert evidence.walk_json_value("x" * evidence.MAX_INPUT_AGGREGATE_BYTES) is None
+    node_limited = [[None, None, None] for _ in range(evidence.MAX_COLLECTION_LENGTH - 1)] + [
+        [None, None]
+    ]
+    assert evidence.walk_json_value(typing.cast(evidence.ColdJsonValue, node_limited)) is None
+    text_limited = evidence.ColdSafetyEvaluation(
+        rule="r" * evidence.MAX_TEXT_FIELD_BYTES,
+        verdict=evidence.ColdSafetyVerdict.REJECT,
+        input_heat=None,
+        input_fan=None,
+        adjusted_heat=None,
+        adjusted_fan=None,
+        reason="q" * evidence.MAX_TEXT_FIELD_BYTES,
+    )
+    assert text_limited.adjusted_heat is None and text_limited.adjusted_fan is None
+
+    low, high = 0, evidence.MAX_RECORD_BYTES
+    accepted_header: evidence.ColdRunHeader | None = None
+    while low <= high:
+        middle = (low + high) // 2
+        canonical_record = '{"x":"' + ("a" * middle) + '"}'
+        candidate = evidence.ColdRunHeader(
+            **_common("header"),
+            identity=evidence.ColdSealedEnvelope(
+                kind=evidence.ColdEnvelopeKind.IDENTITY,
+                schema_version=1,
+                canonical_json=canonical_record,
+                canonical_byte_length=len(canonical_record),
+                sha256=hashlib.sha256(canonical_record.encode()).hexdigest(),
+            ),
+        )
+        size = len(_canonical(candidate.model_dump(mode="json")).encode())
+        if size <= evidence.MAX_RECORD_BYTES:
+            accepted_header, low = candidate, middle + 1
+        else:
+            high = middle - 1
+    assert accepted_header is not None
+    assert (
+        len(_canonical(accepted_header.model_dump(mode="json")).encode())
+        == evidence.MAX_RECORD_BYTES
+    )
+    assert evidence.validate_record(accepted_header) == accepted_header
     monkeypatch.setattr(evidence, "MAX_INPUT_AGGREGATE_BYTES", 1)
     with pytest.raises(evidence.ColdEvidenceError):
         evidence.walk_json_value(None)
@@ -642,6 +689,22 @@ def test_projection_error_locations_are_closed_schema_names_only() -> None:
     assert all(isinstance(field, evidence.ColdAudioField) for field in fields)
     assert evidence.ColdAudioField.UNKNOWN_FIELD in fields
     assert "nested" not in repr(fields)
+    validation_error = pydantic.ValidationError.from_exception_data(
+        "synthetic",
+        typing.cast(
+            typing.Any,
+            [
+                {"type": "missing", "loc": ("nested", "field"), "input": None},
+                {"type": "missing", "loc": (1,), "input": None},
+                {"type": "missing", "loc": (object(),), "input": None},
+            ],
+        ),
+    )
+    assert projection_fields(validation_error) == (
+        evidence.ColdAudioField.UNKNOWN_FIELD,
+        evidence.ColdAudioField.UNKNOWN_FIELD,
+        evidence.ColdAudioField.UNKNOWN_FIELD,
+    )
 
 
 def test_tolerant_mirror_can_launder_missing_counter_but_projection_refuses() -> None:
@@ -708,6 +771,19 @@ def test_union_advisory_and_record_surfaces_are_closed() -> None:
     )
     with pytest.raises((pydantic.ValidationError, evidence.ColdEvidenceError)):
         evidence.ColdSafetyEvaluation.model_validate({"rule": "r", "verdict": "allow"})
+    for verdict in (evidence.ColdSafetyVerdict.REJECT, evidence.ColdSafetyVerdict.FAULT):
+        assert (
+            evidence.ColdSafetyEvaluation(
+                rule="r",
+                verdict=verdict,
+                input_heat=None,
+                input_fan=None,
+                adjusted_heat=None,
+                adjusted_fan=None,
+                reason="r",
+            ).adjusted_fan
+            is None
+        )
 
 
 def test_construct_copy_snapshot_and_no_warning_boundary_cases() -> None:
@@ -718,6 +794,20 @@ def test_construct_copy_snapshot_and_no_warning_boundary_cases() -> None:
     )
     validated = typing.cast(evidence.ColdTickRecord, evidence.validate_record(constructed))
     assert isinstance(validated.phase, evidence.ColdPhaseKind)
+    nested_audio = typing.cast(typing.Any, evidence.ColdTickAudioSample).model_construct(
+        **_audio_payload()
+    )
+    nested_valid = tick.model_copy(update={"audio": nested_audio})
+    assert isinstance(evidence.validate_record(nested_valid), evidence.ColdTickRecord)
+    missing_counter = typing.cast(typing.Any, evidence.ColdTickAudioSample).model_construct(
+        **{
+            key: value
+            for key, value in _audio_payload().items()
+            if key != "inference_overrun_count"
+        }
+    )
+    with pytest.raises(evidence.ColdEvidenceError):
+        evidence.validate_record(tick.model_copy(update={"audio": missing_counter}))
     copied = tick.model_copy(update={"heat_level_percent": 101})
     with pytest.raises(evidence.ColdEvidenceError):
         evidence.validate_record(copied)
@@ -727,6 +817,97 @@ def test_construct_copy_snapshot_and_no_warning_boundary_cases() -> None:
     with warnings.catch_warnings(record=True) as caught, pytest.raises(evidence.ColdEvidenceError):
         evidence.validate_record(hostile)
     assert not caught
+
+
+def test_contract_annotations_union_and_all_anchored_consumers_are_exact() -> None:
+    """Consumer-owned fields preserve upstream shape and every anchored consumer rejects drift."""
+    assert tuple(evidence.ColdTickAudioSample.model_fields) == tuple(
+        FinalisationFirstCrackStatus.model_fields
+    )
+    for name, field in evidence.ColdTickAudioSample.model_fields.items():
+        assert field.annotation == FinalisationFirstCrackStatus.model_fields[name].annotation
+    for name, field in evidence.ColdHostSample.model_fields.items():
+        assert field.annotation == HostBoundSample.model_fields[name].annotation
+    for name in ("rule", "input_heat", "input_fan", "adjusted_heat", "adjusted_fan", "reason"):
+        assert (
+            evidence.ColdSafetyEvaluation.model_fields[name].annotation
+            == SafetyEvaluation.model_fields[name].annotation
+        )
+    assert (
+        evidence.ColdSafetyEvaluation.model_fields["rule"].metadata[-1].max_length
+        == evidence.MAX_TEXT_FIELD_BYTES
+    )
+    assert (
+        evidence.ColdSafetyEvaluation.model_fields["reason"].metadata[-1].max_length
+        == evidence.MAX_TEXT_FIELD_BYTES
+    )
+    assert evidence.ColdSafetyEvaluation.model_fields["adjusted_heat"].metadata[0].ge == 0
+    assert evidence.ColdSafetyEvaluation.model_fields["adjusted_heat"].metadata[1].le == 100
+    union = typing.get_args(evidence.ColdEvidenceRecord)[0]
+    assert set(typing.get_args(union)) == {
+        evidence.ColdRunHeader,
+        evidence.ColdTickRecord,
+        evidence.ColdHostRecord,
+        evidence.ColdAdvisoryRecord,
+        evidence.ColdFinalisationRecord,
+        evidence.ColdAbortRecord,
+    }
+    for record_type, stream in zip(
+        typing.get_args(union), evidence.ColdEvidenceStream, strict=True
+    ):
+        assert record_type.model_fields["schema_version"].annotation == typing.Literal[1]
+        assert record_type.model_fields["stream"].annotation == typing.Literal[stream.value]
+    assert evidence.ColdAdvisoryRecord.model_fields["failure"].annotation == (
+        evidence.ColdAdvisorFailureKind | None
+    )
+    for digest in ("A" * 64, "g" * 64, ("a" * 64) + "\n"):
+        values = _common("tick")
+        values["identity_sha256"] = digest
+        with pytest.raises(pydantic.ValidationError):
+            evidence.ColdTickRecord(
+                **values,
+                tick=0,
+                bean_temp_c=None,
+                env_temp_c=None,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=False,
+                connected=True,
+                audio=evidence.project_tick_audio(_audio_payload()).audio,
+            )
+
+
+def test_foreign_instance_is_rejected_before_any_attribute_introspection() -> None:
+    """The exact-class guard does not inspect a foreign instance's hostile attributes."""
+
+    class Foreign:
+        def __getattribute__(self, name: str) -> object:
+            raise AssertionError(name)
+
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(typing.cast(evidence.ColdEvidenceRecord, Foreign()))
+    assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED
+
+
+def test_identity_envelope_binds_delivered_identity_canonical_digest() -> None:
+    """A synthetic identity's retained bytes and delivered digest agree exactly."""
+    values: dict[str, object] = {name: "synthetic" for name in ColdRunIdentity.model_fields}
+    values.update(
+        {"controller_tick_seconds": 1.0, "credential_present": False, "model_manifest": ()}
+    )
+    identity = ColdRunIdentity.model_construct(**typing.cast(typing.Any, values))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        canonical = _canonical(identity.model_dump(mode="json"))
+        digest = identity_sha256(identity)
+    envelope = evidence.ColdSealedEnvelope(
+        kind=evidence.ColdEnvelopeKind.IDENTITY,
+        schema_version=1,
+        canonical_json=canonical,
+        canonical_byte_length=len(canonical.encode()),
+        sha256=digest,
+    )
+    assert envelope.sha256 == digest
 
 
 def test_persisted_raw_empty_container_at_exact_depth_is_admitted() -> None:
@@ -893,23 +1074,40 @@ def test_common_identity_fields_are_absolute_and_version_one_only(run_id: str) -
 
 
 def test_scope_and_import_fence_are_closed() -> None:
-    """The source surface exposes only the two boundary callables publicly."""
+    """The source surface has only approved imports, callables, and no verdict policy."""
     source = pathlib.Path(inspect.getfile(evidence)).read_text()
     tree = ast.parse(source)
     imports = {
-        alias.name.split(".")[0]
+        alias.name
         for node in ast.walk(tree)
         if isinstance(node, ast.Import)
         for alias in node.names
     }
-    assert imports == {"collections", "enum", "hashlib", "json", "math", "typing", "pydantic"}
+    imported_from = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+    assert imports == {"collections.abc", "enum", "hashlib", "json", "math", "typing", "pydantic"}
+    assert imported_from == set()
+    dynamic_imports = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "__import__"
+            or isinstance(node.func, ast.Attribute)
+            and node.func.attr == "import_module"
+        )
+    ]
+    assert dynamic_imports == []
     assert not math.isnan(0.0)
-    public_functions = {
+    public_callables = {
         name
         for name, value in vars(evidence).items()
-        if not name.startswith("_") and inspect.isfunction(value)
+        if not name.startswith("_")
+        and callable(value)
+        and not inspect.isclass(value)
+        and name not in {"ColdJsonValue", "ColdEvidenceRecord"}
     }
-    assert public_functions == {"walk_json_value", "project_tick_audio", "validate_record"}
+    assert public_callables == {"walk_json_value", "project_tick_audio", "validate_record"}
     assert not any(
         name in vars(evidence)
         for name in {
@@ -917,5 +1115,28 @@ def test_scope_and_import_fence_are_closed() -> None:
             "PEAK_TRAILING_LOST_AUDIO_MS_X",
             "PRODUCTION_FATAL_STREAK",
             "EFFECTIVE_HOP_SECONDS",
+            "HOST_MAX_TEMP",
+            "HOST_MIN_",
         }
     )
+
+
+def test_walker_is_structurally_iterative_beyond_python_recursion_depth() -> None:
+    """The walker has no self-call and refuses a very deep graph structurally, not recursively."""
+    function = next(
+        node
+        for node in ast.walk(ast.parse(pathlib.Path(inspect.getfile(evidence)).read_text()))
+        if isinstance(node, ast.FunctionDef) and node.name == "_walk_json_value"
+    )
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == function.name
+        for node in ast.walk(function)
+    )
+    deep: object = None
+    for _ in range(sys.getrecursionlimit() + 10):
+        deep = [deep]
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.walk_json_value(typing.cast(evidence.ColdJsonValue, deep))
+    assert raised.value.failure is evidence.ColdEvidenceFailure.JSON_DEPTH_EXCEEDED
