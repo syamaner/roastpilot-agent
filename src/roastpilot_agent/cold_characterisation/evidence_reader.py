@@ -219,6 +219,13 @@ def read_retained_run(
 ) -> ColdRetainedRun:
     """Verify one retained tree, then strictly and losslessly read every record.
 
+    Trust boundary: ``expected_manifest_sha256`` must be the externally recorded
+    ``ColdSealedRun.manifest_sha256`` returned by a successful seal.  It must never be
+    derived from the candidate tree, its ``manifest.json`` or its sidecar, which would
+    verify a tree against itself.  A seal that fails after creating manifest artefacts
+    can leave internally consistent bytes but returns no digest, so such a tree has no
+    trusted receipt.  None of this is a filesystem transaction.
+
     Args:
         root: Absolute evidence root holding the run directory.
         run_id: The run identifier.

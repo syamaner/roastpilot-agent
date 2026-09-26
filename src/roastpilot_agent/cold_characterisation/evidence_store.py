@@ -356,37 +356,94 @@ def _protected_realpaths(declared: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(protected)
 
 
-def _open_absolute_directory(path: str) -> int:
-    """Open an absolute directory by per-component no-follow descriptor traversal."""
+def _directory_identity(descriptor: int) -> tuple[int, int]:
+    """Return one open directory's ``(st_dev, st_ino)``, mapping failures closed."""
+    node = _fstat(descriptor, ColdEvidenceStoreFailure.ROOT_UNUSABLE)
+    return node.dev, node.ino
+
+
+def _protected_identities(protected: tuple[str, ...]) -> frozenset[tuple[int, int]]:
+    """Return ``(st_dev, st_ino)`` of every protected root that exists.
+
+    A protected root that does not exist contributes nothing here; its resolved-path
+    containment check still applies.  Any other stat failure fails closed.
+    """
+    identities: set[tuple[int, int]] = set()
+    for path in protected:
+        result: os.stat_result | None = None
+        missing = False
+        try:
+            result = os.stat(path)
+        except (FileNotFoundError, NotADirectoryError):
+            missing = True
+        except (OSError, ValueError):
+            pass
+        if missing:
+            continue
+        if result is None:
+            raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ROOT_UNUSABLE)
+        identities.add((result.st_dev, result.st_ino))
+    return frozenset(identities)
+
+
+def _open_absolute_directory(path: str, lineage: list[tuple[int, int]] | None = None) -> int:
+    """Open an absolute directory by per-component no-follow descriptor traversal.
+
+    When ``lineage`` is given, it receives ``(st_dev, st_ino)`` of ``/`` and of every
+    opened component, so containment can be judged by filesystem identity.
+    """
     components = [part for part in path.split("/") if part not in ("", ".")]
     if ".." in components:
         raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ROOT_UNUSABLE)
     flags = _directory_flags()
     descriptor = _guard(lambda: os.open("/", flags), ColdEvidenceStoreFailure.ROOT_UNUSABLE)
-    for component in components:
-        parent = descriptor
-        try:
-            descriptor = _open_at(component, flags, parent, ColdEvidenceStoreFailure.ROOT_UNUSABLE)
-        finally:
-            os.close(parent)
+    owned = True
+    try:
+        if lineage is not None:
+            lineage.append(_directory_identity(descriptor))
+        for component in components:
+            parent = descriptor
+            owned = False
+            try:
+                descriptor = _open_at(
+                    component, flags, parent, ColdEvidenceStoreFailure.ROOT_UNUSABLE
+                )
+            finally:
+                os.close(parent)
+            owned = True
+            if lineage is not None:
+                lineage.append(_directory_identity(descriptor))
+    except BaseException:
+        if owned:
+            os.close(descriptor)
+        raise
     return descriptor
 
 
 class ColdAdmittedRoot:
     """An evidence root admitted by :func:`admit_evidence_root`; holds no descriptor."""
 
-    __slots__ = ("path", "realpath")
+    __slots__ = ("lineage", "path", "realpath")
 
     path: str
     realpath: str
+    lineage: tuple[tuple[int, int], ...]
 
-    def __init__(self, path: str, realpath: str, *, token: object) -> None:
+    def __init__(
+        self,
+        path: str,
+        realpath: str,
+        *,
+        token: object,
+        lineage: tuple[tuple[int, int], ...] = (),
+    ) -> None:
         """Create an admitted root; only the admission function may do so.
 
         Args:
             path: The admitted absolute root string, exactly as supplied.
             realpath: Its resolved real path.
             token: Private admission token.
+            lineage: ``(st_dev, st_ino)`` of ``/`` and each component, root last.
 
         Raises:
             ColdEvidenceStoreError: If constructed outside admission.
@@ -395,6 +452,7 @@ class ColdAdmittedRoot:
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ROOT_UNUSABLE)
         self.path = path
         self.realpath = realpath
+        self.lineage = lineage
 
 
 def admit_evidence_root(root: str, *, protected_roots: tuple[str, ...] = ()) -> ColdAdmittedRoot:
@@ -409,6 +467,12 @@ def admit_evidence_root(root: str, *, protected_roots: tuple[str, ...] = ()) -> 
 
     Raises:
         ColdEvidenceStoreError: If the platform, path, protection, or traversal fails.
+
+    Protection is judged twice: by resolved-path containment, which also covers a
+    declared protected root that does not exist, and by filesystem identity along the
+    candidate's no-follow traversal, so an alias spelling (for example a case variant)
+    that names an existing protected root or one of its descendants is refused.
+    Same-uid substitution between these checks and later use remains a named residual.
     """
     if not _platform_is_supported():
         raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.PLATFORM_UNSUPPORTED)
@@ -418,9 +482,13 @@ def admit_evidence_root(root: str, *, protected_roots: tuple[str, ...] = ()) -> 
     real = _realpath(root, ColdEvidenceStoreFailure.ROOT_UNUSABLE)
     if any(_is_within(real, parent) for parent in protected):
         raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ROOT_PROTECTED)
-    descriptor = _open_absolute_directory(root)
+    identities = _protected_identities(protected)
+    lineage: list[tuple[int, int]] = []
+    descriptor = _open_absolute_directory(root, lineage)
     os.close(descriptor)
-    return ColdAdmittedRoot(root, real, token=_ADMISSION_TOKEN)
+    if identities.intersection(lineage):
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ROOT_PROTECTED)
+    return ColdAdmittedRoot(root, real, token=_ADMISSION_TOKEN, lineage=tuple(lineage))
 
 
 # ----------------------------------------------------------------- identity v1
@@ -1569,6 +1637,13 @@ def verify_retained_tree(
 ) -> ColdVerifiedTree:
     """Admit and verify one retained tree against its expected manifest digest; read-only.
 
+    Trust boundary: ``expected_manifest_sha256`` must be the externally recorded
+    ``ColdSealedRun.manifest_sha256`` returned by a successful seal.  It must never be
+    derived from the candidate tree, its ``manifest.json`` or its sidecar, which would
+    verify a tree against itself.  A seal that fails after creating manifest artefacts
+    can leave internally consistent bytes but returns no digest, so such a tree has no
+    trusted receipt.  None of this is a filesystem transaction.
+
     Args:
         root: Absolute evidence root holding the run directory.
         run_id: The run identifier.
@@ -1691,6 +1766,12 @@ def read_verified_lines(
     return framer.finish()
 
 
+def _regular_file_identities(tree: ColdVerifiedTree) -> frozenset[tuple[int, int]]:
+    """Return ``(st_dev, st_ino)`` of every verified regular file, manifests included."""
+    nodes = tree._nodes  # pyright: ignore[reportPrivateUsage]
+    return frozenset((node.dev, node.ino) for node in nodes.values() if not node.is_directory)
+
+
 def _run_directory_identity(root: ColdAdmittedRoot, run_id: str) -> tuple[int, int]:
     """Return one run directory's ``(st_dev, st_ino)`` to refuse aliased copies.
 
@@ -1714,6 +1795,13 @@ def verify_retained_copies(
 ) -> ColdVerifiedManifest:
     """Verify both retained copies against one manifest digest; never writes or repairs.
 
+    Trust boundary: ``expected_manifest_sha256`` must be the externally recorded
+    ``ColdSealedRun.manifest_sha256`` returned by a successful seal.  It must never be
+    derived from the candidate tree, its ``manifest.json`` or its sidecar, which would
+    verify a tree against itself.  A seal that fails after creating manifest artefacts
+    can leave internally consistent bytes but returns no digest, so such a tree has no
+    trusted receipt.  None of this is a filesystem transaction.
+
     Args:
         first: Absolute root of the first retained copy.
         second: Absolute root of the second retained copy.
@@ -1730,8 +1818,11 @@ def verify_retained_copies(
     _require_run_id(run_id)
     first_root = admit_evidence_root(first, protected_roots=protected_roots)
     second_root = admit_evidence_root(second, protected_roots=protected_roots)
-    if _is_within(first_root.realpath, second_root.realpath) or _is_within(
-        second_root.realpath, first_root.realpath
+    if (
+        _is_within(first_root.realpath, second_root.realpath)
+        or _is_within(second_root.realpath, first_root.realpath)
+        or first_root.lineage[-1] in second_root.lineage
+        or second_root.lineage[-1] in first_root.lineage
     ):
         raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ROOTS_OVERLAP)
     if _run_directory_identity(first_root, run_id) == _run_directory_identity(second_root, run_id):
@@ -1747,6 +1838,8 @@ def verify_retained_copies(
         or trees[0].sidecar_bytes != trees[1].sidecar_bytes
     ):
         raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.MANIFEST_COPIES_DIFFER)
+    if _regular_file_identities(trees[0]) & _regular_file_identities(trees[1]):
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ROOTS_OVERLAP)
     manifest = trees[0].manifest
     return ColdVerifiedManifest(
         run_id=manifest.run_id,

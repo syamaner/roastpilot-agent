@@ -1741,3 +1741,247 @@ def test_reader_refuses_bad_run_ids_before_verification(
         ),
     )
     assert entered == []
+
+
+# ------------------------------------------------- identity-based containment
+
+
+def _alias_stat(monkeypatch: pytest.MonkeyPatch, alias: str, target: Path | None) -> None:
+    """Make ``os.stat(alias)`` report ``target``'s identity (or raise when ``None``)."""
+    real_stat = os.stat
+
+    def aliased(path: typing.Any, *args: typing.Any, **kwargs: typing.Any) -> os.stat_result:
+        if path == alias:
+            if target is None:
+                raise PermissionError("denied")
+            return real_stat(target)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", aliased)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, aliased})
+    monkeypatch.setattr(os, "supports_follow_symlinks", {*os.supports_follow_symlinks, aliased})
+
+
+@pytest.mark.parametrize("candidate", ["equal", "descendant"])
+def test_alias_of_a_protected_root_is_refused_by_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, candidate: str
+) -> None:
+    """A spelling that differs as a string but names the protected inode is refused."""
+    protected = Path(make_root(tmp_path, "protected"))
+    (protected / "child").mkdir()
+    alias = str(tmp_path.resolve() / "Alias-Of-Protected")
+    _alias_stat(monkeypatch, alias, protected)
+    target = protected if candidate == "equal" else protected / "child"
+    expect(
+        Failure.ROOT_PROTECTED,
+        lambda: store.admit_evidence_root(str(target), protected_roots=(alias,)),
+    )
+
+
+@pytest.mark.parametrize("candidate", ["sibling-prefix", "ancestor"])
+def test_identity_containment_has_no_boundary_false_positive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, candidate: str
+) -> None:
+    """A name-prefix sibling or an ancestor of the protected root is still admitted."""
+    base = Path(make_root(tmp_path, "base"))
+    protected = base / "prot"
+    protected.mkdir()
+    sibling = base / "prot2"
+    sibling.mkdir()
+    alias = str(tmp_path.resolve() / "Alias-Of-Prot")
+    _alias_stat(monkeypatch, alias, protected)
+    target = str(sibling if candidate == "sibling-prefix" else base)
+    assert store.admit_evidence_root(target, protected_roots=(alias,)).path == target
+
+
+def test_missing_declared_root_adds_no_identity_and_unreadable_one_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared root that does not exist is skipped; one that cannot be read refuses."""
+    root = make_root(tmp_path)
+    ghost = str(tmp_path.resolve() / "ghost" / "declared")
+    assert store.admit_evidence_root(root, protected_roots=(ghost,)).path == root
+    denied = str(tmp_path.resolve() / "denied")
+    _alias_stat(monkeypatch, denied, None)
+    expect(
+        Failure.ROOT_UNUSABLE,
+        lambda: store.admit_evidence_root(root, protected_roots=(denied,)),
+    )
+
+
+def test_admitted_root_lineage_ends_at_the_root_inode(tmp_path: Path) -> None:
+    """Admission records the no-follow traversal identities, root last."""
+    root = make_root(tmp_path)
+    admitted = store.admit_evidence_root(root)
+    result = os.stat(root)
+    assert admitted.lineage[-1] == (result.st_dev, result.st_ino)
+    assert admitted.lineage[0] == (os.stat("/").st_dev, os.stat("/").st_ino)
+    assert len(admitted.lineage) == len(Path(root).parts)
+
+
+def _case_alias(path: Path) -> str | None:
+    """Return a case-variant spelling of ``path`` when the filesystem folds case."""
+    variant = path.with_name(path.name.swapcase())
+    if variant.name == path.name or not os.path.isdir(variant):
+        return None
+    return str(variant)
+
+
+def test_real_case_alias_of_a_declared_protected_root_is_refused(tmp_path: Path) -> None:
+    """On a case-insensitive filesystem a case variant cannot bypass protection."""
+    protected = Path(make_root(tmp_path, "area"))
+    (protected / "child").mkdir()
+    alias = _case_alias(protected)
+    if alias is None:
+        pytest.skip("filesystem is case-sensitive; the mocked alias tests cover the rule")
+    for target in (protected, protected / "child"):
+        expect(
+            Failure.ROOT_PROTECTED,
+            lambda target=target: store.admit_evidence_root(str(target), protected_roots=(alias,)),
+        )
+
+
+def test_real_case_alias_of_the_checkout_is_refused(tmp_path: Path) -> None:
+    """A case-variant spelling of the source checkout is still the protected checkout."""
+    checkout = store._source_checkout_root(store.__file__)  # pyright: ignore[reportPrivateUsage]
+    if checkout is None:
+        pytest.skip("packaged runtime: no source checkout to alias")
+    alias = _case_alias(Path(checkout))
+    if alias is None:
+        pytest.skip("filesystem is case-sensitive; the mocked alias tests cover the rule")
+    expect(Failure.ROOT_PROTECTED, lambda: store.admit_evidence_root(alias))
+    expect(Failure.ROOT_PROTECTED, lambda: store.admit_evidence_root(str(Path(alias) / "docs")))
+
+
+def test_copy_roots_nested_by_identity_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Copy roots whose lineages nest are one tree, whatever their string spelling."""
+    first = make_root(tmp_path, "first")
+    second = make_root(tmp_path, "second")
+    lineages = {first: ((1, 1), (1, 2)), second: ((1, 1), (1, 2), (1, 3))}
+
+    def admitted(root: str, *, protected_roots: tuple[str, ...] = ()) -> store.ColdAdmittedRoot:
+        del protected_roots
+        return store.ColdAdmittedRoot(
+            root,
+            root,
+            token=store._ADMISSION_TOKEN,  # pyright: ignore[reportPrivateUsage]
+            lineage=lineages[root],
+        )
+
+    monkeypatch.setattr(store, "admit_evidence_root", admitted)
+    for pair in ((first, second), (second, first)):
+        expect(
+            Failure.ROOTS_OVERLAP,
+            lambda pair=pair: store.verify_retained_copies(
+                pair[0], pair[1], run_id=RUN_ID, expected_manifest_sha256="0" * 64
+            ),
+        )
+
+
+def test_real_case_alias_nested_copy_root_overlaps(tmp_path: Path) -> None:
+    """On a case-insensitive filesystem a copy root nested via a case alias overlaps."""
+    root, _sealed, _records = write_full_run(tmp_path, "pi")
+    alias = _case_alias(Path(root))
+    if alias is None:
+        pytest.skip("filesystem is case-sensitive; the mocked lineage test covers the rule")
+    nested = Path(root) / "nested"
+    nested.mkdir()
+    expect(
+        Failure.ROOTS_OVERLAP,
+        lambda: store.verify_retained_copies(
+            root,
+            str(Path(alias) / "nested"),
+            run_id=RUN_ID,
+            expected_manifest_sha256="0" * 64,
+        ),
+    )
+
+
+def _linked_copy(root: str, tmp_path: Path, *, link: typing.Callable[[str], bool]) -> str:
+    """Recreate a run under a second root, hard-linking the files ``link`` selects."""
+    destination = make_root(tmp_path, "laptop")
+    source = run_dir(root)
+    for path in sorted(source.rglob("*")):
+        target = run_dir(destination) / path.relative_to(source)
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if link(path.relative_to(source).as_posix()):
+            os.link(path, target)
+        else:
+            shutil.copy2(path, target)
+    return destination
+
+
+_LINK_SELECTORS: list[typing.Callable[[str], bool]] = [
+    lambda _path: True,
+    lambda path: path == store.MANIFEST_JSON_NAME,
+    lambda path: "tick" in path,
+]
+
+
+@pytest.mark.parametrize(
+    "selector", _LINK_SELECTORS, ids=["all-linked", "manifest-linked", "one-record-linked"]
+)
+def test_hard_linked_copies_are_not_distinct_copies(
+    tmp_path: Path, selector: typing.Callable[[str], bool]
+) -> None:
+    """Copies sharing any regular-file inode are refused; a real copy verifies."""
+    root, sealed, _records = write_full_run(tmp_path)
+    laptop = _linked_copy(root, tmp_path, link=selector)
+    expect(
+        Failure.ROOTS_OVERLAP,
+        lambda: store.verify_retained_copies(
+            root, laptop, run_id=RUN_ID, expected_manifest_sha256=sealed.manifest_sha256
+        ),
+    )
+
+
+def test_fully_copied_tree_shares_no_inode_and_verifies(tmp_path: Path) -> None:
+    """A byte-identical copy with its own inodes verifies (no storage-independence claim)."""
+    root, sealed, _records = write_full_run(tmp_path)
+    laptop = _linked_copy(root, tmp_path, link=lambda _path: False)
+    verified = store.verify_retained_copies(
+        root, laptop, run_id=RUN_ID, expected_manifest_sha256=sealed.manifest_sha256
+    )
+    assert verified.manifest_sha256 == sealed.manifest_sha256
+
+
+def test_lineage_identity_failure_closes_the_opened_directory_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If recording a component's identity fails, its descriptor is closed exactly once."""
+    root = make_root(tmp_path)
+    ledger = _DescriptorLedger(monkeypatch)
+
+    def failing_fstat(_descriptor: int) -> os.stat_result:
+        raise OSError("fstat failed")
+
+    monkeypatch.setattr(os, "fstat", failing_fstat)
+    expect(Failure.ROOT_UNUSABLE, lambda: store.admit_evidence_root(root))
+    assert ledger.double_closes == []
+    assert ledger.leaked == []
+
+
+def test_resolved_path_containment_holds_without_the_identity_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The resolved-path containment layer refuses protected roots on its own."""
+
+    def no_identities(_protected: tuple[str, ...]) -> frozenset[tuple[int, int]]:
+        return frozenset()
+
+    monkeypatch.setattr(store, "_protected_identities", no_identities)
+    package = Path(store.__file__).resolve().parents[1]
+    expect(Failure.ROOT_PROTECTED, lambda: store.admit_evidence_root(str(package)))
+    declared = Path(make_root(tmp_path, "declared"))
+    (declared / "child").mkdir()
+    expect(
+        Failure.ROOT_PROTECTED,
+        lambda: store.admit_evidence_root(
+            str(declared / "child"), protected_roots=(str(declared),)
+        ),
+    )
