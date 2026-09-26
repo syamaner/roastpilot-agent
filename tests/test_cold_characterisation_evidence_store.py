@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import stat
+import threading
 import typing
 from pathlib import Path
 
@@ -1195,12 +1196,13 @@ def test_class_o_and_i_new_modules_use_descriptor_relative_io_only() -> None:
         assert "subprocess" not in source
         for node in _calls(path):
             name = _call_name(node)
-            assert name not in {"open", "Path", "os.walk", "os.scandir"}, (path.name, name)
+            assert name not in {"open", "Path", "os.walk"}, (path.name, name)
             if name in {"os.open", "os.mkdir"}:
                 keywords = {keyword.arg for keyword in node.keywords}
                 root_traversal = name == "os.open" and ast.unparse(node.args[0]) == "'/'"
                 assert "dir_fd" in keywords or root_traversal, (path.name, ast.unparse(node))
-            if name == "os.listdir":
+            assert name != "os.listdir", path.name
+            if name == "os.scandir":
                 assert ast.unparse(node.args[0]) == "descriptor"
     subprocess_users = sorted(
         path.name for path in COLD_PACKAGE.glob("*.py") if "subprocess" in path.read_text()
@@ -1307,3 +1309,413 @@ def test_vanished_header_file_refuses_seal(tmp_path: Path) -> None:
     writer.append(tick_for(off))
     (run_dir(root) / "records" / "recording_off" / "header.jsonl").unlink()
     expect(Failure.SEAL_TREE_INVALID, writer.seal)
+
+
+# ------------------------------------------------------------- repair round
+
+
+BAD_RUN_IDS: list[object] = ["../escape", "a/b", "..", ".", "/abs/path", "", 1, None, b"x"]
+
+
+class _FilesystemSpy:
+    """Record every filesystem entry point the store could use."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.calls: list[str] = []
+        for module, name in (
+            (os, "open"),
+            (os, "mkdir"),
+            (os, "stat"),
+            (os, "lstat"),
+            (os, "scandir"),
+            (os, "fstat"),
+            (os.path, "realpath"),
+            (os.path, "isfile"),
+            (os.path, "isdir"),
+        ):
+            monkeypatch.setattr(module, name, self._wrap(name, getattr(module, name)))
+
+    def _wrap(self, name: str, real: typing.Callable[..., object]) -> typing.Callable[..., object]:
+        def spy(*args: object, **kwargs: object) -> object:
+            self.calls.append(name)
+            return real(*args, **kwargs)
+
+        return spy
+
+
+@pytest.mark.parametrize("bad", BAD_RUN_IDS, ids=[repr(item) for item in BAD_RUN_IDS])
+def test_bad_run_ids_refuse_before_any_filesystem_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: object
+) -> None:
+    """Public verify and read paths validate the run id before touching the filesystem."""
+    root = make_root(tmp_path)
+    laptop = make_root(tmp_path, "laptop")
+    run_id = typing.cast(str, bad)
+    spy = _FilesystemSpy(monkeypatch)
+    expect(
+        Failure.RUN_ID_MISMATCHED,
+        lambda: store.verify_retained_tree(root, run_id=run_id, expected_manifest_sha256="0" * 64),
+    )
+    expect(
+        Failure.RUN_ID_MISMATCHED,
+        lambda: store.verify_retained_copies(
+            root, laptop, run_id=run_id, expected_manifest_sha256="0" * 64
+        ),
+    )
+    expect(
+        Failure.RUN_ID_MISMATCHED,
+        lambda: reader.read_retained_run(root, run_id=run_id, expected_manifest_sha256="0" * 64),
+    )
+    assert spy.calls == []
+
+
+@pytest.mark.parametrize("bad", BAD_RUN_IDS, ids=[repr(item) for item in BAD_RUN_IDS])
+def test_internal_run_directory_open_refuses_bad_ids_without_opening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: object
+) -> None:
+    """The shared run-directory boundary refuses a bad id before any descriptor open."""
+    admitted = store.admit_evidence_root(make_root(tmp_path))
+    spy = _FilesystemSpy(monkeypatch)
+    expect(
+        Failure.RUN_ID_MISMATCHED,
+        lambda: store._open_run_directory(  # pyright: ignore[reportPrivateUsage]
+            admitted, typing.cast(str, bad), Failure.INVENTORY_MISMATCHED
+        ),
+    )
+    assert spy.calls == []
+
+
+class _DescriptorLedger:
+    """Account every descriptor opened and closed while installed."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.state: dict[int, str] = {}
+        self.double_closes: list[int] = []
+        real_open = os.open
+        real_close = os.close
+
+        def ledger_open(*args: typing.Any, **kwargs: typing.Any) -> int:
+            descriptor = real_open(*args, **kwargs)
+            self.state[descriptor] = "open"
+            return descriptor
+
+        def ledger_close(descriptor: int) -> None:
+            if self.state.get(descriptor) == "closed":
+                self.double_closes.append(descriptor)
+            self.state[descriptor] = "closed"
+            real_close(descriptor)
+
+        monkeypatch.setattr(os, "open", ledger_open)
+        monkeypatch.setattr(os, "close", ledger_close)
+        monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, ledger_open})
+
+    @property
+    def leaked(self) -> list[int]:
+        """Descriptors opened while installed and never closed."""
+        return [fd for fd, state in self.state.items() if state == "open"]
+
+
+def _swap_directory(directory: Path, *, symlink: bool) -> None:
+    """Move a directory away, optionally leaving a symlink to it in its place."""
+    moved = directory.with_name("moved")
+    directory.rename(moved)
+    if symlink:
+        directory.symlink_to(moved)
+
+
+@pytest.mark.parametrize("symlink", [False, True], ids=["vanished", "symlink-swap"])
+def test_directory_open_failure_during_seal_closes_each_descriptor_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, symlink: bool
+) -> None:
+    """A directory that vanishes or becomes a symlink mid-seal fails closed, closing once."""
+    writer, root = open_writer(tmp_path)
+    off = header_for(tmp_path, root, OFF)
+    writer.append(off)
+    writer.append(tick_for(off))
+    directory = run_dir(root) / "records" / "recording_off"
+    swapped: list[str] = []
+
+    def swap(relative_path: str) -> None:
+        if not swapped:
+            swapped.append(relative_path)
+            _swap_directory(directory, symlink=symlink)
+
+    monkeypatch.setattr(store, "_after_first_identity_read", swap)
+    ledger = _DescriptorLedger(monkeypatch)
+    expect(Failure.SEAL_TREE_CHANGED, writer.seal)
+    assert swapped == ["records/recording_off/header.jsonl"]
+    assert ledger.double_closes == []
+    assert ledger.leaked == []
+
+
+@pytest.mark.parametrize("symlink", [False, True], ids=["vanished", "symlink-swap"])
+def test_directory_open_failure_during_verify_closes_each_descriptor_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, symlink: bool
+) -> None:
+    """The same directory failure during verification fails closed, closing once."""
+    root, _sealed, _records = write_full_run(tmp_path)
+    digest = hashlib.sha256((run_dir(root) / store.MANIFEST_JSON_NAME).read_bytes()).hexdigest()
+    directory = run_dir(root) / "records" / "recording_off"
+    swapped: list[str] = []
+
+    def swap(relative_path: str) -> None:
+        if not swapped and relative_path.startswith("records/recording_off/"):
+            swapped.append(relative_path)
+            _swap_directory(directory, symlink=symlink)
+
+    monkeypatch.setattr(store, "_after_first_identity_read", swap)
+    ledger = _DescriptorLedger(monkeypatch)
+    expect(
+        Failure.SEAL_TREE_CHANGED,
+        lambda: store.verify_retained_tree(root, run_id=RUN_ID, expected_manifest_sha256=digest),
+    )
+    assert len(swapped) == 1
+    assert ledger.double_closes == []
+    assert ledger.leaked == []
+
+
+def test_read_flags_are_non_blocking_and_no_follow() -> None:
+    """Evidence reads open non-blocking and no-follow."""
+    flags = store._file_read_flags()  # pyright: ignore[reportPrivateUsage]
+    assert flags & os.O_NONBLOCK and flags & os.O_NOFOLLOW
+    assert flags & (os.O_WRONLY | os.O_RDWR) == 0
+
+
+def test_fifo_swap_is_refused_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A regular file swapped for a FIFO is refused at once; a bounded rescue proves it."""
+    writer, root = open_writer(tmp_path)
+    off = header_for(tmp_path, root, OFF)
+    writer.append(off)
+    writer.append(tick_for(off))
+    fifo = run_dir(root) / "records" / "recording_off" / "tick.jsonl"
+    real_flags = store._file_read_flags  # pyright: ignore[reportPrivateUsage]
+    calls: list[int] = []
+
+    def swap_then_flags() -> int:
+        calls.append(1)
+        if len(calls) == 2:
+            fifo.unlink()
+            os.mkfifo(fifo, 0o600)
+        return real_flags()
+
+    monkeypatch.setattr(store, "_file_read_flags", swap_then_flags)
+    finished = threading.Event()
+    rescued: list[bool] = []
+
+    def rescue() -> None:
+        if finished.wait(5.0):
+            return
+        try:
+            descriptor = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            return
+        rescued.append(True)
+        os.close(descriptor)
+
+    thread = threading.Thread(target=rescue, daemon=True)
+    thread.start()
+    try:
+        expect(Failure.FILE_CHANGED, writer.seal)
+    finally:
+        finished.set()
+        thread.join(10.0)
+    assert rescued == []
+
+
+class _CountingScan:
+    """Delegate one real directory scan, counting yielded entries and closure."""
+
+    opened: typing.ClassVar[list["_CountingScan"]] = []
+
+    def __init__(self, real: typing.Any, *, fail_after: int | None = None) -> None:
+        self._real = real
+        self._fail_after = fail_after
+        self.yielded = 0
+        self.closed = False
+        _CountingScan.opened.append(self)
+
+    def __enter__(self) -> "_CountingScan":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.closed = True
+        self._real.close()
+
+    def __iter__(self) -> "_CountingScan":
+        return self
+
+    def __next__(self) -> typing.Any:
+        if self._fail_after is not None and self.yielded >= self._fail_after:
+            raise OSError("scan failed")
+        entry = next(self._real)
+        self.yielded += 1
+        return entry
+
+
+def _install_counting_scan(
+    monkeypatch: pytest.MonkeyPatch, *, fail_after: int | None = None
+) -> list[_CountingScan]:
+    """Replace ``os.scandir`` with a counting delegate; return the opened scans."""
+    real_scandir = os.scandir
+    _CountingScan.opened = []
+
+    def counting(descriptor: int) -> _CountingScan:
+        return _CountingScan(real_scandir(descriptor), fail_after=fail_after)
+
+    monkeypatch.setattr(os, "scandir", counting)
+    return _CountingScan.opened
+
+
+def test_enumeration_stops_at_the_bound_without_listing_everything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Listing is incremental: the bound stops the scan early and every scan is closed."""
+    writer, root = open_writer(tmp_path)
+    writer.append(header_for(tmp_path, root, OFF))
+    directory = run_dir(root) / "records" / "recording_off"
+    for index in range(50):
+        path = directory / f"extra{index}.jsonl"
+        path.write_bytes(b"x")
+        os.chmod(path, 0o600)
+    monkeypatch.setattr(store, "MAX_MANIFEST_ENTRIES", 1)
+    scans = _install_counting_scan(monkeypatch)
+    expect(Failure.SEAL_LIMIT_EXCEEDED, writer.seal)
+    assert sum(scan.yielded for scan in scans) <= 4
+    assert scans and all(scan.closed for scan in scans)
+
+
+def test_scan_errors_fail_closed_and_close_the_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A listing error mid-scan is a closed tree failure, and the scan is still closed."""
+    writer, root = open_writer(tmp_path)
+    writer.append(header_for(tmp_path, root, OFF))
+    scans = _install_counting_scan(monkeypatch, fail_after=0)
+    expect(Failure.SEAL_TREE_INVALID, writer.seal)
+    assert scans and all(scan.closed for scan in scans)
+
+
+def _verified_with(tmp_path: Path, data: bytes) -> store.ColdVerifiedTree:
+    """Return a verified tree whose OFF tick file holds exactly ``data``."""
+    root, _sealed, _records = write_full_run(tmp_path)
+    (run_dir(root) / "records/recording_off/tick.jsonl").write_bytes(data)
+    digest = craft_manifest(run_dir(root))
+    return store.verify_retained_tree(root, run_id=RUN_ID, expected_manifest_sha256=digest)
+
+
+def _count_reads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Count bytes returned by every subsequent chunk read."""
+    real_read = store._read_chunk  # pyright: ignore[reportPrivateUsage]
+    counts: list[int] = []
+
+    def counting(descriptor: int, size: int) -> bytes:
+        chunk = real_read(descriptor, size)
+        counts.append(len(chunk))
+        return chunk
+
+    monkeypatch.setattr(store, "_read_chunk", counting)
+    return counts
+
+
+def test_overlong_line_is_refused_before_buffering_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An overlong line stops the re-read early instead of buffering the whole file."""
+    tree = _verified_with(tmp_path, b"x" * 10_000)
+    monkeypatch.setattr(store, "_READ_CHUNK_BYTES", 64)
+    counts = _count_reads(monkeypatch)
+    expect(
+        Failure.LINE_TOO_LARGE,
+        lambda: store.read_verified_lines(
+            tree, "records/recording_off/tick.jsonl", max_line_bytes=100
+        ),
+    )
+    assert sum(counts) <= 100 + 64
+
+
+def test_line_framing_is_exact_across_chunk_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lines split across chunks reassemble exactly; the bound is inclusive of LF."""
+    lines = [b"a" * 99, b"", b"b" * 3, b"c" * 50]
+    data = b"\n".join(lines) + b"\n"
+    tree = _verified_with(tmp_path, data)
+    monkeypatch.setattr(store, "_READ_CHUNK_BYTES", 7)
+    path = "records/recording_off/tick.jsonl"
+    assert store.read_verified_lines(tree, path, max_line_bytes=100) == tuple(lines)
+    expect(Failure.LINE_TOO_LARGE, lambda: store.read_verified_lines(tree, path, max_line_bytes=99))
+
+
+@pytest.mark.parametrize("data", [b"torn", b"", b"ok\ntorn"], ids=["torn", "empty", "tail"])
+def test_line_framing_refuses_torn_or_empty_files(tmp_path: Path, data: bytes) -> None:
+    """A final line without LF, or an empty file, is malformed."""
+    tree = _verified_with(tmp_path, data)
+    expect(
+        Failure.LINE_MALFORMED,
+        lambda: store.read_verified_lines(
+            tree, "records/recording_off/tick.jsonl", max_line_bytes=100
+        ),
+    )
+
+
+def test_lines_are_returned_only_after_the_digest_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-read bytes that differ from the manifest digest are never returned."""
+    tree = _verified_with(tmp_path, b"alpha\nbeta\n")
+    real_read = store._read_chunk  # pyright: ignore[reportPrivateUsage]
+
+    def flipping(descriptor: int, size: int) -> bytes:
+        chunk = real_read(descriptor, size)
+        return chunk.replace(b"alpha", b"alphA")
+
+    monkeypatch.setattr(store, "_read_chunk", flipping)
+    expect(
+        Failure.FILE_DIGEST_MISMATCHED,
+        lambda: store.read_verified_lines(
+            tree, "records/recording_off/tick.jsonl", max_line_bytes=100
+        ),
+    )
+
+
+def test_aliased_run_directories_refuse(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two root paths naming one run directory inode are refused before verification."""
+    root, laptop, digest = _two_trees(tmp_path)
+
+    def same_identity(_root: store.ColdAdmittedRoot, _run_id: str) -> tuple[int, int]:
+        return 1, 1
+
+    verified: list[str] = []
+
+    def never(*_args: object, **_kwargs: object) -> store.ColdVerifiedTree:
+        verified.append("called")
+        raise AssertionError
+
+    monkeypatch.setattr(store, "_run_directory_identity", same_identity)
+    monkeypatch.setattr(store, "_verify_admitted_tree", never)
+    expect(
+        Failure.ROOTS_OVERLAP,
+        lambda: store.verify_retained_copies(
+            root, laptop, run_id=RUN_ID, expected_manifest_sha256=digest
+        ),
+    )
+    assert verified == []
+
+
+def test_case_alias_of_one_directory_refuses_where_the_filesystem_folds_case(
+    tmp_path: Path,
+) -> None:
+    """On a case-insensitive filesystem two spellings of one root are one copy."""
+    root, _sealed, _records = write_full_run(tmp_path, "Pi")
+    alias = str(Path(root).with_name("pi"))
+    if not os.path.isdir(alias):
+        pytest.skip("filesystem is case-sensitive; the patched alias test covers the rule")
+    digest = hashlib.sha256((run_dir(root) / store.MANIFEST_JSON_NAME).read_bytes()).hexdigest()
+    expect(
+        Failure.ROOTS_OVERLAP,
+        lambda: store.verify_retained_copies(
+            root, alias, run_id=RUN_ID, expected_manifest_sha256=digest
+        ),
+    )

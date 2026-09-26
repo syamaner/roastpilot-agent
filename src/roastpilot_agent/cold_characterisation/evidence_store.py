@@ -146,9 +146,19 @@ def _lstat_at(name: str, dir_fd: int, failure: ColdEvidenceStoreFailure) -> "_No
     return _guard(lambda: _node_stat(os.stat(name, dir_fd=dir_fd, follow_symlinks=False)), failure)
 
 
-def _list_directory(descriptor: int, failure: ColdEvidenceStoreFailure) -> list[str]:
-    """List one directory by descriptor, mapping failures closed."""
-    return _guard(lambda: os.listdir(descriptor), failure)
+def _scan_directory(
+    descriptor: int, failure: ColdEvidenceStoreFailure
+) -> "os._ScandirIterator[str]":  # pyright: ignore[reportPrivateUsage]
+    """Open one incremental directory scan by descriptor, mapping failures closed."""
+    return _guard(lambda: os.scandir(descriptor), failure)
+
+
+def _next_name(
+    iterator: collections.abc.Iterator["os.DirEntry[str]"], failure: ColdEvidenceStoreFailure
+) -> str | None:
+    """Return the next scanned entry name, or ``None`` at the end, mapping failures closed."""
+    entry = _guard(lambda: next(iterator, None), failure)
+    return None if entry is None else entry.name
 
 
 def _realpath(path: str, failure: ColdEvidenceStoreFailure) -> str:
@@ -277,7 +287,8 @@ def _platform_is_supported() -> bool:
         and os.mkdir in os.supports_dir_fd
         and os.stat in os.supports_dir_fd
         and os.stat in os.supports_follow_symlinks
-        and os.listdir in os.supports_fd
+        and os.scandir in os.supports_fd
+        and hasattr(os, "O_NONBLOCK")
         and hasattr(os, "O_NOFOLLOW")
         and hasattr(os, "O_DIRECTORY")
         and hasattr(os, "fchmod")
@@ -290,8 +301,12 @@ def _directory_flags() -> int:
 
 
 def _file_read_flags() -> int:
-    """Return no-follow read-only regular-file open flags."""
-    return os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    """Return no-follow, non-blocking read-only open flags.
+
+    ``O_NONBLOCK`` keeps a regular file swapped for a FIFO from blocking the open;
+    the following identity check then refuses the non-regular node.
+    """
+    return os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
 
 
 def _file_create_flags(*, append: bool) -> int:
@@ -882,19 +897,23 @@ def _open_node_directory(
     flags = _directory_flags()
     changed = ColdEvidenceStoreFailure.SEAL_TREE_CHANGED
     descriptor = _open_at(".", flags, run_fd, changed)
+    owned = True
     walked: list[str] = []
     try:
         for segment in segments:
             parent = descriptor
+            owned = False
             try:
                 descriptor = _open_at(segment, flags, parent, changed)
             finally:
                 os.close(parent)
+            owned = True
             walked.append(segment)
         if _fstat(descriptor, changed) != nodes.get("/".join(walked)):
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.SEAL_TREE_CHANGED)
     except BaseException:
-        os.close(descriptor)
+        if owned:
+            os.close(descriptor)
         raise
     return descriptor
 
@@ -907,34 +926,49 @@ def _enumerate(run_fd: int, rules: _TreeRules) -> dict[str, _NodeStat]:
         segments = pending.pop()
         directory = _open_node_directory(run_fd, segments, nodes)
         try:
-            names = sorted(_list_directory(directory, rules.invalid))
-            for name in names:
-                if len(nodes) > 2 * MAX_MANIFEST_ENTRIES + 2:
-                    raise ColdEvidenceStoreError(rules.limit)
-                child = (*segments, name)
-                relative = "/".join(child)
-                if not _segment_is_valid(name):
-                    raise ColdEvidenceStoreError(rules.invalid)
-                if len(child) > MAX_PATH_SEGMENTS:
-                    raise ColdEvidenceStoreError(rules.limit)
-                node = _lstat_at(name, directory, ColdEvidenceStoreFailure.SEAL_TREE_CHANGED)
-                if node.is_directory:
-                    if rules.seal and stat.S_IMODE(node.mode) != 0o700:
-                        raise ColdEvidenceStoreError(rules.invalid)
-                    pending.append(child)
-                elif stat.S_ISREG(node.mode):
-                    if rules.seal and (
-                        stat.S_IMODE(node.mode) != 0o600
-                        or node.nlink != 1
-                        or relative in _RESERVED_TOP_LEVEL_NAMES
-                    ):
-                        raise ColdEvidenceStoreError(rules.invalid)
-                else:
-                    raise ColdEvidenceStoreError(rules.not_regular)
-                nodes[relative] = node
+            with _scan_directory(directory, rules.invalid) as scan:
+                _scan_entries(scan, directory, segments, nodes, pending, rules)
         finally:
             os.close(directory)
     return nodes
+
+
+def _scan_entries(
+    scan: collections.abc.Iterator["os.DirEntry[str]"],
+    directory: int,
+    segments: tuple[str, ...],
+    nodes: dict[str, _NodeStat],
+    pending: list[tuple[str, ...]],
+    rules: _TreeRules,
+) -> None:
+    """Record one directory's entries incrementally, stopping at the first bound breach."""
+    while True:
+        if len(nodes) > 2 * MAX_MANIFEST_ENTRIES + 2:
+            raise ColdEvidenceStoreError(rules.limit)
+        name = _next_name(scan, rules.invalid)
+        if name is None:
+            return
+        child = (*segments, name)
+        relative = "/".join(child)
+        if not _segment_is_valid(name):
+            raise ColdEvidenceStoreError(rules.invalid)
+        if len(child) > MAX_PATH_SEGMENTS:
+            raise ColdEvidenceStoreError(rules.limit)
+        node = _lstat_at(name, directory, ColdEvidenceStoreFailure.SEAL_TREE_CHANGED)
+        if node.is_directory:
+            if rules.seal and stat.S_IMODE(node.mode) != 0o700:
+                raise ColdEvidenceStoreError(rules.invalid)
+            pending.append(child)
+        elif stat.S_ISREG(node.mode):
+            if rules.seal and (
+                stat.S_IMODE(node.mode) != 0o600
+                or node.nlink != 1
+                or relative in _RESERVED_TOP_LEVEL_NAMES
+            ):
+                raise ColdEvidenceStoreError(rules.invalid)
+        else:
+            raise ColdEvidenceStoreError(rules.not_regular)
+        nodes[relative] = node
 
 
 def _files_and_orphans(nodes: dict[str, _NodeStat]) -> tuple[list[str], list[str]]:
@@ -957,8 +991,12 @@ def _read_node(
     nodes: dict[str, _NodeStat],
     *,
     retain: bool,
+    sink: collections.abc.Callable[[bytes], None] | None = None,
 ) -> tuple[str, bytes | None]:
-    """Hash one recorded file under before/after identity checks and complete reads."""
+    """Hash one recorded file under before/after identity checks and complete reads.
+
+    ``sink`` receives each chunk as it is read and may refuse early by raising.
+    """
     segments = relative_path.split("/")
     expected = nodes[relative_path]
     parent = _open_node_directory(run_fd, segments[:-1], nodes)
@@ -988,6 +1026,8 @@ def _read_node(
             digest.update(chunk)
             if retained is not None:
                 retained.extend(chunk)
+            if sink is not None:
+                sink(chunk)
         if total != expected.size:
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.FILE_READ_INCOMPLETE)
         after = _fstat(descriptor, ColdEvidenceStoreFailure.FILE_CHANGED)
@@ -998,10 +1038,18 @@ def _read_node(
     return digest.hexdigest(), bytes(retained) if retained is not None else None
 
 
+def _require_run_id(run_id: object) -> str:
+    """Refuse any run id outside the record grammar before any filesystem access."""
+    if not run_id_is_valid(run_id):
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.RUN_ID_MISMATCHED)
+    return typing.cast(str, run_id)
+
+
 def _open_run_directory(
     root: ColdAdmittedRoot, run_id: str, failure: ColdEvidenceStoreFailure
 ) -> int:
     """Open one run directory beneath an admitted root by no-follow descriptor walk."""
+    _require_run_id(run_id)
     root_fd = _open_absolute_directory(root.path)
     try:
         return _open_at(run_id, _directory_flags(), root_fd, failure)
@@ -1533,10 +1581,39 @@ def verify_retained_tree(
     Raises:
         ColdEvidenceStoreError: If admission or any integrity check fails.
     """
+    _require_run_id(run_id)
     admitted = admit_evidence_root(root, protected_roots=protected_roots)
     return _verify_admitted_tree(
         admitted, run_id=run_id, expected_manifest_sha256=expected_manifest_sha256
     )
+
+
+def _reread_entry(
+    tree: ColdVerifiedTree,
+    relative_path: str,
+    *,
+    retain: bool,
+    sink: collections.abc.Callable[[bytes], None] | None,
+) -> bytes | None:
+    """Re-read one verified entry under identity checks and require its manifest digest."""
+    entry = next(
+        (item for item in tree.manifest.entries if item.relative_path == relative_path), None
+    )
+    if entry is None:
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ENTRY_PATH_INVALID)
+    nodes = tree._nodes  # pyright: ignore[reportPrivateUsage]
+    run_fd = _open_run_directory(
+        tree.root, tree.manifest.run_id, ColdEvidenceStoreFailure.FILE_CHANGED
+    )
+    try:
+        if _fstat(run_fd, ColdEvidenceStoreFailure.FILE_CHANGED) != nodes[_ROOT_NODE]:
+            raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.FILE_CHANGED)
+        digest, data = _read_node(run_fd, relative_path, nodes, retain=retain, sink=sink)
+    finally:
+        os.close(run_fd)
+    if digest != entry.sha256:
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.FILE_DIGEST_MISMATCHED)
+    return data
 
 
 def read_verified_file(tree: ColdVerifiedTree, relative_path: str) -> bytes:
@@ -1552,24 +1629,79 @@ def read_verified_file(tree: ColdVerifiedTree, relative_path: str) -> bytes:
     Raises:
         ColdEvidenceStoreError: If the file changed since verification or its digest differs.
     """
-    entry = next(
-        (item for item in tree.manifest.entries if item.relative_path == relative_path), None
-    )
-    if entry is None:
-        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ENTRY_PATH_INVALID)
-    nodes = tree._nodes  # pyright: ignore[reportPrivateUsage]
-    run_fd = _open_run_directory(
-        tree.root, tree.manifest.run_id, ColdEvidenceStoreFailure.FILE_CHANGED
-    )
+    return _reread_entry(tree, relative_path, retain=True, sink=None) or b""
+
+
+class _LineFramer:
+    """Frame LF-terminated lines incrementally, refusing an overlong line before buffering it."""
+
+    __slots__ = ("_limit", "_pending", "lines")
+
+    def __init__(self, max_line_bytes: int) -> None:
+        self._limit = max_line_bytes
+        self._pending = bytearray()
+        self.lines: list[bytes] = []
+
+    def feed(self, chunk: bytes) -> None:
+        """Consume one chunk; the partial-line buffer never exceeds the line bound."""
+        view = memoryview(chunk)
+        start = 0
+        while True:
+            index = chunk.find(b"\n", start)
+            end = len(chunk) if index < 0 else index
+            if len(self._pending) + (end - start) + 1 > self._limit:
+                raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.LINE_TOO_LARGE)
+            self._pending += view[start:end]
+            if index < 0:
+                return
+            self.lines.append(bytes(self._pending))
+            self._pending.clear()
+            start = index + 1
+
+    def finish(self) -> tuple[bytes, ...]:
+        """Return the complete lines, refusing a torn final line or an empty file."""
+        if self._pending or not self.lines:
+            raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.LINE_MALFORMED)
+        return tuple(self.lines)
+
+
+def read_verified_lines(
+    tree: ColdVerifiedTree, relative_path: str, *, max_line_bytes: int
+) -> tuple[bytes, ...]:
+    """Re-read one verified record file, framing lines incrementally under the line bound.
+
+    An overlong line is refused as soon as its partial buffer would exceed the bound.
+    Lines are returned only after the identity and manifest-digest checks pass, so no
+    caller parses changed or unverified bytes.  Complete lines of a legitimate file are
+    held until then (bounded by the file cap), because verification precedes parsing.
+
+    Args:
+        tree: A verified tree.
+        relative_path: One manifest entry path.
+        max_line_bytes: Maximum bytes per line including its LF.
+
+    Returns:
+        The file's lines without their LF terminators.
+
+    Raises:
+        ColdEvidenceStoreError: If framing, identity, or digest checks fail.
+    """
+    framer = _LineFramer(max_line_bytes)
+    _reread_entry(tree, relative_path, retain=False, sink=framer.feed)
+    return framer.finish()
+
+
+def _run_directory_identity(root: ColdAdmittedRoot, run_id: str) -> tuple[int, int]:
+    """Return one run directory's ``(st_dev, st_ino)`` to refuse aliased copies.
+
+    This is a same-host software check only; it proves nothing about physical storage.
+    """
+    run_fd = _open_run_directory(root, run_id, ColdEvidenceStoreFailure.INVENTORY_MISMATCHED)
     try:
-        if _fstat(run_fd, ColdEvidenceStoreFailure.FILE_CHANGED) != nodes[_ROOT_NODE]:
-            raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.FILE_CHANGED)
-        digest, data = _read_node(run_fd, relative_path, nodes, retain=True)
+        node = _fstat(run_fd, ColdEvidenceStoreFailure.INVENTORY_MISMATCHED)
     finally:
         os.close(run_fd)
-    if digest != entry.sha256 or data is None:
-        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.FILE_DIGEST_MISMATCHED)
-    return data
+    return node.dev, node.ino
 
 
 def verify_retained_copies(
@@ -1595,11 +1727,14 @@ def verify_retained_copies(
     Raises:
         ColdEvidenceStoreError: If either copy fails or the copies differ.
     """
+    _require_run_id(run_id)
     first_root = admit_evidence_root(first, protected_roots=protected_roots)
     second_root = admit_evidence_root(second, protected_roots=protected_roots)
     if _is_within(first_root.realpath, second_root.realpath) or _is_within(
         second_root.realpath, first_root.realpath
     ):
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ROOTS_OVERLAP)
+    if _run_directory_identity(first_root, run_id) == _run_directory_identity(second_root, run_id):
         raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ROOTS_OVERLAP)
     trees = [
         _verify_admitted_tree(

@@ -41,7 +41,8 @@ from roastpilot_agent.cold_characterisation.evidence_store import (
     canonical_json,
     check_record_binding,
     load_strict_json,
-    read_verified_file,
+    read_verified_lines,
+    run_id_is_valid,
     verify_retained_tree,
 )
 
@@ -167,9 +168,10 @@ def _read_line(
     stream: ColdEvidenceStream,
     state: ColdBindingState,
 ) -> ColdEvidenceRecord:
-    """Strictly decode, losslessly re-prove, validate, and bind one record line."""
-    if len(line) + 1 > MAX_LINE_BYTES:
-        raise _closed(ColdEvidenceStoreFailure.LINE_TOO_LARGE)
+    """Strictly decode, losslessly re-prove, validate, and bind one framed record line.
+
+    The line bound is enforced earlier, incrementally, by ``read_verified_lines``.
+    """
     if not line:
         raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
     decoded = load_strict_json(line, malformed=ColdEvidenceStoreFailure.LINE_MALFORMED)
@@ -191,13 +193,6 @@ def _read_line(
     snapshot = validate_record(validated)
     check_record_binding(state, snapshot, writer_root=None)
     return snapshot
-
-
-def _split_lines(data: bytes) -> list[bytes]:
-    """Split a record file into LF-terminated lines, refusing torn or empty content."""
-    if not data or not data.endswith(b"\n"):
-        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
-    return data[:-1].split(b"\n")
 
 
 def _record_layout(tree: ColdVerifiedTree) -> dict[ColdPhaseKind, dict[ColdEvidenceStream, str]]:
@@ -237,6 +232,8 @@ def read_retained_run(
         ColdEvidenceStoreError: If verification, decoding, or binding fails.
         ColdEvidenceError: If a decoded record fails schema revalidation.
     """
+    if not run_id_is_valid(run_id):
+        raise _closed(ColdEvidenceStoreFailure.RUN_ID_MISMATCHED)
     tree = verify_retained_tree(
         root,
         run_id=run_id,
@@ -258,7 +255,7 @@ def read_retained_run(
                 continue
             records = tuple(
                 _read_line(line, phase=phase, stream=stream, state=state)
-                for line in _split_lines(read_verified_file(tree, path))
+                for line in read_verified_lines(tree, path, max_line_bytes=MAX_LINE_BYTES)
             )
             streams.append(ColdRetainedStream(phase=phase, stream=stream, records=records))
     bound = {(header.phase, header.identity_sha256) for header, _identity in state.headers}
