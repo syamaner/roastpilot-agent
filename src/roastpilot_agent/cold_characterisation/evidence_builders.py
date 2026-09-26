@@ -148,7 +148,7 @@ def build_tick_record(
         projection: Strict audio projection; its raw extras are always retained.
 
     Returns:
-        The validated tick snapshot; oversized input refuses and is never truncated.
+        The validated tick snapshot; oversized input refuses and is never shortened.
 
     Raises:
         ColdEvidenceError: If any input or the record fails admission.

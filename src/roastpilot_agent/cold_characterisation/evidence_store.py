@@ -2,7 +2,7 @@
 
 This module writes, seals, and verifies private cold-characterisation evidence
 trees.  It computes integrity facts only: it never interprets an outcome, never
-deletes, renames, truncates, or repairs anything, and never claims a filesystem
+deletes, moves, shortens, or repairs anything, and never claims a filesystem
 transaction.  The sealing boundary is "every node seen at enumeration pass 1 is
 unchanged at pass 2"; same-size, same-timestamp rewrites between the two
 identity reads remain a named residual.
