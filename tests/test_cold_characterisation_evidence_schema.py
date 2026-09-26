@@ -12,6 +12,14 @@ import pydantic
 import pytest
 
 from roastpilot_agent.cold_characterisation import evidence_schema as evidence
+from roastpilot_agent.cold_characterisation.host import ColdHostBoundFailure, HostBoundSample
+from roastpilot_agent.cold_characterisation.identity import ColdIdentityFailure
+from roastpilot_agent.cold_characterisation.mcp import (
+    FinalisationFirstCrackStatus,
+    RejectionReason,
+)
+from roastpilot_agent.mcp_client import FirstCrackStatus
+from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 
 
 def _audio_payload() -> dict[str, evidence.ColdJsonValue]:
@@ -254,6 +262,7 @@ def test_designated_ingresses_strip_parser_context_and_attacker_key() -> None:
 def test_validate_record_revalidates_constructed_nested_data_and_copies_maps() -> None:
     """The persistence boundary rejects bypassed nested data and returns snapshots."""
     tick = _tick()
+    assert evidence.validate_record(tick) == tick
     raw = {"vendor": [1]}
     constructed = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
         **(tick.model_dump() | {"raw_vendor_data": raw})
@@ -387,6 +396,87 @@ def test_record_union_has_six_closed_streams_and_abort_pairs() -> None:
             reason=evidence.ColdOperatorAbortReason.OPERATOR_STOP,
         )
     assert raised.value.failure is evidence.ColdEvidenceFailure.ABORT_DOMAIN_REASON_MISMATCHED
+
+
+def test_consumer_owned_contracts_match_delivered_models_without_importing_them() -> None:
+    """Cheap duplicated schema surfaces stay structurally tied to their upstream contracts."""
+    assert tuple(evidence.ColdTickAudioSample.model_fields) == tuple(
+        FinalisationFirstCrackStatus.model_fields
+    )
+    assert tuple(evidence.ColdHostSample.model_fields) == tuple(HostBoundSample.model_fields)
+    assert tuple(evidence.ColdSafetyEvaluation.model_fields) == tuple(SafetyEvaluation.model_fields)
+    assert {member.value for member in evidence.ColdSafetyVerdict} == {
+        member.value for member in SafetyVerdict
+    }
+    assert {member.value for member in evidence.ColdHostAbortReason} == {
+        member.value for member in ColdHostBoundFailure
+    }
+    assert {member.value for member in evidence.ColdIdentityAbortReason} == {
+        member.value for member in ColdIdentityFailure
+    }
+    assert {member.value for member in evidence.ColdMcpAbortReason} == {
+        *(member.value for member in RejectionReason),
+        "emergency_stop",
+        "session_or_reservation_changed",
+    }
+    assert FirstCrackStatus.model_fields["queued_window_count"].default == 0
+    assert "max_consecutive_overflow_count" not in FirstCrackStatus.model_fields
+
+
+def test_every_closed_enum_member_and_record_stream_is_admissible() -> None:
+    """Closed vocabularies enumerate the entire declared grammar, not a subset."""
+    assert len(evidence.ColdEvidenceFailure) == 19
+    assert len(evidence.ColdAudioField) == 21
+    assert len(evidence.ColdMcpAbortReason) == 14
+    assert len(evidence.ColdHostAbortReason) == 15
+    assert len(evidence.ColdIdentityAbortReason) == 11
+    assert len(evidence.ColdSafetyVerdict) == 6
+    assert len(evidence.ColdFinalisationStatus) == 6
+    assert len(evidence.ColdEvidenceStream) == 6
+    for domain, enum_type in (
+        (evidence.ColdAbortDomain.HOST, evidence.ColdHostAbortReason),
+        (evidence.ColdAbortDomain.IDENTITY, evidence.ColdIdentityAbortReason),
+        (evidence.ColdAbortDomain.EVIDENCE, evidence.ColdEvidenceFailure),
+        (evidence.ColdAbortDomain.MCP, evidence.ColdMcpAbortReason),
+        (evidence.ColdAbortDomain.ADVISOR, evidence.ColdAdvisorFailureKind),
+        (evidence.ColdAbortDomain.OPERATOR, evidence.ColdOperatorAbortReason),
+    ):
+        for reason in enum_type:
+            record = evidence.ColdAbortRecord(**_common("abort"), domain=domain, reason=reason)
+            assert evidence.validate_record(record) == record
+
+
+@pytest.mark.parametrize("run_id", ["../escape", "a/b", ".", "..", "", "UPPER", "x ", "x\\y"])
+def test_common_identity_fields_are_absolute_and_version_one_only(run_id: str) -> None:
+    """Every common record refuses path-shaped ids, uppercase digests, and later schemas."""
+    values = _common("tick")
+    values["run_id"] = run_id
+    with pytest.raises(pydantic.ValidationError):
+        evidence.ColdTickRecord(
+            **values,
+            tick=0,
+            bean_temp_c=None,
+            env_temp_c=None,
+            heat_level_percent=0,
+            fan_level_percent=0,
+            cooling_on=False,
+            connected=True,
+            audio=evidence.project_tick_audio(_audio_payload()).audio,
+        )
+    values = _common("tick")
+    values["schema_version"] = 2
+    with pytest.raises(pydantic.ValidationError):
+        evidence.ColdTickRecord(
+            **values,
+            tick=0,
+            bean_temp_c=None,
+            env_temp_c=None,
+            heat_level_percent=0,
+            fan_level_percent=0,
+            cooling_on=False,
+            connected=True,
+            audio=evidence.project_tick_audio(_audio_payload()).audio,
+        )
 
 
 def test_scope_and_import_fence_are_closed() -> None:
