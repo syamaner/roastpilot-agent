@@ -27,11 +27,28 @@ from roastpilot_agent.cold_characterisation.identity import (
     identity_sha256,
 )
 from roastpilot_agent.cold_characterisation.mcp import (
+    DisconnectEvidence,
+    DriverCommandStateEvidence,
+    DriverEvidenceRead,
+    FinalisationFailure,
     FinalisationFirstCrackStatus,
+    FinalisationStageResult,
+    FirstCrackRuntimeFinalisationEvidence,
+    RecordingArtifact,
+    RecordingFinalisationEvidence,
     RejectionReason,
+    SamplerFinalisationEvidence,
+    SessionFinalisationResult,
+    StrictMCPMirror,
 )
 from roastpilot_agent.config import MCPDeviceConfig
-from roastpilot_agent.mcp_client import FirstCrackStatus, RuntimeConfigSnapshot, ServerInfo
+from roastpilot_agent.mcp_client import (
+    FirstCrackStatus,
+    MCPMirror,
+    RoasterDeviceState,
+    RuntimeConfigSnapshot,
+    ServerInfo,
+)
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 
 
@@ -1514,11 +1531,316 @@ def test_consumer_owned_contracts_match_delivered_models_without_importing_them(
     }
     assert {member.value for member in evidence.ColdMcpAbortReason} == {
         *(member.value for member in RejectionReason),
-        "emergency_stop",
-        "session_or_reservation_changed",
+        *(
+            literal_value
+            for value in typing.get_args(
+                SessionFinalisationResult.model_fields["abort_reason"].annotation
+            )
+            if value is not type(None)
+            for literal_value in typing.get_args(value)
+        ),
     }
+    assert {member.value for member in evidence.ColdFinalisationStatus} == set(
+        typing.get_args(SessionFinalisationResult.model_fields["status"].annotation)
+    )
     assert FirstCrackStatus.model_fields["queued_window_count"].default == 0
     assert "max_consecutive_overflow_count" not in FirstCrackStatus.model_fields
+
+
+def test_delivered_model_signatures_are_explicitly_pinned_to_the_bound_base() -> None:
+    """Delivered tolerant and strict mirrors retain their exact public model shape."""
+    required = object()
+    expected: dict[type[pydantic.BaseModel], tuple[tuple[str, object], ...]] = {
+        MCPMirror: (),
+        RoasterDeviceState: tuple(
+            (name, required)
+            for name in (
+                "driver",
+                "connected",
+                "bean_temp_c",
+                "env_temp_c",
+                "heat_level_percent",
+                "fan_level_percent",
+                "cooling_on",
+                "raw_vendor_data",
+            )
+        ),
+        FirstCrackStatus: (
+            *(
+                (name, required)
+                for name in (
+                    "mode",
+                    "status",
+                    "detected_at_utc",
+                    "detected_monotonic_seconds",
+                    "allow_manual_override",
+                )
+            ),
+            ("reason", None),
+            ("audio_running", False),
+            ("queued_window_count", 0),
+            ("emitted_window_count", 0),
+            ("dropped_window_count", 0),
+            ("processed_window_count", 0),
+            ("overflow_count_last_minute", 0),
+            ("estimated_lost_audio_ms_last_minute", 0.0),
+            ("total_overflow_count", 0),
+        ),
+        HostBoundSample: tuple(
+            (name, required)
+            for name in (
+                "captured_at_utc",
+                "monotonic_seconds",
+                "soc_temp_c",
+                "throttled_word_hex",
+                "mem_available_bytes",
+                "free_bytes",
+            )
+        ),
+        SafetyEvaluation: (
+            ("rule", required),
+            ("verdict", required),
+            ("input_heat", None),
+            ("input_fan", None),
+            ("adjusted_heat", None),
+            ("adjusted_fan", None),
+            ("reason", required),
+        ),
+        StrictMCPMirror: (),
+        FinalisationFailure: tuple(
+            (name, required)
+            for name in (
+                "stage",
+                "code",
+                "message",
+                "attempt_number",
+                "recorded_at_utc",
+            )
+        ),
+        FinalisationStageResult: tuple(
+            (name, required)
+            for name in (
+                "stage",
+                "status",
+                "completed_at_utc",
+                "completed_in_attempt",
+                "detail",
+            )
+        ),
+        DriverCommandStateEvidence: tuple(
+            (name, required)
+            for name in (
+                "driver",
+                "connected",
+                "command_streaming_required",
+                "command_loop_running",
+                "serial_open",
+                "heat_level_percent",
+                "roast_fan_level_percent",
+                "main_fan_level_percent",
+                "drum_motor_on",
+                "cooling_motor_on",
+                "solenoid_open",
+                "safe_zero",
+                "non_zero_dimensions",
+                "command_send_attempts",
+                "command_write_count",
+                "last_command_write_size",
+                "command_loop_error_count",
+                "status_packet_count",
+                "status_read_error_count",
+            )
+        ),
+        DriverEvidenceRead: tuple(
+            (name, required)
+            for name in (
+                "captured_at_utc",
+                "outcome",
+                "error",
+                "evidence",
+            )
+        ),
+        SamplerFinalisationEvidence: tuple(
+            (name, required)
+            for name in (
+                "owned_by_session_before_stop",
+                "thread_alive_after_join",
+                "last_error",
+            )
+        ),
+        FinalisationFirstCrackStatus: tuple(
+            (name, required)
+            for name in (
+                "mode",
+                "status",
+                "detected_at_utc",
+                "detected_monotonic_seconds",
+                "allow_manual_override",
+                "reason",
+                "audio_running",
+                "queued_window_count",
+                "emitted_window_count",
+                "dropped_window_count",
+                "processed_window_count",
+                "mic_peak_dbfs",
+                "mic_rms_dbfs",
+                "overflow_count_last_minute",
+                "estimated_lost_audio_ms_last_minute",
+                "total_overflow_count",
+                "max_consecutive_overflow_count",
+                "last_inference_duration_ms",
+                "max_inference_duration_ms",
+                "inference_overrun_count",
+            )
+        ),
+        FirstCrackRuntimeFinalisationEvidence: tuple(
+            (name, required)
+            for name in (
+                "outcome",
+                "stop_error",
+                "capture_running_after_stop",
+                "final_status",
+            )
+        ),
+        RecordingArtifact: tuple(
+            (name, required)
+            for name in (
+                "role",
+                "filename",
+                "path",
+                "exists",
+                "size_bytes",
+            )
+        ),
+        RecordingFinalisationEvidence: tuple(
+            (name, required)
+            for name in (
+                "expected",
+                "outcome",
+                "reason",
+                "artifacts",
+            )
+        ),
+        DisconnectEvidence: tuple(
+            (name, required)
+            for name in (
+                "attempt_count",
+                "first_attempted_at_utc",
+                "last_attempted_at_utc",
+                "last_returned_without_error",
+                "last_error",
+                "connected_false_confirmed",
+                "command_loop_stopped",
+                "serial_closed",
+            )
+        ),
+        SessionFinalisationResult: tuple(
+            (name, required)
+            for name in (
+                "session_id",
+                "session_purpose",
+                "status",
+                "clean",
+                "rejection_reason",
+                "abort_reason",
+                "retained",
+                "reservation_generation",
+                "attempt_number",
+                "recovered_after_failure",
+                "first_started_at_utc",
+                "first_started_session_elapsed_seconds",
+                "last_ended_at_utc",
+                "last_ended_session_elapsed_seconds",
+                "emergency_stop_ordering",
+                "stages",
+                "failures",
+                "admission_driver_evidence",
+                "pre_disconnect_driver_evidence",
+                "final_driver_evidence",
+                "sampler",
+                "pre_finalisation_first_crack_status",
+                "first_crack_runtime",
+                "recording",
+                "disconnect",
+                "session_active_after",
+                "session_phase_after",
+            )
+        ),
+    }
+    strict_config = {"frozen": True, "extra": "forbid", "strict": True, "allow_inf_nan": False}
+    configs = {
+        MCPMirror: {"frozen": True, "extra": "ignore"},
+        RoasterDeviceState: {"frozen": True, "extra": "ignore"},
+        FirstCrackStatus: {"frozen": True, "extra": "ignore"},
+        HostBoundSample: {"allow_inf_nan": False, "frozen": True},
+        SafetyEvaluation: {},
+        **{model: strict_config for model in tuple(expected)[5:]},
+    }
+    for model, signature in expected.items():
+        assert tuple(model.model_fields) == tuple(name for name, _ in signature)
+        assert dict(model.model_config) == configs[model]
+        for name, default in signature:
+            field = model.model_fields[name]
+            assert field.is_required() is (default is required)
+            if default is not required:
+                assert field.default == default
+                assert field.default_factory is None
+    assert RoasterDeviceState.model_fields["bean_temp_c"].annotation == float | None
+    assert RoasterDeviceState.model_fields["env_temp_c"].annotation == float | None
+    assert RoasterDeviceState.model_fields["connected"].annotation is bool
+    assert RoasterDeviceState.model_fields["cooling_on"].annotation is bool
+    assert (
+        FinalisationFirstCrackStatus.model_fields["mode"].annotation
+        == typing.Literal["disabled", "audio", "manual"]
+    )
+    assert (
+        FinalisationFirstCrackStatus.model_fields["status"].annotation
+        == typing.Literal["disabled", "manual", "pending", "detected", "faulted", "unavailable"]
+    )
+
+
+def _model_in_map(value: object) -> object:
+    """Place one value inside a free-form mapping."""
+    return {"x": value}
+
+
+def _model_in_list(value: object) -> object:
+    """Place one value inside a free-form list."""
+    return [value]
+
+
+def _model_in_nested_map_list(value: object) -> object:
+    """Place one value below both free-form container kinds."""
+    return {"x": [value]}
+
+
+def _model_in_nested_list_map(value: object) -> object:
+    """Place one value below both free-form container kinds in reverse order."""
+    return [{"x": value}]
+
+
+@pytest.mark.parametrize("field_name", ["raw_vendor_data", "raw_audio_extra"])
+@pytest.mark.parametrize(
+    "container",
+    [_model_in_map, _model_in_list, _model_in_nested_map_list, _model_in_nested_list_map],
+)
+def test_validate_record_refuses_models_inside_free_form_tick_maps(
+    field_name: str, container: typing.Callable[[object], object]
+) -> None:
+    """Free-form JSON maps never admit a schema model at any depth."""
+    tick = _tick()
+    hostile = tick.model_copy(update={field_name: container(tick.audio)})
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(hostile)
+    assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED
+
+
+def test_validate_record_admits_only_declared_nested_model_edges() -> None:
+    """Typed nested models remain copied at their declared record-owner edges."""
+    tick = _tick()
+    validated = typing.cast(evidence.ColdTickRecord, evidence.validate_record(tick))
+    assert validated.audio == tick.audio
+    assert validated.audio is not tick.audio
 
 
 def test_every_closed_enum_member_and_record_stream_is_admissible() -> None:

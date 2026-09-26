@@ -703,6 +703,15 @@ _MODEL_FIELDS: dict[type[pydantic.BaseModel], tuple[str, ...]] = {
     ColdAbortRecord: tuple(ColdAbortRecord.model_fields),
 }
 _NESTED_CLASSES = tuple(_MODEL_FIELDS)
+_DECLARED_NESTED_MODEL_EDGES: dict[
+    tuple[type[pydantic.BaseModel], str], type[pydantic.BaseModel]
+] = {
+    (ColdRunHeader, "identity"): ColdSealedEnvelope,
+    (ColdTickRecord, "audio"): ColdTickAudioSample,
+    (ColdHostRecord, "sample"): ColdHostSample,
+    (ColdAdvisoryRecord, "evaluation"): ColdSafetyEvaluation,
+    (ColdFinalisationRecord, "envelope"): ColdSealedEnvelope,
+}
 
 
 _ADMITTED_ENUM_TYPES = (
@@ -782,6 +791,13 @@ def _extract_model(value: pydantic.BaseModel, aggregate: list[int]) -> dict[str,
         current, depth, parent, slot, owner, field_name = stack.pop()
         nodes += 1
         if type(current) in _NESTED_CLASSES:
+            declared_model = (
+                _DECLARED_NESTED_MODEL_EDGES.get((owner, field_name))
+                if owner is not None and field_name is not None
+                else None
+            )
+            if declared_model is not type(current):
+                raise _closed(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
             model = typing.cast(pydantic.BaseModel, current)
             fields = _extract_model_fields(model, aggregate)
             if depth >= MAX_JSON_DEPTH:
