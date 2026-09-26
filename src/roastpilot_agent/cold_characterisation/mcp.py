@@ -470,6 +470,23 @@ def _command_streaming_required(evidence: DriverCommandStateEvidence) -> bool:
     return evidence.command_streaming_required
 
 
+def finalisation_command_streaming_observation(result: SessionFinalisationResult) -> bool | None:
+    """Return the observed capability discriminator, or ``None`` without trusted evidence.
+
+    This is a read-only accessor over the sole predicate; it computes no outcome.
+
+    Args:
+        result: Strictly parsed MCP finalisation result.
+
+    Returns:
+        The trusted final driver evidence's streaming requirement, else ``None``.
+    """
+    evidence = _trusted_final_driver_evidence(result)
+    if evidence is None:
+        return None
+    return _command_streaming_required(evidence)
+
+
 def _finalisation_has_capability_compatible_evidence(result: SessionFinalisationResult) -> bool:
     """Apply the sole AC23 streaming-capability branch to strict evidence."""
     evidence = _trusted_final_driver_evidence(result)

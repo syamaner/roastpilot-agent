@@ -2168,3 +2168,55 @@ def test_walker_is_structurally_iterative_beyond_python_recursion_depth() -> Non
     with pytest.raises(evidence.ColdEvidenceError) as raised:
         evidence.walk_json_value(typing.cast(evidence.ColdJsonValue, deep))
     assert raised.value.failure is evidence.ColdEvidenceFailure.JSON_DEPTH_EXCEEDED
+
+
+def _finalisation_pair(
+    observed: bool | None, branch: evidence.ColdCapabilityBranch | None
+) -> evidence.ColdFinalisationRecord:
+    """Build one format-only finalisation record with a capability pair."""
+    return evidence.ColdFinalisationRecord(
+        **_common("finalisation"),
+        session_id="session",
+        envelope=_envelope(evidence.ColdEnvelopeKind.FINALISATION),
+        status=evidence.ColdFinalisationStatus.REJECTED,
+        clean=False,
+        observed_command_streaming_required=observed,
+        applied_branch=branch,
+    )
+
+
+@pytest.mark.parametrize(
+    ("observed", "branch"),
+    [
+        (None, None),
+        (True, evidence.ColdCapabilityBranch.STREAMING),
+        (False, evidence.ColdCapabilityBranch.NON_STREAMING),
+    ],
+)
+def test_finalisation_capability_pairs_that_agree_are_admitted(
+    observed: bool | None, branch: evidence.ColdCapabilityBranch | None
+) -> None:
+    """H-B: both absent, or both present and agreeing, is the only admitted shape."""
+    record = _finalisation_pair(observed, branch)
+    assert evidence.validate_record(record) == record
+
+
+@pytest.mark.parametrize(
+    ("observed", "branch"),
+    [
+        (True, None),
+        (False, None),
+        (None, evidence.ColdCapabilityBranch.STREAMING),
+        (None, evidence.ColdCapabilityBranch.NON_STREAMING),
+        (True, evidence.ColdCapabilityBranch.NON_STREAMING),
+        (False, evidence.ColdCapabilityBranch.STREAMING),
+    ],
+)
+def test_finalisation_capability_pairs_unpaired_or_disagreeing_refuse(
+    observed: bool | None, branch: evidence.ColdCapabilityBranch | None
+) -> None:
+    """H-B: an unpaired or disagreeing capability pair fails closed."""
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        _finalisation_pair(observed, branch)
+    assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED
+    assert raised.value.__context__ is None

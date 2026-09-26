@@ -9,6 +9,7 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
+from roastpilot_agent.cold_characterisation import mcp as cold_mcp
 from roastpilot_agent.cold_characterisation.mcp import (
     COLD_ALLOWED_TOOLS,
     ColdCharacterisationMCPClient,
@@ -24,6 +25,7 @@ from roastpilot_agent.cold_characterisation.mcp import (
     RejectionReason,
     SessionFinalisationResult,
     _finalisation_has_capability_compatible_evidence,  # pyright: ignore[reportPrivateUsage]
+    finalisation_command_streaming_observation,
     finalisation_is_clean,
 )
 from roastpilot_agent.mcp_client import MCPConnectionError, MCPToolError, MCPToolTimeoutError
@@ -1432,3 +1434,47 @@ def test_capability_branch_has_one_predicate_and_no_driver_name_path() -> None:
     assert source.count("if _command_streaming_required(evidence):") == 1
     assert "driver_name" not in source
     assert "driver_type" not in source
+
+
+def _observation(payload: dict[str, object]) -> bool | None:
+    """Return the H-A accessor's reading of one strictly parsed payload."""
+    return finalisation_command_streaming_observation(
+        SessionFinalisationResult.model_validate_json(json.dumps(payload))
+    )
+
+
+def test_streaming_observation_reads_trusted_final_evidence_only() -> None:
+    """H-A: the accessor returns the predicate value, or ``None`` without trusted evidence."""
+    assert _observation(_payload()) is False
+    assert _observation(_streaming_payload()) is True
+    absent = _streaming_payload()
+    absent["final_driver_evidence"] = None
+    assert _observation(absent) is None
+    for update in (
+        {"outcome": "unreadable", "error": "driver_state_unreadable", "evidence": None},
+        {"outcome": "read", "error": "late error"},
+        {"outcome": "read", "error": None, "evidence": None},
+        {"outcome": "unsupported"},
+    ):
+        untrusted = _streaming_payload()
+        final = cast("dict[str, object]", untrusted["final_driver_evidence"])
+        final.update(update)
+        assert _observation(untrusted) is None, update
+
+
+def test_streaming_observation_delegates_to_the_sole_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H-A: the accessor reads the capability only through the single predicate."""
+    seen: list[bool] = []
+
+    def spy(evidence: object) -> bool:
+        seen.append(True)
+        return True
+
+    monkeypatch.setattr(cold_mcp, "_command_streaming_required", spy)
+    assert _observation(_payload()) is True
+    assert seen == [True]
+    source = inspect.getsource(finalisation_command_streaming_observation)
+    assert "return _command_streaming_required(evidence)" in source
+    assert ".command_streaming_required" not in source
