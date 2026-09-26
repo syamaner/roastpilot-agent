@@ -182,23 +182,29 @@ def test_configs_and_rust_patterns_preserve_the_ratified_absolute_grammar() -> N
     }
     assert StrictMCPMirror.model_config == strict_config
     assert run_pattern.endswith(r"\Z")
+    assert run_rust_pattern.startswith(r"\A")
     assert run_rust_pattern.endswith(r"\z")
+    assert run_rust_pattern == r"\A[0-9]{8}T[0-9]{6}Z-[a-z0-9-]{1,48}\z"
     assert sha_pattern.endswith(r"\Z")
     assert sha_rust_pattern.endswith(r"\z")
-    payload = _common("tick")
-    payload["run_id"] += "\n"
-    with pytest.raises(pydantic.ValidationError):
-        evidence.ColdTickRecord(
-            **payload,
-            tick=0,
-            bean_temp_c=None,
-            env_temp_c=None,
-            heat_level_percent=0,
-            fan_level_percent=0,
-            cooling_on=False,
-            connected=True,
-            audio=evidence.project_tick_audio(_audio_payload()).audio,
-        )
+    for run_id in (
+        _common("tick")["run_id"] + "\n",
+        "../" + _common("tick")["run_id"],
+    ):
+        payload = _common("tick")
+        payload["run_id"] = run_id
+        with pytest.raises(pydantic.ValidationError):
+            evidence.ColdTickRecord(
+                **payload,
+                tick=0,
+                bean_temp_c=None,
+                env_temp_c=None,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=False,
+                connected=True,
+                audio=evidence.project_tick_audio(_audio_payload()).audio,
+            )
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
@@ -551,6 +557,95 @@ def test_validate_record_revalidates_constructed_nested_data_and_copies_maps() -
     )
     with pytest.raises(evidence.ColdEvidenceError):
         evidence.validate_record(typing.cast(evidence.ColdEvidenceRecord, advisory))
+
+
+@pytest.mark.parametrize(
+    ("field_name", "untyped_value"),
+    [
+        (
+            "canonical_byte_length",
+            str(len(_envelope(evidence.ColdEnvelopeKind.IDENTITY).canonical_json)),
+        ),
+        ("kind", evidence.ColdEnvelopeKind.IDENTITY.value),
+    ],
+)
+def test_validate_record_strictly_refuses_lax_coercible_nested_envelope_values(
+    field_name: str, untyped_value: object
+) -> None:
+    """Persistence admission refuses nested strings the lax adapter would coerce."""
+    envelope = _envelope(evidence.ColdEnvelopeKind.IDENTITY)
+    header = evidence.ColdRunHeader(**_common("header"), identity=envelope)
+    nested_payload = envelope.model_dump(mode="python") | {field_name: untyped_value}
+    payload = header.model_dump(mode="python") | {"identity": nested_payload}
+    adapter = getattr(evidence, "_" + "RECORD_ADAPTER")
+    assert isinstance(adapter.validate_python(payload), evidence.ColdRunHeader)
+
+    constructed_envelope = typing.cast(typing.Any, evidence.ColdSealedEnvelope).model_construct(
+        **nested_payload
+    )
+    constructed_header = typing.cast(typing.Any, evidence.ColdRunHeader).model_construct(
+        **(header.model_dump() | {"identity": constructed_envelope})
+    )
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(typing.cast(evidence.ColdEvidenceRecord, constructed_header))
+    assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED
+    assert raised.value.args == ("Cold evidence admission failed.",)
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+def test_raw_extraction_accounts_for_each_fixed_model_field_name_utf8_byte(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fixed model-field names consume the aggregate budget before adaptation."""
+    header_field_names = (
+        "schema_version",
+        "stream",
+        "run_id",
+        "phase",
+        "recorded_at_utc",
+        "monotonic_seconds",
+        "identity_sha256",
+        "identity",
+    )
+    envelope_field_names = (
+        "kind",
+        "schema_version",
+        "canonical_json",
+        "canonical_byte_length",
+        "sha256",
+    )
+    assert tuple(evidence.ColdRunHeader.model_fields) == header_field_names
+    assert tuple(evidence.ColdSealedEnvelope.model_fields) == envelope_field_names
+    expected_field_name_bytes = sum(
+        len(name.encode("utf-8")) for name in header_field_names + envelope_field_names
+    )
+
+    envelope = _envelope(evidence.ColdEnvelopeKind.IDENTITY)
+    header = evidence.ColdRunHeader(**_common("header"), identity=envelope)
+    expected_value_bytes = (
+        len(header.stream.encode("utf-8"))
+        + len(header.run_id.encode("utf-8"))
+        + len(header.recorded_at_utc.encode("utf-8"))
+        + len(header.identity_sha256.encode("utf-8"))
+        + len(envelope.canonical_json.encode("utf-8"))
+        + len(envelope.sha256.encode("utf-8"))
+        + (3 * (evidence.MAX_INT_DIGITS + 1))
+        + 32
+    )
+    expected_aggregate = expected_field_name_bytes + expected_value_bytes
+    extract = getattr(evidence, "_" + "extract_model")
+
+    aggregate = [0]
+    extracted = extract(header, aggregate)
+    assert extracted["identity"]["canonical_json"] == envelope.canonical_json
+    assert aggregate == [expected_aggregate]
+
+    monkeypatch.setattr(evidence, "MAX_INPUT_AGGREGATE_BYTES", expected_aggregate)
+    assert extract(header, [0])["identity"]["sha256"] == envelope.sha256
+    monkeypatch.setattr(evidence, "MAX_INPUT_AGGREGATE_BYTES", expected_aggregate - 1)
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        extract(header, [0])
+    assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_TOO_LARGE
 
 
 def test_validate_record_bounds_constructed_cycles_and_unknown_shapes_before_adapter() -> None:
