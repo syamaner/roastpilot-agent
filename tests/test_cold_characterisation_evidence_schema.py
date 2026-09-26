@@ -120,6 +120,42 @@ def test_projection_is_strict_and_preserves_unknown_keys_losslessly() -> None:
         evidence.ColdTickAudioSample.model_validate({**_audio_payload(), "extra": 1})
 
 
+def test_configs_and_rust_patterns_preserve_the_ratified_absolute_grammar() -> None:
+    """Schema configs match the strict mirror and Rust patterns keep absolute ends."""
+    from roastpilot_agent.cold_characterisation.mcp import StrictMCPMirror
+
+    model_config = getattr(evidence, "_" + "COLD_EVIDENCE_MODEL_CONFIG")
+    strict_config = getattr(evidence, "_" + "COLD_EVIDENCE_STRICT_CONFIG")
+    run_pattern = getattr(evidence, "_" + "RUN_ID_PATTERN")
+    run_rust_pattern = getattr(evidence, "_" + "RUN_ID_RUST_PATTERN")
+    sha_pattern = getattr(evidence, "_" + "SHA256_PATTERN")
+    sha_rust_pattern = getattr(evidence, "_" + "SHA256_RUST_PATTERN")
+    assert model_config == {
+        "frozen": True,
+        "extra": "forbid",
+        "allow_inf_nan": False,
+    }
+    assert StrictMCPMirror.model_config == strict_config
+    assert run_pattern.endswith(r"\Z")
+    assert run_rust_pattern.endswith(r"\z")
+    assert sha_pattern.endswith(r"\Z")
+    assert sha_rust_pattern.endswith(r"\z")
+    payload = _common("tick")
+    payload["run_id"] += "\n"
+    with pytest.raises(pydantic.ValidationError):
+        evidence.ColdTickRecord(
+            **payload,
+            tick=0,
+            bean_temp_c=None,
+            env_temp_c=None,
+            heat_level_percent=0,
+            fan_level_percent=0,
+            cooling_on=False,
+            connected=True,
+            audio=evidence.project_tick_audio(_audio_payload()).audio,
+        )
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
 def test_walker_rejects_nonfinite_values(value: float) -> None:
     """The pre-serialisation walker rejects every non-finite float."""
@@ -182,6 +218,8 @@ def test_walker_enforces_aggregate_text_and_pending_node_reservations(
         evidence.walk_json_value("aa")
     with pytest.raises(evidence.ColdEvidenceError):
         evidence.walk_json_value("é")
+    with pytest.raises(evidence.ColdEvidenceError):
+        evidence.walk_json_value(None)
     monkeypatch.setattr(evidence, "MAX_INPUT_AGGREGATE_BYTES", 524_288)
     monkeypatch.setattr(evidence, "MAX_JSON_NODES", 0)
     with pytest.raises(evidence.ColdEvidenceError):
@@ -192,10 +230,16 @@ def test_walker_enforces_aggregate_text_and_pending_node_reservations(
     with pytest.raises(evidence.ColdEvidenceError):
         evidence.walk_json_value({"key": None})
     monkeypatch.setattr(evidence, "MAX_JSON_NODES", 4096)
-    payload = _audio_payload()
-    payload["reason"] = "x" * (evidence.MAX_TEXT_FIELD_BYTES + 1)
-    with pytest.raises(evidence.ColdEvidenceError):
-        evidence.project_tick_audio(payload)
+    with pytest.raises(pydantic.ValidationError):
+        evidence.ColdSafetyEvaluation(
+            rule="all_clear",
+            verdict=evidence.ColdSafetyVerdict.ALLOW,
+            input_heat=0,
+            input_fan=0,
+            adjusted_heat=0,
+            adjusted_fan=0,
+            reason="x" * (evidence.MAX_TEXT_FIELD_BYTES + 1),
+        )
 
 
 def test_envelope_binds_length_digest_and_canonical_json() -> None:
@@ -210,6 +254,31 @@ def test_envelope_binds_length_digest_and_canonical_json() -> None:
     ):
         with pytest.raises((evidence.ColdEvidenceError, pydantic.ValidationError)):
             typing.cast(typing.Any, envelope.__class__)(**(envelope.model_dump() | changed))
+
+
+def test_projection_and_envelope_close_byte_and_unexpected_exception_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Map and envelope byte-cap failures use fixed closed errors."""
+    payload = _audio_payload()
+    payload["future"] = "x"
+    monkeypatch.setattr(evidence, "MAX_RAW_AUDIO_EXTRA_BYTES", 1)
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.project_tick_audio(payload)
+    assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_RAW_AUDIO_EXTRA_TOO_LARGE
+
+    constructed = evidence.ColdSealedEnvelope.model_construct(
+        kind=evidence.ColdEnvelopeKind.IDENTITY,
+        schema_version=1,
+        canonical_json="\ud800",
+        canonical_byte_length=1,
+        sha256="a" * 64,
+    )
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        typing.cast(
+            typing.Callable[[], object], getattr(constructed, "_" + "validate_canonical_bytes")
+        )()
+    assert raised.value.failure is evidence.ColdEvidenceFailure.ENVELOPE_NOT_CANONICAL
 
 
 def test_envelope_and_record_kind_pairing_fail_closed() -> None:
@@ -374,6 +443,142 @@ def test_raw_extraction_covers_closed_graph_shapes(monkeypatch: pytest.MonkeyPat
     with pytest.raises(evidence.ColdEvidenceError) as raised:
         evidence.validate_record(typing.cast(evidence.ColdEvidenceRecord, raw_reason))
     assert raised.value.failure is evidence.ColdEvidenceFailure.ABORT_DOMAIN_REASON_MISMATCHED
+
+
+def test_raw_extraction_refuses_all_constructed_shape_and_budget_breaches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every hostile constructed graph shape is refused before strict adaptation."""
+    tick = _tick()
+    extract = getattr(evidence, "_" + "extract_model")
+
+    missing = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(**tick.model_dump())
+    object.__getattribute__(missing, "__dict__").pop("tick")
+    with pytest.raises(evidence.ColdEvidenceError):
+        extract(missing, [0])
+
+    absent = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(**tick.model_dump())
+    absent_data = object.__getattribute__(absent, "__dict__")
+    absent_data.pop("tick")
+    absent_data["unexpected"] = 0
+    with pytest.raises(evidence.ColdEvidenceError):
+        extract(absent, [0])
+
+    unexpected = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
+        **tick.model_dump()
+    )
+    object.__getattribute__(unexpected, "__dict__")["unexpected"] = 1
+    with pytest.raises(evidence.ColdEvidenceError):
+        extract(unexpected, [0])
+
+    wrong_name = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
+        **tick.model_dump()
+    )
+    wrong_data = object.__getattribute__(wrong_name, "__dict__")
+    wrong_data.pop("tick")
+    wrong_data[type("Key", (str,), {})("tick")] = 0
+    with pytest.raises(evidence.ColdEvidenceError):
+        extract(wrong_name, [0])
+
+    wrong_dict = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
+        **tick.model_dump()
+    )
+    object.__setattr__(wrong_dict, "__pydantic_extra__", [])
+    with pytest.raises(evidence.ColdEvidenceError):
+        extract(wrong_dict, [0])
+
+    extra = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(**tick.model_dump())
+    object.__setattr__(extra, "__pydantic_extra__", {"unexpected": 1})
+    with pytest.raises(evidence.ColdEvidenceError):
+        extract(extra, [0])
+
+    for hostile in (
+        {str(index): None for index in range(evidence.MAX_COLLECTION_LENGTH + 1)},
+        {"vendor": [None] * (evidence.MAX_COLLECTION_LENGTH + 1)},
+        {"vendor": {"x": [None] * (evidence.MAX_COLLECTION_LENGTH + 1)}},
+        {"vendor": {1: "bad"}},
+        {"vendor": {"x" * (evidence.MAX_JSON_KEY_BYTES + 1): 1}},
+        {"vendor": 10**evidence.MAX_INT_DIGITS},
+        {"vendor": float("nan")},
+    ):
+        constructed = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
+            **(tick.model_dump() | {"raw_vendor_data": hostile})
+        )
+        with pytest.raises(evidence.ColdEvidenceError):
+            extract(constructed, [0])
+
+    deep: object = []
+    for _ in range(evidence.MAX_JSON_DEPTH + 1):
+        deep = [deep]
+    constructed = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
+        **(tick.model_dump() | {"raw_vendor_data": {"deep": deep}})
+    )
+    with pytest.raises(evidence.ColdEvidenceError):
+        extract(constructed, [0])
+
+    class MappingSubclass(dict[str, object]):
+        """Hostile non-exact mapping for raw extraction."""
+
+    for hostile in (MappingSubclass(), object()):
+        constructed = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
+            **(tick.model_dump() | {"raw_vendor_data": hostile})
+        )
+        with pytest.raises(evidence.ColdEvidenceError):
+            extract(constructed, [0])
+
+    monkeypatch.setattr(evidence, "MAX_INPUT_AGGREGATE_BYTES", 10)
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        extract(tick, [0])
+    assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_TOO_LARGE
+    monkeypatch.setattr(evidence, "MAX_INPUT_AGGREGATE_BYTES", 524_288)
+    monkeypatch.setattr(evidence, "MAX_JSON_NODES", 0)
+    with pytest.raises(evidence.ColdEvidenceError):
+        extract(tick, [0])
+    root_aggregate = [0]
+    root_fields = getattr(evidence, "_" + "extract_model_fields")(tick, root_aggregate)
+    monkeypatch.setattr(evidence, "MAX_JSON_NODES", len(root_fields) + 21)
+    map_record = tick.model_copy(update={"raw_vendor_data": {"one": 1}})
+    with pytest.raises(evidence.ColdEvidenceError):
+        extract(map_record, [0])
+    list_record = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
+        **(tick.model_dump() | {"raw_vendor_data": [1]})
+    )
+    with pytest.raises(evidence.ColdEvidenceError):
+        extract(list_record, [0])
+
+    host = evidence.ColdHostRecord(
+        **_common("host"),
+        sample=evidence.ColdHostSample(
+            captured_at_utc="now",
+            monotonic_seconds=1.0,
+            soc_temp_c=1.0,
+            throttled_word_hex="0x0",
+            mem_available_bytes=1,
+            free_bytes=1,
+        ),
+    )
+    host_fields = getattr(evidence, "_" + "extract_model_fields")(host, [0])
+    monkeypatch.setattr(evidence, "MAX_JSON_NODES", len(host_fields) + 2)
+    with pytest.raises(evidence.ColdEvidenceError):
+        extract(host, [0])
+    monkeypatch.setattr(evidence, "MAX_JSON_NODES", 4_096)
+    monkeypatch.setattr(evidence, "MAX_JSON_DEPTH", 1)
+    with pytest.raises(evidence.ColdEvidenceError):
+        extract(tick, [0])
+
+    aggregate = [0]
+    getattr(evidence, "_" + "extract_model_fields")(tick, aggregate)
+    with pytest.raises(evidence.ColdEvidenceError):
+        extract(tick, [evidence.MAX_INPUT_AGGREGATE_BYTES - aggregate[0] - 1])
+
+
+def test_audio_reason_is_not_a_new_schema_owned_text_cap() -> None:
+    """Mirrored MCP audio text remains limited only by aggregate and record budgets."""
+    payload = _audio_payload()
+    payload["reason"] = "x" * (evidence.MAX_TEXT_FIELD_BYTES + 1)
+    tick = _tick().model_copy(update={"audio": evidence.project_tick_audio(payload).audio})
+    validated = typing.cast(evidence.ColdTickRecord, evidence.validate_record(tick))
+    assert validated.audio.reason == payload["reason"]
 
 
 def test_persisted_raw_empty_container_at_exact_depth_is_admitted() -> None:

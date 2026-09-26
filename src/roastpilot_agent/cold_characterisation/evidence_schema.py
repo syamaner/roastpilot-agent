@@ -27,12 +27,12 @@ MAX_INT_DIGITS = 32
 MAX_COLLECTION_LENGTH = 1_024
 _RUN_ID_PATTERN = r"\A[0-9]{8}T[0-9]{6}Z-[a-z0-9-]{1,48}\Z"
 _SHA256_PATTERN = r"\A[0-9a-f]{64}\Z"
+_RUN_ID_RUST_PATTERN = _RUN_ID_PATTERN.removesuffix(r"\Z") + r"\z"
+_SHA256_RUST_PATTERN = _SHA256_PATTERN.removesuffix(r"\Z") + r"\z"
 
-_COLD_EVIDENCE_MODEL_CONFIG = pydantic.ConfigDict(
-    frozen=True, extra="forbid", allow_inf_nan=False, regex_engine="python-re"
-)
+_COLD_EVIDENCE_MODEL_CONFIG = pydantic.ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 _COLD_EVIDENCE_STRICT_CONFIG = pydantic.ConfigDict(
-    frozen=True, extra="forbid", allow_inf_nan=False, strict=True, regex_engine="python-re"
+    frozen=True, extra="forbid", allow_inf_nan=False, strict=True
 )
 
 
@@ -294,7 +294,7 @@ def _walk_json_value(value: ColdJsonValue, aggregate: list[int]) -> None:
         nodes += 1
         if nodes > MAX_JSON_NODES:
             raise _closed(ColdEvidenceFailure.JSON_NODE_LIMIT_EXCEEDED)
-        if depth > MAX_JSON_DEPTH:
+        if depth > MAX_JSON_DEPTH:  # pragma: no cover - guarded pushes never exceed depth.
             raise _closed(ColdEvidenceFailure.JSON_DEPTH_EXCEEDED)
         if current is None or type(current) is bool:
             aggregate[0] += 5
@@ -356,7 +356,7 @@ class ColdTickAudioSample(pydantic.BaseModel):
     detected_at_utc: str | None
     detected_monotonic_seconds: float | None
     allow_manual_override: bool
-    reason: str | None = pydantic.Field(max_length=MAX_TEXT_FIELD_BYTES)
+    reason: str | None
     audio_running: bool
     queued_window_count: int
     emitted_window_count: int
@@ -455,7 +455,7 @@ class ColdSealedEnvelope(pydantic.BaseModel):
     schema_version: typing.Literal[1]
     canonical_json: str
     canonical_byte_length: int = pydantic.Field(ge=0)
-    sha256: str = pydantic.Field(pattern=_SHA256_PATTERN)
+    sha256: str = pydantic.Field(pattern=_SHA256_RUST_PATTERN)
 
     @pydantic.model_validator(mode="after")
     def _validate_canonical_bytes(self) -> typing.Self:
@@ -515,11 +515,11 @@ class ColdRunHeader(pydantic.BaseModel):
 
     schema_version: typing.Literal[1]
     stream: typing.Literal["header"]
-    run_id: str = pydantic.Field(pattern=_RUN_ID_PATTERN)
+    run_id: str = pydantic.Field(pattern=_RUN_ID_RUST_PATTERN)
     phase: ColdPhaseKind
     recorded_at_utc: str = pydantic.Field(max_length=MAX_TEXT_FIELD_BYTES)
     monotonic_seconds: float
-    identity_sha256: str = pydantic.Field(pattern=_SHA256_PATTERN)
+    identity_sha256: str = pydantic.Field(pattern=_SHA256_RUST_PATTERN)
     identity: ColdSealedEnvelope
 
     @pydantic.model_validator(mode="after")
@@ -537,11 +537,11 @@ class ColdTickRecord(pydantic.BaseModel):
 
     schema_version: typing.Literal[1]
     stream: typing.Literal["tick"]
-    run_id: str = pydantic.Field(pattern=_RUN_ID_PATTERN)
+    run_id: str = pydantic.Field(pattern=_RUN_ID_RUST_PATTERN)
     phase: ColdPhaseKind
     recorded_at_utc: str = pydantic.Field(max_length=MAX_TEXT_FIELD_BYTES)
     monotonic_seconds: float
-    identity_sha256: str = pydantic.Field(pattern=_SHA256_PATTERN)
+    identity_sha256: str = pydantic.Field(pattern=_SHA256_RUST_PATTERN)
     tick: int = pydantic.Field(ge=0)
     bean_temp_c: float | None
     env_temp_c: float | None
@@ -561,11 +561,11 @@ class ColdHostRecord(pydantic.BaseModel):
 
     schema_version: typing.Literal[1]
     stream: typing.Literal["host"]
-    run_id: str = pydantic.Field(pattern=_RUN_ID_PATTERN)
+    run_id: str = pydantic.Field(pattern=_RUN_ID_RUST_PATTERN)
     phase: ColdPhaseKind
     recorded_at_utc: str = pydantic.Field(max_length=MAX_TEXT_FIELD_BYTES)
     monotonic_seconds: float
-    identity_sha256: str = pydantic.Field(pattern=_SHA256_PATTERN)
+    identity_sha256: str = pydantic.Field(pattern=_SHA256_RUST_PATTERN)
     sample: ColdHostSample
 
 
@@ -576,11 +576,11 @@ class ColdAdvisoryRecord(pydantic.BaseModel):
 
     schema_version: typing.Literal[1]
     stream: typing.Literal["advisory"]
-    run_id: str = pydantic.Field(pattern=_RUN_ID_PATTERN)
+    run_id: str = pydantic.Field(pattern=_RUN_ID_RUST_PATTERN)
     phase: ColdPhaseKind
     recorded_at_utc: str = pydantic.Field(max_length=MAX_TEXT_FIELD_BYTES)
     monotonic_seconds: float
-    identity_sha256: str = pydantic.Field(pattern=_SHA256_PATTERN)
+    identity_sha256: str = pydantic.Field(pattern=_SHA256_RUST_PATTERN)
     requested_heat: int = pydantic.Field(ge=0, le=100)
     requested_fan: int = pydantic.Field(ge=0, le=100)
     should_drop: bool
@@ -597,11 +597,11 @@ class ColdFinalisationRecord(pydantic.BaseModel):
 
     schema_version: typing.Literal[1]
     stream: typing.Literal["finalisation"]
-    run_id: str = pydantic.Field(pattern=_RUN_ID_PATTERN)
+    run_id: str = pydantic.Field(pattern=_RUN_ID_RUST_PATTERN)
     phase: ColdPhaseKind
     recorded_at_utc: str = pydantic.Field(max_length=MAX_TEXT_FIELD_BYTES)
     monotonic_seconds: float
-    identity_sha256: str = pydantic.Field(pattern=_SHA256_PATTERN)
+    identity_sha256: str = pydantic.Field(pattern=_SHA256_RUST_PATTERN)
     session_id: str = pydantic.Field(max_length=MAX_TEXT_FIELD_BYTES)
     envelope: ColdSealedEnvelope
     status: ColdFinalisationStatus
@@ -624,11 +624,11 @@ class ColdAbortRecord(pydantic.BaseModel):
 
     schema_version: typing.Literal[1]
     stream: typing.Literal["abort"]
-    run_id: str = pydantic.Field(pattern=_RUN_ID_PATTERN)
+    run_id: str = pydantic.Field(pattern=_RUN_ID_RUST_PATTERN)
     phase: ColdPhaseKind
     recorded_at_utc: str = pydantic.Field(max_length=MAX_TEXT_FIELD_BYTES)
     monotonic_seconds: float
-    identity_sha256: str = pydantic.Field(pattern=_SHA256_PATTERN)
+    identity_sha256: str = pydantic.Field(pattern=_SHA256_RUST_PATTERN)
     domain: ColdAbortDomain
     reason: (
         ColdHostAbortReason
@@ -715,13 +715,11 @@ _ADMITTED_ENUM_TYPES = (
 
 
 def _store_extracted(
-    parent: dict[str, object] | list[object] | None,
+    parent: dict[str, object] | list[object],
     slot: str | None,
     value: object,
 ) -> object:
     """Attach one copied graph node without rendering its source value."""
-    if parent is None:
-        return value
     if type(parent) is dict and type(slot) is str:
         parent[slot] = value
     elif type(parent) is list and slot is None:
@@ -731,48 +729,60 @@ def _store_extracted(
     return value
 
 
+def _extract_model_fields(
+    model: pydantic.BaseModel, aggregate: list[int]
+) -> tuple[tuple[str, object], ...]:
+    """Return one exact model's declared raw fields after bounded accounting."""
+    expected = _MODEL_FIELDS[type(model)]
+    data = object.__getattribute__(model, "__dict__")
+    extra = object.__getattribute__(model, "__pydantic_extra__")
+    if type(data) is not dict or (extra is not None and type(extra) is not dict):
+        raise _closed(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    raw_data = typing.cast(dict[object, object], data)
+    raw_extra = typing.cast(dict[object, object] | None, extra)
+    if len(raw_data) != len(expected) or raw_extra:
+        raise _closed(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    for name in expected:
+        if name not in raw_data:
+            raise _closed(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+        _admit_text(name, aggregate)
+    for name in raw_data:
+        if type(name) is not str or name not in expected:
+            raise _closed(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    return tuple((name, raw_data[name]) for name in expected)
+
+
 def _extract_model(value: pydantic.BaseModel, aggregate: list[int]) -> dict[str, object]:
     """Iteratively copy a bounded admitted model graph before any adapter runs."""
-    root: object | None = None
-    nodes = 0
+    root: dict[str, object] = {}
+    root_fields = _extract_model_fields(value, aggregate)
+    nodes = 1
+    if nodes + len(root_fields) > MAX_JSON_NODES:
+        raise _closed(ColdEvidenceFailure.JSON_NODE_LIMIT_EXCEEDED)
     stack: list[
-        tuple[object, int, dict[str, object] | list[object] | None, str | None, str | None]
-    ] = [(value, 0, None, None, None)]
+        tuple[
+            object,
+            int,
+            dict[str, object] | list[object],
+            str | None,
+            type[pydantic.BaseModel] | None,
+            str | None,
+        ]
+    ] = [(raw_value, 1, root, name, type(value), name) for name, raw_value in reversed(root_fields)]
     while stack:
-        current, depth, parent, slot, field_name = stack.pop()
+        current, depth, parent, slot, owner, field_name = stack.pop()
         nodes += 1
-        if nodes > MAX_JSON_NODES:
-            raise _closed(ColdEvidenceFailure.JSON_NODE_LIMIT_EXCEEDED)
-        if depth > MAX_JSON_DEPTH:
-            raise _closed(ColdEvidenceFailure.JSON_DEPTH_EXCEEDED)
         if type(current) in _NESTED_CLASSES:
             model = typing.cast(pydantic.BaseModel, current)
-            expected = _MODEL_FIELDS[type(model)]
-            data = object.__getattribute__(model, "__dict__")
-            extra = object.__getattribute__(model, "__pydantic_extra__")
-            if type(data) is not dict or (extra is not None and type(extra) is not dict):
-                raise _closed(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
-            raw_data = typing.cast(dict[object, object], data)
-            raw_extra = typing.cast(dict[object, object] | None, extra)
-            if len(raw_data) != len(expected) or raw_extra:
-                raise _closed(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
-            for name in expected:
-                if name not in raw_data:
-                    raise _closed(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
-                _admit_text(name, aggregate)
+            fields = _extract_model_fields(model, aggregate)
             if depth >= MAX_JSON_DEPTH:
                 raise _closed(ColdEvidenceFailure.JSON_DEPTH_EXCEEDED)
-            if nodes + len(stack) + len(expected) > MAX_JSON_NODES:
+            if nodes + len(stack) + len(fields) > MAX_JSON_NODES:
                 raise _closed(ColdEvidenceFailure.JSON_NODE_LIMIT_EXCEEDED)
             copied_model: dict[str, object] = {}
-            root = _store_extracted(parent, slot, copied_model) if parent is None else root
-            if parent is not None:
-                _store_extracted(parent, slot, copied_model)
-            for name, _raw in raw_data.items():
-                if type(name) is not str or name not in expected:
-                    raise _closed(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
-            for name in reversed(expected):
-                stack.append((raw_data[name], depth + 1, copied_model, name, name))
+            _store_extracted(parent, slot, copied_model)
+            for name, raw_value in reversed(fields):
+                stack.append((raw_value, depth + 1, copied_model, name, type(model), name))
         elif type(current) is dict:
             mapping = typing.cast(dict[object, object], current)
             if len(mapping) > MAX_COLLECTION_LENGTH:
@@ -782,9 +792,7 @@ def _extract_model(value: pydantic.BaseModel, aggregate: list[int]) -> dict[str,
             if nodes + len(stack) + len(mapping) > MAX_JSON_NODES:
                 raise _closed(ColdEvidenceFailure.JSON_NODE_LIMIT_EXCEEDED)
             copied_map: dict[str, object] = {}
-            root = _store_extracted(parent, slot, copied_map) if parent is None else root
-            if parent is not None:
-                _store_extracted(parent, slot, copied_map)
+            _store_extracted(parent, slot, copied_map)
             map_items: list[tuple[str, object]] = []
             for key, child in mapping.items():
                 if type(key) is not str:
@@ -794,7 +802,7 @@ def _extract_model(value: pydantic.BaseModel, aggregate: list[int]) -> dict[str,
                     raise _closed(ColdEvidenceFailure.JSON_KEY_INVALID)
                 map_items.append((key, child))
             for key, child in reversed(map_items):
-                stack.append((child, depth + 1, copied_map, key, None))
+                stack.append((child, depth + 1, copied_map, key, None, None))
         elif type(current) is list:
             items = typing.cast(list[object], current)
             if len(items) > MAX_COLLECTION_LENGTH:
@@ -804,53 +812,50 @@ def _extract_model(value: pydantic.BaseModel, aggregate: list[int]) -> dict[str,
             if nodes + len(stack) + len(items) > MAX_JSON_NODES:
                 raise _closed(ColdEvidenceFailure.JSON_NODE_LIMIT_EXCEEDED)
             copied_list: list[object] = []
-            root = _store_extracted(parent, slot, copied_list) if parent is None else root
-            if parent is not None:
-                _store_extracted(parent, slot, copied_list)
+            _store_extracted(parent, slot, copied_list)
             for child in reversed(items):
-                stack.append((child, depth + 1, copied_list, None, None))
+                stack.append((child, depth + 1, copied_list, None, None, None))
         elif type(current) is str:
             maximum = (
                 MAX_TEXT_FIELD_BYTES
-                if field_name in {"recorded_at_utc", "session_id", "rule", "reason"}
+                if (owner, field_name)
+                in {
+                    (ColdRunHeader, "recorded_at_utc"),
+                    (ColdTickRecord, "recorded_at_utc"),
+                    (ColdHostRecord, "recorded_at_utc"),
+                    (ColdAdvisoryRecord, "recorded_at_utc"),
+                    (ColdFinalisationRecord, "recorded_at_utc"),
+                    (ColdAbortRecord, "recorded_at_utc"),
+                    (ColdFinalisationRecord, "session_id"),
+                    (ColdSafetyEvaluation, "rule"),
+                    (ColdSafetyEvaluation, "reason"),
+                }
                 else None
             )
             _admit_text(current, aggregate, maximum)
-            root = _store_extracted(parent, slot, current) if parent is None else root
-            if parent is not None:
-                _store_extracted(parent, slot, current)
+            _store_extracted(parent, slot, current)
         elif current is None or type(current) is bool:
             aggregate[0] += 5
-            root = _store_extracted(parent, slot, current) if parent is None else root
-            if parent is not None:
-                _store_extracted(parent, slot, current)
+            _store_extracted(parent, slot, current)
         elif type(current) is int:
             if current > 10**MAX_INT_DIGITS - 1 or current < -(10**MAX_INT_DIGITS - 1):
                 raise _closed(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
             aggregate[0] += MAX_INT_DIGITS + 1
-            root = _store_extracted(parent, slot, current) if parent is None else root
-            if parent is not None:
-                _store_extracted(parent, slot, current)
+            _store_extracted(parent, slot, current)
         elif type(current) is float:
             if not math.isfinite(current):
                 raise _closed(ColdEvidenceFailure.JSON_VALUE_NOT_FINITE)
             aggregate[0] += 32
-            root = _store_extracted(parent, slot, current) if parent is None else root
-            if parent is not None:
-                _store_extracted(parent, slot, current)
+            _store_extracted(parent, slot, current)
         elif type(current) in _ADMITTED_ENUM_TYPES:
-            root = _store_extracted(parent, slot, current) if parent is None else root
-            if parent is not None:
-                _store_extracted(parent, slot, current)
+            _store_extracted(parent, slot, current)
         elif isinstance(current, (collections.abc.Mapping, collections.abc.Sequence)):
             raise _closed(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
         else:
             raise _closed(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
         if aggregate[0] > MAX_INPUT_AGGREGATE_BYTES:
             raise _closed(ColdEvidenceFailure.RECORD_TOO_LARGE)
-    if type(root) is not dict:
-        raise _closed(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
-    return typing.cast(dict[str, object], root)
+    return root
 
 
 def _copy_json_value(value: ColdJsonValue) -> ColdJsonValue:
