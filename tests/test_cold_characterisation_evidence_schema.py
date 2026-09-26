@@ -1,6 +1,7 @@
 """Behavioural tests for the closed cold evidence schema boundary."""
 
 import ast
+import enum
 import hashlib
 import inspect
 import json
@@ -882,6 +883,28 @@ def test_contract_annotations_union_and_all_anchored_consumers_are_exact() -> No
             if type(metadata).__name__ != "MaxLen"
         )
         assert actual_metadata == tuple(SafetyEvaluation.model_fields[name].metadata)
+    assert (
+        evidence.ColdSafetyEvaluation.model_fields["verdict"].annotation
+        is evidence.ColdSafetyVerdict
+    )
+    for enum_type in (
+        evidence.ColdAudioField,
+        evidence.ColdEvidenceFailure,
+        evidence.ColdMcpAbortReason,
+        evidence.ColdHostAbortReason,
+        evidence.ColdIdentityAbortReason,
+        evidence.ColdPhaseKind,
+        evidence.ColdEvidenceStream,
+        evidence.ColdEnvelopeKind,
+        evidence.ColdCapabilityBranch,
+        evidence.ColdFinalisationStatus,
+        evidence.ColdSafetyVerdict,
+        evidence.ColdAdvisorFailureKind,
+        evidence.ColdAbortDomain,
+        evidence.ColdOperatorAbortReason,
+    ):
+        assert issubclass(enum_type, enum.Enum)
+        assert not issubclass(enum_type, enum.StrEnum)
     assert (
         evidence.ColdSafetyEvaluation.model_fields["rule"].metadata[-1].max_length
         == evidence.MAX_TEXT_FIELD_BYTES
