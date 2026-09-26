@@ -22,6 +22,7 @@ import pydantic
 from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdCapabilityBranch,
     ColdEnvelopeKind,
+    ColdEvidenceError,
     ColdEvidenceRecord,
     ColdFinalisationRecord,
     ColdFinalisationStatus,
@@ -129,6 +130,28 @@ def _guard(
     else:
         return value
     raise ColdEvidenceStoreError(failure)
+
+
+def _release(descriptor: int) -> bool:
+    """Close one descriptor exactly once, reporting (never raising) a close failure.
+
+    A failed close is never retried: the kernel may already have released the
+    number, which could then belong to an unrelated later open.  A ``False`` result
+    therefore proves nothing about the descriptor's final kernel state.
+    """
+    try:
+        os.close(descriptor)
+    except OSError:
+        return False
+    return True
+
+
+def _release_all(descriptors: collections.abc.Iterable[int]) -> bool:
+    """Attempt every descriptor exactly once; ``False`` if any release failed."""
+    released = True
+    for descriptor in descriptors:
+        released = _release(descriptor) and released
+    return released
 
 
 def _open_at(name: str, flags: int, dir_fd: int, failure: ColdEvidenceStoreFailure) -> int:
@@ -409,13 +432,13 @@ def _open_absolute_directory(path: str, lineage: list[tuple[int, int]] | None = 
                     component, flags, parent, ColdEvidenceStoreFailure.ROOT_UNUSABLE
                 )
             finally:
-                os.close(parent)
+                _release(parent)
             owned = True
             if lineage is not None:
                 lineage.append(_directory_identity(descriptor))
     except BaseException:
         if owned:
-            os.close(descriptor)
+            _release(descriptor)
         raise
     return descriptor
 
@@ -485,7 +508,7 @@ def admit_evidence_root(root: str, *, protected_roots: tuple[str, ...] = ()) -> 
     identities = _protected_identities(protected)
     lineage: list[tuple[int, int]] = []
     descriptor = _open_absolute_directory(root, lineage)
-    os.close(descriptor)
+    _release(descriptor)
     if identities.intersection(lineage):
         raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ROOT_PROTECTED)
     return ColdAdmittedRoot(root, real, token=_ADMISSION_TOKEN, lineage=tuple(lineage))
@@ -974,14 +997,14 @@ def _open_node_directory(
             try:
                 descriptor = _open_at(segment, flags, parent, changed)
             finally:
-                os.close(parent)
+                _release(parent)
             owned = True
             walked.append(segment)
         if _fstat(descriptor, changed) != nodes.get("/".join(walked)):
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.SEAL_TREE_CHANGED)
     except BaseException:
         if owned:
-            os.close(descriptor)
+            _release(descriptor)
         raise
     return descriptor
 
@@ -997,7 +1020,7 @@ def _enumerate(run_fd: int, rules: _TreeRules) -> dict[str, _NodeStat]:
             with _scan_directory(directory, rules.invalid) as scan:
                 _scan_entries(scan, directory, segments, nodes, pending, rules)
         finally:
-            os.close(directory)
+            _release(directory)
     return nodes
 
 
@@ -1073,7 +1096,7 @@ def _read_node(
             segments[-1], _file_read_flags(), parent, ColdEvidenceStoreFailure.FILE_CHANGED
         )
     finally:
-        os.close(parent)
+        _release(parent)
     try:
         before = _fstat(descriptor, ColdEvidenceStoreFailure.FILE_CHANGED)
         if before != expected:
@@ -1102,7 +1125,7 @@ def _read_node(
         if after != before:
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.FILE_CHANGED)
     finally:
-        os.close(descriptor)
+        _release(descriptor)
     return digest.hexdigest(), bytes(retained) if retained is not None else None
 
 
@@ -1122,7 +1145,7 @@ def _open_run_directory(
     try:
         return _open_at(run_id, _directory_flags(), root_fd, failure)
     finally:
-        os.close(root_fd)
+        _release(root_fd)
 
 
 # ------------------------------------------------------------------ manifest
@@ -1255,7 +1278,7 @@ def _make_directory(parent: int, name: str) -> int:
         _require_owned(descriptor, directory=True, mode=0o700)
         os.fsync(parent)
     except BaseException:
-        os.close(descriptor)
+        _release(descriptor)
         raise
     return descriptor
 
@@ -1268,7 +1291,7 @@ def _create_file(parent: int, name: str, *, append: bool) -> int:
         _require_owned(descriptor, directory=False, mode=0o600)
         os.fsync(parent)
     except BaseException:
-        os.close(descriptor)
+        _release(descriptor)
         raise
     return descriptor
 
@@ -1319,26 +1342,42 @@ class ColdEvidenceWriter:
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITER_POISONED)
         return self._run_fd
 
-    def _close_streams(self) -> None:
-        """Close every stream and layout descriptor."""
-        for descriptor in (
-            *self._stream_fds.values(),
-            *self._phase_fds.values(),
-            *([self._records_fd] if self._records_fd is not None else []),
-        ):
-            os.close(descriptor)
+    def _detach_streams(self) -> list[int]:
+        """Remove every stream and layout descriptor from ownership, returning them."""
+        detached = [*self._stream_fds.values(), *self._phase_fds.values()]
+        if self._records_fd is not None:
+            detached.append(self._records_fd)
         self._stream_fds = {}
         self._phase_fds = {}
         self._records_fd = None
+        return detached
+
+    def _detach_all(self) -> list[int]:
+        """Remove every owned descriptor, the run directory's last, returning them."""
+        detached = self._detach_streams()
+        if self._run_fd is not None:
+            detached.append(self._run_fd)
+            self._run_fd = None
+        return detached
+
+    def _abandon(self) -> None:
+        """Poison, then release every owned descriptor once; never raises OSError."""
+        self._poisoned = True
+        _release_all(self._detach_all())
 
     def close(self) -> None:
-        """Release every descriptor; an unsealed writer becomes unusable."""
-        self._close_streams()
-        if self._run_fd is not None:
-            os.close(self._run_fd)
-            self._run_fd = None
+        """Release every descriptor once; an unsealed writer becomes unusable.
+
+        Ownership is detached before any release, so a repeated call is a no-op and
+        never retries a descriptor number.
+
+        Raises:
+            ColdEvidenceStoreError: ``WRITE_FAILED`` if any release reported failure.
+        """
         if not self._sealed:
             self._poisoned = True
+        if not _release_all(self._detach_all()):
+            raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
 
     def _stream_fd(self, run_fd: int, phase: ColdPhaseKind, stream: str) -> int:
         """Return one stream descriptor, creating its layout lazily."""
@@ -1368,16 +1407,24 @@ class ColdEvidenceWriter:
         """
         run_fd = self._require_writable()
         snapshot = validate_record(record)
-        check_record_binding(self._state, snapshot, writer_root=self._root_path)
-        line = (canonical_json(snapshot.model_dump(mode="json")) + "\n").encode("utf-8")
+        try:
+            check_record_binding(self._state, snapshot, writer_root=self._root_path)
+        except (ColdEvidenceStoreError, ColdEvidenceError):
+            raise
+        except BaseException:
+            self._abandon()
+            raise
         failed = False
         try:
+            line = (canonical_json(snapshot.model_dump(mode="json")) + "\n").encode("utf-8")
             _write_all(self._stream_fd(run_fd, snapshot.phase, snapshot.stream), line)
         except (OSError, ValueError, ColdEvidenceStoreError):
             failed = True
+        except BaseException:
+            self._abandon()
+            raise
         if failed:
-            self._poisoned = True
-            self.close()
+            self._abandon()
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
 
     def seal(self) -> ColdSealedRun:
@@ -1390,15 +1437,18 @@ class ColdEvidenceWriter:
             ColdEvidenceStoreError: If the writer is unusable or sealing fails (then poisoned).
         """
         run_fd = self._require_writable()
+        sealed: ColdSealedRun | None = None
         try:
-            self._close_streams()
-            sealed = self._seal(run_fd)
+            if _release_all(self._detach_streams()):
+                sealed = self._seal(run_fd)
         except BaseException:
-            self._poisoned = True
-            self.close()
+            self._abandon()
             raise
+        if sealed is None:
+            self._abandon()
+            raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
         self._sealed = True
-        self.close()
+        _release_all(self._detach_all())
         return sealed
 
     def _seal(self, run_fd: int) -> ColdSealedRun:
@@ -1452,8 +1502,11 @@ class ColdEvidenceWriter:
                 descriptor = _create_file(run_fd, name, append=False)
                 try:
                     _write_all(descriptor, data)
-                finally:
-                    os.close(descriptor)
+                except BaseException:
+                    _release(descriptor)
+                    raise
+                if not _release(descriptor):
+                    raise OSError("artefact close failed")
             os.fsync(run_fd)
         except (OSError, ValueError, ColdEvidenceStoreError):
             failed = True
@@ -1512,14 +1565,14 @@ def open_run(root: ColdAdmittedRoot, run_id: str) -> ColdEvidenceWriter:
             run_id, _directory_flags(), root_fd, ColdEvidenceStoreFailure.ROOT_UNUSABLE
         )
     finally:
-        os.close(root_fd)
+        _release(root_fd)
     try:
         _guard(
             lambda: _require_owned_after_chmod(run_fd),
             ColdEvidenceStoreFailure.OWNERSHIP_OR_MODE_MISMATCH,
         )
     except BaseException:
-        os.close(run_fd)
+        _release(run_fd)
         raise
     return ColdEvidenceWriter(
         root_path=root.path, run_id=run_id, run_fd=run_fd, token=_ADMISSION_TOKEN
@@ -1617,7 +1670,7 @@ def _verify_admitted_tree(
         if _enumerate(run_fd, _VERIFY_RULES) != first:
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.SEAL_TREE_CHANGED)
     finally:
-        os.close(run_fd)
+        _release(run_fd)
     return ColdVerifiedTree(
         root=root,
         manifest=manifest,
@@ -1685,7 +1738,7 @@ def _reread_entry(
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.FILE_CHANGED)
         digest, data = _read_node(run_fd, relative_path, nodes, retain=retain, sink=sink)
     finally:
-        os.close(run_fd)
+        _release(run_fd)
     if digest != entry.sha256:
         raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.FILE_DIGEST_MISMATCHED)
     return data
@@ -1781,7 +1834,7 @@ def _run_directory_identity(root: ColdAdmittedRoot, run_id: str) -> tuple[int, i
     try:
         node = _fstat(run_fd, ColdEvidenceStoreFailure.INVENTORY_MISMATCHED)
     finally:
-        os.close(run_fd)
+        _release(run_fd)
     return node.dev, node.ino
 
 

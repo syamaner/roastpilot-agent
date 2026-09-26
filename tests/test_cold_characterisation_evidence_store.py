@@ -1085,6 +1085,7 @@ def test_verification_and_reading_modify_nothing(tmp_path: Path) -> None:
     before = snapshot_tree(root, laptop)
     store.verify_retained_copies(root, laptop, run_id=RUN_ID, expected_manifest_sha256=digest)
     reader.read_retained_run(laptop, run_id=RUN_ID, expected_manifest_sha256=digest)
+    assert snapshot_tree(root, laptop) == before
     _flip(run_dir(laptop) / "records/recording_on/tick.jsonl")
     during = snapshot_tree(root, laptop)
     with pytest.raises(store.ColdEvidenceStoreError):
@@ -2008,3 +2009,248 @@ def test_seal_admits_exactly_the_entry_and_file_byte_bounds(
     )
     assert len(verified.manifest.entries) == 3
     assert max(entry.size_bytes for entry in verified.manifest.entries) == largest
+
+
+# ------------------------------------------------ descriptor release discipline
+
+
+class _CloseFaults:
+    """Record every close attempt; chosen attempts release, then raise."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, fail_attempts: set[int]) -> None:
+        self.attempts: list[int] = []
+        self._fail_attempts = fail_attempts
+        real_close = os.close
+
+        def faulty_close(descriptor: int) -> None:
+            self.attempts.append(descriptor)
+            real_close(descriptor)
+            if len(self.attempts) in self._fail_attempts:
+                raise OSError("close reported failure after release")
+
+        monkeypatch.setattr(os, "close", faulty_close)
+
+
+def _owned(writer: store.ColdEvidenceWriter) -> list[int]:
+    """Return every descriptor a writer currently owns."""
+    owned = [
+        *writer._stream_fds.values(),  # pyright: ignore[reportPrivateUsage]
+        *writer._phase_fds.values(),  # pyright: ignore[reportPrivateUsage]
+    ]
+    for descriptor in (writer._records_fd, writer._run_fd):  # pyright: ignore[reportPrivateUsage]
+        if descriptor is not None:
+            owned.append(descriptor)
+    return owned
+
+
+def _two_stream_writer_and_root(tmp_path: Path) -> tuple[store.ColdEvidenceWriter, str]:
+    """Return a writer owning two streams, a phase and records directory, and its run."""
+    writer, root = open_writer(tmp_path)
+    off = header_for(tmp_path, root, OFF)
+    writer.append(off)
+    writer.append(tick_for(off))
+    return writer, root
+
+
+def _two_stream_writer(tmp_path: Path) -> store.ColdEvidenceWriter:
+    """Return only the writer of :func:`_two_stream_writer_and_root`."""
+    return _two_stream_writer_and_root(tmp_path)[0]
+
+
+def _assert_released_once(
+    writer: store.ColdEvidenceWriter, owned: list[int], attempts: list[int]
+) -> None:
+    """Every owned descriptor was attempted exactly once and none remains owned."""
+    assert sorted(attempts) == sorted(owned)
+    assert len(set(attempts)) == len(attempts)
+    assert _owned(writer) == []
+
+
+def test_seal_close_fault_releases_each_descriptor_once_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A close fault on the second stream descriptor gives WRITE_FAILED without retries."""
+    writer = _two_stream_writer(tmp_path)
+    owned = _owned(writer)
+    assert len(owned) == 5
+    faults = _CloseFaults(monkeypatch, fail_attempts={2})
+    expect(Failure.WRITE_FAILED, writer.seal)
+    _assert_released_once(writer, owned, faults.attempts)
+    monkeypatch.undo()
+    expect(Failure.WRITER_POISONED, writer.seal)
+    writer.close()
+
+
+def test_failed_append_cleanup_close_fault_keeps_the_typed_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A close fault while cleaning up a failed write never masks WRITE_FAILED."""
+    writer, root = _two_stream_writer_and_root(tmp_path)
+    owned = _owned(writer)
+    off_tick = tick_for(header_for(tmp_path, root, OFF), 1)
+
+    def failing_write(_descriptor: int, _data: memoryview) -> int:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "_write_chunk", failing_write)
+    faults = _CloseFaults(monkeypatch, fail_attempts={2})
+    expect(Failure.WRITE_FAILED, lambda: writer.append(off_tick))
+    _assert_released_once(writer, owned, faults.attempts)
+    monkeypatch.undo()
+    expect(Failure.WRITER_POISONED, lambda: writer.append(off_tick))
+
+
+def test_run_descriptor_close_fault_is_typed_and_never_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing reports a run-descriptor fault once; a repeated close retries nothing."""
+    writer = _two_stream_writer(tmp_path)
+    owned = _owned(writer)
+    faults = _CloseFaults(monkeypatch, fail_attempts={len(owned)})
+    expect(Failure.WRITE_FAILED, writer.close)
+    _assert_released_once(writer, owned, faults.attempts)
+    writer.close()
+    assert len(faults.attempts) == len(owned)
+    expect(Failure.WRITER_POISONED, writer.seal)
+
+
+def test_repeated_close_of_a_healthy_writer_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Close releases each descriptor once; later closes do nothing."""
+    writer = _two_stream_writer(tmp_path)
+    owned = _owned(writer)
+    faults = _CloseFaults(monkeypatch, fail_attempts=set())
+    writer.close()
+    writer.close()
+    _assert_released_once(writer, owned, faults.attempts)
+
+
+def _interrupt(exception: BaseException) -> typing.Callable[..., typing.NoReturn]:
+    """Return a callable raising one non-ordinary interruption."""
+
+    def raise_it(*_args: object, **_kwargs: object) -> typing.NoReturn:
+        raise exception
+
+    return raise_it
+
+
+@pytest.mark.parametrize(
+    ("seam", "exception"),
+    [
+        ("canonical_json", KeyboardInterrupt()),
+        ("_create_file", KeyboardInterrupt()),
+        ("_write_all", MemoryError()),
+    ],
+    ids=["rendering", "stream-creation", "writing"],
+)
+def test_interruption_after_binding_poisons_and_releases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seam: str, exception: BaseException
+) -> None:
+    """A non-ordinary interruption after binding propagates only after poisoning."""
+    writer, root = open_writer(tmp_path)
+    off = header_for(tmp_path, root, OFF)
+    writer.append(off)
+    tick = tick_for(off)
+    owned = _owned(writer)
+    monkeypatch.setattr(store, seam, _interrupt(exception))
+    with pytest.raises(type(exception)):
+        writer.append(tick)
+    monkeypatch.undo()
+    assert _owned(writer) == [] and owned
+    expect(Failure.WRITER_POISONED, lambda: writer.append(tick))
+    expect(Failure.WRITER_POISONED, writer.seal)
+
+
+def test_interruption_mid_write_leaves_no_sealable_torn_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial write followed by an interruption can never be sealed into a receipt."""
+    writer, root = open_writer(tmp_path)
+    off = header_for(tmp_path, root, OFF)
+    writer.append(off)
+    real_write = store._write_chunk  # pyright: ignore[reportPrivateUsage]
+
+    def torn(descriptor: int, data: memoryview) -> int:
+        real_write(descriptor, data[:7])
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(store, "_write_chunk", torn)
+    with pytest.raises(KeyboardInterrupt):
+        writer.append(tick_for(off))
+    monkeypatch.undo()
+    assert len((run_dir(root) / "records/recording_off/tick.jsonl").read_bytes()) == 7
+    expect(Failure.WRITER_POISONED, writer.seal)
+    assert not (run_dir(root) / store.MANIFEST_JSON_NAME).exists()
+
+
+def test_interruption_during_binding_poisons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interruption inside binding (not a refusal) also poisons the writer."""
+    writer, root = open_writer(tmp_path)
+    off = header_for(tmp_path, root, OFF)
+    monkeypatch.setattr(store, "read_identity_v1", _interrupt(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        writer.append(off)
+    monkeypatch.undo()
+    expect(Failure.WRITER_POISONED, lambda: writer.append(off))
+
+
+def test_artefact_close_fault_during_seal_is_write_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A close fault on a written manifest artefact fails the seal closed."""
+    writer, root = open_writer(tmp_path)
+    writer.append(header_for(tmp_path, root, OFF))
+    real_create = store._create_file  # pyright: ignore[reportPrivateUsage]
+    created: list[int] = []
+
+    def tracking(parent: int, name: str, *, append: bool) -> int:
+        descriptor = real_create(parent, name, append=append)
+        if name == store.MANIFEST_JSON_NAME:
+            created.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(store, "_create_file", tracking)
+    real_close = os.close
+    faulted: list[int] = []
+
+    def faulty(descriptor: int) -> None:
+        real_close(descriptor)
+        if created and descriptor == created[0] and not faulted:
+            faulted.append(descriptor)
+            raise OSError("artefact close failed")
+
+    monkeypatch.setattr(os, "close", faulty)
+    expect(Failure.WRITE_FAILED, writer.seal)
+    assert faulted == created
+    assert _owned(writer) == []
+    assert not (run_dir(root) / store.MANIFEST_SIDECAR_NAME).exists()
+
+
+def test_read_path_close_faults_never_mask_or_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Close faults on read-only descriptors neither retry nor raise raw errors."""
+    root, _sealed, _records = write_full_run(tmp_path)
+    digest = hashlib.sha256((run_dir(root) / store.MANIFEST_JSON_NAME).read_bytes()).hexdigest()
+    faults = _CloseFaults(monkeypatch, fail_attempts=set(range(1, 10_000)))
+    retained = reader.read_retained_run(root, run_id=RUN_ID, expected_manifest_sha256=digest)
+    assert retained.run_id == RUN_ID
+    expect(
+        Failure.MANIFEST_DIGEST_MISMATCHED,
+        lambda: store.verify_retained_tree(root, run_id=RUN_ID, expected_manifest_sha256="0" * 64),
+    )
+    assert faults.attempts
+
+
+def test_close_after_seal_keeps_the_sealed_state(tmp_path: Path) -> None:
+    """Closing a sealed writer releases nothing further and never poisons it."""
+    writer, root = open_writer(tmp_path)
+    off = header_for(tmp_path, root, OFF)
+    writer.append(off)
+    writer.seal()
+    writer.close()
+    assert _owned(writer) == []
+    expect(Failure.WRITER_SEALED, lambda: writer.append(tick_for(off)))

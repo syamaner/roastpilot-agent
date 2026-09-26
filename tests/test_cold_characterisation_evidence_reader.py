@@ -594,3 +594,14 @@ def test_identity_extras_are_admitted_exactly_at_the_cap(tmp_path: Path) -> None
         document["runtime_config"][f"extra_{index}"] = index
     identity = store.read_identity_v1(envelope_of(document))
     assert len(identity.runtime_config_extras) == store.MAX_IDENTITY_EXTRA_KEYS
+
+
+def test_lone_surrogate_line_is_refused_by_the_walker(tmp_path: Path) -> None:
+    """A JSON-escaped lone surrogate parses but is refused before model validation."""
+    root, _sealed, _records = write_full_run(tmp_path)
+    document = {**first_line(root, TICK_OFF), "raw_vendor_data": {"k": "\ud800"}}
+    line = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+    digest = rewrite(root, TICK_OFF, line)
+    with pytest.raises(schema.ColdEvidenceError) as raised:
+        read(root, digest)
+    assert raised.value.failure is schema.ColdEvidenceFailure.JSON_VALUE_TYPE_NOT_ADMITTED
