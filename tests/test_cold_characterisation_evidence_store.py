@@ -163,9 +163,13 @@ def craft_manifest(
     return hashlib.sha256(manifest).hexdigest()
 
 
-def snapshot_tree(*roots: str) -> dict[str, tuple[int, int, int, int, int]]:
-    """Return ``(dev, ino, mode, mtime_ns, size)`` for every node under roots."""
-    nodes: dict[str, tuple[int, int, int, int, int]] = {}
+def snapshot_tree(*roots: str) -> dict[str, tuple[int, int, int, int, int, int]]:
+    """Return ``(dev, ino, mode, mtime_ns, ctime_ns, size)`` for every node under roots.
+
+    ``ctime_ns`` catches metadata writes, such as a same-mode chmod, that leave mode,
+    mtime and size unchanged.
+    """
+    nodes: dict[str, tuple[int, int, int, int, int, int]] = {}
     for root in roots:
         for path in [Path(root), *Path(root).rglob("*")]:
             result = os.lstat(path)
@@ -174,6 +178,7 @@ def snapshot_tree(*roots: str) -> dict[str, tuple[int, int, int, int, int]]:
                 result.st_ino,
                 result.st_mode,
                 result.st_mtime_ns,
+                result.st_ctime_ns,
                 result.st_size,
             )
     return nodes
@@ -1079,9 +1084,20 @@ def test_overlapping_or_equal_roots_refuse(tmp_path: Path) -> None:
         )
 
 
+def _make_non_private(root: str) -> None:
+    """Set a copied run to readable, non-private 0755/0644 modes."""
+    for path in [run_dir(root), *run_dir(root).rglob("*")]:
+        os.chmod(path, 0o755 if path.is_dir() else 0o644)
+
+
 def test_verification_and_reading_modify_nothing(tmp_path: Path) -> None:
-    """Verify and read are read-only: every node's identity is unchanged."""
+    """Verify and read are read-only: every node's identity is unchanged.
+
+    The laptop copy is made readable and non-private first, so any mode repair
+    towards 0700/0600 would show in the snapshot.
+    """
     root, laptop, digest = _two_trees(tmp_path)
+    _make_non_private(laptop)
     before = snapshot_tree(root, laptop)
     store.verify_retained_copies(root, laptop, run_id=RUN_ID, expected_manifest_sha256=digest)
     reader.read_retained_run(laptop, run_id=RUN_ID, expected_manifest_sha256=digest)
@@ -2254,3 +2270,134 @@ def test_close_after_seal_keeps_the_sealed_state(tmp_path: Path) -> None:
     writer.close()
     assert _owned(writer) == []
     expect(Failure.WRITER_SEALED, lambda: writer.append(tick_for(off)))
+
+
+# --------------------------------------------------- read-only intent spy
+
+
+_FORBIDDEN_OS_CALLS = (
+    "chmod",
+    "fchmod",
+    "lchmod",
+    "chown",
+    "fchown",
+    "lchown",
+    "write",
+    "pwrite",
+    "writev",
+    "fsync",
+    "mkdir",
+    "makedirs",
+    "unlink",
+    "remove",
+    "rmdir",
+    "removedirs",
+    "rename",
+    "renames",
+    "replace",
+    "truncate",
+    "ftruncate",
+    "utime",
+    "link",
+    "symlink",
+    "mkfifo",
+)
+_WRITE_INTENT_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+
+
+def _forbid_write_intent(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Within a monkeypatch context, record and refuse any write-capable os call."""
+    attempted: list[str] = []
+    real_open = os.open
+
+    def refuse(name: str) -> typing.Callable[..., typing.NoReturn]:
+        def refused(*_args: object, **_kwargs: object) -> typing.NoReturn:
+            attempted.append(name)
+            raise AssertionError(f"write intent: {name}")
+
+        return refused
+
+    def read_only_open(
+        path: typing.Any, flags: int, *args: typing.Any, **kwargs: typing.Any
+    ) -> int:
+        if flags & _WRITE_INTENT_FLAGS:
+            attempted.append("open-for-write")
+            raise AssertionError("write intent: open")
+        return real_open(path, flags, *args, **kwargs)
+
+    replacements: list[typing.Callable[..., object]] = [read_only_open]
+    for name in _FORBIDDEN_OS_CALLS:
+        if hasattr(os, name):
+            replacement = refuse(name)
+            monkeypatch.setattr(os, name, replacement)
+            replacements.append(replacement)
+    monkeypatch.setattr(os, "open", read_only_open)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, *replacements})
+    return attempted
+
+
+def test_verify_and_read_express_no_write_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify and read open only read-only and never call a mutating os primitive."""
+    root, laptop, digest = _two_trees(tmp_path)
+    _make_non_private(laptop)
+    with monkeypatch.context() as bounded:
+        attempted = _forbid_write_intent(bounded)
+        verified = store.verify_retained_copies(
+            root, laptop, run_id=RUN_ID, expected_manifest_sha256=digest
+        )
+        retained = reader.read_retained_run(laptop, run_id=RUN_ID, expected_manifest_sha256=digest)
+    assert attempted == []
+    assert verified.manifest_sha256 == retained.manifest_sha256 == digest
+
+
+def test_write_intent_spy_detects_a_same_mode_chmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The spy refuses a chmod even when it would not change the mode."""
+    root = Path(make_root(tmp_path))
+    mode = stat.S_IMODE(os.lstat(root).st_mode)
+    with monkeypatch.context() as bounded:
+        attempted = _forbid_write_intent(bounded)
+        with pytest.raises(AssertionError):
+            os.chmod(root, mode)
+        with pytest.raises(AssertionError):
+            os.open(root / "new", os.O_WRONLY | os.O_CREAT, 0o600)
+        descriptor = os.open(root, os.O_RDONLY)
+        os.close(descriptor)
+    assert attempted == ["chmod", "open-for-write"]
+
+
+# ------------------------------------------------------ ratified constants
+
+
+def test_ratified_store_constants_are_pinned() -> None:
+    """The ratified bounds are exactly the contract's values."""
+    assert store.MAX_MANIFEST_ENTRIES == 16_384
+    assert store.MAX_EVIDENCE_FILE_BYTES == 1024**3
+    assert store.MAX_MANIFEST_BYTES == 8 * 1024**2
+    assert store.MAX_PATH_SEGMENTS == 4
+    assert store.MAX_SEGMENT_CHARACTERS == 128
+    assert store.MAX_IDENTITY_EXTRA_KEYS == 64
+    assert store.MAX_MODEL_MANIFEST_ENTRIES == 1_024
+    assert reader.MAX_LINE_BYTES == schema.MAX_RECORD_BYTES + 1
+
+
+def test_segment_grammar_admits_128_and_refuses_129_characters(tmp_path: Path) -> None:
+    """The segment bound is inclusive at 128 characters, at the guard and at seal."""
+    valid = store._segment_is_valid  # pyright: ignore[reportPrivateUsage]
+    assert valid("a" * 128)
+    assert not valid("a" * 129)
+    writer, root = open_writer(tmp_path)
+    writer.append(header_for(tmp_path, root, OFF))
+    accepted = run_dir(root) / "records" / "recording_off" / ("b" * 128)
+    accepted.write_bytes(b"x")
+    os.chmod(accepted, 0o600)
+    assert writer.seal().entry_count == 2
+    second, second_root = open_writer(tmp_path, "second")
+    second.append(header_for(tmp_path, second_root, OFF))
+    refused = run_dir(second_root) / "records" / "recording_off" / ("c" * 129)
+    refused.write_bytes(b"x")
+    os.chmod(refused, 0o600)
+    expect(Failure.SEAL_TREE_INVALID, second.seal)
