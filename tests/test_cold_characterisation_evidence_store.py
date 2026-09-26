@@ -1719,3 +1719,25 @@ def test_case_alias_of_one_directory_refuses_where_the_filesystem_folds_case(
             root, alias, run_id=RUN_ID, expected_manifest_sha256=digest
         ),
     )
+
+
+@pytest.mark.parametrize("bad", BAD_RUN_IDS, ids=[repr(item) for item in BAD_RUN_IDS])
+def test_reader_refuses_bad_run_ids_before_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: object
+) -> None:
+    """The reader's own guard refuses a bad run id before entering verification."""
+    root = make_root(tmp_path)
+    entered: list[str] = []
+
+    def spy(*_args: object, **_kwargs: object) -> store.ColdVerifiedTree:
+        entered.append("verify")
+        raise AssertionError
+
+    monkeypatch.setattr(reader, "verify_retained_tree", spy)
+    expect(
+        Failure.RUN_ID_MISMATCHED,
+        lambda: reader.read_retained_run(
+            root, run_id=typing.cast(str, bad), expected_manifest_sha256="0" * 64
+        ),
+    )
+    assert entered == []
