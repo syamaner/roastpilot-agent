@@ -537,3 +537,60 @@ def test_writer_emitted_identity_reads_back_as_v1(tmp_path: Path) -> None:
     assert identity.pi_evidence_root == "/synthetic/pi"
     assert identity.runtime_config_extras == {} and identity.server_info_extras == {}
     assert tick_for(header).identity_sha256 == header.identity_sha256
+
+
+# ------------------------------------------------ reader-side shared binding
+
+
+ON_HEADER = "records/recording_on/header.jsonl"
+ON_FINALISATION = "records/recording_on/finalisation.jsonl"
+
+
+def _tampered(root: str, relative_path: str, **update: object) -> str:
+    """Replace a stream's first line with a canonical, schema-valid tampered line."""
+    lines = (run_dir(root) / relative_path).read_bytes().split(b"\n")
+    lines[0] = line_of({**json.loads(lines[0]), **update})[:-1]
+    return rewrite(root, relative_path, b"\n".join(lines))
+
+
+def test_reader_binds_non_header_run_ids(tmp_path: Path) -> None:
+    """A valid foreign run id on an OFF tick is refused by the reader's shared binding."""
+    root, _sealed, _records = write_full_run(tmp_path)
+    digest = _tampered(root, TICK_OFF, run_id="20260926T120000Z-foreign")
+    expect(Failure.RUN_ID_MISMATCHED, lambda: read(root, digest))
+
+
+def test_reader_binds_non_header_phase_digests(tmp_path: Path) -> None:
+    """An OFF tick carrying the ON header's identity digest is refused by the reader."""
+    root, _sealed, _records = write_full_run(tmp_path)
+    on_digest = first_line(root, ON_HEADER)["identity_sha256"]
+    assert on_digest != first_line(root, TICK_OFF)["identity_sha256"]
+    digest = _tampered(root, TICK_OFF, identity_sha256=on_digest)
+    expect(Failure.IDENTITY_DIGEST_MISMATCHED, lambda: read(root, digest))
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"clean": False},
+        {"observed_command_streaming_required": None, "applied_branch": None},
+    ],
+    ids=["clean-flipped", "null-fabricated"],
+)
+def test_reader_rederives_the_finalisation_index(tmp_path: Path, update: dict[str, object]) -> None:
+    """Scalars disagreeing with the trusted envelope are refused by the reader binding."""
+    root, _sealed, _records = write_full_run(tmp_path)
+    original = first_line(root, ON_FINALISATION)
+    assert original["clean"] is True
+    assert original["observed_command_streaming_required"] is False
+    digest = _tampered(root, ON_FINALISATION, **update)
+    expect(Failure.FINALISATION_INDEX_MISMATCHED, lambda: read(root, digest))
+
+
+def test_identity_extras_are_admitted_exactly_at_the_cap(tmp_path: Path) -> None:
+    """Exactly the maximum number of tolerant-origin extras is retained."""
+    document = identity_document(tmp_path)
+    for index in range(store.MAX_IDENTITY_EXTRA_KEYS):
+        document["runtime_config"][f"extra_{index}"] = index
+    identity = store.read_identity_v1(envelope_of(document))
+    assert len(identity.runtime_config_extras) == store.MAX_IDENTITY_EXTRA_KEYS

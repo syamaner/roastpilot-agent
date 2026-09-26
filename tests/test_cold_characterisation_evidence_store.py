@@ -1227,8 +1227,7 @@ def test_class_d_no_prefix_or_suffix_matching_in_new_modules() -> None:
     for path in NEW_MODULES:
         for node in _calls(path):
             name = _call_name(node)
-            if name.endswith(("startswith", "endswith")):
-                assert path.name == "evidence_reader.py" and name == "data.endswith"
+            assert not name.endswith(("startswith", "endswith")), (path.name, name)
 
 
 # ------------------------------------------------------------ residual branches
@@ -1985,3 +1984,27 @@ def test_resolved_path_containment_holds_without_the_identity_layer(
             str(declared / "child"), protected_roots=(str(declared),)
         ),
     )
+
+
+# --------------------------------------------------------- exact-bound positives
+
+
+def test_seal_admits_exactly_the_entry_and_file_byte_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tree exactly at the patched entry and per-file byte bounds seals and verifies."""
+    writer, root = open_writer(tmp_path)
+    off = header_for(tmp_path, root, OFF)
+    for record in (off, tick_for(off), host_for(off)):
+        writer.append(record)
+    files = [path for path in run_dir(root).rglob("*") if path.is_file()]
+    largest = max(path.stat().st_size for path in files)
+    monkeypatch.setattr(store, "MAX_MANIFEST_ENTRIES", len(files))
+    monkeypatch.setattr(store, "MAX_EVIDENCE_FILE_BYTES", largest)
+    sealed = writer.seal()
+    assert sealed.entry_count == len(files) == 3
+    verified = store.verify_retained_tree(
+        root, run_id=RUN_ID, expected_manifest_sha256=sealed.manifest_sha256
+    )
+    assert len(verified.manifest.entries) == 3
+    assert max(entry.size_bytes for entry in verified.manifest.entries) == largest
