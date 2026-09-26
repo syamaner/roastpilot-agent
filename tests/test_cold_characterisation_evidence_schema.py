@@ -7,6 +7,7 @@ import json
 import math
 import pathlib
 import typing
+import warnings
 
 import pydantic
 import pytest
@@ -579,6 +580,153 @@ def test_audio_reason_is_not_a_new_schema_owned_text_cap() -> None:
     tick = _tick().model_copy(update={"audio": evidence.project_tick_audio(payload).audio})
     validated = typing.cast(evidence.ColdTickRecord, evidence.validate_record(tick))
     assert validated.audio.reason == payload["reason"]
+
+
+def test_exact_limits_accept_without_truncation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every bounded JSON and map surface accepts its exact declared limit."""
+    assert evidence.walk_json_value(10**evidence.MAX_INT_DIGITS - 1) is None
+    assert evidence.walk_json_value({"x" * evidence.MAX_JSON_KEY_BYTES: None}) is None
+    assert (
+        evidence.walk_json_value(
+            typing.cast(evidence.ColdJsonValue, [None] * evidence.MAX_COLLECTION_LENGTH)
+        )
+        is None
+    )
+    nested: evidence.ColdJsonValue = []
+    for _ in range(evidence.MAX_JSON_DEPTH):
+        nested = [nested]
+    assert evidence.walk_json_value(nested) is None
+
+    extra_overhead = len(_canonical({"future": ""}).encode())
+    payload = _audio_payload()
+    payload["future"] = "x" * (evidence.MAX_RAW_AUDIO_EXTRA_BYTES - extra_overhead)
+    projection = evidence.project_tick_audio(payload)
+    assert (
+        len(_canonical(projection.raw_audio_extra).encode()) == evidence.MAX_RAW_AUDIO_EXTRA_BYTES
+    )
+
+    vendor_overhead = len(_canonical({"vendor": ""}).encode())
+    tick = _tick().model_copy(
+        update={
+            "raw_vendor_data": {"vendor": "x" * (evidence.MAX_VENDOR_BLOB_BYTES - vendor_overhead)}
+        }
+    )
+    validated = typing.cast(evidence.ColdTickRecord, evidence.validate_record(tick))
+    assert len(_canonical(validated.raw_vendor_data).encode()) == evidence.MAX_VENDOR_BLOB_BYTES
+
+    control_count, tail = divmod(evidence.MAX_ENVELOPE_BYTES - 8, 6)
+    canonical = '{"x":"' + ("\\u0001" * control_count) + ("a" * tail) + '"}'
+    assert len(canonical.encode()) == evidence.MAX_ENVELOPE_BYTES
+    envelope = evidence.ColdSealedEnvelope(
+        kind=evidence.ColdEnvelopeKind.IDENTITY,
+        schema_version=1,
+        canonical_json=canonical,
+        canonical_byte_length=evidence.MAX_ENVELOPE_BYTES,
+        sha256=hashlib.sha256(canonical.encode()).hexdigest(),
+    )
+    assert envelope.canonical_byte_length == evidence.MAX_ENVELOPE_BYTES
+    monkeypatch.setattr(evidence, "MAX_INPUT_AGGREGATE_BYTES", 1)
+    with pytest.raises(evidence.ColdEvidenceError):
+        evidence.walk_json_value(None)
+
+
+def test_projection_error_locations_are_closed_schema_names_only() -> None:
+    """Known, nested, integer, and hostile parser locations never escape diagnostics."""
+    projection_fields = getattr(evidence, "_" + "projection_fields")
+    with pytest.raises(pydantic.ValidationError) as raised:
+        evidence.ColdTickAudioSample.model_validate(
+            {**_audio_payload(), "queued_window_count": "bad", "nested": {1: "bad"}}
+        )
+    fields = projection_fields(raised.value)
+    assert fields
+    assert all(isinstance(field, evidence.ColdAudioField) for field in fields)
+    assert evidence.ColdAudioField.UNKNOWN_FIELD in fields
+    assert "nested" not in repr(fields)
+
+
+def test_tolerant_mirror_can_launder_missing_counter_but_projection_refuses() -> None:
+    """The delivered tolerant mirror contrast proves why this projection is strict."""
+    payload = _audio_payload()
+    del payload["max_consecutive_overflow_count"]
+    tolerant = FirstCrackStatus.model_validate(payload)
+    assert tolerant.status == "pending"
+    assert "max_consecutive_overflow_count" not in FirstCrackStatus.model_fields
+    with pytest.raises(evidence.ColdEvidenceError):
+        evidence.project_tick_audio(payload)
+
+
+def test_union_advisory_and_record_surfaces_are_closed() -> None:
+    """Records expose exactly six streams and no untyped advisory or actuator fields."""
+    assert set(evidence.ColdTickRecord.model_fields) == {
+        "schema_version",
+        "stream",
+        "run_id",
+        "phase",
+        "recorded_at_utc",
+        "monotonic_seconds",
+        "identity_sha256",
+        "tick",
+        "bean_temp_c",
+        "env_temp_c",
+        "heat_level_percent",
+        "fan_level_percent",
+        "cooling_on",
+        "connected",
+        "audio",
+        "raw_audio_extra",
+        "raw_vendor_data",
+    }
+    assert not {"main_fan", "drum", "solenoid", "verdict"} & set(
+        evidence.ColdTickRecord.model_fields
+    )
+    assert tuple(evidence.ColdEvidenceStream) == (
+        evidence.ColdEvidenceStream.HEADER,
+        evidence.ColdEvidenceStream.TICK,
+        evidence.ColdEvidenceStream.HOST,
+        evidence.ColdEvidenceStream.ADVISORY,
+        evidence.ColdEvidenceStream.FINALISATION,
+        evidence.ColdEvidenceStream.ABORT,
+    )
+    evaluation = evidence.ColdSafetyEvaluation.model_fields
+    assert tuple(evaluation) == (
+        "rule",
+        "verdict",
+        "input_heat",
+        "input_fan",
+        "adjusted_heat",
+        "adjusted_fan",
+        "reason",
+    )
+    assert set(evidence.ColdAdvisorFailureKind) == {
+        evidence.ColdAdvisorFailureKind.TIMEOUT,
+        evidence.ColdAdvisorFailureKind.PROVIDER_ERROR,
+        evidence.ColdAdvisorFailureKind.MALFORMED_OUTPUT,
+        evidence.ColdAdvisorFailureKind.UNSAFE_OUTPUT,
+    }
+    assert not {"message", "body", "prompt", "url", "credential"} & set(
+        evidence.ColdAdvisoryRecord.model_fields
+    )
+    with pytest.raises((pydantic.ValidationError, evidence.ColdEvidenceError)):
+        evidence.ColdSafetyEvaluation.model_validate({"rule": "r", "verdict": "allow"})
+
+
+def test_construct_copy_snapshot_and_no_warning_boundary_cases() -> None:
+    """Valid constructed data is revalidated, enums stay typed, and hostile data never warns."""
+    tick = _tick()
+    constructed = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
+        **tick.model_dump()
+    )
+    validated = typing.cast(evidence.ColdTickRecord, evidence.validate_record(constructed))
+    assert isinstance(validated.phase, evidence.ColdPhaseKind)
+    copied = tick.model_copy(update={"heat_level_percent": 101})
+    with pytest.raises(evidence.ColdEvidenceError):
+        evidence.validate_record(copied)
+    hostile = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
+        **(tick.model_dump() | {"raw_vendor_data": {"hostile": object()}})
+    )
+    with warnings.catch_warnings(record=True) as caught, pytest.raises(evidence.ColdEvidenceError):
+        evidence.validate_record(hostile)
+    assert not caught
 
 
 def test_persisted_raw_empty_container_at_exact_depth_is_admitted() -> None:
