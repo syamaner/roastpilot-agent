@@ -1,6 +1,7 @@
 """Behavioural tests for the closed cold evidence schema boundary."""
 
 import ast
+import collections.abc
 import enum
 import hashlib
 import inspect
@@ -1112,6 +1113,7 @@ def test_construct_copy_snapshot_and_no_warning_boundary_cases(
 
     monkeypatch.setattr(evidence.ColdTickRecord, "model_dump", dump_spy)
     with warnings.catch_warnings(record=True) as caught, pytest.raises(evidence.ColdEvidenceError):
+        warnings.simplefilter("always")
         evidence.validate_record(hostile)
     assert not caught
     assert dump_calls == []
@@ -1326,6 +1328,7 @@ def test_identity_envelope_binds_delivered_identity_canonical_digest(
         boot_id_path=boot_id,
     )
     with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         canonical = _canonical(identity.model_dump(mode="json"))
         digest = identity_sha256(identity)
     assert not caught
@@ -1841,6 +1844,114 @@ def test_validate_record_admits_only_declared_nested_model_edges() -> None:
     validated = typing.cast(evidence.ColdTickRecord, evidence.validate_record(tick))
     assert validated.audio == tick.audio
     assert validated.audio is not tick.audio
+
+
+def test_free_form_json_refuses_sequence_subclasses_without_introspection() -> None:
+    """Only exact lists are admitted below persistence free-form maps."""
+
+    calls: list[str] = []
+
+    class HostileSequence(collections.abc.Sequence[object]):
+        """Sequence whose protocol methods must never be reached."""
+
+        def __len__(self) -> int:
+            calls.append("len")
+            return 0
+
+        @typing.overload
+        def __getitem__(self, index: int) -> object: ...
+
+        @typing.overload
+        def __getitem__(self, index: slice) -> collections.abc.Sequence[object]: ...
+
+        def __getitem__(self, index: int | slice) -> object | collections.abc.Sequence[object]:
+            calls.append("getitem")
+            return [] if isinstance(index, slice) else None
+
+    class ListSubclass(list[object]):
+        """A list-shaped non-exact container."""
+
+    for value in (typing.cast(evidence.ColdJsonValue, [1]), (1,), HostileSequence()):
+        if type(value) is list:
+            evidence.walk_json_value(value)
+            continue
+        with pytest.raises(evidence.ColdEvidenceError) as raised:
+            evidence.walk_json_value(typing.cast(evidence.ColdJsonValue, value))
+        assert raised.value.failure is evidence.ColdEvidenceFailure.JSON_VALUE_TYPE_NOT_ADMITTED
+        assert raised.value.__context__ is None
+        assert calls == []
+    for field_name in ("raw_vendor_data", "raw_audio_extra"):
+        for value in (ListSubclass([1]), (1,), HostileSequence()):
+            hostile = _tick().model_copy(update={field_name: {"nested": [value]}})
+            with pytest.raises(evidence.ColdEvidenceError) as raised:
+                evidence.validate_record(hostile)
+            assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED
+            assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("field_name", "maximum", "failure"),
+    [
+        (
+            "raw_vendor_data",
+            evidence.MAX_VENDOR_BLOB_BYTES,
+            evidence.ColdEvidenceFailure.RECORD_VENDOR_BLOB_TOO_LARGE,
+        ),
+        (
+            "raw_audio_extra",
+            evidence.MAX_RAW_AUDIO_EXTRA_BYTES,
+            evidence.ColdEvidenceFailure.RECORD_RAW_AUDIO_EXTRA_TOO_LARGE,
+        ),
+    ],
+)
+def test_validate_record_attributes_each_free_form_map_cap(
+    field_name: str, maximum: int, failure: evidence.ColdEvidenceFailure
+) -> None:
+    """Each persistence map cap refuses independently of the whole-record cap."""
+    payload = {"x": "a" * maximum}
+    assert len(_canonical(payload).encode("utf-8")) > maximum
+    tick = _tick().model_copy(update={field_name: payload})
+    assert len(_canonical(tick.model_dump(mode="json")).encode("utf-8")) < evidence.MAX_RECORD_BYTES
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(tick)
+    assert raised.value.failure is failure
+    assert raised.value.args == ("Cold evidence admission failed.",)
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("update", "failure"),
+    [
+        ({"sha256": "0" * 64}, evidence.ColdEvidenceFailure.ENVELOPE_DIGEST_MISMATCHED),
+        ({"canonical_byte_length": 0}, evidence.ColdEvidenceFailure.ENVELOPE_LENGTH_MISMATCHED),
+        (
+            {
+                "canonical_json": '{"b":"value","a":[1,true]}',
+            },
+            evidence.ColdEvidenceFailure.ENVELOPE_NOT_CANONICAL,
+        ),
+    ],
+)
+def test_validate_record_attributes_constructed_identity_envelope_failures(
+    update: dict[str, object], failure: evidence.ColdEvidenceFailure
+) -> None:
+    """Persistence revalidation preserves the exact sealed-identity failure reason."""
+    envelope = _envelope(evidence.ColdEnvelopeKind.IDENTITY)
+    values = envelope.model_dump()
+    values.update(update)
+    if "canonical_json" in update:
+        encoded = typing.cast(str, values["canonical_json"]).encode("utf-8")
+        values["canonical_byte_length"] = len(encoded)
+        values["sha256"] = hashlib.sha256(encoded).hexdigest()
+    bad_envelope = typing.cast(typing.Any, evidence.ColdSealedEnvelope).model_construct(**values)
+    header = evidence.ColdRunHeader(
+        **_common("header"), identity=_envelope(evidence.ColdEnvelopeKind.IDENTITY)
+    ).model_copy(update={"identity": bad_envelope})
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(header)
+    assert raised.value.failure is failure
+    assert raised.value.args == ("Cold evidence admission failed.",)
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
 
 
 def test_every_closed_enum_member_and_record_stream_is_admissible() -> None:
