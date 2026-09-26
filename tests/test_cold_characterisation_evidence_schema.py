@@ -908,6 +908,12 @@ def test_contract_annotations_union_and_all_anchored_consumers_are_exact() -> No
     ):
         assert record_type.model_fields["schema_version"].annotation == typing.Literal[1]
         assert record_type.model_fields["stream"].annotation == typing.Literal[stream.value]
+        assert record_type.model_fields["run_id"].metadata[0].pattern == getattr(
+            evidence, "_" + "RUN_ID_RUST_PATTERN"
+        )
+        assert record_type.model_fields["identity_sha256"].metadata[0].pattern == getattr(
+            evidence, "_" + "SHA256_RUST_PATTERN"
+        )
     assert evidence.ColdAdvisoryRecord.model_fields["failure"].annotation == (
         evidence.ColdAdvisorFailureKind | None
     )
@@ -926,6 +932,9 @@ def test_contract_annotations_union_and_all_anchored_consumers_are_exact() -> No
                 connected=True,
                 audio=evidence.project_tick_audio(_audio_payload()).audio,
             )
+    assert evidence.ColdSealedEnvelope.model_fields["sha256"].metadata[0].pattern == getattr(
+        evidence, "_" + "SHA256_RUST_PATTERN"
+    )
 
 
 def test_foreign_instance_is_rejected_before_extractor_introspection(
@@ -1125,6 +1134,98 @@ def test_record_union_has_six_closed_streams_and_abort_pairs() -> None:
     assert [record.stream for record in records] == [
         member.value for member in evidence.ColdEvidenceStream
     ]
+    expected_fields = {
+        evidence.ColdRunHeader: (
+            "schema_version",
+            "stream",
+            "run_id",
+            "phase",
+            "recorded_at_utc",
+            "monotonic_seconds",
+            "identity_sha256",
+            "identity",
+        ),
+        evidence.ColdTickRecord: (
+            "schema_version",
+            "stream",
+            "run_id",
+            "phase",
+            "recorded_at_utc",
+            "monotonic_seconds",
+            "identity_sha256",
+            "tick",
+            "bean_temp_c",
+            "env_temp_c",
+            "heat_level_percent",
+            "fan_level_percent",
+            "cooling_on",
+            "connected",
+            "audio",
+            "raw_audio_extra",
+            "raw_vendor_data",
+        ),
+        evidence.ColdHostRecord: (
+            "schema_version",
+            "stream",
+            "run_id",
+            "phase",
+            "recorded_at_utc",
+            "monotonic_seconds",
+            "identity_sha256",
+            "sample",
+        ),
+        evidence.ColdAdvisoryRecord: (
+            "schema_version",
+            "stream",
+            "run_id",
+            "phase",
+            "recorded_at_utc",
+            "monotonic_seconds",
+            "identity_sha256",
+            "requested_heat",
+            "requested_fan",
+            "should_drop",
+            "confidence",
+            "latency_seconds",
+            "evaluation",
+            "failure",
+        ),
+        evidence.ColdFinalisationRecord: (
+            "schema_version",
+            "stream",
+            "run_id",
+            "phase",
+            "recorded_at_utc",
+            "monotonic_seconds",
+            "identity_sha256",
+            "session_id",
+            "envelope",
+            "status",
+            "clean",
+            "observed_command_streaming_required",
+            "applied_branch",
+        ),
+        evidence.ColdAbortRecord: (
+            "schema_version",
+            "stream",
+            "run_id",
+            "phase",
+            "recorded_at_utc",
+            "monotonic_seconds",
+            "identity_sha256",
+            "domain",
+            "reason",
+        ),
+    }
+    assert {type(record) for record in records} == set(expected_fields)
+    for record_type, names in expected_fields.items():
+        assert tuple(record_type.model_fields) == names
+    for digest in ("A" * 64, "g" * 64, ("a" * 64) + "\n"):
+        for record in records:
+            with pytest.raises(pydantic.ValidationError):
+                typing.cast(typing.Any, type(record))(
+                    **(record.model_dump() | {"identity_sha256": digest})
+                )
     with pytest.raises(evidence.ColdEvidenceError) as raised:
         evidence.ColdAbortRecord(
             **_common("abort"),
