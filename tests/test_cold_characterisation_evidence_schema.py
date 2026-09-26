@@ -13,18 +13,24 @@ import warnings
 import pydantic
 import pytest
 
+from roastpilot_agent.advisor import AdvisorDescriptor
 from roastpilot_agent.cold_characterisation import evidence_schema as evidence
 from roastpilot_agent.cold_characterisation.host import ColdHostBoundFailure, HostBoundSample
 from roastpilot_agent.cold_characterisation.identity import (
+    REQUIRED_MCP_VERSION,
+    AgentBuildProvenance,
+    ColdArtefactKind,
     ColdIdentityFailure,
-    ColdRunIdentity,
+    EffectiveMCPProfile,
+    freeze_identity,
     identity_sha256,
 )
 from roastpilot_agent.cold_characterisation.mcp import (
     FinalisationFirstCrackStatus,
     RejectionReason,
 )
-from roastpilot_agent.mcp_client import FirstCrackStatus
+from roastpilot_agent.config import MCPDeviceConfig
+from roastpilot_agent.mcp_client import FirstCrackStatus, RuntimeConfigSnapshot, ServerInfo
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 
 
@@ -111,7 +117,7 @@ def test_projection_requires_every_declared_audio_field() -> None:
 
 def test_projection_is_strict_and_preserves_unknown_keys_losslessly() -> None:
     """Known values reject coercion while compatible unknown JSON survives intact."""
-    payload = _audio_payload()
+    payload = typing.cast(dict[str, typing.Any], _audio_payload())
     payload["future_counter"] = {"list": [1, "two"]}
     projection = evidence.project_tick_audio(payload)
     assert projection.raw_audio_extra == {"future_counter": {"list": [1, "two"]}}
@@ -124,6 +130,19 @@ def test_projection_is_strict_and_preserves_unknown_keys_losslessly() -> None:
         evidence.project_tick_audio(typing.cast(dict[str, evidence.ColdJsonValue], []))
     with pytest.raises(pydantic.ValidationError):
         evidence.ColdTickAudioSample.model_validate({**_audio_payload(), "extra": 1})
+    with pytest.raises(pydantic.ValidationError):
+        evidence.ColdTickAudioSample.model_validate(
+            {**_audio_payload(), "queued_window_count": "1", "allow_manual_override": 1}
+        )
+    payload = typing.cast(dict[str, typing.Any], _audio_payload())
+    nested = {"list": [1]}
+    payload["future"] = nested
+    projected = evidence.project_tick_audio(payload)
+    nested["list"].append(2)
+    assert projected.raw_audio_extra == {"future": {"list": [1]}}
+    returned_future = typing.cast(dict[str, list[int]], projected.raw_audio_extra["future"])
+    returned_future["list"].append(3)
+    assert nested == {"list": [1, 2]}
 
 
 def test_configs_and_rust_patterns_preserve_the_ratified_absolute_grammar() -> None:
@@ -705,6 +724,16 @@ def test_projection_error_locations_are_closed_schema_names_only() -> None:
         evidence.ColdAudioField.UNKNOWN_FIELD,
         evidence.ColdAudioField.UNKNOWN_FIELD,
     )
+    bad_payload = _audio_payload()
+    bad_payload["queued_window_count"] = "not-an-integer"
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.project_tick_audio(bad_payload)
+    error = raised.value
+    assert error.__cause__ is None and error.__context__ is None
+    assert error.args == ("Cold evidence admission failed.",)
+    assert error.field_names == (evidence.ColdAudioField.QUEUED_WINDOW_COUNT,)
+    assert "not-an-integer" not in repr(error)
+    assert not hasattr(error, "errors") and not getattr(error, "__notes__", ())
 
 
 def test_tolerant_mirror_can_launder_missing_counter_but_projection_refuses() -> None:
@@ -786,7 +815,9 @@ def test_union_advisory_and_record_surfaces_are_closed() -> None:
         )
 
 
-def test_construct_copy_snapshot_and_no_warning_boundary_cases() -> None:
+def test_construct_copy_snapshot_and_no_warning_boundary_cases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Valid constructed data is revalidated, enums stay typed, and hostile data never warns."""
     tick = _tick()
     constructed = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
@@ -814,9 +845,20 @@ def test_construct_copy_snapshot_and_no_warning_boundary_cases() -> None:
     hostile = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
         **(tick.model_dump() | {"raw_vendor_data": {"hostile": object()}})
     )
+    dump_calls: list[object] = []
+    original_dump = evidence.ColdTickRecord.model_dump
+
+    def dump_spy(
+        self: evidence.ColdTickRecord, *args: object, **kwargs: object
+    ) -> dict[str, object]:
+        dump_calls.append(self)
+        return typing.cast(dict[str, object], original_dump(self, *args, **kwargs))
+
+    monkeypatch.setattr(evidence.ColdTickRecord, "model_dump", dump_spy)
     with warnings.catch_warnings(record=True) as caught, pytest.raises(evidence.ColdEvidenceError):
         evidence.validate_record(hostile)
     assert not caught
+    assert dump_calls == []
 
 
 def test_contract_annotations_union_and_all_anchored_consumers_are_exact() -> None:
@@ -828,11 +870,18 @@ def test_contract_annotations_union_and_all_anchored_consumers_are_exact() -> No
         assert field.annotation == FinalisationFirstCrackStatus.model_fields[name].annotation
     for name, field in evidence.ColdHostSample.model_fields.items():
         assert field.annotation == HostBoundSample.model_fields[name].annotation
+        assert field.metadata == HostBoundSample.model_fields[name].metadata
     for name in ("rule", "input_heat", "input_fan", "adjusted_heat", "adjusted_fan", "reason"):
         assert (
             evidence.ColdSafetyEvaluation.model_fields[name].annotation
             == SafetyEvaluation.model_fields[name].annotation
         )
+        actual_metadata = tuple(
+            metadata
+            for metadata in evidence.ColdSafetyEvaluation.model_fields[name].metadata
+            if type(metadata).__name__ != "MaxLen"
+        )
+        assert actual_metadata == tuple(SafetyEvaluation.model_fields[name].metadata)
     assert (
         evidence.ColdSafetyEvaluation.model_fields["rule"].metadata[-1].max_length
         == evidence.MAX_TEXT_FIELD_BYTES
@@ -843,6 +892,8 @@ def test_contract_annotations_union_and_all_anchored_consumers_are_exact() -> No
     )
     assert evidence.ColdSafetyEvaluation.model_fields["adjusted_heat"].metadata[0].ge == 0
     assert evidence.ColdSafetyEvaluation.model_fields["adjusted_heat"].metadata[1].le == 100
+    assert evidence.ColdSafetyEvaluation.model_fields["adjusted_fan"].metadata[0].ge == 0
+    assert evidence.ColdSafetyEvaluation.model_fields["adjusted_fan"].metadata[1].le == 100
     union = typing.get_args(evidence.ColdEvidenceRecord)[0]
     assert set(typing.get_args(union)) == {
         evidence.ColdRunHeader,
@@ -877,29 +928,120 @@ def test_contract_annotations_union_and_all_anchored_consumers_are_exact() -> No
             )
 
 
-def test_foreign_instance_is_rejected_before_any_attribute_introspection() -> None:
+def test_foreign_instance_is_rejected_before_extractor_introspection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The exact-class guard does not inspect a foreign instance's hostile attributes."""
 
     class Foreign:
         def __getattribute__(self, name: str) -> object:
             raise AssertionError(name)
 
+    calls: list[object] = []
+
+    def extractor_spy(value: object, aggregate: list[int]) -> dict[str, object]:
+        calls.append(value)
+        raise AssertionError(aggregate)
+
+    monkeypatch.setattr(evidence, "_" + "extract_model", extractor_spy)
     with pytest.raises(evidence.ColdEvidenceError) as raised:
         evidence.validate_record(typing.cast(evidence.ColdEvidenceRecord, Foreign()))
     assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED
+    assert calls == []
 
 
-def test_identity_envelope_binds_delivered_identity_canonical_digest() -> None:
+def test_identity_envelope_binds_delivered_identity_canonical_digest(
+    tmp_path: pathlib.Path,
+) -> None:
     """A synthetic identity's retained bytes and delivered digest agree exactly."""
-    values: dict[str, object] = {name: "synthetic" for name in ColdRunIdentity.model_fields}
-    values.update(
-        {"controller_tick_seconds": 1.0, "credential_present": False, "model_manifest": ()}
+    boot_id = tmp_path / "boot_id"
+    boot_id.write_text("123e4567-e89b-12d3-a456-426614174000\n", encoding="ascii")
+    runtime = RuntimeConfigSnapshot.model_validate(
+        {
+            "config_source": None,
+            "roaster_driver": "hottop_kn8828b_2k_plus",
+            "roaster_port": "/dev/ttyUSB0",
+            "roaster_baudrate": 115200,
+            "temperature_unit": "celsius",
+            "command_interval_seconds": 0.3,
+            "first_crack_mode": "audio",
+            "model_repo_id": "repo",
+            "model_precision": "int8",
+            "allow_manual_override": False,
+            "log_dir": "logs",
+            "sample_interval_seconds": 5.0,
+            "auto_t0_detection_enabled": False,
+            "auto_t0_drop_threshold_c": 25.0,
+        }
     )
-    identity = ColdRunIdentity.model_construct(**typing.cast(typing.Any, values))
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+    server = ServerInfo(
+        product_name="Coffee Roaster MCP",
+        package_name="coffee-roaster-mcp",
+        version="0.2.1",
+        transport="stdio",
+        current_phase="bootstrap",
+        roaster_driver="hottop_kn8828b_2k_plus",
+        first_crack_mode="audio",
+        bootstrap_safe=True,
+        available_bootstrap_tools=(),
+        started_at_utc="2026-09-22T00:00:00Z",
+    )
+    provenance = AgentBuildProvenance(
+        source_revision="b" * 40,
+        source_tree_dirty=False,
+        artefact_kind=ColdArtefactKind.WHEEL,
+        artefact_sha256="a" * 64,
+    )
+    profile = EffectiveMCPProfile(
+        source_sha256="a" * 64,
+        source_byte_length=100,
+        first_crack_onnx_threads=2,
+        first_crack_min_positive_windows=3,
+        first_crack_confirmation_window_seconds=30.0,
+        first_crack_revision="revision",
+        audio_sample_rate=16000,
+        audio_window_seconds=10.0,
+        audio_overlap=0.3,
+        audio_hop_seconds=None,
+        session_ror_window_seconds=60,
+        session_ror_min_sample_seconds=10,
+    )
+    identity = freeze_identity(
+        run_id="cold-1",
+        started_at_utc="2026-09-22T00:00:00Z",
+        coffee_roaster_mcp_version=REQUIRED_MCP_VERSION,
+        python_version="3.11.9",
+        platform="linux",
+        machine="aarch64",
+        operating_system="Linux",
+        kernel="6.6.0",
+        pi_model="Raspberry Pi 5",
+        pi_revision="d04170",
+        runtime_config=runtime,
+        server_info=server,
+        device_config=MCPDeviceConfig(recording_devices=("USB microphone",)),
+        build_provenance=provenance,
+        effective_mcp_profile=profile,
+        audio_device_identity="USB microphone",
+        serial_port_path="/dev/ttyUSB0",
+        controller_tick_seconds=1.0,
+        pi_evidence_root="/synthetic/pi",
+        laptop_evidence_root="/synthetic/laptop",
+        advisor_descriptor=AdvisorDescriptor(
+            provider="openrouter", model="test/model", prompt_version="v1"
+        ),
+        credential_env_var_name="OPENROUTER_API_KEY",
+        credential_present=True,
+        stimulus_block="tap",
+        operator_host_notes="host",
+        operator_psu_notes="psu",
+        operator_cooling_notes="cooling",
+        boot_id_path=boot_id,
+    )
+    with warnings.catch_warnings(record=True) as caught:
         canonical = _canonical(identity.model_dump(mode="json"))
         digest = identity_sha256(identity)
+    assert not caught
     envelope = evidence.ColdSealedEnvelope(
         kind=evidence.ColdEnvelopeKind.IDENTITY,
         schema_version=1,
@@ -1027,6 +1169,82 @@ def test_every_closed_enum_member_and_record_stream_is_admissible() -> None:
     assert len(evidence.ColdSafetyVerdict) == 6
     assert len(evidence.ColdFinalisationStatus) == 6
     assert len(evidence.ColdEvidenceStream) == 6
+    for enum_type in (
+        evidence.ColdAudioField,
+        evidence.ColdEvidenceFailure,
+        evidence.ColdPhaseKind,
+        evidence.ColdEvidenceStream,
+        evidence.ColdEnvelopeKind,
+        evidence.ColdCapabilityBranch,
+        evidence.ColdFinalisationStatus,
+        evidence.ColdAdvisorFailureKind,
+        evidence.ColdAbortDomain,
+        evidence.ColdOperatorAbortReason,
+    ):
+        assert tuple((member.name, member.value) for member in enum_type) == tuple(
+            (member.name, member.name.lower()) for member in enum_type
+        )
+    assert tuple(member.value for member in evidence.ColdPhaseKind) == (
+        "recording_off",
+        "recording_on",
+    )
+    assert tuple(member.value for member in evidence.ColdEvidenceStream) == (
+        "header",
+        "tick",
+        "host",
+        "advisory",
+        "finalisation",
+        "abort",
+    )
+    assert tuple(member.value for member in evidence.ColdEnvelopeKind) == (
+        "identity",
+        "finalisation",
+    )
+    assert tuple(member.value for member in evidence.ColdCapabilityBranch) == (
+        "streaming",
+        "non_streaming",
+    )
+    assert tuple(member.value for member in evidence.ColdFinalisationStatus) == (
+        "rejected",
+        "clean",
+        "completed_not_clean",
+        "partial",
+        "disconnect_indeterminate",
+        "aborted",
+    )
+    assert tuple(member.value for member in evidence.ColdAdvisorFailureKind) == (
+        "timeout",
+        "provider_error",
+        "malformed_output",
+        "unsafe_output",
+    )
+    assert tuple(member.value for member in evidence.ColdAbortDomain) == (
+        "host",
+        "identity",
+        "evidence",
+        "mcp",
+        "advisor",
+        "operator",
+    )
+    assert tuple(member.value for member in evidence.ColdOperatorAbortReason) == ("operator_stop",)
+    assert all(field.is_required() for field in evidence.ColdTickAudioSample.model_fields.values())
+    for model in (
+        evidence.ColdTickAudioSample,
+        evidence.ColdHostSample,
+        evidence.ColdSafetyEvaluation,
+    ):
+        assert model.model_config == getattr(evidence, "_" + "COLD_EVIDENCE_STRICT_CONFIG")
+    for model in (
+        evidence.ColdTickProjection,
+        evidence.ColdSealedEnvelope,
+        evidence.ColdRunHeader,
+        evidence.ColdTickRecord,
+        evidence.ColdHostRecord,
+        evidence.ColdAdvisoryRecord,
+        evidence.ColdFinalisationRecord,
+        evidence.ColdAbortRecord,
+    ):
+        assert model.model_config == getattr(evidence, "_" + "COLD_EVIDENCE_MODEL_CONFIG")
     for domain, enum_type in (
         (evidence.ColdAbortDomain.HOST, evidence.ColdHostAbortReason),
         (evidence.ColdAbortDomain.IDENTITY, evidence.ColdIdentityAbortReason),
@@ -1132,6 +1350,19 @@ def test_walker_is_structurally_iterative_beyond_python_recursion_depth() -> Non
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == function.name
+        for node in ast.walk(function)
+    )
+    assert any(isinstance(node, ast.While) for node in ast.walk(function))
+    assert any(
+        isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "stack"
+        for node in ast.walk(function)
+    )
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_copy_json_value"
         for node in ast.walk(function)
     )
     deep: object = None
