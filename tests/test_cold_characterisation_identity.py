@@ -152,6 +152,18 @@ def _assert_failure(tmp_path: Path, failure: ColdIdentityFailure, **changes: obj
     assert raised.value.failure is failure
 
 
+def _assert_closed_revision_rejection(
+    raised: pytest.ExceptionInfo[ColdIdentityError], revision: str
+) -> None:
+    """Assert a revision refusal cannot expose its untrusted value or raw Pydantic error."""
+    assert raised.value.failure is ColdIdentityFailure.OPERATOR_TEXT_REJECTED
+    assert revision not in str(raised.value)
+    assert revision not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert not hasattr(raised.value, "errors")
+
+
 def test_freeze_requires_and_carries_provenance_and_effective_profile(tmp_path: Path) -> None:
     """Freezing cannot omit either new immutable identity component."""
     identity = _freeze(tmp_path)
@@ -371,9 +383,88 @@ def test_effective_profile_admits_revision_tokens_without_operator_entropy_scree
     assert _effective_mcp_profile(first_crack_revision=_HEX_40).first_crack_revision == _HEX_40
     assert cold_identity._operator_text_is_safe(_HEX_40) is False  # pyright: ignore[reportPrivateUsage]
     assert _effective_mcp_profile(first_crack_revision="a" * 128).first_crack_revision == "a" * 128
-    for value in ("", "a" * 129, "model revision", "model/path", "model:tag", "é"):
+    for value in ("", "model revision", "model/path", "model:tag", "é"):
         with pytest.raises(ValidationError):
             _effective_mcp_profile(first_crack_revision=value)
+
+
+@pytest.mark.parametrize(
+    "revision",
+    ["a" * 129, "github_pat_" + "a" * 120],
+)
+def test_effective_profile_refuses_oversized_revision_without_exposing_it(revision: str) -> None:
+    """Overlength benign and credential-shaped revisions use the closed refusal path."""
+    with pytest.raises(ColdIdentityError) as raised:
+        _effective_mcp_profile(first_crack_revision=revision)
+
+    _assert_closed_revision_rejection(raised, revision)
+
+
+def test_effective_profile_keyword_constructor_refuses_credential_shaped_revision() -> None:
+    """Direct keyword construction closes credential-shaped in-bound revisions."""
+    revision = "github_pat_abcdefghijklmnop"
+    values = _effective_mcp_profile().model_dump(mode="python")
+    values["first_crack_revision"] = revision
+
+    with pytest.raises(ColdIdentityError) as raised:
+        EffectiveMCPProfile(**values)
+
+    _assert_closed_revision_rejection(raised, revision)
+
+
+@pytest.mark.parametrize(
+    ("revision", "missing_sibling"),
+    [
+        ("a" * 129, False),
+        ("github_pat_" + "a" * 120, True),
+    ],
+)
+def test_nested_identity_refuses_oversized_revision_before_sibling_errors(
+    tmp_path: Path, revision: str, missing_sibling: bool
+) -> None:
+    """Nested oversized revisions stay closed despite invalid or absent sibling fields."""
+    payload = _freeze(tmp_path).model_dump(mode="python")
+    profile = cast(dict[str, object], payload["effective_mcp_profile"])
+    profile["first_crack_revision"] = revision
+    if missing_sibling:
+        del profile["audio_sample_rate"]
+    else:
+        profile["audio_sample_rate"] = 0
+
+    with pytest.raises(ColdIdentityError) as raised:
+        ColdRunIdentity.model_validate(payload)
+
+    _assert_closed_revision_rejection(raised, revision)
+
+
+def test_oversized_revision_skips_credential_pattern_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The raw size bound prevents credential-pattern work for large direct and nested inputs."""
+    revision = "github_pat_" + "a" * 100_000
+    payload = _freeze(tmp_path).model_dump(mode="python")
+    profile = cast(dict[str, object], payload["effective_mcp_profile"])
+    profile["first_crack_revision"] = revision
+    calls = 0
+
+    def fail_if_called(value: str) -> bool:
+        nonlocal calls
+        calls += 1
+        raise AssertionError(f"credential scan unexpectedly received {len(value)} characters")
+
+    monkeypatch.setattr(cold_identity, "_revision_has_credential_shape", fail_if_called)
+    with pytest.raises(ColdIdentityError) as raised:
+        _effective_mcp_profile(first_crack_revision=revision)
+
+    _assert_closed_revision_rejection(raised, revision)
+    assert calls == 0
+
+    with pytest.raises(ColdIdentityError) as nested_raised:
+        ColdRunIdentity.model_validate(payload)
+
+    _assert_closed_revision_rejection(nested_raised, revision)
+    assert calls == 0
 
 
 @pytest.mark.parametrize(

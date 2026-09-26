@@ -211,6 +211,9 @@ class EffectiveMCPProfile(BaseModel):
             if isinstance(value, Mapping)
             else None
         )
+        if isinstance(raw_revision, str) and len(raw_revision) > 128:
+            # Deliberately reuse this reason because the revision originates in operator YAML.
+            raise ColdIdentityError(ColdIdentityFailure.OPERATOR_TEXT_REJECTED)
         profile: EffectiveMCPProfile | None = None
         validation_error: ValidationError | None = None
         try:
