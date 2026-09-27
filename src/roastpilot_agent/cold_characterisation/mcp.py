@@ -686,12 +686,20 @@ class ColdTickObservation(BaseModel):
     complete projection of the raw first-crack payload of the same response.
     ``state.first_crack_status`` is tolerant roast-path telemetry whose counters
     may be defaulted or dropped, so it must never feed cold evidence.
+
+    ``device`` is the only admissible per-tick device evidence: a strict,
+    complete projection of the raw ``device_state`` of the same response, or
+    ``None`` exactly when MCP reported JSON ``null``.  ``None`` records absent
+    telemetry only; it is never a pass, a default, or a zero device, and every
+    consumer must handle it explicitly.  ``state.device_state`` is tolerant
+    telemetry and must never feed cold evidence.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True, allow_inf_nan=False)
 
     state: RoastSessionState
     audio: ColdTickProjection
+    device: ColdTickDeviceState | None
 
 
 class ColdCharacterisationMCPClient:
@@ -873,14 +881,15 @@ class ColdCharacterisationMCPClient:
         return result
 
     async def get_roast_state(self, session_id: str | None = None) -> ColdTickObservation:
-        """Return one cold tick whose audio evidence is strictly projected.
+        """Return one cold tick whose audio and device evidence are strictly projected.
 
         Args:
             session_id: Optional explicit session; it must be the established one.
 
         Returns:
-            The tolerant session state and the strict audio projection, both
-            parsed from one MCP response.
+            The tolerant session state, the strict audio projection, and the
+            strict device projection (``None`` only for JSON ``null``), all
+            parsed from one MCP response.  Audio is projected before device.
 
         Raises:
             ColdSessionIdentityError: If the session is not the established one.
@@ -888,6 +897,7 @@ class ColdCharacterisationMCPClient:
             ColdMcpTransportError: If the MCP transport fails.
             ColdMcpValidationError: If the response violates the cold contract.
             ColdTickAudioProjectionError: If the audio evidence is not strictly complete.
+            ColdTickDeviceProjectionError: If the device state is not strictly complete.
         """
         expected_session_id = self._cold_session_id
         if expected_session_id is None or (
@@ -909,7 +919,8 @@ class ColdCharacterisationMCPClient:
             failure = error.failure
             field_names = error.field_names
         else:
-            return ColdTickObservation(state=state, audio=audio)
+            device = self._project_device(cast("dict[str, object]", tree)["device_state"])
+            return ColdTickObservation(state=state, audio=audio, device=device)
         raise ColdTickAudioProjectionError(failure, field_names)
 
     async def mark_beans_added(self) -> EventCommandResult:
