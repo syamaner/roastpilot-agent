@@ -615,8 +615,8 @@ class ColdFinalisationRecord(pydantic.BaseModel):
     envelope: ColdSealedEnvelope
     status: ColdFinalisationStatus
     clean: bool
-    observed_command_streaming_required: bool
-    applied_branch: ColdCapabilityBranch
+    observed_command_streaming_required: bool | None
+    applied_branch: ColdCapabilityBranch | None
 
     @pydantic.model_validator(mode="after")
     def _require_finalisation_kind(self) -> typing.Self:
@@ -624,6 +624,19 @@ class ColdFinalisationRecord(pydantic.BaseModel):
         if self.envelope.kind is not ColdEnvelopeKind.FINALISATION:
             raise ColdEvidenceError(ColdEvidenceFailure.ENVELOPE_KIND_MISMATCHED)
         return self
+
+    @pydantic.model_validator(mode="after")
+    def _require_capability_pairing(self) -> typing.Self:
+        """Require both capability fields absent, or both present and agreeing."""
+        observed = self.observed_command_streaming_required
+        branch = self.applied_branch
+        if (
+            (observed is None and branch is None)
+            or (observed is True and branch is ColdCapabilityBranch.STREAMING)
+            or (observed is False and branch is ColdCapabilityBranch.NON_STREAMING)
+        ):
+            return self
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
 
 
 class ColdAbortRecord(pydantic.BaseModel):

@@ -83,8 +83,20 @@ python -m pytest
 
 CI uses a four-worker ordinary xdist lane, a serial lane, a three-entry stress
 matrix, and the Package job for `tests/test_packaging.py`; one coverage job combines
-their data. For a fast local parallel loop, run `python -m pytest -n 4 --dist
-worksteal -m 'not serial and not stress'`. `stress` tests exercise real production
+their data. The serial lane is event-selected (#954): pull-request and push runs add
+`and not exhaustive_only`, omitting only the closed `exhaustive_only` inventory pinned
+in `tests/test_pytest_governance.py` (initially the nested QA-wrapper suite test,
+whose members must also be `serial`), while the daily `schedule` (02:23 UTC) and
+manual `workflow_dispatch` runs of `ci.yml` select the entire collection through the
+same lanes. A focused actual-wrapper test keeps the sentinel proof on every pull
+request. A red scheduled or dispatched exhaustive run is diagnosed independently of
+its author. Merges whose change is affected by the diagnosed failure pause until it
+is resolved or the operator records an explicit disposition; unrelated merges are
+not frozen. Missing or delayed scheduled evidence is reported as such in the merge
+context, never presented as green. A dispatch on a PR ref is optional operator
+choice, not a standing prerequisite. For a fast local parallel loop, run
+`python -m pytest -n 4 --dist worksteal -m 'not serial and not stress'`. `stress`
+tests exercise real production
 resource limits, `slow` tests use real subprocesses or MCP sessions, and `serial`
 tests are never run under `-n`. The full gate (`python -m pytest`, all markers,
 single process) remains mandatory before handback and before opening a PR.
@@ -768,21 +780,55 @@ its cross-reference to the former AGENTS.md implementation-delegation bullet.
 The Codex parent invokes existing `.claude/agents/` roles selectively; their
 definitions, model pins, and read/write capabilities remain authoritative.
 
-- Planning: high-effort `claude-opus-5` roles `planning-architect` for complex,
+- Planning: medium-effort `claude-opus-5-5` roles `planning-architect` for complex,
   ambiguous, cross-repository, or safety-boundary design and `story-planner`
   for the mandatory implementation contract before every delegated slice. Both
   remain read-only.
-- Implementation capacity: `engineer-be` and `engineer-fe` remain high-effort
-  `claude-sonnet-5` workers when capacity routing selects Claude. They are leaf
+- Implementation capacity: `engineer-be` and `engineer-fe` remain medium-effort
+  `claude-opus-5-5` workers when capacity routing selects Claude. They are leaf
   implementers, never delivery orchestrators.
 - Assurance: `qa`, `security-reviewer`, `ui-reviewer`,
   `mcp-contract-checker`, and `sim-roast-runner` retain their existing pins and
-  lenses. `safety-reviewer` remains the mandatory `claude-opus-5`, `xhigh`
+  lenses. `safety-reviewer` remains the mandatory `claude-opus-5-5`, `high`
   safety floor.
 - Adjudication/audit: `pr-triage` runs only when substantive findings require
   independent disposition. `product-auditor` runs at story completion, epic
   completion, suspected plan drift, or when a finding suggests the contract was
   wrong; it is not a per-slice default.
+
+### Running Claude Opus 5.5 roles
+
+Every `.claude/agents/` role is pinned to `claude-opus-5-5`. These rules follow
+Anthropic's Opus 5.5 prompting guidance and bind both the role files and the
+briefs the parent writes for them.
+
+- **Effort is the thinking control.** Opus 5.5 effort names do not map to Opus 5's:
+  `medium` matches or beats Opus 5 at `high`, and each level thinks more per turn.
+  Roles therefore run at `medium`, with `safety-reviewer` at `high`. Raise a role
+  to `xhigh` or `max` only after a measured quality gain on that role's work, and
+  record the measurement with the pin change. To reduce thinking, lower effort;
+  do not add prompt text for it.
+- **No thinking-substitute instructions.** Role files and briefs never tell a
+  role to "think carefully", "think step by step", or write out its internal
+  reasoning in the reply; the model already thinks, and requests to reproduce
+  its reasoning can be refused (`reasoning_extraction`). Ask for conclusions
+  with `file:line` evidence instead.
+- **A text-only handback is a report, not proof of completion.** Every role
+  file ends with a "How your run ends" section that tells the role not to stop
+  on a summary that announces its next step. The parent still checks each
+  handback against the contract's deliverables; if items are open and no
+  blocker is stated, it sends one continuation naming them, and after two or
+  three continuations on the same slice it stops and escalates rather than
+  looping. A role whose background command or tool call is still running has
+  not finished.
+- **Name the defaults to avoid, not "avoid generic".** For SPA work,
+  `engineer-fe` and `ui-reviewer` carry an explicit list of default styles
+  (cream background, italic heading accents, numbered section labels, monospace
+  labels, pill buttons, gradient hero panels). When a result still looks
+  templated, extend that list with the specific pattern observed.
+- **Dense visuals get element-level screenshots.** `ui-reviewer` judges curves,
+  markers, and badges from full-resolution element captures, not full-page
+  shots alone.
 
 ### Capacity-aware implementation routing
 

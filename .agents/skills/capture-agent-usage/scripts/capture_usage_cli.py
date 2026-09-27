@@ -602,7 +602,7 @@ def _native_role_pin(role: NativeClaudeRole) -> _NativeRolePin:
     if (
         any(len(value) != 1 for value in values.values())
         or values["effort"][0] not in _SUPPORTED_EFFORTS
-        or not re.fullmatch(r"claude-(?:sonnet|opus)-5", values["model"][0])
+        or not re.fullmatch(r"claude-(?:sonnet|opus)-5(?:-5)?", values["model"][0])
     ):
         raise CaptureUsageError("native agent frontmatter is invalid")
     tools = tuple(token.strip() for token in values["tools"][0].split(","))

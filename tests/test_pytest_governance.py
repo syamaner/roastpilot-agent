@@ -70,6 +70,46 @@ _TIMEOUT_BEARING_JOBS = (
 )
 _CHECKOUT_PIN = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
 
+#: #954: the closed inventory omitted from pull_request/push CI and selected only by
+#: scheduled and manually dispatched ``ci.yml`` runs. Every member must be ``serial``.
+_EXHAUSTIVE_ONLY_INVENTORY = frozenset(
+    {
+        "tests/test_capture_agent_usage.py::test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper"
+    }
+)
+#: #954: the exact serial-lane selection expression; any other value fails closed.
+_SERIAL_SELECTION_EXPRESSION = (
+    "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') "
+    "&& 'serial and not stress' || 'serial and not stress and not exhaustive_only' }}"
+)
+_EXHAUSTIVE_SERIAL_SELECTION = "serial and not stress"
+_FAST_SERIAL_SELECTION = "serial and not stress and not exhaustive_only"
+#: Exact event -> serial selection; an unmapped event is a KeyError (fail closed).
+_SERIAL_SELECTION_BY_EVENT = {
+    "pull_request": _FAST_SERIAL_SELECTION,
+    "push": _FAST_SERIAL_SELECTION,
+    "schedule": _EXHAUSTIVE_SERIAL_SELECTION,
+    "workflow_dispatch": _EXHAUSTIVE_SERIAL_SELECTION,
+}
+_CI_TRIGGERS = {
+    "pull_request": None,
+    "push": {"branches": ["main"]},
+    "workflow_dispatch": None,
+    "schedule": [{"cron": "23 2 * * *"}],
+}
+_COVERAGE_ARGUMENTS = (
+    "--cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts "
+    "--cov-report="
+)
+_ORDINARY_RUN = (
+    'python -m pytest -n 4 --dist worksteal -m "not serial and not stress" '
+    f"--ignore=tests/test_packaging.py {_COVERAGE_ARGUMENTS}"
+)
+_SERIAL_RUN = (
+    'python -m pytest -m "$SERIAL_SELECTION" '
+    f"--ignore=tests/test_packaging.py {_COVERAGE_ARGUMENTS}"
+)
+
 
 def _pytest_options() -> dict[str, object]:
     """Load the Pytest configuration from the project metadata."""
@@ -106,8 +146,14 @@ def _steps(job: dict[str, object]) -> list[dict[str, object]]:
     return [_mapping(step) for step in cast(list[object], steps)]
 
 
-def _pytest_lanes(workflow: dict[str, object]) -> list[tuple[str, list[str], str]]:
-    """Expand each governed pytest lane into its test arguments and coverage file."""
+def _pytest_lanes(workflow: dict[str, object], event: str) -> list[tuple[str, list[str], str]]:
+    """Expand each governed pytest lane for one trigger event.
+
+    ``$SERIAL_SELECTION`` resolves only when the step's env value equals the pinned
+    expression exactly; the event then maps to its branch, and an unmapped event
+    fails closed.
+    """
+    selection = _SERIAL_SELECTION_BY_EVENT[event]
     jobs = _mapping(workflow["jobs"])
     lanes: list[tuple[str, list[str], str]] = []
     for job_id in ("pytest-ordinary", "pytest-serial", "package", "pytest-stress"):
@@ -126,6 +172,11 @@ def _pytest_lanes(workflow: dict[str, object]) -> list[tuple[str, list[str], str
             env = _mapping(step["env"])
             coverage_file = env["COVERAGE_FILE"]
             assert isinstance(coverage_file, str)
+            if "SERIAL_SELECTION" in env or "$SERIAL_SELECTION" in run:
+                assert job_id == "pytest-serial"
+                assert env["SERIAL_SELECTION"] == _SERIAL_SELECTION_EXPRESSION
+                assert run.count('"$SERIAL_SELECTION"') == 1
+                run = run.replace('"$SERIAL_SELECTION"', shlex.quote(selection))
             for matrix_entry in matrix_entries:
                 command = run
                 resolved_coverage_file = coverage_file
@@ -135,6 +186,7 @@ def _pytest_lanes(workflow: dict[str, object]) -> list[tuple[str, list[str], str
                     resolved_coverage_file = resolved_coverage_file.replace(
                         f"${{{{ matrix.{key} }}}}", value
                     )
+                assert "$" not in command
                 arguments = shlex.split(command)
                 assert arguments[:3] == ["python", "-m", "pytest"]
                 lanes.append((job_id, arguments[3:], resolved_coverage_file))
@@ -342,19 +394,38 @@ def test_stress_collection_selects_real_parser_boundaries() -> None:
     assert "test_codex_opaque_total_boundary_rejects_one_over" in result.stdout
 
 
-def test_ci_lane_selections_partition_the_full_collection() -> None:
-    """Every collected test belongs to exactly one explicit CI lane."""
+@pytest.mark.parametrize(
+    ("events", "exhaustive"),
+    [(("pull_request", "push"), False), (("schedule", "workflow_dispatch"), True)],
+    ids=("pull-request-and-push", "schedule-and-workflow-dispatch"),
+)
+def test_ci_lane_selections_partition_the_full_collection(
+    events: tuple[str, str], exhaustive: bool
+) -> None:
+    """Every collected test belongs to exactly one lane, or to the closed inventory.
+
+    Pull-request and push lanes plus the ``exhaustive_only`` inventory equal the full
+    collection; scheduled and dispatched lanes alone equal it (#954).
+    """
     workflow = _workflow()
+    first, second = events
+    assert _pytest_lanes(workflow, first) == _pytest_lanes(workflow, second)
     by_job: dict[str, set[str]] = {}
-    for job_id, arguments, _ in _pytest_lanes(workflow):
+    for job_id, arguments, _ in _pytest_lanes(workflow, first):
         returncode, nodeids, output = _collect_nodeids(arguments)
         assert returncode == 0, output
         by_job.setdefault(job_id, set()).update(nodeids)
 
     full_returncode, full, full_output = _collect_nodeids([])
     stress_returncode, stress, stress_output = _collect_nodeids(["-m", "stress"])
+    inventory_returncode, inventory, inventory_output = _collect_nodeids(["-m", "exhaustive_only"])
+    serial_returncode, serial, serial_output = _collect_nodeids(["-m", "serial"])
     assert full_returncode == 0, full_output
     assert stress_returncode == 0, stress_output
+    assert inventory_returncode == 0, inventory_output
+    assert serial_returncode == 0, serial_output
+    assert inventory == _EXHAUSTIVE_ONLY_INVENTORY
+    assert inventory <= serial
     assert set(by_job) == {"pytest-ordinary", "pytest-serial", "pytest-stress", "package"}
     assert all(by_job.values())
 
@@ -362,7 +433,13 @@ def test_ci_lane_selections_partition_the_full_collection() -> None:
     for index, current in enumerate(lane_sets):
         for other in lane_sets[index + 1 :]:
             assert current.isdisjoint(other)
-    assert set().union(*lane_sets) == full
+    lanes = set[str]().union(*lane_sets)
+    if exhaustive:
+        assert lanes == full
+        assert inventory <= by_job["pytest-serial"]
+    else:
+        assert lanes.isdisjoint(inventory)
+        assert lanes | inventory == full
     assert by_job["pytest-stress"] == stress
 
     package_nodeids = {nodeid for nodeid in full if nodeid.startswith("tests/test_packaging.py::")}
@@ -372,18 +449,90 @@ def test_ci_lane_selections_partition_the_full_collection() -> None:
     assert full and len(full) > 4_000
 
 
+def test_ci_triggers_and_serial_selection_are_pinned_exactly() -> None:
+    """The four triggers, the daily schedule, and the serial expression are exact (#954).
+
+    The exhaustive branch is chosen only by the exact ``schedule`` and
+    ``workflow_dispatch`` event names; every other event takes the fast selection.
+    """
+    workflow = _workflow()
+    assert workflow["on"] == _CI_TRIGGERS
+    on_block = _mapping(workflow["on"])
+    assert set(on_block) == {"pull_request", "push", "workflow_dispatch", "schedule"}
+    assert on_block["schedule"] == [{"cron": "23 2 * * *"}]
+    assert on_block["workflow_dispatch"] is None
+
+    jobs = _mapping(workflow["jobs"])
+    selection_steps = [
+        (job_id, step)
+        for job_id, job in jobs.items()
+        for step in _steps(_mapping(job))
+        if "SERIAL_SELECTION" in _mapping(step.get("env", {}))
+    ]
+    assert [job_id for job_id, _ in selection_steps] == ["pytest-serial"]
+    _, serial_step = selection_steps[0]
+    serial_env = _mapping(serial_step["env"])
+    assert serial_env == {
+        "COVERAGE_FILE": ".coverage.serial",
+        "SERIAL_SELECTION": _SERIAL_SELECTION_EXPRESSION,
+    }
+    assert serial_step["run"] == _SERIAL_RUN
+    workflow_text = (REPO_ROOT / ".github/workflows/ci.yml").read_text()
+    assert workflow_text.count("exhaustive_only") == 1
+    assert workflow_text.count("SERIAL_SELECTION") == 2
+
+    for event, expected in _SERIAL_SELECTION_BY_EVENT.items():
+        serial_arguments = next(
+            arguments
+            for job_id, arguments, _ in _pytest_lanes(workflow, event)
+            if job_id == "pytest-serial"
+        )
+        assert serial_arguments[serial_arguments.index("-m") + 1] == expected
+    with pytest.raises(KeyError):
+        _pytest_lanes(workflow, "pull_request_target")
+
+
+def test_agents_md_describes_the_event_selected_serial_lane() -> None:
+    """AGENTS.md names the event-selected lane and inventory; the full-gate rule stays."""
+    agents_md = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    assert "The serial lane is event-selected (#954)" in agents_md
+    assert "`and not exhaustive_only`" in agents_md
+    assert "closed `exhaustive_only` inventory" in agents_md
+    assert "`tests/test_pytest_governance.py`" in agents_md
+    assert "daily `schedule` (02:23 UTC)" in agents_md
+    assert "manual `workflow_dispatch`" in agents_md
+    assert (
+        "tests are never run under `-n`. The full gate (`python -m pytest`, all markers,\n"
+        "single process) remains mandatory before handback and before opening a PR.\n"
+    ) in agents_md
+
+
 def test_ci_lanes_are_bounded_parallel_and_write_unique_coverage_files() -> None:
     """CI lanes have fixed xdist bounds and preserve all coverage data files."""
     workflow = _workflow()
     jobs = _mapping(workflow["jobs"])
-    lanes = _pytest_lanes(workflow)
-    ordinary_arguments = next(arguments for job, arguments, _ in lanes if job == "pytest-ordinary")
-    assert ordinary_arguments.count("-n") == 1
-    assert ordinary_arguments[ordinary_arguments.index("-n") + 1] == "4"
-    assert ordinary_arguments[ordinary_arguments.index("--dist") + 1] == "worksteal"
-    for job_id, arguments, _ in lanes:
-        if job_id != "pytest-ordinary":
-            assert "-n" not in arguments
+    ordinary_runs = [
+        step.get("run") for step in _steps(_mapping(jobs["pytest-ordinary"])) if "run" in step
+    ]
+    serial_runs = [
+        step.get("run") for step in _steps(_mapping(jobs["pytest-serial"])) if "run" in step
+    ]
+    assert _ORDINARY_RUN in ordinary_runs
+    assert _SERIAL_RUN in serial_runs
+    for event in _SERIAL_SELECTION_BY_EVENT:
+        event_lanes = _pytest_lanes(workflow, event)
+        ordinary_arguments = next(
+            arguments for job, arguments, _ in event_lanes if job == "pytest-ordinary"
+        )
+        assert ordinary_arguments.count("-n") == 1
+        assert ordinary_arguments[ordinary_arguments.index("-n") + 1] == "4"
+        assert ordinary_arguments[ordinary_arguments.index("--dist") + 1] == "worksteal"
+        for job_id, arguments, _ in event_lanes:
+            if job_id != "pytest-ordinary":
+                assert "-n" not in arguments
+                assert not any(argument.startswith("-n") for argument in arguments)
+                assert "--numprocesses" not in arguments
+    lanes = _pytest_lanes(workflow, "pull_request")
 
     coverage_files = [coverage_file for _, _, coverage_file in lanes]
     assert all(coverage_file.startswith(".coverage.") for coverage_file in coverage_files)
@@ -828,7 +977,9 @@ def test_docs_fastpath_job_structure_and_dependency_group() -> None:
 
     # docs-fastpath's pytest invocation is deliberately not a governed lane:
     # it never appears in `_pytest_lanes`'s job-id allowlist.
-    assert "docs-fastpath" not in {job_id for job_id, _, _ in _pytest_lanes(workflow)}
+    assert "docs-fastpath" not in {
+        job_id for job_id, _, _ in _pytest_lanes(workflow, "pull_request")
+    }
 
     with (REPO_ROOT / "pyproject.toml").open("rb") as config_file:
         project = cast(dict[str, object], tomllib.load(config_file))

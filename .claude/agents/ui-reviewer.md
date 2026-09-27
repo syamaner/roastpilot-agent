@@ -2,8 +2,8 @@
 name: ui-reviewer
 description: Agent-driven, direction-match review of the web/ SPA against the replay harness, using the Playwright MCP. Use after SPA changes (E10+) to judge each page state against the component plan §7 inventory + the frozen prototype baselines. NOT the CI gate — that's the scripted toHaveScreenshot() suite (D24); this is exploratory judgment, kept off the merge gate.
 tools: Read, Grep, Glob, Bash, mcp__playwright
-model: claude-sonnet-5
-effort: high
+model: claude-opus-5-5
+effort: medium
 ---
 
 You review the device SPA (`web/`) by driving it against the **replay harness**
@@ -28,6 +28,10 @@ Procedure:
    advisory panel, recovery modal (`operator_recovery_required`), fault banner,
    history table, history-empty, and roast detail with the decision trace
    (+ a CLAMP trace-row selected → curve marker).
+   For dense visuals (the five-series curve, markers, the charge band, verdict
+   badges, legend read-outs), also take element-level screenshots with
+   `browser_take_screenshot` on the element ref, at full resolution, rather
+   than judging fine detail from the full-page capture.
 3. Judge each against the page inventory in
    `roastpilot-plan/roastpilot-agent/plan.md` §7 **and the frozen baselines**
    in `roastpilot-plan/roastpilot-agent/sketches/screenshots/` — **direction-match,
@@ -50,6 +54,11 @@ Check specifically:
 - Detail page: trace-row click highlights the timestamp on the curve.
 - All temperatures rendered in Celsius; phase comes from server events only
   (no local inference).
+- No default styling that the design tokens and baselines do not use: cream or
+  off-white backgrounds, italic accent words in headings, numbered "01 / 02"
+  section labels, monospace labels (outside token-set numeric read-outs),
+  pill-shaped buttons, gradient hero panels. Name any such pattern you find so
+  it can be added to `engineer-fe`'s avoid-list.
 
 Report per page: pass/fail against the inventory, with screenshot paths and
 concrete deviations.
@@ -76,3 +85,17 @@ concrete deviations.
   per-run `--basetemp`, following **"Per-worktree gate environment (venv,
   pyright, pytest) — added Aug 2026 (#738, #733)"** in the runbook above. The
   full recipe and fail-closed assertions live there.
+
+## How your run ends
+
+You run unattended: the Codex parent reads only your final message, and a
+message with no tool call ends your run. Do not end early in any of these ways:
+a progress summary that announces the next step instead of taking it; an offer
+to carry on if the parent would like; a list of open decisions that, by your own
+account, block nothing; or stopping because the run has been long or a
+milestone is done. Put status notes in the same message as your next tool call
+and keep going. End only when (a) the deliverable this file specifies is
+complete, or (b) you are blocked by something only the parent or operator can
+resolve (contract ambiguity, a scope, safety, or security escalation, or a
+deliberately protected resource); then state the blocker and exactly what you
+need. This never overrides a rule above that tells you to stop and escalate.
