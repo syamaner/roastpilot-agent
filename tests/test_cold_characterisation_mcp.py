@@ -1,5 +1,6 @@
 """Behavioural safety tests for the cold-characterisation MCP boundary."""
 
+import ast
 import inspect
 import json
 import traceback
@@ -10,6 +11,13 @@ import pytest
 from pydantic import ValidationError
 
 from roastpilot_agent.cold_characterisation import mcp as cold_mcp
+from roastpilot_agent.cold_characterisation.evidence_schema import (
+    MAX_JSON_KEY_BYTES,
+    MAX_RAW_AUDIO_EXTRA_BYTES,
+    ColdAudioField,
+    ColdEvidenceFailure,
+    ColdTickAudioSample,
+)
 from roastpilot_agent.cold_characterisation.mcp import (
     COLD_ALLOWED_TOOLS,
     ColdCharacterisationMCPClient,
@@ -22,13 +30,21 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdSessionIdentityError,
     ColdSessionPhaseError,
     ColdSessionPurposeError,
+    ColdTickAudioProjectionError,
+    ColdTickObservation,
     RejectionReason,
     SessionFinalisationResult,
     _finalisation_has_capability_compatible_evidence,  # pyright: ignore[reportPrivateUsage]
     finalisation_command_streaming_observation,
     finalisation_is_clean,
 )
-from roastpilot_agent.mcp_client import MCPConnectionError, MCPToolError, MCPToolTimeoutError
+from roastpilot_agent.mcp_client import (
+    MCPConnectionError,
+    MCPServerProcess,
+    MCPToolError,
+    MCPToolTimeoutError,
+    RoastSessionState,
+)
 
 _MCP_TOOL_FIXTURES = Path(__file__).parent / "fixtures" / "mcp-tool-results"
 _FINALISATION_FIXTURE = _MCP_TOOL_FIXTURES / "finalise_cold_characterisation_session.json"
@@ -382,7 +398,7 @@ async def test_cold_state_and_activation_return_validated_results() -> None:
     )
     client = ColdCharacterisationMCPClient(caller)
     await client.start_cold_session()
-    assert (await client.get_roast_state()).session_id == "session-id"
+    assert (await client.get_roast_state()).state.session_id == "session-id"
     assert (await client.mark_beans_added()).event.kind == "beans_added"
 
 
@@ -1478,3 +1494,536 @@ def test_streaming_observation_delegates_to_the_sole_predicate(
     source = inspect.getsource(finalisation_command_streaming_observation)
     assert "return _command_streaming_required(evidence)" in source
     assert ".command_streaming_required" not in source
+
+
+# --- #954 slice 4a: strict per-tick first-crack observation (HD-1) ---
+
+#: Audio fields the tolerant ``FirstCrackStatus`` mirror requires (no default).
+_REQUIRED_MIRROR_AUDIO_FIELDS: tuple[str, ...] = (
+    "mode",
+    "status",
+    "detected_at_utc",
+    "detected_monotonic_seconds",
+    "allow_manual_override",
+)
+#: Audio fields the tolerant mirror defaults (nine) or silently ignores (six).
+_TOLERATED_AUDIO_FIELDS: tuple[str, ...] = (
+    "reason",
+    "audio_running",
+    "queued_window_count",
+    "emitted_window_count",
+    "dropped_window_count",
+    "processed_window_count",
+    "overflow_count_last_minute",
+    "estimated_lost_audio_ms_last_minute",
+    "total_overflow_count",
+    "mic_peak_dbfs",
+    "mic_rms_dbfs",
+    "max_consecutive_overflow_count",
+    "last_inference_duration_ms",
+    "max_inference_duration_ms",
+    "inference_overrun_count",
+)
+_TICK_MESSAGE = "MCP tick audio evidence failed strict projection"
+_GENERIC_MESSAGE = "MCP response failed cold contract validation"
+_COLD_PACKAGE = Path(inspect.getfile(cold_mcp)).parent
+
+
+def _first_crack(payload: dict[str, object]) -> dict[str, object]:
+    """Return the mutable raw first-crack mapping of a tick payload."""
+    return cast("dict[str, object]", payload["first_crack_status"])
+
+
+def _assert_tolerant_mirror_accepts(payload: dict[str, object]) -> None:
+    """Prove in-test that the tolerant roast mirror accepts this payload."""
+    RoastSessionState.model_validate_json(json.dumps(payload))
+
+
+def _runtime_canary() -> str:
+    """Assemble a synthetic credential-shaped canary at runtime (never a real secret)."""
+    return "".join(["sk", "-or-v1-", "c0ld", "canary", "7" * 12])
+
+
+def _assert_contained(error: BaseException, canary: str) -> None:
+    """Assert a canary is absent from every public rendering of an error."""
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert canary not in str(error)
+    assert canary not in repr(error)
+    assert all(canary not in repr(arg) for arg in error.args)
+    assert canary not in "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+
+
+async def _started_client(
+    state: object,
+) -> tuple[ColdCharacterisationMCPClient, _MappingCaller]:
+    """Return a cold client established through its public start method."""
+    caller = _MappingCaller(
+        {"start_roast_session": _cold_start_payload(), "get_roast_state": state}
+    )
+    client = ColdCharacterisationMCPClient(caller)
+    await client.start_cold_session()
+    return client, caller
+
+
+def _state_calls(caller: _MappingCaller) -> list[tuple[str, dict[str, object]]]:
+    """Return only the recorded per-tick state reads."""
+    return [call for call in caller.calls if call[0] == "get_roast_state"]
+
+
+@pytest.mark.asyncio
+async def test_cold_tick_returns_strict_audio_from_the_raw_response() -> None:
+    """T1/AC-P1: every audio field equals the raw response value, from one read."""
+    payload = _cold_state_payload()
+    raw_audio = dict(_first_crack(payload))
+    client, caller = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    assert type(observation) is ColdTickObservation
+    assert type(observation.audio.audio) is ColdTickAudioSample
+    for field in ColdAudioField:
+        if field is ColdAudioField.UNKNOWN_FIELD:
+            continue
+        value = getattr(observation.audio.audio, field.value)
+        assert value == raw_audio[field.value], field
+        assert type(value) is type(raw_audio[field.value]), field
+    assert observation.state.session_id == "session-id"
+    assert observation.audio.raw_audio_extra == {}
+    assert _state_calls(caller) == [("get_roast_state", {"session_id": "session-id"})]
+
+
+def test_tick_audio_field_partition_is_exact() -> None:
+    """T2: required-mirror and tolerated fields partition the closed audio names."""
+    required = set(_REQUIRED_MIRROR_AUDIO_FIELDS)
+    tolerated = set(_TOLERATED_AUDIO_FIELDS)
+    assert len(required) == 5
+    assert len(tolerated) == 15
+    assert required.isdisjoint(tolerated)
+    assert required | tolerated == {
+        field.value for field in ColdAudioField if field is not ColdAudioField.UNKNOWN_FIELD
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", _REQUIRED_MIRROR_AUDIO_FIELDS)
+async def test_missing_required_mirror_audio_field_fails_generic_validation(field: str) -> None:
+    """T2a: a field the tolerant mirror requires fails before projection is reachable."""
+    payload = _cold_state_payload()
+    del _first_crack(payload)[field]
+    client, caller = await _started_client(payload)
+
+    with pytest.raises(ColdMcpValidationError) as raised:
+        await client.get_roast_state()
+
+    assert type(raised.value) is ColdMcpValidationError
+    assert str(raised.value) == _GENERIC_MESSAGE
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert len(_state_calls(caller)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", _TOLERATED_AUDIO_FIELDS)
+async def test_missing_tolerated_audio_field_fails_strict_projection(field: str) -> None:
+    """T2b/AC-P2: a field the tolerant mirror would default or drop cannot be invented."""
+    payload = _cold_state_payload()
+    del _first_crack(payload)[field]
+    _assert_tolerant_mirror_accepts(payload)
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdTickAudioProjectionError) as raised:
+        await client.get_roast_state()
+
+    assert raised.value.failure is ColdEvidenceFailure.TICK_PAYLOAD_NOT_STRICT
+    assert raised.value.field_names == (ColdAudioField(field),)
+    assert str(raised.value) == _TICK_MESSAGE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), [("mode", "not-a-mode"), ("status", "not-a-status")])
+async def test_out_of_set_mode_or_status_fails_generic_validation(field: str, value: str) -> None:
+    """T3a: closed mode/status values are refused by the tolerant mirror first."""
+    payload = _cold_state_payload()
+    _first_crack(payload)[field] = value
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdMcpValidationError) as raised:
+        await client.get_roast_state()
+
+    assert type(raised.value) is ColdMcpValidationError
+    assert str(raised.value) == _GENERIC_MESSAGE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_consecutive_overflow_count", "0"),
+        ("inference_overrun_count", True),
+        ("max_inference_duration_ms", "1.5"),
+        ("last_inference_duration_ms", None),
+        ("mic_peak_dbfs", "x"),
+        ("queued_window_count", "0"),
+        ("audio_running", "true"),
+        ("estimated_lost_audio_ms_last_minute", "0.0"),
+    ],
+)
+async def test_coerced_audio_value_fails_strict_projection(field: str, value: object) -> None:
+    """T3b/AC-P2: a value the tolerant mirror accepts or ignores is never coerced."""
+    payload = _cold_state_payload()
+    _first_crack(payload)[field] = value
+    _assert_tolerant_mirror_accepts(payload)
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdTickAudioProjectionError) as raised:
+        await client.get_roast_state()
+
+    assert raised.value.failure is ColdEvidenceFailure.TICK_PAYLOAD_NOT_STRICT
+    assert raised.value.field_names == (ColdAudioField(field),)
+
+
+@pytest.mark.asyncio
+async def test_unknown_in_bound_audio_key_is_preserved_losslessly() -> None:
+    """T4/AC-P3: a forward-compatible key is kept in extras and fills no named field."""
+    payload = _cold_state_payload()
+    _first_crack(payload)["future_counter"] = 1
+    client, _ = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    assert observation.audio.raw_audio_extra == {"future_counter": 1}
+    assert "future_counter" not in type(observation.audio.audio).model_fields
+    assert observation.audio.audio.max_consecutive_overflow_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["max_consecutive_overflow", "MAX_CONSECUTIVE_OVERFLOW_COUNT"])
+async def test_variant_audio_key_cannot_stand_in_for_the_real_field(variant: str) -> None:
+    """T4: a near-miss key name never satisfies the required projection field."""
+    payload = _cold_state_payload()
+    audio = _first_crack(payload)
+    audio[variant] = audio.pop("max_consecutive_overflow_count")
+    _assert_tolerant_mirror_accepts(payload)
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdTickAudioProjectionError) as raised:
+        await client.get_roast_state()
+
+    assert raised.value.failure is ColdEvidenceFailure.TICK_PAYLOAD_NOT_STRICT
+    assert raised.value.field_names == (ColdAudioField.MAX_CONSECUTIVE_OVERFLOW_COUNT,)
+
+
+@pytest.mark.asyncio
+async def test_oversized_audio_extra_fails_strict_projection() -> None:
+    """T5: forward-compatible extras stay inside their canonical byte bound."""
+    payload = _cold_state_payload()
+    _first_crack(payload)["future_blob"] = "x" * (MAX_RAW_AUDIO_EXTRA_BYTES + 1)
+    _assert_tolerant_mirror_accepts(payload)
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdTickAudioProjectionError) as raised:
+        await client.get_roast_state()
+
+    assert raised.value.failure is ColdEvidenceFailure.RECORD_RAW_AUDIO_EXTRA_TOO_LARGE
+    assert raised.value.field_names == ()
+
+
+@pytest.mark.asyncio
+async def test_non_finite_audio_value_fails_generic_validation() -> None:
+    """T5: a non-finite float fails serialisation before either parse."""
+    payload = _cold_state_payload()
+    _first_crack(payload)["max_inference_duration_ms"] = float("nan")
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdMcpValidationError) as raised:
+        await client.get_roast_state()
+
+    assert type(raised.value) is ColdMcpValidationError
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("session_id", "other-session", ColdSessionIdentityError),
+        ("session_purpose", "roast", ColdSessionPurposeError),
+    ],
+)
+async def test_identity_and_purpose_checks_precede_audio_projection(
+    field: str, value: str, error: type[ColdMcpError]
+) -> None:
+    """T6: a wrong session or purpose wins over incomplete audio evidence."""
+    payload = _cold_state_payload()
+    payload[field] = value
+    del _first_crack(payload)["max_consecutive_overflow_count"]
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdMcpError) as raised:
+        await client.get_roast_state()
+
+    assert type(raised.value) is error
+
+
+@pytest.mark.asyncio
+async def test_generic_tick_validation_failure_contains_the_rejected_value() -> None:
+    """T7a/AC-P5: a rejected mirror value never reaches the error chain."""
+    canary = _runtime_canary()
+    payload = _cold_state_payload()
+    _first_crack(payload)["mode"] = canary
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdMcpValidationError) as raised:
+        await client.get_roast_state()
+
+    assert type(raised.value) is ColdMcpValidationError
+    _assert_contained(raised.value, canary)
+
+
+@pytest.mark.asyncio
+async def test_projection_failure_contains_the_rejected_value() -> None:
+    """T7b/AC-P5: a value the tolerant mirror ignores never reaches the error chain."""
+    canary = _runtime_canary()
+    payload = _cold_state_payload()
+    _first_crack(payload)["max_consecutive_overflow_count"] = canary
+    _assert_tolerant_mirror_accepts(payload)
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdTickAudioProjectionError) as raised:
+        await client.get_roast_state()
+
+    assert isinstance(raised.value, ColdMcpValidationError)
+    assert raised.value.failure is ColdEvidenceFailure.TICK_PAYLOAD_NOT_STRICT
+    assert raised.value.field_names == (ColdAudioField.MAX_CONSECUTIVE_OVERFLOW_COUNT,)
+    assert raised.value.args == (_TICK_MESSAGE,)
+    _assert_contained(raised.value, canary)
+
+
+@pytest.mark.asyncio
+async def test_projection_failure_contains_a_rejected_key_name() -> None:
+    """T7c/AC-P5: an over-length key name is refused without being rendered."""
+    canary = _runtime_canary()
+    key = canary + "k" * (MAX_JSON_KEY_BYTES + 1 - len(canary.encode("utf-8")))
+    assert len(key.encode("utf-8")) > MAX_JSON_KEY_BYTES
+    payload = _cold_state_payload()
+    _first_crack(payload)[key] = 0
+    _assert_tolerant_mirror_accepts(payload)
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdTickAudioProjectionError) as raised:
+        await client.get_roast_state()
+
+    assert raised.value.failure is ColdEvidenceFailure.JSON_KEY_INVALID
+    assert raised.value.field_names == ()
+    assert raised.value.args == (_TICK_MESSAGE,)
+    _assert_contained(raised.value, canary)
+
+
+class _SequencedCaller:
+    """Transport returning successive per-tool responses from a queue."""
+
+    def __init__(self, responses: dict[str, list[object]]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def __call__(self, tool: str, args: dict[str, object]) -> object:
+        self.calls.append((tool, args))
+        return self.responses[tool].pop(0)
+
+
+@pytest.mark.asyncio
+async def test_tick_state_and_audio_come_from_one_read() -> None:
+    """T8: state and audio share one response even when a second would differ."""
+    first = _cold_state_payload()
+    second = _cold_state_payload()
+    _first_crack(second)["mode"] = "audio"
+    assert _first_crack(first)["mode"] != _first_crack(second)["mode"]
+    caller = _SequencedCaller(
+        {"start_roast_session": [_cold_start_payload()], "get_roast_state": [first, second]}
+    )
+    client = ColdCharacterisationMCPClient(caller)
+    await client.start_cold_session()
+
+    observation = await client.get_roast_state()
+
+    assert observation.state.first_crack_status.mode == observation.audio.audio.mode
+    assert observation.audio.audio.mode == _first_crack(first)["mode"]
+    assert [call[0] for call in caller.calls].count("get_roast_state") == 1
+
+
+#: The six audio fields the strict sample declares as ``float`` or ``float | None``.
+_FLOAT_AUDIO_FIELDS: tuple[str, ...] = (
+    "detected_monotonic_seconds",
+    "mic_peak_dbfs",
+    "mic_rms_dbfs",
+    "estimated_lost_audio_ms_last_minute",
+    "last_inference_duration_ms",
+    "max_inference_duration_ms",
+)
+
+
+def test_float_audio_field_inventory_matches_the_strict_sample() -> None:
+    """The float-designated inventory is exactly the sample's float annotations."""
+    declared = {
+        name
+        for name, info in ColdTickAudioSample.model_fields.items()
+        if info.annotation in (float, float | None)
+    }
+    assert declared == set(_FLOAT_AUDIO_FIELDS)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", _FLOAT_AUDIO_FIELDS)
+async def test_json_integer_in_float_audio_field_is_refused(field: str) -> None:
+    """A raw JSON integer is never silently widened into float audio evidence."""
+    payload = _cold_state_payload()
+    _first_crack(payload)[field] = 1
+    _assert_tolerant_mirror_accepts(payload)
+    client, caller = await _started_client(payload)
+
+    with pytest.raises(ColdTickAudioProjectionError) as raised:
+        await client.get_roast_state()
+
+    assert raised.value.failure is ColdEvidenceFailure.TICK_PAYLOAD_NOT_STRICT
+    assert raised.value.field_names == (ColdAudioField(field),)
+    assert raised.value.args == (_TICK_MESSAGE,)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert len(_state_calls(caller)) == 1
+
+
+@pytest.mark.asyncio
+async def test_json_floats_in_every_float_audio_field_are_accepted() -> None:
+    """Correctly typed JSON floats keep their exact type and value."""
+    payload = _cold_state_payload()
+    for field in _FLOAT_AUDIO_FIELDS:
+        _first_crack(payload)[field] = 1.5
+    client, _ = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    for field in _FLOAT_AUDIO_FIELDS:
+        value = getattr(observation.audio.audio, field)
+        assert type(value) is float, field
+        assert value == 1.5, field
+
+
+@pytest.mark.asyncio
+@pytest.mark.slow
+@pytest.mark.serial(reason="drives a real MCP process group; must not run concurrently")
+async def test_real_child_cold_tick_projects_strictly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T9/AC-P6: the published mock MCP's cold tick projects strictly (shape only)."""
+    monkeypatch.chdir(tmp_path)
+    process = MCPServerProcess()
+    await process.start()
+    try:
+        client = ColdCharacterisationMCPClient(process.call_tool)
+        await client.start_cold_session()
+        await client.mark_beans_added()
+        observation = await client.get_roast_state()
+        assert type(observation) is ColdTickObservation
+        assert observation.state.session_purpose == "cold_characterisation"
+        assert type(observation.audio.audio) is ColdTickAudioSample
+        audio = observation.audio.audio
+        assert type(audio.max_consecutive_overflow_count) is int
+        assert type(audio.inference_overrun_count) is int
+        assert type(audio.last_inference_duration_ms) is float
+        assert type(audio.max_inference_duration_ms) is float
+    finally:
+        await process.stop()
+    assert not process.running
+
+
+def test_cold_tick_observation_declares_its_closed_configuration() -> None:
+    """T11: configuration pin only; this is not a behavioural coercion proof."""
+    config = dict(ColdTickObservation.model_config)
+    assert config.get("strict") is True
+    assert config.get("frozen") is True
+    assert config.get("extra") == "forbid"
+    assert config.get("allow_inf_nan") is False
+
+
+@pytest.mark.asyncio
+async def test_cold_tick_observation_is_closed_and_frozen() -> None:
+    """T11: the observation refuses unknown fields and reassignment."""
+    client, _ = await _started_client(_cold_state_payload())
+    observation = await client.get_roast_state()
+
+    with pytest.raises(ValidationError):
+        ColdTickObservation.model_validate(
+            {"state": observation.state, "audio": observation.audio, "unexpected": 1}
+        )
+    with pytest.raises(ValidationError):
+        observation.audio = observation.audio
+
+
+_TOLERANT_FIRST_CRACK_NAME = "first_crack_status"
+
+
+def _cold_production_trees() -> dict[str, ast.Module]:
+    """Parse every cold production module (docstrings and comments are not nodes)."""
+    return {
+        path.relative_to(_COLD_PACKAGE).as_posix(): ast.parse(path.read_text(encoding="utf-8"))
+        for path in sorted(_COLD_PACKAGE.rglob("*.py"))
+    }
+
+
+def test_cold_production_code_never_reads_tolerant_first_crack_status() -> None:
+    """T12: a finite syntax guard over literal, attribute, and keyword uses of the name.
+
+    Across every cold production module it forbids ``.first_crack_status``
+    attribute nodes, ``getattr`` with that literal, keyword arguments and
+    class-pattern keywords of that name, and any exact ``"first_crack_status"``
+    string constant except the single raw projection subscript in ``mcp.py``.
+    Docstrings are longer strings, so they are not counted.  Access through a
+    variable or a dynamically computed name is an explicit residual: this is a
+    syntax guard, not a proof that the tolerant mirror is unreachable.
+    """
+    trees = _cold_production_trees()
+    assert "mcp.py" in trees
+    attributes: list[str] = []
+    getattr_calls: list[str] = []
+    keywords: list[str] = []
+    pattern_keywords: list[str] = []
+    constants: dict[str, list[ast.Constant]] = {}
+    for name, tree in trees.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == _TOLERANT_FIRST_CRACK_NAME:
+                attributes.append(name)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and any(
+                    isinstance(arg, ast.Constant) and arg.value == _TOLERANT_FIRST_CRACK_NAME
+                    for arg in node.args
+                )
+            ):
+                getattr_calls.append(name)
+            if isinstance(node, ast.keyword) and node.arg == _TOLERANT_FIRST_CRACK_NAME:
+                keywords.append(name)
+            if isinstance(node, ast.MatchClass) and _TOLERANT_FIRST_CRACK_NAME in node.kwd_attrs:
+                pattern_keywords.append(name)
+            if isinstance(node, ast.Constant) and node.value == _TOLERANT_FIRST_CRACK_NAME:
+                constants.setdefault(name, []).append(node)
+    assert attributes == []
+    assert getattr_calls == []
+    assert keywords == []
+    assert pattern_keywords == []
+    assert sorted(constants) == ["mcp.py"]
+    assert len(constants["mcp.py"]) == 1
+    subscripts = [
+        node
+        for node in ast.walk(trees["mcp.py"])
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Constant)
+        and node.slice.value == _TOLERANT_FIRST_CRACK_NAME
+    ]
+    assert len(subscripts) == 1
+    assert subscripts[0].slice is constants["mcp.py"][0]

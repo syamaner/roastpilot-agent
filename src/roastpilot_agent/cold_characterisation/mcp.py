@@ -12,6 +12,14 @@ from typing import Literal, Protocol, TypeAlias, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, ValidationError, model_validator
 
+from roastpilot_agent.cold_characterisation.evidence_schema import (
+    ColdAudioField,
+    ColdEvidenceError,
+    ColdEvidenceFailure,
+    ColdJsonValue,
+    ColdTickProjection,
+    project_tick_audio,
+)
 from roastpilot_agent.config import MCPDeviceConfig
 from roastpilot_agent.mcp_client import (
     EventCommandResult,
@@ -60,6 +68,30 @@ class ColdSessionPhaseError(ColdMcpError):
 
 class ColdMcpValidationError(ColdMcpError):
     """Raised when an MCP response violates the cold boundary schema."""
+
+
+class ColdTickAudioProjectionError(ColdMcpValidationError):
+    """Raised when a tick's first-crack evidence fails the strict audio projection.
+
+    The error keeps only closed schema-owned diagnostics.  It never carries a
+    rejected value or key name, and its message is fixed.
+    """
+
+    failure: ColdEvidenceFailure
+    field_names: tuple[ColdAudioField, ...]
+
+    def __init__(
+        self, failure: ColdEvidenceFailure, field_names: tuple[ColdAudioField, ...]
+    ) -> None:
+        """Retain closed projection diagnostics behind a fixed public message.
+
+        Args:
+            failure: Closed failure reported by the strict projection.
+            field_names: Closed audio field diagnostics reported by the projection.
+        """
+        super().__init__("MCP tick audio evidence failed strict projection")
+        self.failure = failure
+        self.field_names = field_names
 
 
 class ColdMcpTransportError(ColdMcpError):
@@ -547,6 +579,21 @@ def finalisation_has_required_safety_evidence(result: SessionFinalisationResult)
     )
 
 
+class ColdTickObservation(BaseModel):
+    """One identity-bound cold tick read from a single MCP response.
+
+    ``audio`` is the only admissible per-tick first-crack evidence: a strict,
+    complete projection of the raw first-crack payload of the same response.
+    ``state.first_crack_status`` is tolerant roast-path telemetry whose counters
+    may be defaulted or dropped, so it must never feed cold evidence.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True, allow_inf_nan=False)
+
+    state: RoastSessionState
+    audio: ColdTickProjection
+
+
 class ColdCharacterisationMCPClient:
     """Typed six-tool, non-actuating client for cold characterisation."""
 
@@ -577,6 +624,52 @@ class ColdCharacterisationMCPClient:
         else:
             return result
         raise ColdMcpValidationError("MCP response failed cold contract validation") from None
+
+    @staticmethod
+    def _parse_tick(payload: object) -> tuple[RoastSessionState, object]:
+        """Parse one tick response into its tolerant mirror and its raw JSON tree.
+
+        Both parses read the same serialised text, so the raw tree is exactly
+        the response the tolerant mirror accepted.
+
+        Args:
+            payload: The untrusted MCP response payload.
+
+        Raises:
+            ColdMcpValidationError: If the response violates the cold contract.
+        """
+        try:
+            text = json.dumps(payload, allow_nan=False)
+            state = RoastSessionState.model_validate_json(text)
+            tree: object = json.loads(text)
+        except (RecursionError, TypeError, ValidationError, ValueError):
+            pass
+        else:
+            return state, tree
+        raise ColdMcpValidationError("MCP response failed cold contract validation") from None
+
+    @staticmethod
+    def _require_lossless_audio_types(
+        raw_audio: dict[str, ColdJsonValue], projection: ColdTickProjection
+    ) -> None:
+        """Refuse a projection whose named field type differs from its raw JSON type.
+
+        The strict projection still converts a JSON integer into a float field,
+        so each of the twenty named audio fields must keep its exact raw type.
+
+        Args:
+            raw_audio: The raw first-crack payload the projection was built from.
+            projection: The strict projection of that same payload.
+
+        Raises:
+            ColdEvidenceError: With a closed failure and the one mismatched field.
+        """
+        for field in ColdAudioField:
+            if field is ColdAudioField.UNKNOWN_FIELD:
+                continue
+            projected: object = getattr(projection.audio, field.value)
+            if type(raw_audio[field.value]) is not type(projected):
+                raise ColdEvidenceError(ColdEvidenceFailure.TICK_PAYLOAD_NOT_STRICT, (field,))
 
     async def _call(self, tool: str, args: dict[str, object]) -> object:
         if tool not in COLD_ALLOWED_TOOLS:
@@ -615,22 +708,45 @@ class ColdCharacterisationMCPClient:
         self._cold_session_id = result.session.session_id
         return result
 
-    async def get_roast_state(self, session_id: str | None = None) -> RoastSessionState:
-        """Return the established cold session state after identity confirmation."""
+    async def get_roast_state(self, session_id: str | None = None) -> ColdTickObservation:
+        """Return one cold tick whose audio evidence is strictly projected.
+
+        Args:
+            session_id: Optional explicit session; it must be the established one.
+
+        Returns:
+            The tolerant session state and the strict audio projection, both
+            parsed from one MCP response.
+
+        Raises:
+            ColdSessionIdentityError: If the session is not the established one.
+            ColdSessionPurposeError: If MCP does not confirm the cold purpose.
+            ColdMcpTransportError: If the MCP transport fails.
+            ColdMcpValidationError: If the response violates the cold contract.
+            ColdTickAudioProjectionError: If the audio evidence is not strictly complete.
+        """
         expected_session_id = self._cold_session_id
         if expected_session_id is None or (
             session_id is not None and session_id != expected_session_id
         ):
             raise ColdSessionIdentityError("requested cold session is not established")
-        result = self._validate(
-            RoastSessionState,
-            await self._call("get_roast_state", {"session_id": expected_session_id}),
+        state, tree = self._parse_tick(
+            await self._call("get_roast_state", {"session_id": expected_session_id})
         )
-        if result.session_id != expected_session_id:
+        if state.session_id != expected_session_id:
             raise ColdSessionIdentityError("MCP did not return the established cold session")
-        if result.session_purpose != "cold_characterisation":
+        if state.session_purpose != "cold_characterisation":
             raise ColdSessionPurposeError("MCP did not confirm cold_characterisation purpose")
-        return result
+        try:
+            raw_audio = cast("dict[str, dict[str, ColdJsonValue]]", tree)["first_crack_status"]
+            audio = project_tick_audio(raw_audio)
+            self._require_lossless_audio_types(raw_audio, audio)
+        except ColdEvidenceError as error:
+            failure = error.failure
+            field_names = error.field_names
+        else:
+            return ColdTickObservation(state=state, audio=audio)
+        raise ColdTickAudioProjectionError(failure, field_names)
 
     async def mark_beans_added(self) -> EventCommandResult:
         """Request the permitted, non-actuating inference-activation event."""
