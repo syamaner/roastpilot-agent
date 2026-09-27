@@ -16,6 +16,7 @@ import enum
 import hashlib
 import inspect
 import io
+import itertools
 import json
 import os
 import re
@@ -538,6 +539,7 @@ def test_untrusted_capability_evidence_is_recorded_as_null(tmp_path: Path) -> No
     assert (phase.observed_command_streaming_required, phase.applied_branch) == (None, None)
 
 
+#: One legal reason per abort domain, not every legal domain and reason pair.
 ALL_ABORTS: tuple[tuple[schema.ColdAbortDomain, typing.Any], ...] = (
     (Domain.HOST, schema.ColdHostAbortReason.THERMAL_EXCEEDED),
     (Domain.IDENTITY, schema.ColdIdentityAbortReason.BOOT_ID_MALFORMED),
@@ -1013,7 +1015,8 @@ def assert_key_sets(model: pydantic.BaseModel, document: object) -> int:
 def test_the_json_is_the_canonical_report_and_round_trips(tmp_path: Path) -> None:
     """Renderer: canonical UTF-8 bytes of the built report; nested key sets are the fields.
 
-    Every legal abort domain and reason pair round-trips through the strict JSON parse.
+    One legal reason per abort domain (six domain and reason pairs, not every legal
+    pair) round-trips through the strict JSON parse.
     """
     off = Spec(hosts=(host(),), advisories=(None, Kind.TIMEOUT), aborts=ALL_ABORTS)
     run = write(tmp_path, {OFF: off, ON: Spec()})
@@ -2034,12 +2037,108 @@ def test_every_projected_model_has_exactly_its_pinned_ordered_fields() -> None:
 
     The nine report models and the embedded D191 metrics and identity facts are pinned
     independently, so a numeric private value, a pass or failure count, a
-    qualification flag or a run outcome cannot enter the projection unseen.
+    qualification flag or a run outcome cannot enter the projection unseen.  All
+    eleven are strict, frozen, closed and finite.
     """
     assert reachable_models(report.ColdSanitisedReport) == set(PROJECTED_FIELDS)
     assert set(REPORT_MODELS) < set(PROJECTED_FIELDS)
     for model, fields in PROJECTED_FIELDS.items():
         assert tuple(model.model_fields) == fields, model.__name__
+        config = model.model_config
+        settings = (
+            config.get("strict"),
+            config.get("frozen"),
+            config.get("extra"),
+            config.get("allow_inf_nan"),
+        )
+        assert settings == (True, True, "forbid", False), model.__name__
+
+
+#: The nested fields rendered under their own headings; every other field is a table row.
+SECTIONED = frozenset(name for name, _note in SECTION_NOTES)
+MarkdownTable = tuple[str, ...]
+
+
+def spelled(value: object) -> str:
+    """One report value's fixed Markdown cell, spelled independently of the module."""
+    if value is None:
+        return "`null`"
+    if type(value) is tuple:
+        return ", ".join(spelled(item) for item in typing.cast(tuple[object, ...], value)) or "none"
+    if type(value) is bool:
+        return "true" if value else "false"
+    if isinstance(value, enum.Enum):
+        return f"`{value.value}`"
+    if type(value) is str:
+        return f"`{value}`"
+    if type(value) is int or type(value) is float:
+        return str(value)
+    raise TypeError(type(value).__name__)
+
+
+def table_of(header: tuple[str, ...], rows: typing.Iterable[tuple[str, ...]]) -> MarkdownTable:
+    """One table's exact lines: its header, its separator, then one line per row."""
+    return (
+        f"| {' | '.join(header)} |",
+        "|" + "---|" * len(header),
+        *(f"| {' | '.join(row)} |" for row in rows),
+    )
+
+
+def field_table(model: pydantic.BaseModel, names: typing.Iterable[str]) -> MarkdownTable:
+    """A field and value table: one row per named field, labelled by that field's name."""
+    return table_of(("Field", "Value"), ((name, spelled(getattr(model, name))) for name in names))
+
+
+def expected_tables(model: pydantic.BaseModel, names: tuple[str, ...]) -> list[MarkdownTable]:
+    """Every table one report model renders over its named fields, in order.
+
+    The scalar fields form one field and value table.  Each section field then adds
+    a field and value table for a nested model, one row per item for a non-empty
+    tuple, and no table when it is ``None`` or empty.  Field orders come only from
+    the independently pinned ``PROJECTED_FIELDS``.
+    """
+    tables = [field_table(model, (name for name in names if name not in SECTIONED))]
+    for name in names:
+        value: object = getattr(model, name)
+        if name not in SECTIONED or value is None or value == ():
+            continue
+        if isinstance(value, pydantic.BaseModel):
+            tables.append(field_table(value, PROJECTED_FIELDS[type(value)]))
+            continue
+        items = typing.cast(tuple[pydantic.BaseModel, ...], value)
+        fields = PROJECTED_FIELDS[type(items[0])]
+        rows = (tuple(spelled(getattr(item, field)) for field in fields) for item in items)
+        tables.append(table_of(fields, rows))
+    return tables
+
+
+def rendered_tables(markdown: str) -> list[MarkdownTable]:
+    """Every run of consecutive table lines in the rendered Markdown, in order."""
+    groups = itertools.groupby(markdown.splitlines(), key=lambda line: line.startswith("|"))
+    return [tuple(lines) for is_table, lines in groups if is_table]
+
+
+@pytest.mark.parametrize(
+    "shape", [case[1] for case in RUN_SHAPES], ids=[case[0] for case in RUN_SHAPES]
+)
+def test_every_markdown_table_is_exactly_the_built_report(
+    tmp_path: Path, shape: typing.Callable[[], dict[schema.ColdPhaseKind, Spec]]
+) -> None:
+    """Markdown closure: every table's header, row labels, row count and values, in order.
+
+    The expected tables come from the pinned field orders and section names over the
+    built report, so an added scalar row (an overall outcome, an all-checks-pass
+    flag), an added check row or an added table fails, even when each added cell
+    would satisfy the cell grammar.
+    """
+    run = write(tmp_path, shape())
+    built = report.build_sanitised_report(run)
+    run_fields = PROJECTED_FIELDS[report.ColdSanitisedReport]
+    expected = expected_tables(built, tuple(name for name in run_fields if name != "phases"))
+    for phase in built.phases:
+        expected += expected_tables(phase, PROJECTED_FIELDS[report.ColdReportPhase])
+    assert rendered_tables(report.render_sanitised_report(run)[1]) == expected
 
 
 # ------------------------------------------------------ entry points and reach
@@ -2267,6 +2366,29 @@ def test_the_unpacked_limit_aliases_bind_only_their_own_locked_limit_keywords() 
     assert sorted(attributes) == sorted(
         ("_require_acceptance_constants", f"self.{alias}") for alias in LIMIT_ALIASES
     )
+
+
+def test_no_string_names_a_limit_field_and_getattr_reads_only_by_variable() -> None:
+    """Class J: no string literal names a limit field, and ``getattr`` names only by variable.
+
+    The alias and attribute pins above see only syntactic names, so a limit read by a
+    string key (``values["x_ms"]``), by ``getattr(limits, "x_ms")``, by a ``getattr``
+    whose name is any literal or inline expression, or by an aliased ``getattr`` would
+    bypass them.  Every remaining ``getattr`` is a direct two-argument call naming its
+    field by a variable, as the generic field reads do.
+    """
+    parents = _parents(TREE)
+    named = [
+        ast.unparse(parents[id(node)])
+        for node in ast.walk(TREE)
+        if isinstance(node, ast.Constant) and node.value in LIMIT_ALIASES
+    ]
+    assert named == []
+    calls = _calls_of(TREE, "getattr")
+    names = [node for node in ast.walk(TREE) if isinstance(node, ast.Name) and node.id == "getattr"]
+    assert calls and len(names) == len(calls)
+    for call in calls:
+        assert len(call.args) == 2 and isinstance(call.args[1], ast.Name), ast.unparse(call)
 
 
 #: Every numeric literal in the module, by owner and immediate context: the non-negative
