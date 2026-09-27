@@ -310,6 +310,97 @@ def test_constructors_outside_admission_refuse(tmp_path: Path) -> None:
     expect(Failure.ROOT_UNUSABLE, lambda: store.open_run(typing.cast(typing.Any, "/"), RUN_ID))
 
 
+def _admitted_fields(admitted: store.ColdAdmittedRoot) -> tuple[object, object, object]:
+    """Return an admitted root's public ``(path, realpath, lineage)`` reads."""
+    return admitted.path, admitted.realpath, admitted.lineage
+
+
+@pytest.mark.parametrize("field", ["path", "realpath", "lineage"])
+def test_admitted_root_fields_refuse_assignment_and_deletion(tmp_path: Path, field: str) -> None:
+    """Every admitted field is frozen against ordinary assignment and deletion."""
+    root = make_root(tmp_path)
+    admitted = store.admit_evidence_root(root)
+    before = _admitted_fields(admitted)
+    replacement: object = ((0, 0),) if field == "lineage" else "/"
+    expect(Failure.ROOT_UNUSABLE, lambda: setattr(admitted, field, replacement))
+    expect(Failure.ROOT_UNUSABLE, lambda: delattr(admitted, field))
+    assert _admitted_fields(admitted) == before
+    assert admitted.path == root
+    assert admitted.realpath == root
+    assert admitted.lineage
+    assert all(type(entry) is tuple and len(entry) == 2 for entry in admitted.lineage)
+
+
+def test_admitted_root_refuses_unknown_attributes_and_reinitialisation(tmp_path: Path) -> None:
+    """No new attribute can be attached, and an admitted instance cannot be re-admitted."""
+    root = make_root(tmp_path)
+    other = make_root(tmp_path, "other")
+    admitted = store.admit_evidence_root(root)
+    before = _admitted_fields(admitted)
+    expect(Failure.ROOT_UNUSABLE, lambda: setattr(admitted, "extra", 1))
+    expect(Failure.ROOT_UNUSABLE, lambda: delattr(admitted, "extra"))
+    expect(
+        Failure.ROOT_UNUSABLE,
+        lambda: admitted.__init__(
+            other,
+            other,
+            token=store._ADMISSION_TOKEN,  # pyright: ignore[reportPrivateUsage]
+        ),
+    )
+    expect(Failure.ROOT_UNUSABLE, lambda: admitted.__init__(other, other, token=object()))
+    assert _admitted_fields(admitted) == before
+
+
+def test_admitted_root_construction_keeps_token_and_lineage(tmp_path: Path) -> None:
+    """Admission alone constructs the root; its public reads carry the traversal lineage."""
+    root = make_root(tmp_path)
+    admitted = store.admit_evidence_root(root)
+    parts = [part for part in root.split("/") if part]
+    assert len(admitted.lineage) == len(parts) + 1
+    final = os.stat(root)
+    assert admitted.lineage[-1] == (final.st_dev, final.st_ino)
+    top = os.stat("/")
+    assert admitted.lineage[0] == (top.st_dev, top.st_ino)
+    direct = store.ColdAdmittedRoot(
+        root,
+        root,
+        token=store._ADMISSION_TOKEN,  # pyright: ignore[reportPrivateUsage]
+    )
+    assert _admitted_fields(direct) == (root, root, ())
+
+
+def test_retargeting_an_admitted_root_at_a_protected_root_creates_no_run(
+    tmp_path: Path,
+) -> None:
+    """A refused retarget leaves the protected root untouched and the safe root usable."""
+    protected = make_root(tmp_path, "protected")
+    expect(
+        Failure.ROOT_PROTECTED,
+        lambda: store.admit_evidence_root(protected, protected_roots=(protected,)),
+    )
+    root = make_root(tmp_path)
+    admitted = store.admit_evidence_root(root, protected_roots=(protected,))
+    protected_before = snapshot_tree(protected)
+    for field, value in (("path", protected), ("realpath", protected)):
+        expect(
+            Failure.ROOT_UNUSABLE, lambda field=field, value=value: setattr(admitted, field, value)
+        )
+    expect(
+        Failure.ROOT_UNUSABLE,
+        lambda: setattr(admitted, "lineage", store.admit_evidence_root(protected).lineage),
+    )
+    writer = store.open_run(admitted, RUN_ID)
+    off = header_for(tmp_path, root, OFF)
+    writer.append(off)
+    writer.append(abort_for(off))
+    sealed = writer.seal()
+    assert sealed.entry_count >= 1
+    assert run_dir(root).is_dir()
+    assert not (Path(protected) / RUN_ID).exists()
+    assert list(Path(protected).iterdir()) == []
+    assert snapshot_tree(protected) == protected_before
+
+
 # ----------------------------------------------------------- run dir and layout
 
 

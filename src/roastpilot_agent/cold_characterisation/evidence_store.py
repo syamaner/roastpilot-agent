@@ -444,7 +444,13 @@ def _open_absolute_directory(path: str, lineage: list[tuple[int, int]] | None = 
 
 
 class ColdAdmittedRoot:
-    """An evidence root admitted by :func:`admit_evidence_root`; holds no descriptor."""
+    """An evidence root admitted by :func:`admit_evidence_root`; holds no descriptor.
+
+    The admitted fields are frozen: ordinary assignment or deletion after admission
+    raises, so an admitted capability cannot be retargeted at a root that admission
+    would refuse.  Deliberate ``object.__setattr__`` reflection is not ordinary
+    mutation and is not claimed to be prevented; this is not a sandbox.
+    """
 
     __slots__ = ("lineage", "path", "realpath")
 
@@ -469,13 +475,41 @@ class ColdAdmittedRoot:
             lineage: ``(st_dev, st_ino)`` of ``/`` and each component, root last.
 
         Raises:
-            ColdEvidenceStoreError: If constructed outside admission.
+            ColdEvidenceStoreError: If constructed outside admission, or if an already
+                admitted instance is initialised again.
         """
         if token is not _ADMISSION_TOKEN:
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ROOT_UNUSABLE)
-        self.path = path
-        self.realpath = realpath
-        self.lineage = lineage
+        if hasattr(self, "path"):
+            raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ROOT_UNUSABLE)
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "realpath", realpath)
+        object.__setattr__(self, "lineage", lineage)
+
+    def __setattr__(self, name: str, value: object) -> typing.NoReturn:
+        """Refuse every ordinary assignment; admitted fields never change.
+
+        Args:
+            name: The attribute name being assigned.
+            value: The value being assigned.
+
+        Raises:
+            ColdEvidenceStoreError: Always.
+        """
+        del name, value
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ROOT_UNUSABLE)
+
+    def __delattr__(self, name: str) -> typing.NoReturn:
+        """Refuse every ordinary deletion; admitted fields never disappear.
+
+        Args:
+            name: The attribute name being deleted.
+
+        Raises:
+            ColdEvidenceStoreError: Always.
+        """
+        del name
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.ROOT_UNUSABLE)
 
 
 def admit_evidence_root(root: str, *, protected_roots: tuple[str, ...] = ()) -> ColdAdmittedRoot:
