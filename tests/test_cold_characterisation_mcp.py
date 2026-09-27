@@ -2094,6 +2094,8 @@ async def _device_error(payload: dict[str, object]) -> ColdTickDeviceProjectionE
     with pytest.raises(ColdTickDeviceProjectionError) as raised:
         await client.get_roast_state()
     assert len(_state_calls(caller)) == 1
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
     return raised.value
 
 
