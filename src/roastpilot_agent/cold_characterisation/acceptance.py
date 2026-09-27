@@ -21,11 +21,38 @@ later applicability gate.  Temperatures are Celsius only; Q2 fails closed.
 """
 
 import enum
+import re
+import types
 import typing
 
 import pydantic
 
-from roastpilot_agent.cold_characterisation.evidence_schema import ColdPhaseKind
+from roastpilot_agent.cold_characterisation.evidence_reader import (
+    ColdRetainedHeader,
+    ColdRetainedRun,
+    ColdRetainedStream,
+)
+from roastpilot_agent.cold_characterisation.evidence_schema import (
+    ColdAbortRecord,
+    ColdAdvisoryRecord,
+    ColdEvidenceError,
+    ColdEvidenceStream,
+    ColdFinalisationRecord,
+    ColdHostRecord,
+    ColdPhaseKind,
+    ColdRunHeader,
+    ColdTickRecord,
+    validate_record,
+)
+from roastpilot_agent.cold_characterisation.evidence_store import (
+    ColdBindingState,
+    ColdEvidenceStoreError,
+    ColdRetainedIdentityV1,
+    check_record_binding,
+    parse_finalisation_envelope,
+    run_id_is_valid,
+)
+from roastpilot_agent.cold_characterisation.mcp import SessionFinalisationResult
 
 __all__ = (
     "D191_N_LIMIT",
@@ -39,9 +66,12 @@ __all__ = (
     "ColdCheckResult",
     "ColdD191Metrics",
     "ColdIdentityFacts",
+    "ColdInterpretation",
     "ColdInterpretationError",
     "ColdInterpretationFailure",
     "ColdPhaseInterpretation",
+    "ColdReboundPhase",
+    "ColdReboundRun",
 )
 
 #: The frozen qualification policy version; it covers identity schema version 1 only.
@@ -219,3 +249,429 @@ class ColdPhaseInterpretation(pydantic.BaseModel):
         if (self.results[0].outcome is ColdCheckOutcome.PASS) != (self.identity_facts is not None):
             raise ValueError("identity facts disagree with the qualification result")
         return self
+
+
+_REBIND_TOKEN: typing.Final = object()
+
+
+class _Capability:
+    """Token-checked, slotted, write-once holder following the admitted-root pattern.
+
+    Construction without the private token, re-initialisation, ordinary assignment
+    and deletion all raise.  Deliberate ``object.__setattr__`` reflection is not
+    ordinary mutation and is not claimed to be prevented; this is not a sandbox.
+    """
+
+    __slots__ = ()
+
+    def _admit(self, token: object, fields: tuple[tuple[str, object], ...]) -> None:
+        """Set every field once, refusing a foreign token or a second initialisation."""
+        if token is not _REBIND_TOKEN or hasattr(self, fields[0][0]):
+            raise ColdInterpretationError(ColdInterpretationFailure.CAPABILITY_INVALID)
+        for name, value in fields:
+            object.__setattr__(self, name, value)
+
+    def __setattr__(self, name: str, value: object) -> typing.NoReturn:
+        """Refuse every ordinary assignment.
+
+        Args:
+            name: The attribute name being assigned.
+            value: The value being assigned.
+
+        Raises:
+            ColdInterpretationError: Always.
+        """
+        del name, value
+        raise ColdInterpretationError(ColdInterpretationFailure.CAPABILITY_INVALID)
+
+    def __delattr__(self, name: str) -> typing.NoReturn:
+        """Refuse every ordinary deletion.
+
+        Args:
+            name: The attribute name being deleted.
+
+        Raises:
+            ColdInterpretationError: Always.
+        """
+        del name
+        raise ColdInterpretationError(ColdInterpretationFailure.CAPABILITY_INVALID)
+
+
+class ColdReboundPhase(_Capability):
+    """One phase's rebound evidence: validated snapshots in file order.
+
+    ``finalisation`` is the envelope of the last finalisation record when every
+    finalisation record shares one session; differing sessions leave it ``None``
+    and set ``finalisation_ambiguous``.
+    """
+
+    __slots__ = (
+        "_identity",
+        "aborts",
+        "advisories",
+        "finalisation",
+        "finalisation_ambiguous",
+        "finalisations",
+        "header",
+        "hosts",
+        "phase",
+        "ticks",
+    )
+
+    phase: ColdPhaseKind
+    header: ColdRunHeader
+    ticks: tuple[ColdTickRecord, ...]
+    hosts: tuple[ColdHostRecord, ...]
+    advisories: tuple[ColdAdvisoryRecord, ...]
+    finalisations: tuple[ColdFinalisationRecord, ...]
+    aborts: tuple[ColdAbortRecord, ...]
+    finalisation: SessionFinalisationResult | None
+    finalisation_ambiguous: bool
+    _identity: ColdRetainedIdentityV1
+
+    def __init__(
+        self,
+        *,
+        token: object,
+        phase: ColdPhaseKind,
+        header: ColdRunHeader,
+        ticks: tuple[ColdTickRecord, ...],
+        hosts: tuple[ColdHostRecord, ...],
+        advisories: tuple[ColdAdvisoryRecord, ...],
+        finalisations: tuple[ColdFinalisationRecord, ...],
+        aborts: tuple[ColdAbortRecord, ...],
+        finalisation: SessionFinalisationResult | None,
+        finalisation_ambiguous: bool,
+        identity: ColdRetainedIdentityV1,
+    ) -> None:
+        """Mint one rebound phase; only this module holds the token.
+
+        Args:
+            token: Private rebinding token.
+            phase: The phase.
+            header: The bound phase header snapshot.
+            ticks: Tick snapshots in file order.
+            hosts: Host snapshots in file order.
+            advisories: Advisory snapshots in file order.
+            finalisations: Finalisation snapshots in file order.
+            aborts: Abort snapshots in file order.
+            finalisation: The selected finalisation result, if unambiguous.
+            finalisation_ambiguous: Whether finalisation records name different sessions.
+            identity: The v1 identity parsed during binding.
+
+        Raises:
+            ColdInterpretationError: If minted without the token, or initialised twice.
+        """
+        self._admit(
+            token,
+            (
+                ("phase", phase),
+                ("header", header),
+                ("ticks", ticks),
+                ("hosts", hosts),
+                ("advisories", advisories),
+                ("finalisations", finalisations),
+                ("aborts", aborts),
+                ("finalisation", finalisation),
+                ("finalisation_ambiguous", finalisation_ambiguous),
+                ("_identity", identity),
+            ),
+        )
+
+
+class ColdReboundRun(_Capability):
+    """A rebound run: its run id, carried manifest digest and present phases in order."""
+
+    __slots__ = ("manifest_sha256", "phases", "run_id")
+
+    run_id: str
+    manifest_sha256: str
+    phases: tuple[ColdReboundPhase, ...]
+
+    def __init__(
+        self,
+        *,
+        token: object,
+        run_id: str,
+        manifest_sha256: str,
+        phases: tuple[ColdReboundPhase, ...],
+    ) -> None:
+        """Mint one rebound run; only this module holds the token.
+
+        Args:
+            token: Private rebinding token.
+            run_id: The bound run identifier.
+            manifest_sha256: The carried (not re-verified) manifest digest.
+            phases: Present phases in ``ColdPhaseKind`` order.
+
+        Raises:
+            ColdInterpretationError: If minted without the token, or initialised twice.
+        """
+        self._admit(
+            token,
+            (("run_id", run_id), ("manifest_sha256", manifest_sha256), ("phases", phases)),
+        )
+
+
+class ColdInterpretation(_Capability):
+    """The rebound run and its per-phase interpretations, in the same order."""
+
+    __slots__ = ("phases", "rebound")
+
+    rebound: ColdReboundRun
+    phases: tuple[ColdPhaseInterpretation, ...]
+
+    def __init__(
+        self,
+        *,
+        token: object,
+        rebound: ColdReboundRun,
+        phases: tuple[ColdPhaseInterpretation, ...],
+    ) -> None:
+        """Mint one interpretation; only this module holds the token.
+
+        Args:
+            token: Private rebinding token.
+            rebound: The rebound run.
+            phases: One interpretation per rebound phase, in the same order.
+
+        Raises:
+            ColdInterpretationError: If minted without the token, or initialised twice.
+        """
+        self._admit(token, (("rebound", rebound), ("phases", phases)))
+
+
+# ------------------------------------------------------------------ rebinding
+
+_T = typing.TypeVar("_T")
+_R = typing.TypeVar("_R")
+_MANIFEST_DIGEST_PATTERN: typing.Final = re.compile(r"\A[0-9a-f]{64}\Z")
+_STREAM_RECORD_CLASS: typing.Final = types.MappingProxyType(
+    {
+        ColdEvidenceStream.HEADER: ColdRunHeader,
+        ColdEvidenceStream.TICK: ColdTickRecord,
+        ColdEvidenceStream.HOST: ColdHostRecord,
+        ColdEvidenceStream.ADVISORY: ColdAdvisoryRecord,
+        ColdEvidenceStream.FINALISATION: ColdFinalisationRecord,
+        ColdEvidenceStream.ABORT: ColdAbortRecord,
+    }
+)
+_REBIND_ERRORS: typing.Final = (
+    ColdEvidenceError,
+    ColdEvidenceStoreError,
+    AttributeError,
+    TypeError,
+    ValueError,
+    RecursionError,
+)
+
+_Record: typing.TypeAlias = (
+    ColdRunHeader
+    | ColdTickRecord
+    | ColdHostRecord
+    | ColdAdvisoryRecord
+    | ColdFinalisationRecord
+    | ColdAbortRecord
+)
+_BoundIdentities: typing.TypeAlias = tuple[tuple[ColdRunHeader, ColdRetainedIdentityV1], ...]
+
+
+class _Containers(typing.NamedTuple):
+    """Step-1 values, read from the supplied run exactly once."""
+
+    run_id: str
+    manifest_sha256: str
+    headers: tuple[ColdRetainedHeader, ...]
+    layout: dict[tuple[ColdPhaseKind, ColdEvidenceStream], ColdRetainedStream]
+
+
+class _Bound(typing.NamedTuple):
+    """Step-2 binding state and per-phase, per-stream snapshots."""
+
+    state: ColdBindingState
+    snapshots: dict[ColdPhaseKind, dict[ColdEvidenceStream, tuple[_Record, ...]]]
+
+
+def _step(call: typing.Callable[[], _T | None], failure: ColdInterpretationFailure) -> _T:
+    """Run one rebinding step; a mapped error or a refusal becomes one closed failure."""
+    try:
+        value = call()
+    except _REBIND_ERRORS:
+        value = None
+    if value is None:
+        raise ColdInterpretationError(failure)
+    return value
+
+
+def _check_containers(run: ColdRetainedRun) -> _Containers | None:
+    """Step 1: exact container types, identifiers, uniqueness and one header per phase.
+
+    Each record's exact class and phase must match its container here, so a
+    relabelled record is a malformed container; step 2 re-checks every snapshot.
+    """
+    if type(run) is not ColdRetainedRun:
+        return None
+    run_id: object = run.run_id
+    digest: object = run.manifest_sha256
+    headers: object = run.headers
+    streams: object = run.streams
+    if type(run_id) is not str or not run_id_is_valid(run_id):
+        return None
+    if type(digest) is not str or _MANIFEST_DIGEST_PATTERN.fullmatch(digest) is None:
+        return None
+    if type(headers) is not tuple or type(streams) is not tuple:
+        return None
+    header_items = typing.cast(tuple[object, ...], headers)
+    if any(type(item) is not ColdRetainedHeader for item in header_items):
+        return None
+    layout: dict[tuple[ColdPhaseKind, ColdEvidenceStream], ColdRetainedStream] = {}
+    for item in typing.cast(tuple[object, ...], streams):
+        if type(item) is not ColdRetainedStream:
+            return None
+        phase: object = item.phase
+        stream: object = item.stream
+        records: object = item.records
+        if type(phase) is not ColdPhaseKind or type(stream) is not ColdEvidenceStream:
+            return None
+        if (phase, stream) in layout or type(records) is not tuple or not records:
+            return None
+        expected = _STREAM_RECORD_CLASS[stream]
+        if any(type(record) is not expected or record.phase is not phase for record in records):
+            return None
+        layout[(phase, stream)] = item
+    for present, _stream in layout:
+        header = layout.get((present, ColdEvidenceStream.HEADER))
+        if header is None or len(header.records) != 1:
+            return None
+    return _Containers(
+        run_id, digest, typing.cast(tuple[ColdRetainedHeader, ...], header_items), layout
+    )
+
+
+def _bind_records(containers: _Containers) -> _Bound | None:
+    """Step 2: validate and bind every container record once, in reader order."""
+    state = ColdBindingState(containers.run_id)
+    snapshots: dict[ColdPhaseKind, dict[ColdEvidenceStream, tuple[_Record, ...]]] = {}
+    for phase in ColdPhaseKind:
+        for stream in ColdEvidenceStream:
+            item = containers.layout.get((phase, stream))
+            if item is None:
+                continue
+            bound: list[_Record] = []
+            for record in item.records:
+                snapshot = validate_record(record)
+                relabelled = (
+                    type(snapshot) is not _STREAM_RECORD_CLASS[stream]
+                    or snapshot.phase is not phase
+                )
+                if relabelled:  # pragma: no cover - validate_record keeps step 1's class and phase.
+                    return None
+                check_record_binding(state, snapshot, writer_root=None)
+                bound.append(snapshot)
+            snapshots.setdefault(phase, {})[stream] = tuple(bound)
+    return _Bound(state, snapshots)
+
+
+def _same(left: object, right: object) -> bool:
+    """Exact-type structural equality; the trusted bound ``left`` value bounds the walk."""
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        mine = typing.cast(dict[object, object], left)
+        theirs = typing.cast(dict[object, object], right)
+        return len(mine) == len(theirs) and all(
+            key in theirs and _same(value, theirs[key]) for key, value in mine.items()
+        )
+    if type(left) in (list, tuple):
+        mine_items = typing.cast(tuple[object, ...], left)
+        their_items = typing.cast(tuple[object, ...], right)
+        return len(mine_items) == len(their_items) and all(
+            _same(a, b) for a, b in zip(mine_items, their_items, strict=True)
+        )
+    return left == right
+
+
+def _identity_value(identity: ColdRetainedIdentityV1) -> tuple[object, ...]:
+    """Return every retained v1 identity field, for exact comparison only."""
+    return (
+        identity.run_id,
+        identity.pi_evidence_root,
+        identity.known,
+        identity.runtime_config_extras,
+        identity.server_info_extras,
+    )
+
+
+def _agreed_headers(
+    headers: tuple[ColdRetainedHeader, ...], state: ColdBindingState
+) -> _BoundIdentities | None:
+    """Step 3: the container headers equal the bound pairs in count, order and value."""
+    bound = state.headers
+    if len(headers) != len(bound):
+        return None
+    for item, (header, identity) in zip(headers, bound, strict=True):
+        exact = type(item.header) is ColdRunHeader and type(item.identity) is ColdRetainedIdentityV1
+        if not exact:
+            return None
+        if not _same(header.model_dump(), validate_record(item.header).model_dump()):
+            return None
+        if not _same(_identity_value(identity), _identity_value(item.identity)):
+            return None
+    return bound
+
+
+def _only(records: tuple[_Record, ...], kind: type[_R]) -> tuple[_R, ...]:
+    """Return one stream's snapshots, whose exact class binding already verified."""
+    return tuple(record for record in records if isinstance(record, kind))
+
+
+def _mint_phase(
+    header: ColdRunHeader,
+    identity: ColdRetainedIdentityV1,
+    streams: dict[ColdEvidenceStream, tuple[_Record, ...]],
+) -> ColdReboundPhase:
+    """Steps 4-5: select the finalisation, then mint one phase capability."""
+    finalisations = _only(streams.get(ColdEvidenceStream.FINALISATION, ()), ColdFinalisationRecord)
+    sessions = {record.session_id for record in finalisations}
+    return ColdReboundPhase(
+        token=_REBIND_TOKEN,
+        phase=header.phase,
+        header=header,
+        ticks=_only(streams.get(ColdEvidenceStream.TICK, ()), ColdTickRecord),
+        hosts=_only(streams.get(ColdEvidenceStream.HOST, ()), ColdHostRecord),
+        advisories=_only(streams.get(ColdEvidenceStream.ADVISORY, ()), ColdAdvisoryRecord),
+        finalisations=finalisations,
+        aborts=_only(streams.get(ColdEvidenceStream.ABORT, ()), ColdAbortRecord),
+        finalisation=(
+            parse_finalisation_envelope(finalisations[-1].envelope) if len(sessions) == 1 else None
+        ),
+        finalisation_ambiguous=len(sessions) > 1,
+        identity=identity,
+    )
+
+
+def _rebind(run: ColdRetainedRun) -> ColdReboundRun:
+    """Rebind a retained run; ``run`` is read in step 1 only, never afterwards."""
+    containers = _step(
+        lambda: _check_containers(run), ColdInterpretationFailure.CONTAINER_MALFORMED
+    )
+    bound = _step(lambda: _bind_records(containers), ColdInterpretationFailure.RECORD_REBIND_FAILED)
+    identities = _step(
+        lambda: _agreed_headers(containers.headers, bound.state),
+        ColdInterpretationFailure.HEADER_SET_MISMATCHED,
+    )
+    if not identities:
+        raise ColdInterpretationError(ColdInterpretationFailure.NO_PHASE_PRESENT)
+    phases = _step(
+        lambda: tuple(
+            _mint_phase(header, identity, bound.snapshots[header.phase])
+            for header, identity in identities
+        ),
+        ColdInterpretationFailure.RECORD_REBIND_FAILED,
+    )
+    return ColdReboundRun(
+        token=_REBIND_TOKEN,
+        run_id=containers.run_id,
+        manifest_sha256=containers.manifest_sha256,
+        phases=phases,
+    )
