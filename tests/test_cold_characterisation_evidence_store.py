@@ -2401,3 +2401,99 @@ def test_segment_grammar_admits_128_and_refuses_129_characters(tmp_path: Path) -
     refused.write_bytes(b"x")
     os.chmod(refused, 0o600)
     expect(Failure.SEAL_TREE_INVALID, second.seal)
+
+
+# ------------------------------------------------------- run-entry durability
+
+
+def _record_fsyncs(
+    monkeypatch: pytest.MonkeyPatch,
+    root: str,
+    events: list[tuple[str, int]],
+    *,
+    root_fault: BaseException | None = None,
+) -> None:
+    """Record mkdir, root-directory fsync, and close order; optionally fault the root sync."""
+    root_identity = (os.stat(root).st_dev, os.stat(root).st_ino)
+    real_mkdir, real_fsync, real_close = os.mkdir, os.fsync, os.close
+
+    def mkdir(*args: typing.Any, **kwargs: typing.Any) -> None:
+        real_mkdir(*args, **kwargs)
+        events.append(("mkdir", -1))
+
+    def fsync(descriptor: int) -> None:
+        result = os.fstat(descriptor)
+        if (result.st_dev, result.st_ino) == root_identity:
+            events.append(("fsync-root", descriptor))
+            if root_fault is not None:
+                raise root_fault
+        real_fsync(descriptor)
+
+    def close(descriptor: int) -> None:
+        events.append(("close", descriptor))
+        real_close(descriptor)
+
+    monkeypatch.setattr(os, "mkdir", mkdir)
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "close", close)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, mkdir})
+
+
+def test_open_run_syncs_the_root_after_creating_the_run_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The admitted root is fsynced after mkdir and before its descriptor is released."""
+    root = make_root(tmp_path)
+    admitted = store.admit_evidence_root(root)
+    events: list[tuple[str, int]] = []
+    _record_fsyncs(monkeypatch, root, events)
+    writer = store.open_run(admitted, RUN_ID)
+    names = [name for name, _descriptor in events]
+    assert names.count("mkdir") == 1 and names.count("fsync-root") == 1
+    synced_at = names.index("fsync-root")
+    root_fd = events[synced_at][1]
+    later_root_closes = [
+        index
+        for index, event in enumerate(events)
+        if index > synced_at and event == ("close", root_fd)
+    ]
+    assert names.index("mkdir") < synced_at < later_root_closes[0]
+    monkeypatch.undo()
+    writer.append(header_for(tmp_path, root, OFF))
+    assert writer.seal().entry_count == 1
+
+
+def test_open_run_refuses_when_the_root_sync_fails_and_keeps_the_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed root sync refuses closed, creates no writer, and removes nothing."""
+    root = make_root(tmp_path)
+    admitted = store.admit_evidence_root(root)
+    ledger = _DescriptorLedger(monkeypatch)
+    events: list[tuple[str, int]] = []
+    _record_fsyncs(monkeypatch, root, events, root_fault=OSError("sync failed"))
+    expect(Failure.ROOT_UNUSABLE, lambda: store.open_run(admitted, RUN_ID))
+    monkeypatch.undo()
+    assert run_dir(root).is_dir()
+    assert list(run_dir(root).iterdir()) == []
+    assert ledger.double_closes == [] and ledger.leaked == []
+    expect(Failure.RUN_DIR_EXISTS, lambda: store.open_run(admitted, RUN_ID))
+
+
+def test_open_run_interrupted_during_root_sync_releases_and_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-ordinary interruption at the root sync propagates after releasing the root."""
+    root = make_root(tmp_path)
+    admitted = store.admit_evidence_root(root)
+    ledger = _DescriptorLedger(monkeypatch)
+    events: list[tuple[str, int]] = []
+    _record_fsyncs(monkeypatch, root, events, root_fault=KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        store.open_run(admitted, RUN_ID)
+    monkeypatch.undo()
+    synced_at = [name for name, _descriptor in events].index("fsync-root")
+    root_fd = events[synced_at][1]
+    assert events[synced_at + 1 :].count(("close", root_fd)) == 1
+    assert ledger.double_closes == [] and ledger.leaked == []
+    assert run_dir(root).is_dir()

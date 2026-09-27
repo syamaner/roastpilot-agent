@@ -1561,6 +1561,9 @@ def open_run(root: ColdAdmittedRoot, run_id: str) -> ColdEvidenceWriter:
             failure = ColdEvidenceStoreFailure.ROOT_UNUSABLE
         if failure is not None:
             raise ColdEvidenceStoreError(failure)
+        # Sync the new entry into the admitted root before anything else relies on it.
+        # A failure keeps the created directory for diagnosis; nothing is removed.
+        _guard(lambda: os.fsync(root_fd), ColdEvidenceStoreFailure.ROOT_UNUSABLE)
         run_fd = _open_at(
             run_id, _directory_flags(), root_fd, ColdEvidenceStoreFailure.ROOT_UNUSABLE
         )
