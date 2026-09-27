@@ -10,14 +10,17 @@ snapshots cannot reach.
 
 import ast
 import builtins
+import collections
 import copy
 import enum
 import functools
 import inspect
 import io
 import json
+import math
 import os
 import re
+import types
 import typing
 from pathlib import Path
 
@@ -816,7 +819,11 @@ def _loads_of(function: ast.FunctionDef, name: str) -> list[ast.Name]:
 
 
 def test_run_is_read_only_while_rebinding() -> None:
-    """R4: the entry point hands ``run`` to rebinding once; only step 1 reads it."""
+    """R4: ``run`` is passed to rebinding once and only step 1 dereferences that name.
+
+    Later rebinding steps read the containers step 1 captured; nothing else takes a
+    run parameter, and evaluation reads only the capability's fresh snapshots.
+    """
     for function_name, callee in (
         ("interpret_retained_run", "_rebind"),
         ("_rebind", "_check_containers"),
@@ -1037,6 +1044,28 @@ def test_editable_source_without_a_digest_qualifies(tmp_path: Path) -> None:
         "editable_source",
         None,
     )
+
+
+@pytest.mark.parametrize(
+    ("changes", "fact", "expected"),
+    [
+        ({"device_config.fc_confidence_threshold": 0.0}, None, None),
+        ({"device_config.fc_confidence_threshold": 1.0}, None, None),
+        ({"effective_mcp_profile.audio_overlap": 0.0}, "audio_overlap", 0.0),
+        ({"effective_mcp_profile.source_byte_length": 0}, "profile_source_byte_length", 0),
+    ],
+    ids=["threshold-0.0", "threshold-1.0", "overlap-0.0", "source-byte-length-0"],
+)
+def test_inclusive_q_boundaries_qualify(
+    tmp_path: Path, changes: dict[str, object], fact: str | None, expected: object
+) -> None:
+    """Q8/Q11: each inclusive bound passes, and the facts keep the exact boundary value."""
+    item = interpret_phase(tmp_path, OFF, document=applying(changes))
+    assert qualification(item).outcome is Outcome.PASS and qualification(item).failures == ()
+    assert item.identity_facts is not None
+    if fact is not None:
+        actual = getattr(item.identity_facts, fact)
+        assert (type(actual), actual) == (type(expected), expected)
 
 
 NOTE_FIELDS = (
@@ -1393,7 +1422,11 @@ SCREEN_CORPUS = (
     "v1.2.3-rc_4",
     "rev/1",
     "/dev/ttyUSB0",
+    "aabcdefghijkaabcdefghijk",
+    "abcdefghijklabcdefghijkl",
 )
+Q7_BELOW_LIMIT = "aabcdefghijkaabcdefghijk"
+Q7_ABOVE_LIMIT = "abcdefghijklabcdefghijkl"
 
 
 def _live_profile_admits(revision: str) -> bool:
@@ -1431,6 +1464,55 @@ def test_frozen_screens_agree_with_the_live_screens() -> None:
         outcomes = [mine(text) for text in SCREEN_CORPUS]
         assert outcomes == [theirs(text) for text in SCREEN_CORPUS]
         assert set(outcomes) == {True, False}
+
+
+def _independent_token_score(token: str) -> float:
+    """Score one token's character entropy independently of both screens under test."""
+    counts = collections.Counter(token)
+    return -sum((count / len(token)) * math.log2(count / len(token)) for count in counts.values())
+
+
+def test_q7_token_score_boundary_outcomes_are_exact() -> None:
+    """Q7: 24-character tokens either side of 3.5 are admitted and refused by both screens."""
+    frozen = typing.cast(typing.Any, acceptance)
+    current = typing.cast(typing.Any, live)
+    assert frozen._ENTROPY_LIMIT == 3.5
+    assert [len(Q7_BELOW_LIMIT), len(Q7_ABOVE_LIMIT)] == [24, 24]
+    assert round(_independent_token_score(Q7_BELOW_LIMIT), 3) == 3.418
+    assert round(_independent_token_score(Q7_ABOVE_LIMIT), 3) == 3.585
+    for screen in (frozen._operator_text_is_safe, current._operator_text_is_safe):
+        assert screen(Q7_BELOW_LIMIT) is True
+        assert screen(Q7_ABOVE_LIMIT) is False
+
+
+def _inline_token_score_limits(source: str) -> list[object]:
+    """Return each constant ``LIMIT`` in a ``_shannon_entropy(...) < LIMIT`` comparison."""
+    return [
+        node.comparators[0].value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Compare)
+        and isinstance(node.left, ast.Call)
+        and isinstance(node.left.func, ast.Name)
+        and node.left.func.id == "_shannon_entropy"
+        and len(node.ops) == 1
+        and isinstance(node.ops[0], ast.Lt)
+        and isinstance(node.comparators[0], ast.Constant)
+    ]
+
+
+def test_live_inline_token_score_limit_is_the_frozen_limit() -> None:
+    """Q7 parity: the live screen's inline limit is pinned to the frozen one; drift is caught.
+
+    The drift checks run on bounded in-memory copies of the live function's text; the
+    live module itself is only read.
+    """
+    source = inspect.getsource(live._operator_text_is_safe)  # pyright: ignore[reportPrivateUsage]
+    frozen_limit = acceptance._ENTROPY_LIMIT  # pyright: ignore[reportPrivateUsage]
+    assert _inline_token_score_limits(source) == [frozen_limit] == [3.5]
+    assert source.count("< 3.5") == 1
+    for drifted in (3.4, 3.6):
+        text = source.replace("< 3.5", f"< {drifted}")
+        assert _inline_token_score_limits(text) == [drifted] != [frozen_limit]
 
 
 # --------------------------------------------------------------- G16 runtime
@@ -1702,6 +1784,21 @@ def test_missing_or_ambiguous_finalisation_is_a_presence_failure(tmp_path: Path)
     ):
         assert failures_of(item, check) == (F.FINALISATION_SESSION_AMBIGUOUS,)
     assert item.d191 is None
+
+
+def test_absent_finalisation_is_only_absence_in_both_phases(tmp_path: Path) -> None:
+    """Presence: with no finalisation record, each evidence check reports only absence.
+
+    In particular, G18 never reads absent evidence as a not-configured recording.
+    """
+    run = write_run(tmp_path, {phase: Phase(results=()) for phase in (OFF, ON)})
+    phases = acceptance.interpret_retained_run(run).phases
+    assert [item.phase for item in phases] == [OFF, ON]
+    for item in phases:
+        assert [failures_of(item, check) for check in tuple(Check)[1:]] == [
+            (F.FINALISATION_EVIDENCE_ABSENT,)
+        ] * 4
+        assert item.d191 is None
 
 
 def test_same_session_retries_are_decided_by_the_last_record(tmp_path: Path) -> None:
@@ -2395,6 +2492,67 @@ def admissible_facts() -> dict[str, object]:
     }
 
 
+OUTPUT_MODELS: tuple[type[pydantic.BaseModel], ...] = (
+    acceptance.ColdCheckResult,
+    acceptance.ColdD191Metrics,
+    acceptance.ColdIdentityFacts,
+    acceptance.ColdPhaseInterpretation,
+)
+
+
+def _valid_output(model: type[pydantic.BaseModel]) -> tuple[dict[str, object], str, object]:
+    """Return valid construction values, one field, and a replacement value to assign."""
+    metrics: dict[str, object] = {
+        "max_consecutive_overflow_count": 0,
+        "peak_trailing_lost_audio_ms": 0.0,
+    }
+    if model is acceptance.ColdCheckResult:
+        return (
+            {"check": Check.AUDIO_COUNTERS, "outcome": Outcome.PASS, "failures": ()},
+            "outcome",
+            Outcome.FAIL,
+        )
+    if model is acceptance.ColdD191Metrics:
+        return metrics, "max_consecutive_overflow_count", 5
+    if model is acceptance.ColdIdentityFacts:
+        return admissible_facts(), "audio_overlap", 0.5
+    results = tuple(
+        acceptance.ColdCheckResult(check=check, outcome=Outcome.PASS, failures=())
+        for check in Check
+    )
+    phase: dict[str, object] = {
+        "phase": OFF,
+        "identity_sha256": "a" * 64,
+        "results": results,
+        "d191": acceptance.ColdD191Metrics.model_validate(metrics),
+        "identity_facts": acceptance.ColdIdentityFacts.model_validate(admissible_facts()),
+    }
+    return phase, "d191", None
+
+
+@pytest.mark.parametrize("model", OUTPUT_MODELS, ids=[model.__name__ for model in OUTPUT_MODELS])
+def test_output_models_are_strict_frozen_closed_and_finite(
+    model: type[pydantic.BaseModel],
+) -> None:
+    """Models: each output model pins its config, constructs, and refuses assignment."""
+    config = model.model_config
+    assert (
+        config.get("strict"),
+        config.get("frozen"),
+        config.get("extra"),
+        config.get("allow_inf_nan"),
+    ) == (True, True, "forbid", False)
+    values, field, replacement = _valid_output(model)
+    instance = model.model_validate(values)
+    assert model(**values) == instance
+    original = getattr(instance, field)
+    with pytest.raises(pydantic.ValidationError):
+        setattr(instance, field, replacement)
+    assert getattr(instance, field) == original
+    with pytest.raises(pydantic.ValidationError):
+        model.model_validate({**values, "unexpected": 1})
+
+
 def test_enums_are_plain_closed_and_pinned() -> None:
     """Enums: plain ``Enum``, unique values, and the ratified member order."""
     for kind in (Check, Outcome, F, Refusal):
@@ -2523,6 +2681,69 @@ def test_imports_are_exactly_the_ratified_allow_list() -> None:
             assert node.level == 0 and node.module in ALLOWED_FROM_IMPORTS, node.module
             names = {alias.name for alias in node.names}
             assert names <= ALLOWED_FROM_IMPORTS[node.module], node.module
+
+
+DYNAMIC_CALL_NAMES = frozenset({"__import__", "import_module", "eval", "exec", "compile"})
+DYNAMIC_CALL_ATTRIBUTES = frozenset({"__import__", "import_module", "eval", "exec"})
+
+
+def _dynamic_calls(tree: ast.AST) -> list[str]:
+    """Return each dynamic-import or evaluation call in a tree; ``re.compile`` is not one."""
+    calls: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        if isinstance(target, ast.Name) and target.id in DYNAMIC_CALL_NAMES:
+            calls.append(target.id)
+        elif isinstance(target, ast.Attribute) and (
+            target.attr in DYNAMIC_CALL_ATTRIBUTES
+            or (
+                target.attr == "compile"
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "builtins"
+            )
+        ):
+            calls.append(ast.unparse(target))
+    return calls
+
+
+DYNAMIC_CALL_SAMPLES: list[tuple[str, str, list[str]]] = [
+    ("bare-import", "__import__('math')", ["__import__"]),
+    ("importlib-import-module", "importlib.import_module('math')", ["importlib.import_module"]),
+    ("bare-import-module", "import_module('math')", ["import_module"]),
+    ("eval", "eval('1')", ["eval"]),
+    ("exec", "exec('x = 1')", ["exec"]),
+    ("builtin-compile", "compile('1', '<sample>', 'eval')", ["compile"]),
+    ("builtins-compile", "builtins.compile('1', '<sample>', 'eval')", ["builtins.compile"]),
+    ("builtins-import", "builtins.__import__('math')", ["builtins.__import__"]),
+    ("dead-function", "def unused():\n    return __import__('math')\n", ["__import__"]),
+    ("re-compile-permitted", "re.compile(r'\\A[a-z]+\\Z')", []),
+    ("pattern-call-permitted", "_PATTERN.fullmatch(text)", []),
+]
+
+
+@pytest.mark.parametrize(
+    ("sample", "expected"),
+    [case[1:] for case in DYNAMIC_CALL_SAMPLES],
+    ids=[case[0] for case in DYNAMIC_CALL_SAMPLES],
+)
+def test_dynamic_call_fence_classifies_bounded_samples(sample: str, expected: list[str]) -> None:
+    """Class B: the fence flags dynamic import and evaluation calls, never ``re.compile``.
+
+    Each sample is only parsed into a syntax tree; none is compiled or executed.
+    """
+    assert _dynamic_calls(ast.parse(sample)) == expected
+
+
+def test_module_makes_no_dynamic_import_and_binds_only_allowed_modules() -> None:
+    """Class B: the source has no dynamic import or evaluation call; only allowed modules bind."""
+    assert _dynamic_calls(TREE) == []
+    assert "re.compile(" in SOURCE
+    bound = {
+        name for name, value in vars(acceptance).items() if isinstance(value, types.ModuleType)
+    }
+    assert bound == ALLOWED_IMPORTS
 
 
 def test_no_assert_and_module_level_policy_is_immutable() -> None:

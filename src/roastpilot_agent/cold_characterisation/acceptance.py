@@ -10,9 +10,17 @@ Honest limit: rebinding re-establishes the record schema, the per-run bindings,
 the v1 identity parse, header agreement and container consistency.  It cannot
 prove that the manifest digest is authentic, that the run is complete, or that
 the retained copies are physically independent.  Deleting or truncating
-records, streams or phases cannot be detected here.  Those properties hold only
-when slice-6 composition supplies the strict retained-run reader's output under
-an externally recorded manifest digest and verifies both retained copies.
+records, streams or phases cannot be detected here.  Records that a caller
+reorders, inserts, duplicates or fabricates within a container are not detected
+either, provided each still validates and binds: container order is file order
+only when the run is the strict retained-run reader's output.  Those properties
+hold only when slice-6 composition supplies the strict retained-run reader's
+output under an externally recorded manifest digest and verifies both retained
+copies.
+
+Every read of the caller's run and its containers happens during rebinding;
+evaluation afterwards reads only the fresh snapshots and parses the capability
+holds.
 
 Qualification (Q1-Q11) is frozen v1 policy over retained values; it never
 converts, folds or trims them.  It is not live-freeze parity: packaged agent,
@@ -486,7 +494,7 @@ _BoundIdentities: typing.TypeAlias = tuple[tuple[ColdRunHeader, ColdRetainedIden
 
 
 class _Containers(typing.NamedTuple):
-    """Step-1 values, read from the supplied run exactly once."""
+    """Step-1 values taken from the run; steps 2 and 3 still read the containers held."""
 
     run_id: str
     manifest_sha256: str
@@ -660,7 +668,7 @@ def _mint_phase(
 
 
 def _rebind(run: ColdRetainedRun) -> ColdReboundRun:
-    """Rebind a retained run; ``run`` is read in step 1 only, never afterwards."""
+    """Rebind a retained run; every read of the caller's run and containers happens here."""
     containers = _step(
         lambda: _check_containers(run), ColdInterpretationFailure.CONTAINER_MALFORMED
     )
@@ -1091,7 +1099,13 @@ def _has_detection(sample: _Sample) -> bool:
 
 
 def _evaluate_inference_runtime(rebound: ColdReboundPhase) -> ColdCheckResult:
-    """G16 ``INFERENCE_RUNTIME``: active inference in every phase; no phase argument."""
+    """G16 ``INFERENCE_RUNTIME`` over ``L``, the runtime outcome and the final status.
+
+    It requires active flags on every observed sample and at least one processed
+    window before finalisation, in every phase and with no phase argument.  It is
+    not a proof of sustained inference: a capture that stalls after one processed
+    window is not detected here.
+    """
     evidence = _series_of(rebound)
     found = set(evidence.absent)
     for sample in evidence.live:
@@ -1290,7 +1304,9 @@ def _interpret_phase(rebound: ColdReboundPhase) -> ColdPhaseInterpretation:
 def interpret_retained_run(run: ColdRetainedRun) -> ColdInterpretation:
     """Rebind one retained run, then interpret every present phase.
 
-    ``run`` is read only while rebinding; every evaluator reads the capability.
+    Every read of the caller's run and its containers happens during rebinding;
+    evaluation afterwards reads only the fresh, validated snapshots and parses held
+    by the capability.
     The manifest digest is carried through, not re-verified, and no completeness,
     provenance or storage-independence property is established here.
 
