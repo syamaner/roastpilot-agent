@@ -14,12 +14,26 @@ The module is pure.  It performs no file, network or process I/O and never calls
 the retained-run reader, the evidence writer or the tree verifier.  It computes no
 run verdict and compares no measurement with a limit: the locked D191 and
 production limits are rendered, labelled not compared, and per-check results are
-rendered as each check defines them.
+rendered as each check defines them.  "Not compared" means not compared by this
+report projection: the G17 inference-duration check already compares against the
+fixed seven-second hop, and no rendered limit is compared against the recorded
+profile.  A per-check pass is not evidence of sustained inference, run duration or
+run qualification.
 
 Honest limit: the manifest digest is carried from the supplied run and is not
 re-verified here, and nothing here establishes the run's completeness, provenance
 or independent storage.  MCP-reported finalisation fields are recorded values, not
 evaluated here.  Temperatures are Celsius only.
+
+Named privacy residuals, disclosed rather than waived: when identity qualification
+passes, the caller-asserted hexadecimal commitments (the 40-character source
+revision and the 64-character artefact and profile-source digests) are rendered.
+They are accepted by shape alone, so any of them could be a hex-shaped secret, and
+nothing here proves that they are real commits or digests.  The run and session
+identifiers are rendered only as tagged SHA-256 digests, but those digests are
+deterministic: equal identifiers remain linkable across reports, and a predictable
+identifier can be guessed by hashing candidates, so the digests do not keep
+identifiers secret.
 """
 
 import enum
@@ -124,8 +138,17 @@ _PROTOCOL_INTENT: typing.Final = (
 )
 #: Markdown section headings for nested report fields; every other field is a table row.
 _SECTION_NOTES: typing.Final = (
-    ("locked_limits", "shown, not compared"),
-    ("checks", "per-check results, not a run verdict"),
+    (
+        "locked_limits",
+        "shown, not compared by the report projection; G17 already compares inference "
+        "duration against the fixed seven-second hop; these recorded limits are not "
+        "compared against the recorded profile",
+    ),
+    (
+        "checks",
+        "per-check results, not a run verdict; a per-check pass is not evidence of "
+        "sustained inference, run duration or run qualification",
+    ),
     ("d191", "derived, not compared"),
     ("counters", "final snapshot, plus the series maximum inference duration; null if unavailable"),
     ("aborts", "closed classifications"),
@@ -175,7 +198,10 @@ class _ReportModel(pydantic.BaseModel):
 class ColdReportLockedLimits(_ReportModel):
     """The locked D191 and production limits, pinned to the acceptance constants.
 
-    They are shown beside the derived values and are never compared with them.
+    They are shown beside the derived values and are never compared with them by
+    this report projection; the label "not compared" means exactly that.  The G17
+    inference-duration check already compares against the fixed seven-second hop,
+    and these recorded limits are not compared against the recorded profile.
     """
 
     label: typing.Literal["not compared"]

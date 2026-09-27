@@ -31,7 +31,10 @@ from roastpilot_agent.cold_characterisation import evidence_reader as reader
 from roastpilot_agent.cold_characterisation import evidence_schema as schema
 from roastpilot_agent.cold_characterisation import evidence_store as store
 from roastpilot_agent.cold_characterisation.host import HostBoundSample
-from roastpilot_agent.cold_characterisation.mcp import SessionFinalisationResult
+from roastpilot_agent.cold_characterisation.mcp import (
+    FinalisationFirstCrackStatus,
+    SessionFinalisationResult,
+)
 from tests.test_cold_characterisation_acceptance import (
     artefact,
     at,
@@ -126,6 +129,40 @@ FORBIDDEN_PHRASES = (
     "passed characterisation",
     "fully autonomous",
     "%",
+)
+#: The nine fixed Markdown heading notes in rendering order, copied independently of the module.
+SECTION_NOTES = (
+    (
+        "locked_limits",
+        "shown, not compared by the report projection; G17 already compares inference "
+        "duration against the fixed seven-second hop; these recorded limits are not "
+        "compared against the recorded profile",
+    ),
+    (
+        "checks",
+        "per-check results, not a run verdict; a per-check pass is not evidence of "
+        "sustained inference, run duration or run qualification",
+    ),
+    ("d191", "derived, not compared"),
+    ("counters", "final snapshot, plus the series maximum inference duration; null if unavailable"),
+    ("aborts", "closed classifications"),
+    ("advisor_failure_counts", "closed classifications"),
+    ("host_extremes", "recorded, not compared"),
+    ("recording_artefacts", "stat only"),
+    ("identity_facts", "shown only when identity check v1 has no failure"),
+)
+RUN_SECTION = f"## `{SECTION_NOTES[0][0]}` ({SECTION_NOTES[0][1]})"
+PHASE_SECTIONS = tuple(f"### `{name}` ({note})" for name, note in SECTION_NOTES[1:])
+#: Every heading a report may render: the title, run and phase headings, and the notes.
+FIXED_HEADINGS = frozenset(
+    {
+        "# Cold characterisation summary (report schema 1)",
+        "## Run",
+        "## Phase `recording_off`",
+        "## Phase `recording_on`",
+        RUN_SECTION,
+        *PHASE_SECTIONS,
+    }
 )
 
 
@@ -565,24 +602,116 @@ def test_host_extremes_are_null_without_hosts_or_with_a_negative_byte_count(
     assert phase_of(tmp_path, OFF, hosts=hosts).host_extremes is None
 
 
+def forged_phase(**fields: typing.Any) -> acceptance.ColdReboundPhase:
+    """Mint one rebound phase with the private token, bypassing strict rebinding.
+
+    Only defensive projection tests use it, to place values that strict rebinding
+    never yields; it leaves the rebinding code itself untouched.
+    """
+    values: dict[str, typing.Any] = {
+        "phase": OFF,
+        "header": schema.ColdRunHeader.model_construct(),
+        "ticks": (),
+        "hosts": (),
+        "advisories": (),
+        "finalisations": (),
+        "aborts": (),
+        "finalisation": None,
+        "finalisation_ambiguous": False,
+        "identity": store.ColdRetainedIdentityV1.model_construct(),
+    }
+    return acceptance.ColdReboundPhase(token=TOKEN, **(values | fields))
+
+
 def test_host_extremes_never_admit_a_malformed_byte_count() -> None:
     """Hosts (defensive): a ``bool`` byte count is unavailable, never an ``int``."""
-    values: Json = {**host_sample().model_dump(), "mem_available_bytes": True}
-    sample = schema.ColdHostSample.model_construct(**values)
-    rebound = acceptance.ColdReboundPhase(
-        token=TOKEN,
+
+    def forged_host(**changes: typing.Any) -> acceptance.ColdReboundPhase:
+        sample = schema.ColdHostSample.model_construct(**(host_sample().model_dump() | changes))
+        return forged_phase(hosts=(schema.ColdHostRecord.model_construct(sample=sample),))
+
+    assert host_extremes_of(forged_host()) is not None
+    assert host_extremes_of(forged_host(mem_available_bytes=True)) is None
+
+
+#: Readings strict rebinding never yields: refused (``inf``, ``bool``) or stored as ``float``.
+MALFORMED_DURATIONS: tuple[tuple[str, object], ...] = (
+    ("inf", float("inf")),
+    ("bool", True),
+    ("int", 9000),
+)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [case[1] for case in MALFORMED_DURATIONS],
+    ids=[case[0] for case in MALFORMED_DURATIONS],
+)
+def test_strict_rebinding_never_yields_a_malformed_duration_reading(
+    tmp_path: Path, value: object
+) -> None:
+    """Precondition: normal rebinding is strict and unchanged, so the report never sees these.
+
+    A tick carrying an ``inf`` or ``bool`` duration fails rebinding and an ``int`` is
+    stored as ``float``; the strict mirror that parses the pre-finalisation and final
+    snapshots does the same.
+    """
+    run = write(tmp_path, {OFF: Spec()})
+    ticks = next(item for item in run.streams if item.phase is OFF and item.stream is Stream.TICK)
+    last = typing.cast(schema.ColdTickRecord, ticks.records[-1])
+    audio = last.audio.model_copy(update={"max_inference_duration_ms": value})
+    stream = reader.ColdRetainedStream.model_construct(
         phase=OFF,
-        header=schema.ColdRunHeader.model_construct(),
-        ticks=(),
-        hosts=(schema.ColdHostRecord.model_construct(sample=sample),),
-        advisories=(),
-        finalisations=(),
-        aborts=(),
-        finalisation=None,
-        finalisation_ambiguous=False,
-        identity=store.ColdRetainedIdentityV1.model_construct(),
+        stream=Stream.TICK,
+        records=(*ticks.records[:-1], last.model_copy(update={"audio": audio})),
     )
-    assert host_extremes_of(rebound) is None
+    forged = rebuilt(run, streams=tuple(stream if item is ticks else item for item in run.streams))
+    snapshot = status(max_inference_duration_ms=value)
+    if type(value) is int:
+        rebound = acceptance.interpret_retained_run(forged).rebound.phases[0]
+        stored = rebound.ticks[-1].audio.max_inference_duration_ms
+        mirrored = FinalisationFirstCrackStatus.model_validate(snapshot).max_inference_duration_ms
+        assert [(type(item), item) for item in (stored, mirrored)] == [(float, 9000.0)] * 2
+    else:
+        expect_report_error(Failure.REBIND_FAILED, lambda: report.build_sanitised_report(forged))
+        with pytest.raises(pydantic.ValidationError):
+            FinalisationFirstCrackStatus.model_validate(snapshot)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [case[1] for case in MALFORMED_DURATIONS],
+    ids=[case[0] for case in MALFORMED_DURATIONS],
+)
+@pytest.mark.parametrize("placement", ["tick", "pre-finalisation", "final"])
+def test_a_malformed_duration_reading_is_unavailable_never_admitted(
+    tmp_path: Path, placement: str, value: object
+) -> None:
+    """G17 maximum (defensive): an ``inf``, ``bool`` or ``int`` reading in ``S`` is ``None``.
+
+    A forged capability places the reading in the last tick, the pre-finalisation
+    snapshot or the final snapshot; the same forgery over the genuine series is the
+    control, so the ``None`` comes from the malformed reading alone.
+    """
+    genuine = acceptance.interpret_retained_run(write(tmp_path, {OFF: Spec()})).rebound.phases[0]
+    result = genuine.finalisation
+    assert result is not None
+    pre, evidence = result.pre_finalisation_first_crack_status, result.first_crack_runtime
+    assert pre is not None and evidence is not None
+    assert g17_maximum_of(forged_phase(ticks=genuine.ticks, finalisation=result)) == 3.0
+    update = {"max_inference_duration_ms": value}
+    ticks, finalisation = genuine.ticks, result
+    if placement == "tick":
+        audio = ticks[-1].audio.model_copy(update=update)
+        ticks = (*ticks[:-1], ticks[-1].model_copy(update={"audio": audio}))
+    elif placement == "pre-finalisation":
+        changed = {"pre_finalisation_first_crack_status": pre.model_copy(update=update)}
+        finalisation = result.model_copy(update=changed)
+    else:
+        final = evidence.final_status.model_copy(update=update)
+        changed = {"first_crack_runtime": evidence.model_copy(update={"final_status": final})}
+        finalisation = result.model_copy(update=changed)
+    assert g17_maximum_of(forged_phase(ticks=ticks, finalisation=finalisation)) is None
 
 
 def test_counters_come_from_the_final_snapshot(tmp_path: Path) -> None:
@@ -742,6 +871,62 @@ def test_absent_or_negative_values_are_none_never_zero(
     assert {name for name, value in view.items() if value is None} == unavailable
 
 
+#: Non-zero final D191 inputs, so a voided or zero-filled derivation cannot pass unseen.
+D191_FINAL: Json = {
+    "max_consecutive_overflow_count": 2,
+    "total_overflow_count": 5,
+    "estimated_lost_audio_ms_last_minute": 40.0,
+}
+
+
+def d191_result(snapshot: str = "final", **reading: object) -> Json:
+    """A recording-off result with non-zero D191 inputs and optional replaced readings."""
+    pre = status(**(reading if snapshot == "pre" else {}))
+    final = final_status(**(D191_FINAL | (reading if snapshot == "final" else {})))
+    return result_for(
+        OFF, pre_finalisation_first_crack_status=pre, first_crack_runtime=runtime(final)
+    )
+
+
+#: One negative reading per case: the five final counters, then both snapshot durations.
+NEGATIVE_READINGS: list[tuple[str, str, str, float, str]] = [
+    ("final-emitted", "final", "emitted_window_count", -1, "emitted"),
+    ("final-processed", "final", "processed_window_count", -1, "processed"),
+    ("final-dropped", "final", "dropped_window_count", -1, "dropped"),
+    ("final-overruns", "final", "inference_overrun_count", -1, "inference_overruns"),
+    ("final-total-overflow", "final", "total_overflow_count", -1, "total_overflows"),
+    ("pre-duration", "pre", "max_inference_duration_ms", -1.0, "max_inference_duration_ms"),
+    ("final-duration", "final", "max_inference_duration_ms", -1.0, "max_inference_duration_ms"),
+]
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "source", "value", "reported"),
+    [case[1:] for case in NEGATIVE_READINGS],
+    ids=[case[0] for case in NEGATIVE_READINGS],
+)
+def test_a_negative_snapshot_reading_is_null_and_only_total_overflow_voids_d191(
+    tmp_path: Path, snapshot: str, source: str, value: float, reported: str
+) -> None:
+    """Unavailable: a negative final counter or snapshot duration is ``None``, never zero.
+
+    The merged D191 derivation reads both overflow counters and the trailing lost
+    audio over ``S``, so a negative final total overflow voids it; the other four
+    final counters and the durations are not D191 inputs, so the metrics stand.
+    """
+    clean_run = write(tmp_path, {OFF: Spec(results=(d191_result(),))}, name="clean")
+    negative_result = d191_result(snapshot, **{source: value})
+    negative_run = write(tmp_path, {OFF: Spec(results=(negative_result,))}, name="negative")
+    clean = report.build_sanitised_report(clean_run).phases[0]
+    negative = report.build_sanitised_report(negative_run).phases[0]
+    assert clean.d191 == acceptance.ColdD191Metrics(
+        max_consecutive_overflow_count=2, peak_trailing_lost_audio_ms=40.0
+    )
+    assert None not in values_of(clean.counters).values()
+    assert negative.counters == clean.counters.model_copy(update={reported: None})
+    assert negative.d191 == (None if source == "total_overflow_count" else clean.d191)
+
+
 def test_recording_artefact_sizes_are_null_when_absent_or_negative(tmp_path: Path) -> None:
     """Recording: roles in order; a missing or negative size is ``None``, zero stays zero."""
     artifacts = [
@@ -857,7 +1042,7 @@ def test_markdown_rows_render_the_report_values(tmp_path: Path) -> None:
         f"| run_id_sha256 | `{built.run_id_sha256}` |",
         f"| manifest_sha256 | `{built.manifest_sha256}` |",
         "| phases_absent | none |",
-        "## `locked_limits` (shown, not compared)",
+        RUN_SECTION,
         "| label | `not compared` |",
         "| n | 1 |",
         "| x_ms | 200.0 |",
@@ -929,10 +1114,6 @@ RUN_SHAPES: list[tuple[str, typing.Callable[[], dict[schema.ColdPhaseKind, Spec]
         lambda: {OFF: Spec(document=at("build_provenance.source_tree_dirty", True))},
     ),
 ]
-HEADING = re.compile(
-    r"\A(?:# Cold characterisation summary \(report schema 1\)|## Run"
-    r"|## Phase `recording_(?:off|on)`|#{2,3} `[a-z0-9_]+` \([a-z0-9 ,;-]+\))\Z"
-)
 CELL = re.compile(
     r"\A(?:`[a-z0-9_. ]+`(?:, `[a-z0-9_. ]+`)*|-?[0-9][0-9.e+-]*"
     r"|true|false|none|Field|Value|[a-z][a-z0-9_]*)\Z"
@@ -954,12 +1135,53 @@ def test_the_text_is_fixed_protocol_intent_and_never_a_claim(
         assert phrase not in lowered, phrase
     for line in filter(None, markdown.splitlines()):
         if line.startswith("#"):
-            assert HEADING.fullmatch(line), line
+            assert line in FIXED_HEADINGS, line
         elif line.startswith("|"):
             if re.fullmatch(r"\|(?:---\|)+", line) is None:
                 assert all(CELL.fullmatch(item) for item in line[2:-2].split(" | ")), line
         else:
             assert line in (*PROTOCOL_INTENT, "none", "`null` (unavailable)"), line
+
+
+def test_the_heading_notes_are_exactly_the_nine_fixed_notes_in_order(tmp_path: Path) -> None:
+    """Text: the nine fixed heading notes, in order; an added overall-pass note fails.
+
+    The checks note says a per-check pass is not evidence of sustained inference, run
+    duration or run qualification.  The locked-limits note says G17 already compares
+    against the fixed seven-second hop and no recorded limit is compared against the
+    recorded profile; the JSON label stays ``not compared``.
+    """
+    assert report._SECTION_NOTES == SECTION_NOTES  # pyright: ignore[reportPrivateUsage]
+    document, markdown = report.render_sanitised_report(write(tmp_path, full_spec()))
+    sections = [line for line in markdown.splitlines() if re.match(r"#{2,3} `", line)]
+    assert sections == [RUN_SECTION, *PHASE_SECTIONS, *PHASE_SECTIONS]
+    assert json.loads(document)["locked_limits"]["label"] == "not compared"
+
+
+#: Module-doc disclosures: the meaning of "not compared", the per-check caveat, and the
+#: two named privacy residuals (hex commitments, linkable and guessable digests).
+MODULE_DISCLOSURES = (
+    '"Not compared" means not compared by this report projection: the G17 '
+    "inference-duration check already compares against the fixed seven-second hop, and "
+    "no rendered limit is compared against the recorded profile.",
+    "A per-check pass is not evidence of sustained inference, run duration or run qualification.",
+    "Named privacy residuals, disclosed rather than waived: when identity qualification "
+    "passes, the caller-asserted hexadecimal commitments (the 40-character source revision "
+    "and the 64-character artefact and profile-source digests) are rendered.",
+    "They are accepted by shape alone, so any of them could be a hex-shaped secret, and "
+    "nothing here proves that they are real commits or digests.",
+    "The run and session identifiers are rendered only as tagged SHA-256 digests, but "
+    "those digests are deterministic: equal identifiers remain linkable across reports, "
+    "and a predictable identifier can be guessed by hashing candidates, so the digests "
+    "do not keep identifiers secret.",
+)
+
+
+def test_module_docs_disclose_the_limit_meaning_and_the_privacy_residuals() -> None:
+    """Docs: the module states each disclosure verbatim, whitespace aside."""
+    text = " ".join((report.__doc__ or "").split())
+    for sentence in MODULE_DISCLOSURES:
+        assert sentence in text, sentence
 
 
 def test_every_markdown_value_passes_through_the_scalar_renderer() -> None:
@@ -1722,6 +1944,104 @@ def test_no_verdict_qualified_pass_or_aggregate_field_or_callable() -> None:
     ]
 
 
+#: Every model the report projects, with its exact field order, written independently.
+PROJECTED_FIELDS: dict[type[pydantic.BaseModel], tuple[str, ...]] = {
+    report.ColdSanitisedReport: (
+        "report_schema_version",
+        "run_id_sha256",
+        "manifest_sha256",
+        "locked_limits",
+        "phases",
+        "phases_absent",
+    ),
+    report.ColdReportLockedLimits: ("label", "n", "x_ms", "fatal_streak", "hop_seconds"),
+    report.ColdReportPhase: (
+        "phase",
+        "identity_sha256",
+        "checks",
+        "d191",
+        "tick_count",
+        "observed_tick_span_seconds",
+        "counters",
+        "session_id_sha256",
+        "mcp_reported_finalisation_status",
+        "mcp_reported_clean",
+        "observed_command_streaming_required",
+        "applied_branch",
+        "aborts",
+        "advisory_record_count",
+        "advisor_failure_counts",
+        "host_extremes",
+        "recording_artefacts",
+        "identity_facts",
+    ),
+    report.ColdReportCheck: ("check", "outcome", "failures"),
+    report.ColdReportCounters: (
+        "emitted",
+        "processed",
+        "dropped",
+        "inference_overruns",
+        "total_overflows",
+        "max_inference_duration_ms",
+    ),
+    report.ColdReportAbort: ("domain", "reason"),
+    report.ColdReportAdvisorFailureCount: ("kind", "count"),
+    report.ColdReportHostExtremes: ("max_soc_temp_c", "min_mem_available_bytes", "min_free_bytes"),
+    report.ColdReportRecordingArtefact: ("role", "size_bytes"),
+    acceptance.ColdD191Metrics: ("max_consecutive_overflow_count", "peak_trailing_lost_audio_ms"),
+    acceptance.ColdIdentityFacts: (
+        "mcp_version",
+        "temperature_unit",
+        "first_crack_mode",
+        "model_precision",
+        "recording_device_count",
+        "source_tree_dirty",
+        "source_revision",
+        "artefact_kind",
+        "artefact_sha256",
+        "profile_source_sha256",
+        "profile_source_byte_length",
+        "first_crack_onnx_threads",
+        "first_crack_min_positive_windows",
+        "first_crack_confirmation_window_seconds",
+        "audio_sample_rate",
+        "audio_window_seconds",
+        "audio_overlap",
+        "audio_hop_seconds",
+        "session_ror_window_seconds",
+        "session_ror_min_sample_seconds",
+    ),
+}
+
+
+def reachable_models(root: type[pydantic.BaseModel]) -> set[type[pydantic.BaseModel]]:
+    """Every model class reachable through field annotations, the root included."""
+    found: set[type[pydantic.BaseModel]] = set()
+    pending: list[object] = [root]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, type) and issubclass(current, pydantic.BaseModel):
+            if current not in found:
+                found.add(current)
+                pending.extend(field.annotation for field in current.model_fields.values())
+        else:
+            pending.extend(typing.get_args(current))
+    return found
+
+
+def test_every_projected_model_has_exactly_its_pinned_ordered_fields() -> None:
+    """Allow-list: the report reaches exactly eleven models, each with its pinned field order.
+
+    The nine report models and the embedded D191 metrics and identity facts are pinned
+    independently, so a numeric private value, a pass or failure count, a
+    qualification flag or a run outcome cannot enter the projection unseen.
+    """
+    assert reachable_models(report.ColdSanitisedReport) == set(PROJECTED_FIELDS)
+    assert set(REPORT_MODELS) < set(PROJECTED_FIELDS)
+    for model, fields in PROJECTED_FIELDS.items():
+        assert tuple(model.model_fields) == fields, model.__name__
+
+
 # ------------------------------------------------------ entry points and reach
 
 
@@ -1873,6 +2193,130 @@ def test_limits_are_rendered_and_never_compared_with_a_measurement() -> None:
     assert all(any(node is inner for inner in ast.walk(declaration)) for node in loads)
     uses = [n for n in ast.walk(TREE) if isinstance(n, ast.Name) and n.id == "_LOCKED_LIMIT_VALUES"]
     assert len(uses) == 3
+
+
+LIMIT_ALIASES = ("n", "x_ms", "fatal_streak", "hop_seconds")
+
+
+def _parents(tree: ast.AST) -> dict[int, ast.AST]:
+    """Map every node's ``id`` to its parent node."""
+    return {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def _owners(tree: ast.AST) -> dict[int, str]:
+    """Map every node's ``id`` to its nearest enclosing function or class name."""
+    owners: dict[int, str] = {}
+
+    def visit(node: ast.AST, owner: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            inner = child.name if isinstance(child, (ast.FunctionDef, ast.ClassDef)) else owner
+            owners[id(child)] = inner
+            visit(child, inner)
+
+    visit(tree, "<module>")
+    return owners
+
+
+def test_the_unpacked_limit_aliases_bind_only_their_own_locked_limit_keywords() -> None:
+    """Class J: each limit alias is read once, as its own ``ColdReportLockedLimits`` keyword.
+
+    The four aliases unpacked from the pinned tuple are never compared, rebound, passed
+    on or used in arithmetic; each keyword binds the alias of the same name, and the
+    rendered limit fields are read back only by the pin validator.
+    """
+    unpackings = [
+        node
+        for node in ast.walk(TREE)
+        if isinstance(node, ast.Assign) and ast.unparse(node.value) == "_LOCKED_LIMIT_VALUES"
+    ]
+    assert len(unpackings) == 1 and len(unpackings[0].targets) == 1
+    target = unpackings[0].targets[0]
+    assert isinstance(target, ast.Tuple)
+    assert tuple(ast.unparse(item) for item in target.elts) == LIMIT_ALIASES
+    limits_class = next(
+        node
+        for node in TREE.body
+        if isinstance(node, ast.ClassDef) and node.name == "ColdReportLockedLimits"
+    )
+    declarations = [
+        statement.target
+        for statement in limits_class.body
+        if isinstance(statement, ast.AnnAssign) and ast.unparse(statement.target) in LIMIT_ALIASES
+    ]
+    names = [n for n in ast.walk(TREE) if isinstance(n, ast.Name) and n.id in LIMIT_ALIASES]
+    stores = {id(node) for node in names if isinstance(node.ctx, ast.Store)}
+    assert stores == {id(node) for node in (*target.elts, *declarations)}
+    calls = [
+        node
+        for node in ast.walk(TREE)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "ColdReportLockedLimits"
+    ]
+    assert len(calls) == 1
+    bindings: dict[str | None, ast.expr] = {item.arg: item.value for item in calls[0].keywords}
+    for alias in LIMIT_ALIASES:
+        value = bindings[alias]
+        assert isinstance(value, ast.Name) and value.id == alias, alias
+    loads = {id(node) for node in names if isinstance(node.ctx, ast.Load)}
+    assert loads == {id(bindings[alias]) for alias in LIMIT_ALIASES}
+    owners = _owners(TREE)
+    attributes = [
+        (owners[id(node)], ast.unparse(node))
+        for node in ast.walk(TREE)
+        if isinstance(node, ast.Attribute) and node.attr in LIMIT_ALIASES
+    ]
+    assert sorted(attributes) == sorted(
+        ("_require_acceptance_constants", f"self.{alias}") for alias in LIMIT_ALIASES
+    )
+
+
+#: Every numeric literal in the module, by owner and immediate context: the non-negative
+#: field constraints and admissions, the tick-span presence floor and sign, the schema
+#: version, and subscript positions.  None of them is a limit.
+NUMERIC_LITERALS = (
+    ("<module>", "ge=0"),
+    ("<module>", "ge=0"),
+    ("ColdSanitisedReport", "typing.Literal[1]"),
+    ("_count", "value >= 0"),
+    ("_projected_phase", "rebound.finalisations[-1]"),
+    ("_reading", "value >= 0"),
+    ("_report_of", "report_schema_version=1"),
+    ("_require_closed_phase", "self.checks[0]"),
+    ("_section", "items[0]"),
+    ("_tick_span", "len(ticks) < 2"),
+    ("_tick_span", "span >= 0"),
+    ("_tick_span", "ticks[-1]"),
+    ("_tick_span", "ticks[0]"),
+)
+#: The only literal comparisons: non-negative admissions (0) and the tick-span floor (2).
+LITERAL_COMPARISONS = (
+    ("_count", "value >= 0"),
+    ("_reading", "value >= 0"),
+    ("_tick_span", "len(ticks) < 2"),
+    ("_tick_span", "span >= 0"),
+)
+
+
+def test_every_numeric_literal_is_pinned_so_no_limit_is_introduced() -> None:
+    """Class J: no new numeric literal, and no literal comparison beyond the 0 and 2 guards.
+
+    A limit cannot enter as a literal comparison, a constraint keyword, a literal type
+    or arithmetic, because every numeric literal is pinned with its owner and context.
+    """
+    parents = _parents(TREE)
+    owners = _owners(TREE)
+    found: list[tuple[str, str]] = []
+    compared: list[tuple[str, str]] = []
+    for node in ast.walk(TREE):
+        if not isinstance(node, ast.Constant) or type(node.value) not in (int, float):
+            continue
+        context = parents[id(node)]
+        if isinstance(context, ast.UnaryOp):
+            context = parents[id(context)]
+        found.append((owners[id(node)], ast.unparse(context)))
+        if isinstance(context, ast.Compare):
+            compared.append(found[-1])
+    assert sorted(found) == sorted(NUMERIC_LITERALS)
+    assert sorted(compared) == sorted(LITERAL_COMPARISONS)
 
 
 ALLOWED_FROM_IMPORTS: dict[str, frozenset[str]] = {
