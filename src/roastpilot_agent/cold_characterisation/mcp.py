@@ -12,6 +12,11 @@ from typing import Literal, Protocol, TypeAlias, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, ValidationError, model_validator
 
+from roastpilot_agent.cold_characterisation.evidence_schema import (
+    ColdAudioField,
+    ColdEvidenceFailure,
+    ColdTickProjection,
+)
 from roastpilot_agent.config import MCPDeviceConfig
 from roastpilot_agent.mcp_client import (
     EventCommandResult,
@@ -60,6 +65,30 @@ class ColdSessionPhaseError(ColdMcpError):
 
 class ColdMcpValidationError(ColdMcpError):
     """Raised when an MCP response violates the cold boundary schema."""
+
+
+class ColdTickAudioProjectionError(ColdMcpValidationError):
+    """Raised when a tick's first-crack evidence fails the strict audio projection.
+
+    The error keeps only closed schema-owned diagnostics.  It never carries a
+    rejected value or key name, and its message is fixed.
+    """
+
+    failure: ColdEvidenceFailure
+    field_names: tuple[ColdAudioField, ...]
+
+    def __init__(
+        self, failure: ColdEvidenceFailure, field_names: tuple[ColdAudioField, ...]
+    ) -> None:
+        """Retain closed projection diagnostics behind a fixed public message.
+
+        Args:
+            failure: Closed failure reported by the strict projection.
+            field_names: Closed audio field diagnostics reported by the projection.
+        """
+        super().__init__("MCP tick audio evidence failed strict projection")
+        self.failure = failure
+        self.field_names = field_names
 
 
 class ColdMcpTransportError(ColdMcpError):
@@ -545,6 +574,21 @@ def finalisation_has_required_safety_evidence(result: SessionFinalisationResult)
         and _finalisation_has_capability_compatible_evidence(result)
         and _finalisation_has_clean_disconnect(result)
     )
+
+
+class ColdTickObservation(BaseModel):
+    """One identity-bound cold tick read from a single MCP response.
+
+    ``audio`` is the only admissible per-tick first-crack evidence: a strict,
+    complete projection of the raw first-crack payload of the same response.
+    ``state.first_crack_status`` is tolerant roast-path telemetry whose counters
+    may be defaulted or dropped, so it must never feed cold evidence.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True, allow_inf_nan=False)
+
+    state: RoastSessionState
+    audio: ColdTickProjection
 
 
 class ColdCharacterisationMCPClient:
