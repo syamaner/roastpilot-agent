@@ -648,6 +648,29 @@ class ColdCharacterisationMCPClient:
             return state, tree
         raise ColdMcpValidationError("MCP response failed cold contract validation") from None
 
+    @staticmethod
+    def _require_lossless_audio_types(
+        raw_audio: dict[str, ColdJsonValue], projection: ColdTickProjection
+    ) -> None:
+        """Refuse a projection whose named field type differs from its raw JSON type.
+
+        The strict projection still converts a JSON integer into a float field,
+        so each of the twenty named audio fields must keep its exact raw type.
+
+        Args:
+            raw_audio: The raw first-crack payload the projection was built from.
+            projection: The strict projection of that same payload.
+
+        Raises:
+            ColdEvidenceError: With a closed failure and the one mismatched field.
+        """
+        for field in ColdAudioField:
+            if field is ColdAudioField.UNKNOWN_FIELD:
+                continue
+            projected: object = getattr(projection.audio, field.value)
+            if type(raw_audio[field.value]) is not type(projected):
+                raise ColdEvidenceError(ColdEvidenceFailure.TICK_PAYLOAD_NOT_STRICT, (field,))
+
     async def _call(self, tool: str, args: dict[str, object]) -> object:
         if tool not in COLD_ALLOWED_TOOLS:
             raise ColdModeForbiddenToolError(f"tool not allowed in cold mode: {tool}")
@@ -715,9 +738,9 @@ class ColdCharacterisationMCPClient:
         if state.session_purpose != "cold_characterisation":
             raise ColdSessionPurposeError("MCP did not confirm cold_characterisation purpose")
         try:
-            audio = project_tick_audio(
-                cast("dict[str, dict[str, ColdJsonValue]]", tree)["first_crack_status"]
-            )
+            raw_audio = cast("dict[str, dict[str, ColdJsonValue]]", tree)["first_crack_status"]
+            audio = project_tick_audio(raw_audio)
+            self._require_lossless_audio_types(raw_audio, audio)
         except ColdEvidenceError as error:
             failure = error.failure
             field_names = error.field_names

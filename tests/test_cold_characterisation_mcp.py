@@ -1855,7 +1855,66 @@ async def test_tick_state_and_audio_come_from_one_read() -> None:
     assert [call[0] for call in caller.calls].count("get_roast_state") == 1
 
 
+#: The six audio fields the strict sample declares as ``float`` or ``float | None``.
+_FLOAT_AUDIO_FIELDS: tuple[str, ...] = (
+    "detected_monotonic_seconds",
+    "mic_peak_dbfs",
+    "mic_rms_dbfs",
+    "estimated_lost_audio_ms_last_minute",
+    "last_inference_duration_ms",
+    "max_inference_duration_ms",
+)
+
+
+def test_float_audio_field_inventory_matches_the_strict_sample() -> None:
+    """The float-designated inventory is exactly the sample's float annotations."""
+    declared = {
+        name
+        for name, info in ColdTickAudioSample.model_fields.items()
+        if info.annotation in (float, float | None)
+    }
+    assert declared == set(_FLOAT_AUDIO_FIELDS)
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("field", _FLOAT_AUDIO_FIELDS)
+async def test_json_integer_in_float_audio_field_is_refused(field: str) -> None:
+    """A raw JSON integer is never silently widened into float audio evidence."""
+    payload = _cold_state_payload()
+    _first_crack(payload)[field] = 1
+    _assert_tolerant_mirror_accepts(payload)
+    client, caller = await _started_client(payload)
+
+    with pytest.raises(ColdTickAudioProjectionError) as raised:
+        await client.get_roast_state()
+
+    assert raised.value.failure is ColdEvidenceFailure.TICK_PAYLOAD_NOT_STRICT
+    assert raised.value.field_names == (ColdAudioField(field),)
+    assert raised.value.args == (_TICK_MESSAGE,)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert len(_state_calls(caller)) == 1
+
+
+@pytest.mark.asyncio
+async def test_json_floats_in_every_float_audio_field_are_accepted() -> None:
+    """Correctly typed JSON floats keep their exact type and value."""
+    payload = _cold_state_payload()
+    for field in _FLOAT_AUDIO_FIELDS:
+        _first_crack(payload)[field] = 1.5
+    client, _ = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    for field in _FLOAT_AUDIO_FIELDS:
+        value = getattr(observation.audio.audio, field)
+        assert type(value) is float, field
+        assert value == 1.5, field
+
+
+@pytest.mark.asyncio
+@pytest.mark.slow
+@pytest.mark.serial(reason="drives a real MCP process group; must not run concurrently")
 async def test_real_child_cold_tick_projects_strictly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
