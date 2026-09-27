@@ -94,6 +94,51 @@ class ColdTickAudioProjectionError(ColdMcpValidationError):
         self.field_names = field_names
 
 
+class ColdDeviceField(Enum):
+    """Closed names of the eight raw per-tick ``device_state`` fields."""
+
+    DRIVER = "driver"
+    CONNECTED = "connected"
+    BEAN_TEMP_C = "bean_temp_c"
+    ENV_TEMP_C = "env_temp_c"
+    HEAT_LEVEL_PERCENT = "heat_level_percent"
+    FAN_LEVEL_PERCENT = "fan_level_percent"
+    COOLING_ON = "cooling_on"
+    RAW_VENDOR_DATA = "raw_vendor_data"
+
+
+class ColdDeviceProjectionFailure(Enum):
+    """Closed reasons a raw per-tick device state fails strict projection."""
+
+    DEVICE_STATE_NOT_OBJECT = "device_state_not_object"
+    FIELD_SET_MISMATCH = "field_set_mismatch"
+    FIELD_TYPE_NOT_EXACT = "field_type_not_exact"
+    DEVICE_VALUE_NOT_ADMITTED = "device_value_not_admitted"
+    VENDOR_DATA_TOO_LARGE = "vendor_data_too_large"
+
+
+class ColdTickDeviceProjectionError(ColdMcpValidationError):
+    """Raised when a tick's device state fails the strict device projection.
+
+    The error keeps only closed diagnostics.  It never carries a rejected value
+    or key name, and its message is fixed.
+    """
+
+    failure: ColdDeviceProjectionFailure
+    field: ColdDeviceField | None
+
+    def __init__(self, failure: ColdDeviceProjectionFailure, field: ColdDeviceField | None) -> None:
+        """Retain closed projection diagnostics behind a fixed public message.
+
+        Args:
+            failure: Closed reason the projection refused the raw device state.
+            field: The one closed device field concerned, when one is known.
+        """
+        super().__init__("MCP tick device state failed strict projection")
+        self.failure = failure
+        self.field = field
+
+
 class ColdMcpTransportError(ColdMcpError):
     """Raised when the injected MCP transport fails in cold mode."""
 
@@ -577,6 +622,29 @@ def finalisation_has_required_safety_evidence(result: SessionFinalisationResult)
         and _finalisation_has_capability_compatible_evidence(result)
         and _finalisation_has_clean_disconnect(result)
     )
+
+
+class ColdTickDeviceState(BaseModel):
+    """Strict, complete projection of one raw per-tick MCP device state.
+
+    It records exact raw values and decides nothing: it applies no zero,
+    connected, range, plausibility, or startup-interval policy.
+    ``ColdTickObservation.device`` is the only admissible per-tick device
+    evidence; ``state.device_state`` is tolerant roast-path telemetry whose
+    values may be coerced or whose unknown keys may be dropped, so it must
+    never feed cold evidence.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True, allow_inf_nan=False)
+
+    driver: str
+    connected: bool
+    bean_temp_c: float | None
+    env_temp_c: float | None
+    heat_level_percent: int
+    fan_level_percent: int
+    cooling_on: bool
+    raw_vendor_data: dict[str, ColdJsonValue]
 
 
 class ColdTickObservation(BaseModel):
