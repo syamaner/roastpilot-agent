@@ -14,8 +14,11 @@ from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, ValidationErr
 
 from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdAudioField,
+    ColdEvidenceError,
     ColdEvidenceFailure,
+    ColdJsonValue,
     ColdTickProjection,
+    project_tick_audio,
 )
 from roastpilot_agent.config import MCPDeviceConfig
 from roastpilot_agent.mcp_client import (
@@ -622,6 +625,29 @@ class ColdCharacterisationMCPClient:
             return result
         raise ColdMcpValidationError("MCP response failed cold contract validation") from None
 
+    @staticmethod
+    def _parse_tick(payload: object) -> tuple[RoastSessionState, object]:
+        """Parse one tick response into its tolerant mirror and its raw JSON tree.
+
+        Both parses read the same serialised text, so the raw tree is exactly
+        the response the tolerant mirror accepted.
+
+        Args:
+            payload: The untrusted MCP response payload.
+
+        Raises:
+            ColdMcpValidationError: If the response violates the cold contract.
+        """
+        try:
+            text = json.dumps(payload, allow_nan=False)
+            state = RoastSessionState.model_validate_json(text)
+            tree: object = json.loads(text)
+        except (RecursionError, TypeError, ValidationError, ValueError):
+            pass
+        else:
+            return state, tree
+        raise ColdMcpValidationError("MCP response failed cold contract validation") from None
+
     async def _call(self, tool: str, args: dict[str, object]) -> object:
         if tool not in COLD_ALLOWED_TOOLS:
             raise ColdModeForbiddenToolError(f"tool not allowed in cold mode: {tool}")
@@ -659,22 +685,45 @@ class ColdCharacterisationMCPClient:
         self._cold_session_id = result.session.session_id
         return result
 
-    async def get_roast_state(self, session_id: str | None = None) -> RoastSessionState:
-        """Return the established cold session state after identity confirmation."""
+    async def get_roast_state(self, session_id: str | None = None) -> ColdTickObservation:
+        """Return one cold tick whose audio evidence is strictly projected.
+
+        Args:
+            session_id: Optional explicit session; it must be the established one.
+
+        Returns:
+            The tolerant session state and the strict audio projection, both
+            parsed from one MCP response.
+
+        Raises:
+            ColdSessionIdentityError: If the session is not the established one.
+            ColdSessionPurposeError: If MCP does not confirm the cold purpose.
+            ColdMcpTransportError: If the MCP transport fails.
+            ColdMcpValidationError: If the response violates the cold contract.
+            ColdTickAudioProjectionError: If the audio evidence is not strictly complete.
+        """
         expected_session_id = self._cold_session_id
         if expected_session_id is None or (
             session_id is not None and session_id != expected_session_id
         ):
             raise ColdSessionIdentityError("requested cold session is not established")
-        result = self._validate(
-            RoastSessionState,
-            await self._call("get_roast_state", {"session_id": expected_session_id}),
+        state, tree = self._parse_tick(
+            await self._call("get_roast_state", {"session_id": expected_session_id})
         )
-        if result.session_id != expected_session_id:
+        if state.session_id != expected_session_id:
             raise ColdSessionIdentityError("MCP did not return the established cold session")
-        if result.session_purpose != "cold_characterisation":
+        if state.session_purpose != "cold_characterisation":
             raise ColdSessionPurposeError("MCP did not confirm cold_characterisation purpose")
-        return result
+        try:
+            audio = project_tick_audio(
+                cast("dict[str, dict[str, ColdJsonValue]]", tree)["first_crack_status"]
+            )
+        except ColdEvidenceError as error:
+            failure = error.failure
+            field_names = error.field_names
+        else:
+            return ColdTickObservation(state=state, audio=audio)
+        raise ColdTickAudioProjectionError(failure, field_names)
 
     async def mark_beans_added(self) -> EventCommandResult:
         """Request the permitted, non-actuating inference-activation event."""
