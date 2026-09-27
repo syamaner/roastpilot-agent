@@ -1904,41 +1904,67 @@ async def test_cold_tick_observation_is_closed_and_frozen() -> None:
         observation.audio = observation.audio
 
 
+_TOLERANT_FIRST_CRACK_NAME = "first_crack_status"
+
+
 def _cold_production_trees() -> dict[str, ast.Module]:
     """Parse every cold production module (docstrings and comments are not nodes)."""
     return {
-        path.name: ast.parse(path.read_text(encoding="utf-8"))
+        path.relative_to(_COLD_PACKAGE).as_posix(): ast.parse(path.read_text(encoding="utf-8"))
         for path in sorted(_COLD_PACKAGE.rglob("*.py"))
     }
 
 
 def test_cold_production_code_never_reads_tolerant_first_crack_status() -> None:
-    """T12: no executable cold code reads the tolerant first-crack mirror."""
+    """T12: a finite syntax guard over literal, attribute, and keyword uses of the name.
+
+    Across every cold production module it forbids ``.first_crack_status``
+    attribute nodes, ``getattr`` with that literal, keyword arguments and
+    class-pattern keywords of that name, and any exact ``"first_crack_status"``
+    string constant except the single raw projection subscript in ``mcp.py``.
+    Docstrings are longer strings, so they are not counted.  Access through a
+    variable or a dynamically computed name is an explicit residual: this is a
+    syntax guard, not a proof that the tolerant mirror is unreachable.
+    """
     trees = _cold_production_trees()
     assert "mcp.py" in trees
     attributes: list[str] = []
     getattr_calls: list[str] = []
+    keywords: list[str] = []
+    pattern_keywords: list[str] = []
+    constants: dict[str, list[ast.Constant]] = {}
     for name, tree in trees.items():
         for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute) and node.attr == "first_crack_status":
+            if isinstance(node, ast.Attribute) and node.attr == _TOLERANT_FIRST_CRACK_NAME:
                 attributes.append(name)
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
                 and node.func.id == "getattr"
                 and any(
-                    isinstance(arg, ast.Constant) and arg.value == "first_crack_status"
+                    isinstance(arg, ast.Constant) and arg.value == _TOLERANT_FIRST_CRACK_NAME
                     for arg in node.args
                 )
             ):
                 getattr_calls.append(name)
+            if isinstance(node, ast.keyword) and node.arg == _TOLERANT_FIRST_CRACK_NAME:
+                keywords.append(name)
+            if isinstance(node, ast.MatchClass) and _TOLERANT_FIRST_CRACK_NAME in node.kwd_attrs:
+                pattern_keywords.append(name)
+            if isinstance(node, ast.Constant) and node.value == _TOLERANT_FIRST_CRACK_NAME:
+                constants.setdefault(name, []).append(node)
     assert attributes == []
     assert getattr_calls == []
+    assert keywords == []
+    assert pattern_keywords == []
+    assert sorted(constants) == ["mcp.py"]
+    assert len(constants["mcp.py"]) == 1
     subscripts = [
         node
         for node in ast.walk(trees["mcp.py"])
         if isinstance(node, ast.Subscript)
         and isinstance(node.slice, ast.Constant)
-        and node.slice.value == "first_crack_status"
+        and node.slice.value == _TOLERANT_FIRST_CRACK_NAME
     ]
     assert len(subscripts) == 1
+    assert subscripts[0].slice is constants["mcp.py"][0]
