@@ -6647,6 +6647,7 @@ def test_gate_target_guard_preserves_broad_discovery_and_gateway_boundary() -> N
 
 @pytest.mark.slow
 @pytest.mark.serial(reason="runs a nested broad pytest suite through a real shell subprocess")
+@pytest.mark.exhaustive_only
 def test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper(tmp_path: Path) -> None:
     """The actual QA prefix collects the gate checks during broad suite execution."""
     root = _executable_gate_root(tmp_path)
@@ -6655,6 +6656,50 @@ def test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper(tmp_path: Pat
     command = f"{wrapper} tests -k {shlex.quote(excluded)}"
     result = _run_gate_command(command, _poisoned_gate_environment(), cwd=Path(__file__).parents[1])
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.slow
+@pytest.mark.serial(reason="runs the rendered QA wrapper through a real shell subprocess")
+def test_rendered_qa_gate_wrapper_runs_gate_checks_and_broad_collection(tmp_path: Path) -> None:
+    """The actual QA prefix runs the gate checks and broadly collects them, without a suite.
+
+    This is the per-pull-request proof that keeps the actual-wrapper sentinel path
+    exercised while the nested broad-suite test runs only in exhaustive CI runs.
+    """
+    root = _executable_gate_root(tmp_path)
+    wrapper = render_validation_commands(NativeClaudeRole.QA, str(root))[1]
+    repository = Path(__file__).parents[1]
+
+    gate = _run_gate_command(f"{wrapper} tests/gate", _poisoned_gate_environment(), cwd=repository)
+    gate_output = gate.stdout + gate.stderr
+    assert gate.returncode == 0, gate_output
+    assert "validation gate sentinel is absent" not in gate_output
+    passed = re.search(r"\b(\d+) passed\b", gate_output)
+    assert passed is not None, gate_output
+    assert int(passed.group(1)) >= 1
+
+    # pyproject ``addopts`` already carries ``-q``: one level lists node IDs, while an
+    # extra ``-q`` (``-qq``) would print only per-file counts.
+    collected = _run_gate_command(
+        f"{wrapper} tests --collect-only", _poisoned_gate_environment(), cwd=repository
+    )
+    collected_output = collected.stdout + collected.stderr
+    assert collected.returncode == 0, collected_output
+    nodeids = {line.strip() for line in collected.stdout.splitlines() if "::" in line}
+    gate_nodeids = {
+        nodeid for nodeid in nodeids if nodeid.startswith("tests/gate/test_gate_environment.py::")
+    }
+    listing = _run_gate_command(
+        f"{wrapper} tests/gate --collect-only", _poisoned_gate_environment(), cwd=repository
+    )
+    assert listing.returncode == 0, listing.stdout + listing.stderr
+    expected_gate_nodeids = {
+        line.strip()
+        for line in listing.stdout.splitlines()
+        if line.strip().startswith("tests/gate/test_gate_environment.py::")
+    }
+    assert expected_gate_nodeids
+    assert gate_nodeids == expected_gate_nodeids
 
 
 def test_rendered_pyright_gate_runs_cold_under_the_closed_environment(tmp_path: Path) -> None:

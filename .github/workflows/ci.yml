@@ -5,6 +5,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: "23 2 * * *"
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -190,7 +192,8 @@ jobs:
       - name: Run serial tests with coverage
         env:
           COVERAGE_FILE: .coverage.serial
-        run: python -m pytest -m "serial and not stress" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report=
+          SERIAL_SELECTION: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'serial and not stress' || 'serial and not stress and not exhaustive_only' }}
+        run: python -m pytest -m "$SERIAL_SELECTION" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report=
 
       - name: Upload serial coverage data
         uses: actions/upload-artifact@v4

@@ -83,8 +83,20 @@ python -m pytest
 
 CI uses a four-worker ordinary xdist lane, a serial lane, a three-entry stress
 matrix, and the Package job for `tests/test_packaging.py`; one coverage job combines
-their data. For a fast local parallel loop, run `python -m pytest -n 4 --dist
-worksteal -m 'not serial and not stress'`. `stress` tests exercise real production
+their data. The serial lane is event-selected (#954): pull-request and push runs add
+`and not exhaustive_only`, omitting only the closed `exhaustive_only` inventory pinned
+in `tests/test_pytest_governance.py` (initially the nested QA-wrapper suite test,
+whose members must also be `serial`), while the daily `schedule` (02:23 UTC) and
+manual `workflow_dispatch` runs of `ci.yml` select the entire collection through the
+same lanes. A focused actual-wrapper test keeps the sentinel proof on every pull
+request. A red scheduled or dispatched exhaustive run is diagnosed independently of
+its author. Merges whose change is affected by the diagnosed failure pause until it
+is resolved or the operator records an explicit disposition; unrelated merges are
+not frozen. Missing or delayed scheduled evidence is reported as such in the merge
+context, never presented as green. A dispatch on a PR ref is optional operator
+choice, not a standing prerequisite. For a fast local parallel loop, run
+`python -m pytest -n 4 --dist worksteal -m 'not serial and not stress'`. `stress`
+tests exercise real production
 resource limits, `slow` tests use real subprocesses or MCP sessions, and `serial`
 tests are never run under `-n`. The full gate (`python -m pytest`, all markers,
 single process) remains mandatory before handback and before opening a PR.
