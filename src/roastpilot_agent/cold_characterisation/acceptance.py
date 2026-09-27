@@ -308,9 +308,10 @@ class _Capability:
 class ColdReboundPhase(_Capability):
     """One phase's rebound evidence: validated snapshots in file order.
 
-    ``finalisation`` is the envelope of the last finalisation record when every
-    finalisation record shares one session; differing sessions leave it ``None``
-    and set ``finalisation_ambiguous``.
+    ``finalisation`` is optional: the result parsed from the envelope of the last
+    finalisation record when every finalisation record shares one session, and
+    ``None`` when there is no finalisation record or the sessions differ (which
+    also sets ``finalisation_ambiguous``).
     """
 
     __slots__ = (
@@ -363,7 +364,7 @@ class ColdReboundPhase(_Capability):
             advisories: Advisory snapshots in file order.
             finalisations: Finalisation snapshots in file order.
             aborts: Abort snapshots in file order.
-            finalisation: The selected finalisation result, if unambiguous.
+            finalisation: The result parsed from the last record's envelope, or ``None``.
             finalisation_ambiguous: Whether finalisation records name different sessions.
             identity: The v1 identity parsed during binding.
 
@@ -572,7 +573,7 @@ def _bind_records(containers: _Containers) -> _Bound | None:
                     type(snapshot) is not _STREAM_RECORD_CLASS[stream]
                     or snapshot.phase is not phase
                 )
-                if relabelled:  # pragma: no cover - validate_record keeps step 1's class and phase.
+                if relabelled:
                     return None
                 check_record_binding(state, snapshot, writer_root=None)
                 bound.append(snapshot)

@@ -591,6 +591,52 @@ def test_refusal_errors_carry_no_input_content(tmp_path: Path) -> None:
     assert CANARY not in rendered
 
 
+Relabel = typing.Callable[
+    [schema.ColdEvidenceRecord, reader.ColdRetainedRun], schema.ColdEvidenceRecord
+]
+
+
+def _host_for_every_tick(
+    snapshot: schema.ColdEvidenceRecord, run: reader.ColdRetainedRun
+) -> schema.ColdEvidenceRecord:
+    """Replace every tick snapshot with a same-phase, bindable host snapshot (a wrong class)."""
+    if type(snapshot) is schema.ColdTickRecord:
+        return host_for(next(i.header for i in run.headers if i.header.phase is snapshot.phase))
+    return snapshot
+
+
+def _on_ticks_as_off(
+    snapshot: schema.ColdEvidenceRecord, run: reader.ColdRetainedRun
+) -> schema.ColdEvidenceRecord:
+    """Relabel every recording-on tick snapshot as recording-off (a changed phase)."""
+    del run
+    if type(snapshot) is schema.ColdTickRecord and snapshot.phase is ON:
+        return snapshot.model_copy(update={"phase": OFF})
+    return snapshot
+
+
+@pytest.mark.parametrize(
+    "relabel", [_host_for_every_tick, _on_ticks_as_off], ids=["wrong-class", "changed-phase"]
+)
+def test_step_two_refuses_a_snapshot_relabelled_after_step_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relabel: Relabel
+) -> None:
+    """R2: a snapshot whose class or phase differs from its checked container is refused.
+
+    Both phases share one identity digest, so the relabelled snapshot would bind;
+    only the step-2 guard refuses it.
+    """
+    run = write_run(tmp_path, {OFF: Phase(), ON: Phase()})
+    assert run.headers[0].header.identity_sha256 == run.headers[1].header.identity_sha256
+    assert len(acceptance.interpret_retained_run(run).phases) == 2
+
+    def relabelling(record: schema.ColdEvidenceRecord) -> schema.ColdEvidenceRecord:
+        return relabel(schema.validate_record(record), run)
+
+    monkeypatch.setattr(acceptance, "validate_record", relabelling)
+    expect_refusal(Refusal.RECORD_REBIND_FAILED, lambda: acceptance.interpret_retained_run(run))
+
+
 def _with_identity(
     run: reader.ColdRetainedRun, index: int, **changes: object
 ) -> tuple[object, ...]:
@@ -617,6 +663,17 @@ def _with_header(run: reader.ColdRetainedRun, **changes: object) -> tuple[object
 
 def _renamed_key(document: Json) -> None:
     document["renamed_key"] = document.pop("boot_id")
+
+
+class SubIdentity(store.ColdRetainedIdentityV1):
+    """A subclassed retained identity."""
+
+
+def _with_subclassed_identity(run: reader.ColdRetainedRun) -> tuple[object, ...]:
+    item = run.headers[0]
+    equal = SubIdentity.model_construct(**dict(item.identity))
+    changed = reader.ColdRetainedHeader.model_construct(header=item.header, identity=equal)
+    return (changed, *run.headers[1:])
 
 
 HEADER_FORGERIES: list[tuple[str, Forge]] = [
@@ -699,6 +756,24 @@ HEADER_FORGERIES: list[tuple[str, Forge]] = [
         ),
     ),
     ("headers-without-streams", forge(lambda run: rebuilt(run, streams=()))),
+    (
+        "identity-run-id-altered",
+        forge(
+            lambda run: rebuilt(
+                run, headers=_with_identity(run, 0, run_id="20260926T120000Z-other")
+            )
+        ),
+    ),
+    (
+        "identity-runtime-extras-altered",
+        forge(
+            lambda run: rebuilt(run, headers=_with_identity(run, 0, runtime_config_extras={"k": 1}))
+        ),
+    ),
+    (
+        "identity-subclassed-equal",
+        forge(lambda run: rebuilt(run, headers=_with_subclassed_identity(run))),
+    ),
 ]
 
 
@@ -946,6 +1021,21 @@ def test_admissible_identity_passes_and_yields_facts(tmp_path: Path) -> None:
         audio_hop_seconds=None,
         session_ror_window_seconds=60,
         session_ror_min_sample_seconds=10,
+    )
+
+
+def test_editable_source_without_a_digest_qualifies(tmp_path: Path) -> None:
+    """Q9: an editable source with a null artefact digest passes; its facts keep both."""
+    unpackaged: dict[str, object] = {
+        "build_provenance.artefact_kind": "editable_source",
+        "build_provenance.artefact_sha256": None,
+    }
+    item = interpret_phase(tmp_path, OFF, document=applying(unpackaged))
+    assert qualification(item).outcome is Outcome.PASS and qualification(item).failures == ()
+    assert item.identity_facts is not None
+    assert (item.identity_facts.artefact_kind, item.identity_facts.artefact_sha256) == (
+        "editable_source",
+        None,
     )
 
 
@@ -1556,6 +1646,31 @@ def test_one_processed_window_is_enough(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("check", "pre", "expected"),
+    [
+        (
+            Check.INFERENCE_RUNTIME,
+            status(audio_running=False),
+            (F.TICK_EVIDENCE_ABSENT, F.INFERENCE_NOT_ACTIVE),
+        ),
+        (
+            Check.AUDIO_COUNTERS,
+            status(dropped_window_count=1),
+            (F.TICK_EVIDENCE_ABSENT, F.DROPPED_WINDOW),
+        ),
+    ],
+    ids=["runtime-pre-not-running", "counters-pre-dropped"],
+)
+def test_missing_ticks_never_hide_failures_in_present_evidence(
+    tmp_path: Path, check: acceptance.ColdCheck, pre: Json, expected: tuple[F, ...]
+) -> None:
+    """G16: a presence failure never short-circuits the rules over the evidence present."""
+    run = write_run(tmp_path, both_phases((), pre_finalisation_first_crack_status=pre))
+    phases = acceptance.interpret_retained_run(run).phases
+    assert {failures_of(item, check) for item in phases} == {expected}
+
+
+@pytest.mark.parametrize(
     "stop",
     [
         runtime(outcome="stop_failed", stop_error="join timed out"),
@@ -1990,6 +2105,28 @@ ON_CASES: list[tuple[str, Json | None, tuple[F, ...]]] = [
         (F.RECORDING_NOT_FINALISED, F.RECORDING_ARTEFACT_SET_UNEXPECTED),
     ),
     ("absent", None, (F.FINALISATION_EVIDENCE_ABSENT,)),
+    (
+        "same-count-additional-for-sidecar",
+        recording_on(
+            [
+                artefact("primary_wav"),
+                artefact("additional_wav"),
+                artefact("annotation_session_sidecar"),
+            ]
+        ),
+        (F.RECORDING_ARTEFACT_SET_UNEXPECTED,),
+    ),
+    (
+        "same-count-duplicate-primary",
+        recording_on(
+            [
+                artefact("primary_wav"),
+                artefact("primary_wav"),
+                artefact("annotation_session_sidecar"),
+            ]
+        ),
+        (F.RECORDING_ARTEFACT_SET_UNEXPECTED,),
+    ),
 ]
 OFF_CASES: list[tuple[str, Json | None, tuple[F, ...]]] = [
     (
@@ -2051,12 +2188,18 @@ def _metrics(
 
 
 def test_x_is_the_trailing_peak_over_every_element(tmp_path: Path) -> None:
-    """D191: X peaks at the earliest tick, the pre snapshot, or the final snapshot."""
+    """D191: X peaks at the earliest tick, the pre snapshot, or the final snapshot.
+
+    The trailing gauge falling from 150 to 0 is not a counter restart.
+    """
     lost = "estimated_lost_audio_ms_last_minute"
-    earliest = _metrics(tmp_path, _ticks_with(0, **{lost: 150.0}))
-    assert earliest == acceptance.ColdD191Metrics(
+    earliest = interpret_phase(
+        tmp_path, OFF, ticks=_ticks_with(0, **{lost: 150.0}), results=(result_for(OFF),)
+    )
+    assert earliest.d191 == acceptance.ColdD191Metrics(
         max_consecutive_overflow_count=0, peak_trailing_lost_audio_ms=150.0
     )
+    assert failures_of(earliest, Check.AUDIO_COUNTERS) == ()
     pre = _metrics(tmp_path / "pre", pre_finalisation_first_crack_status=status(**{lost: 120.0}))
     assert pre is not None and pre.peak_trailing_lost_audio_ms == 120.0
     final = _metrics(tmp_path / "final", first_crack_runtime=runtime(final_status(**{lost: 90.0})))
@@ -2091,6 +2234,19 @@ UNAVAILABLE_CASES: list[tuple[str, tuple[Json, ...] | None, dict[str, object]]] 
         "total-restart",
         None,
         {"pre_finalisation_first_crack_status": status(total_overflow_count=9)},
+    ),
+    (
+        "final-streak-decrease",
+        None,
+        {
+            "pre_finalisation_first_crack_status": status(max_consecutive_overflow_count=3),
+            "first_crack_runtime": runtime(final_status(max_consecutive_overflow_count=0)),
+        },
+    ),
+    (
+        "final-negative-streak",
+        None,
+        {"first_crack_runtime": runtime(final_status(max_consecutive_overflow_count=-1))},
     ),
 ]
 
@@ -2392,7 +2548,13 @@ def test_no_assert_and_module_level_policy_is_immutable() -> None:
 def test_interpretation_performs_no_file_io(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Scope: with every file and reader entry point disabled, interpretation still runs."""
+    """Scope: interpretation needs none of eight patched file and evidence entry points.
+
+    Only ``builtins.open``, ``io.open``, ``os.open``, ``os.scandir``, the reader's
+    ``read_retained_run`` and the store's ``verify_retained_tree``,
+    ``verify_retained_copies`` and ``read_verified_lines`` are patched to raise while
+    an already-read run is interpreted; the evidence tree is then unchanged.
+    """
     run = write_run(tmp_path, {OFF: Phase(), ON: Phase()})
     root = str(tmp_path.resolve() / "pi")
     before = snapshot_tree(root)
