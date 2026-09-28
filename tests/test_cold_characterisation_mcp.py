@@ -56,6 +56,7 @@ from roastpilot_agent.mcp_client import (
     RoasterDeviceState,
     RoastSessionState,
 )
+from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 
 _MCP_TOOL_FIXTURES = Path(__file__).parent / "fixtures" / "mcp-tool-results"
 _FINALISATION_FIXTURE = _MCP_TOOL_FIXTURES / "finalise_cold_characterisation_session.json"
@@ -2492,3 +2493,105 @@ def test_device_enums_are_closed_plain_enums_matching_the_mirror() -> None:
         "DEVICE_VALUE_NOT_ADMITTED",
         "VENDOR_DATA_TOO_LARGE",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "nulled",
+    [
+        (ColdDeviceField.BEAN_TEMP_C,),
+        (ColdDeviceField.ENV_TEMP_C,),
+        (ColdDeviceField.BEAN_TEMP_C, ColdDeviceField.ENV_TEMP_C),
+    ],
+)
+async def test_null_temperatures_project_as_none_exactly(
+    nulled: tuple[ColdDeviceField, ...],
+) -> None:
+    """T-D2b: a JSON-null temperature is ``None`` in a present device, never ``0.0``."""
+    payload = _cold_state_payload()
+    for field in nulled:
+        _device(payload)[field.value] = None
+    _assert_tolerant_mirror_accepts(payload)
+    raw = dict(_device(payload))
+    client, caller = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    device = observation.device
+    assert type(device) is ColdTickDeviceState
+    for field in ColdDeviceField:
+        value = getattr(device, field.value)
+        if field in nulled:
+            assert value is None, field
+            assert value != 0.0, field
+        else:
+            assert value == raw[field.value], field
+            assert type(value) is type(raw[field.value]), field
+    assert len(_state_calls(caller)) == 1
+
+
+def test_projector_maps_both_null_temperatures_to_none_directly() -> None:
+    """T-D2b: the direct projector gives the same result for both temperatures null."""
+    raw = dict(_device(_cold_state_payload()))
+    raw["bean_temp_c"] = None
+    raw["env_temp_c"] = None
+
+    device = ColdCharacterisationMCPClient._project_device(raw)  # pyright: ignore[reportPrivateUsage]
+
+    assert type(device) is ColdTickDeviceState
+    assert device.bean_temp_c is None
+    assert device.env_temp_c is None
+    assert device.driver == raw["driver"]
+    assert device.heat_level_percent == raw["heat_level_percent"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connected", [True, False])
+async def test_device_state_is_recorded_as_data_without_a_verdict(connected: bool) -> None:
+    """T-D16/AC-D5: the projection records these raw values exactly and returns no verdict."""
+    recorded: dict[ColdDeviceField, object] = {
+        ColdDeviceField.CONNECTED: connected,
+        ColdDeviceField.COOLING_ON: True,
+        ColdDeviceField.HEAT_LEVEL_PERCENT: 100,
+        ColdDeviceField.FAN_LEVEL_PERCENT: 55,
+    }
+    payload = _cold_state_payload()
+    for field, value in recorded.items():
+        _device(payload)[field.value] = value
+    _assert_tolerant_mirror_accepts(payload)
+    client, caller = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    device = observation.device
+    assert type(device) is ColdTickDeviceState
+    for field, value in recorded.items():
+        projected = getattr(device, field.value)
+        assert projected == value, field
+        assert type(projected) is type(value), field
+    assert set(ColdTickDeviceState.model_fields) == {field.value for field in ColdDeviceField}
+    assert not isinstance(device, SafetyEvaluation | SafetyVerdict)
+    assert len(_state_calls(caller)) == 1
+
+
+@pytest.mark.asyncio
+async def test_step_six_guard_refuses_a_scalar_whose_exact_type_changed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T-D17: with step 4 broadened, the post-construct exact-type guard still refuses."""
+    broadened: tuple[type, ...] = (float, int, type(None))
+    monkeypatch.setitem(
+        cold_mcp._DEVICE_FIELD_TYPES,  # pyright: ignore[reportPrivateUsage]
+        ColdDeviceField.BEAN_TEMP_C,
+        broadened,
+    )
+    assert cold_mcp._has_exact_type(20, broadened)  # pyright: ignore[reportPrivateUsage]
+    payload = _cold_state_payload()
+    _device(payload)["bean_temp_c"] = 20
+    _assert_tolerant_mirror_accepts(payload)
+
+    error = await _device_error(payload)
+
+    assert error.failure is ColdDeviceProjectionFailure.FIELD_TYPE_NOT_EXACT
+    assert error.field is ColdDeviceField.BEAN_TEMP_C
+    assert str(error) == _DEVICE_MESSAGE

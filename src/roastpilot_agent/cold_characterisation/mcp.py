@@ -815,7 +815,7 @@ class ColdCharacterisationMCPClient:
             if field is ColdDeviceField.RAW_VENDOR_DATA:
                 continue
             if type(getattr(device, field.value)) is not type(mapping[field.value]):
-                raise ColdTickDeviceProjectionError(  # pragma: no cover - strict keeps exact types
+                raise ColdTickDeviceProjectionError(
                     ColdDeviceProjectionFailure.FIELD_TYPE_NOT_EXACT, field
                 )
         return device
