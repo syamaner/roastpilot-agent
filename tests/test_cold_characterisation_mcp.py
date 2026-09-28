@@ -4,6 +4,7 @@ import ast
 import inspect
 import json
 import traceback
+from enum import Enum
 from pathlib import Path
 from typing import cast
 
@@ -14,13 +15,20 @@ from roastpilot_agent.cold_characterisation import mcp as cold_mcp
 from roastpilot_agent.cold_characterisation.evidence_schema import (
     MAX_JSON_KEY_BYTES,
     MAX_RAW_AUDIO_EXTRA_BYTES,
+    MAX_VENDOR_BLOB_BYTES,
     ColdAudioField,
     ColdEvidenceFailure,
+    ColdPhaseKind,
     ColdTickAudioSample,
+    ColdTickRecord,
+    _canonical_json,  # pyright: ignore[reportPrivateUsage]
+    validate_record,
 )
 from roastpilot_agent.cold_characterisation.mcp import (
     COLD_ALLOWED_TOOLS,
     ColdCharacterisationMCPClient,
+    ColdDeviceField,
+    ColdDeviceProjectionFailure,
     ColdFinalisationNotCleanError,
     ColdFinalisationSafetyError,
     ColdMcpError,
@@ -31,6 +39,8 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdSessionPhaseError,
     ColdSessionPurposeError,
     ColdTickAudioProjectionError,
+    ColdTickDeviceProjectionError,
+    ColdTickDeviceState,
     ColdTickObservation,
     RejectionReason,
     SessionFinalisationResult,
@@ -43,8 +53,10 @@ from roastpilot_agent.mcp_client import (
     MCPServerProcess,
     MCPToolError,
     MCPToolTimeoutError,
+    RoasterDeviceState,
     RoastSessionState,
 )
+from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 
 _MCP_TOOL_FIXTURES = Path(__file__).parent / "fixtures" / "mcp-tool-results"
 _FINALISATION_FIXTURE = _MCP_TOOL_FIXTURES / "finalise_cold_characterisation_session.json"
@@ -1935,6 +1947,17 @@ async def test_real_child_cold_tick_projects_strictly(
         assert type(audio.inference_overrun_count) is int
         assert type(audio.last_inference_duration_ms) is float
         assert type(audio.max_inference_duration_ms) is float
+        device = observation.device
+        assert device is not None
+        assert type(device) is ColdTickDeviceState
+        assert type(device.driver) is str
+        assert type(device.connected) is bool
+        assert device.bean_temp_c is None or type(device.bean_temp_c) is float
+        assert device.env_temp_c is None or type(device.env_temp_c) is float
+        assert type(device.heat_level_percent) is int
+        assert type(device.fan_level_percent) is int
+        assert type(device.cooling_on) is bool
+        assert type(device.raw_vendor_data) is dict
     finally:
         await process.stop()
     assert not process.running
@@ -1957,10 +1980,17 @@ async def test_cold_tick_observation_is_closed_and_frozen() -> None:
 
     with pytest.raises(ValidationError):
         ColdTickObservation.model_validate(
-            {"state": observation.state, "audio": observation.audio, "unexpected": 1}
+            {
+                "state": observation.state,
+                "audio": observation.audio,
+                "device": observation.device,
+                "unexpected": 1,
+            }
         )
     with pytest.raises(ValidationError):
         observation.audio = observation.audio
+    with pytest.raises(ValidationError):
+        observation.device = observation.device
 
 
 _TOLERANT_FIRST_CRACK_NAME = "first_crack_status"
@@ -2027,3 +2057,541 @@ def test_cold_production_code_never_reads_tolerant_first_crack_status() -> None:
     ]
     assert len(subscripts) == 1
     assert subscripts[0].slice is constants["mcp.py"][0]
+
+
+# --- #954 slice 4b: strict per-tick device-state projection -----------------
+
+_DEVICE_MESSAGE = "MCP tick device state failed strict projection"
+_TOLERANT_DEVICE_NAME = "device_state"
+
+
+def _device(payload: dict[str, object]) -> dict[str, object]:
+    """Return the mutable raw ``device_state`` mapping of a tick payload."""
+    return cast("dict[str, object]", payload[_TOLERANT_DEVICE_NAME])
+
+
+def _numeric_canary() -> str:
+    """Assemble the numeric containment canary at runtime from fragments."""
+    return "".join(["9081", "7263", "54"])
+
+
+def _vendor_of_size(size: int) -> dict[str, object]:
+    """Return a walker-admissible vendor map of exactly ``size`` canonical bytes."""
+    vendor: dict[str, object] = {}
+    index = 0
+    while len(_canonical_json(vendor).encode("utf-8")) < size:
+        vendor[f"k{index:02d}"] = "x" * 1_500
+        index += 1
+    key = f"k{index - 1:02d}"
+    overshoot = len(_canonical_json(vendor).encode("utf-8")) - size
+    vendor[key] = "x" * (1_500 - overshoot)
+    assert len(_canonical_json(vendor).encode("utf-8")) == size
+    return vendor
+
+
+async def _device_error(payload: dict[str, object]) -> ColdTickDeviceProjectionError:
+    """Read one tick through the public client and return its device projection error."""
+    client, caller = await _started_client(payload)
+    with pytest.raises(ColdTickDeviceProjectionError) as raised:
+        await client.get_roast_state()
+    assert len(_state_calls(caller)) == 1
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    return raised.value
+
+
+def _assert_device_contained(error: ColdTickDeviceProjectionError, canary: str) -> None:
+    """Assert a canary is absent from every rendering and closed diagnostic of an error."""
+    assert isinstance(error, ColdMcpValidationError)
+    assert error.args == (_DEVICE_MESSAGE,)
+    _assert_contained(error, canary)
+    assert canary not in error.failure.value
+    assert error.field is None or canary not in error.field.value
+
+
+@pytest.mark.asyncio
+async def test_cold_tick_device_equals_the_raw_values_exactly() -> None:
+    """T-D1: every device field equals its raw value with an identical type, from one read."""
+    payload = _cold_state_payload()
+    raw = dict(_device(payload))
+    client, caller = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    device = observation.device
+    assert type(device) is ColdTickDeviceState
+    for field in ColdDeviceField:
+        value = getattr(device, field.value)
+        assert value == raw[field.value], field
+        assert type(value) is type(raw[field.value]), field
+    assert device.heat_level_percent == 70
+    assert _state_calls(caller) == [("get_roast_state", {"session_id": "session-id"})]
+    direct = ColdCharacterisationMCPClient._project_device(raw)  # pyright: ignore[reportPrivateUsage]
+    assert direct is not None
+    assert direct.raw_vendor_data == raw["raw_vendor_data"]
+    assert direct.raw_vendor_data is not raw["raw_vendor_data"]
+
+
+@pytest.mark.asyncio
+async def test_null_device_state_is_recorded_as_absent_not_as_a_device() -> None:
+    """T-D2: JSON null is represented as ``None``, never as a zero device."""
+    payload = _cold_state_payload()
+    payload[_TOLERANT_DEVICE_NAME] = None
+    client, caller = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    assert observation.device is None
+    assert not isinstance(observation.device, ColdTickDeviceState)
+    assert len(_state_calls(caller)) == 1
+
+
+def _generic_device_cases() -> list[tuple[str, object]]:
+    """Return mutations the tolerant mirror itself refuses before projection."""
+    cases: list[tuple[str, object]] = [(field.value, "<delete>") for field in ColdDeviceField]
+    cases.append(("driver", 1))
+    cases.append(("raw_vendor_data", {"k": {"n": 1}}))
+    return cases
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), _generic_device_cases())
+async def test_device_values_the_mirror_refuses_fail_generic_validation(
+    field: str, value: object
+) -> None:
+    """T-D3a: a missing key or mirror-refused type fails with the generic error."""
+    payload = _cold_state_payload()
+    if value == "<delete>":
+        del _device(payload)[field]
+    else:
+        _device(payload)[field] = value
+    client, caller = await _started_client(payload)
+
+    with pytest.raises(ColdMcpValidationError) as raised:
+        await client.get_roast_state()
+
+    assert type(raised.value) is ColdMcpValidationError
+    assert str(raised.value) == _GENERIC_MESSAGE
+    assert len(_state_calls(caller)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (ColdDeviceField.HEAT_LEVEL_PERCENT, "0"),
+        (ColdDeviceField.HEAT_LEVEL_PERCENT, 0.0),
+        (ColdDeviceField.HEAT_LEVEL_PERCENT, False),
+        (ColdDeviceField.FAN_LEVEL_PERCENT, "0"),
+        (ColdDeviceField.FAN_LEVEL_PERCENT, True),
+        (ColdDeviceField.COOLING_ON, 0),
+        (ColdDeviceField.COOLING_ON, "false"),
+        (ColdDeviceField.CONNECTED, 1),
+        (ColdDeviceField.CONNECTED, "true"),
+        (ColdDeviceField.BEAN_TEMP_C, 20),
+        (ColdDeviceField.BEAN_TEMP_C, "20.1"),
+        (ColdDeviceField.ENV_TEMP_C, 21),
+    ],
+)
+async def test_coerced_device_value_fails_strict_projection(
+    field: ColdDeviceField, value: object
+) -> None:
+    """T-D3b: a value the tolerant mirror would coerce is refused, never coerced."""
+    payload = _cold_state_payload()
+    _device(payload)[field.value] = value
+    _assert_tolerant_mirror_accepts(payload)
+
+    error = await _device_error(payload)
+
+    assert error.failure is ColdDeviceProjectionFailure.FIELD_TYPE_NOT_EXACT
+    assert error.field is field
+    assert str(error) == _DEVICE_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_unknown_device_key_is_refused_not_dropped() -> None:
+    """T-D4: a key the tolerant mirror silently drops is refused by the projection."""
+    payload = _cold_state_payload()
+    _device(payload)["main_fan_level_percent"] = 0
+    _assert_tolerant_mirror_accepts(payload)
+
+    error = await _device_error(payload)
+
+    assert error.failure is ColdDeviceProjectionFailure.FIELD_SET_MISMATCH
+    assert error.field is None
+
+
+@pytest.mark.asyncio
+async def test_vendor_map_at_the_persistence_cap_projects() -> None:
+    """T-D5: a vendor map of exactly the canonical cap is admitted unchanged."""
+    payload = _cold_state_payload()
+    vendor = _vendor_of_size(MAX_VENDOR_BLOB_BYTES)
+    _device(payload)["raw_vendor_data"] = vendor
+    _assert_tolerant_mirror_accepts(payload)
+    client, _ = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    assert observation.device is not None
+    assert observation.device.raw_vendor_data == vendor
+
+
+@pytest.mark.asyncio
+async def test_vendor_map_one_byte_over_the_cap_is_refused() -> None:
+    """T-D5: one canonical byte over the persistence cap is refused at read time."""
+    payload = _cold_state_payload()
+    _device(payload)["raw_vendor_data"] = _vendor_of_size(MAX_VENDOR_BLOB_BYTES + 1)
+    _assert_tolerant_mirror_accepts(payload)
+
+    error = await _device_error(payload)
+
+    assert error.failure is ColdDeviceProjectionFailure.VENDOR_DATA_TOO_LARGE
+    assert error.field is ColdDeviceField.RAW_VENDOR_DATA
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["huge_int", "long_vendor_key"])
+async def test_device_value_the_walker_refuses_is_not_admitted(case: str) -> None:
+    """T-D5: walker bounds apply to the whole raw device state."""
+    payload = _cold_state_payload()
+    if case == "huge_int":
+        _device(payload)["heat_level_percent"] = 10**40
+    else:
+        key = "v" * (MAX_JSON_KEY_BYTES + 1)
+        _device(payload)["raw_vendor_data"] = {key: 1}
+    _assert_tolerant_mirror_accepts(payload)
+
+    error = await _device_error(payload)
+
+    assert error.failure is ColdDeviceProjectionFailure.DEVICE_VALUE_NOT_ADMITTED
+    assert error.field is None
+
+
+@pytest.mark.asyncio
+async def test_read_time_vendor_cap_matches_persistence() -> None:
+    """T-D5 parity: an at-cap map persists, and the canonical helper is byte-identical."""
+    client, _ = await _started_client(_cold_state_payload())
+    observation = await client.get_roast_state()
+    vendor = _vendor_of_size(MAX_VENDOR_BLOB_BYTES)
+    record = ColdTickRecord.model_validate(
+        {
+            "schema_version": 1,
+            "stream": "tick",
+            "run_id": "20260904T143036Z-d183-char-fan-music-retry4",
+            "phase": ColdPhaseKind.RECORDING_ON,
+            "recorded_at_utc": "2026-09-04T14:30:36Z",
+            "monotonic_seconds": 1.0,
+            "identity_sha256": "a" * 64,
+            "tick": 0,
+            "bean_temp_c": None,
+            "env_temp_c": None,
+            "heat_level_percent": 0,
+            "fan_level_percent": 0,
+            "cooling_on": False,
+            "connected": True,
+            "audio": observation.audio.audio,
+            "raw_vendor_data": vendor,
+        }
+    )
+    validated = validate_record(record)
+    assert type(validated) is ColdTickRecord
+    assert validated.raw_vendor_data == vendor
+    fixed: dict[str, object] = {"b": [1, 2.5, None], "a": "é", "c": {"z": True}}
+    local = cold_mcp._canonical_vendor_json(fixed)  # pyright: ignore[reportPrivateUsage]
+    assert local == _canonical_json(fixed)
+
+
+def test_projector_refuses_non_object_and_names_the_first_missing_field() -> None:
+    """T-D6: direct defensive paths report closed diagnostics."""
+    project = ColdCharacterisationMCPClient._project_device  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(ColdTickDeviceProjectionError) as raised:
+        project([])
+    assert raised.value.failure is ColdDeviceProjectionFailure.DEVICE_STATE_NOT_OBJECT
+    assert raised.value.field is None
+
+    raw = dict(_device(_cold_state_payload()))
+    del raw["driver"]
+    with pytest.raises(ColdTickDeviceProjectionError) as raised:
+        project(raw)
+    assert raised.value.failure is ColdDeviceProjectionFailure.FIELD_SET_MISMATCH
+    assert raised.value.field is ColdDeviceField.DRIVER
+
+
+@pytest.mark.asyncio
+async def test_device_projection_failure_contains_a_rejected_value() -> None:
+    """T-D7a/AC-D6: a coerced numeric string never reaches the error chain."""
+    canary = _numeric_canary()
+    payload = _cold_state_payload()
+    _device(payload)["heat_level_percent"] = canary
+    _assert_tolerant_mirror_accepts(payload)
+
+    error = await _device_error(payload)
+
+    assert error.failure is ColdDeviceProjectionFailure.FIELD_TYPE_NOT_EXACT
+    assert error.field is ColdDeviceField.HEAT_LEVEL_PERCENT
+    _assert_device_contained(error, canary)
+
+
+@pytest.mark.asyncio
+async def test_device_projection_failure_contains_a_rejected_key_name() -> None:
+    """T-D7b/AC-D6: an unknown key name never reaches the error chain."""
+    canary = _numeric_canary()
+    key = "rpcanary" + canary
+    assert len(key.encode("utf-8")) < MAX_JSON_KEY_BYTES
+    payload = _cold_state_payload()
+    _device(payload)[key] = 0
+    _assert_tolerant_mirror_accepts(payload)
+
+    error = await _device_error(payload)
+
+    assert error.failure is ColdDeviceProjectionFailure.FIELD_SET_MISMATCH
+    assert error.field is None
+    _assert_device_contained(error, canary)
+
+
+@pytest.mark.asyncio
+async def test_audio_projection_precedes_device_projection() -> None:
+    """T-D8: incomplete audio evidence wins over a bad device state."""
+    payload = _cold_state_payload()
+    del _first_crack(payload)["max_consecutive_overflow_count"]
+    _device(payload)["heat_level_percent"] = "0"
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdMcpError) as raised:
+        await client.get_roast_state()
+
+    assert type(raised.value) is ColdTickAudioProjectionError
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("session_id", "other-session", ColdSessionIdentityError),
+        ("session_purpose", "roast", ColdSessionPurposeError),
+    ],
+)
+async def test_identity_and_purpose_checks_precede_device_projection(
+    field: str, value: str, error: type[ColdMcpError]
+) -> None:
+    """T-D8: a wrong session or purpose wins over a bad device state."""
+    payload = _cold_state_payload()
+    payload[field] = value
+    _device(payload)["heat_level_percent"] = "0"
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdMcpError) as raised:
+        await client.get_roast_state()
+
+    assert type(raised.value) is error
+
+
+@pytest.mark.asyncio
+async def test_tick_state_and_device_come_from_one_read() -> None:
+    """T-D8b: state and device share one response even when a second would differ."""
+    first = _cold_state_payload()
+    second = _cold_state_payload()
+    _device(second)["driver"] = "other-driver"
+    caller = _SequencedCaller(
+        {"start_roast_session": [_cold_start_payload()], "get_roast_state": [first, second]}
+    )
+    client = ColdCharacterisationMCPClient(caller)
+    await client.start_cold_session()
+
+    observation = await client.get_roast_state()
+
+    assert observation.device is not None
+    assert observation.state.device_state is not None
+    assert observation.device.driver == observation.state.device_state.driver
+    assert observation.device.driver == _device(first)["driver"]
+    assert [call[0] for call in caller.calls].count("get_roast_state") == 1
+
+
+def test_cold_tick_device_state_declares_its_closed_configuration() -> None:
+    """T-D11: configuration pin only; behaviour is proved by the projection tests."""
+    config = dict(ColdTickDeviceState.model_config)
+    assert config.get("strict") is True
+    assert config.get("frozen") is True
+    assert config.get("extra") == "forbid"
+    assert config.get("allow_inf_nan") is False
+
+
+def test_cold_tick_device_state_refuses_unknown_fields() -> None:
+    """T-D11: eight valid fields plus an unknown key are refused."""
+    raw = dict(_device(_cold_state_payload()))
+    ColdTickDeviceState.model_validate(raw)
+    with pytest.raises(ValidationError):
+        ColdTickDeviceState.model_validate({**raw, "x": 1})
+
+
+def test_cold_production_code_never_reads_tolerant_device_state() -> None:
+    """T-D12: a finite syntax guard over literal, attribute, and keyword uses of the name.
+
+    Across every cold production module it forbids ``.device_state`` attribute
+    nodes, ``getattr`` with that literal, keyword arguments and class-pattern
+    keywords of that name, and any exact ``"device_state"`` string constant
+    except the single raw projection subscript in ``mcp.py``.  Parameter and
+    plain-name uses (the builder's ``device_state`` argument) are not counted.
+    Access through a variable or a dynamically computed name is an explicit
+    residual: this is a syntax guard, not a proof that the tolerant mirror is
+    unreachable.
+    """
+    trees = _cold_production_trees()
+    assert "mcp.py" in trees
+    attributes: list[str] = []
+    getattr_calls: list[str] = []
+    keywords: list[str] = []
+    pattern_keywords: list[str] = []
+    constants: dict[str, list[ast.Constant]] = {}
+    for name, tree in trees.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == _TOLERANT_DEVICE_NAME:
+                attributes.append(name)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and any(
+                    isinstance(arg, ast.Constant) and arg.value == _TOLERANT_DEVICE_NAME
+                    for arg in node.args
+                )
+            ):
+                getattr_calls.append(name)
+            if isinstance(node, ast.keyword) and node.arg == _TOLERANT_DEVICE_NAME:
+                keywords.append(name)
+            if isinstance(node, ast.MatchClass) and _TOLERANT_DEVICE_NAME in node.kwd_attrs:
+                pattern_keywords.append(name)
+            if isinstance(node, ast.Constant) and node.value == _TOLERANT_DEVICE_NAME:
+                constants.setdefault(name, []).append(node)
+    assert attributes == []
+    assert getattr_calls == []
+    assert keywords == []
+    assert pattern_keywords == []
+    assert sorted(constants) == ["mcp.py"]
+    assert len(constants["mcp.py"]) == 1
+    subscripts = [
+        node
+        for node in ast.walk(trees["mcp.py"])
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Constant)
+        and node.slice.value == _TOLERANT_DEVICE_NAME
+    ]
+    assert len(subscripts) == 1
+    assert subscripts[0].slice is constants["mcp.py"][0]
+
+
+def test_device_enums_are_closed_plain_enums_matching_the_mirror() -> None:
+    """T-D13: the eight device names match the 0.2.1 mirror in order; enums are plain."""
+    assert [member.value for member in ColdDeviceField] == list(RoasterDeviceState.model_fields)
+    assert len(ColdDeviceField) == 8
+    for enum_type in (ColdDeviceField, ColdDeviceProjectionFailure):
+        assert enum_type.__mro__[1:] == (Enum, object)
+    assert {member.name for member in ColdDeviceProjectionFailure} == {
+        "DEVICE_STATE_NOT_OBJECT",
+        "FIELD_SET_MISMATCH",
+        "FIELD_TYPE_NOT_EXACT",
+        "DEVICE_VALUE_NOT_ADMITTED",
+        "VENDOR_DATA_TOO_LARGE",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "nulled",
+    [
+        (ColdDeviceField.BEAN_TEMP_C,),
+        (ColdDeviceField.ENV_TEMP_C,),
+        (ColdDeviceField.BEAN_TEMP_C, ColdDeviceField.ENV_TEMP_C),
+    ],
+)
+async def test_null_temperatures_project_as_none_exactly(
+    nulled: tuple[ColdDeviceField, ...],
+) -> None:
+    """T-D2b: a JSON-null temperature is ``None`` in a present device, never ``0.0``."""
+    payload = _cold_state_payload()
+    for field in nulled:
+        _device(payload)[field.value] = None
+    _assert_tolerant_mirror_accepts(payload)
+    raw = dict(_device(payload))
+    client, caller = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    device = observation.device
+    assert type(device) is ColdTickDeviceState
+    for field in ColdDeviceField:
+        value = getattr(device, field.value)
+        if field in nulled:
+            assert value is None, field
+            assert value != 0.0, field
+        else:
+            assert value == raw[field.value], field
+            assert type(value) is type(raw[field.value]), field
+    assert len(_state_calls(caller)) == 1
+
+
+def test_projector_maps_both_null_temperatures_to_none_directly() -> None:
+    """T-D2b: the direct projector gives the same result for both temperatures null."""
+    raw = dict(_device(_cold_state_payload()))
+    raw["bean_temp_c"] = None
+    raw["env_temp_c"] = None
+
+    device = ColdCharacterisationMCPClient._project_device(raw)  # pyright: ignore[reportPrivateUsage]
+
+    assert type(device) is ColdTickDeviceState
+    assert device.bean_temp_c is None
+    assert device.env_temp_c is None
+    assert device.driver == raw["driver"]
+    assert device.heat_level_percent == raw["heat_level_percent"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connected", [True, False])
+async def test_device_state_is_recorded_as_data_without_a_verdict(connected: bool) -> None:
+    """T-D16/AC-D5: the projection records these raw values exactly and returns no verdict."""
+    recorded: dict[ColdDeviceField, object] = {
+        ColdDeviceField.CONNECTED: connected,
+        ColdDeviceField.COOLING_ON: True,
+        ColdDeviceField.HEAT_LEVEL_PERCENT: 100,
+        ColdDeviceField.FAN_LEVEL_PERCENT: 55,
+    }
+    payload = _cold_state_payload()
+    for field, value in recorded.items():
+        _device(payload)[field.value] = value
+    _assert_tolerant_mirror_accepts(payload)
+    client, caller = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    device = observation.device
+    assert type(device) is ColdTickDeviceState
+    for field, value in recorded.items():
+        projected = getattr(device, field.value)
+        assert projected == value, field
+        assert type(projected) is type(value), field
+    assert set(ColdTickDeviceState.model_fields) == {field.value for field in ColdDeviceField}
+    assert not isinstance(device, SafetyEvaluation | SafetyVerdict)
+    assert len(_state_calls(caller)) == 1
+
+
+@pytest.mark.asyncio
+async def test_step_six_guard_refuses_a_scalar_whose_exact_type_changed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T-D17: with step 4 broadened, the post-construct exact-type guard still refuses."""
+    broadened: tuple[type, ...] = (float, int, type(None))
+    monkeypatch.setitem(
+        cold_mcp._DEVICE_FIELD_TYPES,  # pyright: ignore[reportPrivateUsage]
+        ColdDeviceField.BEAN_TEMP_C,
+        broadened,
+    )
+    assert cold_mcp._has_exact_type(20, broadened)  # pyright: ignore[reportPrivateUsage]
+    payload = _cold_state_payload()
+    _device(payload)["bean_temp_c"] = 20
+    _assert_tolerant_mirror_accepts(payload)
+
+    error = await _device_error(payload)
+
+    assert error.failure is ColdDeviceProjectionFailure.FIELD_TYPE_NOT_EXACT
+    assert error.field is ColdDeviceField.BEAN_TEMP_C
+    assert str(error) == _DEVICE_MESSAGE

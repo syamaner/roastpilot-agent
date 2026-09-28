@@ -5,6 +5,7 @@ client.  Finalisation evidence is parsed strictly because it is a safety gate,
 not forward-compatible roast telemetry.
 """
 
+import copy
 import json
 from contextlib import suppress
 from enum import Enum
@@ -13,12 +14,14 @@ from typing import Literal, Protocol, TypeAlias, TypeVar, cast
 from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, ValidationError, model_validator
 
 from roastpilot_agent.cold_characterisation.evidence_schema import (
+    MAX_VENDOR_BLOB_BYTES,
     ColdAudioField,
     ColdEvidenceError,
     ColdEvidenceFailure,
     ColdJsonValue,
     ColdTickProjection,
     project_tick_audio,
+    walk_json_value,
 )
 from roastpilot_agent.config import MCPDeviceConfig
 from roastpilot_agent.mcp_client import (
@@ -92,6 +95,51 @@ class ColdTickAudioProjectionError(ColdMcpValidationError):
         super().__init__("MCP tick audio evidence failed strict projection")
         self.failure = failure
         self.field_names = field_names
+
+
+class ColdDeviceField(Enum):
+    """Closed names of the eight raw per-tick ``device_state`` fields."""
+
+    DRIVER = "driver"
+    CONNECTED = "connected"
+    BEAN_TEMP_C = "bean_temp_c"
+    ENV_TEMP_C = "env_temp_c"
+    HEAT_LEVEL_PERCENT = "heat_level_percent"
+    FAN_LEVEL_PERCENT = "fan_level_percent"
+    COOLING_ON = "cooling_on"
+    RAW_VENDOR_DATA = "raw_vendor_data"
+
+
+class ColdDeviceProjectionFailure(Enum):
+    """Closed reasons a raw per-tick device state fails strict projection."""
+
+    DEVICE_STATE_NOT_OBJECT = "device_state_not_object"
+    FIELD_SET_MISMATCH = "field_set_mismatch"
+    FIELD_TYPE_NOT_EXACT = "field_type_not_exact"
+    DEVICE_VALUE_NOT_ADMITTED = "device_value_not_admitted"
+    VENDOR_DATA_TOO_LARGE = "vendor_data_too_large"
+
+
+class ColdTickDeviceProjectionError(ColdMcpValidationError):
+    """Raised when a tick's device state fails the strict device projection.
+
+    The error keeps only closed diagnostics.  It never carries a rejected value
+    or key name, and its message is fixed.
+    """
+
+    failure: ColdDeviceProjectionFailure
+    field: ColdDeviceField | None
+
+    def __init__(self, failure: ColdDeviceProjectionFailure, field: ColdDeviceField | None) -> None:
+        """Retain closed projection diagnostics behind a fixed public message.
+
+        Args:
+            failure: Closed reason the projection refused the raw device state.
+            field: The one closed device field concerned, when one is known.
+        """
+        super().__init__("MCP tick device state failed strict projection")
+        self.failure = failure
+        self.field = field
 
 
 class ColdMcpTransportError(ColdMcpError):
@@ -579,6 +627,58 @@ def finalisation_has_required_safety_evidence(result: SessionFinalisationResult)
     )
 
 
+class ColdTickDeviceState(BaseModel):
+    """Strict, complete projection of one raw per-tick MCP device state.
+
+    It records exact raw values and decides nothing: it applies no zero,
+    connected, range, plausibility, or startup-interval policy.
+    ``ColdTickObservation.device`` is the only admissible per-tick device
+    evidence; ``state.device_state`` is tolerant roast-path telemetry whose
+    values may be coerced or whose unknown keys may be dropped, so it must
+    never feed cold evidence.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True, allow_inf_nan=False)
+
+    driver: str
+    connected: bool
+    bean_temp_c: float | None
+    env_temp_c: float | None
+    heat_level_percent: int
+    fan_level_percent: int
+    cooling_on: bool
+    raw_vendor_data: dict[str, ColdJsonValue]
+
+
+#: Exact raw JSON types admitted per device field (compared with ``is``).
+_DEVICE_FIELD_TYPES: dict[ColdDeviceField, tuple[type, ...]] = {
+    ColdDeviceField.DRIVER: (str,),
+    ColdDeviceField.CONNECTED: (bool,),
+    ColdDeviceField.BEAN_TEMP_C: (float, type(None)),
+    ColdDeviceField.ENV_TEMP_C: (float, type(None)),
+    ColdDeviceField.HEAT_LEVEL_PERCENT: (int,),
+    ColdDeviceField.FAN_LEVEL_PERCENT: (int,),
+    ColdDeviceField.COOLING_ON: (bool,),
+    ColdDeviceField.RAW_VENDOR_DATA: (dict,),
+}
+
+
+def _canonical_vendor_json(value: object) -> str:
+    """Return canonical JSON byte-identical to the evidence schema's persistence form."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+
+
+def _has_exact_type(value: object, allowed: tuple[type, ...]) -> bool:
+    """Whether a value's exact type is one of the allowed types (no subclasses)."""
+    return any(type(value) is expected for expected in allowed)
+
+
 class ColdTickObservation(BaseModel):
     """One identity-bound cold tick read from a single MCP response.
 
@@ -586,12 +686,20 @@ class ColdTickObservation(BaseModel):
     complete projection of the raw first-crack payload of the same response.
     ``state.first_crack_status`` is tolerant roast-path telemetry whose counters
     may be defaulted or dropped, so it must never feed cold evidence.
+
+    ``device`` is the only admissible per-tick device evidence: a strict,
+    complete projection of the raw ``device_state`` of the same response, or
+    ``None`` exactly when MCP reported JSON ``null``.  ``None`` records absent
+    telemetry only; it is never a pass, a default, or a zero device, and every
+    consumer must handle it explicitly.  ``state.device_state`` is tolerant
+    telemetry and must never feed cold evidence.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True, allow_inf_nan=False)
 
     state: RoastSessionState
     audio: ColdTickProjection
+    device: ColdTickDeviceState | None
 
 
 class ColdCharacterisationMCPClient:
@@ -647,6 +755,70 @@ class ColdCharacterisationMCPClient:
         else:
             return state, tree
         raise ColdMcpValidationError("MCP response failed cold contract validation") from None
+
+    @staticmethod
+    def _project_device(raw: object) -> ColdTickDeviceState | None:
+        """Project one raw ``device_state`` value without coercing or defaulting it.
+
+        Args:
+            raw: The raw ``device_state`` value parsed from the tick response text.
+
+        Returns:
+            The strict device projection, or ``None`` exactly when the raw value is
+            JSON ``null``.  ``None`` records absence only; it is never a clean state.
+
+        Raises:
+            ColdTickDeviceProjectionError: With closed diagnostics when the raw
+                value is not an exact, complete, admitted device state.
+        """
+        if raw is None:
+            return None
+        if type(raw) is not dict:
+            raise ColdTickDeviceProjectionError(
+                ColdDeviceProjectionFailure.DEVICE_STATE_NOT_OBJECT, None
+            )
+        mapping = cast("dict[str, ColdJsonValue]", raw)
+        admitted = True
+        try:
+            walk_json_value(mapping)
+        except ColdEvidenceError:
+            admitted = False
+        if not admitted:
+            raise ColdTickDeviceProjectionError(
+                ColdDeviceProjectionFailure.DEVICE_VALUE_NOT_ADMITTED, None
+            )
+        if set(mapping) != {field.value for field in ColdDeviceField}:
+            missing = next((field for field in ColdDeviceField if field.value not in mapping), None)
+            raise ColdTickDeviceProjectionError(
+                ColdDeviceProjectionFailure.FIELD_SET_MISMATCH, missing
+            )
+        for field, allowed in _DEVICE_FIELD_TYPES.items():
+            if not _has_exact_type(mapping[field.value], allowed):
+                raise ColdTickDeviceProjectionError(
+                    ColdDeviceProjectionFailure.FIELD_TYPE_NOT_EXACT, field
+                )
+        vendor = mapping[ColdDeviceField.RAW_VENDOR_DATA.value]
+        if len(_canonical_vendor_json(vendor).encode("utf-8")) > MAX_VENDOR_BLOB_BYTES:
+            raise ColdTickDeviceProjectionError(
+                ColdDeviceProjectionFailure.VENDOR_DATA_TOO_LARGE, ColdDeviceField.RAW_VENDOR_DATA
+            )
+        fresh = dict(mapping)
+        fresh[ColdDeviceField.RAW_VENDOR_DATA.value] = copy.deepcopy(vendor)
+        device: ColdTickDeviceState | None = None
+        with suppress(ValidationError):
+            device = ColdTickDeviceState.model_validate(fresh, strict=True)
+        if device is None:  # pragma: no cover - unreachable after the exact type checks
+            raise ColdTickDeviceProjectionError(
+                ColdDeviceProjectionFailure.FIELD_TYPE_NOT_EXACT, None
+            )
+        for field in ColdDeviceField:
+            if field is ColdDeviceField.RAW_VENDOR_DATA:
+                continue
+            if type(getattr(device, field.value)) is not type(mapping[field.value]):
+                raise ColdTickDeviceProjectionError(
+                    ColdDeviceProjectionFailure.FIELD_TYPE_NOT_EXACT, field
+                )
+        return device
 
     @staticmethod
     def _require_lossless_audio_types(
@@ -709,14 +881,15 @@ class ColdCharacterisationMCPClient:
         return result
 
     async def get_roast_state(self, session_id: str | None = None) -> ColdTickObservation:
-        """Return one cold tick whose audio evidence is strictly projected.
+        """Return one cold tick whose audio and device evidence are strictly projected.
 
         Args:
             session_id: Optional explicit session; it must be the established one.
 
         Returns:
-            The tolerant session state and the strict audio projection, both
-            parsed from one MCP response.
+            The tolerant session state, the strict audio projection, and the
+            strict device projection (``None`` only for JSON ``null``), all
+            parsed from one MCP response.  Audio is projected before device.
 
         Raises:
             ColdSessionIdentityError: If the session is not the established one.
@@ -724,6 +897,7 @@ class ColdCharacterisationMCPClient:
             ColdMcpTransportError: If the MCP transport fails.
             ColdMcpValidationError: If the response violates the cold contract.
             ColdTickAudioProjectionError: If the audio evidence is not strictly complete.
+            ColdTickDeviceProjectionError: If the device state is not strictly complete.
         """
         expected_session_id = self._cold_session_id
         if expected_session_id is None or (
@@ -745,7 +919,8 @@ class ColdCharacterisationMCPClient:
             failure = error.failure
             field_names = error.field_names
         else:
-            return ColdTickObservation(state=state, audio=audio)
+            device = self._project_device(cast("dict[str, object]", tree)["device_state"])
+            return ColdTickObservation(state=state, audio=audio, device=device)
         raise ColdTickAudioProjectionError(failure, field_names)
 
     async def mark_beans_added(self) -> EventCommandResult:
