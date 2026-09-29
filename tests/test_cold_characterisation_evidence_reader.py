@@ -272,13 +272,40 @@ def _tick_device_line(root: str, **device_update: object) -> bytes:
     return line_of(_tick_device_document(root, **device_update))
 
 
-def test_nested_device_forge_keeps_the_exact_top_level_key_set(tmp_path: Path) -> None:
-    """T-E16: device negatives never rely on an unknown top-level tick key."""
+def _int_for_bool_device_line(root: str) -> bytes:
+    """Return the first OFF tick with a nested ``device.cooling_on`` of int ``1``."""
+    return _tick_device_line(root, cooling_on=1)
+
+
+def _int_for_float_device_line(root: str) -> bytes:
+    """Return the first OFF tick with a nested ``device.bean_temp_c`` of int ``20``."""
+    return _tick_device_line(root, bean_temp_c=20)
+
+
+def _secret_vendor_line(root: str) -> bytes:
+    """Return a non-canonical first OFF tick carrying a secret in nested vendor data."""
+    return _tick_device_line(root, raw_vendor_data={SECRET: SECRET}).replace(b":", b": ")
+
+
+@pytest.mark.parametrize(
+    ("make", "device_key", "value"),
+    [
+        (_int_for_bool_device_line, "cooling_on", 1),
+        (_int_for_float_device_line, "bean_temp_c", 20),
+        (_secret_vendor_line, "raw_vendor_data", {SECRET: SECRET}),
+    ],
+    ids=["int-for-bool", "int-for-float", "secret-vendor"],
+)
+def test_nested_device_forge_keeps_the_exact_top_level_key_set(
+    tmp_path: Path, make: LineMaker, device_key: str, value: object
+) -> None:
+    """T-E16: each crafted device negative keeps the exact tick and device key sets."""
     root, _sealed, _records = write_full_run(tmp_path)
-    for update in ({"cooling_on": 1}, {"raw_vendor_data": {SECRET: SECRET}}):
-        document = _tick_device_document(root, **update)
-        assert set(document) == set(schema.ColdTickRecord.model_fields)
-        assert set(document["device"]) == set(schema.ColdTickDeviceEvidence.model_fields)
+    document = json.loads(make(root))
+    assert set(document) == set(schema.ColdTickRecord.model_fields)
+    assert set(document["device"]) == set(schema.ColdTickDeviceEvidence.model_fields)
+    assert document["device"][device_key] == value
+    assert type(document["device"][device_key]) is type(value)
 
 
 def _replaced(old: bytes, new: bytes) -> LineMaker:
@@ -296,11 +323,8 @@ def _replaced(old: bytes, new: bytes) -> LineMaker:
     ("make", "failure"),
     [
         (line_maker(lambda r: _tick_line(r, tick="1")), Failure.LINE_MALFORMED),
-        (line_maker(lambda r: _tick_device_line(r, cooling_on=1)), Failure.LINE_MALFORMED),
-        (
-            line_maker(lambda r: _tick_device_line(r, bean_temp_c=20)),
-            Failure.LINE_NOT_CANONICAL,
-        ),
+        (line_maker(_int_for_bool_device_line), Failure.LINE_MALFORMED),
+        (line_maker(_int_for_float_device_line), Failure.LINE_NOT_CANONICAL),
         (line_maker(lambda r: _tick_line(r, monotonic_seconds=2)), Failure.LINE_NOT_CANONICAL),
         (line_maker(lambda r: _tick_line(r, schema_version=2)), Failure.SCHEMA_VERSION_UNKNOWN),
         (line_maker(lambda r: _tick_line(r, schema_version=True)), Failure.SCHEMA_VERSION_UNKNOWN),
@@ -443,11 +467,7 @@ def test_unverified_bytes_are_never_parsed(tmp_path: Path) -> None:
 def test_reader_errors_carry_no_line_content(tmp_path: Path) -> None:
     """A credential-shaped value in a rejected line reaches no error channel."""
     root, _sealed, _records = write_full_run(tmp_path)
-    digest = rewrite(
-        root,
-        TICK_OFF,
-        _tick_device_line(root, raw_vendor_data={SECRET: SECRET}).replace(b":", b": "),
-    )
+    digest = rewrite(root, TICK_OFF, _secret_vendor_line(root))
     with pytest.raises(store.ColdEvidenceStoreError) as raised:
         read(root, digest)
     assert raised.value.failure is store.ColdEvidenceStoreFailure.LINE_NOT_CANONICAL
