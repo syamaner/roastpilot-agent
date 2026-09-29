@@ -2144,12 +2144,23 @@ def test_every_tool_has_a_captured_fixture() -> None:
     assert captured == set(FIXTURE_MIRRORS)
 
 
-def test_captured_server_info_pins_021_bootstrap_inventory() -> None:
-    """The fixture records published 0.2.1's 14-tool plus finalisation inventory."""
+def test_captured_server_info_pins_022_bootstrap_inventory() -> None:
+    """The fixture records published 0.2.2's 14-tool plus finalisation inventory."""
     payload = json.loads((TOOL_RESULT_FIXTURES / "get_server_info.json").read_text())
-    assert payload["version"] == "0.2.1"
+    assert payload["version"] == "0.2.2"
     tools = set(payload["available_bootstrap_tools"])
     assert tools == set(FIXTURE_MIRRORS)
+
+
+def test_captured_normal_state_keeps_null_cold_observation() -> None:
+    """The normal tolerant fixture records the additive cold field as JSON null."""
+    payload = json.loads((TOOL_RESULT_FIXTURES / "get_roast_state.json").read_text())
+    assert "cold_characterisation_observation" in payload
+    assert payload["cold_characterisation_observation"] is None
+    start = json.loads((TOOL_RESULT_FIXTURES / "start_roast_session.json").read_text())
+    session = start["session"]
+    assert "cold_characterisation_observation" in session
+    assert session["cold_characterisation_observation"] is None
 
 
 def test_captured_sessions_are_normal_roasts_and_unknown_purpose_is_rejected() -> None:

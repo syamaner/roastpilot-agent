@@ -139,7 +139,7 @@ case "$name" in
       [ "${FAKE_PIPX_MCP_MISSING:-}" != 1 ] || exit 24
       case "${3:-}" in
         show)
-          mcp_version="${FAKE_PIPX_MCP_VERSION:-0.2.1}"
+          mcp_version="${FAKE_PIPX_MCP_VERSION:-0.2.2}"
           mcp_shape=normal
           if [[ "$venv" == *-roastpilot-stage-* ]]; then
             if [ -n "${FAKE_PIPX_STAGE_MCP_VERSION:-}" ]; then
@@ -177,9 +177,9 @@ case "$name" in
         freeze)
           if [ -n "${FAKE_PIPX_FREEZE_DIRECT_REFERENCE:-}" ]; then
             printf 'FAKE_PIPX_FREEZE_DIRECT_REFERENCE <%s>\\n' "$FAKE_PIPX_FREEZE_DIRECT_REFERENCE" >> "$FAKE_LOG"
-            printf 'roastpilot-agent @ file://%s\\ncoffee-roaster-mcp==%s\\n' "$FAKE_PIPX_FREEZE_DIRECT_REFERENCE" "${FAKE_PIPX_MCP_VERSION:-0.2.1}"
+            printf 'roastpilot-agent @ file://%s\\ncoffee-roaster-mcp==%s\\n' "$FAKE_PIPX_FREEZE_DIRECT_REFERENCE" "${FAKE_PIPX_MCP_VERSION:-0.2.2}"
           else
-            printf 'roastpilot-agent==1.2\\ncoffee-roaster-mcp==%s\\n' "${FAKE_PIPX_MCP_VERSION:-0.2.1}"
+            printf 'roastpilot-agent==1.2\\ncoffee-roaster-mcp==%s\\n' "${FAKE_PIPX_MCP_VERSION:-0.2.2}"
           fi ;;
         wheel)
           [ "${FAKE_PIPX_FAIL_WHEELHOUSE:-}" != 1 ] || { printf 'FAKE_PIPX_WHEELHOUSE_FAILURE\\n' >> "$FAKE_LOG"; exit 54; }
@@ -4104,7 +4104,7 @@ def test_indexed_prior_wheelhouse_failure_aborts_before_uninstall(
 
 
 @pytest.mark.serial
-@pytest.mark.parametrize("mcp_version", ("0.1.9", "0.2.0"))
+@pytest.mark.parametrize("mcp_version", ("0.1.9", "0.2.0", "0.2.1"))
 def test_mcp_version_must_match_the_e11_pin_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], mcp_version: str
 ) -> None:

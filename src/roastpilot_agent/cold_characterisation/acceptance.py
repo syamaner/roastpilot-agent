@@ -22,10 +22,11 @@ Every read of the caller's run and its containers happens during rebinding;
 evaluation afterwards reads only the fresh snapshots and parses the capability
 holds.
 
-Qualification (Q1-Q11) is frozen v1 policy over retained values; it never
-converts, folds or trims them.  It is not live-freeze parity: packaged agent,
-model and manifest constants, and D188 profile applicability, belong to the
-later applicability gate.  Temperatures are Celsius only; Q2 fails closed.
+Qualification (Q1-Q11) is frozen v2 policy over retained v1 identity values;
+it never converts, folds or trims them.  It is not live-freeze parity:
+packaged agent, model and manifest constants, and D188 profile applicability,
+belong to the later applicability gate.  Temperatures are Celsius only; Q2
+fails closed.
 """
 
 import enum
@@ -90,8 +91,9 @@ __all__ = (
     "interpret_retained_run",
 )
 
-#: The frozen qualification policy version; it covers identity schema version 1 only.
-QUALIFICATION_POLICY_VERSION: typing.Final = 1
+#: Policy v2 requires MCP 0.2.2 because 0.2.1 lacks per-tick commanded roast-fan
+#: observation; the retained identity schema remains version 1.
+QUALIFICATION_POLICY_VERSION: typing.Final = 2
 #: Locked D191 and production limits: declared for later rendering, never compared here.
 D191_N_LIMIT: typing.Final = 1
 D191_X_LIMIT_MS: typing.Final = 200.0
@@ -222,7 +224,7 @@ class ColdIdentityFacts(pydantic.BaseModel):
         frozen=True, extra="forbid", strict=True, allow_inf_nan=False
     )
 
-    mcp_version: typing.Literal["0.2.1"]
+    mcp_version: typing.Literal["0.2.2"]
     temperature_unit: typing.Literal["celsius"]
     first_crack_mode: typing.Literal["audio"]
     model_precision: typing.Literal["int8"]
@@ -702,7 +704,7 @@ _HEX64_PATTERN: typing.Final = re.compile(r"\A[0-9a-f]{64}\Z")
 
 # Frozen v1 literals (Q1-Q11).  Tests pin each to its live counterpart; this module
 # never imports the live identity module or any packaged constant.
-_REQUIRED_MCP_VERSION: typing.Final = "0.2.1"
+_REQUIRED_MCP_VERSION: typing.Final = "0.2.2"
 _REQUIRED_MODEL_PRECISION: typing.Final = "int8"
 _ALLOWED_CELSIUS_TOKENS: typing.Final = frozenset({"celsius"})
 _ALLOWED_INFERENCE_MODES: typing.Final = frozenset({"audio"})
@@ -991,7 +993,7 @@ def _identity_facts(view: dict[tuple[str, str], typing.Any]) -> ColdIdentityFact
 def _qualify_identity_v1(
     identity: ColdRetainedIdentityV1,
 ) -> tuple[ColdCheckResult, ColdIdentityFacts | None]:
-    """Apply the frozen v1 gates Q1-Q11 to one retained identity; never raises.
+    """Apply frozen v2 qualification gates Q1-Q11 to one retained v1 identity; never raises.
 
     Every gate is evaluated and every failure collected.  A value whose key is
     missing or whose exact type is wrong records ``Q_SHAPE_UNEXPECTED`` and is not

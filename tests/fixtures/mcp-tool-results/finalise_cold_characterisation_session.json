@@ -1,7 +1,7 @@
 {
   "abort_reason": null,
   "admission_driver_evidence": {
-    "captured_at_utc": "2026-09-20T08:59:57.933720+00:00",
+    "captured_at_utc": "2026-09-29T07:53:19.120476+00:00",
     "error": null,
     "evidence": {
       "command_loop_error_count": null,
@@ -32,8 +32,8 @@
     "attempt_count": 1,
     "command_loop_stopped": "not_applicable",
     "connected_false_confirmed": true,
-    "first_attempted_at_utc": "2026-09-20T08:59:57.934318+00:00",
-    "last_attempted_at_utc": "2026-09-20T08:59:57.934318+00:00",
+    "first_attempted_at_utc": "2026-09-29T07:53:19.120934+00:00",
+    "last_attempted_at_utc": "2026-09-29T07:53:19.120934+00:00",
     "last_error": null,
     "last_returned_without_error": true,
     "serial_closed": "not_applicable"
@@ -41,7 +41,7 @@
   "emergency_stop_ordering": "finalisation_committed_first",
   "failures": [],
   "final_driver_evidence": {
-    "captured_at_utc": "2026-09-20T08:59:57.934478+00:00",
+    "captured_at_utc": "2026-09-29T07:53:19.121042+00:00",
     "error": null,
     "evidence": {
       "command_loop_error_count": null,
@@ -93,12 +93,12 @@
     "outcome": "not_active",
     "stop_error": null
   },
-  "first_started_at_utc": "2026-09-20T08:59:57.933806+00:00",
-  "first_started_session_elapsed_seconds": 0.05166462499619229,
-  "last_ended_at_utc": "2026-09-20T08:59:57.934528+00:00",
-  "last_ended_session_elapsed_seconds": 0.05237983299593907,
+  "first_started_at_utc": "2026-09-29T07:53:19.120525+00:00",
+  "first_started_session_elapsed_seconds": 0.05340445798356086,
+  "last_ended_at_utc": "2026-09-29T07:53:19.121087+00:00",
+  "last_ended_session_elapsed_seconds": 0.05396587506402284,
   "pre_disconnect_driver_evidence": {
-    "captured_at_utc": "2026-09-20T08:59:57.934290+00:00",
+    "captured_at_utc": "2026-09-29T07:53:19.120911+00:00",
     "error": null,
     "evidence": {
       "command_loop_error_count": null,
@@ -161,33 +161,33 @@
     "thread_alive_after_join": false
   },
   "session_active_after": false,
-  "session_id": "3dc82ea2407a4ae9ab3a47e9a684e283",
+  "session_id": "42e610c80331486c96bcd39361cae8b4",
   "session_phase_after": "roasting",
   "session_purpose": "cold_characterisation",
   "stages": [
     {
-      "completed_at_utc": "2026-09-20T08:59:57.933943+00:00",
+      "completed_at_utc": "2026-09-29T07:53:19.120606+00:00",
       "completed_in_attempt": 1,
       "detail": null,
       "stage": "telemetry_sampler",
       "status": "completed"
     },
     {
-      "completed_at_utc": "2026-09-20T08:59:57.934087+00:00",
+      "completed_at_utc": "2026-09-29T07:53:19.120728+00:00",
       "completed_in_attempt": 1,
       "detail": null,
       "stage": "first_crack_runtime",
       "status": "not_applicable"
     },
     {
-      "completed_at_utc": "2026-09-20T08:59:57.934193+00:00",
+      "completed_at_utc": "2026-09-29T07:53:19.120822+00:00",
       "completed_in_attempt": 1,
       "detail": null,
       "stage": "recording",
       "status": "not_applicable"
     },
     {
-      "completed_at_utc": "2026-09-20T08:59:57.934517+00:00",
+      "completed_at_utc": "2026-09-29T07:53:19.121076+00:00",
       "completed_in_attempt": 1,
       "detail": null,
       "stage": "driver_disconnect",

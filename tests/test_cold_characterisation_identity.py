@@ -92,7 +92,7 @@ def _server() -> ServerInfo:
     return ServerInfo(
         product_name="Coffee Roaster MCP",
         package_name="coffee-roaster-mcp",
-        version="0.2.1",
+        version="0.2.2",
         transport="stdio",
         current_phase="bootstrap",
         roaster_driver="hottop_kn8828b_2k_plus",
@@ -720,7 +720,7 @@ def test_identity_rejects_substituted_packaged_manifest_constants(tmp_path: Path
 @pytest.mark.parametrize(
     ("field", "value", "failure"),
     [
-        ("coffee_roaster_mcp_version", "0.2.2", ColdIdentityFailure.MCP_VERSION_NOT_PINNED),
+        ("coffee_roaster_mcp_version", "0.2.1", ColdIdentityFailure.MCP_VERSION_NOT_PINNED),
         (
             "runtime_config",
             _runtime(temperature_unit="fahrenheit"),
@@ -937,7 +937,7 @@ def test_freeze_admits_high_entropy_device_identifiers(tmp_path: Path) -> None:
     assert identity.device_config.ambient_device == "0123456789abcdef0123456789abcdef01234567"
 
 
-@pytest.mark.parametrize("version", ["0.2.0", "0.2.2", "0.3.0", "0.2.1.post1", "0.2.10", " 0.2.1"])
+@pytest.mark.parametrize("version", ["0.2.0", "0.2.1", "0.3.0", "0.2.2.post1", "0.2.20", " 0.2.2"])
 def test_freeze_requires_exact_mcp_version(tmp_path: Path, version: str) -> None:
     """Only the exact ratified MCP release may be frozen."""
     _assert_failure(
