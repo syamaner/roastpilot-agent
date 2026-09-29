@@ -1398,6 +1398,106 @@ async def test_client_rejects_missing_or_non_list_finalisation_containers(
     await _assert_public_finalisation_validation_failure(payload, None if missing else marker)
 
 
+_STATUS_FLOAT_FIELDS = (
+    "detected_monotonic_seconds",
+    "mic_peak_dbfs",
+    "mic_rms_dbfs",
+    "estimated_lost_audio_ms_last_minute",
+    "last_inference_duration_ms",
+    "max_inference_duration_ms",
+)
+_NULLABLE_STATUS_FLOAT_FIELDS = _STATUS_FLOAT_FIELDS[:3]
+
+
+def _first_crack_status(payload: dict[str, object], location: str) -> dict[str, object]:
+    """Return the mutable pre- or final first-crack status mapping of a payload."""
+    if location == "pre":
+        return cast("dict[str, object]", payload["pre_finalisation_first_crack_status"])
+    runtime = cast("dict[str, object]", payload["first_crack_runtime"])
+    return cast("dict[str, object]", runtime["final_status"])
+
+
+async def _assert_status_type_refused(payload: dict[str, object]) -> None:
+    """Assert one fixed refusal before identity reset, with exactly one MCP call."""
+    await _assert_public_finalisation_validation_failure(payload, None)
+    client, caller = _client_for(payload)
+    with pytest.raises(ColdMcpValidationError):
+        await client.finalise_session("session-id")
+    assert caller.calls == [
+        ("finalise_cold_characterisation_session", {"session_id": "session-id"})
+    ]
+    assert client._cold_session_id == "session-id"  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("location", ["pre", "final"])
+@pytest.mark.parametrize("field", _STATUS_FLOAT_FIELDS)
+async def test_finalisation_refuses_json_integer_in_status_float_field(
+    location: str, field: str
+) -> None:
+    """T1: a JSON integer in any status float field is refused, never converted."""
+    payload = _payload()
+    _first_crack_status(payload, location)[field] = 1
+    await _assert_status_type_refused(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("location", ["pre", "final"])
+async def test_finalisation_refuses_value_changing_integer_in_status(location: str) -> None:
+    """T2: an integer above 2**53 that would round on conversion is refused."""
+    payload = _payload()
+    _first_crack_status(payload, location)["max_inference_duration_ms"] = 2**53 + 1
+    await _assert_status_type_refused(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("location", ["pre", "final"])
+async def test_finalisation_refuses_out_of_range_integer_in_status(location: str) -> None:
+    """T3: an integer beyond the float range still maps to the fixed error."""
+    payload = _payload()
+    _first_crack_status(payload, location)["max_inference_duration_ms"] = 10**400
+    await _assert_status_type_refused(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("location", ["pre", "final"])
+async def test_finalisation_accepts_exact_float_and_null_status_values(location: str) -> None:
+    """T4: exact floats and JSON nulls in status float fields remain accepted."""
+    payload = _payload()
+    status = _first_crack_status(payload, location)
+    status["max_inference_duration_ms"] = 1.5
+    for field in _NULLABLE_STATUS_FLOAT_FIELDS:
+        status[field] = None
+    client, _ = _client_for(payload)
+    result = await client.finalise_session("session-id")
+    assert result.status == "clean"
+    if location == "pre":
+        parsed = result.pre_finalisation_first_crack_status
+    else:
+        assert result.first_crack_runtime is not None
+        parsed = result.first_crack_runtime.final_status
+    assert parsed is not None
+    assert type(parsed.max_inference_duration_ms) is float
+    assert parsed.max_inference_duration_ms == 1.5
+    for field in _NULLABLE_STATUS_FLOAT_FIELDS:
+        assert getattr(parsed, field) is None
+
+
+@pytest.mark.asyncio
+async def test_finalisation_status_type_check_precedes_session_identity_check() -> None:
+    """T5: the exact-type refusal happens before the returned session id comparison."""
+    mismatched = _payload()
+    mismatched["session_id"] = "other-session"
+    client, _ = _client_for(mismatched)
+    with pytest.raises(ColdSessionIdentityError):
+        await client.finalise_session("session-id")
+
+    payload = _payload()
+    payload["session_id"] = "other-session"
+    _first_crack_status(payload, "final")["max_inference_duration_ms"] = 1
+    await _assert_status_type_refused(payload)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("payload", [{"bad": {1, 2}}, {"cycle": None}])
 async def test_client_maps_serialisation_failures_to_fixed_typed_cold_error(
