@@ -182,7 +182,7 @@ dev = [
   # The real MCP server, spawned as a stdio child in mock-driver mode for the
   # E9-S2 vertical slice (D6). #954 pins this development/mock-driver surface
   # to the same published 0.2.2 release as [pi]; their exact pins no longer
-  # conflict and the 14 captured mirror fixtures are regenerated together.
+  # conflict and the 15 captured fixture/mirror pairs are regenerated together.
   # It pulls heavy ML/audio deps (transformers/onnxruntime/sounddevice) that
   # mock mode never activates; CI installs libportaudio2 for sounddevice's import.
   "coffee-roaster-mcp==0.2.2",

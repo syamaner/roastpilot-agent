@@ -2159,9 +2159,8 @@ def test_captured_normal_state_keeps_null_cold_observation() -> None:
     assert payload["cold_characterisation_observation"] is None
     start = json.loads((TOOL_RESULT_FIXTURES / "start_roast_session.json").read_text())
     session = start["session"]
-    assert "cold_characterisation_observation" not in session or (
-        session["cold_characterisation_observation"] is None
-    )
+    assert "cold_characterisation_observation" in session
+    assert session["cold_characterisation_observation"] is None
 
 
 def test_captured_sessions_are_normal_roasts_and_unknown_purpose_is_rejected() -> None:

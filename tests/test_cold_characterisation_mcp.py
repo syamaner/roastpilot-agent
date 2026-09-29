@@ -2680,6 +2680,8 @@ async def test_cold_tick_projects_closed_roast_fan_outcomes(
         ("not_object", ColdRoastFanProjectionFailure.OBSERVATION_NOT_OBJECT),
         ("extra_key", ColdRoastFanProjectionFailure.FIELD_SET_MISMATCH),
         ("missing_outcome", ColdRoastFanProjectionFailure.FIELD_SET_MISMATCH),
+        ("null_outcome", ColdRoastFanProjectionFailure.OUTCOME_NOT_ADMITTED),
+        ("number_outcome", ColdRoastFanProjectionFailure.OUTCOME_NOT_ADMITTED),
         ("bad_outcome", ColdRoastFanProjectionFailure.OUTCOME_NOT_ADMITTED),
         ("bad_outcome_case", ColdRoastFanProjectionFailure.OUTCOME_NOT_ADMITTED),
         ("bad_outcome_space", ColdRoastFanProjectionFailure.OUTCOME_NOT_ADMITTED),
@@ -2708,6 +2710,10 @@ async def test_cold_tick_roast_fan_projection_fails_closed(
         raw["main_fan_level_percent"] = 0
     elif mutation == "missing_outcome":
         del raw["outcome"]
+    elif mutation == "null_outcome":
+        raw["outcome"] = None
+    elif mutation == "number_outcome":
+        raw["outcome"] = 0
     elif mutation == "bad_outcome":
         raw["outcome"] = "stalled"
     elif mutation == "bad_outcome_case":
@@ -2748,10 +2754,17 @@ async def test_roast_fan_projection_contains_untrusted_value_and_key() -> None:
     _assert_contained(error, canary)
 
     payload = _cold_state_payload()
-    key = canary + "k" * (MAX_JSON_KEY_BYTES + 1 - len(canary.encode("utf-8")))
+    key = "unexpected_" + canary
+    assert len(key.encode("utf-8")) < MAX_JSON_KEY_BYTES
     _roast_fan(payload)[key] = 0
     error = await _roast_fan_error(payload)
     assert error.failure is ColdRoastFanProjectionFailure.FIELD_SET_MISMATCH
+    _assert_contained(error, canary)
+
+    payload = _cold_state_payload()
+    _roast_fan(payload)["outcome"] = canary
+    error = await _roast_fan_error(payload)
+    assert error.failure is ColdRoastFanProjectionFailure.OUTCOME_NOT_ADMITTED
     _assert_contained(error, canary)
 
 
