@@ -209,7 +209,12 @@ class ColdFinalisationSafetyError(ColdFinalisationResultError):
 
 
 class StrictMCPMirror(BaseModel):
-    """Immutable MCP mirror that rejects unknown fields and scalar coercion."""
+    """Immutable MCP mirror that rejects unknown fields and most scalar coercion.
+
+    Strict mode still converts a JSON integer into a float field, so the cold
+    ingresses (tick audio and finalisation first-crack status) additionally
+    enforce the exact raw JSON type of each such field.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True, allow_inf_nan=False)
 
@@ -565,6 +570,38 @@ def _trusted_final_driver_evidence(
     return driver_read.evidence
 
 
+def _finalisation_status_types_are_exact(tree: object, result: SessionFinalisationResult) -> bool:
+    """Whether each parsed first-crack status field keeps its exact raw JSON type.
+
+    Strict validation still converts a JSON integer into a float field, so both
+    finalisation first-crack status locations are compared field by field
+    against the raw JSON tree parsed from the same response text.
+
+    Args:
+        tree: The raw JSON tree the strict result was validated from.
+        result: The strictly validated result of that same response text.
+
+    Returns:
+        ``True`` only when every non-null status keeps each raw field type exactly.
+    """
+    root = cast("dict[str, dict[str, object]]", tree)
+    pairs: list[tuple[object, FinalisationFirstCrackStatus | None]] = [
+        (root["pre_finalisation_first_crack_status"], result.pre_finalisation_first_crack_status)
+    ]
+    if result.first_crack_runtime is not None:
+        pairs.append(
+            (root["first_crack_runtime"]["final_status"], result.first_crack_runtime.final_status)
+        )
+    for raw, parsed in pairs:
+        if parsed is None:
+            continue
+        mapping = cast("dict[str, object]", raw)
+        for name in FinalisationFirstCrackStatus.model_fields:
+            if type(mapping[name]) is not type(getattr(parsed, name)):
+                return False
+    return True
+
+
 def _finalisation_has_safe_zero(result: SessionFinalisationResult) -> bool:
     """Whether D195 final evidence proves all six command dimensions are zero."""
     evidence = _trusted_final_driver_evidence(result)
@@ -805,6 +842,30 @@ class ColdCharacterisationMCPClient:
             pass
         else:
             return result
+        raise ColdMcpValidationError("MCP response failed cold contract validation") from None
+
+    @staticmethod
+    def _validate_finalisation(payload: object) -> SessionFinalisationResult:
+        """Validate one finalisation result and its exact first-crack status types.
+
+        Both parses read the same serialised text, so the raw tree is exactly
+        the response the strict mirror accepted.
+
+        Args:
+            payload: The untrusted MCP finalisation response payload.
+
+        Raises:
+            ColdMcpValidationError: If the response violates the cold contract.
+        """
+        try:
+            text = json.dumps(payload, allow_nan=False)
+            result = SessionFinalisationResult.model_validate_json(text)
+            tree: object = json.loads(text)
+        except (RecursionError, TypeError, ValidationError, ValueError):
+            pass
+        else:
+            if _finalisation_status_types_are_exact(tree, result):
+                return result
         raise ColdMcpValidationError("MCP response failed cold contract validation") from None
 
     @staticmethod
@@ -1093,9 +1154,8 @@ class ColdCharacterisationMCPClient:
         """
         if not session_id.strip() or self._cold_session_id != session_id:
             raise ColdSessionIdentityError("requested cold session is not established")
-        result = self._validate(
-            SessionFinalisationResult,
-            await self._call("finalise_cold_characterisation_session", {"session_id": session_id}),
+        result = self._validate_finalisation(
+            await self._call("finalise_cold_characterisation_session", {"session_id": session_id})
         )
         if result.session_id != session_id:
             raise ColdSessionIdentityError("MCP did not return the requested cold session")
