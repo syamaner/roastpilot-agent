@@ -2845,6 +2845,11 @@ def test_cold_tick_roast_fan_model_is_closed_and_records_no_verdict() -> None:
         )
     with pytest.raises(ValidationError):
         ColdTickRoastFanObservation.model_validate(
+            {"outcome": ColdRoastFanOutcome.NOT_ELIGIBLE, "roast_fan_level_percent": 0},
+            strict=True,
+        )
+    with pytest.raises(ValidationError):
+        ColdTickRoastFanObservation.model_validate(
             {
                 "outcome": ColdRoastFanOutcome.OBSERVED,
                 "roast_fan_level_percent": 0,
