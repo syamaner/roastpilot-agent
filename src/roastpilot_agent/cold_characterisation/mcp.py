@@ -957,7 +957,7 @@ class ColdCharacterisationMCPClient:
             return ColdTickRoastFanObservation.model_validate(
                 {"outcome": outcome, "roast_fan_level_percent": level}, strict=True
             )
-        except ValidationError:
+        except ValidationError:  # pragma: no cover - exact guards are exhaustive
             failure = ColdRoastFanProjectionFailure.LEVEL_OUTCOME_MISMATCH
         raise ColdTickRoastFanProjectionError(failure)  # pragma: no cover - exact guards
 
