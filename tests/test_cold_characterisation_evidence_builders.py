@@ -24,9 +24,15 @@ from roastpilot_agent.cold_characterisation.identity import (
     freeze_identity,
     identity_sha256,
 )
-from roastpilot_agent.cold_characterisation.mcp import SessionFinalisationResult
+from roastpilot_agent.cold_characterisation.mcp import (
+    ColdRoastFanOutcome,
+    ColdTickDeviceState,
+    ColdTickObservation,
+    ColdTickRoastFanObservation,
+    SessionFinalisationResult,
+)
 from roastpilot_agent.config import MCPDeviceConfig
-from roastpilot_agent.mcp_client import RoasterDeviceState, RuntimeConfigSnapshot, ServerInfo
+from roastpilot_agent.mcp_client import RoastSessionState, RuntimeConfigSnapshot, ServerInfo
 
 RUN_ID = "20260926T120000Z-cold-integrity"
 FIXTURE_PATH = (
@@ -34,6 +40,9 @@ FIXTURE_PATH = (
     / "fixtures"
     / "mcp-tool-results"
     / "finalise_cold_characterisation_session.json"
+)
+STATE_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "mcp-tool-results" / "get_roast_state.json"
 )
 COLD_PACKAGE = Path(builders.__file__).parent
 NEW_MODULES = tuple(
@@ -155,8 +164,8 @@ def audio_payload() -> dict[str, schema.ColdJsonValue]:
     }
 
 
-def device_state(**overrides: object) -> RoasterDeviceState:
-    """Return one typed, safe-zero cold device state with vendor data."""
+def device_state(**overrides: object) -> ColdTickDeviceState:
+    """Return one strict, safe-zero cold device projection with vendor data."""
     values: dict[str, object] = {
         "driver": "mock",
         "connected": True,
@@ -168,7 +177,34 @@ def device_state(**overrides: object) -> RoasterDeviceState:
         "raw_vendor_data": {"packet": "abc", "count": 3},
     }
     values.update(overrides)
-    return RoasterDeviceState.model_validate(values)
+    return ColdTickDeviceState.model_validate(values)
+
+
+def roast_fan_state(
+    outcome: ColdRoastFanOutcome = ColdRoastFanOutcome.OBSERVED, level: int | None = 0
+) -> ColdTickRoastFanObservation:
+    """Return one strict commanded roast-fan observation."""
+    return ColdTickRoastFanObservation(outcome=outcome, roast_fan_level_percent=level)
+
+
+def tolerant_state() -> RoastSessionState:
+    """Return the committed tolerant roast state; its device values differ from ``device_state``."""
+    return RoastSessionState.model_validate_json(STATE_FIXTURE_PATH.read_text(encoding="utf-8"))
+
+
+def observation(
+    device: ColdTickDeviceState | None,
+    *,
+    roast_fan: ColdTickRoastFanObservation | None = None,
+    audio: dict[str, schema.ColdJsonValue] | None = None,
+) -> ColdTickObservation:
+    """Return one strict cold tick observation; ``device=None`` is absent telemetry."""
+    return ColdTickObservation(
+        state=tolerant_state(),
+        audio=schema.project_tick_audio(audio_payload() if audio is None else audio),
+        device=device,
+        roast_fan=roast_fan_state() if roast_fan is None else roast_fan,
+    )
 
 
 def finalisation_payload(*, streaming: bool | None = False) -> dict[str, typing.Any]:
@@ -222,8 +258,7 @@ def tick_for(header: schema.ColdRunHeader, tick: int = 0) -> schema.ColdTickReco
         tick=tick,
         recorded_at_utc="2026-09-26T12:00:01Z",
         monotonic_seconds=2.0 + tick,
-        device_state=device_state(),
-        projection=schema.project_tick_audio(audio_payload()),
+        observation=observation(device_state()),
     )
 
 
@@ -358,41 +393,199 @@ def test_header_digest_disagreement_refuses(
     assert raised.value.failure is store.ColdEvidenceStoreFailure.IDENTITY_DIGEST_MISMATCHED
 
 
-def test_tick_inherits_header_and_retains_raw_extras(tmp_path: Path) -> None:
-    """Ticks copy six device fields and retain unknown audio keys and vendor data."""
-    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
-    state = device_state(heat_level_percent=0, fan_level_percent=0, bean_temp_c=None)
-    tick = builders.build_tick_record(
+def build_tick(
+    header: schema.ColdRunHeader, source: ColdTickObservation, tick: int = 7
+) -> schema.ColdTickRecord:
+    """Build one tick from an observation through the real builder."""
+    return builders.build_tick_record(
         header=header,
-        tick=7,
+        tick=tick,
         recorded_at_utc="2026-09-26T12:00:08Z",
         monotonic_seconds=9.0,
-        device_state=state,
-        projection=schema.project_tick_audio(audio_payload()),
+        observation=source,
     )
+
+
+def test_tick_inherits_header_and_retains_raw_extras(tmp_path: Path) -> None:
+    """Ticks copy the strict device and retain unknown audio keys and vendor data."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    state = device_state(heat_level_percent=0, fan_level_percent=0, bean_temp_c=None)
+    tick = build_tick(header, observation(state))
     assert (tick.run_id, tick.phase, tick.identity_sha256) == (
         header.run_id,
         header.phase,
         header.identity_sha256,
     )
     assert tick.raw_audio_extra == {"future_audio_key": {"nested": [1, 2.5, "x"]}}
-    assert tick.raw_vendor_data == {"packet": "abc", "count": 3}
-    assert (tick.bean_temp_c, tick.env_temp_c, tick.connected, tick.cooling_on) == (
+    assert tick.device is not None
+    assert tick.device.raw_vendor_data == {"packet": "abc", "count": 3}
+    device = tick.device
+    assert (device.bean_temp_c, device.env_temp_c, device.connected, device.cooling_on) == (
         None,
         22.0,
         True,
         False,
     )
-    assert (tick.heat_level_percent, tick.fan_level_percent, tick.tick) == (0, 0, 7)
+    assert (device.heat_level_percent, device.fan_level_percent, tick.tick) == (0, 0, 7)
+
+
+def test_t_e1_tick_copies_strict_device_and_roast_fan_exactly(tmp_path: Path) -> None:
+    """T-E1: all eight device and both roast-fan fields equal their strict sources."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    source = observation(
+        device_state(driver="hottop", heat_level_percent=3, fan_level_percent=4),
+        roast_fan=roast_fan_state(ColdRoastFanOutcome.OBSERVED, 5),
+    )
+    assert source.device is not None
+    tolerant = source.state.device_state
+    assert tolerant is not None
+    assert (tolerant.heat_level_percent, tolerant.fan_level_percent) != (3, 4)
+    tick = build_tick(header, source)
+    assert tick.device is not None
+    for name in ColdTickDeviceState.model_fields:
+        copied = getattr(tick.device, name)
+        original = getattr(source.device, name)
+        assert copied == original, name
+        assert type(copied) is type(original), name
+    assert tick.device.raw_vendor_data is not source.device.raw_vendor_data
+    assert type(tick.roast_fan) is schema.ColdTickRoastFanEvidence
+    assert tick.roast_fan.outcome is schema.ColdTickRoastFanOutcome.OBSERVED
+    assert tick.roast_fan.roast_fan_level_percent == 5
+    assert type(tick.roast_fan.roast_fan_level_percent) is int
+    assert tick.audio == source.audio.audio
+
+
+@pytest.mark.parametrize("outcome", list(ColdRoastFanOutcome))
+def test_t_e1_every_roast_fan_outcome_maps_to_its_schema_member(
+    tmp_path: Path, outcome: ColdRoastFanOutcome
+) -> None:
+    """T-E1: each of D197's five outcomes maps by exact value; only observed has a level."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    level = 0 if outcome is ColdRoastFanOutcome.OBSERVED else None
+    tick = build_tick(
+        header, observation(device_state(), roast_fan=roast_fan_state(outcome, level))
+    )
+    assert tick.roast_fan.outcome is schema.ColdTickRoastFanOutcome(outcome.value)
+    assert tick.roast_fan.roast_fan_level_percent == level
+
+
+def test_t_e2_absent_device_is_recorded_as_none_never_zeroed(tmp_path: Path) -> None:
+    """T-E2: ``device=None`` stays ``None``; no zero, previous, or tolerant substitute."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    source = observation(None, roast_fan=roast_fan_state(ColdRoastFanOutcome.UNREADABLE, None))
+    assert source.state.device_state is not None
+    tick = build_tick(header, source)
+    assert tick.device is None
+    assert tick.model_dump(mode="json")["device"] is None
+    assert tick.roast_fan.outcome is schema.ColdTickRoastFanOutcome.UNREADABLE
+    assert tick.roast_fan.roast_fan_level_percent is None
+
+
+def test_t_e3_unsafe_device_values_are_retained_without_a_verdict(tmp_path: Path) -> None:
+    """T-E3: unsafe or implausible values are recorded faithfully, never refused."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    source = observation(
+        device_state(
+            heat_level_percent=150, fan_level_percent=-1, connected=False, cooling_on=True
+        ),
+        roast_fan=roast_fan_state(ColdRoastFanOutcome.OBSERVED, 100),
+    )
+    tick = build_tick(header, source)
+    assert tick.device is not None
+    assert (
+        tick.device.heat_level_percent,
+        tick.device.fan_level_percent,
+        tick.device.connected,
+        tick.device.cooling_on,
+    ) == (150, -1, False, True)
+    assert tick.roast_fan.roast_fan_level_percent == 100
+    assert not {"verdict", "clean", "safe_zero"} & set(schema.ColdTickRecord.model_fields)
 
 
 def test_tick_builder_has_no_path_that_omits_the_projection() -> None:
-    """``projection`` is a required keyword; raw audio extras cannot default."""
-    parameter = inspect.signature(builders.build_tick_record).parameters["projection"]
+    """``observation`` is a required keyword; raw audio extras cannot default."""
+    parameters = inspect.signature(builders.build_tick_record).parameters
+    assert tuple(parameters) == (
+        "header",
+        "tick",
+        "recorded_at_utc",
+        "monotonic_seconds",
+        "observation",
+    )
+    parameter = parameters["observation"]
     assert parameter.default is inspect.Parameter.empty
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     source = inspect.getsource(builders.build_tick_record)
     assert "raw_audio_extra=dict(projection.raw_audio_extra)" in source
+
+
+_TOLERANT_ATTRIBUTES = frozenset({"state", "device_state", "first_crack_status"})
+
+
+def test_t_e9_tick_builder_never_reads_the_tolerant_state() -> None:
+    """T-E9: no tolerant attribute read and no tolerant device-state name in the builders."""
+    tree = ast.parse((COLD_PACKAGE / "evidence_builders.py").read_text(encoding="utf-8"))
+    attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    assert attributes & _TOLERANT_ATTRIBUTES == set()
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    aliases = {node.name for node in ast.walk(tree) if isinstance(node, ast.alias)}
+    assert "RoasterDeviceState" not in names | aliases
+
+
+def test_t_e9_tick_builder_refuses_wrong_observation_types(tmp_path: Path) -> None:
+    """T-E9: only an exact ``ColdTickObservation`` with exact strict parts is accepted."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    genuine = observation(device_state())
+
+    class ObservationSubclass(ColdTickObservation):
+        """A non-exact observation type."""
+
+    class DeviceSubclass(ColdTickDeviceState):
+        """A non-exact device type."""
+
+    class RoastFanSubclass(ColdTickRoastFanObservation):
+        """A non-exact roast-fan type."""
+
+    subclass = ObservationSubclass(
+        state=genuine.state, audio=genuine.audio, device=genuine.device, roast_fan=genuine.roast_fan
+    )
+    assert genuine.device is not None
+    wrong_device = typing.cast(typing.Any, ColdTickObservation).model_construct(
+        state=genuine.state,
+        audio=genuine.audio,
+        device=DeviceSubclass(**dict(genuine.device)),
+        roast_fan=genuine.roast_fan,
+    )
+    tolerant_device = typing.cast(typing.Any, ColdTickObservation).model_construct(
+        state=genuine.state,
+        audio=genuine.audio,
+        device=genuine.state.device_state,
+        roast_fan=genuine.roast_fan,
+    )
+    wrong_fan = typing.cast(typing.Any, ColdTickObservation).model_construct(
+        state=genuine.state,
+        audio=genuine.audio,
+        device=genuine.device,
+        roast_fan=RoastFanSubclass(**dict(genuine.roast_fan)),
+    )
+    wrong_audio = typing.cast(typing.Any, ColdTickObservation).model_construct(
+        state=genuine.state,
+        audio=genuine.audio.model_dump(),
+        device=genuine.device,
+        roast_fan=genuine.roast_fan,
+    )
+    for bad in (
+        genuine.state,
+        subclass,
+        genuine.model_dump(),
+        wrong_device,
+        tolerant_device,
+        wrong_fan,
+        wrong_audio,
+    ):
+        with pytest.raises(schema.ColdEvidenceError) as raised:
+            build_tick(header, typing.cast(typing.Any, bad))
+        assert raised.value.failure is schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED
 
 
 def test_oversized_raw_maps_refuse_without_truncation(tmp_path: Path) -> None:
@@ -400,29 +593,15 @@ def test_oversized_raw_maps_refuse_without_truncation(tmp_path: Path) -> None:
     header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
     big_vendor = device_state(raw_vendor_data={"blob": "x" * (schema.MAX_VENDOR_BLOB_BYTES + 1)})
     with pytest.raises(schema.ColdEvidenceError) as raised:
-        builders.build_tick_record(
-            header=header,
-            tick=0,
-            recorded_at_utc="t",
-            monotonic_seconds=1.0,
-            device_state=big_vendor,
-            projection=schema.project_tick_audio(audio_payload()),
-        )
+        build_tick(header, observation(big_vendor))
     assert raised.value.failure is schema.ColdEvidenceFailure.RECORD_VENDOR_BLOB_TOO_LARGE
-    projection = schema.project_tick_audio(audio_payload())
+    genuine = observation(device_state())
     oversized = schema.ColdTickProjection(
-        audio=projection.audio,
+        audio=genuine.audio.audio,
         raw_audio_extra={"blob": "y" * (schema.MAX_RAW_AUDIO_EXTRA_BYTES + 1)},
     )
     with pytest.raises(schema.ColdEvidenceError) as raised:
-        builders.build_tick_record(
-            header=header,
-            tick=0,
-            recorded_at_utc="t",
-            monotonic_seconds=1.0,
-            device_state=device_state(),
-            projection=oversized,
-        )
+        build_tick(header, genuine.model_copy(update={"audio": oversized}))
     assert raised.value.failure is schema.ColdEvidenceFailure.RECORD_RAW_AUDIO_EXTRA_TOO_LARGE
 
 
@@ -489,7 +668,6 @@ def test_finalisation_builder_refuses_a_non_round_tripping_result(
 def test_builders_refuse_wrong_input_types(tmp_path: Path) -> None:
     """Builders accept only the exact typed inputs they bind."""
     header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
-    projection = schema.project_tick_audio(audio_payload())
     calls: list[typing.Callable[[], object]] = [
         lambda: builders.build_host_record(
             header=typing.cast(typing.Any, header.model_dump()),
@@ -502,8 +680,7 @@ def test_builders_refuse_wrong_input_types(tmp_path: Path) -> None:
             tick=0,
             recorded_at_utc="t",
             monotonic_seconds=1.0,
-            device_state=typing.cast(typing.Any, device_state().model_dump()),
-            projection=projection,
+            observation=typing.cast(typing.Any, observation(device_state()).model_dump()),
         ),
         lambda: builders.build_finalisation_record(
             header=header,
@@ -569,6 +746,74 @@ def _identifiers(source: str) -> set[str]:
     return names
 
 
+# A1-4d: the tick builder copies D197's recorded roast-fan read ``outcome`` and
+# its schema-owned enum.  Exactly these two identifiers are exempt, and only in
+# ``evidence_builders.py``; every other identifier stays under the token guard.
+_ROAST_FAN_OUTCOME_IDENTIFIERS: typing.Final[frozenset[str]] = frozenset(
+    {"ColdTickRoastFanOutcome", "outcome"}
+)
+
+
+def _token_violations(module_name: str, identifiers: set[str]) -> set[str]:
+    """Return every identifier breaching the verdict/evaluation/report/outcome token rules."""
+    violations: set[str] = set()
+    for identifier in identifiers:
+        lowered = identifier.lower()
+        if (
+            any(token in lowered for token in ("verdict", "evaluat", "report"))
+            or "outcome" in lowered
+            and not (
+                module_name == "evidence_builders.py"
+                and identifier in _ROAST_FAN_OUTCOME_IDENTIFIERS
+            )
+        ):
+            violations.add(identifier)
+    return violations
+
+
+def _outcome_receiver_violations(source: str) -> list[str]:
+    """Return every ``.outcome`` read whose receiver is not ``.roast_fan``."""
+    reads = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Attribute) and node.attr == "outcome"
+    ]
+    if not reads:
+        return ["missing roast_fan.outcome read"]
+    return [
+        ast.unparse(node)
+        for node in reads
+        if not (isinstance(node.value, ast.Attribute) and node.value.attr == "roast_fan")
+    ]
+
+
+def test_token_exception_is_exact_and_receiver_pinned() -> None:
+    """T-E14b: the exception is exact set membership, builder-only, and receiver-pinned."""
+    builder = "evidence_builders.py"
+    assert _token_violations(builder, {"ColdTickRoastFanOutcome", "outcome"}) == set()
+    for name in (
+        "phase_outcome",
+        "ColdCheckOutcome",
+        "outcome_check",
+        "ColdTickRoastFanOutcomeX",
+        "Outcome",
+    ):
+        assert _token_violations(builder, {name}) == {name}
+    banned = {"evaluate_roast_fan", "roast_fan_verdict", "report_row"}
+    assert _token_violations(builder, banned) == banned
+    assert _token_violations("evidence_store.py", {"outcome"}) == {"outcome"}
+    assert _token_violations("evidence_reader.py", {"ColdTickRoastFanOutcome"}) == {
+        "ColdTickRoastFanOutcome"
+    }
+    assert _outcome_receiver_violations("x = observation.roast_fan.outcome") == []
+    assert len(_outcome_receiver_violations("x = header.outcome")) == 1
+    assert (
+        len(_outcome_receiver_violations("x = observation.roast_fan.outcome\ny = check.outcome"))
+        == 1
+    )
+    assert _outcome_receiver_violations("x = 1") == ["missing roast_fan.outcome read"]
+
+
 def test_new_modules_contain_no_actuator_verdict_or_limit_names() -> None:
     """Classes E and K: no actuator reach, clean conjunction, verdict, report, or limit."""
     forbidden_text = (
@@ -594,11 +839,9 @@ def test_new_modules_contain_no_actuator_verdict_or_limit_names() -> None:
         source = path.read_text()
         for name in forbidden_text:
             assert name not in source, (path.name, name)
-        for identifier in _identifiers(source):
-            lowered = identifier.lower()
-            assert not any(
-                token in lowered for token in ("verdict", "evaluat", "report", "outcome")
-            ), (path.name, identifier)
+        assert _token_violations(path.name, _identifiers(source)) == set(), path.name
+    assert _outcome_receiver_violations((COLD_PACKAGE / "evidence_builders.py").read_text()) == []
+    assert frozenset({"ColdTickRoastFanOutcome", "outcome"}) == _ROAST_FAN_OUTCOME_IDENTIFIERS
 
 
 _COLD = "roastpilot_agent.cold_characterisation."
@@ -615,13 +858,11 @@ _MODULE_IMPORT_ALLOW_LIST: dict[str, frozenset[str]] = {
             _COLD + "identity",
             _COLD + "mcp",
             _COLD + "host",
-            "roastpilot_agent.mcp_client",
         }
     ),
 }
 _RESTRICTED_NAMES: dict[str, frozenset[str]] = {
     _COLD + "host": frozenset({"HostBoundSample"}),
-    "roastpilot_agent.mcp_client": frozenset({"RoasterDeviceState"}),
 }
 
 

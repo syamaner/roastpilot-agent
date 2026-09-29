@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from roastpilot_agent.cold_characterisation import evidence_builders as builders
 from roastpilot_agent.cold_characterisation import evidence_reader as reader
 from roastpilot_agent.cold_characterisation import evidence_schema as schema
 from roastpilot_agent.cold_characterisation import evidence_store as store
@@ -17,12 +18,16 @@ from roastpilot_agent.cold_characterisation.identity import (
     ManagedDeviceIdentity,
     ModelManifestEntry,
 )
+from roastpilot_agent.cold_characterisation.mcp import ColdRoastFanOutcome
 from roastpilot_agent.mcp_client import RuntimeConfigSnapshot, ServerInfo
 from tests.test_cold_characterisation_evidence_builders import (
     RUN_ID,
     abort_for,
+    device_state,
     header_for,
     make_identity,
+    observation,
+    roast_fan_state,
     tick_for,
 )
 from tests.test_cold_characterisation_evidence_store import (
@@ -120,6 +125,67 @@ def test_all_six_record_kinds_round_trip(tmp_path: Path) -> None:
     )
 
 
+def test_t_e7_every_roast_fan_outcome_and_absent_device_round_trip(tmp_path: Path) -> None:
+    """T-E2/T-E7: nested device, ``device=None``, and all five outcomes survive losslessly."""
+    writer, root = open_writer(tmp_path)
+    off = header_for(tmp_path, root, OFF)
+    observations = [
+        observation(
+            device_state(),
+            roast_fan=roast_fan_state(
+                outcome, 0 if outcome is ColdRoastFanOutcome.OBSERVED else None
+            ),
+        )
+        for outcome in ColdRoastFanOutcome
+    ]
+    observations.append(
+        observation(None, roast_fan=roast_fan_state(ColdRoastFanOutcome.UNREADABLE, None))
+    )
+    observations.append(
+        observation(
+            device_state(heat_level_percent=150, fan_level_percent=-1, cooling_on=True),
+            roast_fan=roast_fan_state(ColdRoastFanOutcome.OBSERVED, 100),
+        )
+    )
+    ticks: list[schema.ColdEvidenceRecord] = [
+        builders.build_tick_record(
+            header=off,
+            tick=index,
+            recorded_at_utc="2026-09-26T12:00:01Z",
+            monotonic_seconds=2.0 + index,
+            observation=source,
+        )
+        for index, source in enumerate(observations)
+    ]
+    for record in (off, *ticks):
+        writer.append(record)
+    sealed = writer.seal()
+    retained = read(root, sealed.manifest_sha256)
+    (tick_stream,) = (
+        item for item in retained.streams if item.stream is schema.ColdEvidenceStream.TICK
+    )
+    assert list(tick_stream.records) == ticks
+    for original, decoded in zip(ticks, tick_stream.records, strict=True):
+        assert store.canonical_json(decoded.model_dump(mode="json")) == store.canonical_json(
+            original.model_dump(mode="json")
+        )
+    decoded_ticks = typing.cast(tuple[schema.ColdTickRecord, ...], tick_stream.records)
+    assert [tick.roast_fan.outcome for tick in decoded_ticks[:5]] == list(
+        schema.ColdTickRoastFanOutcome
+    )
+    assert decoded_ticks[5].device is None
+    lines = (run_dir(root) / TICK_OFF).read_bytes().split(b"\n")
+    assert json.loads(lines[5])["device"] is None
+    assert b'"device":null' in lines[5]
+    unsafe = decoded_ticks[6].device
+    assert unsafe is not None
+    assert (unsafe.heat_level_percent, unsafe.fan_level_percent, unsafe.cooling_on) == (
+        150,
+        -1,
+        True,
+    )
+
+
 def test_every_legal_abort_pair_round_trips(tmp_path: Path) -> None:
     """Abort records decode exactly by domain for every legal domain/reason pair."""
     writer, root = open_writer(tmp_path)
@@ -194,6 +260,54 @@ def _tick_line(root: str, **update: object) -> bytes:
     return line_of({**first_line(root, TICK_OFF), **update})
 
 
+def _tick_device_document(root: str, **device_update: object) -> dict[str, typing.Any]:
+    """Return the first OFF tick with fields merged into its nested ``device`` object."""
+    document = first_line(root, TICK_OFF)
+    assert type(document["device"]) is dict
+    return {**document, "device": {**document["device"], **device_update}}
+
+
+def _tick_device_line(root: str, **device_update: object) -> bytes:
+    """Return the first OFF tick as a canonical line after one nested device update."""
+    return line_of(_tick_device_document(root, **device_update))
+
+
+def _int_for_bool_device_line(root: str) -> bytes:
+    """Return the first OFF tick with a nested ``device.cooling_on`` of int ``1``."""
+    return _tick_device_line(root, cooling_on=1)
+
+
+def _int_for_float_device_line(root: str) -> bytes:
+    """Return the first OFF tick with a nested ``device.bean_temp_c`` of int ``20``."""
+    return _tick_device_line(root, bean_temp_c=20)
+
+
+def _secret_vendor_line(root: str) -> bytes:
+    """Return a non-canonical first OFF tick carrying a secret in nested vendor data."""
+    return _tick_device_line(root, raw_vendor_data={SECRET: SECRET}).replace(b":", b": ")
+
+
+@pytest.mark.parametrize(
+    ("make", "device_key", "value"),
+    [
+        (_int_for_bool_device_line, "cooling_on", 1),
+        (_int_for_float_device_line, "bean_temp_c", 20),
+        (_secret_vendor_line, "raw_vendor_data", {SECRET: SECRET}),
+    ],
+    ids=["int-for-bool", "int-for-float", "secret-vendor"],
+)
+def test_nested_device_forge_keeps_the_exact_top_level_key_set(
+    tmp_path: Path, make: LineMaker, device_key: str, value: object
+) -> None:
+    """T-E16: each crafted device negative keeps the exact tick and device key sets."""
+    root, _sealed, _records = write_full_run(tmp_path)
+    document = json.loads(make(root))
+    assert set(document) == set(schema.ColdTickRecord.model_fields)
+    assert set(document["device"]) == set(schema.ColdTickDeviceEvidence.model_fields)
+    assert document["device"][device_key] == value
+    assert type(document["device"][device_key]) is type(value)
+
+
 def _replaced(old: bytes, new: bytes) -> LineMaker:
     """Return a factory replacing literal bytes inside the canonical first tick."""
 
@@ -209,7 +323,8 @@ def _replaced(old: bytes, new: bytes) -> LineMaker:
     ("make", "failure"),
     [
         (line_maker(lambda r: _tick_line(r, tick="1")), Failure.LINE_MALFORMED),
-        (line_maker(lambda r: _tick_line(r, cooling_on=1)), Failure.LINE_MALFORMED),
+        (line_maker(_int_for_bool_device_line), Failure.LINE_MALFORMED),
+        (line_maker(_int_for_float_device_line), Failure.LINE_MALFORMED),
         (line_maker(lambda r: _tick_line(r, monotonic_seconds=2)), Failure.LINE_NOT_CANONICAL),
         (line_maker(lambda r: _tick_line(r, schema_version=2)), Failure.SCHEMA_VERSION_UNKNOWN),
         (line_maker(lambda r: _tick_line(r, schema_version=True)), Failure.SCHEMA_VERSION_UNKNOWN),
@@ -236,6 +351,7 @@ def _replaced(old: bytes, new: bytes) -> LineMaker:
     ids=[
         "string-for-int",
         "int-for-bool",
+        "device-int-for-float",
         "int-for-float",
         "version-2",
         "version-bool",
@@ -290,7 +406,7 @@ def test_walker_bounds_apply_to_decoded_lines(tmp_path: Path) -> None:
     nested: object = 1
     for _ in range(schema.MAX_JSON_DEPTH + 2):
         nested = [nested]
-    digest = rewrite(root, TICK_OFF, _tick_line(root, raw_vendor_data={"deep": nested}))
+    digest = rewrite(root, TICK_OFF, _tick_device_line(root, raw_vendor_data={"deep": nested}))
     with pytest.raises(schema.ColdEvidenceError) as raised:
         read(root, digest)
     assert raised.value.failure is schema.ColdEvidenceFailure.JSON_DEPTH_EXCEEDED
@@ -351,11 +467,10 @@ def test_unverified_bytes_are_never_parsed(tmp_path: Path) -> None:
 def test_reader_errors_carry_no_line_content(tmp_path: Path) -> None:
     """A credential-shaped value in a rejected line reaches no error channel."""
     root, _sealed, _records = write_full_run(tmp_path)
-    digest = rewrite(
-        root, TICK_OFF, _tick_line(root, raw_vendor_data={SECRET: SECRET}).replace(b":", b": ")
-    )
+    digest = rewrite(root, TICK_OFF, _secret_vendor_line(root))
     with pytest.raises(store.ColdEvidenceStoreError) as raised:
         read(root, digest)
+    assert raised.value.failure is store.ColdEvidenceStoreFailure.LINE_NOT_CANONICAL
     rendered = f"{raised.value!s}{raised.value!r}{raised.value.args}"
     assert SECRET not in rendered
     assert raised.value.__cause__ is None and raised.value.__context__ is None
@@ -599,7 +714,7 @@ def test_identity_extras_are_admitted_exactly_at_the_cap(tmp_path: Path) -> None
 def test_lone_surrogate_line_is_refused_by_the_walker(tmp_path: Path) -> None:
     """A JSON-escaped lone surrogate parses but is refused before model validation."""
     root, _sealed, _records = write_full_run(tmp_path)
-    document = {**first_line(root, TICK_OFF), "raw_vendor_data": {"k": "\ud800"}}
+    document = _tick_device_document(root, raw_vendor_data={"k": "\ud800"})
     line = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
     digest = rewrite(root, TICK_OFF, line)
     with pytest.raises(schema.ColdEvidenceError) as raised:

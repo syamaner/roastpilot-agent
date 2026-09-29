@@ -21,8 +21,11 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdPhaseKind,
     ColdRunHeader,
     ColdSealedEnvelope,
+    ColdTickDeviceEvidence,
     ColdTickProjection,
     ColdTickRecord,
+    ColdTickRoastFanEvidence,
+    ColdTickRoastFanOutcome,
     validate_record,
     walk_json_value,
 )
@@ -36,8 +39,12 @@ from roastpilot_agent.cold_characterisation.evidence_store import (
 )
 from roastpilot_agent.cold_characterisation.host import HostBoundSample
 from roastpilot_agent.cold_characterisation.identity import ColdRunIdentity, identity_sha256
-from roastpilot_agent.cold_characterisation.mcp import SessionFinalisationResult
-from roastpilot_agent.mcp_client import RoasterDeviceState
+from roastpilot_agent.cold_characterisation.mcp import (
+    ColdTickDeviceState,
+    ColdTickObservation,
+    ColdTickRoastFanObservation,
+    SessionFinalisationResult,
+)
 
 _RecordT = typing.TypeVar(
     "_RecordT", ColdRunHeader, ColdTickRecord, ColdHostRecord, ColdFinalisationRecord
@@ -128,24 +135,35 @@ def build_run_header(
     )
 
 
+def _roast_fan_member(value: object) -> ColdTickRoastFanOutcome:
+    """Map one MCP roast-fan enum value to its schema-owned member by exact value."""
+    member = typing.cast(object, ColdTickRoastFanOutcome._value2member_map_.get(value))
+    if type(member) is not ColdTickRoastFanOutcome:  # pragma: no cover - value sets pinned equal.
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    return member
+
+
 def build_tick_record(
     *,
     header: ColdRunHeader,
     tick: int,
     recorded_at_utc: str,
     monotonic_seconds: float,
-    device_state: RoasterDeviceState,
-    projection: ColdTickProjection,
+    observation: ColdTickObservation,
 ) -> ColdTickRecord:
-    """Build one tick record retaining raw audio extras and raw vendor data.
+    """Build one tick record from the strict parts of one cold observation.
+
+    Device, roast-fan, and audio evidence come only from the observation's
+    strict ``device``, ``roast_fan``, and ``audio`` projections of one MCP
+    response.  A ``None`` device is recorded as ``None``; it is never defaulted.
+    Values are recorded exactly and judged nowhere here.
 
     Args:
         header: The bound phase header.
         tick: Tick index.
         recorded_at_utc: Recording timestamp.
         monotonic_seconds: Recording monotonic time.
-        device_state: Typed MCP device state; six fields and vendor data are copied.
-        projection: Strict audio projection; its raw extras are always retained.
+        observation: One identity-bound strict cold tick observation.
 
     Returns:
         The validated tick snapshot; oversized input refuses and is never shortened.
@@ -154,8 +172,29 @@ def build_tick_record(
         ColdEvidenceError: If any input or the record fails admission.
     """
     _require_type(header, ColdRunHeader)
-    _require_type(device_state, RoasterDeviceState)
+    _require_type(observation, ColdTickObservation)
+    projection = observation.audio
+    source_device = observation.device
+    source_fan = observation.roast_fan
     _require_type(projection, ColdTickProjection)
+    _require_type(source_fan, ColdTickRoastFanObservation)
+    if source_device is not None:
+        _require_type(source_device, ColdTickDeviceState)
+
+    def _device() -> ColdTickDeviceEvidence | None:
+        if source_device is None:
+            return None
+        return ColdTickDeviceEvidence(
+            driver=source_device.driver,
+            connected=source_device.connected,
+            bean_temp_c=source_device.bean_temp_c,
+            env_temp_c=source_device.env_temp_c,
+            heat_level_percent=source_device.heat_level_percent,
+            fan_level_percent=source_device.fan_level_percent,
+            cooling_on=source_device.cooling_on,
+            raw_vendor_data=dict(source_device.raw_vendor_data),
+        )
+
     return _construct(
         lambda: ColdTickRecord(
             schema_version=1,
@@ -166,15 +205,13 @@ def build_tick_record(
             monotonic_seconds=monotonic_seconds,
             identity_sha256=header.identity_sha256,
             tick=tick,
-            bean_temp_c=device_state.bean_temp_c,
-            env_temp_c=device_state.env_temp_c,
-            heat_level_percent=device_state.heat_level_percent,
-            fan_level_percent=device_state.fan_level_percent,
-            cooling_on=device_state.cooling_on,
-            connected=device_state.connected,
+            device=_device(),
+            roast_fan=ColdTickRoastFanEvidence(
+                outcome=_roast_fan_member(observation.roast_fan.outcome.value),
+                roast_fan_level_percent=source_fan.roast_fan_level_percent,
+            ),
             audio=projection.audio,
             raw_audio_extra=dict(projection.raw_audio_extra),
-            raw_vendor_data=dict(device_state.raw_vendor_data),
         ),
         ColdTickRecord,
     )

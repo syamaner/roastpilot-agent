@@ -44,6 +44,7 @@ from tests.test_cold_characterisation_evidence_builders import (
     finalisation_payload,
     header_for,
     host_for,
+    observation,
 )
 from tests.test_cold_characterisation_evidence_reader import envelope_of, identity_document, read
 from tests.test_cold_characterisation_evidence_store import (
@@ -212,8 +213,7 @@ def tick_record(header: schema.ColdRunHeader, index: int, audio: Json) -> schema
         tick=index,
         recorded_at_utc="2026-09-26T12:00:01Z",
         monotonic_seconds=2.0 + index,
-        device_state=device_state(),
-        projection=schema.project_tick_audio(audio),
+        observation=observation(device_state(), audio=audio),
     )
 
 
@@ -555,10 +555,38 @@ def _foreign_run_id(run: reader.ColdRetainedRun) -> object:
     return rebuilt(run, run_id="20260926T120000Z-foreign")
 
 
-def _invalid_tick(run: reader.ColdRetainedRun) -> object:
+def _roast_fan_forge(
+    tick: schema.ColdTickRecord, outcome: schema.ColdTickRoastFanOutcome, level: int | None
+) -> schema.ColdTickRecord:
+    """Copy a tick with an unvalidated nested roast-fan pair (no top-level key added)."""
+    forged_fan = tick.roast_fan.model_copy(
+        update={"outcome": outcome, "roast_fan_level_percent": level}
+    )
+    return tick.model_copy(update={"roast_fan": forged_fan})
+
+
+def _invalid_tick_record(run: reader.ColdRetainedRun) -> schema.ColdTickRecord:
     tick = typing.cast(schema.ColdTickRecord, container(run, OFF, Stream.TICK).records[0])
-    forged = tick.model_copy(update={"heat_level_percent": 101})
+    return _roast_fan_forge(tick, schema.ColdTickRoastFanOutcome.OBSERVED, 101)
+
+
+def _invalid_tick(run: reader.ColdRetainedRun) -> object:
+    forged = _invalid_tick_record(run)
     return rebuilt(run, streams=replaced(run, OFF, Stream.TICK, _single(OFF, Stream.TICK, forged)))
+
+
+def test_invalid_tick_forge_fails_for_the_pairing_reason(tmp_path: Path) -> None:
+    """T-E15: the forge is a D197 pairing breach, not an unknown top-level key."""
+    run, _records = genuine(tmp_path)
+    forged = _invalid_tick_record(run)
+    assert set(forged.__dict__) == set(schema.ColdTickRecord.model_fields)
+    with pytest.raises(schema.ColdEvidenceError) as raised:
+        schema.validate_record(forged)
+    assert raised.value.failure is schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED
+    tick = typing.cast(schema.ColdTickRecord, container(run, OFF, Stream.TICK).records[0])
+    control = _roast_fan_forge(tick, schema.ColdTickRoastFanOutcome.NOT_ELIGIBLE, None)
+    assert set(control.__dict__) == set(schema.ColdTickRecord.model_fields)
+    assert isinstance(schema.validate_record(control), schema.ColdTickRecord)
 
 
 def _misbound_tick(run: reader.ColdRetainedRun) -> object:
@@ -1029,6 +1057,43 @@ def test_admissible_identity_passes_and_yields_facts(tmp_path: Path) -> None:
         session_ror_window_seconds=60,
         session_ror_min_sample_seconds=10,
     )
+
+
+def test_minimum_positive_profile_counts_qualify_as_facts(tmp_path: Path) -> None:
+    """Q11: one ONNX thread and one positive window are admissible and copied exactly."""
+    minimum: dict[str, object] = {
+        "effective_mcp_profile.first_crack_onnx_threads": 1,
+        "effective_mcp_profile.first_crack_min_positive_windows": 1,
+    }
+    item = interpret_phase(tmp_path, OFF, document=applying(minimum))
+    assert qualification(item).outcome is Outcome.PASS and qualification(item).failures == ()
+    assert item.identity_facts is not None
+    assert item.identity_facts.first_crack_onnx_threads == 1
+    assert item.identity_facts.first_crack_min_positive_windows == 1
+
+
+# 32 [A-Za-z0-9] characters: 8 symbols twice and 4 symbols four times, which is
+# exactly 3.5 bits in binary floating point (2.0 + 1.5, both exact).
+EXACT_LIMIT_TOKEN = "ABCDEFGH" * 2 + "wxyz" * 4
+
+
+def test_exact_entropy_limit_token_is_refused_by_frozen_and_live_screens(
+    tmp_path: Path,
+) -> None:
+    """Q7: a token scoring exactly 3.5 is refused by the frozen copy and the live screen."""
+    text = f"note {EXACT_LIMIT_TOKEN} end"
+    frozen_entropy = acceptance._shannon_entropy(EXACT_LIMIT_TOKEN)  # pyright: ignore[reportPrivateUsage]
+    live_entropy = live._shannon_entropy(EXACT_LIMIT_TOKEN)  # pyright: ignore[reportPrivateUsage]
+    assert frozen_entropy == live_entropy == 3.5
+    assert acceptance._CREDENTIAL_SHAPE_PATTERN.search(text) is None  # pyright: ignore[reportPrivateUsage]
+    assert not acceptance._operator_text_is_safe(text)  # pyright: ignore[reportPrivateUsage]
+    assert not live._operator_text_is_safe(text)  # pyright: ignore[reportPrivateUsage]
+    below = "note " + "ABCDEFGH" * 3 + " end"
+    assert acceptance._operator_text_is_safe(below)  # pyright: ignore[reportPrivateUsage]
+    assert live._operator_text_is_safe(below)  # pyright: ignore[reportPrivateUsage]
+    item = interpret_phase(tmp_path, OFF, document=applying({"operator_psu_notes": text}))
+    assert qualification(item).failures == (F.Q_OPERATOR_TEXT,)
+    assert item.identity_facts is None
 
 
 def test_editable_source_without_a_digest_qualifies(tmp_path: Path) -> None:

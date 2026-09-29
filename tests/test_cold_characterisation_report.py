@@ -54,6 +54,7 @@ from tests.test_cold_characterisation_evidence_builders import (
     device_state,
     finalisation_payload,
     host_sample,
+    observation,
 )
 from tests.test_cold_characterisation_evidence_reader import envelope_of, identity_document
 from tests.test_cold_characterisation_evidence_store import (
@@ -227,8 +228,7 @@ def tick_record(
         tick=index,
         recorded_at_utc=text,
         monotonic_seconds=seconds,
-        device_state=state,
-        projection=schema.project_tick_audio(audio),
+        observation=observation(state, audio=audio),
     )
 
 

@@ -20,7 +20,10 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdEvidenceFailure,
     ColdPhaseKind,
     ColdTickAudioSample,
+    ColdTickDeviceEvidence,
     ColdTickRecord,
+    ColdTickRoastFanEvidence,
+    ColdTickRoastFanOutcome,
     _canonical_json,  # pyright: ignore[reportPrivateUsage]
     validate_record,
 )
@@ -2290,6 +2293,8 @@ async def test_read_time_vendor_cap_matches_persistence() -> None:
     client, _ = await _started_client(_cold_state_payload())
     observation = await client.get_roast_state()
     vendor = _vendor_of_size(MAX_VENDOR_BLOB_BYTES)
+    device = observation.device
+    assert device is not None
     record = ColdTickRecord.model_validate(
         {
             "schema_version": 1,
@@ -2300,19 +2305,27 @@ async def test_read_time_vendor_cap_matches_persistence() -> None:
             "monotonic_seconds": 1.0,
             "identity_sha256": "a" * 64,
             "tick": 0,
-            "bean_temp_c": None,
-            "env_temp_c": None,
-            "heat_level_percent": 0,
-            "fan_level_percent": 0,
-            "cooling_on": False,
-            "connected": True,
+            "device": ColdTickDeviceEvidence(
+                driver=device.driver,
+                connected=device.connected,
+                bean_temp_c=device.bean_temp_c,
+                env_temp_c=device.env_temp_c,
+                heat_level_percent=device.heat_level_percent,
+                fan_level_percent=device.fan_level_percent,
+                cooling_on=device.cooling_on,
+                raw_vendor_data=json.loads(_canonical_json(vendor)),
+            ),
+            "roast_fan": ColdTickRoastFanEvidence(
+                outcome=ColdTickRoastFanOutcome(observation.roast_fan.outcome.value),
+                roast_fan_level_percent=observation.roast_fan.roast_fan_level_percent,
+            ),
             "audio": observation.audio.audio,
-            "raw_vendor_data": vendor,
         }
     )
     validated = validate_record(record)
     assert type(validated) is ColdTickRecord
-    assert validated.raw_vendor_data == vendor
+    assert validated.device is not None
+    assert validated.device.raw_vendor_data == vendor
     fixed: dict[str, object] = {"b": [1, 2.5, None], "a": "é", "c": {"z": True}}
     local = cold_mcp._canonical_vendor_json(fixed)  # pyright: ignore[reportPrivateUsage]
     assert local == _canonical_json(fixed)
