@@ -868,12 +868,20 @@ def test_raw_extraction_refuses_all_constructed_shape_and_budget_breaches(
     )
     monkeypatch.setattr(evidence, "MAX_JSON_NODES", 1 + len(root_fields) + nested_field_count)
     assert extract(tick, [0])["tick"] == 0
-    map_record = _with_vendor(tick, {"one": 1})
-    with pytest.raises(evidence.ColdEvidenceError):
+    # ``raw_audio_extra`` is the final retained map, so it is copied only after
+    # every other node is counted: its one child reaches the dict/list budget
+    # guards themselves rather than an earlier nested-model guard.
+    assert tuple(evidence.ColdTickRecord.model_fields)[-1] == "raw_audio_extra"
+    map_record = tick.model_copy(update={"raw_audio_extra": {"one": 1}})
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
         extract(map_record, [0])
-    list_record = _with_vendor(tick, [1])
-    with pytest.raises(evidence.ColdEvidenceError):
+    assert raised.value.failure is evidence.ColdEvidenceFailure.JSON_NODE_LIMIT_EXCEEDED
+    list_record = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
+        **(dict(tick) | {"raw_audio_extra": [1]})
+    )
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
         extract(list_record, [0])
+    assert raised.value.failure is evidence.ColdEvidenceFailure.JSON_NODE_LIMIT_EXCEEDED
 
     host = evidence.ColdHostRecord(
         **_common("host"),
@@ -2370,6 +2378,8 @@ def _device_with_unknown_key() -> evidence.ColdTickRecord:
 _STRICT_DEVICE_REFUSALS: dict[str, typing.Callable[[], evidence.ColdTickRecord]] = {
     "bool-for-level": lambda: _with_device(_tick(), heat_level_percent=True),
     "string-for-level": lambda: _with_device(_tick(), fan_level_percent="0"),
+    "int-for-bean-temperature": lambda: _with_device(_tick(), bean_temp_c=20),
+    "int-for-env-temperature": lambda: _with_device(_tick(), env_temp_c=20),
     "unknown-device-key": _device_with_unknown_key,
     "undeclared-model-in-device": lambda: _with_device(_tick(), bean_temp_c=_tick().audio),
     "wrong-model-at-device-edge": lambda: typing.cast(
@@ -2391,6 +2401,31 @@ def test_t_e5_nested_tick_evidence_is_strict_at_ingress(name: str) -> None:
     assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED
     assert raised.value.args == ("Cold evidence admission failed.",)
     assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+@pytest.mark.parametrize("field_name", ["bean_temp_c", "env_temp_c"])
+@pytest.mark.parametrize("value", [20, True, "20.0"], ids=["int", "bool", "string"])
+def test_t_e5_temperatures_are_exact_float_or_null(field_name: str, value: object) -> None:
+    """T-E5: a non-float temperature is refused, never coerced, directly and at ingress."""
+    with pytest.raises(pydantic.ValidationError):
+        _device(**{field_name: value})
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(_with_device(_tick(), **{field_name: value}))
+    assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+def test_t_e5_exact_float_and_null_temperatures_are_admitted() -> None:
+    """T-E5 control: floats and nulls pass unchanged; integer command levels stay unbounded."""
+    for bean, env in ((21.5, None), (None, 20.0), (-0.5, 250.25)):
+        device = _device(bean_temp_c=bean, env_temp_c=env, heat_level_percent=150)
+        validated = _validate_tick(_tick().model_copy(update={"device": device}))
+        assert validated.device is not None
+        assert (validated.device.bean_temp_c, validated.device.env_temp_c) == (bean, env)
+        assert type(validated.device.bean_temp_c) is type(bean)
+        assert type(validated.device.env_temp_c) is type(env)
+        assert validated.device.heat_level_percent == 150
+        assert type(validated.device.heat_level_percent) is int
 
 
 def test_t_e5_driver_text_is_byte_bounded() -> None:

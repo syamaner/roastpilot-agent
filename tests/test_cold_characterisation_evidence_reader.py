@@ -324,7 +324,7 @@ def _replaced(old: bytes, new: bytes) -> LineMaker:
     [
         (line_maker(lambda r: _tick_line(r, tick="1")), Failure.LINE_MALFORMED),
         (line_maker(_int_for_bool_device_line), Failure.LINE_MALFORMED),
-        (line_maker(_int_for_float_device_line), Failure.LINE_NOT_CANONICAL),
+        (line_maker(_int_for_float_device_line), Failure.LINE_MALFORMED),
         (line_maker(lambda r: _tick_line(r, monotonic_seconds=2)), Failure.LINE_NOT_CANONICAL),
         (line_maker(lambda r: _tick_line(r, schema_version=2)), Failure.SCHEMA_VERSION_UNKNOWN),
         (line_maker(lambda r: _tick_line(r, schema_version=True)), Failure.SCHEMA_VERSION_UNKNOWN),

@@ -540,7 +540,7 @@ class ColdRunHeader(pydantic.BaseModel):
 
 
 class ColdTickRoastFanOutcome(enum.Enum):
-    """Closed recorded commanded-roast-fan outcomes (D197), carrying no verdict."""
+    """Closed recorded commanded-roast-fan read outcomes (D197); record-only data."""
 
     OBSERVED = "observed"
     NOT_ELIGIBLE = "not_eligible"
@@ -567,6 +567,14 @@ class ColdTickDeviceEvidence(pydantic.BaseModel):
     fan_level_percent: int
     cooling_on: bool
     raw_vendor_data: dict[str, ColdJsonValue]
+
+    @pydantic.field_validator("bean_temp_c", "env_temp_c", mode="before")
+    @classmethod
+    def _require_exact_float_temperature(cls, value: object) -> object:
+        """Refuse an int (or any non-float) temperature instead of coercing it."""
+        if value is None or type(value) is float:
+            return value
+        raise ValueError("temperature must be an exact float or null")
 
 
 class ColdTickRoastFanEvidence(pydantic.BaseModel):
