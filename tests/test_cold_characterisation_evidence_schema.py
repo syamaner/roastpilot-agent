@@ -28,6 +28,9 @@ from roastpilot_agent.cold_characterisation.identity import (
     identity_sha256,
 )
 from roastpilot_agent.cold_characterisation.mcp import (
+    ColdRoastFanOutcome,
+    ColdTickDeviceState,
+    ColdTickRoastFanObservation,
     DisconnectEvidence,
     DriverCommandStateEvidence,
     DriverEvidenceRead,
@@ -109,19 +112,79 @@ def _common(stream: str) -> dict[str, typing.Any]:
     }
 
 
+def _device(**overrides: typing.Any) -> evidence.ColdTickDeviceEvidence:
+    """Return one valid synthetic per-tick device evidence copy."""
+    values: dict[str, typing.Any] = {
+        "driver": "mock",
+        "connected": True,
+        "bean_temp_c": None,
+        "env_temp_c": None,
+        "heat_level_percent": 0,
+        "fan_level_percent": 0,
+        "cooling_on": False,
+        "raw_vendor_data": {},
+    }
+    values.update(overrides)
+    return evidence.ColdTickDeviceEvidence(**values)
+
+
+def _roast_fan(
+    outcome: evidence.ColdTickRoastFanOutcome = evidence.ColdTickRoastFanOutcome.OBSERVED,
+    level: int | None = 0,
+) -> evidence.ColdTickRoastFanEvidence:
+    """Return one valid synthetic commanded roast-fan evidence copy."""
+    return evidence.ColdTickRoastFanEvidence(outcome=outcome, roast_fan_level_percent=level)
+
+
+def _tick_body() -> dict[str, typing.Any]:
+    """Return the valid tick-specific (non-common) record fields."""
+    return {
+        "tick": 0,
+        "device": _device(),
+        "roast_fan": _roast_fan(),
+        "audio": evidence.project_tick_audio(_audio_payload()).audio,
+    }
+
+
 def _tick() -> evidence.ColdTickRecord:
     """Return a valid synthetic tick record."""
-    return evidence.ColdTickRecord(
-        **_common("tick"),
-        tick=0,
-        bean_temp_c=None,
-        env_temp_c=None,
-        heat_level_percent=0,
-        fan_level_percent=0,
-        cooling_on=False,
-        connected=True,
-        audio=evidence.project_tick_audio(_audio_payload()).audio,
+    return evidence.ColdTickRecord(**_common("tick"), **_tick_body())
+
+
+def _with_device(tick: evidence.ColdTickRecord, **update: object) -> evidence.ColdTickRecord:
+    """Return an unvalidated tick whose nested device fields are replaced."""
+    device = tick.device
+    assert device is not None
+    constructed = typing.cast(typing.Any, evidence.ColdTickDeviceEvidence).model_construct(
+        **(dict(device) | update)
     )
+    return typing.cast(
+        evidence.ColdTickRecord,
+        typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
+            **(dict(tick) | {"device": constructed})
+        ),
+    )
+
+
+def _with_vendor(tick: evidence.ColdTickRecord, vendor: object) -> evidence.ColdTickRecord:
+    """Return an unvalidated tick whose nested device vendor data is replaced."""
+    return _with_device(tick, raw_vendor_data=vendor)
+
+
+def _with_free_form(
+    tick: evidence.ColdTickRecord, field_name: str, value: object
+) -> evidence.ColdTickRecord:
+    """Place one value in a tick's free-form map named by its retained field name."""
+    if field_name == "raw_vendor_data":
+        return _with_vendor(tick, value)
+    return tick.model_copy(update={field_name: value})
+
+
+def _vendor_of(record: evidence.ColdEvidenceRecord) -> object:
+    """Return a validated tick's nested device vendor data."""
+    assert type(record) is evidence.ColdTickRecord
+    assert record.device is not None
+    return record.device.raw_vendor_data
 
 
 def test_projection_requires_every_declared_audio_field() -> None:
@@ -212,17 +275,7 @@ def test_configs_and_rust_patterns_preserve_the_ratified_absolute_grammar() -> N
         payload = _common("tick")
         payload["run_id"] = run_id
         with pytest.raises(pydantic.ValidationError):
-            evidence.ColdTickRecord(
-                **payload,
-                tick=0,
-                bean_temp_c=None,
-                env_temp_c=None,
-                heat_level_percent=0,
-                fan_level_percent=0,
-                cooling_on=False,
-                connected=True,
-                audio=evidence.project_tick_audio(_audio_payload()).audio,
-            )
+            evidence.ColdTickRecord(**payload, **_tick_body())
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
@@ -544,15 +597,10 @@ def test_validate_record_revalidates_constructed_nested_data_and_copies_maps() -
     tick = _tick()
     assert evidence.validate_record(tick) == tick
     raw = {"vendor": [1]}
-    constructed = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
-        **(tick.model_dump() | {"raw_vendor_data": raw})
-    )
-    validated = typing.cast(
-        evidence.ColdTickRecord,
-        evidence.validate_record(typing.cast(evidence.ColdEvidenceRecord, constructed)),
-    )
+    constructed = _with_vendor(tick, raw)
+    validated = evidence.validate_record(constructed)
     raw["vendor"].append(2)
-    assert validated.raw_vendor_data == {"vendor": [1]}
+    assert _vendor_of(validated) == {"vendor": [1]}
 
     unsafe_evaluation = typing.cast(typing.Any, evidence.ColdSafetyEvaluation).model_construct(
         rule="all_clear",
@@ -671,9 +719,7 @@ def test_validate_record_bounds_constructed_cycles_and_unknown_shapes_before_ada
     tick = _tick()
     cyclic: dict[str, object] = {}
     cyclic["self"] = cyclic
-    constructed = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
-        **(tick.model_dump() | {"raw_vendor_data": cyclic})
-    )
+    constructed = _with_vendor(tick, cyclic)
     with pytest.raises(evidence.ColdEvidenceError) as raised:
         evidence.validate_record(typing.cast(evidence.ColdEvidenceRecord, constructed))
     assert raised.value.failure is evidence.ColdEvidenceFailure.JSON_DEPTH_EXCEEDED
@@ -706,11 +752,11 @@ def test_validate_record_rejects_foreign_instance_and_record_caps(
 
 def test_raw_extraction_covers_closed_graph_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Raw extraction copies every admitted scalar/container shape before the adapter."""
-    tick = _tick().model_copy(update={"raw_vendor_data": {"nested": [None, True, 1, 1.5, "text"]}})
+    tick = _with_vendor(_tick(), {"nested": [None, True, 1, 1.5, "text"]})
     private_name = "_" + "extract_model"
     extract = getattr(evidence, private_name)
     extracted = extract(tick, [0])
-    assert extracted["raw_vendor_data"] == {"nested": [None, True, 1, 1.5, "text"]}
+    assert extracted["device"]["raw_vendor_data"] == {"nested": [None, True, 1, 1.5, "text"]}
     monkeypatch.setattr(evidence, "MAX_TEXT_FIELD_BYTES", 1)
     with pytest.raises(evidence.ColdEvidenceError) as raised:
         extract(tick, [0])
@@ -783,18 +829,14 @@ def test_raw_extraction_refuses_all_constructed_shape_and_budget_breaches(
         {"vendor": 10**evidence.MAX_INT_DIGITS},
         {"vendor": float("nan")},
     ):
-        constructed = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
-            **(tick.model_dump() | {"raw_vendor_data": hostile})
-        )
+        constructed = _with_vendor(tick, hostile)
         with pytest.raises(evidence.ColdEvidenceError):
             extract(constructed, [0])
 
     deep: object = []
     for _ in range(evidence.MAX_JSON_DEPTH + 1):
         deep = [deep]
-    constructed = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
-        **(tick.model_dump() | {"raw_vendor_data": {"deep": deep}})
-    )
+    constructed = _with_vendor(tick, {"deep": deep})
     with pytest.raises(evidence.ColdEvidenceError):
         extract(constructed, [0])
 
@@ -802,9 +844,7 @@ def test_raw_extraction_refuses_all_constructed_shape_and_budget_breaches(
         """Hostile non-exact mapping for raw extraction."""
 
     for hostile in (MappingSubclass(), object()):
-        constructed = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
-            **(tick.model_dump() | {"raw_vendor_data": hostile})
-        )
+        constructed = _with_vendor(tick, hostile)
         with pytest.raises(evidence.ColdEvidenceError):
             extract(constructed, [0])
 
@@ -818,13 +858,20 @@ def test_raw_extraction_refuses_all_constructed_shape_and_budget_breaches(
         extract(tick, [0])
     root_aggregate = [0]
     root_fields = getattr(evidence, "_" + "extract_model_fields")(tick, root_aggregate)
-    monkeypatch.setattr(evidence, "MAX_JSON_NODES", len(root_fields) + 21)
-    map_record = tick.model_copy(update={"raw_vendor_data": {"one": 1}})
+    nested_field_count = sum(
+        len(model.model_fields)
+        for model in (
+            evidence.ColdTickAudioSample,
+            evidence.ColdTickDeviceEvidence,
+            evidence.ColdTickRoastFanEvidence,
+        )
+    )
+    monkeypatch.setattr(evidence, "MAX_JSON_NODES", 1 + len(root_fields) + nested_field_count)
+    assert extract(tick, [0])["tick"] == 0
+    map_record = _with_vendor(tick, {"one": 1})
     with pytest.raises(evidence.ColdEvidenceError):
         extract(map_record, [0])
-    list_record = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
-        **(tick.model_dump() | {"raw_vendor_data": [1]})
-    )
+    list_record = _with_vendor(tick, [1])
     with pytest.raises(evidence.ColdEvidenceError):
         extract(list_record, [0])
 
@@ -887,13 +934,11 @@ def test_exact_limits_accept_without_truncation(monkeypatch: pytest.MonkeyPatch)
     )
 
     vendor_overhead = len(_canonical({"vendor": ""}).encode())
-    tick = _tick().model_copy(
-        update={
-            "raw_vendor_data": {"vendor": "x" * (evidence.MAX_VENDOR_BLOB_BYTES - vendor_overhead)}
-        }
+    tick = _with_vendor(
+        _tick(), {"vendor": "x" * (evidence.MAX_VENDOR_BLOB_BYTES - vendor_overhead)}
     )
-    validated = typing.cast(evidence.ColdTickRecord, evidence.validate_record(tick))
-    assert len(_canonical(validated.raw_vendor_data).encode()) == evidence.MAX_VENDOR_BLOB_BYTES
+    validated = evidence.validate_record(tick)
+    assert len(_canonical(_vendor_of(validated)).encode()) == evidence.MAX_VENDOR_BLOB_BYTES
 
     control_count, tail = divmod(evidence.MAX_ENVELOPE_BYTES - 8, 6)
     canonical = '{"x":"' + ("\\u0001" * control_count) + ("a" * tail) + '"}'
@@ -1015,18 +1060,29 @@ def test_union_advisory_and_record_surfaces_are_closed() -> None:
         "monotonic_seconds",
         "identity_sha256",
         "tick",
-        "bean_temp_c",
-        "env_temp_c",
-        "heat_level_percent",
-        "fan_level_percent",
-        "cooling_on",
-        "connected",
+        "device",
+        "roast_fan",
         "audio",
         "raw_audio_extra",
-        "raw_vendor_data",
     }
     assert not {"main_fan", "drum", "solenoid", "verdict"} & set(
         evidence.ColdTickRecord.model_fields
+    )
+    # D197 names ``fan_level_percent`` the main fan; no other main-fan, drum,
+    # solenoid, or verdict field is retained per tick.
+    assert {"main_fan", "drum", "solenoid", "verdict"} & set(
+        evidence.ColdTickDeviceEvidence.model_fields
+    ) == set()
+    assert not {"main_fan", "drum", "solenoid", "verdict"} & set(
+        evidence.ColdTickRoastFanEvidence.model_fields
+    )
+    assert evidence.ColdTickRecord.model_fields["device"].is_required()
+    assert evidence.ColdTickRecord.model_fields["roast_fan"].is_required()
+    assert all(
+        field.is_required() for field in evidence.ColdTickDeviceEvidence.model_fields.values()
+    )
+    assert all(
+        field.is_required() for field in evidence.ColdTickRoastFanEvidence.model_fields.values()
     )
     assert tuple(evidence.ColdEvidenceStream) == (
         evidence.ColdEvidenceStream.HEADER,
@@ -1096,12 +1152,13 @@ def test_construct_copy_snapshot_and_no_warning_boundary_cases(
     )
     with pytest.raises(evidence.ColdEvidenceError):
         evidence.validate_record(tick.model_copy(update={"audio": missing_counter}))
-    copied = tick.model_copy(update={"heat_level_percent": 101})
+    unpaired_fan = typing.cast(typing.Any, evidence.ColdTickRoastFanEvidence).model_construct(
+        outcome=evidence.ColdTickRoastFanOutcome.OBSERVED, roast_fan_level_percent=101
+    )
+    copied = tick.model_copy(update={"roast_fan": unpaired_fan})
     with pytest.raises(evidence.ColdEvidenceError):
         evidence.validate_record(copied)
-    hostile = typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
-        **(tick.model_dump() | {"raw_vendor_data": {"hostile": object()}})
-    )
+    hostile = _with_vendor(tick, {"hostile": object()})
     dump_calls: list[object] = []
     original_dump = evidence.ColdTickRecord.model_dump
 
@@ -1159,6 +1216,7 @@ def test_contract_annotations_union_and_all_anchored_consumers_are_exact() -> No
         evidence.ColdAdvisorFailureKind,
         evidence.ColdAbortDomain,
         evidence.ColdOperatorAbortReason,
+        evidence.ColdTickRoastFanOutcome,
     ):
         assert issubclass(enum_type, enum.Enum)
         assert not issubclass(enum_type, enum.StrEnum)
@@ -1201,17 +1259,7 @@ def test_contract_annotations_union_and_all_anchored_consumers_are_exact() -> No
         values = _common("tick")
         values["identity_sha256"] = digest
         with pytest.raises(pydantic.ValidationError):
-            evidence.ColdTickRecord(
-                **values,
-                tick=0,
-                bean_temp_c=None,
-                env_temp_c=None,
-                heat_level_percent=0,
-                fan_level_percent=0,
-                cooling_on=False,
-                connected=True,
-                audio=evidence.project_tick_audio(_audio_payload()).audio,
-            )
+            evidence.ColdTickRecord(**values, **_tick_body())
     assert evidence.ColdSealedEnvelope.model_fields["sha256"].metadata[0].pattern == getattr(
         evidence, "_" + "SHA256_RUST_PATTERN"
     )
@@ -1347,9 +1395,15 @@ def test_persisted_raw_empty_container_at_exact_depth_is_admitted() -> None:
     nested: evidence.ColdJsonValue = []
     for _ in range(evidence.MAX_JSON_DEPTH - 2):
         nested = [nested]
-    tick = _tick().model_copy(update={"raw_vendor_data": {"nested": nested}})
+    tick = _tick().model_copy(update={"raw_audio_extra": {"nested": nested}})
     validated = typing.cast(evidence.ColdTickRecord, evidence.validate_record(tick))
-    assert validated.raw_vendor_data == {"nested": nested}
+    assert validated.raw_audio_extra == {"nested": nested}
+    # Vendor data sits one level deeper, inside the nested device evidence.
+    vendor_tick = _with_vendor(_tick(), {"nested": nested[0]})
+    assert _vendor_of(evidence.validate_record(vendor_tick)) == {"nested": nested[0]}
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(_with_vendor(_tick(), {"nested": [nested]}))
+    assert raised.value.failure is evidence.ColdEvidenceFailure.JSON_DEPTH_EXCEEDED
 
 
 def test_walker_closes_unencodable_unicode_without_exception_chain() -> None:
@@ -1435,15 +1489,10 @@ def test_record_union_has_six_closed_streams_and_abort_pairs() -> None:
             "monotonic_seconds",
             "identity_sha256",
             "tick",
-            "bean_temp_c",
-            "env_temp_c",
-            "heat_level_percent",
-            "fan_level_percent",
-            "cooling_on",
-            "connected",
+            "device",
+            "roast_fan",
             "audio",
             "raw_audio_extra",
-            "raw_vendor_data",
         ),
         evidence.ColdHostRecord: (
             "schema_version",
@@ -1501,6 +1550,20 @@ def test_record_union_has_six_closed_streams_and_abort_pairs() -> None:
     assert {type(record) for record in records} == set(expected_fields)
     for record_type, names in expected_fields.items():
         assert tuple(record_type.model_fields) == names
+    assert tuple(evidence.ColdTickDeviceEvidence.model_fields) == (
+        "driver",
+        "connected",
+        "bean_temp_c",
+        "env_temp_c",
+        "heat_level_percent",
+        "fan_level_percent",
+        "cooling_on",
+        "raw_vendor_data",
+    )
+    assert tuple(evidence.ColdTickRoastFanEvidence.model_fields) == (
+        "outcome",
+        "roast_fan_level_percent",
+    )
     for digest in ("A" * 64, "g" * 64, ("a" * 64) + "\n"):
         for record in records:
             with pytest.raises(pydantic.ValidationError):
@@ -1769,6 +1832,22 @@ def test_delivered_model_signatures_are_explicitly_pinned_to_the_bound_base() ->
                 "session_phase_after",
             )
         ),
+        evidence.ColdTickDeviceEvidence: tuple(
+            (name, required)
+            for name in (
+                "driver",
+                "connected",
+                "bean_temp_c",
+                "env_temp_c",
+                "heat_level_percent",
+                "fan_level_percent",
+                "cooling_on",
+                "raw_vendor_data",
+            )
+        ),
+        evidence.ColdTickRoastFanEvidence: tuple(
+            (name, required) for name in ("outcome", "roast_fan_level_percent")
+        ),
     }
     strict_config = {"frozen": True, "extra": "forbid", "strict": True, "allow_inf_nan": False}
     configs = {
@@ -1832,7 +1911,7 @@ def test_validate_record_refuses_models_inside_free_form_tick_maps(
 ) -> None:
     """Free-form JSON maps never admit a schema model at any depth."""
     tick = _tick()
-    hostile = tick.model_copy(update={field_name: container(tick.audio)})
+    hostile = _with_free_form(tick, field_name, container(tick.audio))
     with pytest.raises(evidence.ColdEvidenceError) as raised:
         evidence.validate_record(hostile)
     assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED
@@ -1882,7 +1961,7 @@ def test_free_form_json_refuses_sequence_subclasses_without_introspection() -> N
         assert calls == []
     for field_name in ("raw_vendor_data", "raw_audio_extra"):
         for value in (ListSubclass([1]), (1,), HostileSequence()):
-            hostile = _tick().model_copy(update={field_name: {"nested": [value]}})
+            hostile = _with_free_form(_tick(), field_name, {"nested": [value]})
             with pytest.raises(evidence.ColdEvidenceError) as raised:
                 evidence.validate_record(hostile)
             assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED
@@ -1910,7 +1989,7 @@ def test_validate_record_attributes_each_free_form_map_cap(
     """Each persistence map cap refuses independently of the whole-record cap."""
     payload = {"x": "a" * maximum}
     assert len(_canonical(payload).encode("utf-8")) > maximum
-    tick = _tick().model_copy(update={field_name: payload})
+    tick = _with_free_form(_tick(), field_name, payload)
     assert len(_canonical(tick.model_dump(mode="json")).encode("utf-8")) < evidence.MAX_RECORD_BYTES
     with pytest.raises(evidence.ColdEvidenceError) as raised:
         evidence.validate_record(tick)
@@ -2022,11 +2101,20 @@ def test_every_closed_enum_member_and_record_stream_is_admissible() -> None:
         "operator",
     )
     assert tuple(member.value for member in evidence.ColdOperatorAbortReason) == ("operator_stop",)
+    assert tuple(member.value for member in evidence.ColdTickRoastFanOutcome) == (
+        "observed",
+        "not_eligible",
+        "unsupported",
+        "unreadable",
+        "malformed",
+    )
     assert all(field.is_required() for field in evidence.ColdTickAudioSample.model_fields.values())
     for model in (
         evidence.ColdTickAudioSample,
         evidence.ColdHostSample,
         evidence.ColdSafetyEvaluation,
+        evidence.ColdTickDeviceEvidence,
+        evidence.ColdTickRoastFanEvidence,
     ):
         assert model.model_config == getattr(evidence, "_" + "COLD_EVIDENCE_STRICT_CONFIG")
     for model in (
@@ -2059,31 +2147,11 @@ def test_common_identity_fields_are_absolute_and_version_one_only(run_id: str) -
     values = _common("tick")
     values["run_id"] = run_id
     with pytest.raises(pydantic.ValidationError):
-        evidence.ColdTickRecord(
-            **values,
-            tick=0,
-            bean_temp_c=None,
-            env_temp_c=None,
-            heat_level_percent=0,
-            fan_level_percent=0,
-            cooling_on=False,
-            connected=True,
-            audio=evidence.project_tick_audio(_audio_payload()).audio,
-        )
+        evidence.ColdTickRecord(**values, **_tick_body())
     values = _common("tick")
     values["schema_version"] = 2
     with pytest.raises(pydantic.ValidationError):
-        evidence.ColdTickRecord(
-            **values,
-            tick=0,
-            bean_temp_c=None,
-            env_temp_c=None,
-            heat_level_percent=0,
-            fan_level_percent=0,
-            cooling_on=False,
-            connected=True,
-            audio=evidence.project_tick_audio(_audio_payload()).audio,
-        )
+        evidence.ColdTickRecord(**values, **_tick_body())
 
 
 def test_scope_and_import_fence_are_closed() -> None:
@@ -2220,3 +2288,174 @@ def test_finalisation_capability_pairs_unpaired_or_disagreeing_refuse(
         _finalisation_pair(observed, branch)
     assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED
     assert raised.value.__context__ is None
+
+
+# ------------------------------------------------------- 4d nested tick evidence
+
+_MCP_ROAST_FAN_OUTCOME = ColdRoastFanOutcome
+_MCP_DEVICE_STATE = ColdTickDeviceState
+_MCP_ROAST_FAN_OBSERVATION = ColdTickRoastFanObservation
+
+
+def _validate_tick(tick: evidence.ColdTickRecord) -> evidence.ColdTickRecord:
+    """Return a validated tick snapshot through the persistence ingress."""
+    validated = evidence.validate_record(tick)
+    assert type(validated) is evidence.ColdTickRecord
+    return validated
+
+
+def _with_roast_fan(
+    tick: evidence.ColdTickRecord, outcome: object, level: object
+) -> evidence.ColdTickRecord:
+    """Return an unvalidated tick carrying one constructed roast-fan pair."""
+    constructed = typing.cast(typing.Any, evidence.ColdTickRoastFanEvidence).model_construct(
+        outcome=outcome, roast_fan_level_percent=level
+    )
+    return typing.cast(
+        evidence.ColdTickRecord,
+        typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
+            **(dict(tick) | {"roast_fan": constructed})
+        ),
+    )
+
+
+_OBSERVED = evidence.ColdTickRoastFanOutcome.OBSERVED
+_NOT_ELIGIBLE = evidence.ColdTickRoastFanOutcome.NOT_ELIGIBLE
+_INVALID_ROAST_FAN_PAIRS: list[tuple[evidence.ColdTickRoastFanOutcome, object]] = [
+    (_OBSERVED, None),
+    (_NOT_ELIGIBLE, 0),
+    (_OBSERVED, 101),
+    (_OBSERVED, -1),
+]
+
+
+@pytest.mark.parametrize(("outcome", "level"), _INVALID_ROAST_FAN_PAIRS)
+def test_t_e4_roast_fan_pairing_refuses_directly_and_at_ingress(
+    outcome: evidence.ColdTickRoastFanOutcome, level: object
+) -> None:
+    """T-E4: an observed level must be 0..100 and every other outcome must carry null."""
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.ColdTickRoastFanEvidence(
+            outcome=outcome, roast_fan_level_percent=typing.cast(typing.Any, level)
+        )
+    assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(_with_roast_fan(_tick(), outcome, level))
+    assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+@pytest.mark.parametrize("outcome", list(evidence.ColdTickRoastFanOutcome))
+def test_t_e4_every_outcome_with_a_valid_level_is_admitted(
+    outcome: evidence.ColdTickRoastFanOutcome,
+) -> None:
+    """T-E4: each of D197's five outcomes passes with its valid level shape."""
+    levels: list[int | None] = [0, 100] if outcome is _OBSERVED else [None]
+    for level in levels:
+        fan = evidence.ColdTickRoastFanEvidence(outcome=outcome, roast_fan_level_percent=level)
+        validated = _validate_tick(_tick().model_copy(update={"roast_fan": fan}))
+        assert validated.roast_fan.outcome is outcome
+        assert validated.roast_fan.roast_fan_level_percent == level
+
+
+def _device_with_unknown_key() -> evidence.ColdTickRecord:
+    """Return a tick whose nested device carries one undeclared key."""
+    tick = _with_device(_tick())
+    device = tick.device
+    assert device is not None
+    object.__getattribute__(device, "__dict__")["unexpected"] = 1
+    return tick
+
+
+_STRICT_DEVICE_REFUSALS: dict[str, typing.Callable[[], evidence.ColdTickRecord]] = {
+    "bool-for-level": lambda: _with_device(_tick(), heat_level_percent=True),
+    "string-for-level": lambda: _with_device(_tick(), fan_level_percent="0"),
+    "unknown-device-key": _device_with_unknown_key,
+    "undeclared-model-in-device": lambda: _with_device(_tick(), bean_temp_c=_tick().audio),
+    "wrong-model-at-device-edge": lambda: typing.cast(
+        evidence.ColdTickRecord,
+        typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
+            **(dict(_tick()) | {"device": _roast_fan()})
+        ),
+    ),
+    "foreign-outcome-enum": lambda: _with_roast_fan(_tick(), _MCP_ROAST_FAN_OUTCOME.OBSERVED, 0),
+    "string-outcome": lambda: _with_roast_fan(_tick(), "observed", 0),
+}
+
+
+@pytest.mark.parametrize("name", list(_STRICT_DEVICE_REFUSALS))
+def test_t_e5_nested_tick_evidence_is_strict_at_ingress(name: str) -> None:
+    """T-E5: coercible, unknown, foreign, or undeclared nested values refuse closed."""
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(_STRICT_DEVICE_REFUSALS[name]())
+    assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED
+    assert raised.value.args == ("Cold evidence admission failed.",)
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+def test_t_e5_driver_text_is_byte_bounded() -> None:
+    """T-E5: ``driver`` admits exactly ``MAX_TEXT_FIELD_BYTES`` UTF-8 bytes and no more."""
+    at_limit = "x" * evidence.MAX_TEXT_FIELD_BYTES
+    validated = _validate_tick(_with_device(_tick(), driver=at_limit))
+    assert validated.device is not None
+    assert validated.device.driver == at_limit
+    over_by_bytes = "é" * (evidence.MAX_TEXT_FIELD_BYTES // 2 + 1)
+    assert len(over_by_bytes) <= evidence.MAX_TEXT_FIELD_BYTES
+    for driver in ("x" * (evidence.MAX_TEXT_FIELD_BYTES + 1), over_by_bytes):
+        with pytest.raises(evidence.ColdEvidenceError) as raised:
+            evidence.validate_record(_with_device(_tick(), driver=driver))
+        assert raised.value.failure is evidence.ColdEvidenceFailure.TEXT_FIELD_TOO_LARGE
+    with pytest.raises(pydantic.ValidationError):
+        _device(driver="x" * (evidence.MAX_TEXT_FIELD_BYTES + 1))
+
+
+def test_t_e6_vendor_cap_is_exact_and_absent_device_has_no_vendor_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T-E6: the nested vendor cap is exact; ``device=None`` runs no vendor check."""
+    overhead = len(_canonical({"v": ""}).encode())
+    at_cap = {"v": "x" * (evidence.MAX_VENDOR_BLOB_BYTES - overhead)}
+    assert _vendor_of(_validate_tick(_with_vendor(_tick(), at_cap))) == at_cap
+    over = {"v": "x" * (evidence.MAX_VENDOR_BLOB_BYTES - overhead + 1)}
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(_with_vendor(_tick(), over))
+    assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_VENDOR_BLOB_TOO_LARGE
+
+    absent = _tick().model_copy(update={"device": None})
+    monkeypatch.setattr(evidence, "MAX_VENDOR_BLOB_BYTES", 1)
+    validated = _validate_tick(absent)
+    assert validated.device is None
+    assert validated.model_dump(mode="json")["device"] is None
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(_tick())
+    assert raised.value.failure is evidence.ColdEvidenceFailure.RECORD_VENDOR_BLOB_TOO_LARGE
+
+
+def test_t_e8_consumer_owned_tick_contracts_match_the_strict_mcp_projection() -> None:
+    """T-E8: the schema-owned copies stay tied to the strict cold MCP projection."""
+    assert [member.value for member in evidence.ColdTickRoastFanOutcome] == [
+        member.value for member in _MCP_ROAST_FAN_OUTCOME
+    ]
+    assert tuple(evidence.ColdTickDeviceEvidence.model_fields) == tuple(
+        _MCP_DEVICE_STATE.model_fields
+    )
+    for name, field in evidence.ColdTickDeviceEvidence.model_fields.items():
+        upstream = _MCP_DEVICE_STATE.model_fields[name]
+        assert field.annotation == upstream.annotation, name
+        assert field.is_required() and upstream.is_required(), name
+        if name == "driver":
+            assert [type(item).__name__ for item in field.metadata] == ["MaxLen"]
+            assert field.metadata[0].max_length == evidence.MAX_TEXT_FIELD_BYTES
+            assert upstream.metadata == []
+        else:
+            assert field.metadata == upstream.metadata == [], name
+    assert tuple(evidence.ColdTickRoastFanEvidence.model_fields) == tuple(
+        _MCP_ROAST_FAN_OBSERVATION.model_fields
+    )
+    assert (
+        evidence.ColdTickRoastFanEvidence.model_fields["roast_fan_level_percent"].annotation
+        == _MCP_ROAST_FAN_OBSERVATION.model_fields["roast_fan_level_percent"].annotation
+    )
+    for enum_type in (evidence.ColdTickRoastFanOutcome, _MCP_ROAST_FAN_OUTCOME):
+        assert issubclass(enum_type, enum.Enum)
+        assert not issubclass(enum_type, enum.StrEnum)

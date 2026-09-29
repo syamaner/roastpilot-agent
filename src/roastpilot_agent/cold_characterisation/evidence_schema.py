@@ -539,8 +539,62 @@ class ColdRunHeader(pydantic.BaseModel):
         return self
 
 
+class ColdTickRoastFanOutcome(enum.Enum):
+    """Closed recorded commanded-roast-fan outcomes (D197), carrying no verdict."""
+
+    OBSERVED = "observed"
+    NOT_ELIGIBLE = "not_eligible"
+    UNSUPPORTED = "unsupported"
+    UNREADABLE = "unreadable"
+    MALFORMED = "malformed"
+
+
+class ColdTickDeviceEvidence(pydantic.BaseModel):
+    """Exact retained copy of one strict per-tick MCP device projection.
+
+    It records and decides nothing: levels are exact integers with no range
+    bound, so an unsafe or implausible reading is retained rather than refused.
+    ``fan_level_percent`` is the main fan (D197), never roast-fan evidence.
+    """
+
+    model_config = _COLD_EVIDENCE_STRICT_CONFIG
+
+    driver: str = pydantic.Field(max_length=MAX_TEXT_FIELD_BYTES)
+    connected: bool
+    bean_temp_c: float | None
+    env_temp_c: float | None
+    heat_level_percent: int
+    fan_level_percent: int
+    cooling_on: bool
+    raw_vendor_data: dict[str, ColdJsonValue]
+
+
+class ColdTickRoastFanEvidence(pydantic.BaseModel):
+    """Retained commanded, not physical, roast-fan observation for one tick."""
+
+    model_config = _COLD_EVIDENCE_STRICT_CONFIG
+
+    outcome: ColdTickRoastFanOutcome
+    roast_fan_level_percent: int | None
+
+    @pydantic.model_validator(mode="after")
+    def _require_outcome_level_pair(self) -> typing.Self:
+        """Require a 0..100 level only when observed, and null otherwise."""
+        level = self.roast_fan_level_percent
+        if self.outcome is ColdTickRoastFanOutcome.OBSERVED:
+            if type(level) is int and 0 <= level <= 100:
+                return self
+        elif level is None:
+            return self
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+
+
 class ColdTickRecord(pydantic.BaseModel):
-    """One non-actuating device and audio observation."""
+    """One non-actuating device, commanded roast-fan, and audio observation.
+
+    ``device`` is ``None`` exactly when the strict observation had no device
+    state; that absence is recorded and never defaulted or read as clean.
+    """
 
     model_config = _COLD_EVIDENCE_MODEL_CONFIG
 
@@ -552,15 +606,10 @@ class ColdTickRecord(pydantic.BaseModel):
     monotonic_seconds: float
     identity_sha256: str = pydantic.Field(pattern=_SHA256_RUST_PATTERN)
     tick: int = pydantic.Field(ge=0)
-    bean_temp_c: float | None
-    env_temp_c: float | None
-    heat_level_percent: int = pydantic.Field(ge=0, le=100)
-    fan_level_percent: int = pydantic.Field(ge=0, le=100)
-    cooling_on: bool
-    connected: bool
+    device: ColdTickDeviceEvidence | None
+    roast_fan: ColdTickRoastFanEvidence
     audio: ColdTickAudioSample
     raw_audio_extra: dict[str, ColdJsonValue] = pydantic.Field(default_factory=dict)
-    raw_vendor_data: dict[str, ColdJsonValue] = pydantic.Field(default_factory=dict)
 
 
 class ColdHostRecord(pydantic.BaseModel):
@@ -706,6 +755,8 @@ _RECORD_CLASSES = (
 _MODEL_FIELDS: dict[type[pydantic.BaseModel], tuple[str, ...]] = {
     ColdTickAudioSample: tuple(ColdTickAudioSample.model_fields),
     ColdHostSample: tuple(ColdHostSample.model_fields),
+    ColdTickDeviceEvidence: tuple(ColdTickDeviceEvidence.model_fields),
+    ColdTickRoastFanEvidence: tuple(ColdTickRoastFanEvidence.model_fields),
     ColdSafetyEvaluation: tuple(ColdSafetyEvaluation.model_fields),
     ColdSealedEnvelope: tuple(ColdSealedEnvelope.model_fields),
     ColdRunHeader: tuple(ColdRunHeader.model_fields),
@@ -721,6 +772,8 @@ _DECLARED_NESTED_MODEL_EDGES: dict[
 ] = {
     (ColdRunHeader, "identity"): ColdSealedEnvelope,
     (ColdTickRecord, "audio"): ColdTickAudioSample,
+    (ColdTickRecord, "device"): ColdTickDeviceEvidence,
+    (ColdTickRecord, "roast_fan"): ColdTickRoastFanEvidence,
     (ColdHostRecord, "sample"): ColdHostSample,
     (ColdAdvisoryRecord, "evaluation"): ColdSafetyEvaluation,
     (ColdFinalisationRecord, "envelope"): ColdSealedEnvelope,
@@ -742,6 +795,7 @@ _ADMITTED_ENUM_TYPES = (
     ColdAdvisorFailureKind,
     ColdAbortDomain,
     ColdOperatorAbortReason,
+    ColdTickRoastFanOutcome,
 )
 
 
@@ -867,6 +921,7 @@ def _extract_model(value: pydantic.BaseModel, aggregate: list[int]) -> dict[str,
                     (ColdFinalisationRecord, "session_id"),
                     (ColdSafetyEvaluation, "rule"),
                     (ColdSafetyEvaluation, "reason"),
+                    (ColdTickDeviceEvidence, "driver"),
                 }
                 else None
             )
@@ -931,11 +986,12 @@ def validate_record(record: ColdEvidenceRecord) -> ColdEvidenceRecord:
         dumped = validated.model_dump(mode="json")
         _record_bytes(dumped, ColdEvidenceFailure.RECORD_TOO_LARGE, MAX_RECORD_BYTES)
         if type(validated) is ColdTickRecord:
-            _record_bytes(
-                validated.raw_vendor_data,
-                ColdEvidenceFailure.RECORD_VENDOR_BLOB_TOO_LARGE,
-                MAX_VENDOR_BLOB_BYTES,
-            )
+            if validated.device is not None:
+                _record_bytes(
+                    validated.device.raw_vendor_data,
+                    ColdEvidenceFailure.RECORD_VENDOR_BLOB_TOO_LARGE,
+                    MAX_VENDOR_BLOB_BYTES,
+                )
             _record_bytes(
                 validated.raw_audio_extra,
                 ColdEvidenceFailure.RECORD_RAW_AUDIO_EXTRA_TOO_LARGE,
