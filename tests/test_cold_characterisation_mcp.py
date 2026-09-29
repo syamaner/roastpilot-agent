@@ -35,6 +35,8 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdMcpTransportError,
     ColdMcpValidationError,
     ColdModeForbiddenToolError,
+    ColdRoastFanOutcome,
+    ColdRoastFanProjectionFailure,
     ColdSessionIdentityError,
     ColdSessionPhaseError,
     ColdSessionPurposeError,
@@ -42,6 +44,8 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdTickDeviceProjectionError,
     ColdTickDeviceState,
     ColdTickObservation,
+    ColdTickRoastFanObservation,
+    ColdTickRoastFanProjectionError,
     RejectionReason,
     SessionFinalisationResult,
     _finalisation_has_capability_compatible_evidence,  # pyright: ignore[reportPrivateUsage]
@@ -173,6 +177,10 @@ def _cold_state_payload() -> dict[str, object]:
     )
     payload["session_id"] = "session-id"
     payload["session_purpose"] = "cold_characterisation"
+    payload["cold_characterisation_observation"] = {
+        "outcome": "observed",
+        "roast_fan_level_percent": 0,
+    }
     return payload
 
 
@@ -1958,6 +1966,14 @@ async def test_real_child_cold_tick_projects_strictly(
         assert type(device.fan_level_percent) is int
         assert type(device.cooling_on) is bool
         assert type(device.raw_vendor_data) is dict
+        roast_fan = observation.roast_fan
+        assert type(roast_fan) is ColdTickRoastFanObservation
+        assert type(roast_fan.outcome) is ColdRoastFanOutcome
+        if roast_fan.outcome is ColdRoastFanOutcome.OBSERVED:
+            assert type(roast_fan.roast_fan_level_percent) is int
+            assert 0 <= roast_fan.roast_fan_level_percent <= 100
+        else:
+            assert roast_fan.roast_fan_level_percent is None
     finally:
         await process.stop()
     assert not process.running
@@ -1984,6 +2000,7 @@ async def test_cold_tick_observation_is_closed_and_frozen() -> None:
                 "state": observation.state,
                 "audio": observation.audio,
                 "device": observation.device,
+                "roast_fan": observation.roast_fan,
                 "unexpected": 1,
             }
         )
@@ -2595,3 +2612,288 @@ async def test_step_six_guard_refuses_a_scalar_whose_exact_type_changed(
     assert error.failure is ColdDeviceProjectionFailure.FIELD_TYPE_NOT_EXACT
     assert error.field is ColdDeviceField.BEAN_TEMP_C
     assert str(error) == _DEVICE_MESSAGE
+
+
+# --- #954 slice 4c: strict commanded roast-fan observation ------------------
+
+_ROAST_FAN_MESSAGE = "MCP tick roast-fan observation failed strict projection"
+_ROAST_FAN_FIELD = "cold_characterisation_observation"
+
+
+def _roast_fan(payload: dict[str, object]) -> dict[str, object]:
+    """Return the mutable raw commanded-roast-fan mapping from a tick payload."""
+    return cast("dict[str, object]", payload[_ROAST_FAN_FIELD])
+
+
+async def _roast_fan_error(
+    payload: dict[str, object],
+) -> ColdTickRoastFanProjectionError:
+    """Read one tick through the public client and return its fan projection error."""
+    _assert_tolerant_mirror_accepts(payload)
+    client, caller = await _started_client(payload)
+    with pytest.raises(ColdTickRoastFanProjectionError) as raised:
+        await client.get_roast_state()
+    assert len(_state_calls(caller)) == 1
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    return raised.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "level"),
+    [
+        (ColdRoastFanOutcome.OBSERVED, 0),
+        (ColdRoastFanOutcome.OBSERVED, 100),
+        (ColdRoastFanOutcome.NOT_ELIGIBLE, None),
+        (ColdRoastFanOutcome.UNSUPPORTED, None),
+        (ColdRoastFanOutcome.UNREADABLE, None),
+        (ColdRoastFanOutcome.MALFORMED, None),
+    ],
+)
+async def test_cold_tick_projects_closed_roast_fan_outcomes(
+    outcome: ColdRoastFanOutcome, level: int | None
+) -> None:
+    """T-C1: every admitted outcome projects the exact commanded value from one read."""
+    payload = _cold_state_payload()
+    _roast_fan(payload).update({"outcome": outcome.value, "roast_fan_level_percent": level})
+    client, caller = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    assert type(observation.roast_fan) is ColdTickRoastFanObservation
+    assert observation.roast_fan.outcome is outcome
+    assert observation.roast_fan.roast_fan_level_percent == level
+    if outcome is ColdRoastFanOutcome.OBSERVED:
+        assert type(observation.roast_fan.roast_fan_level_percent) is int
+    else:
+        assert observation.roast_fan.roast_fan_level_percent is None
+    assert len(_state_calls(caller)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "failure"),
+    [
+        ("missing", ColdRoastFanProjectionFailure.OBSERVATION_KEY_MISSING),
+        ("null", ColdRoastFanProjectionFailure.OBSERVATION_NULL),
+        ("not_object", ColdRoastFanProjectionFailure.OBSERVATION_NOT_OBJECT),
+        ("extra_key", ColdRoastFanProjectionFailure.FIELD_SET_MISMATCH),
+        ("missing_outcome", ColdRoastFanProjectionFailure.FIELD_SET_MISMATCH),
+        ("bad_outcome", ColdRoastFanProjectionFailure.OUTCOME_NOT_ADMITTED),
+        ("bad_outcome_case", ColdRoastFanProjectionFailure.OUTCOME_NOT_ADMITTED),
+        ("bad_outcome_space", ColdRoastFanProjectionFailure.OUTCOME_NOT_ADMITTED),
+        ("bool_level", ColdRoastFanProjectionFailure.LEVEL_TYPE_NOT_EXACT),
+        ("float_level", ColdRoastFanProjectionFailure.LEVEL_TYPE_NOT_EXACT),
+        ("string_level", ColdRoastFanProjectionFailure.LEVEL_TYPE_NOT_EXACT),
+        ("low_level", ColdRoastFanProjectionFailure.LEVEL_OUT_OF_RANGE),
+        ("high_level", ColdRoastFanProjectionFailure.LEVEL_OUT_OF_RANGE),
+        ("observed_null", ColdRoastFanProjectionFailure.LEVEL_OUTCOME_MISMATCH),
+        ("non_observed_level", ColdRoastFanProjectionFailure.LEVEL_OUTCOME_MISMATCH),
+    ],
+)
+async def test_cold_tick_roast_fan_projection_fails_closed(
+    mutation: str, failure: ColdRoastFanProjectionFailure
+) -> None:
+    """T-C2: every malformed raw roast-fan shape gets one closed failure."""
+    payload = _cold_state_payload()
+    raw = _roast_fan(payload)
+    if mutation == "missing":
+        del payload[_ROAST_FAN_FIELD]
+    elif mutation == "null":
+        payload[_ROAST_FAN_FIELD] = None
+    elif mutation == "not_object":
+        payload[_ROAST_FAN_FIELD] = []
+    elif mutation == "extra_key":
+        raw["main_fan_level_percent"] = 0
+    elif mutation == "missing_outcome":
+        del raw["outcome"]
+    elif mutation == "bad_outcome":
+        raw["outcome"] = "stalled"
+    elif mutation == "bad_outcome_case":
+        raw["outcome"] = "Observed"
+    elif mutation == "bad_outcome_space":
+        raw["outcome"] = " observed"
+    elif mutation == "bool_level":
+        raw["roast_fan_level_percent"] = False
+    elif mutation == "float_level":
+        raw["roast_fan_level_percent"] = 0.0
+    elif mutation == "string_level":
+        raw["roast_fan_level_percent"] = "0"
+    elif mutation == "low_level":
+        raw["roast_fan_level_percent"] = -1
+    elif mutation == "high_level":
+        raw["roast_fan_level_percent"] = 101
+    elif mutation == "observed_null":
+        raw["roast_fan_level_percent"] = None
+    else:
+        raw["outcome"] = "not_eligible"
+        raw["roast_fan_level_percent"] = 0
+
+    error = await _roast_fan_error(payload)
+
+    assert error.failure is failure
+    assert error.args == (_ROAST_FAN_MESSAGE,)
+    assert str(error) == _ROAST_FAN_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_roast_fan_projection_contains_untrusted_value_and_key() -> None:
+    """T-C3: malformed values and keys are never included in public diagnostics."""
+    canary = _numeric_canary()
+    payload = _cold_state_payload()
+    _roast_fan(payload)["roast_fan_level_percent"] = canary
+    error = await _roast_fan_error(payload)
+    assert error.failure is ColdRoastFanProjectionFailure.LEVEL_TYPE_NOT_EXACT
+    _assert_contained(error, canary)
+
+    payload = _cold_state_payload()
+    key = canary + "k" * (MAX_JSON_KEY_BYTES + 1 - len(canary.encode("utf-8")))
+    _roast_fan(payload)[key] = 0
+    error = await _roast_fan_error(payload)
+    assert error.failure is ColdRoastFanProjectionFailure.FIELD_SET_MISMATCH
+    _assert_contained(error, canary)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("earlier", "expected"),
+    [
+        ("identity", ColdSessionIdentityError),
+        ("purpose", ColdSessionPurposeError),
+        ("audio", ColdTickAudioProjectionError),
+        ("device", ColdTickDeviceProjectionError),
+    ],
+)
+async def test_earlier_cold_tick_projections_precede_roast_fan(
+    earlier: str, expected: type[ColdMcpError]
+) -> None:
+    """T-C4: identity, purpose, audio, and device failures win over fan failure."""
+    payload = _cold_state_payload()
+    _roast_fan(payload)["roast_fan_level_percent"] = "0"
+    if earlier == "identity":
+        payload["session_id"] = "other-session"
+    elif earlier == "purpose":
+        payload["session_purpose"] = "roast"
+    elif earlier == "audio":
+        del _first_crack(payload)["max_consecutive_overflow_count"]
+    else:
+        _device(payload)["heat_level_percent"] = "0"
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdMcpError) as raised:
+        await client.get_roast_state()
+
+    assert type(raised.value) is expected
+
+
+@pytest.mark.asyncio
+async def test_tick_state_and_roast_fan_come_from_one_read() -> None:
+    """T-C5: the roast fan shares one response with state even if another differs."""
+    first = _cold_state_payload()
+    second = _cold_state_payload()
+    _roast_fan(second)["roast_fan_level_percent"] = 100
+    caller = _SequencedCaller(
+        {"start_roast_session": [_cold_start_payload()], "get_roast_state": [first, second]}
+    )
+    client = ColdCharacterisationMCPClient(caller)
+    await client.start_cold_session()
+
+    observation = await client.get_roast_state()
+
+    assert observation.roast_fan.roast_fan_level_percent == 0
+    assert [call[0] for call in caller.calls].count("get_roast_state") == 1
+
+
+def test_cold_tick_roast_fan_model_is_closed_and_records_no_verdict() -> None:
+    """T-C6/C7: the strict observation is closed, frozen, and policy-free."""
+    config = dict(ColdTickRoastFanObservation.model_config)
+    assert config == {
+        **config,
+        "strict": True,
+        "frozen": True,
+        "extra": "forbid",
+        "allow_inf_nan": False,
+    }
+    assert set(ColdTickRoastFanObservation.model_fields) == {
+        "outcome",
+        "roast_fan_level_percent",
+    }
+    for outcome in ColdRoastFanOutcome:
+        level = 100 if outcome is ColdRoastFanOutcome.OBSERVED else None
+        observation = ColdTickRoastFanObservation.model_validate(
+            {"outcome": outcome, "roast_fan_level_percent": level}, strict=True
+        )
+        assert not isinstance(observation, SafetyEvaluation | SafetyVerdict)
+    with pytest.raises(ValidationError):
+        ColdTickRoastFanObservation.model_validate(
+            {"outcome": ColdRoastFanOutcome.OBSERVED, "roast_fan_level_percent": None},
+            strict=True,
+        )
+    with pytest.raises(ValidationError):
+        ColdTickRoastFanObservation.model_validate(
+            {
+                "outcome": ColdRoastFanOutcome.OBSERVED,
+                "roast_fan_level_percent": 0,
+                "unexpected": 1,
+            },
+            strict=True,
+        )
+
+
+def test_cold_roast_fan_enums_are_closed_plain_enums() -> None:
+    """T-C6: outcome and failure enums are exact plain enums, never strings."""
+    assert [outcome.value for outcome in ColdRoastFanOutcome] == [
+        "observed",
+        "not_eligible",
+        "unsupported",
+        "unreadable",
+        "malformed",
+    ]
+    for enum_type in (ColdRoastFanOutcome, ColdRoastFanProjectionFailure):
+        assert enum_type.__mro__[1:] == (Enum, object)
+    assert {failure.name for failure in ColdRoastFanProjectionFailure} == {
+        "OBSERVATION_KEY_MISSING",
+        "OBSERVATION_NULL",
+        "OBSERVATION_NOT_OBJECT",
+        "FIELD_SET_MISMATCH",
+        "OUTCOME_NOT_ADMITTED",
+        "LEVEL_TYPE_NOT_EXACT",
+        "LEVEL_OUT_OF_RANGE",
+        "LEVEL_OUTCOME_MISMATCH",
+    }
+
+
+def test_cold_production_code_never_reads_tolerant_roast_fan_observation() -> None:
+    """T-C8: one raw subscript is the only production access to the new key."""
+    target = "cold_" + "characterisation_observation"
+    attributes: list[str] = []
+    getattr_calls: list[str] = []
+    constants: dict[str, list[ast.Constant]] = {}
+    trees = _cold_production_trees()
+    for name, tree in trees.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == target:
+                attributes.append(name)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and any(isinstance(arg, ast.Constant) and arg.value == target for arg in node.args)
+            ):
+                getattr_calls.append(name)
+            if isinstance(node, ast.Constant) and node.value == target:
+                constants.setdefault(name, []).append(node)
+    assert attributes == []
+    assert getattr_calls == []
+    assert sorted(constants) == ["mcp.py"]
+    assert len(constants["mcp.py"]) == 1
+    subscripts = [
+        node
+        for node in ast.walk(trees["mcp.py"])
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Constant)
+        and node.slice.value == target
+    ]
+    assert len(subscripts) == 1
+    assert subscripts[0].slice is constants["mcp.py"][0]

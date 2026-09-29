@@ -97,6 +97,44 @@ class ColdTickAudioProjectionError(ColdMcpValidationError):
         self.field_names = field_names
 
 
+class ColdRoastFanOutcome(Enum):
+    """Closed commanded-roast-fan outcomes returned by a cold tick."""
+
+    OBSERVED = "observed"
+    NOT_ELIGIBLE = "not_eligible"
+    UNSUPPORTED = "unsupported"
+    UNREADABLE = "unreadable"
+    MALFORMED = "malformed"
+
+
+class ColdRoastFanProjectionFailure(Enum):
+    """Closed reasons a raw roast-fan observation fails strict projection."""
+
+    OBSERVATION_KEY_MISSING = "observation_key_missing"
+    OBSERVATION_NULL = "observation_null"
+    OBSERVATION_NOT_OBJECT = "observation_not_object"
+    FIELD_SET_MISMATCH = "field_set_mismatch"
+    OUTCOME_NOT_ADMITTED = "outcome_not_admitted"
+    LEVEL_TYPE_NOT_EXACT = "level_type_not_exact"
+    LEVEL_OUT_OF_RANGE = "level_out_of_range"
+    LEVEL_OUTCOME_MISMATCH = "level_outcome_mismatch"
+
+
+class ColdTickRoastFanProjectionError(ColdMcpValidationError):
+    """Raised when a tick's roast-fan observation fails strict projection."""
+
+    failure: ColdRoastFanProjectionFailure
+
+    def __init__(self, failure: ColdRoastFanProjectionFailure) -> None:
+        """Retain one closed failure behind a fixed public message.
+
+        Args:
+            failure: Closed reason the projection refused the observation.
+        """
+        super().__init__("MCP tick roast-fan observation failed strict projection")
+        self.failure = failure
+
+
 class ColdDeviceField(Enum):
     """Closed names of the eight raw per-tick ``device_state`` fields."""
 
@@ -650,6 +688,38 @@ class ColdTickDeviceState(BaseModel):
     raw_vendor_data: dict[str, ColdJsonValue]
 
 
+class ColdTickRoastFanObservation(BaseModel):
+    """Strict commanded roast-fan state projected from one cold MCP tick.
+
+    This records and decides nothing. It is not physical sensing, and
+    ``device.fan_level_percent`` remains the main-fan value rather than a
+    roast-fan observation.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True, allow_inf_nan=False)
+
+    outcome: ColdRoastFanOutcome
+    roast_fan_level_percent: int | None
+
+    @model_validator(mode="after")
+    def _validate_outcome_level_pair(self) -> "ColdTickRoastFanObservation":
+        """Require a bounded level only for an observed command state.
+
+        Returns:
+            This validated observation.
+
+        Raises:
+            ValueError: If outcome and level presence or bounds disagree.
+        """
+        level = self.roast_fan_level_percent
+        if self.outcome is ColdRoastFanOutcome.OBSERVED:
+            if type(level) is not int or not 0 <= level <= 100:
+                raise ValueError("observed roast fan requires a bounded integer level")
+        elif level is not None:
+            raise ValueError("non-observed roast fan requires a null level")
+        return self
+
+
 #: Exact raw JSON types admitted per device field (compared with ``is``).
 _DEVICE_FIELD_TYPES: dict[ColdDeviceField, tuple[type, ...]] = {
     ColdDeviceField.DRIVER: (str,),
@@ -693,6 +763,9 @@ class ColdTickObservation(BaseModel):
     telemetry only; it is never a pass, a default, or a zero device, and every
     consumer must handle it explicitly.  ``state.device_state`` is tolerant
     telemetry and must never feed cold evidence.
+
+    ``roast_fan`` is the commanded, not physical, roast-fan observation from
+    the same response. The tolerant main-fan telemetry is never used for it.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True, allow_inf_nan=False)
@@ -700,6 +773,7 @@ class ColdTickObservation(BaseModel):
     state: RoastSessionState
     audio: ColdTickProjection
     device: ColdTickDeviceState | None
+    roast_fan: ColdTickRoastFanObservation
 
 
 class ColdCharacterisationMCPClient:
@@ -821,6 +895,73 @@ class ColdCharacterisationMCPClient:
         return device
 
     @staticmethod
+    def _project_roast_fan(tree: dict[str, object]) -> ColdTickRoastFanObservation:
+        """Strictly project the commanded roast-fan observation from one raw tick.
+
+        Args:
+            tree: Raw JSON tree parsed from the same tick response as the state.
+
+        Returns:
+            The closed commanded-state observation.
+
+        Raises:
+            ColdTickRoastFanProjectionError: With one closed projection failure.
+        """
+        failure: ColdRoastFanProjectionFailure | None = None
+        raw: object = None
+        try:
+            raw = tree["cold_characterisation_observation"]
+        except KeyError:
+            failure = ColdRoastFanProjectionFailure.OBSERVATION_KEY_MISSING
+        if failure is None and raw is None:
+            failure = ColdRoastFanProjectionFailure.OBSERVATION_NULL
+        if failure is None and type(raw) is not dict:
+            failure = ColdRoastFanProjectionFailure.OBSERVATION_NOT_OBJECT
+
+        mapping: dict[str, object] | None = None
+        if failure is None:
+            mapping = cast("dict[str, object]", raw)
+            if set(mapping) != {"outcome", "roast_fan_level_percent"}:
+                failure = ColdRoastFanProjectionFailure.FIELD_SET_MISMATCH
+
+        outcome: ColdRoastFanOutcome | None = None
+        level: object = None
+        if failure is None and mapping is not None:
+            raw_outcome = mapping["outcome"]
+            level = mapping["roast_fan_level_percent"]
+            if type(raw_outcome) is not str:
+                failure = ColdRoastFanProjectionFailure.OUTCOME_NOT_ADMITTED
+            else:
+                try:
+                    outcome = ColdRoastFanOutcome(raw_outcome)
+                except ValueError:
+                    failure = ColdRoastFanProjectionFailure.OUTCOME_NOT_ADMITTED
+
+        if failure is None and type(level) not in (int, type(None)):
+            failure = ColdRoastFanProjectionFailure.LEVEL_TYPE_NOT_EXACT
+        if failure is None and type(level) is int and not 0 <= level <= 100:
+            failure = ColdRoastFanProjectionFailure.LEVEL_OUT_OF_RANGE
+        if (
+            failure is None
+            and outcome is not None
+            and (
+                (outcome is ColdRoastFanOutcome.OBSERVED and level is None)
+                or (outcome is not ColdRoastFanOutcome.OBSERVED and level is not None)
+            )
+        ):
+            failure = ColdRoastFanProjectionFailure.LEVEL_OUTCOME_MISMATCH
+        if failure is not None:
+            raise ColdTickRoastFanProjectionError(failure)
+
+        try:
+            return ColdTickRoastFanObservation.model_validate(
+                {"outcome": outcome, "roast_fan_level_percent": level}, strict=True
+            )
+        except ValidationError:  # pragma: no cover - exact checks above make this unreachable
+            failure = ColdRoastFanProjectionFailure.LEVEL_OUTCOME_MISMATCH
+        raise ColdTickRoastFanProjectionError(failure)
+
+    @staticmethod
     def _require_lossless_audio_types(
         raw_audio: dict[str, ColdJsonValue], projection: ColdTickProjection
     ) -> None:
@@ -881,15 +1022,16 @@ class ColdCharacterisationMCPClient:
         return result
 
     async def get_roast_state(self, session_id: str | None = None) -> ColdTickObservation:
-        """Return one cold tick whose audio and device evidence are strictly projected.
+        """Return one cold tick whose audio, device, and roast-fan evidence are projected.
 
         Args:
             session_id: Optional explicit session; it must be the established one.
 
         Returns:
             The tolerant session state, the strict audio projection, and the
-            strict device projection (``None`` only for JSON ``null``), all
-            parsed from one MCP response.  Audio is projected before device.
+            strict device projection (``None`` only for JSON ``null``), and
+            strict commanded roast-fan projection, all parsed from one MCP
+            response. Audio is projected before device and roast fan.
 
         Raises:
             ColdSessionIdentityError: If the session is not the established one.
@@ -898,6 +1040,7 @@ class ColdCharacterisationMCPClient:
             ColdMcpValidationError: If the response violates the cold contract.
             ColdTickAudioProjectionError: If the audio evidence is not strictly complete.
             ColdTickDeviceProjectionError: If the device state is not strictly complete.
+            ColdTickRoastFanProjectionError: If the roast-fan observation is malformed.
         """
         expected_session_id = self._cold_session_id
         if expected_session_id is None or (
@@ -920,7 +1063,8 @@ class ColdCharacterisationMCPClient:
             field_names = error.field_names
         else:
             device = self._project_device(cast("dict[str, object]", tree)["device_state"])
-            return ColdTickObservation(state=state, audio=audio, device=device)
+            roast_fan = self._project_roast_fan(cast("dict[str, object]", tree))
+            return ColdTickObservation(state=state, audio=audio, device=device, roast_fan=roast_fan)
         raise ColdTickAudioProjectionError(failure, field_names)
 
     async def mark_beans_added(self) -> EventCommandResult:

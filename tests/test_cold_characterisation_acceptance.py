@@ -1008,7 +1008,7 @@ def test_admissible_identity_passes_and_yields_facts(tmp_path: Path) -> None:
     item = interpret_phase(tmp_path, OFF)
     assert qualification(item).outcome is Outcome.PASS and qualification(item).failures == ()
     assert item.identity_facts == acceptance.ColdIdentityFacts(
-        mcp_version="0.2.1",
+        mcp_version="0.2.2",
         temperature_unit="celsius",
         first_crack_mode="audio",
         model_precision="int8",
@@ -1091,8 +1091,9 @@ DEVICE_TEXT_FIELDS = (
 QCase = tuple[str, dict[str, object], F]
 Q_CASES: list[QCase] = [
     ("q1-0.2.0", {"coffee_roaster_mcp_version": "0.2.0"}, F.Q_MCP_VERSION),
-    ("q1-0.2.10", {"coffee_roaster_mcp_version": "0.2.10"}, F.Q_MCP_VERSION),
-    ("q1-leading-space", {"coffee_roaster_mcp_version": " 0.2.1"}, F.Q_MCP_VERSION),
+    ("q1-0.2.1", {"coffee_roaster_mcp_version": "0.2.1"}, F.Q_MCP_VERSION),
+    ("q1-0.2.20", {"coffee_roaster_mcp_version": "0.2.20"}, F.Q_MCP_VERSION),
+    ("q1-leading-space", {"coffee_roaster_mcp_version": " 0.2.2"}, F.Q_MCP_VERSION),
     ("q2-capitalised", {"runtime_config.temperature_unit": "Celsius"}, F.Q_TEMPERATURE_UNIT),
     ("q2-trailing-space", {"runtime_config.temperature_unit": "celsius "}, F.Q_TEMPERATURE_UNIT),
     ("q2-fahrenheit", {"runtime_config.temperature_unit": "fahrenheit"}, F.Q_TEMPERATURE_UNIT),
@@ -1184,6 +1185,26 @@ def test_each_frozen_gate_fails_closed(
     assert qualification(item).outcome is Outcome.FAIL
     assert qualification(item).failures == (failure,)
     assert item.identity_facts is None
+
+
+def test_retained_v1_identity_with_mcp_021_is_losslessly_read_then_fails_q1(
+    tmp_path: Path,
+) -> None:
+    """T-C13: historical v1 identity bytes remain readable but cannot qualify under v2."""
+    document = identity_document(tmp_path)
+    document["coffee_roaster_mcp_version"] = "0.2.1"
+    envelope = envelope_of(document)
+    retained = store.read_identity_v1(envelope)
+    assert retained.known["coffee_roaster_mcp_version"] == "0.2.1"
+    assert envelope.canonical_json == store.canonical_json(document)
+
+    item = interpret_phase(
+        tmp_path,
+        OFF,
+        document=applying({"coffee_roaster_mcp_version": "0.2.1"}),
+    )
+    assert qualification(item).outcome is Outcome.FAIL
+    assert qualification(item).failures == (F.Q_MCP_VERSION,)
 
 
 def test_every_gate_row_has_a_negative_case() -> None:
@@ -1388,7 +1409,7 @@ def test_frozen_literals_equal_their_live_counterparts() -> None:
         mine, theirs = getattr(frozen, name), getattr(current, name)
         assert (mine.pattern, mine.flags) == (theirs.pattern, theirs.flags), name
     assert frozen._MAX_OPERATOR_TEXT_LENGTH == current._MAX_OPERATOR_TEXT_LENGTH
-    assert acceptance.QUALIFICATION_POLICY_VERSION == 1
+    assert acceptance.QUALIFICATION_POLICY_VERSION == 2
 
 
 SCREEN_CORPUS = (
@@ -2469,7 +2490,7 @@ def test_metrics_and_facts_models_are_strict_and_closed() -> None:
 def admissible_facts() -> dict[str, object]:
     """Return one admissible set of identity-fact values."""
     return {
-        "mcp_version": "0.2.1",
+        "mcp_version": "0.2.2",
         "temperature_unit": "celsius",
         "first_crack_mode": "audio",
         "model_precision": "int8",
