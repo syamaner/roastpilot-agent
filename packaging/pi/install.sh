@@ -628,7 +628,7 @@ verify_pi_capability() {
     if (($# >= 2)); then
         expected_mcp_version="$2"
     else
-        expected_mcp_version="0.2.1"
+        expected_mcp_version="0.2.2"
     fi
     [[ -n "$expected_mcp_version" ]] || return 1
     probe_pipx_venv_root || return 1

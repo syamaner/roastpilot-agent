@@ -90,8 +90,8 @@ __all__ = (
     "interpret_retained_run",
 )
 
-#: The frozen qualification policy version; it covers identity schema version 1 only.
-QUALIFICATION_POLICY_VERSION: typing.Final = 1
+#: The frozen v2 policy requires MCP 0.2.2 while retaining identity schema version 1.
+QUALIFICATION_POLICY_VERSION: typing.Final = 2
 #: Locked D191 and production limits: declared for later rendering, never compared here.
 D191_N_LIMIT: typing.Final = 1
 D191_X_LIMIT_MS: typing.Final = 200.0
@@ -222,7 +222,7 @@ class ColdIdentityFacts(pydantic.BaseModel):
         frozen=True, extra="forbid", strict=True, allow_inf_nan=False
     )
 
-    mcp_version: typing.Literal["0.2.1"]
+    mcp_version: typing.Literal["0.2.2"]
     temperature_unit: typing.Literal["celsius"]
     first_crack_mode: typing.Literal["audio"]
     model_precision: typing.Literal["int8"]
@@ -702,7 +702,7 @@ _HEX64_PATTERN: typing.Final = re.compile(r"\A[0-9a-f]{64}\Z")
 
 # Frozen v1 literals (Q1-Q11).  Tests pin each to its live counterpart; this module
 # never imports the live identity module or any packaged constant.
-_REQUIRED_MCP_VERSION: typing.Final = "0.2.1"
+_REQUIRED_MCP_VERSION: typing.Final = "0.2.2"
 _REQUIRED_MODEL_PRECISION: typing.Final = "int8"
 _ALLOWED_CELSIUS_TOKENS: typing.Final = frozenset({"celsius"})
 _ALLOWED_INFERENCE_MODES: typing.Final = frozenset({"audio"})

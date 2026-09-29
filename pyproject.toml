@@ -133,9 +133,9 @@ all-providers = [
   "pydantic-ai-slim[google]>=1.0,<2"
 ]
 # #954: the appliance and development/mock-driver paths deliberately share the
-# published 0.2.1 MCP surface. Regenerated contract fixtures validate that
+# published 0.2.2 MCP surface. Regenerated contract fixtures validate that
 # single release, so the groups can be installed together in one venv.
-pi = ["coffee-roaster-mcp==0.2.1"]
+pi = ["coffee-roaster-mcp==0.2.2"]
 
 [project.urls]
 Homepage = "https://github.com/syamaner/roastpilot-agent"
@@ -181,11 +181,11 @@ dev = [
   "pydantic-ai-slim[google]>=1.0,<2",
   # The real MCP server, spawned as a stdio child in mock-driver mode for the
   # E9-S2 vertical slice (D6). #954 pins this development/mock-driver surface
-  # to the same published 0.2.1 release as [pi]; their exact pins no longer
+  # to the same published 0.2.2 release as [pi]; their exact pins no longer
   # conflict and the 14 captured mirror fixtures are regenerated together.
   # It pulls heavy ML/audio deps (transformers/onnxruntime/sounddevice) that
   # mock mode never activates; CI installs libportaudio2 for sounddevice's import.
-  "coffee-roaster-mcp==0.2.1",
+  "coffee-roaster-mcp==0.2.2",
   # Analysis-harness numeric core (scripts/curve_feature_eval.py, #229). numpy
   # is already present transitively (via the MCP server's ML stack), but the
   # curve-feature analysis imports it directly, so declare it explicitly here:

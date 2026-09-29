@@ -26,7 +26,7 @@ from roastpilot_agent.appliance.model_manifest import MANIFEST_FILES, REPO_ID, R
 from roastpilot_agent.config import FINITE_NUMERIC_MODEL_CONFIG, MCPDeviceConfig
 from roastpilot_agent.mcp_client import RuntimeConfigSnapshot, ServerInfo
 
-REQUIRED_MCP_VERSION: Final = "0.2.1"
+REQUIRED_MCP_VERSION: Final = "0.2.2"
 BOOT_ID_PATH: Final = Path("/proc/sys/kernel/random/boot_id")
 _MAX_BOOT_ID_BYTES: Final = 128
 _MAX_OPERATOR_TEXT_LENGTH: Final = 2000
