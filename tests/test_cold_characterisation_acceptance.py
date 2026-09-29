@@ -44,6 +44,7 @@ from tests.test_cold_characterisation_evidence_builders import (
     finalisation_payload,
     header_for,
     host_for,
+    observation,
 )
 from tests.test_cold_characterisation_evidence_reader import envelope_of, identity_document, read
 from tests.test_cold_characterisation_evidence_store import (
@@ -212,8 +213,7 @@ def tick_record(header: schema.ColdRunHeader, index: int, audio: Json) -> schema
         tick=index,
         recorded_at_utc="2026-09-26T12:00:01Z",
         monotonic_seconds=2.0 + index,
-        device_state=device_state(),
-        projection=schema.project_tick_audio(audio),
+        observation=observation(device_state(), audio=audio),
     )
 
 
@@ -555,10 +555,38 @@ def _foreign_run_id(run: reader.ColdRetainedRun) -> object:
     return rebuilt(run, run_id="20260926T120000Z-foreign")
 
 
-def _invalid_tick(run: reader.ColdRetainedRun) -> object:
+def _roast_fan_forge(
+    tick: schema.ColdTickRecord, outcome: schema.ColdTickRoastFanOutcome, level: int | None
+) -> schema.ColdTickRecord:
+    """Copy a tick with an unvalidated nested roast-fan pair (no top-level key added)."""
+    forged_fan = tick.roast_fan.model_copy(
+        update={"outcome": outcome, "roast_fan_level_percent": level}
+    )
+    return tick.model_copy(update={"roast_fan": forged_fan})
+
+
+def _invalid_tick_record(run: reader.ColdRetainedRun) -> schema.ColdTickRecord:
     tick = typing.cast(schema.ColdTickRecord, container(run, OFF, Stream.TICK).records[0])
-    forged = tick.model_copy(update={"heat_level_percent": 101})
+    return _roast_fan_forge(tick, schema.ColdTickRoastFanOutcome.OBSERVED, 101)
+
+
+def _invalid_tick(run: reader.ColdRetainedRun) -> object:
+    forged = _invalid_tick_record(run)
     return rebuilt(run, streams=replaced(run, OFF, Stream.TICK, _single(OFF, Stream.TICK, forged)))
+
+
+def test_invalid_tick_forge_fails_for_the_pairing_reason(tmp_path: Path) -> None:
+    """T-E15: the forge is a D197 pairing breach, not an unknown top-level key."""
+    run, _records = genuine(tmp_path)
+    forged = _invalid_tick_record(run)
+    assert set(forged.__dict__) == set(schema.ColdTickRecord.model_fields)
+    with pytest.raises(schema.ColdEvidenceError) as raised:
+        schema.validate_record(forged)
+    assert raised.value.failure is schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED
+    tick = typing.cast(schema.ColdTickRecord, container(run, OFF, Stream.TICK).records[0])
+    control = _roast_fan_forge(tick, schema.ColdTickRoastFanOutcome.NOT_ELIGIBLE, None)
+    assert set(control.__dict__) == set(schema.ColdTickRecord.model_fields)
+    assert isinstance(schema.validate_record(control), schema.ColdTickRecord)
 
 
 def _misbound_tick(run: reader.ColdRetainedRun) -> object:
