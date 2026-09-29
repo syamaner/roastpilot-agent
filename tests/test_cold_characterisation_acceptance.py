@@ -1059,6 +1059,43 @@ def test_admissible_identity_passes_and_yields_facts(tmp_path: Path) -> None:
     )
 
 
+def test_minimum_positive_profile_counts_qualify_as_facts(tmp_path: Path) -> None:
+    """Q11: one ONNX thread and one positive window are admissible and copied exactly."""
+    minimum: dict[str, object] = {
+        "effective_mcp_profile.first_crack_onnx_threads": 1,
+        "effective_mcp_profile.first_crack_min_positive_windows": 1,
+    }
+    item = interpret_phase(tmp_path, OFF, document=applying(minimum))
+    assert qualification(item).outcome is Outcome.PASS and qualification(item).failures == ()
+    assert item.identity_facts is not None
+    assert item.identity_facts.first_crack_onnx_threads == 1
+    assert item.identity_facts.first_crack_min_positive_windows == 1
+
+
+# 32 [A-Za-z0-9] characters: 8 symbols twice and 4 symbols four times, which is
+# exactly 3.5 bits in binary floating point (2.0 + 1.5, both exact).
+EXACT_LIMIT_TOKEN = "ABCDEFGH" * 2 + "wxyz" * 4
+
+
+def test_exact_entropy_limit_token_is_refused_by_frozen_and_live_screens(
+    tmp_path: Path,
+) -> None:
+    """Q7: a token scoring exactly 3.5 is refused by the frozen copy and the live screen."""
+    text = f"note {EXACT_LIMIT_TOKEN} end"
+    frozen_entropy = acceptance._shannon_entropy(EXACT_LIMIT_TOKEN)  # pyright: ignore[reportPrivateUsage]
+    live_entropy = live._shannon_entropy(EXACT_LIMIT_TOKEN)  # pyright: ignore[reportPrivateUsage]
+    assert frozen_entropy == live_entropy == 3.5
+    assert acceptance._CREDENTIAL_SHAPE_PATTERN.search(text) is None  # pyright: ignore[reportPrivateUsage]
+    assert not acceptance._operator_text_is_safe(text)  # pyright: ignore[reportPrivateUsage]
+    assert not live._operator_text_is_safe(text)  # pyright: ignore[reportPrivateUsage]
+    below = "note " + "ABCDEFGH" * 3 + " end"
+    assert acceptance._operator_text_is_safe(below)  # pyright: ignore[reportPrivateUsage]
+    assert live._operator_text_is_safe(below)  # pyright: ignore[reportPrivateUsage]
+    item = interpret_phase(tmp_path, OFF, document=applying({"operator_psu_notes": text}))
+    assert qualification(item).failures == (F.Q_OPERATOR_TEXT,)
+    assert item.identity_facts is None
+
+
 def test_editable_source_without_a_digest_qualifies(tmp_path: Path) -> None:
     """Q9: an editable source with a null artefact digest passes; its facts keep both."""
     unpackaged: dict[str, object] = {
