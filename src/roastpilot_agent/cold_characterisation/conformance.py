@@ -127,6 +127,14 @@ from roastpilot_agent.cold_characterisation.evidence_store import (
     check_record_binding,
     load_strict_json,
 )
+from roastpilot_agent.cold_characterisation.host_policy import (
+    HOST_MIN_FREE_BYTES_DURING,
+    free_bytes_meets_floor,
+    mem_available_is_admitted,
+    parse_retained_throttle_hex,
+    soc_temp_below_limit,
+    throttle_word_is_clear,
+)
 from roastpilot_agent.cold_characterisation.mcp import (
     finalisation_has_required_safety_evidence,
     finalisation_is_clean,
@@ -184,6 +192,7 @@ class ColdConformanceFinding(enum.Enum):
     TICK_COUNT_MISMATCH = "tick_count_mismatch"
     TICK_OUTSIDE_WINDOW = "tick_outside_window"
     HOST_EVIDENCE_MISMATCH = "host_evidence_mismatch"
+    HOST_BOUND_VALUE_NOT_ADMITTED = "host_bound_value_not_admitted"
     RETAINED_TICK_POLICY_VIOLATED = "retained_tick_policy_violated"
     TRANSITION_NOT_BOUND = "transition_not_bound"
     TRANSITION_BUDGET_EXCEEDED = "transition_budget_exceeded"
@@ -601,6 +610,8 @@ def _check_phases(interpretation: ColdInterpretation, found: set[ColdConformance
             found.add(_F.ADVISORY_EVIDENCE_PRESENT)
         if not phase.ticks:
             found.add(_F.TICKS_ABSENT)
+        if not all(_host_values_admitted(record.sample) for record in phase.hosts):
+            found.add(_F.HOST_BOUND_VALUE_NOT_ADMITTED)
         if any(result.outcome is ColdCheckOutcome.FAIL for result in item.results):
             found.add(_F.ACCEPTANCE_CHECK_FAILED)
         metrics = item.d191
@@ -621,6 +632,18 @@ def _check_phases(interpretation: ColdInterpretation, found: set[ColdConformance
             found.add(_F.FINALISATION_NOT_CLEAN)
         if not finalisation_has_required_safety_evidence(result):
             found.add(_F.FINALISATION_SAFETY_EVIDENCE_MISSING)
+
+
+def _host_values_admitted(sample: ColdHostSample) -> bool:
+    """Whether one retained host sample meets every AC15 during-run bound (shared policy)."""
+    word = parse_retained_throttle_hex(sample.throttled_word_hex)
+    return (
+        soc_temp_below_limit(sample.soc_temp_c)
+        and word is not None
+        and throttle_word_is_clear(word)
+        and mem_available_is_admitted(sample.mem_available_bytes)
+        and free_bytes_meets_floor(sample.free_bytes, HOST_MIN_FREE_BYTES_DURING)
+    )
 
 
 def _exact_map(value: object) -> dict[str, object]:
