@@ -21,6 +21,8 @@ from roastpilot_agent.cold_characterisation import evidence_store as store
 from tests.test_cold_characterisation_evidence_builders import (
     COLD_PACKAGE,
     RUN_ID,
+    _identifiers,  # pyright: ignore[reportPrivateUsage]
+    _token_violations,  # pyright: ignore[reportPrivateUsage]
     header_for,
     make_identity,
     tick_for,
@@ -588,7 +590,10 @@ _BAD_FIELD_VALUES: list[tuple[str, object]] = [
     ("schema_version", True),
     ("monotonic_seconds", 11),
     ("monotonic_seconds", "11.0"),
+    # Coupled: a -1.0 append time also precedes the 10.0 event (see the coupled test).
     ("monotonic_seconds", -1.0),
+    # Confounded: also breaks the derived scheduled end; the isolated event-after-append
+    # oracle is test_event_after_append_is_refused_at_every_boundary.
     ("event_monotonic_seconds", 20.0),
     ("scheduled_end_monotonic", -1.0),
     ("transition_seconds", 1),
@@ -949,7 +954,12 @@ def test_required_timestamps_refuse_none_before_derivation(
 
 
 def test_required_event_time_none_refuses_for_a_transition(tmp_path: Path) -> None:
-    """A transition with a ``None`` event instant is refused with the closed error."""
+    """Non-discriminating closed-error regression for a ``None`` transition event instant.
+
+    Before the required-timestamp fix this path also ended in the closed error (via the
+    derivation handler), so it does not discriminate that fix; the four trap and
+    constructor-probe cases in test_required_timestamps_refuse_none_before_derivation do.
+    """
     on = on_header(tmp_path, str(tmp_path.resolve()))
     expect_evidence(
         NOT_VALIDATED,
@@ -1773,25 +1783,18 @@ def test_lifecycle_module_imports_exactly_its_allow_list() -> None:
 def test_lifecycle_module_carries_no_forbidden_names() -> None:
     """L-T14: no outcome/verdict/report/evaluation/qualification token, actuator, or reads."""
     tree = ast.parse(_LIFECYCLE_SOURCE)
-    identifiers: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Name):
-            identifiers.add(node.id)
-        elif isinstance(node, ast.Attribute):
-            identifiers.add(node.attr)
+        if isinstance(node, ast.Attribute):
             assert node.attr not in {
                 "active",
                 "elapsed_monotonic_seconds",
                 "device_state",
                 "first_crack_status",
             }
-        elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
-            identifiers.add(node.name)
-        elif isinstance(node, ast.alias):
-            identifiers.add(node.asname or node.name)
-    tokens = ("outcome", "verdict", "report", "evaluat", "qualif")
-    assert {name for name in identifiers if any(token in name.lower() for token in tokens)} == set()
-    for text in ("set_heat", "set_fan", "drop_beans", "emergency_stop", "subprocess", "call_tool"):
+    identifiers = _fence_identifiers(_LIFECYCLE_SOURCE)
+    assert _token_violations("evidence_lifecycle.py", identifiers) == set()
+    assert {name for name in identifiers if "qualif" in name.lower()} == set()
+    for text in _FORBIDDEN_CAPABILITY_TEXT:
         assert text not in _LIFECYCLE_SOURCE
     assigned = {
         ast.unparse(target)
@@ -1802,6 +1805,81 @@ def test_lifecycle_module_carries_no_forbidden_names() -> None:
     assert "COLD_PHASE_OBSERVATION_SECONDS" not in assigned
     assert "COLD_TRANSITION_BUDGET_SECONDS" in assigned
     assert lifecycle.COLD_PHASE_OBSERVATION_SECONDS is engine_policy.COLD_PHASE_OBSERVATION_SECONDS
+
+
+#: The builders test's actuator/limit/clean-conjunction text fence, plus ``subprocess``.
+_FORBIDDEN_CAPABILITY_TEXT: tuple[str, ...] = (
+    "set_heat",
+    "set_fan",
+    "drop_beans",
+    "start_cooling",
+    "stop_cooling",
+    "emergency_stop",
+    "mark_first_crack",
+    "set_targets",
+    "call_tool",
+    "RoasterControlAdapter",
+    "MAX_CONSECUTIVE_OVERFLOW",
+    "LOST_AUDIO_MS",
+    "FATAL_STREAK",
+    "EFFECTIVE_HOP",
+    "HOST_MAX",
+    "HOST_MIN",
+    "finalisation_is_clean",
+    "subprocess",
+)
+
+
+def _fence_identifiers(source: str) -> set[str]:
+    """Return the builders test's identifiers plus every argument and keyword name."""
+    names = set(_identifiers(source))
+    for node in ast.walk(ast.parse(source)):
+        name = node.arg if isinstance(node, (ast.arg, ast.keyword)) else None
+        if name is not None:
+            names.add(name)
+    return names
+
+
+def test_fence_sees_argument_and_keyword_identifiers() -> None:
+    """Structural evidence: the extended collector sees names the shared one does not.
+
+    This proves only that the fence inspects argument and keyword identifiers; it says
+    nothing about any runtime behaviour.
+    """
+    synthetic = "def f(evaluate_x):\n    g(verdict_y=1, qualified_z=2)\n"
+    assert {"evaluate_x", "verdict_y", "qualified_z"} <= _fence_identifiers(synthetic)
+    assert {"evaluate_x", "verdict_y", "qualified_z"}.isdisjoint(_identifiers(synthetic))
+    assert _token_violations("evidence_lifecycle.py", _fence_identifiers(synthetic)) == {
+        "evaluate_x",
+        "verdict_y",
+    }
+    assert {"set_heat", "start_cooling", "RoasterControlAdapter"} <= set(_FORBIDDEN_CAPABILITY_TEXT)
+
+
+def test_event_after_append_is_refused_at_every_boundary(tmp_path: Path) -> None:
+    """An event instant after its append instant is refused; equal instants are admitted.
+
+    ``CHILD_STOPPED`` carries no derived arithmetic, so apart from the event-before-append
+    rule every fact stays valid at revalidation, builder, writer, and reader boundaries.
+    """
+    writer, root = open_writer(tmp_path)
+    off = header_for(tmp_path, root, OFF)
+    writer.append(off)
+    equal = lc(off, 0, Event.CHILD_STOPPED, at=5.0, event_at=5.0, child_stop=Stop.CONFIRMED)
+    assert lifecycle.validate_lifecycle_record(equal) == equal
+    later = forged(equal, event_monotonic_seconds=6.0)
+    refused(later)
+    expect_evidence(
+        NOT_VALIDATED,
+        lambda: lc(off, 0, Event.CHILD_STOPPED, at=5.0, event_at=6.0, child_stop=Stop.CONFIRMED),
+    )
+    expect_evidence(NOT_VALIDATED, lambda: writer.append_lifecycle(later))
+    writer.append_lifecycle(equal)
+    digest = writer.seal().manifest_sha256
+    assert list(read2(root, digest).lifecycle) == [equal]
+    document = equal.model_dump(mode="json")
+    tampered = rewrite(root, LIFECYCLE_OFF, line_of({**document, "event_monotonic_seconds": 6.0}))
+    expect(Failure.LINE_MALFORMED, lambda: read2(root, tampered))
 
 
 def test_lifecycle_enums_are_plain_closed_enums() -> None:
