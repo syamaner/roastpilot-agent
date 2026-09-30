@@ -18,9 +18,11 @@ caller-defined code runs.  The walk borrows the caller's graph and snapshots not
 it holds only temporary references into it.  A package model's ``__dict__`` must have
 exactly its declared field count before any key is scanned; a nested model's
 remaining node budget is checked after that bounded extraction.  Each variable-size
-record or identity ``dict``/``list`` is checked against its existing collection and
-remaining node allowances before its keys are scanned or its items listed.  The
-outer carrier tuples are iterated, never copied or capped.
+record ``dict``/``list`` is checked against its existing collection-length and
+remaining-node allowances, and each identity ``dict``/``list`` against its existing
+remaining-node allowance (identity has no separate collection-length cap here),
+before its keys are scanned or its items listed.  The outer carrier tuples are
+iterated, never copied or capped.
 The caller owns that graph and must not mutate it concurrently during this
 synchronous call; hostile data, not hostile in-process code, is the threat addressed.
 Every later rule reads only fresh validator snapshots and the interpretation
