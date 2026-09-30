@@ -251,6 +251,10 @@ _CARRIER_CLASSES: typing.Final[tuple[type[pydantic.BaseModel], ...]] = (
 _FIELD_NAMES: typing.Final = tuple(
     (model, tuple(model.model_fields)) for model in (*_MODEL_CLASSES, *_CARRIER_CLASSES)
 )
+#: Each model's trusted field-name bytes, charged as ``_extract_model_fields`` charges them.
+_NAME_BYTES: typing.Final = tuple(
+    (model, sum(len(name.encode("utf-8")) for name in names)) for model, names in _FIELD_NAMES
+)
 _ALL_ENUMS: typing.Final[tuple[type[enum.Enum], ...]] = (*SCHEMA_ENUM_TYPES, *LIFECYCLE_ENUM_TYPES)
 _ENUM_MEMBERS: typing.Final[_Members] = tuple(
     (kind, tuple(kind))
@@ -357,12 +361,10 @@ def _keys(mapping: dict[object, object], budget: list[int], limit: int) -> list[
 def _admit_record(record: object, model: type[pydantic.BaseModel]) -> bool:
     """Walk one v1 record with ``validate_record``'s own limits and charging."""
     budget = [0]
-    fields = _fields(record, model)
-    if fields is None or _charge_names(model, budget) is None:
+    fields = _charged_fields(record, model, budget)
+    if fields is None:
         return False
     nodes = 1
-    if nodes + len(fields) > MAX_JSON_NODES:
-        return False
     stack: list[tuple[object, int]] = [(value, 1) for value in reversed(fields)]
     while stack:
         current, depth = stack.pop()
@@ -370,8 +372,8 @@ def _admit_record(record: object, model: type[pydantic.BaseModel]) -> bool:
         nested = _scan(type(current), _MODEL_CLASSES)
         children: list[object]
         if nested is not None:
-            values = _fields(current, nested)
-            if values is None or _charge_names(nested, budget) is None:
+            values = _charged_fields(current, nested, budget)
+            if values is None:
                 return False
             children = list(values)
             if depth >= MAX_JSON_DEPTH:
@@ -401,13 +403,15 @@ def _admit_record(record: object, model: type[pydantic.BaseModel]) -> bool:
     return True
 
 
-def _charge_names(model: type[pydantic.BaseModel], budget: list[int]) -> int | None:
-    """Charge a model's trusted field names, as ``_extract_model_fields`` does."""
-    names = next(names for candidate, names in _FIELD_NAMES if candidate is model)
-    for name in names:
-        if _charge(name, budget, MAX_INPUT_AGGREGATE_BYTES) is None:
-            return None
-    return len(names)
+def _charged_fields(
+    node: object, model: type[pydantic.BaseModel], budget: list[int]
+) -> tuple[object, ...] | None:
+    """Return a model's raw values and charge its trusted field names to the budget.
+
+    An overflow is refused by the walk's aggregate check, as the validator refuses it.
+    """
+    budget[0] += next(size for candidate, size in _NAME_BYTES if candidate is model)
+    return _fields(node, model)
 
 
 def _admit_lifecycle(record: object) -> bool:
