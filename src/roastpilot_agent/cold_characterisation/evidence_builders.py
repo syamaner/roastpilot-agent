@@ -11,13 +11,21 @@ import typing
 import pydantic
 
 from roastpilot_agent.cold_characterisation.evidence_schema import (
+    ColdAbortDomain,
+    ColdAbortRecord,
+    ColdAdvisorFailureKind,
+    ColdEngineAbortReason,
     ColdEnvelopeKind,
     ColdEvidenceError,
     ColdEvidenceFailure,
     ColdEvidenceRecord,
     ColdFinalisationRecord,
+    ColdHostAbortReason,
     ColdHostRecord,
     ColdHostSample,
+    ColdIdentityAbortReason,
+    ColdMcpAbortReason,
+    ColdOperatorAbortReason,
     ColdPhaseKind,
     ColdRunHeader,
     ColdSealedEnvelope,
@@ -26,6 +34,8 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdTickRecord,
     ColdTickRoastFanEvidence,
     ColdTickRoastFanOutcome,
+    ColdTickSessionEvidence,
+    ColdTickSessionPhase,
     validate_record,
     walk_json_value,
 )
@@ -43,11 +53,17 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdTickDeviceState,
     ColdTickObservation,
     ColdTickRoastFanObservation,
+    ColdTickSessionMetadata,
     SessionFinalisationResult,
 )
 
 _RecordT = typing.TypeVar(
-    "_RecordT", ColdRunHeader, ColdTickRecord, ColdHostRecord, ColdFinalisationRecord
+    "_RecordT",
+    ColdRunHeader,
+    ColdTickRecord,
+    ColdHostRecord,
+    ColdFinalisationRecord,
+    ColdAbortRecord,
 )
 
 
@@ -153,10 +169,12 @@ def build_tick_record(
 ) -> ColdTickRecord:
     """Build one tick record from the strict parts of one cold observation.
 
-    Device, roast-fan, and audio evidence come only from the observation's
-    strict ``device``, ``roast_fan``, and ``audio`` projections of one MCP
-    response.  A ``None`` device is recorded as ``None``; it is never defaulted.
-    Values are recorded exactly and judged nowhere here.
+    Device, roast-fan, session, and audio evidence come only from the
+    observation's strict ``device``, ``roast_fan``, ``session``, and ``audio``
+    projections of one MCP response.  A ``None`` device is recorded as ``None``;
+    it is never defaulted.  Values are recorded exactly and judged nowhere here:
+    the session identity is retained but not compared with the header or any
+    other session, and the session clock is an MCP software heartbeat only.
 
     Args:
         header: The bound phase header.
@@ -180,6 +198,17 @@ def build_tick_record(
     _require_type(source_fan, ColdTickRoastFanObservation)
     if source_device is not None:
         _require_type(source_device, ColdTickDeviceState)
+    source_session = observation.session
+    _require_type(source_session, ColdTickSessionMetadata)
+    purpose: object = source_session.session_purpose
+    if type(purpose) is not str or purpose != "cold_characterisation":
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    phase_value: object = source_session.phase
+    if type(phase_value) is not str:
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    phase = typing.cast(
+        ColdTickSessionPhase, ColdTickSessionPhase._value2member_map_.get(phase_value)
+    )
 
     def _device() -> ColdTickDeviceEvidence | None:
         if source_device is None:
@@ -209,6 +238,13 @@ def build_tick_record(
             roast_fan=ColdTickRoastFanEvidence(
                 outcome=_roast_fan_member(observation.roast_fan.outcome.value),
                 roast_fan_level_percent=source_fan.roast_fan_level_percent,
+            ),
+            session=ColdTickSessionEvidence(
+                session_id=source_session.session_id,
+                active=source_session.active,
+                session_purpose="cold_characterisation",
+                phase=phase,
+                elapsed_monotonic_seconds=source_session.elapsed_monotonic_seconds,
             ),
             audio=projection.audio,
             raw_audio_extra=dict(projection.raw_audio_extra),
@@ -315,4 +351,59 @@ def build_finalisation_record(
             applied_branch=index.applied_branch,
         ),
         ColdFinalisationRecord,
+    )
+
+
+def build_abort_record(
+    *,
+    header: ColdRunHeader,
+    domain: ColdAbortDomain,
+    reason: (
+        ColdHostAbortReason
+        | ColdIdentityAbortReason
+        | ColdEvidenceFailure
+        | ColdMcpAbortReason
+        | ColdAdvisorFailureKind
+        | ColdOperatorAbortReason
+        | ColdEngineAbortReason
+    ),
+    recorded_at_utc: str,
+    monotonic_seconds: float,
+) -> ColdAbortRecord:
+    """Build one closed abort record bound to its phase header.
+
+    The record carries only a closed domain and its paired closed reason plus
+    the bounded recording metadata; it accepts no free-form diagnostic text and
+    computes no verdict.  Any abort still makes qualification impossible.
+
+    Args:
+        header: The bound phase header.
+        domain: Closed abort domain.
+        reason: Closed reason, which must be the enum paired with ``domain``.
+        recorded_at_utc: Recording timestamp.
+        monotonic_seconds: Recording monotonic time.
+
+    Returns:
+        The validated abort snapshot.
+
+    Raises:
+        ColdEvidenceError: If any input or the record fails admission.
+    """
+    _require_type(header, ColdRunHeader)
+    return _construct(
+        lambda: ColdAbortRecord.model_validate(
+            {
+                "schema_version": 1,
+                "stream": "abort",
+                "run_id": header.run_id,
+                "phase": header.phase,
+                "recorded_at_utc": recorded_at_utc,
+                "monotonic_seconds": monotonic_seconds,
+                "identity_sha256": header.identity_sha256,
+                "domain": domain,
+                "reason": reason,
+            },
+            strict=True,
+        ),
+        ColdAbortRecord,
     )
