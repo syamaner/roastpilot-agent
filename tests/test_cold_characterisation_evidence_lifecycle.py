@@ -1856,28 +1856,48 @@ def test_fence_sees_argument_and_keyword_identifiers() -> None:
     assert {"set_heat", "start_cooling", "RoasterControlAdapter"} <= set(_FORBIDDEN_CAPABILITY_TEXT)
 
 
-def test_event_after_append_is_refused_at_every_boundary(tmp_path: Path) -> None:
-    """An event instant after its append instant is refused; equal instants are admitted.
+# ``CHILD_STOPPED`` carries no derived arithmetic, so in each test below every fact other
+# than the event-before-append rule stays valid; equal instants are the admitted control.
 
-    ``CHILD_STOPPED`` carries no derived arithmetic, so apart from the event-before-append
-    rule every fact stays valid at revalidation, builder, writer, and reader boundaries.
-    """
+
+def _stopped_at(header: schema.ColdRunHeader, event_at: float) -> lifecycle.ColdLifecycleRecord:
+    """Build a ``CHILD_STOPPED`` record appended at 5.0 with the given event instant."""
+    return lc(header, 0, Event.CHILD_STOPPED, at=5.0, event_at=event_at, child_stop=Stop.CONFIRMED)
+
+
+def test_event_after_append_is_refused_at_revalidation(tmp_path: Path) -> None:
+    """Revalidation admits equal instants and refuses an event after its append."""
+    equal = _stopped_at(header_for(tmp_path, str(tmp_path.resolve()), OFF), 5.0)
+    assert lifecycle.validate_lifecycle_record(equal) == equal
+    refused(forged(equal, event_monotonic_seconds=6.0))
+
+
+def test_event_after_append_is_refused_by_the_builder(tmp_path: Path) -> None:
+    """The public builder admits equal instants and refuses an event after its append."""
+    off = header_for(tmp_path, str(tmp_path.resolve()), OFF)
+    assert _stopped_at(off, 5.0).event_monotonic_seconds == 5.0
+    expect_evidence(NOT_VALIDATED, lambda: _stopped_at(off, 6.0))
+
+
+def test_event_after_append_is_refused_by_the_writer(tmp_path: Path) -> None:
+    """The writer refuses an event after its append without poisoning, then appends equal."""
     writer, root = open_writer(tmp_path)
     off = header_for(tmp_path, root, OFF)
     writer.append(off)
-    equal = lc(off, 0, Event.CHILD_STOPPED, at=5.0, event_at=5.0, child_stop=Stop.CONFIRMED)
-    assert lifecycle.validate_lifecycle_record(equal) == equal
-    later = forged(equal, event_monotonic_seconds=6.0)
-    refused(later)
+    equal = _stopped_at(off, 5.0)
     expect_evidence(
         NOT_VALIDATED,
-        lambda: lc(off, 0, Event.CHILD_STOPPED, at=5.0, event_at=6.0, child_stop=Stop.CONFIRMED),
+        lambda: writer.append_lifecycle(forged(equal, event_monotonic_seconds=6.0)),
     )
-    expect_evidence(NOT_VALIDATED, lambda: writer.append_lifecycle(later))
     writer.append_lifecycle(equal)
-    digest = writer.seal().manifest_sha256
-    assert list(read2(root, digest).lifecycle) == [equal]
-    document = equal.model_dump(mode="json")
+    assert list(read2(root, writer.seal().manifest_sha256).lifecycle) == [equal]
+
+
+def test_event_after_append_is_refused_by_the_reader(tmp_path: Path) -> None:
+    """A retained line whose event follows its append is malformed; equal reads back."""
+    root, digest, written = seal_run(tmp_path, [stopped(Stop.CONFIRMED, 5.0)])
+    assert list(read2(root, digest).lifecycle) == written
+    document = written[0].model_dump(mode="json")
     tampered = rewrite(root, LIFECYCLE_OFF, line_of({**document, "event_monotonic_seconds": 6.0}))
     expect(Failure.LINE_MALFORMED, lambda: read2(root, tampered))
 
