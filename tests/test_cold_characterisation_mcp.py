@@ -5,6 +5,8 @@ import asyncio
 import inspect
 import json
 import traceback
+import types
+import typing
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
@@ -3304,8 +3306,10 @@ def test_cold_production_code_never_reads_tolerant_session_metadata() -> None:
     """T-S9: no cold production getattr or subscript access to the tolerant names.
 
     Attribute reads of the names are governed by ``_session_read_violations``:
-    only the tick builder's single strict ``source_session`` binding may read
-    them.  This is a syntax guard over attribute nodes and literal ``getattr``
+    only the closed ``_SESSION_READ_SITES`` table's single receiver binding per
+    module (the tick builder's ``source_session`` and the engine policy's
+    ``retained_session``) may read them.  This is a syntax guard over attribute
+    nodes and literal ``getattr``
     calls, not a proof that the tolerant mirror is unreachable.  The strict
     projector reads the raw keys through ``ColdSessionField`` values, so no
     subscript uses these names as a literal constant.
@@ -3335,12 +3339,27 @@ def test_cold_production_code_never_reads_tolerant_session_metadata() -> None:
             ):
                 subscripts[node.slice.value] += 1
     assert "evidence_builders.py" in attributes
+    assert "engine_policy.py" in attributes
+    assert "engine.py" in attributes
     assert all(violations == [] for violations in attributes.values()), attributes
     assert getattr_calls == []
     assert subscripts == {"active": 0, "elapsed_monotonic_seconds": 0}
 
 
-_SESSION_RECEIVER = "source_session"
+class _SessionReadSite(typing.NamedTuple):
+    function: str
+    receiver: str
+    parameter: str
+
+
+_SESSION_READ_SITES: typing.Final = types.MappingProxyType(
+    {
+        "evidence_builders.py": _SessionReadSite(
+            "build_tick_record", "source_session", "observation"
+        ),
+        "engine_policy.py": _SessionReadSite("evaluate_tick", "retained_session", "record"),
+    }
+)
 
 
 def _bindings_of(root: ast.AST, name: str) -> list[tuple[str, ast.AST]]:
@@ -3368,13 +3387,13 @@ def _bindings_of(root: ast.AST, name: str) -> list[tuple[str, ast.AST]]:
     return found
 
 
-def _is_observation_session(value: ast.expr) -> bool:
-    """Whether an expression is exactly ``observation.session``."""
+def _is_parameter_session(value: ast.expr, parameter: str) -> bool:
+    """Whether an expression is exactly ``<parameter>.session``."""
     return (
         isinstance(value, ast.Attribute)
         and value.attr == "session"
         and isinstance(value.value, ast.Name)
-        and value.value.id == "observation"
+        and value.value.id == parameter
         and isinstance(value.value.ctx, ast.Load)
     )
 
@@ -3391,28 +3410,29 @@ def _session_read_violations(module_name: str, tree: ast.Module) -> list[str]:
         if isinstance(node, ast.Attribute) and node.attr in _TOLERANT_SESSION_NAMES
     ]
     violations: list[str] = []
-    # R1: only the builders module may read the governed names at all.
-    if module_name != "evidence_builders.py":
+    # R1: only a module keyed in the closed site table may read the governed names.
+    site = _SESSION_READ_SITES.get(module_name)
+    if site is None:
         return [f"R1:{ast.unparse(node)}" for node in governed]
     functions = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "build_tick_record"
+        if isinstance(node, ast.FunctionDef) and node.name == site.function
     ]
     if len(functions) != 1:
-        return [f"R2:build_tick_record:{len(functions)}"]
+        return [f"R2:{site.function}:{len(functions)}"]
     (function,) = functions
     inside = {id(node) for node in ast.walk(function)}
-    # R2: every governed read lies lexically inside ``build_tick_record``.
+    # R2: every governed read lies lexically inside the site's function.
     for node in governed:
         if id(node) not in inside:
             violations.append(f"R2:{ast.unparse(node)}")
-    # R3: every governed read's receiver is exactly the loaded ``source_session``.
+    # R3: every governed read's receiver is exactly the site's loaded receiver.
     for node in governed:
         receiver = node.value
         if not (
             isinstance(receiver, ast.Name)
-            and receiver.id == _SESSION_RECEIVER
+            and receiver.id == site.receiver
             and isinstance(receiver.ctx, ast.Load)
         ):
             violations.append(f"R3:{ast.unparse(node)}")
@@ -3421,7 +3441,7 @@ def _session_read_violations(module_name: str, tree: ast.Module) -> list[str]:
         count = sum(1 for node in governed if node.attr == attribute)
         if count != 1:
             violations.append(f"R4:{attribute}:{count}")
-    # R5a: exactly one authorised ``source_session = observation.session``.
+    # R5a: exactly one authorised ``<receiver> = <parameter>.session``.
     authorised: list[ast.Assign] = []
     for statement in function.body:
         if not isinstance(statement, ast.Assign):
@@ -3431,21 +3451,21 @@ def _session_read_violations(module_name: str, tree: ast.Module) -> list[str]:
         target = statement.targets[0]
         if not (
             isinstance(target, ast.Name)
-            and target.id == _SESSION_RECEIVER
+            and target.id == site.receiver
             and isinstance(target.ctx, ast.Store)
         ):
             continue
-        if not _is_observation_session(statement.value):
+        if not _is_parameter_session(statement.value, site.parameter):
             continue
         authorised.append(statement)
     if len(authorised) != 1:
         violations.append(f"R5a:{len(authorised)}")
     authorised_targets = {id(statement.targets[0]) for statement in authorised}
-    # R5b: no other binding of ``source_session`` anywhere in the module.
-    for category, node in _bindings_of(tree, _SESSION_RECEIVER):
+    # R5b: no other binding of the receiver anywhere in the module.
+    for category, node in _bindings_of(tree, site.receiver):
         if id(node) not in authorised_targets:
             violations.append(f"R5b:{category}")
-    # R6: ``observation`` is a parameter and is never rebound inside the function.
+    # R6: the site's parameter is present and is never rebound inside the function.
     arguments = function.args
     parameters = [
         *arguments.posonlyargs,
@@ -3454,11 +3474,11 @@ def _session_read_violations(module_name: str, tree: ast.Module) -> list[str]:
         *([arguments.vararg] if arguments.vararg is not None else []),
         *([arguments.kwarg] if arguments.kwarg is not None else []),
     ]
-    own = [parameter for parameter in parameters if parameter.arg == "observation"]
+    own = [parameter for parameter in parameters if parameter.arg == site.parameter]
     if len(own) != 1:
         violations.append("R6:parameter")
     own_ids = {id(parameter) for parameter in own}
-    for category, node in _bindings_of(function, "observation"):
+    for category, node in _bindings_of(function, site.parameter):
         if id(node) not in own_ids:
             violations.append(f"R6:{category}")
     return violations
@@ -3564,3 +3584,72 @@ def test_session_read_probe_is_refused(probe: str) -> None:
     """T-S9b: each representative probe breaches exactly its named rule or branch."""
     module_name, source = _SESSION_PROBES[probe]
     assert _session_read_violations(module_name, ast.parse(source)) != []
+
+
+_VALID_POLICY_SPECIMEN = """
+def evaluate_tick(record, *, established_session_id):
+    retained_session = record.session
+    a = retained_session.active
+    b = retained_session.elapsed_monotonic_seconds
+"""
+_POLICY_B_LINE = "    b = retained_session.elapsed_monotonic_seconds\n"
+
+#: #954 slice 4f-c probes E1-E5 over the engine-policy site; each names its rule.
+_POLICY_PROBES: dict[str, tuple[str, str, str]] = {
+    "E1-R1-engine": ("engine.py", _VALID_POLICY_SPECIMEN, "R1:"),
+    "E2-R3-receiver": (
+        "engine_policy.py",
+        _VALID_POLICY_SPECIMEN.replace("a = retained_session.active", "a = record.session.active"),
+        "R3:",
+    ),
+    "E3-R5a-count": (
+        "engine_policy.py",
+        _VALID_POLICY_SPECIMEN + "    retained_session = record.session\n",
+        "R5a:",
+    ),
+    "E4-R6-parameter": (
+        "engine_policy.py",
+        _VALID_POLICY_SPECIMEN.replace("(record, *,", "(other, *,"),
+        "R6:",
+    ),
+    "E5-R2-function": (
+        "engine_policy.py",
+        _VALID_POLICY_SPECIMEN.replace(_POLICY_B_LINE, "")
+        + "\ndef helper():\n    return retained_session.elapsed_monotonic_seconds\n",
+        "R2:",
+    ),
+}
+
+
+def test_session_read_sites_table_is_closed_and_immutable() -> None:
+    """T21: the site table is exactly the two governed modules and cannot be mutated."""
+    assert dict(_SESSION_READ_SITES) == {
+        "evidence_builders.py": ("build_tick_record", "source_session", "observation"),
+        "engine_policy.py": ("evaluate_tick", "retained_session", "record"),
+    }
+    with pytest.raises(TypeError):
+        _SESSION_READ_SITES["engine.py"] = _SessionReadSite(  # type: ignore[index]
+            "x", "y", "z"
+        )
+
+
+def test_engine_policy_session_specimen_is_admitted() -> None:
+    """T21 E6: a valid ``engine_policy.py`` specimen yields no violation."""
+    assert _session_read_violations("engine_policy.py", ast.parse(_VALID_POLICY_SPECIMEN)) == []
+
+
+@pytest.mark.parametrize("probe", list(_POLICY_PROBES))
+def test_engine_policy_session_probe_is_refused(probe: str) -> None:
+    """T21 E1-E5: each engine-policy probe is refused by its named rule."""
+    module_name, source, rule = _POLICY_PROBES[probe]
+    violations = _session_read_violations(module_name, ast.parse(source))
+    assert any(violation.startswith(rule) for violation in violations), violations
+
+
+def test_engine_carries_the_heartbeat_only_under_the_renamed_decision_field() -> None:
+    """T21/A1: ``engine.py`` passes T-S9 and reads only ``next_previous_elapsed_seconds``."""
+    tree = _cold_production_trees()["engine.py"]
+    names = [node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)]
+    assert _session_read_violations("engine.py", tree) == []
+    assert "next_previous_elapsed_seconds" in names
+    assert "elapsed_monotonic_seconds" not in names
