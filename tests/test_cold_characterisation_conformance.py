@@ -412,6 +412,33 @@ def _on_tail_tied(run: Plan) -> None:
     run.results[ON][0] = (run.results[ON][0][0], end)
 
 
+def _on_header_at_phase(phase: Phase, mono: float) -> Edit:
+    """Move one phase header's admission instant."""
+
+    def edit(run: Plan) -> None:
+        run.headers[phase] = mono
+
+    return edit
+
+
+def _off_return_event_at(instant: float) -> Edit:
+    """Move only the OFF finalisation-return event instant; its recording stays 1811.5."""
+
+    def edit(run: Plan) -> None:
+        entry(run, OFF, Event.FINALISATION_RETURNED).ev = instant
+
+    return edit
+
+
+def _off_child_stop_event_at(instant: float) -> Edit:
+    """Move only the OFF child-stop event instant; its recording stays 1812.0."""
+
+    def edit(run: Plan) -> None:
+        entry(run, OFF, Event.CHILD_STOPPED).ev = instant
+
+    return edit
+
+
 INCLUSIVE_POSITIVES: list[tuple[str, Edit]] = [
     ("tick_at_activation", _tick_at(OFF, 0, 10.0)),
     ("tick_at_elapsed", _tick_at(OFF, 2, 1810.0)),
@@ -421,6 +448,9 @@ INCLUSIVE_POSITIVES: list[tuple[str, Edit]] = [
     ("on_header_equals_activation", _on_header_at(1830.0)),
     ("child_stop_equals_child_start", _stop_and_start_tied),
     ("on_finalisation_at_terminal_with_tied_chain", _on_tail_tied),
+    ("off_header_equals_activation", _on_header_at_phase(OFF, 10.0)),
+    ("off_elapsed_equals_return_event", _off_return_event_at(1810.0)),
+    ("off_return_event_equals_child_stop", _off_child_stop_event_at(1811.0)),
 ]
 
 
@@ -1260,6 +1290,20 @@ def _forged_enum(run: reader.ColdRetainedRunV2) -> object:
     return _replace_stream(run, 0, run.run.streams[0].model_copy(update={"phase": forged}))
 
 
+def _forged_event() -> object:
+    """An instance of the real lifecycle event enum class that is no member of it."""
+    forged = object.__new__(lifecycle.ColdLifecycleEvent)
+    assert type(forged) is lifecycle.ColdLifecycleEvent
+    assert not any(forged is member for member in lifecycle.ColdLifecycleEvent)
+    return forged
+
+
+def _lifecycle_field(run: reader.ColdRetainedRunV2, **update: object) -> object:
+    """A copy of an actual lifecycle record with raw field values replaced, put back."""
+    first = run.lifecycle[0].model_copy(update=update)
+    return _construct(run, lifecycle=(first, *run.lifecycle[1:]))
+
+
 CARRIER_FORGERIES: list[tuple[str, Forge]] = [
     ("lifecycle_list", lambda run: _construct(run, lifecycle=list(run.lifecycle))),
     (
@@ -1274,6 +1318,7 @@ CARRIER_FORGERIES: list[tuple[str, Forge]] = [
     ("retained_run_extra_key", lambda run: _construct(run, run=_with_extra_key(run.run))),
     ("record_over_depth", _deep_record),
     ("forged_enum_object", _forged_enum),
+    ("forged_lifecycle_event_enum", lambda run: _lifecycle_field(run, event=_forged_event())),
 ]
 
 
@@ -1442,6 +1487,7 @@ HOSTILE_CARRIERS: list[tuple[str, Forge]] = [
     ("deep_vendor_key", lambda run: _vendor(run, {"packet": {"deep": {SpyStr("x"): 1}}})),
     ("metaclass_in_model_slot", _spy_metaclass),
     ("value_in_lifecycle_state", lambda run: _construct(run, lifecycle_state=Spy())),
+    ("metaclass_in_lifecycle_field", lambda run: _lifecycle_field(run, session_id=SpyModel())),
     ("value_in_record_field", _spy_record_field),
     ("value_in_identity_leaf", _spy_identity_leaf),
     ("self_referencing_vendor_dict", _self_reference),
@@ -1502,22 +1548,56 @@ def _host_sample(run: reader.ColdRetainedRunV2) -> schema.ColdHostSample:
 
 
 #: Forged v1 records: ``(id, record factory)``; each is also refused by ``validate_record``.
-RECORD_REFUSALS: list[tuple[str, typing.Callable[[reader.ColdRetainedRunV2], object]]] = [
-    ("record_extra_key", lambda run: _with_extra_key(_first_tick(run))),
-    ("model_at_depth_limit", lambda run: _raw_tick(run, _nest_leaf(6, _host_sample(run)))),
-    ("key_over_limit", lambda run: _raw_tick(run, {"k" * (schema.MAX_JSON_KEY_BYTES + 1): 1})),
-    ("int_over_bound", lambda run: _raw_tick(run, {"big": 10**schema.MAX_INT_DIGITS})),
-    ("int_under_bound", lambda run: _raw_tick(run, {"small": -(10**schema.MAX_INT_DIGITS)})),
-    ("non_finite_float", lambda run: _raw_tick(run, {"x": math.inf})),
-    ("lone_surrogate", lambda run: _raw_tick(run, {"x": "\ud800"})),
-    ("text_length_over_aggregate", lambda run: _raw_tick(run, {"x": "x" * (_AGGREGATE + 1)})),
-    ("text_bytes_over_aggregate", lambda run: _raw_tick(run, {"x": "é" * (_AGGREGATE // 2 + 1)})),
+_V = schema.ColdEvidenceFailure
+#: ``(id, record factory, frozen validator failure)``; each member is the validator's own
+#: refusal on its extraction path, pinned independently of the checker under test.
+RECORD_REFUSALS: list[
+    tuple[str, typing.Callable[[reader.ColdRetainedRunV2], object], schema.ColdEvidenceFailure]
+] = [
+    ("record_extra_key", lambda run: _with_extra_key(_first_tick(run)), _V.RECORD_NOT_VALIDATED),
+    (
+        "model_at_depth_limit",
+        lambda run: _raw_tick(run, _nest_leaf(6, _host_sample(run))),
+        _V.RECORD_NOT_VALIDATED,
+    ),
+    (
+        "key_over_limit",
+        lambda run: _raw_tick(run, {"k" * (schema.MAX_JSON_KEY_BYTES + 1): 1}),
+        _V.JSON_KEY_INVALID,
+    ),
+    (
+        "int_over_bound",
+        lambda run: _raw_tick(run, {"big": 10**schema.MAX_INT_DIGITS}),
+        _V.RECORD_NOT_VALIDATED,
+    ),
+    (
+        "int_under_bound",
+        lambda run: _raw_tick(run, {"small": -(10**schema.MAX_INT_DIGITS)}),
+        _V.RECORD_NOT_VALIDATED,
+    ),
+    ("non_finite_float", lambda run: _raw_tick(run, {"x": math.inf}), _V.JSON_VALUE_NOT_FINITE),
+    ("lone_surrogate", lambda run: _raw_tick(run, {"x": "\ud800"}), _V.RECORD_NOT_VALIDATED),
+    (
+        "text_length_over_aggregate",
+        lambda run: _raw_tick(run, {"x": "x" * (_AGGREGATE + 1)}),
+        _V.RECORD_TOO_LARGE,
+    ),
+    (
+        "text_bytes_over_aggregate",
+        lambda run: _raw_tick(run, {"x": "é" * (_AGGREGATE // 2 + 1)}),
+        _V.RECORD_TOO_LARGE,
+    ),
     (
         "aggregate_after_primitives",
         lambda run: _raw_tick(run, {"s": "x" * (_AGGREGATE - 3000), "n": [0] * 200}),
+        _V.RECORD_TOO_LARGE,
     ),
-    ("node_overflow", lambda run: _raw_tick(run, _node_vendor(schema.MAX_COLLECTION_LENGTH))),
-    ("tuple_value", lambda run: _raw_tick(run, {"x": (1, 2)})),
+    (
+        "node_overflow",
+        lambda run: _raw_tick(run, _node_vendor(schema.MAX_COLLECTION_LENGTH)),
+        _V.JSON_NODE_LIMIT_EXCEEDED,
+    ),
+    ("tuple_value", lambda run: _raw_tick(run, {"x": (1, 2)}), _V.RECORD_NOT_VALIDATED),
 ]
 
 
@@ -1529,17 +1609,21 @@ def _raw_tick(run: reader.ColdRetainedRunV2, vendor: object) -> schema.ColdTickR
     )
 
 
-@pytest.mark.parametrize(("name", "make"), RECORD_REFUSALS, ids=[c[0] for c in RECORD_REFUSALS])
+@pytest.mark.parametrize(
+    ("name", "make", "failure"), RECORD_REFUSALS, ids=[c[0] for c in RECORD_REFUSALS]
+)
 def test_admission_refuses_records_the_validator_refuses(
     genuine: reader.ColdRetainedRunV2,
     name: str,
     make: typing.Callable[[reader.ColdRetainedRunV2], object],
+    failure: schema.ColdEvidenceFailure,
 ) -> None:
     """Each forged record the frozen validator refuses is refused before it runs."""
     del name
     record = make(genuine)
-    with pytest.raises(schema.ColdEvidenceError):
+    with pytest.raises(schema.ColdEvidenceError) as raised:
         schema.validate_record(typing.cast(schema.ColdEvidenceRecord, record))
+    assert raised.value.failure is failure
     forged = _replace_record(genuine, OFF, schema.ColdEvidenceStream.TICK, record)
     assert check(forged).findings == (F.CARRIER_NOT_ADMITTED,)
 
