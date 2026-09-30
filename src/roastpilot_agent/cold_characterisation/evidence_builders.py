@@ -452,7 +452,8 @@ def _lifecycle_inputs_admitted(
     sequence: object,
     event: object,
     enums: tuple[tuple[object, type[object]], ...],
-    monotonic: tuple[object, ...],
+    required_monotonic: tuple[object, ...],
+    optional_monotonic: tuple[object, ...],
     tick_count: object,
     activation_deadline_exceeded: object,
     instants: tuple[object, ...],
@@ -464,7 +465,8 @@ def _lifecycle_inputs_admitted(
         and sequence >= 0
         and type(event) is ColdLifecycleEvent
         and all(value is None or type(value) is kind for value, kind in enums)
-        and all(value is None or is_admissible_monotonic(value) for value in monotonic)
+        and all(is_admissible_monotonic(value) for value in required_monotonic)
+        and all(value is None or is_admissible_monotonic(value) for value in optional_monotonic)
         and (tick_count is None or (type(tick_count) is int and tick_count >= 0))
         and (activation_deadline_exceeded is None or type(activation_deadline_exceeded) is bool)
         and all(is_admissible_utc_instant(value) for value in instants)
@@ -543,12 +545,8 @@ def build_lifecycle_record(
             (termination, ColdRunTermination),
             (termination_reason, ColdRunTerminationReason),
         ),
-        monotonic=(
-            event_monotonic_seconds,
-            monotonic_seconds,
-            scheduled_end_monotonic,
-            transition_start_monotonic,
-        ),
+        required_monotonic=(event_monotonic_seconds, monotonic_seconds),
+        optional_monotonic=(scheduled_end_monotonic, transition_start_monotonic),
         tick_count=tick_count,
         activation_deadline_exceeded=activation_deadline_exceeded,
         instants=(event_utc, recorded_at_utc),
@@ -589,9 +587,9 @@ def build_lifecycle_record(
             transition_seconds = transition_end - transition_start_monotonic
             budget = COLD_TRANSITION_BUDGET_SECONDS
             within = 0.0 <= transition_seconds <= COLD_TRANSITION_BUDGET_SECONDS
-    except (ArithmeticError, TypeError, ValueError):  # pragma: no cover - inputs admitted above.
+    except (ArithmeticError, TypeError, ValueError):  # pragma: no cover - finite float operands.
         derived = False
-    if not derived:  # pragma: no cover - raw admission makes derivation total.
+    if not derived:  # pragma: no cover - required and present optional operands are finite floats.
         raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
     return _construct_lifecycle(
         lambda: ColdLifecycleRecord(

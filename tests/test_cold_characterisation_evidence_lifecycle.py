@@ -886,6 +886,106 @@ def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
     )
 
 
+class _DerivationProbe:
+    """Stand-in for the phase-length constant; any use records entry into derivation."""
+
+    calls = 0
+
+    def __radd__(self, _other: object) -> float:
+        """Record the derivation arithmetic and refuse with an inert canary."""
+        _DerivationProbe.calls += 1
+        raise RuntimeError("derivation entered")
+
+    __add__ = __radd__
+
+
+@pytest.mark.parametrize("missing", ["event_monotonic_seconds", "monotonic_seconds"])
+@pytest.mark.parametrize("event", [Event.PHASE_ACTIVATED, Event.CHILD_STOPPED])
+def test_required_timestamps_refuse_none_before_derivation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing: str,
+    event: lifecycle.ColdLifecycleEvent,
+) -> None:
+    """A ``None`` required timestamp is refused before derivation or construction.
+
+    Probe evidence (not a general proof): the builder's module-global phase-length
+    constant is read only inside the derivation block, so replacing it with a trap
+    records whether derivation was entered; a spy records whether construction was.
+    """
+    off = header_for(tmp_path, str(tmp_path.resolve()), OFF)
+    fields: dict[str, typing.Any] = (
+        {"session_id": "session"}
+        if event is Event.PHASE_ACTIVATED
+        else {"child_stop": Stop.CONFIRMED}
+    )
+    kwargs: dict[str, typing.Any] = {
+        "header": off,
+        "sequence": 0,
+        "event": event,
+        "event_utc": T0,
+        "event_monotonic_seconds": 10.0,
+        "recorded_at_utc": T0,
+        "monotonic_seconds": 10.0,
+        **fields,
+    }
+    assert builders.build_lifecycle_record(**kwargs).event is event
+    constructed: list[object] = []
+    real = builders._construct_lifecycle  # pyright: ignore[reportPrivateUsage]
+
+    def spy(build: typing.Callable[[], lifecycle.ColdLifecycleRecord]) -> object:
+        constructed.append(build)
+        return real(build)
+
+    _DerivationProbe.calls = 0
+    monkeypatch.setattr(builders, "COLD_PHASE_OBSERVATION_SECONDS", _DerivationProbe())
+    monkeypatch.setattr(builders, "_construct_lifecycle", spy)
+    expect_evidence(
+        NOT_VALIDATED,
+        functools.partial(builders.build_lifecycle_record, **{**kwargs, missing: None}),
+    )
+    assert _DerivationProbe.calls == 0
+    assert constructed == []
+
+
+def test_required_event_time_none_refuses_for_a_transition(tmp_path: Path) -> None:
+    """A transition with a ``None`` event instant is refused with the closed error."""
+    on = on_header(tmp_path, str(tmp_path.resolve()))
+    expect_evidence(
+        NOT_VALIDATED,
+        lambda: builders.build_lifecycle_record(
+            header=on,
+            sequence=0,
+            event=Event.TRANSITION_MEASURED,
+            event_utc=T0,
+            event_monotonic_seconds=typing.cast(typing.Any, None),
+            recorded_at_utc=T0,
+            monotonic_seconds=1830.0,
+            session_id=ON_SESSION,
+            previous_phase_session_id=OFF_SESSION,
+            transition_start_monotonic=1810.0,
+        ),
+    )
+
+
+def test_optional_timestamps_stay_optional(tmp_path: Path) -> None:
+    """Optional ``None`` timestamps remain admitted where the event matrix forbids them."""
+    off = header_for(tmp_path, str(tmp_path.resolve()), OFF)
+    record = builders.build_lifecycle_record(
+        header=off,
+        sequence=0,
+        event=Event.CHILD_STOPPED,
+        event_utc=T0,
+        event_monotonic_seconds=5.0,
+        recorded_at_utc=T0,
+        monotonic_seconds=5.0,
+        child_stop=Stop.CONFIRMED,
+        scheduled_end_monotonic=None,
+        transition_start_monotonic=None,
+    )
+    assert (record.scheduled_end_monotonic, record.transition_start_monotonic) == (None, None)
+
+
 def test_derivation_handler_catches_exactly_three_exception_classes() -> None:
     """LM28 (structural): the clock-free derivation handler names exactly three classes."""
     tree = ast.parse((COLD_PACKAGE / "evidence_builders.py").read_text(encoding="utf-8"))
