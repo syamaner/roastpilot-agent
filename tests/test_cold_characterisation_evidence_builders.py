@@ -1,13 +1,16 @@
 """Behavioural tests for contained cold evidence construction, plus shared helpers."""
 
 import ast
+import enum
 import hashlib
 import inspect
 import json
+import math
 import re
 import typing
 from pathlib import Path
 
+import pydantic
 import pytest
 
 from roastpilot_agent.advisor import AdvisorDescriptor
@@ -33,7 +36,12 @@ from roastpilot_agent.cold_characterisation.mcp import (
     SessionFinalisationResult,
 )
 from roastpilot_agent.config import MCPDeviceConfig
-from roastpilot_agent.mcp_client import RoastSessionState, RuntimeConfigSnapshot, ServerInfo
+from roastpilot_agent.mcp_client import (
+    MCPPhase,
+    RoastSessionState,
+    RuntimeConfigSnapshot,
+    ServerInfo,
+)
 
 RUN_ID = "20260926T120000Z-cold-integrity"
 FIXTURE_PATH = (
@@ -45,6 +53,8 @@ FIXTURE_PATH = (
 STATE_FIXTURE_PATH = (
     Path(__file__).parent / "fixtures" / "mcp-tool-results" / "get_roast_state.json"
 )
+#: The committed state fixture's own session identity, reused by the strict helper.
+FIXTURE_SESSION_ID = "4dcc267d8c9041b59fd2b7f83d565609"
 COLD_PACKAGE = Path(builders.__file__).parent
 NEW_MODULES = tuple(
     COLD_PACKAGE / name
@@ -189,8 +199,27 @@ def roast_fan_state(
 
 
 def tolerant_state() -> RoastSessionState:
-    """Return the committed tolerant roast state; its device values differ from ``device_state``."""
-    return RoastSessionState.model_validate_json(STATE_FIXTURE_PATH.read_text(encoding="utf-8"))
+    """Return the committed tolerant state as a cold session.
+
+    Its session fields equal ``session_metadata()``; its device values
+    deliberately differ from ``device_state``.
+    """
+    document = json.loads(STATE_FIXTURE_PATH.read_text(encoding="utf-8"))
+    document["session_purpose"] = "cold_characterisation"
+    return RoastSessionState.model_validate(document)
+
+
+def session_metadata(**overrides: object) -> ColdTickSessionMetadata:
+    """Return one strict cold session projection coherent with ``tolerant_state``."""
+    values: dict[str, object] = {
+        "session_id": FIXTURE_SESSION_ID,
+        "active": True,
+        "session_purpose": "cold_characterisation",
+        "phase": "roasting",
+        "elapsed_monotonic_seconds": 0.059,
+    }
+    values.update(overrides)
+    return ColdTickSessionMetadata.model_validate(values)
 
 
 def observation(
@@ -198,6 +227,7 @@ def observation(
     *,
     roast_fan: ColdTickRoastFanObservation | None = None,
     audio: dict[str, schema.ColdJsonValue] | None = None,
+    session: ColdTickSessionMetadata | None = None,
 ) -> ColdTickObservation:
     """Return one strict cold tick observation; ``device=None`` is absent telemetry."""
     return ColdTickObservation(
@@ -205,13 +235,7 @@ def observation(
         audio=schema.project_tick_audio(audio_payload() if audio is None else audio),
         device=device,
         roast_fan=roast_fan_state() if roast_fan is None else roast_fan,
-        session=ColdTickSessionMetadata(
-            session_id="session-id",
-            active=True,
-            session_purpose="cold_characterisation",
-            phase="roasting",
-            elapsed_monotonic_seconds=0.059,
-        ),
+        session=session_metadata() if session is None else session,
     )
 
 
@@ -987,3 +1011,326 @@ def test_advisor_is_reached_only_through_the_allowed_identity_module() -> None:
     assert "roastpilot_agent.advisor" in _reachable_package_modules(roots)
     without_identity = _reachable_package_modules(roots, stop=frozenset({_COLD + "identity"}))
     assert "roastpilot_agent.advisor" not in without_identity
+
+
+# ------------------------------------ 4f-b abort builder and retained tick session
+
+_CLOSED_MESSAGE = "Cold evidence admission failed."
+_SESSION_NAMES = (
+    "session_id",
+    "active",
+    "session_purpose",
+    "phase",
+    "elapsed_monotonic_seconds",
+)
+
+
+def _assert_closed(error: schema.ColdEvidenceError, failure: schema.ColdEvidenceFailure) -> None:
+    """Assert one closed evidence failure with its fixed message and no chain."""
+    assert error.failure is failure
+    assert error.args == (_CLOSED_MESSAGE,)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def _build_abort(header: schema.ColdRunHeader, domain: object, reason: object) -> object:
+    """Build one abort through the real builder with the shared recording metadata."""
+    return builders.build_abort_record(
+        header=header,
+        domain=typing.cast(typing.Any, domain),
+        reason=typing.cast(typing.Any, reason),
+        recorded_at_utc="2026-09-26T12:05:00Z",
+        monotonic_seconds=300.0,
+    )
+
+
+_LEGAL_ABORT_PAIRS: list[tuple[schema.ColdAbortDomain, enum.Enum]] = [
+    (domain, reason)
+    for domain, reason_type in (
+        (schema.ColdAbortDomain.HOST, schema.ColdHostAbortReason),
+        (schema.ColdAbortDomain.IDENTITY, schema.ColdIdentityAbortReason),
+        (schema.ColdAbortDomain.EVIDENCE, schema.ColdEvidenceFailure),
+        (schema.ColdAbortDomain.MCP, schema.ColdMcpAbortReason),
+        (schema.ColdAbortDomain.ADVISOR, schema.ColdAdvisorFailureKind),
+        (schema.ColdAbortDomain.OPERATOR, schema.ColdOperatorAbortReason),
+        (schema.ColdAbortDomain.ENGINE, schema.ColdEngineAbortReason),
+    )
+    for reason in typing.cast(type[enum.Enum], reason_type)
+]
+
+
+def test_t_b1_every_legal_pair_builds_equal_to_direct_construction(tmp_path: Path) -> None:
+    """T-B1: builder, direct construction, and ``validate_record`` agree on all seven domains."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    assert {domain for domain, _reason in _LEGAL_ABORT_PAIRS} == set(schema.ColdAbortDomain)
+    assert schema.ColdAbortDomain.ENGINE in {domain for domain, _reason in _LEGAL_ABORT_PAIRS}
+    for domain, reason in _LEGAL_ABORT_PAIRS:
+        direct = abort_for(header, domain, reason)
+        built = _build_abort(header, domain, reason)
+        assert type(built) is schema.ColdAbortRecord
+        assert built == direct == schema.validate_record(direct)
+        assert (built.run_id, built.phase, built.identity_sha256) == (
+            header.run_id,
+            header.phase,
+            header.identity_sha256,
+        )
+        assert built.reason is reason
+
+
+class _HeaderSub(schema.ColdRunHeader):
+    """A non-exact header type."""
+
+
+class _PlainReason(enum.Enum):
+    """A foreign plain enum sharing an ENGINE value."""
+
+    CANCELLED = "cancelled"
+
+
+class _MixinReason(str, enum.Enum):  # noqa: UP042 - the contract's str-mixin fixture, not StrEnum
+    """A foreign ``str``-mixin enum sharing an ENGINE value."""
+
+    CANCELLED = "cancelled"
+
+
+_ENGINE = schema.ColdAbortDomain.ENGINE
+_CANCELLED = schema.ColdEngineAbortReason.CANCELLED
+_BUILDER_ABORT_CASES: dict[str, tuple[object, object, schema.ColdEvidenceFailure]] = {
+    "string-domain": ("engine", _CANCELLED, schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED),
+    "mismatched-pair": (
+        _ENGINE,
+        schema.ColdMcpAbortReason.SESSION_NOT_ACTIVE,
+        schema.ColdEvidenceFailure.ABORT_DOMAIN_REASON_MISMATCHED,
+    ),
+    "foreign-plain-enum": (
+        _ENGINE,
+        _PlainReason.CANCELLED,
+        schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    ),
+    "foreign-str-mixin-enum": (
+        _ENGINE,
+        _MixinReason.CANCELLED,
+        schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    ),
+    "raw-string-reason": (
+        _ENGINE,
+        "cancelled",
+        schema.ColdEvidenceFailure.ABORT_DOMAIN_REASON_MISMATCHED,
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_BUILDER_ABORT_CASES))
+def test_t_b4_abort_builder_refuses_each_forged_pair(tmp_path: Path, name: str) -> None:
+    """T-B4: the builder refuses string domains, foreign enums, raw text, and mismatches."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    domain, reason, failure = _BUILDER_ABORT_CASES[name]
+    with pytest.raises(schema.ColdEvidenceError) as raised:
+        _build_abort(header, domain, reason)
+    _assert_closed(raised.value, failure)
+
+
+def test_t_b4_abort_builder_refuses_a_header_subclass(tmp_path: Path) -> None:
+    """T-B4: only an exact ``ColdRunHeader`` binds an abort record."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    subclass = typing.cast(typing.Any, _HeaderSub).model_construct(**dict(header))
+    with pytest.raises(schema.ColdEvidenceError) as raised:
+        _build_abort(subclass, _ENGINE, _CANCELLED)
+    _assert_closed(raised.value, schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+
+
+def test_t_b5_abort_builder_takes_no_free_form_or_exception_input() -> None:
+    """T-B5: keyword-only closed inputs, no handler, and strict validation."""
+    tree = ast.parse((COLD_PACKAGE / "evidence_builders.py").read_text(encoding="utf-8"))
+    (function,) = (
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "build_abort_record"
+    )
+    arguments = function.args
+    assert arguments.posonlyargs == [] and arguments.args == []
+    assert arguments.vararg is None and arguments.kwarg is None
+    assert tuple(argument.arg for argument in arguments.kwonlyargs) == (
+        "header",
+        "domain",
+        "reason",
+        "recorded_at_utc",
+        "monotonic_seconds",
+    )
+    for argument in arguments.kwonlyargs:
+        assert argument.annotation is not None
+        annotation = ast.unparse(argument.annotation)
+        assert "Exception" not in annotation, argument.arg
+        if argument.arg != "recorded_at_utc":
+            assert annotation != "str", argument.arg
+    assert not any(isinstance(node, (ast.Try, ast.ExceptHandler)) for node in ast.walk(function))
+    strict_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "model_validate"
+        and any(
+            keyword.arg == "strict"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in node.keywords
+        )
+    ]
+    assert len(strict_calls) == 1
+
+
+def test_t_b15_helpers_are_one_coherent_cold_session() -> None:
+    """T-B15: the strict helper's five session values equal the tolerant fixture's."""
+    tolerant = tolerant_state()
+    strict = session_metadata()
+    assert tolerant.session_purpose == "cold_characterisation"
+    assert strict.session_id == FIXTURE_SESSION_ID
+    for name in _SESSION_NAMES:
+        assert getattr(strict, name) == getattr(tolerant, name), name
+    assert (strict.active, strict.phase, strict.elapsed_monotonic_seconds) == (
+        True,
+        "roasting",
+        0.059,
+    )
+
+
+def test_t_b6_tick_copies_the_strict_session_exactly(tmp_path: Path) -> None:
+    """T-B6: the tick retains the observation's five session values with exact types."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    source = observation(device_state())
+    tick = build_tick(header, source)
+    for name in ("session_id", "active", "elapsed_monotonic_seconds"):
+        copied = getattr(tick.session, name)
+        original = getattr(source.session, name)
+        assert copied == original, name
+        assert type(copied) is type(original), name
+    assert tick.session.session_purpose == "cold_characterisation"
+    assert type(tick.session.session_purpose) is str
+    assert type(tick.session.phase) is schema.ColdTickSessionPhase
+    assert tick.session.phase.value == source.session.phase
+    assert tuple(schema.ColdTickSessionEvidence.model_fields) == _SESSION_NAMES
+    assert (
+        schema.ColdTickSessionEvidence.model_fields["session_purpose"].annotation
+        == (typing.Literal["cold_characterisation"])
+    )
+
+
+@pytest.mark.parametrize("phase", list(typing.get_args(MCPPhase)))
+def test_t_b6_every_mcp_phase_maps_to_its_schema_member(tmp_path: Path, phase: str) -> None:
+    """T-B6: each MCP phase value maps by exact value to the schema-owned mirror."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    tick = build_tick(header, observation(device_state(), session=session_metadata(phase=phase)))
+    assert tick.session.phase is schema.ColdTickSessionPhase(phase)
+
+
+_TICK_ADAPTER = pydantic.TypeAdapter(schema.ColdTickRecord)
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"active": False},
+        {"phase": "fault"},
+        {"elapsed_monotonic_seconds": -1.0},
+        {"elapsed_monotonic_seconds": 0.0},
+    ],
+    ids=["inactive", "fault", "negative-clock", "zero-clock"],
+)
+def test_t_b7_session_values_are_data_not_policy(tmp_path: Path, update: dict[str, object]) -> None:
+    """T-B7: inactive, fault, negative, and zero session values are retained exactly."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    source = observation(device_state(), session=session_metadata(**update))
+    tick = build_tick(header, source)
+    for name, value in update.items():
+        retained = getattr(tick.session, name)
+        retained_value = retained.value if name == "phase" else retained
+        assert retained_value == value
+        assert type(retained_value) is type(value)
+    line = store.canonical_json(tick.model_dump(mode="json"))
+    decoded = _TICK_ADAPTER.validate_json(line, strict=True)
+    assert decoded == tick
+    assert store.canonical_json(decoded.model_dump(mode="json")) == line
+
+
+class _StrSub(str):
+    """A ``str`` subclass that strict pydantic would otherwise normalise."""
+
+
+class _SessionMetadataSubclass(ColdTickSessionMetadata):
+    """A non-exact strict session metadata type."""
+
+
+def _forged_session(**update: object) -> ColdTickSessionMetadata:
+    """Return unvalidated session metadata with one field replaced."""
+    return typing.cast(
+        ColdTickSessionMetadata,
+        typing.cast(typing.Any, ColdTickSessionMetadata).model_construct(
+            **(dict(session_metadata()) | update)
+        ),
+    )
+
+
+_FORGED_SESSIONS: dict[str, typing.Callable[[], ColdTickSessionMetadata]] = {
+    "a-subclass": lambda: _SessionMetadataSubclass(**dict(session_metadata())),
+    "b-roast-purpose": lambda: _forged_session(session_purpose="roast"),
+    "c-str-subclass-purpose": lambda: _forged_session(
+        session_purpose=_StrSub("cold_characterisation")
+    ),
+    "d-str-subclass-phase": lambda: _forged_session(phase=_StrSub("roasting")),
+    "e-unknown-phase": lambda: _forged_session(phase="bogus"),
+    "f-null-phase": lambda: _forged_session(phase=None),
+    "g-int-active": lambda: _forged_session(active=1),
+    "h-string-active": lambda: _forged_session(active="true"),
+    "i-int-clock": lambda: _forged_session(elapsed_monotonic_seconds=1),
+    "j-bool-clock": lambda: _forged_session(elapsed_monotonic_seconds=True),
+    "k-string-clock": lambda: _forged_session(elapsed_monotonic_seconds="0.5"),
+    "l-nan-clock": lambda: _forged_session(elapsed_monotonic_seconds=math.nan),
+    "m-inf-clock": lambda: _forged_session(elapsed_monotonic_seconds=math.inf),
+    "n-int-session-id": lambda: _forged_session(session_id=1),
+    "o-str-subclass-session-id": lambda: _forged_session(session_id=_StrSub(FIXTURE_SESSION_ID)),
+}
+
+
+@pytest.mark.parametrize("name", list(_FORGED_SESSIONS))
+def test_t_b8_tick_builder_admits_only_exact_session_metadata(tmp_path: Path, name: str) -> None:
+    """T-B8: forged, subclassed, or coercible session metadata never becomes a tick."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    genuine = observation(device_state())
+    forged = genuine.model_copy(update={"session": _FORGED_SESSIONS[name]()})
+    with pytest.raises(schema.ColdEvidenceError) as raised:
+        build_tick(header, forged)
+    _assert_closed(raised.value, schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+
+
+def test_t_b10_session_id_at_the_byte_bound_is_retained_exactly(tmp_path: Path) -> None:
+    """T-B10: an ASCII session id of exactly the bound is admitted and never shortened."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    at_bound = "s" * schema.MAX_TEXT_FIELD_BYTES
+    tick = build_tick(
+        header, observation(device_state(), session=session_metadata(session_id=at_bound))
+    )
+    assert tick.session.session_id == at_bound
+    line = store.canonical_json(tick.model_dump(mode="json"))
+    assert _TICK_ADAPTER.validate_json(line, strict=True) == tick
+
+
+@pytest.mark.parametrize(
+    ("session_id", "failure"),
+    [
+        ("s" * (schema.MAX_TEXT_FIELD_BYTES + 1), schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED),
+        ("€" * 683, schema.ColdEvidenceFailure.TEXT_FIELD_TOO_LARGE),
+        ("\ud800", schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED),
+    ],
+    ids=["ascii-over-bound", "multibyte-over-bound", "lone-surrogate"],
+)
+def test_t_b10_session_id_beyond_the_bound_refuses_without_truncation(
+    tmp_path: Path, session_id: str, failure: schema.ColdEvidenceFailure
+) -> None:
+    """T-B10: an over-bound or unencodable session id refuses with its closed code."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_ON)
+    genuine = observation(device_state())
+    forged = genuine.model_copy(update={"session": _forged_session(session_id=session_id)})
+    with pytest.raises(schema.ColdEvidenceError) as raised:
+        build_tick(header, forged)
+    _assert_closed(raised.value, failure)

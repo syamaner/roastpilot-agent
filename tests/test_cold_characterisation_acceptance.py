@@ -396,6 +396,35 @@ def test_genuine_two_phase_run_interprets_into_fresh_snapshots(tmp_path: Path) -
         assert tuple(result.check for result in item.results) == tuple(Check)
 
 
+def test_t_b14_engine_abort_rebinds_into_its_phase_without_a_verdict(tmp_path: Path) -> None:
+    """T-B14: a retained ENGINE abort rebinds into its phase; nothing carries a verdict."""
+    writer, root = open_writer(tmp_path)
+    header = header_for(tmp_path, root, OFF)
+    tick = tick_record(header, 0, tick_audio())
+    engine_abort = builders.build_abort_record(
+        header=header,
+        domain=schema.ColdAbortDomain.ENGINE,
+        reason=schema.ColdEngineAbortReason.SESSION_CLOCK_STALLED,
+        recorded_at_utc="2026-09-26T12:05:00Z",
+        monotonic_seconds=300.0,
+    )
+    for record in (header, tick, engine_abort):
+        writer.append(record)
+    run = read(root, writer.seal().manifest_sha256)
+    (off,) = acceptance.interpret_retained_run(run).rebound.phases
+    assert off.phase is OFF
+    assert off.ticks == (tick,)
+    assert off.aborts == (engine_abort,)
+    assert off.aborts[0].domain is schema.ColdAbortDomain.ENGINE
+    assert off.aborts[0].reason is schema.ColdEngineAbortReason.SESSION_CLOCK_STALLED
+    names = [name for name in dir(off) if not name.startswith("_")]
+    for model in (schema.ColdAbortRecord, schema.ColdTickRecord, schema.ColdTickSessionEvidence):
+        names.extend(model.model_fields)
+    assert "aborts" in names and "session" in names
+    for name in names:
+        assert not any(token in name for token in ("verdict", "qualif", "clean")), name
+
+
 class SubRun(reader.ColdRetainedRun):
     """A subclassed run container."""
 
