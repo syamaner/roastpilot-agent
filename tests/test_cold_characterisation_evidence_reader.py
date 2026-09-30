@@ -28,6 +28,7 @@ from tests.test_cold_characterisation_evidence_builders import (
     make_identity,
     observation,
     roast_fan_state,
+    session_metadata,
     tick_for,
 )
 from tests.test_cold_characterisation_evidence_store import (
@@ -202,6 +203,8 @@ def test_every_legal_abort_pair_round_trips(tmp_path: Path) -> None:
     retained = read(root, sealed.manifest_sha256)
     assert list(retained.streams[-1].records) == aborts
     assert {record.domain for record in aborts} == set(schema.ColdAbortDomain)
+    engine_aborts = [record for record in aborts if record.domain is schema.ColdAbortDomain.ENGINE]
+    assert [record.reason for record in engine_aborts] == list(schema.ColdEngineAbortReason)
 
 
 def test_reader_pairing_table_equals_the_schema_validator() -> None:
@@ -250,6 +253,39 @@ def test_abort_with_an_extra_field_refuses_strictly(tmp_path: Path) -> None:
     path = "records/recording_on/abort.jsonl"
     digest = rewrite(root, path, line_of({**first_line(root, path), "extra": 1}))
     expect(Failure.LINE_MALFORMED, lambda: read(root, digest))
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"domain": "engine", "reason": "session_not_active"},
+        {"domain": "engines", "reason": "cancelled"},
+        {"domain": "engine", "reason": 1},
+    ],
+    ids=["engine-with-mcp-reason", "unknown-domain", "engine-non-string-reason"],
+)
+def test_t_b4_engine_abort_lines_refuse_outside_the_closed_pairing(
+    tmp_path: Path, update: dict[str, object]
+) -> None:
+    """T-B4: a mismatched ENGINE pair, an unknown domain, or a raw reason refuses."""
+    root, _sealed, _records = write_full_run(tmp_path)
+    path = "records/recording_on/abort.jsonl"
+    digest = rewrite(root, path, line_of({**first_line(root, path), **update}))
+    expect(Failure.LINE_MALFORMED, lambda: read(root, digest))
+
+
+def test_t_b4_engine_abort_line_round_trips(tmp_path: Path) -> None:
+    """T-B1/T-B4 control: a genuine ENGINE abort line decodes to its closed pair."""
+    root, _sealed, _records = write_full_run(tmp_path)
+    path = "records/recording_on/abort.jsonl"
+    line = line_of({**first_line(root, path), "domain": "engine", "reason": "cancelled"})
+    digest = rewrite(root, path, line)
+    retained = read(root, digest)
+    (abort,) = retained.streams[-1].records
+    assert type(abort) is schema.ColdAbortRecord
+    assert abort.domain is schema.ColdAbortDomain.ENGINE
+    assert abort.reason is schema.ColdEngineAbortReason.CANCELLED
+    assert store.canonical_json(abort.model_dump(mode="json")).encode() + b"\n" == line
 
 
 # -------------------------------------------------------------- line hardening
@@ -377,6 +413,111 @@ def test_line_hardening_refuses(
     root, _sealed, _records = write_full_run(tmp_path)
     digest = rewrite(root, TICK_OFF, make(root))
     expect(failure, lambda: read(root, digest))
+
+
+def _tick_session_line(root: str, **session_update: object) -> bytes:
+    """Return the first OFF tick as a canonical line after one nested session update."""
+    document = first_line(root, TICK_OFF)
+    assert type(document["session"]) is dict
+    session = typing.cast(dict[str, object], document["session"])
+    return line_of({**document, "session": {**session, **session_update}})
+
+
+def _tick_without_session_line(root: str) -> bytes:
+    """Return the first OFF tick as a canonical line with its ``session`` removed."""
+    document = first_line(root, TICK_OFF)
+    del document["session"]
+    return line_of(document)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        line_maker(lambda r: _tick_session_line(r, elapsed_monotonic_seconds=1)),
+        line_maker(lambda r: _tick_session_line(r, active=1)),
+        line_maker(lambda r: _tick_session_line(r, phase="bogus")),
+        line_maker(lambda r: _tick_session_line(r, session_purpose="roast")),
+        line_maker(lambda r: _tick_session_line(r, session_id=1)),
+        line_maker(
+            lambda r: _tick_session_line(r, session_id="s" * (schema.MAX_TEXT_FIELD_BYTES + 1))
+        ),
+        line_maker(lambda r: _tick_session_line(r, unexpected=1)),
+        line_maker(_tick_without_session_line),
+    ],
+    ids=[
+        "int-clock",
+        "int-active",
+        "unknown-phase",
+        "roast-purpose",
+        "int-session-id",
+        "over-bound-session-id",
+        "extra-session-key",
+        "missing-session",
+    ],
+)
+def test_t_b11_crafted_session_lines_refuse(tmp_path: Path, make: LineMaker) -> None:
+    """T-B11: coerced, unknown, oversized, extra, or missing session evidence refuses."""
+    root, _sealed, _records = write_full_run(tmp_path)
+    digest = rewrite(root, TICK_OFF, make(root))
+    expect(Failure.LINE_MALFORMED, lambda: read(root, digest))
+
+
+def test_t_b11_genuine_tick_session_round_trips_byte_identically(tmp_path: Path) -> None:
+    """T-B11 control: a genuine tick, session included, re-serialises to its exact line."""
+    root, sealed, _records = write_full_run(tmp_path)
+    lines = (run_dir(root) / TICK_OFF).read_bytes().split(b"\n")[:-1]
+    retained = read(root, sealed.manifest_sha256)
+    (tick_stream,) = (
+        item
+        for item in retained.streams
+        if item.stream is schema.ColdEvidenceStream.TICK and item.phase is OFF
+    )
+    decoded = [
+        store.canonical_json(record.model_dump(mode="json")).encode()
+        for record in tick_stream.records
+    ]
+    assert decoded == lines
+    assert all(b'"session":{' in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"active": False},
+        {"phase": "fault"},
+        {"elapsed_monotonic_seconds": -1.0},
+        {"elapsed_monotonic_seconds": 0.0},
+    ],
+    ids=["inactive", "fault", "negative-clock", "zero-clock"],
+)
+def test_t_b7_session_data_round_trips_through_the_reader(
+    tmp_path: Path, update: dict[str, object]
+) -> None:
+    """T-B7: inactive, fault, negative, and zero session values survive write, seal, read."""
+    writer, root = open_writer(tmp_path)
+    off = header_for(tmp_path, root, OFF)
+    tick = builders.build_tick_record(
+        header=off,
+        tick=0,
+        recorded_at_utc="2026-09-26T12:00:01Z",
+        monotonic_seconds=2.0,
+        observation=observation(device_state(), session=session_metadata(**update)),
+    )
+    for record in (off, tick):
+        writer.append(record)
+    sealed = writer.seal()
+    retained = read(root, sealed.manifest_sha256)
+    (tick_stream,) = (
+        item for item in retained.streams if item.stream is schema.ColdEvidenceStream.TICK
+    )
+    assert list(tick_stream.records) == [tick]
+    decoded = typing.cast(schema.ColdTickRecord, tick_stream.records[0])
+    for name, value in update.items():
+        retained_value = getattr(decoded.session, name)
+        if name == "phase":
+            retained_value = retained_value.value
+        assert retained_value == value
+        assert type(retained_value) is type(value)
 
 
 def test_missing_schema_version_is_unknown(tmp_path: Path) -> None:
