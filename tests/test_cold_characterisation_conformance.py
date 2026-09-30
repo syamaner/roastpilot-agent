@@ -2122,16 +2122,37 @@ SAFE_HOST_BOUNDARIES: list[tuple[str, dict[str, object]]] = [
 ]
 
 
-def _host_case(tmp_path: Path, phase: Phase, values: dict[str, object]) -> Findings:
+def _host_case(tmp_path: Path, phase: Phase, values: dict[str, object], index: int = 0) -> Findings:
     run = plan(tmp_path)
-    run.host_overrides[(phase, 0)] = values
+    run.host_overrides[(phase, index)] = values
     retained = write(tmp_path, run)
-    retained_sample = interpreted(retained).rebound.phases[run.phases.index(phase)].hosts[0].sample
+    hosts = interpreted(retained).rebound.phases[run.phases.index(phase)].hosts
+    retained_sample = hosts[index].sample
     for name, value in values.items():
         assert getattr(retained_sample, name) == value, "the writer retained the exact value"
     result = check(retained)
     assert (result.outcome is Outcome.PRE_ADVISORY_CONFORMANT) == (result.findings == ())
     return result.findings
+
+
+@pytest.mark.parametrize("index", [1, 2])
+@pytest.mark.parametrize("phase", [OFF, ON])
+def test_a2_every_retained_host_sample_is_checked(tmp_path: Path, phase: Phase, index: int) -> None:
+    """Only one later host sample is unsafe; every other retained sample stays admitted."""
+    run = plan(tmp_path)
+    run.host_overrides[(phase, index)] = {"soc_temp_c": 80.0}
+    retained = write(tmp_path, run)
+    for rebound in interpreted(retained).rebound.phases:
+        temperatures = [record.sample.soc_temp_c for record in rebound.hosts]
+        expected = [45.5, 45.5, 45.5]
+        if rebound.phase is phase:
+            expected[index] = 80.0
+        assert temperatures == expected
+    result = check(retained)
+    assert (result.outcome, result.findings) == (
+        Outcome.NOT_CONFORMANT,
+        (F.HOST_BOUND_VALUE_NOT_ADMITTED,),
+    )
 
 
 @pytest.mark.parametrize("phase", [OFF, ON])
