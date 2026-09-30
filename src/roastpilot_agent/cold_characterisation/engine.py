@@ -394,24 +394,38 @@ def _admit_instant(clock: ColdEngineClock, previous: _Instant | None) -> _Instan
     return _Instant(monotonic, utc)
 
 
+def _discard(future: "asyncio.Future[typing.Any]") -> None:
+    """Observe and discard a completed future's outcome so none goes unreported."""
+    if future.done() and not future.cancelled():
+        future.exception()
+
+
 async def _owned_thread(fn: Callable[[Path], _T], arg: Path) -> _T:
     """Run ``fn(arg)`` on one owned, shielded worker thread.
 
     On cancellation the thread is awaited to completion, its result or exception
     is retrieved once and discarded, and one ``CancelledError`` is re-raised.
+    Cancellation always wins, including when the thread finished before the
+    cancellation was delivered.
     """
     task = asyncio.ensure_future(asyncio.to_thread(fn, arg))
+    guard = asyncio.shield(task)
     try:
-        return await asyncio.shield(task)
+        return await guard
     except asyncio.CancelledError:
-        pass
+        _discard(guard)
+    retrieved = False
     while not task.done():
+        guard = asyncio.shield(task)
         try:
-            await asyncio.shield(task)
+            await guard
+            retrieved = True
         except asyncio.CancelledError:
-            continue
+            _discard(guard)
         except Exception:
-            break
+            retrieved = True
+    if not retrieved:
+        _discard(task)
     raise asyncio.CancelledError
 
 
@@ -710,17 +724,25 @@ class _PhaseRun:
             raise _Classified(_engine(ColdEngineAbortReason.CLOCK_INVALID))
 
     async def _start(self) -> str:
-        """Start the cold session and bound its id before activation."""
+        """Start the cold session and bound its id before activation.
+
+        A returned exact ``str`` id is retained for the result even when it is
+        refused, so a later phase hand-off can still name the started session.
+        """
         session_id: object = None
         try:
             session_id = (await self._mcp.start_cold_session()).session.session_id
         except ColdMcpError:
             session_id = None
-        if type(session_id) is not str or not 1 <= len(session_id.encode("utf-8")) <= (
-            MAX_TEXT_FIELD_BYTES
-        ):
+        size = 0
+        if type(session_id) is str:
+            self._session_id = session_id
+            try:
+                size = len(session_id.encode("utf-8"))
+            except UnicodeEncodeError:
+                size = 0
+        if type(session_id) is not str or not 1 <= size <= MAX_TEXT_FIELD_BYTES:
             raise _Classified(_engine(ColdEngineAbortReason.SESSION_START_FAILED))
-        self._session_id = session_id
         return session_id
 
     async def _activate(self) -> _Instant:
