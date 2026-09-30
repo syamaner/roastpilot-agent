@@ -889,8 +889,12 @@ _STDLIB_ALLOWED = frozenset(
     {"os", "stat", "hashlib", "json", "math", "enum", "typing", "collections.abc", "pydantic"}
 )
 _MODULE_IMPORT_ALLOW_LIST: dict[str, frozenset[str]] = {
-    "evidence_store.py": frozenset({_COLD + "evidence_schema", _COLD + "mcp"}),
-    "evidence_reader.py": frozenset({_COLD + "evidence_schema", _COLD + "evidence_store"}),
+    "evidence_store.py": frozenset(
+        {_COLD + "evidence_schema", _COLD + "mcp", _COLD + "evidence_lifecycle"}
+    ),
+    "evidence_reader.py": frozenset(
+        {_COLD + "evidence_schema", _COLD + "evidence_store", _COLD + "evidence_lifecycle"}
+    ),
     "evidence_builders.py": frozenset(
         {
             _COLD + "evidence_schema",
@@ -898,6 +902,7 @@ _MODULE_IMPORT_ALLOW_LIST: dict[str, frozenset[str]] = {
             _COLD + "identity",
             _COLD + "mcp",
             _COLD + "host",
+            _COLD + "evidence_lifecycle",
         }
     ),
 }

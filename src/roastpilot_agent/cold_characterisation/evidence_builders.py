@@ -10,6 +10,22 @@ import typing
 
 import pydantic
 
+from roastpilot_agent.cold_characterisation.evidence_lifecycle import (
+    COLD_PHASE_OBSERVATION_SECONDS,
+    COLD_TRANSITION_BUDGET_SECONDS,
+    ColdLifecycleChildStart,
+    ColdLifecycleChildStop,
+    ColdLifecycleEvent,
+    ColdLifecycleFinalisationResult,
+    ColdLifecycleRecord,
+    ColdLifecycleSessionAdmission,
+    ColdRunTermination,
+    ColdRunTerminationReason,
+    is_admissible_monotonic,
+    is_admissible_session_id,
+    is_admissible_utc_instant,
+    validate_lifecycle_record,
+)
 from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdAbortDomain,
     ColdAbortRecord,
@@ -407,4 +423,202 @@ def build_abort_record(
             strict=True,
         ),
         ColdAbortRecord,
+    )
+
+
+_SESSION_REQUIRED_EVENTS = frozenset(
+    {
+        ColdLifecycleEvent.PHASE_ACTIVATED,
+        ColdLifecycleEvent.OBSERVATION_WINDOW_ELAPSED,
+        ColdLifecycleEvent.FINALISATION_RETURNED,
+        ColdLifecycleEvent.TRANSITION_MEASURED,
+    }
+)
+
+
+def _construct_lifecycle(build: typing.Callable[[], ColdLifecycleRecord]) -> ColdLifecycleRecord:
+    """Construct one lifecycle record, then return only its revalidated snapshot."""
+    try:
+        record = build()
+    except pydantic.ValidationError:
+        pass
+    else:
+        return validate_lifecycle_record(record)
+    raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+
+
+def _lifecycle_inputs_admitted(
+    *,
+    sequence: object,
+    event: object,
+    enums: tuple[tuple[object, type[object]], ...],
+    required_monotonic: tuple[object, ...],
+    optional_monotonic: tuple[object, ...],
+    tick_count: object,
+    activation_deadline_exceeded: object,
+    instants: tuple[object, ...],
+    session_ids: tuple[object, ...],
+) -> bool:
+    """Whether every supplied raw input is exact before any arithmetic runs."""
+    return (
+        type(sequence) is int
+        and sequence >= 0
+        and type(event) is ColdLifecycleEvent
+        and all(value is None or type(value) is kind for value, kind in enums)
+        and all(is_admissible_monotonic(value) for value in required_monotonic)
+        and all(value is None or is_admissible_monotonic(value) for value in optional_monotonic)
+        and (tick_count is None or (type(tick_count) is int and tick_count >= 0))
+        and (activation_deadline_exceeded is None or type(activation_deadline_exceeded) is bool)
+        and all(is_admissible_utc_instant(value) for value in instants)
+        and all(value is None or is_admissible_session_id(value) for value in session_ids)
+    )
+
+
+def build_lifecycle_record(
+    *,
+    header: ColdRunHeader,
+    sequence: int,
+    event: ColdLifecycleEvent,
+    event_utc: str,
+    event_monotonic_seconds: float,
+    recorded_at_utc: str,
+    monotonic_seconds: float,
+    session_id: str | None = None,
+    previous_phase_session_id: str | None = None,
+    scheduled_end_monotonic: float | None = None,
+    tick_count: int | None = None,
+    activation_deadline_exceeded: bool | None = None,
+    finalisation_result: ColdLifecycleFinalisationResult | None = None,
+    child_stop: ColdLifecycleChildStop | None = None,
+    child_start: ColdLifecycleChildStart | None = None,
+    transition_start_monotonic: float | None = None,
+    termination: ColdRunTermination | None = None,
+    termination_reason: ColdRunTerminationReason | None = None,
+) -> ColdLifecycleRecord:
+    """Build one v2 lifecycle record bound to a phase header, deriving its computed fields.
+
+    Run id, phase, and identity digest come only from a fresh header snapshot.
+    Session admission, the ``PHASE_ACTIVATED`` scheduled end, and every
+    ``TRANSITION_MEASURED`` derived field are computed here and never accepted from
+    the caller.  Every raw input is admitted exactly before any arithmetic runs.
+    A missing ``session_id`` on ``PHASE_ABORTED_NOT_FINALISED`` is recorded as
+    ``NOT_ADMITTED``, which never proves that no session exists.
+
+    Args:
+        header: The bound phase header.
+        sequence: Run-wide contiguous lifecycle append index.
+        event: The closed lifecycle event.
+        event_utc: When the event happened (UTC).
+        event_monotonic_seconds: When the event happened (engine monotonic clock).
+        recorded_at_utc: The append instant (UTC); never back-dated.
+        monotonic_seconds: The append instant (engine monotonic clock).
+        session_id: The event's MCP session identity, where the matrix admits one.
+        previous_phase_session_id: The recording-off session for a transition.
+        scheduled_end_monotonic: The elapsed event's scheduled end; refused for
+            ``PHASE_ACTIVATED``, which derives it.
+        tick_count: Ticks observed by the elapsed observation window.
+        activation_deadline_exceeded: Whether an aborted phase missed activation.
+        finalisation_result: The recorded finalisation return classification.
+        child_stop: Whether a child stop was confirmed.
+        child_start: Whether a child start succeeded.
+        transition_start_monotonic: The recording-off scheduled end.
+        termination: How the run ended.
+        termination_reason: Why a failed run ended.
+
+    Returns:
+        The validated lifecycle snapshot.
+
+    Raises:
+        ColdEvidenceError: If any input or the record fails admission.
+    """
+    _require_type(header, ColdRunHeader)
+    bound = validate_record(header)
+    if type(bound) is not ColdRunHeader:  # pragma: no cover - validate_record keeps the class.
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    if not _lifecycle_inputs_admitted(
+        sequence=sequence,
+        event=event,
+        enums=(
+            (finalisation_result, ColdLifecycleFinalisationResult),
+            (child_stop, ColdLifecycleChildStop),
+            (child_start, ColdLifecycleChildStart),
+            (termination, ColdRunTermination),
+            (termination_reason, ColdRunTerminationReason),
+        ),
+        required_monotonic=(event_monotonic_seconds, monotonic_seconds),
+        optional_monotonic=(scheduled_end_monotonic, transition_start_monotonic),
+        tick_count=tick_count,
+        activation_deadline_exceeded=activation_deadline_exceeded,
+        instants=(event_utc, recorded_at_utc),
+        session_ids=(session_id, previous_phase_session_id),
+    ):
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    admission: ColdLifecycleSessionAdmission | None
+    if event in _SESSION_REQUIRED_EVENTS:
+        admission = ColdLifecycleSessionAdmission.ADMITTED
+        refused = session_id is None
+    elif event is ColdLifecycleEvent.PHASE_ABORTED_NOT_FINALISED:
+        admission = (
+            ColdLifecycleSessionAdmission.NOT_ADMITTED
+            if session_id is None
+            else ColdLifecycleSessionAdmission.ADMITTED
+        )
+        refused = False
+    else:
+        admission = None
+        refused = session_id is not None
+    if refused or (
+        event is ColdLifecycleEvent.PHASE_ACTIVATED and scheduled_end_monotonic is not None
+    ):
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    transition_end: float | None = None
+    transition_seconds: float | None = None
+    budget: float | None = None
+    within: bool | None = None
+    derived: bool = True
+    try:
+        if event is ColdLifecycleEvent.PHASE_ACTIVATED:
+            scheduled_end_monotonic = event_monotonic_seconds + COLD_PHASE_OBSERVATION_SECONDS
+        if (
+            event is ColdLifecycleEvent.TRANSITION_MEASURED
+            and transition_start_monotonic is not None
+        ):
+            transition_end = event_monotonic_seconds
+            transition_seconds = transition_end - transition_start_monotonic
+            budget = COLD_TRANSITION_BUDGET_SECONDS
+            within = 0.0 <= transition_seconds <= COLD_TRANSITION_BUDGET_SECONDS
+    except (ArithmeticError, TypeError, ValueError):  # pragma: no cover - finite float operands.
+        derived = False
+    if not derived:  # pragma: no cover - required and present optional operands are finite floats.
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    return _construct_lifecycle(
+        lambda: ColdLifecycleRecord(
+            schema_version=2,
+            stream="lifecycle",
+            run_id=bound.run_id,
+            phase=bound.phase,
+            recorded_at_utc=recorded_at_utc,
+            monotonic_seconds=monotonic_seconds,
+            identity_sha256=bound.identity_sha256,
+            sequence=sequence,
+            event=event,
+            event_utc=event_utc,
+            event_monotonic_seconds=event_monotonic_seconds,
+            session_admission=admission,
+            session_id=session_id,
+            previous_phase_session_id=previous_phase_session_id,
+            scheduled_end_monotonic=scheduled_end_monotonic,
+            tick_count=tick_count,
+            activation_deadline_exceeded=activation_deadline_exceeded,
+            finalisation_result=finalisation_result,
+            child_stop=child_stop,
+            child_start=child_start,
+            transition_start_monotonic=transition_start_monotonic,
+            transition_end_monotonic=transition_end,
+            transition_seconds=transition_seconds,
+            transition_budget_seconds=budget,
+            transition_within_budget=within,
+            termination=termination,
+            termination_reason=termination_reason,
+        )
     )
