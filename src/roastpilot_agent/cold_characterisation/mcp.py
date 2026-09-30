@@ -27,6 +27,7 @@ from roastpilot_agent.config import MCPDeviceConfig
 from roastpilot_agent.mcp_client import (
     EventCommandResult,
     MCPConnectionError,
+    MCPPhase,
     RoastSessionState,
     RuntimeConfigSnapshot,
     ServerInfo,
@@ -177,6 +178,35 @@ class ColdTickDeviceProjectionError(ColdMcpValidationError):
         """
         super().__init__("MCP tick device state failed strict projection")
         self.failure = failure
+        self.field = field
+
+
+class ColdSessionField(Enum):
+    """Closed names of the five raw top-level per-tick session metadata fields."""
+
+    SESSION_ID = "session_id"
+    ACTIVE = "active"
+    SESSION_PURPOSE = "session_purpose"
+    PHASE = "phase"
+    ELAPSED_MONOTONIC_SECONDS = "elapsed_monotonic_seconds"
+
+
+class ColdTickSessionProjectionError(ColdMcpValidationError):
+    """Raised when tick session metadata fails the strict session projection.
+
+    The error keeps only one closed field diagnostic.  It never carries a
+    rejected value or key name, and its message is fixed.
+    """
+
+    field: ColdSessionField | None
+
+    def __init__(self, field: ColdSessionField | None) -> None:
+        """Retain one closed field diagnostic behind a fixed public message.
+
+        Args:
+            field: The one closed session field concerned, when one is known.
+        """
+        super().__init__("MCP tick session metadata failed strict projection")
         self.field = field
 
 
@@ -786,6 +816,40 @@ def _has_exact_type(value: object, allowed: tuple[type, ...]) -> bool:
     return any(type(value) is expected for expected in allowed)
 
 
+#: Exact raw JSON types admitted per session field, in declaration order
+#: (compared with ``is``; a ``bool`` is never admitted as an ``int`` and a JSON
+#: integer is never admitted as a float).
+_SESSION_FIELD_TYPES: tuple[tuple[ColdSessionField, tuple[type, ...]], ...] = (
+    (ColdSessionField.SESSION_ID, (str,)),
+    (ColdSessionField.ACTIVE, (bool,)),
+    (ColdSessionField.SESSION_PURPOSE, (str,)),
+    (ColdSessionField.PHASE, (str,)),
+    (ColdSessionField.ELAPSED_MONOTONIC_SECONDS, (float,)),
+)
+
+
+class ColdTickSessionMetadata(BaseModel):
+    """Strict per-tick MCP session metadata projected from one raw response.
+
+    This model records and decides nothing: it applies no active, phase,
+    advance, range, or startup policy.  ``ColdTickObservation.session`` is the
+    only admissible per-tick session metadata.  The tolerant ``state`` fields
+    ``active``, ``elapsed_monotonic_seconds``, and their siblings are lax
+    roast-path telemetry and must never feed cold decisions or evidence.
+
+    ``elapsed_monotonic_seconds`` is the MCP software session clock.  It is not
+    evidence of serial-link or driver-sample freshness, nor of any physical state.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True, allow_inf_nan=False)
+
+    session_id: str
+    active: bool
+    session_purpose: Literal["cold_characterisation"]
+    phase: MCPPhase
+    elapsed_monotonic_seconds: float
+
+
 class ColdTickObservation(BaseModel):
     """One identity-bound cold tick read from a single MCP response.
 
@@ -1021,6 +1085,37 @@ class ColdCharacterisationMCPClient:
         except ValidationError:  # pragma: no cover - exact guards are exhaustive
             failure = ColdRoastFanProjectionFailure.LEVEL_OUTCOME_MISMATCH
         raise ColdTickRoastFanProjectionError(failure)  # pragma: no cover - exact guards
+
+    @staticmethod
+    def _project_session(tree: dict[str, object]) -> ColdTickSessionMetadata:
+        """Strictly project the top-level session metadata from one raw tick.
+
+        The projection records and decides nothing: it applies no active,
+        phase, advance, range, or startup policy.
+
+        Args:
+            tree: Raw JSON tree parsed from the same tick response as the state.
+
+        Returns:
+            The strict session metadata carrying the exact raw values.
+
+        Raises:
+            ColdTickSessionProjectionError: With the one closed field whose raw
+                JSON type is not exactly the declared type, or ``None`` when the
+                strict model refuses the exactly typed values.
+        """
+        values: dict[str, object] = {}
+        for field, allowed in _SESSION_FIELD_TYPES:
+            raw = tree[field.value]
+            if not _has_exact_type(raw, allowed):
+                raise ColdTickSessionProjectionError(field)
+            values[field.value] = raw
+        session: ColdTickSessionMetadata | None = None
+        with suppress(ValidationError):
+            session = ColdTickSessionMetadata.model_validate(values, strict=True)
+        if session is None:
+            raise ColdTickSessionProjectionError(None)
+        return session
 
     @staticmethod
     def _require_lossless_audio_types(
