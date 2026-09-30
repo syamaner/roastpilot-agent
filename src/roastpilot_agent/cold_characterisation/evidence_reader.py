@@ -17,6 +17,7 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdAbortRecord,
     ColdAdvisorFailureKind,
     ColdAdvisoryRecord,
+    ColdEngineAbortReason,
     ColdEvidenceFailure,
     ColdEvidenceRecord,
     ColdEvidenceStream,
@@ -61,6 +62,7 @@ ABORT_REASON_BY_DOMAIN: dict[ColdAbortDomain, type[enum.Enum]] = {
     ColdAbortDomain.MCP: ColdMcpAbortReason,
     ColdAbortDomain.ADVISOR: ColdAdvisorFailureKind,
     ColdAbortDomain.OPERATOR: ColdOperatorAbortReason,
+    ColdAbortDomain.ENGINE: ColdEngineAbortReason,
 }
 
 _HEADER_ADAPTER = pydantic.TypeAdapter(ColdRunHeader)

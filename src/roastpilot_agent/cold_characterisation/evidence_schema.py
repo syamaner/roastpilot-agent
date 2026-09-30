@@ -214,12 +214,41 @@ class ColdAbortDomain(enum.Enum):
     MCP = "mcp"
     ADVISOR = "advisor"
     OPERATOR = "operator"
+    ENGINE = "engine"
 
 
 class ColdOperatorAbortReason(enum.Enum):
     """The sole operator-originated abort classification."""
 
     OPERATOR_STOP = "operator_stop"
+
+
+class ColdEngineAbortReason(enum.Enum):
+    """Closed cold-engine abort vocabulary; a classification only, never a verdict.
+
+    ``ColdAbortDomain.MCP`` stays the D195 finalisation refusal grammar; engine
+    aborts, including MCP read failures observed by the engine, use this grammar.
+    Mapping runtime conditions onto these members is a later engine concern.
+    """
+
+    COMMAND_STATE_NON_ZERO = "command_state_non_zero"
+    DEVICE_DISCONNECTED = "device_disconnected"
+    DRIVER_IDENTITY_MISMATCH = "driver_identity_mismatch"
+    ROAST_FAN_NOT_OBSERVABLE = "roast_fan_not_observable"
+    SESSION_INACTIVE = "session_inactive"
+    SESSION_PHASE_CHANGED = "session_phase_changed"
+    FIRST_CRACK_CONFIRMED = "first_crack_confirmed"
+    INFERENCE_NOT_ACTIVE = "inference_not_active"
+    SESSION_CLOCK_STALLED = "session_clock_stalled"
+    TELEMETRY_ABSENT_AFTER_STARTUP = "telemetry_absent_after_startup"
+    MCP_TRANSPORT_FAILED = "mcp_transport_failed"
+    MCP_RESPONSE_NOT_ADMITTED = "mcp_response_not_admitted"
+    MCP_SESSION_IDENTITY_CHANGED = "mcp_session_identity_changed"
+    SESSION_START_FAILED = "session_start_failed"
+    ACTIVATION_FAILED = "activation_failed"
+    CLOCK_INVALID = "clock_invalid"
+    CANCELLED = "cancelled"
+    UNEXPECTED_FAILURE = "unexpected_failure"
 
 
 class ColdEvidenceError(RuntimeError):
@@ -597,11 +626,60 @@ class ColdTickRoastFanEvidence(pydantic.BaseModel):
         raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
 
 
+class ColdTickSessionPhase(enum.Enum):
+    """Schema-owned record-only mirror of the MCP session phase; not ``RoastPhase``."""
+
+    PRE_ROAST = "pre_roast"
+    ROASTING = "roasting"
+    DEVELOPMENT = "development"
+    DROPPED = "dropped"
+    COOLING = "cooling"
+    COMPLETE = "complete"
+    FAULT = "fault"
+
+
+class ColdTickSessionEvidence(pydantic.BaseModel):
+    """Exact retained copy of one tick's strict MCP session metadata.
+
+    It records and decides nothing: an inactive session, a ``fault`` phase, and
+    a zero or negative finite clock are retained as data, never refused.  The
+    session identity is private evidence and is never rendered in the sanitised
+    report.  The published 0.2.2 MCP session clock is computed on read; it is an
+    MCP software heartbeat only, not driver, serial-sample or physical freshness.
+    Retaining the session identity does not compare it with anything.
+    """
+
+    model_config = _COLD_EVIDENCE_STRICT_CONFIG
+
+    session_id: str = pydantic.Field(max_length=MAX_TEXT_FIELD_BYTES)
+    active: bool
+    session_purpose: typing.Literal["cold_characterisation"]
+    phase: ColdTickSessionPhase
+    elapsed_monotonic_seconds: float
+
+    @pydantic.field_validator("session_id", mode="before")
+    @classmethod
+    def _require_exact_session_id(cls, value: object) -> object:
+        """Refuse a non-``str`` or ``str``-subclass identity instead of normalising it."""
+        if type(value) is str:
+            return value
+        raise ValueError("session id must be an exact str")
+
+    @pydantic.field_validator("elapsed_monotonic_seconds", mode="before")
+    @classmethod
+    def _require_exact_float_clock(cls, value: object) -> object:
+        """Refuse an int (or any non-float) session clock instead of coercing it."""
+        if type(value) is float:
+            return value
+        raise ValueError("session clock must be an exact float")
+
+
 class ColdTickRecord(pydantic.BaseModel):
-    """One non-actuating device, commanded roast-fan, and audio observation.
+    """One non-actuating device, commanded roast-fan, session, and audio observation.
 
     ``device`` is ``None`` exactly when the strict observation had no device
     state; that absence is recorded and never defaulted or read as clean.
+    ``session`` is required: no tick is recorded without complete session evidence.
     """
 
     model_config = _COLD_EVIDENCE_MODEL_CONFIG
@@ -616,6 +694,7 @@ class ColdTickRecord(pydantic.BaseModel):
     tick: int = pydantic.Field(ge=0)
     device: ColdTickDeviceEvidence | None
     roast_fan: ColdTickRoastFanEvidence
+    session: ColdTickSessionEvidence
     audio: ColdTickAudioSample
     raw_audio_extra: dict[str, ColdJsonValue] = pydantic.Field(default_factory=dict)
 
@@ -716,6 +795,7 @@ class ColdAbortRecord(pydantic.BaseModel):
         | ColdMcpAbortReason
         | ColdAdvisorFailureKind
         | ColdOperatorAbortReason
+        | ColdEngineAbortReason
     )
 
     @pydantic.field_validator("reason", mode="before")
@@ -736,6 +816,7 @@ class ColdAbortRecord(pydantic.BaseModel):
             ColdAbortDomain.MCP: ColdMcpAbortReason,
             ColdAbortDomain.ADVISOR: ColdAdvisorFailureKind,
             ColdAbortDomain.OPERATOR: ColdOperatorAbortReason,
+            ColdAbortDomain.ENGINE: ColdEngineAbortReason,
         }
         if type(self.reason) is not expected[self.domain]:
             raise ColdEvidenceError(ColdEvidenceFailure.ABORT_DOMAIN_REASON_MISMATCHED)
@@ -765,6 +846,7 @@ _MODEL_FIELDS: dict[type[pydantic.BaseModel], tuple[str, ...]] = {
     ColdHostSample: tuple(ColdHostSample.model_fields),
     ColdTickDeviceEvidence: tuple(ColdTickDeviceEvidence.model_fields),
     ColdTickRoastFanEvidence: tuple(ColdTickRoastFanEvidence.model_fields),
+    ColdTickSessionEvidence: tuple(ColdTickSessionEvidence.model_fields),
     ColdSafetyEvaluation: tuple(ColdSafetyEvaluation.model_fields),
     ColdSealedEnvelope: tuple(ColdSealedEnvelope.model_fields),
     ColdRunHeader: tuple(ColdRunHeader.model_fields),
@@ -782,6 +864,7 @@ _DECLARED_NESTED_MODEL_EDGES: dict[
     (ColdTickRecord, "audio"): ColdTickAudioSample,
     (ColdTickRecord, "device"): ColdTickDeviceEvidence,
     (ColdTickRecord, "roast_fan"): ColdTickRoastFanEvidence,
+    (ColdTickRecord, "session"): ColdTickSessionEvidence,
     (ColdHostRecord, "sample"): ColdHostSample,
     (ColdAdvisoryRecord, "evaluation"): ColdSafetyEvaluation,
     (ColdFinalisationRecord, "envelope"): ColdSealedEnvelope,
@@ -804,6 +887,8 @@ _ADMITTED_ENUM_TYPES = (
     ColdAbortDomain,
     ColdOperatorAbortReason,
     ColdTickRoastFanOutcome,
+    ColdEngineAbortReason,
+    ColdTickSessionPhase,
 )
 
 
@@ -930,6 +1015,7 @@ def _extract_model(value: pydantic.BaseModel, aggregate: list[int]) -> dict[str,
                     (ColdSafetyEvaluation, "rule"),
                     (ColdSafetyEvaluation, "reason"),
                     (ColdTickDeviceEvidence, "driver"),
+                    (ColdTickSessionEvidence, "session_id"),
                 }
                 else None
             )

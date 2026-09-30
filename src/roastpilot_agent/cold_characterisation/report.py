@@ -68,6 +68,7 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdAbortDomain,
     ColdAdvisorFailureKind,
     ColdCapabilityBranch,
+    ColdEngineAbortReason,
     ColdEvidenceFailure,
     ColdFinalisationStatus,
     ColdHostAbortReason,
@@ -257,6 +258,7 @@ class ColdReportAbort(_ReportModel):
         | ColdMcpAbortReason
         | ColdAdvisorFailureKind
         | ColdOperatorAbortReason
+        | ColdEngineAbortReason
     )
 
     @pydantic.model_validator(mode="after")
