@@ -14,6 +14,12 @@ Residuals: host-thread duration is bounded only by the host reader itself; a
 read is bounded by ``call_timeout_seconds`` only when composed over the
 timeout-bounded ``MCPServerProcess`` transport; the session clock is an MCP
 software heartbeat.
+
+Carried to later composition: use the same client, host and clock instances for
+admission and observation, and admit, open and observe back-to-back; an
+independent operator emergency stop is required; finalisation session
+equality, qualification across every abort domain, and empty-tick-stream
+rejection remain later obligations.
 """
 
 import asyncio
@@ -118,7 +124,16 @@ class ColdEngineClock(typing.Protocol):
         ...
 
     async def sleep(self, seconds: float) -> None:
-        """Suspend for ``seconds``."""
+        """Suspend for ``seconds``.
+
+        ``sleep`` returns after the requested duration on this port's monotonic
+        clock. Standard asyncio scheduling may wake up to one platform
+        clock-resolution early; this is an ordinary production timer-resolution
+        residual, not a physical-determinism claim. No progress watchdog or
+        independent wall-clock bound is provided. A non-advancing clock or a
+        sleep that never returns may leave the phase stalled and uncompleted;
+        this never qualifies the run.
+        """
         ...
 
 
@@ -143,7 +158,16 @@ class ColdEngineSink(typing.Protocol):
 
 
 class MonotonicEngineClock:
-    """Production clock over ``time.monotonic``, UTC ``datetime`` and ``asyncio.sleep``."""
+    """Production clock over ``time.monotonic``, UTC ``datetime`` and ``asyncio.sleep``.
+
+    ``sleep`` returns after the requested duration on this port's monotonic
+    clock. Standard asyncio scheduling may wake up to one platform
+    clock-resolution early; this is an ordinary production timer-resolution
+    residual, not a physical-determinism claim. No progress watchdog or
+    independent wall-clock bound is provided. A non-advancing clock or a sleep
+    that never returns may leave the phase stalled and uncompleted; this never
+    qualifies the run.
+    """
 
     def monotonic(self) -> float:
         """Return ``time.monotonic()``."""
@@ -213,7 +237,13 @@ class ColdEvidenceIncompleteError(RuntimeError):
 
 
 class ColdEngineUnexpectedError(RuntimeError):
-    """Fixed closed error for an unexpected engine failure; carries no input text."""
+    """Fixed closed error for an unexpected engine failure; carries no input text.
+
+    The retained ``session_id`` may be refused, untrusted or unbounded; it is for
+    private hand-off only and is never written to a public log, a report or a
+    new record without readmission.  ``session_id=None`` is not proof that no
+    session exists.
+    """
 
     abort_recorded: bool
     session_id: str | None
@@ -267,7 +297,14 @@ class ColdPhaseCompleted(pydantic.BaseModel):
 
 
 class ColdPhaseAborted(pydantic.BaseModel):
-    """The phase aborted with closed classifications; ``abort_recorded`` is honest."""
+    """The phase aborted with closed classifications; ``abort_recorded`` is honest.
+
+    The retained ``session_id`` may be refused, untrusted or unbounded; it is for
+    private hand-off only and is never written to a public log, a report or a
+    new record without readmission.  ``session_id=None`` is not proof that no
+    session exists after a timeout or cancellation, and a failed tick append is
+    not proof that the commanded state was safe.
+    """
 
     model_config = _RESULT_CONFIG
 
@@ -407,7 +444,9 @@ async def _owned_thread(fn: Callable[[Path], _T], arg: Path) -> _T:
     On cancellation the thread is awaited to completion, its result or exception
     is retrieved once and discarded, and one ``CancelledError`` is re-raised.
     Cancellation always wins, including when the thread finished before the
-    cancellation was delivered.
+    cancellation was delivered.  The explicit retrieval is defensive ownership,
+    not a fix for a demonstrated leak: a standard ``asyncio.shield`` already
+    observes the inner outcome on CPython 3.11.
     """
     task = asyncio.ensure_future(asyncio.to_thread(fn, arg))
     guard = asyncio.shield(task)

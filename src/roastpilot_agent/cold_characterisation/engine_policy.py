@@ -9,6 +9,12 @@ observed main-fan command (``device.fan_level_percent``, D197) is rejected when
 non-zero, which is not continuous main-fan, drum, or solenoid/drop assurance;
 those remain D195 finalisation only.  The session clock is an MCP software
 heartbeat, not serial, driver-sample, or physical freshness.
+
+A null device is unknown commanded state (heat, cooling, connection and driver
+are all unknown), so it aborts immediately as ``MCP_RESPONSE_NOT_ADMITTED`` and
+is never an absent-telemetry form.  Temperatures are checked only for presence;
+no numeric plausibility range is applied, and finiteness alone is not claimed
+to satisfy D187 plausibility, which remains an open hardware-readiness item.
 """
 
 import typing
@@ -79,8 +85,11 @@ def evaluate_tick(
     roast_fan = record.roast_fan
     audio = record.audio
     triggered: set[ColdEngineAbortReason] = set()
-    absent = device is None
-    if device is not None:
+    absent = False
+    if device is None:
+        # Unknown commanded state: no startup grace (D187, D197).
+        triggered.add(ColdEngineAbortReason.MCP_RESPONSE_NOT_ADMITTED)
+    else:
         if (
             device.heat_level_percent != 0
             or device.cooling_on is True
