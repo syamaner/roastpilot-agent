@@ -867,6 +867,14 @@ class ColdTickObservation(BaseModel):
 
     ``roast_fan`` is the commanded, not physical, roast-fan observation from
     the same response. The tolerant main-fan telemetry is never used for it.
+
+    ``session`` is the only admissible per-tick session metadata: a strict,
+    complete projection of the raw top-level ``session_id``, ``active``,
+    ``session_purpose``, ``phase``, and ``elapsed_monotonic_seconds`` of the
+    same response.  It records and decides nothing.  The matching tolerant
+    ``state`` fields are lax roast-path telemetry and must never feed cold
+    decisions or evidence.  The clock is an MCP software session clock, not
+    evidence of serial-link or driver-sample freshness.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True, allow_inf_nan=False)
@@ -875,6 +883,7 @@ class ColdTickObservation(BaseModel):
     audio: ColdTickProjection
     device: ColdTickDeviceState | None
     roast_fan: ColdTickRoastFanObservation
+    session: ColdTickSessionMetadata
 
 
 class ColdCharacterisationMCPClient:
@@ -1178,7 +1187,7 @@ class ColdCharacterisationMCPClient:
         return result
 
     async def get_roast_state(self, session_id: str | None = None) -> ColdTickObservation:
-        """Return one cold tick whose audio, device, and roast-fan evidence are projected.
+        """Return one cold tick whose audio, device, roast-fan, and session data are projected.
 
         Args:
             session_id: Optional explicit session; it must be the established one.
@@ -1186,8 +1195,9 @@ class ColdCharacterisationMCPClient:
         Returns:
             The tolerant session state, the strict audio projection, and the
             strict device projection (``None`` only for JSON ``null``), and
-            strict commanded roast-fan projection, all parsed from one MCP
-            response. Audio is projected before device and roast fan.
+            strict commanded roast-fan projection, and the strict session
+            metadata projection, all parsed from one MCP response. Audio is
+            projected before device, then roast fan, then session metadata.
 
         Raises:
             ColdSessionIdentityError: If the session is not the established one.
@@ -1197,6 +1207,7 @@ class ColdCharacterisationMCPClient:
             ColdTickAudioProjectionError: If the audio evidence is not strictly complete.
             ColdTickDeviceProjectionError: If the device state is not strictly complete.
             ColdTickRoastFanProjectionError: If the roast-fan observation is malformed.
+            ColdTickSessionProjectionError: If the session metadata is not exactly typed.
         """
         expected_session_id = self._cold_session_id
         if expected_session_id is None or (
@@ -1220,7 +1231,10 @@ class ColdCharacterisationMCPClient:
         else:
             device = self._project_device(cast("dict[str, object]", tree)["device_state"])
             roast_fan = self._project_roast_fan(cast("dict[str, object]", tree))
-            return ColdTickObservation(state=state, audio=audio, device=device, roast_fan=roast_fan)
+            session = self._project_session(cast("dict[str, object]", tree))
+            return ColdTickObservation(
+                state=state, audio=audio, device=device, roast_fan=roast_fan, session=session
+            )
         raise ColdTickAudioProjectionError(failure, field_names)
 
     async def mark_beans_added(self) -> EventCommandResult:
