@@ -890,6 +890,7 @@ _ADMITTED_ENUM_TYPES = (
     ColdEngineAbortReason,
     ColdTickSessionPhase,
 )
+ADMITTED_ENUM_TYPES: typing.Final = _ADMITTED_ENUM_TYPES
 
 
 def _store_extracted(
