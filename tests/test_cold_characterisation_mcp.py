@@ -1,9 +1,11 @@
 """Behavioural safety tests for the cold-characterisation MCP boundary."""
 
 import ast
+import asyncio
 import inspect
 import json
 import traceback
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from typing import cast
@@ -40,6 +42,7 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdModeForbiddenToolError,
     ColdRoastFanOutcome,
     ColdRoastFanProjectionFailure,
+    ColdSessionField,
     ColdSessionIdentityError,
     ColdSessionPhaseError,
     ColdSessionPurposeError,
@@ -49,6 +52,8 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdTickObservation,
     ColdTickRoastFanObservation,
     ColdTickRoastFanProjectionError,
+    ColdTickSessionMetadata,
+    ColdTickSessionProjectionError,
     RejectionReason,
     SessionFinalisationResult,
     _finalisation_has_capability_compatible_evidence,  # pyright: ignore[reportPrivateUsage]
@@ -2039,9 +2044,15 @@ async def test_json_floats_in_every_float_audio_field_are_accepted() -> None:
 @pytest.mark.slow
 @pytest.mark.serial(reason="drives a real MCP process group; must not run concurrently")
 async def test_real_child_cold_tick_projects_strictly(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    record_property: Callable[[str, object], None],
 ) -> None:
-    """T9/AC-P6: the published mock MCP's cold tick projects strictly (shape only)."""
+    """T9/AC-P6, T-S8/AC-S6: the published mock MCP cold tick projects strictly.
+
+    The session metadata has exact types, and the MCP session clock strictly
+    advances between two reads at least 1.0 s apart (the heartbeat premise).
+    """
     monkeypatch.chdir(tmp_path)
     process = MCPServerProcess()
     await process.start()
@@ -2077,6 +2088,25 @@ async def test_real_child_cold_tick_projects_strictly(
             assert 0 <= roast_fan.roast_fan_level_percent <= 100
         else:
             assert roast_fan.roast_fan_level_percent is None
+        first = observation.session
+        await asyncio.sleep(1.1)
+        second = (await client.get_roast_state()).session
+        for session in (first, second):
+            assert type(session) is ColdTickSessionMetadata
+            assert type(session.session_id) is str
+            assert type(session.active) is bool
+            assert session.active is True
+            assert type(session.session_purpose) is str
+            assert session.session_purpose == "cold_characterisation"
+            assert type(session.phase) is str
+            assert session.phase == "roasting"
+            assert type(session.elapsed_monotonic_seconds) is float
+        assert second.session_id == first.session_id
+        record_property(
+            "session_elapsed_pair",
+            (first.elapsed_monotonic_seconds, second.elapsed_monotonic_seconds),
+        )
+        assert second.elapsed_monotonic_seconds > first.elapsed_monotonic_seconds
     finally:
         await process.stop()
     assert not process.running
@@ -2104,6 +2134,7 @@ async def test_cold_tick_observation_is_closed_and_frozen() -> None:
                 "audio": observation.audio,
                 "device": observation.device,
                 "roast_fan": observation.roast_fan,
+                "session": observation.session,
                 "unexpected": 1,
             }
         )
@@ -2111,6 +2142,8 @@ async def test_cold_tick_observation_is_closed_and_frozen() -> None:
         observation.audio = observation.audio
     with pytest.raises(ValidationError):
         observation.device = observation.device
+    with pytest.raises(ValidationError):
+        observation.session = observation.session
 
 
 _TOLERANT_FIRST_CRACK_NAME = "first_crack_status"
@@ -3028,3 +3061,269 @@ def test_cold_production_code_never_reads_tolerant_roast_fan_observation() -> No
     ]
     assert len(subscripts) == 1
     assert subscripts[0].slice is constants["mcp.py"][0]
+
+
+# --- #954 slice 4f-a: strict per-tick session metadata -----------------------
+
+_SESSION_MESSAGE = "MCP tick session metadata failed strict projection"
+_TOLERANT_SESSION_NAMES = frozenset({"active", "elapsed_monotonic_seconds"})
+
+
+async def _session_error(payload: dict[str, object]) -> ColdTickSessionProjectionError:
+    """Read one tolerant-admitted tick and return its session projection error."""
+    _assert_tolerant_mirror_accepts(payload)
+    client, caller = await _started_client(payload)
+    with pytest.raises(ColdTickSessionProjectionError) as raised:
+        await client.get_roast_state()
+    assert len(_state_calls(caller)) == 1
+    assert isinstance(raised.value, ColdMcpValidationError)
+    assert raised.value.args == (_SESSION_MESSAGE,)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    return raised.value
+
+
+@pytest.mark.asyncio
+async def test_cold_tick_session_equals_the_raw_values_exactly() -> None:
+    """T-S1/AC-S1: every session field equals its raw value with an identical type."""
+    payload = _cold_state_payload()
+    client, caller = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    session = observation.session
+    assert type(session) is ColdTickSessionMetadata
+    for field in ColdSessionField:
+        value: object = getattr(session, field.value)
+        assert value == payload[field.value], field
+        assert type(value) is type(payload[field.value]), field
+    assert session.active is True
+    assert session.elapsed_monotonic_seconds == 0.059
+    assert session.phase == "roasting"
+    assert session.session_purpose == "cold_characterisation"
+    assert _state_calls(caller) == [("get_roast_state", {"session_id": "session-id"})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (ColdSessionField.ACTIVE, "true"),
+        (ColdSessionField.ACTIVE, 1),
+        (ColdSessionField.ACTIVE, 0),
+        (ColdSessionField.ELAPSED_MONOTONIC_SECONDS, 1),
+        (ColdSessionField.ELAPSED_MONOTONIC_SECONDS, "0.5"),
+    ],
+)
+async def test_coerced_session_value_fails_strict_projection(
+    field: ColdSessionField, value: object
+) -> None:
+    """T-S2/AC-S2: a value the tolerant mirror coerces is refused with its closed field."""
+    payload = _cold_state_payload()
+    payload[field.value] = value
+
+    error = await _session_error(payload)
+
+    assert error.field is field
+
+
+@pytest.mark.asyncio
+async def test_session_projection_failure_contains_the_rejected_value() -> None:
+    """T-S3/AC-S5: a rejected clock value never reaches any rendering of the error."""
+    canary = "".join(["9081", "7263", ".54"])
+    payload = _cold_state_payload()
+    payload[ColdSessionField.ELAPSED_MONOTONIC_SECONDS.value] = canary
+
+    error = await _session_error(payload)
+
+    assert error.field is ColdSessionField.ELAPSED_MONOTONIC_SECONDS
+    _assert_contained(error, canary)
+    assert canary not in error.field.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("earlier", "expected"),
+    [
+        ("identity", ColdSessionIdentityError),
+        ("purpose", ColdSessionPurposeError),
+        ("audio", ColdTickAudioProjectionError),
+        ("device", ColdTickDeviceProjectionError),
+        ("roast_fan", ColdTickRoastFanProjectionError),
+    ],
+)
+async def test_earlier_cold_tick_checks_precede_session_projection(
+    earlier: str, expected: type[ColdMcpError]
+) -> None:
+    """T-S4/AC-S4: identity, purpose, audio, device, and roast fan win over session."""
+    payload = _cold_state_payload()
+    payload[ColdSessionField.ACTIVE.value] = "true"
+    if earlier == "identity":
+        payload["session_id"] = "other-session"
+    elif earlier == "purpose":
+        payload["session_purpose"] = "roast"
+    elif earlier == "audio":
+        del _first_crack(payload)["max_consecutive_overflow_count"]
+    elif earlier == "device":
+        _device(payload)["heat_level_percent"] = "0"
+    else:
+        _roast_fan(payload)["roast_fan_level_percent"] = "0"
+    client, caller = await _started_client(payload)
+
+    with pytest.raises(ColdMcpError) as raised:
+        await client.get_roast_state()
+
+    assert type(raised.value) is expected
+    assert len(_state_calls(caller)) == 1
+
+
+@pytest.mark.asyncio
+async def test_tick_state_and_session_come_from_one_read() -> None:
+    """T-S5/AC-S1: session metadata shares one response with state."""
+    first = _cold_state_payload()
+    second = _cold_state_payload()
+    second[ColdSessionField.ACTIVE.value] = False
+    second[ColdSessionField.PHASE.value] = "fault"
+    second[ColdSessionField.ELAPSED_MONOTONIC_SECONDS.value] = 99.5
+    caller = _SequencedCaller(
+        {"start_roast_session": [_cold_start_payload()], "get_roast_state": [first, second]}
+    )
+    client = ColdCharacterisationMCPClient(caller)
+    await client.start_cold_session()
+
+    observation = await client.get_roast_state()
+
+    assert observation.session.session_id == observation.state.session_id
+    assert observation.session.active is True
+    assert observation.session.phase == "roasting"
+    assert observation.session.elapsed_monotonic_seconds == 0.059
+    assert [call[0] for call in caller.calls].count("get_roast_state") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (ColdSessionField.ACTIVE, False),
+        (ColdSessionField.PHASE, "fault"),
+        (ColdSessionField.ELAPSED_MONOTONIC_SECONDS, -1.0),
+        (ColdSessionField.ELAPSED_MONOTONIC_SECONDS, 0.0),
+    ],
+)
+async def test_session_metadata_is_recorded_as_data_without_a_verdict(
+    field: ColdSessionField, value: object
+) -> None:
+    """T-S6/AC-S3: inactive, faulted, or odd clock values project unchanged."""
+    payload = _cold_state_payload()
+    payload[field.value] = value
+    client, _ = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    projected: object = getattr(observation.session, field.value)
+    assert projected == value
+    assert type(projected) is type(value)
+    assert not isinstance(observation.session, SafetyEvaluation | SafetyVerdict)
+
+
+def test_cold_tick_session_metadata_is_closed_frozen_and_required() -> None:
+    """T-S7: the strict session model is closed, frozen, and required on the tick."""
+    config = dict(ColdTickSessionMetadata.model_config)
+    assert config == {
+        **config,
+        "strict": True,
+        "frozen": True,
+        "extra": "forbid",
+        "allow_inf_nan": False,
+    }
+    assert list(ColdTickSessionMetadata.model_fields) == [field.value for field in ColdSessionField]
+    assert all(info.is_required() for info in ColdTickSessionMetadata.model_fields.values())
+    values: dict[str, object] = {
+        "session_id": "session-id",
+        "active": True,
+        "session_purpose": "cold_characterisation",
+        "phase": "roasting",
+        "elapsed_monotonic_seconds": 0.5,
+    }
+    session = ColdTickSessionMetadata.model_validate(values, strict=True)
+    with pytest.raises(ValidationError):
+        ColdTickSessionMetadata.model_validate({**values, "unexpected": 1}, strict=True)
+    with pytest.raises(ValidationError):
+        session.active = False
+    assert ColdTickObservation.model_fields["session"].is_required()
+    assert set(ColdTickObservation.model_fields) == {
+        "state",
+        "audio",
+        "device",
+        "roast_fan",
+        "session",
+    }
+
+
+def test_session_enum_is_a_closed_plain_enum_matching_the_raw_keys() -> None:
+    """T-S7: the closed session field enum is a plain enum over the five raw keys."""
+    assert ColdSessionField.__mro__[1:] == (Enum, object)
+    assert [field.value for field in ColdSessionField] == [
+        "session_id",
+        "active",
+        "session_purpose",
+        "phase",
+        "elapsed_monotonic_seconds",
+    ]
+    assert {field.value for field in ColdSessionField} <= set(RoastSessionState.model_fields)
+
+
+def test_session_projector_refuses_exactly_typed_values_the_model_refuses() -> None:
+    """T-S7: exactly typed but model-refused values fail closed without a field."""
+    tree: dict[str, object] = {
+        "session_id": "session-id",
+        "active": True,
+        "session_purpose": "roast",
+        "phase": "roasting",
+        "elapsed_monotonic_seconds": 0.5,
+    }
+    with pytest.raises(ColdTickSessionProjectionError) as raised:
+        ColdCharacterisationMCPClient._project_session(tree)  # pyright: ignore[reportPrivateUsage]
+
+    assert raised.value.field is None
+    assert raised.value.args == (_SESSION_MESSAGE,)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_cold_production_code_never_reads_tolerant_session_metadata() -> None:
+    """T-S9: no cold production attribute or getattr access to the tolerant names.
+
+    This is a syntax guard over attribute nodes and literal ``getattr`` calls,
+    not a proof that the tolerant mirror is unreachable.  The strict projector
+    reads the raw keys through ``ColdSessionField`` values, so no subscript
+    uses these names as a literal constant.
+    """
+    trees = _cold_production_trees()
+    assert "mcp.py" in trees
+    attributes: list[tuple[str, str]] = []
+    getattr_calls: list[str] = []
+    subscripts: dict[str, int] = dict.fromkeys(sorted(_TOLERANT_SESSION_NAMES), 0)
+    for name, tree in trees.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in _TOLERANT_SESSION_NAMES:
+                attributes.append((name, node.attr))
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and any(
+                    isinstance(arg, ast.Constant) and arg.value in _TOLERANT_SESSION_NAMES
+                    for arg in node.args
+                )
+            ):
+                getattr_calls.append(name)
+            if (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value in _TOLERANT_SESSION_NAMES
+            ):
+                subscripts[node.slice.value] += 1
+    assert attributes == []
+    assert getattr_calls == []
+    assert subscripts == {"active": 0, "elapsed_monotonic_seconds": 0}

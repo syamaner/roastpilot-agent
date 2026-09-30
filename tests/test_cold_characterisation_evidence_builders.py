@@ -29,6 +29,7 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdTickDeviceState,
     ColdTickObservation,
     ColdTickRoastFanObservation,
+    ColdTickSessionMetadata,
     SessionFinalisationResult,
 )
 from roastpilot_agent.config import MCPDeviceConfig
@@ -204,6 +205,13 @@ def observation(
         audio=schema.project_tick_audio(audio_payload() if audio is None else audio),
         device=device,
         roast_fan=roast_fan_state() if roast_fan is None else roast_fan,
+        session=ColdTickSessionMetadata(
+            session_id="session-id",
+            active=True,
+            session_purpose="cold_characterisation",
+            phase="roasting",
+            elapsed_monotonic_seconds=0.059,
+        ),
     )
 
 
@@ -547,7 +555,11 @@ def test_t_e9_tick_builder_refuses_wrong_observation_types(tmp_path: Path) -> No
         """A non-exact roast-fan type."""
 
     subclass = ObservationSubclass(
-        state=genuine.state, audio=genuine.audio, device=genuine.device, roast_fan=genuine.roast_fan
+        state=genuine.state,
+        audio=genuine.audio,
+        device=genuine.device,
+        roast_fan=genuine.roast_fan,
+        session=genuine.session,
     )
     assert genuine.device is not None
     wrong_device = typing.cast(typing.Any, ColdTickObservation).model_construct(
@@ -555,24 +567,28 @@ def test_t_e9_tick_builder_refuses_wrong_observation_types(tmp_path: Path) -> No
         audio=genuine.audio,
         device=DeviceSubclass(**dict(genuine.device)),
         roast_fan=genuine.roast_fan,
+        session=genuine.session,
     )
     tolerant_device = typing.cast(typing.Any, ColdTickObservation).model_construct(
         state=genuine.state,
         audio=genuine.audio,
         device=genuine.state.device_state,
         roast_fan=genuine.roast_fan,
+        session=genuine.session,
     )
     wrong_fan = typing.cast(typing.Any, ColdTickObservation).model_construct(
         state=genuine.state,
         audio=genuine.audio,
         device=genuine.device,
         roast_fan=RoastFanSubclass(**dict(genuine.roast_fan)),
+        session=genuine.session,
     )
     wrong_audio = typing.cast(typing.Any, ColdTickObservation).model_construct(
         state=genuine.state,
         audio=genuine.audio.model_dump(),
         device=genuine.device,
         roast_fan=genuine.roast_fan,
+        session=genuine.session,
     )
     for bad in (
         genuine.state,
