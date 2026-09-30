@@ -19,6 +19,13 @@ import typing
 
 import pydantic
 
+from roastpilot_agent.cold_characterisation.evidence_lifecycle import (
+    ColdLifecycleError,
+    ColdLifecycleFailure,
+    ColdLifecycleRecord,
+    ColdLifecycleSequence,
+    validate_lifecycle_record,
+)
 from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdCapabilityBranch,
     ColdEnvelopeKind,
@@ -925,11 +932,7 @@ def check_record_binding(
         state._headers[record.phase] = record  # pyright: ignore[reportPrivateUsage]
         state._identities[record.phase] = identity  # pyright: ignore[reportPrivateUsage]
         return
-    header = state._headers.get(record.phase)  # pyright: ignore[reportPrivateUsage]
-    if header is None:
-        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.HEADER_MISSING)
-    if record.identity_sha256 != header.identity_sha256:
-        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.IDENTITY_DIGEST_MISMATCHED)
+    _phase_header_for(state, phase=record.phase, identity_sha256=record.identity_sha256)
     if type(record) is ColdFinalisationRecord:
         index = derive_finalisation_index(parse_finalisation_envelope(record.envelope))
         if (
@@ -941,6 +944,35 @@ def check_record_binding(
             or record.applied_branch is not index.applied_branch
         ):
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.FINALISATION_INDEX_MISMATCHED)
+
+
+def _phase_header_for(
+    state: ColdBindingState, *, phase: ColdPhaseKind, identity_sha256: str
+) -> ColdRunHeader:
+    """Return a bound phase header whose digest matches; reads state only."""
+    header = state._headers.get(phase)  # pyright: ignore[reportPrivateUsage]
+    if header is None:
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.HEADER_MISSING)
+    if identity_sha256 != header.identity_sha256:
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.IDENTITY_DIGEST_MISMATCHED)
+    return header
+
+
+def check_lifecycle_binding(state: ColdBindingState, record: ColdLifecycleRecord) -> None:
+    """Bind one validated lifecycle record to its run and bound phase header.
+
+    It never binds a header and never mutates ``state``.
+
+    Args:
+        state: Binding state holding the already bound phase headers.
+        record: A snapshot returned by ``validate_lifecycle_record``.
+
+    Raises:
+        ColdEvidenceStoreError: If the run id, phase header, or identity digest fails.
+    """
+    if record.run_id != state.run_id:
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.RUN_ID_MISMATCHED)
+    _phase_header_for(state, phase=record.phase, identity_sha256=record.identity_sha256)
 
 
 # ------------------------------------------------------------ tree primitives
@@ -1365,6 +1397,7 @@ class ColdEvidenceWriter:
         self._phase_fds: dict[ColdPhaseKind, int] = {}
         self._stream_fds: dict[tuple[ColdPhaseKind, str], int] = {}
         self._state = ColdBindingState(run_id)
+        self._lifecycle = ColdLifecycleSequence()
         self._poisoned = False
         self._sealed = False
 
@@ -1460,6 +1493,46 @@ class ColdEvidenceWriter:
         if failed:
             self._abandon()
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
+
+    def append_lifecycle(self, record: ColdLifecycleRecord) -> None:
+        """Validate, bind, order, and durably append one v2 lifecycle line.
+
+        The record must belong to the latest bound phase.  Validation, binding, and
+        ordering refusals leave the writer usable; a write fault poisons it.
+
+        Args:
+            record: One in-process lifecycle record.
+
+        Raises:
+            ColdEvidenceError: If schema revalidation fails (propagated unchanged).
+            ColdEvidenceStoreError: If binding fails, or a write fails (then poisoned).
+            ColdLifecycleError: If the record is not in the latest phase or breaks order.
+        """
+        run_fd = self._require_writable()
+        snapshot = validate_lifecycle_record(record)
+        try:
+            check_lifecycle_binding(self._state, snapshot)
+            if snapshot.phase is not self._state.headers[-1][0].phase:
+                raise ColdLifecycleError(ColdLifecycleFailure.PHASE_NOT_LATEST)
+            self._lifecycle.check(snapshot)
+        except (ColdEvidenceStoreError, ColdLifecycleError):
+            raise
+        except BaseException:
+            self._abandon()
+            raise
+        failed = False
+        try:
+            line = (canonical_json(snapshot.model_dump(mode="json")) + "\n").encode("utf-8")
+            _write_all(self._stream_fd(run_fd, snapshot.phase, "lifecycle"), line)
+        except (OSError, ValueError, ColdEvidenceStoreError):
+            failed = True
+        except BaseException:
+            self._abandon()
+            raise
+        if failed:
+            self._abandon()
+            raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
+        self._lifecycle.commit(snapshot)
 
     def seal(self) -> ColdSealedRun:
         """Seal the run: two-pass enumeration, hashing, and the manifest pair.
