@@ -14,7 +14,10 @@ access, serialisation or pydantic validation touches the caller's value, one bou
 iterative walk admits the whole carrier graph.  After admission, every value the
 checker or an existing validator reaches is an exact builtin with exact ``str`` keys,
 an exact package model with an exact ``__dict__``, or a real package enum member; no
-caller-defined code runs.  The walk borrows the caller's graph and copies nothing.
+caller-defined code runs.  The walk borrows the caller's graph and snapshots nothing:
+it holds only temporary references into it, and every record and identity container
+is checked against its length and remaining node budget before its keys are scanned
+or its items listed.  The outer carrier tuples are iterated, never copied or capped.
 The caller owns that graph and must not mutate it concurrently during this
 synchronous call; hostile data, not hostile in-process code, is the threat addressed.
 Every later rule reads only fresh validator snapshots and the interpretation
@@ -35,8 +38,11 @@ checker proves internal evidence consistency only, never actual append provenanc
 Residuals: an independent operator emergency stop is required.  Per-tick evidence
 covers heat, roast fan and cooling; all six command dimensions are checked only at
 D195 finalisation.  Clock progress is a port contract, not a watchdog: a stalled
-clock or sleep can leave a phase unfinished, and such a run never conforms.  A
-finite temperature is not a plausibility claim.  ``MCP_RESPONSE_NOT_ADMITTED`` covers
+clock or sleep can leave a phase unfinished, and such a run never conforms.  A stall
+that later resumes can still yield a completed, conforming phase with sparse retained
+ticks, because policy v1 has no tick-density or maximum-gap rule; conformance does
+not establish continuous observation.  A finite temperature is not a plausibility
+claim.  ``MCP_RESPONSE_NOT_ADMITTED`` covers
 both null-device and projection refusals.  A missing or failed append never proves
 that the commanded state was safe.  The absence of a model is unknown, not safe.
 """
@@ -316,12 +322,21 @@ def _fields(node: object, model: type[pydantic.BaseModel]) -> tuple[object, ...]
     ):
         return None
     raw = typing.cast(dict[object, object], data)
-    for key in raw:
-        if type(key) is not str:
-            return None
-    if len(raw) != len(names) or not all(name in raw for name in names):
+    if len(raw) != len(names) or not _exact_str_keys(raw):
+        return None
+    if not all(name in raw for name in names):
         return None
     return tuple(raw[name] for name in names)
+
+
+def _exact_str_keys(mapping: dict[object, object]) -> bool:
+    """Whether every key is an exact ``str``; each caller bounds ``len(mapping)`` first."""
+    return all(type(key) is str for key in mapping)
+
+
+def _items(items: list[object]) -> list[object]:
+    """List borrowed references from an exact list; each caller bounds its length first."""
+    return list(items)
 
 
 def _scalar(value: object, budget: list[int], limit: int) -> bool:
@@ -347,9 +362,8 @@ def _scalar(value: object, budget: list[int], limit: int) -> bool:
 
 def _keys(mapping: dict[object, object], budget: list[int], limit: int) -> list[str] | None:
     """Admit every key as an exact bounded ``str`` before any key is used."""
-    for key in mapping:
-        if type(key) is not str:
-            return None
+    if not _exact_str_keys(mapping):
+        return None
     keys = typing.cast(list[str], list(mapping))
     for key in keys:
         size = _charge(key, budget, limit)
@@ -372,16 +386,19 @@ def _admit_record(record: object, model: type[pydantic.BaseModel]) -> bool:
         nested = _scan(type(current), _MODEL_CLASSES)
         children: list[object]
         if nested is not None:
-            values = _charged_fields(current, nested, budget)
-            if values is None:
-                return False
-            children = list(values)
             if depth >= MAX_JSON_DEPTH:
                 return False
+            values = _charged_fields(current, nested, budget)
+            if values is None or nodes + len(stack) + len(values) > MAX_JSON_NODES:
+                return False
+            children = list(values)
         elif type(current) is dict or type(current) is list:
             container = typing.cast(dict[object, object] | list[object], current)
-            if len(container) > MAX_COLLECTION_LENGTH or (
-                depth >= MAX_JSON_DEPTH and len(container) > 0
+            size = len(container)
+            if (
+                size > MAX_COLLECTION_LENGTH
+                or (depth >= MAX_JSON_DEPTH and size > 0)
+                or nodes + len(stack) + size > MAX_JSON_NODES
             ):
                 return False
             if type(container) is dict:
@@ -390,12 +407,10 @@ def _admit_record(record: object, model: type[pydantic.BaseModel]) -> bool:
                     return False
                 children = [container[key] for key in keys]
             else:
-                children = list(typing.cast(list[object], container))
+                children = _items(typing.cast(list[object], container))
         elif _is_member(current) or _scalar(current, budget, MAX_INPUT_AGGREGATE_BYTES):
             children = []
         else:
-            return False
-        if nodes + len(stack) + len(children) > MAX_JSON_NODES:
             return False
         stack.extend((child, depth + 1) for child in reversed(children))
         if budget[0] > MAX_INPUT_AGGREGATE_BYTES:
@@ -443,19 +458,20 @@ def _admit_identity(identity: object) -> bool:
         if nodes > MAX_JSON_NODES + _IDENTITY_SCAFFOLD_NODES or depth > MAX_JSON_DEPTH + 1:
             return False
         children: list[object]
-        if type(current) is dict:
-            mapping = typing.cast(dict[object, object], current)
-            keys = _keys(mapping, budget, _IDENTITY_TEXT_BUDGET)
-            if keys is None:
+        if type(current) is dict or type(current) is list:
+            container = typing.cast(dict[object, object] | list[object], current)
+            if nodes + len(stack) + len(container) > MAX_JSON_NODES + _IDENTITY_SCAFFOLD_NODES:
                 return False
-            children = [mapping[key] for key in keys]
-        elif type(current) is list:
-            children = list(typing.cast(list[object], current))
+            if type(container) is dict:
+                keys = _keys(container, budget, _IDENTITY_TEXT_BUDGET)
+                if keys is None:
+                    return False
+                children = [container[key] for key in keys]
+            else:
+                children = _items(typing.cast(list[object], container))
         elif _scalar(current, budget, _IDENTITY_TEXT_BUDGET):
             children = []
         else:
-            return False
-        if nodes + len(stack) + len(children) > MAX_JSON_NODES + _IDENTITY_SCAFFOLD_NODES:
             return False
         stack.extend((child, depth + 1) for child in children)
         if budget[0] > _IDENTITY_TEXT_BUDGET:
