@@ -22,6 +22,7 @@ from roastpilot_agent.cold_characterisation import evidence_builders as builders
 from roastpilot_agent.cold_characterisation import evidence_lifecycle as lifecycle
 from roastpilot_agent.cold_characterisation import evidence_reader as reader
 from roastpilot_agent.cold_characterisation import evidence_schema as schema
+from roastpilot_agent.cold_characterisation import evidence_store as store
 from roastpilot_agent.cold_characterisation.mcp import SessionFinalisationResult
 from tests.test_cold_characterisation_acceptance import (
     final_status,
@@ -1590,6 +1591,7 @@ def _stream(run: reader.ColdRetainedRunV2, **update: object) -> object:
 
 CARRIER_REFUSALS: list[tuple[str, Forge]] = [
     ("dunder_dict_subclass", _dict_subclass),
+    ("renamed_field_same_count", lambda run: _renamed_field(run)),
     (
         "identity_extra_key",
         lambda run: _replace_identity(run, _with_extra_key(run.run.headers[0].identity)),
@@ -1912,3 +1914,375 @@ def test_n44_limits_are_imported_and_the_d195_policy_is_called() -> None:
         if isinstance(node, ast.Constant) and type(node.value) in (int, float)
     }
     assert numbers.isdisjoint({1800, 60, 200})
+
+
+def _renamed_field(run: reader.ColdRetainedRunV2) -> object:
+    """Exact ``str`` keys with the declared count, but one declared name is missing."""
+    copy = run.model_copy()
+    data = object.__getattribute__(copy, "__dict__")
+    data["rum"] = data.pop("run")
+    return copy
+
+
+# -------------------------------------- R1: subtree bounds before scanning or listing
+
+
+class Seams:
+    """Record every container handed to the two admission scan/list seams.
+
+    This is a structural ordering proof: the seams are the only places the pre-walk
+    scans a mapping's keys or lists a sequence's items, so a container that never
+    reaches them was refused before any work proportional to its size.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.seen: list[object] = []
+        scan = conformance._exact_str_keys  # pyright: ignore[reportPrivateUsage]
+        items = conformance._items  # pyright: ignore[reportPrivateUsage]
+
+        def spy_scan(mapping: dict[object, object]) -> bool:
+            self.seen.append(mapping)
+            return scan(mapping)
+
+        def spy_items(values: list[object]) -> list[object]:
+            self.seen.append(values)
+            return items(values)
+
+        monkeypatch.setattr(conformance, "_exact_str_keys", spy_scan)
+        monkeypatch.setattr(conformance, "_items", spy_items)
+
+    def touched(self, target: object) -> bool:
+        """Whether one exact container object reached a scan or list seam."""
+        return any(item is target for item in self.seen)
+
+
+_IDENTITY_NODES = schema.MAX_JSON_NODES + 8
+
+
+def _oversized_model_data(run: reader.ColdRetainedRunV2) -> tuple[object, object]:
+    tick = _first_tick(run)
+    assert tick.device is not None
+    device = tick.device.model_copy()
+    data = object.__getattribute__(device, "__dict__")
+    data.update({f"extra{index}": 0 for index in range(5000)})
+    forged = tick.model_copy(update={"device": device})
+    return _replace_record(run, OFF, schema.ColdEvidenceStream.TICK, forged), data
+
+
+def _oversized_record_list(run: reader.ColdRetainedRunV2) -> tuple[object, object]:
+    target = [0] * schema.MAX_COLLECTION_LENGTH
+    vendor = _node_vendor(0) | {"d": target}
+    return _replace_record(run, OFF, schema.ColdEvidenceStream.TICK, _raw_tick(run, vendor)), target
+
+
+def _overlong_record_list(run: reader.ColdRetainedRunV2) -> tuple[object, object]:
+    target = [0] * (schema.MAX_COLLECTION_LENGTH + 1)
+    forged = _raw_tick(run, {"items": target})
+    return _replace_record(run, OFF, schema.ColdEvidenceStream.TICK, forged), target
+
+
+def _oversized_identity_list(run: reader.ColdRetainedRunV2) -> tuple[object, object]:
+    target = [0] * (_IDENTITY_NODES + 1)
+    return _known(run, huge=target), target
+
+
+def _oversized_identity_dict(run: reader.ColdRetainedRunV2) -> tuple[object, object]:
+    target = {f"k{index}": 0 for index in range(_IDENTITY_NODES + 1)}
+    return _known(run, huge=target), target
+
+
+OVERSIZED: list[tuple[str, typing.Callable[[reader.ColdRetainedRunV2], tuple[object, object]]]] = [
+    ("model_data_over_field_count", _oversized_model_data),
+    ("record_list_over_node_budget", _oversized_record_list),
+    ("record_list_over_collection_length", _overlong_record_list),
+    ("identity_list_over_node_budget", _oversized_identity_list),
+    ("identity_dict_over_node_budget", _oversized_identity_dict),
+]
+
+
+@pytest.mark.parametrize(("name", "forge"), OVERSIZED, ids=[c[0] for c in OVERSIZED])
+def test_r1_oversized_subtrees_are_refused_before_scanning_or_listing(
+    genuine: reader.ColdRetainedRunV2,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    forge: typing.Callable[[reader.ColdRetainedRunV2], tuple[object, object]],
+) -> None:
+    """R1: an oversized exact list, dict or model ``__dict__`` never reaches a seam."""
+    del name
+    carrier, target = forge(genuine)
+    seams = Seams(monkeypatch)
+    assert check(carrier).findings == (F.CARRIER_NOT_ADMITTED,)
+    assert seams.seen, "the seams observed the walk"
+    assert not seams.touched(target)
+
+
+def test_r1_seams_observe_genuine_containers(
+    genuine: reader.ColdRetainedRunV2, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1 control: admitted containers do reach the seams, so a miss is meaningful."""
+    carrier, _target = _oversized_record_list(genuine)
+    vendor = typing.cast(dict[str, object], _first_tick(genuine).model_dump()["device"])
+    assert vendor["raw_vendor_data"]
+    seams = Seams(monkeypatch)
+    assert check(genuine).findings == ()
+    assert any(type(item) is list for item in seams.seen)
+    assert any(type(item) is dict for item in seams.seen)
+    seams.seen.clear()
+    check(carrier)
+    full = schema.MAX_COLLECTION_LENGTH
+    lists: list[object] = [
+        item
+        for item in seams.seen
+        if type(item) is list and len(typing.cast(list[object], item)) == full
+    ]
+    assert lists, "the earlier full-length lists in the same subtree were listed"
+
+
+# -------------------------------------------- R2: every causal and binding relation
+
+
+def _lifecycle_event_at(phase: Phase, event: lifecycle.ColdLifecycleEvent, instant: float) -> Edit:
+    def edit(run: Plan) -> None:
+        entry(run, phase, event).ev = instant
+
+    return edit
+
+
+def _header_at(phase: Phase, instant: float) -> Edit:
+    def edit(run: Plan) -> None:
+        run.headers[phase] = instant
+
+    return edit
+
+
+def _result_at(phase: Phase, instant: float) -> Edit:
+    def edit(run: Plan) -> None:
+        run.results[phase][0] = (run.results[phase][0][0], instant)
+
+    return edit
+
+
+_UP, _DOWN = math.inf, -math.inf
+#: One case per enforced causal relation; every other instant stays admissible.
+CAUSAL_CASES: list[tuple[str, Edit]] = [
+    ("h_off_after_a_off", _header_at(OFF, math.nextafter(10.0, _UP))),
+    ("h_on_after_a_on", _header_at(ON, math.nextafter(1830.0, _UP))),
+    (
+        "f_off_before_e_off",
+        _lifecycle_event_at(OFF, Event.FINALISATION_RETURNED, math.nextafter(1810.0, _DOWN)),
+    ),
+    (
+        "cs_off_before_f_off",
+        _lifecycle_event_at(OFF, Event.CHILD_STOPPED, math.nextafter(1811.0, _DOWN)),
+    ),
+    (
+        "ct_off_before_cs_off",
+        _lifecycle_event_at(OFF, Event.CHILD_STARTED, math.nextafter(1812.0, _DOWN)),
+    ),
+    ("h_on_before_ct_off", _header_at(ON, math.nextafter(1813.0, _DOWN))),
+    (
+        "f_on_before_e_on",
+        _lifecycle_event_at(ON, Event.FINALISATION_RETURNED, math.nextafter(3630.0, _DOWN)),
+    ),
+    (
+        "cs_on_before_f_on",
+        _lifecycle_event_at(ON, Event.CHILD_STOPPED, math.nextafter(3631.0, _DOWN)),
+    ),
+    (
+        "z_before_cs_on",
+        _lifecycle_event_at(ON, Event.RUN_TERMINATED, math.nextafter(3632.0, _DOWN)),
+    ),
+    ("fin_off_before_e_off", _result_at(OFF, math.nextafter(1810.0, _DOWN))),
+    ("fin_on_before_e_on", _result_at(ON, math.nextafter(3630.0, _DOWN))),
+    ("fin_off_after_f_off_recording", _result_at(OFF, math.nextafter(1811.5, _UP))),
+    ("fin_on_after_f_on_recording", _result_at(ON, math.nextafter(3631.5, _UP))),
+]
+
+
+@pytest.mark.parametrize(("name", "edit"), CAUSAL_CASES, ids=[c[0] for c in CAUSAL_CASES])
+def test_r2_each_causal_relation_is_enforced(tmp_path: Path, name: str, edit: Edit) -> None:
+    """R2: moving one instant just across one inclusive bound yields only that finding."""
+    del name
+    run = plan(tmp_path)
+    edit(run)
+    assert findings(tmp_path, run) == (F.CAUSAL_ORDER_VIOLATED,)
+
+
+def _transition_event_after_activation(run: Plan) -> None:
+    measured = entry(run, ON, Event.TRANSITION_MEASURED)
+    measured.ev = measured.rec = math.nextafter(1830.0, _UP)
+
+
+BINDING_CASES: list[tuple[str, Edit, Findings]] = [
+    (
+        "transition_event_not_activation",
+        _transition_event_after_activation,
+        (F.TRANSITION_NOT_BOUND,),
+    ),
+    (
+        "off_return_session",
+        _set(OFF, Event.FINALISATION_RETURNED, session_id="session-other"),
+        (F.SESSION_BINDING_MISMATCH,),
+    ),
+    (
+        "on_return_session",
+        _set(ON, Event.FINALISATION_RETURNED, session_id="session-other"),
+        (F.SESSION_BINDING_MISMATCH,),
+    ),
+    (
+        "transition_current_session",
+        _set(ON, Event.TRANSITION_MEASURED, session_id="session-other"),
+        (F.SESSION_BINDING_MISMATCH,),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "edit", "expected"), BINDING_CASES, ids=[c[0] for c in BINDING_CASES]
+)
+def test_r2_transition_and_session_bindings(
+    tmp_path: Path, name: str, edit: Edit, expected: Findings
+) -> None:
+    """R2: each transition-instant and session binding is independently enforced."""
+    del name
+    run = plan(tmp_path)
+    edit(run)
+    assert findings(tmp_path, run) == expected
+
+
+# ------------------------------------- R3: reachable identity depth and node maxima
+
+
+def _identity_admission(doc: Json) -> schema.ColdEvidenceFailure | None:
+    """Envelope, header and identity-v1 validators as the independent oracle."""
+    try:
+        snapshot = schema.validate_record(header_of(doc, OFF, 1.0))
+        assert type(snapshot) is schema.ColdRunHeader
+        store.read_identity_v1(snapshot.identity)
+    except schema.ColdEvidenceError as error:
+        return error.failure
+    return None
+
+
+def _with_extras(doc: Json, extras: Json) -> Json:
+    copy = json.loads(json.dumps(doc))
+    copy["runtime_config"].update(extras)
+    return copy
+
+
+def _identity_run(tmp_path: Path, extras: Json) -> Findings:
+    run = plan(tmp_path)
+    for phase in (OFF, ON):
+        run.documents[phase] = _with_extras(run.documents[phase], extras)
+    return findings(tmp_path, run)
+
+
+def test_r3_deepest_admitted_identity_extra_conforms(tmp_path: Path) -> None:
+    """R3: the deepest tolerant identity extra the frozen validators admit conforms."""
+    doc = plan(tmp_path / "probe").documents[OFF]
+    levels = 0
+    while _identity_admission(_with_extras(doc, {"deep": _nest(levels + 1)})) is None:
+        levels += 1
+    assert _identity_admission(_with_extras(doc, {"deep": _nest(levels + 1)})) is (
+        schema.ColdEvidenceFailure.JSON_DEPTH_EXCEEDED
+    )
+    assert levels == schema.MAX_JSON_DEPTH - 2
+    assert _identity_run(tmp_path / "run", {"deep": _nest(levels)}) == ()
+
+
+def _wide(tail: int) -> Json:
+    full = [0] * schema.MAX_COLLECTION_LENGTH
+    return {"e0": full, "e1": list(full), "e2": list(full), "e3": [0] * tail}
+
+
+def test_r3_widest_admitted_identity_extra_conforms(tmp_path: Path) -> None:
+    """R3: the identity holding the envelope's maximum node count conforms."""
+    doc = plan(tmp_path / "probe").documents[OFF]
+    low, high = 0, schema.MAX_COLLECTION_LENGTH
+    assert _identity_admission(_with_extras(doc, _wide(low))) is None
+    assert _identity_admission(_with_extras(doc, _wide(high))) is not None
+    while high - low > 1:
+        middle = (low + high) // 2
+        low, high = (
+            (middle, high)
+            if _identity_admission(_with_extras(doc, _wide(middle))) is None
+            else (low, middle)
+        )
+    assert _identity_admission(_with_extras(doc, _wide(low + 1))) is (
+        schema.ColdEvidenceFailure.JSON_NODE_LIMIT_EXCEEDED
+    )
+    assert _identity_run(tmp_path / "run", _wide(low)) == ()
+
+
+# ----------------------------- R4: replay never receives a negative since-activation
+
+
+def test_r4_replay_skips_ticks_before_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R4: before-activation ticks in both phases are refused and never replayed."""
+    run = plan(tmp_path)
+    run.ticks[OFF][0].mono = math.nextafter(10.0, _DOWN)
+    run.ticks[ON][0].mono = math.nextafter(1830.0, _DOWN)
+    retained = write(tmp_path, run)
+    received: list[float] = []
+    real = engine_policy.evaluate_tick
+
+    def spy(record: schema.ColdTickRecord, **kwargs: typing.Any) -> typing.Any:
+        received.append(kwargs["since_activation_seconds"])
+        return real(record, **kwargs)
+
+    monkeypatch.setattr(conformance, "evaluate_tick", spy)
+    assert check(retained).findings == (F.TICK_OUTSIDE_WINDOW,)
+    assert len(received) == 4
+    assert min(received) >= 0.0
+
+
+# ------------------------------------------------ R5: host count and window variants
+
+
+def _host(phase: Phase, position: int, mono: float) -> Edit:
+    def edit(run: Plan) -> None:
+        run.hosts[phase][position] = mono
+
+    return edit
+
+
+def _late_on_host(run: Plan) -> None:
+    def make(header: schema.ColdRunHeader) -> schema.ColdEvidenceRecord:
+        return host_record(header, 3634.0)
+
+    run.late.append((ON, make))
+
+
+HOST_CASES: list[tuple[str, Edit, Findings]] = [
+    ("excess_host", lambda run: run.hosts[OFF].append(12.5), (F.HOST_EVIDENCE_MISMATCH,)),
+    ("off_host_at_activation", _host(OFF, 0, 10.0), ()),
+    ("off_host_at_elapsed", _host(OFF, 2, 1810.0), ()),
+    ("on_host_at_activation", _host(ON, 0, 1830.0), ()),
+    ("on_host_at_elapsed", _host(ON, 2, 3630.0), ()),
+    ("on_tick_at_activation", _tick_at(ON, 0, 1830.0), ()),
+    ("on_tick_at_elapsed", _tick_at(ON, 2, 3630.0), ()),
+    (
+        "off_host_before_activation",
+        _host(OFF, 0, math.nextafter(10.0, _DOWN)),
+        (F.TICK_OUTSIDE_WINDOW,),
+    ),
+    ("on_host_after_elapsed", _host(ON, 2, math.nextafter(3630.0, _UP)), (F.TICK_OUTSIDE_WINDOW,)),
+    (
+        "on_host_after_terminal",
+        _late_on_host,
+        (F.TICK_OUTSIDE_WINDOW, F.HOST_EVIDENCE_MISMATCH, F.RECORD_AFTER_TERMINATION),
+    ),
+]
+
+
+@pytest.mark.parametrize(("name", "edit", "expected"), HOST_CASES, ids=[c[0] for c in HOST_CASES])
+def test_r5_host_count_and_window(
+    tmp_path: Path, name: str, edit: Edit, expected: Findings
+) -> None:
+    """R5: host count equality, inclusive host/tick window edges, and a post-terminal host."""
+    del name
+    run = plan(tmp_path)
+    edit(run)
+    assert findings(tmp_path, run) == expected
