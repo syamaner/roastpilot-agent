@@ -82,6 +82,8 @@ Reason = schema.ColdEngineAbortReason
 Domain = schema.ColdAbortDomain
 _MCP_FIXTURES = Path(__file__).parent / "fixtures" / "mcp-tool-results"
 _POLARITY: typing.Final = object()
+#: Syntactically valid ISO 8601 UTC text over the record bound; only length refuses it.
+OVERSIZED_UTC = "2026-09-26T12:00:00." + "0" * 2100 + "+00:00"
 
 
 # ------------------------------------------------------------------ harness
@@ -202,7 +204,7 @@ class FakeClock:
                 .isoformat()
             )
         if fault == "oversize":
-            return "2" * (schema.MAX_TEXT_FIELD_BYTES + 1)
+            return OVERSIZED_UTC
         if fault is None:
             self.good.append((self.t, self._utc()))
         return self._utc()
@@ -575,8 +577,15 @@ async def test_t2b_long_read_starts_the_next_read_at_completion(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_t2c_oversleep_past_the_deadline_completes_without_a_read(tmp_path: Path) -> None:
-    """T2c: an oversleep past the deadline is re-checked; no read starts at or after it."""
+async def test_t2c_oversleep_after_the_first_read_completes_without_a_further_read(
+    tmp_path: Path,
+) -> None:
+    """T2c: an oversleep after the first read is re-checked; no read starts at or after it.
+
+    An oversleep before the first read is impossible: the initial next start is
+    the activation instant and the first valid P2 is not earlier, so no sleep
+    precedes the first read.  The zero-tick clock-jump case is separate.
+    """
     clock = FakeClock(oversleep={0: 1900.0})
     rig = make_rig(tmp_path, clock=clock)
     result = completed((await run_phase(rig))[0])
@@ -965,6 +974,11 @@ _IMMEDIATE: list[tuple[str, Callable[[], ColdTickObservation], tuple[Reason, ...
         lambda: clean(session=session_metadata(session_id="foreign")),
         (Reason.MCP_SESSION_IDENTITY_CHANGED,),
     ),
+    (
+        "device-null",
+        lambda: clean(device=None),
+        (Reason.MCP_RESPONSE_NOT_ADMITTED,),
+    ),
 ]
 
 
@@ -995,7 +1009,6 @@ def test_t5_a_clean_tick_decides_nothing_and_carries_the_heartbeat(tmp_path: Pat
 
 
 _ABSENT: list[tuple[str, Callable[[], ColdTickObservation]]] = [
-    ("device-null", lambda: clean(device=None)),
     ("bean-none", lambda: clean(bean_temp_c=None)),
     ("env-none", lambda: clean(env_temp_c=None)),
     ("audio-disabled", lambda: clean(audio={**audio_payload(), "status": "disabled"})),
@@ -1024,6 +1037,14 @@ def test_t9_unreadable_roast_fan_is_never_absent_telemetry(tmp_path: Path) -> No
     assert decide(record, since=60.0) == (Reason.ROAST_FAN_NOT_OBSERVABLE,)
 
 
+def test_t9_a_null_device_is_unknown_state_never_graced(tmp_path: Path) -> None:
+    """T9/A2: a null device aborts immediately, never as absent telemetry."""
+    record = tick_record(clean(device=None), tmp_path)
+    assert decide(record, since=0.0) == (Reason.MCP_RESPONSE_NOT_ADMITTED,)
+    assert decide(record, since=59.999) == (Reason.MCP_RESPONSE_NOT_ADMITTED,)
+    assert decide(record, since=60.0) == (Reason.MCP_RESPONSE_NOT_ADMITTED,)
+
+
 def test_t11_reasons_follow_declaration_order(tmp_path: Path) -> None:
     """T11: reasons are filtered from the enum in declaration order."""
     first = clean(
@@ -1046,6 +1067,11 @@ def test_t11_reasons_follow_declaration_order(tmp_path: Path) -> None:
         Reason.ROAST_FAN_NOT_OBSERVABLE,
         Reason.MCP_SESSION_IDENTITY_CHANGED,
     )
+    third = clean(bean_temp_c=None, session=session_metadata(session_id="foreign"))
+    assert decide(tick_record(third, tmp_path), since=60.0) == (
+        Reason.TELEMETRY_ABSENT_AFTER_STARTUP,
+        Reason.MCP_SESSION_IDENTITY_CHANGED,
+    )
 
 
 # --------------------------------------------------------------- T6 / T10
@@ -1056,8 +1082,9 @@ def test_t11_reasons_follow_declaration_order(tmp_path: Path) -> None:
     [
         lambda: clean(roast_fan=roast_fan_state(ColdRoastFanOutcome.UNREADABLE, None)),
         lambda: clean(heat_level_percent=5),
+        lambda: clean(device=None),
     ],
-    ids=["unreadable", "heat"],
+    ids=["unreadable", "heat", "null-device"],
 )
 @pytest.mark.asyncio
 async def test_t6_immediate_abort_retains_the_tick_first_and_stops(
@@ -1390,6 +1417,19 @@ def test_t13_instant_admission_rules() -> None:
     assert not admissible(1.0, "", None)
     assert not admissible(1.0, 5, None)
     assert not admissible(True, utc, None)
+    assert datetime.fromisoformat(OVERSIZED_UTC).utcoffset() == timedelta(0)
+    assert len(OVERSIZED_UTC.encode("utf-8")) > schema.MAX_TEXT_FIELD_BYTES
+    assert not admissible(1.0, OVERSIZED_UTC, None)
+
+
+@pytest.mark.asyncio
+async def test_t13_an_oversized_valid_utc_at_admission_is_clock_invalid(tmp_path: Path) -> None:
+    """T13/A0: a parseable but oversized UTC header instant refuses admission."""
+    rig = make_rig(tmp_path, clock=FakeClock(faults={0: "oversize"}))
+    with pytest.raises(engine.ColdAdmissionRefusedError) as raised:
+        await admit(rig)
+    assert raised.value.failure is engine.ColdAdmissionFailure.CLOCK_INVALID
+    assert root_entries(rig.root) == []
 
 
 # ------------------------------------------------------------- T14 / T15
@@ -1478,10 +1518,15 @@ async def test_t15_typed_sink_failures_return_unrecorded_aborts(
 async def test_t15c_an_unknown_sink_failure_raises_with_no_further_append(tmp_path: Path) -> None:
     """T15c: an unknown append exception raises closed with zero further appends."""
     rig = make_rig(tmp_path)
+    admission = await admit(rig)
+    sink = SpySink(engine.open_phase_evidence(admission), fail_at=1, error=RuntimeError(CANARY))
     with pytest.raises(engine.ColdEngineUnexpectedError) as raised:
-        await run_phase(rig, fail_at=1, error=RuntimeError(CANARY))
+        await engine.observe_cold_phase(
+            admission=admission, sink=sink, mcp=rig.mcp, host=rig.host, clock=rig.clock
+        )
     assert raised.value.abort_recorded is False
     assert_contained(raised.value, "Cold engine failed unexpectedly.")
+    assert sink.attempts == 2
 
 
 @pytest.mark.asyncio
@@ -1495,6 +1540,32 @@ async def test_t15d_a_failed_second_abort_keeps_both_and_does_not_recurse(tmp_pa
     assert aborted(result).abort_recorded is False
     assert sink.attempts == 4
     assert streams(sink) == ["header", "tick", "abort"]
+
+
+@pytest.mark.asyncio
+async def test_t15d_a_failed_first_abort_stops_with_both_classifications(tmp_path: Path) -> None:
+    """T15d/A2: the first of two abort appends failing stops recording at once."""
+    rig = make_rig(tmp_path, ticks=lambda index: clean(heat_level_percent=1, connected=False))
+    result, sink = await run_phase(rig, fail_at=2, error=RuntimeError(CANARY))
+    assert aborted(result).aborts == engine_aborts(
+        Reason.COMMAND_STATE_NON_ZERO, Reason.DEVICE_DISCONNECTED
+    )
+    assert aborted(result).abort_recorded is False
+    assert sink.attempts == 3
+    assert streams(sink) == ["header", "tick"]
+
+
+@pytest.mark.asyncio
+async def test_t15_successful_multi_abort_persists_in_declaration_order(tmp_path: Path) -> None:
+    """T6/T15, A2: every abort record is retained, in reason declaration order."""
+    rig = make_rig(tmp_path, ticks=lambda index: clean(heat_level_percent=1, connected=False))
+    result, sink = await run_phase(rig)
+    assert aborted(result).abort_recorded is True
+    assert [(r.domain, r.reason) for r in aborts_of(sink)] == [
+        (Domain.ENGINE, Reason.COMMAND_STATE_NON_ZERO),
+        (Domain.ENGINE, Reason.DEVICE_DISCONNECTED),
+    ]
+    assert streams(sink) == ["header", "tick", "abort", "abort"]
 
 
 @pytest.mark.asyncio
@@ -1608,6 +1679,7 @@ async def test_t17b_cancellation_during_a_read_records_cancelled(tmp_path: Path)
     await _cancel_observer(task)
     assert rig.mcp.calls.count("get_roast_state") == 1
     assert streams(sink) == ["header", "abort"]
+    assert [(r.domain, r.reason) for r in aborts_of(sink)] == [(Domain.ENGINE, Reason.CANCELLED)]
 
 
 @pytest.mark.asyncio
@@ -1983,6 +2055,14 @@ def test_t20_new_modules_are_fenced() -> None:
         "roastpilot_agent.cold_characterisation.evidence_schema",
     }
     assert imported <= allowed
+    engine_mcp_client_imports = [
+        sorted(alias.name for alias in node.names)
+        for node in ast.walk(trees["engine.py"])
+        if isinstance(node, ast.ImportFrom) and node.module == "roastpilot_agent.mcp_client"
+    ]
+    assert engine_mcp_client_imports == [
+        ["EventCommandResult", "RuntimeConfigSnapshot", "ServerInfo", "StartRoastSessionResult"]
+    ]
     policy_names = [
         node.attr for node in ast.walk(trees["engine_policy.py"]) if isinstance(node, ast.Attribute)
     ]
