@@ -11,8 +11,9 @@ reaches exactly five non-actuating MCP operations through ``ColdEngineMcp``.
 Finalisation and session equality belong to the later phase hand-off.
 
 Residuals: host-thread duration is bounded only by the host reader itself; a
-read is bounded by ``call_timeout_seconds`` only when composed over
-``MCPServerProcess.call_tool``; the session clock is an MCP software heartbeat.
+read is bounded by ``call_timeout_seconds`` only when composed over the
+timeout-bounded ``MCPServerProcess`` transport; the session clock is an MCP
+software heartbeat.
 """
 
 import asyncio
