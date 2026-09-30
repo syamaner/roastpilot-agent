@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import ast
 import io
+import re
 import runpy
 import subprocess
 import sys
 import threading
 import time
 import tomllib
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -2512,11 +2514,48 @@ def _repository_module_candidates(module: str, filename: str, repository_root: P
     return candidates
 
 
+_DocsProxyMemo = dict[tuple[str, str, Path], frozenset[str]]
+
+
+def _memoised_proxy_docs_readers(
+    proxy: str, filename: str, repository_root: Path, memo: _DocsProxyMemo
+) -> frozenset[str]:
+    """Return one imported proxy's docs readers, reusing work within one audit call.
+
+    The memo lives for exactly one top-level :func:`_docs_reading_test_modules`
+    call and is dropped when that call returns or raises. A hit requires the exact
+    full proxy text, source filename and repository root, because importer-local
+    module resolution depends on the filename. A result is stored only after the
+    analysis returns normally; every exception propagates unchanged and nothing is
+    stored, so a failure is never reused as a success and there is no in-progress
+    placeholder. As with the existing non-atomic source reads, files are assumed
+    not to change during one synchronous analysis.
+
+    Args:
+        proxy: The imported module source plus its synthetic probe tests.
+        filename: The imported module's source path, used for resolution.
+        repository_root: The confined repository root for module resolution.
+        memo: The current top-level call's proxy result memo.
+
+    Returns:
+        The immutable set of probe test names that read committed docs.
+    """
+
+    key = (proxy, filename, repository_root)
+    if key in memo:
+        return memo[key]
+    result = frozenset(_docs_reading_test_modules_in_call(proxy, filename, repository_root, memo))
+    memo[key] = result
+    return result
+
+
 def _repository_imported_fixture_analyses(
     tree: ast.Module,
     filename: str,
     repository_root: Path,
     plugin_modules: set[str] | None = None,
+    *,
+    memo: _DocsProxyMemo,
 ) -> tuple[dict[str, _FunctionAnalysis], set[str], set[str]]:
     """Return synthetic analyses for directly imported first-party fixtures.
 
@@ -2575,9 +2614,7 @@ def _repository_imported_fixture_analyses(
                 + "def test_import_return() -> None:\n"
                 + f"    {function.name}().read_text()\n"
             )
-            readers = _docs_reading_test_modules(
-                proxy, filename=str(source_path), repository_root=repository_root
-            )
+            readers = _memoised_proxy_docs_readers(proxy, str(source_path), repository_root, memo)
             analysis = _FunctionAnalysis(
                 reads_directly="test_import_direct" in readers,
                 calls=set(),
@@ -2644,9 +2681,7 @@ def _repository_imported_fixture_analyses(
                 + "def test_import_return() -> None:\n"
                 + f"    {function.name}().read_text()\n"
             )
-            readers = _docs_reading_test_modules(
-                proxy, filename=str(source_path), repository_root=repository_root
-            )
+            readers = _memoised_proxy_docs_readers(proxy, str(source_path), repository_root, memo)
             analysis = _FunctionAnalysis(
                 reads_directly="test_import_direct" in readers,
                 calls=set(),
@@ -2684,9 +2719,7 @@ def _repository_imported_fixture_analyses(
             proxy = (
                 source + "\n\ndef test_import_direct() -> None:\n" + f"    {hook_function.name}()\n"
             )
-            readers = _docs_reading_test_modules(
-                proxy, filename=str(source_path), repository_root=repository_root
-            )
+            readers = _memoised_proxy_docs_readers(proxy, str(source_path), repository_root, memo)
             if "test_import_direct" in readers:
                 ambiguous.add("__pytest_plugin_hook__")
     return analyses, ambiguous, autouse
@@ -2870,7 +2903,7 @@ def _imported_parameter_read_names(func: _FunctionNode) -> set[str]:
 
 
 def _repository_imported_function_analyses(
-    tree: ast.Module, filename: str, repository_root: Path
+    tree: ast.Module, filename: str, repository_root: Path, *, memo: _DocsProxyMemo
 ) -> tuple[
     dict[str, _FunctionAnalysis],
     set[str],
@@ -2971,9 +3004,7 @@ def _repository_imported_function_analyses(
                 + "def test_import_return() -> None:\n"
                 + f"    {function.name}().read_text()\n"
             )
-            readers = _docs_reading_test_modules(
-                proxy, filename=str(source_path), repository_root=repository_root
-            )
+            readers = _memoised_proxy_docs_readers(proxy, str(source_path), repository_root, memo)
             analyses[qualified] = _FunctionAnalysis(
                 reads_directly="test_import_direct" in readers,
                 calls=set(),
@@ -3123,9 +3154,7 @@ def _repository_imported_function_analyses(
                 + "def test_import_return() -> None:\n"
                 + f"    {imported.name}().read_text()\n"
             )
-            readers = _docs_reading_test_modules(
-                proxy, filename=str(source_path), repository_root=repository_root
-            )
+            readers = _memoised_proxy_docs_readers(proxy, str(source_path), repository_root, memo)
             analyses[alias] = _FunctionAnalysis(
                 reads_directly="test_import_direct" in readers,
                 calls=set(),
@@ -4985,6 +5014,32 @@ def _docs_reading_test_modules(
             silently under- or over-marking.
     """
 
+    return _docs_reading_test_modules_in_call(source, filename, repository_root, {})
+
+
+def _docs_reading_test_modules_in_call(
+    source: str, filename: str, repository_root: Path, memo: _DocsProxyMemo
+) -> set[str]:
+    """Analyse one module source within one top-level docs-reader audit call.
+
+    This is the body of :func:`_docs_reading_test_modules`. The only difference is
+    that ``memo`` is threaded to every recursive imported-proxy analysis, so the
+    memo's lifetime is the enclosing top-level call and never longer.
+
+    Args:
+        source: The module's Python source.
+        filename: A label used in diagnostics and importer-local resolution.
+        repository_root: The confined repository root for module resolution.
+        memo: The current top-level call's proxy result memo.
+
+    Returns:
+        The qualified executable test prefixes that read docs content.
+
+    Raises:
+        AssertionError: If reader provenance is ambiguous, exactly as the
+            top-level entry point documents.
+    """
+
     tree = ast.parse(source)
     _assert_no_aliased_qualified_open_calls(tree, filename)
     for statement in ast.walk(tree):
@@ -5072,7 +5127,7 @@ def _docs_reading_test_modules(
         ambiguous_module_values,
         imported_collected_test_classes,
     ) = _repository_imported_function_analyses(
-        tree_with_import_call_imports, filename, repository_root
+        tree_with_import_call_imports, filename, repository_root, memo=memo
     )
     ambiguous_imports = ambiguous_imports | ambiguous_module_import_call_names
     if "*" in ambiguous_imports:
@@ -5108,7 +5163,9 @@ def _docs_reading_test_modules(
         imported_fixture_by_name,
         ambiguous_imported_fixtures,
         imported_autouse_fixtures,
-    ) = _repository_imported_fixture_analyses(tree, filename, repository_root, plugin_modules)
+    ) = _repository_imported_fixture_analyses(
+        tree, filename, repository_root, plugin_modules, memo=memo
+    )
     if "__pytest_plugins__" in ambiguous_imported_fixtures:
         raise AssertionError("pytest_plugins repository fixture provenance is ambiguous")
     if "__pytest_plugin_hook__" in ambiguous_imported_fixtures:
@@ -5474,7 +5531,7 @@ def _docs_reading_test_modules(
             body=[*imports, *scoped_import_call_imports, node], type_ignores=[]
         )
         scoped_analyses, scoped_ambiguous, *_ = _repository_imported_function_analyses(
-            scoped_tree, filename, repository_root
+            scoped_tree, filename, repository_root, memo=memo
         )
         targets = local_targets.setdefault(owner, {})
         ambiguous_targets = ambiguous_local_targets.setdefault(owner, set())
@@ -6317,6 +6374,323 @@ def test_docs_governance_follows_function_scoped_repository_imports(tmp_path: Pa
             filename=str(tmp_path / "test_local_relative.py"),
             repository_root=tmp_path,
         )
+
+
+_MEMO_DOCS_LEAF = (
+    "from pathlib import Path\n\ndef leaf():\n    return Path('docs/x.md').read_text()\n"
+)
+_MEMO_CONFIG_LEAF = (
+    "from pathlib import Path\n\ndef leaf():\n    return Path('config/x.md').read_text()\n"
+)
+_MEMO_FAN_IN_TOP = (
+    "from mid_a import a\nfrom mid_b import b\n\n"
+    "def test_a() -> None:\n    assert a()\n\n"
+    "def test_b() -> None:\n    assert b()\n"
+)
+_MEMO_CHAIN_TOP = (
+    "from m0 import f0_a, f0_b\n\n"
+    "def test_a() -> None:\n    assert f0_a()\n\n"
+    "def test_b() -> None:\n    assert f0_b()\n"
+)
+
+
+def _write_memo_fan_in_corpus(root: Path) -> None:
+    """Write a two-importer fan-in onto one docs-reading leaf module."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "leaf.py").write_text(_MEMO_DOCS_LEAF, encoding="utf-8")
+    (root / "mid_a.py").write_text(
+        "from leaf import leaf\n\ndef a():\n    return leaf()\n", encoding="utf-8"
+    )
+    (root / "mid_b.py").write_text(
+        "from leaf import leaf\n\ndef b():\n    return leaf()\n", encoding="utf-8"
+    )
+
+
+def _write_memo_branching_chain_corpus(root: Path) -> None:
+    """Write a depth-four chain whose every level imports two next-level functions."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    for level in range(3):
+        after = level + 1
+        (root / f"m{level}.py").write_text(
+            f"from m{after} import f{after}_a, f{after}_b\n\n"
+            f"def f{level}_a():\n    return f{after}_a() + f{after}_b()\n\n"
+            f"def f{level}_b():\n    return f{after}_a() + f{after}_b()\n",
+            encoding="utf-8",
+        )
+    (root / "m3.py").write_text(
+        "from pathlib import Path\n\n"
+        "def f3_a():\n    return Path('docs/x.md').read_text()\n\n"
+        "def f3_b():\n    return 'x'\n",
+        encoding="utf-8",
+    )
+
+
+def _count_docs_analysis_calls(monkeypatch: pytest.MonkeyPatch) -> Counter[str]:
+    """Count per-filename docs-reader analyses by wrapping the per-call worker.
+
+    Args:
+        monkeypatch: The requesting test's monkeypatch fixture, which restores the
+            original worker at teardown.
+
+    Returns:
+        A live counter keyed by each analysed source's ``filename`` argument.
+    """
+
+    counts: Counter[str] = Counter()
+    original = _docs_reading_test_modules_in_call
+
+    def counting(
+        source: str, filename: str, repository_root: Path, memo: _DocsProxyMemo
+    ) -> set[str]:
+        counts[filename] += 1
+        return original(source, filename, repository_root, memo)
+
+    monkeypatch.setattr(sys.modules[__name__], "_docs_reading_test_modules_in_call", counting)
+    return counts
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_proxy_memo_reuses_fan_in_within_one_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two importers of one docs-reading leaf both remain readers."""
+
+    _write_memo_fan_in_corpus(tmp_path)
+    counts = _count_docs_analysis_calls(monkeypatch)
+    assert _docs_reading_test_modules(_MEMO_FAN_IN_TOP, repository_root=tmp_path) == {
+        "test_a",
+        "test_b",
+    }
+    assert dict(counts) == {
+        "<module>": 1,
+        str(tmp_path / "mid_a.py"): 1,
+        str(tmp_path / "mid_b.py"): 1,
+        str(tmp_path / "leaf.py"): 1,
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_proxy_memo_reuses_imported_fixture_duplicate_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directly imported autouse fixture keeps reader provenance."""
+
+    (tmp_path / "plugin.py").write_text(
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture(autouse=True)\ndef docs_auto():\n"
+        "    return Path('docs/x.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = "from plugin import docs_auto\n\ndef test_direct_autouse() -> None:\n    assert True\n"
+    counts = _count_docs_analysis_calls(monkeypatch)
+    assert _docs_reading_test_modules(source, repository_root=tmp_path) == {"test_direct_autouse"}
+    assert dict(counts) == {"<module>": 1, str(tmp_path / "plugin.py"): 1}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_proxy_memo_bounds_branching_chain_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A branching import chain keeps its deepest docs read visible."""
+
+    _write_memo_branching_chain_corpus(tmp_path)
+    counts = _count_docs_analysis_calls(monkeypatch)
+    assert _docs_reading_test_modules(_MEMO_CHAIN_TOP, repository_root=tmp_path) == {
+        "test_a",
+        "test_b",
+    }
+    assert dict(counts) == {
+        "<module>": 1,
+        **{str(tmp_path / f"m{level}.py"): 2 for level in range(4)},
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_proxy_memo_threads_function_scoped_imports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated function-scoped imports of one helper keep reader provenance."""
+
+    (tmp_path / "leaf.py").write_text(_MEMO_DOCS_LEAF, encoding="utf-8")
+    (tmp_path / "mid.py").write_text(
+        "from leaf import leaf\n\ndef mid():\n    return leaf()\n", encoding="utf-8"
+    )
+    source = (
+        "def test_one() -> None:\n    from mid import mid\n    assert mid()\n\n"
+        "def test_two() -> None:\n    from mid import mid\n    assert mid()\n"
+    )
+    counts = _count_docs_analysis_calls(monkeypatch)
+    assert _docs_reading_test_modules(source, repository_root=tmp_path) == {
+        "test_one",
+        "test_two",
+    }
+    assert dict(counts) == {
+        "<module>": 1,
+        str(tmp_path / "mid.py"): 1,
+        str(tmp_path / "leaf.py"): 1,
+    }
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize("case", ["repeated_work", "source_edits"])
+def test_docs_governance_proxy_memo_is_fresh_per_top_level_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Every top-level call re-analyses sources, observing direct and transitive edits."""
+
+    counts = _count_docs_analysis_calls(monkeypatch)
+    if case == "repeated_work":
+        _write_memo_branching_chain_corpus(tmp_path)
+        for _ in range(2):
+            assert _docs_reading_test_modules(_MEMO_CHAIN_TOP, repository_root=tmp_path) == {
+                "test_a",
+                "test_b",
+            }
+        assert dict(counts) == {
+            "<module>": 2,
+            **{str(tmp_path / f"m{level}.py"): 4 for level in range(4)},
+        }
+        return
+    fan_in_paths = [str(tmp_path / f"{name}.py") for name in ("mid_a", "mid_b", "leaf")]
+    _write_memo_fan_in_corpus(tmp_path)
+    assert _docs_reading_test_modules(_MEMO_FAN_IN_TOP, repository_root=tmp_path) == {
+        "test_a",
+        "test_b",
+    }
+    (tmp_path / "leaf.py").write_text(_MEMO_CONFIG_LEAF, encoding="utf-8")
+    assert _docs_reading_test_modules(_MEMO_FAN_IN_TOP, repository_root=tmp_path) == set()
+    assert dict(counts) == {"<module>": 2, **dict.fromkeys(fan_in_paths, 2)}
+    (tmp_path / "leaf.py").write_text(_MEMO_DOCS_LEAF, encoding="utf-8")
+    (tmp_path / "mid_a.py").write_text("def a():\n    return 'x'\n", encoding="utf-8")
+    assert _docs_reading_test_modules(_MEMO_FAN_IN_TOP, repository_root=tmp_path) == {"test_b"}
+    assert dict(counts) == {"<module>": 3, **dict.fromkeys(fan_in_paths, 3)}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_proxy_memo_isolates_importer_local_resolution(tmp_path: Path) -> None:
+    """Byte-identical helpers resolve their own importer-local dependencies."""
+
+    helper = "from leaf import leaf\n\ndef helper():\n    return leaf()\n"
+    for package, leaf in (("pkg_a", _MEMO_DOCS_LEAF), ("pkg_b", _MEMO_CONFIG_LEAF)):
+        (tmp_path / package).mkdir()
+        (tmp_path / package / "helper.py").write_text(helper, encoding="utf-8")
+        (tmp_path / package / "leaf.py").write_text(leaf, encoding="utf-8")
+    source = (
+        "from pkg_a.helper import helper as helper_a\n"
+        "from pkg_b.helper import helper as helper_b\n\n"
+        "def test_a() -> None:\n    assert helper_a()\n\n"
+        "def test_b() -> None:\n    assert helper_b()\n"
+    )
+    assert _docs_reading_test_modules(source, repository_root=tmp_path) == {"test_a"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_proxy_memo_isolates_repository_roots(tmp_path: Path) -> None:
+    """Identical layouts under different roots keep their own provenance."""
+
+    source = "from mid import mid\n\ndef test_mid() -> None:\n    assert mid()\n"
+    for name, leaf in (("r1", _MEMO_DOCS_LEAF), ("r2", _MEMO_CONFIG_LEAF)):
+        root = tmp_path / name
+        root.mkdir()
+        (root / "leaf.py").write_text(leaf, encoding="utf-8")
+        (root / "mid.py").write_text(
+            "from leaf import leaf\n\ndef mid():\n    return leaf()\n", encoding="utf-8"
+        )
+    assert _docs_reading_test_modules(source, repository_root=tmp_path / "r1") == {"test_mid"}
+    assert _docs_reading_test_modules(source, repository_root=tmp_path / "r2") == set()
+    assert _docs_reading_test_modules(source, repository_root=tmp_path / "r1") == {"test_mid"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_proxy_memo_never_caches_failures(tmp_path: Path) -> None:
+    """An ambiguous imported dependency fails every call and is never cached as a result."""
+
+    ambiguous = _MEMO_DOCS_LEAF.replace("leaf", "bad") + "\nbad.__test__ = False\n"
+    (tmp_path / "bad.py").write_text(ambiguous, encoding="utf-8")
+    for name in ("a", "b"):
+        (tmp_path / f"mid_{name}.py").write_text(
+            f"from bad import bad\n\ndef {name}():\n    return bad()\n", encoding="utf-8"
+        )
+    failure = (
+        re.escape(str(tmp_path / "bad.py"))
+        + r":\d+: explicit __test__ callable provenance is ambiguous"
+    )
+    with pytest.raises(AssertionError, match=failure):
+        _docs_reading_test_modules(_MEMO_FAN_IN_TOP, repository_root=tmp_path)
+    (tmp_path / "bad.py").write_text(_MEMO_DOCS_LEAF.replace("leaf", "bad"), encoding="utf-8")
+    assert _docs_reading_test_modules(_MEMO_FAN_IN_TOP, repository_root=tmp_path) == {
+        "test_a",
+        "test_b",
+    }
+    (tmp_path / "bad.py").write_text(ambiguous, encoding="utf-8")
+    with pytest.raises(AssertionError, match=failure):
+        _docs_reading_test_modules(_MEMO_FAN_IN_TOP, repository_root=tmp_path)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_cross_module_import_cycle_still_fails(tmp_path: Path) -> None:
+    """A cross-module import cycle still raises instead of resolving to a result."""
+
+    (tmp_path / "a.py").write_text(
+        "from b import fb\n\ndef fa():\n    return fb()\n", encoding="utf-8"
+    )
+    (tmp_path / "b.py").write_text(
+        "from a import fa\n\ndef fb():\n    return fa()\n", encoding="utf-8"
+    )
+    with pytest.raises(RecursionError):
+        _docs_reading_test_modules(
+            "from a import fa\n\ndef test_cycle() -> None:\n    fa()\n", repository_root=tmp_path
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_proxy_memo_reuses_module_import_members(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Module-import members reaching one leaf share its analysis within one call."""
+
+    (tmp_path / "leaf.py").write_text(_MEMO_DOCS_LEAF, encoding="utf-8")
+    for name in ("a", "b"):
+        (tmp_path / f"mid_{name}.py").write_text(
+            f"import leaf\n\ndef {name}():\n    return leaf.leaf()\n", encoding="utf-8"
+        )
+    source = (
+        "import mid_a\nimport mid_b\n\n"
+        "def test_a() -> None:\n    assert mid_a.a()\n\n"
+        "def test_b() -> None:\n    assert mid_b.b()\n"
+    )
+    counts = _count_docs_analysis_calls(monkeypatch)
+    assert _docs_reading_test_modules(source, repository_root=tmp_path) == {"test_a", "test_b"}
+    assert dict(counts) == {
+        "<module>": 1,
+        str(tmp_path / "mid_a.py"): 1,
+        str(tmp_path / "mid_b.py"): 1,
+        str(tmp_path / "leaf.py"): 1,
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_proxy_memo_reuses_plugin_and_direct_fixture_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One fixture reached through pytest_plugins and a direct import is analysed once."""
+
+    (tmp_path / "plugin.py").write_text(
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture(autouse=True)\ndef docs_auto():\n"
+        "    return Path('docs/x.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "pytest_plugins = ['plugin']\n"
+        "from plugin import docs_auto\n\n"
+        "def test_plugin_autouse() -> None:\n    assert True\n"
+    )
+    counts = _count_docs_analysis_calls(monkeypatch)
+    assert _docs_reading_test_modules(source, repository_root=tmp_path) == {"test_plugin_autouse"}
+    assert dict(counts) == {"<module>": 1, str(tmp_path / "plugin.py"): 1}
 
 
 @pytest.mark.docs_ci
