@@ -1681,15 +1681,28 @@ def _thread_task(outer: asyncio.Task[typing.Any]) -> asyncio.Task[typing.Any]:
 @pytest.mark.parametrize("fails", [False, True], ids=["success", "failing-host"])
 @pytest.mark.asyncio
 async def test_owned_thread_cancellation_winning_a_completion_race(
-    fails: bool, early_cancels: int
+    fails: bool, early_cancels: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Lead finding 2: cancellation delivered after completion still wins, observed once."""
+    """Lead finding 2: cancellation delivered after completion still wins, observed once.
+
+    The ``_discard`` spy pins that the cancellation path itself observes a
+    completed outcome.  CPython's ``shield`` callback also reads the inner
+    outcome, so the diagnostic assertion alone would not detect its removal.
+    """
     loop = asyncio.get_running_loop()
     diagnostics: list[dict[str, typing.Any]] = []
     previous = loop.get_exception_handler()
     loop.set_exception_handler(lambda _loop, context: diagnostics.append(context))
     gate = threading.Event()
     calls: list[Path] = []
+    observed: list[tuple[bool, bool]] = []
+    real_discard = engine._discard  # pyright: ignore[reportPrivateUsage]
+
+    def spy(future: "asyncio.Future[typing.Any]") -> None:
+        observed.append((future.done(), future.cancelled()))
+        real_discard(future)
+
+    monkeypatch.setattr(engine, "_discard", spy)
 
     def work(path: Path) -> int:
         calls.append(path)
@@ -1714,6 +1727,7 @@ async def test_owned_thread_cancellation_winning_a_completion_race(
         assert outer.cancelled()
         assert inner.done()
         assert calls == [Path("/evidence")]
+        assert (True, False) in observed
         gc.collect()
         await asyncio.sleep(0)
         assert diagnostics == []
