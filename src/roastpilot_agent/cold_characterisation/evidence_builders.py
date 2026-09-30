@@ -374,7 +374,7 @@ def build_abort_record(
 
     The record carries only a closed domain and its paired closed reason plus
     the bounded recording metadata; it accepts no free-form diagnostic text and
-    computes no verdict.  Any abort still makes qualification impossible.
+    computes no outcome.  Any abort still makes qualification impossible.
 
     Args:
         header: The bound phase header.

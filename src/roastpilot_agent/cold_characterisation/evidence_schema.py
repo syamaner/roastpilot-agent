@@ -224,7 +224,7 @@ class ColdOperatorAbortReason(enum.Enum):
 
 
 class ColdEngineAbortReason(enum.Enum):
-    """Closed cold-engine abort vocabulary; a classification only, never a verdict.
+    """Closed cold-engine abort vocabulary; a classification only, never an outcome.
 
     ``ColdAbortDomain.MCP`` stays the D195 finalisation refusal grammar; engine
     aborts, including MCP read failures observed by the engine, use this grammar.
