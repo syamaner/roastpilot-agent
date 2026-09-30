@@ -1825,7 +1825,10 @@ def test_n42_valid_results_and_closed_vocabularies() -> None:
     )
     assert [member.name for member in Outcome] == ["PRE_ADVISORY_CONFORMANT", "NOT_CONFORMANT"]
     assert all(member.value == member.name.lower() for member in F)
-    assert len(F) == 36
+    assert len(F) == 37
+    members = list(F)
+    position = members.index(F.HOST_EVIDENCE_MISMATCH)
+    assert members[position + 1] is F.HOST_BOUND_VALUE_NOT_ADMITTED
     assert F.CARRIER_NOT_ADMITTED is list(F)[0] and F.CHECKER_INTERNAL_FAILURE is list(F)[-1]
     for vocabulary in (Outcome, F):
         assert type(vocabulary) is type(Phase) and not issubclass(vocabulary, str)
@@ -1905,6 +1908,16 @@ ALLOWED_IMPORTS: dict[str, frozenset[str]] = {
         }
     ),
     _COLD + "engine_policy": frozenset({"evaluate_tick", "ColdTickDecision"}),
+    _COLD + "host_policy": frozenset(
+        {
+            "HOST_MIN_FREE_BYTES_DURING",
+            "free_bytes_meets_floor",
+            "mem_available_is_admitted",
+            "parse_retained_throttle_hex",
+            "soc_temp_below_limit",
+            "throttle_word_is_clear",
+        }
+    ),
 }
 
 
@@ -1946,13 +1959,19 @@ def test_n44_imports_stay_inside_the_ratified_allow_list() -> None:
 
 
 def test_n44_nothing_imports_the_checker() -> None:
-    """N44: the checker has no production consumer in this slice."""
+    """N44: no production module imports the checker (actual import nodes)."""
     package = SOURCE_PATH.parents[1]
-    consumers = [
-        path.relative_to(package).as_posix()
-        for path in package.rglob("*.py")
-        if path != SOURCE_PATH and "conformance" in path.read_text(encoding="utf-8")
-    ]
+    module = _COLD + "conformance"
+    consumers: list[str] = []
+    for path in package.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            imported: list[str] = []
+            if isinstance(node, ast.Import):
+                imported = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imported = [node.module, *(f"{node.module}.{a.name}" for a in node.names)]
+            if module in imported:
+                consumers.append(path.relative_to(package).as_posix())
     assert consumers == []
 
 
@@ -2024,6 +2043,23 @@ def test_n44_limits_are_imported_and_the_d195_policy_is_called() -> None:
     assert numbers.isdisjoint({1800, 60, 200})
 
 
+def test_a2_checker_copies_no_host_threshold_mask_or_regex() -> None:
+    """A2 fence: host bounds come only from host_policy; the checker never imports host."""
+    source = SOURCE_PATH.read_text(encoding="utf-8")
+    for text in ("80.0", "0x000F000F", "0x000f000f", "2**20", "2**30", "2 ** 20", "2 ** 30"):
+        assert text not in source, text
+    modules = {node.module for node in ast.walk(TREE) if isinstance(node, ast.ImportFrom)}
+    assert _COLD + "host" not in modules and _COLD + "host_policy" in modules
+    plain = {alias.name for n in ast.walk(TREE) if isinstance(n, ast.Import) for alias in n.names}
+    assert "re" not in plain
+    numbers = {
+        node.value
+        for node in ast.walk(TREE)
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float)
+    }
+    assert numbers.isdisjoint({80.0, 0x000F000F, 2**20, 2**30})
+
+
 # ------------------------------------------- A2: retained host values (AC15 bounds)
 
 
@@ -2057,26 +2093,70 @@ def test_a2_safe_host_baseline_conforms(tmp_path: Path) -> None:
 
 _MEM_FLOOR = host.HOST_MIN_MEM_AVAILABLE_BYTES
 _RUN_DISK_FLOOR = host.HOST_MIN_FREE_BYTES_DURING
+_START_DISK_FLOOR = host.HOST_MIN_FREE_BYTES_BEFORE
+#: H-N: one unsafe or malformed retained value; exactly the host-value finding.
 UNSAFE_HOST_VALUES: list[tuple[str, dict[str, object]]] = [
     ("temperature_at_limit", {"soc_temp_c": 80.0}),
-    ("throttle_guarded_bit", {"throttled_word_hex": "0x1"}),
+    ("temperature_above_limit", {"soc_temp_c": 80.5}),
+    *[
+        (f"throttle_bit_{bit:#x}", {"throttled_word_hex": f"{bit:#x}"})
+        for bit in (0x1, 0x2, 0x4, 0x8, 0x10000, 0x20000, 0x40000, 0x80000)
+    ],
     ("memory_below_floor", {"mem_available_bytes": _MEM_FLOOR - 1}),
     ("disk_below_run_floor", {"free_bytes": _RUN_DISK_FLOOR - 1}),
+    *[
+        (f"malformed_throttle_{index}", {"throttled_word_hex": spelling})
+        for index, spelling in enumerate(("", "0x", "0X0", "0xA", "0x000000000", "-0x1", " 0x0"))
+    ],
 ]
+#: H-P: admitted boundary values; the run stays conformant.
+SAFE_HOST_BOUNDARIES: list[tuple[str, dict[str, object]]] = [
+    ("temperature_just_below_limit", {"soc_temp_c": math.nextafter(80.0, -math.inf)}),
+    ("temperature_negative", {"soc_temp_c": -5.0}),
+    ("memory_at_floor", {"mem_available_bytes": _MEM_FLOOR}),
+    ("disk_at_run_floor", {"free_bytes": _RUN_DISK_FLOOR}),
+    ("disk_below_start_floor", {"free_bytes": _START_DISK_FLOOR - 1}),
+    ("throttle_zero", {"throttled_word_hex": "0x0"}),
+    ("throttle_zero_padded", {"throttled_word_hex": "0x00000000"}),
+    ("throttle_unmasked_bits", {"throttled_word_hex": "0xfff0fff0"}),
+]
+
+
+def _host_case(tmp_path: Path, phase: Phase, values: dict[str, object]) -> Findings:
+    run = plan(tmp_path)
+    run.host_overrides[(phase, 0)] = values
+    retained = write(tmp_path, run)
+    retained_sample = interpreted(retained).rebound.phases[run.phases.index(phase)].hosts[0].sample
+    for name, value in values.items():
+        assert getattr(retained_sample, name) == value, "the writer retained the exact value"
+    result = check(retained)
+    assert (result.outcome is Outcome.PRE_ADVISORY_CONFORMANT) == (result.findings == ())
+    return result.findings
 
 
 @pytest.mark.parametrize("phase", [OFF, ON])
 @pytest.mark.parametrize(
     ("name", "values"), UNSAFE_HOST_VALUES, ids=[c[0] for c in UNSAFE_HOST_VALUES]
 )
-def test_a2_pre_unsafe_retained_host_value_never_conforms(
+def test_a2_unsafe_retained_host_value_is_a_finding(
     tmp_path: Path, phase: Phase, name: str, values: dict[str, object]
 ) -> None:
-    """H-PRE: one unsafe value in one retained host sample of one phase never conforms."""
+    """H-N: one unsafe or malformed value in one host sample of one phase."""
     del name
-    run = plan(tmp_path)
-    run.host_overrides[(phase, 0)] = values
-    assert check(write(tmp_path, run)).outcome is Outcome.NOT_CONFORMANT
+    result = _host_case(tmp_path / "run", phase, values)
+    assert result == (F.HOST_BOUND_VALUE_NOT_ADMITTED,)
+
+
+@pytest.mark.parametrize("phase", [OFF, ON])
+@pytest.mark.parametrize(
+    ("name", "values"), SAFE_HOST_BOUNDARIES, ids=[c[0] for c in SAFE_HOST_BOUNDARIES]
+)
+def test_a2_admitted_host_boundaries_conform(
+    tmp_path: Path, phase: Phase, name: str, values: dict[str, object]
+) -> None:
+    """H-P: each inclusive or unmasked boundary value in one phase stays conformant."""
+    del name
+    assert _host_case(tmp_path / "run", phase, values) == ()
 
 
 def _renamed_field(run: reader.ColdRetainedRunV2) -> object:
