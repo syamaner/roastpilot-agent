@@ -17,7 +17,7 @@ from pathlib import Path
 import pydantic
 import pytest
 
-from roastpilot_agent.cold_characterisation import acceptance, conformance, engine_policy
+from roastpilot_agent.cold_characterisation import acceptance, conformance, engine_policy, host
 from roastpilot_agent.cold_characterisation import evidence_builders as builders
 from roastpilot_agent.cold_characterisation import evidence_lifecycle as lifecycle
 from roastpilot_agent.cold_characterisation import evidence_reader as reader
@@ -34,7 +34,6 @@ from tests.test_cold_characterisation_acceptance import (
 from tests.test_cold_characterisation_evidence_builders import (
     RUN_ID,
     device_state,
-    host_sample,
     observation,
     roast_fan_state,
     session_metadata,
@@ -101,6 +100,9 @@ class Plan:
     extras: list[tuple[Phase, Maker]] = dataclasses.field(default_factory=list[tuple[Phase, Maker]])
     late: list[tuple[Phase, Maker]] = dataclasses.field(default_factory=list[tuple[Phase, Maker]])
     phases: tuple[Phase, ...] = (OFF, ON)
+    host_overrides: dict[tuple[Phase, int], dict[str, object]] = dataclasses.field(
+        default_factory=dict[tuple[Phase, int], dict[str, object]]
+    )
 
 
 def document(tmp_path: Path, root: str, recording: bool, driver: str = DRIVER) -> Json:
@@ -258,10 +260,31 @@ def tick_record(header: schema.ColdRunHeader, tick: Tick) -> schema.ColdTickReco
     )
 
 
-def host_record(header: schema.ColdRunHeader, mono: float) -> schema.ColdHostRecord:
-    """Build one host record through the real builder."""
+#: A retained host sample strictly inside every AC15 during-run and start bound.
+SAFE_HOST_VALUES: typing.Final[dict[str, object]] = {
+    "captured_at_utc": "2026-09-26T12:00:01Z",
+    "monotonic_seconds": 2.0,
+    "soc_temp_c": 45.5,
+    "throttled_word_hex": "0x0",
+    "mem_available_bytes": 1024 * 2**20,
+    "free_bytes": 4 * 2**30,
+}
+
+
+def safe_host_sample(**overrides: object) -> host.HostBoundSample:
+    """The safe local host baseline, with optional single-dimension overrides."""
+    return host.HostBoundSample.model_validate({**SAFE_HOST_VALUES, **overrides})
+
+
+def host_record(
+    header: schema.ColdRunHeader, mono: float, **overrides: object
+) -> schema.ColdHostRecord:
+    """Build one host record from the safe baseline through the real builder."""
     return builders.build_host_record(
-        header=header, sample=host_sample(), recorded_at_utc=T0, monotonic_seconds=mono
+        header=header,
+        sample=safe_host_sample(**overrides),
+        recorded_at_utc=T0,
+        monotonic_seconds=mono,
     )
 
 
@@ -288,8 +311,9 @@ def write(tmp_path: Path, run: Plan) -> reader.ColdRetainedRunV2:
         writer.append(header)
         for tick in run.ticks[phase]:
             writer.append(tick_record(header, tick))
-        for mono in run.hosts[phase]:
-            writer.append(host_record(header, mono))
+        for position, mono in enumerate(run.hosts[phase]):
+            overrides = run.host_overrides.get((phase, position), {})
+            writer.append(host_record(header, mono, **overrides))
         for payload, mono in run.results[phase]:
             writer.append(finalisation(header, payload, mono))
         for owner, make in run.extras:
@@ -1998,6 +2022,61 @@ def test_n44_limits_are_imported_and_the_d195_policy_is_called() -> None:
         if isinstance(node, ast.Constant) and type(node.value) in (int, float)
     }
     assert numbers.isdisjoint({1800, 60, 200})
+
+
+# ------------------------------------------- A2: retained host values (AC15 bounds)
+
+
+def test_a2_safe_host_baseline_lies_strictly_inside_every_bound() -> None:
+    """The local baseline is strictly within the live reader's public AC15 bounds."""
+    sample = safe_host_sample()
+    assert sample.soc_temp_c < host.HOST_MAX_TEMP_C
+    assert sample.throttled_word_hex == "0x0" and int(sample.throttled_word_hex, 16) == 0
+    assert sample.mem_available_bytes > host.HOST_MIN_MEM_AVAILABLE_BYTES
+    assert sample.free_bytes > host.HOST_MIN_FREE_BYTES_BEFORE > host.HOST_MIN_FREE_BYTES_DURING
+
+
+def test_a2_safe_host_baseline_conforms(tmp_path: Path) -> None:
+    """Positive control: every retained host sample is the safe baseline and conforms."""
+    retained = write(tmp_path, plan(tmp_path))
+    samples = [
+        record.sample.model_dump(mode="json")
+        for phase in interpreted(retained).rebound.phases
+        for record in phase.hosts
+    ]
+    assert len(samples) == 6
+    for sample in samples:
+        assert {name: sample[name] for name in ("soc_temp_c", "throttled_word_hex")} == {
+            "soc_temp_c": 45.5,
+            "throttled_word_hex": "0x0",
+        }
+        assert (sample["mem_available_bytes"], sample["free_bytes"]) == (1024 * 2**20, 4 * 2**30)
+    result = check(retained)
+    assert (result.outcome, result.findings) == (Outcome.PRE_ADVISORY_CONFORMANT, ())
+
+
+_MEM_FLOOR = host.HOST_MIN_MEM_AVAILABLE_BYTES
+_RUN_DISK_FLOOR = host.HOST_MIN_FREE_BYTES_DURING
+UNSAFE_HOST_VALUES: list[tuple[str, dict[str, object]]] = [
+    ("temperature_at_limit", {"soc_temp_c": 80.0}),
+    ("throttle_guarded_bit", {"throttled_word_hex": "0x1"}),
+    ("memory_below_floor", {"mem_available_bytes": _MEM_FLOOR - 1}),
+    ("disk_below_run_floor", {"free_bytes": _RUN_DISK_FLOOR - 1}),
+]
+
+
+@pytest.mark.parametrize("phase", [OFF, ON])
+@pytest.mark.parametrize(
+    ("name", "values"), UNSAFE_HOST_VALUES, ids=[c[0] for c in UNSAFE_HOST_VALUES]
+)
+def test_a2_pre_unsafe_retained_host_value_never_conforms(
+    tmp_path: Path, phase: Phase, name: str, values: dict[str, object]
+) -> None:
+    """H-PRE: one unsafe value in one retained host sample of one phase never conforms."""
+    del name
+    run = plan(tmp_path)
+    run.host_overrides[(phase, 0)] = values
+    assert check(write(tmp_path, run)).outcome is Outcome.NOT_CONFORMANT
 
 
 def _renamed_field(run: reader.ColdRetainedRunV2) -> object:
