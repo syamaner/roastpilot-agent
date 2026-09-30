@@ -590,10 +590,11 @@ _BAD_FIELD_VALUES: list[tuple[str, object]] = [
     ("schema_version", True),
     ("monotonic_seconds", 11),
     ("monotonic_seconds", "11.0"),
-    # Coupled: a -1.0 append time also precedes the 10.0 event (see the coupled test).
+    # Coupled: a -1.0 append time also precedes the 10.0 event (see
+    # test_coupled_negative_append_and_transition_end_are_refused).
     ("monotonic_seconds", -1.0),
     # Confounded: also breaks the derived scheduled end; the isolated event-after-append
-    # oracle is test_event_after_append_is_refused_at_every_boundary.
+    # oracles are the four test_event_after_append_is_refused_* tests.
     ("event_monotonic_seconds", 20.0),
     ("scheduled_end_monotonic", -1.0),
     ("transition_seconds", 1),
