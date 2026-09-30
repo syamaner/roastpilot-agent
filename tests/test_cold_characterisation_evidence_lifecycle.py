@@ -1367,6 +1367,210 @@ def test_tampered_lifecycle_is_refused_before_any_parse(
     assert calls == []
 
 
+# ------------------------------------------- repair: sign, budget, int-for-float
+
+
+def _record_samples(
+    tmp_path: Path,
+) -> tuple[
+    lifecycle.ColdLifecycleRecord, lifecycle.ColdLifecycleRecord, lifecycle.ColdLifecycleRecord
+]:
+    """Return valid CHILD_STOPPED, OBSERVATION_WINDOW_ELAPSED, and TRANSITION_MEASURED records."""
+    sample = samples(tmp_path)
+    stop = sample[Event.CHILD_STOPPED]
+    window = sample[Event.OBSERVATION_WINDOW_ELAPSED]
+    moved = sample[Event.TRANSITION_MEASURED]
+    assert (stop.event_monotonic_seconds, stop.monotonic_seconds) == (5.0, 5.0)
+    assert (window.scheduled_end_monotonic, window.event_monotonic_seconds) == (1810.0, 1810.0)
+    assert (moved.transition_start_monotonic, moved.transition_end_monotonic) == (1810.0, 1830.0)
+    return stop, window, moved
+
+
+def test_negative_event_time_alone_is_refused(tmp_path: Path) -> None:
+    """Repair 1: a -1.0 event with a positive append time is refused only by its sign rule.
+
+    Every cross-field rule holds (event <= append, no matrix field touched), so the
+    refusal is attributable to the event-instant sign guard alone.
+    """
+    stop, _window, _moved = _record_samples(tmp_path)
+    consistent = forged(stop, event_monotonic_seconds=0.0)
+    assert lifecycle.validate_lifecycle_record(consistent) == consistent
+    refused(forged(stop, event_monotonic_seconds=-1.0))
+
+
+def test_negative_transition_start_alone_is_refused(tmp_path: Path) -> None:
+    """Repair 1: a negative start with a non-negative end, exact delta, and flag is refused.
+
+    ``transition_seconds == end - start`` and ``within`` stay exactly consistent, so
+    only the start sign guard explains the refusal.
+    """
+    _stop, _window, moved = _record_samples(tmp_path)
+    event = moved.event_monotonic_seconds
+    near = forged(
+        moved,
+        transition_start_monotonic=0.0,
+        transition_seconds=event - 0.0,
+        transition_within_budget=False,
+    )
+    assert lifecycle.validate_lifecycle_record(near) == near
+    start = event - 30.0 - 1830.0
+    assert start < 0.0 <= event
+    negative = forged(
+        moved,
+        transition_start_monotonic=start,
+        transition_seconds=event - start,
+        transition_within_budget=0.0 <= event - start <= 60.0,
+    )
+    refused(negative)
+
+
+def test_negative_scheduled_end_alone_is_refused(tmp_path: Path) -> None:
+    """Repair 1: an elapsed window with a negative scheduled end is refused by its sign rule.
+
+    The event instant still follows the scheduled end, so the ordering rule holds.
+    """
+    _stop, window, _moved = _record_samples(tmp_path)
+    zero = forged(window, scheduled_end_monotonic=0.0)
+    assert lifecycle.validate_lifecycle_record(zero) == zero
+    refused(forged(window, scheduled_end_monotonic=-1.0))
+
+
+def test_coupled_negative_append_and_transition_end_are_refused(tmp_path: Path) -> None:
+    """Repair 1: negative append time and negative transition end are refused.
+
+    These are coupled cases, not isolated oracles: a negative append time requires a
+    non-positive event instant (event <= append), and a negative transition end must
+    equal an equally negative event instant.  Each refusal is therefore also explained
+    by the event-instant sign guard; they cannot prove their own redundant guard alone.
+    """
+    stop, _window, moved = _record_samples(tmp_path)
+    refused(forged(stop, monotonic_seconds=-1.0, event_monotonic_seconds=-1.0))
+    refused(forged(stop, monotonic_seconds=-1.0, event_monotonic_seconds=-2.0))
+    refused(
+        forged(
+            moved,
+            event_monotonic_seconds=-1.0,
+            transition_end_monotonic=-1.0,
+            transition_start_monotonic=0.0,
+            transition_seconds=-1.0,
+            transition_within_budget=False,
+        )
+    )
+
+
+def _stopped_document(tmp_path: Path) -> tuple[str, dict[str, typing.Any]]:
+    """Seal a run holding one CHILD_STOPPED record and return its root and document."""
+    root, digest, written = seal_run(tmp_path, [stopped(Stop.CONFIRMED, 5.0)])
+    assert list(read2(root, digest).lifecycle) == written
+    return root, written[0].model_dump(mode="json")
+
+
+def _transition_document(tmp_path: Path) -> tuple[str, dict[str, typing.Any]]:
+    """Seal a two-phase run and rewrite its recording-on file with a valid transition."""
+    root, _off, on = _two_phase(tmp_path)
+    record = transition(1810.0, 1830.0)(on, 1)
+    document = record.model_dump(mode="json")
+    digest = rewrite(root, LIFECYCLE_ON, line_of(document))
+    retained = read2(root, digest)
+    assert retained.lifecycle[-1] == record
+    assert type(retained.lifecycle[-1].transition_budget_seconds) is float
+    return root, document
+
+
+def test_reader_refuses_a_negative_event_time(tmp_path: Path) -> None:
+    """Repair 1: a retained CHILD_STOPPED line with a -1.0 event instant is malformed."""
+    root, document = _stopped_document(tmp_path)
+    digest = rewrite(root, LIFECYCLE_OFF, line_of({**document, "event_monotonic_seconds": -1.0}))
+    expect(Failure.LINE_MALFORMED, lambda: read2(root, digest))
+
+
+def test_reader_refuses_a_negative_transition_start(tmp_path: Path) -> None:
+    """Repair 1: a retained transition with a negative start and exact delta is malformed."""
+    root, document = _transition_document(tmp_path)
+    changed = {
+        **document,
+        "transition_start_monotonic": -10.0,
+        "transition_seconds": 1840.0,
+        "transition_within_budget": False,
+    }
+    assert changed["transition_end_monotonic"] - changed["transition_start_monotonic"] == 1840.0
+    digest = rewrite(root, LIFECYCLE_ON, line_of(changed))
+    expect(Failure.LINE_MALFORMED, lambda: read2(root, digest))
+
+
+@pytest.mark.parametrize("budget", [60, True], ids=["int60", "true"])
+def test_fixed_budget_refuses_non_float_natives(tmp_path: Path, budget: object) -> None:
+    """Repair 2: only the exact float budget is admitted; ``60`` and ``True`` are refused.
+
+    Revalidation and the real writer path both refuse; the float baseline round-trips.
+    """
+    writer, root = open_writer(tmp_path)
+    off = header_for(tmp_path, root, OFF)
+    writer.append(off)
+    on = on_header(tmp_path, root)
+    writer.append(on)
+    moved = transition(1810.0, 1830.0)(on, 0)
+    assert type(moved.transition_budget_seconds) is float
+    forged_record = forged(moved, transition_budget_seconds=budget)
+    refused(forged_record)
+    expect_evidence(NOT_VALIDATED, lambda: writer.append_lifecycle(forged_record))
+    writer.append_lifecycle(moved)
+    retained = read2(root, writer.seal().manifest_sha256)
+    assert list(retained.lifecycle) == [moved]
+    assert type(retained.lifecycle[0].transition_budget_seconds) is float
+
+
+@pytest.mark.parametrize("budget", [60, True], ids=["int60", "true"])
+def test_reader_refuses_a_non_float_budget(tmp_path: Path, budget: object) -> None:
+    """Repair 2: a retained budget of JSON ``60`` or ``true`` is malformed."""
+    root, document = _transition_document(tmp_path)
+    digest = rewrite(root, LIFECYCLE_ON, line_of({**document, "transition_budget_seconds": budget}))
+    expect(Failure.LINE_MALFORMED, lambda: read2(root, digest))
+
+
+def test_absolute_fields_refuse_integers_with_valid_values(tmp_path: Path) -> None:
+    """Repair 3: each absolute field refuses an int even when its value keeps every rule."""
+    stop, window, moved = _record_samples(tmp_path)
+    cases: list[tuple[lifecycle.ColdLifecycleRecord, dict[str, object]]] = [
+        (stop, {"monotonic_seconds": 5}),
+        (stop, {"event_monotonic_seconds": 5}),
+        (window, {"scheduled_end_monotonic": 1810}),
+        (moved, {"transition_start_monotonic": 1810}),
+        (moved, {"transition_end_monotonic": 1830}),
+        (moved, {"transition_seconds": 20}),
+    ]
+    for record, update in cases:
+        ((name, value),) = update.items()
+        assert getattr(record, name) == value
+        refused(forged(record, **update))
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("event_monotonic_seconds", 1830),
+        ("monotonic_seconds", 1830),
+        ("transition_start_monotonic", 1810),
+        ("transition_end_monotonic", 1830),
+    ],
+)
+def test_reader_refuses_integer_absolute_fields(tmp_path: Path, name: str, value: int) -> None:
+    """Repair 3: a retained absolute field written as a JSON integer is malformed."""
+    root, document = _transition_document(tmp_path)
+    assert document[name] == value
+    digest = rewrite(root, LIFECYCLE_ON, line_of({**document, name: value}))
+    expect(Failure.LINE_MALFORMED, lambda: read2(root, digest))
+
+
+def test_reader_refuses_an_integer_scheduled_end(tmp_path: Path) -> None:
+    """Repair 3: a retained elapsed window with an integer scheduled end is malformed."""
+    root, digest, written = seal_run(tmp_path, [elapsed(OFF_SESSION, 1810.0)])
+    assert list(read2(root, digest).lifecycle) == written
+    document = written[0].model_dump(mode="json")
+    digest = rewrite(root, LIFECYCLE_OFF, line_of({**document, "scheduled_end_monotonic": 1810}))
+    expect(Failure.LINE_MALFORMED, lambda: read2(root, digest))
+
+
 # ---------------------------------------------------------- L-T12 canaries
 
 
