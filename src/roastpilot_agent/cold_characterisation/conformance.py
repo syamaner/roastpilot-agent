@@ -15,9 +15,12 @@ iterative walk admits the whole carrier graph.  After admission, every value the
 checker or an existing validator reaches is an exact builtin with exact ``str`` keys,
 an exact package model with an exact ``__dict__``, or a real package enum member; no
 caller-defined code runs.  The walk borrows the caller's graph and snapshots nothing:
-it holds only temporary references into it, and every record and identity container
-is checked against its length and remaining node budget before its keys are scanned
-or its items listed.  The outer carrier tuples are iterated, never copied or capped.
+it holds only temporary references into it.  A package model's ``__dict__`` must have
+exactly its declared field count before any key is scanned; a nested model's
+remaining node budget is checked after that bounded extraction.  Each variable-size
+record or identity ``dict``/``list`` is checked against its existing collection and
+remaining node allowances before its keys are scanned or its items listed.  The
+outer carrier tuples are iterated, never copied or capped.
 The caller owns that graph and must not mutate it concurrently during this
 synchronous call; hostile data, not hostile in-process code, is the threat addressed.
 Every later rule reads only fresh validator snapshots and the interpretation
