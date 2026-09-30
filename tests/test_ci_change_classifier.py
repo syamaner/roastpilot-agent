@@ -6633,12 +6633,64 @@ def test_docs_governance_proxy_memo_never_caches_failures(tmp_path: Path) -> Non
 def test_docs_governance_cross_module_import_cycle_still_fails(tmp_path: Path) -> None:
     """A cross-module import cycle still raises instead of resolving to a result."""
 
-    (tmp_path / "a.py").write_text("from b import fb\n\ndef fa():\n    return fb()\n")
-    (tmp_path / "b.py").write_text("from a import fa\n\ndef fb():\n    return fa()\n")
+    (tmp_path / "a.py").write_text(
+        "from b import fb\n\ndef fa():\n    return fb()\n", encoding="utf-8"
+    )
+    (tmp_path / "b.py").write_text(
+        "from a import fa\n\ndef fb():\n    return fa()\n", encoding="utf-8"
+    )
     with pytest.raises(RecursionError):
         _docs_reading_test_modules(
             "from a import fa\n\ndef test_cycle() -> None:\n    fa()\n", repository_root=tmp_path
         )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_proxy_memo_reuses_module_import_members(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Module-import members reaching one leaf share its analysis within one call."""
+
+    (tmp_path / "leaf.py").write_text(_MEMO_DOCS_LEAF, encoding="utf-8")
+    for name in ("a", "b"):
+        (tmp_path / f"mid_{name}.py").write_text(
+            f"import leaf\n\ndef {name}():\n    return leaf.leaf()\n", encoding="utf-8"
+        )
+    source = (
+        "import mid_a\nimport mid_b\n\n"
+        "def test_a() -> None:\n    assert mid_a.a()\n\n"
+        "def test_b() -> None:\n    assert mid_b.b()\n"
+    )
+    counts = _count_docs_analysis_calls(monkeypatch)
+    assert _docs_reading_test_modules(source, repository_root=tmp_path) == {"test_a", "test_b"}
+    assert dict(counts) == {
+        "<module>": 1,
+        str(tmp_path / "mid_a.py"): 1,
+        str(tmp_path / "mid_b.py"): 1,
+        str(tmp_path / "leaf.py"): 1,
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_proxy_memo_reuses_plugin_and_direct_fixture_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One fixture reached through pytest_plugins and a direct import is analysed once."""
+
+    (tmp_path / "plugin.py").write_text(
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture(autouse=True)\ndef docs_auto():\n"
+        "    return Path('docs/x.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "pytest_plugins = ['plugin']\n"
+        "from plugin import docs_auto\n\n"
+        "def test_plugin_autouse() -> None:\n    assert True\n"
+    )
+    counts = _count_docs_analysis_calls(monkeypatch)
+    assert _docs_reading_test_modules(source, repository_root=tmp_path) == {"test_plugin_autouse"}
+    assert dict(counts) == {"<module>": 1, str(tmp_path / "plugin.py"): 1}
 
 
 @pytest.mark.docs_ci
