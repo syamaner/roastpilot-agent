@@ -26,6 +26,8 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdTickRecord,
     ColdTickRoastFanEvidence,
     ColdTickRoastFanOutcome,
+    ColdTickSessionEvidence,
+    ColdTickSessionPhase,
     _canonical_json,  # pyright: ignore[reportPrivateUsage]
     validate_record,
 )
@@ -2452,6 +2454,13 @@ async def test_read_time_vendor_cap_matches_persistence() -> None:
                 outcome=ColdTickRoastFanOutcome(observation.roast_fan.outcome.value),
                 roast_fan_level_percent=observation.roast_fan.roast_fan_level_percent,
             ),
+            "session": ColdTickSessionEvidence(
+                session_id=observation.session.session_id,
+                active=observation.session.active,
+                session_purpose=observation.session.session_purpose,
+                phase=ColdTickSessionPhase(observation.session.phase),
+                elapsed_monotonic_seconds=observation.session.elapsed_monotonic_seconds,
+            ),
             "audio": observation.audio.audio,
         }
     )
@@ -3292,22 +3301,23 @@ def test_session_projector_refuses_exactly_typed_values_the_model_refuses() -> N
 
 
 def test_cold_production_code_never_reads_tolerant_session_metadata() -> None:
-    """T-S9: no cold production attribute or getattr access to the tolerant names.
+    """T-S9: no cold production getattr or subscript access to the tolerant names.
 
-    This is a syntax guard over attribute nodes and literal ``getattr`` calls,
-    not a proof that the tolerant mirror is unreachable.  The strict projector
-    reads the raw keys through ``ColdSessionField`` values, so no subscript
-    uses these names as a literal constant.
+    Attribute reads of the names are governed by ``_session_read_violations``:
+    only the tick builder's single strict ``source_session`` binding may read
+    them.  This is a syntax guard over attribute nodes and literal ``getattr``
+    calls, not a proof that the tolerant mirror is unreachable.  The strict
+    projector reads the raw keys through ``ColdSessionField`` values, so no
+    subscript uses these names as a literal constant.
     """
     trees = _cold_production_trees()
     assert "mcp.py" in trees
-    attributes: list[tuple[str, str]] = []
+    attributes: dict[str, list[str]] = {}
     getattr_calls: list[str] = []
     subscripts: dict[str, int] = dict.fromkeys(sorted(_TOLERANT_SESSION_NAMES), 0)
     for name, tree in trees.items():
+        attributes[name] = _session_read_violations(name, tree)
         for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute) and node.attr in _TOLERANT_SESSION_NAMES:
-                attributes.append((name, node.attr))
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
@@ -3324,6 +3334,233 @@ def test_cold_production_code_never_reads_tolerant_session_metadata() -> None:
                 and node.slice.value in _TOLERANT_SESSION_NAMES
             ):
                 subscripts[node.slice.value] += 1
-    assert attributes == []
+    assert "evidence_builders.py" in attributes
+    assert all(violations == [] for violations in attributes.values()), attributes
     assert getattr_calls == []
     assert subscripts == {"active": 0, "elapsed_monotonic_seconds": 0}
+
+
+_SESSION_RECEIVER = "source_session"
+
+
+def _bindings_of(root: ast.AST, name: str) -> list[tuple[str, ast.AST]]:
+    """Return every enumerated binding form of ``name`` under ``root`` (B1-B9)."""
+    found: list[tuple[str, ast.AST]] = []
+    for node in ast.walk(root):
+        if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Store):
+            found.append(("B1", node))
+        if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Del):
+            found.append(("B2", node))
+        if isinstance(node, ast.arg) and node.arg == name:
+            found.append(("B3", node))
+        if isinstance(node, ast.alias) and (node.asname or node.name.split(".")[0]) == name:
+            found.append(("B4", node))
+        if isinstance(node, ast.ExceptHandler) and node.name == name:
+            found.append(("B5", node))
+        if isinstance(node, ast.MatchAs) and node.name == name:
+            found.append(("B6", node))
+        if isinstance(node, ast.MatchStar) and node.name == name:
+            found.append(("B7", node))
+        if isinstance(node, ast.MatchMapping) and node.rest == name:
+            found.append(("B8", node))
+        if isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+            found.append(("B9", node))
+    return found
+
+
+def _is_observation_session(value: ast.expr) -> bool:
+    """Whether an expression is exactly ``observation.session``."""
+    return (
+        isinstance(value, ast.Attribute)
+        and value.attr == "session"
+        and isinstance(value.value, ast.Name)
+        and value.value.id == "observation"
+        and isinstance(value.value.ctx, ast.Load)
+    )
+
+
+def _session_read_violations(module_name: str, tree: ast.Module) -> list[str]:
+    """Return every governed session-attribute read or binding breaching R1-R6.
+
+    This is a finite syntax guard over the enumerated binding and read forms;
+    not a whole-program reachability proof.
+    """
+    governed = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr in _TOLERANT_SESSION_NAMES
+    ]
+    violations: list[str] = []
+    # R1: only the builders module may read the governed names at all.
+    if module_name != "evidence_builders.py":
+        return [f"R1:{ast.unparse(node)}" for node in governed]
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "build_tick_record"
+    ]
+    if len(functions) != 1:
+        return [f"R2:build_tick_record:{len(functions)}"]
+    (function,) = functions
+    inside = {id(node) for node in ast.walk(function)}
+    # R2: every governed read lies lexically inside ``build_tick_record``.
+    for node in governed:
+        if id(node) not in inside:
+            violations.append(f"R2:{ast.unparse(node)}")
+    # R3: every governed read's receiver is exactly the loaded ``source_session``.
+    for node in governed:
+        receiver = node.value
+        if not (
+            isinstance(receiver, ast.Name)
+            and receiver.id == _SESSION_RECEIVER
+            and isinstance(receiver.ctx, ast.Load)
+        ):
+            violations.append(f"R3:{ast.unparse(node)}")
+    # R4: exactly one governed read of each name across the module.
+    for attribute in sorted(_TOLERANT_SESSION_NAMES):
+        count = sum(1 for node in governed if node.attr == attribute)
+        if count != 1:
+            violations.append(f"R4:{attribute}:{count}")
+    # R5a: exactly one authorised ``source_session = observation.session``.
+    authorised: list[ast.Assign] = []
+    for statement in function.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        if len(statement.targets) != 1:
+            continue
+        target = statement.targets[0]
+        if not (
+            isinstance(target, ast.Name)
+            and target.id == _SESSION_RECEIVER
+            and isinstance(target.ctx, ast.Store)
+        ):
+            continue
+        if not _is_observation_session(statement.value):
+            continue
+        authorised.append(statement)
+    if len(authorised) != 1:
+        violations.append(f"R5a:{len(authorised)}")
+    authorised_targets = {id(statement.targets[0]) for statement in authorised}
+    # R5b: no other binding of ``source_session`` anywhere in the module.
+    for category, node in _bindings_of(tree, _SESSION_RECEIVER):
+        if id(node) not in authorised_targets:
+            violations.append(f"R5b:{category}")
+    # R6: ``observation`` is a parameter and is never rebound inside the function.
+    arguments = function.args
+    parameters = [
+        *arguments.posonlyargs,
+        *arguments.args,
+        *arguments.kwonlyargs,
+        *([arguments.vararg] if arguments.vararg is not None else []),
+        *([arguments.kwarg] if arguments.kwarg is not None else []),
+    ]
+    own = [parameter for parameter in parameters if parameter.arg == "observation"]
+    if len(own) != 1:
+        violations.append("R6:parameter")
+    own_ids = {id(parameter) for parameter in own}
+    for category, node in _bindings_of(function, "observation"):
+        if id(node) not in own_ids:
+            violations.append(f"R6:{category}")
+    return violations
+
+
+_VALID_SESSION_SPECIMEN = """
+def build_tick_record(*, observation):
+    source_session = observation.session
+    a = source_session.active
+    b = source_session.elapsed_monotonic_seconds
+"""
+_B_LINE = "    b = source_session.elapsed_monotonic_seconds\n"
+_ASSIGN_LINE = "    source_session = observation.session\n"
+
+
+def _appended(block: str) -> str:
+    """Return the valid specimen with one indented block appended to the function."""
+    return _VALID_SESSION_SPECIMEN + "".join(f"    {line}\n" for line in block.splitlines())
+
+
+#: One representative probe per rule or binding branch (§2.6(b)); each changes one property.
+_SESSION_PROBES: dict[str, tuple[str, str]] = {
+    "P1-R3-receiver": (
+        "evidence_builders.py",
+        _VALID_SESSION_SPECIMEN.replace(
+            "a = source_session.active", "a = observation.session.active"
+        ),
+    ),
+    "P3-R5a-value": (
+        "evidence_builders.py",
+        _VALID_SESSION_SPECIMEN.replace("= observation.session\n", "= observation.state\n"),
+    ),
+    "P4-R5a-count": ("evidence_builders.py", _VALID_SESSION_SPECIMEN + _ASSIGN_LINE),
+    "P19-R5a-direct-child": (
+        "evidence_builders.py",
+        _VALID_SESSION_SPECIMEN.replace(_ASSIGN_LINE, "    if flag:\n    " + _ASSIGN_LINE),
+    ),
+    "P5-B1": ("evidence_builders.py", _appended("for source_session in xs: pass")),
+    "P20-B2": ("evidence_builders.py", _appended("del source_session")),
+    "P9-B3": (
+        "evidence_builders.py",
+        _VALID_SESSION_SPECIMEN.replace("(*, observation)", "(*, observation, source_session)"),
+    ),
+    "P12-B4": ("evidence_builders.py", "import x as source_session\n" + _VALID_SESSION_SPECIMEN),
+    "P11-B5": (
+        "evidence_builders.py",
+        _appended("try:\n    pass\nexcept E as source_session:\n    pass"),
+    ),
+    "P13-B6": (
+        "evidence_builders.py",
+        _appended("match v:\n    case source_session:\n        pass"),
+    ),
+    "P21-B7": (
+        "evidence_builders.py",
+        _appended("match v:\n    case [*source_session]:\n        pass"),
+    ),
+    "P22-B8": (
+        "evidence_builders.py",
+        _appended("match v:\n    case {**source_session}:\n        pass"),
+    ),
+    "P23-B9": (
+        "evidence_builders.py",
+        _VALID_SESSION_SPECIMEN + "\ndef other():\n    global source_session\n",
+    ),
+    "P14-R6": ("evidence_builders.py", _appended("observation = other")),
+    "P15-R1": ("acceptance.py", _VALID_SESSION_SPECIMEN),
+    "P16-R4": ("evidence_builders.py", _appended("c = source_session.active")),
+    "P18-R2": (
+        "evidence_builders.py",
+        _VALID_SESSION_SPECIMEN.replace(_B_LINE, "")
+        + "\ndef helper():\n    return source_session.elapsed_monotonic_seconds\n",
+    ),
+}
+#: Further members sharing a representative's branch; each must also be refused.
+_SESSION_SHARED_PROBES: dict[str, str] = {
+    "B1-with": _appended("with ctx as source_session:\n    pass"),
+    "B1-comprehension": _appended("[source_session for source_session in xs]"),
+    "B1-augassign": _appended("source_session += 0"),
+    "B1-walrus": _appended("(source_session := 0)"),
+    "B1-annassign": _appended("source_session: int = 0"),
+    "B3-lambda": _appended("lambda source_session: 0"),
+    "B9-nonlocal": _appended("def _inner():\n    nonlocal source_session"),
+    "R4-P17-missing-read": _VALID_SESSION_SPECIMEN.replace(_B_LINE, ""),
+}
+
+
+def test_session_read_exception_is_exact_and_receiver_pinned() -> None:
+    """T-S9b: the valid specimen passes; every single-property probe is refused."""
+    assert (
+        _session_read_violations("evidence_builders.py", ast.parse(_VALID_SESSION_SPECIMEN)) == []
+    )
+    nested = _VALID_SESSION_SPECIMEN.replace(
+        _B_LINE,
+        "    def _inner():\n        return source_session.elapsed_monotonic_seconds\n",
+    )
+    assert _session_read_violations("evidence_builders.py", ast.parse(nested)) == []
+    for source in _SESSION_SHARED_PROBES.values():
+        assert _session_read_violations("evidence_builders.py", ast.parse(source)) != []
+
+
+@pytest.mark.parametrize("probe", list(_SESSION_PROBES))
+def test_session_read_probe_is_refused(probe: str) -> None:
+    """T-S9b: each representative probe breaches exactly its named rule or branch."""
+    module_name, source = _SESSION_PROBES[probe]
+    assert _session_read_violations(module_name, ast.parse(source)) != []

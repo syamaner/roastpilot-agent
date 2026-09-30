@@ -16,7 +16,9 @@ import pydantic
 import pytest
 
 from roastpilot_agent.advisor import AdvisorDescriptor
+from roastpilot_agent.cold_characterisation import evidence_reader
 from roastpilot_agent.cold_characterisation import evidence_schema as evidence
+from roastpilot_agent.cold_characterisation import report as cold_report
 from roastpilot_agent.cold_characterisation.host import ColdHostBoundFailure, HostBoundSample
 from roastpilot_agent.cold_characterisation.identity import (
     REQUIRED_MCP_VERSION,
@@ -29,6 +31,7 @@ from roastpilot_agent.cold_characterisation.identity import (
 )
 from roastpilot_agent.cold_characterisation.mcp import (
     ColdRoastFanOutcome,
+    ColdSessionField,
     ColdTickDeviceState,
     ColdTickRoastFanObservation,
     DisconnectEvidence,
@@ -49,6 +52,7 @@ from roastpilot_agent.config import MCPDeviceConfig
 from roastpilot_agent.mcp_client import (
     FirstCrackStatus,
     MCPMirror,
+    MCPPhase,
     RoasterDeviceState,
     RuntimeConfigSnapshot,
     ServerInfo,
@@ -136,12 +140,26 @@ def _roast_fan(
     return evidence.ColdTickRoastFanEvidence(outcome=outcome, roast_fan_level_percent=level)
 
 
+def _session(**overrides: typing.Any) -> evidence.ColdTickSessionEvidence:
+    """Return one valid synthetic retained tick session evidence copy."""
+    values: dict[str, typing.Any] = {
+        "session_id": "session-id",
+        "active": True,
+        "session_purpose": "cold_characterisation",
+        "phase": evidence.ColdTickSessionPhase.ROASTING,
+        "elapsed_monotonic_seconds": 0.059,
+    }
+    values.update(overrides)
+    return evidence.ColdTickSessionEvidence(**values)
+
+
 def _tick_body() -> dict[str, typing.Any]:
     """Return the valid tick-specific (non-common) record fields."""
     return {
         "tick": 0,
         "device": _device(),
         "roast_fan": _roast_fan(),
+        "session": _session(),
         "audio": evidence.project_tick_audio(_audio_payload()).audio,
     }
 
@@ -864,6 +882,7 @@ def test_raw_extraction_refuses_all_constructed_shape_and_budget_breaches(
             evidence.ColdTickAudioSample,
             evidence.ColdTickDeviceEvidence,
             evidence.ColdTickRoastFanEvidence,
+            evidence.ColdTickSessionEvidence,
         )
     )
     monkeypatch.setattr(evidence, "MAX_JSON_NODES", 1 + len(root_fields) + nested_field_count)
@@ -1070,6 +1089,7 @@ def test_union_advisory_and_record_surfaces_are_closed() -> None:
         "tick",
         "device",
         "roast_fan",
+        "session",
         "audio",
         "raw_audio_extra",
     }
@@ -1086,6 +1106,10 @@ def test_union_advisory_and_record_surfaces_are_closed() -> None:
     )
     assert evidence.ColdTickRecord.model_fields["device"].is_required()
     assert evidence.ColdTickRecord.model_fields["roast_fan"].is_required()
+    assert evidence.ColdTickRecord.model_fields["session"].is_required()
+    assert all(
+        field.is_required() for field in evidence.ColdTickSessionEvidence.model_fields.values()
+    )
     assert all(
         field.is_required() for field in evidence.ColdTickDeviceEvidence.model_fields.values()
     )
@@ -1499,6 +1523,7 @@ def test_record_union_has_six_closed_streams_and_abort_pairs() -> None:
             "tick",
             "device",
             "roast_fan",
+            "session",
             "audio",
             "raw_audio_extra",
         ),
@@ -1571,6 +1596,13 @@ def test_record_union_has_six_closed_streams_and_abort_pairs() -> None:
     assert tuple(evidence.ColdTickRoastFanEvidence.model_fields) == (
         "outcome",
         "roast_fan_level_percent",
+    )
+    assert tuple(evidence.ColdTickSessionEvidence.model_fields) == (
+        "session_id",
+        "active",
+        "session_purpose",
+        "phase",
+        "elapsed_monotonic_seconds",
     )
     for digest in ("A" * 64, "g" * 64, ("a" * 64) + "\n"):
         for record in records:
@@ -2062,6 +2094,8 @@ def test_every_closed_enum_member_and_record_stream_is_admissible() -> None:
         evidence.ColdAdvisorFailureKind,
         evidence.ColdAbortDomain,
         evidence.ColdOperatorAbortReason,
+        evidence.ColdEngineAbortReason,
+        evidence.ColdTickSessionPhase,
     ):
         assert tuple((member.name, member.value) for member in enum_type) == tuple(
             (member.name, member.name.lower()) for member in enum_type
@@ -2107,6 +2141,7 @@ def test_every_closed_enum_member_and_record_stream_is_admissible() -> None:
         "mcp",
         "advisor",
         "operator",
+        "engine",
     )
     assert tuple(member.value for member in evidence.ColdOperatorAbortReason) == ("operator_stop",)
     assert tuple(member.value for member in evidence.ColdTickRoastFanOutcome) == (
@@ -2123,6 +2158,7 @@ def test_every_closed_enum_member_and_record_stream_is_admissible() -> None:
         evidence.ColdSafetyEvaluation,
         evidence.ColdTickDeviceEvidence,
         evidence.ColdTickRoastFanEvidence,
+        evidence.ColdTickSessionEvidence,
     ):
         assert model.model_config == getattr(evidence, "_" + "COLD_EVIDENCE_STRICT_CONFIG")
     for model in (
@@ -2143,6 +2179,7 @@ def test_every_closed_enum_member_and_record_stream_is_admissible() -> None:
         (evidence.ColdAbortDomain.MCP, evidence.ColdMcpAbortReason),
         (evidence.ColdAbortDomain.ADVISOR, evidence.ColdAdvisorFailureKind),
         (evidence.ColdAbortDomain.OPERATOR, evidence.ColdOperatorAbortReason),
+        (evidence.ColdAbortDomain.ENGINE, evidence.ColdEngineAbortReason),
     ):
         for reason in enum_type:
             record = evidence.ColdAbortRecord(**_common("abort"), domain=domain, reason=reason)
@@ -2494,3 +2531,291 @@ def test_t_e8_consumer_owned_tick_contracts_match_the_strict_mcp_projection() ->
     for enum_type in (evidence.ColdTickRoastFanOutcome, _MCP_ROAST_FAN_OUTCOME):
         assert issubclass(enum_type, enum.Enum)
         assert not issubclass(enum_type, enum.StrEnum)
+
+
+# ------------------------------------ 4f-b ENGINE abort grammar and tick session
+
+_CLOSED_MESSAGE = "Cold evidence admission failed."
+_ENGINE_REASON_VALUES = (
+    "command_state_non_zero",
+    "device_disconnected",
+    "driver_identity_mismatch",
+    "roast_fan_not_observable",
+    "session_inactive",
+    "session_phase_changed",
+    "first_crack_confirmed",
+    "inference_not_active",
+    "session_clock_stalled",
+    "telemetry_absent_after_startup",
+    "mcp_transport_failed",
+    "mcp_response_not_admitted",
+    "mcp_session_identity_changed",
+    "session_start_failed",
+    "activation_failed",
+    "clock_invalid",
+    "cancelled",
+    "unexpected_failure",
+)
+_REASON_ENUMS: tuple[type[enum.Enum], ...] = (
+    evidence.ColdHostAbortReason,
+    evidence.ColdIdentityAbortReason,
+    evidence.ColdEvidenceFailure,
+    evidence.ColdMcpAbortReason,
+    evidence.ColdAdvisorFailureKind,
+    evidence.ColdOperatorAbortReason,
+    evidence.ColdEngineAbortReason,
+)
+
+
+class _PlainReason(enum.Enum):
+    """A foreign plain enum sharing an ENGINE value."""
+
+    CANCELLED = "cancelled"
+
+
+class _MixinReason(str, enum.Enum):  # noqa: UP042 - the contract's str-mixin fixture, not StrEnum
+    """A foreign ``str``-mixin enum sharing an ENGINE value."""
+
+    CANCELLED = "cancelled"
+
+
+class _ForeignPhase(enum.Enum):
+    """A foreign plain enum sharing a session phase value."""
+
+    ROASTING = "roasting"
+
+
+class _StrSub(str):
+    """A ``str`` subclass that strict pydantic would otherwise normalise."""
+
+
+def _assert_closed(
+    error: evidence.ColdEvidenceError, failure: evidence.ColdEvidenceFailure
+) -> None:
+    """Assert one closed evidence failure with its fixed message and no chain."""
+    assert error.failure is failure
+    assert error.args == (_CLOSED_MESSAGE,)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_t_b2_engine_grammar_is_closed_ordered_plain_and_disjoint() -> None:
+    """T-B2: 18 ordered plain-Enum ENGINE reasons, disjoint from every other abort grammar."""
+    for index, first in enumerate(_REASON_ENUMS):
+        for second in _REASON_ENUMS[index + 1 :]:
+            first_values = {member.value for member in first}
+            second_values = {member.value for member in second}
+            assert first_values.isdisjoint(second_values), (first, second)
+    assert tuple(member.value for member in evidence.ColdEngineAbortReason) == (
+        _ENGINE_REASON_VALUES
+    )
+    assert evidence.ColdEngineAbortReason.__mro__[1:] == (enum.Enum, object)
+    assert len(evidence.ColdMcpAbortReason) == 14
+    assert tuple(evidence.ColdAbortDomain) == (
+        evidence.ColdAbortDomain.HOST,
+        evidence.ColdAbortDomain.IDENTITY,
+        evidence.ColdAbortDomain.EVIDENCE,
+        evidence.ColdAbortDomain.MCP,
+        evidence.ColdAbortDomain.ADVISOR,
+        evidence.ColdAbortDomain.OPERATOR,
+        evidence.ColdAbortDomain.ENGINE,
+    )
+
+
+def test_t_b3_record_and_report_unions_equal_the_reader_pairing() -> None:
+    """T-B3: the record and report reason unions hold exactly the reader's paired enums."""
+    paired = set(evidence_reader.ABORT_REASON_BY_DOMAIN.values())
+    assert set(evidence_reader.ABORT_REASON_BY_DOMAIN) == set(evidence.ColdAbortDomain)
+    record_union = evidence.ColdAbortRecord.model_fields["reason"].annotation
+    report_union = cold_report.ColdReportAbort.model_fields["reason"].annotation
+    assert set(typing.get_args(record_union)) == paired
+    assert set(typing.get_args(report_union)) == paired
+
+
+def _constructed_abort(domain: object, reason: object) -> evidence.ColdAbortRecord:
+    """Return an unvalidated abort record carrying one constructed domain/reason pair."""
+    return typing.cast(
+        evidence.ColdAbortRecord,
+        typing.cast(typing.Any, evidence.ColdAbortRecord).model_construct(
+            **_common("abort"), domain=domain, reason=reason
+        ),
+    )
+
+
+_ENGINE = evidence.ColdAbortDomain.ENGINE
+_ABORT_INGRESS_CASES: dict[str, tuple[object, object, evidence.ColdEvidenceFailure]] = {
+    "string-domain": (
+        "engine",
+        evidence.ColdEngineAbortReason.CANCELLED,
+        evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    ),
+    "mismatched-pair": (
+        _ENGINE,
+        evidence.ColdMcpAbortReason.SESSION_NOT_ACTIVE,
+        evidence.ColdEvidenceFailure.ABORT_DOMAIN_REASON_MISMATCHED,
+    ),
+    "foreign-plain-enum": (
+        _ENGINE,
+        _PlainReason.CANCELLED,
+        evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    ),
+    "foreign-str-mixin-enum": (
+        _ENGINE,
+        _MixinReason.CANCELLED,
+        evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    ),
+    "raw-string-reason": (
+        _ENGINE,
+        "cancelled",
+        evidence.ColdEvidenceFailure.ABORT_DOMAIN_REASON_MISMATCHED,
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_ABORT_INGRESS_CASES))
+def test_t_b4_validate_record_refuses_each_forged_engine_abort(name: str) -> None:
+    """T-B4: the persistence ingress refuses every forged ENGINE pair with its closed code."""
+    domain, reason, failure = _ABORT_INGRESS_CASES[name]
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(_constructed_abort(domain, reason))
+    _assert_closed(raised.value, failure)
+
+
+def test_t_b4_validate_record_refuses_a_non_record_object() -> None:
+    """T-B4: a non-record object never reaches extraction."""
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(typing.cast(typing.Any, object()))
+    _assert_closed(raised.value, evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+
+
+def test_t_b4_direct_engine_construction_admits_pairs_and_refuses_mismatch() -> None:
+    """T-B4: direct construction admits the ENGINE pair and refuses a mismatched one."""
+    record = evidence.ColdAbortRecord(
+        **_common("abort"), domain=_ENGINE, reason=evidence.ColdEngineAbortReason.CANCELLED
+    )
+    assert evidence.validate_record(record) == record
+    for reason in (evidence.ColdMcpAbortReason.SESSION_NOT_ACTIVE, "cancelled"):
+        with pytest.raises(evidence.ColdEvidenceError) as raised:
+            evidence.ColdAbortRecord(
+                **_common("abort"), domain=_ENGINE, reason=typing.cast(typing.Any, reason)
+            )
+        _assert_closed(raised.value, evidence.ColdEvidenceFailure.ABORT_DOMAIN_REASON_MISMATCHED)
+
+
+def _with_session_object(tick: evidence.ColdTickRecord, session: object) -> evidence.ColdTickRecord:
+    """Return an unvalidated tick whose session slot holds one constructed object."""
+    return typing.cast(
+        evidence.ColdTickRecord,
+        typing.cast(typing.Any, evidence.ColdTickRecord).model_construct(
+            **(dict(tick) | {"session": session})
+        ),
+    )
+
+
+def _with_session(tick: evidence.ColdTickRecord, **update: object) -> evidence.ColdTickRecord:
+    """Return an unvalidated tick whose nested session fields are replaced."""
+    constructed = typing.cast(typing.Any, evidence.ColdTickSessionEvidence).model_construct(
+        **(dict(tick.session) | update)
+    )
+    return _with_session_object(tick, constructed)
+
+
+def _session_with_extra_key() -> evidence.ColdTickRecord:
+    """Return a tick whose nested session carries one undeclared key."""
+    tick = _with_session(_tick())
+    object.__getattribute__(tick.session, "__dict__")["unexpected"] = 1
+    return tick
+
+
+class _SessionSubclass(evidence.ColdTickSessionEvidence):
+    """A non-exact retained session type."""
+
+
+_OVER_BYTES_SESSION_ID = "€" * 683
+_SESSION_INGRESS_CASES: dict[
+    str, tuple[typing.Callable[[], evidence.ColdTickRecord], evidence.ColdEvidenceFailure]
+] = {
+    "plain-string-phase": (
+        lambda: _with_session(_tick(), phase="roasting"),
+        evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    ),
+    "foreign-enum-phase": (
+        lambda: _with_session(_tick(), phase=_ForeignPhase.ROASTING),
+        evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    ),
+    "roast-purpose": (
+        lambda: _with_session(_tick(), session_purpose="roast"),
+        evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    ),
+    "int-clock": (
+        lambda: _with_session(_tick(), elapsed_monotonic_seconds=1),
+        evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    ),
+    "nan-clock": (
+        lambda: _with_session(_tick(), elapsed_monotonic_seconds=float("nan")),
+        evidence.ColdEvidenceFailure.JSON_VALUE_NOT_FINITE,
+    ),
+    "int-active": (
+        lambda: _with_session(_tick(), active=1),
+        evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    ),
+    "null-session": (
+        lambda: _with_session_object(_tick(), None),
+        evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    ),
+    "extra-session-key": (
+        _session_with_extra_key,
+        evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    ),
+    "session-subclass": (
+        lambda: _with_session_object(
+            _tick(), typing.cast(typing.Any, _SessionSubclass).model_construct(**dict(_session()))
+        ),
+        evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    ),
+    "str-subclass-session-id": (
+        lambda: _with_session(_tick(), session_id=_StrSub("session-id")),
+        evidence.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    ),
+    "over-bytes-session-id": (
+        lambda: _with_session(_tick(), session_id=_OVER_BYTES_SESSION_ID),
+        evidence.ColdEvidenceFailure.TEXT_FIELD_TOO_LARGE,
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_SESSION_INGRESS_CASES))
+def test_t_b9_validate_record_refuses_each_forged_session(name: str) -> None:
+    """T-B9: forged, coerced, foreign, or oversized session evidence refuses at ingress."""
+    build, failure = _SESSION_INGRESS_CASES[name]
+    with pytest.raises(evidence.ColdEvidenceError) as raised:
+        evidence.validate_record(build())
+    _assert_closed(raised.value, failure)
+
+
+def test_t_b9_session_is_required_and_a_genuine_session_is_retained_exactly() -> None:
+    """T-B9: a tick without ``session`` is refused; a genuine session round-trips exactly."""
+    body = _tick_body()
+    del body["session"]
+    with pytest.raises(pydantic.ValidationError):
+        evidence.ColdTickRecord(**_common("tick"), **body)
+    assert len(_OVER_BYTES_SESSION_ID.encode("utf-8")) == evidence.MAX_TEXT_FIELD_BYTES + 1
+    validated = _validate_tick(_tick())
+    assert validated.session == _session()
+    assert type(validated.session) is evidence.ColdTickSessionEvidence
+    assert type(validated.session.phase) is evidence.ColdTickSessionPhase
+
+
+def test_t_b12_session_mirror_matches_the_mcp_contract_without_importing_it() -> None:
+    """T-B12: the schema-owned phase and field order equal MCP 0.2.2's (test-only imports)."""
+    assert [member.value for member in evidence.ColdTickSessionPhase] == list(
+        typing.get_args(MCPPhase)
+    )
+    assert tuple(evidence.ColdTickSessionEvidence.model_fields) == tuple(
+        field.value for field in ColdSessionField
+    )
+    assert evidence.ColdTickSessionPhase.__mro__[1:] == (enum.Enum, object)
+    assert (
+        evidence.ColdTickSessionEvidence.model_fields["session_purpose"].annotation
+        == (typing.Literal["cold_characterisation"])
+    )

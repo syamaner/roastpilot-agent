@@ -55,6 +55,7 @@ from tests.test_cold_characterisation_evidence_builders import (
     finalisation_payload,
     host_sample,
     observation,
+    session_metadata,
 )
 from tests.test_cold_characterisation_evidence_reader import envelope_of, identity_document
 from tests.test_cold_characterisation_evidence_store import (
@@ -220,15 +221,17 @@ def tick_record(
     *,
     text: str = UTC,
     vendor: Json | None = None,
+    session_id: str | None = None,
 ) -> schema.ColdTickRecord:
     """Build one tick through the real builder."""
     state = device_state() if vendor is None else device_state(raw_vendor_data=vendor)
+    session = None if session_id is None else session_metadata(session_id=session_id)
     return builders.build_tick_record(
         header=header,
         tick=index,
         recorded_at_utc=text,
         monotonic_seconds=seconds,
-        observation=observation(state, audio=audio),
+        observation=observation(state, audio=audio, session=session),
     )
 
 
@@ -547,6 +550,7 @@ ALL_ABORTS: tuple[tuple[schema.ColdAbortDomain, typing.Any], ...] = (
     (Domain.MCP, schema.ColdMcpAbortReason.EMERGENCY_STOP),
     (Domain.ADVISOR, Kind.PROVIDER_ERROR),
     (Domain.OPERATOR, OPERATOR_STOP),
+    (Domain.ENGINE, schema.ColdEngineAbortReason.CANCELLED),
 )
 
 
@@ -1015,7 +1019,7 @@ def assert_key_sets(model: pydantic.BaseModel, document: object) -> int:
 def test_the_json_is_the_canonical_report_and_round_trips(tmp_path: Path) -> None:
     """Renderer: canonical UTF-8 bytes of the built report; nested key sets are the fields.
 
-    One legal reason per abort domain (six domain and reason pairs, not every legal
+    One legal reason per abort domain (seven domain and reason pairs, not every legal
     pair) round-trips through the strict JSON parse.
     """
     off = Spec(hosts=(host(),), advisories=(None, Kind.TIMEOUT), aborts=ALL_ABORTS)
@@ -1026,8 +1030,8 @@ def test_the_json_is_the_canonical_report_and_round_trips(tmp_path: Path) -> Non
     assert report.ColdSanitisedReport.model_validate_json(document) == built
     assert [(item.domain, item.reason) for item in built.phases[0].aborts] == list(ALL_ABORTS)
     # Root and limits, then per phase: itself, five checks, D191, counters, aborts,
-    # four advisor counts, host extremes, artefacts and facts (20 off, 16 on).
-    assert assert_key_sets(built, json.loads(document)) == 38
+    # four advisor counts, host extremes, artefacts and facts (21 off, 16 on).
+    assert assert_key_sets(built, json.loads(document)) == 39
     assert report.render_sanitised_report(run) == (document, markdown)
 
 
@@ -1616,7 +1620,15 @@ def write_canary_run(
                 mint(): {mint(): [mint(), 1.5]},
             }
             writer.append(
-                tick_record(header, index, audio, 2.0 + index, text=mint(), vendor={mint(): mint()})
+                tick_record(
+                    header,
+                    index,
+                    audio,
+                    2.0 + index,
+                    text=mint(),
+                    vendor={mint(): mint()},
+                    session_id=mint(),
+                )
             )
         writer.append(
             builders.build_host_record(
@@ -1702,6 +1714,46 @@ def test_report_errors_carry_no_canary(tmp_path: Path, monkeypatch: pytest.Monke
     for error in errors:
         text = f"{rendered(error)}{error.failure!r}"
         assert not any(secret in text for secret in mint.minted)
+
+
+def test_t_b13_tick_session_identity_is_private_evidence_only(tmp_path: Path) -> None:
+    """T-B13: every tick's minted ``session_id`` is retained yet absent from both outputs."""
+    mint = Canaries(credential_shaped=False)
+    run_id = "20260926T120000Z-zqx9997qzx"
+    root, run = write_canary_run(tmp_path, mint, run_id)
+    session_ids = [
+        typing.cast(schema.ColdTickRecord, record).session.session_id
+        for stream in run.streams
+        if stream.stream is schema.ColdEvidenceStream.TICK
+        for record in stream.records
+    ]
+    assert len(session_ids) == 4
+    assert set(session_ids) <= set(mint.minted)
+    private = retained_text(root, run_id)
+    document, markdown = report.render_sanitised_report(run)
+    public = document.decode("utf-8")
+    for session_id in session_ids:
+        assert session_id in private
+        assert session_id not in public
+        assert session_id not in markdown
+    assert not {"session", "session_id"} & set(report.ColdReportPhase.model_fields)
+
+
+def test_t_b13_engine_abort_renders_only_as_its_closed_pair(tmp_path: Path) -> None:
+    """T-B13: an ENGINE abort renders as its closed domain and reason values only."""
+    engine_abort = (Domain.ENGINE, schema.ColdEngineAbortReason.CANCELLED)
+    run = write(tmp_path, {OFF: Spec(aborts=(engine_abort,)), ON: Spec()})
+    document, markdown = report.render_sanitised_report(run)
+    built = report.build_sanitised_report(run)
+    assert [(item.domain, item.reason) for item in built.phases[0].aborts] == [engine_abort]
+    assert [item["aborts"] for item in json.loads(document)["phases"]] == [
+        [{"domain": "engine", "reason": "cancelled"}],
+        [],
+    ]
+    assert [line for line in markdown.splitlines() if "cancelled" in line] == [
+        line for line in markdown.splitlines() if "engine" in line and "cancelled" in line
+    ]
+    assert any("cancelled" in line for line in markdown.splitlines())
 
 
 # ------------------------------------------------------------ schema closure
@@ -2465,6 +2517,7 @@ ALLOWED_FROM_IMPORTS: dict[str, frozenset[str]] = {
             "ColdAbortDomain",
             "ColdAdvisorFailureKind",
             "ColdCapabilityBranch",
+            "ColdEngineAbortReason",
             "ColdEvidenceFailure",
             "ColdFinalisationStatus",
             "ColdHostAbortReason",
