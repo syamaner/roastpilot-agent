@@ -23,6 +23,13 @@ qualification or observation is claimed in that case.  ``KeyboardInterrupt`` and
 ``SystemExit`` are not isolated.  No exception, result or argument text is
 retained or formatted, but the advisor itself may format provider errors, so no
 global redaction claim is made.
+
+After settlement the sampler offers two further synchronous, port-free facts:
+:meth:`ColdAdvisorySampler.request_provider_cancellation` makes at most one owned
+cancellation request for the most recent published provider task, and
+:meth:`ColdAdvisorySampler.observe_provider_task` reports that task's live state.
+Neither proves delivery, suppression or that provider work stopped, and neither
+upgrades the stored settlement.  This module implements no OD5 or OD7 policy.
 """
 
 import asyncio
@@ -70,9 +77,13 @@ from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 
 __all__ = (
     "ColdAdvisoryAdvisorPort",
+    "ColdAdvisoryCallFact",
+    "ColdAdvisoryCancellationRequest",
     "ColdAdvisoryClockPort",
     "ColdAdvisoryEvaluatorPort",
+    "ColdAdvisoryProviderObservation",
     "ColdAdvisoryProviderTask",
+    "ColdAdvisoryProviderTaskState",
     "ColdAdvisorySampler",
     "ColdAdvisorySamplerRefusedError",
     "ColdAdvisorySamplerRun",
@@ -186,6 +197,46 @@ class ColdAdvisoryProviderTask(enum.Enum):
     OUTSTANDING = "outstanding"
 
 
+class ColdAdvisoryCancellationRequest(enum.Enum):
+    """The settlement-time provider cancellation request; two members are provisional.
+
+    ``NOT_SETTLED`` and ``IN_PROGRESS`` are never stored.  ``REQUESTED`` means only
+    that ``Task.cancel`` accepted the request: it proves neither delivery nor that the
+    provider stopped.  ``REQUEST_INTERRUPTED`` is stored when a ``BaseException``
+    escaped the request.
+    """
+
+    NOT_SETTLED = "not_settled"
+    IN_PROGRESS = "in_progress"
+    NO_PROVIDER_TASK = "no_provider_task"
+    TASK_ALREADY_DONE = "task_already_done"
+    REQUESTED = "requested"
+    REQUEST_NOT_ACCEPTED = "request_not_accepted"
+    REQUEST_RAISED = "request_raised"
+    REQUEST_INTERRUPTED = "request_interrupted"
+
+
+class ColdAdvisoryProviderTaskState(enum.Enum):
+    """The live state of the most recent published provider task."""
+
+    NONE = "none"
+    OUTSTANDING = "outstanding"
+    DONE_RETURNED = "done_returned"
+    DONE_CANCELLED = "done_cancelled"
+    DONE_RAISED = "done_raised"
+
+
+class ColdAdvisoryCallFact(enum.Enum):
+    """What the most recent published provider call recorded, independent of its task."""
+
+    NO_CALL = "no_call"
+    NOT_INVOKED = "not_invoked"
+    REFUSED_BEFORE_INVOCATION = "refused_before_invocation"
+    INVOKED_NO_OUTCOME = "invoked_no_outcome"
+    OUTCOME_PUBLISHED = "outcome_published"
+    DISCARDED_AFTER_SETTLEMENT = "discarded_after_settlement"
+
+
 _RESULT_CONFIG = pydantic.ConfigDict(frozen=True, strict=True, extra="forbid")
 
 
@@ -201,8 +252,10 @@ class ColdAdvisorySamplerRun(pydantic.BaseModel):
 class ColdAdvisorySettlement(pydantic.BaseModel):
     """The closed settlement fact handed to the later integration and composition slices.
 
-    ``OUTSTANDING`` and ``ENDED_WITHOUT_OUTCOME`` are the only interface for OD5 and
-    OD7/D201, which this module does not implement.
+    Its fields and meaning are frozen.  ``OUTSTANDING`` and ``ENDED_WITHOUT_OUTCOME``
+    are facts for OD5 and OD7/D201; :meth:`ColdAdvisorySampler.request_provider_cancellation`
+    and :meth:`ColdAdvisorySampler.observe_provider_task` are additional sources of
+    facts.  This module implements no OD5 or OD7 policy.
     """
 
     model_config = _RESULT_CONFIG
@@ -210,6 +263,22 @@ class ColdAdvisorySettlement(pydantic.BaseModel):
     closure: ColdAdvisorySettlementClosure
     provider_task: ColdAdvisoryProviderTask
     attempts_resolved: int
+
+
+class ColdAdvisoryProviderObservation(pydantic.BaseModel):
+    """Independent live facts about the most recent published provider task and call.
+
+    It is never delivery, success, suppression or qualification evidence, and it
+    never changes the stored settlement.  Task creation that exits before
+    publication is not proven observable here.
+    """
+
+    model_config = _RESULT_CONFIG
+
+    task: ColdAdvisoryProviderTaskState
+    call: ColdAdvisoryCallFact
+    abandonment_cancel_requested: bool
+    settlement_cancellation: ColdAdvisoryCancellationRequest | None
 
 
 def _is_label(value: object) -> bool:
@@ -706,13 +775,14 @@ class ColdAdvisorySampler:
     """One phase's standalone observation-only advisory sampler (D199, D200, D201).
 
     It has no lifecycle, finalisation, stop, kill, join or exit capability.  The
-    caller must, after obtaining the stored settlement, cancel and await
-    :meth:`run` within its own composition; if an inner call returned the
-    provisional ``NOT_RECORDED_REENTRANT`` fact, it must settle again from outside
-    any port.  An ``OUTSTANDING`` or ``ENDED_WITHOUT_OUTCOME`` provider task hands
-    over to OD5 and OD7/D201, implemented only by the later integration and
-    composition slices.  Terminating the local Agent proves neither that the remote
-    request stopped, that the roaster is physically safe, nor that sealing succeeded.
+    caller must, after obtaining the stored settlement, request cancellation of the
+    task running :meth:`run` without awaiting it before cleanup; if an inner call
+    returned the provisional ``NOT_RECORDED_REENTRANT`` fact, it must settle again
+    from outside any port.  An ``OUTSTANDING`` or ``ENDED_WITHOUT_OUTCOME`` provider
+    task hands over to OD5 and OD7/D201, implemented only by the later integration
+    and composition slices.  Terminating the local Agent proves neither that the
+    remote request stopped, that the roaster is physically safe, nor that sealing
+    succeeded.
     """
 
     def __init__(
@@ -784,6 +854,9 @@ class ColdAdvisorySampler:
             self._settling = False
             self._commit_latch = False
             self._attempts_resolved = 0
+            self._abandon_cancel_requested = False
+            self._cancellation: ColdAdvisoryCancellationRequest | None = None
+            self._cancel_in_progress = False
             self._advisor, self._evaluator, self._sink = advisor, evaluator, sink
             self._ticks, self._clock = ticks, clock
             descriptor = _counted(self._gate, lambda: advisor.descriptor_for(RoastPhase.PREHEATING))
@@ -1012,6 +1085,7 @@ class ColdAdvisorySampler:
         if gate.closed:
             return stops.SETTLED
         task.cancel()
+        self._abandon_cancel_requested = True
         invocation = typing.cast(_Instant, cell.invocation)
         try:
             record = build_advisory_resolution_record(
@@ -1196,3 +1270,98 @@ class ColdAdvisorySampler:
         if invocation is None:
             return closures.RECORDED_UNRESOLVED_NOT_INVOKED
         return closures.RECORDED_UNRESOLVED_INVOKED
+
+    def request_provider_cancellation(self) -> ColdAdvisoryCancellationRequest:
+        """Request cancellation of the published provider task at most once; synchronous.
+
+        Admitted only after a stored settlement; before that it returns the
+        provisional ``NOT_SETTLED`` with no effect.  Two latches are set before the
+        one ``task.cancel()`` call, so a synchronous reentry sees ``IN_PROGRESS`` and
+        an escaping ``BaseException`` leaves ``REQUEST_INTERRUPTED`` stored.  It calls
+        no clock, advisor, sink, evaluator or tick port and never awaits or joins.
+        Its only foreign exposure is that ``task.cancel()`` can synchronously run the
+        ``cancel`` method of a provider-supplied awaited future.  Only a successfully
+        published provider task is reachable; task creation that exited before
+        publication is not proven observable or cancellable.
+
+        Returns:
+            The stored request fact, or a provisional ``NOT_SETTLED``/``IN_PROGRESS``.
+        """
+        requests = ColdAdvisoryCancellationRequest
+        if self._cancel_in_progress:
+            return requests.IN_PROGRESS
+        stored = self._cancellation
+        if stored is not None:
+            return stored
+        if self._settlement is None:
+            return requests.NOT_SETTLED
+        task = self._task
+        if task is None:
+            result = requests.NO_PROVIDER_TASK
+        elif task.done():
+            result = requests.TASK_ALREADY_DONE
+        else:
+            self._cancellation = requests.REQUEST_INTERRUPTED
+            self._cancel_in_progress = True
+            raised = False
+            try:
+                try:
+                    accepted = task.cancel()
+                except Exception:
+                    raised, accepted = True, False
+            finally:
+                self._cancel_in_progress = False
+            if raised:
+                result = requests.REQUEST_RAISED
+            elif accepted:
+                result = requests.REQUESTED
+            else:
+                result = requests.REQUEST_NOT_ACCEPTED
+        self._cancellation = result
+        return result
+
+    def observe_provider_task(self) -> ColdAdvisoryProviderObservation | None:
+        """Observe the most recent published provider task and call; pure and synchronous.
+
+        Returns:
+            ``None`` before a stored settlement; otherwise independent live facts that
+            describe the most recent published task, never delivery, success or
+            qualification.  ``NONE`` and ``NO_CALL`` do not prove that an interrupted
+            task creation had no side effect.
+        """
+        if self._settlement is None:
+            return None
+        task, cell = self._task, self._task_cell
+        states, calls = ColdAdvisoryProviderTaskState, ColdAdvisoryCallFact
+        if task is None:
+            state = states.NONE
+        elif not task.done():
+            state = states.OUTSTANDING
+        elif task.cancelled():
+            state = states.DONE_CANCELLED
+        elif task.exception() is not None:
+            state = states.DONE_RAISED
+        else:
+            state = states.DONE_RETURNED
+        if cell is None:
+            call = calls.NO_CALL
+        elif cell.discarded_after_settlement:
+            call = calls.DISCARDED_AFTER_SETTLEMENT
+        elif cell.outcome is not None:
+            call = calls.OUTCOME_PUBLISHED
+        elif cell.refusal is not None:
+            call = calls.REFUSED_BEFORE_INVOCATION
+        elif cell.invoked:
+            call = calls.INVOKED_NO_OUTCOME
+        else:
+            call = calls.NOT_INVOKED
+        return ColdAdvisoryProviderObservation(
+            task=state,
+            call=call,
+            abandonment_cancel_requested=self._abandon_cancel_requested,
+            settlement_cancellation=(
+                ColdAdvisoryCancellationRequest.IN_PROGRESS
+                if self._cancel_in_progress
+                else self._cancellation
+            ),
+        )
