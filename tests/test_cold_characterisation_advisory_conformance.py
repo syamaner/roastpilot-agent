@@ -1544,10 +1544,11 @@ def test_f_imp_imports_attributes_and_public_surface() -> None:
 
 
 def test_f_imp_only_the_advisory_checker_imports_the_window() -> None:
-    """Only ``advisory_conformance`` imports ``advisory_window``; nothing imports it."""
+    """Only the checker and the 5c-i sampler import the window; nothing imports the checker."""
     package = SOURCE.parents[1]
     assert _checker_consumers(package, "roastpilot_agent", module="advisory_window") == [
-        "cold_characterisation/advisory_conformance.py"
+        "cold_characterisation/advisory_conformance.py",
+        "cold_characterisation/advisory_sampler.py",
     ]
     assert _checker_consumers(package, "roastpilot_agent", module="advisory_conformance") == []
 
