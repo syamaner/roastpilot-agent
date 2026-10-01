@@ -16,6 +16,7 @@ import enum
 import itertools
 import json
 import math
+import types
 import typing
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -25,6 +26,7 @@ import pydantic
 import pytest
 
 from roastpilot_agent.cold_characterisation import conformance, engine, two_phase
+from roastpilot_agent.cold_characterisation import evidence_builders as builders
 from roastpilot_agent.cold_characterisation import evidence_lifecycle as lifecycle
 from roastpilot_agent.cold_characterisation import evidence_reader as reader
 from roastpilot_agent.cold_characterisation import evidence_schema as schema
@@ -1576,3 +1578,756 @@ def test_4gc_t16_forged_hook_arguments_are_refused_before_any_use(
         assert world.clock.samples == 0, change
         assert spy_calls() == [], change
         assert run._sessions == {} and run._ledger.floor is None, change
+
+
+# ----------------------------------------------------------- clock ledger
+
+
+class CountingClock:
+    """Returns scripted (monotonic, utc) pairs and counts each call."""
+
+    def __init__(self, *pairs: tuple[object, object]) -> None:
+        self.pairs = list(pairs)
+        self.monotonic_calls = 0
+        self.utc_calls = 0
+        self.current: tuple[object, object] = (0.0, utc_at(0.0))
+
+    def monotonic(self) -> float:
+        self.monotonic_calls += 1
+        self.current = self.pairs.pop(0)
+        if isinstance(self.current[0], BaseException):
+            raise self.current[0]
+        return typing.cast(float, self.current[0])
+
+    def utc_now_iso(self) -> str:
+        self.utc_calls += 1
+        if isinstance(self.current[1], BaseException):
+            raise self.current[1]
+        return typing.cast(str, self.current[1])
+
+    async def sleep(self, seconds: float) -> None:  # pragma: no cover - never awaited.
+        del seconds
+
+
+def test_4gc_ledger_admits_ties_and_refuses_regressions_without_resampling() -> None:
+    """Clock floor: ties admitted, a regression refused once with the floor unchanged."""
+    ledger = two_phase._ClockFloor()
+    clock = CountingClock(
+        (10.0, utc_at(10.0)),
+        (10.0, utc_at(10.0)),
+        (9.5, utc_at(9.5)),
+        (RuntimeError(CANARY), None),
+        (11.0, RuntimeError(CANARY)),
+        (math.nan, utc_at(1.0)),
+        (12.0, "not-a-time"),
+        (12.0, utc_at(12.0)),
+    )
+    assert ledger.sample(clock) == (10.0, utc_at(10.0))
+    assert ledger.sample(clock) == (10.0, utc_at(10.0))
+    for _ in range(5):
+        assert ledger.sample(clock) is None
+        assert ledger.floor == 10.0
+    assert clock.monotonic_calls == 7
+    assert ledger.sample(clock) == (12.0, utc_at(12.0))
+    assert ledger.floor == 12.0
+
+
+@pytest.mark.parametrize(
+    ("monotonic", "utc", "admitted"),
+    [
+        (12.0, utc_at(12.0), True),
+        (math.nextafter(12.0, -math.inf), utc_at(11.0), False),
+        (13, utc_at(13.0), False),
+        (True, utc_at(13.0), False),
+        (-1.0, utc_at(13.0), False),
+        (math.inf, utc_at(13.0), False),
+        (13.0, "2026-09-26T12:00:00+01:00", False),
+        (13.0, HostileStr(utc_at(13.0)), False),
+    ],
+    ids=repr,
+)
+def test_4gc_ledger_facts_are_admitted_exactly(
+    monotonic: object, utc: object, admitted: bool
+) -> None:
+    """Clock floor: an engine fact must be an exact admitted pair at or after the floor."""
+    ledger = two_phase._ClockFloor()
+    assert ledger.observe_fact(12.0, utc_at(12.0)) is not None
+    reset_spies()
+    fact = ledger.observe_fact(monotonic, utc)
+    assert (fact is not None) is admitted
+    assert ledger.floor == (monotonic if admitted else 12.0)
+    assert spy_calls() == []
+
+
+# ------------------------------------------------- T15: guarded run sink
+
+
+class WriterProxy:
+    """Delegates to a real writer and records every call; ``fail`` injects a fault."""
+
+    def __init__(self, writer: store.ColdEvidenceWriter) -> None:
+        self.writer = writer
+        self.calls: list[str] = []
+        self.fail: set[str] = set()
+        self.digest: object = None
+
+    def _call(self, name: str, action: Callable[[], object]) -> typing.Any:
+        self.calls.append(name)
+        if name in self.fail:
+            raise RuntimeError(CANARY)
+        return action()
+
+    def append(self, record: schema.ColdEvidenceRecord) -> None:
+        self._call("append", lambda: self.writer.append(record))
+
+    def append_lifecycle(self, record: lifecycle.ColdLifecycleRecord) -> None:
+        self._call("append_lifecycle", lambda: self.writer.append_lifecycle(record))
+
+    def seal(self) -> typing.Any:
+        sealed = self._call("seal", self.writer.seal)
+        if self.digest is not None:
+            return types_namespace(manifest_sha256=self.digest)
+        return sealed
+
+    def close(self) -> None:
+        self._call("close", self.writer.close)
+
+
+def types_namespace(**values: object) -> typing.Any:
+    """A plain attribute bag."""
+    return types.SimpleNamespace(**values)
+
+
+class SinkRig:
+    """A guarded sink over a real writer with genuine headers for both phases."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.world = World(tmp_path)
+        self.proxy = WriterProxy(store.open_run(self.world.admitted, RUN_ID))
+        self.sink = two_phase._RunSink(typing.cast(store.ColdEvidenceWriter, self.proxy))
+        self.headers = {
+            phase: builders.build_run_header(
+                identity=self.world.ids[phase],
+                phase=phase,
+                recorded_at_utc=utc_at(1.0),
+                monotonic_seconds=1.0,
+            )
+            for phase in (OFF, ON)
+        }
+
+    def lc(
+        self, phase: Phase, event: lifecycle.ColdLifecycleEvent, **fields: typing.Any
+    ) -> typing.Any:
+        return builders.build_lifecycle_record(
+            header=self.headers[phase],
+            sequence=self.sink.next_sequence,
+            event=event,
+            event_utc=utc_at(2000.0),
+            event_monotonic_seconds=2000.0,
+            recorded_at_utc=utc_at(2000.0),
+            monotonic_seconds=2000.0,
+            **fields,
+        )
+
+    def tick(self, phase: Phase) -> schema.ColdTickRecord:
+        return builders.build_tick_record(
+            header=self.headers[phase],
+            tick=0,
+            recorded_at_utc=utc_at(2.0),
+            monotonic_seconds=2.0,
+            observation=conforming_tick(phase, 0),
+        )
+
+    def host(self, phase: Phase) -> schema.ColdHostRecord:
+        return builders.build_host_record(
+            header=self.headers[phase],
+            sample=safe_host_sample(),
+            recorded_at_utc=utc_at(2.0),
+            monotonic_seconds=2.0,
+        )
+
+    def abort(self, phase: Phase) -> schema.ColdAbortRecord:
+        return builders.build_abort_record(
+            header=self.headers[phase],
+            domain=schema.ColdAbortDomain.OPERATOR,
+            reason=schema.ColdOperatorAbortReason.OPERATOR_STOP,
+            recorded_at_utc=utc_at(2.0),
+            monotonic_seconds=2.0,
+        )
+
+    def fin(self, phase: Phase) -> schema.ColdFinalisationRecord:
+        return builders.build_finalisation_record(
+            header=self.headers[phase],
+            result=clean_result(phase, SESSIONS[phase]),
+            recorded_at_utc=utc_at(2001.0),
+            monotonic_seconds=2001.0,
+        )
+
+    def elapsed(self, phase: Phase) -> typing.Any:
+        return self.lc(
+            phase,
+            Event.OBSERVATION_WINDOW_ELAPSED,
+            session_id=SESSIONS[phase],
+            scheduled_end_monotonic=1900.0,
+            tick_count=1,
+        )
+
+    def returned(
+        self, phase: Phase, result: lifecycle.ColdLifecycleFinalisationResult
+    ) -> typing.Any:
+        return self.lc(
+            phase,
+            Event.FINALISATION_RETURNED,
+            session_id=SESSIONS[phase],
+            finalisation_result=result,
+        )
+
+    def aborted(self, phase: Phase) -> typing.Any:
+        return self.lc(phase, Event.PHASE_ABORTED_NOT_FINALISED, activation_deadline_exceeded=False)
+
+    def started(self) -> typing.Any:
+        return self.lc(
+            OFF, Event.CHILD_STARTED, child_start=lifecycle.ColdLifecycleChildStart.STARTED
+        )
+
+    def terminal(self, phase: Phase) -> typing.Any:
+        return self.lc(
+            phase, Event.RUN_TERMINATED, termination=lifecycle.ColdRunTermination.COMPLETED
+        )
+
+    def bind_off(self) -> None:
+        self.sink.append(self.headers[OFF])
+
+    def bind_on(self) -> None:
+        self.bind_off()
+        self.sink.append_lifecycle(self.started())
+        self.sink.append(self.headers[ON])
+
+    def refused(self, action: Callable[[], object]) -> None:
+        """Assert one fixed refusal that poisons and never reaches the writer."""
+        before = list(self.proxy.calls)
+        with pytest.raises(two_phase.ColdRunSinkRefusedError) as caught:
+            action()
+        assert caught.value.args == ("Cold run evidence refused.",)
+        assert caught.value.__cause__ is None and caught.value.__context__ is None
+        assert CANARY not in repr(caught.value)
+        assert self.sink.poisoned and not self.sink.usable
+        assert self.proxy.calls == before
+
+
+Result = lifecycle.ColdLifecycleFinalisationResult
+
+
+def test_4gc_t15_a_full_grammar_passes_the_guard_and_seals(tmp_path: Path) -> None:
+    """T15 positive control: the success grammar with ticks, hosts and results seals."""
+    rig = SinkRig(tmp_path)
+    sink = rig.sink
+    for phase in (OFF, ON):
+        if phase is OFF:
+            rig.bind_off()
+        else:
+            sink.append_lifecycle(rig.started())
+            sink.append(rig.headers[ON])
+        sink.append_lifecycle(rig.lc(phase, Event.PHASE_ACTIVATED, session_id=SESSIONS[phase]))
+        sink.append(rig.tick(phase))
+        sink.append(rig.host(phase))
+        assert not sink.finalisation_eligible(phase)
+        sink.append_lifecycle(rig.elapsed(phase))
+        assert sink.finalisation_eligible(phase)
+        sink.append(rig.fin(phase))
+        sink.append_lifecycle(rig.returned(phase, Result.CLEAN_RECORDED))
+        assert not sink.finalisation_eligible(phase)
+    sink.append_lifecycle(rig.terminal(ON))
+    digest = sink.seal()
+    assert len(digest) == 64 and not sink.poisoned
+    assert rig.proxy.calls.count("seal") == 1
+
+
+def test_4gc_t15_r1_a_poisoned_sink_may_only_be_closed(tmp_path: Path) -> None:
+    """R1: after poison every append and seal is refused without the writer; close works."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.refused(lambda: rig.sink.append(rig.headers[ON]))
+    rig.refused(lambda: rig.sink.append(rig.tick(OFF)))
+    rig.refused(
+        lambda: rig.sink.append_lifecycle(
+            rig.lc(OFF, Event.PHASE_ACTIVATED, session_id=SESSIONS[OFF])
+        )
+    )
+    rig.refused(rig.sink.seal)
+    rig.sink.close()
+    assert rig.proxy.calls == ["append", "close"]
+
+
+def test_4gc_t15_r2_nothing_appends_after_the_terminal(tmp_path: Path) -> None:
+    """R2: after RUN_TERMINATED every append is refused."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.sink.append_lifecycle(rig.terminal(OFF))
+    assert rig.sink.terminated and not rig.sink.usable
+    rig.refused(lambda: rig.sink.append(rig.tick(OFF)))
+    rig2 = SinkRig(tmp_path / "second")
+    rig2.bind_off()
+    rig2.sink.append_lifecycle(rig2.terminal(OFF))
+    rig2.refused(lambda: rig2.sink.append_lifecycle(rig2.started()))
+
+
+@pytest.mark.parametrize("case", ["no_header", "not_terminated", "terminal_without_header"])
+def test_4gc_t15_r3_seal_and_terminal_require_a_bound_header(tmp_path: Path, case: str) -> None:
+    """R3: seal needs a terminal and a header; a terminal needs a header."""
+    rig = SinkRig(tmp_path)
+    if case == "no_header":
+        rig.refused(rig.sink.seal)
+    elif case == "not_terminated":
+        rig.bind_off()
+        rig.refused(rig.sink.seal)
+    else:
+        rig.refused(lambda: rig.sink.append_lifecycle(rig.terminal(OFF)))
+
+
+@pytest.mark.parametrize("case", ["on_first", "off_twice", "on_before_child_started", "on_twice"])
+def test_4gc_t15_r4_headers_bind_only_in_order(tmp_path: Path, case: str) -> None:
+    """R4: OFF first; ON only after an OFF CHILD_STARTED and only once."""
+    rig = SinkRig(tmp_path)
+    if case == "on_first":
+        rig.refused(lambda: rig.sink.append(rig.headers[ON]))
+    elif case == "off_twice":
+        rig.bind_off()
+        rig.refused(lambda: rig.sink.append(rig.headers[OFF]))
+    elif case == "on_before_child_started":
+        rig.bind_off()
+        rig.refused(lambda: rig.sink.append(rig.headers[ON]))
+    else:
+        rig.bind_on()
+        assert rig.sink.phase is ON
+        rig.refused(lambda: rig.sink.append(rig.headers[ON]))
+
+
+@pytest.mark.parametrize("case", ["v1_before_header", "v1_prior_phase", "lifecycle_prior_phase"])
+def test_4gc_t15_r5_records_belong_to_the_current_phase(tmp_path: Path, case: str) -> None:
+    """R5: no record before a header, and no prior-phase record after the switch."""
+    rig = SinkRig(tmp_path)
+    if case == "v1_before_header":
+        rig.refused(lambda: rig.sink.append(rig.tick(OFF)))
+        return
+    rig.bind_on()
+    if case == "v1_prior_phase":
+        rig.refused(lambda: rig.sink.append(rig.tick(OFF)))
+    else:
+        rig.refused(
+            lambda: rig.sink.append_lifecycle(
+                rig.lc(
+                    OFF, Event.CHILD_STOPPED, child_stop=lifecycle.ColdLifecycleChildStop.CONFIRMED
+                )
+            )
+        )
+
+
+def test_4gc_t15_r6_advisory_evidence_is_refused(tmp_path: Path) -> None:
+    """R6: pre-advisory policy refuses any advisory record."""
+    from tests.test_cold_characterisation_conformance import advisory_for_at
+
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.refused(lambda: rig.sink.append(advisory_for_at(rig.headers[OFF], 2.0)))
+
+
+@pytest.mark.parametrize("closer", ["elapsed", "aborted"])
+@pytest.mark.parametrize("kind", ["tick", "host", "abort"])
+def test_4gc_t15_r7_no_observation_after_the_window_closes(
+    tmp_path: Path, closer: str, kind: str
+) -> None:
+    """R7: ticks, hosts and aborts are refused once the window is closed."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.sink.append_lifecycle(rig.elapsed(OFF) if closer == "elapsed" else rig.aborted(OFF))
+    record = {"tick": rig.tick, "host": rig.host, "abort": rig.abort}[kind](OFF)
+    rig.refused(lambda: rig.sink.append(record))
+
+
+@pytest.mark.parametrize(
+    "case", ["before_elapsed", "second", "after_failed_return", "after_aborted"]
+)
+def test_4gc_t15_r8_finalisation_records_need_an_open_elapsed_phase(
+    tmp_path: Path, case: str
+) -> None:
+    """R8: one finalisation record, only after ELAPSED and before any return or abort fact."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    if case == "before_elapsed":
+        rig.refused(lambda: rig.sink.append(rig.fin(OFF)))
+        return
+    if case == "after_aborted":
+        rig.sink.append_lifecycle(rig.aborted(OFF))
+        rig.refused(lambda: rig.sink.append(rig.fin(OFF)))
+        return
+    rig.sink.append_lifecycle(rig.elapsed(OFF))
+    if case == "second":
+        rig.sink.append(rig.fin(OFF))
+    else:
+        rig.sink.append_lifecycle(rig.returned(OFF, Result.FAILED_WITHOUT_RESULT))
+    rig.refused(lambda: rig.sink.append(rig.fin(OFF)))
+
+
+@pytest.mark.parametrize(
+    ("with_record", "result"),
+    [
+        (False, Result.CLEAN_RECORDED),
+        (False, Result.NOT_CLEAN_RECORDED),
+        (True, Result.FAILED_WITHOUT_RESULT),
+        (True, Result.RECORD_NOT_RETAINED),
+    ],
+)
+def test_4gc_t15_r9_returned_results_match_the_retained_record(
+    tmp_path: Path, with_record: bool, result: lifecycle.ColdLifecycleFinalisationResult
+) -> None:
+    """R9: recorded results need the v1 record; the other two need its absence."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.sink.append_lifecycle(rig.elapsed(OFF))
+    if with_record:
+        rig.sink.append(rig.fin(OFF))
+    rig.refused(lambda: rig.sink.append_lifecycle(rig.returned(OFF, result)))
+
+
+def test_4gc_t15_r10_no_abort_fact_after_a_finalisation_record(tmp_path: Path) -> None:
+    """R10: PHASE_ABORTED_NOT_FINALISED is refused once a finalisation record exists."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.sink.append_lifecycle(rig.elapsed(OFF))
+    rig.sink.append(rig.fin(OFF))
+    rig.refused(lambda: rig.sink.append_lifecycle(rig.aborted(OFF)))
+
+
+def test_4gc_t15_r11_no_elapsed_fact_after_a_retained_abort(tmp_path: Path) -> None:
+    """R11: OBSERVATION_WINDOW_ELAPSED is refused after any retained v1 abort."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.sink.append(rig.abort(OFF))
+    assert rig.sink.abort_retained(OFF) and not rig.sink.abort_retained(ON)
+    rig.refused(lambda: rig.sink.append_lifecycle(rig.elapsed(OFF)))
+
+
+def test_4gc_t15_forged_records_are_refused_before_the_writer(tmp_path: Path) -> None:
+    """T15: a forged record fails the settled snapshot and never reaches the writer."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.refused(lambda: rig.sink.append(forged(rig.tick(OFF), tick=True)))
+    rig2 = SinkRig(tmp_path / "second")
+    rig2.bind_off()
+    rig2.refused(
+        lambda: rig2.sink.append_lifecycle(forged(rig2.terminal(OFF), sequence=HostileStr("0")))
+    )
+
+
+@pytest.mark.parametrize("method", ["append", "append_lifecycle", "seal"])
+def test_4gc_t15_writer_faults_poison_with_the_fixed_error(tmp_path: Path, method: str) -> None:
+    """T15: any writer exception poisons the guard and is replaced by the fixed refusal."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    if method == "seal":
+        rig.sink.append_lifecycle(rig.terminal(OFF))
+    rig.proxy.fail.add(method)
+    action: dict[str, Callable[[], object]] = {
+        "append": lambda: rig.sink.append(rig.tick(OFF)),
+        "append_lifecycle": lambda: rig.sink.append_lifecycle(rig.elapsed(OFF)),
+        "seal": rig.sink.seal,
+    }
+    with pytest.raises(two_phase.ColdRunSinkRefusedError) as caught:
+        action[method]()
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert CANARY not in repr(caught.value)
+    assert rig.sink.poisoned
+    assert rig.proxy.calls[-1] == method
+
+
+@pytest.mark.parametrize("digest", ["A" * 64, "a" * 63, None, HostileStr("a" * 64)], ids=repr)
+def test_4gc_t15_a_seal_without_an_admitted_digest_is_refused(
+    tmp_path: Path, digest: object
+) -> None:
+    """T15: a seal returning anything but an exact lowercase digest is refused."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.sink.append_lifecycle(rig.terminal(OFF))
+    rig.proxy.digest = digest if digest is not None else 12345
+    reset_spies()
+    with pytest.raises(two_phase.ColdRunSinkRefusedError):
+        rig.sink.seal()
+    assert rig.sink.poisoned and spy_calls() == []
+
+
+def test_4gc_t15_a_close_fault_is_absorbed(tmp_path: Path) -> None:
+    """T15: closing never raises; the sink stays poisoned."""
+    rig = SinkRig(tmp_path)
+    rig.proxy.fail.add("close")
+    rig.sink.close()
+    assert rig.sink.poisoned and rig.proxy.calls == ["close"]
+
+
+GUARD_FLAGS: typing.Final = (
+    "abort_seen",
+    "aborted_not_finalised",
+    "finalisation_appended",
+    "finalisation_returned",
+)
+
+
+def eligible_rig(tmp_path: Path) -> SinkRig:
+    """A sink whose OFF guard is set directly to the eligible baseline."""
+    rig = SinkRig(tmp_path)
+    rig.sink.phase = OFF
+    guard = rig.sink._guards[OFF]
+    guard.header = True
+    guard.elapsed = True
+    guard.window_closed = True
+    return rig
+
+
+@pytest.mark.parametrize(
+    "toggle",
+    [*GUARD_FLAGS, "poisoned", "terminated", "no_header", "no_elapsed", "other_phase", None],
+)
+def test_4gc_t21_eligibility_truth_table(tmp_path: Path, toggle: str | None) -> None:
+    """Isolated eligibility: each failing predicate alone refuses; the baseline admits."""
+    rig = eligible_rig(tmp_path)
+    guard = rig.sink._guards[OFF]
+    if toggle in GUARD_FLAGS:
+        setattr(guard, typing.cast(str, toggle), True)
+    elif toggle == "poisoned":
+        rig.sink.poisoned = True
+    elif toggle == "terminated":
+        rig.sink.terminated = True
+    elif toggle == "no_header":
+        guard.header = False
+    elif toggle == "no_elapsed":
+        guard.elapsed = False
+    elif toggle == "other_phase":
+        rig.sink.phase = ON
+    assert rig.sink.finalisation_eligible(OFF) is (toggle is None)
+
+
+@pytest.mark.parametrize("toggle", [*GUARD_FLAGS, "no_elapsed", None])
+def test_4gc_t21_r8_truth_table(tmp_path: Path, toggle: str | None) -> None:
+    """Isolated R8: a finalisation record is admitted only from the eligible baseline."""
+    rig = eligible_rig(tmp_path)
+    guard = rig.sink._guards[OFF]
+    if toggle in GUARD_FLAGS:
+        setattr(guard, typing.cast(str, toggle), True)
+    elif toggle == "no_elapsed":
+        guard.elapsed = False
+    snapshot = schema.validate_record(rig.fin(OFF))
+    assert rig.sink._admits(snapshot) is (toggle is None)
+
+
+@pytest.mark.parametrize("abort_seen", [False, True])
+def test_4gc_t21_r11_truth_table(tmp_path: Path, abort_seen: bool) -> None:
+    """Isolated R11: ELAPSED is admitted exactly when no abort was retained."""
+    rig = SinkRig(tmp_path)
+    rig.sink.phase = OFF
+    rig.sink._guards[OFF].abort_seen = abort_seen
+    snapshot = lifecycle.validate_lifecycle_record(rig.elapsed(OFF))
+    assert rig.sink._admits_lifecycle(snapshot) is (not abort_seen)
+
+
+# --------------------------------------------- T12: writer faults in a run
+
+
+class WriterSpy:
+    """Class-level writer spy: one injected fault, then counts every later call."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, trigger: Callable[[str, object], bool]):
+        self.calls: list[tuple[str, str, bool]] = []
+        self.armed = False
+        self.trigger = trigger
+        original_chunk = store._write_chunk
+
+        def chunk(descriptor: int, data: memoryview) -> int:
+            if self.armed:
+                self.armed = False
+                raise OSError(CANARY)
+            return original_chunk(descriptor, data)
+
+        monkeypatch.setattr(store, "_write_chunk", chunk)
+        for name in ("append", "append_lifecycle", "seal"):
+            monkeypatch.setattr(store.ColdEvidenceWriter, name, self._wrap(name))
+
+    def _wrap(self, name: str) -> Callable[..., typing.Any]:
+        original = getattr(store.ColdEvidenceWriter, name)
+        spy = self
+
+        def call(writer: store.ColdEvidenceWriter, *args: typing.Any) -> typing.Any:
+            label = self.label(name, args)
+            if spy.trigger(name, args[0] if args else None) and not any(
+                failed is False for _n, _l, failed in spy.calls
+            ):
+                spy.armed = True
+            try:
+                value = original(writer, *args)
+            except Exception:
+                spy.calls.append((name, label, False))
+                raise
+            spy.calls.append((name, label, True))
+            return value
+
+        return call
+
+    @staticmethod
+    def label(name: str, args: tuple[typing.Any, ...]) -> str:
+        if not args:
+            return name
+        record = args[0]
+        if name == "append_lifecycle":
+            return f"{record.phase.value}:{record.event.value}"
+        return f"{record.phase.value}:{record.stream}"
+
+    def after_failure(self) -> list[tuple[str, str, bool]]:
+        index = next(i for i, call in enumerate(self.calls) if call[2] is False)
+        return self.calls[index + 1 :]
+
+
+def _is(
+    name: str, stream: str | None = None, event: str | None = None
+) -> Callable[[str, object], bool]:
+    def trigger(method: str, record: object) -> bool:
+        if method != name:
+            return False
+        if stream is not None:
+            return getattr(record, "stream", None) == stream
+        if event is not None:
+            return getattr(getattr(record, "event", None), "value", None) == event
+        return True
+
+    return trigger
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "trigger"),
+    [
+        ("v1_tick", _is("append", stream="tick")),
+        ("hook_lifecycle", _is("append_lifecycle", event="phase_activated")),
+        ("elapsed_lifecycle", _is("append_lifecycle", event="observation_window_elapsed")),
+        ("seal", _is("seal")),
+        ("off_header", _is("append", stream="header")),
+    ],
+)
+async def test_4gc_t12_a_write_fault_leaves_unsealed_evidence_and_stops_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    trigger: Callable[[str, object], bool],
+) -> None:
+    """T12: one failed writer call, no later writer call, no digest, child stopped."""
+    spy = WriterSpy(monkeypatch, trigger)
+    world = World(tmp_path)
+    result = await world.run()
+    assert result.outcome is Outcome.EVIDENCE_NOT_SEALED
+    assert result.manifest_sha256 is None and result.conformance is None
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+    assert [call for call in spy.calls if call[2] is False] != []
+    assert len([call for call in spy.calls if call[2] is False]) == 1
+    assert spy.after_failure() == []
+    # A seal failing mid-write may leave a partial manifest; it never yields a digest.
+    assert world.manifest_exists() is (case == "seal")
+    assert_no_canary(result)
+    if case == "off_header":
+        assert spy.calls == [("append", "recording_off:header", False)]
+        assert world.records("lifecycle") == []
+    if case == "seal":
+        assert world.events() == GRAMMAR
+        assert world.child_ops() == NORMAL_CHILD_OPS
+        assert result.termination_reason is None
+    else:
+        assert world.child_ops() == [("configure", OFF), ("start", OFF), ("stop", OFF)]
+        assert world.mcp.finalised == []
+        assert not any(event == "run_terminated" for _phase, event in world.events())
+
+
+# ---------------------------------------------- T6: orchestrator clock floor
+
+
+def assert_lifecycle_ordered(world: World) -> None:
+    """Lifecycle recording instants never regress and no event follows its recording."""
+    records = world.lifecycle()
+    recorded = [record["monotonic_seconds"] for record in records]
+    assert recorded == sorted(recorded)
+    assert all(r["event_monotonic_seconds"] <= r["monotonic_seconds"] for r in records)
+
+
+@pytest.mark.asyncio
+async def test_4gc_t6_a_regressed_finalisation_return_is_clock_invalid(tmp_path: Path) -> None:
+    """T6: ``fr`` below the floor records nothing from it and starts nothing new."""
+    world = World(tmp_path)
+    world.mcp.before["finalise_session:recording_off"] = lambda: world.clock.pending.append(
+        "regress"
+    )
+    result = await world.run()
+    assert_failed(world, result, R.CLOCK_INVALID)
+    assert world.records("finalisation") == []
+    assert ("recording_off", "finalisation_returned") not in world.events()
+    assert world.child_ops() == [("configure", OFF), ("start", OFF), ("stop", OFF)]
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+    assert_lifecycle_ordered(world)
+
+
+@pytest.mark.asyncio
+async def test_4gc_t6_a_regressed_on_activation_is_clock_invalid(tmp_path: Path) -> None:
+    """T6: an ON activation the engine admits but the run floor refuses reads nothing."""
+    world = World(tmp_path)
+
+    def advance() -> None:
+        world.clock.t += 10.0
+
+    world.host.before_start[1] = advance
+    world.mcp.before["mark_beans_added:recording_on"] = lambda: world.clock.pending.append(
+        "regress:5"
+    )
+    result = await world.run()
+    assert_failed(world, result, R.CLOCK_INVALID)
+    assert ("get_roast_state", ON) not in world.mcp.calls
+    assert world.mcp.finalised == [SESSIONS[OFF]]
+    assert ("recording_on", "phase_activated") not in world.events()
+    aborted = world.event(ON, "phase_aborted_not_finalised")
+    assert aborted["session_id"] == SESSIONS[ON]
+    assert_lifecycle_ordered(world)
+
+
+@pytest.mark.asyncio
+async def test_4gc_t6_a_regressed_completion_is_clock_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T6: a completion below the floor is not recorded and the phase is not finalised."""
+
+    async def behaviour(admission: typing.Any, sink: typing.Any, clock: Clock) -> object:
+        clock.t += 1800.0
+        return engine.ColdPhaseCompleted(
+            session_id=SESSIONS[OFF],
+            observation_end_monotonic=T0 - 10.0,
+            observation_end_utc=utc_at(T0 - 10.0),
+            tick_count=3,
+        )
+
+    monkeypatch.setattr(two_phase, "observe_cold_phase", scripted_observer(OFF, behaviour))
+    world = World(tmp_path)
+    result = await world.run()
+    assert_failed(world, result, R.CLOCK_INVALID)
+    assert world.mcp.finalised == []
+    assert ("recording_off", "observation_window_elapsed") not in world.events()
+    assert world.event(OFF, "phase_aborted_not_finalised")["session_id"] == SESSIONS[OFF]
+    assert world.child_ops() == [("configure", OFF), ("start", OFF), ("stop", OFF)]
+    assert_lifecycle_ordered(world)
+
+
+@pytest.mark.asyncio
+async def test_4gc_t6_no_terminal_without_an_admitted_instant_means_no_seal(
+    tmp_path: Path,
+) -> None:
+    """T6: an inadmissible terminal sample leaves no terminal, no seal and no digest."""
+    world = World(tmp_path)
+    world.child.before_stop[1] = lambda: world.clock.pending.extend(["", "", "raise"])
+    result = await world.run()
+    assert result.outcome is Outcome.EVIDENCE_NOT_SEALED
+    assert result.termination_reason is R.CLOCK_INVALID
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+    assert world.events() == GRAMMAR[:-1]
+    assert not world.manifest_exists()
