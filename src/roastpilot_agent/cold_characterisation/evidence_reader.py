@@ -11,6 +11,15 @@ import typing
 
 import pydantic
 
+from roastpilot_agent.cold_characterisation.evidence_advisory import (
+    ColdAdvisoryAttemptEvidenceState,
+    ColdAdvisoryAttemptRecord,
+    ColdAdvisoryEntry,
+    ColdAdvisoryIntentRecord,
+    ColdAdvisoryResolutionRecord,
+    ColdAdvisorySequence,
+    validate_advisory_attempt_record,
+)
 from roastpilot_agent.cold_characterisation.evidence_lifecycle import (
     ColdLifecycleEvidenceState,
     ColdLifecycleRecord,
@@ -46,6 +55,7 @@ from roastpilot_agent.cold_characterisation.evidence_store import (
     ColdRetainedIdentityV1,
     ColdVerifiedTree,
     canonical_json,
+    check_advisory_attempt_binding,
     check_lifecycle_binding,
     check_record_binding,
     load_strict_json,
@@ -63,6 +73,21 @@ _STREAMS_BY_VALUE = {stream.value: stream for stream in ColdEvidenceStream}
 _LIFECYCLE_FILE_NAME = "lifecycle.jsonl"
 _LIFECYCLE_STREAM = "lifecycle"
 _LIFECYCLE_SCHEMA_VERSIONS = frozenset({2})
+_ADVISORY_FILE_NAME = "advisory_attempt.jsonl"
+_ADVISORY_STREAM = "advisory_attempt"
+_ADVISORY_SCHEMA_VERSIONS = frozenset({2})
+
+
+class _ReadProfile(enum.Enum):
+    """Closed reader profiles; each value is the immutable set of extra file names admitted.
+
+    A profile is a reader grammar, not a record schema version.
+    """
+
+    V1 = frozenset[str]()
+    V2 = frozenset({_LIFECYCLE_FILE_NAME})
+    V3 = frozenset({_LIFECYCLE_FILE_NAME, _ADVISORY_FILE_NAME})
+
 
 #: Reader-local abort pairing; a contract test pins it to ``ColdAbortRecord``'s validator.
 ABORT_REASON_BY_DOMAIN: dict[ColdAbortDomain, type[enum.Enum]] = {
@@ -82,6 +107,10 @@ _ADVISORY_ADAPTER = pydantic.TypeAdapter(ColdAdvisoryRecord)
 _FINALISATION_ADAPTER = pydantic.TypeAdapter(ColdFinalisationRecord)
 _ABORT_ADAPTER = pydantic.TypeAdapter(ColdAbortRecord)
 _LIFECYCLE_ADAPTER = pydantic.TypeAdapter(ColdLifecycleRecord)
+_ADVISORY_ADAPTERS: dict[str, pydantic.TypeAdapter[ColdAdvisoryAttemptRecord]] = {
+    ColdAdvisoryEntry.INTENT.value: pydantic.TypeAdapter(ColdAdvisoryIntentRecord),
+    ColdAdvisoryEntry.RESOLUTION.value: pydantic.TypeAdapter(ColdAdvisoryResolutionRecord),
+}
 
 
 class ColdRetainedHeader(pydantic.BaseModel):
@@ -133,6 +162,44 @@ class ColdRetainedRunV2(pydantic.BaseModel):
         if (self.lifecycle_state is ColdLifecycleEvidenceState.ABSENT) != (self.lifecycle == ()):
             raise ValueError("lifecycle state does not match its records")
         return self
+
+
+class ColdRetainedRunV3(pydantic.BaseModel):
+    """A verified retained run with its lifecycle and advisory-attempt streams.
+
+    Integrity facts only.  ``ABSENT`` and ``OPEN_TAIL`` are never healthy, and
+    ``COMPLETE`` means only that every retained attempt is structurally resolved,
+    possibly as failed, abandoned, or unresolved at phase end.  It is not a
+    conformance input.
+    """
+
+    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
+
+    run: ColdRetainedRun
+    lifecycle_state: ColdLifecycleEvidenceState
+    lifecycle: tuple[ColdLifecycleRecord, ...]
+    advisory_attempt_state: ColdAdvisoryAttemptEvidenceState
+    advisory_attempts: tuple[ColdAdvisoryIntentRecord | ColdAdvisoryResolutionRecord, ...]
+
+    @pydantic.model_validator(mode="after")
+    def _require_states_match_records(self) -> typing.Self:
+        """Require each stream state to be exactly the one its records imply."""
+        if (self.lifecycle_state is ColdLifecycleEvidenceState.ABSENT) != (self.lifecycle == ()):
+            raise ValueError("lifecycle state does not match its records")
+        if self.advisory_attempt_state is not _advisory_state(self.advisory_attempts):
+            raise ValueError("advisory attempt state does not match its records")
+        return self
+
+
+def _advisory_state(
+    attempts: tuple[ColdAdvisoryAttemptRecord, ...],
+) -> ColdAdvisoryAttemptEvidenceState:
+    """Return the structural state implied by retained attempts in run order."""
+    if not attempts:
+        return ColdAdvisoryAttemptEvidenceState.ABSENT
+    if isinstance(attempts[-1], ColdAdvisoryIntentRecord):
+        return ColdAdvisoryAttemptEvidenceState.OPEN_TAIL
+    return ColdAdvisoryAttemptEvidenceState.COMPLETE
 
 
 def _closed(failure: ColdEvidenceStoreFailure) -> ColdEvidenceStoreError:
@@ -267,29 +334,86 @@ def _read_lifecycle_line(
     return snapshot
 
 
-def _record_layout(
-    tree: ColdVerifiedTree, *, admit_lifecycle: bool
-) -> tuple[dict[ColdPhaseKind, dict[ColdEvidenceStream, str]], dict[ColdPhaseKind, str]]:
+def _read_advisory_attempt_line(
+    line: bytes,
+    *,
+    phase: ColdPhaseKind,
+    state: ColdBindingState,
+    sequence: ColdAdvisorySequence,
+) -> ColdAdvisoryAttemptRecord:
+    """Strictly decode, losslessly re-prove, validate, bind, and order one attempt line."""
+    if not line:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    decoded = load_strict_json(line, malformed=ColdEvidenceStoreFailure.LINE_MALFORMED)
+    if type(decoded) is not dict:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    document = typing.cast(dict[str, object], decoded)
+    walk_json_value(typing.cast(pydantic.JsonValue, document))
+    version = document.get("schema_version")
+    if type(version) is not int or version not in _ADVISORY_SCHEMA_VERSIONS:
+        raise _closed(ColdEvidenceStoreFailure.SCHEMA_VERSION_UNKNOWN)
+    stream_value = document.get("stream")
+    if type(stream_value) is not str or stream_value != _ADVISORY_STREAM:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    entry = document.get("entry")
+    adapter = _ADVISORY_ADAPTERS.get(entry) if type(entry) is str else None
+    validated: ColdAdvisoryAttemptRecord | None = None
+    if adapter is not None:
+        try:
+            validated = adapter.validate_json(line, strict=True)
+        except pydantic.ValidationError:
+            validated = None
+    if validated is None:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    if validated.phase is not phase:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    if canonical_json(validated.model_dump(mode="json")).encode("utf-8") != line:
+        raise _closed(ColdEvidenceStoreFailure.LINE_NOT_CANONICAL)
+    snapshot = validate_advisory_attempt_record(validated)
+    check_advisory_attempt_binding(state, snapshot)
+    sequence.check(snapshot)
+    sequence.commit(snapshot)
+    return snapshot
+
+
+class _RecordLayout(typing.NamedTuple):
+    """Every ``records/`` entry mapped to its closed phase and stream or extra file."""
+
+    streams: dict[ColdPhaseKind, dict[ColdEvidenceStream, str]]
+    lifecycle: dict[ColdPhaseKind, str]
+    advisory: dict[ColdPhaseKind, str]
+
+
+def _record_layout(tree: ColdVerifiedTree, *, profile: _ReadProfile) -> _RecordLayout:
     """Map every ``records/`` entry to its closed phase and stream, refusing others.
 
-    Only when ``admit_lifecycle`` is set does the exact name ``lifecycle.jsonl`` map
-    to a phase's lifecycle stream; every other unknown entry is refused.
+    Only the exact extra file names the profile admits map to a phase's lifecycle
+    or advisory-attempt stream; every other unknown entry is refused.
     """
-    layout: dict[ColdPhaseKind, dict[ColdEvidenceStream, str]] = {}
-    lifecycle: dict[ColdPhaseKind, str] = {}
+    layout = _RecordLayout({}, {}, {})
+    extras = {_LIFECYCLE_FILE_NAME: layout.lifecycle, _ADVISORY_FILE_NAME: layout.advisory}
     for entry in tree.manifest.entries:
         segments = entry.relative_path.split("/")
         if segments[0] != _RECORDS_DIRECTORY:
             continue
         phase = _PHASES_BY_NAME.get(segments[1]) if len(segments) == 3 else None
-        if phase is not None and admit_lifecycle and segments[2] == _LIFECYCLE_FILE_NAME:
-            lifecycle[phase] = entry.relative_path
+        if phase is not None and segments[2] in profile.value:
+            extras[segments[2]][phase] = entry.relative_path
             continue
         stream = _STREAMS_BY_FILE_NAME.get(segments[2]) if len(segments) == 3 else None
         if phase is None or stream is None:
             raise _closed(ColdEvidenceStoreFailure.ENTRY_PATH_INVALID)
-        layout.setdefault(phase, {})[stream] = entry.relative_path
-    return layout, lifecycle
+        layout.streams.setdefault(phase, {})[stream] = entry.relative_path
+    return layout
+
+
+class _VerifiedRead(typing.NamedTuple):
+    """The single shared read loop's result, before any profile-specific carrier."""
+
+    run: ColdRetainedRun
+    lifecycle: tuple[ColdLifecycleRecord, ...]
+    lifecycle_present: bool
+    advisory: tuple[ColdAdvisoryAttemptRecord, ...]
 
 
 def _read_verified_run(
@@ -298,8 +422,8 @@ def _read_verified_run(
     run_id: str,
     expected_manifest_sha256: str,
     protected_roots: tuple[str, ...],
-    admit_lifecycle: bool,
-) -> tuple[ColdRetainedRun, tuple[ColdLifecycleRecord, ...], bool]:
+    profile: _ReadProfile,
+) -> _VerifiedRead:
     """Verify one tree, then strictly read every record; the single shared read loop."""
     if not run_id_is_valid(run_id):
         raise _closed(ColdEvidenceStoreFailure.RUN_ID_MISMATCHED)
@@ -309,15 +433,18 @@ def _read_verified_run(
         expected_manifest_sha256=expected_manifest_sha256,
         protected_roots=protected_roots,
     )
-    layout, lifecycle_paths = _record_layout(tree, admit_lifecycle=admit_lifecycle)
+    layout = _record_layout(tree, profile=profile)
     state = ColdBindingState(run_id)
     order = ColdLifecycleSequence()
+    attempt_order = ColdAdvisorySequence()
     streams: list[ColdRetainedStream] = []
     lifecycle: list[ColdLifecycleRecord] = []
+    advisory: list[ColdAdvisoryAttemptRecord] = []
     for phase in ColdPhaseKind:
-        files = layout.get(phase, {})
-        lifecycle_path = lifecycle_paths.get(phase)
-        if not files and lifecycle_path is None:
+        files = layout.streams.get(phase, {})
+        lifecycle_path = layout.lifecycle.get(phase)
+        advisory_path = layout.advisory.get(phase)
+        if not files and lifecycle_path is None and advisory_path is None:
             continue
         if ColdEvidenceStream.HEADER not in files:
             raise _closed(ColdEvidenceStoreFailure.HEADER_MISSING)
@@ -335,6 +462,11 @@ def _read_verified_run(
                 _read_lifecycle_line(line, phase=phase, state=state, sequence=order)
                 for line in read_verified_lines(tree, lifecycle_path, max_line_bytes=MAX_LINE_BYTES)
             )
+        if advisory_path is not None:
+            advisory.extend(
+                _read_advisory_attempt_line(line, phase=phase, state=state, sequence=attempt_order)
+                for line in read_verified_lines(tree, advisory_path, max_line_bytes=MAX_LINE_BYTES)
+            )
     bound = {(header.phase, header.identity_sha256) for header, _identity in state.headers}
     recorded = {(item.phase, item.identity_sha256) for item in tree.manifest.identity_bindings}
     if bound != recorded:
@@ -348,7 +480,7 @@ def _read_verified_run(
         ),
         streams=tuple(streams),
     )
-    return run, tuple(lifecycle), bool(lifecycle_paths)
+    return _VerifiedRead(run, tuple(lifecycle), bool(layout.lifecycle), tuple(advisory))
 
 
 def read_retained_run(
@@ -385,8 +517,8 @@ def read_retained_run(
         run_id=run_id,
         expected_manifest_sha256=expected_manifest_sha256,
         protected_roots=protected_roots,
-        admit_lifecycle=False,
-    )[0]
+        profile=_ReadProfile.V1,
+    ).run
 
 
 def read_retained_run_v2(
@@ -427,17 +559,76 @@ def read_retained_run_v2(
         ColdEvidenceError: If a decoded record fails schema revalidation.
         ColdLifecycleError: If lifecycle records break the run-wide order.
     """
-    run, lifecycle, present = _read_verified_run(
+    read = _read_verified_run(
         root,
         run_id=run_id,
         expected_manifest_sha256=expected_manifest_sha256,
         protected_roots=protected_roots,
-        admit_lifecycle=True,
+        profile=_ReadProfile.V2,
     )
     return ColdRetainedRunV2(
-        run=run,
+        run=read.run,
         lifecycle_state=(
-            ColdLifecycleEvidenceState.PRESENT if present else ColdLifecycleEvidenceState.ABSENT
+            ColdLifecycleEvidenceState.PRESENT
+            if read.lifecycle_present
+            else ColdLifecycleEvidenceState.ABSENT
         ),
-        lifecycle=lifecycle,
+        lifecycle=read.lifecycle,
+    )
+
+
+def read_retained_run_v3(
+    root: str,
+    *,
+    run_id: str,
+    expected_manifest_sha256: str,
+    protected_roots: tuple[str, ...] = (),
+) -> ColdRetainedRunV3:
+    """Verify one retained tree, then strictly read v1 records, lifecycle, and attempts.
+
+    Trust boundary: ``expected_manifest_sha256`` must be the externally recorded
+    ``ColdSealedRun.manifest_sha256`` returned by a successful seal.  It must never be
+    derived from the candidate tree, its ``manifest.json`` or its sidecar, which would
+    verify a tree against itself.  A seal that fails after creating manifest artefacts
+    can leave internally consistent bytes but returns no digest, so such a tree has no
+    trusted receipt.  None of this is a filesystem transaction.
+
+    The whole tree is verified before anything is parsed.  ``lifecycle.jsonl`` and
+    ``advisory_attempt.jsonl`` each accept their own per-stream version 2 only; any
+    other ``records/`` entry is refused.  This reader never calls the v1 or v2
+    reader and nests no v2 carrier.  ``ABSENT`` and ``OPEN_TAIL`` are never healthy,
+    and the result is not a conformance input.
+
+    Args:
+        root: Absolute evidence root holding the run directory.
+        run_id: The run identifier.
+        expected_manifest_sha256: The recorded ``manifest.json`` digest.
+        protected_roots: Additional absolute roots evidence may never occupy.
+
+    Returns:
+        The retained run, lifecycle state and records, and attempt state and records.
+
+    Raises:
+        ColdEvidenceStoreError: If verification, decoding, or binding fails.
+        ColdEvidenceError: If a decoded record fails schema revalidation.
+        ColdLifecycleError: If lifecycle records break the run-wide order.
+        ColdAdvisoryAttemptError: If attempt records break the run-wide order.
+    """
+    read = _read_verified_run(
+        root,
+        run_id=run_id,
+        expected_manifest_sha256=expected_manifest_sha256,
+        protected_roots=protected_roots,
+        profile=_ReadProfile.V3,
+    )
+    return ColdRetainedRunV3(
+        run=read.run,
+        lifecycle_state=(
+            ColdLifecycleEvidenceState.PRESENT
+            if read.lifecycle_present
+            else ColdLifecycleEvidenceState.ABSENT
+        ),
+        lifecycle=read.lifecycle,
+        advisory_attempt_state=_advisory_state(read.advisory),
+        advisory_attempts=read.advisory,
     )
