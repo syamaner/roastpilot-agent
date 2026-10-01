@@ -13,6 +13,7 @@ the fixed 60 s budget, never from values the orchestrator computed.
 import ast
 import asyncio
 import enum
+import gc
 import itertools
 import json
 import math
@@ -313,6 +314,8 @@ class Child:
             raise RuntimeError(CANARY)
         if mode == "cancelled":
             raise asyncio.CancelledError
+        if mode == "boom":
+            raise StopBoom
         if mode == "unconfirmed":
             self.running_value = False
             self.unconfirmed_value = True
@@ -3263,7 +3266,6 @@ def _nan_admission(world: World) -> None:
 
 
 def _regressed_admission(world: World) -> None:
-    world.host.before_start[0] = lambda: None
     world.mcp.before["get_runtime_config:recording_on"] = lambda: world.clock.pending.append(
         "regress:1"
     )
@@ -3441,7 +3443,7 @@ async def test_4gc_a_cancelled_cleanup_stop_never_replaces_the_initiating_except
 async def test_4gc_a_repeated_teardown_exception_is_contained_unsealed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An ordinary exception from teardown, first and fallback, never escapes raw."""
+    """An ordinary exception after a COMPLETED terminal is contained and never re-sealed."""
     attempts: list[int] = []
 
     def seal(self: two_phase._RunSink) -> str:
@@ -3451,7 +3453,7 @@ async def test_4gc_a_repeated_teardown_exception_is_contained_unsealed(
     monkeypatch.setattr(two_phase._RunSink, "seal", seal)
     world = World(tmp_path)
     result = await world.run()
-    assert len(attempts) == 2
+    assert len(attempts) == 1
     assert result.outcome is Outcome.EVIDENCE_NOT_SEALED
     assert result.termination_reason is R.UNEXPECTED_FAILURE
     assert result.manifest_sha256 is None and result.conformance is None
@@ -3465,7 +3467,7 @@ async def test_4gc_a_repeated_teardown_exception_is_contained_unsealed(
 async def test_4gc_a_repeated_teardown_exception_before_evidence_is_contained(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With no writer yet, a repeated teardown exception is REFUSED/UNEXPECTED_FAILURE."""
+    """With no writer yet, a teardown exception is REFUSED/UNEXPECTED_FAILURE (no re-run)."""
     attempts: list[int] = []
 
     def refused(self: two_phase._TwoPhaseRun, refusal: two_phase.ColdRunStartRefusal) -> typing.Any:
@@ -3476,7 +3478,7 @@ async def test_4gc_a_repeated_teardown_exception_before_evidence_is_contained(
     world = World(tmp_path)
     world.identities.values[OFF] = RuntimeError(CANARY)
     result = await world.run()
-    assert len(attempts) == 2
+    assert len(attempts) == 1
     assert (result.outcome, result.start_refusal) == (
         Outcome.REFUSED_BEFORE_EVIDENCE,
         Refusal.UNEXPECTED_FAILURE,
@@ -3484,6 +3486,416 @@ async def test_4gc_a_repeated_teardown_exception_before_evidence_is_contained(
     assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
     assert world.child_ops() == [("configure", OFF), ("start", OFF), ("stop", OFF)]
     assert_no_canary(result)
+
+
+# ---------------------------------------------- A2: one-shot seal lifecycle
+
+
+class StopBoom(BaseException):
+    """A non-``Exception`` raised by a cleanup stop, different from the initiator."""
+
+
+RESULT_CLASS: typing.Final = two_phase.ColdTwoPhaseResult
+
+
+class Counters:
+    """Counts writer seals, reader calls and checker calls at their exact seams."""
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        seal: Callable[[store.ColdEvidenceWriter], typing.Any] | None = None,
+        read: Callable[..., typing.Any] | None = None,
+        check: Callable[[object], typing.Any] | None = None,
+    ) -> None:
+        self.seals = self.reads = self.checks = 0
+        real_seal = store.ColdEvidenceWriter.seal
+        real_read = reader.read_retained_run_v2
+        real_check = conformance.check_pre_advisory_conformance
+
+        def counted_seal(writer: store.ColdEvidenceWriter) -> typing.Any:
+            self.seals += 1
+            return (seal or real_seal)(writer)
+
+        def counted_read(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+            self.reads += 1
+            return (read or real_read)(*args, **kwargs)
+
+        def counted_check(run: object) -> typing.Any:
+            self.checks += 1
+            return (check or real_check)(run)
+
+        monkeypatch.setattr(store.ColdEvidenceWriter, "seal", counted_seal)
+        monkeypatch.setattr(two_phase, "read_retained_run_v2", counted_read)
+        monkeypatch.setattr(two_phase, "check_pre_advisory_conformance", counted_check)
+
+    @property
+    def counts(self) -> tuple[int, int, int]:
+        return self.seals, self.reads, self.checks
+
+
+def count_teardowns(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Count ``_teardown`` entries (first attempt plus any fallback)."""
+    calls: list[int] = []
+    real = two_phase._TwoPhaseRun._teardown
+
+    async def teardown(self: two_phase._TwoPhaseRun) -> typing.Any:
+        calls.append(1)
+        return await real(self)
+
+    monkeypatch.setattr(two_phase._TwoPhaseRun, "_teardown", teardown)
+    return calls
+
+
+def one_result_fault(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Fault exactly the first digest-bearing result construction; later ones succeed."""
+    faults: list[int] = []
+    real = two_phase.ColdTwoPhaseResult
+
+    def construct(**kwargs: typing.Any) -> two_phase.ColdTwoPhaseResult:
+        if not faults and kwargs.get("manifest_sha256") is not None:
+            faults.append(1)
+            raise RuntimeError(f"{CANARY} /private/evidence {SESSIONS[ON]}")
+        return real(**kwargs)
+
+    monkeypatch.setattr(two_phase, "ColdTwoPhaseResult", construct)
+    return faults
+
+
+def assert_contained(result: two_phase.ColdTwoPhaseResult) -> None:
+    """A returned row (no escaping exception) that carries no canary text."""
+    assert type(result) is RESULT_CLASS
+    assert_no_canary(result)
+
+
+@pytest.mark.asyncio
+async def test_4gc_a2_s1_a_fault_before_the_writer_seal_never_seals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S1: an inadmissible terminal sample means no terminal, no writer seal, no digest."""
+    counters = Counters(monkeypatch)
+    world = World(tmp_path)
+    world.child.before_stop[1] = lambda: world.clock.pending.extend(["", "", "raise"])
+    result = await world.run()
+    assert result.outcome is Outcome.EVIDENCE_NOT_SEALED and result.manifest_sha256 is None
+    assert counters.counts == (0, 0, 0)
+    assert not world.manifest_exists()
+    assert_contained(result)
+
+
+@pytest.mark.asyncio
+async def test_4gc_a2_s2_a_writer_that_writes_then_raises_is_sealed_at_most_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S2: one writer seal call that writes artefacts then raises; no digest, no retry."""
+    real_chunk = store._write_chunk
+    armed: list[bool] = []
+
+    def chunk(descriptor: int, data: memoryview) -> int:
+        if armed:
+            armed.clear()
+            raise OSError(CANARY)
+        return real_chunk(descriptor, data)
+
+    real_seal = store.ColdEvidenceWriter.seal
+
+    def faulty_seal(writer: store.ColdEvidenceWriter) -> typing.Any:
+        armed.append(True)
+        return real_seal(writer)
+
+    monkeypatch.setattr(store, "_write_chunk", chunk)
+    counters = Counters(monkeypatch, seal=faulty_seal)
+    world = World(tmp_path)
+    result = await world.run()
+    assert result.outcome is Outcome.EVIDENCE_NOT_SEALED and result.manifest_sha256 is None
+    assert counters.counts == (1, 0, 0)
+    assert_contained(result)
+
+
+@pytest.mark.asyncio
+async def test_4gc_a2_s3_an_admitted_digest_survives_a_later_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S3: after an admitted seal, one result fault keeps the held digest; no re-seal."""
+    counters = Counters(monkeypatch)
+    faults = one_result_fault(monkeypatch)
+    world = World(tmp_path)
+    result = await world.run()
+    assert faults == [1]
+    assert result.outcome is Outcome.NOT_CONFORMANT
+    assert result.conformance is None and result.termination_reason is R.UNEXPECTED_FAILURE
+    assert result.manifest_sha256 is not None
+    assert world.retained(result.manifest_sha256).run.manifest_sha256 == result.manifest_sha256
+    assert counters.counts == (1, 1, 1)
+    assert_contained(result)
+
+
+@pytest.mark.asyncio
+async def test_4gc_a2_s4_a_completed_terminal_is_never_sealed_after_a_new_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S4: a fault after the COMPLETED terminal and before sealing never seals that run."""
+    counters = Counters(monkeypatch)
+    real = two_phase._RunSink.seal
+    faults: list[int] = []
+
+    def seal(self: two_phase._RunSink) -> str:
+        if not faults:
+            faults.append(1)
+            raise RuntimeError(CANARY)
+        return real(self)
+
+    monkeypatch.setattr(two_phase._RunSink, "seal", seal)
+    world = World(tmp_path)
+    result = await world.run()
+    assert faults == [1]
+    assert result.outcome is Outcome.EVIDENCE_NOT_SEALED and result.manifest_sha256 is None
+    assert counters.counts == (0, 0, 0)
+    assert world.lifecycle()[-1]["termination"] == "completed"
+    assert not world.manifest_exists()
+    assert_contained(result)
+
+
+@pytest.mark.asyncio
+async def test_4gc_a2_s5a_the_attempt_is_recorded_before_the_writer_is_entered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S5a: at writer entry the sink already records the attempt; afterwards it is poisoned."""
+    CapturingSink.created.clear()
+    monkeypatch.setattr(two_phase, "_RunSink", CapturingSink)
+    observed: list[object] = []
+
+    def entry(writer: store.ColdEvidenceWriter) -> typing.Any:
+        observed.append(getattr(CapturingSink.created[0], "seal_attempted", None))
+        raise RuntimeError(CANARY)
+
+    counters = Counters(monkeypatch, seal=entry)
+    world = World(tmp_path)
+    result = await world.run()
+    assert observed == [True]
+    (sink,) = CapturingSink.created
+    assert sink.poisoned
+    assert result.outcome is Outcome.EVIDENCE_NOT_SEALED
+    assert counters.counts == (1, 0, 0)
+
+
+class PermissiveWriter(WriterProxy):
+    """A writer double whose seal always returns the same valid receipt and counts calls."""
+
+    def seal(self) -> typing.Any:
+        self.calls.append("seal")
+        return types_namespace(manifest_sha256="c" * 64)
+
+
+def test_4gc_a2_s5b_seal_is_one_shot_even_against_a_permissive_writer(tmp_path: Path) -> None:
+    """S5b: a second seal is refused without the writer; the stored receipt is unchanged."""
+    world = World(tmp_path)
+    proxy = PermissiveWriter(store.open_run(world.admitted, RUN_ID))
+    sink = two_phase._RunSink(typing.cast(store.ColdEvidenceWriter, proxy))
+    header = builders.build_run_header(
+        identity=world.ids[OFF], phase=OFF, recorded_at_utc=utc_at(1.0), monotonic_seconds=1.0
+    )
+    sink.append(header)
+    sink.append_lifecycle(
+        builders.build_lifecycle_record(
+            header=header,
+            sequence=0,
+            event=Event.RUN_TERMINATED,
+            event_utc=utc_at(2.0),
+            event_monotonic_seconds=2.0,
+            recorded_at_utc=utc_at(2.0),
+            monotonic_seconds=2.0,
+            termination=lifecycle.ColdRunTermination.COMPLETED,
+        )
+    )
+    assert sink.seal() == "c" * 64
+    with pytest.raises(two_phase.ColdRunSinkRefusedError):
+        sink.seal()
+    assert proxy.calls.count("seal") == 1
+    assert getattr(sink, "sealed_digest", None) == "c" * 64
+
+
+@pytest.mark.asyncio
+async def test_4gc_a2_s6a_a_fault_with_a_held_digest_has_no_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S6: with a held digest, recovery returns at once (no second teardown, no re-seal)."""
+    teardowns = count_teardowns(monkeypatch)
+    counters = Counters(monkeypatch)
+    one_result_fault(monkeypatch)
+    world = World(tmp_path)
+    result = await world.run()
+    assert teardowns == [1]
+    assert (result.outcome, result.manifest_sha256 is not None) == (Outcome.NOT_CONFORMANT, True)
+    assert counters.counts == (1, 1, 1)
+    assert_contained(result)
+
+
+@pytest.mark.asyncio
+async def test_4gc_a2_s6b_a_raising_fallback_without_a_digest_is_contained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S6: a fallback that raises again is contained unsealed; no further fallback."""
+    teardowns = count_teardowns(monkeypatch)
+    counters = Counters(monkeypatch)
+    real = builders.build_lifecycle_record
+
+    def build(**kwargs: typing.Any) -> typing.Any:
+        if kwargs["event"] is Event.RUN_TERMINATED:
+            raise RuntimeError(f"{CANARY} {SESSIONS[OFF]}")
+        return real(**kwargs)
+
+    monkeypatch.setattr(two_phase, "build_lifecycle_record", build)
+    world = World(tmp_path)
+    result = await world.run()
+    assert teardowns == [1, 1]
+    assert (result.outcome, result.manifest_sha256) == (Outcome.EVIDENCE_NOT_SEALED, None)
+    assert result.termination_reason is R.UNEXPECTED_FAILURE
+    assert counters.counts == (0, 0, 0)
+    assert_contained(result)
+
+
+@pytest.mark.asyncio
+async def test_4gc_a2_s6c_a_poisoned_unsealed_sink_is_closed_without_a_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S6: an exception with a poisoned sink closes it, stops the child, never seals."""
+    CapturingSink.created.clear()
+    monkeypatch.setattr(two_phase, "_RunSink", CapturingSink)
+    teardowns = count_teardowns(monkeypatch)
+    counters = Counters(monkeypatch)
+    real = builders.build_lifecycle_record
+
+    def build(**kwargs: typing.Any) -> typing.Any:
+        if kwargs["event"] is Event.CHILD_STARTED:
+            CapturingSink.created[0].poisoned = True
+            raise RuntimeError(f"{CANARY} {SESSIONS[ON]}")
+        return real(**kwargs)
+
+    monkeypatch.setattr(two_phase, "build_lifecycle_record", build)
+    world = World(tmp_path)
+    result = await world.run()
+    assert teardowns == []
+    assert (result.outcome, result.manifest_sha256) == (Outcome.EVIDENCE_NOT_SEALED, None)
+    assert result.termination_reason is R.UNEXPECTED_FAILURE
+    assert world.child_ops() == NORMAL_CHILD_OPS
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+    assert counters.counts == (0, 0, 0)
+    assert_contained(result)
+
+
+READ_FAULTS: typing.Final = ["reader_refuses", "checker_raises", "checker_inadmissible"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", READ_FAULTS)
+async def test_4gc_a2_s7_a_post_seal_refusal_is_final_for_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    """S7: a post-seal reader/checker refusal is final; a later diagnostic never upgrades it."""
+    real_read = reader.read_retained_run_v2
+    real_check = conformance.check_pre_advisory_conformance
+
+    def refuse_read(*args: typing.Any, **kwargs: typing.Any) -> typing.NoReturn:
+        raise store.ColdEvidenceStoreError(store.ColdEvidenceStoreFailure.HEADER_MISSING)
+
+    def raise_check(run: object) -> typing.NoReturn:
+        raise RuntimeError(CANARY)
+
+    def inadmissible_check(run: object) -> object:
+        genuine = typing.cast(conformance.ColdConformanceResult, CHECKED["conformant"])
+        return forged(genuine, policy_version=True)
+
+    counters = Counters(
+        monkeypatch,
+        read=refuse_read if fault == "reader_refuses" else None,
+        check={"checker_raises": raise_check, "checker_inadmissible": inadmissible_check}.get(
+            fault
+        ),
+    )
+    world = World(tmp_path)
+    result = await world.run()
+    assert result.outcome is Outcome.NOT_CONFORMANT
+    assert result.conformance is None and result.termination_reason is None
+    assert result.manifest_sha256 is not None
+    assert counters.counts == (1, 1, 0 if fault == "reader_refuses" else 1)
+    diagnostic = real_check(
+        real_read(world.root, run_id=RUN_ID, expected_manifest_sha256=result.manifest_sha256)
+    )
+    assert diagnostic.outcome is conformance.ColdConformanceOutcome.PRE_ADVISORY_CONFORMANT
+    assert result.outcome is Outcome.NOT_CONFORMANT
+    assert_contained(result)
+
+
+def test_4gc_a2_k1_key_bytes_are_budgeted_before_later_keys_are_encoded() -> None:
+    """K1: cumulative key bytes over the budget refuse before a later bad key is encoded."""
+    limit = schema.MAX_ENVELOPE_BYTES
+    early = {"a" * (limit // 2): None, "b" * (limit // 2 + 1): None, "\ud800": None}
+    assert two_phase._copy_node(early, HOLDER_TABLE, set()) is None
+    assert holder_snapshot(early) is None
+    assert two_phase._copy_node({"k" * (limit + 1): None}, HOLDER_TABLE, set()) is None
+    at_limit = two_phase._copy_node(
+        {"a" * (limit // 2): None, "b" * (limit - limit // 2): None}, HOLDER_TABLE, set()
+    )
+    assert at_limit is not None and at_limit[2] == limit
+
+
+def run_with_child(world: World, initiator: BaseException) -> two_phase._TwoPhaseRun:
+    """A run whose sequence raises ``initiator`` while it owns a running child."""
+    run = make_run(world)
+    world.child.running_value = True
+    run._child.state = State.RUNNING_CONFIRMED
+
+    async def sequence() -> typing.NoReturn:
+        raise initiator
+
+    run._sequence = sequence  # type: ignore[method-assign]
+    return run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["cancelled", "halt"])
+async def test_4gc_a2_c1_cleanup_preserves_the_initiating_exception(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, kind: str
+) -> None:
+    """C1: a different BaseException from the cleanup stop never replaces the original."""
+    world = World(tmp_path)
+    world.child.stop_modes = ["boom"]
+    initiator: BaseException = asyncio.CancelledError() if kind == "cancelled" else Halt()
+    run = run_with_child(world, initiator)
+    with pytest.raises(type(initiator)) as caught:
+        await run.execute()
+    assert caught.value is initiator
+    assert world.child.stops == 1 and world.child.stops_completed == 1
+    assert run._child.ownership is Own.OWNED_STOP_UNCONFIRMED
+    assert not run._child.needs_stop
+    gc.collect()
+    assert "never retrieved" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_4gc_a2_c1_repeated_cancellation_still_preserves_the_original(
+    tmp_path: Path,
+) -> None:
+    """C1: repeated cancellation during a raising cleanup stop still re-raises the original."""
+    world = World(tmp_path)
+    world.child.stop_modes = ["boom"]
+    entered = world.gates.arm("stop:0")
+    halt = Halt()
+    run = run_with_child(world, halt)
+    task = asyncio.ensure_future(run.execute())
+    await asyncio.wait_for(entered.wait(), 5)
+    for _ in range(2):
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    world.gates.gates["stop:0"].set()
+    with pytest.raises(Halt) as caught:
+        await task
+    assert caught.value is halt
+    assert world.child.stops == 1
+    assert run._child.ownership is Own.OWNED_STOP_UNCONFIRMED
 
 
 # ------------------------------------------------------------ T11: sessions

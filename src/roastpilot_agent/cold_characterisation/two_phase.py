@@ -471,9 +471,13 @@ def _copy_node(
         if not all(type(key) is str for key in mapping):
             return None
         keys = typing.cast(list[str], list(mapping))
-        if any(len(key) > MAX_ENVELOPE_BYTES for key in keys):
-            return None
-        size = sum(len(key.encode("utf-8")) for key in keys)
+        size = 0
+        for key in keys:
+            if len(key) > MAX_ENVELOPE_BYTES:
+                return None
+            size += len(key.encode("utf-8"))
+            if size > MAX_ENVELOPE_BYTES:
+                return None
         return {}, [(key, mapping[key]) for key in keys], size
     return [], [(None, item) for item in typing.cast(tuple[object, ...], current)], 0
 
@@ -646,6 +650,8 @@ class _RunSink:
         self.next_sequence = 0
         self.terminated = False
         self.poisoned = False
+        self.seal_attempted = False
+        self.sealed_digest: str | None = None
 
     @property
     def usable(self) -> bool:
@@ -785,14 +791,21 @@ class _RunSink:
             self.terminated = True
 
     def seal(self) -> str:
-        """Seal a terminated run with a bound header and return its manifest digest.
+        """Seal a terminated run with a bound header once and return its manifest digest.
+
+        The writer is entered at most once per run: the attempt is recorded before
+        the call, and a later call is refused without touching the writer or the
+        held receipt.
 
         Raises:
-            ColdRunSinkRefusedError: If poisoned, not terminated, unbound or sealing
-                fails (then poisoned).
+            ColdRunSinkRefusedError: If poisoned, not terminated, unbound, already
+                attempted, or sealing fails (then poisoned).
         """
         if self.poisoned or not self.terminated or self.phase is None:
             self._refuse()
+        if self.seal_attempted:
+            self._refuse()
+        self.seal_attempted = True
         digest: object = None
         try:
             digest = self._writer.seal().manifest_sha256
@@ -800,7 +813,8 @@ class _RunSink:
             digest = None
         if not _is_digest(digest):
             self._refuse()
-        return typing.cast(str, digest)
+        self.sealed_digest = typing.cast(str, digest)
+        return self.sealed_digest
 
     def close(self) -> None:
         """Poison and release the writer; a close fault is absorbed."""
@@ -922,14 +936,20 @@ class _ChildOwner:
         return True
 
     async def shielded_cleanup(self) -> None:
-        """Run at most one owned cleanup stop to completion, absorbing cancellation."""
+        """Run at most one owned cleanup stop to completion; never raise from it.
+
+        Repeated cancellation is absorbed until the same task is done.  The task's
+        own outcome (including a non-cancellation ``BaseException`` from the stop)
+        is retrieved once and absorbed, so it never replaces the exception that
+        started the cleanup.
+        """
         if not self.needs_stop:
             return
         task = asyncio.ensure_future(self.stop())
         while not task.done():
             try:
                 await asyncio.shield(task)
-            except asyncio.CancelledError:
+            except BaseException:
                 continue
         if not task.cancelled():
             task.exception()
@@ -1448,15 +1468,17 @@ class _TwoPhaseRun:
         )
 
     async def _contained(self) -> ColdTwoPhaseResult:
-        """Contain a repeated ordinary teardown failure as the unsealed failure row.
+        """Contain an ordinary failure without sealing, re-reading or re-checking.
 
-        The sink is closed (never sealed) and only the permitted owned cleanup
-        stop runs; nothing is finalised or stopped again and no text escapes.
+        The sink is closed and only the permitted owned cleanup stop runs; nothing
+        is finalised or stopped again and no text escapes.  A held seal receipt is
+        never lost: it is returned as ``NOT_CONFORMANT`` with that digest.
         """
-        if self._sink is not None:
-            self._sink.close()
+        sink = self._sink
+        if sink is not None:
+            sink.close()
         await self._child.shielded_cleanup()
-        if self._sink is None:
+        if sink is None:
             return ColdTwoPhaseResult(
                 outcome=ColdTwoPhaseOutcome.REFUSED_BEFORE_EVIDENCE,
                 start_refusal=ColdRunStartRefusal.UNEXPECTED_FAILURE,
@@ -1465,14 +1487,32 @@ class _TwoPhaseRun:
                 manifest_sha256=None,
                 conformance=None,
             )
+        if sink.sealed_digest is not None:
+            return self._result(ColdTwoPhaseOutcome.NOT_CONFORMANT, sink.sealed_digest)
         return self._result(ColdTwoPhaseOutcome.EVIDENCE_NOT_SEALED)
+
+    async def _recover(self) -> ColdTwoPhaseResult:
+        """Recover once from an ordinary exception, never recursively.
+
+        Only a usable sink that has neither a terminal nor a seal attempt gets the
+        fallback teardown (one ``FAILED`` terminal, then at most one seal).  Every
+        other state, including a held receipt, a poisoned sink or any existing
+        terminal, is contained without sealing.
+        """
+        sink = self._sink
+        if sink is not None and sink.usable and not sink.seal_attempted:
+            try:
+                return await self._teardown()
+            except Exception:
+                self._fail(_R.UNEXPECTED_FAILURE)
+        return await self._contained()
 
     async def execute(self) -> ColdTwoPhaseResult:
         """Run once; contain ordinary failures, and re-raise any other ``BaseException``.
 
-        An ordinary exception gets one fallback teardown; if that also fails the
-        run returns the unsealed failure row.  Cancellation and other
-        ``BaseException`` close the sink, run the shielded cleanup and re-raise.
+        An ordinary exception is recovered once (see :meth:`_recover`).
+        Cancellation and every other ``BaseException`` close the sink, run the
+        shielded cleanup and re-raise the original exception object unchanged.
         """
         try:
             try:
@@ -1480,11 +1520,7 @@ class _TwoPhaseRun:
             except Exception:
                 self._fail(_R.UNEXPECTED_FAILURE)
             self._refusal = ColdRunStartRefusal.UNEXPECTED_FAILURE
-            try:
-                return await self._teardown()
-            except Exception:
-                self._fail(_R.UNEXPECTED_FAILURE)
-            return await self._contained()
+            return await self._recover()
         except BaseException:
             if self._sink is not None:
                 self._sink.close()
