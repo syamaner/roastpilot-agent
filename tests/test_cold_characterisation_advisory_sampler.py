@@ -869,6 +869,7 @@ REFUSALS: dict[str, Overrides] = {
     "bound_zero": lambda b: {"configured_call_bound_seconds": 0.0},
     "bound_int": lambda b: {"configured_call_bound_seconds": 5},
     "bound_nan": lambda b: {"configured_call_bound_seconds": math.nan},
+    "bound_inf": lambda b: {"configured_call_bound_seconds": math.inf},
     "dwell_4999": lambda b: {"configured_dwell_seconds": 4.999},
     "dwell_true": lambda b: {"configured_dwell_seconds": True},
     "descriptor_raises": lambda b: _advisor_with(RuntimeError("descriptor fault")),
@@ -2590,6 +2591,17 @@ def _structural(pid: str) -> None:
         length = lengths[0]
         [admit] = _calls(init, "is_admissible_session_id")
         assert (_line(length), length.col_offset) < (_line(admit), admit.col_offset)
+    elif pid == "label_length_before_encode":
+        label = _function("_is_label")
+        lengths = [
+            node
+            for node in ast.walk(label)
+            if isinstance(node, ast.Compare)
+            and ast.unparse(node) == "len(value) > MAX_TEXT_FIELD_BYTES"
+        ]
+        assert len(lengths) == 1
+        [encode] = _calls(label, "encode")
+        assert (_line(lengths[0]), lengths[0].col_offset) < (_line(encode), encode.col_offset)
     elif pid == "create_task_after_intent_append":
         [append] = [c for c in _calls(attempts, "_append") if ast.unparse(c.args[2]) == "intent"]
         [create] = _calls(attempts, "create_task")
@@ -2720,6 +2732,7 @@ def _class(name: str) -> ast.ClassDef:
 
 STRUCTURAL = [
     "session_len_before_encode",
+    "label_length_before_encode",
     "create_task_after_intent_append",
     "open_bookkeeping_before_gate_check",
     "consumed_before_gate_check",
