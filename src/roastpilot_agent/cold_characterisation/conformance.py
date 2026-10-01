@@ -753,7 +753,11 @@ def _check_matched(
     snapshots: _Snapshots,
     found: set[ColdConformanceFinding],
 ) -> None:
-    """Session, window, transition, causal-order and post-terminal rules (grammar matched)."""
+    """Session, window, transition, causal-order and post-terminal rules (grammar matched).
+
+    Retained ticks and hosts are each non-decreasing in file order (engine sampled
+    clock); ties admitted; no cross-stream, inner-sample or cadence claim.
+    """
     a_off, e_off, f_off, cs_off, ct_off, a_on, measured, e_on, f_on, cs_on, terminal = snapshots
     off, on = interpretation.rebound.phases
     s_off, s_on = a_off.session_id, a_on.session_id
@@ -815,6 +819,12 @@ def _check_matched(
         for record in phase.finalisations:
             chain.append((elapsed.event_monotonic_seconds, record.monotonic_seconds))
             chain.append((record.monotonic_seconds, returned.monotonic_seconds))
+    for phase in (off, on):
+        for stream in (phase.ticks, phase.hosts):
+            chain.extend(
+                (earlier.monotonic_seconds, later.monotonic_seconds)
+                for earlier, later in zip(stream, stream[1:], strict=False)
+            )
     if any(not earlier <= later for earlier, later in chain):
         found.add(_F.CAUSAL_ORDER_VIOLATED)
     retained = [
