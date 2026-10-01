@@ -764,6 +764,7 @@ class ColdAdvisorySampler:
             self._task: asyncio.Task[None] | None = None
             self._task_cell: _CallCell | None = None
             self._ran = False
+            self._settling = False
             self._attempts_resolved = 0
             self._advisor, self._evaluator, self._sink = advisor, evaluator, sink
             self._ticks, self._clock = ticks, clock
@@ -1052,9 +1053,12 @@ class ColdAdvisorySampler:
         """Close the gate and write at most one terminal resolution; synchronous, idempotent.
 
         A call made during any sampler-initiated synchronous port call (including
-        settlement's own) returns a provisional ``NOT_RECORDED_REENTRANT`` fact with
-        no write, no port call and no storage.  If a ``BaseException`` escapes
-        mid-settlement nothing is stored.
+        settlement's own), or at any other point while a settlement is in progress
+        (for example from a finaliser of port-returned data released during
+        settlement-owned consumption), returns a provisional ``NOT_RECORDED_REENTRANT``
+        fact with no write, no port call and no storage.  If a ``BaseException``
+        escapes mid-settlement it propagates, nothing is stored and the in-progress
+        latch is released.
 
         Returns:
             The stored settlement, or a fresh provisional fact on reentry.
@@ -1064,18 +1068,22 @@ class ColdAdvisorySampler:
             return stored
         gate = self._gate
         gate.closed = True
-        if gate.depth > 0:
+        if gate.depth > 0 or self._settling:
             return ColdAdvisorySettlement(
                 closure=ColdAdvisorySettlementClosure.NOT_RECORDED_REENTRANT,
                 provider_task=self._task_fact(),
                 attempts_resolved=self._attempts_resolved,
             )
-        closure = self._terminal()
-        settlement = ColdAdvisorySettlement(
-            closure=closure,
-            provider_task=self._task_fact(),
-            attempts_resolved=self._attempts_resolved,
-        )
+        self._settling = True
+        try:
+            closure = self._terminal()
+            settlement = ColdAdvisorySettlement(
+                closure=closure,
+                provider_task=self._task_fact(),
+                attempts_resolved=self._attempts_resolved,
+            )
+        finally:
+            self._settling = False
         self._settlement = settlement
         return settlement
 

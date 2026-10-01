@@ -14,7 +14,10 @@ import asyncio
 import dataclasses
 import enum
 import inspect
+import json
 import math
+import os
+import subprocess
 import sys
 import typing
 from collections.abc import Awaitable, Callable, Sequence
@@ -1135,10 +1138,13 @@ def test_ports_strict_assignment(base: Base, tmp_path: Path) -> None:
     advisor: ColdAdvisoryAdvisorPort = real_advisor(ManualClock(0.0))
     evaluator: ColdAdvisoryEvaluatorPort = SafetyPolicy(SafetyLimits())
     writer, _ = open_writer(tmp_path)
-    sink: ColdAdvisorySinkPort = writer
-    clock: ColdAdvisoryClockPort = MonotonicEngineClock()
-    ticks: ColdAdvisoryTickPort = typing.cast(ColdAdvisoryTickPort, TickPort(base.tick))
-    assert all(item is not None for item in (advisor, evaluator, sink, clock, ticks))
+    try:
+        sink: ColdAdvisorySinkPort = writer
+        clock: ColdAdvisoryClockPort = MonotonicEngineClock()
+        ticks: ColdAdvisoryTickPort = typing.cast(ColdAdvisoryTickPort, TickPort(base.tick))
+        assert all(item is not None for item in (advisor, evaluator, sink, clock, ticks))
+    finally:
+        writer.close()
 
 
 # ------------------------------------------------------------------ timing
@@ -1259,20 +1265,23 @@ async def test_real_writer_refusal_never_invokes(base: Base, tmp_path: Path) -> 
     """The real writer refuses an intent for a phase that is not latest; it stays usable."""
     run = fixture_run(tmp_path)
     writer, _ = open_writer(tmp_path)
-    off = header_of(run.documents[OFF], OFF, 1.0)
-    on = header_of(run.documents[ON], ON, 2.0)
-    writer.append(off)
-    writer.append(on)
-    rig = make(
-        base,
-        header=off,
-        sink=RecordingSink(inner=writer),
-        ticks=TickPort(tick_record(off, run.ticks[OFF][2])),
-    )
-    result = await run_all(rig)
-    assert result.stop is Stop.INTENT_NOT_APPENDED
-    assert rig.advisor.entries == []
-    writer.append(tick_record(on, run.ticks[ON][0]))
+    try:
+        off = header_of(run.documents[OFF], OFF, 1.0)
+        on = header_of(run.documents[ON], ON, 2.0)
+        writer.append(off)
+        writer.append(on)
+        rig = make(
+            base,
+            header=off,
+            sink=RecordingSink(inner=writer),
+            ticks=TickPort(tick_record(off, run.ticks[OFF][2])),
+        )
+        result = await run_all(rig)
+        assert result.stop is Stop.INTENT_NOT_APPENDED
+        assert rig.advisor.entries == []
+        writer.append(tick_record(on, run.ticks[ON][0]))
+    finally:
+        writer.close()
 
 
 @pytest.mark.parametrize(
@@ -1808,6 +1817,98 @@ async def test_settlement_provider_task_fact(base: Base, pid: str) -> None:
         assert (settled.closure, settled.provider_task) == expected
     finally:
         event.set()
+        await idle()
+
+
+#: One armed finaliser hook (popped exactly once by ``FinalisingRule``).
+FINALISER_HOOKS: list[Callable[[], object]] = []
+
+
+class FinalisingRule(str):
+    """Port-returned ``str`` data whose finaliser runs one armed hook."""
+
+    def __del__(self) -> None:
+        if FINALISER_HOOKS:
+            FINALISER_HOOKS.pop()()
+
+
+@pytest.mark.asyncio
+async def test_settlement_reentry_from_released_port_data(base: Base) -> None:
+    """Settlement re-entered while settlement-owned consumption releases port data.
+
+    The evaluator returns a real carrier whose rule's finaliser settles; it runs at
+    depth zero after the counted evaluator call returned.  The inner call is
+    provisional and unstored; the one genuine outer result is stored once.
+    """
+    holder: list[Rig] = []
+    inner: list[ColdAdvisorySettlement] = []
+
+    def evaluate(kwargs: dict[str, typing.Any]) -> object:
+        FINALISER_HOOKS.append(settler(holder[0], inner))
+        return UNCHECKED_EVALUATION.model_construct(
+            rule=FinalisingRule("r"),
+            verdict=SafetyVerdict.REJECT,
+            input_heat=kwargs["requested_heat"],
+            input_fan=kwargs["requested_fan"],
+            adjusted_heat=None,
+            adjusted_fan=None,
+            reason="x",
+        )
+
+    rig = make(base, evaluator=DoubleEvaluator(evaluate))
+    holder.append(rig)
+    outer: list[ColdAdvisorySettlement] = []
+    rig.advisor.schedule_on_return = settler(rig, outer)
+    result = await run_all(rig)
+    assert result.stop is Stop.SETTLED
+    assert FINALISER_HOOKS == []
+    assert len(inner) == 1
+    assert inner[0].closure is Closure.NOT_RECORDED_REENTRANT
+    assert len(outer) == 1
+    assert outer[0].closure is Closure.RECORDED_COMPLETED_CALL
+    assert outer[0].attempts_resolved == 1
+    assert priv(rig.sampler)._settlement is outer[0]
+    assert priv(rig.sampler)._settlement is not inner[0]
+    assert len(rig.sink.resolutions) == 1
+    assert rig.sampler.settle_at_phase_end() is outer[0]
+    assert len(rig.evaluator.calls) == 1
+
+
+class Abort(BaseException):
+    """A synthetic ``BaseException`` (not an ``Exception``) raised by a port."""
+
+
+@pytest.mark.asyncio
+async def test_settlement_latch_released_after_base_exception(base: Base) -> None:
+    """A ``BaseException`` from a port propagates, stores nothing and releases the latch."""
+    event = asyncio.Event()
+    armed = [True]
+    sink = RecordingSink(
+        refuse=lambda record: Abort() if armed[0] and type(record) is Resolution else None
+    )
+    rig = make(base, acts=[Act("block", event=event)], sink=sink)
+    task = start(rig)
+    try:
+        await drive(rig.clock, OPEN)
+        try:
+            rig.sampler.settle_at_phase_end()
+        except Abort:
+            aborted = True
+        else:
+            aborted = False
+        assert aborted
+        assert priv(rig.sampler)._settling is False
+        assert priv(rig.sampler)._settlement is None
+        assert sink.resolutions == []
+        armed[0] = False
+        settled = rig.sampler.settle_at_phase_end()
+        assert settled.closure is Closure.RECORDED_UNRESOLVED_INVOKED
+        assert settled.attempts_resolved == 1
+        assert rig.sampler.settle_at_phase_end() is settled
+        assert len(sink.resolutions) == 1
+    finally:
+        event.set()
+        await finish(task, rig.clock)
         await idle()
 
 
@@ -2376,6 +2477,10 @@ WAITER_CASES = [
 ]
 
 
+#: Normal exits whose waiter state is snapshotted in the run task's own done callback.
+NORMAL_EXITS = frozenset({"exhausted", "abandoned", "clock_invalid"})
+
+
 @pytest.mark.parametrize("pid", WAITER_CASES)
 @pytest.mark.asyncio
 async def test_waiters_retired(base: Base, pid: str) -> None:
@@ -2391,6 +2496,14 @@ async def test_waiters_retired(base: Base, pid: str) -> None:
     if pid == "clock_invalid":
         rig.clock.raise_on_next_sleep = True
     task = start(rig)
+    snapshots: list[tuple[int, list[str]]] = []
+    if pid in NORMAL_EXITS:
+        rig.clock.cancel_lag = 1
+
+        def snapshot(_: object) -> None:
+            snapshots.append((rig.clock.live_sleepers(), _pending_waiters()))
+
+        task.add_done_callback(snapshot)
     try:
         if pid == "settled":
             await idle()
@@ -2420,6 +2533,9 @@ async def test_waiters_retired(base: Base, pid: str) -> None:
         else:
             await drive(rig.clock, 1800.0)
         await drive_until(task.done)
+        if pid in NORMAL_EXITS:
+            await drive_until(lambda: bool(snapshots))
+            assert snapshots == [(0, [])]
         assert rig.clock.live_sleepers() == 0
         assert [name for name in _pending_waiters() if name == "Event.wait"] == []
         assert _pending_waiters() == []
@@ -2811,6 +2927,53 @@ def _relative(module: str | None, level: int) -> str:
         return module or ""
     parent = ["roastpilot_agent", "cold_characterisation"][: 2 - (level - 1)]
     return ".".join([*parent, *([module] if module else [])])
+
+
+APPLICATION_MODULES = (
+    "roastpilot_agent.mcp_client",
+    "roastpilot_agent.controller",
+    "roastpilot_agent.cold_characterisation.engine",
+    "roastpilot_agent.cold_characterisation.two_phase",
+)
+
+
+def _scrubbed_environment() -> dict[str, str]:
+    names = {"PYTHONPATH", "PYTEST_ADDOPTS", "PYTHONOPTIMIZE", "OPENROUTER_API_KEY"}
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in names
+        and not key.upper().startswith(("ROASTPILOT_", "COFFEE_"))
+        and not key.upper().endswith(("_API_KEY", "_TOKEN", "_SECRET"))
+    }
+
+
+@pytest.mark.slow
+def test_sampler_import_loads_no_application_actuator_module() -> None:
+    """A fresh interpreter importing the sampler loads no application actuator module.
+
+    Third-party ``mcp`` may load through existing provider SDK dependencies; an imported
+    SDK package is not an injected MCP or actuator capability and is not asserted here.
+    """
+    code = (
+        "import json, sys\n"
+        "import roastpilot_agent.cold_characterisation.advisory_sampler\n"
+        f"names = {list(APPLICATION_MODULES)!r}\n"
+        "print(json.dumps({'sampler': "
+        "'roastpilot_agent.cold_characterisation.advisory_sampler' in sys.modules, "
+        "'loaded': sorted(n for n in names if n in sys.modules)}))\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        env=_scrubbed_environment(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr[-500:]
+    assert json.loads(completed.stdout) == {"sampler": True, "loaded": []}
 
 
 def test_import_and_capability_fence() -> None:
