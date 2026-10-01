@@ -3139,6 +3139,18 @@ async def test_4gc_t4_each_checkpoint_stops_the_next_operation(
 
 
 @pytest.mark.asyncio
+async def test_4gc_t4_the_post_finalisation_checkpoint_precedes_the_stop(tmp_path: Path) -> None:
+    """T4: a budget breach found after finalisation is primary over a later uncertain stop."""
+    world = World(tmp_path)
+    world.mcp.finalise_advance = 61.0
+    world.child.stop_modes = ["unconfirmed"]
+    result = await world.run()
+    assert_failed(world, result, R.TRANSITION_BUDGET_EXCEEDED)
+    assert result.child_ownership is Own.OWNED_STOP_UNCONFIRMED
+    assert world.event(OFF, "child_stopped")["child_stop"] == "unconfirmed"
+
+
+@pytest.mark.asyncio
 async def test_4gc_t7a_an_identity_delta_outside_the_leaves_is_refused(tmp_path: Path) -> None:
     """T7a: an ON identity differing outside the five leaves refuses before the ON header."""
     world = World(tmp_path)
