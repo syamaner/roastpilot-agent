@@ -1837,12 +1837,24 @@ class FinalisingRule(str):
     """Port-returned ``str`` data whose finaliser runs one armed hook exactly once."""
 
     def __del__(self) -> None:
-        if FINALISER_HOOKS:
-            hook = FINALISER_HOOKS.pop()
-            try:
-                hook()
-            except BaseException as error:
-                FINALISER_ERRORS.append(error)
+        _fire_finaliser()
+
+
+class FinalisingFloat(float):
+    """Port-returned ``float`` data whose finaliser runs one armed hook exactly once."""
+
+    def __del__(self) -> None:
+        _fire_finaliser()
+
+
+def _fire_finaliser() -> None:
+    """Pop and run one armed hook; its exceptions are kept for the test's assertion."""
+    if FINALISER_HOOKS:
+        hook = FINALISER_HOOKS.pop()
+        try:
+            hook()
+        except BaseException as error:
+            FINALISER_ERRORS.append(error)
 
 
 @pytest.mark.asyncio
@@ -2120,6 +2132,81 @@ async def test_carrier_finaliser_settlement(base: Base, pid: str) -> None:
 
 
 Matcher = Callable[[typing.Any, str, object], bool]
+
+
+class CarrierClock(ManualClock):
+    """A manual clock whose one armed access returns an inadmissible finalising carrier."""
+
+    def __init__(self, start: float) -> None:
+        super().__init__(start)
+        self.carry: str | None = None
+
+    def monotonic(self) -> float:
+        """Return ``now``, or once a finalising ``float`` subclass carrying it."""
+        value = super().monotonic()
+        if self.carry != "monotonic":
+            return value
+        self.carry = None
+        return FinalisingFloat(value)
+
+    def utc_now_iso(self) -> str:
+        """Return the UTC instant, or once a finalising ``str`` subclass carrying it."""
+        value = super().utc_now_iso()
+        if self.carry != "utc":
+            return value
+        self.carry = None
+        return FinalisingRule(value)
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
+@pytest.mark.parametrize("pid", ["monotonic", "utc"])
+@pytest.mark.asyncio
+async def test_completion_clock_carrier_release_discards_completion(base: Base, pid: str) -> None:
+    """An inadmissible completion-clock carrier settles on release; the call is discarded.
+
+    The provider's completion sample receives a real carrier the floor refuses; its
+    finaliser settles while the sample unwinds, outside every commit region, so the
+    settlement is genuine.  The provider must then discard its completion with no
+    further advisor or clock access (no post-settlement usage getter).
+    """
+    assert (FINALISER_HOOKS, FINALISER_ERRORS) == ([], [])
+    clock = CarrierClock(13.5)
+    rig = make(base, clock=clock, configured_dwell_seconds=MAX)
+    inner: list[ColdAdvisorySettlement] = []
+    marks: list[tuple[int, int, int, int]] = []
+
+    def hook() -> None:
+        inner.append(rig.sampler.settle_at_phase_end())
+        marks.append(_snapshot(rig))
+
+    def arm() -> None:
+        FINALISER_HOOKS.append(hook)
+        clock.carry = pid
+
+    rig.advisor.on_enter = arm
+    task = start(rig)
+    try:
+        await drive(clock, 1800.0)
+        await drive_until(lambda: provider_settled(rig))
+        assert task.done()
+        assert (FINALISER_HOOKS, FINALISER_ERRORS, clock.carry) == ([], [], None)
+        assert len(inner) == 1
+        assert triple(inner[0]) == (Closure.RECORDED_UNRESOLVED_INVOKED, Fact.OUTSTANDING, 1)
+        assert priv(rig.sampler)._settlement is inner[0]
+        assert _snapshot(rig) == marks[0]
+        assert rig.advisor.entries == [OPEN]
+        assert [record.resolution for record in rig.sink.resolutions] == [
+            Kind.UNRESOLVED_AT_PHASE_END
+        ]
+        cell = provider_cell(rig)
+        assert (cell.discarded_after_settlement, cell.outcome) == (True, None)
+        assert task.result().stop is Stop.SETTLED
+        assert rig.sampler.settle_at_phase_end() is inner[0]
+    finally:
+        await finish(task, clock)
+        FINALISER_HOOKS.clear()
+        clock.carry = None
+        await idle()
 
 
 class CallBoundary:

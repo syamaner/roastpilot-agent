@@ -610,7 +610,7 @@ async def _provider_call(
             cell.discarded_after_settlement = True
             return
         resolved = floor.sample(_Owner.PROVIDER)
-        if resolved is _Gated.CLOSED:
+        if resolved is _Gated.CLOSED or gate.closed:
             cell.discarded_after_settlement = True
             return
         try:
