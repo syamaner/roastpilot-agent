@@ -2331,3 +2331,504 @@ async def test_4gc_t6_no_terminal_without_an_admitted_instant_means_no_seal(
     assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
     assert world.events() == GRAMMAR[:-1]
     assert not world.manifest_exists()
+
+
+# ------------------------------------------------- child ownership (unit)
+
+State = two_phase._ChildState
+
+
+class Port:
+    """Minimal child port for the state machine; flags and outcomes are scripted."""
+
+    def __init__(self) -> None:
+        self.running_value: object = False
+        self.unconfirmed_value: object = False
+        self.raise_flags = False
+        self.calls: list[str] = []
+        self.start_mode = "ok"
+        self.stop_mode = "ok"
+        self.gate: asyncio.Event | None = None
+        self.entered = asyncio.Event()
+
+    @property
+    def running(self) -> bool:
+        if self.raise_flags:
+            raise RuntimeError(CANARY)
+        return typing.cast(bool, self.running_value)
+
+    @property
+    def stop_unconfirmed(self) -> bool:
+        return typing.cast(bool, self.unconfirmed_value)
+
+    def configure_phase(self, phase: Phase) -> None:
+        self.calls.append(f"configure:{phase.value}")
+        if self.start_mode == "configure_raises":
+            raise RuntimeError(CANARY)
+
+    async def start(self) -> None:
+        self.calls.append("start")
+        if self.start_mode == "raise":
+            raise RuntimeError(CANARY)
+        if self.start_mode != "silent":
+            self.running_value = True
+        if self.start_mode == "unconfirmed":
+            self.unconfirmed_value = True
+
+    async def stop(self) -> None:
+        self.calls.append("stop")
+        if self.gate is not None:
+            self.entered.set()
+            try:
+                await self.gate.wait()
+            except asyncio.CancelledError:
+                self.unconfirmed_value = True
+                raise
+        if self.stop_mode == "raise":
+            raise RuntimeError(CANARY)
+        if self.stop_mode == "unconfirmed":
+            self.unconfirmed_value = True
+        if self.stop_mode != "still_running":
+            self.running_value = False
+
+
+def owner_of(port: Port) -> two_phase._ChildOwner:
+    return two_phase._ChildOwner(port)
+
+
+def test_4gc_child_ports_conform_structurally(tmp_path: Path) -> None:
+    """The fakes satisfy the consumer-owned ports (pyright-checked assignments)."""
+    world = World(tmp_path)
+    child: two_phase.ColdChildLifecycle = world.child
+    port: two_phase.ColdChildLifecycle = Port()
+    mcp: two_phase.ColdTwoPhaseMcp = world.mcp
+    identities: two_phase.ColdPhaseIdentitySource = world.identities
+    assert child is world.child and port is not None and mcp is world.mcp
+    assert identities is world.identities
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("running", "unconfirmed", "raising"),
+    [
+        (True, False, False),
+        (False, True, False),
+        (1, False, False),
+        (False, 0, False),
+        (False, False, True),
+    ],
+    ids=["running", "unconfirmed", "truthy_int", "falsy_int", "raising"],
+)
+async def test_4gc_child_start_requires_an_exact_idle_child(
+    running: object, unconfirmed: object, raising: bool
+) -> None:
+    """Start is refused, with no port call, unless both flags are exactly False."""
+    port = Port()
+    port.running_value, port.unconfirmed_value, port.raise_flags = running, unconfirmed, raising
+    owner = owner_of(port)
+    assert await owner.start() is False
+    assert port.calls == [] and owner.state is State.UNOWNED
+    assert owner.ownership is Own.NOT_OWNED and not owner.needs_stop
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "confirmed"),
+    [("ok", True), ("silent", False), ("raise", False), ("unconfirmed", False)],
+)
+async def test_4gc_child_start_is_confirmed_only_by_exact_flags(mode: str, confirmed: bool) -> None:
+    """A start counts only when it returns with running exactly True and no uncertainty."""
+    port = Port()
+    port.start_mode = mode
+    owner = owner_of(port)
+    assert await owner.start() is confirmed
+    assert port.calls == ["start"]
+    assert owner.state is (State.RUNNING_CONFIRMED if confirmed else State.STARTING)
+    assert owner.needs_stop
+    assert owner.ownership is Own.OWNED_STOP_UNCONFIRMED
+
+
+@pytest.mark.asyncio
+async def test_4gc_child_start_with_non_bool_running_after_start_is_unconfirmed() -> None:
+    """A truthy non-bool ``running`` after start never confirms it."""
+    port = Port()
+    owner = owner_of(port)
+
+    async def truthy_start() -> None:
+        port.calls.append("start")
+        port.running_value = 1
+
+    port.start = truthy_start  # type: ignore[method-assign]
+    assert await owner.start() is False and owner.state is State.STARTING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "state"),
+    [
+        ("ok", State.STOPPED_CONFIRMED),
+        ("unconfirmed", State.STOP_UNCONFIRMED),
+        ("still_running", State.STOP_UNCONFIRMED),
+        ("raise", State.STOP_UNCONFIRMED),
+    ],
+)
+async def test_4gc_child_stop_is_never_retried(mode: str, state: two_phase._ChildState) -> None:
+    """A returned or raised stop is final: a second request never calls the port again."""
+    port = Port()
+    owner = owner_of(port)
+    assert await owner.start()
+    port.stop_mode = mode
+    await owner.stop()
+    await owner.stop()
+    await owner.shielded_cleanup()
+    assert port.calls == ["start", "stop"]
+    assert owner.state is state and not owner.needs_stop
+    confirmed = state is State.STOPPED_CONFIRMED
+    assert owner.ownership is (
+        Own.OWNED_STOP_CONFIRMED if confirmed else Own.OWNED_STOP_UNCONFIRMED
+    )
+    assert owner.configure(ON) is confirmed
+
+
+@pytest.mark.asyncio
+async def test_4gc_child_configure_and_start_only_from_idle_owned_states() -> None:
+    """Configure/start only before any start or after a confirmed stop; never otherwise."""
+    port = Port()
+    owner = owner_of(port)
+    assert owner.configure(OFF) is True
+    assert await owner.start()
+    assert owner.configure(ON) is False
+    assert await owner.start() is False
+    assert port.calls == ["configure:recording_off", "start"]
+    await owner.stop()
+    assert owner.configure(ON) is True
+    assert await owner.start() is True
+    port.start_mode = "configure_raises"
+    starting = owner_of(Port())
+    starting.state = State.STARTING
+    assert starting.configure(ON) is False
+    failing = Port()
+    failing.start_mode = "configure_raises"
+    assert owner_of(failing).configure(OFF) is False
+    for blocked in (State.STOP_UNCONFIRMED, State.STOP_INTERRUPTED, State.STOP_IN_FLIGHT):
+        other_port = Port()
+        other = owner_of(other_port)
+        other.state = blocked
+        assert other.configure(ON) is False and await other.start() is False
+        assert other_port.calls == []
+
+
+@pytest.mark.asyncio
+async def test_4gc_child_an_interrupted_stop_gets_one_cleanup_and_stays_unconfirmed() -> None:
+    """An interrupted stop is cleaned up once; even a confirming cleanup never upgrades it."""
+    port = Port()
+    owner = owner_of(port)
+    assert await owner.start()
+    port.gate = asyncio.Event()
+    task = asyncio.ensure_future(owner.stop())
+    await asyncio.wait_for(port.entered.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert owner.state is State.STOP_INTERRUPTED and owner.needs_stop
+    port.gate = None
+    port.unconfirmed_value = False
+    port.running_value = False
+    await owner.shielded_cleanup()
+    assert port.calls == ["start", "stop", "stop"]
+    assert owner.state is State.STOP_INTERRUPTED and not owner.needs_stop
+    assert owner.ownership is Own.OWNED_STOP_UNCONFIRMED
+    await owner.stop()
+    await owner.shielded_cleanup()
+    assert port.calls == ["start", "stop", "stop"]
+    raising = Port()
+    interrupted = owner_of(raising)
+    interrupted.state = State.STOP_INTERRUPTED
+    raising.stop_mode = "raise"
+    await interrupted.stop()
+    assert raising.calls == ["stop"] and interrupted.ownership is Own.OWNED_STOP_UNCONFIRMED
+
+
+@pytest.mark.asyncio
+async def test_4gc_child_shielded_cleanup_absorbs_repeated_cancellation() -> None:
+    """The cleanup-owned stop task is awaited to completion through repeated cancellation."""
+    port = Port()
+    owner = owner_of(port)
+    assert await owner.start()
+    port.gate = asyncio.Event()
+    outer = asyncio.ensure_future(owner.shielded_cleanup())
+    await asyncio.wait_for(port.entered.wait(), 5)
+    for _ in range(3):
+        outer.cancel()
+        await asyncio.sleep(0)
+        assert not outer.done()
+    port.gate.set()
+    await outer
+    assert port.calls == ["start", "stop"]
+    assert owner.state is State.STOPPED_CONFIRMED
+
+
+def test_4gc_child_ownership_maps_every_state() -> None:
+    """Only UNOWNED is NOT_OWNED and only STOPPED_CONFIRMED is confirmed."""
+    expected = {
+        State.UNOWNED: Own.NOT_OWNED,
+        State.STARTING: Own.OWNED_STOP_UNCONFIRMED,
+        State.RUNNING_CONFIRMED: Own.OWNED_STOP_UNCONFIRMED,
+        State.STOP_IN_FLIGHT: Own.OWNED_STOP_UNCONFIRMED,
+        State.STOPPED_CONFIRMED: Own.OWNED_STOP_CONFIRMED,
+        State.STOP_UNCONFIRMED: Own.OWNED_STOP_UNCONFIRMED,
+        State.STOP_INTERRUPTED: Own.OWNED_STOP_UNCONFIRMED,
+    }
+    assert set(expected) == set(State)
+    for state, ownership in expected.items():
+        owner = owner_of(Port())
+        owner.state = state
+        assert owner.ownership is ownership
+        assert owner.needs_stop is (
+            state in (State.STARTING, State.RUNNING_CONFIRMED, State.STOP_INTERRUPTED)
+        )
+
+
+# ----------------------------------------- T9 / T10: child in a real run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["unconfirmed", "still_running", "raise"])
+async def test_4gc_t9_an_uncertain_off_stop_is_never_followed_by_a_respawn(
+    tmp_path: Path, mode: str
+) -> None:
+    """T9: one OFF stop, never retried, then no configure or start of the ON child."""
+    world = World(tmp_path)
+    world.child.stop_modes = [mode]
+    result = await world.run()
+    assert_failed(world, result, R.CHILD_STOP_UNCONFIRMED)
+    assert world.child_ops() == [("configure", OFF), ("start", OFF), ("stop", OFF)]
+    assert world.event(OFF, "child_stopped")["child_stop"] == "unconfirmed"
+    assert result.child_ownership is Own.OWNED_STOP_UNCONFIRMED
+    assert world.identities.calls == [OFF]
+
+
+@pytest.mark.asyncio
+async def test_4gc_t9_an_uncertain_final_stop_never_completes(tmp_path: Path) -> None:
+    """T9: an unconfirmed final stop is FAILED/CHILD_STOP_UNCONFIRMED, never COMPLETED."""
+    world = World(tmp_path)
+    world.child.stop_modes = ["ok", "unconfirmed"]
+    result = await world.run()
+    assert_failed(world, result, R.CHILD_STOP_UNCONFIRMED)
+    assert world.child_ops() == NORMAL_CHILD_OPS
+    assert world.event(ON, "child_stopped")["child_stop"] == "unconfirmed"
+    assert result.child_ownership is Own.OWNED_STOP_UNCONFIRMED
+
+
+class RaisingFlagsChild(Child):
+    """A child whose ``running`` property raises."""
+
+    @property
+    def running(self) -> bool:
+        raise RuntimeError(CANARY)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("running", "unconfirmed", "refusal"),
+    [
+        (True, False, Refusal.CHILD_ALREADY_RUNNING),
+        (True, True, Refusal.CHILD_ALREADY_RUNNING),
+        (False, True, Refusal.CHILD_STOP_UNCONFIRMED_AT_ENTRY),
+        (1, False, Refusal.UNEXPECTED_FAILURE),
+        (False, "no", Refusal.UNEXPECTED_FAILURE),
+    ],
+)
+async def test_4gc_t10_entry_refusals_create_nothing(
+    tmp_path: Path, running: object, unconfirmed: object, refusal: two_phase.ColdRunStartRefusal
+) -> None:
+    """T10: a running, uncertain or non-bool child is refused before any configure or start."""
+    world = World(tmp_path)
+    world.child.running_value, world.child.unconfirmed_value = running, unconfirmed
+    result = await world.run()
+    assert result.outcome is Outcome.REFUSED_BEFORE_EVIDENCE
+    assert result.start_refusal is refusal and result.child_ownership is Own.NOT_OWNED
+    assert world.child_ops() == [] and world.identities.calls == []
+    assert not (Path(world.root) / RUN_ID).exists()
+
+
+@pytest.mark.asyncio
+async def test_4gc_t10_a_raising_entry_property_is_unexpected(tmp_path: Path) -> None:
+    """T10: a raising child property fails closed before any start."""
+    world = World(tmp_path)
+    world.child = RaisingFlagsChild(world)
+    result = await world.run()
+    assert (result.outcome, result.start_refusal) == (
+        Outcome.REFUSED_BEFORE_EVIDENCE,
+        Refusal.UNEXPECTED_FAILURE,
+    )
+    assert result.child_ownership is Own.NOT_OWNED and world.child.calls == []
+
+
+@pytest.mark.asyncio
+async def test_4gc_t10_a_configure_off_failure_is_not_owned(tmp_path: Path) -> None:
+    """T10: a configure-OFF exception refuses with NOT_OWNED and no start or stop."""
+    world = World(tmp_path)
+    world.child.configure_errors[OFF] = RuntimeError(CANARY)
+    result = await world.run()
+    assert (result.start_refusal, result.child_ownership) == (
+        Refusal.CHILD_START_FAILED,
+        Own.NOT_OWNED,
+    )
+    assert world.child_ops() == [("configure", OFF)]
+    assert_no_canary(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "ownership"),
+    [
+        ("silent", Own.OWNED_STOP_CONFIRMED),
+        ("raise", Own.OWNED_STOP_CONFIRMED),
+        ("unconfirmed", Own.OWNED_STOP_UNCONFIRMED),
+    ],
+)
+async def test_4gc_t10_a_failed_off_start_gets_exactly_one_cleanup_stop(
+    tmp_path: Path, mode: str, ownership: two_phase.ColdChildOwnership
+) -> None:
+    """T10: an attempted but unconfirmed start is owned and stopped once, nothing more."""
+    world = World(tmp_path)
+    world.child.start_modes = [mode]
+    result = await world.run()
+    assert result.outcome is Outcome.REFUSED_BEFORE_EVIDENCE
+    assert result.start_refusal is Refusal.CHILD_START_FAILED
+    assert result.child_ownership is ownership
+    assert world.child_ops() == [("configure", OFF), ("start", OFF), ("stop", OFF)]
+    assert world.identities.calls == []
+
+
+@pytest.mark.asyncio
+async def test_4gc_t10_a_failed_on_start_is_respawn_failed_with_one_cleanup_stop(
+    tmp_path: Path,
+) -> None:
+    """T10: an ON start failure records CHILD_STARTED FAILED, one cleanup stop, no freeze."""
+    world = World(tmp_path)
+    world.child.start_modes = ["ok", "raise"]
+    result = await world.run()
+    assert_failed(world, result, R.RESPAWN_FAILED)
+    assert world.child_ops() == NORMAL_CHILD_OPS
+    assert world.identities.calls == [OFF]
+    assert world.events()[-4:] == [
+        ("recording_off", "child_stopped"),
+        ("recording_off", "child_started"),
+        ("recording_off", "child_stopped"),
+        ("recording_off", "run_terminated"),
+    ]
+    assert world.lifecycle()[-3]["child_start"] == "failed"
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+
+
+@pytest.mark.asyncio
+async def test_4gc_t10_an_on_configure_failure_keeps_the_confirmed_stop(tmp_path: Path) -> None:
+    """T10: an ON configure exception is RESPAWN_FAILED; no start; stop stays confirmed."""
+    world = World(tmp_path)
+    world.child.configure_errors[ON] = RuntimeError(CANARY)
+    result = await world.run()
+    assert_failed(world, result, R.RESPAWN_FAILED)
+    assert world.child_ops() == [
+        ("configure", OFF),
+        ("start", OFF),
+        ("stop", OFF),
+        ("configure", ON),
+    ]
+    assert ("recording_off", "child_started") not in world.events()
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+
+
+@pytest.mark.asyncio
+async def test_4gc_t10_an_already_attached_on_child_is_never_started(tmp_path: Path) -> None:
+    """T10: the pre-start recheck refuses an attached child; a silent no-op never counts."""
+    world = World(tmp_path)
+
+    def attach() -> None:
+        world.child.running_value = True
+
+    world.child.on_configure[ON] = attach
+    result = await world.run()
+    assert_failed(world, result, R.RESPAWN_FAILED)
+    assert world.child_ops() == [
+        ("configure", OFF),
+        ("start", OFF),
+        ("stop", OFF),
+        ("configure", ON),
+    ]
+    assert world.lifecycle()[-2]["child_start"] == "failed"
+
+
+# ------------------------------------------------------ T8: cancellation
+
+
+class CapturingSink(two_phase._RunSink):
+    """Records every guarded sink the orchestrator creates."""
+
+    created: typing.ClassVar[list["CapturingSink"]] = []
+
+    def __init__(self, writer: store.ColdEvidenceWriter) -> None:
+        super().__init__(writer)
+        CapturingSink.created.append(self)
+
+
+BEFORE_ON = [("configure", OFF), ("start", OFF), ("stop", OFF), ("configure", ON), ("start", ON)]
+CANCEL_CASES: typing.Final = [
+    ("start:recording_off", [("configure", OFF), ("start", OFF), ("stop", OFF)], 1),
+    ("get_roast_state:recording_off", [("configure", OFF), ("start", OFF), ("stop", OFF)], 1),
+    ("finalise_session:recording_off", [("configure", OFF), ("start", OFF), ("stop", OFF)], 1),
+    ("stop:0", [("configure", OFF), ("start", OFF), ("stop", OFF), ("stop", OFF)], 1),
+    ("start:recording_on", [*BEFORE_ON, ("stop", ON)], 2),
+    ("freeze:recording_on", [*BEFORE_ON, ("stop", ON)], 2),
+    ("get_roast_state:recording_on", [*BEFORE_ON, ("stop", ON)], 2),
+    ("stop:1", [*BEFORE_ON, ("stop", ON), ("stop", ON)], 2),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second", [False, True], ids=["once", "again_during_cleanup"])
+@pytest.mark.parametrize(
+    ("gate", "ops", "completed"), CANCEL_CASES, ids=[case[0] for case in CANCEL_CASES]
+)
+async def test_4gc_t8_cancellation_reaps_the_child_and_never_seals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate: str,
+    ops: list[tuple[str, Phase | None]],
+    completed: int,
+    second: bool,
+) -> None:
+    """T8: CancelledError is re-raised after one shielded cleanup stop; no terminal or seal."""
+    CapturingSink.created.clear()
+    monkeypatch.setattr(two_phase, "_RunSink", CapturingSink)
+    world = World(tmp_path)
+    entered = world.gates.arm(gate)
+    stops_before = sum(1 for op in ops if op[0] == "stop") - 1
+    cleanup_gate = f"stop:{stops_before}"
+    cleanup_entered = world.gates.arm(cleanup_gate) if second else None
+    task = asyncio.ensure_future(world.run())
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    if cleanup_entered is not None:
+        await asyncio.wait_for(cleanup_entered.wait(), 5)
+        task.cancel()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not task.done()
+        world.gates.gates[cleanup_gate].set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert world.child_ops() == ops
+    assert world.child.stops_completed == completed
+    assert not any(event == "run_terminated" for _phase, event in world.events())
+    assert not world.manifest_exists()
+    if gate.startswith("stop:"):
+        assert world.child.unconfirmed_value is True
+    if gate == "start:recording_off":
+        assert CapturingSink.created == []
+    else:
+        (sink,) = CapturingSink.created
+        assert sink.poisoned and not sink.usable
+        with pytest.raises(two_phase.ColdRunSinkRefusedError):
+            sink.append_lifecycle(typing.cast(lifecycle.ColdLifecycleRecord, None))
