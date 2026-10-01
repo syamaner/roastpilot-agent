@@ -814,24 +814,75 @@ def _rationale_state(rationale: str) -> ColdAdvisoryRationaleState:
     return ColdAdvisoryRationaleState.RETAINED
 
 
-def _flatten(
-    evaluation: ColdSafetyEvaluation | None, usage: ColdAdvisoryUsageReading | None
-) -> dict[str, object]:
-    """Shape-check the exact embedded carriers in full, then flatten their raw values."""
-    try:
-        flattened = {
-            **(
-                {}
-                if evaluation is None
-                else {f"evaluation_{k}": v for k, v in _raw_fields(evaluation).items()}
-            ),
-            **({} if usage is None else {f"usage_{k}": v for k, v in _raw_fields(usage).items()}),
-        }
-    except ValueError:
-        failure = ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
-    else:
-        return flattened
-    raise failure
+def _is_exact_str(value: object) -> bool:
+    """Whether a value is an exact ``str``."""
+    return type(value) is str
+
+
+def _is_exact_int(value: object) -> bool:
+    """Whether a value is an exact ``int`` (never a ``bool``)."""
+    return type(value) is int
+
+
+def _is_optional_int(value: object) -> bool:
+    """Whether a value is ``None`` or an exact ``int``."""
+    return value is None or type(value) is int
+
+
+def _is_verdict(value: object) -> bool:
+    """Whether a value is a real safety-verdict member, found by identity."""
+    return any(value is member for member in ColdSafetyVerdict)
+
+
+_CarrierTable: typing.TypeAlias = tuple[
+    type[pydantic.BaseModel], dict[str, typing.Callable[[object], bool]]
+]
+#: Closed per-field exact-type admission for each embedded carrier, checked before flattening.
+_EVALUATION_CARRIER: _CarrierTable = (
+    ColdSafetyEvaluation,
+    {
+        "rule": _is_exact_str,
+        "verdict": _is_verdict,
+        "input_heat": _is_optional_int,
+        "input_fan": _is_optional_int,
+        "adjusted_heat": _is_optional_int,
+        "adjusted_fan": _is_optional_int,
+        "reason": _is_exact_str,
+    },
+)
+_USAGE_CARRIER: _CarrierTable = (
+    ColdAdvisoryUsageReading,
+    {
+        "input_tokens": _is_exact_int,
+        "output_tokens": _is_exact_int,
+        "total_tokens": _is_exact_int,
+        "reasoning_tokens": _is_optional_int,
+    },
+)
+
+
+def _admit_carrier(carrier: object, table: _CarrierTable) -> dict[str, object]:
+    """Admit one embedded carrier's exact class, raw state, and per-field exact types.
+
+    Semantic checks (ranges, lengths, the request binding) stay with the strict
+    record; this layer only refuses a carrier whose shape or raw types are not exact.
+
+    Raises:
+        ColdEvidenceError: ``RECORD_NOT_VALIDATED`` for any refused carrier.
+    """
+    carrier_class, admitted = table
+    if type(carrier) is not carrier_class:
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    data = object.__getattribute__(carrier, "__dict__")
+    extra = object.__getattribute__(carrier, "__pydantic_extra__")
+    if type(data) is not dict or extra is not None and (type(extra) is not dict or extra):
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    raw = typing.cast(dict[object, object], data)
+    if any(type(name) is not str for name in raw) or set(raw) != set(carrier_class.model_fields):
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    if not all(check(raw[name]) for name, check in admitted.items()):
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    return {name: raw[name] for name in admitted}
 
 
 def build_advisory_resolution_record(
@@ -916,7 +967,10 @@ def build_advisory_resolution_record(
     )
     if not _is_admitted_member(resolution):
         raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
-    flattened = _flatten(evaluation, usage)
+    evaluation_values = (
+        None if evaluation is None else _admit_carrier(evaluation, _EVALUATION_CARRIER)
+    )
+    usage_values = None if usage is None else _admit_carrier(usage, _USAGE_CARRIER)
     decision = resolution is ColdAdvisoryResolution.RETURNED_DECISION
     absent_evaluation = ColdAdvisoryEvaluationState.NOT_RECORDED if decision else None
     absent_usage = ColdAdvisoryUsageState.NOT_RECORDED if resolution in _USAGE_KINDS else None
@@ -949,9 +1003,11 @@ def build_advisory_resolution_record(
             absent_evaluation if evaluation is None else ColdAdvisoryEvaluationState.RECORDED
         ),
         "usage_state": absent_usage if usage is None else ColdAdvisoryUsageState.RECORDED,
-        **flattened,
     }
-    if usage is not None:
+    if evaluation_values is not None:
+        values.update((f"evaluation_{name}", value) for name, value in evaluation_values.items())
+    if usage_values is not None:
+        values.update((f"usage_{name}", value) for name, value in usage_values.items())
         values["usage_basis"] = ColdAdvisoryUsageBasis.PRODUCTION_NORMALISED
     return typing.cast(
         ColdAdvisoryResolutionRecord, _construct(ColdAdvisoryResolutionRecord, values)
