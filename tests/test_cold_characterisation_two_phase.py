@@ -3398,6 +3398,12 @@ FINALISATION_CASES: typing.Final[list[tuple[str, Callable[[Phase, str], object],
         "failed_without_result",
         R.FINALISATION_FAILED,
     ),
+    (
+        "whitespace_padded_session",
+        lambda p, s: clean_result(p, s + " "),
+        "failed_without_result",
+        R.FINALISATION_FAILED,
+    ),
 ]
 
 
@@ -3644,12 +3650,13 @@ def _completion(session: str) -> Behaviour:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("session", ["another-session", f"{SESSIONS[OFF]} ", f" {SESSIONS[OFF]}"])
 async def test_4gc_a_completion_for_another_session_is_never_finalised(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, session: str
 ) -> None:
-    """A completed carrier whose session differs from the hook's is not finalised."""
+    """A completed carrier whose session differs (even by padding) is not finalised."""
     monkeypatch.setattr(
-        two_phase, "observe_cold_phase", scripted_observer(OFF, _completion("another-session"))
+        two_phase, "observe_cold_phase", scripted_observer(OFF, _completion(session))
     )
     world = World(tmp_path)
     result = await world.run()
