@@ -35,6 +35,8 @@ from roastpilot_agent.cold_characterisation.identity import ColdArtefactKind, Co
 from roastpilot_agent.cold_characterisation.mcp import (
     ColdFinalisationNotCleanError,
     ColdFinalisationSafetyError,
+    ColdMcpTransportError,
+    ColdSessionIdentityError,
     ColdTickObservation,
     SessionFinalisationResult,
 )
@@ -340,6 +342,7 @@ class Host:
         self.start_calls = 0
         self.samples = 0
         self.before_start: dict[int, Callable[[], None]] = {}
+        self.sample_error: Callable[[], BaseException | None] = lambda: None
 
     def check_start_bounds(self, evidence_root: Path) -> None:
         del evidence_root
@@ -351,6 +354,9 @@ class Host:
     def sample(self, evidence_root: Path) -> typing.Any:
         del evidence_root
         self.samples += 1
+        error = self.sample_error()
+        if error is not None:
+            raise error
         return safe_host_sample()
 
 
@@ -622,6 +628,10 @@ def identity_forgeries(genuine: ColdRunIdentity) -> dict[str, object]:
         "missing_dict_key": with_dict(
             genuine, {k: v for k, v in raw_fields(genuine).items() if k != "kernel"}
         ),
+        "renamed_dict_key": with_dict(
+            genuine,
+            {(k if k != "kernel" else "kernel_renamed"): v for k, v in raw_fields(genuine).items()},
+        ),
         "str_subclass_key": with_dict(genuine, hostile_key),
         "pydantic_extra": with_slot(genuine, "__pydantic_extra__", {"x": 1}),
         "pydantic_extra_empty": with_slot(genuine, "__pydantic_extra__", {}),
@@ -742,7 +752,7 @@ def test_4gc_t16_every_forged_identity_is_refused_with_zero_spy_calls(
 
     monkeypatch.setattr(ColdRunIdentity, "model_dump", spy_dump)
     forgeries = identity_forgeries(genuine)
-    assert len(forgeries) == 27
+    assert len(forgeries) == 28
     for name, value in forgeries.items():
         reset_spies()
         dumped.clear()
@@ -2209,6 +2219,7 @@ def _is(
         ("elapsed_lifecycle", _is("append_lifecycle", event="observation_window_elapsed")),
         ("seal", _is("seal")),
         ("off_header", _is("append", stream="header")),
+        ("on_transition", _is("append_lifecycle", event="transition_measured")),
     ],
 )
 async def test_4gc_t12_a_write_fault_leaves_unsealed_evidence_and_stops_writing(
@@ -2237,6 +2248,11 @@ async def test_4gc_t12_a_write_fault_leaves_unsealed_evidence_and_stops_writing(
         assert world.events() == GRAMMAR
         assert world.child_ops() == NORMAL_CHILD_OPS
         assert result.termination_reason is None
+    elif case == "on_transition":
+        assert world.child_ops() == NORMAL_CHILD_OPS
+        assert world.mcp.finalised == [SESSIONS[OFF]]
+        assert ("get_roast_state", ON) not in world.mcp.calls
+        assert world.events()[-1] == ("recording_on", "phase_activated")
     else:
         assert world.child_ops() == [("configure", OFF), ("start", OFF), ("stop", OFF)]
         assert world.mcp.finalised == []
@@ -2832,3 +2848,942 @@ async def test_4gc_t8_cancellation_reaps_the_child_and_never_seals(
         assert sink.poisoned and not sink.usable
         with pytest.raises(two_phase.ColdRunSinkRefusedError):
             sink.append_lifecycle(typing.cast(lifecycle.ColdLifecycleRecord, None))
+
+
+# ------------------------------------------------- T1 / T2 / T20: success paths
+
+
+def advance(world: World, seconds: float) -> Callable[[], None]:
+    """A hook that moves the scripted clock forward by ``seconds``."""
+
+    def move() -> None:
+        world.clock.t += seconds
+
+    return move
+
+
+def set_time(world: World, instant: float) -> Callable[[], None]:
+    """A hook that sets the scripted clock to ``instant``."""
+
+    def move() -> None:
+        world.clock.t = instant
+
+    return move
+
+
+@pytest.mark.asyncio
+async def test_4gc_t1_the_happy_path_is_pre_advisory_conformant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T1: one run, one directory, two sessions, 11-entry grammar, exact child calls."""
+    seen: list[tuple[int, int, int]] = []
+    real_observe = engine.observe_cold_phase
+    real_admit = engine.admit_cold_phase
+
+    async def spy_observe(**kwargs: typing.Any) -> typing.Any:
+        seen.append((id(kwargs["mcp"]), id(kwargs["host"]), id(kwargs["clock"])))
+        return await real_observe(**kwargs)
+
+    async def spy_admit(**kwargs: typing.Any) -> typing.Any:
+        seen.append((id(kwargs["mcp"]), id(kwargs["host"]), id(kwargs["clock"])))
+        return await real_admit(**kwargs)
+
+    monkeypatch.setattr(two_phase, "observe_cold_phase", spy_observe)
+    monkeypatch.setattr(two_phase, "admit_cold_phase", spy_admit)
+    world = World(tmp_path)
+    result = await world.run()
+    assert result.outcome is Outcome.PRE_ADVISORY_CONFORMANT
+    assert result.termination_reason is None and result.start_refusal is None
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+    assert result.conformance == conformance.ColdConformanceResult(
+        policy_version=1,
+        outcome=conformance.ColdConformanceOutcome.PRE_ADVISORY_CONFORMANT,
+        findings=(),
+    )
+    retained = world.retained(result.manifest_sha256)
+    assert retained.run.manifest_sha256 == result.manifest_sha256
+    assert world.events() == GRAMMAR
+    assert world.child_ops() == NORMAL_CHILD_OPS
+    assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
+    assert world.identities.calls == [OFF, ON]
+    assert world.host.start_calls == 2 and world.host.samples == 8
+    assert [p for name, p in world.mcp.calls if name == "get_roast_state"] == [OFF] * 4 + [ON] * 4
+    assert seen == [(id(world.mcp), id(world.host), id(world.clock))] * 4
+    assert sorted(path.name for path in Path(world.root).iterdir()) == [RUN_ID]
+    # Independently authored instants: OFF 100 -> 1900, finalise +1, ON 1901 -> 3701.
+    off_activated = world.event(OFF, "phase_activated")
+    assert (off_activated["event_monotonic_seconds"], off_activated["scheduled_end_monotonic"]) == (
+        T0,
+        OFF_END,
+    )
+    off_elapsed = world.event(OFF, "observation_window_elapsed")
+    assert (off_elapsed["event_monotonic_seconds"], off_elapsed["tick_count"]) == (OFF_END, 4)
+    assert off_elapsed["scheduled_end_monotonic"] == OFF_END
+    assert world.event(OFF, "finalisation_returned")["event_monotonic_seconds"] == 1901.0
+    measured = world.event(ON, "transition_measured")
+    assert measured["transition_start_monotonic"] == OFF_END
+    assert measured["transition_end_monotonic"] == 1901.0
+    assert measured["transition_seconds"] == 1.0 and measured["transition_within_budget"] is True
+    assert measured["previous_phase_session_id"] == SESSIONS[OFF]
+    assert measured["session_id"] == SESSIONS[ON]
+    on_activated = world.event(ON, "phase_activated")
+    assert on_activated["scheduled_end_monotonic"] == 3701.0
+    assert world.event(ON, "observation_window_elapsed")["event_monotonic_seconds"] == 3701.0
+    terminal = world.event(ON, "run_terminated")
+    assert (terminal["termination"], terminal["termination_reason"]) == ("completed", None)
+    assert terminal["event_monotonic_seconds"] == 3702.0
+    headers = world.records("header")
+    assert [h["monotonic_seconds"] for h in headers] == [T0, 1901.0]
+    assert world.event(OFF, "child_started")["event_monotonic_seconds"] == 1901.0
+    finalisations = world.records("finalisation")
+    assert [f["session_id"] for f in finalisations] == [SESSIONS[OFF], SESSIONS[ON]]
+    assert_lifecycle_ordered(world)
+    assert_no_canary(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["zero", "sixty", "sixty_at_stop", "overrun", "overrun_sixty"])
+async def test_4gc_t2_the_budget_boundaries_conform(tmp_path: Path, case: str) -> None:
+    """T2: ON activation at OFF_END + 0 and + 60 (inclusive), with and without an overrun."""
+    world = World(tmp_path)
+    expected_seconds = {"zero": 0.0, "sixty": 60.0, "sixty_at_stop": 60.0}.get(case, 60.0)
+    if case == "zero":
+        world.mcp.finalise_advance = 0.0
+    elif case == "sixty":
+        world.mcp.before["mark_beans_added:recording_on"] = set_time(world, OFF_END + 60.0)
+    elif case == "sixty_at_stop":
+        world.child.before_stop[0] = set_time(world, OFF_END + 60.0)
+    else:
+        # The OFF window overruns: its last read ends at 1950, 50 s after the scheduled end.
+        world.mcp.read_seconds = lambda phase, index: 500.0 if (phase, index) == (OFF, 3) else 450.0
+        world.mcp.before["mark_beans_added:recording_on"] = set_time(world, OFF_END + 60.0)
+    result = await world.run()
+    assert result.outcome is Outcome.PRE_ADVISORY_CONFORMANT, findings_of(result)
+    measured = world.event(ON, "transition_measured")
+    assert measured["transition_start_monotonic"] == OFF_END
+    assert measured["transition_seconds"] == expected_seconds
+    assert world.event(OFF, "phase_activated")["scheduled_end_monotonic"] == OFF_END
+    if case.startswith("overrun"):
+        assert world.event(OFF, "observation_window_elapsed")["event_monotonic_seconds"] == 1950.0
+
+
+@pytest.mark.asyncio
+async def test_4gc_t20_an_on_overrun_never_meets_the_off_budget(tmp_path: Path) -> None:
+    """T20: ON at OFF_END + 60 and an ON completion 500 s late still conforms."""
+    world = World(tmp_path)
+    world.mcp.before["mark_beans_added:recording_on"] = set_time(world, OFF_END + 60.0)
+    world.mcp.read_seconds = lambda phase, index: 950.0 if (phase, index) == (ON, 3) else 450.0
+    result = await world.run()
+    assert result.outcome is Outcome.PRE_ADVISORY_CONFORMANT, findings_of(result)
+    # ON activation 1960; scheduled end 3760; last read ends 1960 + 1350 + 950 = 4260.
+    assert world.event(ON, "observation_window_elapsed")["event_monotonic_seconds"] == 4260.0
+    assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
+
+
+# -------------------------------------------------- T3 / T4: budget refusals
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overrun", [False, True])
+async def test_4gc_t3_an_activation_past_the_budget_reads_nothing(
+    tmp_path: Path, overrun: bool
+) -> None:
+    """T3: just past OFF_END + 60 the ON phase is refused before its first read."""
+    world = World(tmp_path)
+    activation = math.nextafter(OFF_END + 60.0, math.inf)
+    if overrun:
+        # OFF completes at 1950: the activation is only 10.5 s after completion.
+        world.mcp.read_seconds = lambda phase, index: 500.0 if (phase, index) == (OFF, 3) else 450.0
+        activation = OFF_END + 60.5
+    world.mcp.before["mark_beans_added:recording_on"] = set_time(world, activation)
+    result = await world.run()
+    assert_failed(world, result, R.TRANSITION_BUDGET_EXCEEDED)
+    assert ("get_roast_state", ON) not in world.mcp.calls
+    assert world.mcp.finalised == [SESSIONS[OFF]]
+    assert world.events()[5:] == [
+        ("recording_on", "phase_activated"),
+        ("recording_on", "transition_measured"),
+        ("recording_on", "phase_aborted_not_finalised"),
+        ("recording_on", "child_stopped"),
+        ("recording_on", "run_terminated"),
+    ]
+    measured = world.event(ON, "transition_measured")
+    assert measured["transition_within_budget"] is False
+    assert measured["transition_start_monotonic"] == OFF_END
+    assert measured["transition_seconds"] == activation - OFF_END
+    aborted = world.event(ON, "phase_aborted_not_finalised")
+    assert aborted["activation_deadline_exceeded"] is True
+    assert aborted["session_id"] == SESSIONS[ON]
+    assert world.records("abort") == []
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+
+
+def _late_completion(world: World) -> None:
+    world.mcp.read_seconds = lambda phase, index: 511.0 if (phase, index) == (OFF, 3) else 450.0
+
+
+def _late_finalisation(world: World) -> None:
+    world.mcp.finalise_advance = 61.0
+
+
+def _late_stop(world: World) -> None:
+    world.child.before_stop[0] = advance(world, 61.0)
+
+
+def _late_start(world: World) -> None:
+    world.child.before_start[ON] = advance(world, 61.0)
+
+
+def _late_identity(world: World) -> None:
+    world.identities.before[ON] = advance(world, 61.0)
+
+
+def _late_admission(world: World) -> None:
+    world.host.before_start[1] = advance(world, 61.0)
+
+
+CHECKPOINTS: typing.Final[list[tuple[str, Callable[[World], None], list[tuple[str, str]]]]] = [
+    (
+        "pre_finalisation",
+        _late_completion,
+        [
+            GRAMMAR[0],
+            GRAMMAR[1],
+            ("recording_off", "child_stopped"),
+            ("recording_off", "run_terminated"),
+        ],
+    ),
+    (
+        "post_finalisation",
+        _late_finalisation,
+        [*GRAMMAR[:3], ("recording_off", "child_stopped"), ("recording_off", "run_terminated")],
+    ),
+    ("post_stop", _late_stop, [*GRAMMAR[:4], ("recording_off", "run_terminated")]),
+    (
+        "post_start",
+        _late_start,
+        [*GRAMMAR[:5], ("recording_off", "child_stopped"), ("recording_off", "run_terminated")],
+    ),
+    (
+        "post_on_identity",
+        _late_identity,
+        [*GRAMMAR[:5], ("recording_off", "child_stopped"), ("recording_off", "run_terminated")],
+    ),
+    (
+        "post_on_admission",
+        _late_admission,
+        [*GRAMMAR[:5], ("recording_off", "child_stopped"), ("recording_off", "run_terminated")],
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "setup", "events"), CHECKPOINTS, ids=[case[0] for case in CHECKPOINTS]
+)
+async def test_4gc_t4_each_checkpoint_stops_the_next_operation(
+    tmp_path: Path,
+    name: str,
+    setup: Callable[[World], None],
+    events: list[tuple[str, str]],
+) -> None:
+    """T4: 61 s past OFF_END at any checkpoint refuses before the next kind of operation."""
+    world = World(tmp_path)
+    setup(world)
+    result = await world.run()
+    assert_failed(world, result, R.TRANSITION_BUDGET_EXCEEDED)
+    assert world.events() == events
+    assert [h["phase"] for h in world.records("header")] == ["recording_off"]
+    assert ("start_cold_session", ON) not in world.mcp.calls
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+    finalised: list[str] = [] if name == "pre_finalisation" else [SESSIONS[OFF]]
+    assert world.mcp.finalised == finalised
+    configured_on = name in ("post_start", "post_on_identity", "post_on_admission")
+    assert (("configure", ON) in world.child_ops()) is configured_on
+    assert (ON in world.identities.calls) is (name in ("post_on_identity", "post_on_admission"))
+    assert (("get_server_info", ON) in world.mcp.calls) is (name == "post_on_admission")
+
+
+# ------------------------------------------------ T7 / admission mappings
+
+
+@pytest.mark.asyncio
+async def test_4gc_t7a_an_identity_delta_outside_the_leaves_is_refused(tmp_path: Path) -> None:
+    """T7a: an ON identity differing outside the five leaves refuses before the ON header."""
+    world = World(tmp_path)
+    world.ids[ON] = on_identity(tmp_path, world.root, operator_host_notes="other host")
+    world.identities.values[ON] = world.ids[ON]
+    result = await world.run()
+    assert_failed(world, result, R.PHASE_IDENTITY_DELTA_NOT_ADMITTED)
+    assert world.host.start_calls == 2
+    assert ("start_cold_session", ON) not in world.mcp.calls
+    assert [h["phase"] for h in world.records("header")] == ["recording_off"]
+
+
+@pytest.mark.asyncio
+async def test_4gc_t7a_a_delta_check_failure_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T7a: a raising identity-delta rule refuses (never treated as equal)."""
+
+    def boom(envelope: object, recording: bool) -> str | None:
+        raise ValueError(CANARY)
+
+    monkeypatch.setattr(two_phase, "masked_identity_text", boom)
+    world = World(tmp_path)
+    result = await world.run()
+    assert_failed(world, result, R.PHASE_IDENTITY_DELTA_NOT_ADMITTED)
+
+
+@pytest.mark.asyncio
+async def test_4gc_t7b_a_reused_session_is_refused_by_the_checker(tmp_path: Path) -> None:
+    """T7b: an ON session equal to the OFF session runs but reloads non-conformant."""
+    world = World(tmp_path)
+    world.mcp.start = lambda phase: start_result(SESSIONS[OFF])
+    world.mcp.tick = lambda phase, index: conforming_tick(OFF, index)
+    result = await world.run()
+    assert result.outcome is Outcome.NOT_CONFORMANT
+    assert result.termination_reason is None
+    assert findings_of(result) == {conformance.ColdConformanceFinding.PHASE_SESSIONS_NOT_DISTINCT}
+    assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[OFF]]
+    assert world.events() == GRAMMAR
+
+
+def _raise_reads(world: World) -> None:
+    def fail() -> None:
+        raise ColdMcpTransportError(CANARY)
+
+    world.mcp.before["get_server_info:recording_on"] = fail
+
+
+def _nan_admission(world: World) -> None:
+    world.mcp.before["get_runtime_config:recording_on"] = lambda: world.clock.pending.append("nan")
+
+
+def _regressed_admission(world: World) -> None:
+    world.host.before_start[0] = lambda: None
+    world.mcp.before["get_runtime_config:recording_on"] = lambda: world.clock.pending.append(
+        "regress:1"
+    )
+
+
+def _wrong_polarity(world: World) -> None:
+    world.identities.values[ON] = cold_identity(world.tmp_path, world.root, phase=OFF)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setup", "reason"),
+    [
+        (_raise_reads, R.RECONNECT_FAILED),
+        (_nan_admission, R.CLOCK_INVALID),
+        (_regressed_admission, R.CLOCK_INVALID),
+        (_wrong_polarity, R.PHASE_ADMISSION_REFUSED),
+    ],
+    ids=["mcp_read_failed", "clock_invalid", "below_floor", "other_refusal"],
+)
+async def test_4gc_t11_on_admission_refusals_map_to_closed_reasons(
+    tmp_path: Path, setup: Callable[[World], None], reason: lifecycle.ColdRunTerminationReason
+) -> None:
+    """ON admission: MCP read failure, clock and other refusals map to closed reasons."""
+    world = World(tmp_path)
+    setup(world)
+    result = await world.run()
+    assert_failed(world, result, reason)
+    assert [h["phase"] for h in world.records("header")] == ["recording_off"]
+    assert ("start_cold_session", ON) not in world.mcp.calls
+
+
+@pytest.mark.asyncio
+async def test_4gc_an_off_admission_refusal_is_refused_before_evidence(tmp_path: Path) -> None:
+    """OFF admission refusal (wrong recording polarity) creates nothing and stops the child."""
+    world = World(tmp_path)
+    world.identities.values[OFF] = world.ids[ON]
+    result = await world.run()
+    assert (result.outcome, result.start_refusal) == (
+        Outcome.REFUSED_BEFORE_EVIDENCE,
+        Refusal.ADMISSION_REFUSED,
+    )
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+    assert not (Path(world.root) / RUN_ID).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", [OFF, ON])
+async def test_4gc_a_non_admission_error_from_admission_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: Phase
+) -> None:
+    """An unexpected admission error is ADMISSION_REFUSED (OFF) or PHASE_ADMISSION_REFUSED (ON)."""
+    real = engine.admit_cold_phase
+
+    async def admit(**kwargs: typing.Any) -> typing.Any:
+        if kwargs["phase"] is phase:
+            raise RuntimeError(CANARY)
+        return await real(**kwargs)
+
+    monkeypatch.setattr(two_phase, "admit_cold_phase", admit)
+    world = World(tmp_path)
+    result = await world.run()
+    if phase is OFF:
+        assert result.start_refusal is Refusal.ADMISSION_REFUSED
+    else:
+        assert_failed(world, result, R.PHASE_ADMISSION_REFUSED)
+
+
+@pytest.mark.asyncio
+async def test_4gc_an_evidence_open_failure_is_refused_with_the_child_stopped(
+    tmp_path: Path,
+) -> None:
+    """An existing run directory refuses as EVIDENCE_OPEN_FAILED; the child is stopped."""
+    world = World(tmp_path)
+    (Path(world.root) / RUN_ID).mkdir(mode=0o700)
+    result = await world.run()
+    assert (result.outcome, result.start_refusal) == (
+        Outcome.REFUSED_BEFORE_EVIDENCE,
+        Refusal.EVIDENCE_OPEN_FAILED,
+    )
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+    assert world.child_ops() == [("configure", OFF), ("start", OFF), ("stop", OFF)]
+    assert list((Path(world.root) / RUN_ID).iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_4gc_a_pre_start_recheck_failure_is_not_owned(tmp_path: Path) -> None:
+    """A child attached between entry and start is never started and never owned."""
+    world = World(tmp_path)
+
+    def attach() -> None:
+        world.child.running_value = True
+
+    world.child.on_configure[OFF] = attach
+    result = await world.run()
+    assert (result.start_refusal, result.child_ownership) == (
+        Refusal.CHILD_START_FAILED,
+        Own.NOT_OWNED,
+    )
+    assert world.child_ops() == [("configure", OFF)]
+
+
+@pytest.mark.asyncio
+async def test_4gc_an_unexpected_error_before_evidence_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unexpected exception before the writer exists is REFUSED/UNEXPECTED_FAILURE."""
+
+    def boom(record: object) -> typing.NoReturn:
+        raise RuntimeError(CANARY)
+
+    monkeypatch.setattr(two_phase, "validate_record", boom)
+    world = World(tmp_path)
+    result = await world.run()
+    assert (result.outcome, result.start_refusal) == (
+        Outcome.REFUSED_BEFORE_EVIDENCE,
+        Refusal.UNEXPECTED_FAILURE,
+    )
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+    assert_no_canary(result)
+
+
+@pytest.mark.asyncio
+async def test_4gc_an_unexpected_error_after_evidence_terminates_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unexpected exception mid-run stops the child and terminates FAILED/UNEXPECTED."""
+    real = builders.build_lifecycle_record
+
+    def build(**kwargs: typing.Any) -> typing.Any:
+        if kwargs["event"] is Event.CHILD_STARTED:
+            raise RuntimeError(CANARY)
+        return real(**kwargs)
+
+    monkeypatch.setattr(two_phase, "build_lifecycle_record", build)
+    world = World(tmp_path)
+    result = await world.run()
+    assert_failed(world, result, R.UNEXPECTED_FAILURE)
+    assert world.child_ops() == NORMAL_CHILD_OPS[:5] + [("stop", ON)]
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+
+
+class Halt(BaseException):
+    """A non-``Exception`` interruption."""
+
+
+@pytest.mark.asyncio
+async def test_4gc_another_base_exception_propagates_after_owned_cleanup(tmp_path: Path) -> None:
+    """A non-Exception ``BaseException`` is re-raised after closing and the cleanup stop."""
+    world = World(tmp_path)
+    world.identities.values[ON] = Halt()
+    with pytest.raises(Halt):
+        await world.run()
+    assert world.child_ops() == NORMAL_CHILD_OPS
+    assert not any(event == "run_terminated" for _phase, event in world.events())
+    assert not world.manifest_exists()
+
+
+# ------------------------------------------------------------ T11: sessions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start", "reason"),
+    [
+        (lambda: start_result("x" * 2049), R.PHASE_ABORTED),
+        (lambda: ColdSessionIdentityError(CANARY), R.PHASE_ABORTED),
+        (lambda: start_result("   "), R.PHASE_FAILED_UNEXPECTEDLY),
+    ],
+    ids=["over_bound", "client_refused_blank", "returned_blank"],
+)
+async def test_4gc_t11_an_ambiguous_start_is_never_finalised(
+    tmp_path: Path, start: Callable[[], object], reason: lifecycle.ColdRunTerminationReason
+) -> None:
+    """T11: an inadmissible session is NOT_ADMITTED, never read further and never finalised."""
+    world = World(tmp_path)
+    world.mcp.start = lambda phase: start()
+    result = await world.run()
+    assert_failed(world, result, reason)
+    assert world.mcp.finalised == []
+    assert ("get_roast_state", OFF) not in world.mcp.calls
+    aborted = world.event(OFF, "phase_aborted_not_finalised")
+    assert aborted["session_admission"] == "not_admitted" and aborted["session_id"] is None
+    if reason is R.PHASE_ABORTED:
+        assert [a["reason"] for a in world.records("abort")] == ["session_start_failed"]
+
+
+# -------------------------------------------------------- T13: finalisation
+
+
+FINALISATION_CASES: typing.Final[list[tuple[str, Callable[[Phase, str], object], str, R]]] = [
+    (
+        "not_clean_error",
+        lambda p, s: ColdFinalisationNotCleanError("m", not_clean_result(p, s)),
+        "not_clean_recorded",
+        R.FINALISATION_NOT_CLEAN,
+    ),
+    (
+        "safety_error",
+        lambda p, s: ColdFinalisationSafetyError(
+            "m", clean_result(p, s, final_driver_evidence=None)
+        ),
+        "not_clean_recorded",
+        R.FINALISATION_NOT_CLEAN,
+    ),
+    ("returned_not_clean", not_clean_result, "not_clean_recorded", R.FINALISATION_NOT_CLEAN),
+    (
+        "returned_unsafe",
+        lambda p, s: clean_result(p, s, final_driver_evidence=None),
+        "not_clean_recorded",
+        R.FINALISATION_NOT_CLEAN,
+    ),
+    (
+        "returned_wrong_purpose",
+        lambda p, s: clean_result(p, s, session_purpose="roast"),
+        "not_clean_recorded",
+        R.FINALISATION_NOT_CLEAN,
+    ),
+    (
+        "transport",
+        lambda p, s: ColdMcpTransportError(CANARY),
+        "failed_without_result",
+        R.FINALISATION_FAILED,
+    ),
+    (
+        "mismatched_session",
+        lambda p, s: clean_result(p, "another-session"),
+        "failed_without_result",
+        R.FINALISATION_FAILED,
+    ),
+    (
+        "error_for_another_session",
+        lambda p, s: ColdFinalisationNotCleanError("m", not_clean_result(p, "another-session")),
+        "failed_without_result",
+        R.FINALISATION_FAILED,
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", [OFF, ON])
+@pytest.mark.parametrize(
+    ("name", "finalise", "recorded", "reason"),
+    FINALISATION_CASES,
+    ids=[case[0] for case in FINALISATION_CASES],
+)
+async def test_4gc_t13_an_unclean_or_failed_finalisation_ends_the_run(
+    tmp_path: Path,
+    phase: Phase,
+    name: str,
+    finalise: Callable[[Phase, str], object],
+    recorded: str,
+    reason: lifecycle.ColdRunTerminationReason,
+) -> None:
+    """T13: the result is recorded honestly; no retry and no respawn follow."""
+    world = World(tmp_path)
+    world.mcp.finalise = lambda p, s: finalise(p, s) if p is phase else clean_result(p, s)
+    result = await world.run()
+    assert_failed(world, result, reason)
+    assert world.event(phase, "finalisation_returned")["finalisation_result"] == recorded
+    retained = [f["phase"] for f in world.records("finalisation")]
+    expected_off = ["recording_off"] if phase is ON else []
+    if recorded == "not_clean_recorded":
+        assert retained == [*expected_off, phase.value]
+    else:
+        assert retained == expected_off
+    assert world.mcp.finalised == ([SESSIONS[OFF]] if phase is OFF else list(SESSIONS.values()))
+    if phase is OFF:
+        assert world.child_ops() == [("configure", OFF), ("start", OFF), ("stop", OFF)]
+    else:
+        assert world.child_ops() == NORMAL_CHILD_OPS
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+
+
+@pytest.mark.asyncio
+async def test_4gc_t13_a_builder_refusal_is_record_not_retained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T13: a refused v1 finalisation record is RECORD_NOT_RETAINED with no v1 record."""
+
+    def refuse(**kwargs: object) -> typing.NoReturn:
+        raise schema.ColdEvidenceError(schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+
+    monkeypatch.setattr(two_phase, "build_finalisation_record", refuse)
+    world = World(tmp_path)
+    result = await world.run()
+    assert_failed(world, result, R.FINALISATION_RECORD_NOT_RETAINED)
+    assert world.event(OFF, "finalisation_returned")["finalisation_result"] == "record_not_retained"
+    assert world.records("finalisation") == []
+    assert ("configure", ON) not in world.child_ops()
+
+
+@pytest.mark.asyncio
+async def test_4gc_finalisation_is_never_attempted_when_not_eligible(tmp_path: Path) -> None:
+    """The orchestrator checks eligibility before calling MCP finalisation."""
+    rig = SinkRig(tmp_path)
+    run = make_run(rig.world)
+    run._sink = rig.sink
+    assert await run._finalise(OFF, SESSIONS[OFF]) is False
+    assert rig.world.mcp.calls == [] and rig.world.mcp.finalised == []
+
+
+# ----------------------------------------- T14 / T21: aborts never finalise
+
+
+ABORT_PAIRS: typing.Final = [
+    (schema.ColdAbortDomain.HOST, schema.ColdHostAbortReason.THERMAL_EXCEEDED),
+    (schema.ColdAbortDomain.IDENTITY, schema.ColdIdentityAbortReason.MCP_VERSION_NOT_PINNED),
+    (schema.ColdAbortDomain.EVIDENCE, schema.ColdEvidenceFailure.RECORD_TOO_LARGE),
+    (schema.ColdAbortDomain.MCP, schema.ColdMcpAbortReason.EMERGENCY_STOP),
+    (schema.ColdAbortDomain.ADVISOR, schema.ColdAdvisorFailureKind.TIMEOUT),
+    (schema.ColdAbortDomain.OPERATOR, schema.ColdOperatorAbortReason.OPERATOR_STOP),
+    (schema.ColdAbortDomain.ENGINE, schema.ColdEngineAbortReason.CANCELLED),
+]
+
+
+def retained_abort(domain: schema.ColdAbortDomain, reason: enum.Enum, completed: bool) -> Behaviour:
+    """Append one genuine bound abort, then return a completed or aborted carrier."""
+
+    async def behaviour(admission: typing.Any, sink: typing.Any, clock: Clock) -> object:
+        sink.append(
+            builders.build_abort_record(
+                header=admission.header,
+                domain=domain,
+                reason=typing.cast(typing.Any, reason),
+                recorded_at_utc=clock.utc_now_iso(),
+                monotonic_seconds=clock.t,
+            )
+        )
+        clock.t += 1800.0
+        session = SESSIONS[admission.phase]
+        if completed:
+            return engine.ColdPhaseCompleted(
+                session_id=session,
+                observation_end_monotonic=clock.t,
+                observation_end_utc=clock.utc_now_iso(),
+                tick_count=3,
+            )
+        return engine.ColdPhaseAborted(
+            aborts=(
+                engine.ColdAbortClassification(
+                    domain=schema.ColdAbortDomain.ENGINE,
+                    reason=schema.ColdEngineAbortReason.UNEXPECTED_FAILURE,
+                ),
+            ),
+            session_id=session,
+            abort_recorded=True,
+        )
+
+    return behaviour
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completed", [False, True], ids=["t14_aborted", "t21_completed"])
+@pytest.mark.parametrize("phase", [OFF, ON])
+@pytest.mark.parametrize(
+    ("domain", "reason"), ABORT_PAIRS, ids=[pair[0].value for pair in ABORT_PAIRS]
+)
+async def test_4gc_t14_t21_any_retained_abort_forbids_finalisation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    domain: schema.ColdAbortDomain,
+    reason: enum.Enum,
+    phase: Phase,
+    completed: bool,
+) -> None:
+    """T14/T21: in either phase, any of the seven domains means no finalisation, no elapsed."""
+    monkeypatch.setattr(
+        two_phase,
+        "observe_cold_phase",
+        scripted_observer(phase, retained_abort(domain, reason, completed)),
+    )
+    world = World(tmp_path)
+    result = await world.run()
+    assert_failed(world, result, R.PHASE_ABORTED)
+    assert world.mcp.finalised == ([] if phase is OFF else [SESSIONS[OFF]])
+    assert (phase.value, "observation_window_elapsed") not in world.events()
+    aborted = world.event(phase, "phase_aborted_not_finalised")
+    assert aborted["session_id"] == SESSIONS[phase]
+    assert [(a["domain"], a["phase"]) for a in world.records("abort")] == [
+        (domain.value, phase.value)
+    ]
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+
+
+def _heat(phase: Phase) -> Callable[[Phase, int], object]:
+    def tick(current: Phase, index: int) -> object:
+        if current is phase and index == 1:
+            return observation(
+                device_state(driver=DRIVER, heat_level_percent=5),
+                roast_fan=roast_fan_state(level=0),
+                audio=audio(index),
+                session=session_metadata(
+                    session_id=SESSIONS[current], elapsed_monotonic_seconds=float(index + 1)
+                ),
+            )
+        return conforming_tick(current, index)
+
+    return tick
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", [OFF, ON])
+@pytest.mark.parametrize("domain", ["engine", "host"])
+async def test_4gc_t14_real_engine_aborts_are_never_finalised(
+    tmp_path: Path, phase: Phase, domain: str
+) -> None:
+    """T14: a real ENGINE (non-zero heat) or HOST abort in either phase is not finalised."""
+    world = World(tmp_path)
+    if domain == "engine":
+        world.mcp.tick = _heat(phase)
+    else:
+        from roastpilot_agent.cold_characterisation.host import (
+            ColdHostBoundError,
+            ColdHostBoundFailure,
+        )
+
+        world.host.sample_error = lambda: (
+            ColdHostBoundError(ColdHostBoundFailure.THERMAL_EXCEEDED)
+            if world.mcp.phase is phase
+            else None
+        )
+    result = await world.run()
+    assert_failed(world, result, R.PHASE_ABORTED)
+    assert world.mcp.finalised == ([] if phase is OFF else [SESSIONS[OFF]])
+    assert [a["domain"] for a in world.records("abort")] == [domain]
+
+
+@pytest.mark.asyncio
+async def test_4gc_t14_an_on_abort_before_activation_has_no_admitted_session(
+    tmp_path: Path,
+) -> None:
+    """T14: an ON start failure is aborted-not-finalised with NOT_ADMITTED."""
+    world = World(tmp_path)
+    world.mcp.start = lambda phase: (
+        ColdSessionIdentityError(CANARY) if phase is ON else start_result(SESSIONS[phase])
+    )
+    result = await world.run()
+    assert_failed(world, result, R.PHASE_ABORTED)
+    assert world.event(ON, "phase_aborted_not_finalised")["session_admission"] == "not_admitted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", [OFF, ON])
+async def test_4gc_t14_an_empty_window_is_finalised_then_failed(
+    tmp_path: Path, phase: Phase
+) -> None:
+    """T14a/b: a completed empty window is finalised (D195) then fails with no next phase."""
+    world = World(tmp_path)
+    # P1, then the hook's recording sample, then the first loop sample jumps past the end.
+    world.mcp.before[f"mark_beans_added:{phase.value}"] = lambda: world.clock.pending.extend(
+        ["", "", "jump:1800"]
+    )
+    result = await world.run()
+    assert_failed(world, result, R.PHASE_FAILED_UNEXPECTEDLY)
+    assert world.event(phase, "observation_window_elapsed")["tick_count"] == 0
+    assert world.event(phase, "finalisation_returned")["finalisation_result"] == "clean_recorded"
+    if phase is OFF:
+        assert world.mcp.finalised == [SESSIONS[OFF]]
+        assert world.child_ops() == [("configure", OFF), ("start", OFF), ("stop", OFF)]
+    else:
+        assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
+        assert world.child_ops() == NORMAL_CHILD_OPS
+    assert conformance.ColdConformanceFinding.TICKS_ABSENT in set(
+        conformance.check_pre_advisory_conformance(world.retained(result.manifest_sha256)).findings
+    )
+
+
+def _completion(session: str) -> Behaviour:
+    async def behaviour(admission: typing.Any, sink: typing.Any, clock: Clock) -> object:
+        clock.t += 1800.0
+        return engine.ColdPhaseCompleted(
+            session_id=session,
+            observation_end_monotonic=clock.t,
+            observation_end_utc=clock.utc_now_iso(),
+            tick_count=1,
+        )
+
+    return behaviour
+
+
+@pytest.mark.asyncio
+async def test_4gc_a_completion_for_another_session_is_never_finalised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed carrier whose session differs from the hook's is not finalised."""
+    monkeypatch.setattr(
+        two_phase, "observe_cold_phase", scripted_observer(OFF, _completion("another-session"))
+    )
+    world = World(tmp_path)
+    result = await world.run()
+    assert_failed(world, result, R.PHASE_FAILED_UNEXPECTEDLY)
+    assert world.mcp.finalised == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returned", ["completed", "refused"])
+async def test_4gc_an_off_result_without_a_hook_session_is_never_finalised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, returned: str
+) -> None:
+    """An OFF completion without an activation, or an OFF refusal, is unexpected."""
+
+    async def observe(*, admission: typing.Any, sink: typing.Any, **kwargs: typing.Any) -> object:
+        sink.append(admission.header)
+        if returned == "completed":
+            return engine.ColdPhaseCompleted(
+                session_id=SESSIONS[OFF],
+                observation_end_monotonic=OFF_END,
+                observation_end_utc=utc_at(OFF_END),
+                tick_count=1,
+            )
+        return engine.ColdPhaseActivationRefused(session_id=SESSIONS[OFF])
+
+    monkeypatch.setattr(two_phase, "observe_cold_phase", observe)
+    world = World(tmp_path)
+    result = await world.run()
+    assert_failed(world, result, R.PHASE_FAILED_UNEXPECTEDLY)
+    aborted = world.event(OFF, "phase_aborted_not_finalised")
+    assert aborted["activation_deadline_exceeded"] is False
+    assert aborted["session_admission"] == "not_admitted"
+    assert world.mcp.finalised == []
+
+
+# ------------------------------------------------ clock failures mid-run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "where",
+    [
+        "after_on_start",
+        "after_off_stop",
+        "post_finalisation_checkpoint",
+        "recording_sample",
+        "aborted",
+    ],
+)
+async def test_4gc_a_clock_failure_mid_run_is_clock_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    """Any inadmissible sample is CLOCK_INVALID; nothing needing it is started or recorded."""
+    world = World(tmp_path)
+    reason = R.CLOCK_INVALID
+    if where == "after_on_start":
+        world.child.before_start[ON] = lambda: world.clock.pending.append("nan")
+    elif where == "after_off_stop":
+        world.child.before_stop[0] = lambda: world.clock.pending.append("nan")
+    elif where == "post_finalisation_checkpoint":
+        world.mcp.before["finalise_session:recording_off"] = lambda: world.clock.pending.extend(
+            ["", "", "nan"]
+        )
+    elif where == "recording_sample":
+        # The OFF CHILD_STOPPED event instant is admitted; its recording instant is not.
+        world.child.before_stop[0] = lambda: world.clock.pending.extend(["", "nan"])
+    else:
+        reason = R.PHASE_ABORTED
+
+        async def behaviour(admission: typing.Any, sink: typing.Any, clock: Clock) -> object:
+            clock.pending.append("nan")
+            return await retained_abort(
+                schema.ColdAbortDomain.OPERATOR, schema.ColdOperatorAbortReason.OPERATOR_STOP, False
+            )(admission, sink, clock)
+
+        monkeypatch.setattr(two_phase, "observe_cold_phase", scripted_observer(OFF, behaviour))
+    result = await world.run()
+    assert_failed(world, result, reason)
+    events = world.events()
+    if where == "after_on_start":
+        assert ("recording_off", "child_started") not in events
+        assert world.identities.calls == [OFF]
+    elif where == "after_off_stop":
+        assert events.count(("recording_off", "child_stopped")) == 0
+        assert ("configure", ON) not in world.child_ops()
+    elif where == "post_finalisation_checkpoint":
+        assert world.child_ops() == [("configure", OFF), ("start", OFF), ("stop", OFF)]
+    elif where == "recording_sample":
+        assert ("recording_off", "child_stopped") not in events
+        assert ("configure", ON) not in world.child_ops()
+    else:
+        assert ("recording_off", "phase_aborted_not_finalised") not in events
+
+
+# -------------------------------------------- T22: contradictory checker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["on_not_clean", "final_stop_unconfirmed"])
+async def test_4gc_t22_a_conformant_checker_never_overrides_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """T22: a checker claiming conformance despite a primary failure is suppressed."""
+
+    def check(run: object) -> object:
+        del run
+        return CHECKED["conformant"]
+
+    monkeypatch.setattr(two_phase, "check_pre_advisory_conformance", check)
+    world = World(tmp_path)
+    if failure == "on_not_clean":
+        world.mcp.finalise = lambda p, s: not_clean_result(p, s) if p is ON else clean_result(p, s)
+        reason = R.FINALISATION_NOT_CLEAN
+        ownership = Own.OWNED_STOP_CONFIRMED
+    else:
+        world.child.stop_modes = ["ok", "unconfirmed"]
+        reason = R.CHILD_STOP_UNCONFIRMED
+        ownership = Own.OWNED_STOP_UNCONFIRMED
+    result = await world.run()
+    assert result.outcome is Outcome.NOT_CONFORMANT
+    assert result.conformance is None
+    assert result.termination_reason is reason
+    assert result.child_ownership is ownership
+    assert result.manifest_sha256 is not None
+
+
+@pytest.mark.asyncio
+async def test_4gc_a_raising_identity_source_is_identity_not_frozen(tmp_path: Path) -> None:
+    """A raising identity source refuses as IDENTITY_NOT_FROZEN with the child stopped."""
+    world = World(tmp_path)
+    world.identities.values[OFF] = RuntimeError(CANARY)
+    result = await world.run()
+    assert (result.start_refusal, result.child_ownership) == (
+        Refusal.IDENTITY_NOT_FROZEN,
+        Own.OWNED_STOP_CONFIRMED,
+    )
+    assert_no_canary(result)

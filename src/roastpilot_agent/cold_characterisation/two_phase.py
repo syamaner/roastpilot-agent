@@ -644,10 +644,6 @@ class _RunSink:
         """Whether another append may be attempted."""
         return not self.poisoned and not self.terminated
 
-    def header_bound(self, phase: ColdPhaseKind) -> bool:
-        """Whether ``phase`` has a bound header."""
-        return self._guards[phase].header
-
     def abort_retained(self, phase: ColdPhaseKind) -> bool:
         """Whether any v1 abort (any of the seven domains) was retained for ``phase``."""
         return self._guards[phase].abort_seen

@@ -2774,6 +2774,9 @@ def _malicious_envelopes(genuine: schema.ColdSealedEnvelope) -> dict[str, object
     hostile_key = _forged(genuine)
     raw = object.__getattribute__(hostile_key, "__dict__")
     raw[_HostileStr("kind")] = raw.pop("kind")
+    renamed_key = _forged(genuine)
+    renamed = object.__getattribute__(renamed_key, "__dict__")
+    renamed["kind_renamed"] = renamed.pop("kind")
     return {
         "subclass": sub,
         "wrong_digest": _forged(genuine, sha256="0" * 64),
@@ -2793,6 +2796,7 @@ def _malicious_envelopes(genuine: schema.ColdSealedEnvelope) -> dict[str, object
         "extra_key": extra_key,
         "pydantic_extra_dict": non_empty_extra,
         "hostile_key": hostile_key,
+        "renamed_key": renamed_key,
         "not_a_model": dict(data),
     }
 
