@@ -158,6 +158,16 @@ def _utf8_size(value: str) -> int | None:
         return None
 
 
+def _within_text_length(value: str) -> bool:
+    """Whether an exact string's length can fit the text byte bound.
+
+    Every code point encodes to at least one UTF-8 byte, so a string longer than
+    ``MAX_TEXT_FIELD_BYTES`` characters is over the byte bound; refusing it here
+    keeps an oversized candidate away from stripping, encoding, and parsing.
+    """
+    return len(value) <= MAX_TEXT_FIELD_BYTES
+
+
 def _canonical_text(value: object) -> str:
     """Return the store's canonical JSON text for an already admitted value."""
     return json.dumps(
@@ -248,7 +258,9 @@ class _ColdAdvisoryAttemptBase(pydantic.BaseModel):
     @classmethod
     def _require_utc_instant(cls, value: object) -> object:
         """Refuse anything but an exact bounded UTC instant string (or null)."""
-        if value is None or is_admissible_utc_instant(value):
+        if value is None or (
+            type(value) is str and _within_text_length(value) and is_admissible_utc_instant(value)
+        ):
             return value
         raise ValueError("value must be an exact UTC instant")
 
@@ -305,7 +317,7 @@ class _ColdAdvisoryAttemptBase(pydantic.BaseModel):
     @classmethod
     def _require_label(cls, value: object) -> object:
         """Refuse anything but an exact, bounded, encodable, non-blank ``str``."""
-        if type(value) is str and value.strip():
+        if type(value) is str and _within_text_length(value) and value.strip():
             size = _utf8_size(value)
             if size is not None and size <= MAX_TEXT_FIELD_BYTES:
                 return value
@@ -319,7 +331,7 @@ class _ColdAdvisoryAttemptBase(pydantic.BaseModel):
         """Refuse anything but an exact, bounded, encodable ``str`` (or null)."""
         if value is None:
             return value
-        if type(value) is str:
+        if type(value) is str and _within_text_length(value):
             size = _utf8_size(value)
             if size is not None and size <= MAX_TEXT_FIELD_BYTES:
                 return value

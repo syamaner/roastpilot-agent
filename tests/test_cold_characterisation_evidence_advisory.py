@@ -468,7 +468,65 @@ def test_presence_matrix_refuses_at_both_layers(
         Resolution.model_validate(values, strict=True)
     forged = base.model_copy(update=update)
     expect_evidence(NOT_VALIDATED, lambda: advisory.validate_advisory_attempt_record(forged))
-    assert label
+
+
+_EVALUATION_PAYLOAD_NULLS: dict[str, object] = {
+    "evaluation_rule": None,
+    "evaluation_verdict": None,
+    "evaluation_input_heat": None,
+    "evaluation_input_fan": None,
+    "evaluation_adjusted_heat": None,
+    "evaluation_adjusted_fan": None,
+    "evaluation_reason": None,
+}
+
+
+def _evaluation_state_cases() -> list[
+    tuple[str, advisory.ColdAdvisoryResolution, dict[str, object]]
+]:
+    """Return breaches only the evaluation-state presence rule can refuse."""
+    cases: list[tuple[str, advisory.ColdAdvisoryResolution, dict[str, object]]] = [
+        (
+            f"{kind.value}-state-not-recorded",
+            kind,
+            {"evaluation_state": EvaluationState.NOT_RECORDED},
+        )
+        for kind in NON_DECISION_KINDS
+    ]
+    cases.append(
+        (
+            "returned_decision-state-and-payload-null",
+            Kind.RETURNED_DECISION,
+            {"evaluation_state": None, **_EVALUATION_PAYLOAD_NULLS},
+        )
+    )
+    return cases
+
+
+_EVALUATION_STATE_CASES = _evaluation_state_cases()
+
+
+@pytest.mark.parametrize(
+    ("kind", "update"),
+    [(case[1], case[2]) for case in _EVALUATION_STATE_CASES],
+    ids=[case[0] for case in _EVALUATION_STATE_CASES],
+)
+def test_evaluation_state_presence_is_refused_in_isolation(
+    tmp_path: Path, kind: advisory.ColdAdvisoryResolution, update: dict[str, object]
+) -> None:
+    """R1-B: the evaluation state alone breaks the matrix; every other field stays valid."""
+    base = resolve(header_for(tmp_path, str(tmp_path.resolve()), OFF), 0, kind)
+    assert advisory.validate_advisory_attempt_record(base) == base
+    values = {**raw(base), **update}
+    changed = {name for name, value in raw(base).items() if values[name] is not value}
+    assert changed <= set(update)
+    if kind is not Kind.RETURNED_DECISION:
+        assert set(update) == {"evaluation_state"}
+        assert all(values[name] is None for name in _EVALUATION_PAYLOAD_NULLS)
+    with pytest.raises(pydantic.ValidationError):
+        Resolution.model_validate(values, strict=True)
+    forged = base.model_copy(update=update)
+    expect_evidence(NOT_VALIDATED, lambda: advisory.validate_advisory_attempt_record(forged))
 
 
 def test_not_invoked_order_is_inclusive(tmp_path: Path) -> None:
@@ -1140,6 +1198,131 @@ def test_a_non_utc_invocation_instant_refuses(tmp_path: Path) -> None:
             record.model_copy(update={"invocation_utc": "2026-09-26T13:00:00+01:00"})
         ),
     )
+
+
+def _count_candidate_calls(
+    monkeypatch: pytest.MonkeyPatch, name: str, candidate: str
+) -> list[object]:
+    """Wrap one module helper, recording only the calls that receive ``candidate``."""
+    original: typing.Callable[[typing.Any], typing.Any] = getattr(advisory, name)
+    seen: list[object] = []
+
+    def counting(value: typing.Any) -> typing.Any:
+        if value is candidate:
+            seen.append(value)
+        return original(value)
+
+    monkeypatch.setattr(advisory, name, counting)
+    return seen
+
+
+def _text_candidate(field: str, unit: str, count: int) -> str:
+    """Assemble one distinct runtime string for a single field."""
+    return field + "-" + unit * (count - len(field) - 1)
+
+
+def _build_with_text(header: schema.ColdRunHeader, field: str, candidate: str) -> object:
+    """Call the builder that owns ``field`` with only that field replaced."""
+    if field in {"profile_name", "provider", "model", "prompt_version"}:
+        labels: dict[str, typing.Any] = {field: candidate}
+        return intend(header, **labels)
+    if field == "intent_recorded_at_utc":
+        return intend(header, recorded_at_utc=candidate)
+    if field in {"rule", "reason"}:
+        fields: dict[str, typing.Any] = {**raw(evaluation()), field: candidate}
+        carrier = schema.ColdSafetyEvaluation.model_construct(**fields)
+        return resolve(header, 0, evaluation=carrier)
+    instants: dict[str, typing.Any] = {
+        "recorded_at_utc": T0,
+        "invocation_utc": T0,
+        "resolved_utc": T0,
+        field: candidate,
+    }
+    return advisory.build_advisory_resolution_record(
+        header=header,
+        attempt_index=0,
+        monotonic_seconds=13.0,
+        resolution=Kind.RETURNED_DECISION,
+        invocation_monotonic=11.0,
+        resolved_monotonic=12.0,
+        **instants,
+        **decision_payload(),
+    )
+
+
+_LABEL_FIELDS = ("profile_name", "provider", "model", "prompt_version", "rule", "reason")
+_UTC_FIELDS = ("intent_recorded_at_utc", "recorded_at_utc", "invocation_utc", "resolved_utc")
+_BOUND = schema.MAX_TEXT_FIELD_BYTES
+
+
+@pytest.mark.parametrize("field", [*_LABEL_FIELDS, *_UTC_FIELDS])
+def test_oversized_text_never_reaches_encoding_or_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    """R1-A: a string over the bound in characters is refused before encoding or parsing."""
+    off = header_for(tmp_path, str(tmp_path.resolve()), OFF)
+    helper = "is_admissible_utc_instant" if field in _UTC_FIELDS else "_utf8_size"
+    oversized = _text_candidate(field, "x", _BOUND + 1)
+    assert type(oversized) is str and len(oversized) == _BOUND + 1
+    seen = _count_candidate_calls(monkeypatch, helper, oversized)
+    expect_evidence(NOT_VALIDATED, lambda: _build_with_text(off, field, oversized))
+    assert seen == []
+
+
+@pytest.mark.parametrize("field", [*_LABEL_FIELDS, *_UTC_FIELDS])
+def test_multibyte_text_at_the_length_bound_still_meets_the_byte_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    """R1-A: a string at the bound in characters is still checked, and refused, by bytes."""
+    off = header_for(tmp_path, str(tmp_path.resolve()), OFF)
+    helper = "is_admissible_utc_instant" if field in _UTC_FIELDS else "_utf8_size"
+    multibyte = _text_candidate(field, "€", _BOUND)
+    assert len(multibyte) == _BOUND and len(multibyte.encode()) > _BOUND
+    seen = _count_candidate_calls(monkeypatch, helper, multibyte)
+    expect_evidence(NOT_VALIDATED, lambda: _build_with_text(off, field, multibyte))
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("field", _LABEL_FIELDS)
+def test_text_at_the_byte_bound_is_admitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    """R1-A: an exact string of exactly the byte bound is admitted unchanged."""
+    off = header_for(tmp_path, str(tmp_path.resolve()), OFF)
+    exact = _text_candidate(field, "y", _BOUND)
+    seen = _count_candidate_calls(monkeypatch, "_utf8_size", exact)
+    if field == "profile_name":
+        record = intend(off, profile_name=exact, context={**CONTEXT, "profile_name": exact})
+    else:
+        record = _build_with_text(off, field, exact)
+    assert exact in raw(typing.cast(pydantic.BaseModel, record)).values()
+    assert seen
+
+
+@pytest.mark.parametrize("field", ["invocation_utc", "rationale"])
+def test_null_optional_text_stays_admitted(tmp_path: Path, field: str) -> None:
+    """R1-A: the length pre-check leaves null optional text admitted."""
+    off = header_for(tmp_path, str(tmp_path.resolve()), OFF)
+    if field == "invocation_utc":
+        record = resolve(off, 0, Kind.UNRESOLVED_AT_PHASE_END, invoked=False)
+    else:
+        record = resolve(off, 0, Kind.ABANDONED_AFTER_BOUND, rationale=None)
+    assert getattr(record, field) is None
+    assert advisory.validate_advisory_attempt_record(record) == record
+
+
+def test_oversized_retained_rationale_never_reaches_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1-A sweep: a forged retained rationale over the bound is refused before encoding."""
+    record = resolve(header_for(tmp_path, str(tmp_path.resolve()), OFF), 0)
+    oversized = _text_candidate("rationale", "x", _BOUND + 1)
+    seen = _count_candidate_calls(monkeypatch, "_utf8_size", oversized)
+    with pytest.raises(pydantic.ValidationError):
+        Resolution.model_validate({**raw(record), "rationale": oversized}, strict=True)
+    forged = record.model_copy(update={"rationale": oversized})
+    expect_evidence(NOT_VALIDATED, lambda: advisory.validate_advisory_attempt_record(forged))
+    assert seen == []
 
 
 class _Foreign(enum.Enum):
