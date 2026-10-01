@@ -457,15 +457,21 @@ class RecordingSink:
         *,
         refuse: Callable[[Record], BaseException | None] | None = None,
         on_append: Callable[[Record], object] | None = None,
+        returns: Callable[[Record], object] | None = None,
     ) -> None:
         self.inner = inner
         self.refuse = refuse
         self.on_append = on_append
+        self.returns = returns
         self.calls: list[Record] = []
         self.records: list[Record] = []
 
     def append_advisory_attempt(self, record: Record) -> None:
-        """Record the call; refuse, forward, keep, then run the hook."""
+        """Record the call; refuse, forward, keep, run the hook, then return any carrier.
+
+        A ``returns`` carrier breaches the port's ``None`` annotation on purpose: the
+        sampler must release it inside its commit region.
+        """
         self.calls.append(record)
         error = None if self.refuse is None else self.refuse(record)
         if error is not None:
@@ -475,6 +481,7 @@ class RecordingSink:
         self.records.append(record)
         if self.on_append is not None:
             self.on_append(record)
+        return typing.cast(None, None if self.returns is None else self.returns(record))
 
     @property
     def intents(self) -> list[Intent]:
@@ -1822,14 +1829,20 @@ async def test_settlement_provider_task_fact(base: Base, pid: str) -> None:
 
 #: One armed finaliser hook (popped exactly once by ``FinalisingRule``).
 FINALISER_HOOKS: list[Callable[[], object]] = []
+#: Exceptions raised by an armed finaliser hook, surfaced by each test's own assertion.
+FINALISER_ERRORS: list[BaseException] = []
 
 
 class FinalisingRule(str):
-    """Port-returned ``str`` data whose finaliser runs one armed hook."""
+    """Port-returned ``str`` data whose finaliser runs one armed hook exactly once."""
 
     def __del__(self) -> None:
         if FINALISER_HOOKS:
-            FINALISER_HOOKS.pop()()
+            hook = FINALISER_HOOKS.pop()
+            try:
+                hook()
+            except BaseException as error:
+                FINALISER_ERRORS.append(error)
 
 
 @pytest.mark.asyncio
@@ -1909,6 +1922,531 @@ async def test_settlement_latch_released_after_base_exception(base: Base) -> Non
     finally:
         event.set()
         await finish(task, rig.clock)
+        await idle()
+
+
+# ------------------------------------------------------------------ commit regions (L9)
+
+
+class HandoverTicks:
+    """A tick port handing its one record over on the first call; it keeps no reference."""
+
+    def __init__(self, record: object) -> None:
+        self.record: object = record
+
+    def latest_retained_tick(self) -> object:
+        """Hand the record over (``None`` afterwards)."""
+        record, self.record = self.record, None
+        return record
+
+
+def carrier_tick(base: Base) -> typing.Any:
+    """An exact retained tick carrying a finalising carrier in its fields-set metadata.
+
+    Validation reads only the declared field values, so the tick validates exactly;
+    the carrier is released only when the sampler drops the raw tick.
+    """
+    copy = base.tick.model_copy()
+    fields_set = {*copy.model_fields_set, FinalisingRule("carrier")}
+    object.__setattr__(copy, "__pydantic_fields_set__", fields_set)
+    return copy
+
+
+def carrier_decision() -> typing.Any:
+    """A returned decision whose rationale is a finalising carrier."""
+    return UNCHECKED_DECISION.model_construct(
+        target_heat=40,
+        target_fan=60,
+        should_drop=False,
+        confidence=0.5,
+        rationale=FinalisingRule("Hold heat."),
+    )
+
+
+def latch_of(rig: Rig) -> object:
+    """White-box: the private commit latch (``None`` where the source has none)."""
+    return getattr(priv(rig.sampler), "_commit_latch", None)
+
+
+def triple(settlement: ColdAdvisorySettlement) -> tuple[Closure, Fact, int]:
+    """A settlement's closure, provider-task fact and resolved count."""
+    return (settlement.closure, settlement.provider_task, settlement.attempts_resolved)
+
+
+def settling_hook(
+    rig: Rig, inner: list[ColdAdvisorySettlement], seen: list[tuple[object, int, int]]
+) -> Callable[[], None]:
+    """Record the latch, depth and accepted-record count at the hook, then settle."""
+
+    def hook() -> None:
+        seen.append((latch_of(rig), priv(rig.sampler)._gate.depth, len(rig.sink.records)))
+        inner.append(rig.sampler.settle_at_phase_end())
+
+    return hook
+
+
+CARRIERS = [
+    "tick",
+    "sink_intent",
+    "sink_resolution",
+    "sink_abandonment",
+    "provider_decision",
+    "run_evaluator",
+]
+
+
+@pytest.mark.parametrize("pid", CARRIERS)
+@pytest.mark.asyncio
+async def test_carrier_finaliser_settlement(base: Base, pid: str) -> None:
+    """A real carrier's finaliser settling inside a commit region is provisional, unstored.
+
+    The carrier is handed to the sampler and released by it; the test keeps no
+    reference.  The provider-return case runs outside every commit region, so its
+    settlement is genuine and the completion is discarded unpublished.
+    """
+    assert (FINALISER_HOOKS, FINALISER_ERRORS) == ([], [])
+    event = asyncio.Event()
+    holder: list[Rig] = []
+    inner: list[ColdAdvisorySettlement] = []
+    seen: list[tuple[object, int, int]] = []
+    evaluations = [0]
+
+    def arm() -> None:
+        FINALISER_HOOKS.append(settling_hook(holder[0], inner, seen))
+
+    def returned(kind: type) -> Callable[[Record], object]:
+        def give(record: Record) -> object:
+            if type(record) is not kind:
+                return None
+            arm()
+            return FinalisingRule("returned")
+
+        return give
+
+    def evaluate(kwargs: dict[str, typing.Any]) -> object:
+        evaluations[0] += 1
+        if evaluations[0] == 1:
+            arm()
+        return UNCHECKED_EVALUATION.model_construct(
+            rule=FinalisingRule("r") if evaluations[0] == 1 else "r",
+            verdict=SafetyVerdict.ALLOW,
+            input_heat=kwargs["requested_heat"],
+            input_fan=kwargs["requested_fan"],
+            adjusted_heat=None,
+            adjusted_fan=None,
+            reason="x",
+        )
+
+    overrides: dict[str, typing.Any] = {"configured_dwell_seconds": MAX}
+    if pid == "tick":
+        overrides["ticks"] = HandoverTicks(carrier_tick(base))
+    elif pid == "sink_intent":
+        overrides["sink"] = RecordingSink(returns=returned(Intent))
+    elif pid in {"sink_resolution", "sink_abandonment"}:
+        overrides["sink"] = RecordingSink(returns=returned(Resolution))
+    elif pid == "run_evaluator":
+        overrides["evaluator"] = DoubleEvaluator(evaluate)
+    if pid == "provider_decision":
+        rig = make(base, acts=[Act(value=carrier_decision())], **overrides)
+    elif pid == "sink_abandonment":
+        rig = make(base, acts=[Act("block", event=event)], **overrides)
+    else:
+        rig = make(base, **overrides)
+    del overrides
+    holder.append(rig)
+    if pid in {"tick", "provider_decision"}:
+        arm()
+    task = start(rig)
+    try:
+        if pid == "sink_abandonment":
+            await drive(rig.clock, OPEN)
+            rig.clock.jump(5.0)
+            await drive_until(task.done)
+        else:
+            await drive(rig.clock, 1800.0)
+        assert task.done()
+        assert (FINALISER_HOOKS, FINALISER_ERRORS) == ([], [])
+        assert len(inner) == 1
+        if pid == "provider_decision":
+            assert triple(inner[0]) == (Closure.RECORDED_UNRESOLVED_INVOKED, Fact.OUTSTANDING, 1)
+            assert priv(rig.sampler)._settlement is inner[0]
+        else:
+            assert inner[0].closure is Closure.NOT_RECORDED_REENTRANT
+            assert priv(rig.sampler)._settlement is None
+        assert task.result().stop is Stop.SETTLED
+        await drive_until(lambda: provider_settled(rig))
+        kinds = [record.resolution for record in rig.sink.resolutions]
+        if pid == "tick":
+            assert rig.sink.calls == []
+            assert priv(rig.sampler)._task is None
+            expected, moment = (Closure.NO_OPEN_ATTEMPT, Fact.NONE, 0), (True, 0, 0)
+        elif pid == "sink_intent":
+            assert [type(record) for record in rig.sink.records] == [Intent]
+            assert priv(rig.sampler)._task is None
+            assert (rig.advisor.getter_reads, rig.advisor.entries) == (0, [])
+            expected = (Closure.RECORDED_UNRESOLVED_NOT_INVOKED, Fact.NONE, 1)
+            moment = (True, 0, 1)
+        elif pid == "sink_resolution":
+            assert kinds == [Kind.RETURNED_DECISION]
+            assert len(rig.evaluator.calls) == 1
+            expected, moment = (Closure.NO_OPEN_ATTEMPT, Fact.COMPLETED, 1), (True, 0, 2)
+        elif pid == "sink_abandonment":
+            assert kinds == [Kind.ABANDONED_AFTER_BOUND]
+            assert rig.advisor.cancels == 1
+            expected = (Closure.NO_OPEN_ATTEMPT, Fact.ENDED_WITHOUT_OUTCOME, 1)
+            moment = (True, 0, 2)
+        elif pid == "provider_decision":
+            cell = provider_cell(rig)
+            assert (cell.discarded_after_settlement, cell.outcome) == (True, None)
+            assert kinds == [Kind.UNRESOLVED_AT_PHASE_END]
+            expected, moment = triple(inner[0]), (False, 0, 1)
+        else:
+            assert kinds == []
+            expected, moment = (Closure.RECORDED_COMPLETED_CALL, Fact.COMPLETED, 1), (True, 0, 1)
+        settled = rig.sampler.settle_at_phase_end()
+        assert triple(settled) == expected
+        assert rig.sampler.settle_at_phase_end() is settled
+        if pid == "run_evaluator":
+            assert [record.resolution for record in rig.sink.resolutions] == [
+                Kind.RETURNED_DECISION
+            ]
+            assert len(rig.evaluator.calls) == 2
+        assert seen == [moment]
+    finally:
+        event.set()
+        await finish(task, rig.clock)
+        FINALISER_HOOKS.clear()
+        await idle()
+
+
+Matcher = Callable[[typing.Any, str, object], bool]
+
+
+class CallBoundary:
+    """Test-scoped ``sys.setprofile`` injection at exact call boundaries.
+
+    Each stage fires once, in order.  Profiling is removed before a stage's action
+    runs and re-installed only for a later stage; the previous profiler is restored
+    on exit.  A call-boundary injection stands in for depth-zero reentry at that
+    boundary; it is not proof that CPython's garbage collector ran there.
+    """
+
+    def __init__(self, *stages: tuple[Matcher, Callable[[], object]]) -> None:
+        self.stages = list(stages)
+        self.fired = 0
+        self.errors: list[BaseException] = []
+        self.previous: typing.Any = None
+
+    def __enter__(self) -> "CallBoundary":
+        self.previous = sys.getprofile()
+        sys.setprofile(self._profile)
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        sys.setprofile(self.previous)
+
+    def _profile(self, frame: typing.Any, event: str, arg: object) -> None:
+        if not self.stages or not self.stages[0][0](frame, event, arg):
+            return
+        sys.setprofile(self.previous)
+        _, action = self.stages.pop(0)
+        self.fired += 1
+        try:
+            action()
+        except BaseException as error:
+            self.errors.append(error)
+        if self.stages:
+            sys.setprofile(self._profile)
+
+
+def _code(name: str) -> object:
+    """A private sampler method's code object (``None`` where the source lacks it)."""
+    return getattr(getattr(ColdAdvisorySampler, name, None), "__code__", None)
+
+
+def _region(frame: typing.Any) -> object:
+    """The function of the bound region handed to the private latch wrapper, if any."""
+    return getattr(frame.f_locals.get("region"), "__func__", None)
+
+
+def _caller(frame: typing.Any) -> object:
+    return getattr(frame.f_back, "f_code", None)
+
+
+def _boundary(pid: str) -> Matcher:
+    """The exact call boundary each injection targets."""
+    intent = advisory.build_advisory_intent_record.__code__
+    resolution = advisory.build_advisory_resolution_record.__code__
+    abandon = getattr(ColdAdvisorySampler, "_abandon", None)
+    if pid == "intent_builder":
+        return lambda f, e, a: e == "call" and f.f_code is intent
+    if pid == "run_resolution_builder":
+        return lambda f, e, a: (
+            e == "call" and f.f_code is resolution and _caller(f) is _code("_consume")
+        )
+    if pid == "abandon_entry":
+        return lambda f, e, a: (
+            e == "call"
+            and _caller(f) is _code("_attempts")
+            and (
+                f.f_code is _code("_abandon")
+                or (f.f_code is _code("_latched") and _region(f) is abandon)
+            )
+        )
+    if pid == "abandonment_builder":
+        return lambda f, e, a: (
+            e == "call" and f.f_code is resolution and _caller(f) is _code("_abandon")
+        )
+    if pid in {"intent_entry", "run_consume_entry"}:
+        name = "_open_attempt" if pid == "intent_entry" else "_consume"
+        region = getattr(ColdAdvisorySampler, name, None)
+        return lambda f, e, a: (
+            e == "call"
+            and f.f_code is _code("_latched")
+            and _caller(f) is _code("_attempts")
+            and _region(f) is region
+        )
+    if pid == "task_creation_return":
+        provider = PRIVATE._provider_call.__code__
+        return lambda f, e, a: (
+            e == "return"
+            and f.f_code is asyncio.create_task.__code__
+            and getattr(f.f_locals.get("coro"), "cr_code", None) is provider
+        )
+    provider = PRIVATE._provider_call.__code__
+    return lambda f, e, a: (
+        e == "call" and f.f_code is asyncio.Event.set.__code__ and _caller(f) is provider
+    )
+
+
+def _published(frame: typing.Any, event: str, arg: object) -> bool:
+    """The private latch wrapper returning from the intent region (latch already reset)."""
+    opened = getattr(ColdAdvisorySampler, "_open_attempt", None)
+    return event == "return" and frame.f_code is _code("_latched") and _region(frame) is opened
+
+
+BOUNDARIES = [
+    "intent_entry",
+    "intent_builder",
+    "run_consume_entry",
+    "run_resolution_builder",
+    "abandon_entry",
+    "abandonment_builder",
+    "task_creation_return",
+    "provider_ready",
+]
+
+
+@pytest.mark.parametrize("pid", BOUNDARIES)
+@pytest.mark.asyncio
+async def test_call_boundary_settlement(base: Base, pid: str) -> None:
+    """Settlement injected at an exact commit boundary is provisional or truthful.
+
+    Labelled call-boundary injections (``sys.setprofile``), not GC proof.  Inside a
+    commit region the inner result is provisional and unstored; at the abandonment
+    entry (before the latch) and at the provider's ready notification it is genuine.
+    """
+    event = asyncio.Event()
+    blocking = pid in {"abandon_entry", "abandonment_builder"}
+    acts = [Act("block", event=event)] if blocking else []
+    rig = make(base, acts=acts, configured_dwell_seconds=MAX)
+    inner: list[ColdAdvisorySettlement] = []
+    outer: list[ColdAdvisorySettlement] = []
+    moments: list[object] = []
+
+    def settle_into(box: list[ColdAdvisorySettlement]) -> Callable[[], None]:
+        def action() -> None:
+            moments.append(latch_of(rig))
+            box.append(rig.sampler.settle_at_phase_end())
+
+        return action
+
+    stages = [(_boundary(pid), settle_into(inner))]
+    if pid == "task_creation_return":
+        stages.append((_published, settle_into(outer)))
+    task = start(rig)
+    try:
+        with CallBoundary(*stages) as boundary:
+            if blocking:
+                await drive(rig.clock, OPEN)
+                rig.clock.jump(5.0)
+                await drive_until(task.done)
+            else:
+                await drive(rig.clock, 1800.0)
+        assert boundary.errors == []
+        assert task.done()
+        assert len(inner) == 1
+        sampler = priv(rig.sampler)
+        kinds = [record.resolution for record in rig.sink.resolutions]
+        genuine = {
+            "intent_entry": (Closure.NO_OPEN_ATTEMPT, Fact.NONE, 0),
+            "run_consume_entry": (Closure.RECORDED_COMPLETED_CALL, Fact.COMPLETED, 1),
+            "abandon_entry": (Closure.RECORDED_UNRESOLVED_INVOKED, Fact.OUTSTANDING, 1),
+            "provider_ready": (Closure.RECORDED_UNRESOLVED_NOT_INVOKED, Fact.OUTSTANDING, 1),
+        }
+        if pid in genuine:
+            assert triple(inner[0]) == genuine[pid]
+            assert sampler._settlement is inner[0]
+        else:
+            assert inner[0].closure is Closure.NOT_RECORDED_REENTRANT
+        assert task.result().stop is Stop.SETTLED
+        if pid == "intent_entry":
+            assert (rig.ticks.calls, rig.sink.calls, sampler._task) == (0, [], None)
+            expected, latches = genuine[pid], [False]
+        elif pid == "run_consume_entry":
+            assert (kinds, len(rig.evaluator.calls)) == ([Kind.RETURNED_DECISION], 1)
+            expected, latches = genuine[pid], [False]
+        elif pid == "intent_builder":
+            assert sampler._settlement is None
+            assert (rig.sink.calls, sampler._task) == ([], None)
+            expected, latches = (Closure.NO_OPEN_ATTEMPT, Fact.NONE, 0), [True]
+        elif pid == "run_resolution_builder":
+            assert sampler._settlement is None
+            assert (kinds, len(rig.evaluator.calls)) == ([], 1)
+            expected, latches = (Closure.RECORDED_COMPLETED_CALL, Fact.COMPLETED, 1), [True]
+        elif pid == "abandon_entry":
+            await idle()
+            assert kinds == [Kind.UNRESOLVED_AT_PHASE_END]
+            assert rig.advisor.cancels == 0
+            assert not provider_task(rig).done()
+            expected, latches = triple(inner[0]), [False]
+        elif pid == "abandonment_builder":
+            assert sampler._settlement is None
+            await drive_until(lambda: provider_settled(rig))
+            assert (kinds, rig.advisor.cancels) == ([], 1)
+            expected = (Closure.NOT_RECORDED_COMPLETION_UNKNOWN, Fact.ENDED_WITHOUT_OUTCOME, 0)
+            latches = [True]
+        elif pid == "task_creation_return":
+            assert triple(inner[0]) == (Closure.NOT_RECORDED_REENTRANT, Fact.NONE, 0)
+            assert len(outer) == 1
+            assert triple(outer[0]) == (
+                Closure.RECORDED_UNRESOLVED_NOT_INVOKED,
+                Fact.OUTSTANDING,
+                1,
+            )
+            assert sampler._settlement is outer[0]
+            await drive_until(lambda: provider_settled(rig))
+            assert provider_cell(rig).refusal is PRIVATE._Refusal.SETTLED_BEFORE_DISPATCH
+            assert (rig.advisor.getter_reads, rig.advisor.lookup_reads) == (0, 0)
+            expected, latches = triple(outer[0]), [True, False]
+        else:
+            await drive_until(lambda: provider_settled(rig))
+            cell = provider_cell(rig)
+            assert (cell.invoked, cell.refusal) == (False, PRIVATE._Refusal.SETTLED_BEFORE_DISPATCH)
+            expected, latches = triple(inner[0]), [False]
+        invoked_pids = {
+            "run_consume_entry",
+            "run_resolution_builder",
+            "abandon_entry",
+            "abandonment_builder",
+        }
+        assert rig.advisor.entries == ([OPEN] if pid in invoked_pids else [])
+        settled = rig.sampler.settle_at_phase_end()
+        assert triple(settled) == expected
+        assert rig.sampler.settle_at_phase_end() is settled
+        if pid in {"run_resolution_builder", "run_consume_entry"}:
+            assert [record.resolution for record in rig.sink.resolutions] == [
+                Kind.RETURNED_DECISION
+            ]
+            assert len(rig.evaluator.calls) == (2 if pid == "run_resolution_builder" else 1)
+        assert moments == latches
+        assert boundary.fired == len(latches)
+    finally:
+        event.set()
+        await finish(task, rig.clock)
+        await idle()
+
+
+@pytest.mark.parametrize("pid", ["intent_sink", "run_evaluator"])
+@pytest.mark.asyncio
+async def test_commit_latch_released_after_base_exception(base: Base, pid: str) -> None:
+    """A ``BaseException`` escaping a commit region resets the latch and stores nothing.
+
+    It propagates out of the run; a later outside settlement is genuine and truthful.
+    """
+    armed = [True]
+
+    def evaluate(kwargs: dict[str, typing.Any]) -> object:
+        if armed[0]:
+            raise Abort
+        return SafetyPolicy(SafetyLimits()).evaluate_command(**kwargs)
+
+    if pid == "intent_sink":
+        sink = RecordingSink(
+            refuse=lambda record: Abort() if armed[0] and type(record) is Intent else None
+        )
+        rig = make(base, sink=sink, configured_dwell_seconds=MAX)
+        expected = (Closure.NO_OPEN_ATTEMPT, Fact.NONE, 0)
+    else:
+        rig = make(base, evaluator=DoubleEvaluator(evaluate), configured_dwell_seconds=MAX)
+        expected = (Closure.RECORDED_COMPLETED_CALL, Fact.COMPLETED, 1)
+    task = start(rig)
+    try:
+        await drive(rig.clock, 1800.0)
+        assert task.done()
+        assert not task.cancelled()
+        assert type(task.exception()) is Abort
+        assert priv(rig.sampler)._settlement is None
+        assert latch_of(rig) is False
+        armed[0] = False
+        settled = rig.sampler.settle_at_phase_end()
+        assert triple(settled) == expected
+        assert rig.sampler.settle_at_phase_end() is settled
+    finally:
+        await finish(task, rig.clock)
+        await idle()
+
+
+EAGER: typing.Any = getattr(asyncio, "eager_task_factory", None)
+
+
+@pytest.mark.skipif(EAGER is None, reason="asyncio.eager_task_factory needs Python 3.12+")
+@pytest.mark.asyncio
+async def test_eager_task_factory_publishes_ownership_inside_commit(base: Base) -> None:
+    """Under a real eager task factory the provider runs inside the commit region.
+
+    The advisor is entered during task creation, before ownership publication; a
+    settlement there is provisional, so no false ``NONE`` fact is stored, and the
+    outside settlement records the truthful outstanding invoked call.
+    """
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    event = asyncio.Event()
+    rig = make(base, acts=[Act("block", event=event)], configured_dwell_seconds=MAX)
+    inner: list[ColdAdvisorySettlement] = []
+    seen: list[tuple[object, object]] = []
+
+    def on_enter() -> None:
+        seen.append((latch_of(rig), priv(rig.sampler)._task))
+        inner.append(rig.sampler.settle_at_phase_end())
+
+    rig.advisor.on_enter = on_enter
+    loop.set_task_factory(EAGER)
+    task: asyncio.Task[ColdAdvisorySamplerRun] | None = None
+    try:
+        task = start(rig)
+        await drive(rig.clock, OPEN)
+        await drive_until(task.done)
+        assert len(inner) == 1
+        assert inner[0].closure is Closure.NOT_RECORDED_REENTRANT
+        assert priv(rig.sampler)._settlement is None
+        assert task.result().stop is Stop.SETTLED
+        assert rig.advisor.entries == [OPEN]
+        assert not provider_task(rig).done()
+        settled = rig.sampler.settle_at_phase_end()
+        assert triple(settled) == (Closure.RECORDED_UNRESOLVED_INVOKED, Fact.OUTSTANDING, 1)
+        before = _snapshot(rig)
+        event.set()
+        await drive_until(lambda: provider_task(rig).done())
+        assert _snapshot(rig) == before
+        assert provider_cell(rig).discarded_after_settlement is True
+        assert rig.sampler.settle_at_phase_end() is settled
+        assert seen == [(True, None)]
+    finally:
+        event.set()
+        if task is not None:
+            await finish(task, rig.clock)
+        loop.set_task_factory(previous)
         await idle()
 
 
@@ -2696,6 +3234,7 @@ def _assigns(node: ast.AST, target: str) -> list[ast.Assign]:
 
 def _structural(pid: str) -> None:
     attempts = _function("_attempts")
+    opening = _function("_open_attempt")
     if pid == "session_len_before_encode":
         init = _function("__init__", _class("ColdAdvisorySampler"))
         lengths = [
@@ -2719,14 +3258,16 @@ def _structural(pid: str) -> None:
         [encode] = _calls(label, "encode")
         assert (_line(lengths[0]), lengths[0].col_offset) < (_line(encode), encode.col_offset)
     elif pid == "create_task_after_intent_append":
-        [append] = [c for c in _calls(attempts, "_append") if ast.unparse(c.args[2]) == "intent"]
-        [create] = _calls(attempts, "create_task")
+        [append] = [c for c in _calls(opening, "_append") if ast.unparse(c.args[2]) == "intent"]
+        [create] = _calls(opening, "create_task")
         assert _line(append) < _line(create)
+        assert _calls(attempts, "create_task") == []
     elif pid == "open_bookkeeping_before_gate_check":
-        [append] = [c for c in _calls(attempts, "_append") if ast.unparse(c.args[2]) == "intent"]
-        [assign] = _assigns(attempts, "self._open")
-        check = min(_line(i) for i in _closed_checks(attempts) if _line(i) > _line(append))
-        assert _line(append) < _line(assign) < check
+        [append] = [c for c in _calls(opening, "_append") if ast.unparse(c.args[2]) == "intent"]
+        [assign] = _assigns(opening, "self._open")
+        check = min(_line(i) for i in _closed_checks(opening) if _line(i) > _line(append))
+        [create] = _calls(opening, "create_task")
+        assert _line(append) < _line(assign) < check < _line(create)
     elif pid == "consumed_before_gate_check":
         for name in ("_consume", "_abandon"):
             function = _function(name)
@@ -2741,13 +3282,17 @@ def _structural(pid: str) -> None:
         assert _line(assign) < _line(call)
     elif pid == "may_start_called_before_intent_build":
         [check] = _calls(attempts, "_may_start_attempt")
-        [build] = _calls(attempts, "build_advisory_intent_record")
-        assert _line(check) < _line(build)
+        [commit] = [c for c in _calls(attempts, "_latched") if _region_of(c) == "_open_attempt"]
+        assert _line(check) < _line(commit)
+        assert len(_calls(opening, "build_advisory_intent_record")) == 1
+        assert _calls(attempts, "build_advisory_intent_record") == []
     elif pid == "settle_has_no_await":
-        for name in ("settle_at_phase_end", "_terminal", "_consume", "_task_fact"):
+        for name in ("settle_at_phase_end", "_terminal", "_consume", "_task_fact", *REGIONS):
             function = _function(name)
             assert isinstance(function, ast.FunctionDef)
             assert not any(isinstance(n, ast.Await) for n in ast.walk(function))
+    elif pid in L9_STRUCTURAL:
+        _structural_l9(pid)
     elif pid == "retire_awaited_in_finally":
         waiter = _function("_await_waiter")
         finals = [n.finalbody for n in ast.walk(waiter) if isinstance(n, ast.Try) and n.finalbody]
@@ -2842,6 +3387,129 @@ def _structural(pid: str) -> None:
         )
 
 
+#: Synchronous commit regions and the latch wrapper that runs them.
+REGIONS = ("_latched", "_open_attempt", "_consume", "_abandon", "_context")
+L9_STRUCTURAL = (
+    "commit_regions_run_only_under_latch",
+    "latch_reset_in_finally",
+    "region_entry_gate_checks",
+    "pre_append_gate_checks",
+    "provider_final_gate_order",
+    "release_before_outcome_publication",
+    "settlement_guard_includes_commit_latch",
+)
+
+
+def _region_of(call: ast.Call) -> str:
+    """The ``self.<region>`` method name handed to the private latch wrapper."""
+    first = call.args[0]
+    return first.attr if isinstance(first, ast.Attribute) else ""
+
+
+def _stmts(body: list[ast.stmt]) -> list[str]:
+    return [ast.unparse(statement) for statement in body]
+
+
+def _preceding(function: ast.AST, call: ast.Call) -> str:
+    """The source of the statement directly preceding the one containing ``call``."""
+    for node in ast.walk(function):
+        raw: object = getattr(node, "body", None)
+        if not isinstance(raw, list):
+            continue
+        body = typing.cast(list[ast.stmt], raw)
+        for index, statement in enumerate(body):
+            if call in list(ast.walk(statement)) and index and isinstance(statement, ast.Expr):
+                return ast.unparse(body[index - 1])
+    raise AssertionError("call not found as a statement")
+
+
+def _structural_l9(pid: str) -> None:
+    if pid == "commit_regions_run_only_under_latch":
+        for name in ("_open_attempt", "_consume", "_abandon"):
+            direct = [c for c in _calls(TREE, name) if isinstance(c.func, ast.Attribute)]
+            assert direct == [], name
+        regions = sorted(_region_of(c) for c in _calls(TREE, "_latched"))
+        assert regions == ["_abandon", "_consume", "_consume", "_open_attempt"]
+        [context] = _calls(TREE, "_context")
+        assert context in list(ast.walk(_function("_open_attempt")))
+        for name in REGIONS:
+            function = _function(name)
+            assert isinstance(function, ast.FunctionDef), name
+            assert not any(isinstance(n, ast.Await | ast.Yield) for n in ast.walk(function))
+        assert _calls(_function("_open_attempt"), "add_done_callback")
+        assert _assigns(_function("_open_attempt"), "(self._task, self._task_cell)")
+    elif pid == "latch_reset_in_finally":
+        body = _function("_latched").body
+        assert _stmts(body[1:]) == [
+            "self._commit_latch = True",
+            "try:\n    return region(*args, **kwargs)\nfinally:\n    self._commit_latch = False",
+        ]
+        writers = [
+            name
+            for name in ("__init__", "_latched", "_attempts", *REGIONS[1:], "_terminal")
+            for _ in _assigns(
+                _function(name, _class("ColdAdvisorySampler"))
+                if name == "__init__"
+                else _function(name),
+                "self._commit_latch",
+            )
+        ]
+        assert writers == ["__init__", "_latched", "_latched"]
+    elif pid == "region_entry_gate_checks":
+        for name in ("_open_attempt", "_abandon"):
+            body = _function(name).body
+            assert _stmts(body[1:3]) == [
+                "stops, gate = (ColdAdvisorySamplerStop, self._gate)",
+                "if gate.closed:\n    return stops.SETTLED",
+            ], name
+        abandon = _function("_abandon")
+        [cancel] = _calls(abandon, "cancel")
+        assert _line(abandon.body[2]) < _line(cancel)
+        assert _stmts(_function("_consume").body[3:4]) == [
+            "if run_owned and gate.closed:\n    return _ConsumeResult.STOPPED_GATE"
+        ]
+    elif pid == "pre_append_gate_checks":
+        expected = {
+            "_open_attempt": "if gate.closed:\n    return stops.SETTLED",
+            "_abandon": "if gate.closed:\n    return stops.SETTLED",
+            "_consume": "if run_owned and gate.closed:\n    return _ConsumeResult.STOPPED_GATE",
+        }
+        for name, check in expected.items():
+            function = _function(name)
+            [append] = _calls(function, "_append")
+            assert _preceding(function, append) == check, name
+    elif pid == "provider_final_gate_order":
+        body = typing.cast(ast.Try, _function("_provider_call").body[1]).body
+        texts = _stmts(body)
+        start = texts.index("cell.ready.set()")
+        assert texts[start : start + 6] == [
+            "cell.ready.set()",
+            "if gate.closed:\n    cell.refusal = _Refusal.SETTLED_BEFORE_DISPATCH\n    return",
+            "cell.invocation = invocation",
+            "cell.deadline = deadline",
+            "cell.invoked = True",
+            "try:\n    decision = await method(context)\nexcept Exception as error:\n"
+            "    kind = _classify(type(error))\n    del error",
+        ]
+        assert texts.count("cell.ready.set()") == 1
+    elif pid == "release_before_outcome_publication":
+        body = typing.cast(ast.Try, _function("_provider_call").body[1]).body
+        assert _stmts(body[-4:]) == [
+            "outcome = _admit_outcome(kind, decision, pre, post, resolved)",
+            "del decision, pre, post, method",
+            "if gate.closed:\n    cell.discarded_after_settlement = True\n    return",
+            "cell.outcome = outcome",
+        ]
+        assert len(_assigns(_function("_provider_call"), "cell.outcome")) == 1
+    else:
+        guards = [
+            ast.unparse(i.test)
+            for i in ast.walk(_function("settle_at_phase_end"))
+            if isinstance(i, ast.If) and "depth" in ast.unparse(i.test)
+        ]
+        assert guards == ["gate.depth > 0 or self._settling or self._commit_latch"]
+
+
 def _class(name: str) -> ast.ClassDef:
     return next(n for n in ast.walk(TREE) if isinstance(n, ast.ClassDef) and n.name == name)
 
@@ -2863,6 +3531,7 @@ STRUCTURAL = [
     "no_public_owner_parameter",
     "ready_set_in_finally",
     "retire_never_receives_provider_task",
+    *L9_STRUCTURAL,
 ]
 
 
@@ -2948,24 +3617,53 @@ def _scrubbed_environment() -> dict[str, str]:
     }
 
 
-@pytest.mark.slow
-def test_sampler_import_loads_no_application_actuator_module() -> None:
-    """A fresh interpreter importing the sampler loads no application actuator module.
+IMPORT_PROBE = """
+import json, sys
+names = NAMES
+def loaded():
+    return sorted(name for name in names if name in sys.modules)
+import roastpilot_agent.cold_characterisation.advisory_sampler as sampler
+after_sampler = loaded()
+import roastpilot_agent.controller
+print(json.dumps({
+    "isolated": sys.flags.isolated,
+    "no_bytecode": sys.flags.dont_write_bytecode,
+    "pycache_prefix": sys.pycache_prefix,
+    "prefix": sys.prefix,
+    "file": sampler.__file__,
+    "origin": sampler.__spec__.origin,
+    "loaded": after_sampler,
+    "control": loaded(),
+}))
+"""
 
-    Third-party ``mcp`` may load through existing provider SDK dependencies; an imported
-    SDK package is not an injected MCP or actuator capability and is not asserted here.
+
+@pytest.mark.slow
+def test_sampler_import_loads_no_application_actuator_module(tmp_path: Path) -> None:
+    """A fresh isolated interpreter importing the sampler loads no application actuator.
+
+    The probe runs with ``-I -B``, an explicit temporary pycache prefix, a temporary
+    working directory and a scrubbed environment; it must import this tested source
+    under the launching interpreter's prefix and write no bytecode.  Importing the
+    controller afterwards is the positive control proving the detector sees an
+    application module.  Third-party ``mcp`` may load through existing provider SDK
+    dependencies; an imported SDK package is not an injected MCP or actuator
+    capability and is not asserted here.
     """
-    code = (
-        "import json, sys\n"
-        "import roastpilot_agent.cold_characterisation.advisory_sampler\n"
-        f"names = {list(APPLICATION_MODULES)!r}\n"
-        "print(json.dumps({'sampler': "
-        "'roastpilot_agent.cold_characterisation.advisory_sampler' in sys.modules, "
-        "'loaded': sorted(n for n in names if n in sys.modules)}))\n"
-    )
+    pycache, cwd = tmp_path / "pycache", tmp_path / "cwd"
+    pycache.mkdir()
+    cwd.mkdir()
     completed = subprocess.run(
-        [sys.executable, "-I", "-c", code],
-        cwd=Path(__file__).resolve().parents[1],
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-X",
+            f"pycache_prefix={pycache}",
+            "-c",
+            IMPORT_PROBE.replace("NAMES", repr(list(APPLICATION_MODULES))),
+        ],
+        cwd=cwd,
         env=_scrubbed_environment(),
         capture_output=True,
         text=True,
@@ -2973,7 +3671,16 @@ def test_sampler_import_loads_no_application_actuator_module() -> None:
         check=False,
     )
     assert completed.returncode == 0, completed.stderr[-500:]
-    assert json.loads(completed.stdout) == {"sampler": True, "loaded": []}
+    report = json.loads(completed.stdout)
+    assert (report["isolated"], report["no_bytecode"]) == (1, 1)
+    prefix = report["pycache_prefix"]
+    assert prefix is not None and Path(prefix).resolve() == pycache.resolve()
+    assert Path(report["prefix"]).resolve() == Path(sys.prefix).resolve()
+    assert Path(report["file"]).resolve() == SOURCE.resolve()
+    assert Path(report["origin"]).resolve() == SOURCE.resolve()
+    assert report["loaded"] == []
+    assert "roastpilot_agent.controller" in report["control"]
+    assert sorted(path.name for path in pycache.rglob("*")) == []
 
 
 def test_import_and_capability_fence() -> None:

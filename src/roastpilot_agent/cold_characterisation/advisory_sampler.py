@@ -303,6 +303,7 @@ class _ConsumeResult(enum.Enum):
 
 
 _T = typing.TypeVar("_T")
+_P = typing.ParamSpec("_P")
 _Instant: typing.TypeAlias = tuple[float, str]
 _ABSENT: typing.Final = object()
 _SPEC_NAMES = (
@@ -591,10 +592,15 @@ async def _provider_call(
         if not math.isfinite(deadline):
             cell.refusal = _Refusal.DEADLINE_NOT_FINITE
             return
-        cell.invocation, cell.deadline, cell.invoked = invocation, deadline, True
-        cell.ready.set()
         kind = ColdAdvisoryResolution.RETURNED_DECISION
         decision: object = None
+        cell.ready.set()
+        if gate.closed:
+            cell.refusal = _Refusal.SETTLED_BEFORE_DISPATCH
+            return
+        cell.invocation = invocation
+        cell.deadline = deadline
+        cell.invoked = True
         try:
             decision = await method(context)
         except Exception as error:
@@ -614,8 +620,12 @@ async def _provider_call(
         if gate.closed:
             cell.discarded_after_settlement = True
             return
-        cell.outcome = _admit_outcome(kind, decision, pre, post, resolved)
-        del decision, pre, post
+        outcome = _admit_outcome(kind, decision, pre, post, resolved)
+        del decision, pre, post, method
+        if gate.closed:
+            cell.discarded_after_settlement = True
+            return
+        cell.outcome = outcome
     finally:
         cell.ready.set()
 
@@ -765,6 +775,7 @@ class ColdAdvisorySampler:
             self._task_cell: _CallCell | None = None
             self._ran = False
             self._settling = False
+            self._commit_latch = False
             self._attempts_resolved = 0
             self._advisor, self._evaluator, self._sink = advisor, evaluator, sink
             self._ticks, self._clock = ticks, clock
@@ -779,6 +790,18 @@ class ColdAdvisorySampler:
             failure = ColdAdvisorySamplerRefusedError()
         if failure is not None:
             raise failure
+
+    def _latched(self, region: typing.Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs) -> _T:
+        """Run one synchronous commit region under the commit latch, reset on any exit.
+
+        A settlement made while the latch is set (including from a carrier released
+        inside the region) is provisional and unstored.
+        """
+        self._commit_latch = True
+        try:
+            return region(*args, **kwargs)
+        finally:
+            self._commit_latch = False
 
     def _context(self, now: float) -> tuple[ColdTickRecord, AdvisorContext] | _Gated | None:
         """Project the latest admitted retained tick into a fixed before-charge context."""
@@ -867,44 +890,13 @@ class ColdAdvisorySampler:
                     return stops.CLOCK_INVALID
             if not _may_start_attempt(self._task):
                 return stops.STOPPED_AFTER_ABANDONMENT
-            built = self._context(now[0])
-            if built is _Gated.CLOSED:
-                return stops.SETTLED
-            if built is None:
-                return stops.CONTEXT_UNAVAILABLE
-            tick, context = built
-            spec, descriptor = self._spec, self._descriptor
-            try:
-                intent = build_advisory_intent_record(
-                    header=self._header,
-                    attempt_index=index,
-                    recorded_at_utc=now[1],
-                    monotonic_seconds=now[0],
-                    context_tick=tick.tick,
-                    context_tick_monotonic=tick.monotonic_seconds,
-                    context=context.model_dump(mode="json"),
-                    profile_name=spec.profile_name,
-                    target_drop_temp_c=spec.target_drop_temp_c,
-                    charge_guidance_min_c=spec.charge_guidance_min_c,
-                    charge_guidance_max_c=spec.charge_guidance_max_c,
-                    provider=descriptor[0],
-                    model=descriptor[1],
-                    prompt_version=descriptor[2],
-                    configured_call_bound_seconds=self._bound,
-                    configured_dwell_seconds=self._dwell,
-                )
-                _append(gate, self._sink, intent)
-            except Exception:
-                return stops.INTENT_NOT_APPENDED
-            cell = _CallCell()
-            self._open = (index, cell)
+            opened = self._latched(self._open_attempt, index, now)
+            if opened is not None:
+                return opened
             if gate.closed:
                 return stops.SETTLED
-            task = asyncio.create_task(
-                _provider_call(self._advisor, context, floor, gate, close, self._bound, cell)
-            )
-            task.add_done_callback(_discard_task_exception)
-            self._task, self._task_cell = task, cell
+            task = typing.cast("asyncio.Task[None]", self._task)
+            cell = typing.cast(_CallCell, self._task_cell)
             while cell.refusal is None and not task.done() and not cell.invoked:
                 woke = await _await_waiter(cell.ready.wait, task)
                 if gate.closed:
@@ -919,16 +911,16 @@ class ColdAdvisorySampler:
                     return stops.CLOCK_INVALID
                 deadline = typing.cast(float, cell.deadline)
                 if sample[0] >= deadline:
-                    return self._abandon(task, cell, index, sample)
+                    return self._latched(self._abandon, task, cell, index, sample)
                 woke = await _await_waiter(_sleeper(clock, deadline - sample[0]), task)
                 if gate.closed:
                     return stops.SETTLED
                 if not woke:
                     return stops.CLOCK_INVALID
             if cell.refusal is not None:
-                # Unreachable while the post-wake gate check above holds: this refusal is
-                # only ever set with the gate already closed.  Kept as the contract's
-                # explicit mapping rather than relying on that ordering.
+                # Unreachable while the gate checks above hold: this refusal is only set
+                # with the gate closed, which a lazy start meets at the post-wake check
+                # and an eager start at the post-region check.  Kept as the explicit map.
                 if cell.refusal is _Refusal.SETTLED_BEFORE_DISPATCH:  # pragma: no cover
                     return stops.SETTLED
                 return stops.NOT_INVOKED
@@ -937,7 +929,7 @@ class ColdAdvisorySampler:
                 return stops.PROVIDER_TASK_ENDED_WITHOUT_OUTCOME
             if outcome.resolved is None:
                 return stops.CLOCK_INVALID
-            consumed = self._consume(cell, outcome, _Owner.RUN)
+            consumed = self._latched(self._consume, cell, outcome, _Owner.RUN)
             if consumed is _ConsumeResult.STOPPED_GATE:
                 return stops.SETTLED
             if consumed is _ConsumeResult.CLOCK_INVALID:
@@ -948,10 +940,70 @@ class ColdAdvisorySampler:
             if not due <= close:
                 return stops.WINDOW_EXHAUSTED
 
+    def _open_attempt(self, index: int, now: _Instant) -> ColdAdvisorySamplerStop | None:
+        """Project, build, append and bookkeep one intent, then start its provider task.
+
+        A synchronous commit region run under the latch: ``None`` means the task was
+        created and published; once the gate is observed closed no task is created.
+        """
+        stops, gate = ColdAdvisorySamplerStop, self._gate
+        if gate.closed:
+            return stops.SETTLED
+        built = self._context(now[0])
+        if built is _Gated.CLOSED:
+            return stops.SETTLED
+        if built is None:
+            return stops.CONTEXT_UNAVAILABLE
+        tick, context = built
+        spec, descriptor = self._spec, self._descriptor
+        cell = _CallCell()
+        try:
+            intent = build_advisory_intent_record(
+                header=self._header,
+                attempt_index=index,
+                recorded_at_utc=now[1],
+                monotonic_seconds=now[0],
+                context_tick=tick.tick,
+                context_tick_monotonic=tick.monotonic_seconds,
+                context=context.model_dump(mode="json"),
+                profile_name=spec.profile_name,
+                target_drop_temp_c=spec.target_drop_temp_c,
+                charge_guidance_min_c=spec.charge_guidance_min_c,
+                charge_guidance_max_c=spec.charge_guidance_max_c,
+                provider=descriptor[0],
+                model=descriptor[1],
+                prompt_version=descriptor[2],
+                configured_call_bound_seconds=self._bound,
+                configured_dwell_seconds=self._dwell,
+            )
+            if gate.closed:
+                return stops.SETTLED
+            _append(gate, self._sink, intent)
+        except Exception:
+            return stops.INTENT_NOT_APPENDED
+        self._open = (index, cell)
+        if gate.closed:
+            return stops.SETTLED
+        task = asyncio.create_task(
+            _provider_call(
+                self._advisor, context, self._floor, gate, self._window[1], self._bound, cell
+            )
+        )
+        task.add_done_callback(_discard_task_exception)
+        self._task, self._task_cell = task, cell
+        return None
+
     def _abandon(
         self, task: "asyncio.Task[None]", cell: _CallCell, index: int, at: _Instant
     ) -> ColdAdvisorySamplerStop:
-        """Request one cancellation, record the abandonment, keep ownership and stop."""
+        """Request one cancellation, record the abandonment, keep ownership and stop.
+
+        A commit region run under the latch: an already-settled entry neither cancels
+        nor appends.
+        """
+        stops, gate = ColdAdvisorySamplerStop, self._gate
+        if gate.closed:
+            return stops.SETTLED
         task.cancel()
         invocation = typing.cast(_Instant, cell.invocation)
         try:
@@ -966,22 +1018,27 @@ class ColdAdvisorySampler:
                 resolved_utc=at[1],
                 resolved_monotonic=at[0],
             )
-            _append(self._gate, self._sink, record)
+            if gate.closed:
+                return stops.SETTLED
+            _append(gate, self._sink, record)
         except Exception:
-            return ColdAdvisorySamplerStop.RESOLUTION_NOT_APPENDED
+            return stops.RESOLUTION_NOT_APPENDED
         cell.consumed = True
         self._attempts_resolved += 1
-        if self._gate.closed:
-            return ColdAdvisorySamplerStop.SETTLED
-        return ColdAdvisorySamplerStop.STOPPED_AFTER_ABANDONMENT
+        if gate.closed:
+            return stops.SETTLED
+        return stops.STOPPED_AFTER_ABANDONMENT
 
     def _consume(self, cell: _CallCell, outcome: _Outcome, owner: _Owner) -> _ConsumeResult:
         """Evaluate, time and append one completed call's resolution from its snapshot.
 
-        Only settlement-owned consumption may call ports after the gate closed.
+        A commit region run under the latch.  Only settlement-owned consumption may
+        call ports after the gate closed.
         """
         gate = self._gate
         run_owned = owner is _Owner.RUN
+        if run_owned and gate.closed:
+            return _ConsumeResult.STOPPED_GATE
         evaluation = None
         if outcome.kind is ColdAdvisoryResolution.RETURNED_DECISION:
             heat, fan = typing.cast(int, outcome.heat), typing.cast(int, outcome.fan)
@@ -1001,6 +1058,7 @@ class ColdAdvisorySampler:
             if run_owned and gate.closed:
                 return _ConsumeResult.STOPPED_GATE
             evaluation = _admit_evaluation(raw, heat, fan)
+            del raw
         recorded = self._floor.sample(owner)
         if recorded is _Gated.CLOSED:
             return _ConsumeResult.STOPPED_GATE
@@ -1027,6 +1085,8 @@ class ColdAdvisorySampler:
                 evaluation=evaluation,
                 usage=outcome.usage,
             )
+            if run_owned and gate.closed:
+                return _ConsumeResult.STOPPED_GATE
             _append(gate, self._sink, record)
         except Exception:
             return _ConsumeResult.SINK_REFUSED
@@ -1053,12 +1113,11 @@ class ColdAdvisorySampler:
         """Close the gate and write at most one terminal resolution; synchronous, idempotent.
 
         A call made during any sampler-initiated synchronous port call (including
-        settlement's own), or at any other point while a settlement is in progress
-        (for example from a finaliser of port-returned data released during
-        settlement-owned consumption), returns a provisional ``NOT_RECORDED_REENTRANT``
-        fact with no write, no port call and no storage.  If a ``BaseException``
-        escapes mid-settlement it propagates, nothing is stored and the in-progress
-        latch is released.
+        settlement's own), or at any other point while a settlement or a synchronous
+        commit region is in progress (for example from a finaliser of port-returned
+        data released there), returns a provisional ``NOT_RECORDED_REENTRANT`` fact
+        with no write, no port call and no storage.  If a ``BaseException`` escapes
+        mid-settlement it propagates, nothing is stored and the latches are released.
 
         Returns:
             The stored settlement, or a fresh provisional fact on reentry.
@@ -1068,7 +1127,7 @@ class ColdAdvisorySampler:
             return stored
         gate = self._gate
         gate.closed = True
-        if gate.depth > 0 or self._settling:
+        if gate.depth > 0 or self._settling or self._commit_latch:
             return ColdAdvisorySettlement(
                 closure=ColdAdvisorySettlementClosure.NOT_RECORDED_REENTRANT,
                 provider_task=self._task_fact(),
@@ -1098,7 +1157,7 @@ class ColdAdvisorySampler:
         done = task is not None and task.done()
         outcome = cell.outcome
         if done and outcome is not None and outcome.resolved is not None:
-            consumed = self._consume(cell, outcome, _Owner.SETTLEMENT)
+            consumed = self._latched(self._consume, cell, outcome, _Owner.SETTLEMENT)
             if consumed is _ConsumeResult.APPENDED:
                 return closures.RECORDED_COMPLETED_CALL
             if consumed is _ConsumeResult.SINK_REFUSED:
