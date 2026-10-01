@@ -157,6 +157,14 @@ class ColdEngineSink(typing.Protocol):
         ...
 
 
+class ColdActivationHook(typing.Protocol):
+    """Caller hook run once at the admitted activation instant, before any read."""
+
+    def __call__(self, *, session_id: str, activated_monotonic: float, activated_utc: str) -> bool:
+        """Return exactly ``True`` to observe the phase, or exactly ``False`` to refuse it."""
+        ...
+
+
 class MonotonicEngineClock:
     """Production clock over ``time.monotonic``, UTC ``datetime`` and ``asyncio.sleep``.
 
@@ -293,7 +301,19 @@ class ColdPhaseCompleted(pydantic.BaseModel):
 
     session_id: str = pydantic.Field(min_length=1, max_length=MAX_TEXT_FIELD_BYTES)
     observation_end_monotonic: float = pydantic.Field(ge=0)
+    observation_end_utc: str = pydantic.Field(min_length=1, max_length=MAX_TEXT_FIELD_BYTES)
     tick_count: int = pydantic.Field(ge=0)
+
+
+class ColdPhaseActivationRefused(pydantic.BaseModel):
+    """The activation hook refused the phase after activation and before any read.
+
+    No abort record is retained for this result; the caller records the refusal.
+    """
+
+    model_config = _RESULT_CONFIG
+
+    session_id: str = pydantic.Field(min_length=1, max_length=MAX_TEXT_FIELD_BYTES)
 
 
 class ColdPhaseAborted(pydantic.BaseModel):
@@ -418,6 +438,15 @@ def _instant_is_admissible(monotonic: object, utc: object, previous: _Instant | 
     except ValueError:
         return False
     return 1 <= size <= MAX_TEXT_FIELD_BYTES and offset == timedelta(0)
+
+
+def _meets_floor(instant: _Instant, floor: object) -> bool:
+    """Whether an admitted instant is at or after an optional exact finite floor."""
+    if floor is None:
+        return True
+    if type(floor) is not float or not math.isfinite(floor) or floor < 0.0:
+        return False
+    return instant.monotonic >= floor
 
 
 def _admit_instant(clock: ColdEngineClock, previous: _Instant | None) -> _Instant | None:
@@ -567,6 +596,7 @@ async def admit_cold_phase(
     mcp: ColdEngineMcp,
     host: ColdEngineHost,
     clock: ColdEngineClock,
+    not_before_monotonic: float | None = None,
 ) -> ColdPhaseAdmission:
     """Admit one phase in order, creating nothing.
 
@@ -577,6 +607,8 @@ async def admit_cold_phase(
         mcp: The five-operation MCP port (only the two identity reads are used).
         host: The host-bound port (only the start check is used).
         clock: The engine clock.
+        not_before_monotonic: Optional exact finite floor the admission instant
+            must not precede; ``None`` applies no floor.
 
     Returns:
         The admission capability.
@@ -607,7 +639,7 @@ async def admit_cold_phase(
     if reads != (again.server_info, again.runtime_config):
         raise ColdAdmissionRefusedError(ColdAdmissionFailure.MCP_IDENTITY_DRIFT)
     instant = _admit_instant(clock, None)
-    if instant is None:
+    if instant is None or not _meets_floor(instant, not_before_monotonic):
         raise ColdAdmissionRefusedError(ColdAdmissionFailure.CLOCK_INVALID)
     header = _bound_header(again, phase, instant, root_path)
     if header is None:
@@ -673,6 +705,18 @@ class _SinkFailed(Exception):
         self.abort = abort
 
 
+class _ActivationRefused(Exception):
+    """Internal signal: the activation hook returned exactly ``False``."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__()
+        self.session_id = session_id
+
+
+class _HookResultNotAdmitted(Exception):
+    """Internal signal: the activation hook returned a non-``bool``."""
+
+
 def _engine(reason: ColdEngineAbortReason) -> ColdAbortClassification:
     """Return one ENGINE-domain classification."""
     return ColdAbortClassification(domain=ColdAbortDomain.ENGINE, reason=reason)
@@ -688,12 +732,14 @@ class _PhaseRun:
         mcp: ColdEngineMcp,
         host: ColdEngineHost,
         clock: ColdEngineClock,
+        hook: ColdActivationHook | None = None,
     ) -> None:
         self._admitted = admitted
         self._sink = sink
         self._mcp = mcp
         self._host = host
         self._clock = clock
+        self._hook = hook
         self._sink_usable = True
         self._last_valid = _Instant(
             admitted.header.monotonic_seconds, admitted.header.recorded_at_utc
@@ -859,10 +905,11 @@ class _PhaseRun:
             ColdAbortClassification(domain=ColdAbortDomain.HOST, reason=ColdHostAbortReason(value))
         )
 
-    async def observe(self) -> "ColdPhaseCompleted | ColdPhaseAborted":
+    async def observe(self) -> "ColdPhaseCompleted | ColdPhaseAborted | ColdPhaseActivationRefused":
         """Observe the phase and convert every failure into a closed result or error."""
         aborts: tuple[ColdAbortClassification, ...] = ()
         sink_abort: ColdAbortClassification | None = None
+        refused: str | None = None
         sink_failed = cancelled = False
         try:
             return await self._loop()
@@ -870,10 +917,14 @@ class _PhaseRun:
             aborts = signal.aborts
         except _SinkFailed as signal:
             sink_failed, sink_abort = True, signal.abort
+        except _ActivationRefused as signal:
+            refused = signal.session_id
         except asyncio.CancelledError:
             cancelled = True
         except Exception:
             pass
+        if refused is not None:
+            return ColdPhaseActivationRefused(session_id=refused)
         if aborts:
             recorded = self._record_aborts(aborts)
             return ColdPhaseAborted(
@@ -895,6 +946,16 @@ class _PhaseRun:
         """Run the fixed-interval observation loop until the deadline or an abort."""
         session_id = await self._start()
         activation = await self._activate()
+        if self._hook is not None:
+            verdict: object = self._hook(
+                session_id=session_id,
+                activated_monotonic=activation.monotonic,
+                activated_utc=activation.utc,
+            )
+            if type(verdict) is not bool:
+                raise _HookResultNotAdmitted
+            if verdict is False:
+                raise _ActivationRefused(session_id)
         end = activation.monotonic + COLD_PHASE_OBSERVATION_SECONDS
         next_start = activation.monotonic
         previous: float | None = None
@@ -933,8 +994,35 @@ class _PhaseRun:
     def _completed(session_id: str, now: _Instant, tick: int) -> ColdPhaseCompleted:
         """Return the elapsed-window result; never a qualification."""
         return ColdPhaseCompleted(
-            session_id=session_id, observation_end_monotonic=now.monotonic, tick_count=tick
+            session_id=session_id,
+            observation_end_monotonic=now.monotonic,
+            observation_end_utc=now.utc,
+            tick_count=tick,
         )
+
+
+@typing.overload
+async def observe_cold_phase(
+    *,
+    admission: ColdPhaseAdmission,
+    sink: ColdEngineSink,
+    mcp: ColdEngineMcp,
+    host: ColdEngineHost,
+    clock: ColdEngineClock,
+    activation_hook: None = None,
+) -> ColdPhaseCompleted | ColdPhaseAborted: ...
+
+
+@typing.overload
+async def observe_cold_phase(
+    *,
+    admission: ColdPhaseAdmission,
+    sink: ColdEngineSink,
+    mcp: ColdEngineMcp,
+    host: ColdEngineHost,
+    clock: ColdEngineClock,
+    activation_hook: ColdActivationHook,
+) -> ColdPhaseCompleted | ColdPhaseAborted | ColdPhaseActivationRefused: ...
 
 
 async def observe_cold_phase(
@@ -944,7 +1032,8 @@ async def observe_cold_phase(
     mcp: ColdEngineMcp,
     host: ColdEngineHost,
     clock: ColdEngineClock,
-) -> ColdPhaseCompleted | ColdPhaseAborted:
+    activation_hook: ColdActivationHook | None = None,
+) -> ColdPhaseCompleted | ColdPhaseAborted | ColdPhaseActivationRefused:
     """Append the phase header, then observe one phase to its deadline or an abort.
 
     Args:
@@ -953,10 +1042,15 @@ async def observe_cold_phase(
         mcp: The five-operation MCP port.
         host: The host-bound port.
         clock: The engine clock.
+        activation_hook: Optional hook called exactly once immediately after the
+            admitted activation instant and before the first sample or read.
+            Exactly ``False`` returns ``ColdPhaseActivationRefused`` with no abort
+            record; a non-``bool`` or raising hook is an unexpected failure.
 
     Returns:
         ``ColdPhaseCompleted`` when the window elapsed without an abort (not
-        qualification), or ``ColdPhaseAborted`` with closed classifications.
+        qualification), ``ColdPhaseAborted`` with closed classifications, or
+        ``ColdPhaseActivationRefused`` when the activation hook refused.
 
     Raises:
         ColdAdmissionRefusedError: ``ADMISSION_NOT_VALID`` before any append.
@@ -974,4 +1068,4 @@ async def observe_cold_phase(
         appended = False
     if not appended:
         raise ColdEvidenceIncompleteError(ColdAdmissionFailure.HEADER_APPEND_FAILED)
-    return await _PhaseRun(admitted, sink, mcp, host, clock).observe()
+    return await _PhaseRun(admitted, sink, mcp, host, clock, activation_hook).observe()

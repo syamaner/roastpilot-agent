@@ -527,7 +527,10 @@ async def test_t1_happy_path_observes_the_full_window_and_round_trips(tmp_path: 
     ]
     assert reads == 1800
     assert result == engine.ColdPhaseCompleted(
-        session_id=SID, observation_end_monotonic=T0 + 1800.0, tick_count=1800
+        session_id=SID,
+        observation_end_monotonic=T0 + 1800.0,
+        observation_end_utc=(BASE_UTC + timedelta(seconds=T0 + 1800.0)).isoformat(),
+        tick_count=1800,
     )
     assert streams(sink) == ["header", *["tick", "host"] * reads]
     ticks = [r for r in sink.records if type(r) is schema.ColdTickRecord]
@@ -1885,7 +1888,12 @@ def test_t18_classification_pairs_are_closed() -> None:
 
 def test_t18_results_are_strict_frozen_and_bounded() -> None:
     """T18: completed and aborted refuse invalid values and extra keys, and are frozen."""
-    ok = {"session_id": SID, "observation_end_monotonic": 1.0, "tick_count": 0}
+    ok = {
+        "session_id": SID,
+        "observation_end_monotonic": 1.0,
+        "observation_end_utc": "2026-09-26T12:00:00+00:00",
+        "tick_count": 0,
+    }
     engine.ColdPhaseCompleted.model_validate(ok)
     for bad in (
         {"observation_end_monotonic": -1.0},
@@ -2081,3 +2089,220 @@ def test_fixed_constants_are_never_shortened() -> None:
     assert policy.COLD_PHASE_OBSERVATION_SECONDS == 1800.0
     assert issubclass(engine.ColdAdmissionFailure, enum.Enum)
     assert not issubclass(engine.ColdAdmissionFailure, str)
+
+
+# ------------------------------------------------- 4g-c: hook, floor, completion UTC
+
+
+class RecordingHook:
+    """Activation hook spy recording its arguments and the rig state when called."""
+
+    def __init__(self, rig: Rig, verdict: object = True, error: BaseException | None = None):
+        self.rig = rig
+        self.verdict = verdict
+        self.error = error
+        self.calls: list[tuple[str, float, str]] = []
+        self.samples_at_call: list[int] = []
+        self.mcp_calls_at_call: list[list[str]] = []
+
+    def __call__(self, *, session_id: str, activated_monotonic: float, activated_utc: str) -> bool:
+        self.calls.append((session_id, activated_monotonic, activated_utc))
+        self.samples_at_call.append(self.rig.clock.samples)
+        self.mcp_calls_at_call.append(list(self.rig.mcp.calls))
+        if self.error is not None:
+            raise self.error
+        return typing.cast(bool, self.verdict)
+
+
+async def run_hooked(
+    rig: Rig, hook: engine.ColdActivationHook
+) -> tuple[
+    engine.ColdPhaseCompleted | engine.ColdPhaseAborted | engine.ColdPhaseActivationRefused, SpySink
+]:
+    """Admit, open, and observe one phase with an activation hook."""
+    admission = await admit(rig)
+    sink = SpySink(engine.open_phase_evidence(admission))
+    result = await engine.observe_cold_phase(
+        admission=admission,
+        sink=sink,
+        mcp=rig.mcp,
+        host=rig.host,
+        clock=rig.clock,
+        activation_hook=hook,
+    )
+    return result, sink
+
+
+@pytest.mark.asyncio
+async def test_4gc_t5_hook_runs_once_after_activation_and_before_any_read(
+    tmp_path: Path,
+) -> None:
+    """T5: one call with the admitted P1 pair, after mark_beans_added, before any read."""
+    rig = make_rig(tmp_path)
+    hook = RecordingHook(rig)
+    result, sink = await run_hooked(rig, hook)
+    done = completed(result)
+    activation_utc = (BASE_UTC + timedelta(seconds=T0)).isoformat()
+    assert hook.calls == [(SID, T0, activation_utc)]
+    # Sample 0 is the admission header, sample 1 is P1; no loop sample yet.
+    assert hook.samples_at_call == [2]
+    assert hook.mcp_calls_at_call == [
+        ["get_server_info", "get_runtime_config", "start_roast_session", "mark_beans_added"]
+    ]
+    assert done.tick_count == 1800
+    assert done.observation_end_monotonic == T0 + 1800.0
+    assert done.observation_end_utc == (BASE_UTC + timedelta(seconds=T0 + 1800.0)).isoformat()
+    assert done.observation_end_utc == rig.clock.good[-1][1]
+    assert streams(sink) == ["header", *["tick", "host"] * 1800]
+
+
+@pytest.mark.asyncio
+async def test_4gc_t5_false_refuses_with_no_read_and_no_abort_record(tmp_path: Path) -> None:
+    """T5: exactly ``False`` returns the refusal, retains only the header, reads nothing."""
+    rig = make_rig(tmp_path)
+    hook = RecordingHook(rig, verdict=False)
+    result, sink = await run_hooked(rig, hook)
+    assert result == engine.ColdPhaseActivationRefused(session_id=SID)
+    assert type(result) is engine.ColdPhaseActivationRefused
+    assert len(hook.calls) == 1
+    assert "get_roast_state" not in rig.mcp.calls
+    assert streams(sink) == ["header"]
+    assert aborts_of(sink) == []
+    assert rig.host.sample_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", [1, 0, None, "True", 1.0], ids=repr)
+async def test_4gc_t5_a_non_bool_verdict_is_unexpected(tmp_path: Path, verdict: object) -> None:
+    """T5: a non-``bool`` verdict records UNEXPECTED_FAILURE and raises the closed error."""
+    rig = make_rig(tmp_path)
+    hook = RecordingHook(rig, verdict=verdict)
+    with pytest.raises(engine.ColdEngineUnexpectedError) as caught:
+        await run_hooked(rig, hook)
+    assert caught.value.abort_recorded is True
+    assert caught.value.session_id == SID
+    assert "get_roast_state" not in rig.mcp.calls
+    assert len(hook.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_4gc_t5_a_raising_hook_is_unexpected_and_contained(tmp_path: Path) -> None:
+    """T5: a raising hook records UNEXPECTED_FAILURE; nothing of its text escapes."""
+    rig = make_rig(tmp_path)
+    hook = RecordingHook(rig, error=RuntimeError(CANARY))
+    admission = await admit(rig)
+    sink = SpySink(engine.open_phase_evidence(admission))
+    with pytest.raises(engine.ColdEngineUnexpectedError) as caught:
+        await engine.observe_cold_phase(
+            admission=admission,
+            sink=sink,
+            mcp=rig.mcp,
+            host=rig.host,
+            clock=rig.clock,
+            activation_hook=hook,
+        )
+    assert caught.value.abort_recorded is True
+    assert [record.reason for record in aborts_of(sink)] == [Reason.UNEXPECTED_FAILURE]
+    assert "get_roast_state" not in rig.mcp.calls
+    assert CANARY not in str(caught.value) and CANARY not in repr(caught.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["start", "activation"])
+async def test_4gc_t5_hook_is_never_called_after_a_start_or_activation_failure(
+    tmp_path: Path, failure: str
+) -> None:
+    """T5: a failed start or activation never reaches the hook."""
+    rig = (
+        make_rig(tmp_path, start=ColdMcpValidationError(CANARY))
+        if failure == "start"
+        else make_rig(tmp_path, mark_error=ColdMcpValidationError(CANARY))
+    )
+    hook = RecordingHook(rig)
+    result, _sink = await run_hooked(rig, hook)
+    expected = Reason.SESSION_START_FAILED if failure == "start" else Reason.ACTIVATION_FAILED
+    assert aborted(result).aborts == engine_aborts(expected)
+    assert hook.calls == []
+
+
+@pytest.mark.asyncio
+async def test_4gc_t5_a_hook_activation_clock_failure_never_reaches_the_hook(
+    tmp_path: Path,
+) -> None:
+    """T5: an inadmissible P1 sample is CLOCK_INVALID before the hook."""
+    rig = make_rig(tmp_path, clock=FakeClock(faults={1: "nan"}))
+    hook = RecordingHook(rig)
+    result, _sink = await run_hooked(rig, hook)
+    assert aborted(result).aborts == engine_aborts(Reason.CLOCK_INVALID)
+    assert hook.calls == []
+
+
+async def admit_with_floor(rig: Rig, floor: object) -> engine.ColdPhaseAdmission:
+    """Admit the rig's phase with an explicit admission floor."""
+    return await engine.admit_cold_phase(
+        identity=rig.identity,
+        phase=rig.phase,
+        root=rig.admitted,
+        mcp=rig.mcp,
+        host=rig.host,
+        clock=rig.clock,
+        not_before_monotonic=typing.cast(float, floor),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("floor", [T0, 0.0, 50.0], ids=repr)
+async def test_4gc_t6_a_floor_at_or_below_the_admission_instant_is_admitted(
+    tmp_path: Path, floor: float
+) -> None:
+    """T6: equality is admitted; the header instant is the sampled A0."""
+    rig = make_rig(tmp_path)
+    admission = await admit_with_floor(rig, floor)
+    assert admission.header.monotonic_seconds == T0
+    assert rig.host.start_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "floor",
+    [math.nextafter(T0, math.inf), T0 + 60.0, math.nan, math.inf, -1.0, 100, True, "100.0"],
+    ids=repr,
+)
+async def test_4gc_t6_a_floor_above_a0_or_inadmissible_is_clock_invalid(
+    tmp_path: Path, floor: object
+) -> None:
+    """T6: A0 below the floor, or a non-exact or non-finite floor, refuses creating nothing."""
+    rig = make_rig(tmp_path)
+    with pytest.raises(engine.ColdAdmissionRefusedError) as caught:
+        await admit_with_floor(rig, floor)
+    assert caught.value.failure is engine.ColdAdmissionFailure.CLOCK_INVALID
+    assert rig.host.start_calls == 0
+    assert root_entries(rig.root) == []
+
+
+@pytest.mark.asyncio
+async def test_4gc_t6_floor_none_is_unchanged(tmp_path: Path) -> None:
+    """T6: an explicit ``None`` floor admits exactly as the default does."""
+    rig = make_rig(tmp_path)
+    admission = await admit_with_floor(rig, None)
+    assert admission.header.monotonic_seconds == T0
+
+
+def test_4gc_activation_refused_result_is_strict_and_bounded() -> None:
+    """The refusal result holds only a bounded session and is frozen."""
+    assert set(engine.ColdPhaseActivationRefused.model_fields) == {"session_id"}
+    for bad in ("", "x" * 2049, 1, None):
+        with pytest.raises(pydantic.ValidationError):
+            engine.ColdPhaseActivationRefused.model_validate({"session_id": bad})
+    with pytest.raises(pydantic.ValidationError):
+        engine.ColdPhaseActivationRefused.model_validate({"session_id": SID, "extra": 1})
+    for bad_utc in ("", "x" * 2049):
+        with pytest.raises(pydantic.ValidationError):
+            engine.ColdPhaseCompleted.model_validate(
+                {
+                    "session_id": SID,
+                    "observation_end_monotonic": 1.0,
+                    "observation_end_utc": bad_utc,
+                    "tick_count": 0,
+                }
+            )
