@@ -678,7 +678,37 @@ async def run_all(rig: Rig, until: float = 1800.0) -> ColdAdvisorySamplerRun:
     await drive(rig.clock, until)
     assert task.done()
     assert not task.cancelled()
+    assert task.exception() is None, type(task.exception())
     return task.result()
+
+
+def only(rig: Rig) -> Resolution:
+    """Assert exactly one accepted resolution and return it."""
+    assert len(rig.sink.resolutions) == 1, len(rig.sink.resolutions)
+    return rig.sink.resolutions[0]
+
+
+def construct(base: Base, **overrides: typing.Any) -> Rig | BaseException:
+    """Construct, returning (not raising) any exception, so oracles assert on it."""
+    try:
+        return make(base, **overrides)
+    except Exception as error:
+        return error
+
+
+def admitted(base: Base, **overrides: typing.Any) -> Rig:
+    """Construct and assert that construction was admitted."""
+    rig = construct(base, **overrides)
+    assert isinstance(rig, Rig), type(rig)
+    return rig
+
+
+def settle_safely(rig: Rig) -> ColdAdvisorySettlement:
+    """Settle and assert that settlement itself never raises (AC-S13)."""
+    try:
+        return rig.sampler.settle_at_phase_end()
+    except Exception as error:
+        raise AssertionError(type(error).__name__) from None
 
 
 def settler(rig: Rig, box: list[ColdAdvisorySettlement]) -> Callable[[], None]:
@@ -844,12 +874,11 @@ REFUSALS: dict[str, Overrides] = {
 def test_construction_refuses(base: Base, pid: str) -> None:
     """Every refused input raises the fixed, causeless refusal; spy keys are never hashed."""
     overrides = REFUSALS[pid](base)
-    with pytest.raises(ColdAdvisorySamplerRefusedError) as raised:
-        make(base, **overrides)
-    assert type(raised.value) is ColdAdvisorySamplerRefusedError
-    assert raised.value.args == ("Cold advisory sampler refused.",)
-    assert raised.value.__cause__ is None
-    assert raised.value.__context__ is None
+    refused = construct(base, **overrides)
+    assert type(refused) is ColdAdvisorySamplerRefusedError, type(refused)
+    assert refused.args == ("Cold advisory sampler refused.",)
+    assert refused.__cause__ is None
+    assert refused.__context__ is None
     if pid.endswith("spy_key"):
         assert SpyKey.calls == 0
 
@@ -871,7 +900,7 @@ def test_construction_admits_edge_values(
     base: Base, pid: str, overrides: dict[str, typing.Any]
 ) -> None:
     """White-box: edge values are admitted and retained byte-exact."""
-    sampler = priv(make(base, **overrides).sampler)
+    sampler = priv(admitted(base, **overrides).sampler)
     if pid == "session_padded":
         assert sampler._session == " s "
     elif pid == "profile_padded":
@@ -899,8 +928,13 @@ SPEC_REFUSALS: dict[str, dict[str, object]] = {
 @pytest.mark.parametrize("pid", sorted(SPEC_REFUSALS))
 def test_spec_model_refuses(pid: str) -> None:
     """The spec model has no defaults, no range and admits only exact finite values."""
-    with pytest.raises(pydantic.ValidationError):
+    try:
         ColdAdvisorySpec.model_validate({**dict(SPEC), **SPEC_REFUSALS[pid]})
+    except pydantic.ValidationError:
+        refused = True
+    else:
+        refused = False
+    assert refused
 
 
 class DictSubclass(dict[str, object]):
@@ -959,7 +993,7 @@ def test_construction_succeeds_with_counted_descriptor_call(base: Base) -> None:
         seen.append(frame.f_locals["self"]._gate.depth)
 
     advisor.on_descriptor = observe
-    rig = make(base, clock=clock, advisor=advisor)
+    rig = admitted(base, clock=clock, advisor=advisor)
     assert seen == [1]
     assert advisor.phases == [RoastPhase.PREHEATING]
     assert priv(rig.sampler)._gate.depth == 0
@@ -1601,7 +1635,7 @@ async def test_settlement_consumes_done_call(base: Base) -> None:
     assert box[0] == ColdAdvisorySettlement(
         closure=Closure.RECORDED_COMPLETED_CALL, provider_task=Fact.COMPLETED, attempts_resolved=1
     )
-    [resolution] = rig.sink.resolutions
+    resolution = only(rig)
     assert resolution.resolution is Kind.RETURNED_DECISION
     assert (resolution.invocation_monotonic, resolution.resolved_monotonic) == (OPEN, OPEN)
     assert len(rig.evaluator.calls) == 1
@@ -1696,7 +1730,7 @@ async def test_settlement_failure_facts(base: Base, pid: str) -> None:
 
         def settle() -> None:
             rig.clock.fail_next_monotonic = pid == "consume_clock_invalid"
-            box.append(rig.sampler.settle_at_phase_end())
+            box.append(settle_safely(rig))
 
         rig.advisor.schedule_on_return = settle
         result = await run_all(rig)
@@ -1724,12 +1758,12 @@ async def test_settlement_failure_facts(base: Base, pid: str) -> None:
             if pid == "clock_invalid"
             else Closure.NOT_RECORDED_SINK_REFUSED
         )
-        settled = rig.sampler.settle_at_phase_end()
+        settled = settle_safely(rig)
         event.set()
         await drive_until(task.done)
         assert settled.closure is expected
     count = len(rig.sink.resolutions)
-    assert rig.sampler.settle_at_phase_end().closure is expected
+    assert settle_safely(rig).closure is expected
     assert len(rig.sink.resolutions) == count == 0
 
 
@@ -1779,7 +1813,7 @@ async def test_settlement_unresolved_invoked(base: Base) -> None:
         provider_task=Fact.OUTSTANDING,
         attempts_resolved=1,
     )
-    [record] = rig.sink.resolutions
+    record = only(rig)
     assert record.resolution is Kind.UNRESOLVED_AT_PHASE_END
     assert (record.invocation_monotonic, record.resolved_monotonic) == (OPEN, 1452.0)
     assert record.monotonic_seconds == 1452.0
@@ -1818,7 +1852,7 @@ async def test_outcome_payloads_real_advisor(base: Base, pid: str) -> None:
     )
     result = await run_all(rig)
     assert result == ColdAdvisorySamplerRun(stop=Stop.WINDOW_EXHAUSTED, attempts_resolved=1)
-    [record] = rig.sink.resolutions
+    record = only(rig)
     recorded = advisory.ColdAdvisoryUsageState.RECORDED
     expected_kind = {
         "decision": Kind.RETURNED_DECISION,
@@ -1890,7 +1924,7 @@ async def test_classification(base: Base, pid: str) -> None:
     SpyKey.calls = 0
     rig = one_attempt(base, acts=[act])
     await run_all(rig)
-    [record] = rig.sink.resolutions
+    record = only(rig)
     assert record.resolution is kind
     assert record.requested_heat is None
     assert record.usage_state is None
@@ -1932,7 +1966,7 @@ async def test_usage_freshness_identity(base: Base) -> None:
     clock = ManualClock(13.5)
     rig = one_attempt(base, clock=clock, advisor=DoubleAdvisor(clock, usage_mode="fixed"))
     await run_all(rig)
-    [record] = rig.sink.resolutions
+    record = only(rig)
     assert record.resolution is Kind.RETURNED_DECISION
     assert record.usage_state is advisory.ColdAdvisoryUsageState.NOT_RECORDED
 
@@ -1949,7 +1983,7 @@ async def test_usage_only_for_decision_or_unsafe(base: Base, pid: str) -> None:
     rig = one_attempt(base, acts=[Act("raise", error=error)])
     result = await run_all(rig)
     assert result.stop is not Stop.RESOLUTION_NOT_APPENDED
-    [record] = rig.sink.resolutions
+    record = only(rig)
     assert record.usage_state is None
 
 
@@ -1991,7 +2025,7 @@ async def test_usage_admission(base: Base, pid: str) -> None:
     rig = one_attempt(base, clock=clock, advisor=advisor)
     SpyKey.calls = 0
     await run_all(rig)
-    [record] = rig.sink.resolutions
+    record = only(rig)
     assert record.resolution is Kind.RETURNED_DECISION
     assert record.usage_state is advisory.ColdAdvisoryUsageState.NOT_RECORDED
     if pid == "spy_key":
@@ -2018,7 +2052,7 @@ async def test_evaluation_verdicts(base: Base, verdict: SafetyVerdict) -> None:
     """All six verdicts map by identity to the same-named cold verdict."""
     rig = one_attempt(base, evaluator=DoubleEvaluator(lambda kw: evaluation(verdict=verdict)))
     await run_all(rig)
-    [record] = rig.sink.resolutions
+    record = only(rig)
     assert record.evaluation_verdict is schema.ColdSafetyVerdict[verdict.name]
 
 
@@ -2082,7 +2116,7 @@ async def test_evaluation_refused(base: Base, pid: str) -> None:
     rig = one_attempt(base, evaluator=evaluator)
     SpyKey.calls = 0
     await run_all(rig)
-    [record] = rig.sink.resolutions
+    record = only(rig)
     assert record.resolution is Kind.RETURNED_DECISION
     assert record.evaluation_state is advisory.ColdAdvisoryEvaluationState.NOT_RECORDED
     assert (record.requested_heat, record.requested_fan) == (40, 60)
@@ -2106,7 +2140,7 @@ async def test_bound_abandons_at_exact_deadline(base: Base) -> None:
     assert task.result() == ColdAdvisorySamplerRun(
         stop=Stop.STOPPED_AFTER_ABANDONMENT, attempts_resolved=1
     )
-    [record] = rig.sink.resolutions
+    record = only(rig)
     assert record.resolution is Kind.ABANDONED_AFTER_BOUND
     assert (record.invocation_monotonic, record.resolved_monotonic) == (OPEN, 1455.0)
     await idle()
@@ -2124,7 +2158,7 @@ async def test_bound_deadline_from_invocation(base: Base) -> None:
     task = start(rig)
     await drive(rig.clock, 1460.0)
     await drive_until(task.done)
-    [record] = rig.sink.resolutions
+    record = only(rig)
     assert record.resolution is Kind.ABANDONED_AFTER_BOUND
     assert record.invocation_monotonic == OPEN + 0.4
     assert record.resolved_monotonic == pytest.approx(OPEN + 0.4 + 5.0, abs=1e-9)
@@ -2161,7 +2195,7 @@ async def test_completion_priority(base: Base, pid: str) -> None:
     rig.clock.advance(delay)
     event.set()
     await drive_until(lambda: len(rig.sink.resolutions) == 1)
-    [record] = rig.sink.resolutions
+    record = only(rig)
     assert record.resolution is Kind.RETURNED_DECISION
     assert record.resolved_monotonic == OPEN + delay
     assert rig.advisor.cancels == 0
@@ -2475,11 +2509,13 @@ async def test_resolution_append_refused(base: Base, pid: str) -> None:
 
 
 def _function(name: str, tree: ast.AST = TREE) -> ast.FunctionDef | ast.AsyncFunctionDef:
-    return next(
+    found = [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == name
-    )
+    ]
+    assert len(found) == 1, name
+    return found[0]
 
 
 def _calls(node: ast.AST, name: str) -> list[ast.Call]:
@@ -2519,11 +2555,13 @@ def _structural(pid: str) -> None:
     attempts = _function("_attempts")
     if pid == "session_len_before_encode":
         init = _function("__init__", _class("ColdAdvisorySampler"))
-        length = next(
+        lengths = [
             node
             for node in ast.walk(init)
             if isinstance(node, ast.Compare) and ast.unparse(node.left) == "len(session)"
-        )
+        ]
+        assert len(lengths) == 1
+        length = lengths[0]
         [admit] = _calls(init, "is_admissible_session_id")
         assert (_line(length), length.col_offset) < (_line(admit), admit.col_offset)
     elif pid == "create_task_after_intent_append":
