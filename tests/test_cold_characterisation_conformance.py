@@ -2520,7 +2520,7 @@ def _late_on_host(run: Plan) -> None:
 
 
 HOST_CASES: list[tuple[str, Edit, Findings]] = [
-    ("excess_host", lambda run: run.hosts[OFF].append(12.5), (F.HOST_EVIDENCE_MISMATCH,)),
+    ("excess_host", lambda run: _append_excess_host(run), (F.HOST_EVIDENCE_MISMATCH,)),
     ("off_host_at_activation", _host(OFF, 0, 10.0), ()),
     ("off_host_at_elapsed", _host(OFF, 2, 1810.0), ()),
     ("on_host_at_activation", _host(ON, 0, 1830.0), ()),
@@ -2550,3 +2550,95 @@ def test_r5_host_count_and_window(
     run = plan(tmp_path)
     edit(run)
     assert findings(tmp_path, run) == expected
+
+
+def _append_excess_host(run: Plan) -> None:
+    """One host more than ticks, appended in clock order and inside the OFF window."""
+    last = run.hosts[OFF][-1]
+    run.hosts[OFF].append(13.5)
+    assert run.hosts[OFF][-1] >= last
+
+
+# ------------------------------------- A3: per-stream retained clock order (ticks, hosts)
+
+_ACTIVATION: typing.Final[dict[Phase, float]] = {OFF: 10.0, ON: 1830.0}
+
+
+def _tick_instants(phase: Phase, *offsets: float) -> Edit:
+    """Set the three tick instants of one phase; indices and heartbeat stay unchanged."""
+
+    def edit(run: Plan) -> None:
+        for tick, offset in zip(run.ticks[phase], offsets, strict=True):
+            tick.mono = _ACTIVATION[phase] + offset
+
+    return edit
+
+
+def _host_instants(phase: Phase, *offsets: float) -> Edit:
+    """Set the three host instants of one phase; ticks stay unchanged."""
+
+    def edit(run: Plan) -> None:
+        run.hosts[phase] = [_ACTIVATION[phase] + offset for offset in offsets]
+
+    return edit
+
+
+CLOCK_ORDER_NEGATIVES: list[tuple[str, typing.Callable[[Phase], Edit]]] = [
+    ("ticks_first_pair_swapped", lambda phase: _tick_instants(phase, 2.0, 1.0, 3.0)),
+    ("ticks_later_pair_swapped", lambda phase: _tick_instants(phase, 1.0, 3.0, 2.0)),
+    ("hosts_first_pair_swapped", lambda phase: _host_instants(phase, 2.0, 1.0, 3.0)),
+    ("hosts_later_pair_swapped", lambda phase: _host_instants(phase, 1.0, 3.0, 2.0)),
+]
+CLOCK_ORDER_TIES: list[tuple[str, typing.Callable[[Phase], Edit]]] = [
+    ("tick_one_equals_tick_zero", lambda phase: _tick_instants(phase, 1.0, 1.0, 3.0)),
+    ("tick_two_equals_tick_one", lambda phase: _tick_instants(phase, 1.0, 2.0, 2.0)),
+    ("host_one_equals_host_zero", lambda phase: _host_instants(phase, 1.0, 1.0, 3.0)),
+    ("host_two_equals_host_one", lambda phase: _host_instants(phase, 1.0, 2.0, 2.0)),
+]
+
+
+@pytest.mark.parametrize("phase", [OFF, ON])
+@pytest.mark.parametrize(
+    ("name", "make"), CLOCK_ORDER_NEGATIVES, ids=[c[0] for c in CLOCK_ORDER_NEGATIVES]
+)
+def test_a3_a_regressed_retained_stream_instant_is_a_causal_finding(
+    tmp_path: Path, phase: Phase, name: str, make: typing.Callable[[Phase], Edit]
+) -> None:
+    """A3: one adjacent tick or host pair regressing in one phase; heartbeat still rises."""
+    del name
+    run = plan(tmp_path)
+    make(phase)(run)
+    assert [tick.elapsed for tick in run.ticks[phase]] == [1.0, 2.0, 3.0]
+    assert [tick.index for tick in run.ticks[phase]] == [0, 1, 2]
+    assert findings(tmp_path, run) == (F.CAUSAL_ORDER_VIOLATED,)
+
+
+@pytest.mark.parametrize("phase", [OFF, ON])
+@pytest.mark.parametrize(("name", "make"), CLOCK_ORDER_TIES, ids=[c[0] for c in CLOCK_ORDER_TIES])
+def test_a3_tied_retained_stream_instants_conform(
+    tmp_path: Path, phase: Phase, name: str, make: typing.Callable[[Phase], Edit]
+) -> None:
+    """A3: equal adjacent tick or host instants are admitted (engine admits ties)."""
+    del name
+    run = plan(tmp_path)
+    make(phase)(run)
+    assert [tick.elapsed for tick in run.ticks[phase]] == [1.0, 2.0, 3.0]
+    assert findings(tmp_path, run) == ()
+
+
+def test_a3_tied_on_ticks_at_both_window_edges_conform(tmp_path: Path) -> None:
+    """A3 boundary: ON ticks at activation, a tie at activation, then the elapsed instant."""
+    run = plan(tmp_path)
+    for tick, mono in zip(run.ticks[ON], (1830.0, 1830.0, 3630.0), strict=True):
+        tick.mono = mono
+    assert entry(run, ON, Event.PHASE_ACTIVATED).ev == 1830.0
+    assert entry(run, ON, Event.OBSERVATION_WINDOW_ELAPSED).ev == 3630.0
+    assert findings(tmp_path, run) == ()
+
+
+def test_a3_regression_outside_the_window_keeps_both_findings(tmp_path: Path) -> None:
+    """A3 combined: OFF tick 1 before activation is out of window and regresses."""
+    run = plan(tmp_path)
+    run.ticks[OFF][1].mono = math.nextafter(10.0, -math.inf)
+    assert [tick.mono for tick in run.ticks[OFF]] == [11.0, math.nextafter(10.0, -math.inf), 13.0]
+    assert findings(tmp_path, run) == (F.TICK_OUTSIDE_WINDOW, F.CAUSAL_ORDER_VIOLATED)
