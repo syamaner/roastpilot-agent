@@ -8,10 +8,15 @@ orchestrator owns only the child it starts, admits every runtime carrier before
 use, enforces run-wide write discipline the v1 grammar cannot prove, and returns
 closed members and a manifest digest only.
 
-D195 finalisation can perform safe-zero and disconnect; it is not a
-non-actuating operation.  It runs only for a completed, unaborted phase after
-its session is re-admitted.  This module adds no actuator control and no
-emergency stop.
+D195 finalisation verifies that all six command dimensions are already
+safe-zero, then performs lifecycle teardown and driver disconnect (on the
+Hottop driver this stops the command loop and closes serial).  It is a
+non-actuating lifecycle operation, not a read-only one: it cannot command
+safe-zero, and unknown, unreadable or non-zero state is rejected before
+teardown without any actuator, stop-cooling or emergency-stop call.  It runs
+only for a completed, unaborted phase after its session is re-admitted;
+skipping it skips that verification and clean disconnect, never a promised
+safe-zero command.  This module adds no actuator control and no emergency stop.
 
 ``PRE_ADVISORY_CONFORMANT`` requires a completed terminal record, a confirmed
 final stop, a sealed digest, a reload through ``read_retained_run_v2`` and an
@@ -153,11 +158,12 @@ class ColdTwoPhaseMcp(ColdEngineMcp, typing.Protocol):
     """The engine's non-actuating operations plus D195 finalisation.
 
     The engine operations are the identity reads, cold-session start, activation
-    and tick reads; finalisation can perform safe-zero and disconnect.
+    and tick reads; finalisation verifies already-safe-zero state, then tears
+    down and disconnects (non-actuating, not read-only).
     """
 
     async def finalise_session(self, session_id: str) -> SessionFinalisationResult:
-        """Finalise one explicit cold session (may safe-zero and disconnect)."""
+        """Finalise one cold session: verify already-safe-zero state, then disconnect."""
         ...
 
 
@@ -847,6 +853,7 @@ class _ChildOwner:
         self._port = port
         self.state = _ChildState.UNOWNED
         self._interrupted_cleanup_attempted = False
+        self._cleanup_started = False
 
     def flags(self) -> tuple[object, object] | None:
         """Read ``running`` and ``stop_unconfirmed`` once each; ``None`` if either raises."""
@@ -935,16 +942,23 @@ class _ChildOwner:
             return False
         return True
 
-    async def shielded_cleanup(self) -> None:
-        """Run at most one owned cleanup stop to completion; never raise from it.
+    async def shielded_cleanup(self) -> bool:
+        """Run at most one owned cleanup stop task to completion; never raise from it.
 
         Repeated cancellation is absorbed until the same task is done.  The task's
         own outcome (including a non-cancellation ``BaseException`` from the stop)
         is retrieved once and absorbed, so it never replaces the exception that
         started the cleanup.
+
+        Returns:
+            Whether a cancellation of the enclosing task arrived meanwhile (the
+            stop task cancelling itself is the child's outcome, not the caller's).
         """
-        if not self.needs_stop:
-            return
+        if self._cleanup_started or not self.needs_stop:
+            return False
+        self._cleanup_started = True
+        current = typing.cast("asyncio.Task[object]", asyncio.current_task())
+        pending = current.cancelling()
         task = asyncio.ensure_future(self.stop())
         while not task.done():
             try:
@@ -953,6 +967,7 @@ class _ChildOwner:
                 continue
         if not task.cancelled():
             task.exception()
+        return current.cancelling() > pending
 
 
 # ------------------------------------------------------------ orchestrator
@@ -1473,11 +1488,16 @@ class _TwoPhaseRun:
         The sink is closed and only the permitted owned cleanup stop runs; nothing
         is finalised or stopped again and no text escapes.  A held seal receipt is
         never lost: it is returned as ``NOT_CONFORMANT`` with that digest.
+
+        Raises:
+            asyncio.CancelledError: If the caller was cancelled during the cleanup
+                stop; no result is returned and nothing further runs.
         """
         sink = self._sink
         if sink is not None:
             sink.close()
-        await self._child.shielded_cleanup()
+        if await self._child.shielded_cleanup():
+            raise asyncio.CancelledError
         if sink is None:
             return ColdTwoPhaseResult(
                 outcome=ColdTwoPhaseOutcome.REFUSED_BEFORE_EVIDENCE,

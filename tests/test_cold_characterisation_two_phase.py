@@ -2332,8 +2332,9 @@ async def test_4gc_t12_a_write_fault_leaves_unsealed_evidence_and_stops_writing(
     assert [call for call in spy.calls if call[2] is False] != []
     assert len([call for call in spy.calls if call[2] is False]) == 1
     assert spy.after_failure() == []
-    # A seal failing mid-write may leave a partial manifest; it never yields a digest.
-    assert world.manifest_exists() is (case == "seal")
+    # A failed seal may leave partial or complete artefacts but never a trusted receipt.
+    if case != "seal":
+        assert not world.manifest_exists()
     assert_no_canary(result)
     if case == "off_header":
         assert spy.calls == [("append", "recording_off:header", False)]
@@ -3426,9 +3427,18 @@ async def test_4gc_another_base_exception_propagates_after_owned_cleanup(tmp_pat
 
 @pytest.mark.asyncio
 async def test_4gc_a_cancelled_cleanup_stop_never_replaces_the_initiating_exception(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The original BaseException survives a cleanup stop whose port raises CancelledError."""
+    owners: list[two_phase._ChildOwner] = []
+    real_owner = two_phase._ChildOwner
+
+    def capture(port: two_phase.ColdChildLifecycle) -> two_phase._ChildOwner:
+        owner = real_owner(port)
+        owners.append(owner)
+        return owner
+
+    monkeypatch.setattr(two_phase, "_ChildOwner", capture)
     world = World(tmp_path)
     world.identities.values[ON] = Halt()
     world.child.stop_modes = ["ok", "cancelled"]
@@ -3437,6 +3447,8 @@ async def test_4gc_a_cancelled_cleanup_stop_never_replaces_the_initiating_except
     assert world.child_ops() == NORMAL_CHILD_OPS
     assert world.child.unconfirmed_value is False and world.child.stops == 2
     assert not world.manifest_exists()
+    (owner,) = owners
+    assert owner.ownership is Own.OWNED_STOP_UNCONFIRMED
 
 
 @pytest.mark.asyncio
@@ -3896,6 +3908,92 @@ async def test_4gc_a2_c1_repeated_cancellation_still_preserves_the_original(
     assert caught.value is halt
     assert world.child.stops == 1
     assert run._child.ownership is Own.OWNED_STOP_UNCONFIRMED
+
+
+# ------------------------------- R2: caller cancellation during containment
+
+
+def _pre_evidence_failure(world: World, monkeypatch: pytest.MonkeyPatch) -> tuple[str, int]:
+    """An ordinary exception before any writer, while the OFF child is owned."""
+
+    def boom(record: object) -> typing.NoReturn:
+        raise RuntimeError(CANARY)
+
+    monkeypatch.setattr(two_phase, "validate_record", boom)
+    del world
+    return "stop:0", 1
+
+
+def _poisoned_sink_failure(world: World, monkeypatch: pytest.MonkeyPatch) -> tuple[str, int]:
+    """An ordinary exception with a poisoned sink, while the ON child is owned."""
+    CapturingSink.created.clear()
+    monkeypatch.setattr(two_phase, "_RunSink", CapturingSink)
+    real = builders.build_lifecycle_record
+
+    def build(**kwargs: typing.Any) -> typing.Any:
+        if kwargs["event"] is Event.CHILD_STARTED:
+            CapturingSink.created[0].poisoned = True
+            raise RuntimeError(CANARY)
+        return real(**kwargs)
+
+    monkeypatch.setattr(two_phase, "build_lifecycle_record", build)
+    del world
+    return "stop:1", 2
+
+
+CONTAINMENT_SCENARIOS: typing.Final = {
+    "pre_evidence": _pre_evidence_failure,
+    "poisoned_sink": _poisoned_sink_failure,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancels", [0, 1, 2])
+@pytest.mark.parametrize("mode", ["ok", "cancelled", "boom"])
+@pytest.mark.parametrize("scenario", sorted(CONTAINMENT_SCENARIOS))
+async def test_4gc_r2_caller_cancellation_during_containment_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    mode: str,
+    cancels: int,
+) -> None:
+    """R2: a caller cancellation during the containment stop propagates, never a result.
+
+    The child stop's own outcome (success, self-cancellation or a different
+    BaseException) never counts as a caller cancellation, and exactly one owned
+    cleanup stop runs, with no terminal, seal or manifest.
+    """
+    world = World(tmp_path)
+    gate, total_stops = CONTAINMENT_SCENARIOS[scenario](world, monkeypatch)
+    counters = Counters(monkeypatch)
+    entered = world.gates.arm(gate)
+    world.child.stop_modes = ["ok", mode] if scenario == "poisoned_sink" else [mode]
+    task = asyncio.ensure_future(world.run())
+    await asyncio.wait_for(entered.wait(), 5)
+    for _ in range(cancels):
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    world.gates.gates[gate].set()
+    if cancels:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        result = await task
+        expected = (
+            Outcome.REFUSED_BEFORE_EVIDENCE
+            if scenario == "pre_evidence"
+            else Outcome.EVIDENCE_NOT_SEALED
+        )
+        assert result.outcome is expected and result.manifest_sha256 is None
+        assert result.child_ownership is (
+            Own.OWNED_STOP_CONFIRMED if mode == "ok" else Own.OWNED_STOP_UNCONFIRMED
+        )
+    assert world.child.stops == total_stops
+    assert counters.seals == 0
+    assert not any(event == "run_terminated" for _phase, event in world.events())
+    assert not world.manifest_exists()
 
 
 # ------------------------------------------------------------ T11: sessions
