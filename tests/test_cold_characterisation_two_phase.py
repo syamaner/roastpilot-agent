@@ -4380,6 +4380,39 @@ async def test_4gc_t22_a_conformant_checker_never_overrides_a_failure(
 
 
 @pytest.mark.asyncio
+async def test_4gc_t22_end_handling_suppresses_a_contradictory_checker_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T22 isolated: end handling returns the suppressed row without raising.
+
+    Recovery would also yield NOT_CONFORMANT with the held digest, so this pins
+    that the contradiction rule itself (not exception recovery) produced it.
+    """
+    errors: list[BaseException] = []
+    real_end = two_phase._TwoPhaseRun._end
+
+    def end(self: two_phase._TwoPhaseRun, sink: two_phase._RunSink) -> typing.Any:
+        try:
+            return real_end(self, sink)
+        except Exception as error:
+            errors.append(error)
+            raise
+
+    def check(run: object) -> object:
+        del run
+        return CHECKED["conformant"]
+
+    monkeypatch.setattr(two_phase._TwoPhaseRun, "_end", end)
+    monkeypatch.setattr(two_phase, "check_pre_advisory_conformance", check)
+    world = World(tmp_path)
+    world.mcp.finalise = lambda p, s: not_clean_result(p, s) if p is ON else clean_result(p, s)
+    result = await world.run()
+    assert errors == []
+    assert (result.outcome, result.conformance) == (Outcome.NOT_CONFORMANT, None)
+    assert result.termination_reason is R.FINALISATION_NOT_CLEAN
+
+
+@pytest.mark.asyncio
 async def test_4gc_a_raising_identity_source_is_identity_not_frozen(tmp_path: Path) -> None:
     """A raising identity source refuses as IDENTITY_NOT_FROZEN with the child stopped."""
     world = World(tmp_path)
