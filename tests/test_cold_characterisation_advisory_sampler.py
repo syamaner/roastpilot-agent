@@ -754,6 +754,17 @@ async def cancel_and_wait(task: "asyncio.Task[typing.Any]") -> None:
     await asyncio.wait({task})
 
 
+async def finish(task: "asyncio.Task[typing.Any]", clock: ManualClock) -> None:
+    """Bounded test cleanup: cancel the run and wake sleepers until it has ended."""
+    for _ in range(STEP_CAP):
+        if task.done():
+            return
+        task.cancel()
+        clock.wake_all()
+        await asyncio.sleep(0)
+    raise AssertionError("cleanup step cap")
+
+
 def forged(model: pydantic.BaseModel, mutate: Callable[[dict[object, object]], None]) -> typing.Any:
     """A shallow copy whose raw ``__dict__`` was mutated (a hostile carrier)."""
     copy = model.model_copy()
@@ -2210,14 +2221,19 @@ async def test_no_call_after_abandonment(base: Base) -> None:
     release = asyncio.Event()
     rig = make(base, acts=[Act("ignore_cancel", event=release)])
     task = start(rig)
-    await drive(rig.clock, OPEN)
-    rig.clock.jump(5.0)
-    await drive_until(task.done)
-    assert task.result().stop is Stop.STOPPED_AFTER_ABANDONMENT
-    release.set()
-    await drive(rig.clock, 1760.0)
-    assert rig.advisor.entries == [OPEN]
-    assert len(rig.sink.intents) == 1
+    try:
+        await drive(rig.clock, OPEN)
+        rig.clock.jump(5.0)
+        await drive_until(task.done)
+        assert task.result().stop is Stop.STOPPED_AFTER_ABANDONMENT
+        release.set()
+        await drive(rig.clock, 1760.0)
+        assert rig.advisor.entries == [OPEN]
+        assert len(rig.sink.intents) == 1
+    finally:
+        release.set()
+        await finish(task, rig.clock)
+        await idle()
 
 
 @pytest.mark.asyncio
@@ -2225,15 +2241,22 @@ async def test_late_completion_after_abandonment_writes_nothing(base: Base) -> N
     """A late completion after abandonment is observed but never appended."""
     release = asyncio.Event()
     rig = make(base, acts=[Act("ignore_cancel", event=release)])
-    await run_all(rig)
-    count = len(rig.sink.records)
-    release.set()
-    await drive_until(lambda: provider_task(rig).done())
-    assert provider_cell(rig).outcome is not None
-    assert len(rig.sink.records) == count
-    settled = rig.sampler.settle_at_phase_end()
-    assert (settled.closure, settled.provider_task) == (Closure.NO_OPEN_ATTEMPT, Fact.COMPLETED)
-    assert len(rig.sink.records) == count
+    try:
+        await run_all(rig)
+        count = len(rig.sink.records)
+        release.set()
+        await drive_until(lambda: provider_task(rig).done())
+        assert provider_cell(rig).outcome is not None
+        assert len(rig.sink.records) == count
+        settled = rig.sampler.settle_at_phase_end()
+        assert (settled.closure, settled.provider_task) == (
+            Closure.NO_OPEN_ATTEMPT,
+            Fact.COMPLETED,
+        )
+        assert len(rig.sink.records) == count
+    finally:
+        release.set()
+        await idle()
 
 
 @pytest.mark.asyncio
@@ -2241,11 +2264,15 @@ async def test_abandonment_cancels_once(base: Base) -> None:
     """Exactly one cancellation request reaches the provider."""
     release = asyncio.Event()
     rig = make(base, acts=[Act("ignore_cancel", event=release)])
-    await run_all(rig)
-    rig.sampler.settle_at_phase_end()
-    release.set()
-    await drive(rig.clock, 1800.0)
-    assert rig.advisor.cancels == 1
+    try:
+        await run_all(rig)
+        rig.sampler.settle_at_phase_end()
+        release.set()
+        await drive(rig.clock, 1800.0)
+        assert rig.advisor.cancels == 1
+    finally:
+        release.set()
+        await idle()
 
 
 @pytest.mark.parametrize("pid", ["invoked_cancelled", "getter_cancelled"])
@@ -2401,8 +2428,7 @@ async def test_waiters_retired(base: Base, pid: str) -> None:
             assert task.exception() is None
     finally:
         event.set()
-        if not task.done():
-            await cancel_and_wait(task)
+        await finish(task, rig.clock)
         await idle()
 
 
