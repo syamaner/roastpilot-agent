@@ -150,7 +150,11 @@ _HEX: typing.Final = frozenset("0123456789abcdef")
 
 
 class ColdTwoPhaseMcp(ColdEngineMcp, typing.Protocol):
-    """The engine's five non-actuating operations plus D195 finalisation."""
+    """The engine's non-actuating operations plus D195 finalisation.
+
+    The engine operations are the identity reads, cold-session start, activation
+    and tick reads; finalisation can perform safe-zero and disconnect.
+    """
 
     async def finalise_session(self, session_id: str) -> SessionFinalisationResult:
         """Finalise one explicit cold session (may safe-zero and disconnect)."""
@@ -219,7 +223,9 @@ class ColdChildOwnership(enum.Enum):
     """What this invocation knows of the child it may have started.
 
     ``NOT_OWNED`` says only that this invocation never attempted a start; it
-    never proves that no child exists.
+    never proves that no child exists.  ``OWNED_STOP_CONFIRMED`` confirms only
+    that the stop of the child this invocation owned was confirmed; it never
+    proves that no child currently exists or that any actuator is in a safe state.
     """
 
     NOT_OWNED = "not_owned"
@@ -465,6 +471,8 @@ def _copy_node(
         if not all(type(key) is str for key in mapping):
             return None
         keys = typing.cast(list[str], list(mapping))
+        if any(len(key) > MAX_ENVELOPE_BYTES for key in keys):
+            return None
         size = sum(len(key.encode("utf-8")) for key in keys)
         return {}, [(key, mapping[key]) for key in keys], size
     return [], [(None, item) for item in typing.cast(tuple[object, ...], current)], 0
@@ -923,7 +931,8 @@ class _ChildOwner:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
                 continue
-        task.exception()
+        if not task.cancelled():
+            task.exception()
 
 
 # ------------------------------------------------------------ orchestrator
@@ -1163,9 +1172,11 @@ class _TwoPhaseRun:
         if not sink.finalisation_eligible(phase):
             return False
         outcome: SessionFinalisationResult | None = None
+        raised = False
         try:
             returned: object = await self._mcp.finalise_session(session)
         except Exception as error:
+            raised = True
             outcome = _finalisation_error_result(error)
         else:
             outcome = _admit_carrier(returned, SessionFinalisationResult, _FINALISATION)
@@ -1203,8 +1214,11 @@ class _TwoPhaseRun:
                 finalisation_result=Result.RECORD_NOT_RETAINED,
             )
             return False
+        # A result carried by a finalisation error is retained but never clean,
+        # whatever its payload says: the error origin itself is a failure.
         clean = (
-            outcome.session_purpose == "cold_characterisation"
+            not raised
+            and outcome.session_purpose == "cold_characterisation"
             and finalisation_is_clean(outcome)
             and finalisation_has_required_safety_evidence(outcome)
         )
@@ -1433,15 +1447,44 @@ class _TwoPhaseRun:
             ColdTwoPhaseOutcome.NOT_CONFORMANT, digest, None if conformant else conformance
         )
 
+    async def _contained(self) -> ColdTwoPhaseResult:
+        """Contain a repeated ordinary teardown failure as the unsealed failure row.
+
+        The sink is closed (never sealed) and only the permitted owned cleanup
+        stop runs; nothing is finalised or stopped again and no text escapes.
+        """
+        if self._sink is not None:
+            self._sink.close()
+        await self._child.shielded_cleanup()
+        if self._sink is None:
+            return ColdTwoPhaseResult(
+                outcome=ColdTwoPhaseOutcome.REFUSED_BEFORE_EVIDENCE,
+                start_refusal=ColdRunStartRefusal.UNEXPECTED_FAILURE,
+                termination_reason=None,
+                child_ownership=self._child.ownership,
+                manifest_sha256=None,
+                conformance=None,
+            )
+        return self._result(ColdTwoPhaseOutcome.EVIDENCE_NOT_SEALED)
+
     async def execute(self) -> ColdTwoPhaseResult:
-        """Run once; on cancellation or another ``BaseException`` clean up and re-raise."""
+        """Run once; contain ordinary failures, and re-raise any other ``BaseException``.
+
+        An ordinary exception gets one fallback teardown; if that also fails the
+        run returns the unsealed failure row.  Cancellation and other
+        ``BaseException`` close the sink, run the shielded cleanup and re-raise.
+        """
         try:
             try:
                 return await self._sequence()
             except Exception:
                 self._fail(_R.UNEXPECTED_FAILURE)
             self._refusal = ColdRunStartRefusal.UNEXPECTED_FAILURE
-            return await self._teardown()
+            try:
+                return await self._teardown()
+            except Exception:
+                self._fail(_R.UNEXPECTED_FAILURE)
+            return await self._contained()
         except BaseException:
             if self._sink is not None:
                 self._sink.close()
@@ -1467,7 +1510,7 @@ async def run_two_phase_characterisation(
 
     Args:
         root: The admitted evidence root.
-        mcp: The cold MCP port (five non-actuating reads plus D195 finalisation).
+        mcp: The cold MCP port (non-actuating operations plus D195 finalisation).
         child: The consumer-owned child lifecycle port.
         identities: The phase identity source, called after each confirmed start.
         host: The host-bound port.

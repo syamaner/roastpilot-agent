@@ -2951,9 +2951,8 @@ def test_4gc_t17_recording_must_be_an_exact_bool(tmp_path: Path, recording: obje
         conformance.masked_identity_text(genuine, recording)  # type: ignore[arg-type]
 
 
-def test_4gc_t17_a_non_object_identity_raises_unchanged(tmp_path: Path) -> None:
+def test_4gc_t17_a_non_object_identity_raises_unchanged() -> None:
     """T17: an admitted envelope whose document is not an object raises (as before)."""
-    del tmp_path
     with pytest.raises(ValueError):
         conformance.masked_identity_text(envelope_of([1, 2]), False)
     with pytest.raises(KeyError):

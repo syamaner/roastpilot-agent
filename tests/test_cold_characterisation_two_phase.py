@@ -37,6 +37,7 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdFinalisationSafetyError,
     ColdMcpTransportError,
     ColdSessionIdentityError,
+    ColdSessionPurposeError,
     ColdTickObservation,
     SessionFinalisationResult,
 )
@@ -310,6 +311,8 @@ class Child:
         self.stops_completed += 1
         if mode == "raise":
             raise RuntimeError(CANARY)
+        if mode == "cancelled":
+            raise asyncio.CancelledError
         if mode == "unconfirmed":
             self.running_value = False
             self.unconfirmed_value = True
@@ -871,6 +874,72 @@ def test_4gc_t16_bounds_admit_their_limits_and_refuse_one_beyond(tmp_path: Path)
     assert two_phase._scalar(HostileStr("x")) is None
 
 
+class Holder(pydantic.BaseModel):
+    """A schema-free test carrier: only ``_snapshot``'s own bounds can refuse it."""
+
+    value: object
+
+
+HOLDER_TABLE: typing.Final = two_phase._carrier((Holder,), ())
+
+
+def holder_snapshot(value: object) -> object | None:
+    """Snapshot one schema-free holder of ``value``."""
+    return two_phase._snapshot(Holder.model_construct(value=value), Holder, HOLDER_TABLE)
+
+
+def test_4gc_dict_keys_are_length_bounded_before_encoding() -> None:
+    """An exact key longer than the envelope bound is refused before any encoding."""
+    limit = schema.MAX_ENVELOPE_BYTES
+    admitted = two_phase._copy_node({"k" * limit: None}, HOLDER_TABLE, set())
+    assert admitted is not None and admitted[2] == limit
+    assert two_phase._copy_node({"k" * (limit + 1): None}, HOLDER_TABLE, set()) is None
+    # A surrogate cannot be encoded: only a pre-encoding length check refuses it quietly.
+    assert two_phase._copy_node({"\ud800" * (limit + 1): None}, HOLDER_TABLE, set()) is None
+    assert holder_snapshot({"\ud800" * (limit + 1): None}) is None
+    hostile = {HostileStr("k"): None}
+    reset_spies()
+    assert two_phase._copy_node(hostile, HOLDER_TABLE, set()) is None
+    assert spy_calls() == []
+    assert holder_snapshot({"k": None}) == {"value": {"k": None}}
+
+
+def test_4gc_scalar_strings_are_length_bounded_before_encoding() -> None:
+    """An exact string longer than the envelope bound is refused before any encoding."""
+    limit = schema.MAX_ENVELOPE_BYTES
+    assert two_phase._scalar("s" * limit) == limit
+    assert two_phase._scalar("s" * (limit + 1)) is None
+    assert two_phase._scalar("\ud800" * (limit + 1)) is None
+
+
+def test_4gc_the_node_limit_is_exact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MAX_JSON_NODES visits are admitted and one more is refused (schema-free carrier)."""
+    visits: list[object] = []
+    original = two_phase._copy_node
+
+    def counting(current: object, table: two_phase._Carrier, seen: set[int]) -> typing.Any:
+        visits.append(current)
+        return original(current, table, seen)
+
+    monkeypatch.setattr(two_phase, "_copy_node", counting)
+
+    def payload(leaves: int) -> list[object]:
+        sizes = [1024, 1024, 1024, leaves - 3 * 1024]
+        return [[None] * size for size in sizes]
+
+    # One holder model, one outer list, four inner lists, then the scalar leaves.
+    at_limit = payload(schema.MAX_JSON_NODES - 6)
+    assert holder_snapshot(at_limit) is not None
+    models = sum(1 for v in visits if type(v) is Holder)
+    containers = sum(1 for v in visits if type(v) is list)
+    scalars = sum(1 for v in visits if v is None)
+    assert (models, containers, scalars) == (1, 5, schema.MAX_JSON_NODES - 6)
+    assert len(visits) == schema.MAX_JSON_NODES
+    visits.clear()
+    assert holder_snapshot(payload(schema.MAX_JSON_NODES - 5)) is None
+    assert len(visits) == schema.MAX_JSON_NODES
+
+
 def test_4gc_t16_a_coercing_snapshot_is_not_silently_accepted(tmp_path: Path) -> None:
     """T16: a value that strict JSON would coerce fails the lossless round trip."""
     genuine = cold_identity(tmp_path, make_root(tmp_path))
@@ -898,9 +967,8 @@ def finalisation_forgeries(genuine: SessionFinalisationResult) -> dict[str, obje
     }
 
 
-def test_4gc_t16_forged_finalisation_results_are_refused(tmp_path: Path) -> None:
+def test_4gc_t16_forged_finalisation_results_are_refused() -> None:
     """T16: forged D195 results are refused with zero spy calls."""
-    del tmp_path
     genuine = clean_result(OFF, SESSIONS[OFF])
     for name, value in finalisation_forgeries(genuine).items():
         reset_spies()
@@ -913,15 +981,10 @@ def test_4gc_t16_forged_finalisation_results_are_refused(tmp_path: Path) -> None
 
 def test_4gc_t16_forged_engine_and_checker_carriers_are_refused() -> None:
     """T16: forged engine results and checker results are refused with zero spy calls."""
-    completed, aborted, refused = engine_carriers()
+    _completed, aborted, _refused = engine_carriers()
     classification = typing.cast(tuple[pydantic.BaseModel, ...], raw_fields(aborted)["aborts"])[0]
-    engine_forgeries: dict[str, object] = {
-        "hostile_session": forged(completed, session_id=HostileStr(SESSIONS[OFF])),
-        "bool_tick_count": forged(completed, tick_count=True),
-        "fabricated_domain": forged(
-            aborted,
-            aborts=(forged(classification, domain=object.__new__(schema.ColdAbortDomain)),),
-        ),
+    corpus: dict[str, object] = {
+        **engine_forgeries(),
         "foreign_reason": forged(
             aborted, aborts=(forged(classification, reason=ForeignArtefactKind.WHEEL),)
         ),
@@ -929,10 +992,9 @@ def test_4gc_t16_forged_engine_and_checker_carriers_are_refused() -> None:
             aborted,
             aborts=(forged(classification, domain=schema.ColdAbortDomain.ENGINE),),
         ),
-        "refused_extra": with_dict(refused, {**raw_fields(refused), "x": 1}),
-        "unknown_root": object(),
     }
-    for name, value in engine_forgeries.items():
+    assert len(corpus) == 7
+    for name, value in corpus.items():
         reset_spies()
         for root in two_phase._ENGINE_ROOTS:
             assert two_phase._admit_carrier(value, root, two_phase._ENGINE) is None, name
@@ -1615,9 +1677,6 @@ class CountingClock:
             raise self.current[1]
         return typing.cast(str, self.current[1])
 
-    async def sleep(self, seconds: float) -> None:  # pragma: no cover - never awaited.
-        del seconds
-
 
 def test_4gc_ledger_admits_ties_and_refuses_regressions_without_resampling() -> None:
     """Clock floor: ties admitted, a regression refused once with the floor unchanged."""
@@ -1632,13 +1691,14 @@ def test_4gc_ledger_admits_ties_and_refuses_regressions_without_resampling() -> 
         (12.0, "not-a-time"),
         (12.0, utc_at(12.0)),
     )
-    assert ledger.sample(clock) == (10.0, utc_at(10.0))
-    assert ledger.sample(clock) == (10.0, utc_at(10.0))
+    port = typing.cast(engine.ColdEngineClock, clock)
+    assert ledger.sample(port) == (10.0, utc_at(10.0))
+    assert ledger.sample(port) == (10.0, utc_at(10.0))
     for _ in range(5):
-        assert ledger.sample(clock) is None
+        assert ledger.sample(port) is None
         assert ledger.floor == 10.0
     assert clock.monotonic_calls == 7
-    assert ledger.sample(clock) == (12.0, utc_at(12.0))
+    assert ledger.sample(port) == (12.0, utc_at(12.0))
     assert ledger.floor == 12.0
 
 
@@ -2550,7 +2610,6 @@ async def test_4gc_child_configure_and_start_only_from_idle_owned_states() -> No
     await owner.stop()
     assert owner.configure(ON) is True
     assert await owner.start() is True
-    port.start_mode = "configure_raises"
     starting = owner_of(Port())
     starting.state = State.STARTING
     assert starting.configure(ON) is False
@@ -3135,9 +3194,6 @@ async def test_4gc_t4_each_checkpoint_stops_the_next_operation(
     assert (("get_server_info", ON) in world.mcp.calls) is (name == "post_on_admission")
 
 
-# ------------------------------------------------ T7 / admission mappings
-
-
 @pytest.mark.asyncio
 async def test_4gc_t4_the_post_finalisation_checkpoint_precedes_the_stop(tmp_path: Path) -> None:
     """T4: a budget breach found after finalisation is primary over a later uncertain stop."""
@@ -3148,6 +3204,9 @@ async def test_4gc_t4_the_post_finalisation_checkpoint_precedes_the_stop(tmp_pat
     assert_failed(world, result, R.TRANSITION_BUDGET_EXCEEDED)
     assert result.child_ownership is Own.OWNED_STOP_UNCONFIRMED
     assert world.event(OFF, "child_stopped")["child_stop"] == "unconfirmed"
+
+
+# ------------------------------------------------ T7 / admission mappings
 
 
 @pytest.mark.asyncio
@@ -3363,6 +3422,70 @@ async def test_4gc_another_base_exception_propagates_after_owned_cleanup(tmp_pat
     assert not world.manifest_exists()
 
 
+@pytest.mark.asyncio
+async def test_4gc_a_cancelled_cleanup_stop_never_replaces_the_initiating_exception(
+    tmp_path: Path,
+) -> None:
+    """The original BaseException survives a cleanup stop whose port raises CancelledError."""
+    world = World(tmp_path)
+    world.identities.values[ON] = Halt()
+    world.child.stop_modes = ["ok", "cancelled"]
+    with pytest.raises(Halt):
+        await world.run()
+    assert world.child_ops() == NORMAL_CHILD_OPS
+    assert world.child.unconfirmed_value is False and world.child.stops == 2
+    assert not world.manifest_exists()
+
+
+@pytest.mark.asyncio
+async def test_4gc_a_repeated_teardown_exception_is_contained_unsealed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ordinary exception from teardown, first and fallback, never escapes raw."""
+    attempts: list[int] = []
+
+    def seal(self: two_phase._RunSink) -> str:
+        attempts.append(1)
+        raise RuntimeError(f"{CANARY} /private/evidence {SESSIONS[OFF]}")
+
+    monkeypatch.setattr(two_phase._RunSink, "seal", seal)
+    world = World(tmp_path)
+    result = await world.run()
+    assert len(attempts) == 2
+    assert result.outcome is Outcome.EVIDENCE_NOT_SEALED
+    assert result.termination_reason is R.UNEXPECTED_FAILURE
+    assert result.manifest_sha256 is None and result.conformance is None
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+    assert world.child_ops() == NORMAL_CHILD_OPS
+    assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
+    assert_no_canary(result)
+
+
+@pytest.mark.asyncio
+async def test_4gc_a_repeated_teardown_exception_before_evidence_is_contained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no writer yet, a repeated teardown exception is REFUSED/UNEXPECTED_FAILURE."""
+    attempts: list[int] = []
+
+    def refused(self: two_phase._TwoPhaseRun, refusal: two_phase.ColdRunStartRefusal) -> typing.Any:
+        attempts.append(1)
+        raise RuntimeError(CANARY)
+
+    monkeypatch.setattr(two_phase._TwoPhaseRun, "_refused", refused)
+    world = World(tmp_path)
+    world.identities.values[OFF] = RuntimeError(CANARY)
+    result = await world.run()
+    assert len(attempts) == 2
+    assert (result.outcome, result.start_refusal) == (
+        Outcome.REFUSED_BEFORE_EVIDENCE,
+        Refusal.UNEXPECTED_FAILURE,
+    )
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+    assert world.child_ops() == [("configure", OFF), ("start", OFF), ("stop", OFF)]
+    assert_no_canary(result)
+
+
 # ------------------------------------------------------------ T11: sessions
 
 
@@ -3444,6 +3567,24 @@ FINALISATION_CASES: typing.Final[list[tuple[str, Callable[[Phase, str], object],
     (
         "whitespace_padded_session",
         lambda p, s: clean_result(p, s + " "),
+        "failed_without_result",
+        R.FINALISATION_FAILED,
+    ),
+    (
+        "not_clean_error_with_clean_payload",
+        lambda p, s: ColdFinalisationNotCleanError("m", clean_result(p, s)),
+        "not_clean_recorded",
+        R.FINALISATION_NOT_CLEAN,
+    ),
+    (
+        "safety_error_with_clean_payload",
+        lambda p, s: ColdFinalisationSafetyError("m", clean_result(p, s)),
+        "not_clean_recorded",
+        R.FINALISATION_NOT_CLEAN,
+    ),
+    (
+        "purpose_error",
+        lambda p, s: ColdSessionPurposeError(CANARY),
         "failed_without_result",
         R.FINALISATION_FAILED,
     ),

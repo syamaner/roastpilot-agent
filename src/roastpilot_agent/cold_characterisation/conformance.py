@@ -649,8 +649,8 @@ def _host_values_admitted(sample: ColdHostSample) -> bool:
 
 
 def _exact_map(value: object) -> dict[str, object]:
-    """Return one identity section known to be an exact JSON object."""
-    if type(value) is not dict:  # pragma: no cover - read_identity_v1 requires every section.
+    """Return one identity section that must be an exact JSON object, else raise."""
+    if type(value) is not dict:
         raise ValueError("identity section is not an exact object")
     return typing.cast(dict[str, object], value)
 
