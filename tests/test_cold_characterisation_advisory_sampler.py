@@ -1412,11 +1412,13 @@ async def test_lookup_value_classification(base: Base, pid: str) -> None:
             None,
         )
         assert (advisor.getter_reads, rig.sink.resolutions) == (1, [])
+        assert (clock.monotonic_calls, clock.utc_calls) == (2, 2)
         expected = (Closure.RECORDED_UNRESOLVED_NOT_INVOKED, Fact.NONE, 1)
     settled = rig.sampler.settle_at_phase_end()
     assert triple(settled) == expected
     assert rig.sampler.settle_at_phase_end() is settled
     if not callable_value:
+        assert (clock.monotonic_calls, clock.utc_calls) == (3, 3)
         record = only(rig)
         assert record.resolution is Kind.UNRESOLVED_AT_PHASE_END
         assert (record.invocation_monotonic, record.invocation_utc) == (None, None)
