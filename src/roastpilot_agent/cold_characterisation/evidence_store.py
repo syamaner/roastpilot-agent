@@ -19,6 +19,13 @@ import typing
 
 import pydantic
 
+from roastpilot_agent.cold_characterisation.evidence_advisory import (
+    ColdAdvisoryAttemptError,
+    ColdAdvisoryAttemptFailure,
+    ColdAdvisoryAttemptRecord,
+    ColdAdvisorySequence,
+    validate_advisory_attempt_record,
+)
 from roastpilot_agent.cold_characterisation.evidence_lifecycle import (
     ColdLifecycleError,
     ColdLifecycleFailure,
@@ -975,6 +982,25 @@ def check_lifecycle_binding(state: ColdBindingState, record: ColdLifecycleRecord
     _phase_header_for(state, phase=record.phase, identity_sha256=record.identity_sha256)
 
 
+def check_advisory_attempt_binding(
+    state: ColdBindingState, record: ColdAdvisoryAttemptRecord
+) -> None:
+    """Bind one validated advisory-attempt record to its run and bound phase header.
+
+    It never binds a header and never mutates ``state``.
+
+    Args:
+        state: Binding state holding the already bound phase headers.
+        record: A snapshot returned by ``validate_advisory_attempt_record``.
+
+    Raises:
+        ColdEvidenceStoreError: If the run id, phase header, or identity digest fails.
+    """
+    if record.run_id != state.run_id:
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.RUN_ID_MISMATCHED)
+    _phase_header_for(state, phase=record.phase, identity_sha256=record.identity_sha256)
+
+
 # ------------------------------------------------------------ tree primitives
 
 
@@ -1398,6 +1424,7 @@ class ColdEvidenceWriter:
         self._stream_fds: dict[tuple[ColdPhaseKind, str], int] = {}
         self._state = ColdBindingState(run_id)
         self._lifecycle = ColdLifecycleSequence()
+        self._advisory = ColdAdvisorySequence()
         self._poisoned = False
         self._sealed = False
 
@@ -1533,6 +1560,49 @@ class ColdEvidenceWriter:
             self._abandon()
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
         self._lifecycle.commit(snapshot)
+
+    def append_advisory_attempt(self, record: ColdAdvisoryAttemptRecord) -> None:
+        """Validate, bind, order, and durably append one advisory-attempt line.
+
+        The record must belong to the latest bound phase.  Validation, binding, and
+        ordering refusals leave the writer usable and the order state unchanged; a
+        write fault poisons the writer.  The order state advances only after the
+        line is durably written.
+
+        Args:
+            record: One in-process advisory-attempt intent or resolution record.
+
+        Raises:
+            ColdEvidenceError: If schema revalidation fails (propagated unchanged).
+            ColdEvidenceStoreError: If binding fails, or a write fails (then poisoned).
+            ColdAdvisoryAttemptError: If the record is not in the latest phase or
+                breaks the run-wide attempt order.
+        """
+        run_fd = self._require_writable()
+        snapshot = validate_advisory_attempt_record(record)
+        try:
+            check_advisory_attempt_binding(self._state, snapshot)
+            if snapshot.phase is not self._state.headers[-1][0].phase:
+                raise ColdAdvisoryAttemptError(ColdAdvisoryAttemptFailure.PHASE_NOT_LATEST)
+            self._advisory.check(snapshot)
+        except (ColdEvidenceStoreError, ColdAdvisoryAttemptError):
+            raise
+        except BaseException:
+            self._abandon()
+            raise
+        failed = False
+        try:
+            line = (canonical_json(snapshot.model_dump(mode="json")) + "\n").encode("utf-8")
+            _write_all(self._stream_fd(run_fd, snapshot.phase, "advisory_attempt"), line)
+        except (OSError, ValueError, ColdEvidenceStoreError):
+            failed = True
+        except BaseException:
+            self._abandon()
+            raise
+        if failed:
+            self._abandon()
+            raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
+        self._advisory.commit(snapshot)
 
     def seal(self) -> ColdSealedRun:
         """Seal the run: two-pass enumeration, hashing, and the manifest pair.

@@ -890,10 +890,20 @@ _STDLIB_ALLOWED = frozenset(
 )
 _MODULE_IMPORT_ALLOW_LIST: dict[str, frozenset[str]] = {
     "evidence_store.py": frozenset(
-        {_COLD + "evidence_schema", _COLD + "mcp", _COLD + "evidence_lifecycle"}
+        {
+            _COLD + "evidence_schema",
+            _COLD + "mcp",
+            _COLD + "evidence_lifecycle",
+            _COLD + "evidence_advisory",
+        }
     ),
     "evidence_reader.py": frozenset(
-        {_COLD + "evidence_schema", _COLD + "evidence_store", _COLD + "evidence_lifecycle"}
+        {
+            _COLD + "evidence_schema",
+            _COLD + "evidence_store",
+            _COLD + "evidence_lifecycle",
+            _COLD + "evidence_advisory",
+        }
     ),
     "evidence_builders.py": frozenset(
         {
