@@ -449,6 +449,15 @@ def test_w5_dwell_below_the_floor(tmp_path: Path) -> None:
     expect(run_case(tmp_path, attempts), (F.DWELL_BELOW_MINIMUM,))
 
 
+def test_w6_a_call_due_exactly_at_close_is_missing(tmp_path: Path) -> None:
+    """W6: 50 attempts every six seconds; the final due (``res_49 + 5.0``) equals close."""
+    attempts = chains({"f": 0.0, "g": 0.0, "d": 1.0, "w": 5.0, "b": 5.0, "n": 50}, fit=False)
+    for phase, items in attempts.items():
+        assert items[-1].inv == OPEN[phase] + 294.0 <= CLOSE[phase]
+        assert items[-1].res + items[-1].dwell == CLOSE[phase]
+    expect(run_case(tmp_path, attempts), (F.WINDOW_CALL_MISSING,))
+
+
 def test_d1_call_duration_just_over_the_bound(tmp_path: Path) -> None:
     """D1: ``res_10`` one ulp after ``inv_10 + 5.0``; later attempts re-timed."""
     attempts = base(res_at={10: lambda inv: math.nextafter(inv + 5.0, math.inf)})
@@ -607,6 +616,79 @@ def test_c2_descriptor_differs_from_the_identity(tmp_path: Path) -> None:
     expect(run_case(tmp_path, attempts), (F.DESCRIPTOR_NOT_BOUND,))
 
 
+#: One individually valid change per configuration 9-tuple member, on recording-off
+#: intent 7; context-spec fields change their retained context with them.
+C4_CASES: list[tuple[str, dict[str, typing.Any], Findings]] = [
+    (
+        "context_profile_name",
+        {
+            "profile_name": "Another profile",
+            "context": {**CONTEXT, "profile_name": "Another profile"},
+        },
+        (F.CONFIGURATION_NOT_CONSTANT,),
+    ),
+    (
+        "context_target_drop_temp_c",
+        {"target_drop_temp_c": 206.0, "context": {**CONTEXT, "target_drop_temp_c": 206.0}},
+        (F.CONFIGURATION_NOT_CONSTANT,),
+    ),
+    (
+        "context_charge_guidance_min_c",
+        {"charge_guidance_min_c": 150.0, "context": {**CONTEXT, "charge_guidance_min_c": 150.0}},
+        (F.CONFIGURATION_NOT_CONSTANT,),
+    ),
+    (
+        "context_charge_guidance_max_c",
+        {"charge_guidance_max_c": 191.0, "context": {**CONTEXT, "charge_guidance_max_c": 191.0}},
+        (F.CONFIGURATION_NOT_CONSTANT,),
+    ),
+    (
+        "descriptor_provider",
+        {"provider": "another-provider"},
+        (F.CONFIGURATION_NOT_CONSTANT, F.DESCRIPTOR_NOT_BOUND),
+    ),
+    (
+        "descriptor_model",
+        {"model": "another/model"},
+        (F.CONFIGURATION_NOT_CONSTANT, F.DESCRIPTOR_NOT_BOUND),
+    ),
+    (
+        "descriptor_prompt_version",
+        {"prompt_version": "another-version"},
+        (F.CONFIGURATION_NOT_CONSTANT, F.DESCRIPTOR_NOT_BOUND),
+    ),
+    (
+        "configured_call_bound_seconds",
+        {"configured_call_bound_seconds": 6.0},
+        (F.CONFIGURATION_NOT_CONSTANT,),
+    ),
+    (
+        "configured_dwell_seconds",
+        {"configured_dwell_seconds": 5.5},
+        (F.CONFIGURATION_NOT_CONSTANT,),
+    ),
+]
+
+
+@pytest.mark.parametrize(("field", "intent", "expected"), C4_CASES, ids=[c[0] for c in C4_CASES])
+def test_c4_each_configuration_member_must_be_constant(
+    tmp_path: Path, field: str, intent: dict[str, typing.Any], expected: Findings
+) -> None:
+    """C4: changing any one of the nine members on one intent breaks constancy.
+
+    The bound stays above the 2.5-second duration, and the dwell change (5.5) keeps
+    ``inv_7 = res_6 + 5.5`` exactly due, so only constancy (and descriptor binding
+    for the three descriptor members) can refuse.
+    """
+    attempts = base()
+    attempts[OFF][7].intent = intent
+    retained = write_v3(tmp_path, plan(tmp_path), attempts)
+    changed = typing.cast(Intent, retained.advisory_attempts[2 * 7])
+    assert changed.attempt_index == 7 and changed.phase is OFF
+    assert getattr(changed, field) != getattr(first_intent(retained), field)
+    expect(check(retained), expected)
+
+
 @pytest.mark.parametrize(
     ("changes"), [{"context_tick": 99}, {"context_at": 11.5}], ids=["c3a_index", "c3b_instant"]
 )
@@ -615,6 +697,14 @@ def test_c3_context_tick_not_retained(tmp_path: Path, changes: dict[str, typing.
     attempts = base()
     for name, value in changes.items():
         setattr(attempts[OFF][3], name, value)
+    expect(run_case(tmp_path, attempts), (F.CONTEXT_TICK_NOT_BOUND,))
+
+
+def test_c3c_context_tick_from_the_other_phase(tmp_path: Path) -> None:
+    """C3c: recording-on intent 3 names the retained recording-off tick 0 at 11.0."""
+    attempts = base()
+    attempts[ON][3].context_at = TICK0[OFF]
+    assert attempts[ON][3].context_tick == 0 and TICK0[OFF] == 11.0
     expect(run_case(tmp_path, attempts), (F.CONTEXT_TICK_NOT_BOUND,))
 
 
@@ -1170,6 +1260,7 @@ PR_REFUSED: list[tuple[str, dict[str, object]]] = [
     ("version_true", {"policy_version": True}),
     ("version_float", {"policy_version": 2.0}),
     ("outcome_string", {"outcome": "not_conformant"}),
+    ("outcome_forged_member", {"outcome": forged_member(Outcome)}),
     ("findings_list", {"findings": [F.ATTEMPTS_ABSENT]}),
     ("pre_string", {"pre_advisory_findings": ("ticks_absent",)}),
     ("order", {"findings": (F.ATTEMPTS_ABSENT, F.CARRIER_NOT_ADMITTED)}),
