@@ -1961,13 +1961,27 @@ def test_n44_imports_stay_inside_the_ratified_allow_list() -> None:
 
 
 def test_n44_nothing_imports_the_checker() -> None:
-    """N44 (4g-c A1): exactly one production module, the two-phase orchestrator, imports it."""
+    """N44-R (5b AC-P12): exactly the two-phase orchestrator and advisory policy 2 import it."""
     actual = _checker_consumers(SOURCE_PATH.parents[1], "roastpilot_agent")
-    assert actual == ["cold_characterisation/two_phase.py"]
+    assert actual == [
+        "cold_characterisation/advisory_conformance.py",
+        "cold_characterisation/two_phase.py",
+    ]
     assert _checker_consumers_admitted(actual) is True
 
 
-_ADMITTED_CHECKER_CONSUMER: typing.Final = "cold_characterisation/two_phase.py"
+def test_n44_ac_nothing_imports_the_advisory_checker() -> None:
+    """N44-AC: no production module imports the advisory conformance checker."""
+    actual = _checker_consumers(
+        SOURCE_PATH.parents[1], "roastpilot_agent", module="advisory_conformance"
+    )
+    assert actual == []
+
+
+_ADMITTED_CHECKER_CONSUMERS: typing.Final = (
+    "cold_characterisation/advisory_conformance.py",
+    "cold_characterisation/two_phase.py",
+)
 
 
 def _import_base(package: str, node: ast.ImportFrom, package_name: str) -> str | None:
@@ -1982,9 +1996,11 @@ def _import_base(package: str, node: ast.ImportFrom, package_name: str) -> str |
     return f"{base}.{node.module}" if node.module else base
 
 
-def _checker_consumers(package_root: Path, package_name: str) -> list[str]:
-    """Return the sorted, unique package-relative paths that import the checker module."""
-    target = f"{package_name}.cold_characterisation.conformance"
+def _checker_consumers(
+    package_root: Path, package_name: str, module: str = "conformance"
+) -> list[str]:
+    """Return the sorted, unique package-relative paths that import one cold module."""
+    target = f"{package_name}.cold_characterisation.{module}"
     found: list[str] = []
     for path in package_root.rglob("*.py"):
         relative = path.relative_to(package_root)
@@ -2007,8 +2023,8 @@ def _checker_consumers(package_root: Path, package_name: str) -> list[str]:
 
 
 def _checker_consumers_admitted(consumers: list[str]) -> bool:
-    """The fence: exact equality with the single admitted consumer, never membership."""
-    return consumers == [_ADMITTED_CHECKER_CONSUMER]
+    """The fence: exact equality with the two admitted consumers, never membership."""
+    return consumers == list(_ADMITTED_CHECKER_CONSUMERS)
 
 
 _CHECKER_IMPORT_FORMS: typing.Final = {
@@ -2033,29 +2049,53 @@ def _synthetic_package(root: Path, files: dict[str, str]) -> Path:
 
 
 @pytest.mark.parametrize("form", sorted(_CHECKER_IMPORT_FORMS))
-def test_n44_p_the_intended_consumer_alone_is_admitted(tmp_path: Path, form: str) -> None:
-    """N44-P(a-e): each admitted import form inside ``two_phase.py`` is the one consumer."""
+def test_n44_p_the_intended_consumers_are_admitted(tmp_path: Path, form: str) -> None:
+    """N44-P(a-e): each import form inside both admitted files lists exactly those two."""
     package = _synthetic_package(
-        tmp_path, {"cold_characterisation/two_phase.py": _CHECKER_IMPORT_FORMS[form]}
+        tmp_path,
+        {
+            "cold_characterisation/two_phase.py": _CHECKER_IMPORT_FORMS[form],
+            "cold_characterisation/advisory_conformance.py": _CHECKER_IMPORT_FORMS[form],
+        },
+    )
+    consumers = _checker_consumers(package, "roastpilot_agent")
+    assert consumers == [
+        "cold_characterisation/advisory_conformance.py",
+        "cold_characterisation/two_phase.py",
+    ]
+    assert _checker_consumers_admitted(consumers) is True
+
+
+def test_n44_s_one_admitted_consumer_alone_is_refused(tmp_path: Path) -> None:
+    """N44-S: the predicate is exact equality, so ``two_phase.py`` alone is refused."""
+    package = _synthetic_package(
+        tmp_path, {"cold_characterisation/two_phase.py": _CHECKER_IMPORT_FORMS["b"]}
     )
     consumers = _checker_consumers(package, "roastpilot_agent")
     assert consumers == ["cold_characterisation/two_phase.py"]
-    assert _checker_consumers_admitted(consumers) is True
+    assert _checker_consumers_admitted(consumers) is False
 
 
 @pytest.mark.parametrize("form", sorted(_CHECKER_IMPORT_FORMS))
 def test_n44_n_a_second_consumer_is_refused(tmp_path: Path, form: str) -> None:
-    """N44-N(a-e): an extra importer is found and the same predicate refuses the pair."""
+    """N44-N(a-e): a third importer is found and the same predicate refuses the three."""
     extra = "othersub/extra.py" if form == "e" else "cold_characterisation/extra.py"
     package = _synthetic_package(
         tmp_path,
         {
             "cold_characterisation/two_phase.py": _CHECKER_IMPORT_FORMS[form],
+            "cold_characterisation/advisory_conformance.py": _CHECKER_IMPORT_FORMS[form],
             extra: _CHECKER_IMPORT_FORMS[form],
         },
     )
     consumers = _checker_consumers(package, "roastpilot_agent")
-    assert consumers == sorted(["cold_characterisation/two_phase.py", extra])
+    assert consumers == sorted(
+        [
+            "cold_characterisation/advisory_conformance.py",
+            "cold_characterisation/two_phase.py",
+            extra,
+        ]
+    )
     assert _checker_consumers_admitted(consumers) is False
 
 
@@ -2083,18 +2123,36 @@ def test_n44_u_unrelated_same_named_modules_are_not_consumers(tmp_path: Path) ->
     assert _checker_consumers_admitted(consumers) is False
 
 
+def test_n44_u2_the_advisory_checker_is_not_the_checker(tmp_path: Path) -> None:
+    """N44-U2: importing ``advisory_conformance`` is not importing ``conformance``."""
+    package = _synthetic_package(
+        tmp_path,
+        {
+            "cold_characterisation/user.py": (
+                "import roastpilot_agent.cold_characterisation.advisory_conformance\n"
+                "from .advisory_conformance import X\n"
+            ),
+        },
+    )
+    assert _checker_consumers(package, "roastpilot_agent") == []
+
+
 def test_n44_d_duplicate_imports_in_one_file_are_listed_once(tmp_path: Path) -> None:
-    """N44-D: a file importing the checker twice (two forms) is one consumer."""
+    """N44-D: a file importing the checker in three forms is listed once."""
     package = _synthetic_package(
         tmp_path,
         {
             "cold_characterisation/two_phase.py": (
                 _CHECKER_IMPORT_FORMS["a"] + _CHECKER_IMPORT_FORMS["c"] + _CHECKER_IMPORT_FORMS["d"]
-            )
+            ),
+            "cold_characterisation/advisory_conformance.py": _CHECKER_IMPORT_FORMS["b"],
         },
     )
     consumers = _checker_consumers(package, "roastpilot_agent")
-    assert consumers == ["cold_characterisation/two_phase.py"]
+    assert consumers == [
+        "cold_characterisation/advisory_conformance.py",
+        "cold_characterisation/two_phase.py",
+    ]
     assert _checker_consumers_admitted(consumers) is True
 
 

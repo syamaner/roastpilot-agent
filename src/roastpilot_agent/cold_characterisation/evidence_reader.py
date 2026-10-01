@@ -169,8 +169,9 @@ class ColdRetainedRunV3(pydantic.BaseModel):
 
     Integrity facts only.  ``ABSENT`` and ``OPEN_TAIL`` are never healthy, and
     ``COMPLETE`` means only that every retained attempt is structurally resolved,
-    possibly as failed, abandoned, or unresolved at phase end.  It is not a
-    conformance input.
+    possibly as failed, abandoned, or unresolved at phase end.  It is the input to
+    advisory conformance policy 2 (``check_advisory_conformance``); a hand-built
+    instance carries no manifest provenance.
     """
 
     model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
@@ -597,7 +598,9 @@ def read_retained_run_v3(
     ``advisory_attempt.jsonl`` each accept their own per-stream version 2 only; any
     other ``records/`` entry is refused.  This reader never calls the v1 or v2
     reader and nests no v2 carrier.  ``ABSENT`` and ``OPEN_TAIL`` are never healthy,
-    and the result is not a conformance input.
+    and the result is the input to advisory conformance policy 2
+    (``check_advisory_conformance``); a hand-built instance carries no manifest
+    provenance.
 
     Args:
         root: Absolute evidence root holding the run directory.

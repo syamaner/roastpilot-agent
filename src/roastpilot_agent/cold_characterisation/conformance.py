@@ -150,7 +150,7 @@ __all__ = (
     "masked_identity_text",
 )
 
-#: Pre-advisory policy; slice 5 bumps it when it adds advisory policy.
+#: Pre-advisory policy v1; advisory policy is the separate versioned advisory_conformance checker.
 CONFORMANCE_POLICY_VERSION: typing.Final = 1
 
 
