@@ -405,10 +405,15 @@ class World:
         )
 
     def records(self, stream: str) -> list[Json]:
-        """Every retained line of one stream in both phases, read raw from disk."""
+        """Every retained line of one stream in both phases, read raw from disk.
+
+        The phase directories are spelled as literals (pinned to the enum values) so
+        the synthetic evidence path's provenance is statically explicit.
+        """
         found: list[Json] = []
-        for phase in (OFF, ON):
-            path = Path(self.root) / RUN_ID / "records" / phase.value / f"{stream}.jsonl"
+        assert (OFF.value, ON.value) == ("recording_off", "recording_on")
+        for phase_directory in ("recording_off", "recording_on"):
+            path = Path(self.root) / RUN_ID / "records" / phase_directory / f"{stream}.jsonl"
             if path.exists():
                 found.extend(json.loads(line) for line in path.read_text().splitlines())
         return found
