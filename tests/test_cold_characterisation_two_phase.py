@@ -2074,6 +2074,37 @@ def test_4gc_t15_a_close_fault_is_absorbed(tmp_path: Path) -> None:
     assert rig.sink.poisoned and rig.proxy.calls == ["close"]
 
 
+def test_4gc_t15_r3_isolated_seal_requires_a_bound_header(tmp_path: Path) -> None:
+    """Isolated R3: even a terminated-flagged sink without a header never reaches the writer."""
+    rig = SinkRig(tmp_path)
+    rig.sink.terminated = True
+    rig.refused(rig.sink.seal)
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "same"),
+    [
+        (SESSIONS[OFF], SESSIONS[OFF], True),
+        (SESSIONS[OFF], SESSIONS[ON], False),
+        (HostileStr(SESSIONS[OFF]), SESSIONS[OFF], False),
+        (SESSIONS[OFF], HostileStr(SESSIONS[OFF]), False),
+        ("", "", False),
+        ("   ", "   ", False),
+        ("x" * 2049, "x" * 2049, False),
+        (None, None, False),
+        (f"{SESSIONS[OFF]} ", SESSIONS[OFF], False),
+    ],
+    ids=repr,
+)
+def test_4gc_session_equality_is_exact_and_admitted(
+    left: object, right: object, same: bool
+) -> None:
+    """Isolated session rule: both must be admitted exact strings, compared unnormalised."""
+    reset_spies()
+    assert two_phase._same_session(left, right) is same
+    assert spy_calls() == []
+
+
 GUARD_FLAGS: typing.Final = (
     "abort_seen",
     "aborted_not_finalised",
