@@ -8,6 +8,7 @@ one independently reasoned, exact full finding tuple.  Hardware-free throughout.
 
 import ast
 import dataclasses
+import hashlib
 import json
 import math
 import typing
@@ -1886,6 +1887,7 @@ ALLOWED_IMPORTS: dict[str, frozenset[str]] = {
             "ColdEvidenceRecord",
             "ColdEvidenceError",
             "ColdEvidenceFailure",
+            "ColdEnvelopeKind",
             *(name for name in dir(schema) if name.startswith("MAX_")),
         }
     ),
@@ -1959,20 +1961,141 @@ def test_n44_imports_stay_inside_the_ratified_allow_list() -> None:
 
 
 def test_n44_nothing_imports_the_checker() -> None:
-    """N44: no production module imports the checker (actual import nodes)."""
-    package = SOURCE_PATH.parents[1]
-    module = _COLD + "conformance"
-    consumers: list[str] = []
-    for path in package.rglob("*.py"):
+    """N44 (4g-c A1): exactly one production module, the two-phase orchestrator, imports it."""
+    actual = _checker_consumers(SOURCE_PATH.parents[1], "roastpilot_agent")
+    assert actual == ["cold_characterisation/two_phase.py"]
+    assert _checker_consumers_admitted(actual) is True
+
+
+_ADMITTED_CHECKER_CONSUMER: typing.Final = "cold_characterisation/two_phase.py"
+
+
+def _import_base(package: str, node: ast.ImportFrom, package_name: str) -> str | None:
+    """Resolve one ``from`` import's base module against the importing file's package."""
+    if node.level == 0:
+        return node.module
+    parts = package.split(".")
+    keep = len(parts) - (node.level - 1)
+    if keep < len(package_name.split(".")):
+        return None
+    base = ".".join(parts[:keep])
+    return f"{base}.{node.module}" if node.module else base
+
+
+def _checker_consumers(package_root: Path, package_name: str) -> list[str]:
+    """Return the sorted, unique package-relative paths that import the checker module."""
+    target = f"{package_name}.cold_characterisation.conformance"
+    found: list[str] = []
+    for path in package_root.rglob("*.py"):
+        relative = path.relative_to(package_root)
+        package = ".".join((package_name, *relative.parent.parts))
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            imported: list[str] = []
+            matched = False
             if isinstance(node, ast.Import):
-                imported = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.module is not None:
-                imported = [node.module, *(f"{node.module}.{a.name}" for a in node.names)]
-            if module in imported:
-                consumers.append(path.relative_to(package).as_posix())
+                matched = any(
+                    alias.name == target or alias.name.startswith(target + ".")
+                    for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom):
+                base = _import_base(package, node, package_name)
+                matched = base is not None and (
+                    base == target or any(f"{base}.{a.name}" == target for a in node.names)
+                )
+            if matched:
+                found.append(relative.as_posix())
+    return sorted(set(found))
+
+
+def _checker_consumers_admitted(consumers: list[str]) -> bool:
+    """The fence: exact equality with the single admitted consumer, never membership."""
+    return consumers == [_ADMITTED_CHECKER_CONSUMER]
+
+
+_CHECKER_IMPORT_FORMS: typing.Final = {
+    "a": "import roastpilot_agent.cold_characterisation.conformance\n",
+    "b": "from roastpilot_agent.cold_characterisation import conformance\n",
+    "c": "from .conformance import check_pre_advisory_conformance\n",
+    "d": "from . import conformance\n",
+    "e": "from ..cold_characterisation import conformance\n",
+}
+
+
+def _synthetic_package(root: Path, files: dict[str, str]) -> Path:
+    """Write a synthetic ``roastpilot_agent`` tree holding the checker module plus ``files``."""
+    package = root / "pkg"
+    for name in ("__init__.py", "cold_characterisation/__init__.py", "othersub/__init__.py"):
+        (package / name).parent.mkdir(parents=True, exist_ok=True)
+        (package / name).write_text("", encoding="utf-8")
+    (package / "cold_characterisation/conformance.py").write_text("X = 1\n", encoding="utf-8")
+    for name, text in files.items():
+        (package / name).write_text(text, encoding="utf-8")
+    return package
+
+
+@pytest.mark.parametrize("form", sorted(_CHECKER_IMPORT_FORMS))
+def test_n44_p_the_intended_consumer_alone_is_admitted(tmp_path: Path, form: str) -> None:
+    """N44-P(a-e): each admitted import form inside ``two_phase.py`` is the one consumer."""
+    package = _synthetic_package(
+        tmp_path, {"cold_characterisation/two_phase.py": _CHECKER_IMPORT_FORMS[form]}
+    )
+    consumers = _checker_consumers(package, "roastpilot_agent")
+    assert consumers == ["cold_characterisation/two_phase.py"]
+    assert _checker_consumers_admitted(consumers) is True
+
+
+@pytest.mark.parametrize("form", sorted(_CHECKER_IMPORT_FORMS))
+def test_n44_n_a_second_consumer_is_refused(tmp_path: Path, form: str) -> None:
+    """N44-N(a-e): an extra importer is found and the same predicate refuses the pair."""
+    extra = "othersub/extra.py" if form == "e" else "cold_characterisation/extra.py"
+    package = _synthetic_package(
+        tmp_path,
+        {
+            "cold_characterisation/two_phase.py": _CHECKER_IMPORT_FORMS[form],
+            extra: _CHECKER_IMPORT_FORMS[form],
+        },
+    )
+    consumers = _checker_consumers(package, "roastpilot_agent")
+    assert consumers == sorted(["cold_characterisation/two_phase.py", extra])
+    assert _checker_consumers_admitted(consumers) is False
+
+
+def test_n44_u_unrelated_same_named_modules_are_not_consumers(tmp_path: Path) -> None:
+    """N44-U: a top-level or other-package ``conformance`` is never the checker."""
+    package = _synthetic_package(
+        tmp_path,
+        {
+            "top.py": "import conformance\nfrom .. import conformance\n",
+            "othersub/conformance.py": "Y = 2\n",
+            "othersub/user.py": (
+                "from roastpilot_agent.othersub import conformance\n"
+                "from .conformance import Y\n"
+                "import roastpilot_agent.othersub.conformance\n"
+            ),
+            "cold_characterisation/other.py": "conformance = 1\n",
+            "cold_characterisation/user.py": (
+                "from .other import conformance\n"
+                "import roastpilot_agent.cold_characterisation_conformance\n"
+            ),
+        },
+    )
+    consumers = _checker_consumers(package, "roastpilot_agent")
     assert consumers == []
+    assert _checker_consumers_admitted(consumers) is False
+
+
+def test_n44_d_duplicate_imports_in_one_file_are_listed_once(tmp_path: Path) -> None:
+    """N44-D: a file importing the checker twice (two forms) is one consumer."""
+    package = _synthetic_package(
+        tmp_path,
+        {
+            "cold_characterisation/two_phase.py": (
+                _CHECKER_IMPORT_FORMS["a"] + _CHECKER_IMPORT_FORMS["c"] + _CHECKER_IMPORT_FORMS["d"]
+            )
+        },
+    )
+    consumers = _checker_consumers(package, "roastpilot_agent")
+    assert consumers == ["cold_characterisation/two_phase.py"]
+    assert _checker_consumers_admitted(consumers) is True
 
 
 def test_n44_no_tolerant_reads_actuators_or_outcome_vocabulary() -> None:
@@ -2642,3 +2765,202 @@ def test_a3_regression_outside_the_window_keeps_both_findings(tmp_path: Path) ->
     run.ticks[OFF][1].mono = math.nextafter(10.0, -math.inf)
     assert [tick.mono for tick in run.ticks[OFF]] == [11.0, math.nextafter(10.0, -math.inf), 13.0]
     assert findings(tmp_path, run) == (F.TICK_OUTSIDE_WINDOW, F.CAUSAL_ORDER_VIOLATED)
+
+
+# ------------------------------------------- 4g-c T17: shared identity-delta rule
+
+_MASK_PATHS: typing.Final = (
+    ("device_config", "recording_enabled"),
+    ("device_config", "recording_autocapture"),
+    ("server_info", "started_at_utc"),
+    ("effective_mcp_profile", "source_sha256"),
+    ("effective_mcp_profile", "source_byte_length"),
+)
+
+
+def _expected_masked(doc: Json) -> str:
+    """Independently mask the five leaves in a deep copy and render canonical JSON."""
+    copy = json.loads(json.dumps(doc))
+    for section, leaf in _MASK_PATHS:
+        copy[section][leaf] = None
+    return store.canonical_json(copy)
+
+
+def _envelope_bytes(envelope: schema.ColdSealedEnvelope) -> bytes:
+    """Snapshot an envelope's raw field values in order, never comparing its keys."""
+    data = object.__getattribute__(envelope, "__dict__")
+    return repr([(str.__repr__(key), repr(value)) for key, value in data.items()]).encode()
+
+
+@pytest.mark.parametrize("recording", [False, True])
+def test_4gc_t17_masked_identity_text_matches_independent_masking(
+    tmp_path: Path, recording: bool
+) -> None:
+    """T17 parity: the masked text equals an independently masked canonical document."""
+    root = str(tmp_path.resolve() / "pi")
+    doc = document(tmp_path, root, recording)
+    before = json.dumps(doc, sort_keys=True)
+    envelope = envelope_of(doc)
+    snapshot = _envelope_bytes(envelope)
+    assert conformance.masked_identity_text(envelope, recording) == _expected_masked(doc)
+    assert json.dumps(doc, sort_keys=True) == before
+    assert _envelope_bytes(envelope) == snapshot
+
+
+def test_4gc_t17_the_two_phase_documents_mask_to_equal_text(tmp_path: Path) -> None:
+    """T17 parity: the conforming OFF and ON documents differ only in masked leaves."""
+    root = str(tmp_path.resolve() / "pi")
+    off = conformance.masked_identity_text(envelope_of(document(tmp_path, root, False)), False)
+    on = conformance.masked_identity_text(envelope_of(document(tmp_path, root, True)), True)
+    assert off is not None and off == on
+    changed = document(tmp_path, root, True)
+    changed["operator_host_notes"] = "a different host note"
+    other = conformance.masked_identity_text(envelope_of(changed), True)
+    assert other is not None and other != off
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "recording"),
+    [
+        (("device_config", "recording_enabled"), True, False),
+        (("device_config", "recording_autocapture"), None, False),
+        (("server_info", "started_at_utc"), 5, False),
+        (("effective_mcp_profile", "source_sha256"), None, False),
+        (("effective_mcp_profile", "source_byte_length"), True, False),
+        (("effective_mcp_profile", "source_byte_length"), 1.0, False),
+    ],
+    ids=lambda value: repr(value),
+)
+def test_4gc_t17_inadmissible_leaves_return_none(
+    tmp_path: Path, path: tuple[str, str], value: object, recording: bool
+) -> None:
+    """T17: a wrong polarity or non-exact leaf returns ``None`` (unchanged rule)."""
+    doc = document(tmp_path, str(tmp_path.resolve() / "pi"), recording)
+    doc[path[0]][path[1]] = value
+    assert conformance.masked_identity_text(envelope_of(doc), recording) is None
+
+
+class _SubEnvelope(schema.ColdSealedEnvelope):
+    """A subclass that must never be admitted as the envelope."""
+
+
+class _HostileStr(str):
+    """A ``str`` subclass whose comparison and hashing must never run."""
+
+    calls: typing.ClassVar[list[str]] = []
+
+    def __eq__(self, other: object) -> bool:
+        _HostileStr.calls.append("eq")
+        return True
+
+    def __hash__(self) -> int:
+        _HostileStr.calls.append("hash")
+        return 0
+
+    def encode(self, *args: typing.Any, **kwargs: typing.Any) -> bytes:  # type: ignore[override]
+        _HostileStr.calls.append("encode")
+        return b"{}"
+
+
+def _forged(genuine: schema.ColdSealedEnvelope, **changes: object) -> schema.ColdSealedEnvelope:
+    """Forge an envelope through ``model_construct`` with selected raw field values."""
+    fields: dict[str, object] = {
+        name: object.__getattribute__(genuine, "__dict__")[name]
+        for name in schema.ColdSealedEnvelope.model_fields
+    }
+    fields.update(changes)
+    return schema.ColdSealedEnvelope.model_construct(**fields)  # pyright: ignore[reportArgumentType]
+
+
+def _valid_envelope_of_text(text: str) -> schema.ColdSealedEnvelope:
+    """Build a self-consistent constructed envelope over arbitrary text (bypassing validators)."""
+    encoded = text.encode("utf-8", "surrogatepass")
+    return schema.ColdSealedEnvelope.model_construct(
+        kind=schema.ColdEnvelopeKind.IDENTITY,
+        schema_version=1,
+        canonical_json=text,
+        canonical_byte_length=len(encoded),
+        sha256=hashlib.sha256(encoded).hexdigest(),
+    )
+
+
+def _malicious_envelopes(genuine: schema.ColdSealedEnvelope) -> dict[str, object]:
+    """Every forged envelope shape T17 must refuse with the fixed error."""
+    data = object.__getattribute__(genuine, "__dict__")
+    sub = _SubEnvelope.model_construct(**data)
+    extra_key = _forged(genuine)
+    object.__getattribute__(extra_key, "__dict__")["undeclared"] = 1
+    non_empty_extra = _forged(genuine)
+    object.__setattr__(non_empty_extra, "__pydantic_extra__", {})
+    hostile_key = _forged(genuine)
+    raw = object.__getattribute__(hostile_key, "__dict__")
+    raw[_HostileStr("kind")] = raw.pop("kind")
+    renamed_key = _forged(genuine)
+    renamed = object.__getattribute__(renamed_key, "__dict__")
+    renamed["kind_renamed"] = renamed.pop("kind")
+    return {
+        "subclass": sub,
+        "wrong_digest": _forged(genuine, sha256="0" * 64),
+        "wrong_length": _forged(genuine, canonical_byte_length=1),
+        "str_subclass_text": _forged(genuine, canonical_json=_HostileStr(data["canonical_json"])),
+        "str_subclass_digest": _forged(genuine, sha256=_HostileStr(data["sha256"])),
+        "oversize_text": _forged(genuine, canonical_json="x" * (schema.MAX_ENVELOPE_BYTES + 1)),
+        "oversize_digest": _forged(genuine, sha256="0" * 65),
+        "wrong_kind": _forged(genuine, kind=schema.ColdEnvelopeKind.FINALISATION),
+        "kind_value": _forged(genuine, kind="identity"),
+        "version_bool": _forged(genuine, schema_version=True),
+        "version_two": _forged(genuine, schema_version=2),
+        "length_bool": _forged(genuine, canonical_byte_length=True),
+        "duplicate_key": _valid_envelope_of_text('{"a":1,"a":2}'),
+        "nan": _valid_envelope_of_text('{"a":NaN}'),
+        "not_canonical": _valid_envelope_of_text('{"b":1, "a":2}'),
+        "extra_key": extra_key,
+        "pydantic_extra_dict": non_empty_extra,
+        "hostile_key": hostile_key,
+        "renamed_key": renamed_key,
+        "not_a_model": dict(data),
+    }
+
+
+def test_4gc_t17_malicious_envelopes_are_refused_with_a_fixed_error(tmp_path: Path) -> None:
+    """T17: every forged envelope is refused before use; nothing is chained or mutated."""
+    genuine = envelope_of(document(tmp_path, str(tmp_path.resolve() / "pi"), False))
+    for name, forged in _malicious_envelopes(genuine).items():
+        _HostileStr.calls.clear()
+        before = (
+            _envelope_bytes(forged) if type(forged) is not dict else repr(forged).encode()  # type: ignore[arg-type]
+        )
+        with pytest.raises(ValueError) as caught:
+            conformance.masked_identity_text(forged, False)  # type: ignore[arg-type]
+        assert caught.value.args == ("identity envelope not admitted",), name
+        assert caught.value.__cause__ is None and caught.value.__context__ is None, name
+        assert _HostileStr.calls == [], name
+        after = (
+            _envelope_bytes(forged) if type(forged) is not dict else repr(forged).encode()  # type: ignore[arg-type]
+        )
+        assert after == before, name
+
+
+@pytest.mark.parametrize("recording", [1, 0, "True", None, 1.0], ids=repr)
+def test_4gc_t17_recording_must_be_an_exact_bool(tmp_path: Path, recording: object) -> None:
+    """T17: a truthy or falsy non-``bool`` polarity is refused, never coerced."""
+    flag = bool(recording) if recording != "True" else True
+    genuine = envelope_of(document(tmp_path, str(tmp_path.resolve() / "pi"), flag))
+    assert conformance.masked_identity_text(genuine, flag) is not None
+    with pytest.raises(ValueError, match="identity envelope not admitted"):
+        conformance.masked_identity_text(genuine, recording)  # type: ignore[arg-type]
+
+
+def test_4gc_t17_a_non_object_identity_raises_unchanged() -> None:
+    """T17: an admitted envelope whose document is not an object raises (as before)."""
+    with pytest.raises(ValueError):
+        conformance.masked_identity_text(envelope_of([1, 2]), False)
+    with pytest.raises(KeyError):
+        conformance.masked_identity_text(envelope_of({"device_config": {}}), False)
+
+
+def test_4gc_t17_checker_uses_the_shared_rule(tmp_path: Path) -> None:
+    """T17: the checker's identity-delta finding still follows the shared rule."""
+    run = plan(tmp_path)
+    run.documents[ON]["operator_host_notes"] = "changed"
+    assert F.IDENTITY_DELTA_NOT_ADMITTED in findings(tmp_path, run)

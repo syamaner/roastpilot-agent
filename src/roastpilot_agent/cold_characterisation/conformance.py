@@ -102,6 +102,7 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     MAX_TEXT_FIELD_BYTES,
     ColdAbortRecord,
     ColdAdvisoryRecord,
+    ColdEnvelopeKind,
     ColdEvidenceStream,
     ColdFinalisationRecord,
     ColdHostRecord,
@@ -146,6 +147,7 @@ __all__ = (
     "ColdConformanceOutcome",
     "ColdConformanceResult",
     "check_pre_advisory_conformance",
+    "masked_identity_text",
 )
 
 #: Pre-advisory policy; slice 5 bumps it when it adds advisory policy.
@@ -647,8 +649,8 @@ def _host_values_admitted(sample: ColdHostSample) -> bool:
 
 
 def _exact_map(value: object) -> dict[str, object]:
-    """Return one identity section known to be an exact JSON object."""
-    if type(value) is not dict:  # pragma: no cover - read_identity_v1 requires every section.
+    """Return one identity section that must be an exact JSON object, else raise."""
+    if type(value) is not dict:
         raise ValueError("identity section is not an exact object")
     return typing.cast(dict[str, object], value)
 
@@ -663,9 +665,76 @@ def _identity_document(phase: ColdReboundPhase) -> dict[str, object]:
     return _exact_map(document)
 
 
-def _masked_identity(phase: ColdReboundPhase, recording: bool) -> str | None:
-    """Return canonical identity text with the five allowlisted leaves masked, or ``None``."""
-    top = _identity_document(phase)
+_ENVELOPE_FIELDS: typing.Final = tuple(ColdSealedEnvelope.model_fields)
+
+
+def _envelope_fields(envelope: object, recording: object) -> dict[str, object] | None:
+    """Return a fresh primitive copy of one exact identity envelope's fields, or ``None``.
+
+    Every type is checked by identity before any key comparison, hash or encoding.
+    """
+    if type(recording) is not bool or type(envelope) is not ColdSealedEnvelope:
+        return None
+    data: object = object.__getattribute__(envelope, "__dict__")
+    extra: object = object.__getattribute__(envelope, "__pydantic_extra__")
+    if type(data) is not dict or extra is not None:
+        return None
+    raw = typing.cast(dict[object, object], data)
+    if len(raw) != len(_ENVELOPE_FIELDS) or not _exact_str_keys(raw):
+        return None
+    if not all(name in raw for name in _ENVELOPE_FIELDS):
+        return None
+    kind, version, text, length, digest = (raw[name] for name in _ENVELOPE_FIELDS)
+    if kind is not ColdEnvelopeKind.IDENTITY or type(version) is not int:
+        return None
+    if type(length) is not int or type(text) is not str or type(digest) is not str:
+        return None
+    if len(text) > MAX_ENVELOPE_BYTES or len(digest) > 64:
+        return None
+    return dict(zip(_ENVELOPE_FIELDS, (kind, version, text, length, digest), strict=True))
+
+
+def _fresh_envelope(envelope: object, recording: object) -> ColdSealedEnvelope:
+    """Admit one identity envelope through the frozen validators, or raise a fixed error."""
+    fresh: ColdSealedEnvelope | None = None
+    try:
+        fields = _envelope_fields(envelope, recording)
+        if fields is not None:
+            fresh = ColdSealedEnvelope.model_validate(fields, strict=True)
+    except Exception:
+        fresh = None
+    if fresh is None:
+        raise ValueError("identity envelope not admitted")
+    return fresh
+
+
+def masked_identity_text(envelope: ColdSealedEnvelope, recording: bool) -> str | None:
+    """Return canonical identity text with the five allowlisted leaves masked, or ``None``.
+
+    The envelope is admitted first: an exact ``ColdSealedEnvelope`` with exactly its
+    declared fields, the real ``IDENTITY`` kind, exact scalar types and a bounded
+    text, re-validated through its own frozen version, length, digest and canonical
+    validators.  Masking then runs on a freshly parsed document, so neither the
+    caller's envelope nor any caller document is mutated.
+
+    Args:
+        envelope: One sealed identity envelope.
+        recording: The exact recording polarity the two flag leaves must carry.
+
+    Returns:
+        The masked canonical text, or ``None`` when a masked leaf is not admitted.
+
+    Raises:
+        ValueError: With a fixed message when the envelope or polarity is refused.
+        Exception: Any parse or walk refusal of the identity text, unchanged.
+    """
+    fresh = _fresh_envelope(envelope, recording)
+    document = load_strict_json(
+        fresh.canonical_json.encode("utf-8"),
+        malformed=ColdEvidenceStoreFailure.IDENTITY_NOT_V1,
+    )
+    walk_json_value(typing.cast(pydantic.JsonValue, document))
+    top = _exact_map(document)
     device = _exact_map(top["device_config"])
     server = _exact_map(top["server_info"])
     profile = _exact_map(top["effective_mcp_profile"])
@@ -683,6 +752,11 @@ def _masked_identity(phase: ColdReboundPhase, recording: bool) -> str | None:
     for section, leaf in _MASKED_LEAVES:
         _exact_map(top[section])[leaf] = None
     return canonical_json(top)
+
+
+def _masked_identity(phase: ColdReboundPhase, recording: bool) -> str | None:
+    """Return one rebound phase's masked identity text, or ``None``."""
+    return masked_identity_text(phase.header.identity, recording)
 
 
 def _check_identity_delta(
