@@ -24,19 +24,33 @@ from typing import IO, Final, Protocol, TypeAlias, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from roastpilot_agent.cold_characterisation.host_policy import (
+    HOST_MAX_TEMP_C as HOST_MAX_TEMP_C,
+)
+from roastpilot_agent.cold_characterisation.host_policy import (
+    HOST_MIN_FREE_BYTES_BEFORE as HOST_MIN_FREE_BYTES_BEFORE,
+)
+from roastpilot_agent.cold_characterisation.host_policy import (
+    HOST_MIN_FREE_BYTES_DURING as HOST_MIN_FREE_BYTES_DURING,
+)
+from roastpilot_agent.cold_characterisation.host_policy import (
+    HOST_MIN_MEM_AVAILABLE_BYTES as HOST_MIN_MEM_AVAILABLE_BYTES,
+)
+from roastpilot_agent.cold_characterisation.host_policy import (
+    HOST_THROTTLE_FAILURE_MASK,
+    free_bytes_meets_floor,
+    mem_available_is_admitted,
+    soc_temp_below_limit,
+    throttle_word_is_clear,
+)
 from roastpilot_agent.config import FINITE_NUMERIC_MODEL_CONFIG
-
-HOST_MAX_TEMP_C: Final = 80.0
-HOST_MIN_MEM_AVAILABLE_BYTES: Final = 512 * 2**20
-HOST_MIN_FREE_BYTES_BEFORE: Final = 2 * 2**30
-HOST_MIN_FREE_BYTES_DURING: Final = 1 * 2**30
 
 _MAX_THROTTLE_STDOUT_BYTES: Final = 4096
 _MAX_THERMAL_BYTES: Final = 128
 _MAX_MEMINFO_BYTES: Final = 65536
 _MAX_MEM_AVAILABLE_DIGITS: Final = 16
 _CLEANUP_RESERVE_SECONDS: Final = 0.1
-_THROTTLE_FAILURE_MASK: Final = 0x000F000F
+_THROTTLE_FAILURE_MASK: Final = HOST_THROTTLE_FAILURE_MASK
 _THERMAL_PATTERN: Final = re.compile(r"-?[0-9]{1,7}")
 _THROTTLE_PATTERN: Final = re.compile(r"throttled=0x[0-9a-fA-F]{1,8}")
 _MEM_AVAILABLE_PATTERN: Final = re.compile(
@@ -281,7 +295,7 @@ class LinuxHostBoundsReader:
         temperature = int(value) / 1000.0
         if not math.isfinite(temperature):  # pragma: no cover - bounded integer input is finite
             raise ColdHostBoundError(ColdHostBoundFailure.THERMAL_MALFORMED)
-        if temperature >= HOST_MAX_TEMP_C:
+        if not soc_temp_below_limit(temperature):
             raise ColdHostBoundError(ColdHostBoundFailure.THERMAL_EXCEEDED)
         return temperature
 
@@ -324,7 +338,7 @@ class LinuxHostBoundsReader:
             word = int(output.removeprefix("throttled=0x"), 16)
         except ValueError:  # pragma: no cover - anchored hexadecimal grammar is int-valid
             raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_OUTPUT_MALFORMED) from None
-        if word & _THROTTLE_FAILURE_MASK:
+        if not throttle_word_is_clear(word):
             raise ColdHostBoundError(ColdHostBoundFailure.THROTTLE_BITS_SET)
         return word, f"0x{output.removeprefix('throttled=0x').lower()}"
 
@@ -347,7 +361,7 @@ class LinuxHostBoundsReader:
             available = int(matches[0]) * 1024
         except ValueError:  # pragma: no cover - anchored decimal grammar is int-valid
             raise ColdHostBoundError(ColdHostBoundFailure.MEMINFO_MALFORMED) from None
-        if available < HOST_MIN_MEM_AVAILABLE_BYTES:
+        if not mem_available_is_admitted(available):
             raise ColdHostBoundError(ColdHostBoundFailure.MEMINFO_BELOW_BOUND)
         return available
 
@@ -433,6 +447,6 @@ class LinuxHostBoundsReader:
         throttled = self._read_throttled()
         memory = self.read_mem_available_bytes()
         free = self.read_free_bytes(evidence_root)
-        if free < minimum_free_bytes:
+        if not free_bytes_meets_floor(free, minimum_free_bytes):
             raise ColdHostBoundError(disk_failure)
         return thermal, throttled, memory, free

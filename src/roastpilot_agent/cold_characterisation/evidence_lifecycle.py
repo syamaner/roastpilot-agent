@@ -453,6 +453,7 @@ _ADMITTED_ENUM_TYPES: tuple[type[enum.Enum], ...] = (
     ColdLifecycleFailure,
     ColdLifecycleEvidenceState,
 )
+ADMITTED_ENUM_TYPES: typing.Final = _ADMITTED_ENUM_TYPES
 _SCALAR_TYPES: tuple[type[object], ...] = (bool, int, float, str)
 
 
