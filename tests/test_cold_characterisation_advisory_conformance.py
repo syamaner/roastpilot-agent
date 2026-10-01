@@ -877,10 +877,12 @@ def test_h1_forged_v3_roots_are_not_admitted(
     del name, spied
     forged = forge(genuine)
     CALLS.clear()
-    assert probe(lambda: PRIVATE._admit_v3(forged)) is None
+    admitted = probe(lambda: PRIVATE._admit_v3(forged))
     assert CALLS == []
-    expect(check(forged), (F.CARRIER_NOT_ADMITTED,))
+    assert admitted is None
+    result = check(forged)
     assert CALLS == []
+    expect(result, (F.CARRIER_NOT_ADMITTED,))
 
 
 def _spy_model_instance(run: V3) -> object:
@@ -945,10 +947,12 @@ def test_h2_forged_attempts_are_not_admitted(
     forged = forge(genuine)
     run = with_attempt(genuine, index, forged)
     CALLS.clear()
-    assert probe(lambda: PRIVATE._admit_attempt(forged)) is False
+    admitted = probe(lambda: PRIVATE._admit_attempt(forged))
     assert CALLS == []
-    expect(check(run), (F.ATTEMPT_NOT_ADMITTED,))
+    assert admitted is False
+    result = check(run)
     assert CALLS == []
+    expect(result, (F.ATTEMPT_NOT_ADMITTED,))
 
 
 def test_h2j2_byte_bound_is_independent_of_the_character_bound() -> None:
@@ -996,9 +1000,10 @@ def test_h2o_admission_precedes_the_5a_validator(
     forged = _intent_with(genuine, descriptor_model=SpyValue())
     run = with_attempt(genuine, 0, forged)
     CALLS.clear()
-    expect(check(run), (F.ATTEMPT_NOT_ADMITTED,))
+    result = check(run)
     assert recorded == []
     assert CALLS == []
+    expect(result, (F.ATTEMPT_NOT_ADMITTED,))
 
 
 def _replace_first_tick(run: V3, record: schema.ColdTickRecord) -> V3:
@@ -1018,8 +1023,9 @@ def test_h3_hostile_run_value_is_left_to_policy_1(genuine: V3) -> None:
     )
     CALLS.clear()
     assert probe(lambda: PRIVATE._admit_v3(forged)) is not None
-    expect(check(forged), (F.PRE_ADVISORY_NOT_CONFORMANT,), (Pre.CARRIER_NOT_ADMITTED,))
+    result = check(forged)
     assert CALLS == []
+    expect(result, (F.PRE_ADVISORY_NOT_CONFORMANT,), (Pre.CARRIER_NOT_ADMITTED,))
 
 
 # ------------------------------------------------------- structural refusals
@@ -1100,8 +1106,9 @@ def test_ra_forged_policy_1_results_are_not_readmitted(
     del name
     forged = forge()
     CALLS.clear()
-    assert probe(lambda: PRIVATE._admit_pre_advisory_result(forged)) is None
+    admitted = probe(lambda: PRIVATE._admit_pre_advisory_result(forged))
     assert CALLS == []
+    assert admitted is None
 
 
 def test_ra_genuine_policy_1_results_are_readmitted() -> None:
@@ -1304,6 +1311,8 @@ def test_r2b_base_exceptions_propagate(genuine: V3, monkeypatch: pytest.MonkeyPa
 
 SOURCE = Path(ac.__file__)
 TREE = ast.parse(SOURCE.read_text(encoding="utf-8"))
+#: Sentinel for a pinned node that is absent: no real line is ever at or past it.
+ABSENT_LINE = 10**9
 _COLD = "roastpilot_agent.cold_characterisation."
 ALLOWED: dict[str, frozenset[str]] = {
     _COLD + "advisory_window": frozenset(
@@ -1481,10 +1490,14 @@ def _is_method_call(node: ast.AST, owner: str, method: str) -> bool:
 
 
 def _first_line(tree: ast.AST, predicate: typing.Callable[[ast.AST], bool]) -> int:
+    """The first matching line, or a sentinel past every line when nothing matches."""
     return min(
-        typing.cast(int, getattr(node, "lineno", None))
-        for node in ast.walk(tree)
-        if predicate(node)
+        (
+            typing.cast(int, getattr(node, "lineno", None))
+            for node in ast.walk(tree)
+            if predicate(node)
+        ),
+        default=ABSENT_LINE,
     )
 
 
@@ -1540,6 +1553,19 @@ def test_s3_every_admission_uses_the_shared_shape(name: str) -> None:
         isinstance(node, ast.Call) and _is_name(node.func, "_shape")
         for node in ast.walk(_function(name))
     )
+
+
+def test_ra_member_and_order_guards_are_structurally_present() -> None:
+    """RA-member/RA-order (structural): re-admission scans every finding by identity and
+    checks declaration order; later agreement checks would otherwise mask their removal."""
+    calls = [
+        node.func.id
+        for node in ast.walk(_function("_admit_pre_advisory_result"))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+    assert calls.count("_is_member") == 2
+    assert calls.count("_strictly_declared") == 1
+    assert calls.count("_is_exact_version") == 1
 
 
 def test_shape_presence_guard_refuses_a_misspelt_name(genuine: V3) -> None:
