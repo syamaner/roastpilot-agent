@@ -327,12 +327,16 @@ class DoubleAdvisor:
         descriptor: object = DESCRIPTOR,
         lookup_raises: bool = False,
         post_usage: Callable[[], object] | None = None,
+        lookup_value: object = None,
+        override_lookup: bool = False,
     ) -> None:
         self.clock = clock
         self.acts = list(acts)
         self.usage_mode = usage_mode
         self.descriptor = descriptor
         self.lookup_raises = lookup_raises
+        self.lookup_value = lookup_value
+        self.override_lookup = override_lookup
         self.post_usage = post_usage
         self.usage: object = AdvisorUsage(input_tokens=100, output_tokens=10, total_tokens=110)
         self.getter_reads = 0
@@ -371,6 +375,8 @@ class DoubleAdvisor:
             hook()
         if self.lookup_raises:
             raise RuntimeError("lookup fault")
+        if self.override_lookup:
+            return typing.cast(typing.Any, self.lookup_value)
         return self._recommend
 
     def descriptor_for(self, phase: RoastPhase) -> object:
@@ -1345,6 +1351,75 @@ async def test_no_invocation_after_window(base: Base) -> None:
     assert rig.sink.resolutions[0].invocation_state is (
         advisory.ColdAdvisoryInvocationState.NOT_INVOKED
     )
+
+
+def _raise_on_call(context: object) -> object:
+    """A callable lookup value that raises when called (an unclassified failure)."""
+    raise RuntimeError("raised on call")
+
+
+def _return_not_awaitable(context: object) -> object:
+    """A callable lookup value returning a non-awaitable (an unclassified failure)."""
+    return 5
+
+
+#: Open-gate lookup values: non-callable ones are port-access failures (never closure).
+NON_CALLABLE_LOOKUPS: dict[str, object] = {
+    "none": None,
+    "int": 5,
+    "text": "recommend",
+    "instance": object(),
+}
+#: Callable lookup values whose call fails keep the existing unclassified semantics.
+CALLABLE_LOOKUPS: dict[str, object] = {
+    "callable_raises": _raise_on_call,
+    "callable_not_awaitable": _return_not_awaitable,
+}
+
+
+@pytest.mark.parametrize("pid", [*NON_CALLABLE_LOOKUPS, *CALLABLE_LOOKUPS])
+@pytest.mark.asyncio
+async def test_lookup_value_classification(base: Base, pid: str) -> None:
+    """An open-gate non-callable lookup is a port-access failure, never a closure.
+
+    With the gate open, ``None`` or any other non-callable retrieved method refuses
+    the attempt as not invoked before any invocation instant is sampled; nothing is
+    settled or stored until the explicit settlement, which records it truthfully as
+    unresolved and not invoked.  A callable whose call raises or returns a
+    non-awaitable is invoked and keeps the existing unclassified-failure meaning.
+    """
+    clock = ManualClock(13.5)
+    callable_value = pid in CALLABLE_LOOKUPS
+    value = CALLABLE_LOOKUPS[pid] if callable_value else NON_CALLABLE_LOOKUPS[pid]
+    advisor = DoubleAdvisor(clock, lookup_value=value, override_lookup=True)
+    rig = make(base, clock=clock, advisor=advisor, configured_dwell_seconds=MAX)
+    result = await run_all(rig)
+    await drive_until(lambda: provider_settled(rig))
+    sampler, cell = priv(rig.sampler), provider_cell(rig)
+    assert (sampler._gate.closed, sampler._settlement) == (False, None)
+    assert (advisor.lookup_reads, advisor.entries) == (1, [])
+    if callable_value:
+        assert result.stop is Stop.WINDOW_EXHAUSTED
+        assert (cell.refusal, cell.invoked, cell.invocation[0]) == (None, True, OPEN)
+        assert [record.resolution for record in rig.sink.resolutions] == [Kind.RAISED_UNCLASSIFIED]
+        expected = (Closure.NO_OPEN_ATTEMPT, Fact.COMPLETED, 1)
+    else:
+        assert result.stop is Stop.NOT_INVOKED
+        assert (cell.refusal, cell.invoked, cell.invocation, cell.deadline) == (
+            PRIVATE._Refusal.PORT_ACCESS_FAILED,
+            False,
+            None,
+            None,
+        )
+        assert (advisor.getter_reads, rig.sink.resolutions) == (1, [])
+        expected = (Closure.RECORDED_UNRESOLVED_NOT_INVOKED, Fact.NONE, 1)
+    settled = rig.sampler.settle_at_phase_end()
+    assert triple(settled) == expected
+    assert rig.sampler.settle_at_phase_end() is settled
+    if not callable_value:
+        record = only(rig)
+        assert record.resolution is Kind.UNRESOLVED_AT_PHASE_END
+        assert (record.invocation_monotonic, record.invocation_utc) == (None, None)
 
 
 @pytest.mark.parametrize("pid", ["getter_raises", "lookup_raises"])

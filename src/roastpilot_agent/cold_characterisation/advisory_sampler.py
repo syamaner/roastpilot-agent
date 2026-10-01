@@ -576,11 +576,17 @@ async def _provider_call(
                 cell.refusal = _Refusal.SETTLED_BEFORE_DISPATCH
                 return
             method = _counted(gate, lambda: None if gate.closed else advisor.get_recommendation)
+            if gate.closed:
+                cell.refusal = _Refusal.SETTLED_BEFORE_DISPATCH
+                return
+            if not callable(method):
+                cell.refusal = _Refusal.PORT_ACCESS_FAILED
+                return
         except Exception:
             cell.refusal = _Refusal.PORT_ACCESS_FAILED
             return
         invocation = floor.sample(_Owner.PROVIDER)
-        if invocation is _Gated.CLOSED or method is None:
+        if invocation is _Gated.CLOSED:
             cell.refusal = _Refusal.SETTLED_BEFORE_DISPATCH
             return
         if invocation is None:
