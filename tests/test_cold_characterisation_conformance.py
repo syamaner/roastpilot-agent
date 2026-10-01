@@ -8,6 +8,7 @@ one independently reasoned, exact full finding tuple.  Hardware-free throughout.
 
 import ast
 import dataclasses
+import hashlib
 import json
 import math
 import typing
@@ -1886,6 +1887,7 @@ ALLOWED_IMPORTS: dict[str, frozenset[str]] = {
             "ColdEvidenceRecord",
             "ColdEvidenceError",
             "ColdEvidenceFailure",
+            "ColdEnvelopeKind",
             *(name for name in dir(schema) if name.startswith("MAX_")),
         }
     ),
@@ -2642,3 +2644,199 @@ def test_a3_regression_outside_the_window_keeps_both_findings(tmp_path: Path) ->
     run.ticks[OFF][1].mono = math.nextafter(10.0, -math.inf)
     assert [tick.mono for tick in run.ticks[OFF]] == [11.0, math.nextafter(10.0, -math.inf), 13.0]
     assert findings(tmp_path, run) == (F.TICK_OUTSIDE_WINDOW, F.CAUSAL_ORDER_VIOLATED)
+
+
+# ------------------------------------------- 4g-c T17: shared identity-delta rule
+
+_MASK_PATHS: typing.Final = (
+    ("device_config", "recording_enabled"),
+    ("device_config", "recording_autocapture"),
+    ("server_info", "started_at_utc"),
+    ("effective_mcp_profile", "source_sha256"),
+    ("effective_mcp_profile", "source_byte_length"),
+)
+
+
+def _expected_masked(doc: Json) -> str:
+    """Independently mask the five leaves in a deep copy and render canonical JSON."""
+    copy = json.loads(json.dumps(doc))
+    for section, leaf in _MASK_PATHS:
+        copy[section][leaf] = None
+    return store.canonical_json(copy)
+
+
+def _envelope_bytes(envelope: schema.ColdSealedEnvelope) -> bytes:
+    """Snapshot an envelope's raw field values in order, never comparing its keys."""
+    data = object.__getattribute__(envelope, "__dict__")
+    return repr([(str.__repr__(key), repr(value)) for key, value in data.items()]).encode()
+
+
+@pytest.mark.parametrize("recording", [False, True])
+def test_4gc_t17_masked_identity_text_matches_independent_masking(
+    tmp_path: Path, recording: bool
+) -> None:
+    """T17 parity: the masked text equals an independently masked canonical document."""
+    root = str(tmp_path.resolve() / "pi")
+    doc = document(tmp_path, root, recording)
+    before = json.dumps(doc, sort_keys=True)
+    envelope = envelope_of(doc)
+    snapshot = _envelope_bytes(envelope)
+    assert conformance.masked_identity_text(envelope, recording) == _expected_masked(doc)
+    assert json.dumps(doc, sort_keys=True) == before
+    assert _envelope_bytes(envelope) == snapshot
+
+
+def test_4gc_t17_the_two_phase_documents_mask_to_equal_text(tmp_path: Path) -> None:
+    """T17 parity: the conforming OFF and ON documents differ only in masked leaves."""
+    root = str(tmp_path.resolve() / "pi")
+    off = conformance.masked_identity_text(envelope_of(document(tmp_path, root, False)), False)
+    on = conformance.masked_identity_text(envelope_of(document(tmp_path, root, True)), True)
+    assert off is not None and off == on
+    changed = document(tmp_path, root, True)
+    changed["operator_host_notes"] = "a different host note"
+    other = conformance.masked_identity_text(envelope_of(changed), True)
+    assert other is not None and other != off
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "recording"),
+    [
+        (("device_config", "recording_enabled"), True, False),
+        (("device_config", "recording_autocapture"), None, False),
+        (("server_info", "started_at_utc"), 5, False),
+        (("effective_mcp_profile", "source_sha256"), None, False),
+        (("effective_mcp_profile", "source_byte_length"), True, False),
+        (("effective_mcp_profile", "source_byte_length"), 1.0, False),
+    ],
+    ids=lambda value: repr(value),
+)
+def test_4gc_t17_inadmissible_leaves_return_none(
+    tmp_path: Path, path: tuple[str, str], value: object, recording: bool
+) -> None:
+    """T17: a wrong polarity or non-exact leaf returns ``None`` (unchanged rule)."""
+    doc = document(tmp_path, str(tmp_path.resolve() / "pi"), recording)
+    doc[path[0]][path[1]] = value
+    assert conformance.masked_identity_text(envelope_of(doc), recording) is None
+
+
+class _SubEnvelope(schema.ColdSealedEnvelope):
+    """A subclass that must never be admitted as the envelope."""
+
+
+class _HostileStr(str):
+    """A ``str`` subclass whose comparison and hashing must never run."""
+
+    calls: typing.ClassVar[list[str]] = []
+
+    def __eq__(self, other: object) -> bool:
+        _HostileStr.calls.append("eq")
+        return True
+
+    def __hash__(self) -> int:
+        _HostileStr.calls.append("hash")
+        return 0
+
+    def encode(self, *args: typing.Any, **kwargs: typing.Any) -> bytes:  # type: ignore[override]
+        _HostileStr.calls.append("encode")
+        return b"{}"
+
+
+def _forged(genuine: schema.ColdSealedEnvelope, **changes: object) -> schema.ColdSealedEnvelope:
+    """Forge an envelope through ``model_construct`` with selected raw field values."""
+    fields: dict[str, object] = {
+        name: object.__getattribute__(genuine, "__dict__")[name]
+        for name in schema.ColdSealedEnvelope.model_fields
+    }
+    fields.update(changes)
+    return schema.ColdSealedEnvelope.model_construct(**fields)  # pyright: ignore[reportArgumentType]
+
+
+def _valid_envelope_of_text(text: str) -> schema.ColdSealedEnvelope:
+    """Build a self-consistent constructed envelope over arbitrary text (bypassing validators)."""
+    encoded = text.encode("utf-8", "surrogatepass")
+    return schema.ColdSealedEnvelope.model_construct(
+        kind=schema.ColdEnvelopeKind.IDENTITY,
+        schema_version=1,
+        canonical_json=text,
+        canonical_byte_length=len(encoded),
+        sha256=hashlib.sha256(encoded).hexdigest(),
+    )
+
+
+def _malicious_envelopes(genuine: schema.ColdSealedEnvelope) -> dict[str, object]:
+    """Every forged envelope shape T17 must refuse with the fixed error."""
+    data = object.__getattribute__(genuine, "__dict__")
+    sub = _SubEnvelope.model_construct(**data)
+    extra_key = _forged(genuine)
+    object.__getattribute__(extra_key, "__dict__")["undeclared"] = 1
+    non_empty_extra = _forged(genuine)
+    object.__setattr__(non_empty_extra, "__pydantic_extra__", {})
+    hostile_key = _forged(genuine)
+    raw = object.__getattribute__(hostile_key, "__dict__")
+    raw[_HostileStr("kind")] = raw.pop("kind")
+    return {
+        "subclass": sub,
+        "wrong_digest": _forged(genuine, sha256="0" * 64),
+        "wrong_length": _forged(genuine, canonical_byte_length=1),
+        "str_subclass_text": _forged(genuine, canonical_json=_HostileStr(data["canonical_json"])),
+        "str_subclass_digest": _forged(genuine, sha256=_HostileStr(data["sha256"])),
+        "oversize_text": _forged(genuine, canonical_json="x" * (schema.MAX_ENVELOPE_BYTES + 1)),
+        "oversize_digest": _forged(genuine, sha256="0" * 65),
+        "wrong_kind": _forged(genuine, kind=schema.ColdEnvelopeKind.FINALISATION),
+        "kind_value": _forged(genuine, kind="identity"),
+        "version_bool": _forged(genuine, schema_version=True),
+        "version_two": _forged(genuine, schema_version=2),
+        "length_bool": _forged(genuine, canonical_byte_length=True),
+        "duplicate_key": _valid_envelope_of_text('{"a":1,"a":2}'),
+        "nan": _valid_envelope_of_text('{"a":NaN}'),
+        "not_canonical": _valid_envelope_of_text('{"b":1, "a":2}'),
+        "extra_key": extra_key,
+        "pydantic_extra_dict": non_empty_extra,
+        "hostile_key": hostile_key,
+        "not_a_model": dict(data),
+    }
+
+
+def test_4gc_t17_malicious_envelopes_are_refused_with_a_fixed_error(tmp_path: Path) -> None:
+    """T17: every forged envelope is refused before use; nothing is chained or mutated."""
+    genuine = envelope_of(document(tmp_path, str(tmp_path.resolve() / "pi"), False))
+    for name, forged in _malicious_envelopes(genuine).items():
+        _HostileStr.calls.clear()
+        before = (
+            _envelope_bytes(forged) if type(forged) is not dict else repr(forged).encode()  # type: ignore[arg-type]
+        )
+        with pytest.raises(ValueError) as caught:
+            conformance.masked_identity_text(forged, False)  # type: ignore[arg-type]
+        assert caught.value.args == ("identity envelope not admitted",), name
+        assert caught.value.__cause__ is None and caught.value.__context__ is None, name
+        assert _HostileStr.calls == [], name
+        after = (
+            _envelope_bytes(forged) if type(forged) is not dict else repr(forged).encode()  # type: ignore[arg-type]
+        )
+        assert after == before, name
+
+
+@pytest.mark.parametrize("recording", [1, 0, "True", None, 1.0], ids=repr)
+def test_4gc_t17_recording_must_be_an_exact_bool(tmp_path: Path, recording: object) -> None:
+    """T17: a truthy or falsy non-``bool`` polarity is refused, never coerced."""
+    flag = bool(recording) if recording != "True" else True
+    genuine = envelope_of(document(tmp_path, str(tmp_path.resolve() / "pi"), flag))
+    assert conformance.masked_identity_text(genuine, flag) is not None
+    with pytest.raises(ValueError, match="identity envelope not admitted"):
+        conformance.masked_identity_text(genuine, recording)  # type: ignore[arg-type]
+
+
+def test_4gc_t17_a_non_object_identity_raises_unchanged(tmp_path: Path) -> None:
+    """T17: an admitted envelope whose document is not an object raises (as before)."""
+    del tmp_path
+    with pytest.raises(ValueError):
+        conformance.masked_identity_text(envelope_of([1, 2]), False)
+    with pytest.raises(KeyError):
+        conformance.masked_identity_text(envelope_of({"device_config": {}}), False)
+
+
+def test_4gc_t17_checker_uses_the_shared_rule(tmp_path: Path) -> None:
+    """T17: the checker's identity-delta finding still follows the shared rule."""
+    run = plan(tmp_path)
+    run.documents[ON]["operator_host_notes"] = "changed"
+    assert F.IDENTITY_DELTA_NOT_ADMITTED in findings(tmp_path, run)
