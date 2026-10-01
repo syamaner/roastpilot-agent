@@ -373,21 +373,21 @@ class _Floor:
     def sample(self, owner: _Owner) -> _Instant | _Gated | None:
         """Sample one admitted, non-regressing instant.
 
-        Run and provider owners check the gate before the monotonic access, between
-        the two accesses and after both, and get ``CLOSED`` with no further access;
+        Run and provider owners check the gate before each access (again inside its
+        counted entry) and after both, and get ``CLOSED`` with no further access;
         settlement skips only that gate rejection.  ``None`` means an invalid sample.
         """
-        gate = self._gate
+        gate, clock = self._gate, self._clock
         guarded = owner is not _Owner.SETTLEMENT
         if guarded and gate.closed:
             return _Gated.CLOSED
         mono: object = None
         utc: object = None
         try:
-            mono = _counted(gate, lambda: self._clock.monotonic())
+            mono = _counted(gate, lambda: None if guarded and gate.closed else clock.monotonic())
             if guarded and gate.closed:
                 return _Gated.CLOSED
-            utc = _counted(gate, lambda: self._clock.utc_now_iso())
+            utc = _counted(gate, lambda: None if guarded and gate.closed else clock.utc_now_iso())
         except Exception:
             mono = None
         if guarded and gate.closed:
@@ -560,26 +560,27 @@ async def _provider_call(
 ) -> None:
     """Invoke the advisor at most once for one open intent; it holds no sink or sampler.
 
-    The gate is checked before every advisor or clock access and immediately after
-    the call returns or raises; after settlement a late completion is discarded with
-    no further access.  ``CancelledError`` and housekeeping failures end the task
-    without an outcome.  This proves invocation of the port, not HTTP dispatch.
+    The gate is checked before every advisor or clock access (again inside its counted
+    entry) and immediately after the call returns or raises; after settlement a late
+    completion is discarded with no further access.  ``CancelledError`` and
+    housekeeping failures end the task without an outcome.  This proves invocation of
+    the port, not HTTP dispatch.
     """
     try:
         if gate.closed:
             cell.refusal = _Refusal.SETTLED_BEFORE_DISPATCH
             return
         try:
-            pre: object = _counted(gate, lambda: advisor.last_usage)
+            pre: object = _counted(gate, lambda: None if gate.closed else advisor.last_usage)
             if gate.closed:
                 cell.refusal = _Refusal.SETTLED_BEFORE_DISPATCH
                 return
-            method = _counted(gate, lambda: advisor.get_recommendation)
+            method = _counted(gate, lambda: None if gate.closed else advisor.get_recommendation)
         except Exception:
             cell.refusal = _Refusal.PORT_ACCESS_FAILED
             return
         invocation = floor.sample(_Owner.PROVIDER)
-        if invocation is _Gated.CLOSED:
+        if invocation is _Gated.CLOSED or method is None:
             cell.refusal = _Refusal.SETTLED_BEFORE_DISPATCH
             return
         if invocation is None:
@@ -614,7 +615,7 @@ async def _provider_call(
             cell.discarded_after_settlement = True
             return
         try:
-            post: object = _counted(gate, lambda: advisor.last_usage)
+            post: object = _counted(gate, lambda: None if gate.closed else advisor.last_usage)
         except Exception:
             post = _ABSENT
         if gate.closed:

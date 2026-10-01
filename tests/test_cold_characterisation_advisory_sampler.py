@@ -2444,6 +2444,105 @@ async def test_call_boundary_settlement(base: Base, pid: str) -> None:
         await idle()
 
 
+COUNTED_ENTRIES = [
+    "provider_pre_getter",
+    "provider_lookup",
+    "provider_post_getter",
+    "provider_monotonic",
+    "provider_utc",
+    "run_monotonic",
+    "run_utc",
+]
+
+
+def _counted_entry(pid: str) -> Matcher:
+    """The ``_counted`` call event (before depth increments) of one guarded port access.
+
+    Sites are identified by the access the counted lambda names, its enclosing
+    function and, for clock reads, the floor sample's owner; ``post`` is the second
+    provider usage read.  It fires on the first matching call (second for ``post``).
+    """
+    provider, sample = "_provider_call.<locals>.<lambda>", "_Floor.sample.<locals>.<lambda>"
+    access, owner = {
+        "provider_pre_getter": ("last_usage", None),
+        "provider_lookup": ("get_recommendation", None),
+        "provider_post_getter": ("last_usage", None),
+        "provider_monotonic": ("monotonic", PRIVATE._Owner.PROVIDER),
+        "provider_utc": ("utc_now_iso", PRIVATE._Owner.PROVIDER),
+        "run_monotonic": ("monotonic", PRIVATE._Owner.RUN),
+        "run_utc": ("utc_now_iso", PRIVATE._Owner.RUN),
+    }[pid]
+    wanted = 2 if pid == "provider_post_getter" else 1
+    seen = [0]
+
+    def match(frame: typing.Any, event: str, arg: object) -> bool:
+        if event != "call" or frame.f_code is not PRIVATE._counted.__code__:
+            return False
+        code = getattr(frame.f_locals.get("call"), "__code__", None)
+        if code is None or access not in code.co_names:
+            return False
+        if owner is None:
+            if code.co_qualname != provider:
+                return False
+        elif code.co_qualname != sample or frame.f_back.f_locals.get("owner") is not owner:
+            return False
+        seen[0] += 1
+        return seen[0] == wanted
+
+    return match
+
+
+@pytest.mark.parametrize("pid", COUNTED_ENTRIES)
+@pytest.mark.asyncio
+async def test_counted_entry_settlement_suppresses_access(base: Base, pid: str) -> None:
+    """A genuine settlement at a guarded counted entry suppresses that port access.
+
+    Labelled call-boundary injection (``sys.setprofile`` on ``_counted`` before the
+    depth increments), not GC proof.  The settlement there is genuine and stored; the
+    guarded advisor or clock access must not start, and nothing is accessed, invoked
+    or written afterwards.  The snapshot is taken after settlement's permitted
+    terminal clock and sink work.
+    """
+    rig = make(base, configured_dwell_seconds=MAX)
+    stored: list[ColdAdvisorySettlement] = []
+    marks: list[tuple[tuple[int, int, int, int], int]] = []
+
+    def settle() -> None:
+        stored.append(rig.sampler.settle_at_phase_end())
+        marks.append((_snapshot(rig), len(rig.sink.calls)))
+
+    task = start(rig)
+    try:
+        with CallBoundary((_counted_entry(pid), settle)) as boundary:
+            await drive(rig.clock, 1800.0)
+            await drive_until(lambda: provider_settled(rig))
+        assert boundary.errors == []
+        assert boundary.fired == 1
+        assert task.done()
+        expected = {
+            "provider_post_getter": (Closure.RECORDED_UNRESOLVED_INVOKED, Fact.OUTSTANDING, 1),
+            "run_monotonic": (Closure.NO_OPEN_ATTEMPT, Fact.NONE, 0),
+            "run_utc": (Closure.NO_OPEN_ATTEMPT, Fact.NONE, 0),
+        }.get(pid, (Closure.RECORDED_UNRESOLVED_NOT_INVOKED, Fact.OUTSTANDING, 1))
+        assert len(stored) == 1
+        assert triple(stored[0]) == expected
+        assert priv(rig.sampler)._settlement is stored[0]
+        assert (_snapshot(rig), len(rig.sink.calls)) == marks[0]
+        assert rig.advisor.entries == ([OPEN] if pid == "provider_post_getter" else [])
+        kinds = [record.resolution for record in rig.sink.resolutions]
+        assert kinds == ([] if pid.startswith("run_") else [Kind.UNRESOLVED_AT_PHASE_END])
+        if pid == "provider_post_getter":
+            cell = provider_cell(rig)
+            assert (cell.discarded_after_settlement, cell.outcome) == (True, None)
+        elif pid.startswith("provider_"):
+            assert provider_cell(rig).refusal is PRIVATE._Refusal.SETTLED_BEFORE_DISPATCH
+        assert task.result().stop is Stop.SETTLED
+        assert rig.sampler.settle_at_phase_end() is stored[0]
+    finally:
+        await finish(task, rig.clock)
+        await idle()
+
+
 @pytest.mark.parametrize("pid", ["intent_sink", "run_evaluator"])
 @pytest.mark.asyncio
 async def test_commit_latch_released_after_base_exception(base: Base, pid: str) -> None:
