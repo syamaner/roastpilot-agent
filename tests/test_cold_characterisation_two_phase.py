@@ -5474,6 +5474,104 @@ async def test_954_t7_an_unconfirmed_run_alone_fails_closed_with_no_check(
 
 
 @pytest.mark.asyncio
+async def test_954_t7b_an_unconfirmed_run_keeps_a_real_pending_provider_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T7b (AC3, 5, 7; D203/D205): run creation is unconfirmed but the run really ran.
+
+    The task factory creates the real sampler run task, keeps it and then raises an
+    ordinary ``RuntimeError`` (the owner's ``TASK_CREATION_UNCONFIRMED``; O-T14).  The
+    orphaned run still samples, and its last OFF call (1840) is a genuine published
+    provider task that ignores cancellation and is unresolved at the OFF end (1900 <
+    1840 + 100).  The start failure fails the run but never clears the real OD5 path:
+    the failed-run terminal is written and the one check reports the real pending
+    provider.
+    """
+    world = World(tmp_path)
+    world.bound = 100.0
+    world.advisor.steps[5] = ignore_cancel
+    world.child.stop_turns = 3
+    starts = record_starts(monkeypatch)
+    log = OwnerLog(monkeypatch)
+    settlements: list[typing.Any] = []
+    observations: list[typing.Any] = []
+    logged_settle, logged_observe = Owner.settle_phase, Owner.observe_phase
+
+    def settle(owner: typing.Any, phase: Phase) -> typing.Any:
+        settled = logged_settle(owner, phase)
+        settlements.append(settled)
+        return settled
+
+    def observe(owner: typing.Any, phase: Phase) -> typing.Any:
+        observed = logged_observe(owner, phase)
+        observations.append(observed)
+        return observed
+
+    monkeypatch.setattr(Owner, "settle_phase", settle)
+    monkeypatch.setattr(Owner, "observe_phase", observe)
+    orphans: list[asyncio.Task[typing.Any]] = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+
+    def factory(
+        task_loop: asyncio.AbstractEventLoop, coro: typing.Any, **kwargs: typing.Any
+    ) -> typing.Any:
+        task = asyncio.Task(coro, loop=task_loop, **kwargs)
+        if not orphans and getattr(coro, "__qualname__", "") == "ColdAdvisorySampler.run":
+            orphans.append(task)
+            raise RuntimeError(PROVIDER_CANARY)
+        return task
+
+    loop.set_task_factory(factory)
+    try:
+        result = await world.run()
+        Start = advisory_run_owner.ColdAdvisoryPhaseStart
+        assert starts == [(OFF, Start.TASK_CREATION_UNCONFIRMED)] and len(orphans) == 1
+        # The orphaned run really sampled: six OFF calls, the last one at 1840.
+        assert [call[0] for call in world.advisor.calls] == [1540.0 + 60.0 * i for i in range(6)]
+        (settlement,) = settlements
+        assert (
+            settlement.run_at_settlement.state
+            is advisory_run_owner.ColdAdvisoryRunTaskState.UNCONFIRMED
+        )
+        assert settlement.run_cancel_requested is False
+        assert settlement.sampler.closure is Closure.RECORDED_UNRESOLVED_INVOKED
+        assert settlement.sampler.provider_task is ProviderTask.OUTSTANDING
+        assert (
+            settlement.provider_cancellation
+            is advisory_sampler.ColdAdvisoryCancellationRequest.REQUESTED
+        )
+        assert_failed_run_terminal(world, result, OFF, "recorded_unresolved_invoked", "requested")
+        assert len(world.records("failed_run_terminal")) == 1
+        # Exactly one owner observation, immediately after the seal, of the real provider.
+        assert log.observes == [OFF] and log.settles == [OFF]
+        log.check_followed_seal()
+        assert log.order[-3:] == ["seal", "observe", "read_v4"]
+        (observed,) = observations
+        assert observed.provider is not None
+        assert observed.provider.task is TaskState.OUTSTANDING
+        assert observed.provider.call is advisory_sampler.ColdAdvisoryCallFact.INVOKED_NO_OUTCOME
+        assert result.provider_check is Check.PENDING_AT_CHECK
+        assert world.advisor.cancelled == 1
+        # D205: the eligible OFF phase is finalised for its exact session; one stop; no ON.
+        returned = world.event(OFF, "finalisation_returned")
+        assert (returned["finalisation_result"], returned["session_id"]) == (
+            "clean_recorded",
+            SESSIONS[OFF],
+        )
+        assert world.mcp.finalised == [SESSIONS[OFF]]
+        assert world.child.stops == 1 and world.child.stops_completed == 1
+        assert world.child_ops() == OFF_ONLY_OPS
+    finally:
+        loop.set_task_factory(previous)
+        world.advisor.release.set()
+        for orphan in orphans:
+            orphan.cancel()
+        await asyncio.gather(*orphans, return_exceptions=True)
+        await world.clock.turns(5)
+
+
+@pytest.mark.asyncio
 async def test_954_t8_an_ordinary_returned_provider_failure_is_not_od5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
