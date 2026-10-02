@@ -1394,8 +1394,9 @@ def _independent_row(
     """The contract's §2.7 outcome table plus the 5c-ii-b §2.2 path/check rows.
 
     Authored independently of ``_row_admits``: no path means no check; a path means a
-    failed (reason-bearing) run that is ``NOT_CONFORMANT`` or ``EVIDENCE_NOT_SEALED``,
-    and a failed-run terminal never carries a policy-2 result.
+    failed (reason-bearing) run that is ``NOT_CONFORMANT`` or ``EVIDENCE_NOT_SEALED``
+    whose one provider check was taken (AC7/D203: never ``NOT_CHECKED``), and a
+    failed-run terminal never carries a policy-2 result.
     """
     if path is AdvisoryPath.NOT_APPLICABLE:
         if check is not Check.NOT_CHECKED:
@@ -1403,6 +1404,7 @@ def _independent_row(
     elif (
         outcome not in (Outcome.NOT_CONFORMANT, Outcome.EVIDENCE_NOT_SEALED)
         or reason is None
+        or check is Check.NOT_CHECKED
         or (path is AdvisoryPath.FAILED_RUN_TERMINAL and checked is not None)
     ):
         return False
@@ -1500,6 +1502,43 @@ def test_4gc_t18_every_field_combination_matches_the_table() -> None:
     assert admitted > 0 and refused > 0
 
 
+@pytest.mark.parametrize(
+    ("path", "outcome"),
+    [
+        (path, outcome)
+        for path in (AdvisoryPath.FAILED_RUN_TERMINAL, AdvisoryPath.PROVIDER_OUTSTANDING_FAILED)
+        for outcome in (Outcome.NOT_CONFORMANT, Outcome.EVIDENCE_NOT_SEALED)
+    ],
+    ids=lambda value: value.value,
+)
+def test_954_an_od5_row_always_carries_a_taken_check(
+    path: two_phase.ColdTwoPhaseAdvisoryPath, outcome: Outcome
+) -> None:
+    """AC7/D203: every OD5 result row carries the one check; NOT_CHECKED is refused.
+
+    Otherwise valid fields: a failed reason, an owned child, no policy-2 result, and a
+    digest only for NOT_CONFORMANT.  Each taken value constructs; NOT_CHECKED never does.
+    """
+    fields: dict[str, object] = {
+        "outcome": outcome,
+        "start_refusal": None,
+        "termination_reason": R.UNEXPECTED_FAILURE,
+        "child_ownership": Own.OWNED_STOP_CONFIRMED,
+        "manifest_sha256": "a" * 64 if outcome is Outcome.NOT_CONFORMANT else None,
+        "conformance": None,
+        "advisory_path": path,
+    }
+    for check in (
+        Check.PENDING_AT_CHECK,
+        Check.NOT_PENDING_AT_CHECK,
+        Check.NOT_OBSERVABLE_AT_CHECK,
+    ):
+        built = two_phase.ColdTwoPhaseResult.model_validate({**fields, "provider_check": check})
+        assert (built.advisory_path, built.provider_check) == (path, check)
+    with pytest.raises(pydantic.ValidationError):
+        two_phase.ColdTwoPhaseResult.model_validate({**fields, "provider_check": Check.NOT_CHECKED})
+
+
 def test_954_t19_every_path_and_check_combination_matches_the_table() -> None:
     """5c-ii-b T19 (AC8): every forbidden outcome/path/check combination is refused."""
     admitted: set[
@@ -1524,7 +1563,11 @@ def test_954_t19_every_path_and_check_combination_matches_the_table() -> None:
         (outcome, path, check)
         for outcome in (Outcome.NOT_CONFORMANT, Outcome.EVIDENCE_NOT_SEALED)
         for path in (AdvisoryPath.FAILED_RUN_TERMINAL, AdvisoryPath.PROVIDER_OUTSTANDING_FAILED)
-        for check in Check
+        for check in (
+            Check.PENDING_AT_CHECK,
+            Check.NOT_PENDING_AT_CHECK,
+            Check.NOT_OBSERVABLE_AT_CHECK,
+        )
     }
     off_path = {(outcome, AdvisoryPath.NOT_APPLICABLE, Check.NOT_CHECKED) for outcome in Outcome}
     assert admitted == on_path | off_path

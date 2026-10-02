@@ -429,7 +429,9 @@ def _advisory_path_admits(result: ColdTwoPhaseResult) -> bool:
     """The extra facts every row on an OD5 path carries.
 
     The run failed (a primary reason is set) with retained or attempted evidence,
-    and a failed-run terminal carries no policy-2 result (the V3 reader refuses it).
+    the one provider check was taken (AC7/D203: one of the three ``*_AT_CHECK``
+    values, never ``NOT_CHECKED``), and a failed-run terminal carries no policy-2
+    result (the V3 reader refuses it).
     """
     outcome = result.outcome
     if not (
@@ -437,7 +439,10 @@ def _advisory_path_admits(result: ColdTwoPhaseResult) -> bool:
         or outcome is ColdTwoPhaseOutcome.EVIDENCE_NOT_SEALED
     ):
         return False
-    if result.termination_reason is None:
+    if (
+        result.termination_reason is None
+        or result.provider_check is ColdTwoPhaseProviderCheck.NOT_CHECKED
+    ):
         return False
     terminal = result.advisory_path is ColdTwoPhaseAdvisoryPath.FAILED_RUN_TERMINAL
     return not (terminal and result.conformance is not None)
