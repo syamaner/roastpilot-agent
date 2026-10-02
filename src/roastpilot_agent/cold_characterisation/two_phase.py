@@ -20,14 +20,15 @@ safe-zero command.  This module adds no actuator control and no emergency stop.
 
 Each activated phase also runs the observation-only advisory sampler through one
 run-owned :class:`ColdAdvisoryRunOwner`: it is started from the activation hook,
-settled synchronously as soon as the engine returns or raises, and never receives
-an MCP, control or lifecycle capability.  A settlement that leaves an attempt
-unresolved or unrecorded, or a provider task outstanding, fails the run (OD5): the
-current phase is still finalised only when otherwise eligible, the child stop is
-attempted, no next phase starts, and the run ends with either the schema-3
-failed-run terminal (an unresolved or unrecorded attempt) or the v2 ``FAILED``
-termination (a provider task outstanding with no open attempt).  Exactly one
-synchronous provider observation follows the seal step on that path; it is an
+settled synchronously as soon as the engine returns or raises, and is typed only to
+the advisory-attempt sink and retained-tick ports (both served by the run's guarded
+sink); it receives no MCP, actuator or control capability.  A settlement that
+leaves an attempt unresolved or unrecorded, or a provider task outstanding, fails
+the run (OD5): the current phase is still finalised only when otherwise eligible,
+the child stop is attempted, no next phase starts, and the run ends with either the
+schema-3 failed-run terminal (an unresolved or unrecorded attempt) or the v2
+``FAILED`` termination (a provider task outstanding with no open attempt).  Exactly
+one synchronous provider observation follows the seal step on that path; it is an
 exit signal for the caller only, never a stop or delivery proof.
 
 ``ADVISORY_CONFORMANT`` requires a completed terminal record, a confirmed final

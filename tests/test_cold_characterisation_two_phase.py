@@ -3506,10 +3506,11 @@ async def test_4gc_t20_an_on_overrun_never_meets_the_off_budget(tmp_path: Path) 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("overrun", [False, True])
 async def test_4gc_t3_an_activation_past_the_budget_reads_nothing(
-    tmp_path: Path, overrun: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrun: bool
 ) -> None:
     """T3: just past OFF_END + 60 the ON phase is refused before its first read."""
     world = World(tmp_path)
+    starts = record_starts(monkeypatch)
     activation = math.nextafter(OFF_END + 60.0, math.inf)
     if overrun:
         # OFF completes at 1950: the activation is only 10.5 s after completion.
@@ -3536,6 +3537,8 @@ async def test_4gc_t3_an_activation_past_the_budget_reads_nothing(
     assert aborted["session_id"] == SESSIONS[ON]
     assert world.records("abort") == []
     assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+    # AC1: the advisory sampler starts only for a within-budget activation.
+    assert [phase for phase, _started in starts] == [OFF]
 
 
 def _late_completion(world: World) -> None:
@@ -5035,6 +5038,28 @@ class OwnerLog:
         assert self.order[index + 1] == "observe"
 
 
+def record_starts(
+    monkeypatch: pytest.MonkeyPatch, refuse: Phase | None = None
+) -> list[tuple[Phase, object]]:
+    """Record every real owner start call and its result; ``refuse`` gets a stored refusal.
+
+    The refused phase never reaches the owner, so it has no sampler to settle.
+    """
+    starts: list[tuple[Phase, object]] = []
+    real = Owner.start_phase
+
+    def start(owner: typing.Any, phase: Phase, **kwargs: typing.Any) -> typing.Any:
+        if phase is refuse:
+            result: object = advisory_run_owner.ColdAdvisoryPhaseStart.REFUSED_HEADER_NOT_ADMITTED
+        else:
+            result = real(owner, phase, **kwargs)
+        starts.append((phase, result))
+        return result
+
+    monkeypatch.setattr(Owner, "start_phase", start)
+    return starts
+
+
 def force_settlement(
     monkeypatch: pytest.MonkeyPatch,
     phase: Phase,
@@ -5620,7 +5645,8 @@ async def test_954_t12_a_pre_seal_failure_is_contained_with_one_guarded_seal_and
     # Containment closes first; the guarded seal is refused before the writer; then the check.
     assert log.order[-3:] == ["close", "seal", "observe"]
     assert log.writer_seals == 0 and log.observes == [OFF]
-    assert world.child.stops <= 1 and world.mcp.finalised == [SESSIONS[OFF]]
+    assert world.child.stops == 1 and world.child.stops_completed == 1
+    assert world.mcp.finalised == [SESSIONS[OFF]]
     assert world.records("failed_run_terminal") == []
     assert not any(event == "run_terminated" for _phase, event in world.events())
     assert_contained(result)
@@ -5726,6 +5752,11 @@ async def test_954_t14_finalisation_failures_with_advisory_active_never_conform(
     assert result.outcome is Outcome.NOT_CONFORMANT
     assert world.child_ops() == OFF_ONLY_OPS and world.mcp.finalised == [SESSIONS[OFF]]
     assert {name for name, _phase in world.mcp.calls} == CALL_NAMES
+    if triggered:
+        # The OD5 path still ends with exactly one schema-3 terminal, never v2.
+        assert result.advisory_path is AdvisoryPath.FAILED_RUN_TERMINAL
+        assert len(world.records("failed_run_terminal")) == 1
+        assert not any(event == "run_terminated" for _phase, event in world.events())
     await release(world)
 
 
@@ -5925,14 +5956,46 @@ async def test_954_t17_a_raising_settlement_never_replaces_the_original(
     world = World(tmp_path)
     halt = Halt()
     world.mcp.before["get_roast_state:recording_off"] = lambda: produce(halt)
+    entered: list[Phase] = []
 
     def settle(owner: typing.Any, phase: Phase) -> typing.NoReturn:
+        entered.append(phase)
         raise StopBoom
 
     monkeypatch.setattr(Owner, "settle_phase", settle)
     with pytest.raises(Halt) as caught:
         await world.run()
     assert caught.value is halt and world.child.stops == 1
+    assert entered == [OFF]
+
+
+@pytest.mark.asyncio
+async def test_954_t17_cancellation_at_the_on_read_settles_both_phases_and_nothing_else(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T17 (AC10): a real cancellation in ON settles OFF and ON once; no check, seal or terminal."""
+    world = World(tmp_path)
+    entered = world.gates.arm("get_roast_state:recording_on")
+    starts = record_starts(monkeypatch)
+    log = OwnerLog(monkeypatch)
+    task = asyncio.ensure_future(world.run())
+    await asyncio.wait_for(entered.wait(), 5)
+    # The OFF pre-respawn gate observation legitimately happened before this point.
+    observes_before, order_before = len(log.observes), len(log.order)
+    assert log.observes == [OFF] and log.settles == [OFF]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [phase for phase, _started in starts] == [OFF, ON]
+    assert log.settles == [OFF, ON]
+    assert len(log.observes) == observes_before
+    cleanup = log.order[order_before:]
+    assert "observe" not in cleanup and "seal" not in cleanup
+    assert not {"read_v3", "read_v4"} & set(cleanup)
+    assert log.writer_seals == 0 and not world.manifest_exists()
+    assert world.records("failed_run_terminal") == []
+    assert not any(event == "run_terminated" for _phase, event in world.events())
+    assert world.child_ops() == [*BEFORE_ON, ("stop", ON)]
 
 
 @pytest.mark.asyncio
@@ -6130,14 +6193,79 @@ def test_954_start_and_settle_faults_fail_closed_without_a_path(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_954_an_invalid_advisory_spec_fails_closed_in_run(tmp_path: Path) -> None:
+async def test_954_an_invalid_advisory_spec_fails_closed_in_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Residual (e): an inadmissible spec is refused by the owner's stored start, in-run."""
     world = World(tmp_path)
     world.dwell = 1.0
+    starts = record_starts(monkeypatch)
     result = await world.run()
     assert result.termination_reason is R.UNEXPECTED_FAILURE
     assert world.child_ops() == OFF_ONLY_OPS and world.advisor.calls == []
     assert result.advisory_path is AdvisoryPath.NOT_APPLICABLE
+    assert starts == [(OFF, advisory_run_owner.ColdAdvisoryPhaseStart.REFUSED_SAMPLER_CONSTRUCTION)]
+    # The refused start never replaced OFF's True activation verdict: OFF ran its full
+    # window and its eligible finalisation, then the run failed with no next phase.
+    assert world.events() == [
+        ("recording_off", "phase_activated"),
+        ("recording_off", "observation_window_elapsed"),
+        ("recording_off", "finalisation_returned"),
+        ("recording_off", "child_stopped"),
+        ("recording_off", "run_terminated"),
+    ]
+    returned = world.event(OFF, "finalisation_returned")
+    assert (returned["finalisation_result"], returned["session_id"]) == (
+        "clean_recorded",
+        SESSIONS[OFF],
+    )
+    assert world.mcp.finalised == [SESSIONS[OFF]]
+    assert result.outcome is Outcome.NOT_CONFORMANT
+
+
+@pytest.mark.asyncio
+async def test_954_a_refused_on_start_keeps_the_activation_and_fails_at_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC1/2: a within-budget ON start refusal leaves ON active, observed and finalised.
+
+    Settlement (no sampler to settle) fails the run with UNEXPECTED_FAILURE; it never
+    conforms, and the hook's True verdict is not replaced by the refusal.
+    """
+    world = World(tmp_path)
+    starts = record_starts(monkeypatch, refuse=ON)
+    log = OwnerLog(monkeypatch)
+    result = await world.run()
+    assert starts == [
+        (OFF, advisory_run_owner.ColdAdvisoryPhaseStart.STARTED),
+        (ON, advisory_run_owner.ColdAdvisoryPhaseStart.REFUSED_HEADER_NOT_ADMITTED),
+    ]
+    assert log.settles == [OFF, ON]
+    assert result.outcome is Outcome.NOT_CONFORMANT
+    assert result.termination_reason is R.UNEXPECTED_FAILURE
+    assert (result.advisory_path, result.provider_check) == (
+        AdvisoryPath.NOT_APPLICABLE,
+        Check.NOT_CHECKED,
+    )
+    # ON activated within budget and ran its whole window: four reads, elapsed, finalised.
+    assert world.events() == GRAMMAR
+    assert [p for name, p in world.mcp.calls if name == "get_roast_state"] == [OFF] * 4 + [ON] * 4
+    assert world.event(ON, "transition_measured")["transition_within_budget"] is True
+    returned = world.event(ON, "finalisation_returned")
+    assert (returned["finalisation_result"], returned["session_id"]) == (
+        "clean_recorded",
+        SESSIONS[ON],
+    )
+    assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
+    terminal = world.event(ON, "run_terminated")
+    assert (terminal["termination"], terminal["termination_reason"]) == (
+        "failed",
+        "unexpected_failure",
+    )
+    assert world.child_ops() == NORMAL_CHILD_OPS
+    # Only OFF sampled; ON had no sampler and retained no attempt line.
+    assert len(world.advisor.calls) == 6
+    assert {r["phase"] for r in world.records("advisory_attempt")} == {"recording_off"}
 
 
 def test_954_the_first_od5_trigger_fixes_the_path(tmp_path: Path) -> None:
