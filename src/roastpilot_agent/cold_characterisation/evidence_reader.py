@@ -56,12 +56,21 @@ from roastpilot_agent.cold_characterisation.evidence_store import (
     ColdVerifiedTree,
     canonical_json,
     check_advisory_attempt_binding,
+    check_failed_run_terminal_binding,
     check_lifecycle_binding,
     check_record_binding,
     load_strict_json,
     read_verified_lines,
     run_id_is_valid,
     verify_retained_tree,
+)
+from roastpilot_agent.cold_characterisation.evidence_terminal import (
+    ColdFailedRunTerminalError,
+    ColdFailedRunTerminalEvidenceState,
+    ColdFailedRunTerminalFailure,
+    ColdFailedRunTerminalRecord,
+    check_failed_run_terminal_order,
+    validate_failed_run_terminal_record,
 )
 
 MAX_LINE_BYTES = MAX_RECORD_BYTES + 1
@@ -76,6 +85,9 @@ _LIFECYCLE_SCHEMA_VERSIONS = frozenset({2})
 _ADVISORY_FILE_NAME = "advisory_attempt.jsonl"
 _ADVISORY_STREAM = "advisory_attempt"
 _ADVISORY_SCHEMA_VERSIONS = frozenset({2})
+_TERMINAL_FILE_NAME = "failed_run_terminal.jsonl"
+_TERMINAL_STREAM = "failed_run_terminal"
+_TERMINAL_SCHEMA_VERSIONS = frozenset({3})
 
 
 class _ReadProfile(enum.Enum):
@@ -87,6 +99,7 @@ class _ReadProfile(enum.Enum):
     V1 = frozenset[str]()
     V2 = frozenset({_LIFECYCLE_FILE_NAME})
     V3 = frozenset({_LIFECYCLE_FILE_NAME, _ADVISORY_FILE_NAME})
+    V4 = frozenset({_LIFECYCLE_FILE_NAME, _ADVISORY_FILE_NAME, _TERMINAL_FILE_NAME})
 
 
 #: Reader-local abort pairing; a contract test pins it to ``ColdAbortRecord``'s validator.
@@ -111,6 +124,7 @@ _ADVISORY_ADAPTERS: dict[str, pydantic.TypeAdapter[ColdAdvisoryAttemptRecord]] =
     ColdAdvisoryEntry.INTENT.value: pydantic.TypeAdapter(ColdAdvisoryIntentRecord),
     ColdAdvisoryEntry.RESOLUTION.value: pydantic.TypeAdapter(ColdAdvisoryResolutionRecord),
 }
+_TERMINAL_ADAPTER = pydantic.TypeAdapter(ColdFailedRunTerminalRecord)
 
 
 class ColdRetainedHeader(pydantic.BaseModel):
@@ -189,6 +203,39 @@ class ColdRetainedRunV3(pydantic.BaseModel):
             raise ValueError("lifecycle state does not match its records")
         if self.advisory_attempt_state is not _advisory_state(self.advisory_attempts):
             raise ValueError("advisory attempt state does not match its records")
+        return self
+
+
+class ColdRetainedRunV4(pydantic.BaseModel):
+    """A verified retained run with lifecycle, advisory attempts, and a failed-run terminal.
+
+    Integrity facts only.  A failed-run terminal is integrity data: it never
+    qualifies a run, and ``ABSENT`` is never healthy.  This carrier is flat; it is
+    not a v2 or v3 carrier, nests none, and is the input to no conformance policy.
+    A hand-built instance carries no manifest provenance.
+    """
+
+    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
+
+    run: ColdRetainedRun
+    lifecycle_state: ColdLifecycleEvidenceState
+    lifecycle: tuple[ColdLifecycleRecord, ...]
+    advisory_attempt_state: ColdAdvisoryAttemptEvidenceState
+    advisory_attempts: tuple[ColdAdvisoryIntentRecord | ColdAdvisoryResolutionRecord, ...]
+    terminal_state: ColdFailedRunTerminalEvidenceState
+    terminal: ColdFailedRunTerminalRecord | None
+
+    @pydantic.model_validator(mode="after")
+    def _require_states_match_records(self) -> typing.Self:
+        """Require each stream state to be exactly the one its records imply."""
+        if (self.lifecycle_state is ColdLifecycleEvidenceState.ABSENT) != (self.lifecycle == ()):
+            raise ValueError("lifecycle state does not match its records")
+        if self.advisory_attempt_state is not _advisory_state(self.advisory_attempts):
+            raise ValueError("advisory attempt state does not match its records")
+        if (self.terminal_state is ColdFailedRunTerminalEvidenceState.ABSENT) != (
+            self.terminal is None
+        ):
+            raise ValueError("terminal state does not match its record")
         return self
 
 
@@ -377,22 +424,62 @@ def _read_advisory_attempt_line(
     return snapshot
 
 
+def _read_failed_run_terminal_line(
+    line: bytes, *, phase: ColdPhaseKind, state: ColdBindingState
+) -> ColdFailedRunTerminalRecord:
+    """Strictly decode, losslessly re-prove, validate, and bind one failed-run terminal line."""
+    if not line:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    decoded = load_strict_json(line, malformed=ColdEvidenceStoreFailure.LINE_MALFORMED)
+    if type(decoded) is not dict:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    document = typing.cast(dict[str, object], decoded)
+    walk_json_value(typing.cast(pydantic.JsonValue, document))
+    version = document.get("schema_version")
+    if type(version) is not int or version not in _TERMINAL_SCHEMA_VERSIONS:
+        raise _closed(ColdEvidenceStoreFailure.SCHEMA_VERSION_UNKNOWN)
+    stream_value = document.get("stream")
+    if type(stream_value) is not str or stream_value != _TERMINAL_STREAM:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    try:
+        validated: ColdFailedRunTerminalRecord | None = _TERMINAL_ADAPTER.validate_json(
+            line, strict=True
+        )
+    except pydantic.ValidationError:
+        validated = None
+    if validated is None:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    if validated.phase is not phase:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    if canonical_json(validated.model_dump(mode="json")).encode("utf-8") != line:
+        raise _closed(ColdEvidenceStoreFailure.LINE_NOT_CANONICAL)
+    snapshot = validate_failed_run_terminal_record(validated)
+    check_failed_run_terminal_binding(state, snapshot)
+    return snapshot
+
+
 class _RecordLayout(typing.NamedTuple):
     """Every ``records/`` entry mapped to its closed phase and stream or extra file."""
 
     streams: dict[ColdPhaseKind, dict[ColdEvidenceStream, str]]
     lifecycle: dict[ColdPhaseKind, str]
     advisory: dict[ColdPhaseKind, str]
+    terminal: dict[ColdPhaseKind, str]
 
 
 def _record_layout(tree: ColdVerifiedTree, *, profile: _ReadProfile) -> _RecordLayout:
     """Map every ``records/`` entry to its closed phase and stream, refusing others.
 
-    Only the exact extra file names the profile admits map to a phase's lifecycle
-    or advisory-attempt stream; every other unknown entry is refused.
+    Only the exact extra file names the profile admits map to a phase's lifecycle,
+    advisory-attempt, or failed-run terminal stream; every other unknown entry is
+    refused.
     """
-    layout = _RecordLayout({}, {}, {})
-    extras = {_LIFECYCLE_FILE_NAME: layout.lifecycle, _ADVISORY_FILE_NAME: layout.advisory}
+    layout = _RecordLayout({}, {}, {}, {})
+    extras = {
+        _LIFECYCLE_FILE_NAME: layout.lifecycle,
+        _ADVISORY_FILE_NAME: layout.advisory,
+        _TERMINAL_FILE_NAME: layout.terminal,
+    }
     for entry in tree.manifest.entries:
         segments = entry.relative_path.split("/")
         if segments[0] != _RECORDS_DIRECTORY:
@@ -415,6 +502,7 @@ class _VerifiedRead(typing.NamedTuple):
     lifecycle: tuple[ColdLifecycleRecord, ...]
     lifecycle_present: bool
     advisory: tuple[ColdAdvisoryAttemptRecord, ...]
+    terminal: ColdFailedRunTerminalRecord | None
 
 
 def _read_verified_run(
@@ -441,11 +529,13 @@ def _read_verified_run(
     streams: list[ColdRetainedStream] = []
     lifecycle: list[ColdLifecycleRecord] = []
     advisory: list[ColdAdvisoryAttemptRecord] = []
+    terminals: list[ColdFailedRunTerminalRecord] = []
     for phase in ColdPhaseKind:
         files = layout.streams.get(phase, {})
         lifecycle_path = layout.lifecycle.get(phase)
         advisory_path = layout.advisory.get(phase)
-        if not files and lifecycle_path is None and advisory_path is None:
+        terminal_path = layout.terminal.get(phase)
+        if not files and lifecycle_path is None and advisory_path is None and terminal_path is None:
             continue
         if ColdEvidenceStream.HEADER not in files:
             raise _closed(ColdEvidenceStoreFailure.HEADER_MISSING)
@@ -468,6 +558,22 @@ def _read_verified_run(
                 _read_advisory_attempt_line(line, phase=phase, state=state, sequence=attempt_order)
                 for line in read_verified_lines(tree, advisory_path, max_line_bytes=MAX_LINE_BYTES)
             )
+        if terminal_path is not None:
+            terminals.extend(
+                _read_failed_run_terminal_line(line, phase=phase, state=state)
+                for line in read_verified_lines(tree, terminal_path, max_line_bytes=MAX_LINE_BYTES)
+            )
+    if len(terminals) > 1:
+        raise ColdFailedRunTerminalError(ColdFailedRunTerminalFailure.TERMINAL_DUPLICATED)
+    terminal = terminals[0] if terminals else None
+    if terminal is not None:
+        check_failed_run_terminal_order(
+            terminal,
+            latest_phase=state.headers[-1][0].phase,
+            lifecycle_terminated=order.terminated,
+            lifecycle_records=order.next_sequence,
+            advisory_records=len(advisory),
+        )
     bound = {(header.phase, header.identity_sha256) for header, _identity in state.headers}
     recorded = {(item.phase, item.identity_sha256) for item in tree.manifest.identity_bindings}
     if bound != recorded:
@@ -481,7 +587,7 @@ def _read_verified_run(
         ),
         streams=tuple(streams),
     )
-    return _VerifiedRead(run, tuple(lifecycle), bool(layout.lifecycle), tuple(advisory))
+    return _VerifiedRead(run, tuple(lifecycle), bool(layout.lifecycle), tuple(advisory), terminal)
 
 
 def read_retained_run(
@@ -634,4 +740,78 @@ def read_retained_run_v3(
         lifecycle=read.lifecycle,
         advisory_attempt_state=_advisory_state(read.advisory),
         advisory_attempts=read.advisory,
+    )
+
+
+def read_retained_run_v4(
+    root: str,
+    *,
+    run_id: str,
+    expected_manifest_sha256: str,
+    protected_roots: tuple[str, ...] = (),
+) -> ColdRetainedRunV4:
+    """Verify one retained tree, then strictly read v1 records, lifecycle, attempts, and terminal.
+
+    Trust boundary: ``expected_manifest_sha256`` must be the externally recorded
+    ``ColdSealedRun.manifest_sha256`` returned by a successful seal.  It must never be
+    derived from the candidate tree, its ``manifest.json`` or its sidecar, which would
+    verify a tree against itself.  A seal that fails after creating manifest artefacts
+    can leave internally consistent bytes but returns no digest, so such a tree has no
+    trusted receipt.  None of this is a filesystem transaction.
+
+    The whole tree is verified before anything is parsed.  ``lifecycle.jsonl`` and
+    ``advisory_attempt.jsonl`` accept their per-stream version 2 only and
+    ``failed_run_terminal.jsonl`` its per-stream version 3 only; any other
+    ``records/`` entry is refused.  At most one terminal line is admitted, in the
+    latest bound phase, after no v2 run termination, and its counts must equal the
+    retained lifecycle and advisory attempt lines.  This reader never calls the v1,
+    v2, or v3 reader and nests no v2 or v3 carrier; the result is the input to no
+    conformance policy, and a terminal never qualifies a run.
+
+    Honest limits: the reader cannot order lines across files.  Lifecycle or
+    advisory lines added after the terminal are detected only through its counts,
+    and a later phase only through ``PHASE_NOT_LATEST``; writer refusal is the guard
+    for v1-stream lines added after the terminal.  A v1 tick or host line written
+    after the terminal into a tree forged with a re-crafted manifest is not
+    detectable here: the trusted manifest digest is the provenance boundary.
+
+    Args:
+        root: Absolute evidence root holding the run directory.
+        run_id: The run identifier.
+        expected_manifest_sha256: The recorded ``manifest.json`` digest.
+        protected_roots: Additional absolute roots evidence may never occupy.
+
+    Returns:
+        The retained run, lifecycle and attempt states and records, and the terminal.
+
+    Raises:
+        ColdEvidenceStoreError: If verification, decoding, or binding fails.
+        ColdEvidenceError: If a decoded record fails schema revalidation.
+        ColdLifecycleError: If lifecycle records break the run-wide order.
+        ColdAdvisoryAttemptError: If attempt records break the run-wide order.
+        ColdFailedRunTerminalError: If terminals are duplicated or contradict the run.
+    """
+    read = _read_verified_run(
+        root,
+        run_id=run_id,
+        expected_manifest_sha256=expected_manifest_sha256,
+        protected_roots=protected_roots,
+        profile=_ReadProfile.V4,
+    )
+    return ColdRetainedRunV4(
+        run=read.run,
+        lifecycle_state=(
+            ColdLifecycleEvidenceState.PRESENT
+            if read.lifecycle_present
+            else ColdLifecycleEvidenceState.ABSENT
+        ),
+        lifecycle=read.lifecycle,
+        advisory_attempt_state=_advisory_state(read.advisory),
+        advisory_attempts=read.advisory,
+        terminal_state=(
+            ColdFailedRunTerminalEvidenceState.ABSENT
+            if read.terminal is None
+            else ColdFailedRunTerminalEvidenceState.PRESENT
+        ),
+        terminal=read.terminal,
     )

@@ -895,6 +895,7 @@ _MODULE_IMPORT_ALLOW_LIST: dict[str, frozenset[str]] = {
             _COLD + "mcp",
             _COLD + "evidence_lifecycle",
             _COLD + "evidence_advisory",
+            _COLD + "evidence_terminal",
         }
     ),
     "evidence_reader.py": frozenset(
@@ -903,6 +904,7 @@ _MODULE_IMPORT_ALLOW_LIST: dict[str, frozenset[str]] = {
             _COLD + "evidence_store",
             _COLD + "evidence_lifecycle",
             _COLD + "evidence_advisory",
+            _COLD + "evidence_terminal",
         }
     ),
     "evidence_builders.py": frozenset(
