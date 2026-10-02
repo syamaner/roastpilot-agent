@@ -1,0 +1,17 @@
+project_doc_max_bytes = 131072
+
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 3
+
+[agents.engineer-be]
+description = "Backend PR-slice implementer."
+config_file = "agents/engineer-be.toml"
+
+[agents.engineer-fe]
+description = "Frontend PR-slice implementer."
+config_file = "agents/engineer-fe.toml"
+
+[agents.repair]
+description = "Lead-directed repair worker."
+config_file = "agents/repair.toml"

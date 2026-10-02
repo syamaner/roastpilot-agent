@@ -903,8 +903,8 @@ operator; do not silently substitute self-review or another same-family lens.
 ### Codex project agents
 
 - Project-scoped roles live in `.codex/agents/`: `engineer-be`, `engineer-fe`,
-  and `repair`. Their files pin `gpt-5.6-terra`; backend/frontend use `high`
-  reasoning and repair uses `medium`. Each role carries only its role-specific
+  and `repair`. Their files pin `gpt-6.1-sol` with `medium` reasoning for all
+  three roles (D206). Each role carries only its role-specific
   boundary and inherits shared policy from this file.
 - `.codex/config.toml` registers all three roles, enables subagents, and caps
   concurrent spawned threads at three. Topology depth one remains mandatory
@@ -915,6 +915,13 @@ operator; do not silently substitute self-review or another same-family lens.
   Codex version and exact post-run rollout/topology evidence, and the parent
   verifies the leaf handback. Admission of a later structurally compatible
   semver does not silently extend this 0.147.0 runtime proof to that version.
+- The D206 `gpt-6.1-sol`/`medium` pins carry no runtime proof here: editing
+  these files does not repin an already-loaded session, and only a fresh
+  registered-role launch after a parent reload, attesting the actual model,
+  effort, role, depth-one topology, and no-spawn state, is evidence. Native
+  Codex usage capture stays bound to the historical `gpt-5.6-terra` role
+  bytes and refuses the current pins before READY; capture for these roles is
+  unsupported, not widened.
 
 ### Shared agent resources
 

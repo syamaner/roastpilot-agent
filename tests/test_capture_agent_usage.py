@@ -71,6 +71,7 @@ from capture_usage_models import (
     MAX_STREAM_BYTES,
     NATIVE_CODEX_CONFIG_SHA256,
     NATIVE_CODEX_REPOSITORY,
+    NATIVE_CODEX_ROLE_INSTRUCTION_SHA256,
     NATIVE_CODEX_ROLE_SHA256,
     NATIVE_ROLE_EXCLUSIONS,
     PLAN_ROOT_ENVIRONMENT_KEY,
@@ -206,7 +207,17 @@ def _native_leaf_boundary(worktree: Path, effort: str) -> dict[str, object]:
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent-usage"
+_HISTORICAL_CODEX = FIXTURES / "native-codex-gpt-5.6-terra"
+_LIVE_CODEX = Path(__file__).resolve().parents[1] / ".codex"
+_LIVE_CODEX_MODEL = "gpt-6.1-sol"
 USAGE_RECORD_ADAPTER = cast(TypeAdapter[UsageRecord], _USAGE_RECORD_ADAPTER)
+
+
+def _copy_historical_codex(destination: Path) -> Path:
+    """Copy the frozen admitted native-Codex role bytes into a temporary root."""
+    copied = destination / ".codex"
+    shutil.copytree(_HISTORICAL_CODEX, copied)
+    return copied
 
 
 def test_observed_claude_version_binds_generic_stream_exactly() -> None:
@@ -508,14 +519,31 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
         )
 
 
-def test_native_codex_registration_closure_matches_committed_project_files() -> None:
-    """All and only committed named Codex leaves carry the fixed capture pins."""
+def test_native_codex_historical_fixture_matches_bound_hashes() -> None:
+    """Frozen historical native-Codex bytes still match the capture admission hashes."""
+    assert hashlib.sha256((_HISTORICAL_CODEX / "config.toml").read_bytes()).hexdigest() == (
+        NATIVE_CODEX_CONFIG_SHA256
+    )
+    for role in NativeCodexRole:
+        role_path = _HISTORICAL_CODEX / "agents" / f"{role.value}.toml"
+        assert hashlib.sha256(role_path.read_bytes()).hexdigest() == NATIVE_CODEX_ROLE_SHA256[role]
+        instructions = tomllib.loads(role_path.read_text())["developer_instructions"]
+        assert isinstance(instructions, str)
+        assert (
+            hashlib.sha256(instructions.encode("utf-8")).hexdigest()
+            == NATIVE_CODEX_ROLE_INSTRUCTION_SHA256[role]
+        )
+
+
+def test_native_codex_historical_registration_closure_is_admitted(tmp_path: Path) -> None:
+    """The frozen historical registration closure remains admitted by capture."""
     expected = {
         NativeCodexRole.ENGINEER_BE: "high",
         NativeCodexRole.ENGINEER_FE: "high",
         NativeCodexRole.REPAIR: "medium",
     }
-    root = usage_native_codex._open_root(str(Path.cwd()), private=False)  # pyright: ignore[reportPrivateUsage]
+    _copy_historical_codex(tmp_path)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
     try:
         for role, effort in expected.items():
             _config_hash, _role_hash, observed_effort, canonical = (
@@ -529,12 +557,43 @@ def test_native_codex_registration_closure_matches_committed_project_files() -> 
         os.close(root.descriptor)
 
 
+def test_native_codex_live_registered_roles_are_unsupported() -> None:
+    """Live D206 role definitions fail capture admission before they can be recorded."""
+    root = usage_native_codex._open_root(str(_LIVE_CODEX.parent), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        for role in NativeCodexRole:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                usage_native_codex._registered_role(root, role)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_live_roles_change_only_model_and_effort_lines() -> None:
+    """D206 changes exactly the two admitted pin lines while config remains frozen."""
+    assert (_LIVE_CODEX / "config.toml").read_bytes() == (
+        _HISTORICAL_CODEX / "config.toml"
+    ).read_bytes()
+    for role in NativeCodexRole:
+        historical = (
+            (_HISTORICAL_CODEX / "agents" / f"{role.value}.toml")
+            .read_bytes()
+            .splitlines(keepends=True)
+        )
+        live = (
+            (_LIVE_CODEX / "agents" / f"{role.value}.toml").read_bytes().splitlines(keepends=True)
+        )
+        expected = historical[:]
+        expected[0] = f'model = "{_LIVE_CODEX_MODEL}"\n'.encode()
+        expected[1] = b'model_reasoning_effort = "medium"\n'
+        assert live == expected
+
+
 @pytest.mark.parametrize("value", [0, 1, 131071])
 def test_native_codex_registration_requires_committed_project_doc_limit(
     tmp_path: Path, value: int
 ) -> None:
     """Any project-doc byte-limit drift blocks native role attestation before READY."""
-    shutil.copytree(".codex", tmp_path / ".codex")
+    _copy_historical_codex(tmp_path)
     config = tmp_path / ".codex" / "config.toml"
     config.write_text(
         config.read_text().replace(
@@ -551,14 +610,27 @@ def test_native_codex_registration_requires_committed_project_doc_limit(
 
 @pytest.mark.parametrize(
     "case",
-    ["top_disabled", "model", "effort", "leaf_enabled", "extra", "wrong_path", "no_model_boundary"],
+    [
+        "none",
+        "top_disabled",
+        "model",
+        "effort",
+        "model_isolated",
+        "effort_isolated",
+        "hash_only",
+        "leaf_enabled",
+        "extra",
+        "wrong_path",
+        "no_model_boundary",
+    ],
 )
 def test_native_codex_registered_role_rejects_tampered_authority(
     monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
     """Every registered-role authority field is closed and fail-closed on drift."""
-    config = Path(".codex/config.toml").read_bytes()
-    role = Path(".codex/agents/engineer-be.toml").read_bytes()
+    config = (_HISTORICAL_CODEX / "config.toml").read_bytes()
+    role = (_HISTORICAL_CODEX / "agents" / "engineer-be.toml").read_bytes()
+    original_role = role
     if case == "top_disabled":
         config = config.replace(b"enabled = true", b"enabled = false", 1)
     elif case == "wrong_path":
@@ -567,13 +639,33 @@ def test_native_codex_registered_role_rejects_tampered_authority(
         role = role.replace(b"gpt-5.6-terra", b"gpt-5.6-other")
     elif case == "effort":
         role = role.replace(b'model_reasoning_effort = "high"', b'model_reasoning_effort = "low"')
+    elif case == "model_isolated":
+        lines = role.splitlines(keepends=True)
+        lines[0] = f'model = "{_LIVE_CODEX_MODEL}"\n'.encode()
+        role = b"".join(lines)
+        monkeypatch.setitem(
+            usage_models.NATIVE_CODEX_ROLE_SHA256,
+            NativeCodexRole.ENGINEER_BE,
+            hashlib.sha256(role).hexdigest(),
+        )
+    elif case == "effort_isolated":
+        lines = role.splitlines(keepends=True)
+        lines[1] = b'model_reasoning_effort = "medium"\n'
+        role = b"".join(lines)
+        monkeypatch.setitem(
+            usage_models.NATIVE_CODEX_ROLE_SHA256,
+            NativeCodexRole.ENGINEER_BE,
+            hashlib.sha256(role).hexdigest(),
+        )
+    elif case == "hash_only":
+        role += b"# comment\n"
     elif case == "leaf_enabled":
         role = role.replace(b"enabled = false", b"enabled = true")
     elif case == "extra":
         role += b"extra = true\n"
     elif case == "no_model_boundary":
         role = role.replace(b"invoke Claude Code or any other model", b"invoke provider")
-    else:  # pragma: no cover - parametrization is closed above.
+    elif case != "none":  # pragma: no cover - parametrization is closed above.
         raise AssertionError(case)
 
     def read(_root: object, parts: tuple[str, ...]) -> bytes:
@@ -581,8 +673,16 @@ def test_native_codex_registered_role_rejects_tampered_authority(
 
     monkeypatch.setattr(usage_native_codex, "_read_relative", read)
     root = usage_native_codex._Root(-1, 0, 0)  # pyright: ignore[reportPrivateUsage]
-    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex._registered_role(root, NativeCodexRole.ENGINEER_BE)  # pyright: ignore[reportPrivateUsage]
+    if case == "none":
+        assert role == original_role
+        _config_hash, _role_hash, effort, canonical = usage_native_codex._registered_role(  # pyright: ignore[reportPrivateUsage]
+            root, NativeCodexRole.ENGINEER_BE
+        )
+        assert effort == "high"
+        assert canonical == NativeCodexRole.ENGINEER_BE.value
+    else:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._registered_role(root, NativeCodexRole.ENGINEER_BE)  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.parametrize(
@@ -4044,6 +4144,13 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
             "0.148.0",
             "0.147.0",
         ),
+        (
+            NativeCodexRole.ENGINEER_BE,
+            NativeCodexTaskStatus.FAILED,
+            "live_pin",
+            "0.147.0",
+            "0.147.0",
+        ),
     ],
 )
 def test_native_codex_supervisor_real_registered_lifecycle(
@@ -4065,7 +4172,10 @@ def test_native_codex_supervisor_real_registered_lifecycle(
     provider.mkdir(parents=True)
     usage.mkdir(mode=0o700)
     os.chmod(usage, 0o700)
-    shutil.copytree(Path(".codex"), repository / ".codex")
+    if instructions == "live_pin":
+        shutil.copytree(_LIVE_CODEX, repository / ".codex")
+    else:
+        _copy_historical_codex(repository)
     (repository / "README.md").write_text("native Codex lifecycle fixture\n")
 
     def git(*arguments: str) -> str:
@@ -4283,21 +4393,32 @@ def test_native_codex_supervisor_real_registered_lifecycle(
     monkeypatch.setattr(usage_native_codex, "_provider_home", lambda: str(codex_home))
     monkeypatch.setattr(usage_native_codex.sys, "stdout", captured_stdout)
     monkeypatch.setattr(usage_native_codex, "_terminal_line", terminal)
+    inventory_calls = 0
+    pre_ready_inventory_calls = 0
     if instructions == "pre_ready_drift":
         original_inventory = usage_native_codex._inventory  # pyright: ignore[reportPrivateUsage]
-        inventory_calls = 0
 
         def inventory(
             root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
         ) -> usage_native_codex._Inventory | set[tuple[int, int, int]]:  # pyright: ignore[reportPrivateUsage]
-            nonlocal inventory_calls
-            inventory_calls += 1
+            nonlocal pre_ready_inventory_calls
+            pre_ready_inventory_calls += 1
             result = original_inventory(root)
-            if inventory_calls == 1:
+            if pre_ready_inventory_calls == 1:
                 (repository / "pre-ready-drift.txt").write_text("untracked drift\n")
             return result
 
         monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
+    current_inventory = usage_native_codex._inventory  # pyright: ignore[reportPrivateUsage]
+
+    def counting_inventory(
+        root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+    ) -> usage_native_codex._Inventory | set[tuple[int, int, int]]:  # pyright: ignore[reportPrivateUsage]
+        nonlocal inventory_calls
+        inventory_calls += 1
+        return current_inventory(root)
+
+    monkeypatch.setattr(usage_native_codex, "_inventory", counting_inventory)
     if instructions == "writable_worktree":
         os.chmod(repository, 0o770)
     arguments = SimpleNamespace(
@@ -4312,18 +4433,30 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         base_sha=base,
         output=Path(".agent-usage/usage.jsonl"),
     )
-    if instructions in {"stale", "pre_ready_drift", "writable_worktree", "version-mismatch"}:
+    if instructions in {
+        "stale",
+        "pre_ready_drift",
+        "writable_worktree",
+        "version-mismatch",
+        "live_pin",
+    }:
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
             usage_native_codex.supervise_native_codex(arguments, harness_version=observed_version)
         assert not (usage / ".agent-usage" / "usage.jsonl").exists()
         assert [json.loads(frame)["type"] for frame in captured_stdout.frames] == (
-            [] if instructions in {"pre_ready_drift", "writable_worktree"} else ["READY"]
+            []
+            if instructions in {"pre_ready_drift", "writable_worktree", "live_pin"}
+            else ["READY"]
         )
+        if instructions == "live_pin":
+            assert inventory_calls == 0
         assert "SECRET_PROVIDER_PROMPT" not in capsys.readouterr().out
         return
     assert (
         usage_native_codex.supervise_native_codex(arguments, harness_version=observed_version) == 0
     )
+    if instructions == "exact":
+        assert inventory_calls >= 1
     assert capsys.readouterr().out == ""
     frames = [json.loads(frame) for frame in captured_stdout.frames]
     assert [frame["type"] for frame in frames] == ["READY", "RESULT"]
@@ -4420,7 +4553,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
     usage.mkdir(mode=0o700)
     os.chmod(usage, 0o700)
     exact_instructions = tomllib.loads(
-        (Path(".codex") / "agents" / "engineer-be.toml").read_text()
+        (_HISTORICAL_CODEX / "agents" / "engineer-be.toml").read_text()
     )["developer_instructions"]
 
     def write_rollout(
@@ -13461,6 +13594,21 @@ def test_native_usage_and_evidence_collection_contracts_are_documented() -> None
     assert "missing API author identity" in runbook
     assert "unique_by([.login,.author_association])" in runbook
     assert "re-read the live PR head, checks" in runbook
+
+
+def test_native_codex_capture_unsupported_status_is_documented() -> None:
+    """D206 documents the deliberate unsupported native-Codex capture state."""
+    normalized = {
+        name: " ".join(path.read_text().split())
+        for name, path in {
+            "skill": _REPO_ROOT / ".agents" / "skills" / "capture-agent-usage" / "SKILL.md",
+            "agents": _REPO_ROOT / "AGENTS.md",
+        }.items()
+    }
+    assert "native Codex capture is currently unsupported for them" in normalized["skill"]
+    assert "capture for these roles is unsupported, not widened" in normalized["agents"]
+    assert _LIVE_CODEX_MODEL in normalized["skill"]
+    assert _LIVE_CODEX_MODEL in normalized["agents"]
 
 
 def test_validation_environment_roles_include_only_bash_capable_read_only_roles() -> None:

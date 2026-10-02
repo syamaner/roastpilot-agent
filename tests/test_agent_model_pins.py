@@ -18,8 +18,9 @@ import shutil
 import subprocess
 import tempfile
 import tomllib
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import cast
+from typing import TypeAlias, cast
 
 import pytest
 from _agent_defs import AGENTS_DIR, agent_body, agent_files, agent_text, parse_frontmatter
@@ -46,10 +47,22 @@ _EXPECTED: dict[str, tuple[str, str]] = {
 }
 _ALIASES = {"sonnet", "opus", "fable", "haiku", "best", "default"}
 _EXPECTED_CODEX: dict[str, tuple[str, str]] = {
-    "engineer-be": ("gpt-5.6-terra", "high"),
-    "engineer-fe": ("gpt-5.6-terra", "high"),
-    "repair": ("gpt-5.6-terra", "medium"),
+    "engineer-be": ("gpt-6.1-sol", "medium"),
+    "engineer-fe": ("gpt-6.1-sol", "medium"),
+    "repair": ("gpt-6.1-sol", "medium"),
 }
+_LEGACY_CODEX_MODEL = "gpt-5.6-terra"
+_CANONICAL_CODEX_PIN_SENTENCE = (
+    "  and `repair`. Their files pin `gpt-6.1-sol` with `medium` reasoning for all\n"
+    "  three roles (D206)."
+)
+
+_ConfigMutation: TypeAlias = Callable[[str], str]
+_RoleMutation: TypeAlias = Callable[[Mapping[str, str]], dict[str, str]]
+_AgentsMutation: TypeAlias = Callable[[str], str]
+_CodexDriftCase: TypeAlias = tuple[
+    str, _ConfigMutation | None, _RoleMutation | None, _AgentsMutation | None
+]
 
 
 def test_every_expected_agent_exists() -> None:
@@ -274,12 +287,12 @@ def test_committed_settings_do_not_defeat_the_pins() -> None:
             assert permitted, f"{rel} availableModels {allowed} does not permit pinned id {pinned}"
 
 
-def test_codex_project_agents_are_bounded_and_pinned() -> None:
-    """Project Codex roles are registered, bounded, leaf-only, and pinned."""
-    project_config = cast(
-        dict[str, object], tomllib.loads((_CODEX_DIR / "config.toml").read_text())
-    )
-    assert "model" not in project_config
+def _assert_codex_project_agents(
+    config_text: str, role_texts: Mapping[str, str], agents_md: str
+) -> None:
+    """Require the closed Codex project-agent registration and role shapes."""
+    project_config = cast(dict[str, object], tomllib.loads(config_text))
+    assert set(project_config) == {"project_doc_max_bytes", "agents"}
     project_doc_max_bytes = project_config["project_doc_max_bytes"]
     assert type(project_doc_max_bytes) is int
     assert project_doc_max_bytes == _PROJECT_DOC_MAX_BYTES
@@ -297,7 +310,7 @@ def test_codex_project_agents_are_bounded_and_pinned() -> None:
         if isinstance(value, dict)
     }
     assert set(registered_roles) == set(_EXPECTED_CODEX)
-    agents_md = (_REPO / "AGENTS.md").read_text()
+    assert set(role_texts) == set(_EXPECTED_CODEX)
     assert "parent dispatches only the three registered named roles" in agents_md
     assert "Unnamed or default worker dispatch\n  is forbidden" in agents_md
     assert "Topology depth one remains mandatory\n  policy" in agents_md
@@ -307,23 +320,344 @@ def test_codex_project_agents_are_bounded_and_pinned() -> None:
         "  each leaf's `agents.enabled = false` removes spawn capability" in agents_md
     )
 
-    files = sorted((_CODEX_DIR / "agents").glob("*.toml"))
-    assert {path.stem for path in files} == set(_EXPECTED_CODEX)
-    for path in files:
-        data = tomllib.loads(path.read_text())
-        model, effort = _EXPECTED_CODEX[path.stem]
-        registration = registered_roles[path.stem]
+    for name, role_text in role_texts.items():
+        data = cast(dict[str, object], tomllib.loads(role_text))
+        model, effort = _EXPECTED_CODEX[name]
+        registration = registered_roles[name]
+        assert set(registration) == {"description", "config_file"}
         assert isinstance(registration["description"], str)
         assert registration["description"].strip()
-        assert registration["config_file"] == f"agents/{path.name}"
-        assert "name" not in data
-        assert "description" not in data
+        assert registration["config_file"] == f"agents/{name}.toml"
+        assert set(data) == {"model", "model_reasoning_effort", "developer_instructions", "agents"}
         assert data["model"] == model
         assert data["model_reasoning_effort"] == effort
-        assert data["agents"]["enabled"] is False
+        raw_role_agents = data["agents"]
+        assert isinstance(raw_role_agents, dict)
+        role_agents = cast(dict[str, object], raw_role_agents)
+        assert set(role_agents) == {"enabled"}
+        assert role_agents["enabled"] is False
         instructions = data["developer_instructions"]
+        assert isinstance(instructions, str)
         assert "do not spawn agents" in instructions.lower()
         assert "invoke Claude Code or any other model" in instructions
+
+
+def _assert_codex_pin_prose(agents_md: str) -> None:
+    """Require the canonical D206 pin declaration without legacy drift."""
+    assert agents_md.count(_CANONICAL_CODEX_PIN_SENTENCE) == 1
+    assert f"Their files pin `{_LEGACY_CODEX_MODEL}`" not in agents_md
+
+
+def test_codex_project_agents_are_bounded_and_pinned() -> None:
+    """Project Codex roles are registered, bounded, leaf-only, and pinned."""
+    role_texts = {
+        path.stem: path.read_text() for path in sorted((_CODEX_DIR / "agents").glob("*.toml"))
+    }
+    agents_md = (_REPO / "AGENTS.md").read_text()
+    _assert_codex_project_agents((_CODEX_DIR / "config.toml").read_text(), role_texts, agents_md)
+    _assert_codex_pin_prose(agents_md)
+
+
+_CODEX_DRIFT_CASES: list[_CodexDriftCase] = [
+    ("config-parent-model", lambda text: 'model = "default"\n' + text, None, None),
+    (
+        "config-unknown-key",
+        lambda text: 'sandbox_mode = "danger-full-access"\n' + text,
+        None,
+        None,
+    ),
+    (
+        "config-doc-bytes",
+        lambda text: text.replace(
+            "project_doc_max_bytes = 131072", "project_doc_max_bytes = 65536"
+        ),
+        None,
+        None,
+    ),
+    (
+        "config-threads-4",
+        lambda text: text.replace(
+            "max_concurrent_threads_per_session = 3", "max_concurrent_threads_per_session = 4"
+        ),
+        None,
+        None,
+    ),
+    (
+        "config-top-disabled",
+        lambda text: text.replace("enabled = true", "enabled = false", 1),
+        None,
+        None,
+    ),
+    (
+        "registration-extra",
+        lambda text: (
+            text + '\n[agents.extra]\ndescription = "Extra"\nconfig_file = "agents/extra.toml"\n'
+        ),
+        None,
+        None,
+    ),
+    (
+        "registration-missing",
+        lambda text: text.replace(
+            "\n[agents.repair]\n"
+            'description = "Lead-directed repair worker."\n'
+            'config_file = "agents/repair.toml"\n',
+            "\n",
+        ),
+        None,
+        None,
+    ),
+    (
+        "role-file-missing",
+        None,
+        lambda texts: {k: v for k, v in texts.items() if k != "repair"},
+        None,
+    ),
+    (
+        "role-file-extra",
+        None,
+        lambda texts: {**texts, "extra": texts["repair"]},
+        None,
+    ),
+    (
+        "agents-md-dispatch-phrase",
+        None,
+        None,
+        lambda text: text.replace("Unnamed or default", "Unnamed", 1),
+    ),
+    (
+        "registration-extra-key",
+        lambda text: text.replace(
+            'description = "Backend PR-slice implementer."',
+            'description = "Backend PR-slice implementer."\nnickname = "be"',
+        ),
+        None,
+        None,
+    ),
+    (
+        "registration-empty-description",
+        lambda text: text.replace(
+            'description = "Backend PR-slice implementer."', 'description = ""'
+        ),
+        None,
+        None,
+    ),
+    (
+        "registration-path-drift",
+        lambda text: text.replace(
+            'config_file = "agents/engineer-be.toml"', 'config_file = "agents/wrong.toml"'
+        ),
+        None,
+        None,
+    ),
+    (
+        "role-unknown-key",
+        None,
+        lambda texts: {
+            **texts,
+            "engineer-be": 'sandbox_mode = "danger-full-access"\n' + texts["engineer-be"],
+        },
+        None,
+    ),
+    (
+        "role-name-key",
+        None,
+        lambda texts: {**texts, "engineer-be": 'name = "be"\n' + texts["engineer-be"]},
+        None,
+    ),
+    (
+        "role-description-key",
+        None,
+        lambda texts: {**texts, "engineer-be": 'description = "be"\n' + texts["engineer-be"]},
+        None,
+    ),
+    (
+        "model-alias-default",
+        None,
+        lambda texts: {
+            **texts,
+            "repair": texts["repair"].replace(
+                f'model = "{_EXPECTED_CODEX["repair"][0]}"', 'model = "default"'
+            ),
+        },
+        None,
+    ),
+    (
+        "model-truncated",
+        None,
+        lambda texts: {
+            **texts,
+            "repair": texts["repair"].replace(
+                f'model = "{_EXPECTED_CODEX["repair"][0]}"', 'model = "gpt-6.1"'
+            ),
+        },
+        None,
+    ),
+    (
+        "model-legacy",
+        None,
+        lambda texts: {
+            **texts,
+            "engineer-fe": texts["engineer-fe"].replace(
+                f'model = "{_EXPECTED_CODEX["engineer-fe"][0]}"',
+                f'model = "{_LEGACY_CODEX_MODEL}"',
+            ),
+        },
+        None,
+    ),
+    (
+        "effort-high-be",
+        None,
+        lambda texts: {
+            **texts,
+            "engineer-be": texts["engineer-be"].replace(
+                'model_reasoning_effort = "medium"', 'model_reasoning_effort = "high"'
+            ),
+        },
+        None,
+    ),
+    (
+        "effort-low-repair",
+        None,
+        lambda texts: {
+            **texts,
+            "repair": texts["repair"].replace(
+                'model_reasoning_effort = "medium"', 'model_reasoning_effort = "low"'
+            ),
+        },
+        None,
+    ),
+    (
+        "leaf-spawn-enabled",
+        None,
+        lambda texts: {
+            **texts,
+            "repair": texts["repair"].replace("enabled = false", "enabled = true"),
+        },
+        None,
+    ),
+    (
+        "leaf-spawn-zero-int",
+        None,
+        lambda texts: {
+            **texts,
+            "repair": texts["repair"].replace("enabled = false", "enabled = 0"),
+        },
+        None,
+    ),
+    (
+        "leaf-spawn-zero-float",
+        None,
+        lambda texts: {
+            **texts,
+            "repair": texts["repair"].replace("enabled = false", "enabled = 0.0"),
+        },
+        None,
+    ),
+    (
+        "leaf-agents-extra-key",
+        None,
+        lambda texts: {**texts, "engineer-be": texts["engineer-be"] + "max_depth = 2\n"},
+        None,
+    ),
+    (
+        "instructions-no-spawn-phrase",
+        None,
+        lambda texts: {
+            **texts,
+            "engineer-be": texts["engineer-be"].replace(
+                "Do not spawn agents", "Do not create leaves"
+            ),
+        },
+        None,
+    ),
+    (
+        "instructions-no-model-boundary",
+        None,
+        lambda texts: {
+            **texts,
+            "engineer-be": texts["engineer-be"].replace(
+                "invoke Claude Code or any other model", "invoke provider"
+            ),
+        },
+        None,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("case", "config_mutation", "role_mutation", "agents_mutation"),
+    _CODEX_DRIFT_CASES,
+    ids=[
+        "config-parent-model",
+        "config-unknown-key",
+        "config-doc-bytes",
+        "config-threads-4",
+        "config-top-disabled",
+        "registration-extra",
+        "registration-missing",
+        "role-file-missing",
+        "role-file-extra",
+        "agents-md-dispatch-phrase",
+        "registration-extra-key",
+        "registration-empty-description",
+        "registration-path-drift",
+        "role-unknown-key",
+        "role-name-key",
+        "role-description-key",
+        "model-alias-default",
+        "model-truncated",
+        "model-legacy",
+        "effort-high-be",
+        "effort-low-repair",
+        "leaf-spawn-enabled",
+        "leaf-spawn-zero-int",
+        "leaf-spawn-zero-float",
+        "leaf-agents-extra-key",
+        "instructions-no-spawn-phrase",
+        "instructions-no-model-boundary",
+    ],
+)
+def test_codex_project_agent_guard_rejects_drift(
+    case: str,
+    config_mutation: _ConfigMutation | None,
+    role_mutation: _RoleMutation | None,
+    agents_mutation: _AgentsMutation | None,
+) -> None:
+    """Every closed project-agent guard rejects its dedicated configuration drift."""
+    config_text = (_CODEX_DIR / "config.toml").read_text()
+    role_texts = {
+        path.stem: path.read_text() for path in sorted((_CODEX_DIR / "agents").glob("*.toml"))
+    }
+    agents_md = (_REPO / "AGENTS.md").read_text()
+    mutated_config = config_mutation(config_text) if config_mutation else config_text
+    mutated_roles = role_mutation(role_texts) if role_mutation else role_texts
+    mutated_agents = agents_mutation(agents_md) if agents_mutation else agents_md
+    assert (mutated_config, mutated_roles, mutated_agents) != (
+        config_text,
+        role_texts,
+        agents_md,
+    ), case
+    with pytest.raises(AssertionError):
+        _assert_codex_project_agents(mutated_config, mutated_roles, mutated_agents)
+
+
+@pytest.mark.parametrize(
+    "agents_md",
+    [
+        (_REPO / "AGENTS.md")
+        .read_text()
+        .replace(_EXPECTED_CODEX["engineer-be"][0], _LEGACY_CODEX_MODEL, 1),
+        (_REPO / "AGENTS.md")
+        .read_text()
+        .replace("`medium` reasoning for all", "`high` reasoning for all", 1),
+    ],
+    ids=["canonical-legacy-model", "canonical-high-effort"],
+)
+def test_codex_pin_prose_guard_rejects_decoys(agents_md: str) -> None:
+    """Canonical D206 prose cannot be satisfied by a legacy model or high effort."""
+    with pytest.raises(AssertionError):
+        _assert_codex_pin_prose(agents_md)
 
 
 def test_agents_md_fits_configured_project_document_budget() -> None:
