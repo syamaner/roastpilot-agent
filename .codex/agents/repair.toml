@@ -1,4 +1,4 @@
-model = "gpt-5.6-terra"
+model = "gpt-6.1-sol"
 model_reasoning_effort = "medium"
 developer_instructions = """
 Apply only the independently adjudicated findings in the lead-authored repair directive supplied by the parent. Read and follow AGENTS.md. The ratified story-planner contract remains binding.

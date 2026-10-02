@@ -1,5 +1,5 @@
-model = "gpt-5.6-terra"
-model_reasoning_effort = "high"
+model = "gpt-6.1-sol"
+model_reasoning_effort = "medium"
 developer_instructions = """
 Implement exactly one approved backend slice from the maintainer-ratified story-planner contract supplied by the parent. Read and follow AGENTS.md, including its architecture, safety, contract, untrusted-input, worktree, and gate rules.
 

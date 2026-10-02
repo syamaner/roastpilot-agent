@@ -39,6 +39,10 @@ the parent `CODEX_THREAD_ID`, reads only newly-created provider rollouts under t
 standard provider root, and records no provider bytes or paths. It requires an
 owned external `--usage-root`; replay, EOF, duplicate status, and `CODEX_HOME`
 overrides fail closed. The parent, not this utility, owns native dispatch.
+Admission is hash-bound to the historical `gpt-5.6-terra` role definitions; the
+committed D206 `gpt-6.1-sol`/`medium` roles are refused before provider inventory
+and READY, so native Codex capture is currently unsupported for them and writes
+no record.
 
 Under D163, `run-native-claude` is the separate parent-only instrumentation path for
 the committed roles `engineer-be`, `engineer-fe`, `mcp-contract-checker`,
