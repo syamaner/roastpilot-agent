@@ -45,6 +45,13 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdSealedEnvelope,
     validate_record,
 )
+from roastpilot_agent.cold_characterisation.evidence_terminal import (
+    ColdFailedRunTerminalError,
+    ColdFailedRunTerminalFailure,
+    ColdFailedRunTerminalRecord,
+    check_failed_run_terminal_order,
+    validate_failed_run_terminal_record,
+)
 from roastpilot_agent.cold_characterisation.mcp import (
     SessionFinalisationResult,
     finalisation_command_streaming_observation,
@@ -1001,6 +1008,25 @@ def check_advisory_attempt_binding(
     _phase_header_for(state, phase=record.phase, identity_sha256=record.identity_sha256)
 
 
+def check_failed_run_terminal_binding(
+    state: ColdBindingState, record: ColdFailedRunTerminalRecord
+) -> None:
+    """Bind one validated failed-run terminal record to its run and bound phase header.
+
+    It never binds a header and never mutates ``state``.
+
+    Args:
+        state: Binding state holding the already bound phase headers.
+        record: A snapshot returned by ``validate_failed_run_terminal_record``.
+
+    Raises:
+        ColdEvidenceStoreError: If the run id, phase header, or identity digest fails.
+    """
+    if record.run_id != state.run_id:
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.RUN_ID_MISMATCHED)
+    _phase_header_for(state, phase=record.phase, identity_sha256=record.identity_sha256)
+
+
 # ------------------------------------------------------------ tree primitives
 
 
@@ -1425,6 +1451,8 @@ class ColdEvidenceWriter:
         self._state = ColdBindingState(run_id)
         self._lifecycle = ColdLifecycleSequence()
         self._advisory = ColdAdvisorySequence()
+        self._advisory_records = 0
+        self._terminal_appended = False
         self._poisoned = False
         self._sealed = False
 
@@ -1435,6 +1463,17 @@ class ColdEvidenceWriter:
         if self._poisoned or self._run_fd is None:
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITER_POISONED)
         return self._run_fd
+
+    def _require_appendable(self) -> int:
+        """Return the run descriptor, refusing any record append after a failed-run terminal.
+
+        Sealed and poisoned writers keep their own refusals first; this refusal never
+        poisons the writer, and sealing and closing are unchanged.
+        """
+        run_fd = self._require_writable()
+        if self._terminal_appended:
+            raise ColdFailedRunTerminalError(ColdFailedRunTerminalFailure.APPENDED_AFTER_TERMINAL)
+        return run_fd
 
     def _detach_streams(self) -> list[int]:
         """Remove every stream and layout descriptor from ownership, returning them."""
@@ -1498,8 +1537,9 @@ class ColdEvidenceWriter:
         Raises:
             ColdEvidenceError: If schema validation fails (propagated unchanged).
             ColdEvidenceStoreError: If binding fails, or a write fails (then poisoned).
+            ColdFailedRunTerminalError: If a failed-run terminal was already appended.
         """
-        run_fd = self._require_writable()
+        run_fd = self._require_appendable()
         snapshot = validate_record(record)
         try:
             check_record_binding(self._state, snapshot, writer_root=self._root_path)
@@ -1534,8 +1574,9 @@ class ColdEvidenceWriter:
             ColdEvidenceError: If schema revalidation fails (propagated unchanged).
             ColdEvidenceStoreError: If binding fails, or a write fails (then poisoned).
             ColdLifecycleError: If the record is not in the latest phase or breaks order.
+            ColdFailedRunTerminalError: If a failed-run terminal was already appended.
         """
-        run_fd = self._require_writable()
+        run_fd = self._require_appendable()
         snapshot = validate_lifecycle_record(record)
         try:
             check_lifecycle_binding(self._state, snapshot)
@@ -1577,8 +1618,9 @@ class ColdEvidenceWriter:
             ColdEvidenceStoreError: If binding fails, or a write fails (then poisoned).
             ColdAdvisoryAttemptError: If the record is not in the latest phase or
                 breaks the run-wide attempt order.
+            ColdFailedRunTerminalError: If a failed-run terminal was already appended.
         """
-        run_fd = self._require_writable()
+        run_fd = self._require_appendable()
         snapshot = validate_advisory_attempt_record(record)
         try:
             check_advisory_attempt_binding(self._state, snapshot)
@@ -1603,6 +1645,55 @@ class ColdEvidenceWriter:
             self._abandon()
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
         self._advisory.commit(snapshot)
+        self._advisory_records += 1
+
+    def append_failed_run_terminal(self, record: ColdFailedRunTerminalRecord) -> None:
+        """Validate, bind, order, and durably append the run's one failed-run terminal line.
+
+        The record must belong to the latest bound phase, follow no v2 run
+        termination, and carry the retained lifecycle and advisory attempt counts.
+        Validation, binding, and ordering refusals leave the writer usable; a write
+        fault poisons it.  Only after the line is durably written does every later
+        record append refuse; sealing and closing are unchanged.
+
+        Args:
+            record: One in-process failed-run terminal record.
+
+        Raises:
+            ColdEvidenceError: If content re-admission fails (propagated unchanged).
+            ColdEvidenceStoreError: If binding fails, or a write fails (then poisoned).
+            ColdFailedRunTerminalError: If a terminal was already appended, or the
+                record contradicts the retained run.
+        """
+        run_fd = self._require_appendable()
+        snapshot = validate_failed_run_terminal_record(record)
+        try:
+            check_failed_run_terminal_binding(self._state, snapshot)
+            check_failed_run_terminal_order(
+                snapshot,
+                latest_phase=self._state.headers[-1][0].phase,
+                lifecycle_terminated=self._lifecycle.terminated,
+                lifecycle_records=self._lifecycle.next_sequence,
+                advisory_records=self._advisory_records,
+            )
+        except (ColdEvidenceStoreError, ColdFailedRunTerminalError):
+            raise
+        except BaseException:
+            self._abandon()
+            raise
+        failed = False
+        try:
+            line = (canonical_json(snapshot.model_dump(mode="json")) + "\n").encode("utf-8")
+            _write_all(self._stream_fd(run_fd, snapshot.phase, "failed_run_terminal"), line)
+        except (OSError, ValueError, ColdEvidenceStoreError):
+            failed = True
+        except BaseException:
+            self._abandon()
+            raise
+        if failed:
+            self._abandon()
+            raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
+        self._terminal_appended = True
 
     def seal(self) -> ColdSealedRun:
         """Seal the run: two-pass enumeration, hashing, and the manifest pair.
