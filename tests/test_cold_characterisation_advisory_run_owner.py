@@ -641,9 +641,8 @@ def test_start_outside_running_loop(owner_base: OwnerBase) -> None:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         assert begin(rig, OFF) is Start.REFUSED_NO_RUNNING_LOOP
-        gc.collect()
     assert [w for w in caught if issubclass(w.category, RuntimeWarning)] == []
-    assert rig.factory.calls == 0
+    assert (rig.factory.calls, priv(rig.owner)._sampler, priv(rig.owner)._task) == (0, {}, {})
     assert begin(rig, OFF) is Start.REFUSED_NO_RUNNING_LOOP
 
 
@@ -978,6 +977,109 @@ async def test_late_provider_release_after_settlement(owner_base: OwnerBase) -> 
         await wind_owner(rig)
 
 
+@pytest.mark.asyncio
+async def test_interrupted_owner_settlement_is_not_stored(owner_base: OwnerBase) -> None:
+    """O-T17: a ``BaseException`` from a provider future's ``cancel`` stops the owner call.
+
+    The sampler settlement and its ``REQUEST_INTERRUPTED`` request stay stored; the
+    owner stores nothing and cancels no run.  The later completed owner call takes
+    its own run snapshot and never repeats the provider request.
+    """
+    future = CountingFuture(error=Halt())
+    rig = owner_rig(owner_base, advisor=FutureAdvisor(future))
+    try:
+        assert begin(rig, OFF) is Start.STARTED
+        await drive(rig.clock, OPEN)
+        with pytest.raises(Halt):
+            rig.owner.settle_phase(OFF)
+        observation = look(rig, OFF)
+        assert observation.settlement is None
+        assert observation.provider is not None
+        assert observation.provider.settlement_cancellation is Req.REQUEST_INTERRUPTED
+        assert observation.provider.task is TaskState.OUTSTANDING
+        task = run_task(rig, OFF)
+        assert (task.done(), task.cancelling(), future.requests) == (False, 0, 1)
+        rig.clock.jump(5.0)
+        await drive_until(task.done)
+        settlement = settled(rig, OFF)
+        assert settlement.run_at_settlement == ColdAdvisoryPhaseRun(
+            state=RunState.FINISHED, stop=Stop.SETTLED
+        )
+        assert settlement.run_cancel_requested is False
+        assert settlement.provider_cancellation is Req.REQUEST_INTERRUPTED
+        assert settlement.sampler.closure is Closure.RECORDED_UNRESOLVED_INVOKED
+        assert future.requests == 1
+        assert rig.owner.settle_phase(OFF) is settlement
+    finally:
+        await wind_owner(rig)
+
+
+LATE_LOOKUPS = ["raises", "not_callable", "reenters"]
+SCHEDULING = [
+    "ordinary",
+    pytest.param(
+        "eager",
+        marks=pytest.mark.skipif(EAGER is None, reason="asyncio.eager_task_factory needs 3.12+"),
+    ),
+]
+
+
+@pytest.mark.parametrize("scheduling", SCHEDULING)
+@pytest.mark.parametrize("pid", LATE_LOOKUPS)
+@pytest.mark.asyncio
+async def test_late_lookup_keeps_sampler_classification(
+    owner_base: OwnerBase, pid: str, scheduling: str
+) -> None:
+    """O-T16a/b/c (direct): a getter admitted at start but failing later is never invoked.
+
+    After owner start completes, the sampler's own counted lookup through the real
+    adapter raises, yields a non-callable, or re-enters settlement.  The provider
+    task refuses before invocation (no entry, no stamp) and the existing not-invoked
+    classification stands; the re-entry is ``SAMPLER_PROVISIONAL`` with no owner
+    action, and a later settlement records the existing sampler facts.
+    """
+    rig = owner_rig(owner_base)
+    inner: list[object] = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    if scheduling == "eager":
+        loop.set_task_factory(EAGER)
+    try:
+        assert begin(rig, OFF) is Start.STARTED
+        assert (rig.factory.calls, rig.advisor.lookup_reads) == (1, 1)
+        if pid == "raises":
+            rig.advisor.lookup_raises = True
+        elif pid == "not_callable":
+            rig.advisor.override_lookup = True
+        else:
+            rig.advisor.on_lookup = lambda: inner.append(rig.owner.settle_phase(OFF))
+        await drive(rig.clock, OPEN)
+        await drive_until(run_task(rig, OFF).done)
+        assert (rig.advisor.lookup_reads, rig.advisor.entries) == (2, [])
+        cell = priv(priv(rig.owner)._sampler[OFF])._open[1]
+        assert (cell.invoked, cell.invocation) == (False, None)
+        stop = Stop.SETTLED if pid == "reenters" else Stop.NOT_INVOKED
+        assert look(rig, OFF).run == ColdAdvisoryPhaseRun(state=RunState.FINISHED, stop=stop)
+        assert inner == ([Refusal.SAMPLER_PROVISIONAL] if pid == "reenters" else [])
+        assert look(rig, OFF).settlement is None
+        settlement = settled(rig, OFF)
+        assert settlement.sampler.closure is Closure.RECORDED_UNRESOLVED_NOT_INVOKED
+        assert settlement.sampler.provider_task is Fact.NONE
+        assert settlement.provider_cancellation is Req.TASK_ALREADY_DONE
+        assert settlement.run_cancel_requested is False
+        provider = look(rig, OFF).provider
+        assert provider is not None
+        assert (provider.task, provider.call) == (
+            TaskState.DONE_RETURNED,
+            Call.REFUSED_BEFORE_INVOCATION,
+        )
+        [record] = rig.sinks[OFF].resolutions
+        assert (record.invocation_monotonic, record.invocation_utc) == (None, None)
+    finally:
+        loop.set_task_factory(previous)
+        await wind_owner(rig)
+
+
 # ------------------------------------------------------------------ runtime task factories
 
 
@@ -1208,11 +1310,28 @@ def _fence(pid: str) -> None:
         ]
         assert [ast.unparse(c.func) for c in cancels] == ["task.cancel"]
         assert cancels[0] in list(ast.walk(_owner_method("settle_phase")))
-    elif pid == "await_only_in_adapter":
-        awaits = [n for n in nodes if isinstance(n, ast.Await)]
+    elif pid == "await_only_in_adapter_wrapper":
+        asyncs = [n for n in nodes if isinstance(n, ast.AsyncFunctionDef)]
+        assert [n.name for n in asyncs] == ["single_flight"]
         adapter = _owner_class_named("_ExclusiveAdvisor")
+        [lookup] = [
+            n
+            for n in adapter.body
+            if isinstance(n, ast.FunctionDef) and n.name == "get_recommendation"
+        ]
+        assert [ast.unparse(d) for d in lookup.decorator_list] == ["property"]
+        assert asyncs[0] in list(ast.walk(lookup))
+        awaits = [n for n in nodes if isinstance(n, ast.Await)]
         assert len(awaits) == 1
-        assert awaits[0] in list(ast.walk(adapter))
+        assert awaits[0] in list(ast.walk(asyncs[0]))
+        scheduling = {"create_task", "ensure_future", "gather", "wait", "wait_for", "shield"}
+        spawns = [
+            n
+            for n in nodes
+            if isinstance(n, ast.Call) and getattr(n.func, "attr", "") in scheduling
+        ]
+        assert [ast.unparse(c.func) for c in spawns] == ["asyncio.create_task"]
+        assert spawns[0] in list(ast.walk(_owner_method("_begin")))
     elif pid == "no_base_exception_handlers":
         types = [
             "" if n.type is None else ast.unparse(n.type)
@@ -1252,7 +1371,7 @@ FENCES = [
     "names",
     "no_private_reads",
     "single_run_cancel",
-    "await_only_in_adapter",
+    "await_only_in_adapter_wrapper",
     "no_base_exception_handlers",
     "public_surface",
 ]

@@ -270,7 +270,9 @@ class ColdAdvisoryProviderObservation(pydantic.BaseModel):
 
     It is never delivery, success, suppression or qualification evidence, and it
     never changes the stored settlement.  Task creation that exits before
-    publication is not proven observable here.
+    publication is not proven observable here.  ``abandonment_cancel_requested`` is
+    true once the existing abandonment ``Task.cancel`` call returned, whatever its
+    result; false does not prove no attempt was made if that call raised.
     """
 
     model_config = _RESULT_CONFIG

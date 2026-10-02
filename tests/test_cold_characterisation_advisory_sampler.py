@@ -3512,11 +3512,13 @@ class FutureAdvisor:
         self.entries = 0
         self.cancelled = 0
         self.descriptor_calls = 0
+        self.usage_reads = 0
         self.usage = AdvisorUsage(input_tokens=100, output_tokens=10, total_tokens=110)
 
     @property
     def last_usage(self) -> AdvisorUsage | None:
-        """The current usage object."""
+        """Count the read and return the current usage object."""
+        self.usage_reads += 1
         return self.usage
 
     def descriptor_for(self, phase: RoastPhase) -> AdvisorDescriptor:
@@ -3866,6 +3868,119 @@ async def test_observation_absent_before_settlement(base: Base) -> None:
         assert pair(rig) == (TaskState.OUTSTANDING, Call.INVOKED_NO_OUTCOME)
     finally:
         await wind_down(rig, task)
+
+
+def port_counts(rig: Rig) -> tuple[int, ...]:
+    """Every port-access counter: clock, advisor, sink, evaluator and tick port."""
+    advisor = rig.advisor
+    if isinstance(advisor, FutureAdvisor):
+        advisor_counts = (advisor.usage_reads, advisor.descriptor_calls, advisor.entries)
+    else:
+        advisor_counts = (
+            advisor.getter_reads,
+            advisor.lookup_reads,
+            len(advisor.phases),
+            len(advisor.entries),
+        )
+    return (
+        rig.clock.monotonic_calls,
+        rig.clock.utc_calls,
+        *advisor_counts,
+        len(rig.sink.calls),
+        len(rig.evaluator.calls),
+        rig.ticks.calls,
+    )
+
+
+PORT_FREE: dict[str, tuple[Req, tuple[TaskState, Call] | None]] = {
+    "pre_settlement": (Req.NOT_SETTLED, None),
+    "provisional_in_progress": (Req.REQUESTED, (TaskState.OUTSTANDING, Call.INVOKED_NO_OUTCOME)),
+    "stored_no_task": (Req.NO_PROVIDER_TASK, (TaskState.NONE, Call.NO_CALL)),
+    "done_task": (Req.TASK_ALREADY_DONE, (TaskState.DONE_RETURNED, Call.OUTCOME_PUBLISHED)),
+    "outstanding": (Req.REQUESTED, (TaskState.OUTSTANDING, Call.INVOKED_NO_OUTCOME)),
+}
+
+
+@pytest.mark.parametrize("pid", sorted(PORT_FREE))
+@pytest.mark.asyncio
+async def test_request_and_observation_make_no_port_access(base: Base, pid: str) -> None:
+    """S-T12 (direct): neither method touches a clock, advisor, sink, evaluator or tick port.
+
+    Counters are compared around the calls with no intervening yield.  The only
+    foreign code a request may run is a provider future's ``cancel``; here that
+    callback is benign (``provisional_in_progress`` re-enters both methods from it
+    and checks the counters there too), so any change is the methods' own access.
+    """
+    request, expected = PORT_FREE[pid]
+    event = asyncio.Event()
+    inner: list[tuple[object, object, bool]] = []
+    holder: list[Rig] = []
+    task: asyncio.Task[ColdAdvisorySamplerRun] | None = None
+
+    def benign() -> None:
+        rig = holder[0]
+        before = port_counts(rig)
+        nested = rig.sampler.request_provider_cancellation()
+        cancellation = observed(rig).settlement_cancellation
+        inner.append((nested, cancellation, port_counts(rig) == before))
+
+    if pid == "provisional_in_progress":
+        rig, task, _ = await future_rig(base, CountingFuture(on_cancel=benign))
+    else:
+        acts = [Act("block", event=event)] if pid in {"pre_settlement", "outstanding"} else []
+        rig = make(base, acts=acts, configured_dwell_seconds=MAX)
+        if pid == "done_task":
+            await run_all(rig)
+        elif pid != "stored_no_task":
+            task = start(rig)
+            await drive(rig.clock, OPEN)
+    holder.append(rig)
+    try:
+        settled = None if pid == "pre_settlement" else rig.sampler.settle_at_phase_end()
+        before = port_counts(rig)
+        first = rig.sampler.request_provider_cancellation()
+        observation = rig.sampler.observe_provider_task()
+        second = rig.sampler.request_provider_cancellation()
+        assert port_counts(rig) == before
+        assert (first, second) == (request, request)
+        if expected is None:
+            assert observation is None
+            assert priv(rig.sampler)._settlement is None
+        else:
+            assert observation is not None
+            assert (observation.task, observation.call) == expected
+            assert rig.sampler.settle_at_phase_end() is settled
+        expected_inner = [(Req.IN_PROGRESS, Req.IN_PROGRESS, True)]
+        assert inner == (expected_inner if pid == "provisional_in_progress" else [])
+    finally:
+        event.set()
+        if task is not None:
+            await wind_down(rig, task)
+        await idle()
+
+
+def test_observation_model_is_closed() -> None:
+    """S-T13: the observation model is frozen, strict about enums and refuses extras."""
+    values: dict[str, object] = {
+        "task": TaskState.NONE,
+        "call": Call.NO_CALL,
+        "abandonment_cancel_requested": False,
+        "settlement_cancellation": None,
+    }
+    observation = ColdAdvisoryProviderObservation.model_validate(values)
+    with pytest.raises(pydantic.ValidationError):
+        typing.cast(typing.Any, observation).task = TaskState.OUTSTANDING
+    assert observation.task is TaskState.NONE
+    coercions: list[dict[str, object]] = [
+        {"task": "none"},
+        {"call": "no_call"},
+        {"settlement_cancellation": "requested"},
+    ]
+    for coerced in coercions:
+        with pytest.raises(pydantic.ValidationError):
+            ColdAdvisoryProviderObservation.model_validate({**values, **coerced})
+    with pytest.raises(pydantic.ValidationError):
+        ColdAdvisoryProviderObservation.model_validate({**values, "undeclared": 1})
 
 
 # ------------------------------------------------------------------ structure (AST oracles)

@@ -37,7 +37,7 @@ advisor or text is exposed.
 import asyncio
 import enum
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 
 import pydantic
 
@@ -168,9 +168,11 @@ class _ConcurrentAdvisoryCall(Exception):
 class _ExclusiveAdvisor:
     """Single-flight adapter over the factory's advisor (defence in depth).
 
-    ``last_usage`` and ``descriptor_for`` pass straight through; an overlapping
-    ``get_recommendation`` is refused.  It cannot police use of a raw advisor that
-    the caller retains.
+    ``last_usage`` and ``descriptor_for`` pass straight through.  The raw
+    ``get_recommendation`` is looked up at access time, so the sampler's counted
+    port access sees a getter failure, a non-callable value or a reentry exactly
+    as on the raw advisor; a callable is returned wrapped so an overlapping call is
+    refused.  It cannot police use of a raw advisor that the caller retains.
     """
 
     __slots__ = ("_advisor", "_busy")
@@ -189,15 +191,31 @@ class _ExclusiveAdvisor:
         """The wrapped advisor's descriptor for ``phase``."""
         return self._advisor.descriptor_for(phase)
 
-    async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
-        """Delegate one call; an overlapping call raises and leaves the first intact."""
-        if self._busy:
-            raise _ConcurrentAdvisoryCall
-        self._busy = True
-        try:
-            return await self._advisor.get_recommendation(context)
-        finally:
-            self._busy = False
+    @property
+    def get_recommendation(
+        self,
+    ) -> Callable[[AdvisorContext], Coroutine[typing.Any, typing.Any, RoastDecision]]:
+        """The raw method looked up now; a callable is wrapped as one single-flight call.
+
+        A getter exception propagates from this lookup, before any invocation.  A
+        nonconforming non-callable value is returned unchanged so the sampler's own
+        callable check refuses it; an overlapping wrapped call raises and leaves the
+        first intact.
+        """
+        method = self._advisor.get_recommendation
+        if not callable(method):
+            return method
+
+        async def single_flight(context: AdvisorContext) -> RoastDecision:
+            if self._busy:
+                raise _ConcurrentAdvisoryCall
+            self._busy = True
+            try:
+                return await method(context)
+            finally:
+                self._busy = False
+
+        return single_flight
 
 
 _ADVISOR_METHODS = ("descriptor_for", "get_recommendation")
@@ -350,6 +368,10 @@ class ColdAdvisoryRunOwner:
                 return self._record(phase, starts.REFUSED_FACTORY_RESULT_NOT_ADMITTED)
             adapter = self._adapter = _ExclusiveAdvisor(raw)
         self._start[phase] = starts.REFUSED_SAMPLER_CONSTRUCTION_INTERRUPTED
+        # The adapter's access-time ``get_recommendation`` property yields the callable
+        # the port's method would (the sampler only looks it up, then calls it); the
+        # checker cannot equate a property with a protocol method, hence this cast.
+        port = typing.cast(ColdAdvisoryAdvisorPort, adapter)
         try:
             sampler = ColdAdvisorySampler(
                 header=header,
@@ -358,7 +380,7 @@ class ColdAdvisoryRunOwner:
                 spec=self._spec,
                 configured_call_bound_seconds=self._bound,
                 configured_dwell_seconds=self._dwell,
-                advisor=adapter,
+                advisor=port,
                 evaluator=evaluator,
                 sink=sink,
                 ticks=ticks,
@@ -434,7 +456,10 @@ class ColdAdvisoryRunOwner:
         Order: settle the sampler, snapshot the run fact, request provider
         cancellation, then request run cancellation only when a handle exists.
         Provisional facts are returned as refusals and nothing is stored or
-        requested after them.
+        requested after them.  The stored run snapshot is taken by the call that
+        completes and stores the settlement; an earlier call interrupted by a
+        ``BaseException`` (for example from a provider future's ``cancel``) stores
+        no snapshot, and the sampler's latched request is never repeated.
 
         Args:
             phase: Exactly ``RECORDING_OFF`` or ``RECORDING_ON``.
