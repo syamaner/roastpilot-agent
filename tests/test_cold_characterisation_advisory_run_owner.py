@@ -1430,7 +1430,7 @@ def test_owner_fences(pid: str) -> None:
 
 
 def test_owner_has_no_production_caller() -> None:
-    """O-T13b (structural): no other source module imports the owner."""
+    """O-T13b (structural): only the two-phase orchestrator (5c-ii-b) imports the owner."""
     importers: list[str] = []
     for path in sorted(PACKAGE_ROOT.rglob("*.py")):
         if path.resolve() == OWNER_SOURCE.resolve():
@@ -1445,4 +1445,4 @@ def test_owner_has_no_production_caller() -> None:
             if any("advisory_run_owner" in name for name in names):
                 importers.append(str(path))
     assert PACKAGE_ROOT.name == "roastpilot_agent"
-    assert importers == []
+    assert importers == [str(PACKAGE_ROOT / "cold_characterisation" / "two_phase.py")]

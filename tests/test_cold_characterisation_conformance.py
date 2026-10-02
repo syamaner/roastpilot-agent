@@ -1971,11 +1971,11 @@ def test_n44_nothing_imports_the_checker() -> None:
 
 
 def test_n44_ac_nothing_imports_the_advisory_checker() -> None:
-    """N44-AC: no production module imports the advisory conformance checker."""
+    """N44-AC: exactly the two-phase orchestrator (5c-ii-b) imports the advisory checker."""
     actual = _checker_consumers(
         SOURCE_PATH.parents[1], "roastpilot_agent", module="advisory_conformance"
     )
-    assert actual == []
+    assert actual == ["cold_characterisation/two_phase.py"]
 
 
 _ADMITTED_CHECKER_CONSUMERS: typing.Final = (

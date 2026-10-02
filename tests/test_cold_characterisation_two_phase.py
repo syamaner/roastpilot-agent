@@ -1,11 +1,13 @@
 """Hardware-free tests for the two-phase cold-characterisation orchestrator (#954 4g-c).
 
-Every run uses a scripted clock and fake MCP, child, identity and host ports over
-the real evidence writer, seal, v2 reader and conformance checker under
-``tmp_path``.  Nothing touches hardware, a serial port, a microphone, a provider
-or a child process.  Expected facts are authored independently of the code under
-test: instants follow from the fixed 1800 s window, the 450 s scripted reads and
-the fixed 60 s budget, never from values the orchestrator computed.
+Every run uses a scripted clock and fake MCP, child, identity, host and advisor
+ports over the real advisory run owner and sampler, evidence writer, seal, V3/V4
+readers and advisory conformance checker under ``tmp_path``.  Nothing touches
+hardware, a serial port, a microphone, a live provider or a child process.
+Expected facts are authored independently of the code under test: instants follow
+from the fixed 1800 s window, the 450 s scripted reads, the fixed 60 s budget and
+the D200 window ``[end - 360, end - 60]`` with a 60 s dwell, never from values the
+orchestrator computed.
 """
 
 # pyright: reportPrivateUsage=false
@@ -26,12 +28,28 @@ from pathlib import Path
 import pydantic
 import pytest
 
-from roastpilot_agent.cold_characterisation import conformance, engine, two_phase
+from roastpilot_agent.advisor import (
+    AdvisorContext,
+    AdvisorDescriptor,
+    AdvisorProviderError,
+    AdvisorUsage,
+    RoastDecision,
+)
+from roastpilot_agent.cold_characterisation import (
+    advisory_conformance,
+    advisory_run_owner,
+    advisory_sampler,
+    conformance,
+    engine,
+    two_phase,
+)
+from roastpilot_agent.cold_characterisation import evidence_advisory as advisory_builders
 from roastpilot_agent.cold_characterisation import evidence_builders as builders
 from roastpilot_agent.cold_characterisation import evidence_lifecycle as lifecycle
 from roastpilot_agent.cold_characterisation import evidence_reader as reader
 from roastpilot_agent.cold_characterisation import evidence_schema as schema
 from roastpilot_agent.cold_characterisation import evidence_store as store
+from roastpilot_agent.cold_characterisation import evidence_terminal as terminal_module
 from roastpilot_agent.cold_characterisation.identity import ColdArtefactKind, ColdRunIdentity
 from roastpilot_agent.cold_characterisation.mcp import (
     ColdFinalisationNotCleanError,
@@ -42,12 +60,15 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdTickObservation,
     SessionFinalisationResult,
 )
+from roastpilot_agent.config import SafetyLimits
 from roastpilot_agent.mcp_client import (
     EventCommandResult,
     RuntimeConfigSnapshot,
     ServerInfo,
     StartRoastSessionResult,
 )
+from roastpilot_agent.models import RoastPhase
+from roastpilot_agent.safety import SafetyPolicy
 from tests.test_cold_characterisation_acceptance import result_for
 from tests.test_cold_characterisation_conformance import audio, safe_host_sample
 from tests.test_cold_characterisation_engine import cold_identity, marked_document, start_result
@@ -68,9 +89,16 @@ R = lifecycle.ColdRunTerminationReason
 Outcome = two_phase.ColdTwoPhaseOutcome
 Own = two_phase.ColdChildOwnership
 Refusal = two_phase.ColdRunStartRefusal
+AdvisoryPath = two_phase.ColdTwoPhaseAdvisoryPath
+Check = two_phase.ColdTwoPhaseProviderCheck
+Closure = advisory_sampler.ColdAdvisorySettlementClosure
+ProviderTask = advisory_sampler.ColdAdvisoryProviderTask
+TaskState = advisory_sampler.ColdAdvisoryProviderTaskState
 Json = dict[str, typing.Any]
 DRIVER = "hottop_kn8828b_2k_plus"
 CANARY = "CANARY-4gc-91d2"
+#: Carried only by provider-side failures; it must never reach evidence or results.
+PROVIDER_CANARY = "PROVIDER-CANARY-5cii-b7"
 #: Session identities carry the canary so any leak into a result is caught.
 SESSIONS: typing.Final = {OFF: f"session-{CANARY}-off", ON: f"session-{CANARY}-on"}
 T0 = 100.0
@@ -78,6 +106,13 @@ BASE_UTC = datetime(2026, 9, 26, 12, 0, 0, tzinfo=UTC)
 READ_SECONDS = 450.0
 #: Independently authored: OFF activates at T0, so its scheduled end is T0 + 1800.
 OFF_END = 1900.0
+#: Independently authored D200 window for the OFF phase: [1900 - 360, 1900 - 60].
+OFF_WINDOW = (1540.0, 1840.0)
+#: The configured per-call bound and post-completion dwell used by every run.
+CALL_BOUND = 30.0
+DWELL = 60.0
+#: Loop turns granted to advisory tasks at each instant a sampler waiter is due.
+ADVISORY_TURNS = 60
 #: The exact v1 success grammar, authored as text.
 GRAMMAR: typing.Final = [
     ("recording_off", "phase_activated"),
@@ -102,17 +137,62 @@ def utc_at(seconds: float) -> str:
     return (BASE_UTC + timedelta(seconds=seconds)).isoformat()
 
 
+#: Coroutines that run in advisory-owned tasks: the sampler run, a provider call
+#: and a sampler waiter (whose coroutine is the clock's own ``sleep``).
+_ADVISORY_COROUTINES: typing.Final = frozenset(
+    {"ColdAdvisorySampler.run", "_provider_call", "Clock.sleep"}
+)
+
+
+def advisory_caller() -> bool:
+    """Whether the current task is an advisory-owned task, judged by its coroutine."""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        return False
+    if task is None:
+        return False
+    return getattr(task.get_coro(), "__qualname__", "") in _ADVISORY_COROUTINES
+
+
 class Clock:
-    """Scripted clock; ``pending`` faults apply to the next ``monotonic`` calls in order."""
+    """Scripted clock; ``pending`` faults apply to the next orchestrator ``monotonic`` calls.
+
+    Advisory-owned tasks read the same instant but never consume ``pending`` faults
+    or count as ``samples`` (they take ``advisory_pending`` instead).  An advisory
+    ``sleep`` waits until the scripted time reaches its target; an orchestrator or
+    engine ``sleep`` advances time as before.  ``advance`` moves time forward,
+    stopping at each due advisory waiter and granting advisory tasks
+    ``ADVISORY_TURNS`` loop turns there, so sampling happens at exact instants.
+    """
 
     def __init__(self) -> None:
-        self.t = T0
+        self._t = T0
         self.pending: list[str] = []
+        self.advisory_pending: list[str] = []
         self.samples = 0
+        self.waiters: list[tuple[float, asyncio.Future[None]]] = []
+
+    @property
+    def t(self) -> float:
+        return self._t
+
+    @t.setter
+    def t(self, value: float) -> None:
+        self._t = value
+        for entry in list(self.waiters):
+            if entry[0] <= value:
+                self.waiters.remove(entry)
+                if not entry[1].done():
+                    entry[1].set_result(None)
 
     def monotonic(self) -> float:
-        self.samples += 1
-        fault = self.pending.pop(0) if self.pending else ""
+        if advisory_caller():
+            queue = self.advisory_pending
+        else:
+            self.samples += 1
+            queue = self.pending
+        fault = queue.pop(0) if queue else ""
         if fault.startswith("regress"):
             return self.t - float(fault.partition(":")[2] or 50.0)
         if fault.startswith("jump"):
@@ -127,7 +207,35 @@ class Clock:
         return utc_at(self.t)
 
     async def sleep(self, seconds: float) -> None:
-        self.t += seconds
+        if not advisory_caller():
+            self.t += seconds
+            return
+        target = self.t + seconds
+        if target <= self.t:
+            return
+        entry = (target, asyncio.get_running_loop().create_future())
+        self.waiters.append(entry)
+        try:
+            await entry[1]
+        finally:
+            if entry in self.waiters:
+                self.waiters.remove(entry)
+
+    async def turns(self, count: int = ADVISORY_TURNS) -> None:
+        """Grant ``count`` event-loop turns without moving time."""
+        for _ in range(count):
+            await asyncio.sleep(0)
+
+    async def advance(self, seconds: float) -> None:
+        """Move time by ``seconds``, pausing at every advisory waiter due on the way."""
+        end = self.t + seconds
+        while True:
+            due = min((t for t, _ in self.waiters if self.t < t <= end), default=None)
+            if due is None:
+                break
+            self.t = due
+            await self.turns()
+        self.t = end
 
 
 def conforming_tick(phase: Phase, index: int) -> ColdTickObservation:
@@ -233,7 +341,7 @@ class Mcp:
         await self._enter("get_roast_state")
         index = self.reads
         self.reads += 1
-        self.world.clock.t += self.read_seconds(self.current, index)
+        await self.world.clock.advance(self.read_seconds(self.current, index))
         return produce(self.tick(self.current, index))
 
     async def finalise_session(self, session_id: str) -> SessionFinalisationResult:
@@ -260,6 +368,8 @@ class Child:
         self.before_stop: dict[int, Callable[[], None]] = {}
         self.stops = 0
         self.stops_completed = 0
+        #: Loop turns a stop yields before completing, as a real process stop would.
+        self.stop_turns = 0
 
     @property
     def running(self) -> bool:
@@ -303,6 +413,8 @@ class Child:
         hook = self.before_stop.get(index)
         if hook is not None:
             hook()
+        for _ in range(self.stop_turns):
+            await asyncio.sleep(0)
         try:
             await self.world.gates.wait(f"stop:{index}")
         except asyncio.CancelledError:
@@ -376,6 +488,131 @@ def on_identity(tmp_path: Path, root: str, **document_changes: object) -> ColdRu
     return ColdRunIdentity.model_validate_json(json.dumps(document))
 
 
+AdvisorStep = Callable[["Advisor", int], typing.Awaitable[object]]
+
+
+async def decide(advisor: "Advisor", index: int) -> object:
+    """The default provider step: one in-range typed decision, with fresh usage."""
+    del index
+    advisor.usage = AdvisorUsage(input_tokens=10, output_tokens=5, total_tokens=15)
+    return RoastDecision(
+        target_heat=0, target_fan=0, should_drop=False, confidence=0.5, rationale="hold"
+    )
+
+
+class Advisor:
+    """Deterministic observation-only advisor fake: typed context in, typed data out.
+
+    It holds no MCP, child, sink or control surface.  ``steps`` scripts a call by
+    its zero-based index (the default step decides at once); ``release`` ends any
+    step that waits on it, including one that ignores cancellation.
+    """
+
+    def __init__(self, world: "World") -> None:
+        identity = world.ids[OFF]
+        self.descriptor = AdvisorDescriptor(
+            provider=identity.advisor_provider,
+            model=identity.advisor_model,
+            prompt_version=identity.advisor_prompt_version,
+        )
+        self.world = world
+        self.usage: AdvisorUsage | None = None
+        self.calls: list[tuple[float, RoastPhase, float]] = []
+        self.steps: dict[int, AdvisorStep] = {}
+        self.release = asyncio.Event()
+        self.cancelled = 0
+        #: From this scripted instant on, reading ``last_usage`` raises (pre-invocation).
+        self.usage_raises_at: float | None = None
+
+    @property
+    def last_usage(self) -> AdvisorUsage | None:
+        if self.usage_raises_at is not None and self.world.clock.t >= self.usage_raises_at:
+            raise RuntimeError(PROVIDER_CANARY)
+        return self.usage
+
+    def descriptor_for(self, phase: RoastPhase) -> AdvisorDescriptor:
+        del phase
+        return self.descriptor
+
+    async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
+        index = len(self.calls)
+        self.calls.append((self.world.clock.t, context.phase, context.current_bean_temp_c))
+        step = self.steps.get(index, decide)
+        return typing.cast(RoastDecision, produce(await step(self, index)))
+
+
+async def hang(advisor: Advisor, index: int) -> object:
+    """A cancellable provider call that waits for ``release``."""
+    del index
+    try:
+        await advisor.release.wait()
+    except asyncio.CancelledError:
+        advisor.cancelled += 1
+        raise
+    return await decide(advisor, 0)
+
+
+async def ignore_cancel(advisor: Advisor, index: int) -> object:
+    """A provider call that absorbs every cancellation made while the run is in progress.
+
+    It ends on ``release``, and a cancellation after the run returned propagates, so
+    event-loop teardown always finishes it even when an assertion failed first.
+    """
+    del index
+    while not advisor.release.is_set():
+        try:
+            await advisor.release.wait()
+        except asyncio.CancelledError:
+            if advisor.world.finished:
+                raise
+            advisor.cancelled += 1
+    return await decide(advisor, 0)
+
+
+async def provider_error(advisor: Advisor, index: int) -> object:
+    """An ordinary returned provider failure whose message carries the canary."""
+    del advisor, index
+    return AdvisorProviderError(f"provider said {PROVIDER_CANARY}")
+
+
+async def self_cancel(advisor: Advisor, index: int) -> object:
+    """An invoked provider call whose task ends cancelled, without an outcome."""
+    del advisor, index
+    raise asyncio.CancelledError
+
+
+class Evaluator:
+    """The real safety policy behind a call counter (typed evaluation only)."""
+
+    def __init__(self) -> None:
+        self.policy = SafetyPolicy(SafetyLimits())
+        self.calls = 0
+
+    def evaluate_command(
+        self,
+        *,
+        requested_heat: int,
+        requested_fan: int,
+        seconds_since_last_command: None,
+        bounds: None = None,
+    ) -> typing.Any:
+        self.calls += 1
+        return self.policy.evaluate_command(
+            requested_heat=requested_heat,
+            requested_fan=requested_fan,
+            seconds_since_last_command=seconds_since_last_command,
+            bounds=bounds,
+        )
+
+
+SPEC: typing.Final = advisory_sampler.ColdAdvisorySpec(
+    profile_name="cold-characterisation",
+    target_drop_temp_c=205.0,
+    charge_guidance_min_c=None,
+    charge_guidance_max_c=None,
+)
+
+
 class World:
     """One complete fake environment over one admitted root."""
 
@@ -393,16 +630,41 @@ class World:
         self.child = Child(self)
         self.identities = Identities(self)
         self.host = Host()
+        self.advisor = Advisor(self)
+        self.factory_calls = 0
+        self.evaluator = Evaluator()
+        self.spec: object = SPEC
+        self.bound: object = CALL_BOUND
+        self.dwell: object = DWELL
+        self.finished = False
+
+    def advisor_factory(self) -> Advisor:
+        self.factory_calls += 1
+        return self.advisor
+
+    def advisory_arguments(self) -> dict[str, typing.Any]:
+        """The five advisory arguments of one run."""
+        return {
+            "advisor_factory": self.advisor_factory,
+            "spec": self.spec,
+            "configured_call_bound_seconds": self.bound,
+            "configured_dwell_seconds": self.dwell,
+            "evaluator": self.evaluator,
+        }
 
     async def run(self) -> two_phase.ColdTwoPhaseResult:
-        return await two_phase.run_two_phase_characterisation(
-            root=self.admitted,
-            mcp=self.mcp,
-            child=self.child,
-            identities=self.identities,
-            host=self.host,
-            clock=self.clock,
-        )
+        try:
+            return await two_phase.run_two_phase_characterisation(
+                root=self.admitted,
+                mcp=self.mcp,
+                child=self.child,
+                identities=self.identities,
+                host=self.host,
+                clock=self.clock,
+                **self.advisory_arguments(),
+            )
+        finally:
+            self.finished = True
 
     def records(self, stream: str) -> list[Json]:
         """Every retained line of one stream in both phases, read raw from disk.
@@ -433,9 +695,15 @@ class World:
     def manifest_exists(self) -> bool:
         return (Path(self.root) / RUN_ID / "manifest.json").exists()
 
-    def retained(self, digest: str | None) -> reader.ColdRetainedRunV2:
+    def retained(self, digest: str | None) -> reader.ColdRetainedRunV3:
         assert digest is not None
-        return reader.read_retained_run_v2(
+        return reader.read_retained_run_v3(
+            self.root, run_id=RUN_ID, expected_manifest_sha256=digest
+        )
+
+    def retained_v4(self, digest: str | None) -> reader.ColdRetainedRunV4:
+        assert digest is not None
+        return reader.read_retained_run_v4(
             self.root, run_id=RUN_ID, expected_manifest_sha256=digest
         )
 
@@ -460,9 +728,19 @@ def assert_no_canary(result: two_phase.ColdTwoPhaseResult) -> None:
         assert "/" not in text.replace("://", "")
 
 
-def findings_of(result: two_phase.ColdTwoPhaseResult) -> set[conformance.ColdConformanceFinding]:
+def findings_of(
+    result: two_phase.ColdTwoPhaseResult,
+) -> set[advisory_conformance.ColdAdvisoryConformanceFinding]:
     assert result.conformance is not None
     return set(result.conformance.findings)
+
+
+def pre_findings_of(
+    result: two_phase.ColdTwoPhaseResult,
+) -> set[conformance.ColdConformanceFinding]:
+    """The composed policy-1 findings carried by the admitted policy-2 result."""
+    assert result.conformance is not None
+    return set(result.conformance.pre_advisory_findings)
 
 
 def assert_failed(
@@ -476,8 +754,8 @@ def assert_failed(
     assert terminal["termination"] == "failed"
     assert terminal["termination_reason"] == reason.value
     retained = world.retained(result.manifest_sha256)
-    checked = conformance.check_pre_advisory_conformance(retained)
-    assert checked.outcome is conformance.ColdConformanceOutcome.NOT_CONFORMANT
+    checked = advisory_conformance.check_advisory_conformance(retained)
+    assert checked.outcome is advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT
     assert_no_canary(result)
 
 
@@ -560,7 +838,7 @@ class ForeignArtefactKind(enum.Enum):
 class ForeignOutcome(enum.Enum):
     """A look-alike conformance outcome."""
 
-    PRE_ADVISORY_CONFORMANT = "pre_advisory_conformant"
+    ADVISORY_CONFORMANT = "advisory_conformant"
 
 
 def reset_spies() -> None:
@@ -709,14 +987,18 @@ def test_4gc_t16_genuine_carriers_are_admitted_fresh(tmp_path: Path) -> None:
     for carrier in engine_carriers():
         again = two_phase._admit_carrier(carrier, type(carrier), two_phase._ENGINE)
         assert again == carrier and again is not carrier
-    checked = conformance.ColdConformanceResult(
-        policy_version=1,
-        outcome=conformance.ColdConformanceOutcome.NOT_CONFORMANT,
-        findings=(conformance.ColdConformanceFinding.TICKS_ABSENT,),
-    )
-    assert (
-        two_phase._admit_carrier(checked, conformance.ColdConformanceResult, two_phase._CHECKER)
-        == checked
+    for checked in (CHECKED["conformant"], CHECKED["not_conformant"]):
+        again = admit_checker(checked)
+        assert again == checked and again is not checked
+
+
+def admit_checker(value: object) -> object:
+    """Admit one candidate policy-2 result exactly as the orchestrator does."""
+    return two_phase._admit_carrier(
+        value,
+        advisory_conformance.ColdAdvisoryConformanceResult,
+        two_phase._CHECKER,
+        flat_identity=True,
     )
 
 
@@ -1007,36 +1289,43 @@ def test_4gc_t16_forged_engine_and_checker_carriers_are_refused() -> None:
         for root in two_phase._ENGINE_ROOTS:
             assert two_phase._admit_carrier(value, root, two_phase._ENGINE) is None, name
         assert spy_calls() == [], name
-    genuine = conformance.ColdConformanceResult(
-        policy_version=1,
-        outcome=conformance.ColdConformanceOutcome.PRE_ADVISORY_CONFORMANT,
-        findings=(),
-    )
+    genuine = typing.cast(pydantic.BaseModel, CHECKED["conformant"])
+    failing = typing.cast(pydantic.BaseModel, CHECKED["not_conformant"])
+    Finding = advisory_conformance.ColdAdvisoryConformanceFinding
     checker_forgeries: dict[str, object] = {
         "bool_version": forged(genuine, policy_version=True),
-        "foreign_outcome": forged(genuine, outcome=ForeignOutcome.PRE_ADVISORY_CONFORMANT),
+        "policy_one": forged(genuine, policy_version=1),
+        "foreign_outcome": forged(genuine, outcome=ForeignOutcome.ADVISORY_CONFORMANT),
         "fabricated_outcome": forged(
-            genuine, outcome=object.__new__(conformance.ColdConformanceOutcome)
+            genuine, outcome=object.__new__(advisory_conformance.ColdAdvisoryConformanceOutcome)
         ),
-        "contradictory": forged(
-            genuine, findings=(conformance.ColdConformanceFinding.TICKS_ABSENT,)
+        "contradictory": forged(genuine, findings=(Finding.WINDOW_CALL_MISSING,)),
+        "string_finding": forged(failing, findings=("pre_advisory_not_conformant",)),
+        "foreign_pre_finding": forged(failing, pre_advisory_findings=(ForeignArtefactKind.WHEEL,)),
+        "unflagged_pre_findings": forged(failing, findings=(Finding.WINDOW_CALL_MISSING,)),
+        # The policy-2 result's own validators admit an exact tuple of real members
+        # only, so a list or a value string is refused (not coerced through JSON).
+        "listed_findings": forged(genuine, findings=[]),
+        "policy_one_result": conformance.ColdConformanceResult(
+            policy_version=1,
+            outcome=conformance.ColdConformanceOutcome.PRE_ADVISORY_CONFORMANT,
+            findings=(),
         ),
     }
     for name, value in checker_forgeries.items():
         reset_spies()
-        assert (
-            two_phase._admit_carrier(value, conformance.ColdConformanceResult, two_phase._CHECKER)
-            is None
-        ), name
+        assert admit_checker(value) is None, name
         assert spy_calls() == [], name
-    # A list where a tuple is declared is the same JSON array: the fresh copy is a tuple.
-    listed = two_phase._admit_carrier(
-        forged(genuine, findings=[]), conformance.ColdConformanceResult, two_phase._CHECKER
-    )
-    assert (
-        listed == genuine
-        and type(raw_fields(typing.cast(pydantic.BaseModel, listed))["findings"]) is tuple
-    )
+    # The flat path validates the original's exact declared values; a root outside
+    # the table or an unreadable value set raises, which admission turns into None.
+    with pytest.raises(StopIteration):
+        two_phase._validated_flat(genuine, ColdRunIdentity, two_phase._CHECKER)
+    with pytest.raises(TypeError):
+        two_phase._validated_flat(
+            with_dict(genuine, {"x": 1}),
+            advisory_conformance.ColdAdvisoryConformanceResult,
+            two_phase._CHECKER,
+        )
 
 
 def test_4gc_t16_engine_and_finalisation_errors_are_admitted_from_exact_dicts() -> None:
@@ -1099,10 +1388,28 @@ def _independent_row(
     owner: Own,
     digest: bool,
     checked: str | None,
+    path: two_phase.ColdTwoPhaseAdvisoryPath = AdvisoryPath.NOT_APPLICABLE,
+    check: two_phase.ColdTwoPhaseProviderCheck = Check.NOT_CHECKED,
 ) -> bool:
-    """The contract's §2.7 outcome table, authored independently of ``_row_admits``."""
+    """The contract's §2.7 outcome table plus the 5c-ii-b §2.2 path/check rows.
+
+    Authored independently of ``_row_admits``: no path means no check; a path means a
+    failed (reason-bearing) run that is ``NOT_CONFORMANT`` or ``EVIDENCE_NOT_SEALED``
+    whose one provider check was taken (AC7/D203: never ``NOT_CHECKED``), and a
+    failed-run terminal never carries a policy-2 result.
+    """
+    if path is AdvisoryPath.NOT_APPLICABLE:
+        if check is not Check.NOT_CHECKED:
+            return False
+    elif (
+        outcome not in (Outcome.NOT_CONFORMANT, Outcome.EVIDENCE_NOT_SEALED)
+        or reason is None
+        or check is Check.NOT_CHECKED
+        or (path is AdvisoryPath.FAILED_RUN_TERMINAL and checked is not None)
+    ):
+        return False
     owned = owner is not Own.NOT_OWNED
-    if outcome is Outcome.PRE_ADVISORY_CONFORMANT:
+    if outcome is Outcome.ADVISORY_CONFORMANT:
         return (
             refusal is None
             and reason is None
@@ -1127,19 +1434,50 @@ def _independent_row(
     return True
 
 
-CHECKED: typing.Final[dict[str | None, conformance.ColdConformanceResult | None]] = {
+CHECKED: typing.Final[
+    dict[str | None, advisory_conformance.ColdAdvisoryConformanceResult | None]
+] = {
     None: None,
-    "conformant": conformance.ColdConformanceResult(
-        policy_version=1,
-        outcome=conformance.ColdConformanceOutcome.PRE_ADVISORY_CONFORMANT,
+    "conformant": advisory_conformance.ColdAdvisoryConformanceResult(
+        policy_version=2,
+        outcome=advisory_conformance.ColdAdvisoryConformanceOutcome.ADVISORY_CONFORMANT,
         findings=(),
+        pre_advisory_findings=(),
     ),
-    "not_conformant": conformance.ColdConformanceResult(
-        policy_version=1,
-        outcome=conformance.ColdConformanceOutcome.NOT_CONFORMANT,
-        findings=(conformance.ColdConformanceFinding.TICKS_ABSENT,),
+    "not_conformant": advisory_conformance.ColdAdvisoryConformanceResult(
+        policy_version=2,
+        outcome=advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT,
+        findings=(advisory_conformance.ColdAdvisoryConformanceFinding.PRE_ADVISORY_NOT_CONFORMANT,),
+        pre_advisory_findings=(conformance.ColdConformanceFinding.TICKS_ABSENT,),
     ),
 }
+
+
+def construct_row(
+    outcome: Outcome,
+    refusal: Refusal | None,
+    reason: R | None,
+    owner: Own,
+    digest: bool,
+    checked: str | None,
+    path: two_phase.ColdTwoPhaseAdvisoryPath,
+    check: two_phase.ColdTwoPhaseProviderCheck,
+) -> bool:
+    """Whether the result model admits one field combination."""
+    try:
+        two_phase.ColdTwoPhaseResult(
+            outcome=outcome,
+            start_refusal=refusal,
+            termination_reason=reason,
+            child_ownership=owner,
+            manifest_sha256="a" * 64 if digest else None,
+            conformance=CHECKED[checked],
+            advisory_path=path,
+            provider_check=check,
+        )
+    except pydantic.ValidationError:
+        return False
+    return True
 
 
 def test_4gc_t18_every_field_combination_matches_the_table() -> None:
@@ -1149,22 +1487,90 @@ def test_4gc_t18_every_field_combination_matches_the_table() -> None:
         Outcome, [None, *Refusal], [None, *R], Own, (False, True), CHECKED
     ):
         expected = _independent_row(outcome, refusal, reason, owner, digest, checked)
-        try:
-            two_phase.ColdTwoPhaseResult(
-                outcome=outcome,
-                start_refusal=refusal,
-                termination_reason=reason,
-                child_ownership=owner,
-                manifest_sha256="a" * 64 if digest else None,
-                conformance=CHECKED[checked],
-            )
-        except pydantic.ValidationError:
-            assert not expected, (outcome, refusal, reason, owner, digest, checked)
-            refused += 1
-        else:
-            assert expected, (outcome, refusal, reason, owner, digest, checked)
-            admitted += 1
+        built = construct_row(
+            outcome,
+            refusal,
+            reason,
+            owner,
+            digest,
+            checked,
+            AdvisoryPath.NOT_APPLICABLE,
+            Check.NOT_CHECKED,
+        )
+        assert built is expected, (outcome, refusal, reason, owner, digest, checked)
+        admitted, refused = admitted + built, refused + (not built)
     assert admitted > 0 and refused > 0
+
+
+@pytest.mark.parametrize(
+    ("path", "outcome"),
+    [
+        (path, outcome)
+        for path in (AdvisoryPath.FAILED_RUN_TERMINAL, AdvisoryPath.PROVIDER_OUTSTANDING_FAILED)
+        for outcome in (Outcome.NOT_CONFORMANT, Outcome.EVIDENCE_NOT_SEALED)
+    ],
+    ids=lambda value: value.value,
+)
+def test_954_an_od5_row_always_carries_a_taken_check(
+    path: two_phase.ColdTwoPhaseAdvisoryPath, outcome: Outcome
+) -> None:
+    """AC7/D203: every OD5 result row carries the one check; NOT_CHECKED is refused.
+
+    Otherwise valid fields: a failed reason, an owned child, no policy-2 result, and a
+    digest only for NOT_CONFORMANT.  Each taken value constructs; NOT_CHECKED never does.
+    """
+    fields: dict[str, object] = {
+        "outcome": outcome,
+        "start_refusal": None,
+        "termination_reason": R.UNEXPECTED_FAILURE,
+        "child_ownership": Own.OWNED_STOP_CONFIRMED,
+        "manifest_sha256": "a" * 64 if outcome is Outcome.NOT_CONFORMANT else None,
+        "conformance": None,
+        "advisory_path": path,
+    }
+    for check in (
+        Check.PENDING_AT_CHECK,
+        Check.NOT_PENDING_AT_CHECK,
+        Check.NOT_OBSERVABLE_AT_CHECK,
+    ):
+        built = two_phase.ColdTwoPhaseResult.model_validate({**fields, "provider_check": check})
+        assert (built.advisory_path, built.provider_check) == (path, check)
+    with pytest.raises(pydantic.ValidationError):
+        two_phase.ColdTwoPhaseResult.model_validate({**fields, "provider_check": Check.NOT_CHECKED})
+
+
+def test_954_t19_every_path_and_check_combination_matches_the_table() -> None:
+    """5c-ii-b T19 (AC8): every forbidden outcome/path/check combination is refused."""
+    admitted: set[
+        tuple[Outcome, two_phase.ColdTwoPhaseAdvisoryPath, two_phase.ColdTwoPhaseProviderCheck]
+    ] = set()
+    for combination in itertools.product(
+        Outcome,
+        [None, Refusal.UNEXPECTED_FAILURE, Refusal.IDENTITY_NOT_FROZEN],
+        [None, R.UNEXPECTED_FAILURE],
+        Own,
+        (False, True),
+        CHECKED,
+        AdvisoryPath,
+        Check,
+    ):
+        built = construct_row(*combination)
+        assert built is _independent_row(*combination), combination
+        if built:
+            admitted.add((combination[0], combination[6], combination[7]))
+    # Authored independently: which (outcome, path, check) triples any row admits.
+    on_path = {
+        (outcome, path, check)
+        for outcome in (Outcome.NOT_CONFORMANT, Outcome.EVIDENCE_NOT_SEALED)
+        for path in (AdvisoryPath.FAILED_RUN_TERMINAL, AdvisoryPath.PROVIDER_OUTSTANDING_FAILED)
+        for check in (
+            Check.PENDING_AT_CHECK,
+            Check.NOT_PENDING_AT_CHECK,
+            Check.NOT_OBSERVABLE_AT_CHECK,
+        )
+    }
+    off_path = {(outcome, AdvisoryPath.NOT_APPLICABLE, Check.NOT_CHECKED) for outcome in Outcome}
+    assert admitted == on_path | off_path
 
 
 def test_4gc_t18_forged_fields_are_refused_and_results_hold_no_text() -> None:
@@ -1176,11 +1582,13 @@ def test_4gc_t18_forged_fields_are_refused_and_results_hold_no_text() -> None:
         "child_ownership": Own.OWNED_STOP_CONFIRMED,
         "manifest_sha256": "a" * 64,
         "conformance": None,
+        "advisory_path": AdvisoryPath.NOT_APPLICABLE,
+        "provider_check": Check.NOT_CHECKED,
     }
     assert two_phase.ColdTwoPhaseResult.model_validate(base).termination_reason is R.PHASE_ABORTED
     contradicted = forged(
-        typing.cast(conformance.ColdConformanceResult, CHECKED["conformant"]),
-        findings=(conformance.ColdConformanceFinding.TICKS_ABSENT,),
+        typing.cast(pydantic.BaseModel, CHECKED["conformant"]),
+        findings=(advisory_conformance.ColdAdvisoryConformanceFinding.WINDOW_CALL_MISSING,),
     )
     bad: list[dict[str, object]] = [
         {"manifest_sha256": "A" * 64},
@@ -1191,6 +1599,11 @@ def test_4gc_t18_forged_fields_are_refused_and_results_hold_no_text() -> None:
         {"outcome": object.__new__(Outcome)},
         {"child_ownership": object.__new__(Own)},
         {"termination_reason": object.__new__(R)},
+        {"advisory_path": "not_applicable"},
+        {"advisory_path": object.__new__(AdvisoryPath)},
+        {"provider_check": "not_checked"},
+        {"provider_check": object.__new__(Check)},
+        {"advisory_path": None},
         {"conformance": contradicted},
         {
             "conformance": forged(
@@ -1215,7 +1628,7 @@ def test_4gc_t18_forged_fields_are_refused_and_results_hold_no_text() -> None:
         )
     valid = two_phase.ColdTwoPhaseResult.model_validate(base)
     with pytest.raises(pydantic.ValidationError):
-        valid.outcome = Outcome.PRE_ADVISORY_CONFORMANT  # type: ignore[misc]
+        valid.outcome = Outcome.ADVISORY_CONFORMANT  # type: ignore[misc]
     assert set(two_phase.ColdTwoPhaseResult.model_fields) == {
         "outcome",
         "start_refusal",
@@ -1223,14 +1636,16 @@ def test_4gc_t18_forged_fields_are_refused_and_results_hold_no_text() -> None:
         "child_ownership",
         "manifest_sha256",
         "conformance",
+        "advisory_path",
+        "provider_check",
     }
-    for kind in (Outcome, Refusal, Own):
+    for kind in (Outcome, Refusal, Own, AdvisoryPath, Check):
         assert issubclass(kind, enum.Enum) and not issubclass(kind, str)
 
 
 def test_4gc_t18_a_forged_conformance_carrier_is_replaced_by_a_fresh_copy() -> None:
     """T18: an admitted checker result is stored as a fresh snapshot, never the caller's."""
-    caller = typing.cast(conformance.ColdConformanceResult, CHECKED["not_conformant"])
+    caller = CHECKED["not_conformant"]
     result = two_phase.ColdTwoPhaseResult(
         outcome=Outcome.NOT_CONFORMANT,
         start_refusal=None,
@@ -1238,6 +1653,8 @@ def test_4gc_t18_a_forged_conformance_carrier_is_replaced_by_a_fresh_copy() -> N
         child_ownership=Own.OWNED_STOP_CONFIRMED,
         manifest_sha256="b" * 64,
         conformance=caller,
+        advisory_path=AdvisoryPath.NOT_APPLICABLE,
+        provider_check=Check.NOT_CHECKED,
     )
     assert result.conformance == caller and result.conformance is not caller
 
@@ -1264,6 +1681,9 @@ def test_4gc_t19_imports_stay_inside_the_contract_allowlist() -> None:
     assert set(modules) == {
         _COLD + name
         for name in (
+            "advisory_conformance",
+            "advisory_run_owner",
+            "advisory_sampler",
             "conformance",
             "engine",
             "evidence_builders",
@@ -1271,6 +1691,7 @@ def test_4gc_t19_imports_stay_inside_the_contract_allowlist() -> None:
             "evidence_reader",
             "evidence_schema",
             "evidence_store",
+            "evidence_terminal",
             "identity",
             "mcp",
         )
@@ -1372,7 +1793,14 @@ def _reachable(*roots: type[pydantic.BaseModel]) -> tuple[set[type], set[type]]:
             "_ENGINE",
             (engine.ColdPhaseCompleted, engine.ColdPhaseAborted, engine.ColdPhaseActivationRefused),
         ),
-        ("_CHECKER", (conformance.ColdConformanceResult,)),
+        ("_CHECKER", (advisory_conformance.ColdAdvisoryConformanceResult,)),
+        (
+            "_ADVISORY",
+            (
+                advisory_run_owner.ColdAdvisoryPhaseSettlement,
+                advisory_run_owner.ColdAdvisoryPhaseObservation,
+            ),
+        ),
     ],
 )
 def test_4gc_t19_admission_tables_equal_the_reachable_classes(
@@ -1577,7 +2005,7 @@ async def test_4gc_t16_a_forged_or_failing_checker_is_never_conformant(
     genuine = typing.cast(conformance.ColdConformanceResult, CHECKED["conformant"])
     returned: dict[str, object] = {
         "forged_conformant": forged(genuine, policy_version=True),
-        "foreign_outcome": forged(genuine, outcome=ForeignOutcome.PRE_ADVISORY_CONFORMANT),
+        "foreign_outcome": forged(genuine, outcome=ForeignOutcome.ADVISORY_CONFORMANT),
         "raises": RuntimeError(CANARY),
         "wrong_type": {"outcome": "pre_advisory_conformant"},
     }
@@ -1586,7 +2014,7 @@ async def test_4gc_t16_a_forged_or_failing_checker_is_never_conformant(
         del run
         return produce(returned[checker])
 
-    monkeypatch.setattr(two_phase, "check_pre_advisory_conformance", check)
+    monkeypatch.setattr(two_phase, "check_advisory_conformance", check)
     world = World(tmp_path)
     result = await world.run()
     assert result.outcome is Outcome.NOT_CONFORMANT
@@ -1606,7 +2034,7 @@ async def test_4gc_t16_a_reload_failure_is_never_conformant(
     def refuse(*args: object, **kwargs: object) -> typing.NoReturn:
         raise store.ColdEvidenceStoreError(store.ColdEvidenceStoreFailure.HEADER_MISSING)
 
-    monkeypatch.setattr(two_phase, "read_retained_run_v2", refuse)
+    monkeypatch.setattr(two_phase, "read_retained_run_v3", refuse)
     world = World(tmp_path)
     result = await world.run()
     assert result.outcome is Outcome.NOT_CONFORMANT and result.conformance is None
@@ -1622,6 +2050,7 @@ def make_run(world: World) -> two_phase._TwoPhaseRun:
         identities=world.identities,
         host=world.host,
         clock=world.clock,
+        **world.advisory_arguments(),
     )
 
 
@@ -1760,6 +2189,14 @@ class WriterProxy:
 
     def append_lifecycle(self, record: lifecycle.ColdLifecycleRecord) -> None:
         self._call("append_lifecycle", lambda: self.writer.append_lifecycle(record))
+
+    def append_advisory_attempt(self, record: typing.Any) -> None:
+        self._call("append_advisory_attempt", lambda: self.writer.append_advisory_attempt(record))
+
+    def append_failed_run_terminal(self, record: typing.Any) -> None:
+        self._call(
+            "append_failed_run_terminal", lambda: self.writer.append_failed_run_terminal(record)
+        )
 
     def seal(self) -> typing.Any:
         sealed = self._call("seal", self.writer.seal)
@@ -2971,10 +3408,10 @@ def set_time(world: World, instant: float) -> Callable[[], None]:
 
 
 @pytest.mark.asyncio
-async def test_4gc_t1_the_happy_path_is_pre_advisory_conformant(
+async def test_4gc_t1_the_happy_path_is_advisory_conformant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T1: one run, one directory, two sessions, 11-entry grammar, exact child calls."""
+    """T1 (5c-ii-b T1/AC1/2/8/11): grammar, child calls, advisory attempts, no write."""
     seen: list[tuple[int, int, int]] = []
     real_observe = engine.observe_cold_phase
     real_admit = engine.admit_cold_phase
@@ -2991,13 +3428,18 @@ async def test_4gc_t1_the_happy_path_is_pre_advisory_conformant(
     monkeypatch.setattr(two_phase, "admit_cold_phase", spy_admit)
     world = World(tmp_path)
     result = await world.run()
-    assert result.outcome is Outcome.PRE_ADVISORY_CONFORMANT
+    assert result.outcome is Outcome.ADVISORY_CONFORMANT
     assert result.termination_reason is None and result.start_refusal is None
     assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
-    assert result.conformance == conformance.ColdConformanceResult(
-        policy_version=1,
-        outcome=conformance.ColdConformanceOutcome.PRE_ADVISORY_CONFORMANT,
+    assert result.conformance == advisory_conformance.ColdAdvisoryConformanceResult(
+        policy_version=2,
+        outcome=advisory_conformance.ColdAdvisoryConformanceOutcome.ADVISORY_CONFORMANT,
         findings=(),
+        pre_advisory_findings=(),
+    )
+    assert (result.advisory_path, result.provider_check) == (
+        AdvisoryPath.NOT_APPLICABLE,
+        Check.NOT_CHECKED,
     )
     retained = world.retained(result.manifest_sha256)
     assert retained.run.manifest_sha256 == result.manifest_sha256
@@ -3036,6 +3478,28 @@ async def test_4gc_t1_the_happy_path_is_pre_advisory_conformant(
     assert world.event(OFF, "child_started")["event_monotonic_seconds"] == 1901.0
     finalisations = world.records("finalisation")
     assert [f["session_id"] for f in finalisations] == [SESSIONS[OFF], SESSIONS[ON]]
+    # Advisory: one factory call; attempts at the window open, then every 60 s dwell,
+    # through the window close (OFF [1540, 1840]; ON 3701 - 360 = 3341 to 3641).
+    assert world.factory_calls == 1
+    off_calls = [1540.0 + 60.0 * index for index in range(6)]
+    on_calls = [3341.0 + 60.0 * index for index in range(6)]
+    assert [call[0] for call in world.advisor.calls] == off_calls + on_calls
+    assert {call[1] for call in world.advisor.calls} == {RoastPhase.PREHEATING}
+    assert world.evaluator.calls == 12
+    attempts = world.records("advisory_attempt")
+    assert len(attempts) == 24
+    assert {record["phase"] for record in attempts[:12]} == {"recording_off"}
+    assert {record["phase"] for record in attempts[12:]} == {"recording_on"}
+    assert not world.records("failed_run_terminal")
+    # The fake MCP log holds only the non-actuating calls and D195 finalisation.
+    assert {name for name, _phase in world.mcp.calls} == {
+        "get_server_info",
+        "get_runtime_config",
+        "start_cold_session",
+        "mark_beans_added",
+        "get_roast_state",
+        "finalise_session",
+    }
     assert_lifecycle_ordered(world)
     assert_no_canary(result)
 
@@ -3057,7 +3521,7 @@ async def test_4gc_t2_the_budget_boundaries_conform(tmp_path: Path, case: str) -
         world.mcp.read_seconds = lambda phase, index: 500.0 if (phase, index) == (OFF, 3) else 450.0
         world.mcp.before["mark_beans_added:recording_on"] = set_time(world, OFF_END + 60.0)
     result = await world.run()
-    assert result.outcome is Outcome.PRE_ADVISORY_CONFORMANT, findings_of(result)
+    assert result.outcome is Outcome.ADVISORY_CONFORMANT, findings_of(result)
     measured = world.event(ON, "transition_measured")
     assert measured["transition_start_monotonic"] == OFF_END
     assert measured["transition_seconds"] == expected_seconds
@@ -3073,7 +3537,7 @@ async def test_4gc_t20_an_on_overrun_never_meets_the_off_budget(tmp_path: Path) 
     world.mcp.before["mark_beans_added:recording_on"] = set_time(world, OFF_END + 60.0)
     world.mcp.read_seconds = lambda phase, index: 950.0 if (phase, index) == (ON, 3) else 450.0
     result = await world.run()
-    assert result.outcome is Outcome.PRE_ADVISORY_CONFORMANT, findings_of(result)
+    assert result.outcome is Outcome.ADVISORY_CONFORMANT, findings_of(result)
     # ON activation 1960; scheduled end 3760; last read ends 1960 + 1350 + 950 = 4260.
     assert world.event(ON, "observation_window_elapsed")["event_monotonic_seconds"] == 4260.0
     assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
@@ -3085,10 +3549,11 @@ async def test_4gc_t20_an_on_overrun_never_meets_the_off_budget(tmp_path: Path) 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("overrun", [False, True])
 async def test_4gc_t3_an_activation_past_the_budget_reads_nothing(
-    tmp_path: Path, overrun: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrun: bool
 ) -> None:
     """T3: just past OFF_END + 60 the ON phase is refused before its first read."""
     world = World(tmp_path)
+    starts = record_starts(monkeypatch)
     activation = math.nextafter(OFF_END + 60.0, math.inf)
     if overrun:
         # OFF completes at 1950: the activation is only 10.5 s after completion.
@@ -3115,6 +3580,8 @@ async def test_4gc_t3_an_activation_past_the_budget_reads_nothing(
     assert aborted["session_id"] == SESSIONS[ON]
     assert world.records("abort") == []
     assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+    # AC1: the advisory sampler starts only for a within-budget activation.
+    assert [phase for phase, _started in starts] == [OFF]
 
 
 def _late_completion(world: World) -> None:
@@ -3255,7 +3722,12 @@ async def test_4gc_t7b_a_reused_session_is_refused_by_the_checker(tmp_path: Path
     result = await world.run()
     assert result.outcome is Outcome.NOT_CONFORMANT
     assert result.termination_reason is None
-    assert findings_of(result) == {conformance.ColdConformanceFinding.PHASE_SESSIONS_NOT_DISTINCT}
+    assert findings_of(result) == {
+        advisory_conformance.ColdAdvisoryConformanceFinding.PRE_ADVISORY_NOT_CONFORMANT
+    }
+    assert pre_findings_of(result) == {
+        conformance.ColdConformanceFinding.PHASE_SESSIONS_NOT_DISTINCT
+    }
     assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[OFF]]
     assert world.events() == GRAMMAR
 
@@ -3528,8 +4000,8 @@ class Counters:
     ) -> None:
         self.seals = self.reads = self.checks = 0
         real_seal = store.ColdEvidenceWriter.seal
-        real_read = reader.read_retained_run_v2
-        real_check = conformance.check_pre_advisory_conformance
+        real_read = reader.read_retained_run_v3
+        real_check = advisory_conformance.check_advisory_conformance
 
         def counted_seal(writer: store.ColdEvidenceWriter) -> typing.Any:
             self.seals += 1
@@ -3544,8 +4016,8 @@ class Counters:
             return (check or real_check)(run)
 
         monkeypatch.setattr(store.ColdEvidenceWriter, "seal", counted_seal)
-        monkeypatch.setattr(two_phase, "read_retained_run_v2", counted_read)
-        monkeypatch.setattr(two_phase, "check_pre_advisory_conformance", counted_check)
+        monkeypatch.setattr(two_phase, "read_retained_run_v3", counted_read)
+        monkeypatch.setattr(two_phase, "check_advisory_conformance", counted_check)
 
     @property
     def counts(self) -> tuple[int, int, int]:
@@ -3811,8 +4283,8 @@ async def test_4gc_a2_s7_a_post_seal_refusal_is_final_for_the_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
 ) -> None:
     """S7: a post-seal reader/checker refusal is final; a later diagnostic never upgrades it."""
-    real_read = reader.read_retained_run_v2
-    real_check = conformance.check_pre_advisory_conformance
+    real_read = reader.read_retained_run_v3
+    real_check = advisory_conformance.check_advisory_conformance
 
     def refuse_read(*args: typing.Any, **kwargs: typing.Any) -> typing.NoReturn:
         raise store.ColdEvidenceStoreError(store.ColdEvidenceStoreFailure.HEADER_MISSING)
@@ -3821,7 +4293,7 @@ async def test_4gc_a2_s7_a_post_seal_refusal_is_final_for_the_run(
         raise RuntimeError(CANARY)
 
     def inadmissible_check(run: object) -> object:
-        genuine = typing.cast(conformance.ColdConformanceResult, CHECKED["conformant"])
+        genuine = typing.cast(pydantic.BaseModel, CHECKED["conformant"])
         return forged(genuine, policy_version=True)
 
     counters = Counters(
@@ -3840,7 +4312,10 @@ async def test_4gc_a2_s7_a_post_seal_refusal_is_final_for_the_run(
     diagnostic = real_check(
         real_read(world.root, run_id=RUN_ID, expected_manifest_sha256=result.manifest_sha256)
     )
-    assert diagnostic.outcome is conformance.ColdConformanceOutcome.PRE_ADVISORY_CONFORMANT
+    assert (
+        diagnostic.outcome
+        is advisory_conformance.ColdAdvisoryConformanceOutcome.ADVISORY_CONFORMANT
+    )
     assert result.outcome is Outcome.NOT_CONFORMANT
     assert_contained(result)
 
@@ -4330,9 +4805,12 @@ async def test_4gc_t14_an_empty_window_is_finalised_then_failed(
     else:
         assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
         assert world.child_ops() == NORMAL_CHILD_OPS
-    assert conformance.ColdConformanceFinding.TICKS_ABSENT in set(
-        conformance.check_pre_advisory_conformance(world.retained(result.manifest_sha256)).findings
+    # 5c-ii-b T15: an empty-tick phase is never ADVISORY_CONFORMANT (policy 1 composed).
+    checked = advisory_conformance.check_advisory_conformance(
+        world.retained(result.manifest_sha256)
     )
+    assert conformance.ColdConformanceFinding.TICKS_ABSENT in checked.pre_advisory_findings
+    assert result.outcome is Outcome.NOT_CONFORMANT
 
 
 def _completion(session: str) -> Behaviour:
@@ -4464,7 +4942,7 @@ async def test_4gc_t22_a_conformant_checker_never_overrides_a_failure(
         del run
         return CHECKED["conformant"]
 
-    monkeypatch.setattr(two_phase, "check_pre_advisory_conformance", check)
+    monkeypatch.setattr(two_phase, "check_advisory_conformance", check)
     world = World(tmp_path)
     if failure == "on_not_clean":
         world.mcp.finalise = lambda p, s: not_clean_result(p, s) if p is ON else clean_result(p, s)
@@ -4506,7 +4984,7 @@ async def test_4gc_t22_end_handling_suppresses_a_contradictory_checker_itself(
         return CHECKED["conformant"]
 
     monkeypatch.setattr(two_phase._TwoPhaseRun, "_end", end)
-    monkeypatch.setattr(two_phase, "check_pre_advisory_conformance", check)
+    monkeypatch.setattr(two_phase, "check_advisory_conformance", check)
     world = World(tmp_path)
     world.mcp.finalise = lambda p, s: not_clean_result(p, s) if p is ON else clean_result(p, s)
     result = await world.run()
@@ -4526,3 +5004,1423 @@ async def test_4gc_a_raising_identity_source_is_identity_not_frozen(tmp_path: Pa
         Own.OWNED_STOP_CONFIRMED,
     )
     assert_no_canary(result)
+
+
+# ------------------------------------------- 5c-ii-b: cold advisory runtime
+
+
+Owner = advisory_run_owner.ColdAdvisoryRunOwner
+Terminal = terminal_module.ColdFailedRunAdvisorySettlement
+Cancellation = terminal_module.ColdFailedRunProviderCancellation
+OFF_ONLY_OPS: typing.Final = [("configure", OFF), ("start", OFF), ("stop", OFF)]
+#: The non-actuating MCP calls plus D195 finalisation; nothing else may appear.
+CALL_NAMES: typing.Final = {
+    "get_server_info",
+    "get_runtime_config",
+    "start_cold_session",
+    "mark_beans_added",
+    "get_roast_state",
+    "finalise_session",
+}
+
+
+class OwnerLog:
+    """Counts owner settlements and observations and logs seal/check/close/reload order."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.order: list[str] = []
+        self.settles: list[Phase] = []
+        self.observes: list[Phase] = []
+        self.writer_seals = 0
+        real_settle, real_observe = Owner.settle_phase, Owner.observe_phase
+        real_seal, real_close = two_phase._RunSink.seal, two_phase._RunSink.close
+        real_writer_seal = store.ColdEvidenceWriter.seal
+        real_v3, real_v4 = reader.read_retained_run_v3, reader.read_retained_run_v4
+
+        def settle(owner: typing.Any, phase: Phase) -> typing.Any:
+            self.settles.append(phase)
+            return real_settle(owner, phase)
+
+        def observe(owner: typing.Any, phase: Phase) -> typing.Any:
+            self.observes.append(phase)
+            self.order.append("observe")
+            return real_observe(owner, phase)
+
+        def seal(sink: two_phase._RunSink) -> str:
+            self.order.append("seal")
+            return real_seal(sink)
+
+        def close(sink: two_phase._RunSink) -> None:
+            self.order.append("close")
+            real_close(sink)
+
+        def writer_seal(writer: store.ColdEvidenceWriter) -> typing.Any:
+            self.writer_seals += 1
+            return real_writer_seal(writer)
+
+        def v3(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+            self.order.append("read_v3")
+            return real_v3(*args, **kwargs)
+
+        def v4(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+            self.order.append("read_v4")
+            return real_v4(*args, **kwargs)
+
+        monkeypatch.setattr(Owner, "settle_phase", settle)
+        monkeypatch.setattr(Owner, "observe_phase", observe)
+        monkeypatch.setattr(two_phase._RunSink, "seal", seal)
+        monkeypatch.setattr(two_phase._RunSink, "close", close)
+        monkeypatch.setattr(store.ColdEvidenceWriter, "seal", writer_seal)
+        monkeypatch.setattr(two_phase, "read_retained_run_v3", v3)
+        monkeypatch.setattr(two_phase, "read_retained_run_v4", v4)
+
+    def check_followed_seal(self) -> None:
+        """Exactly one observation, immediately after the one seal step."""
+        assert self.order.count("observe") == 1 and self.order.count("seal") == 1
+        index = self.order.index("seal")
+        assert self.order[index + 1] == "observe"
+
+
+def record_starts(
+    monkeypatch: pytest.MonkeyPatch, refuse: Phase | None = None
+) -> list[tuple[Phase, object]]:
+    """Record every real owner start call and its result; ``refuse`` gets a stored refusal.
+
+    The refused phase never reaches the owner, so it has no sampler to settle.
+    """
+    starts: list[tuple[Phase, object]] = []
+    real = Owner.start_phase
+
+    def start(owner: typing.Any, phase: Phase, **kwargs: typing.Any) -> typing.Any:
+        if phase is refuse:
+            result: object = advisory_run_owner.ColdAdvisoryPhaseStart.REFUSED_HEADER_NOT_ADMITTED
+        else:
+            result = real(owner, phase, **kwargs)
+        starts.append((phase, result))
+        return result
+
+    monkeypatch.setattr(Owner, "start_phase", start)
+    return starts
+
+
+def force_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: Phase,
+    sampler: dict[str, object],
+    **settlement: object,
+) -> None:
+    """Replace one phase's stored settlement facts with forged (content-valid) ones."""
+    real = Owner.settle_phase
+
+    def settle(owner: typing.Any, settle_phase: Phase) -> typing.Any:
+        settled: typing.Any = real(owner, settle_phase)
+        if settle_phase is not phase:
+            return settled
+        copied = settled.sampler.model_copy(update=sampler)
+        return settled.model_copy(update={"sampler": copied, **settlement})
+
+    monkeypatch.setattr(Owner, "settle_phase", settle)
+
+
+def during_settlement(monkeypatch: pytest.MonkeyPatch, action: Callable[[], None]) -> None:
+    """Run ``action`` once, right before the first phase settlement."""
+    real = Owner.settle_phase
+    done: list[int] = []
+
+    def settle(owner: typing.Any, phase: Phase) -> typing.Any:
+        if not done:
+            done.append(1)
+            action()
+        return real(owner, phase)
+
+    monkeypatch.setattr(Owner, "settle_phase", settle)
+
+
+def install_task_factory(rule: Callable[[str], str | None]) -> None:
+    """Route task creation through ``rule(coroutine qualname)``: raise, cancel or create."""
+
+    def factory(
+        loop: asyncio.AbstractEventLoop, coro: typing.Any, **kwargs: typing.Any
+    ) -> typing.Any:
+        action = rule(getattr(coro, "__qualname__", ""))
+        if action == "raise":
+            coro.close()
+            raise RuntimeError(PROVIDER_CANARY)
+        task = asyncio.Task(coro, loop=loop, **kwargs)
+        if action == "cancel_both":
+            task.cancel()
+            typing.cast("asyncio.Task[object]", asyncio.current_task()).cancel()
+        elif action == "cancel_current":
+            typing.cast("asyncio.Task[object]", asyncio.current_task()).cancel()
+        return task
+
+    asyncio.get_running_loop().set_task_factory(factory)
+
+
+async def release(world: World) -> None:
+    """End any provider call still waiting, then let its task finish."""
+    world.advisor.release.set()
+    await world.clock.turns(5)
+
+
+def terminal_record(world: World) -> Json:
+    """The one retained failed-run terminal line."""
+    (record,) = world.records("failed_run_terminal")
+    return record
+
+
+def unresolved_invoked_at_off_end(world: World) -> None:
+    """The last OFF call (1840) is still running at the OFF end (1900 < 1840 + 100).
+
+    The child stop yields a few loop turns, so a requested cancellation of a
+    cancellable provider can land before the post-seal check.
+    """
+    world.bound = 100.0
+    world.advisor.steps[5] = hang
+    world.child.stop_turns = 3
+
+
+def assert_failed_run_terminal(
+    world: World,
+    result: two_phase.ColdTwoPhaseResult,
+    phase: Phase,
+    settlement: str,
+    cancellation: str,
+) -> None:
+    """The schema-3 terminal alone ends a sealed failed run whose counts are retained."""
+    assert result.outcome is Outcome.NOT_CONFORMANT and result.manifest_sha256 is not None
+    assert result.termination_reason is R.UNEXPECTED_FAILURE and result.conformance is None
+    assert result.advisory_path is AdvisoryPath.FAILED_RUN_TERMINAL
+    record = terminal_record(world)
+    assert (record["phase"], record["advisory_settlement"], record["provider_cancellation"]) == (
+        phase.value,
+        settlement,
+        cancellation,
+    )
+    assert record["lifecycle_records_retained"] == len(world.lifecycle())
+    assert record["advisory_attempt_records_retained"] == len(world.records("advisory_attempt"))
+    assert not any(event == "run_terminated" for _phase, event in world.events())
+    retained = world.retained_v4(result.manifest_sha256)
+    assert retained.terminal is not None and retained.terminal.phase is phase
+    assert {name for name, _phase in world.mcp.calls} <= CALL_NAMES
+    assert_no_canary(result)
+
+
+def set_unresolved_not_invoked(world: World) -> None:
+    world.advisor.usage_raises_at = 1840.0
+
+
+def set_completion_unknown(world: World) -> None:
+    world.advisor.steps[5] = self_cancel
+
+
+#: OFF closure -> (setup, expected settlement-time cancellation, expected check).
+CLOSURE_CASES: typing.Final[
+    dict[str, tuple[Callable[[World], None], str, two_phase.ColdTwoPhaseProviderCheck]]
+] = {
+    "recorded_unresolved_invoked": (
+        unresolved_invoked_at_off_end,
+        "requested",
+        Check.NOT_PENDING_AT_CHECK,
+    ),
+    "recorded_unresolved_not_invoked": (
+        set_unresolved_not_invoked,
+        "task_already_done",
+        Check.NOT_PENDING_AT_CHECK,
+    ),
+    "not_recorded_clock_invalid": (
+        unresolved_invoked_at_off_end,
+        "requested",
+        Check.NOT_PENDING_AT_CHECK,
+    ),
+    "not_recorded_sink_refused": (
+        unresolved_invoked_at_off_end,
+        "requested",
+        Check.NOT_PENDING_AT_CHECK,
+    ),
+    "not_recorded_completion_unknown": (
+        set_completion_unknown,
+        "task_already_done",
+        Check.NOT_PENDING_AT_CHECK,
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closure", sorted(CLOSURE_CASES))
+async def test_954_t2_each_od5_closure_on_off_writes_only_the_failed_run_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, closure: str
+) -> None:
+    """T2a-e (AC3-5, 7, 9): terminal only, retained counts, finalised, no ON, one check."""
+    world = World(tmp_path)
+    setup, cancellation, check = CLOSURE_CASES[closure]
+    setup(world)
+    if closure == "not_recorded_clock_invalid":
+        during_settlement(monkeypatch, lambda: world.clock.pending.insert(0, "nan"))
+    if closure == "not_recorded_sink_refused":
+        real_build = advisory_builders.build_advisory_resolution_record
+        settling: list[bool] = []
+
+        def build(**kwargs: typing.Any) -> typing.Any:
+            if settling:
+                raise RuntimeError(PROVIDER_CANARY)
+            return real_build(**kwargs)
+
+        monkeypatch.setattr(advisory_sampler, "build_advisory_resolution_record", build)
+        during_settlement(monkeypatch, lambda: settling.append(True))
+    log = OwnerLog(monkeypatch)
+    result = await world.run()
+    assert_failed_run_terminal(world, result, OFF, closure, cancellation)
+    assert result.provider_check is check
+    assert log.settles == [OFF] and log.observes == [OFF]
+    log.check_followed_seal()
+    assert log.order[-3:] == ["seal", "observe", "read_v4"]
+    # D205: the unresolved attempt does not forbid the eligible OFF finalisation.
+    assert world.mcp.finalised == [SESSIONS[OFF]]
+    assert world.event(OFF, "finalisation_returned")["finalisation_result"] == "clean_recorded"
+    assert world.events() == [
+        ("recording_off", "phase_activated"),
+        ("recording_off", "observation_window_elapsed"),
+        ("recording_off", "finalisation_returned"),
+        ("recording_off", "child_stopped"),
+    ]
+    assert world.child_ops() == OFF_ONLY_OPS
+    assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
+    assert ("get_server_info", ON) not in world.mcp.calls
+    await release(world)
+
+
+@pytest.mark.asyncio
+async def test_954_t2f_an_unresolved_invoked_on_attempt_ends_with_the_on_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T2f (AC5): the last ON call (3641) still runs at the ON end (3701 < 3741)."""
+    world = World(tmp_path)
+    world.bound = 100.0
+    world.advisor.steps[11] = hang
+    world.child.stop_turns = 3
+    log = OwnerLog(monkeypatch)
+    result = await world.run()
+    assert_failed_run_terminal(world, result, ON, "recorded_unresolved_invoked", "requested")
+    assert result.provider_check is Check.NOT_PENDING_AT_CHECK
+    assert world.child_ops() == NORMAL_CHILD_OPS
+    assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
+    # One pre-respawn gate observation of OFF, then the one post-seal check of ON.
+    assert log.observes == [OFF, ON] and log.settles == [OFF, ON]
+    assert log.order[-3:] == ["seal", "observe", "read_v4"]
+    await release(world)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["run_raised_unpublished", "run_cancelled", "no_intent"])
+async def test_954_t3_pre_invocation_mechanics_never_claim_a_pending_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    """T3 (AC3, 5; D205): an open intent with no invocation fails the run; none, never pending."""
+    world = World(tmp_path)
+    fired: list[str] = []
+
+    def rule(name: str) -> str | None:
+        if fired:
+            return None
+        if variant == "no_intent" and name == "Clock.sleep":
+            fired.append(name)
+            return "cancel_current"
+        if name == "_provider_call" and world.clock.t == 1840.0 and variant != "no_intent":
+            fired.append(name)
+            return "raise" if variant == "run_raised_unpublished" else "cancel_both"
+        return None
+
+    install_task_factory(rule)
+    log = OwnerLog(monkeypatch)
+    result = await world.run()
+    assert fired
+    if variant == "no_intent":
+        # Not triggered: the run proceeds, and an attempt-free phase never conforms.
+        assert (result.advisory_path, result.provider_check) == (
+            AdvisoryPath.NOT_APPLICABLE,
+            Check.NOT_CHECKED,
+        )
+        assert result.outcome is Outcome.NOT_CONFORMANT and result.termination_reason is None
+        assert advisory_conformance.ColdAdvisoryConformanceFinding.ATTEMPTS_ABSENT in findings_of(
+            result
+        )
+        assert world.child_ops() == NORMAL_CHILD_OPS
+        assert log.observes == [OFF]
+        return
+    assert_failed_run_terminal(
+        world, result, OFF, "recorded_unresolved_not_invoked", "task_already_done"
+    )
+    assert result.provider_check is Check.NOT_PENDING_AT_CHECK
+    assert world.child_ops() == OFF_ONLY_OPS
+    assert log.observes == [OFF]
+    resolutions = [r for r in world.records("advisory_attempt") if "resolution" in r]
+    assert resolutions[-1]["resolution"] == "unresolved_at_phase_end"
+    assert resolutions[-1]["invocation_monotonic"] is None
+
+
+@pytest.mark.asyncio
+async def test_954_t4_class_a_an_outstanding_provider_ends_v2_failed_and_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T4 (AC6, 7): abandoned after the bound, still outstanding: v2 FAILED and PENDING."""
+    world = World(tmp_path)
+    world.advisor.steps[5] = ignore_cancel
+    world.child.stop_turns = 3
+    log = OwnerLog(monkeypatch)
+    result = await world.run()
+    assert result.outcome is Outcome.NOT_CONFORMANT and result.manifest_sha256 is not None
+    assert result.termination_reason is R.UNEXPECTED_FAILURE
+    assert result.advisory_path is AdvisoryPath.PROVIDER_OUTSTANDING_FAILED
+    assert result.provider_check is Check.PENDING_AT_CHECK
+    assert log.observes == [OFF]
+    assert log.order[-3:] == ["seal", "observe", "read_v3"]
+    # The retained ABANDONED_AFTER_BOUND line, at the bound (1840 + 30), stays as written.
+    last = world.records("advisory_attempt")[-1]
+    assert (last["resolution"], last["monotonic_seconds"]) == ("abandoned_after_bound", 1870.0)
+    terminal = world.lifecycle()[-1]
+    assert (terminal["event"], terminal["termination"], terminal["termination_reason"]) == (
+        "run_terminated",
+        "failed",
+        "unexpected_failure",
+    )
+    assert world.records("failed_run_terminal") == []
+    assert result.conformance is not None
+    assert (
+        result.conformance.outcome
+        is advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT
+    )
+    assert world.child_ops() == OFF_ONLY_OPS
+    assert world.mcp.finalised == [SESSIONS[OFF]]
+    # The abandonment and the settlement each requested a cancellation that was
+    # delivered (the stop yields) and absorbed: the task is still observed pending.
+    assert world.advisor.cancelled == 2
+    await release(world)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("step", [hang, ignore_cancel], ids=["cancellable", "ignores_cancel"])
+async def test_954_t5_the_check_reports_the_provider_task_it_observes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: AdvisorStep
+) -> None:
+    """T5 (AC7): a cancellable provider is not pending at the check; one that ignores it is."""
+    world = World(tmp_path)
+    world.bound = 100.0
+    world.advisor.steps[5] = step
+    world.child.stop_turns = 3
+    log = OwnerLog(monkeypatch)
+    result = await world.run()
+    assert result.advisory_path is AdvisoryPath.FAILED_RUN_TERMINAL
+    expected = Check.NOT_PENDING_AT_CHECK if step is hang else Check.PENDING_AT_CHECK
+    assert result.provider_check is expected
+    assert world.advisor.cancelled == 1
+    assert log.observes == [OFF]
+    await release(world)
+
+
+@pytest.mark.asyncio
+async def test_954_t6_a_completed_call_with_an_outstanding_task_triggers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T6 (AC3): RECORDED_COMPLETED_CALL with OUTSTANDING is a contradiction that triggers."""
+    force_settlement(
+        monkeypatch,
+        OFF,
+        {
+            "closure": Closure.RECORDED_COMPLETED_CALL,
+            "provider_task": ProviderTask.OUTSTANDING,
+        },
+    )
+    world = World(tmp_path)
+    result = await world.run()
+    assert result.advisory_path is AdvisoryPath.PROVIDER_OUTSTANDING_FAILED
+    assert result.outcome is Outcome.NOT_CONFORMANT
+    assert result.termination_reason is R.UNEXPECTED_FAILURE
+    # The real provider task finished; the check reports what it observes.
+    assert result.provider_check is Check.NOT_PENDING_AT_CHECK
+    assert world.lifecycle()[-1]["termination"] == "failed"
+    assert world.child_ops() == OFF_ONLY_OPS
+
+
+@pytest.mark.asyncio
+async def test_954_t6_no_open_attempt_alone_never_triggers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T6 (AC3): NO_OPEN_ATTEMPT with a published task that is not outstanding is not OD5."""
+    for provider in (ProviderTask.NONE, ProviderTask.COMPLETED, ProviderTask.ENDED_WITHOUT_OUTCOME):
+        assert not two_phase._od5_triggered(
+            advisory_sampler.ColdAdvisorySettlement(
+                closure=Closure.NO_OPEN_ATTEMPT, provider_task=provider, attempts_resolved=0
+            )
+        )
+    for closure in Closure:
+        settlement = advisory_sampler.ColdAdvisorySettlement(
+            closure=closure, provider_task=ProviderTask.OUTSTANDING, attempts_resolved=0
+        )
+        assert two_phase._od5_triggered(settlement), closure
+    triggering = {
+        Closure.RECORDED_UNRESOLVED_INVOKED,
+        Closure.RECORDED_UNRESOLVED_NOT_INVOKED,
+        Closure.NOT_RECORDED_CLOCK_INVALID,
+        Closure.NOT_RECORDED_SINK_REFUSED,
+        Closure.NOT_RECORDED_COMPLETION_UNKNOWN,
+    }
+    for closure in Closure:
+        settlement = advisory_sampler.ColdAdvisorySettlement(
+            closure=closure, provider_task=ProviderTask.COMPLETED, attempts_resolved=0
+        )
+        assert two_phase._od5_triggered(settlement) is (closure in triggering), closure
+    world = World(tmp_path)
+    log = OwnerLog(monkeypatch)
+    result = await world.run()
+    assert result.outcome is Outcome.ADVISORY_CONFORMANT and log.observes == [OFF]
+
+
+def test_954_the_identity_maps_cover_exactly_the_storable_members() -> None:
+    """AC5: closure and cancellation maps are total over the storable members, by identity."""
+    for stored, member in two_phase._TERMINAL_SETTLEMENTS:
+        assert stored.value == member.value
+        assert two_phase._terminal_settlement(stored) is member
+    assert {member for _stored, member in two_phase._TERMINAL_SETTLEMENTS} == set(Terminal)
+    assert two_phase._terminal_settlement(Closure.NO_OPEN_ATTEMPT) is None
+    assert two_phase._terminal_settlement(Closure.RECORDED_COMPLETED_CALL) is None
+    assert two_phase._terminal_settlement(Closure.NOT_RECORDED_REENTRANT) is None
+    Request = advisory_sampler.ColdAdvisoryCancellationRequest
+    for stored, member in two_phase._TERMINAL_CANCELLATIONS:
+        assert stored.value == member.value
+        assert two_phase._terminal_cancellation(stored) is member
+    assert {member for _stored, member in two_phase._TERMINAL_CANCELLATIONS} == set(Cancellation)
+    assert two_phase._terminal_cancellation(Request.NOT_SETTLED) is None
+    assert two_phase._terminal_cancellation(Request.IN_PROGRESS) is None
+
+
+@pytest.mark.asyncio
+async def test_954_t7_an_unconfirmed_run_alone_fails_closed_with_no_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T7 (AC3, 9): OFF TASK_CREATION_UNCONFIRMED fails the run; no ON, no path, no check."""
+    world = World(tmp_path)
+    install_task_factory(lambda name: "raise" if name == "ColdAdvisorySampler.run" else None)
+    log = OwnerLog(monkeypatch)
+    result = await world.run()
+    assert (result.advisory_path, result.provider_check) == (
+        AdvisoryPath.NOT_APPLICABLE,
+        Check.NOT_CHECKED,
+    )
+    assert result.outcome is Outcome.NOT_CONFORMANT
+    assert result.termination_reason is R.UNEXPECTED_FAILURE
+    assert log.settles == [OFF] and log.observes == []
+    assert world.child_ops() == OFF_ONLY_OPS
+    assert world.mcp.finalised == [SESSIONS[OFF]]
+    assert world.records("advisory_attempt") == [] and world.advisor.calls == []
+    assert world.lifecycle()[-1]["termination_reason"] == "unexpected_failure"
+
+
+@pytest.mark.asyncio
+async def test_954_t7b_an_unconfirmed_run_keeps_a_real_pending_provider_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T7b (AC3, 5, 7; D203/D205): run creation is unconfirmed but the run really ran.
+
+    The task factory creates the real sampler run task, keeps it and then raises an
+    ordinary ``RuntimeError`` (the owner's ``TASK_CREATION_UNCONFIRMED``; O-T14).  The
+    orphaned run still samples, and its last OFF call (1840) is a genuine published
+    provider task that ignores cancellation and is unresolved at the OFF end (1900 <
+    1840 + 100).  The start failure fails the run but never clears the real OD5 path:
+    the failed-run terminal is written and the one check reports the real pending
+    provider.
+    """
+    world = World(tmp_path)
+    world.bound = 100.0
+    world.advisor.steps[5] = ignore_cancel
+    world.child.stop_turns = 3
+    starts = record_starts(monkeypatch)
+    log = OwnerLog(monkeypatch)
+    settlements: list[typing.Any] = []
+    observations: list[typing.Any] = []
+    logged_settle, logged_observe = Owner.settle_phase, Owner.observe_phase
+
+    def settle(owner: typing.Any, phase: Phase) -> typing.Any:
+        settled = logged_settle(owner, phase)
+        settlements.append(settled)
+        return settled
+
+    def observe(owner: typing.Any, phase: Phase) -> typing.Any:
+        observed = logged_observe(owner, phase)
+        observations.append(observed)
+        return observed
+
+    monkeypatch.setattr(Owner, "settle_phase", settle)
+    monkeypatch.setattr(Owner, "observe_phase", observe)
+    orphans: list[asyncio.Task[typing.Any]] = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+
+    def factory(
+        task_loop: asyncio.AbstractEventLoop, coro: typing.Any, **kwargs: typing.Any
+    ) -> typing.Any:
+        task = asyncio.Task(coro, loop=task_loop, **kwargs)
+        if not orphans and getattr(coro, "__qualname__", "") == "ColdAdvisorySampler.run":
+            orphans.append(task)
+            raise RuntimeError(PROVIDER_CANARY)
+        return task
+
+    loop.set_task_factory(factory)
+    try:
+        result = await world.run()
+        Start = advisory_run_owner.ColdAdvisoryPhaseStart
+        assert starts == [(OFF, Start.TASK_CREATION_UNCONFIRMED)] and len(orphans) == 1
+        # The orphaned run really sampled: six OFF calls, the last one at 1840.
+        assert [call[0] for call in world.advisor.calls] == [1540.0 + 60.0 * i for i in range(6)]
+        (settlement,) = settlements
+        assert (
+            settlement.run_at_settlement.state
+            is advisory_run_owner.ColdAdvisoryRunTaskState.UNCONFIRMED
+        )
+        assert settlement.run_cancel_requested is False
+        assert settlement.sampler.closure is Closure.RECORDED_UNRESOLVED_INVOKED
+        assert settlement.sampler.provider_task is ProviderTask.OUTSTANDING
+        assert (
+            settlement.provider_cancellation
+            is advisory_sampler.ColdAdvisoryCancellationRequest.REQUESTED
+        )
+        assert_failed_run_terminal(world, result, OFF, "recorded_unresolved_invoked", "requested")
+        assert len(world.records("failed_run_terminal")) == 1
+        # Exactly one owner observation, immediately after the seal, of the real provider.
+        assert log.observes == [OFF] and log.settles == [OFF]
+        log.check_followed_seal()
+        assert log.order[-3:] == ["seal", "observe", "read_v4"]
+        (observed,) = observations
+        assert observed.provider is not None
+        assert observed.provider.task is TaskState.OUTSTANDING
+        assert observed.provider.call is advisory_sampler.ColdAdvisoryCallFact.INVOKED_NO_OUTCOME
+        assert result.provider_check is Check.PENDING_AT_CHECK
+        assert world.advisor.cancelled == 1
+        # D205: the eligible OFF phase is finalised for its exact session; one stop; no ON.
+        returned = world.event(OFF, "finalisation_returned")
+        assert (returned["finalisation_result"], returned["session_id"]) == (
+            "clean_recorded",
+            SESSIONS[OFF],
+        )
+        assert world.mcp.finalised == [SESSIONS[OFF]]
+        assert world.child.stops == 1 and world.child.stops_completed == 1
+        assert world.child_ops() == OFF_ONLY_OPS
+    finally:
+        loop.set_task_factory(previous)
+        world.advisor.release.set()
+        for orphan in orphans:
+            orphan.cancel()
+        await asyncio.gather(*orphans, return_exceptions=True)
+        await world.clock.turns(5)
+
+
+@pytest.mark.asyncio
+async def test_954_t8_an_ordinary_returned_provider_failure_is_not_od5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T8 (AC3): a returned provider error continues; ON runs; policy 2 rejects it."""
+    world = World(tmp_path)
+    world.advisor.steps[2] = provider_error
+    log = OwnerLog(monkeypatch)
+    result = await world.run()
+    assert result.outcome is Outcome.NOT_CONFORMANT and result.termination_reason is None
+    assert (result.advisory_path, result.provider_check) == (
+        AdvisoryPath.NOT_APPLICABLE,
+        Check.NOT_CHECKED,
+    )
+    assert findings_of(result) == {
+        advisory_conformance.ColdAdvisoryConformanceFinding.ATTEMPT_RETURNED_FAILURE
+    }
+    assert world.child_ops() == NORMAL_CHILD_OPS and len(world.advisor.calls) == 12
+    resolutions = [r.get("resolution") for r in world.records("advisory_attempt")]
+    assert [r for r in resolutions if r is not None and r != "returned_decision"] == [
+        "returned_provider_error"
+    ]
+    assert {name for name, _phase in world.mcp.calls} == CALL_NAMES
+    assert log.observes == [OFF]
+
+
+@pytest.mark.asyncio
+async def test_954_t9_a_failed_writer_seal_is_unsealed_with_one_check_after_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T9 (AC5, 7): the writer seal raises; EVIDENCE_NOT_SEALED; check, then close."""
+    world = World(tmp_path)
+    unresolved_invoked_at_off_end(world)
+    log = OwnerLog(monkeypatch)
+
+    def failing_seal(writer: store.ColdEvidenceWriter) -> typing.Any:
+        log.writer_seals += 1
+        del writer
+        raise RuntimeError(PROVIDER_CANARY)
+
+    monkeypatch.setattr(store.ColdEvidenceWriter, "seal", failing_seal)
+    result = await world.run()
+    assert result.outcome is Outcome.EVIDENCE_NOT_SEALED and result.manifest_sha256 is None
+    assert result.advisory_path is AdvisoryPath.FAILED_RUN_TERMINAL
+    assert result.provider_check is Check.NOT_PENDING_AT_CHECK
+    assert log.writer_seals == 1
+    assert log.order[-3:] == ["seal", "observe", "close"]
+    log.check_followed_seal()
+    assert terminal_record(world)["advisory_settlement"] == "recorded_unresolved_invoked"
+    assert_no_canary(result)
+    await release(world)
+
+
+@pytest.mark.asyncio
+async def test_954_t9_a_refused_settlement_write_poisons_and_is_never_sealed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T9 (AC5, 7): NOT_RECORDED_SINK_REFUSED by the writer: zero writer seals, one check."""
+    world = World(tmp_path)
+    unresolved_invoked_at_off_end(world)
+    real_append = store.ColdEvidenceWriter.append_advisory_attempt
+    settling: list[bool] = []
+
+    def append(writer: store.ColdEvidenceWriter, record: typing.Any) -> None:
+        if settling:
+            raise RuntimeError(PROVIDER_CANARY)
+        real_append(writer, record)
+
+    monkeypatch.setattr(store.ColdEvidenceWriter, "append_advisory_attempt", append)
+    during_settlement(monkeypatch, lambda: settling.append(True))
+    log = OwnerLog(monkeypatch)
+    result = await world.run()
+    assert result.outcome is Outcome.EVIDENCE_NOT_SEALED and result.manifest_sha256 is None
+    assert result.advisory_path is AdvisoryPath.FAILED_RUN_TERMINAL
+    assert result.termination_reason is R.UNEXPECTED_FAILURE
+    assert result.provider_check is Check.NOT_PENDING_AT_CHECK
+    assert log.writer_seals == 0 and log.observes == [OFF]
+    assert log.order[-3:] == ["seal", "observe", "close"]
+    assert world.records("failed_run_terminal") == [] and not world.manifest_exists()
+    # The poisoned sink records nothing more: no elapsed fact, no finalisation.
+    assert world.mcp.finalised == [] and world.child_ops() == OFF_ONLY_OPS
+    assert_no_canary(result)
+    await release(world)
+
+
+@pytest.mark.asyncio
+async def test_954_t10_an_unconfirmed_stop_on_a_triggered_path_is_never_conformant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T10 (AC4): the child stop is attempted once; unconfirmed; the check is still made."""
+    world = World(tmp_path)
+    unresolved_invoked_at_off_end(world)
+    world.child.stop_modes = ["unconfirmed"]
+    log = OwnerLog(monkeypatch)
+    result = await world.run()
+    assert result.child_ownership is Own.OWNED_STOP_UNCONFIRMED
+    assert result.outcome is Outcome.NOT_CONFORMANT
+    assert result.provider_check is Check.NOT_PENDING_AT_CHECK and log.observes == [OFF]
+    assert world.child.stops == 1
+    assert world.event(OFF, "child_stopped")["child_stop"] == "unconfirmed"
+    await release(world)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["failed_run_terminal", "provider_outstanding"])
+async def test_954_t11_a_pending_check_survives_a_reload_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """T11 (AC7): PENDING is kept through ``_end``'s own reload catch; one observation."""
+    world = World(tmp_path)
+    world.advisor.steps[5] = ignore_cancel
+    if path == "failed_run_terminal":
+        world.bound = 100.0
+    log = OwnerLog(monkeypatch)
+
+    def refuse(*args: object, **kwargs: object) -> typing.NoReturn:
+        log.order.append("refused_reload")
+        raise store.ColdEvidenceStoreError(store.ColdEvidenceStoreFailure.HEADER_MISSING)
+
+    monkeypatch.setattr(two_phase, "read_retained_run_v4", refuse)
+    monkeypatch.setattr(two_phase, "read_retained_run_v3", refuse)
+    result = await world.run()
+    assert result.provider_check is Check.PENDING_AT_CHECK
+    assert result.outcome is Outcome.NOT_CONFORMANT and result.manifest_sha256 is not None
+    assert result.conformance is None
+    assert log.observes == [OFF] and log.order[-3:] == ["seal", "observe", "refused_reload"]
+    await release(world)
+
+
+@pytest.mark.asyncio
+async def test_954_t11_a_pending_check_survives_an_escaping_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T11 (AC7): an exception after the check reaches containment; PENDING is projected."""
+    world = World(tmp_path)
+    world.bound = 100.0
+    world.advisor.steps[5] = ignore_cancel
+    log = OwnerLog(monkeypatch)
+    faults = one_result_fault(monkeypatch)
+    result = await world.run()
+    assert faults == [1]
+    assert result.provider_check is Check.PENDING_AT_CHECK
+    assert result.advisory_path is AdvisoryPath.FAILED_RUN_TERMINAL
+    assert result.outcome is Outcome.NOT_CONFORMANT and result.manifest_sha256 is not None
+    assert log.observes == [OFF] and log.writer_seals == 1
+    assert_contained(result)
+    await release(world)
+
+
+@pytest.mark.asyncio
+async def test_954_t12_a_pre_seal_failure_is_contained_with_one_guarded_seal_and_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T12 (AC7): teardown fails before the seal twice; containment refuses, then checks."""
+    world = World(tmp_path)
+    unresolved_invoked_at_off_end(world)
+    log = OwnerLog(monkeypatch)
+    attempts: list[int] = []
+
+    def append(self: two_phase._TwoPhaseRun, sink: two_phase._RunSink) -> None:
+        attempts.append(1)
+        raise RuntimeError(PROVIDER_CANARY)
+
+    monkeypatch.setattr(two_phase._TwoPhaseRun, "_append_failed_run_terminal", append)
+    result = await world.run()
+    assert attempts == [1, 1]
+    assert result.outcome is Outcome.EVIDENCE_NOT_SEALED and result.manifest_sha256 is None
+    assert result.advisory_path is AdvisoryPath.FAILED_RUN_TERMINAL
+    assert result.provider_check is Check.NOT_PENDING_AT_CHECK
+    # Containment closes first; the guarded seal is refused before the writer; then the check.
+    assert log.order[-3:] == ["close", "seal", "observe"]
+    assert log.writer_seals == 0 and log.observes == [OFF]
+    assert world.child.stops == 1 and world.child.stops_completed == 1
+    assert world.mcp.finalised == [SESSIONS[OFF]]
+    assert world.records("failed_run_terminal") == []
+    assert not any(event == "run_terminated" for _phase, event in world.events())
+    assert_contained(result)
+    await release(world)
+
+
+@pytest.mark.asyncio
+async def test_954_t12_containment_without_a_path_never_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T12 (AC7): with no OD5 path, containment makes no seal call and no observation."""
+    world = World(tmp_path)
+    log = OwnerLog(monkeypatch)
+    real = builders.build_lifecycle_record
+
+    def build(**kwargs: typing.Any) -> typing.Any:
+        if kwargs["event"] is Event.RUN_TERMINATED:
+            raise RuntimeError(PROVIDER_CANARY)
+        return real(**kwargs)
+
+    monkeypatch.setattr(two_phase, "build_lifecycle_record", build)
+    result = await world.run()
+    assert result.outcome is Outcome.EVIDENCE_NOT_SEALED
+    assert (result.advisory_path, result.provider_check) == (
+        AdvisoryPath.NOT_APPLICABLE,
+        Check.NOT_CHECKED,
+    )
+    assert "seal" not in log.order and log.observes == [OFF]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("domain", "reason"), ABORT_PAIRS, ids=[pair[0].value for pair in ABORT_PAIRS]
+)
+async def test_954_t13_a_retained_abort_forbids_finalisation_on_a_triggered_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    domain: schema.ColdAbortDomain,
+    reason: enum.Enum,
+) -> None:
+    """T13 (AC4): every domain's abort means no finalisation; the terminal follows the path."""
+    monkeypatch.setattr(
+        two_phase,
+        "observe_cold_phase",
+        scripted_observer(OFF, retained_abort(domain, reason, True)),
+    )
+    force_settlement(monkeypatch, OFF, {"closure": Closure.RECORDED_UNRESOLVED_INVOKED})
+    world = World(tmp_path)
+    log = OwnerLog(monkeypatch)
+    result = await world.run()
+    assert_failed_run_terminal(
+        world, result, OFF, "recorded_unresolved_invoked", "no_provider_task"
+    )
+    assert result.provider_check is Check.NOT_PENDING_AT_CHECK
+    assert world.mcp.finalised == []
+    assert world.event(OFF, "phase_aborted_not_finalised")["session_id"] == SESSIONS[OFF]
+    assert world.child_ops() == OFF_ONLY_OPS and log.observes == [OFF]
+
+
+@pytest.mark.asyncio
+async def test_954_an_unstorable_forged_cancellation_writes_no_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC5 / D202: a cancellation member the terminal cannot carry is never fabricated."""
+    force_settlement(
+        monkeypatch,
+        OFF,
+        {"closure": Closure.RECORDED_UNRESOLVED_INVOKED},
+        provider_cancellation=advisory_sampler.ColdAdvisoryCancellationRequest.IN_PROGRESS,
+    )
+    world = World(tmp_path)
+    log = OwnerLog(monkeypatch)
+    result = await world.run()
+    assert result.outcome is Outcome.EVIDENCE_NOT_SEALED
+    assert result.advisory_path is AdvisoryPath.FAILED_RUN_TERMINAL
+    assert world.records("failed_run_terminal") == [] and log.writer_seals == 0
+    log.check_followed_seal()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["session_mismatch", "not_clean"])
+@pytest.mark.parametrize("triggered", [False, True], ids=["advisory_active", "od5_path"])
+async def test_954_t14_finalisation_failures_with_advisory_active_never_conform(
+    tmp_path: Path, kind: str, triggered: bool
+) -> None:
+    """T14 (AC4): a mismatched or non-zero finalisation fails; nothing commands zero."""
+    world = World(tmp_path)
+    if triggered:
+        unresolved_invoked_at_off_end(world)
+    world.mcp.finalise = lambda phase, session: (
+        clean_result(phase, "session-other")
+        if kind == "session_mismatch"
+        else not_clean_result(phase, session)
+    )
+    result = await world.run()
+    expected = {
+        "session_mismatch": ("failed_without_result", R.FINALISATION_FAILED),
+        "not_clean": ("not_clean_recorded", R.FINALISATION_NOT_CLEAN),
+    }[kind]
+    assert world.event(OFF, "finalisation_returned")["finalisation_result"] == expected[0]
+    # The first failure wins: an OD5 trigger precedes finalisation.
+    assert result.termination_reason is (R.UNEXPECTED_FAILURE if triggered else expected[1])
+    assert result.outcome is Outcome.NOT_CONFORMANT
+    assert world.child_ops() == OFF_ONLY_OPS and world.mcp.finalised == [SESSIONS[OFF]]
+    assert {name for name, _phase in world.mcp.calls} == CALL_NAMES
+    if triggered:
+        # The OD5 path still ends with exactly one schema-3 terminal, never v2.
+        assert result.advisory_path is AdvisoryPath.FAILED_RUN_TERMINAL
+        assert len(world.records("failed_run_terminal")) == 1
+        assert not any(event == "run_terminated" for _phase, event in world.events())
+    await release(world)
+
+
+def test_954_t16_the_tick_port_never_falls_back_to_another_phase(tmp_path: Path) -> None:
+    """T16 (AC11): ON has no tick despite OFF ticks; a null-device tick is the latest."""
+    rig = SinkRig(tmp_path)
+    assert rig.sink.latest_retained_tick() is None
+    rig.bind_off()
+    assert rig.sink.latest_retained_tick() is None
+    first = rig.tick(OFF)
+    rig.sink.append(first)
+    latest = rig.sink.latest_retained_tick()
+    assert latest == first and latest is not None and latest.phase is OFF
+    rig.sink.append(rig.host(OFF))
+    assert rig.sink.latest_retained_tick() == first
+    rig.sink.append_lifecycle(rig.started())
+    rig.sink.append(rig.headers[ON])
+    assert rig.sink.latest_retained_tick() is None
+    null_device = builders.build_tick_record(
+        header=rig.headers[ON],
+        tick=0,
+        recorded_at_utc=utc_at(3.0),
+        monotonic_seconds=3.0,
+        observation=observation(None),
+    )
+    rig.sink.append(null_device)
+    returned = rig.sink.latest_retained_tick()
+    assert returned == null_device and returned is not None and returned.device is None
+
+
+def advisory_intent(rig: SinkRig, phase: Phase, index: int = 0) -> typing.Any:
+    """One genuine intent line for ``phase`` (attempt ``index``)."""
+    tick = rig.tick(phase)
+    context = AdvisorContext(
+        phase=RoastPhase.PREHEATING,
+        roast_elapsed_seconds=0.0,
+        development_elapsed_seconds=None,
+        current_bean_temp_c=21.5,
+        current_env_temp_c=22.0,
+        bean_ror_c_per_min=None,
+        env_ror_c_per_min=None,
+        target_drop_temp_c=205.0,
+        profile_name="cold-characterisation",
+        charge_guidance_min_c=None,
+        charge_guidance_max_c=None,
+        first_crack_detected=False,
+        seconds_since_charge=None,
+    )
+    identity = rig.world.ids[phase]
+    return advisory_builders.build_advisory_intent_record(
+        header=rig.headers[phase],
+        attempt_index=index,
+        recorded_at_utc=utc_at(2.0),
+        monotonic_seconds=2.0,
+        context_tick=tick.tick,
+        context_tick_monotonic=tick.monotonic_seconds,
+        context=context.model_dump(mode="json"),
+        profile_name="cold-characterisation",
+        target_drop_temp_c=205.0,
+        charge_guidance_min_c=None,
+        charge_guidance_max_c=None,
+        provider=identity.advisor_provider,
+        model=identity.advisor_model,
+        prompt_version=identity.advisor_prompt_version,
+        configured_call_bound_seconds=CALL_BOUND,
+        configured_dwell_seconds=DWELL,
+    )
+
+
+def test_954_r12_an_open_window_admits_one_attempt_line(tmp_path: Path) -> None:
+    """R12 positive control: the current, bound, open phase admits and counts the line."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.sink.append_advisory_attempt(advisory_intent(rig, OFF))
+    assert rig.sink.advisory_count == 1 and rig.sink.usable
+    assert rig.proxy.calls[-1] == "append_advisory_attempt"
+
+
+@pytest.mark.parametrize(
+    "case", ["unbound", "window_closed", "aborted", "finalised", "other_phase", "terminated"]
+)
+def test_954_r12_attempt_lines_are_refused_outside_the_open_current_phase(
+    tmp_path: Path, case: str
+) -> None:
+    """R12: no line after the window closes, after finalisation, or for another phase."""
+    rig = SinkRig(tmp_path)
+    phase = OFF
+    if case != "unbound":
+        rig.bind_off()
+    if case == "window_closed":
+        rig.sink.append_lifecycle(rig.elapsed(OFF))
+    elif case == "aborted":
+        rig.sink.append_lifecycle(rig.aborted(OFF))
+    elif case == "finalised":
+        rig.sink._guards[OFF].elapsed = True
+        rig.sink.append(rig.fin(OFF))
+    elif case == "other_phase":
+        phase = ON
+    elif case == "terminated":
+        rig.sink.append_lifecycle(rig.terminal(OFF))
+    record = advisory_intent(rig, phase)
+    rig.refused(lambda: rig.sink.append_advisory_attempt(record))
+    assert rig.sink.advisory_count == 0
+
+
+@pytest.mark.parametrize("fault", ["writer", "forged_phase", "foreign_object"])
+def test_954_r12_a_writer_fault_or_unreadable_record_poisons(tmp_path: Path, fault: str) -> None:
+    """R12: a writer refusal or a record whose phase cannot be read poisons the sink."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    record: object = advisory_intent(rig, OFF)
+    if fault == "writer":
+        rig.proxy.fail.add("append_advisory_attempt")
+    elif fault == "forged_phase":
+        record = with_dict(typing.cast(pydantic.BaseModel, record), HostileDict({"phase": OFF}))
+    else:
+        record = object()
+    with pytest.raises(two_phase.ColdRunSinkRefusedError):
+        rig.sink.append_advisory_attempt(record)
+    assert rig.sink.poisoned and rig.sink.advisory_count == 0
+
+
+def test_954_record_phase_reads_only_an_exact_dict_by_identity() -> None:
+    """The phase slot is read from an exact ``dict`` with exact ``str`` keys only."""
+    holder = types_namespace(phase=OFF)
+    assert two_phase._record_phase(holder) is OFF
+    assert two_phase._record_phase(types_namespace(phase="recording_off")) is None
+    assert two_phase._record_phase(types_namespace(**{"phase": ForeignArtefactKind.WHEEL})) is None
+    keyed = types_namespace()
+    keyed.__dict__[HostileStr("phase")] = OFF
+    assert two_phase._record_phase(keyed) is None
+    assert two_phase._record_phase(1) is None
+    assert two_phase._record_phase(with_dict(SPEC, HostileDict({"phase": OFF}))) is None
+
+
+def test_954_the_failed_run_terminal_append_needs_a_usable_bound_sink(tmp_path: Path) -> None:
+    """The terminal append refuses an unbound or poisoned sink before the writer."""
+
+    def record(rig: SinkRig) -> typing.Any:
+        return terminal_module.build_failed_run_terminal_record(
+            rig.headers[OFF],
+            advisory_settlement=Terminal.RECORDED_UNRESOLVED_INVOKED,
+            provider_cancellation=Cancellation.REQUESTED,
+            lifecycle_records_retained=0,
+            advisory_attempt_records_retained=0,
+        )
+
+    rig = SinkRig(tmp_path)
+    rig.refused(lambda: rig.sink.append_failed_run_terminal(record(rig)))
+    healthy = SinkRig(tmp_path / "healthy")
+    healthy.bind_off()
+    healthy.sink.append_failed_run_terminal(record(healthy))
+    assert healthy.sink.terminated and not healthy.sink.usable
+    assert healthy.proxy.calls[-1] == "append_failed_run_terminal"
+    refused = SinkRig(tmp_path / "refused")
+    refused.bind_off()
+    refused.proxy.fail.add("append_failed_run_terminal")
+    with pytest.raises(two_phase.ColdRunSinkRefusedError):
+        refused.sink.append_failed_run_terminal(record(refused))
+    assert refused.sink.poisoned and not refused.sink.terminated
+
+
+@pytest.mark.asyncio
+async def test_954_t17_a_base_exception_mid_phase_settles_and_reraises_the_same_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T17 (AC10): close, settle the open attempt, clean up, re-raise; nothing else."""
+    world = World(tmp_path)
+    world.advisor.steps[0] = hang
+    world.mcp.read_seconds = lambda phase, index: 450.0 if index < 3 else 100.0
+    halt = Halt()
+
+    def interrupt() -> None:
+        if world.mcp.reads == 4:
+            raise halt
+
+    world.mcp.before["get_roast_state:recording_off"] = interrupt
+    log = OwnerLog(monkeypatch)
+    with pytest.raises(Halt) as caught:
+        await world.run()
+    assert caught.value is halt
+    assert log.settles == [OFF] and log.observes == []
+    assert "seal" not in log.order and log.writer_seals == 0
+    assert world.records("failed_run_terminal") == []
+    assert not any(event == "run_terminated" for _phase, event in world.events())
+    assert not world.manifest_exists()
+    # The open attempt (1540) stays an open intent: the sink was closed before settling.
+    assert [r.get("resolution") for r in world.records("advisory_attempt")] == [None]
+    assert world.child.stops == 1 and world.advisor.cancelled == 1
+
+
+@pytest.mark.asyncio
+async def test_954_t17_a_raising_settlement_never_replaces_the_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T17 (AC10): an exception from settlement during BaseException cleanup is absorbed."""
+    world = World(tmp_path)
+    halt = Halt()
+    world.mcp.before["get_roast_state:recording_off"] = lambda: produce(halt)
+    entered: list[Phase] = []
+
+    def settle(owner: typing.Any, phase: Phase) -> typing.NoReturn:
+        entered.append(phase)
+        raise StopBoom
+
+    monkeypatch.setattr(Owner, "settle_phase", settle)
+    with pytest.raises(Halt) as caught:
+        await world.run()
+    assert caught.value is halt and world.child.stops == 1
+    assert entered == [OFF]
+
+
+@pytest.mark.asyncio
+async def test_954_t17_cancellation_at_the_on_read_settles_both_phases_and_nothing_else(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T17 (AC10): a real cancellation in ON settles OFF and ON once; no check, seal or terminal."""
+    world = World(tmp_path)
+    entered = world.gates.arm("get_roast_state:recording_on")
+    starts = record_starts(monkeypatch)
+    log = OwnerLog(monkeypatch)
+    task = asyncio.ensure_future(world.run())
+    await asyncio.wait_for(entered.wait(), 5)
+    # The OFF pre-respawn gate observation legitimately happened before this point.
+    observes_before, order_before = len(log.observes), len(log.order)
+    assert log.observes == [OFF] and log.settles == [OFF]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [phase for phase, _started in starts] == [OFF, ON]
+    assert log.settles == [OFF, ON]
+    assert len(log.observes) == observes_before
+    cleanup = log.order[order_before:]
+    assert "observe" not in cleanup and "seal" not in cleanup
+    assert not {"read_v3", "read_v4"} & set(cleanup)
+    assert log.writer_seals == 0 and not world.manifest_exists()
+    assert world.records("failed_run_terminal") == []
+    assert not any(event == "run_terminated" for _phase, event in world.events())
+    assert world.child_ops() == [*BEFORE_ON, ("stop", ON)]
+
+
+@pytest.mark.asyncio
+async def test_954_t18_provider_text_never_reaches_evidence_results_or_output(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T18 (AC12): a provider error's text is absent from the tree, the result and output."""
+    world = World(tmp_path)
+    world.advisor.steps[0] = provider_error
+    world.advisor.steps[6] = provider_error
+    with caplog.at_level("DEBUG"):
+        result = await world.run()
+    assert result.outcome is Outcome.NOT_CONFORMANT
+    run_directory = Path(world.root) / RUN_ID
+    files = [path for path in run_directory.rglob("*") if path.is_file()]
+    assert files and all(PROVIDER_CANARY.encode() not in path.read_bytes() for path in files)
+    for text in (repr(result), str(result), result.model_dump_json()):
+        assert PROVIDER_CANARY not in text
+    captured = capsys.readouterr()
+    assert PROVIDER_CANARY not in caplog.text + captured.out + captured.err
+    assert_no_canary(result)
+
+
+@pytest.mark.asyncio
+async def test_954_the_advance_gate_fails_closed_on_owner_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC9: an OUTSTANDING OFF observation stops the respawn even with a clean OFF phase."""
+    real = Owner.observe_phase
+
+    def observe(owner: typing.Any, phase: Phase) -> typing.Any:
+        observed: typing.Any = real(owner, phase)
+        provider = observed.provider.model_copy(update={"task": TaskState.OUTSTANDING})
+        return observed.model_copy(update={"provider": provider})
+
+    monkeypatch.setattr(Owner, "observe_phase", observe)
+    world = World(tmp_path)
+    result = await world.run()
+    assert result.termination_reason is R.UNEXPECTED_FAILURE
+    assert (result.advisory_path, result.provider_check) == (
+        AdvisoryPath.NOT_APPLICABLE,
+        Check.NOT_CHECKED,
+    )
+    assert world.child_ops() == OFF_ONLY_OPS
+    assert world.mcp.finalised == [SESSIONS[OFF]]
+
+
+def _observation(**changes: object) -> advisory_run_owner.ColdAdvisoryPhaseObservation:
+    """One genuine settled, finished, not-outstanding OFF observation, with ``changes``."""
+    sampler = advisory_sampler.ColdAdvisorySettlement(
+        closure=Closure.NO_OPEN_ATTEMPT, provider_task=ProviderTask.COMPLETED, attempts_resolved=6
+    )
+
+    def finished() -> advisory_run_owner.ColdAdvisoryPhaseRun:
+        # A fresh run fact per slot, as the owner builds them (no shared node).
+        return advisory_run_owner.ColdAdvisoryPhaseRun(
+            state=advisory_run_owner.ColdAdvisoryRunTaskState.FINISHED,
+            stop=advisory_sampler.ColdAdvisorySamplerStop.WINDOW_EXHAUSTED,
+        )
+
+    settlement = advisory_run_owner.ColdAdvisoryPhaseSettlement(
+        sampler=sampler,
+        run_at_settlement=finished(),
+        provider_cancellation=advisory_sampler.ColdAdvisoryCancellationRequest.TASK_ALREADY_DONE,
+        run_cancel_requested=False,
+    )
+    provider = advisory_sampler.ColdAdvisoryProviderObservation(
+        task=TaskState.DONE_RETURNED,
+        call=advisory_sampler.ColdAdvisoryCallFact.OUTCOME_PUBLISHED,
+        abandonment_cancel_requested=False,
+        settlement_cancellation=advisory_sampler.ColdAdvisoryCancellationRequest.TASK_ALREADY_DONE,
+    )
+    values: dict[str, typing.Any] = {
+        "start": advisory_run_owner.ColdAdvisoryPhaseStart.STARTED,
+        "run": finished(),
+        "provider": provider,
+        "settlement": settlement,
+    }
+    values.update(changes)
+    return advisory_run_owner.ColdAdvisoryPhaseObservation.model_construct(None, **values)
+
+
+def _unconfirmed_settlement() -> object:
+    settled = typing.cast(advisory_run_owner.ColdAdvisoryPhaseSettlement, _observation().settlement)
+    unconfirmed = advisory_run_owner.ColdAdvisoryPhaseRun(
+        state=advisory_run_owner.ColdAdvisoryRunTaskState.UNCONFIRMED, stop=None
+    )
+    return settled.model_copy(update={"run_at_settlement": unconfirmed})
+
+
+def _triggered_settlement() -> object:
+    settled = typing.cast(advisory_run_owner.ColdAdvisoryPhaseSettlement, _observation().settlement)
+    sampler = settled.sampler.model_copy(update={"closure": Closure.NOT_RECORDED_CLOCK_INVALID})
+    return settled.model_copy(update={"sampler": sampler})
+
+
+ADVANCE_CASES: typing.Final[dict[str, Callable[[], object]]] = {
+    "refusal": lambda: advisory_run_owner.ColdAdvisoryOwnerRefusal.REENTRANT,
+    "no_settlement": lambda: _observation(settlement=None),
+    "triggered_settlement": lambda: _observation(settlement=_triggered_settlement()),
+    "unconfirmed_at_settlement": lambda: _observation(settlement=_unconfirmed_settlement()),
+    "unconfirmed_now": lambda: _observation(
+        run=advisory_run_owner.ColdAdvisoryPhaseRun(
+            state=advisory_run_owner.ColdAdvisoryRunTaskState.UNCONFIRMED, stop=None
+        )
+    ),
+    "no_provider": lambda: _observation(provider=None),
+    "outstanding": lambda: _observation(
+        provider=typing.cast(
+            advisory_sampler.ColdAdvisoryProviderObservation, _observation().provider
+        ).model_copy(update={"task": TaskState.OUTSTANDING})
+    ),
+    "forged_member": lambda: _observation(start=ForeignArtefactKind.WHEEL),
+    "raises": lambda: RuntimeError(PROVIDER_CANARY),
+}
+
+
+@pytest.mark.parametrize("case", sorted(ADVANCE_CASES))
+def test_954_advance_permitted_requires_every_owner_fact(tmp_path: Path, case: str) -> None:
+    """AC9: each missing or adverse owner fact refuses the advance and fails the run."""
+    run = make_run(World(tmp_path))
+    value = ADVANCE_CASES[case]()
+
+    def observe(phase: Phase) -> object:
+        del phase
+        return produce(value)
+
+    def observe_clean(phase: Phase) -> object:
+        del phase
+        return _observation()
+
+    run._owner = types_namespace(observe_phase=observe)
+    assert run._advance_permitted() is False
+    assert run._primary is R.UNEXPECTED_FAILURE
+    clean = make_run(World(tmp_path / "clean"))
+    clean._owner = types_namespace(observe_phase=observe_clean)
+    assert clean._advance_permitted() is True and clean._primary is None
+
+
+@pytest.mark.parametrize(
+    ("observed", "expected"),
+    [
+        ("refusal", Check.NOT_OBSERVABLE_AT_CHECK),
+        ("no_provider", Check.NOT_OBSERVABLE_AT_CHECK),
+        ("raises", Check.NOT_OBSERVABLE_AT_CHECK),
+        ("forged_member", Check.NOT_OBSERVABLE_AT_CHECK),
+        ("outstanding", Check.PENDING_AT_CHECK),
+        ("no_settlement", Check.NOT_PENDING_AT_CHECK),
+    ],
+)
+def test_954_the_check_is_latched_and_never_guesses(
+    tmp_path: Path, observed: str, expected: two_phase.ColdTwoPhaseProviderCheck
+) -> None:
+    """AC7: NOT_OBSERVABLE is never mapped to PENDING or NOT_PENDING; a taken value is kept."""
+    run = make_run(World(tmp_path))
+    calls: list[Phase] = []
+    value = ADVANCE_CASES[observed]()
+
+    def observe(phase: Phase) -> object:
+        calls.append(phase)
+        return produce(value)
+
+    run._owner = types_namespace(observe_phase=observe)
+    assert run._check_provider() is Check.NOT_CHECKED and calls == []
+    run._path, run._path_phase = AdvisoryPath.FAILED_RUN_TERMINAL, ON
+    assert run._check_provider() is expected
+    assert run._check_provider() is expected
+    assert calls == [ON]
+
+
+def test_954_start_and_settle_faults_fail_closed_without_a_path(tmp_path: Path) -> None:
+    """AC1/2: a raising start or settlement fails the run; no path; settled at most once."""
+    run = make_run(World(tmp_path))
+    settles: list[Phase] = []
+
+    def start_phase(phase: Phase, **kwargs: object) -> typing.NoReturn:
+        raise RuntimeError(PROVIDER_CANARY)
+
+    def settle_phase(phase: Phase) -> typing.NoReturn:
+        settles.append(phase)
+        raise RuntimeError(PROVIDER_CANARY)
+
+    run._owner = types_namespace(start_phase=start_phase, settle_phase=settle_phase)
+    run._sink = typing.cast(typing.Any, object())
+    run._headers[OFF] = typing.cast(typing.Any, None)
+    run._sessions[OFF], run._ends[OFF] = SESSIONS[OFF], OFF_END
+    run._start_advisory(OFF)
+    assert run._starts == {OFF: None}
+    run._settle(ON)
+    assert settles == []
+    run._settle_unsettled()
+    run._settle_unsettled()
+    assert settles == [OFF] and run._primary is R.UNEXPECTED_FAILURE
+    assert run._path is AdvisoryPath.NOT_APPLICABLE
+
+
+@pytest.mark.asyncio
+async def test_954_an_invalid_advisory_spec_fails_closed_in_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Residual (e): an inadmissible spec is refused by the owner's stored start, in-run."""
+    world = World(tmp_path)
+    world.dwell = 1.0
+    starts = record_starts(monkeypatch)
+    result = await world.run()
+    assert result.termination_reason is R.UNEXPECTED_FAILURE
+    assert world.child_ops() == OFF_ONLY_OPS and world.advisor.calls == []
+    assert result.advisory_path is AdvisoryPath.NOT_APPLICABLE
+    assert starts == [(OFF, advisory_run_owner.ColdAdvisoryPhaseStart.REFUSED_SAMPLER_CONSTRUCTION)]
+    # The refused start never replaced OFF's True activation verdict: OFF ran its full
+    # window and its eligible finalisation, then the run failed with no next phase.
+    assert world.events() == [
+        ("recording_off", "phase_activated"),
+        ("recording_off", "observation_window_elapsed"),
+        ("recording_off", "finalisation_returned"),
+        ("recording_off", "child_stopped"),
+        ("recording_off", "run_terminated"),
+    ]
+    returned = world.event(OFF, "finalisation_returned")
+    assert (returned["finalisation_result"], returned["session_id"]) == (
+        "clean_recorded",
+        SESSIONS[OFF],
+    )
+    assert world.mcp.finalised == [SESSIONS[OFF]]
+    assert result.outcome is Outcome.NOT_CONFORMANT
+
+
+@pytest.mark.asyncio
+async def test_954_a_refused_on_start_keeps_the_activation_and_fails_at_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC1/2: a within-budget ON start refusal leaves ON active, observed and finalised.
+
+    Settlement (no sampler to settle) fails the run with UNEXPECTED_FAILURE; it never
+    conforms, and the hook's True verdict is not replaced by the refusal.
+    """
+    world = World(tmp_path)
+    starts = record_starts(monkeypatch, refuse=ON)
+    log = OwnerLog(monkeypatch)
+    result = await world.run()
+    assert starts == [
+        (OFF, advisory_run_owner.ColdAdvisoryPhaseStart.STARTED),
+        (ON, advisory_run_owner.ColdAdvisoryPhaseStart.REFUSED_HEADER_NOT_ADMITTED),
+    ]
+    assert log.settles == [OFF, ON]
+    assert result.outcome is Outcome.NOT_CONFORMANT
+    assert result.termination_reason is R.UNEXPECTED_FAILURE
+    assert (result.advisory_path, result.provider_check) == (
+        AdvisoryPath.NOT_APPLICABLE,
+        Check.NOT_CHECKED,
+    )
+    # ON activated within budget and ran its whole window: four reads, elapsed, finalised.
+    assert world.events() == GRAMMAR
+    assert [p for name, p in world.mcp.calls if name == "get_roast_state"] == [OFF] * 4 + [ON] * 4
+    assert world.event(ON, "transition_measured")["transition_within_budget"] is True
+    returned = world.event(ON, "finalisation_returned")
+    assert (returned["finalisation_result"], returned["session_id"]) == (
+        "clean_recorded",
+        SESSIONS[ON],
+    )
+    assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
+    terminal = world.event(ON, "run_terminated")
+    assert (terminal["termination"], terminal["termination_reason"]) == (
+        "failed",
+        "unexpected_failure",
+    )
+    assert world.child_ops() == NORMAL_CHILD_OPS
+    # Only OFF sampled; ON had no sampler and retained no attempt line.
+    assert len(world.advisor.calls) == 6
+    assert {r["phase"] for r in world.records("advisory_attempt")} == {"recording_off"}
+
+
+def test_954_the_first_od5_trigger_fixes_the_path(tmp_path: Path) -> None:
+    """AC3/5: a later trigger never replaces the first path, phase or stored settlement."""
+    run = make_run(World(tmp_path))
+    off = typing.cast(advisory_run_owner.ColdAdvisoryPhaseSettlement, _triggered_settlement())
+    outstanding = off.sampler.model_copy(
+        update={"closure": Closure.NO_OPEN_ATTEMPT, "provider_task": ProviderTask.OUTSTANDING}
+    )
+    on = off.model_copy(update={"sampler": outstanding})
+    settled = {OFF: off, ON: on}
+    run._owner = types_namespace(settle_phase=settled.__getitem__)
+    run._starts = {phase: advisory_run_owner.ColdAdvisoryPhaseStart.STARTED for phase in (OFF, ON)}
+    run._settle_unsettled()
+    assert run._path is AdvisoryPath.FAILED_RUN_TERMINAL and run._path_phase is OFF
+    assert run._path_settlement == off and run._path_settlement is not off
+    assert run._primary is R.UNEXPECTED_FAILURE
