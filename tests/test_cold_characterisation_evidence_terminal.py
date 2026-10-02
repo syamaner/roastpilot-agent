@@ -436,6 +436,95 @@ def test_t14_honest_limit_exact_constructed_valid_content_is_admitted(tmp_path: 
     assert validate(copied) is not copied
 
 
+EnumT = typing.TypeVar("EnumT", bound=enum.Enum)
+
+
+def populated_forgery(member: EnumT) -> EnumT:
+    """Return an exact-type instance carrying a real member's name and value, not a member.
+
+    Unlike a bare ``object.__new__`` instance, its ``.value`` and ``.name`` read like the
+    real member's, so only member-identity admission can refuse it.
+    """
+    forged = object.__new__(type(member))
+    object.__setattr__(forged, "_value_", member.value)
+    object.__setattr__(forged, "_name_", member.name)
+    return forged
+
+
+_IDENTITY_CASES: list[tuple[str, enum.Enum]] = [
+    ("phase", OFF),
+    ("advisory_settlement", Settlement.RECORDED_UNRESOLVED_INVOKED),
+    ("provider_cancellation", Cancel.REQUESTED),
+]
+
+
+def _assert_forgery_reads_like(forged: enum.Enum, member: enum.Enum) -> None:
+    """Precondition: the forgery is exact-typed, value/name equal, and no real member."""
+    assert type(forged) is type(member)
+    assert (forged.name, forged.value) == (member.name, member.value)
+    assert not any(forged is real for real in type(member))
+
+
+@pytest.mark.parametrize(("field", "member"), _IDENTITY_CASES, ids=[c[0] for c in _IDENTITY_CASES])
+def test_l3_populated_member_forgery_is_refused_by_the_validator(
+    tmp_path: Path, field: str, member: enum.Enum
+) -> None:
+    """L3: a populated non-member of an admitted enum type is refused by identity alone.
+
+    Strict model validation admits the same typed instance, so the refusal comes from
+    member-identity admission, not from a missing attribute or the model.
+    """
+    source = header(tmp_path)
+    forged = populated_forgery(member)
+    _assert_forgery_reads_like(forged, member)
+    admitted_by_model = model(source, **{field: forged})
+    assert getattr(admitted_by_model, field) is forged
+    expect_evidence(NOT_VALIDATED, lambda: validate(admitted_by_model))
+    genuine = model(source, **{field: member})
+    assert getattr(validate(genuine), field) is member
+
+
+@pytest.mark.parametrize(("field", "member"), _IDENTITY_CASES, ids=[c[0] for c in _IDENTITY_CASES])
+def test_l3_populated_member_forgery_is_refused_by_the_writer(
+    tmp_path: Path, field: str, member: enum.Enum
+) -> None:
+    """L3: the writer refuses the populated forgery, writes nothing, and stays usable."""
+    s = scenario(tmp_path, phase=OFF)
+    genuine = build(s.latest, s.lifecycle, s.advisory)
+    forged_member = populated_forgery(member)
+    _assert_forgery_reads_like(forged_member, member)
+    forged = genuine.model_copy(update={field: forged_member})
+    expect_evidence(NOT_VALIDATED, lambda: s.writer.append_failed_run_terminal(forged))
+    assert not (run_dir(s.root) / TERMINAL_OFF).exists()
+    s.writer.append(tick_for(s.latest, 1))
+    s.writer.append_failed_run_terminal(genuine)
+    retained = read4(s.root, s.writer.seal().manifest_sha256)
+    assert retained.terminal == genuine
+
+
+def test_l3_builder_refuses_populated_settlement_and_cancellation_forgeries(
+    tmp_path: Path,
+) -> None:
+    """L3: the builder's two enum arguments refuse a populated forgery after strict construction.
+
+    Strict model construction alone accepts the forged typed instance (shown first), so
+    the builder's refusal comes from its final content re-admission.  The phase is
+    header-derived and re-admitted at the header boundary; no claim is made here for it.
+    """
+    source = header(tmp_path)
+    settlement = populated_forgery(Settlement.RECORDED_UNRESOLVED_INVOKED)
+    cancellation = populated_forgery(Cancel.REQUESTED)
+    _assert_forgery_reads_like(settlement, Settlement.RECORDED_UNRESOLVED_INVOKED)
+    _assert_forgery_reads_like(cancellation, Cancel.REQUESTED)
+    assert model(source, advisory_settlement=settlement).advisory_settlement is settlement
+    assert model(source, provider_cancellation=cancellation).provider_cancellation is cancellation
+    expect_evidence(NOT_VALIDATED, lambda: build(source, settlement=settlement))
+    expect_evidence(NOT_VALIDATED, lambda: build(source, cancellation=cancellation))
+    record = build(source)
+    assert record.advisory_settlement is Settlement.RECORDED_UNRESOLVED_INVOKED
+    assert record.provider_cancellation is Cancel.REQUESTED
+
+
 @pytest.mark.parametrize("field", COUNT_FIELDS)
 def test_l1_validator_keeps_the_shared_integer_bound(tmp_path: Path, field: str) -> None:
     """L1: the walker admits ``10**32 - 1`` and refuses ``10**32`` with its own member."""
