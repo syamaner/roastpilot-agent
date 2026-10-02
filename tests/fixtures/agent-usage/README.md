@@ -99,3 +99,5 @@ rows whose `atis` values are discarded by the parser.
 Older retained Claude-version fixtures are rejection evidence: they fail when
 their version-bearing evidence disagrees with the version bound by the harness
 probe, rather than because their names appear outside an allow-list.
+
+`native-codex-gpt-5.6-terra` contains frozen historical admitted role bytes, bound by the `capture_usage_models.py` hashes, and is never regenerated from live files.
