@@ -1427,8 +1427,11 @@ def test_t49_terminal_module_carries_no_capability_or_decision_names() -> None:
 
 
 def test_t50_no_runtime_module_reaches_the_terminal_api() -> None:
-    """T50: the runtime modules never name the terminal module, append, or V4 reader."""
-    for name in ("two_phase.py", "engine.py", "advisory_sampler.py", "advisory_run_owner.py"):
+    """T50: only the two-phase orchestrator (5c-ii-b) names the terminal API at runtime."""
+    texts = ("evidence_terminal", "append_failed_run_terminal", "read_retained_run_v4")
+    for name in ("engine.py", "advisory_sampler.py", "advisory_run_owner.py"):
         source = (COLD_PACKAGE / name).read_text(encoding="utf-8")
-        for text in ("evidence_terminal", "append_failed_run_terminal", "read_retained_run_v4"):
+        for text in texts:
             assert text not in source, (name, text)
+    two_phase_source = (COLD_PACKAGE / "two_phase.py").read_text(encoding="utf-8")
+    assert all(text in two_phase_source for text in texts)

@@ -1,4 +1,4 @@
-"""Two-phase cold-characterisation orchestration (#954 slice 4g-c).
+"""Two-phase cold-characterisation orchestration (#954 slices 4g-c and 5c-ii-b).
 
 One run identity, one evidence directory and two MCP sessions: recording-off
 observation for 1800 s, clean D195 finalisation, a confirmed child stop, a
@@ -18,10 +18,23 @@ only for a completed, unaborted phase after its session is re-admitted;
 skipping it skips that verification and clean disconnect, never a promised
 safe-zero command.  This module adds no actuator control and no emergency stop.
 
-``PRE_ADVISORY_CONFORMANT`` requires a completed terminal record, a confirmed
-final stop, a sealed digest, a reload through ``read_retained_run_v2`` and an
-admitted conformant policy-v1 result.  It is never qualification, readiness,
-hardware acceptance, advisory acceptance or recording-on acceptance.
+Each activated phase also runs the observation-only advisory sampler through one
+run-owned :class:`ColdAdvisoryRunOwner`: it is started from the activation hook,
+settled synchronously as soon as the engine returns or raises, and never receives
+an MCP, control or lifecycle capability.  A settlement that leaves an attempt
+unresolved or unrecorded, or a provider task outstanding, fails the run (OD5): the
+current phase is still finalised only when otherwise eligible, the child stop is
+attempted, no next phase starts, and the run ends with either the schema-3
+failed-run terminal (an unresolved or unrecorded attempt) or the v2 ``FAILED``
+termination (a provider task outstanding with no open attempt).  Exactly one
+synchronous provider observation follows the seal step on that path; it is an
+exit signal for the caller only, never a stop or delivery proof.
+
+``ADVISORY_CONFORMANT`` requires a completed terminal record, a confirmed final
+stop, no advisory failure path, a sealed digest, a reload through the V3 reader
+and an admitted conformant advisory policy-2 result (which composes policy 1).  It
+is never qualification, readiness, hardware acceptance or recording-on
+acceptance.
 
 The transition budget runs from the recording-off ``PHASE_ACTIVATED`` scheduled
 end (which includes any overrun) to recording-on activation, and is checked at
@@ -48,11 +61,35 @@ import typing
 
 import pydantic
 
+from roastpilot_agent.cold_characterisation.advisory_conformance import (
+    ColdAdvisoryConformanceFinding,
+    ColdAdvisoryConformanceOutcome,
+    ColdAdvisoryConformanceResult,
+    check_advisory_conformance,
+)
+from roastpilot_agent.cold_characterisation.advisory_run_owner import (
+    ColdAdvisoryPhaseObservation,
+    ColdAdvisoryPhaseRun,
+    ColdAdvisoryPhaseSettlement,
+    ColdAdvisoryPhaseStart,
+    ColdAdvisoryRunOwner,
+    ColdAdvisoryRunTaskState,
+)
+from roastpilot_agent.cold_characterisation.advisory_sampler import (
+    ColdAdvisoryAdvisorPort,
+    ColdAdvisoryCallFact,
+    ColdAdvisoryCancellationRequest,
+    ColdAdvisoryEvaluatorPort,
+    ColdAdvisoryProviderObservation,
+    ColdAdvisoryProviderTask,
+    ColdAdvisoryProviderTaskState,
+    ColdAdvisorySamplerStop,
+    ColdAdvisorySettlement,
+    ColdAdvisorySettlementClosure,
+    ColdAdvisorySpec,
+)
 from roastpilot_agent.cold_characterisation.conformance import (
     ColdConformanceFinding,
-    ColdConformanceOutcome,
-    ColdConformanceResult,
-    check_pre_advisory_conformance,
     masked_identity_text,
 )
 from roastpilot_agent.cold_characterisation.engine import (
@@ -91,7 +128,10 @@ from roastpilot_agent.cold_characterisation.evidence_lifecycle import (
     is_admissible_utc_instant,
     validate_lifecycle_record,
 )
-from roastpilot_agent.cold_characterisation.evidence_reader import read_retained_run_v2
+from roastpilot_agent.cold_characterisation.evidence_reader import (
+    read_retained_run_v3,
+    read_retained_run_v4,
+)
 from roastpilot_agent.cold_characterisation.evidence_schema import (
     MAX_COLLECTION_LENGTH,
     MAX_ENVELOPE_BYTES,
@@ -108,12 +148,19 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdHostAbortReason,
     ColdPhaseKind,
     ColdRunHeader,
+    ColdTickRecord,
     validate_record,
 )
 from roastpilot_agent.cold_characterisation.evidence_store import (
     ColdAdmittedRoot,
     ColdEvidenceWriter,
     canonical_json,
+)
+from roastpilot_agent.cold_characterisation.evidence_terminal import (
+    ColdFailedRunAdvisorySettlement,
+    ColdFailedRunProviderCancellation,
+    ColdFailedRunTerminalRecord,
+    build_failed_run_terminal_record,
 )
 from roastpilot_agent.cold_characterisation.identity import (
     AgentBuildProvenance,
@@ -207,10 +254,40 @@ class ColdPhaseIdentitySource(typing.Protocol):
 class ColdTwoPhaseOutcome(enum.Enum):
     """Closed run outcome; never qualification, readiness or acceptance."""
 
-    PRE_ADVISORY_CONFORMANT = "pre_advisory_conformant"
+    ADVISORY_CONFORMANT = "advisory_conformant"
     NOT_CONFORMANT = "not_conformant"
     EVIDENCE_NOT_SEALED = "evidence_not_sealed"
     REFUSED_BEFORE_EVIDENCE = "refused_before_evidence"
+
+
+class ColdTwoPhaseAdvisoryPath(enum.Enum):
+    """Which OD5 advisory failure path, if any, the run took.
+
+    ``FAILED_RUN_TERMINAL``: a stored settlement left an attempt unresolved or
+    unrecorded; the run ends with the schema-3 failed-run terminal.
+    ``PROVIDER_OUTSTANDING_FAILED``: a provider task was outstanding at settlement
+    with no such attempt; the run ends with the v2 ``FAILED`` termination.  Neither
+    proves delivery, cancellation, a stop or any physical state.
+    """
+
+    NOT_APPLICABLE = "not_applicable"
+    FAILED_RUN_TERMINAL = "failed_run_terminal"
+    PROVIDER_OUTSTANDING_FAILED = "provider_outstanding_failed"
+
+
+class ColdTwoPhaseProviderCheck(enum.Enum):
+    """The one post-seal provider observation of an OD5 path.
+
+    Only ``PENDING_AT_CHECK`` is an exit signal.  ``NOT_PENDING_AT_CHECK`` means only
+    that the most recent published provider task was observed not outstanding; it
+    never claims that no task or remote call exists.  ``NOT_OBSERVABLE_AT_CHECK``
+    means the observation was refused, absent, not admitted or raised.
+    """
+
+    NOT_CHECKED = "not_checked"
+    PENDING_AT_CHECK = "pending_at_check"
+    NOT_PENDING_AT_CHECK = "not_pending_at_check"
+    NOT_OBSERVABLE_AT_CHECK = "not_observable_at_check"
 
 
 class ColdRunStartRefusal(enum.Enum):
@@ -272,7 +349,9 @@ class ColdTwoPhaseResult(pydantic.BaseModel):
     termination_reason: ColdRunTerminationReason | None
     child_ownership: ColdChildOwnership
     manifest_sha256: str | None
-    conformance: ColdConformanceResult | None
+    conformance: ColdAdvisoryConformanceResult | None
+    advisory_path: ColdTwoPhaseAdvisoryPath
+    provider_check: ColdTwoPhaseProviderCheck
 
     @pydantic.field_validator("manifest_sha256", mode="before")
     @classmethod
@@ -288,14 +367,14 @@ class ColdTwoPhaseResult(pydantic.BaseModel):
         """Replace a checker result with its admitted fresh snapshot, or refuse it."""
         if value is None:
             return None
-        fresh = _admit_carrier(value, ColdConformanceResult, _CHECKER)
+        fresh = _admit_carrier(value, ColdAdvisoryConformanceResult, _CHECKER, flat_identity=True)
         if fresh is None:
             raise ValueError("conformance result not admitted")
         return fresh
 
     @pydantic.model_validator(mode="after")
     def _require_closed_row(self) -> typing.Self:
-        """Admit exactly the four closed outcome rows."""
+        """Admit exactly the closed outcome rows."""
         if not _row_admits(self):
             raise ValueError("result fields do not form a closed row")
         return self
@@ -306,18 +385,27 @@ def _row_admits(result: ColdTwoPhaseResult) -> bool:
     outcome, refusal = result.outcome, result.start_refusal
     reason, owner = result.termination_reason, result.child_ownership
     digest, checked = result.manifest_sha256, result.conformance
+    path, check = result.advisory_path, result.provider_check
     if not (
         _is_member(outcome, ColdTwoPhaseOutcome)
         and _is_member(owner, ColdChildOwnership)
+        and _is_member(path, ColdTwoPhaseAdvisoryPath)
+        and _is_member(check, ColdTwoPhaseProviderCheck)
         and (refusal is None or _is_member(refusal, ColdRunStartRefusal))
         and (reason is None or _is_member(reason, ColdRunTerminationReason))
     ):
         return False
+    if path is ColdTwoPhaseAdvisoryPath.NOT_APPLICABLE:
+        if check is not ColdTwoPhaseProviderCheck.NOT_CHECKED:
+            return False
+    elif not _advisory_path_admits(result):
+        return False
     owned = owner is not ColdChildOwnership.NOT_OWNED
     conformant = (
-        checked is not None and checked.outcome is ColdConformanceOutcome.PRE_ADVISORY_CONFORMANT
+        checked is not None
+        and checked.outcome is ColdAdvisoryConformanceOutcome.ADVISORY_CONFORMANT
     )
-    if outcome is ColdTwoPhaseOutcome.PRE_ADVISORY_CONFORMANT:
+    if outcome is ColdTwoPhaseOutcome.ADVISORY_CONFORMANT:
         return (
             refusal is None
             and reason is None
@@ -334,6 +422,24 @@ def _row_admits(result: ColdTwoPhaseResult) -> bool:
     if any(refusal is member for member in _ENTRY_REFUSALS):
         return not owned
     return owned or not any(refusal is member for member in _STARTED_REFUSALS)
+
+
+def _advisory_path_admits(result: ColdTwoPhaseResult) -> bool:
+    """The extra facts every row on an OD5 path carries.
+
+    The run failed (a primary reason is set) with retained or attempted evidence,
+    and a failed-run terminal carries no policy-2 result (the V3 reader refuses it).
+    """
+    outcome = result.outcome
+    if not (
+        outcome is ColdTwoPhaseOutcome.NOT_CONFORMANT
+        or outcome is ColdTwoPhaseOutcome.EVIDENCE_NOT_SEALED
+    ):
+        return False
+    if result.termination_reason is None:
+        return False
+    terminal = result.advisory_path is ColdTwoPhaseAdvisoryPath.FAILED_RUN_TERMINAL
+    return not (terminal and result.conformance is not None)
 
 
 class ColdRunSinkRefusedError(RuntimeError):
@@ -397,13 +503,99 @@ _ENGINE: typing.Final = _carrier(
     (ColdAbortDomain, ColdHostAbortReason, ColdEvidenceFailure, ColdEngineAbortReason),
 )
 _CHECKER: typing.Final = _carrier(
-    (ColdConformanceResult,), (ColdConformanceOutcome, ColdConformanceFinding)
+    (ColdAdvisoryConformanceResult,),
+    (ColdAdvisoryConformanceOutcome, ColdAdvisoryConformanceFinding, ColdConformanceFinding),
+)
+_ADVISORY: typing.Final = _carrier(
+    (
+        ColdAdvisoryPhaseSettlement,
+        ColdAdvisorySettlement,
+        ColdAdvisoryPhaseRun,
+        ColdAdvisoryPhaseObservation,
+        ColdAdvisoryProviderObservation,
+    ),
+    (
+        ColdAdvisorySettlementClosure,
+        ColdAdvisoryProviderTask,
+        ColdAdvisoryRunTaskState,
+        ColdAdvisorySamplerStop,
+        ColdAdvisoryCancellationRequest,
+        ColdAdvisoryPhaseStart,
+        ColdAdvisoryProviderTaskState,
+        ColdAdvisoryCallFact,
+    ),
 )
 _ENGINE_ROOTS: typing.Final[tuple[type[pydantic.BaseModel], ...]] = (
     ColdPhaseCompleted,
     ColdPhaseAborted,
     ColdPhaseActivationRefused,
 )
+
+# ----------------------------------------------------- OD5 advisory policy
+
+_Closure: typing.TypeAlias = ColdAdvisorySettlementClosure
+_Cancel: typing.TypeAlias = ColdAdvisoryCancellationRequest
+#: The five stored closures that leave an attempt unresolved or unrecorded, each
+#: mapped by identity to its schema-3 failed-run terminal member.
+_TERMINAL_SETTLEMENTS: typing.Final[
+    tuple[tuple[ColdAdvisorySettlementClosure, ColdFailedRunAdvisorySettlement], ...]
+] = (
+    (
+        _Closure.RECORDED_UNRESOLVED_INVOKED,
+        ColdFailedRunAdvisorySettlement.RECORDED_UNRESOLVED_INVOKED,
+    ),
+    (
+        _Closure.RECORDED_UNRESOLVED_NOT_INVOKED,
+        ColdFailedRunAdvisorySettlement.RECORDED_UNRESOLVED_NOT_INVOKED,
+    ),
+    (
+        _Closure.NOT_RECORDED_CLOCK_INVALID,
+        ColdFailedRunAdvisorySettlement.NOT_RECORDED_CLOCK_INVALID,
+    ),
+    (_Closure.NOT_RECORDED_SINK_REFUSED, ColdFailedRunAdvisorySettlement.NOT_RECORDED_SINK_REFUSED),
+    (
+        _Closure.NOT_RECORDED_COMPLETION_UNKNOWN,
+        ColdFailedRunAdvisorySettlement.NOT_RECORDED_COMPLETION_UNKNOWN,
+    ),
+)
+#: The six storable settlement-time cancellation requests, mapped by identity.
+_TERMINAL_CANCELLATIONS: typing.Final[
+    tuple[tuple[ColdAdvisoryCancellationRequest, ColdFailedRunProviderCancellation], ...]
+] = (
+    (_Cancel.NO_PROVIDER_TASK, ColdFailedRunProviderCancellation.NO_PROVIDER_TASK),
+    (_Cancel.TASK_ALREADY_DONE, ColdFailedRunProviderCancellation.TASK_ALREADY_DONE),
+    (_Cancel.REQUESTED, ColdFailedRunProviderCancellation.REQUESTED),
+    (_Cancel.REQUEST_NOT_ACCEPTED, ColdFailedRunProviderCancellation.REQUEST_NOT_ACCEPTED),
+    (_Cancel.REQUEST_RAISED, ColdFailedRunProviderCancellation.REQUEST_RAISED),
+    (_Cancel.REQUEST_INTERRUPTED, ColdFailedRunProviderCancellation.REQUEST_INTERRUPTED),
+)
+
+
+def _terminal_settlement(
+    closure: ColdAdvisorySettlementClosure,
+) -> ColdFailedRunAdvisorySettlement | None:
+    """The failed-run terminal member for one of the five closures, by identity."""
+    return next((member for stored, member in _TERMINAL_SETTLEMENTS if closure is stored), None)
+
+
+def _terminal_cancellation(
+    request: ColdAdvisoryCancellationRequest,
+) -> ColdFailedRunProviderCancellation | None:
+    """The failed-run terminal member for one storable cancellation request, by identity."""
+    return next((member for stored, member in _TERMINAL_CANCELLATIONS if request is stored), None)
+
+
+def _od5_triggered(settlement: ColdAdvisorySettlement) -> bool:
+    """OD5: an outstanding provider task, or one of the five closures, at settlement.
+
+    ``NO_OPEN_ATTEMPT`` alone never establishes resolution, and a completed call
+    recorded while its task is still outstanding is a contradiction that triggers.
+    """
+    return (
+        settlement.provider_task is ColdAdvisoryProviderTask.OUTSTANDING
+        or _terminal_settlement(settlement.closure) is not None
+    )
+
 
 _Parent: typing.TypeAlias = dict[str, object] | list[object]
 _Children: typing.TypeAlias = list[tuple[str | None, object]]
@@ -524,20 +716,45 @@ def _snapshot(value: object, root: type[pydantic.BaseModel], table: _Carrier) ->
     return holder[0]
 
 
-def _admit_carrier(value: object, root: type[_M], table: _Carrier) -> _M | None:
+def _validated_flat(value: object, root: type[_M], table: _Carrier) -> _M:
+    """Strictly validate one flat root from the exact declared values of the original.
+
+    For a root whose own validators admit enum members and tuples by identity only,
+    so a JSON round trip can never satisfy them: those validators judge the real
+    values, already bounded and identity-checked by the snapshot walk.
+
+    Raises:
+        Exception: If the root is not in the table, its values cannot be read, or
+            strict validation refuses them (the caller refuses the carrier).
+    """
+    names = next(names for model, names in table.models if model is root)
+    values = typing.cast(tuple[object, ...], _model_values(value, names))
+    return root.model_validate(dict(zip(names, values, strict=True)), strict=True)
+
+
+def _admit_carrier(
+    value: object, root: type[_M], table: _Carrier, *, flat_identity: bool = False
+) -> _M | None:
     """Return a fresh, losslessly re-validated instance of ``root``, or ``None``.
 
     The snapshot is canonicalised, validated with ``model_validate_json`` in strict
     mode, and must round-trip to the identical canonical text from a fresh dump:
     no coercion or dropped input is silently accepted.  No input or error text is
-    emitted.
+    emitted.  With ``flat_identity`` (a flat root whose validators admit members and
+    tuples by identity) the admitted original's declared values are validated in
+    strict Python mode instead (see :func:`_validated_flat`); the same lossless round
+    trip to the snapshot text is required.
     """
     try:
         snapshot = _snapshot(value, root, table)
         if snapshot is None:
             return None
         text = canonical_json(snapshot)
-        fresh = root.model_validate_json(text, strict=True)
+        fresh = (
+            _validated_flat(value, root, table)
+            if flat_identity
+            else root.model_validate_json(text, strict=True)
+        )
         lossless = canonical_json(fresh.model_dump(mode="json")) == text
     except Exception:
         return None
@@ -591,6 +808,25 @@ def _finalisation_error_result(error: object) -> SessionFinalisationResult | Non
 def _same_session(left: object, right: object) -> bool:
     """Whether both values are admitted exact session strings and equal (no normalisation)."""
     return is_admissible_session_id(left) and is_admissible_session_id(right) and left == right
+
+
+def _record_phase(record: object) -> ColdPhaseKind | None:
+    """Read a record's ``phase`` slot from its exact ``__dict__`` by identity, or ``None``.
+
+    Every key must be an exact ``str`` before the lookup; nothing is validated,
+    hashed beyond the key scan, or formatted here (the writer re-admits the record).
+    """
+    try:
+        data: object = object.__getattribute__(record, "__dict__")
+    except Exception:
+        return None
+    if type(data) is not dict:
+        return None
+    raw = typing.cast(dict[object, object], data)
+    if not all(type(key) is str for key in raw):
+        return None
+    phase = raw.get("phase")
+    return typing.cast(ColdPhaseKind, phase) if _is_member(phase, ColdPhaseKind) else None
 
 
 # ------------------------------------------------------------- clock ledger
@@ -652,8 +888,10 @@ class _RunSink:
     def __init__(self, writer: ColdEvidenceWriter) -> None:
         self._writer = writer
         self._guards = {_OFF: _PhaseGuard(), _ON: _PhaseGuard()}
+        self._latest_tick: dict[ColdPhaseKind, ColdTickRecord] = {}
         self.phase: ColdPhaseKind | None = None
         self.next_sequence = 0
+        self.advisory_count = 0
         self.terminated = False
         self.poisoned = False
         self.seal_attempted = False
@@ -743,6 +981,8 @@ class _RunSink:
         if type(fresh) is ColdRunHeader:
             self.phase = fresh.phase
             self._guards[fresh.phase].header = True
+        elif type(fresh) is ColdTickRecord:
+            self._latest_tick[fresh.phase] = fresh
         elif type(fresh) is ColdAbortRecord:
             self._guards[fresh.phase].abort_seen = True
         elif type(fresh) is ColdFinalisationRecord:
@@ -795,6 +1035,50 @@ class _RunSink:
             guard.child_started = True
         elif fresh.event is _E.RUN_TERMINATED:
             self.terminated = True
+
+    def append_advisory_attempt(self, record: object) -> None:
+        """Guard and durably append one advisory-attempt record (R12, the sampler's sink).
+
+        Admitted only while the sink is usable, for the current bound phase, before
+        its observation window closed and before any finalisation record.  The
+        writer re-admits, binds and orders the record itself.
+
+        Raises:
+            ColdRunSinkRefusedError: On any refusal or writer fault (then poisoned).
+        """
+        if not self.usable or self.phase is None:
+            self._refuse()
+        guard = self._guards[self.phase]
+        if (
+            _record_phase(record) is not self.phase
+            or not guard.header
+            or guard.window_closed
+            or guard.finalisation_appended
+        ):
+            self._refuse()
+        self._write(lambda: self._writer.append_advisory_attempt(typing.cast(typing.Any, record)))
+        self.advisory_count += 1
+
+    def latest_retained_tick(self) -> ColdTickRecord | None:
+        """The latest durably appended tick of the current phase only (the tick port)."""
+        if self.phase is None:
+            return None
+        return self._latest_tick.get(self.phase)
+
+    def append_failed_run_terminal(self, record: ColdFailedRunTerminalRecord) -> None:
+        """Durably append the one schema-3 failed-run terminal; the run is then terminated.
+
+        The writer independently checks the phase, the retained counts and that no
+        v2 run termination exists.
+
+        Raises:
+            ColdRunSinkRefusedError: If not usable or unbound, or on a writer refusal or
+                fault (then poisoned).
+        """
+        if not self.usable or self.phase is None:
+            self._refuse()
+        self._write(lambda: self._writer.append_failed_run_terminal(record))
+        self.terminated = True
 
     def seal(self) -> str:
         """Seal a terminated run with a bound header once and return its manifest digest.
@@ -989,6 +1273,11 @@ class _TwoPhaseRun:
         identities: ColdPhaseIdentitySource,
         host: ColdEngineHost,
         clock: ColdEngineClock,
+        advisor_factory: typing.Callable[[], ColdAdvisoryAdvisorPort],
+        spec: ColdAdvisorySpec,
+        configured_call_bound_seconds: float,
+        configured_dwell_seconds: float,
+        evaluator: ColdAdvisoryEvaluatorPort,
     ) -> None:
         self._root = root
         self._mcp = mcp
@@ -996,6 +1285,22 @@ class _TwoPhaseRun:
         self._identities = identities
         self._host = host
         self._clock = clock
+        self._evaluator = evaluator
+        # The owner's constructor only stores its inputs; an invalid input is refused
+        # in-run by its stored start result, which fails the run closed.
+        self._owner = ColdAdvisoryRunOwner(
+            advisor_factory=advisor_factory,
+            spec=spec,
+            configured_call_bound_seconds=configured_call_bound_seconds,
+            configured_dwell_seconds=configured_dwell_seconds,
+            clock=clock,
+        )
+        self._starts: dict[ColdPhaseKind, object] = {}
+        self._settled: set[ColdPhaseKind] = set()
+        self._path = ColdTwoPhaseAdvisoryPath.NOT_APPLICABLE
+        self._path_settlement: ColdAdvisoryPhaseSettlement | None = None
+        self._path_phase: ColdPhaseKind | None = None
+        self._check: ColdTwoPhaseProviderCheck | None = None
         self._ledger = _ClockFloor()
         self._sink: _RunSink | None = None
         self._primary: ColdRunTerminationReason | None = None
@@ -1078,12 +1383,17 @@ class _TwoPhaseRun:
         return at
 
     def _off_hook(self, *, session_id: str, activated_monotonic: float, activated_utc: str) -> bool:
-        """Recording-off activation: record the activation and its scheduled end."""
+        """Recording-off activation: record it and its scheduled end, then start advisory."""
         self._activated(_OFF, session_id, activated_monotonic, activated_utc)
+        self._start_advisory(_OFF)
         return True
 
     def _on_hook(self, *, session_id: str, activated_monotonic: float, activated_utc: str) -> bool:
-        """Recording-on activation: record it and the transition, then apply the budget."""
+        """Recording-on activation: record it and the transition, then apply the budget.
+
+        Advisory sampling starts only when the budget holds; its start result never
+        changes this hook's verdict.
+        """
         at = self._activated(_ON, session_id, activated_monotonic, activated_utc)
         start = self._ends[_OFF]
         measured = self._lifecycle(
@@ -1095,7 +1405,139 @@ class _TwoPhaseRun:
         )
         if measured is None:
             raise _HookFailed
-        return at.monotonic - start <= COLD_TRANSITION_BUDGET_SECONDS
+        within = at.monotonic - start <= COLD_TRANSITION_BUDGET_SECONDS
+        if within:
+            self._start_advisory(_ON)
+        return within
+
+    # ----------------------------------------------------------- advisory
+
+    def _start_advisory(self, phase: ColdPhaseKind) -> None:
+        """Start one phase's sampler with the exact admitted header, session and end.
+
+        The phase counts as started before the owner is entered, so it is settled
+        even if the start raised; any start other than ``STARTED`` fails the run at
+        settlement.
+        """
+        sink = typing.cast(_RunSink, self._sink)
+        self._starts[phase] = None
+        started: object = None
+        try:
+            started = self._owner.start_phase(
+                phase,
+                header=self._headers[phase],
+                established_session_id=self._sessions[phase],
+                scheduled_end_monotonic=self._ends[phase],
+                evaluator=self._evaluator,
+                sink=sink,
+                ticks=sink,
+            )
+        except Exception:
+            started = None
+        self._starts[phase] = started
+
+    def _settle(self, phase: ColdPhaseKind) -> None:
+        """Settle one started phase exactly once, synchronously, then apply OD5.
+
+        An OD5 trigger fails the run and fixes the advisory path (the first trigger
+        wins).  A refusal, an inadmissible settlement or a start other than
+        ``STARTED`` fails the run closed without establishing a path.
+        """
+        if phase not in self._starts or phase in self._settled:
+            return
+        self._settled.add(phase)
+        raw: object = None
+        try:
+            raw = self._owner.settle_phase(phase)
+        except Exception:
+            raw = None
+        settlement = _admit_carrier(raw, ColdAdvisoryPhaseSettlement, _ADVISORY)
+        if settlement is not None and _od5_triggered(settlement.sampler):
+            self._fail(_R.UNEXPECTED_FAILURE)
+            if self._path is ColdTwoPhaseAdvisoryPath.NOT_APPLICABLE:
+                terminal = _terminal_settlement(settlement.sampler.closure) is not None
+                self._path = (
+                    ColdTwoPhaseAdvisoryPath.FAILED_RUN_TERMINAL
+                    if terminal
+                    else ColdTwoPhaseAdvisoryPath.PROVIDER_OUTSTANDING_FAILED
+                )
+                self._path_settlement = settlement
+                self._path_phase = phase
+        if settlement is None or self._starts[phase] is not ColdAdvisoryPhaseStart.STARTED:
+            self._fail(_R.UNEXPECTED_FAILURE)
+
+    def _settle_unsettled(self) -> None:
+        """Settle every started phase that is not yet settled, in phase order."""
+        for phase in (_OFF, _ON):
+            self._settle(phase)
+
+    def _advance_permitted(self) -> bool:
+        """Fail closed unless the owner's own recording-off facts admit recording-on.
+
+        Requires a stored settlement with no OD5 trigger, a run fact other than
+        ``UNCONFIRMED`` (at settlement and now) and a provider observation that is
+        present and not ``OUTSTANDING``.
+        """
+        permitted = False
+        try:
+            raw: object = self._owner.observe_phase(_OFF)
+            observed = _admit_carrier(raw, ColdAdvisoryPhaseObservation, _ADVISORY)
+            unconfirmed = ColdAdvisoryRunTaskState.UNCONFIRMED
+            permitted = (
+                observed is not None
+                and observed.settlement is not None
+                and not _od5_triggered(observed.settlement.sampler)
+                and observed.settlement.run_at_settlement.state is not unconfirmed
+                and observed.run.state is not unconfirmed
+                and observed.provider is not None
+                and observed.provider.task is not ColdAdvisoryProviderTaskState.OUTSTANDING
+            )
+        except Exception:
+            permitted = False
+        if not permitted:
+            self._fail(_R.UNEXPECTED_FAILURE)
+        return permitted
+
+    def _check_provider(self) -> ColdTwoPhaseProviderCheck:
+        """Take the one synchronous post-seal provider observation of an OD5 path.
+
+        Latched: a taken value is returned unchanged and never recomputed.  It never
+        appends, mutates or seals.  ``PENDING_AT_CHECK`` requires an admitted
+        observation whose provider task is ``OUTSTANDING``.
+        """
+        if self._check is not None:
+            return self._check
+        if self._path is ColdTwoPhaseAdvisoryPath.NOT_APPLICABLE:
+            return ColdTwoPhaseProviderCheck.NOT_CHECKED
+        checked = ColdTwoPhaseProviderCheck.NOT_OBSERVABLE_AT_CHECK
+        try:
+            raw: object = self._owner.observe_phase(typing.cast(ColdPhaseKind, self._path_phase))
+            observed = _admit_carrier(raw, ColdAdvisoryPhaseObservation, _ADVISORY)
+            if observed is not None and observed.provider is not None:
+                outstanding = observed.provider.task is ColdAdvisoryProviderTaskState.OUTSTANDING
+                checked = (
+                    ColdTwoPhaseProviderCheck.PENDING_AT_CHECK
+                    if outstanding
+                    else ColdTwoPhaseProviderCheck.NOT_PENDING_AT_CHECK
+                )
+        except Exception:
+            checked = ColdTwoPhaseProviderCheck.NOT_OBSERVABLE_AT_CHECK
+        self._check = checked
+        return checked
+
+    def _seal_then_check(self, sink: "_RunSink") -> str | None:
+        """The seal step, then the provider check as the very next statement.
+
+        A precondition refusal (poisoned, unterminated or unbound sink) raises before
+        any writer call; nothing here claims that a refused seal entered the writer.
+        """
+        digest: str | None = None
+        try:
+            digest = sink.seal()
+        except ColdRunSinkRefusedError:
+            digest = None
+        self._check_provider()
+        return digest
 
     # -------------------------------------------------------------- phases
 
@@ -1147,6 +1589,8 @@ class _TwoPhaseRun:
             )
         except Exception as error:
             reported = _unexpected_session(error)
+        # Settle before classifying, so before any phase-end lifecycle append.
+        self._settle(phase)
         fresh = next(
             (
                 result
@@ -1362,6 +1806,8 @@ class _TwoPhaseRun:
             child_ownership=self._child.ownership,
             manifest_sha256=None,
             conformance=None,
+            advisory_path=ColdTwoPhaseAdvisoryPath.NOT_APPLICABLE,
+            provider_check=ColdTwoPhaseProviderCheck.NOT_CHECKED,
         )
 
     def _entry_refusal(self) -> ColdRunStartRefusal | None:
@@ -1399,12 +1845,16 @@ class _TwoPhaseRun:
         except Exception:
             return await self._teardown()
         self._sink = _RunSink(writer)
-        if await self._run_off(admission):
+        if await self._run_off(admission) and self._advance_permitted():
             await self._run_on()
         return await self._teardown()
 
     async def _teardown(self) -> ColdTwoPhaseResult:
-        """Cleanup stop, ``CHILD_STOPPED``, terminal, seal, reload and check."""
+        """Cleanup stop, ``CHILD_STOPPED``, terminal, seal, reload and check.
+
+        The terminal is the schema-3 failed-run terminal on the
+        ``FAILED_RUN_TERMINAL`` path, instead of (never alongside) the v2 one.
+        """
         sink = self._sink
         if self._child.needs_stop:
             if sink is None:
@@ -1413,6 +1863,9 @@ class _TwoPhaseRun:
                 await self._stop()
         if sink is None:
             return self._refused(self._refusal)
+        if self._path is ColdTwoPhaseAdvisoryPath.FAILED_RUN_TERMINAL:
+            self._append_failed_run_terminal(sink)
+            return self._end(sink)
         at = self._sample()
         if at is not None:
             primary = self._primary
@@ -1425,11 +1878,36 @@ class _TwoPhaseRun:
             )
         return self._end(sink)
 
+    def _append_failed_run_terminal(self, sink: _RunSink) -> None:
+        """Append the one failed-run terminal from the stored settlement and actual counts.
+
+        A missing mapping, a builder refusal or a sink refusal writes nothing, so the
+        run stays unterminated and is never sealed; nothing is fabricated.
+        """
+        # The FAILED_RUN_TERMINAL path is only ever set together with its settlement,
+        # and only after a phase header was bound.
+        settlement = typing.cast(ColdAdvisoryPhaseSettlement, self._path_settlement)
+        closure = _terminal_settlement(settlement.sampler.closure)
+        cancellation = _terminal_cancellation(settlement.provider_cancellation)
+        if closure is None or cancellation is None:
+            return
+        try:
+            record = build_failed_run_terminal_record(
+                self._headers[typing.cast(ColdPhaseKind, sink.phase)],
+                advisory_settlement=closure,
+                provider_cancellation=cancellation,
+                lifecycle_records_retained=sink.next_sequence,
+                advisory_attempt_records_retained=sink.advisory_count,
+            )
+            sink.append_failed_run_terminal(record)
+        except Exception:
+            return
+
     def _result(
         self,
         outcome: ColdTwoPhaseOutcome,
         digest: str | None = None,
-        conformance: ColdConformanceResult | None = None,
+        conformance: ColdAdvisoryConformanceResult | None = None,
     ) -> ColdTwoPhaseResult:
         """Build one evidence-bearing result row from admitted closed fields."""
         return ColdTwoPhaseResult(
@@ -1439,10 +1917,25 @@ class _TwoPhaseRun:
             child_ownership=self._child.ownership,
             manifest_sha256=digest,
             conformance=conformance,
+            advisory_path=self._path,
+            provider_check=(
+                ColdTwoPhaseProviderCheck.NOT_CHECKED if self._check is None else self._check
+            ),
         )
 
     def _end(self, sink: _RunSink) -> ColdTwoPhaseResult:
-        """Seal a terminated run, reload it by its digest and check it."""
+        """Seal a terminated run, reload it by its digest and check it.
+
+        On an OD5 path the seal is called once whatever the sink state (a poisoned,
+        unterminated or unbound sink is refused before any writer call) and the one
+        provider check follows it immediately.
+        """
+        if self._path is not ColdTwoPhaseAdvisoryPath.NOT_APPLICABLE:
+            sealed = self._seal_then_check(sink)
+            if sealed is None:
+                sink.close()
+                return self._result(ColdTwoPhaseOutcome.EVIDENCE_NOT_SEALED)
+            return self._reload(sealed)
         if sink.poisoned or not sink.terminated:
             sink.close()
             return self._result(ColdTwoPhaseOutcome.EVIDENCE_NOT_SEALED)
@@ -1451,32 +1944,56 @@ class _TwoPhaseRun:
         except ColdRunSinkRefusedError:
             sink.close()
             return self._result(ColdTwoPhaseOutcome.EVIDENCE_NOT_SEALED)
+        return self._reload(digest)
+
+    def _verify_failed_run_terminal(self, digest: str) -> bool:
+        """Reload a failed-run terminal through the V4 reader; verification only."""
         try:
-            retained = read_retained_run_v2(
+            read_retained_run_v4(
                 self._root.path,
                 run_id=self._headers[_OFF].run_id,
                 expected_manifest_sha256=digest,
             )
-            checked: object = check_pre_advisory_conformance(retained)
+        except Exception:
+            return False
+        return True
+
+    def _reload(self, digest: str) -> ColdTwoPhaseResult:
+        """Reload a sealed run by its digest and check it; a failed-run terminal never qualifies."""
+        if self._path is ColdTwoPhaseAdvisoryPath.FAILED_RUN_TERMINAL:
+            self._verify_failed_run_terminal(digest)
+            return self._result(ColdTwoPhaseOutcome.NOT_CONFORMANT, digest)
+        try:
+            retained = read_retained_run_v3(
+                self._root.path,
+                run_id=self._headers[_OFF].run_id,
+                expected_manifest_sha256=digest,
+            )
+            checked: object = check_advisory_conformance(retained)
         except Exception:
             checked = None
-        conformance = _admit_carrier(checked, ColdConformanceResult, _CHECKER)
+        conformance = _admit_carrier(
+            checked, ColdAdvisoryConformanceResult, _CHECKER, flat_identity=True
+        )
         conformant = (
             conformance is not None
-            and conformance.outcome is ColdConformanceOutcome.PRE_ADVISORY_CONFORMANT
+            and conformance.outcome is ColdAdvisoryConformanceOutcome.ADVISORY_CONFORMANT
         )
         if (
             conformant
             and self._primary is None
             and self._child.ownership is ColdChildOwnership.OWNED_STOP_CONFIRMED
+            and self._path is ColdTwoPhaseAdvisoryPath.NOT_APPLICABLE
         ):
             return ColdTwoPhaseResult(
-                outcome=ColdTwoPhaseOutcome.PRE_ADVISORY_CONFORMANT,
+                outcome=ColdTwoPhaseOutcome.ADVISORY_CONFORMANT,
                 start_refusal=None,
                 termination_reason=None,
                 child_ownership=ColdChildOwnership.OWNED_STOP_CONFIRMED,
                 manifest_sha256=digest,
                 conformance=conformance,
+                advisory_path=ColdTwoPhaseAdvisoryPath.NOT_APPLICABLE,
+                provider_check=ColdTwoPhaseProviderCheck.NOT_CHECKED,
             )
         return self._result(
             ColdTwoPhaseOutcome.NOT_CONFORMANT, digest, None if conformant else conformance
@@ -1488,6 +2005,11 @@ class _TwoPhaseRun:
         The sink is closed and only the permitted owned cleanup stop runs; nothing
         is finalised or stopped again and no text escapes.  A held seal receipt is
         never lost: it is returned as ``NOT_CONFORMANT`` with that digest.
+
+        A provider check already taken is projected, never repeated.  When an OD5
+        path is established but the check was not taken (and no seal was attempted),
+        the cleanup attempts have finished here, so the one guarded seal call is made
+        (refused on the closed sink before any writer call) and the check follows it.
 
         Raises:
             asyncio.CancelledError: If the caller was cancelled during the cleanup
@@ -1506,7 +2028,15 @@ class _TwoPhaseRun:
                 child_ownership=self._child.ownership,
                 manifest_sha256=None,
                 conformance=None,
+                advisory_path=ColdTwoPhaseAdvisoryPath.NOT_APPLICABLE,
+                provider_check=ColdTwoPhaseProviderCheck.NOT_CHECKED,
             )
+        if (
+            self._check is None
+            and self._path is not ColdTwoPhaseAdvisoryPath.NOT_APPLICABLE
+            and not sink.seal_attempted
+        ):
+            self._seal_then_check(sink)
         if sink.sealed_digest is not None:
             return self._result(ColdTwoPhaseOutcome.NOT_CONFORMANT, sink.sealed_digest)
         return self._result(ColdTwoPhaseOutcome.EVIDENCE_NOT_SEALED)
@@ -1519,6 +2049,7 @@ class _TwoPhaseRun:
         other state, including a held receipt, a poisoned sink or any existing
         terminal, is contained without sealing.
         """
+        self._settle_unsettled()
         sink = self._sink
         if sink is not None and sink.usable and not sink.seal_attempted:
             try:
@@ -1531,8 +2062,10 @@ class _TwoPhaseRun:
         """Run once; contain ordinary failures, and re-raise any other ``BaseException``.
 
         An ordinary exception is recovered once (see :meth:`_recover`).
-        Cancellation and every other ``BaseException`` close the sink, run the
-        shielded cleanup and re-raise the original exception object unchanged.
+        Cancellation and every other ``BaseException`` close the sink, settle each
+        started unsettled phase (absorbing anything that raises), run the shielded
+        cleanup and re-raise the original exception object unchanged: no terminal,
+        seal, finalisation or provider check follows.
         """
         try:
             try:
@@ -1544,6 +2077,10 @@ class _TwoPhaseRun:
         except BaseException:
             if self._sink is not None:
                 self._sink.close()
+            try:
+                self._settle_unsettled()
+            except BaseException:
+                self._fail(_R.UNEXPECTED_FAILURE)
             await self._child.shielded_cleanup()
             raise
 
@@ -1556,13 +2093,19 @@ async def run_two_phase_characterisation(
     identities: ColdPhaseIdentitySource,
     host: ColdEngineHost,
     clock: ColdEngineClock,
+    advisor_factory: typing.Callable[[], ColdAdvisoryAdvisorPort],
+    spec: ColdAdvisorySpec,
+    configured_call_bound_seconds: float,
+    configured_dwell_seconds: float,
+    evaluator: ColdAdvisoryEvaluatorPort,
 ) -> ColdTwoPhaseResult:
     """Run one hardware-free-testable two-phase cold characterisation.
 
     The same ``mcp``, ``child``, ``host`` and ``clock`` instances are used for both
     phases.  The child is started only from a confirmed idle state and never
     respawned after any failure or uncertainty; the evidence directory is created
-    once, for the recording-off phase only.
+    once, for the recording-off phase only.  The advisor is observation-only: it
+    receives typed context and returns typed data, never an MCP or control surface.
 
     Args:
         root: The admitted evidence root.
@@ -1571,14 +2114,29 @@ async def run_two_phase_characterisation(
         identities: The phase identity source, called after each confirmed start.
         host: The host-bound port.
         clock: The engine clock.
+        advisor_factory: Called at most once for one fresh advisor.
+        spec: The explicit per-run advisory spec (Celsius).
+        configured_call_bound_seconds: The sampler's configured per-call bound.
+        configured_dwell_seconds: The sampler's configured post-completion dwell.
+        evaluator: The typed safety-evaluation port for returned requests.
 
     Returns:
-        The closed result; ``PRE_ADVISORY_CONFORMANT`` is never qualification.
+        The closed result; ``ADVISORY_CONFORMANT`` is never qualification.
 
     Raises:
         asyncio.CancelledError: After owned cleanup, with no terminal and no seal.
     """
     run = _TwoPhaseRun(
-        root=root, mcp=mcp, child=child, identities=identities, host=host, clock=clock
+        root=root,
+        mcp=mcp,
+        child=child,
+        identities=identities,
+        host=host,
+        clock=clock,
+        advisor_factory=advisor_factory,
+        spec=spec,
+        configured_call_bound_seconds=configured_call_bound_seconds,
+        configured_dwell_seconds=configured_dwell_seconds,
+        evaluator=evaluator,
     )
     return await run.execute()
