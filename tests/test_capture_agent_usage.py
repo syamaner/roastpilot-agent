@@ -13596,7 +13596,6 @@ def test_native_usage_and_evidence_collection_contracts_are_documented() -> None
     assert "re-read the live PR head, checks" in runbook
 
 
-@pytest.mark.docs
 def test_native_codex_capture_unsupported_status_is_documented() -> None:
     """D206 documents the deliberate unsupported native-Codex capture state."""
     normalized = {
