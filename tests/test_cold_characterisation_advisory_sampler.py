@@ -50,9 +50,13 @@ from roastpilot_agent.cold_characterisation import evidence_schema as schema
 from roastpilot_agent.cold_characterisation import evidence_store as store
 from roastpilot_agent.cold_characterisation.advisory_sampler import (
     ColdAdvisoryAdvisorPort,
+    ColdAdvisoryCallFact,
+    ColdAdvisoryCancellationRequest,
     ColdAdvisoryClockPort,
     ColdAdvisoryEvaluatorPort,
+    ColdAdvisoryProviderObservation,
     ColdAdvisoryProviderTask,
+    ColdAdvisoryProviderTaskState,
     ColdAdvisorySampler,
     ColdAdvisorySamplerRefusedError,
     ColdAdvisorySamplerRun,
@@ -85,6 +89,9 @@ Kind = advisory.ColdAdvisoryResolution
 Stop = ColdAdvisorySamplerStop
 Closure = ColdAdvisorySettlementClosure
 Fact = ColdAdvisoryProviderTask
+Req = ColdAdvisoryCancellationRequest
+TaskState = ColdAdvisoryProviderTaskState
+Call = ColdAdvisoryCallFact
 Intent = advisory.ColdAdvisoryIntentRecord
 Resolution = advisory.ColdAdvisoryResolutionRecord
 Record = Intent | Resolution
@@ -1412,11 +1419,13 @@ async def test_lookup_value_classification(base: Base, pid: str) -> None:
             None,
         )
         assert (advisor.getter_reads, rig.sink.resolutions) == (1, [])
+        assert (clock.monotonic_calls, clock.utc_calls) == (2, 2)
         expected = (Closure.RECORDED_UNRESOLVED_NOT_INVOKED, Fact.NONE, 1)
     settled = rig.sampler.settle_at_phase_end()
     assert triple(settled) == expected
     assert rig.sampler.settle_at_phase_end() is settled
     if not callable_value:
+        assert (clock.monotonic_calls, clock.utc_calls) == (3, 3)
         record = only(rig)
         assert record.resolution is Kind.UNRESOLVED_AT_PHASE_END
         assert (record.invocation_monotonic, record.invocation_utc) == (None, None)
@@ -3447,6 +3456,545 @@ async def test_resolution_append_refused(base: Base, pid: str) -> None:
         await idle()
 
 
+# ------------------------------------------------------------------ cancellation request (5c-ii-a)
+
+
+class Halt(BaseException):
+    """A test-local interruption that is not an ``Exception``."""
+
+
+class CountingFuture(asyncio.Future[None]):
+    """A provider-awaited future whose ``cancel`` override counts every request.
+
+    Each request runs one one-shot ``on_cancel`` hook, then raises one one-shot
+    ``error`` if armed, and otherwise delegates to ``Future.cancel``.
+    """
+
+    def __init__(
+        self,
+        *,
+        on_cancel: Callable[[], object] | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        super().__init__()
+        self.requests = 0
+        self.on_cancel = on_cancel
+        self.error = error
+
+    def cancel(self, msg: typing.Any | None = None) -> bool:
+        """Count the request, run the hook, raise the armed error or cancel."""
+        self.requests += 1
+        hook, self.on_cancel = self.on_cancel, None
+        if hook is not None:
+            hook()
+        error, self.error = self.error, None
+        if error is not None:
+            raise error
+        return super().cancel(msg)
+
+
+class FutureAdvisor:
+    """An advisor whose recommendation awaits one ``CountingFuture``.
+
+    ``honour`` re-raises a cancellation, ``ignore`` then waits for ``release`` and
+    returns, and ``suppress`` returns at once.  Entries, observed cancellations,
+    usage reads, ``get_recommendation`` lookups and descriptor calls are counted.
+    """
+
+    def __init__(
+        self,
+        future: CountingFuture,
+        mode: typing.Literal["honour", "ignore", "suppress"] = "honour",
+    ) -> None:
+        self.future = future
+        self.mode = mode
+        self.release = asyncio.Event()
+        self.entries = 0
+        self.cancelled = 0
+        self.descriptor_calls = 0
+        self.usage_reads = 0
+        self.lookup_reads = 0
+        self.usage = AdvisorUsage(input_tokens=100, output_tokens=10, total_tokens=110)
+
+    @property
+    def last_usage(self) -> AdvisorUsage | None:
+        """Count the read and return the current usage object."""
+        self.usage_reads += 1
+        return self.usage
+
+    def descriptor_for(self, phase: RoastPhase) -> AdvisorDescriptor:
+        """Count the call and return the fixed descriptor."""
+        self.descriptor_calls += 1
+        return DESCRIPTOR
+
+    @property
+    def get_recommendation(self) -> Callable[[AdvisorContext], Awaitable[RoastDecision]]:
+        """Count the lookup and return the recommendation coroutine function."""
+        self.lookup_reads += 1
+        return self._recommend
+
+    async def _recommend(self, context: AdvisorContext) -> RoastDecision:
+        """Await the future, applying the cancellation mode."""
+        self.entries += 1
+        try:
+            await self.future
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            if self.mode == "honour":
+                raise
+            if self.mode == "ignore":
+                await self.release.wait()
+        self.usage = AdvisorUsage(input_tokens=100, output_tokens=10, total_tokens=110)
+        return DECISION
+
+
+async def future_rig(
+    base: Base,
+    future: CountingFuture | None = None,
+    mode: typing.Literal["honour", "ignore", "suppress"] = "honour",
+) -> tuple[Rig, "asyncio.Task[ColdAdvisorySamplerRun]", CountingFuture]:
+    """Start a one-attempt run whose provider is entered and awaiting ``future``."""
+    future = CountingFuture() if future is None else future
+    rig = make(base, advisor=FutureAdvisor(future, mode), configured_dwell_seconds=MAX)
+    task = start(rig)
+    await drive(rig.clock, OPEN)
+    assert rig.advisor.entries == 1
+    return rig, task, future
+
+
+async def wind_down(rig: Rig, task: "asyncio.Task[typing.Any]") -> None:
+    """Test cleanup: release any future provider, end the run and the provider task."""
+    advisor = rig.advisor
+    if isinstance(advisor, FutureAdvisor):
+        advisor.release.set()
+        if not advisor.future.done():
+            advisor.future.set_result(None)
+    await finish(task, rig.clock)
+    await drive_until(lambda: provider_settled(rig))
+    await idle()
+
+
+def observed(rig: Rig) -> ColdAdvisoryProviderObservation:
+    """The observation, which must exist (a settlement is stored)."""
+    observation = rig.sampler.observe_provider_task()
+    assert observation is not None
+    return observation
+
+
+def pair(rig: Rig) -> tuple[TaskState, Call]:
+    """The observed task state and call fact."""
+    observation = observed(rig)
+    return (observation.task, observation.call)
+
+
+@pytest.mark.parametrize("pid", ["before_run", "sink_during_settlement"])
+@pytest.mark.asyncio
+async def test_request_before_settlement_is_provisional(base: Base, pid: str) -> None:
+    """S-T1: before a stored settlement the request is ``NOT_SETTLED``, unstored, inert."""
+    if pid == "before_run":
+        rig = make(base)
+        assert rig.sampler.request_provider_cancellation() is Req.NOT_SETTLED
+        assert rig.sampler.observe_provider_task() is None
+        rig.sampler.settle_at_phase_end()
+        assert rig.sampler.request_provider_cancellation() is Req.NO_PROVIDER_TASK
+        return
+    rig, task, future = await future_rig(base)
+    inner: list[Req] = []
+
+    def on_append(record: Record) -> None:
+        inner.append(rig.sampler.request_provider_cancellation())
+
+    rig.sink.on_append = on_append
+    try:
+        settled = rig.sampler.settle_at_phase_end()
+        assert settled.closure is Closure.RECORDED_UNRESOLVED_INVOKED
+        assert (inner, future.requests) == ([Req.NOT_SETTLED], 0)
+        assert rig.sampler.request_provider_cancellation() is Req.REQUESTED
+        assert future.requests == 1
+    finally:
+        await wind_down(rig, task)
+
+
+@pytest.mark.asyncio
+async def test_request_after_settlement_is_stored_once(base: Base) -> None:
+    """S-T2 (direct): two requests before yielding give one stored request and one cancel."""
+    rig, task, future = await future_rig(base)
+    try:
+        settled = rig.sampler.settle_at_phase_end()
+        first = rig.sampler.request_provider_cancellation()
+        second = rig.sampler.request_provider_cancellation()
+        assert (first, second) == (Req.REQUESTED, Req.REQUESTED)
+        assert future.requests == 1
+        await drive_until(lambda: provider_settled(rig))
+        assert rig.advisor.cancelled == 1
+        assert rig.sampler.settle_at_phase_end() is settled
+        assert pair(rig) == (TaskState.DONE_CANCELLED, Call.INVOKED_NO_OUTCOME)
+    finally:
+        await wind_down(rig, task)
+
+
+@pytest.mark.parametrize("pid", ["request", "observe", "settle"])
+@pytest.mark.asyncio
+async def test_request_reentry_from_cancel_override(base: Base, pid: str) -> None:
+    """S-T3 (direct): a reentry from the future's ``cancel`` sees ``IN_PROGRESS``."""
+    seen: list[object] = []
+    box: list[ColdAdvisorySettlement] = []
+    holder: list[Rig] = []
+
+    def reenter() -> None:
+        sampler = holder[0].sampler
+        if pid == "observe":
+            observation = sampler.observe_provider_task()
+            assert observation is not None
+            seen.append(observation.settlement_cancellation)
+        elif pid == "settle":
+            seen.append(sampler.settle_at_phase_end() is box[0])
+        seen.append(sampler.request_provider_cancellation())
+
+    rig, task, future = await future_rig(base, CountingFuture(on_cancel=reenter))
+    holder.append(rig)
+    try:
+        box.append(rig.sampler.settle_at_phase_end())
+        assert rig.sampler.request_provider_cancellation() is Req.REQUESTED
+        expected: dict[str, list[object]] = {
+            "request": [Req.IN_PROGRESS],
+            "observe": [Req.IN_PROGRESS, Req.IN_PROGRESS],
+            "settle": [True, Req.IN_PROGRESS],
+        }
+        assert seen == expected[pid]
+        assert future.requests == 1
+        assert observed(rig).settlement_cancellation is Req.REQUESTED
+    finally:
+        await wind_down(rig, task)
+
+
+@pytest.mark.asyncio
+async def test_request_raising_override_is_stored(base: Base) -> None:
+    """S-T4: an ``Exception`` from the override is stored as ``REQUEST_RAISED``."""
+    rig, task, future = await future_rig(base, CountingFuture(error=RuntimeError("cancel fault")))
+    try:
+        rig.sampler.settle_at_phase_end()
+        assert rig.sampler.request_provider_cancellation() is Req.REQUEST_RAISED
+        assert rig.sampler.request_provider_cancellation() is Req.REQUEST_RAISED
+        assert future.requests == 1
+        observation = observed(rig)
+        assert observation.task is TaskState.OUTSTANDING
+        assert observation.settlement_cancellation is Req.REQUEST_RAISED
+    finally:
+        await wind_down(rig, task)
+
+
+@pytest.mark.asyncio
+async def test_request_interrupted_override_is_latched(base: Base) -> None:
+    """S-T5: a ``BaseException`` propagates and leaves ``REQUEST_INTERRUPTED`` stored."""
+    rig, task, future = await future_rig(base, CountingFuture(error=Halt()))
+    try:
+        rig.sampler.settle_at_phase_end()
+        with pytest.raises(Halt):
+            rig.sampler.request_provider_cancellation()
+        assert rig.sampler.request_provider_cancellation() is Req.REQUEST_INTERRUPTED
+        assert future.requests == 1
+        observation = observed(rig)
+        assert observation.task is TaskState.OUTSTANDING
+        assert observation.settlement_cancellation is Req.REQUEST_INTERRUPTED
+    finally:
+        await wind_down(rig, task)
+
+
+@pytest.mark.parametrize("pid", ["no_task", "task_done"])
+@pytest.mark.asyncio
+async def test_request_without_live_task(base: Base, pid: str) -> None:
+    """S-T6: no published task, or a task already done, makes no cancel call."""
+    rig = make(base, configured_dwell_seconds=MAX)
+    if pid == "task_done":
+        await run_all(rig)
+    rig.sampler.settle_at_phase_end()
+    if pid == "no_task":
+        assert rig.sampler.request_provider_cancellation() is Req.NO_PROVIDER_TASK
+        assert observed(rig) == ColdAdvisoryProviderObservation(
+            task=TaskState.NONE,
+            call=Call.NO_CALL,
+            abandonment_cancel_requested=False,
+            settlement_cancellation=Req.NO_PROVIDER_TASK,
+        )
+    else:
+        assert rig.sampler.request_provider_cancellation() is Req.TASK_ALREADY_DONE
+        assert pair(rig) == (TaskState.DONE_RETURNED, Call.OUTCOME_PUBLISHED)
+
+
+class StubTask:
+    """A task stand-in whose ``cancel`` is refused while it is not done."""
+
+    def __init__(self) -> None:
+        self.cancels = 0
+
+    def done(self) -> bool:
+        """Never done."""
+        return False
+
+    def cancel(self, msg: object = None) -> bool:
+        """Count and refuse the request."""
+        self.cancels += 1
+        return False
+
+
+def test_request_not_accepted_white_box(base: Base) -> None:
+    """S-T7 (white-box): a refused ``cancel`` on a live task is ``REQUEST_NOT_ACCEPTED``."""
+    rig = make(base)
+    rig.sampler.settle_at_phase_end()
+    stub = StubTask()
+    priv(rig.sampler)._task = stub
+    assert rig.sampler.request_provider_cancellation() is Req.REQUEST_NOT_ACCEPTED
+    assert rig.sampler.request_provider_cancellation() is Req.REQUEST_NOT_ACCEPTED
+    assert stub.cancels == 1
+
+
+OBSERVATION_CASES: dict[str, tuple[Req, list[tuple[TaskState, Call]]]] = {
+    "honours": (Req.REQUESTED, [(TaskState.DONE_CANCELLED, Call.INVOKED_NO_OUTCOME)]),
+    "ignores": (
+        Req.REQUESTED,
+        [
+            (TaskState.OUTSTANDING, Call.INVOKED_NO_OUTCOME),
+            (TaskState.DONE_RETURNED, Call.DISCARDED_AFTER_SETTLEMENT),
+        ],
+    ),
+    "suppresses": (Req.REQUESTED, [(TaskState.DONE_RETURNED, Call.DISCARDED_AFTER_SETTLEMENT)]),
+    "raises_cancelled": (
+        Req.TASK_ALREADY_DONE,
+        [(TaskState.DONE_CANCELLED, Call.INVOKED_NO_OUTCOME)],
+    ),
+    "raises_base": (Req.TASK_ALREADY_DONE, [(TaskState.DONE_RAISED, Call.INVOKED_NO_OUTCOME)]),
+    "getter_cancelled": (Req.TASK_ALREADY_DONE, [(TaskState.DONE_CANCELLED, Call.NOT_INVOKED)]),
+    "refused": (
+        Req.TASK_ALREADY_DONE,
+        [(TaskState.DONE_RETURNED, Call.REFUSED_BEFORE_INVOCATION)],
+    ),
+    "completed": (Req.TASK_ALREADY_DONE, [(TaskState.DONE_RETURNED, Call.OUTCOME_PUBLISHED)]),
+}
+
+
+def _done_rig(base: Base, pid: str) -> Rig:
+    clock = ManualClock(13.5)
+    if pid == "raises_cancelled":
+        advisor = DoubleAdvisor(clock, [Act("raise_cancelled")])
+    elif pid == "raises_base":
+        advisor = DoubleAdvisor(clock, [Act(error=Halt())])
+    elif pid == "getter_cancelled":
+        advisor = DoubleAdvisor(clock)
+        advisor.getter_errors[1] = asyncio.CancelledError()
+    elif pid == "refused":
+        advisor = DoubleAdvisor(clock, lookup_value=None, override_lookup=True)
+    else:
+        advisor = DoubleAdvisor(clock)
+    return make(base, clock=clock, advisor=advisor, configured_dwell_seconds=MAX)
+
+
+@pytest.mark.parametrize("pid", sorted(OBSERVATION_CASES))
+@pytest.mark.asyncio
+async def test_observation_matrix(base: Base, pid: str) -> None:
+    """S-T8: exact independent task/call facts; the stored settlement never changes."""
+    request, expected = OBSERVATION_CASES[pid]
+    if pid in {"honours", "ignores", "suppresses"}:
+        mode = {"honours": "honour", "ignores": "ignore", "suppresses": "suppress"}[pid]
+        rig, task, _ = await future_rig(base, mode=typing.cast(typing.Any, mode))
+    else:
+        rig = _done_rig(base, pid)
+        task = start(rig)
+        await drive(rig.clock, 1800.0)
+        assert task.done()
+    try:
+        settled = rig.sampler.settle_at_phase_end()
+        snapshot = settled.model_dump()
+        assert rig.sampler.request_provider_cancellation() is request
+        await drive_until(lambda: provider_settled(rig) or pid == "ignores")
+        await idle()
+        seen = [pair(rig)]
+        if pid == "ignores":
+            rig.advisor.release.set()
+            await drive_until(lambda: provider_settled(rig))
+            seen.append(pair(rig))
+        assert seen == expected
+        observation = observed(rig)
+        assert observation.abandonment_cancel_requested is False
+        assert observation.settlement_cancellation is request
+        assert rig.sampler.settle_at_phase_end() is settled
+        assert priv(rig.sampler)._settlement is settled
+        assert settled.model_dump() == snapshot
+    finally:
+        await wind_down(rig, task)
+
+
+@pytest.mark.asyncio
+async def test_observation_self_cancelled_provider_with_outcome(base: Base) -> None:
+    """S-T9 (direct): a provider that self-cancels then returns is cancelled with an outcome."""
+    rig = make(base, configured_dwell_seconds=MAX)
+
+    def cancel_self() -> None:
+        typing.cast("asyncio.Task[None]", asyncio.current_task()).cancel()
+
+    rig.advisor.on_enter = cancel_self
+    result = await run_all(rig)
+    assert result.stop is Stop.WINDOW_EXHAUSTED
+    rig.sampler.settle_at_phase_end()
+    assert provider_task(rig).cancelled()
+    assert pair(rig) == (TaskState.DONE_CANCELLED, Call.OUTCOME_PUBLISHED)
+    assert rig.sampler.request_provider_cancellation() is Req.TASK_ALREADY_DONE
+
+
+@pytest.mark.asyncio
+async def test_observation_abandonment_flag_is_separate(base: Base) -> None:
+    """S-T10: the abandonment cancel is a flag; the settlement request is a separate fact."""
+    rig, task, future = await future_rig(base, mode="ignore")
+    try:
+        rig.clock.jump(5.0)
+        await drive_until(task.done)
+        assert task.result().stop is Stop.STOPPED_AFTER_ABANDONMENT
+        assert future.requests == 1
+        rig.sampler.settle_at_phase_end()
+        before = observed(rig)
+        assert (before.abandonment_cancel_requested, before.settlement_cancellation) == (True, None)
+        assert before.task is TaskState.OUTSTANDING
+        assert rig.sampler.request_provider_cancellation() is Req.REQUESTED
+        after = observed(rig)
+        assert (after.abandonment_cancel_requested, after.settlement_cancellation) == (
+            True,
+            Req.REQUESTED,
+        )
+    finally:
+        await wind_down(rig, task)
+
+
+@pytest.mark.asyncio
+async def test_observation_absent_before_settlement(base: Base) -> None:
+    """S-T11: no observation before settlement; right after the request it is outstanding."""
+    rig, task, _ = await future_rig(base)
+    try:
+        assert rig.sampler.observe_provider_task() is None
+        rig.sampler.settle_at_phase_end()
+        assert rig.sampler.request_provider_cancellation() is Req.REQUESTED
+        assert pair(rig) == (TaskState.OUTSTANDING, Call.INVOKED_NO_OUTCOME)
+    finally:
+        await wind_down(rig, task)
+
+
+def port_counts(rig: Rig) -> tuple[int, ...]:
+    """Every port-access counter: clock, advisor, sink, evaluator and tick port."""
+    advisor = rig.advisor
+    if isinstance(advisor, FutureAdvisor):
+        advisor_counts = (
+            advisor.usage_reads,
+            advisor.lookup_reads,
+            advisor.descriptor_calls,
+            advisor.entries,
+        )
+    else:
+        advisor_counts = (
+            advisor.getter_reads,
+            advisor.lookup_reads,
+            len(advisor.phases),
+            len(advisor.entries),
+        )
+    return (
+        rig.clock.monotonic_calls,
+        rig.clock.utc_calls,
+        *advisor_counts,
+        len(rig.sink.calls),
+        len(rig.evaluator.calls),
+        rig.ticks.calls,
+    )
+
+
+PORT_FREE: dict[str, tuple[Req, tuple[TaskState, Call] | None]] = {
+    "pre_settlement": (Req.NOT_SETTLED, None),
+    "provisional_in_progress": (Req.REQUESTED, (TaskState.OUTSTANDING, Call.INVOKED_NO_OUTCOME)),
+    "stored_no_task": (Req.NO_PROVIDER_TASK, (TaskState.NONE, Call.NO_CALL)),
+    "done_task": (Req.TASK_ALREADY_DONE, (TaskState.DONE_RETURNED, Call.OUTCOME_PUBLISHED)),
+    "outstanding": (Req.REQUESTED, (TaskState.OUTSTANDING, Call.INVOKED_NO_OUTCOME)),
+}
+
+
+@pytest.mark.parametrize("pid", sorted(PORT_FREE))
+@pytest.mark.asyncio
+async def test_request_and_observation_make_no_port_access(base: Base, pid: str) -> None:
+    """S-T12 (direct): neither method touches a clock, advisor, sink, evaluator or tick port.
+
+    Counters are compared around the calls with no intervening yield.  The only
+    foreign code a request may run is a provider future's ``cancel``; here that
+    callback is benign (``provisional_in_progress`` re-enters both methods from it
+    and checks the counters there too), so any change is the methods' own access.
+    """
+    request, expected = PORT_FREE[pid]
+    event = asyncio.Event()
+    inner: list[tuple[object, object, bool]] = []
+    holder: list[Rig] = []
+    task: asyncio.Task[ColdAdvisorySamplerRun] | None = None
+
+    def benign() -> None:
+        rig = holder[0]
+        before = port_counts(rig)
+        nested = rig.sampler.request_provider_cancellation()
+        cancellation = observed(rig).settlement_cancellation
+        inner.append((nested, cancellation, port_counts(rig) == before))
+
+    if pid == "provisional_in_progress":
+        rig, task, _ = await future_rig(base, CountingFuture(on_cancel=benign))
+    else:
+        acts = [Act("block", event=event)] if pid in {"pre_settlement", "outstanding"} else []
+        rig = make(base, acts=acts, configured_dwell_seconds=MAX)
+        if pid == "done_task":
+            await run_all(rig)
+        elif pid != "stored_no_task":
+            task = start(rig)
+            await drive(rig.clock, OPEN)
+    holder.append(rig)
+    try:
+        settled = None if pid == "pre_settlement" else rig.sampler.settle_at_phase_end()
+        before = port_counts(rig)
+        first = rig.sampler.request_provider_cancellation()
+        observation = rig.sampler.observe_provider_task()
+        second = rig.sampler.request_provider_cancellation()
+        assert port_counts(rig) == before
+        assert (first, second) == (request, request)
+        if expected is None:
+            assert observation is None
+            assert priv(rig.sampler)._settlement is None
+        else:
+            assert observation is not None
+            assert (observation.task, observation.call) == expected
+            assert rig.sampler.settle_at_phase_end() is settled
+        expected_inner = [(Req.IN_PROGRESS, Req.IN_PROGRESS, True)]
+        assert inner == (expected_inner if pid == "provisional_in_progress" else [])
+    finally:
+        event.set()
+        if task is not None:
+            await wind_down(rig, task)
+        await idle()
+
+
+def test_observation_model_is_closed() -> None:
+    """S-T13: the observation model is frozen, strict about enums and refuses extras."""
+    values: dict[str, object] = {
+        "task": TaskState.NONE,
+        "call": Call.NO_CALL,
+        "abandonment_cancel_requested": False,
+        "settlement_cancellation": None,
+    }
+    observation = ColdAdvisoryProviderObservation.model_validate(values)
+    with pytest.raises(pydantic.ValidationError):
+        typing.cast(typing.Any, observation).task = TaskState.OUTSTANDING
+    assert observation.task is TaskState.NONE
+    coercions: list[dict[str, object]] = [
+        {"task": "none"},
+        {"call": "no_call"},
+        {"settlement_cancellation": "requested"},
+    ]
+    for coerced in coercions:
+        with pytest.raises(pydantic.ValidationError):
+            ColdAdvisoryProviderObservation.model_validate({**values, **coerced})
+    with pytest.raises(pydantic.ValidationError):
+        ColdAdvisoryProviderObservation.model_validate({**values, "undeclared": 1})
+
+
 # ------------------------------------------------------------------ structure (AST oracles)
 
 
@@ -3582,10 +4130,12 @@ def _structural(pid: str) -> None:
         assert not set(types) & {"BaseException", "KeyboardInterrupt", "SystemExit"}
     elif pid == "single_provider_cancel_call":
         cancels = [ast.unparse(c.func) for c in _calls(TREE, "cancel")]
-        assert sorted(cancels) == ["task.cancel", "waiter.cancel"]
+        assert sorted(cancels) == ["task.cancel", "task.cancel", "waiter.cancel"]
         assert [ast.unparse(c.func) for c in _calls(_function("_abandon"), "cancel")] == [
             "task.cancel"
         ]
+        request = _function("request_provider_cancellation")
+        assert [ast.unparse(c.func) for c in _calls(request, "cancel")] == ["task.cancel"]
     elif pid == "provider_call_params":
         provider = _function("_provider_call")
         assert [a.arg for a in provider.args.args] == [
@@ -3602,7 +4152,13 @@ def _structural(pid: str) -> None:
     elif pid == "no_public_owner_parameter":
         signatures = {
             name: list(inspect.signature(getattr(ColdAdvisorySampler, name)).parameters)
-            for name in ("__init__", "run", "settle_at_phase_end")
+            for name in (
+                "__init__",
+                "run",
+                "settle_at_phase_end",
+                "request_provider_cancellation",
+                "observe_provider_task",
+            )
         }
         assert signatures == {
             "__init__": [
@@ -3621,6 +4177,8 @@ def _structural(pid: str) -> None:
             ],
             "run": ["self"],
             "settle_at_phase_end": ["self"],
+            "request_provider_cancellation": ["self"],
+            "observe_provider_task": ["self"],
         }
         assert "_Owner" not in sampler_module.__all__
         assert not [n for n in dir(ColdAdvisorySampler) if "owner" in n.lower()]
@@ -3975,9 +4533,13 @@ def test_import_and_capability_fence() -> None:
             assert all(isinstance(value, ast.Constant) for value in node.values)
     assert sampler_module.__all__ == (
         "ColdAdvisoryAdvisorPort",
+        "ColdAdvisoryCallFact",
+        "ColdAdvisoryCancellationRequest",
         "ColdAdvisoryClockPort",
         "ColdAdvisoryEvaluatorPort",
+        "ColdAdvisoryProviderObservation",
         "ColdAdvisoryProviderTask",
+        "ColdAdvisoryProviderTaskState",
         "ColdAdvisorySampler",
         "ColdAdvisorySamplerRefusedError",
         "ColdAdvisorySamplerRun",
@@ -3990,8 +4552,10 @@ def test_import_and_capability_fence() -> None:
     )
     assert all(
         issubclass(member, enum.Enum) and not issubclass(member, str)
-        for member in (Stop, Closure, Fact)
+        for member in (Stop, Closure, Fact, Req, TaskState, Call)
     )
+    for member in (Req, TaskState, Call):
+        assert all(item.value == item.name.lower() for item in member)
 
 
 # ------------------------------------------------------------------ policy-2 integration
