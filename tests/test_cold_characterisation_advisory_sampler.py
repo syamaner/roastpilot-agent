@@ -3497,8 +3497,8 @@ class FutureAdvisor:
     """An advisor whose recommendation awaits one ``CountingFuture``.
 
     ``honour`` re-raises a cancellation, ``ignore`` then waits for ``release`` and
-    returns, and ``suppress`` returns at once.  Entries, observed cancellations and
-    descriptor calls are counted.
+    returns, and ``suppress`` returns at once.  Entries, observed cancellations,
+    usage reads, ``get_recommendation`` lookups and descriptor calls are counted.
     """
 
     def __init__(
@@ -3513,6 +3513,7 @@ class FutureAdvisor:
         self.cancelled = 0
         self.descriptor_calls = 0
         self.usage_reads = 0
+        self.lookup_reads = 0
         self.usage = AdvisorUsage(input_tokens=100, output_tokens=10, total_tokens=110)
 
     @property
@@ -3526,7 +3527,13 @@ class FutureAdvisor:
         self.descriptor_calls += 1
         return DESCRIPTOR
 
-    async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
+    @property
+    def get_recommendation(self) -> Callable[[AdvisorContext], Awaitable[RoastDecision]]:
+        """Count the lookup and return the recommendation coroutine function."""
+        self.lookup_reads += 1
+        return self._recommend
+
+    async def _recommend(self, context: AdvisorContext) -> RoastDecision:
         """Await the future, applying the cancellation mode."""
         self.entries += 1
         try:
@@ -3874,7 +3881,12 @@ def port_counts(rig: Rig) -> tuple[int, ...]:
     """Every port-access counter: clock, advisor, sink, evaluator and tick port."""
     advisor = rig.advisor
     if isinstance(advisor, FutureAdvisor):
-        advisor_counts = (advisor.usage_reads, advisor.descriptor_calls, advisor.entries)
+        advisor_counts = (
+            advisor.usage_reads,
+            advisor.lookup_reads,
+            advisor.descriptor_calls,
+            advisor.entries,
+        )
     else:
         advisor_counts = (
             advisor.getter_reads,

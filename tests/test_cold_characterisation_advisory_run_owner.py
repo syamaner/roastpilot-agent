@@ -1186,15 +1186,18 @@ async def test_task_creation_raising_is_unconfirmed(owner_base: OwnerBase) -> No
     factory = InterruptingFactory(RuntimeError, None)
     previous = install(factory)
     try:
-        with pytest.warns(RuntimeWarning, match="was never awaited"):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             assert begin(rig, OFF) is Start.TASK_CREATION_UNCONFIRMED
-            gc.collect()
     finally:
         restore(previous)
+    messages = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert messages.count("coroutine 'ColdAdvisorySampler.run' was never awaited") == 1
     try:
         assert begin(rig, OFF) is Start.TASK_CREATION_UNCONFIRMED
         assert OFF in priv(rig.owner)._sampler
         assert factory.retained == []
+        assert rig.advisor.entries == []
         unconfirmed = ColdAdvisoryPhaseRun(state=RunState.UNCONFIRMED, stop=None)
         assert look(rig, OFF).run == unconfirmed
         assert (len(rig.advisor.phases), rig.factory.calls) == (1, 1)
@@ -1218,6 +1221,49 @@ def test_phase_run_stop_iff_finished(state: RunState, stop: Stop | None) -> None
     """A stop is present exactly when the run finished."""
     with pytest.raises(pydantic.ValidationError):
         ColdAdvisoryPhaseRun(state=state, stop=stop)
+
+
+@pytest.mark.asyncio
+async def test_phase_result_models_are_closed(owner_base: OwnerBase) -> None:
+    """Real settlement and observation results are frozen, strict and refuse extras."""
+    rig = owner_rig(owner_base)
+    try:
+        assert begin(rig, OFF) is Start.STARTED
+        settlement = settled(rig, OFF)
+        observation = look(rig, OFF)
+    finally:
+        await wind_owner(rig)
+    assert observation.settlement is settlement
+    settlement_values: dict[str, object] = {
+        "sampler": settlement.sampler,
+        "run_at_settlement": settlement.run_at_settlement,
+        "provider_cancellation": settlement.provider_cancellation,
+        "run_cancel_requested": settlement.run_cancel_requested,
+    }
+    observation_values: dict[str, object] = {
+        "start": observation.start,
+        "run": observation.run,
+        "provider": observation.provider,
+        "settlement": observation.settlement,
+    }
+    assert ColdAdvisoryPhaseSettlement.model_validate(settlement_values) == settlement
+    assert ColdAdvisoryPhaseObservation.model_validate(observation_values) == observation
+    rejected: list[tuple[type[pydantic.BaseModel], dict[str, object], dict[str, object]]] = [
+        (ColdAdvisoryPhaseSettlement, settlement_values, {"provider_cancellation": "requested"}),
+        (ColdAdvisoryPhaseSettlement, settlement_values, {"run_cancel_requested": 1}),
+        (ColdAdvisoryPhaseSettlement, settlement_values, {"undeclared": 1}),
+        (ColdAdvisoryPhaseObservation, observation_values, {"start": "started"}),
+        (ColdAdvisoryPhaseObservation, observation_values, {"run": None}),
+        (ColdAdvisoryPhaseObservation, observation_values, {"undeclared": 1}),
+    ]
+    for model, values, change in rejected:
+        with pytest.raises(pydantic.ValidationError):
+            model.model_validate({**values, **change})
+    with pytest.raises(pydantic.ValidationError):
+        typing.cast(typing.Any, settlement).run_cancel_requested = False
+    with pytest.raises(pydantic.ValidationError):
+        typing.cast(typing.Any, observation).start = None
+    assert (settlement.run_cancel_requested, observation.start) == (True, Start.STARTED)
 
 
 @pytest.mark.asyncio
