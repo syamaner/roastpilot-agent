@@ -1,0 +1,157 @@
+{
+  "epoch": "0123456789abcdef",
+  "frames": [
+    {
+      "name": "canonical_isoformat_micros",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-1\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_on\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"observed\",\"roast_fan_percent\":40,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-1",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_on\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"observed\",\"roast_fan_percent\":40,\"schema_version\":1}"
+    },
+    {
+      "name": "utc_without_micros",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-2\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:02+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-2",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:02+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}"
+    },
+    {
+      "name": "utc_zulu",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-3\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:03Z\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-3",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:03Z\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}"
+    },
+    {
+      "name": "device_absent",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-4\nevent: observation\ndata: {\"bean_temp_c\":null,\"cold_phase\":\"recording_off\",\"cooling_on\":null,\"device_reported\":false,\"env_temp_c\":null,\"fan_percent\":null,\"heat_percent\":null,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-4",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":null,\"cold_phase\":\"recording_off\",\"cooling_on\":null,\"device_reported\":false,\"env_temp_c\":null,\"fan_percent\":null,\"heat_percent\":null,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}"
+    },
+    {
+      "name": "device_temperatures_null",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-5\nevent: observation\ndata: {\"bean_temp_c\":null,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":null,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-5",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":null,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":null,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}"
+    },
+    {
+      "name": "heat_max_exact_int",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-6\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":9007199254740991,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-6",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":9007199254740991,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}"
+    },
+    {
+      "name": "heat_min_exact_int",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-7\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":-9007199254740991,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-7",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":-9007199254740991,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}"
+    },
+    {
+      "name": "heat_beyond_exact_int_projects_null",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-8\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":null,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-8",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":null,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}"
+    },
+    {
+      "name": "outcome_observed",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-9\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"observed\",\"roast_fan_percent\":55,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-9",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"observed\",\"roast_fan_percent\":55,\"schema_version\":1}"
+    },
+    {
+      "name": "outcome_not_eligible",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-10\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-10",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}"
+    },
+    {
+      "name": "outcome_unsupported",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-11\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"unsupported\",\"roast_fan_percent\":null,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-11",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"unsupported\",\"roast_fan_percent\":null,\"schema_version\":1}"
+    },
+    {
+      "name": "outcome_unreadable",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-12\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"unreadable\",\"roast_fan_percent\":null,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-12",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"unreadable\",\"roast_fan_percent\":null,\"schema_version\":1}"
+    },
+    {
+      "name": "outcome_malformed",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-13\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"malformed\",\"roast_fan_percent\":null,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-13",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"malformed\",\"roast_fan_percent\":null,\"schema_version\":1}"
+    },
+    {
+      "name": "observed_level_0",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-14\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"observed\",\"roast_fan_percent\":0,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-14",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"observed\",\"roast_fan_percent\":0,\"schema_version\":1}"
+    },
+    {
+      "name": "observed_level_100",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-15\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"observed\",\"roast_fan_percent\":100,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-15",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"observed\",\"roast_fan_percent\":100,\"schema_version\":1}"
+    },
+    {
+      "name": "cooling_on_true",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-16\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":true,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-16",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":true,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}"
+    },
+    {
+      "name": "cooling_on_false",
+      "source": "retained_tick",
+      "frame_text": "id: 0123456789abcdef-17\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-17",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_off\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"not_eligible\",\"roast_fan_percent\":null,\"schema_version\":1}"
+    },
+    {
+      "name": "observed_null_level",
+      "source": "public_model_only",
+      "frame_text": "id: 0123456789abcdef-18\nevent: observation\ndata: {\"bean_temp_c\":21.5,\"cold_phase\":\"recording_on\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"observed\",\"roast_fan_percent\":null,\"schema_version\":1}\n\n",
+      "id": "0123456789abcdef-18",
+      "event": "observation",
+      "data": "{\"bean_temp_c\":21.5,\"cold_phase\":\"recording_on\",\"cooling_on\":false,\"device_reported\":true,\"env_temp_c\":22.25,\"fan_percent\":null,\"heat_percent\":0,\"recorded_at_utc\":\"2026-01-01T00:00:01.250000+00:00\",\"roast_fan_outcome\":\"observed\",\"roast_fan_percent\":null,\"schema_version\":1}"
+    },
+    {
+      "name": "heartbeat",
+      "source": "heartbeat",
+      "frame_text": "event: heartbeat\ndata: {}\n\n",
+      "id": null,
+      "event": "heartbeat",
+      "data": "{}"
+    }
+  ]
+}
