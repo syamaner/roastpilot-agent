@@ -24,7 +24,8 @@ claim. #954 stays open, and E11-S3 is not started.
 - **The independent operator emergency stop is required throughout the run.**
   The hosted app is read-only and cannot actuate an emergency stop.
 - The appliance service is stopped, so neither the serial port nor port 8000 is
-  held by another process.
+  held by another process. A successful bind does not prove that the service
+  was stopped; confirm it independently.
 - The shell exports no `COFFEE_*` variable, and the configured `mcp.env` is
   empty. The cold composition refuses either one.
 - `ROASTPILOT_CONFIG_FILE` names a cold-specific configuration file whose
@@ -120,8 +121,8 @@ profile, note, credential or exception text is printed.
 | 5 | `REFUSED_BEFORE_EVIDENCE` | |
 | 6 | `NOT_CONFORMANT` | |
 | 7 | `EVIDENCE_NOT_SEALED` | |
-| 8 | Unadmitted result or propagated exception; this invocation's child status is unknown | Not proof that the child is absent |
-| 130 / 143 | Cancelled by SIGINT / SIGTERM; before the run `run_invoked=false`, during it the child is unknown | Not proof that the child is absent |
+| 8 | Unadmitted result, propagated exception, or any other non-cancellation failure out of the run (after the engine's own cleanup); this invocation's child status is unknown | Not proof that the child is absent |
+| 130 / 143 | Cancelled by SIGINT / SIGTERM; before the run `run_invoked=false`, during it the child is unknown. Exit 130 with `signal=none` means the process was interrupted or cancelled without a recorded first signal | Not proof that the child is absent |
 | 80-83 | Pending provider call at the single post-seal check; self-termination | See below |
 | 1 | Unexpected failure outside this runbook, including a cancellation no signal requested | |
 
@@ -141,12 +142,19 @@ profile, note, credential or exception text is printed.
   `roastpilot-cold-*` and `roastpilot-cold-store-*` temporary directories
   (holding the operator YAML and the SQLite store) remain for operator cleanup,
   and the MCP child may be orphaned.
+- A missing or incomplete closed summary is not evidence of any outcome. In
+  particular, an exit status of 0 without a complete closed summary is not
+  conformance.
+- If the process exit status differs from the summary's `exit_code` line, the
+  process was interrupted after the summary was written, and teardown may be
+  incomplete and is uncertain. A printed summary is never a delivery receipt.
 
 ## 6. Evidence
 
 On an ordinary exit with a `manifest_sha256` value, record that value
 **externally** (for example in the supervision notes) as the receipt. Never
-derive the receipt from the evidence tree itself.
+derive the receipt from the evidence tree itself. If no `manifest_sha256` value
+was printed, there is no receipt for that run.
 
 The software writes only the primary root. The operator copies the run tree to
 the secondary root. The run directory under the primary root is named by the
@@ -163,6 +171,9 @@ Independent Pi evidence review follows separately.
 
 - The first Ctrl-C or SIGTERM before the run starts means the run is never
   invoked; the process cleans up and exits 130 or 143.
+- A SIGTERM that arrives before the cold runner has installed its handlers keeps
+  the default disposition: the process ends with no summary. A Ctrl-C at that
+  point exits 130 with a closed summary that records `signal=none`.
 - The first signal during the run triggers the engine's shielded cleanup and
   then the ordinary teardown.
 - **Repeated signals neither force an exit nor cancel again.** There is no

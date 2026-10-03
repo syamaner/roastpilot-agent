@@ -64,6 +64,14 @@ def test_runbook_states_the_safety_boundaries() -> None:
         "advisory only",
         "Never derive the receipt from the evidence tree itself.",
         "There is no CLI verifier",
+        "A successful bind does not prove that the service was stopped",
+        "If no `manifest_sha256` value was printed, there is no receipt for that run.",
+        "an exit status of 0 without a complete closed summary is not conformance",
+        "If the process exit status differs from the summary's `exit_code` line",
+        "teardown may be incomplete and is uncertain",
+        "keeps the default disposition: the process ends with no summary",
+        "Exit 130 with `signal=none` means the process was interrupted or cancelled "
+        "without a recorded first signal",
     ):
         assert phrase.replace("**", "") in text.replace("**", ""), phrase
 
