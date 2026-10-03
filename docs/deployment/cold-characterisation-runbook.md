@@ -91,7 +91,10 @@ roastpilot-agent cold-characterisation \
   refuses the run. Point `--spa-dir` only at a trusted built SPA directory:
   every file under it is served to unauthenticated clients. An explicitly empty
   `--host` is a usage error; any non-loopback bind must name its address
-  explicitly and is covered by the LAN residual in §4.
+  explicitly and is covered by the LAN residual in §4. `--port` must be
+  1-65535: `0` (which would pick an unannounced ephemeral port) and out-of-range
+  values are usage errors, as is an explicitly empty `--spa-dir`; a relative
+  `--spa-dir` resolves against the current working directory.
 - The provenance options (`--source-revision`, `--source-tree`,
   `--artefact-kind`, `--artefact-sha256`) are an **operator assertion**, not an
   attestation. The self-reported versions, the temporary directories and the
