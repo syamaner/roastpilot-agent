@@ -184,7 +184,7 @@ outstanding. E11-S3 remains the unstarted Pi soak.
 
 **#954 cold characterisation (Oct 2026):** the software for the supervised
 cold characterisation is delivered across U1 (PR #993), U2 (PR #994), the U3
-cold view and U4 (the cold CLI, same-loop hosting and
+cold view (PR #995) and U4 (the cold CLI, same-loop hosting and
 `docs/deployment/cold-characterisation-runbook.md`). The physical cold run and
 E11-S3 are not started, every operator-supervised gate is unexecuted, and #954
 stays open.

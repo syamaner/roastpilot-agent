@@ -39,7 +39,7 @@ supersedes the in-progress or stays-open-pending language in all earlier #702
 
 **3 Oct 2026 — #954 cold characterisation software delivered (#954 stays
 OPEN):** the software for the supervised cold characterisation is delivered
-across U1 (PR #993), U2 (PR #994), the U3 cold view and U4 (the
+across U1 (PR #993), U2 (PR #994), the U3 cold view (PR #995) and U4 (the
 `roastpilot-agent cold-characterisation` action, same-loop hosting of the
 read-only app, and `docs/deployment/cold-characterisation-runbook.md`). No
 hardware, Pi or physical cold run has taken place: the supervised gate chain
