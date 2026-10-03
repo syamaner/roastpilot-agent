@@ -1526,6 +1526,10 @@ def main() -> int:
     ``appliance ...`` runs the native Pi appliance packaging commands (#138);
     without any of these the scaffold entrypoint prints help."""
     argv = sys.argv[1:]
+    if argv and argv[0] == "cold-characterisation":
+        from roastpilot_agent.cold_cli import main as cold_main
+
+        return cold_main(argv[1:])
     if argv and argv[0] == "appliance":
         return _run_appliance_cli(argv[1:])
     parser = _build_parser()
