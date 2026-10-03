@@ -257,8 +257,22 @@ def _mark_run_invoked() -> None:
     _RUN_INVOKED = True  # pyright: ignore[reportConstantRedefinition]
 
 
-def _report(summary: ColdRunSummary) -> int:
-    """Emit the summary, remember its code, and return the code."""
+def report_summary(summary: ColdRunSummary) -> int:
+    """Attempt to report one closed summary and return its exit code.
+
+    The report-attempt latch (see :func:`reported_exit_code`) is set first, before
+    any formatting or output, so an interrupt during rendering or writing still
+    leaves the attempt recorded.  It marks an attempt only: it never proves the
+    summary was delivered and is never a receipt.  The summary values come only
+    from the caller's closed :class:`ColdRunSummary`; this neither reads nor sets
+    the per-interpreter latch or the run-invoked fact.
+
+    Args:
+        summary: The closed summary to report.
+
+    Returns:
+        The summary's exit code.
+    """
     global _REPORTED_EXIT
     _REPORTED_EXIT = summary.exit_code  # pyright: ignore[reportConstantRedefinition]
     emit(render_summary(summary))
@@ -624,7 +638,7 @@ class _HostedRun:
     async def teardown(self, summary: ColdRunSummary) -> int:
         """Step 8: summary, then reverse-order teardown; every step is contained."""
         self.state.phase = _Phase.POST_ENGINE
-        code = _report(dataclasses.replace(summary, signal_number=self.state.signal_number))
+        code = report_summary(dataclasses.replace(summary, signal_number=self.state.signal_number))
         hub, server, task, sock = self.hub, self.server, self.serve_task, self.sock
         if hub is not None:
             _contain(hub.close)
@@ -691,7 +705,7 @@ async def run_hosted(
     """
     global _CONSUMED
     if _CONSUMED:
-        return _report(
+        return report_summary(
             ColdRunSummary(
                 run_invoked=False,
                 result=SummaryResult.CLI_REFUSED,

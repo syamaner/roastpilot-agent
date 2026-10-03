@@ -220,7 +220,8 @@ def _read_within(opener: Opener, path: Path, limit: int) -> bytes | None:
     """Read with a one-byte over-read check; ``None`` when absent, failing or over."""
     try:
         data = opener(path, limit + 1)
-    except OSError:
+    except Exception:
+        # Any ordinary probe failure refuses; BaseException (interrupts) propagates.
         return None
     return data if len(data) <= limit else None
 
@@ -274,7 +275,7 @@ def read_host_facts(
     *,
     opener: Opener = read_bounded,
     mcp_version: Callable[[], str] = _mcp_version,
-    platform_values: Callable[[], tuple[str, str, str, str, str]] = _platform_values,
+    platform_values: Callable[[], object] = _platform_values,
 ) -> ColdHostFacts | None:
     """Read the caller-observed host facts, failing closed.
 
@@ -284,13 +285,28 @@ def read_host_facts(
         platform_values: Returns the five platform strings.
 
     Returns:
-        The admitted facts, or ``None`` on any absent, oversized or malformed fact.
+        The admitted facts, or ``None`` on any absent, oversized or malformed fact
+        or any ordinary (``Exception``) probe failure.  Interrupts and other
+        ``BaseException`` subclasses propagate unchanged; no exception is retained
+        or formatted.
     """
     try:
         version = mcp_version()
-    except importlib.metadata.PackageNotFoundError:
+    except Exception:
         return None
-    python_version, platform_text, machine, operating_system, kernel = platform_values()
+    try:
+        values = platform_values()
+    except Exception:
+        return None
+    if type(values) is not tuple:
+        return None
+    shape = typing.cast(tuple[object, ...], values)
+    if len(shape) != 5:
+        return None
+    # Element types are judged by the strict ColdHostFacts model below.
+    python_version, platform_text, machine, operating_system, kernel = typing.cast(
+        tuple[str, str, str, str, str], shape
+    )
     pi_model = _pi_model(opener)
     pi_revision = _pi_revision(opener)
     if pi_model is None or pi_revision is None:
@@ -312,18 +328,15 @@ def read_host_facts(
 
 
 def _refuse(refusal: cold_runner.CliRefusal, code: int) -> int:
-    """Print the closed refusal summary (run not invoked) and return ``code``."""
-    cold_runner.emit(
-        cold_runner.render_summary(
-            cold_runner.ColdRunSummary(
-                run_invoked=False,
-                result=cold_runner.SummaryResult.CLI_REFUSED,
-                exit_code=code,
-                cli_refusal=refusal,
-            )
+    """Attempt the closed refusal summary (run not invoked) and return ``code``."""
+    return cold_runner.report_summary(
+        cold_runner.ColdRunSummary(
+            run_invoked=False,
+            result=cold_runner.SummaryResult.CLI_REFUSED,
+            exit_code=code,
+            cli_refusal=refusal,
         )
     )
-    return code
 
 
 def _resolve_spa_dir(explicit: str | None) -> Path | None:
@@ -424,17 +437,14 @@ def main(argv: Sequence[str]) -> int:
         if cold_runner.reported_exit_code() is not None:
             return _CANCELLED_EXIT
         invoked = cold_runner.run_invoked()
-        cold_runner.emit(
-            cold_runner.render_summary(
-                cold_runner.ColdRunSummary(
-                    run_invoked=invoked,
-                    result=(
-                        cold_runner.SummaryResult.CANCELLED
-                        if invoked
-                        else cold_runner.SummaryResult.CANCELLED_BEFORE_RUN
-                    ),
-                    exit_code=_CANCELLED_EXIT,
-                )
+        return cold_runner.report_summary(
+            cold_runner.ColdRunSummary(
+                run_invoked=invoked,
+                result=(
+                    cold_runner.SummaryResult.CANCELLED
+                    if invoked
+                    else cold_runner.SummaryResult.CANCELLED_BEFORE_RUN
+                ),
+                exit_code=_CANCELLED_EXIT,
             )
         )
-        return _CANCELLED_EXIT

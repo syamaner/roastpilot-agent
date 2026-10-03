@@ -8,8 +8,12 @@ its injected opener.
 
 # pyright: reportPrivateUsage=false
 
+import ast
+import asyncio
 import builtins
+import functools
 import importlib.metadata
+import inspect
 import os
 import sys
 import typing
@@ -760,3 +764,290 @@ def test_main_dispatch_returns_the_runner_code(
     harness.code = 7
     monkeypatch.setattr(sys, "argv", ["roastpilot-agent", "cold-characterisation", *base_argv()])
     assert cli.main() == 7
+
+
+# --- A4.1: host-probe failures refuse; interrupts propagate --------------------------------
+
+REAL_READ_HOST_FACTS = cold_cli.read_host_facts
+VALID_VALUES = ("3.11.9", "Linux-x", "aarch64", "Linux", "6.6")
+
+
+def _valid_opener(path: Path, limit: int) -> bytes:
+    return {cold_cli.PI_MODEL_PATH: MODEL, cold_cli.CPUINFO_PATH: CPUINFO}[path][:limit]
+
+
+def _valid_version() -> str:
+    return "0.2.2"
+
+
+def _valid_values() -> object:
+    return VALID_VALUES
+
+
+def _four_values() -> object:
+    return VALID_VALUES[:4]
+
+
+def _raising(error: BaseException) -> Callable[..., typing.NoReturn]:
+    def raise_it(*_args: object, **_kwargs: object) -> typing.NoReturn:
+        raise error
+
+    return raise_it
+
+
+def _opener_failing_at(path: Path, error: BaseException) -> Callable[[Path, int], bytes]:
+    def opener(target: Path, limit: int) -> bytes:
+        if target == path:
+            raise error
+        return _valid_opener(target, limit)
+
+    return opener
+
+
+def probe_outcome(
+    *,
+    version: Callable[[], str] = lambda: "0.2.2",
+    values: Callable[[], object] = lambda: VALID_VALUES,
+    opener: Callable[[Path, int], bytes] = _valid_opener,
+) -> object:
+    """``read_host_facts``'s result, or the ordinary exception it let escape.
+
+    Capturing an escaped exception as the outcome makes a missing catch fail the
+    explicit ``outcome is None`` assertion rather than error the test.
+    """
+    try:
+        return REAL_READ_HOST_FACTS(opener=opener, mcp_version=version, platform_values=values)
+    except Exception as exc:
+        return exc
+
+
+def _decode_error() -> UnicodeDecodeError:
+    return UnicodeDecodeError("ascii", b"\xff", 0, 1, MARKER)
+
+
+VERSION_ERRORS: list[BaseException] = [
+    OSError(MARKER),
+    _decode_error(),
+    ValueError(MARKER),
+    RuntimeError(MARKER),
+]
+MALFORMED_VALUES: list[object] = [
+    list(VALID_VALUES),
+    VALID_VALUES[:4],
+    (*VALID_VALUES, "extra"),
+    None,
+    ("3.11.9", 5, "aarch64", "Linux", "6.6"),
+    ("3.11.9", b"x", "aarch64", "Linux", "6.6"),
+]
+
+
+def test_valid_probe_outcome_is_admitted() -> None:
+    """Positive control for the probe helper: valid fakes admit the facts."""
+    assert isinstance(probe_outcome(), ColdHostFacts)
+
+
+@pytest.mark.parametrize("error", VERSION_ERRORS, ids=["os", "decode", "value", "runtime"])
+def test_any_ordinary_version_probe_error_refuses(error: BaseException) -> None:
+    """C31: every ordinary version-probe failure refuses as ``None``."""
+    assert probe_outcome(version=_raising(error)) is None
+
+
+@pytest.mark.parametrize("error", [OSError(MARKER), _decode_error()], ids=["os", "decode"])
+def test_any_ordinary_platform_probe_error_refuses(error: BaseException) -> None:
+    """C32: a platform-probe failure refuses as ``None``."""
+    assert probe_outcome(values=_raising(error)) is None
+
+
+@pytest.mark.parametrize(
+    "values",
+    MALFORMED_VALUES,
+    ids=["list", "four", "six", "none", "int-element", "bytes-element"],
+)
+def test_malformed_platform_values_refuse(values: object) -> None:
+    """C33a/C33b: only an exact five-element tuple of strings is admitted."""
+    assert probe_outcome(values=lambda: values) is None
+
+
+@pytest.mark.parametrize("which", ["model", "cpuinfo"])
+@pytest.mark.parametrize(
+    "error", [ValueError(MARKER), RuntimeError(MARKER)], ids=["value", "runtime"]
+)
+def test_any_ordinary_opener_error_refuses(which: str, error: BaseException) -> None:
+    """C33d: a non-OSError opener failure refuses as ``None``."""
+    path = cold_cli.PI_MODEL_PATH if which == "model" else cold_cli.CPUINFO_PATH
+    assert probe_outcome(opener=_opener_failing_at(path, error)) is None
+
+
+INTERRUPTS: list[type[BaseException]] = [KeyboardInterrupt, asyncio.CancelledError]
+
+
+@pytest.mark.parametrize("interrupt", INTERRUPTS, ids=["keyboard", "cancelled"])
+@pytest.mark.parametrize("probe", ["version", "platform", "opener"])
+def test_interrupts_from_any_probe_propagate(probe: str, interrupt: type[BaseException]) -> None:
+    """C33c: interrupts are never swallowed by a probe catch."""
+    kwargs: dict[str, typing.Any] = {}
+    if probe == "version":
+        kwargs["version"] = _raising(interrupt())
+    elif probe == "platform":
+        kwargs["values"] = _raising(interrupt())
+    else:
+        kwargs["opener"] = _opener_failing_at(cold_cli.PI_MODEL_PATH, interrupt())
+    with pytest.raises(interrupt):
+        probe_outcome(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["version", "platform", "malformed", "opener"],
+)
+def test_probe_failures_through_main_refuse_before_the_run(
+    harness: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    fault: str,
+) -> None:
+    """Probe failures reach ``main`` as host_facts_not_read, exit 3, nothing leaked."""
+    version: Callable[[], str] = _valid_version
+    values: Callable[[], object] = _valid_values
+    opener: Callable[[Path, int], bytes] = _valid_opener
+    if fault == "version":
+        version = _raising(RuntimeError(MARKER))
+    elif fault == "platform":
+        values = _raising(OSError(MARKER))
+    elif fault == "malformed":
+        values = _four_values
+    else:
+        opener = _opener_failing_at(cold_cli.CPUINFO_PATH, ValueError(MARKER))
+    monkeypatch.setattr(
+        cold_cli,
+        "read_host_facts",
+        functools.partial(
+            REAL_READ_HOST_FACTS, opener=opener, mcp_version=version, platform_values=values
+        ),
+    )
+    assert exit_status(base_argv()) == 3
+    captured = capsys.readouterr()
+    summary = parse_summary(captured.out)
+    assert (summary["cli_refusal"], summary["run_invoked"]) == ("host_facts_not_read", "false")
+    assert harness.hosted == []
+    assert MARKER not in captured.out + captured.err + caplog.text
+
+
+def test_probe_interrupt_through_main_reports_cancelled_before_run(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        cold_cli,
+        "read_host_facts",
+        functools.partial(
+            REAL_READ_HOST_FACTS,
+            opener=_valid_opener,
+            mcp_version=_raising(KeyboardInterrupt()),
+            platform_values=lambda: VALID_VALUES,
+        ),
+    )
+    assert cold_cli.main(base_argv()) == 130
+    out = capsys.readouterr().out
+    assert out.count("mode=cold_characterisation\n") == 1
+    assert parse_summary(out)["result"] == "cancelled_before_run"
+    assert harness.hosted == []
+
+
+# --- A4.2: every cold summary goes through the latched report attempt ----------------------
+
+
+def _config_refusing() -> typing.NoReturn:
+    raise ConfigFileError("broken")
+
+
+def test_interrupt_while_the_refusal_is_written_never_writes_a_second_summary(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-a (C34/C35a): the refusal attempt is latched before output; no second summary."""
+    calls: list[str] = []
+
+    def emit(text: str) -> None:
+        calls.append(text)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cold_cli, "load_app_config", _config_refusing)
+    monkeypatch.setattr(cold_runner, "emit", emit)
+    assert cold_cli.main(base_argv()) == 130
+    assert cold_runner.reported_exit_code() == 3
+    assert sum("mode=cold_characterisation" in text for text in calls) == 1
+
+
+def test_interrupt_while_the_refusal_is_rendered_is_already_latched(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-b (C35b): the attempt is marked before rendering; no summary is written."""
+    calls: list[str] = []
+    real_render = cold_runner.render_summary
+    raised: list[bool] = []
+
+    def render(summary: cold_runner.ColdRunSummary) -> str:
+        if not raised:
+            raised.append(True)
+            raise KeyboardInterrupt
+        return real_render(summary)
+
+    monkeypatch.setattr(cold_cli, "load_app_config", _config_refusing)
+    monkeypatch.setattr(cold_runner, "render_summary", render)
+    monkeypatch.setattr(cold_runner, "emit", calls.append)
+    assert cold_cli.main(base_argv()) == 130
+    assert cold_runner.reported_exit_code() == 3
+    assert calls == []
+
+
+def test_the_cancelled_fallback_summary_is_a_latched_attempt(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """R-c (C36): the fallback summary goes through the latched reporter."""
+    monkeypatch.setattr(cold_cli, "load_app_config", _raising(KeyboardInterrupt()))
+    assert cold_cli.main(base_argv()) == 130
+    assert cold_runner.reported_exit_code() == 130
+    assert parse_summary(capsys.readouterr().out)["result"] == "cancelled_before_run"
+
+
+_FORBIDDEN_REPORT_CALLS = frozenset({"emit", "render_summary"})
+_FORBIDDEN_REPORT_NAMES = frozenset({"_report", "_REPORTED_EXIT"})
+
+
+def _direct_report_violations(source: str) -> list[str]:
+    """R-d: direct emit/render calls or private latch access in CLI source."""
+    problems: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name in _FORBIDDEN_REPORT_CALLS:
+                problems.append(f"call:{name}")
+        if isinstance(node, ast.Name) and node.id in _FORBIDDEN_REPORT_NAMES:
+            problems.append(f"name:{node.id}")
+        if isinstance(node, ast.Attribute) and node.attr in _FORBIDDEN_REPORT_NAMES:
+            problems.append(f"attr:{node.attr}")
+    return problems
+
+
+def test_cli_reports_only_through_the_latched_reporter() -> None:
+    """R-d (static): the CLI never emits, renders or touches the private latch directly."""
+    assert _direct_report_violations(inspect.getsource(cold_cli)) == []
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "cold_runner.emit('x')\n",
+        "emit('x')\n",
+        "cold_runner.render_summary(s)\n",
+        "render_summary(s)\n",
+        "cold_runner._report(s)\n",
+        "cold_runner._REPORTED_EXIT\n",
+        "_REPORTED_EXIT = 1\n",
+    ],
+)
+def test_direct_report_checker_flags_negative_controls(snippet: str) -> None:
+    """C37: each forbidden form is flagged by the R-d checker."""
+    assert _direct_report_violations(snippet) != []

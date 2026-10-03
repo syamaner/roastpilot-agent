@@ -33,7 +33,7 @@ import pytest_asyncio
 import uvicorn
 from starlette.types import Message
 
-from roastpilot_agent import api, cold_runner
+from roastpilot_agent import api, cold_cli, cold_runner
 from roastpilot_agent.cold_app import COLD_OBSERVATION_EVENTS_PATH
 from roastpilot_agent.cold_characterisation import advisory_conformance
 from roastpilot_agent.cold_characterisation.advisory_sampler import ColdAdvisorySpec
@@ -1817,8 +1817,13 @@ def test_step_seven_has_no_await_between_handback_and_exit() -> None:
 
 def test_new_modules_avoid_normal_mode_wiring() -> None:
     """C21 (static): no env forwarding or live-service wiring in the cold modules."""
-    for path in (RUNNER_SOURCE, RUNNER_SOURCE.with_name("cold_cli.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    modules = (cold_runner, cold_cli)
+    assert {module.__name__ for module in modules} == {
+        "roastpilot_agent.cold_runner",
+        "roastpilot_agent.cold_cli",
+    }
+    for module in modules:
+        tree = ast.parse(inspect.getsource(module))
         names = {
             node.id if isinstance(node, ast.Name) else node.attr
             for node in ast.walk(tree)
@@ -1838,7 +1843,7 @@ def test_new_modules_avoid_normal_mode_wiring() -> None:
             "_SignalManagedServer",
             "_configure_access_log",
         }
-        assert not (names | imported) & forbidden, path.name
+        assert not (names | imported) & forbidden, module.__name__
 
 
 # --- the outer fallback for an interrupt escaping asyncio.run (cold_cli) ------------------
@@ -1859,7 +1864,6 @@ class NoDbStore(LoggingStore):
 
 def _cli_with_ports(monkeypatch: pytest.MonkeyPatch, ports: Ports, run: RunFn) -> None:
     """Route ``cold_cli.main`` into the real runner with these injected test ports."""
-    from roastpilot_agent import cold_cli
 
     def load() -> tuple[AppConfig, frozenset[str]]:
         return AppConfig(), frozenset()
@@ -1911,13 +1915,20 @@ def test_interrupt_after_the_engine_before_the_report_says_invoked(
     sync_ports: Ports, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """C28a: an interrupt at teardown entry reports cancelled, invoked, child unknown."""
-    from roastpilot_agent import cold_cli
 
-    def interrupted(_summary: cold_runner.ColdRunSummary) -> int:
-        raise KeyboardInterrupt
+    real_report = cold_runner.report_summary
+    fired: list[bool] = []
+
+    def interrupted(summary: cold_runner.ColdRunSummary) -> int:
+        # The runner's own teardown report is the first call: interrupt it before
+        # any attempt; the CLI fallback's later call reaches the real reporter.
+        if not fired:
+            fired.append(True)
+            raise KeyboardInterrupt
+        return real_report(summary)
 
     _cli_with_ports(monkeypatch, sync_ports, returning(ADVISORY_CONFORMANT))
-    monkeypatch.setattr(cold_runner, "_report", interrupted)
+    monkeypatch.setattr(cold_runner, "report_summary", interrupted)
     assert cold_cli.main(_cli_argv()) == 130
     out = capsys.readouterr().out
     assert "run" in LOG
@@ -1926,14 +1937,13 @@ def test_interrupt_after_the_engine_before_the_report_says_invoked(
     assert (summary["result"], summary["run_invoked"]) == ("cancelled", "true")
     assert (summary["child_ownership"], summary["signal"]) == ("unknown", "none")
     assert summary["exit_code"] == "130"
+    assert fired == [True]
 
 
 def test_interrupt_after_the_latch_before_the_engine_says_not_invoked(
     sync_ports: Ports, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """C28b: an interrupt inside store initialisation reports the run never invoked."""
-    from roastpilot_agent import cold_cli
-
     monkeypatch.setattr(NoDbStore, "interrupt_on_initialize", True)
     _cli_with_ports(monkeypatch, sync_ports, returning(ADVISORY_CONFORMANT))
     assert cold_cli.main(_cli_argv()) == 130
@@ -1949,8 +1959,6 @@ def test_interrupt_while_emitting_the_report_writes_no_second_summary(
     sync_ports: Ports, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """C29(i): once a report attempt began, the fallback never writes another summary."""
-    from roastpilot_agent import cold_cli
-
     real_emit = cold_runner.emit
     raised: list[bool] = []
 
@@ -1971,7 +1979,6 @@ def test_interrupt_during_handler_restore_keeps_exactly_one_summary(
     sync_ports: Ports, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """C29(ii): an interrupt after the summary returns 130 with no second summary."""
-    from roastpilot_agent import cold_cli
 
     def interrupted() -> None:
         raise KeyboardInterrupt
