@@ -44,12 +44,14 @@ child, per D6), mDNS, and a deployment doc. **No Docker image; no PyTorch on the
 
 ### E11-S1 — Wheel with bundled SPA + the `[pi]` extra
 
-**Delivered 5 Sep 2026:** E11-S1 now publishes a `pi` optional dependency
-extra pinned exactly to the torch-free `coffee-roaster-mcp==0.2.0`. The base
+**Delivered 5 Sep 2026:** E11-S1 publishes a `pi` optional dependency extra
+pinned exactly to a torch-free `coffee-roaster-mcp` release; it was delivered
+against `0.2.0`, and #954 has since unified the `[pi]` extra and the
+development group on the same published `coffee-roaster-mcp==0.2.2`. The base
 wheel remains lean: it has no unconditional MCP, `torch`, `torchaudio`, or
-`transformers` requirement. The development group deliberately remains pinned
-to MCP 0.1.13 for the mock-driver mirrors and fixtures, so development and Pi
-smokes use separate venvs. The package lane covers the base wheel on x86 and a
+`transformers` requirement. The regenerated contract fixtures validate that
+single release, and the Pi smokes still use their own separate venvs. The
+package lane covers the base wheel on x86 and a
 native hosted ARM64 runner covers `wheel[pi]`, its exact MCP pin, the CLI, and
 the replay-mode bundled SPA. Hosted ARM64 evidence is package compatibility
 only; it is not Raspberry Pi hardware validation.
@@ -66,12 +68,12 @@ Acceptance criteria:
   source-checkout `web/dist` (editable installs skip the hook entirely). CI `package`
   job builds the real wheel + smoke-tests it in a clean venv.
 - [x] A **`pi` optional-dependency extra** declares exactly the pinned,
-  torch-free `coffee-roaster-mcp==0.2.0`; package metadata and clean-venv
+  torch-free `coffee-roaster-mcp==0.2.2`; package metadata and clean-venv
   tests reject `torch`, `torchaudio`, and `transformers`. The base wheel stays
   lean; `roastpilot-agent[pi]` pulls only the appliance MCP dependency.
 - [x] Built-wheel smoke tests in CI: x86_64 installs the base wheel; native
   hosted ARM64 builds its own wheel, installs `wheel[pi]` in a separate clean
-  venv, verifies `aarch64` and MCP 0.2.0, and runs CLI and replay-mode SPA
+  venv, verifies `aarch64` and MCP 0.2.2, and runs CLI and replay-mode SPA
   smokes. This hosted-runner proof is not Pi hardware validation.
 - [x] Build-hook approach recorded in plan §11 (closes open item 3; fallback: commit
   built dist for the first release — **not needed**, the build hook shipped).
@@ -94,48 +96,60 @@ Acceptance criteria:
   accuracy boundaries: it makes no autonomous-operation or release-suitability claim
   before the outstanding hardware evidence.
 
-### E11-S3 — Pi 5 dual-mic recording + FC-detection CPU soak (overflow validation)
+### E11-S3 — Pi 5 single-primary-mic complete-appliance cold characterisation (overflow validation)
 
-The dual-mic roast audio capture (#176) is **CPU-heavy and shares the audio path with
-FC detection**, so on the constrained Pi it must be soak-validated before the appliance
-ships with recording on.
-
-**Why this story exists (roast 5, 27 Jun):** on the *Mac*, the recording WAV flush
-packed each 16k-sample block one sample at a time via `struct.pack` in a Python loop
-(GIL held ~3.6 ms), in the detector capture worker **and** the 2nd-mic thread — that
-stalled the detector read enough to overflow the mic input **30 consecutive reads →
-audio faulted, FC dead, roast aborted**. Fixed in **coffee-roaster-mcp#180**
-(numpy-vectorised flush, 0.28 ms, 13×, byte-identical PCM16); a 2.5-min Mac soak at
-`onnx_threads=8`, both mics, then showed **max 1 consecutive overflow, no fault**.
-
-**The Pi risk:** the Mac has huge CPU headroom that hid the margin. The Pi 5 is far
-tighter — RP1 xHCI, fewer/slower cores, **`onnx_threads=2`**, int8 — running the 2-mic
-capture + 2 WAV writers + ONNX inference + the USB-serial on one budget. The #180 fix is
-**necessary but may not be sufficient** on the Pi.
+**Scope (D194):** one primary microphone delivering one mono 16 kHz / 16-bit
+stream, on the complete appliance (Pi 5, Hottop serial link, first-crack
+detector and advisory-only advisor), run under
+`docs/deployment/cold-characterisation-runbook.md`. Multi-microphone capture is
+deferred. The #954 software for the supervised cold run is delivered; the
+physical cold run itself is not started, and this story stays not started.
 
 Acceptance criteria:
 
-- [ ] **Sustained soak on the Pi 5** (real appliance load, several minutes, both mics +
-  detector + a live/dry roast): the consecutive-overflow counter stays well under the
-  fatal threshold and the audio never faults. Method: the `audio.py` "overflowed (N
-  consecutive)" log + the dashboard mic-status — the same gate used on the Mac soak.
-- [ ] If the Pi overflows even with #180, apply optimisation levers (in order) and
-  re-soak: **(a)** move the teed WAV write off the detector read loop — bounded queue +
-  a separate writer thread (the structural decouple, the #180 follow-on); **(b)** lower
-  the recording flush threshold; **(c)** drop to **single-mic capture on the Pi** (the
-  detector mic only, or one extra); **(d)** trim the detector cost (window/overlap/
-  threads); **(e)** fall back to a separate capture process. Record which lever the Pi
-  needed.
-- [ ] Deployment doc notes the recording CPU cost + the validated appliance config (mic
-  count, `onnx_threads`, flush threshold).
+These are the active D194 criteria; the locked D191 limits apply unchanged.
 
-Depends on coffee-roaster-mcp#180 (the flush fix) + #176 (recording) — **both now SHIPPED:
-#176 (capture) in MCP 0.1.9, #180 + #162 in MCP 0.1.10, #181 (full-roast recorder lifecycle) + #178 (live mic peak/RMS
-levels) in MCP 0.1.11, agent pinned 0.1.11 (`pyproject.toml:131`); the recording now spans
-charge→drop on the Mac. The Pi-5 soak is the remaining open validation.** Pairs with the
-local Pi dual-mic capture validation (research 27 Jun: no published Pi-5 CPU numbers; the
-CM4 dwc2 USB gap does not apply to the Pi 5's RP1 xHCI; independent streams are not
-sample-locked, which is fine for FC training).
+- [ ] A supervised cold run on the Pi 5 complete appliance, with the single
+  primary mono 16 kHz / 16-bit stream and the detector active, across the full
+  30-minute recording-off phase followed by the 30-minute recording-on phase,
+  meets the locked D191 limits unchanged: at most N = 1 consecutive overflow,
+  and at most X = 200 ms of peak trailing-60-second lost audio. The production
+  fatal consecutive-overflow streak of 30 is unchanged. These locked limits
+  permit their stated margin; failing to meet them fails qualification, and no
+  limit is loosened in the light of results. Method: the `audio.py`
+  "overflowed (N consecutive)" log and the dashboard mic status, recorded as
+  run evidence.
+- [ ] Both retained evidence copies verify against the externally recorded
+  receipt, and independent Pi evidence review clears.
+- [ ] The deployment doc notes the recording CPU cost and the frozen appliance
+  configuration the run characterised (`onnx_threads`, flush threshold).
+
+This cold run authorises no tuning. Any optimisation (for example the teed
+WAV writer, the flush threshold, the detector window, overlap or threads, or a
+separate capture process) is a separate, separately authorised change, never
+part of this run. A material change to the frozen hardware, software, device or
+configuration identity requires a fresh characterisation.
+
+**History (superseded by D194; retained as history only).** The story was
+originally a Pi 5 dual-mic recording plus FC-detection CPU soak. The dual-mic
+roast audio capture (#176) is CPU-heavy and shares the audio path with FC
+detection. On roast 5 (27 Jun), on the *Mac*, the recording WAV flush packed
+each 16k-sample block one sample at a time via `struct.pack` in a Python loop
+(GIL held ~3.6 ms) in the detector capture worker and the second-mic thread,
+which stalled the detector read enough to overflow the mic input 30 consecutive
+reads, faulting audio and aborting the roast. coffee-roaster-mcp#180 fixed it
+(numpy-vectorised flush, 0.28 ms, byte-identical PCM16); a 2.5-minute Mac soak
+at `onnx_threads=8` with both mics then showed at most 1 consecutive overflow
+and no fault. The Pi 5 is far tighter (RP1 xHCI, fewer and slower cores,
+`onnx_threads=2`, int8), so the #180 fix was judged necessary but possibly not
+sufficient there. Recording shipped in MCP 0.1.9 (#176), 0.1.10 (#180, #162)
+and 0.1.11 (#181, #178); the agent pin has since moved to 0.2.2. The earlier
+research (27 Jun) found no published Pi 5 CPU numbers and noted that the CM4
+dwc2 USB gap does not apply to the Pi 5's RP1 xHCI. The original optimisation
+levers considered then (move the teed WAV write off the detector read loop,
+lower the flush threshold, trim the detector cost, fall back to a separate
+capture process) are historical context only and are not authorised by the
+cold run.
 
 ## Status
 
@@ -143,7 +157,7 @@ sample-locked, which is fine for FC training).
 |-------|-------|--------|
 | E11-S1 | Wheel with bundled SPA + the `[pi]` extra | done — base-wheel, `[pi]`, and native hosted ARM64 package smokes delivered 5 Sep 2026; hosted-runner evidence is not Pi hardware validation |
 | E11-S2 | Native installer, systemd unit, bundled model, deploy doc | done — native installer, managed service/configuration, pinned local model, and deployment guide delivered 12 Sep 2026; package and documentation evidence is not Pi or physical-device validation |
-| E11-S3 | Pi 5 dual-mic recording + FC-detection CPU soak (overflow validation) | not started |
+| E11-S3 | Pi 5 single-primary-mic complete-appliance cold characterisation (overflow validation) | not started |
 
 Epic status: **in progress — E11-S1 and E11-S2 are done; E11-S3 is not started.**
 The **operator manual tests** (D28) are
@@ -159,12 +173,12 @@ fallback was not needed). **Verified the base wheel stays lean:** the shipped wh
 the wheel's METADATA and from a clean-venv install's `pip list` — so nothing pulls the
 heavy ML stack through transitively; `coffee-roaster-mcp` is a dev-group-only pin (tests
 spawn it in mock-driver mode) and never a runtime dependency of the shipped artifact.
-**E11-S1 now includes the `[pi]` extra:** it pins `coffee-roaster-mcp==0.2.0`, while the
-development group intentionally retains its 0.1.13 mock-driver pin and fixtures. The clean
+**E11-S1 now includes the `[pi]` extra:** it pins `coffee-roaster-mcp==0.2.2`, the same
+release the development group pins for its mock-driver mirrors and fixtures (#954). The clean
 native-hosted ARM64 smoke builds a wheel independently, installs `wheel[pi]` separately,
 verifies its denylist and exact pin, and runs CLI/replay SPA smokes. This is package evidence
 only, not validation on Pi hardware. **E11-S3
-logged:** the recording bundle it soaks shipped in MCP 0.1.10/0.1.11
+logged (historical; superseded by the D194 scope in the E11-S3 story above):** the recording bundle it soaks shipped in MCP 0.1.10/0.1.11
 (#180/#162/#181/#178; agent pinned 0.1.11), so the Mac side is validated and the Pi-5 CPU
 soak is the open work. Re-sliced for native-only + torch-free + bundled-model distribution
 (D27, 11 Jun 2026); manual-test gate recorded as D28 (13 Jun 2026), cleared 28 Jun 2026.
@@ -179,3 +193,10 @@ documentation evidence into Pi or physical-device evidence. D191/D192
 characterisation, independent Pi evidence review, complete-appliance
 validation, and separately authorised supervised live-roast acceptance remain
 outstanding. E11-S3 remains the unstarted Pi soak.
+
+**#954 cold characterisation (Oct 2026):** the software for the supervised
+cold characterisation is delivered across U1 (PR #993), U2 (PR #994), the U3
+cold view (PR #995) and U4 (the cold CLI, same-loop hosting and
+`docs/deployment/cold-characterisation-runbook.md`). The physical cold run and
+E11-S3 are not started, every operator-supervised gate is unexecuted, and #954
+stays open.
