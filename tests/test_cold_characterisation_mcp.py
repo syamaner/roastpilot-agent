@@ -22,15 +22,18 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     MAX_VENDOR_BLOB_BYTES,
     ColdAudioField,
     ColdEvidenceFailure,
+    ColdJsonValue,
     ColdPhaseKind,
     ColdTickAudioSample,
     ColdTickDeviceEvidence,
+    ColdTickProjection,
     ColdTickRecord,
     ColdTickRoastFanEvidence,
     ColdTickRoastFanOutcome,
     ColdTickSessionEvidence,
     ColdTickSessionPhase,
     _canonical_json,  # pyright: ignore[reportPrivateUsage]
+    project_tick_audio,
     validate_record,
 )
 from roastpilot_agent.cold_characterisation.mcp import (
@@ -58,11 +61,17 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdTickRoastFanProjectionError,
     ColdTickSessionMetadata,
     ColdTickSessionProjectionError,
+    ColdTickTemperatureProjectionError,
     RejectionReason,
     SessionFinalisationResult,
     _finalisation_has_capability_compatible_evidence,  # pyright: ignore[reportPrivateUsage]
     finalisation_command_streaming_observation,
     finalisation_is_clean,
+)
+from roastpilot_agent.cold_characterisation.temperature_projection import (
+    FIELD_NAMES,
+    ColdTemperatureProjectionFailure,
+    ColdTickTemperatureProjection,
 )
 from roastpilot_agent.mcp_client import (
     MCPConnectionError,
@@ -73,6 +82,11 @@ from roastpilot_agent.mcp_client import (
     RoastSessionState,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
+from tests.test_cold_characterisation_temperature_projection import (
+    ACCEPTED_SHAPES,
+    LEAF_FAILURES,
+    celsius_agree,
+)
 
 _MCP_TOOL_FIXTURES = Path(__file__).parent / "fixtures" / "mcp-tool-results"
 _FINALISATION_FIXTURE = _MCP_TOOL_FIXTURES / "finalise_cold_characterisation_session.json"
@@ -193,6 +207,7 @@ def _cold_state_payload() -> dict[str, object]:
         "outcome": "observed",
         "roast_fan_level_percent": 0,
     }
+    payload["cold_temperature_projection"] = celsius_agree()
     return payload
 
 
@@ -2044,6 +2059,41 @@ async def test_json_floats_in_every_float_audio_field_are_accepted() -> None:
         assert value == 1.5, field
 
 
+class _RealProjections(typing.NamedTuple):
+    """The strict non-temperature projections of one raw real-child tick."""
+
+    state: RoastSessionState
+    audio: ColdTickProjection
+    device: ColdTickDeviceState | None
+    roast_fan: ColdTickRoastFanObservation
+    session: ColdTickSessionMetadata
+
+
+async def _real_projections_without_temperature(
+    process: MCPServerProcess, session_id: str
+) -> _RealProjections:
+    """Read one raw real-child tick and apply every strict projector but temperature.
+
+    This keeps exact-type evidence for the existing projectors against the
+    published MCP, whose responses the public read now refuses in full.
+    """
+    raw = await process.call_tool("get_roast_state", {"session_id": session_id})
+    client_type = ColdCharacterisationMCPClient
+    state, tree = client_type._parse_tick(raw)  # pyright: ignore[reportPrivateUsage]
+    mapping = cast("dict[str, object]", tree)
+    assert "cold_" + "temperature_projection" not in mapping
+    raw_audio = cast("dict[str, ColdJsonValue]", mapping["first_crack_status"])
+    audio = project_tick_audio(raw_audio)
+    client_type._require_lossless_audio_types(raw_audio, audio)  # pyright: ignore[reportPrivateUsage]
+    return _RealProjections(
+        state=state,
+        audio=audio,
+        device=client_type._project_device(mapping["device_state"]),  # pyright: ignore[reportPrivateUsage]
+        roast_fan=client_type._project_roast_fan(mapping),  # pyright: ignore[reportPrivateUsage]
+        session=client_type._project_session(mapping),  # pyright: ignore[reportPrivateUsage]
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.slow
 @pytest.mark.serial(reason="drives a real MCP process group; must not run concurrently")
@@ -2052,20 +2102,27 @@ async def test_real_child_cold_tick_projects_strictly(
     monkeypatch: pytest.MonkeyPatch,
     record_property: Callable[[str, object], None],
 ) -> None:
-    """T9/AC-P6, T-S8/AC-S6: the published mock MCP cold tick projects strictly.
+    """T9/AC-P6, T-S8/AC-S6, #997 T17: the published mock MCP cold tick.
 
-    The session metadata has exact types, and the MCP session clock strictly
-    advances between two reads at least 1.0 s apart (the heartbeat premise).
+    Published 0.2.2 carries no temperature projection, so the public read fails
+    closed with ``PROJECTION_KEY_MISSING`` and returns no observation.  The
+    other strict projectors are then applied to raw responses read directly
+    from the same real child, so their exact-type evidence against the
+    published MCP is retained: the session metadata has exact types, and the
+    MCP session clock strictly advances between two reads at least 1.0 s
+    apart (the heartbeat premise).
     """
     monkeypatch.chdir(tmp_path)
     process = MCPServerProcess()
     await process.start()
     try:
         client = ColdCharacterisationMCPClient(process.call_tool)
-        await client.start_cold_session()
+        session_id = (await client.start_cold_session()).session.session_id
         await client.mark_beans_added()
-        observation = await client.get_roast_state()
-        assert type(observation) is ColdTickObservation
+        with pytest.raises(ColdTickTemperatureProjectionError) as raised:
+            await client.get_roast_state()
+        assert raised.value.failure is ColdTemperatureProjectionFailure.PROJECTION_KEY_MISSING
+        observation = await _real_projections_without_temperature(process, session_id)
         assert observation.state.session_purpose == "cold_characterisation"
         assert type(observation.audio.audio) is ColdTickAudioSample
         audio = observation.audio.audio
@@ -2094,7 +2151,7 @@ async def test_real_child_cold_tick_projects_strictly(
             assert roast_fan.roast_fan_level_percent is None
         first = observation.session
         await asyncio.sleep(1.1)
-        second = (await client.get_roast_state()).session
+        second = (await _real_projections_without_temperature(process, session_id)).session
         for session in (first, second):
             assert type(session) is ColdTickSessionMetadata
             assert type(session.session_id) is str
@@ -2139,6 +2196,7 @@ async def test_cold_tick_observation_is_closed_and_frozen() -> None:
                 "device": observation.device,
                 "roast_fan": observation.roast_fan,
                 "session": observation.session,
+                "temperature": observation.temperature,
                 "unexpected": 1,
             }
         )
@@ -3268,6 +3326,7 @@ def test_cold_tick_session_metadata_is_closed_frozen_and_required() -> None:
         "device",
         "roast_fan",
         "session",
+        "temperature",
     }
 
 
@@ -3653,3 +3712,288 @@ def test_engine_carries_the_heartbeat_only_under_the_renamed_decision_field() ->
     assert _session_read_violations("engine.py", tree) == []
     assert "next_previous_elapsed_seconds" in names
     assert "elapsed_monotonic_seconds" not in names
+
+
+# --- #997 S1: closed version-1 temperature projection admission ---------------
+
+_TEMPERATURE_MESSAGE = "MCP tick temperature projection failed strict admission"
+_TEMPERATURE_KEY = "cold_" + "temperature_projection"
+
+
+async def _temperature_error(payload: dict[str, object]) -> ColdTickTemperatureProjectionError:
+    """Read one tolerant-admitted tick and return its temperature admission error."""
+    _assert_tolerant_mirror_accepts(payload)
+    client, caller = await _started_client(payload)
+    with pytest.raises(ColdTickTemperatureProjectionError) as raised:
+        await client.get_roast_state()
+    assert len(_state_calls(caller)) == 1
+    assert isinstance(raised.value, ColdMcpValidationError)
+    assert raised.value.args == (_TEMPERATURE_MESSAGE,)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    return raised.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "raw"), ACCEPTED_SHAPES, ids=[case[0] for case in ACCEPTED_SHAPES]
+)
+async def test_t9_public_read_returns_the_exact_temperature_projection(
+    name: str, raw: dict[str, object]
+) -> None:
+    """T9: each admitted shape reaches the observation unchanged from one read."""
+    del name
+    payload = _cold_state_payload()
+    payload[_TEMPERATURE_KEY] = raw
+    _assert_tolerant_mirror_accepts(payload)
+    client, caller = await _started_client(payload)
+
+    observation = await client.get_roast_state()
+
+    temperature = observation.temperature
+    assert type(temperature) is ColdTickTemperatureProjection
+    for field in FIELD_NAMES:
+        value: object = getattr(temperature, field)
+        expected = raw[field]
+        if isinstance(value, Enum):
+            assert value.value == expected, field
+        else:
+            assert type(value) is type(expected), field
+            assert value == expected, field
+    assert _state_calls(caller) == [("get_roast_state", {"session_id": "session-id"})]
+
+
+@pytest.mark.asyncio
+async def test_t10_missing_projection_key_fails_closed_without_fallback() -> None:
+    """T10: a response lacking the key (published 0.2.2) is refused; no fallback."""
+    payload = _cold_state_payload()
+    del payload[_TEMPERATURE_KEY]
+
+    error = await _temperature_error(payload)
+
+    assert error.failure is ColdTemperatureProjectionFailure.PROJECTION_KEY_MISSING
+
+
+_ADAPTER_REPRESENTATIVES = (
+    "null",
+    "list",
+    "version-true",
+    "extra-key",
+    "outcome-case",
+    "counter-bool",
+    "reported-auto",
+    "counter-negative",
+    "shape",
+)
+
+
+def _adapter_cases() -> list[tuple[str, object, ColdTemperatureProjectionFailure]]:
+    """Return one JSON-safe leaf failure case per leaf failure member."""
+    by_name = {name: (raw, expected) for name, raw, expected in LEAF_FAILURES}
+    return [(name, *by_name[name]) for name in _ADAPTER_REPRESENTATIVES]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "raw", "expected"), _adapter_cases(), ids=list(_ADAPTER_REPRESENTATIVES)
+)
+async def test_t10_every_leaf_failure_surfaces_through_the_adapter(
+    name: str, raw: object, expected: ColdTemperatureProjectionFailure
+) -> None:
+    """T10: each leaf failure member surfaces unchanged as the closed adapter error."""
+    del name
+    payload = _cold_state_payload()
+    payload[_TEMPERATURE_KEY] = raw
+
+    error = await _temperature_error(payload)
+
+    assert error.failure is expected
+
+
+def test_t10_adapter_representatives_cover_every_leaf_failure() -> None:
+    """T10: the adapter corpus reaches every failure member except the adapter-only one."""
+    reached = {expected for _, _, expected in _adapter_cases()}
+    assert reached == set(ColdTemperatureProjectionFailure) - {
+        ColdTemperatureProjectionFailure.PROJECTION_KEY_MISSING
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["absent", "null", "junk"])
+async def test_t11_start_response_projection_is_never_read(variant: str) -> None:
+    """T11: start-response null means not reported; the start never reads the projection."""
+    start = _cold_start_payload()
+    session = cast("dict[str, object]", start["session"])
+    session.pop(_TEMPERATURE_KEY, None)
+    if variant == "null":
+        session[_TEMPERATURE_KEY] = None
+    elif variant == "junk":
+        session[_TEMPERATURE_KEY] = {"junk": 1}
+    caller = _MappingCaller(
+        {"start_roast_session": start, "get_roast_state": _cold_state_payload()}
+    )
+    client = ColdCharacterisationMCPClient(caller)
+
+    result = await client.start_cold_session()
+
+    assert result.session.session_id == "session-id"
+    observation = await client.get_roast_state()
+    assert type(observation.temperature) is ColdTickTemperatureProjection
+
+
+def test_t12_tolerant_mirror_gains_no_temperature_field() -> None:
+    """T12: the tolerant top-level mirror stays unchanged; only the cold path admits."""
+    assert _TEMPERATURE_KEY not in RoastSessionState.model_fields
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("earlier", "expected"),
+    [
+        ("identity", ColdSessionIdentityError),
+        ("purpose", ColdSessionPurposeError),
+        ("audio", ColdTickAudioProjectionError),
+        ("device", ColdTickDeviceProjectionError),
+        ("roast_fan", ColdTickRoastFanProjectionError),
+        ("session", ColdTickSessionProjectionError),
+    ],
+)
+async def test_t12_earlier_cold_tick_checks_precede_temperature_admission(
+    earlier: str, expected: type[ColdMcpError]
+) -> None:
+    """T12: identity, purpose, audio, device, roast fan, and session win over temperature."""
+    payload = _cold_state_payload()
+    payload[_TEMPERATURE_KEY] = celsius_agree(projection_version=2)
+    if earlier == "identity":
+        payload["session_id"] = "other-session"
+    elif earlier == "purpose":
+        payload["session_purpose"] = "roast"
+    elif earlier == "audio":
+        del _first_crack(payload)["max_consecutive_overflow_count"]
+    elif earlier == "device":
+        _device(payload)["heat_level_percent"] = "0"
+    elif earlier == "roast_fan":
+        _roast_fan(payload)["roast_fan_level_percent"] = "0"
+    else:
+        payload[ColdSessionField.ACTIVE.value] = "true"
+    client, caller = await _started_client(payload)
+
+    with pytest.raises(ColdMcpError) as raised:
+        await client.get_roast_state()
+
+    assert type(raised.value) is expected
+    assert len(_state_calls(caller)) == 1
+
+
+@pytest.mark.asyncio
+async def test_t12_foreign_session_with_a_valid_projection_is_refused_first() -> None:
+    """T12: a valid projection never rescues a foreign session identity."""
+    payload = _cold_state_payload()
+    payload["session_id"] = "other-session"
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdSessionIdentityError):
+        await client.get_roast_state()
+
+
+@pytest.mark.asyncio
+async def test_t12_null_roast_fan_stays_rejected_beside_a_valid_projection() -> None:
+    """T12/AC7: a missing required observation stays rejected with a good temperature."""
+    payload = _cold_state_payload()
+    payload["cold_characterisation_observation"] = None
+    client, _ = await _started_client(payload)
+
+    with pytest.raises(ColdTickRoastFanProjectionError) as raised:
+        await client.get_roast_state()
+
+    assert raised.value.failure is ColdRoastFanProjectionFailure.OBSERVATION_NULL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("location", ["extra-key", "token", "string-counter"])
+async def test_t13_temperature_failure_contains_untrusted_values(location: str) -> None:
+    """T13: a rejected key or value never reaches any rendering of the error."""
+    canary = _runtime_canary()
+    raw = celsius_agree()
+    if location == "extra-key":
+        raw[canary] = 1
+        expected = ColdTemperatureProjectionFailure.FIELD_SET_MISMATCH
+    elif location == "token":
+        raw["reported_temperature_unit"] = canary
+        expected = ColdTemperatureProjectionFailure.TOKEN_NOT_ADMITTED
+    else:
+        raw["status_packet_count"] = canary
+        expected = ColdTemperatureProjectionFailure.VALUE_TYPE_NOT_EXACT
+    payload = _cold_state_payload()
+    payload[_TEMPERATURE_KEY] = raw
+
+    error = await _temperature_error(payload)
+
+    assert error.failure is expected
+    _assert_contained(error, canary)
+    assert canary not in repr(error.failure)
+
+
+@pytest.mark.asyncio
+async def test_t14_observation_requires_an_exact_temperature_projection() -> None:
+    """T14: omission, ``None``, or a subclass instance is refused on direct construction."""
+    client, _ = await _started_client(_cold_state_payload())
+    observation = await client.get_roast_state()
+
+    class ProjectionSubclass(ColdTickTemperatureProjection):
+        """A non-exact projection type."""
+
+    subclass = ProjectionSubclass.model_validate(dict(observation.temperature))
+    parts: dict[str, object] = {
+        "state": observation.state,
+        "audio": observation.audio,
+        "device": observation.device,
+        "roast_fan": observation.roast_fan,
+        "session": observation.session,
+    }
+    assert ColdTickObservation.model_fields["temperature"].is_required()
+    with pytest.raises(ValidationError):
+        ColdTickObservation.model_validate(parts)
+    for bad in (None, subclass, dict(observation.temperature)):
+        with pytest.raises(ValidationError):
+            ColdTickObservation.model_validate({**parts, "temperature": bad})
+    rebuilt = ColdTickObservation.model_validate({**parts, "temperature": observation.temperature})
+    assert rebuilt == observation
+
+
+def test_t15_cold_production_code_reads_the_temperature_key_once() -> None:
+    """T15: one raw subscript in ``mcp.py`` is the only production access to the key."""
+    attributes: list[str] = []
+    getattr_calls: list[str] = []
+    constants: dict[str, list[ast.Constant]] = {}
+    trees = _cold_production_trees()
+    for name, tree in trees.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == _TEMPERATURE_KEY:
+                attributes.append(name)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and any(
+                    isinstance(arg, ast.Constant) and arg.value == _TEMPERATURE_KEY
+                    for arg in node.args
+                )
+            ):
+                getattr_calls.append(name)
+            if isinstance(node, ast.Constant) and node.value == _TEMPERATURE_KEY:
+                constants.setdefault(name, []).append(node)
+    assert "temperature_projection.py" in trees
+    assert attributes == []
+    assert getattr_calls == []
+    assert sorted(constants) == ["mcp.py"]
+    assert len(constants["mcp.py"]) == 1
+    subscripts = [
+        node
+        for node in ast.walk(trees["mcp.py"])
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Constant)
+        and node.slice.value == _TEMPERATURE_KEY
+    ]
+    assert len(subscripts) == 1
+    assert subscripts[0].slice is constants["mcp.py"][0]

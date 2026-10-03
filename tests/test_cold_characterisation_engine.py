@@ -47,6 +47,7 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdTickObservation,
     ColdTickRoastFanProjectionError,
     ColdTickSessionProjectionError,
+    ColdTickTemperatureProjectionError,
 )
 from roastpilot_agent.config import MCPConfig
 from roastpilot_agent.mcp_client import (
@@ -70,6 +71,7 @@ from tests.test_cold_characterisation_evidence_builders import (
     session_metadata,
 )
 from tests.test_cold_characterisation_evidence_store import make_root
+from tests.test_cold_characterisation_temperature_projection import celsius_agree
 
 OFF = schema.ColdPhaseKind.RECORDING_OFF
 ON = schema.ColdPhaseKind.RECORDING_ON
@@ -120,6 +122,7 @@ def cold_state_document(session_id: str = SID) -> dict[str, typing.Any]:
         "outcome": "observed",
         "roast_fan_level_percent": 0,
     }
+    document["cold_temperature_projection"] = celsius_agree()
     return document
 
 
@@ -1210,6 +1213,12 @@ _REAL_CASES: list[tuple[str, object, type[BaseException], Reason]] = [
         ColdTickSessionProjectionError,
         Reason.MCP_RESPONSE_NOT_ADMITTED,
     ),
+    (
+        "temperature",
+        _state(cold_temperature_projection=None),
+        ColdTickTemperatureProjectionError,
+        Reason.MCP_RESPONSE_NOT_ADMITTED,
+    ),
     ("transport", MCPConnectionError(CANARY), Exception, Reason.MCP_TRANSPORT_FAILED),
 ]
 
@@ -1236,6 +1245,8 @@ async def test_t7_real_client_failures_map_by_type_with_no_tick_and_no_retry(
     assert aborted(result).aborts == engine_aborts(reason)
     assert caller.calls.count("get_roast_state") == 1
     assert streams(sink) == ["header", "abort"]
+    # A retained engine abort is never followed by finalisation (D199).
+    assert "finalise_cold_characterisation_session" not in caller.calls
 
 
 @pytest.mark.asyncio

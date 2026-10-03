@@ -35,6 +35,9 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdTickSessionMetadata,
     SessionFinalisationResult,
 )
+from roastpilot_agent.cold_characterisation.temperature_projection import (
+    ColdTickTemperatureProjection,
+)
 from roastpilot_agent.config import MCPDeviceConfig
 from roastpilot_agent.mcp_client import (
     MCPPhase,
@@ -42,6 +45,7 @@ from roastpilot_agent.mcp_client import (
     RuntimeConfigSnapshot,
     ServerInfo,
 )
+from tests.test_cold_characterisation_temperature_projection import valid_projection
 
 RUN_ID = "20260926T120000Z-cold-integrity"
 FIXTURE_PATH = (
@@ -228,14 +232,19 @@ def observation(
     roast_fan: ColdTickRoastFanObservation | None = None,
     audio: dict[str, schema.ColdJsonValue] | None = None,
     session: ColdTickSessionMetadata | None = None,
+    temperature: ColdTickTemperatureProjection | None = None,
 ) -> ColdTickObservation:
-    """Return one strict cold tick observation; ``device=None`` is absent telemetry."""
+    """Return one strict cold tick observation; ``device=None`` is absent telemetry.
+
+    ``temperature`` defaults to one admitted observed-Celsius member-form projection.
+    """
     return ColdTickObservation(
         state=tolerant_state(),
         audio=schema.project_tick_audio(audio_payload() if audio is None else audio),
         device=device,
         roast_fan=roast_fan_state() if roast_fan is None else roast_fan,
         session=session_metadata() if session is None else session,
+        temperature=valid_projection() if temperature is None else temperature,
     )
 
 
@@ -584,6 +593,7 @@ def test_t_e9_tick_builder_refuses_wrong_observation_types(tmp_path: Path) -> No
         device=genuine.device,
         roast_fan=genuine.roast_fan,
         session=genuine.session,
+        temperature=genuine.temperature,
     )
     assert genuine.device is not None
     wrong_device = typing.cast(typing.Any, ColdTickObservation).model_construct(
@@ -592,6 +602,7 @@ def test_t_e9_tick_builder_refuses_wrong_observation_types(tmp_path: Path) -> No
         device=DeviceSubclass(**dict(genuine.device)),
         roast_fan=genuine.roast_fan,
         session=genuine.session,
+        temperature=genuine.temperature,
     )
     tolerant_device = typing.cast(typing.Any, ColdTickObservation).model_construct(
         state=genuine.state,
@@ -599,6 +610,7 @@ def test_t_e9_tick_builder_refuses_wrong_observation_types(tmp_path: Path) -> No
         device=genuine.state.device_state,
         roast_fan=genuine.roast_fan,
         session=genuine.session,
+        temperature=genuine.temperature,
     )
     wrong_fan = typing.cast(typing.Any, ColdTickObservation).model_construct(
         state=genuine.state,
@@ -606,6 +618,7 @@ def test_t_e9_tick_builder_refuses_wrong_observation_types(tmp_path: Path) -> No
         device=genuine.device,
         roast_fan=RoastFanSubclass(**dict(genuine.roast_fan)),
         session=genuine.session,
+        temperature=genuine.temperature,
     )
     wrong_audio = typing.cast(typing.Any, ColdTickObservation).model_construct(
         state=genuine.state,
@@ -613,6 +626,7 @@ def test_t_e9_tick_builder_refuses_wrong_observation_types(tmp_path: Path) -> No
         device=genuine.device,
         roast_fan=genuine.roast_fan,
         session=genuine.session,
+        temperature=genuine.temperature,
     )
     for bad in (
         genuine.state,

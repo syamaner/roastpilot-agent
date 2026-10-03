@@ -11,7 +11,15 @@ from contextlib import suppress
 from enum import Enum
 from typing import Literal, Protocol, TypeAlias, TypeVar, cast
 
-from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    StrictBool,
+    StrictInt,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from roastpilot_agent.cold_characterisation.evidence_schema import (
     MAX_VENDOR_BLOB_BYTES,
@@ -22,6 +30,11 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdTickProjection,
     project_tick_audio,
     walk_json_value,
+)
+from roastpilot_agent.cold_characterisation.temperature_projection import (
+    ColdTemperatureProjectionFailure,
+    ColdTickTemperatureProjection,
+    admit_cold_temperature_projection,
 )
 from roastpilot_agent.config import MCPDeviceConfig
 from roastpilot_agent.mcp_client import (
@@ -208,6 +221,25 @@ class ColdTickSessionProjectionError(ColdMcpValidationError):
         """
         super().__init__("MCP tick session metadata failed strict projection")
         self.field = field
+
+
+class ColdTickTemperatureProjectionError(ColdMcpValidationError):
+    """Raised when a tick's temperature projection fails strict admission.
+
+    The error keeps only one closed failure.  It never carries a rejected value
+    or key name, and its message is fixed.
+    """
+
+    failure: ColdTemperatureProjectionFailure
+
+    def __init__(self, failure: ColdTemperatureProjectionFailure) -> None:
+        """Retain one closed failure behind a fixed public message.
+
+        Args:
+            failure: Closed reason admission refused the raw projection.
+        """
+        super().__init__("MCP tick temperature projection failed strict admission")
+        self.failure = failure
 
 
 class ColdMcpTransportError(ColdMcpError):
@@ -875,6 +907,11 @@ class ColdTickObservation(BaseModel):
     ``state`` fields are lax roast-path telemetry and must never feed cold
     decisions or evidence.  The clock is an MCP software session clock, not
     evidence of serial-link or driver-sample freshness.
+
+    ``temperature`` is the only admissible per-tick temperature-projection
+    evidence: the closed version-1 admission of the same response's raw
+    temperature projection.  It is required and decides nothing; it applies
+    no envelope, freshness, liveness, or readiness policy.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True, allow_inf_nan=False)
@@ -884,6 +921,15 @@ class ColdTickObservation(BaseModel):
     device: ColdTickDeviceState | None
     roast_fan: ColdTickRoastFanObservation
     session: ColdTickSessionMetadata
+    temperature: ColdTickTemperatureProjection
+
+    @field_validator("temperature", mode="before")
+    @classmethod
+    def _require_exact_temperature(cls, value: object) -> object:
+        """Admit only an exact admitted projection, never ``None`` or a subclass."""
+        if type(value) is not ColdTickTemperatureProjection:
+            raise ValueError("temperature must be an exact admitted projection")
+        return value
 
 
 class ColdCharacterisationMCPClient:
@@ -1127,6 +1173,35 @@ class ColdCharacterisationMCPClient:
         return session
 
     @staticmethod
+    def _project_temperature(tree: dict[str, object]) -> ColdTickTemperatureProjection:
+        """Admit the closed version-1 temperature projection from one raw tick.
+
+        A response without the projection key (every published 0.2.2 response)
+        is refused; there is no compatibility fallback.
+
+        Args:
+            tree: Raw JSON tree parsed from the same tick response as the state.
+
+        Returns:
+            The strict admitted projection carrying the exact raw values.
+
+        Raises:
+            ColdTickTemperatureProjectionError: With one closed admission failure.
+        """
+        failure: ColdTemperatureProjectionFailure | None = None
+        raw: object = None
+        try:
+            raw = tree["cold_temperature_projection"]
+        except KeyError:
+            failure = ColdTemperatureProjectionFailure.PROJECTION_KEY_MISSING
+        if failure is None:
+            admitted = admit_cold_temperature_projection(raw)
+            if not isinstance(admitted, ColdTemperatureProjectionFailure):
+                return admitted
+            failure = admitted
+        raise ColdTickTemperatureProjectionError(failure)
+
+    @staticmethod
     def _require_lossless_audio_types(
         raw_audio: dict[str, ColdJsonValue], projection: ColdTickProjection
     ) -> None:
@@ -1187,7 +1262,7 @@ class ColdCharacterisationMCPClient:
         return result
 
     async def get_roast_state(self, session_id: str | None = None) -> ColdTickObservation:
-        """Return one cold tick whose audio, device, roast-fan, and session data are projected.
+        """Return one cold tick whose audio, device, fan, session, and temperature are projected.
 
         Args:
             session_id: Optional explicit session; it must be the established one.
@@ -1195,9 +1270,10 @@ class ColdCharacterisationMCPClient:
         Returns:
             The tolerant session state, the strict audio projection, and the
             strict device projection (``None`` only for JSON ``null``), and
-            strict commanded roast-fan projection, and the strict session
-            metadata projection, all parsed from one MCP response. Audio is
-            projected before device, then roast fan, then session metadata.
+            strict commanded roast-fan projection, the strict session
+            metadata projection, and the closed temperature projection, all
+            parsed from one MCP response. Audio is projected before device,
+            then roast fan, then session metadata, then temperature.
 
         Raises:
             ColdSessionIdentityError: If the session is not the established one.
@@ -1208,6 +1284,8 @@ class ColdCharacterisationMCPClient:
             ColdTickDeviceProjectionError: If the device state is not strictly complete.
             ColdTickRoastFanProjectionError: If the roast-fan observation is malformed.
             ColdTickSessionProjectionError: If the session metadata is not exactly typed.
+            ColdTickTemperatureProjectionError: If the temperature projection is
+                missing or fails closed version-1 admission.
         """
         expected_session_id = self._cold_session_id
         if expected_session_id is None or (
@@ -1232,8 +1310,14 @@ class ColdCharacterisationMCPClient:
             device = self._project_device(cast("dict[str, object]", tree)["device_state"])
             roast_fan = self._project_roast_fan(cast("dict[str, object]", tree))
             session = self._project_session(cast("dict[str, object]", tree))
+            temperature = self._project_temperature(cast("dict[str, object]", tree))
             return ColdTickObservation(
-                state=state, audio=audio, device=device, roast_fan=roast_fan, session=session
+                state=state,
+                audio=audio,
+                device=device,
+                roast_fan=roast_fan,
+                session=session,
+                temperature=temperature,
             )
         raise ColdTickAudioProjectionError(failure, field_names)
 
