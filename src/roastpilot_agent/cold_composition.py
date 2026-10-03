@@ -1026,14 +1026,18 @@ async def run_cold_characterisation(
     object is constructed; such a refusal returns its closed member with nothing
     constructed.  The per-phase identity guards (MCP version and config source)
     run later, after the child starts, and surface through the runtime as an
-    identity-not-frozen refusal with the owned child stopped.  The runtime's
+    identity-not-frozen refusal; the runtime then attempts to stop the child and
+    reports the resulting ownership status, which may be unconfirmed (a port can
+    also stall), so no physically safe state is inferred from it.  The runtime's
     result, including a pending provider check, is returned as-is.
 
     Caller obligation: do not start another cold run while a preceding child's
-    shutdown remains unconfirmed.  This function keeps no process-wide retry
-    latch and grants no termination authority; uncertain child ownership alone
-    authorises nothing.  Same-user tampering, the SDK merge-order dependency, the
-    independent operator emergency stop and the hardware residuals remain.
+    shutdown remains unconfirmed, including after a propagated exception or a
+    not-owned result (neither proves the child is absent).  This function keeps
+    no process-wide retry latch and grants no termination authority; uncertain
+    child ownership alone authorises nothing.  Same-user tampering, the SDK
+    merge-order dependency, the independent operator emergency stop and the
+    hardware residuals remain.
 
     Args:
         config: The application config (advisor, safety, controller timing, MCP).
