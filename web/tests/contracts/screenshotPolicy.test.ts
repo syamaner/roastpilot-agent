@@ -194,10 +194,11 @@ describe("visual screenshot policy", () => {
     }
   });
 
-  test("recursively discovers all eleven non-empty e2e specs", () => {
+  test("recursively discovers all twelve non-empty e2e specs", () => {
     const specs = discoverSpecFiles();
     expect(specs).not.toHaveLength(0);
     expect(specs.map((path) => basename(path)).sort()).toEqual([
+      "cold-characterisation.spec.ts",
       "config.spec.ts",
       "dashboard.spec.ts",
       "detail.spec.ts",
@@ -273,7 +274,7 @@ describe("visual screenshot policy", () => {
     ]);
     expect(counts).toEqual([
       [SCREENSHOT_CLASSES.CANVAS_PAGE, 12],
-      [SCREENSHOT_CLASSES.DOM_PAGE, 9],
+      [SCREENSHOT_CLASSES.DOM_PAGE, 11],
       [SCREENSHOT_CLASSES.DOM_LOCATOR, 4],
       [SCREENSHOT_CLASSES.CANVAS_LOCATOR, 1],
     ]);

@@ -41,7 +41,7 @@ target's rendered canvas membership matches its closed class before comparison:
 substantially tighter full-page ratio; `DOM_LOCATOR` and `CANVAS_LOCATOR` use
 absolute pixel caps so a material region cannot be diluted by page area. The
 structural Vitest policy guard derives every `expectScreenshot()` call from the
-11 e2e specs and requires exact equality with the checked-in inventory.
+12 e2e specs and requires exact equality with the checked-in inventory.
 
 Budgets are calibrated only with `RP_VISUAL_CALIBRATE=1` in the pinned
 linux/amd64 image. That exact value sets every allowance to zero to expose

@@ -96,6 +96,16 @@ const LiveFinishedHarnessPage = lazy(() =>
 const ConfigPage = lazy(() =>
   import("@/pages/config/ConfigPage").then((m) => ({ default: m.ConfigPage })),
 );
+const ColdCharacterisationPage = lazy(() =>
+  import("@/pages/cold/ColdCharacterisationPage").then((m) => ({
+    default: m.ColdCharacterisationPage,
+  })),
+);
+const ColdCharacterisationHarnessPage = lazy(() =>
+  import("@/pages/cold/ColdCharacterisationHarnessPage").then((m) => ({
+    default: m.ColdCharacterisationHarnessPage,
+  })),
+);
 
 export const routes: RouteObject[] = [
   // Operator-facing routes nest under RootLayout → the persistent nav (#324) is
@@ -142,4 +152,9 @@ export const routes: RouteObject[] = [
   // __live-finished-harness: persistent nav + LiveFinishedView over a seeded
   // just-completed run (#423 snapshot target, D26).
   { path: "/__live-finished-harness", element: <LiveFinishedHarnessPage /> },
+  // #954 read-only cold-characterisation view: top-level, OUTSIDE RootLayout (no
+  // nav, no health/controls queries); its only service request is the cold stream.
+  { path: "/cold-characterisation", element: <ColdCharacterisationPage /> },
+  // __cold-characterisation-harness: synthetic, banner-labelled cold view snapshots.
+  { path: "/__cold-characterisation-harness", element: <ColdCharacterisationHarnessPage /> },
 ];
