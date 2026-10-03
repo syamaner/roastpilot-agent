@@ -8,18 +8,21 @@ snapshot with the exact planned tick carrier table.  All data is synthetic.
 # pyright: reportPrivateUsage=false
 
 import asyncio
+import enum
 import gc
 import inspect
+import re
 import typing
 import warnings
 from collections.abc import Callable
 from pathlib import Path
 
-import pydantic
 import pytest
 
-from roastpilot_agent.cold_characterisation import engine, two_phase
+from roastpilot_agent import cold_observation_stream as stream
+from roastpilot_agent.cold_characterisation import advisory_conformance, engine, two_phase
 from roastpilot_agent.cold_characterisation import evidence_builders as builders
+from roastpilot_agent.cold_characterisation import evidence_lifecycle as lifecycle
 from roastpilot_agent.cold_characterisation import evidence_schema as schema
 from roastpilot_agent.cold_characterisation import evidence_store as store
 from tests.test_cold_characterisation_evidence_builders import (
@@ -40,7 +43,6 @@ from tests.test_cold_characterisation_two_phase import (
     Outcome,
     R,
     World,
-    assert_failed,
     audio,
     conforming_tick,
     make_run,
@@ -367,7 +369,8 @@ def snapshot(world: World, result: object) -> dict[str, object]:
     return {
         "records": {stream: world.records(stream) for stream in STREAMS},
         "manifest": manifest.read_bytes() if manifest.exists() else None,
-        "result": typing.cast(pydantic.BaseModel, result).model_dump(mode="json"),
+        # Compared only as a bool by ``differing``; never dumped, rendered or formatted.
+        "result": result,
         "mcp": list(world.mcp.calls),
         "finalised": list(world.mcp.finalised),
         "child": list(world.child.calls),
@@ -376,6 +379,87 @@ def snapshot(world: World, result: object) -> dict[str, object]:
         "host": (world.host.samples, world.host.start_calls),
         "advisor": list(world.advisor.calls),
     }
+
+
+def finalised_phases(world: World) -> list[Phase | None]:
+    """The phase of each finalised session (``None`` if foreign); no ID is formatted."""
+    return [
+        next((phase for phase in (OFF, ON) if session == SESSIONS[phase]), None)
+        for session in world.mcp.finalised
+    ]
+
+
+_RESULT_FIELDS: typing.Final = frozenset(
+    {
+        "outcome",
+        "start_refusal",
+        "termination_reason",
+        "child_ownership",
+        "manifest_sha256",
+        "conformance",
+        "advisory_path",
+        "provider_check",
+    }
+)
+
+
+def _closed_member(value: object) -> bool:
+    """Whether one runtime value is an enum member (checked at runtime, not by type)."""
+    return isinstance(value, enum.Enum)
+
+
+def public_result_is_closed(result: two_phase.ColdTwoPhaseResult) -> bool:
+    """Whether the public result holds only closed members, a digest and closed findings.
+
+    Structural replacement for the frozen canary formatter: proves no session, path or
+    error text can be present without rendering the result.
+    """
+    if frozenset(type(result).model_fields) != _RESULT_FIELDS:
+        return False
+    for name in _RESULT_FIELDS - {"manifest_sha256", "conformance"}:
+        value: object = getattr(result, name)
+        if not (value is None or isinstance(value, enum.Enum)):
+            return False
+    digest: object = result.manifest_sha256
+    if digest is not None and not (
+        type(digest) is str and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+    ):
+        return False
+    checked = result.conformance
+    if checked is None:
+        return True
+    findings = (*checked.findings, *checked.pre_advisory_findings)
+    return (
+        type(checked) is advisory_conformance.ColdAdvisoryConformanceResult
+        and type(checked.policy_version) is int
+        and _closed_member(checked.outcome)
+        and all(_closed_member(finding) for finding in findings)
+    )
+
+
+def assert_failed_safely(
+    world: World, result: two_phase.ColdTwoPhaseResult, reason: lifecycle.ColdRunTerminationReason
+) -> None:
+    """A sealed FAILED run with ``reason``, never conformant; asserts closed locals only."""
+    outcome = result.outcome
+    assert outcome is Outcome.NOT_CONFORMANT
+    termination_reason = result.termination_reason
+    assert termination_reason is reason
+    terminal = world.lifecycle()[-1]
+    event, termination, terminal_reason = (
+        terminal["event"],
+        terminal["termination"],
+        terminal["termination_reason"],
+    )
+    assert (event, termination, terminal_reason) == ("run_terminated", "failed", reason.value)
+    digest = result.manifest_sha256
+    sealed = digest is not None and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+    assert sealed
+    retained = world.retained(digest)
+    checked = advisory_conformance.check_advisory_conformance(retained).outcome
+    assert checked is advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT
+    closed = public_result_is_closed(result)
+    assert closed
 
 
 def differing(left: dict[str, object], right: dict[str, object]) -> list[str]:
@@ -634,8 +718,8 @@ async def test_t_d6_a_session_mismatch_suppresses_publication_without_failing(
     before = at if phase is OFF else TICKS_PER_PHASE + at
     assert recorder.calls == before
     assert differing(observed, plain) == []
-    result = typing.cast(dict[str, object], observed["result"])
-    assert result["termination_reason"] == R.PHASE_ABORTED.value
+    reason = typing.cast(two_phase.ColdTwoPhaseResult, observed["result"]).termination_reason
+    assert reason is R.PHASE_ABORTED
 
 
 # ------------------------------------------------------------ T-D7 (unit)
@@ -804,13 +888,13 @@ def assert_off_failure(world: World, result: two_phase.ColdTwoPhaseResult) -> No
     assert len(off_ticks) == TICKS_PER_PHASE
     assert (OFF.value, "observation_window_elapsed") in world.events()
     assert world.event(OFF, "observation_window_elapsed")["tick_count"] == TICKS_PER_PHASE
-    assert world.records("abort") == []
+    assert len(world.records("abort")) == 0
     reason = result.termination_reason
     assert reason is R.UNEXPECTED_FAILURE
-    assert_failed(world, result, R.UNEXPECTED_FAILURE)
+    assert_failed_safely(world, result, R.UNEXPECTED_FAILURE)
     outcome = result.outcome
     assert outcome is not Outcome.ADVISORY_CONFORMANT
-    assert world.mcp.finalised == [SESSIONS[OFF]]
+    assert finalised_phases(world) == [OFF]
     assert [r["phase"] for r in world.records("header")] == [OFF.value]
     assert (OFF.value, "child_started") not in world.events()
     assert all(phase == OFF.value for phase, _event in world.events())
@@ -843,12 +927,12 @@ async def test_t_d8b_a_first_on_tick_failure_finalises_on_then_stops(tmp_path: P
     world = ObservedWorld(tmp_path, recorder)
     result = await world.run()
     assert recorder.phases == [(OFF, i) for i in range(TICKS_PER_PHASE)] + [(ON, 0)]
-    assert_failed(world, result, R.UNEXPECTED_FAILURE)
+    assert_failed_safely(world, result, R.UNEXPECTED_FAILURE)
     outcome = result.outcome
     assert outcome is not Outcome.ADVISORY_CONFORMANT
-    assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
+    assert finalised_phases(world) == [OFF, ON]
     assert world.event(ON, "observation_window_elapsed")["tick_count"] == TICKS_PER_PHASE
-    assert world.records("abort") == []
+    assert len(world.records("abort")) == 0
 
 
 async def _never_awaited() -> None:
@@ -916,9 +1000,9 @@ async def test_t_d10_a_retained_abort_still_forbids_finalisation(
     world = ObservedWorld(tmp_path, recorder)
     result = await world.run()
     assert [tick.phase for tick in recorder.ticks][-1] is phase
-    assert_failed(world, result, R.UNEXPECTED_FAILURE)
-    assert SESSIONS[phase] not in world.mcp.finalised
-    assert world.mcp.finalised == ([] if phase is OFF else [SESSIONS[OFF]])
+    assert_failed_safely(world, result, R.UNEXPECTED_FAILURE)
+    assert phase not in finalised_phases(world)
+    assert finalised_phases(world) == ([] if phase is OFF else [OFF])
     assert [(a["domain"], a["phase"]) for a in world.records("abort")] == [
         (domain.value, phase.value)
     ]
@@ -952,10 +1036,10 @@ async def test_t_d11_a_base_exception_propagates_identically_after_cleanup(
     assert world.child.stops_completed == 1
     assert not any(event == "run_terminated" for _phase, event in world.events())
     assert not any(event == "finalisation_returned" for _phase, event in world.events())
-    assert world.mcp.finalised == []
+    assert finalised_phases(world) == []
     assert not world.manifest_exists()
     assert checks == []
-    assert world.records("abort") == []
+    assert len(world.records("abort")) == 0
 
 
 @pytest.mark.asyncio
@@ -976,7 +1060,7 @@ async def test_t_d12_cancellation_from_the_observer_records_cancelled_and_reaps(
     assert world.child_ops() == [("configure", OFF), ("start", OFF), ("stop", OFF)]
     assert world.child.stops_completed == 1
     assert not any(event == "run_terminated" for _phase, event in world.events())
-    assert world.mcp.finalised == []
+    assert finalised_phases(world) == []
     assert not world.manifest_exists()
 
 
@@ -1030,3 +1114,191 @@ def test_t_d14_tick_carrier_is_the_reachable_closure() -> None:
     assert {model for model, _ in two_phase._TICK.models} == models
     assert {kind for kind, _ in two_phase._TICK.enums} == enums
     assert two_phase._TICK == PLANNED_TICK
+
+
+# ------------------------------------------- T-D5 completion: actual _after_tick
+
+
+class Publishing:
+    """A display-only observer that keeps each copy and publishes it to the hub."""
+
+    def __init__(self, hub: stream.ColdObservationHub) -> None:
+        self.hub = hub
+        self.copies: list[schema.ColdTickRecord] = []
+
+    def __call__(self, tick: schema.ColdTickRecord, /) -> None:
+        self.copies.append(tick)
+        self.hub.publish(tick)
+
+
+def bounded_tick(
+    rig: UnitRig,
+    *,
+    vendor: dict[str, typing.Any] | None = None,
+    extra: dict[str, typing.Any] | None = None,
+    reason: str | None = None,
+    driver: str | None = None,
+    session: str | None = None,
+    heat: int | None = None,
+    bean: float | None = None,
+    utc: str | None = None,
+) -> schema.ColdTickRecord:
+    """The rig's bound stored tick with boundary parts replaced (re-admitted by the caller)."""
+    base = rig.stored()
+    assert base.device is not None
+    device: dict[str, object] = {}
+    if vendor is not None:
+        device["raw_vendor_data"] = vendor
+    if driver is not None:
+        device["driver"] = driver
+    if heat is not None:
+        device["heat_level_percent"] = heat
+    if bean is not None:
+        device["bean_temp_c"] = bean
+    update: dict[str, object] = {"device": base.device.model_copy(update=device)}
+    if extra is not None:
+        update["raw_audio_extra"] = extra
+    if reason is not None:
+        update["audio"] = base.audio.model_copy(update={"reason": reason})
+    if session is not None:
+        update["session"] = base.session.model_copy(update={"session_id": session})
+    if utc is not None:
+        update["recorded_at_utc"] = utc
+    return base.model_copy(update=update)
+
+
+def _drain(subscription: stream.ColdSubscription) -> list[str | None]:
+    items: list[str | None] = []
+    while not subscription.queue.empty():
+        items.append(subscription.queue.get_nowait())
+    return items
+
+
+BOUNDARY_CASES: typing.Final = (
+    "depth_vendor",
+    "depth_audio_extra",
+    "nodes",
+    "vendor_bytes",
+    "audio_extra_bytes",
+    "record_bytes_ascii",
+    "record_bytes_multibyte",
+    "text_key_scalar_extremes",
+)
+
+
+def boundary_record(rig: UnitRig, case: str) -> schema.ColdTickRecord:
+    """One independently schema-admitted boundary tick bound to the rig's header and session."""
+    vendor_max = _padded(schema.MAX_VENDOR_BLOB_BYTES)
+    extra_max = _padded(schema.MAX_RAW_AUDIO_EXTRA_BYTES)
+    if case == "depth_vendor":
+        record = bounded_tick(rig, vendor=_nested(schema.MAX_JSON_DEPTH - 2))
+        beyond = bounded_tick(rig, vendor=_nested(schema.MAX_JSON_DEPTH - 1))
+    elif case == "depth_audio_extra":
+        record = bounded_tick(rig, extra=_nested(schema.MAX_JSON_DEPTH - 1))
+        beyond = bounded_tick(rig, extra=_nested(schema.MAX_JSON_DEPTH))
+    elif case == "nodes":
+        limit = _boundary(
+            lambda n: bounded_tick(rig, vendor=_vendor_nodes(n)), 1, schema.MAX_JSON_NODES
+        )
+        record = bounded_tick(rig, vendor=_vendor_nodes(limit))
+        beyond = bounded_tick(rig, vendor=_vendor_nodes(limit + 1))
+    elif case == "vendor_bytes":
+        record = bounded_tick(rig, vendor=vendor_max)
+        beyond = bounded_tick(rig, vendor=_padded(schema.MAX_VENDOR_BLOB_BYTES + 1))
+    elif case == "audio_extra_bytes":
+        record = bounded_tick(rig, extra=extra_max)
+        beyond = bounded_tick(rig, extra=_padded(schema.MAX_RAW_AUDIO_EXTRA_BYTES + 1))
+    elif case in ("record_bytes_ascii", "record_bytes_multibyte"):
+        char = "x" if case == "record_bytes_ascii" else "é"
+        limit = _boundary(
+            lambda n: bounded_tick(rig, vendor=vendor_max, extra=extra_max, reason=char * n),
+            0,
+            schema.MAX_RECORD_BYTES,
+        )
+        record = bounded_tick(rig, vendor=vendor_max, extra=extra_max, reason=char * limit)
+        size = len(schema._canonical_json(record.model_dump(mode="json")).encode("utf-8"))
+        near = schema.MAX_RECORD_BYTES - 2 <= size <= schema.MAX_RECORD_BYTES
+        assert near
+        beyond = bounded_tick(rig, vendor=vendor_max, extra=extra_max, reason=char * (limit + 1))
+    else:
+        text = "t" * schema.MAX_TEXT_FIELD_BYTES
+        key = "k" * schema.MAX_JSON_KEY_BYTES
+        bound = 10**schema.MAX_INT_DIGITS - 1
+        rig.run._sessions[OFF] = text
+        record = bounded_tick(
+            rig,
+            vendor={key: bound, "neg": -bound, "max": 1.7976931348623157e308, "tiny": 5e-324},
+            extra={key: [bound, -bound, -0.0]},
+            driver=text,
+            session=text,
+            heat=bound,
+            bean=-273.15,
+        )
+        beyond = bounded_tick(rig, driver=text + "t")
+    admitted = _refusal(record) is None
+    refused = _refusal(beyond) is not None
+    assert admitted and refused
+    return typing.cast(schema.ColdTickRecord, schema.validate_record(record))
+
+
+@pytest.mark.parametrize("case", BOUNDARY_CASES)
+def test_t_d5_boundary_ticks_publish_one_frame_through_after_tick(
+    tmp_path: Path, case: str
+) -> None:
+    """T-D5/AC3: each schema-admitted boundary tick reaches the hub once as an exclusive copy."""
+    hub = stream.ColdObservationHub()
+    subscription = hub.subscribe(None)
+    assert subscription is not None
+    publishing = Publishing(hub)
+    rig = UnitRig(tmp_path, publishing)
+    stored = boundary_record(rig, case)
+    rig.run._after_tick(stored)
+    frames = _drain(subscription)
+    assert len(frames) == 1 and len(publishing.copies) == 1
+    no_failure = rig.run._primary is None
+    still_attached = rig.run._observer is publishing
+    assert no_failure and still_attached
+    (copy,) = publishing.copies
+    assert copy.device is not None and stored.device is not None
+    exclusive = (
+        copy == stored,
+        copy is not stored,
+        copy.device is not stored.device,
+        copy.device.raw_vendor_data is not stored.device.raw_vendor_data,
+        copy.raw_audio_extra is not stored.raw_audio_extra,
+        copy.session is not stored.session,
+        copy.audio is not stored.audio,
+    )
+    assert exclusive == (True,) * 7
+    frame = frames[0]
+    assert frame is not None
+    data_line = next(part for part in frame.split("\n") if part.startswith("data: "))
+    data = stream.ColdObservationData.model_validate_json(data_line.removeprefix("data: "))
+    same_utc = data.recorded_at_utc == stored.recorded_at_utc
+    assert same_utc and data.fan_percent is None and data.device_reported is True
+    if case == "text_key_scalar_extremes":
+        # Beyond the JSON-exact bound the projection publishes null (existing U2 rule).
+        assert data.heat_percent is None and data.bean_temp_c == -273.15
+
+
+def test_t_d5_public_inadmissible_utc_is_a_projection_refusal_not_a_carrier_failure(
+    tmp_path: Path,
+) -> None:
+    """A schema-valid 2048-char UTC passes the carrier but is refused by the projection."""
+    hub = stream.ColdObservationHub()
+    subscription = hub.subscribe(None)
+    assert subscription is not None
+    publishing = Publishing(hub)
+    rig = UnitRig(tmp_path, publishing)
+    record = bounded_tick(rig, utc="t" * schema.MAX_TEXT_FIELD_BYTES)
+    admitted = _refusal(record) is None
+    assert admitted
+    stored = typing.cast(schema.ColdTickRecord, schema.validate_record(record))
+    carried = two_phase._admit_carrier(stored, schema.ColdTickRecord, two_phase._TICK) is not None
+    assert carried
+    rig.run._after_tick(stored)
+    assert len(publishing.copies) == 1
+    assert len(_drain(subscription)) == 0
+    assert rig.run._primary is R.UNEXPECTED_FAILURE
+    detached = rig.run._observer is None
+    assert detached

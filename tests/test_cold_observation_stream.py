@@ -170,8 +170,8 @@ def test_t_p1_closed_key_set_and_no_private_byte(caplog: pytest.LogCaptureFixtur
     (frame,) = drain(subscription)
     assert frame is not None
     for canary in CANARIES:
-        assert canary not in frame
-        assert canary not in caplog.text
+        leaked = (canary in frame, canary in caplog.text)
+        assert leaked == (False, False)
     assert set(frame_data(frame)) == FIELDS
 
 
@@ -313,7 +313,8 @@ def test_t_p6_refusals_are_fixed_and_carry_no_canary(case: str) -> None:
     assert str(raised.value) == "Cold observation projection refused."
     assert raised.value.__cause__ is None and raised.value.__context__ is None
     for canary in CANARIES:
-        assert canary not in str(raised.value)
+        leaked = canary in str(raised.value)
+        assert not leaked
 
 
 def test_projection_maps_both_phases_by_identity() -> None:
@@ -406,15 +407,16 @@ def test_t_h2_ring_holds_exactly_the_last_frames_as_text() -> None:
         3,
         b"0123456789abcdef-3",
     ],
-    ids=repr,
+    ids=lambda _raw: "malformed",
 )
 def test_t_h3_malformed_ids_are_a_fresh_connection(raw: object) -> None:
     """T-H3: each malformed ID is ignored (fresh connection: no replay)."""
-    assert stream.parse_last_event_id(raw) is None
+    accepted = stream.parse_last_event_id(raw) is not None
+    assert not accepted
     hub = published(5)
     subscription = hub.subscribe(raw)
     assert subscription is not None
-    assert drain(subscription) == []
+    assert len(drain(subscription)) == 0
 
 
 def test_t_h3_the_longest_valid_id_is_accepted() -> None:
@@ -513,7 +515,7 @@ def test_t_h6_overflow_delivers_queued_frames_then_the_sentinel() -> None:
         {"epoch": "0123456789abcdef0"},
         {"epoch": 12},
     ],
-    ids=repr,
+    ids=lambda _kwargs: "refused",
 )
 def test_t_h7_constructor_refusals(kwargs: dict[str, typing.Any]) -> None:
     """T-H7: each refused bound or epoch raises a fixed ``ValueError``."""
