@@ -1755,11 +1755,49 @@ def test_4gc_t19_no_actuator_transport_logging_or_output_reach() -> None:
 
 
 def test_4gc_t19_nothing_imports_the_orchestrator() -> None:
-    """T19 reverse fence: no production module imports ``two_phase``."""
+    """T19 reverse fence: only the cold composition imports four public ``two_phase`` names."""
     package = SOURCE.parents[1]
-    for path in package.rglob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        assert "two_phase" not in text or path == SOURCE, path
+    offenders = sorted(
+        p
+        for p in package.rglob("*.py")
+        if p != SOURCE and "two_phase" in p.read_text(encoding="utf-8")
+    )
+    assert offenders == [package / "cold_composition.py"]
+    public = {
+        "run_two_phase_characterisation",
+        "ColdTwoPhaseResult",
+        "ColdChildLifecycle",
+        "ColdPhaseIdentitySource",
+    }
+
+    def two_phase_imports(tree: ast.Module) -> list[tuple[str, tuple[str, ...]]]:
+        found: list[tuple[str, tuple[str, ...]]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                found.extend((alias.name, ()) for alias in node.names if "two_phase" in alias.name)
+            elif isinstance(node, ast.ImportFrom) and (
+                "two_phase" in (node.module or "")
+                or any("two_phase" in alias.name for alias in node.names)
+            ):
+                found.append((node.module or "", tuple(alias.name for alias in node.names)))
+        return found
+
+    def admitted(tree: ast.Module) -> bool:
+        found = two_phase_imports(tree)
+        return (
+            len(found) == 1
+            and found[0][0] == "roastpilot_agent.cold_characterisation.two_phase"
+            and bool(found[0][1])
+            and set(found[0][1]) <= public
+        )
+
+    composition = ast.parse((package / "cold_composition.py").read_text(encoding="utf-8"))
+    assert admitted(composition)
+    forged = ast.parse(
+        "from roastpilot_agent.cold_characterisation.two_phase import _TwoPhaseRun\n"
+    )
+    assert not admitted(forged)
+    assert not admitted(ast.parse("from roastpilot_agent.cold_characterisation import two_phase\n"))
 
 
 def _reachable(*roots: type[pydantic.BaseModel]) -> tuple[set[type], set[type]]:
