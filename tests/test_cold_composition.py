@@ -14,6 +14,7 @@ formats a whole run result, a real inherited environment or a secret value.
 # pyright: reportPrivateUsage=false
 
 import ast
+import asyncio
 import contextlib
 import copy
 import enum
@@ -639,7 +640,17 @@ def test_t_e2_unknown_family_is_refused_by_parameter() -> None:
     assert cold_composition._read_process_environment("OPENROUTER_API_KEY", "java") is None
     assert cold_composition._snapshot_environment({"PATH": "/x"}, "K", "java") is None
     assert cold_composition._admit_sdk_default_names(_POSIX_SDK, "java") is False
-    assert cold_composition._admit_environment(AppConfig(), os.name) is not None
+    admitted = cold_composition._admit_environment(AppConfig(), os.name)
+    assert type(admitted) is cold_composition._EnvSnapshot
+    assert isinstance(admitted, cold_composition._EnvSnapshot)
+    assert admitted.credential_present is True and admitted.coffee_names_present is False
+    assert dict(admitted.values) == {
+        "PATH": "/usr/bin:/bin",
+        "HOME": SYNTHETIC_HOME,
+        "USER": "cold-test",
+        "LOGNAME": "cold-test",
+        "TMPDIR": "/nonexistent-rp954/tmp",
+    }
 
 
 @pytest.mark.asyncio
@@ -695,7 +706,7 @@ async def test_t_c1_credential_absent_is_independent_of_the_builder(
 
 
 @pytest.mark.asyncio
-async def test_t_c1_real_build_advisor_returning_none_is_unavailable(
+async def test_t_c1_supplied_builder_returning_none_is_unavailable(
     tmp_path: Path,
     resources: ColdCompositionResources,
     spawns: _Spawns,
@@ -1578,6 +1589,61 @@ async def test_t_c7_no_follow_applies_at_the_actual_open(
     monkeypatch.setattr(os, "lstat", lying_lstat)
     result = await _run(tmp_path, resources, inputs=_inputs(tmp_path, link))
     assert result is R.MCP_SOURCE_NOT_ADMITTED
+    assert spawns.processes == [] and runtime.calls == []
+
+
+def test_t_c7_fifo_open_is_non_blocking_and_refused_without_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L1: a FIFO swapped in after a regular-file ``lstat`` is opened non-blocking and refused.
+
+    The ``os.open`` recorder asserts ``O_NONBLOCK`` before delegating to the real
+    open, so a dropped flag fails here, before any kernel open could block.  The
+    helper is called directly so no composition refusal can absorb that failure.
+    """
+    fifo = tmp_path / "swapped.fifo"
+    os.mkfifo(fifo)
+    decoy = tmp_path / "decoy.yaml"
+    decoy.write_text(TEMPLATE_YAML, encoding="utf-8")
+    real_lstat, real_open, real_close = os.lstat, os.open, os.close
+    opened: list[int] = []
+    closed: list[int] = []
+    reads: list[int] = []
+
+    def lying_lstat(path: typing.Any, *args: typing.Any, **kwargs: typing.Any) -> os.stat_result:
+        if not args and not kwargs and Path(path) == fifo:
+            return real_lstat(decoy)
+        return real_lstat(path, *args, **kwargs)
+
+    def recording_open(
+        path: typing.Any, flags: int, *args: typing.Any, **kwargs: typing.Any
+    ) -> int:
+        if Path(path) == fifo:
+            assert flags & os.O_NONBLOCK, "O_NONBLOCK missing before the kernel open"
+            assert flags & os.O_NOFOLLOW
+            descriptor = real_open(path, flags, *args, **kwargs)
+            opened.append(descriptor)
+            return descriptor
+        return real_open(path, flags, *args, **kwargs)
+
+    def recording_close(descriptor: int) -> None:
+        if descriptor in opened:
+            closed.append(descriptor)
+        real_close(descriptor)
+
+    def no_read(descriptor: int, size: int) -> bytes:
+        reads.append(descriptor)
+        raise AssertionError("no byte may be read from a refused descriptor")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "lstat", lying_lstat)
+        patch.setattr(os, "open", recording_open)
+        patch.setattr(os, "close", recording_close)
+        patch.setattr(os, "read", no_read)
+        with pytest.raises(ColdCompositionChildError, match=r"\ACold file read refused\.\Z"):
+            cold_composition._read_bounded_regular(fifo, 128)
+    assert len(opened) == 1 and closed == opened
+    assert reads == []
 
 
 @pytest.mark.asyncio
@@ -1602,6 +1668,59 @@ async def test_t_c7_identity_change_between_check_and_open_refused(
     monkeypatch.setattr(os, "lstat", other_identity)
     result = await _run(tmp_path, resources, inputs=_inputs(tmp_path, source))
     assert result is R.MCP_SOURCE_NOT_ADMITTED
+    assert spawns.processes == [] and runtime.calls == []
+
+
+def _bom_source(count: int) -> bytes:
+    """A valid template document plus one double-quoted string of ``count`` raw U+FEFF.
+
+    The unchanged renderer emits each raw three-byte U+FEFF as the six-byte escape
+    ``\\uFEFF`` (plus line folding), so the rendered file roughly doubles.
+    """
+    return (TEMPLATE_YAML + 'bom: "' + "\ufeff" * count + '"\n').encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("count", "refused"),
+    [(21_700, True), (20_000, False)],
+    ids=["rendered_over_cap", "rendered_under_cap"],
+)
+@pytest.mark.asyncio
+async def test_t_c7_rendered_byte_cap_through_unicode_escape_expansion(
+    count: int,
+    refused: bool,
+    tmp_path: Path,
+    resources: ColdCompositionResources,
+    spawns: _Spawns,
+    runtime: _RuntimeStub,
+) -> None:
+    """T-C7: a valid <=64 KiB source whose escapes render past 128 KiB is refused pre-spawn."""
+    data = _bom_source(count)
+    assert len(data) <= cold_composition.MAX_COLD_MCP_SOURCE_YAML_BYTES
+    assert len(cold_composition._admit_yaml(data)) > 0
+    # Independent oracle: the unchanged renderer on a separate copy of the same bytes.
+    oracle = tmp_path / "oracle-bom"
+    oracle.mkdir()
+    (oracle / "source.yaml").write_bytes(data)
+    off = _inputs(tmp_path).device_config.model_copy(
+        update={"recording_enabled": False, "recording_autocapture": False}
+    )
+    render_mcp_yaml(off, oracle / "source.yaml", oracle / "out.yaml")
+    rendered_length = len((oracle / "out.yaml").read_bytes())
+    cap = cold_composition.MAX_COLD_MCP_RENDERED_YAML_BYTES
+    assert (rendered_length > cap) is refused
+    result = await _run(tmp_path, resources, inputs=_inputs(tmp_path, _source(tmp_path, data)))
+    directory = resources.directory
+    assert directory is not None
+    if refused:
+        assert result is R.MCP_SOURCE_NOT_ADMITTED
+        assert spawns.processes == [] and runtime.calls == []
+        assert (directory / "source.yaml").read_bytes() == data
+        assert len((directory / "phase-off.yaml").read_bytes()) == rendered_length
+    else:
+        assert result is runtime.result
+        assert len(spawns.processes) == 1 and len(runtime.calls) == 1
+        assert len((directory / "phase-off.yaml").read_bytes()) == rendered_length
 
 
 PROFILE_REFUSALS: dict[str, str] = {
@@ -1798,6 +1917,36 @@ async def test_t_c10_pending_result_is_returned_as_is(
     same = result is runtime.result
     assert same
     assert _project(result)[-1] is ColdTwoPhaseProviderCheck.PENDING_AT_CHECK
+    directory = resources.directory
+    assert directory is not None and directory.is_dir()
+    assert (directory / "phase-off.yaml").is_file()
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_t_c10_cancellation_propagates_the_original_object(
+    tmp_path: Path,
+    resources: ColdCompositionResources,
+    spawns: _Spawns,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T-C10: a runtime ``CancelledError`` propagates unchanged; nothing cleaned or emitted."""
+    caplog.set_level(logging.DEBUG)
+    cancelled = asyncio.CancelledError()
+    calls: list[int] = []
+
+    async def cancelling_runtime(**kwargs: typing.Any) -> ColdTwoPhaseResult:
+        calls.append(1)
+        raise cancelled
+
+    monkeypatch.setattr(cold_composition, "run_two_phase_characterisation", cancelling_runtime)
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await _run(tmp_path, resources)
+    same = raised.value is cancelled
+    assert same
+    assert calls == [1] and len(spawns.processes) == 1
+    assert spawns.processes[0].started == 0
     directory = resources.directory
     assert directory is not None and directory.is_dir()
     assert (directory / "phase-off.yaml").is_file()

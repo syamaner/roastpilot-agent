@@ -799,8 +799,10 @@ class ColdMCPServerProcess(MCPServerProcess):
 
         The SDK's current default-name list is re-admitted on every spawn, before
         the SDK is called; a refusal raises and the start fails with no spawn.  The
-        command goes through the existing resolver unchanged.  The process
-        environment is never read here.
+        child environment is the frozen mapping only: it is never derived from the
+        live process environment at spawn.  The command goes through the existing
+        resolver unchanged, whose accepted default-command fallback may consult the
+        live ``PATH`` to locate the binary; that is not a child-environment input.
 
         Returns:
             The stdio spawn parameters, identical for both phases.
@@ -1001,6 +1003,12 @@ async def run_cold_characterisation(
     Every check runs before the child process object is constructed; a refusal
     returns its closed member with nothing constructed.  The runtime's result,
     including a pending provider check, is returned as-is.
+
+    Caller obligation: do not start another cold run while a preceding child's
+    shutdown remains unconfirmed.  This function keeps no process-wide retry
+    latch and grants no termination authority; uncertain child ownership alone
+    authorises nothing.  Same-user tampering, the SDK merge-order dependency, the
+    independent operator emergency stop and the hardware residuals remain.
 
     Args:
         config: The application config (advisor, safety, controller timing, MCP).
