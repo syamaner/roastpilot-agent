@@ -123,6 +123,14 @@ def _sha256(text: str) -> str:
     return text
 
 
+def _tcp_port(text: str) -> int:
+    """Admit a TCP port 1-65535 using the existing ``int`` syntax; 0 is refused."""
+    value = int(text)
+    if not 1 <= value <= 65535:
+        raise ValueError("not a port")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the fixed cold-characterisation grammar.
 
@@ -180,8 +188,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="asserted 64-hex artefact digest (packaged kinds only)",
     )
     single("--host", type=_non_empty, required=False, help="bind host (default 127.0.0.1)")
-    single("--port", type=int, required=False, help="bind port (default 8000)")
-    single("--spa-dir", required=False, help="built SPA directory (bundled build if omitted)")
+    single("--port", type=_tcp_port, required=False, help="bind port (default 8000)")
+    single(
+        "--spa-dir",
+        type=_non_empty,
+        required=False,
+        help="built SPA directory (bundled build if omitted)",
+    )
     return parser
 
 

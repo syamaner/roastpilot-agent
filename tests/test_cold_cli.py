@@ -461,6 +461,48 @@ def test_explicit_non_empty_host_reaches_the_runner_verbatim(harness: Harness, h
 @pytest.mark.parametrize(
     "argv",
     [
+        [*base_argv(), "--port", "-1"],
+        [*base_argv(), "--port", "0"],
+        [*base_argv(), "--port", "65536"],
+        [*base_argv(), "--port=0"],
+        [*base_argv(), "--spa-dir", ""],
+        [*base_argv(), "--spa-dir="],
+    ],
+    ids=["port-negative", "port-zero", "port-above", "port-equals-zero", "spa-empty", "spa-equals"],
+)
+def test_out_of_range_port_and_empty_spa_dir_are_fixed_usage_errors_before_any_resource(
+    harness: Harness, capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    """A7 T1/T3: no unannounced ephemeral port and no working-directory SPA mount."""
+    assert exit_status(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == cold_cli.USAGE_ERROR_LINE
+    assert captured.out == ""
+    assert harness.config_loads == 0
+    assert harness.hosted == []
+
+
+@pytest.mark.parametrize("port", [1, 65535])
+def test_port_range_bounds_reach_the_runner(harness: Harness, port: int) -> None:
+    """A7 T2: both inclusive bounds are admitted unchanged."""
+    assert exit_status([*base_argv(), "--port", str(port)]) == 0
+    _config, _inputs, kwargs = harness.hosted[0]
+    assert kwargs["bind_port"] == port
+
+
+def test_relative_spa_dir_is_still_admitted_verbatim(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A7 T4: only the empty string is refused; a relative path keeps its meaning."""
+    monkeypatch.chdir(harness.spa_dir)
+    assert exit_status([*base_argv(), "--spa-dir", "."]) == 0
+    _config, _inputs, kwargs = harness.hosted[0]
+    assert kwargs["spa_dir"] == Path(".")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
         base_argv(**{"--artefact-kind": "wheel"}),
         [*base_argv(), "--artefact-sha256", DIGEST],
         base_argv(**{"--profile-name": "   "}),
