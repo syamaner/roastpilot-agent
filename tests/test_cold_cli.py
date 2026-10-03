@@ -296,8 +296,26 @@ DUPLICATE_ROWS: list[tuple[str, list[str]]] = [
     ("cooling-notes", [*base_argv(), "--operator-cooling-notes", f"c-{MARKER}"]),
     ("revision", [*base_argv(), "--source-revision", "f" * 40]),
     ("tree", [*base_argv(**{"--source-tree": "clean"}), "--source-tree", "dirty"]),
-    ("kind", [*base_argv(**{"--artefact-kind": "wheel"}), "--artefact-kind", "sdist"]),
-    ("digest", [*base_argv(), "--artefact-sha256", DIGEST, "--artefact-sha256", "cd" * 32]),
+    (
+        "kind",
+        [
+            *base_argv(**{"--artefact-kind": "wheel"}),
+            "--artefact-kind",
+            "sdist",
+            "--artefact-sha256",
+            DIGEST,
+        ],
+    ),
+    (
+        "digest",
+        [
+            *base_argv(**{"--artefact-kind": "wheel"}),
+            "--artefact-sha256",
+            DIGEST,
+            "--artefact-sha256",
+            "cd" * 32,
+        ],
+    ),
     ("host", [*base_argv(), "--host", "127.0.0.1", "--host", "0.0.0.0"]),
     ("port", [*base_argv(), "--port", "8001", "--port", "8002"]),
     ("spa", [*base_argv(), "--spa-dir", "/srv/a", "--spa-dir", f"/srv/{MARKER}"]),
