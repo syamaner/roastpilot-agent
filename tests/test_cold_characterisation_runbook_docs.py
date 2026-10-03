@@ -267,3 +267,28 @@ def test_runbook_route_empty_host_and_distinct_evidence_roots() -> None:
     for word in ("nested", "aliased", "hard-linked"):
         assert word in secondary, word
     assert "An explicitly empty `--host` is a usage error" in command
+
+
+@pytest.mark.docs
+def test_runbook_states_complete_appliance_preconditions_and_interrupted_usage_output() -> None:
+    """A8: D183/D194 operator preconditions; an interrupted usage or help write exits 130."""
+    raw = RUNBOOK.read_text(encoding="utf-8")
+    prerequisites = _flat(_section(raw, "## 2. Prerequisites"))
+    for phrase in (
+        "Raspberry Pi 5",
+        "one mono 16 kHz / 16-bit stream; multi-microphone capture is deferred",
+        "ONNX-int8 first-crack inference",
+        "advisory-only advisor runs with a frozen production provider, model and prompt",
+        "Any material identity change restarts characterisation.",
+        "does not independently attest the physical board, the microphone format or the "
+        "actual loaded model",
+        "not physical proof",
+    ):
+        assert phrase in prerequisites, phrase
+    summary = _flat(_section(raw, "## 5. Exit codes and summary"))
+    usage = summary.index("A usage error prints only the fixed usage line on stderr (exit 2)")
+    interrupted = summary.index(
+        "An interrupt arriving while the usage line or help text is being written follows "
+        "the interrupt rule instead: exit 130 with one `cancelled_before_run` summary"
+    )
+    assert 0 < interrupted - usage < 200

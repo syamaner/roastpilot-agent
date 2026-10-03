@@ -43,6 +43,24 @@ duration and no run authority of its own.
 - The installed package pins `coffee-roaster-mcp==0.2.2`.
 - The terminal session survives a disconnect (for example `tmux` or `screen`).
   SIGHUP is not handled.
+- **Complete appliance (D194, E11-S3).** A Raspberry Pi 5 runs the installed
+  appliance stack, with the Hottop serial link connected and its telemetry
+  read-only. Exactly one primary microphone delivers one mono 16 kHz / 16-bit
+  stream; multi-microphone capture is deferred. Real ONNX-int8 first-crack
+  inference runs on that stream. The advisory-only advisor runs with a frozen
+  production provider, model and prompt, and returns typed `RoastDecision` data
+  only.
+- **Frozen identity, recorded before the run (D183).** Record the Pi 5 board
+  and RAM; the 64-bit OS, kernel and firmware; the PSU and cooling; the storage;
+  Python; the candidate MCP wheel SHA-256 and dependency inventory; the
+  ONNX-int8 model and config hashes; the ALSA primary-device identity; and the
+  Hottop serial identity. Any material identity change restarts
+  characterisation.
+- These are operator preconditions only. The software's existing admission and
+  qualification checks still apply, but the software does not independently
+  attest the physical board, the microphone format or the actual loaded model
+  and its quantisation. Self-reported identities and software evidence are not
+  physical proof.
 
 ## 3. Command
 
@@ -134,7 +152,10 @@ the run.
 ## 5. Exit codes and summary
 
 A usage error prints only the fixed usage line on stderr (exit 2), never a
-summary. Every other ordinary path that reaches the reporter attempts one closed
+summary. An interrupt arriving while the usage line or help text is being
+written follows the interrupt rule instead: exit 130 with one
+`cancelled_before_run` summary, and the usage or help text may be partial.
+Every other ordinary path that reaches the reporter attempts one closed
 summary of exactly 16 `key=value` lines (delivery may be incomplete, as below):
 `mode`, `run_invoked`, `result`, `cli_refusal`, `composition_refusal`,
 `outcome`, `start_refusal`, `termination_reason`, `child_ownership`,
