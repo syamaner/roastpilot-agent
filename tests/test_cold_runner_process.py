@@ -80,6 +80,30 @@ class Driver:
             if text == wanted or (wanted.endswith("*") and text.startswith(wanted[:-1])):
                 return text
 
+    def observe(self, wanted: str) -> bool:
+        """Read lines until ``wanted``; ``False`` if the driver's output ended first.
+
+        A bound expiring is still a test failure (never guard proof); only the
+        driver's own exit is reported, so the caller asserts on it explicitly.
+        """
+        while True:
+            try:
+                line = self._queue.get(timeout=BOUND_SECONDS)
+            except queue.Empty:
+                pytest.fail(f"bound expired waiting for {wanted!r}")
+            if line is None:
+                return False
+            self.lines.append(line)
+            if line.rstrip("\n") == wanted:
+                return True
+
+    def exit_code(self) -> int:
+        """The driver's exit code once it has ended (bounded wait)."""
+        try:
+            return self.process.wait(timeout=BOUND_SECONDS)
+        except subprocess.TimeoutExpired:
+            pytest.fail("bound expired waiting for the driver to exit")
+
     def signal(self, signum: int) -> None:
         self.process.send_signal(signum)
 
@@ -162,9 +186,11 @@ def test_p2_repeated_signals_never_force_exit_or_recancel(
     driver.expect(f"SIG {int(signal.SIGINT)}")
     driver.expect("CANCELLED")
     driver.signal(signal.SIGINT)
-    driver.expect(f"SIG {int(signal.SIGINT)}")
+    survived = driver.observe(f"SIG {int(signal.SIGINT)}")
+    assert survived, f"a repeated SIGINT ended the driver with exit {driver.exit_code()}"
     driver.signal(signal.SIGTERM)
-    driver.expect(f"SIG {int(signal.SIGTERM)}")
+    survived = driver.observe(f"SIG {int(signal.SIGTERM)}")
+    assert survived, f"a repeated SIGTERM ended the driver with exit {driver.exit_code()}"
     assert driver.process.poll() is None
     driver.release()
     code, stdout, _stderr = driver.finish()

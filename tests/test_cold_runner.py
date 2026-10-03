@@ -266,7 +266,8 @@ class Ports:
         return self.configs[-1].app
 
     async def cleanup(self) -> None:
-        """Release what a pending exit intentionally left behind."""
+        """Release what a pending exit (or a failed assertion) left behind."""
+        self.serve_release.set()
         for server in self.servers:
             server.should_exit = True
         for server in self.servers:
@@ -677,11 +678,14 @@ async def test_no_exit_authority_without_an_admitted_pending_row(
     result: str,
 ) -> None:
     """C3/C4/C5: laundered, look-alike, unadmitted and non-pending values never exit."""
+    granted: int | None = None
+    observed: int | None = None
     try:
         observed = await hosted(ports, returning(raw_factory()))
     except ExitCalled as exc:
+        granted = exc.code
         await ports.cleanup()
-        pytest.fail(f"exit authority granted without an admitted pending row: {exc.code}")
+    assert granted is None, f"exit authority granted without an admitted pending row: {granted}"
     assert observed == code
     assert not any(entry.startswith("exit:") for entry in LOG)
     out = capsys.readouterr().out
