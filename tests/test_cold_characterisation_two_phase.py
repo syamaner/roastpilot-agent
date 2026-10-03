@@ -1754,50 +1754,209 @@ def test_4gc_t19_no_actuator_transport_logging_or_output_reach() -> None:
     assert dumps and all(id(node) in inside for node in dumps)
 
 
-def test_4gc_t19_nothing_imports_the_orchestrator() -> None:
-    """T19 reverse fence: only the cold composition imports four public ``two_phase`` names."""
-    package = SOURCE.parents[1]
-    offenders = sorted(
-        p
-        for p in package.rglob("*.py")
-        if p != SOURCE and "two_phase" in p.read_text(encoding="utf-8")
-    )
-    assert offenders == [package / "cold_composition.py"]
-    public = {
-        "run_two_phase_characterisation",
-        "ColdTwoPhaseResult",
-        "ColdChildLifecycle",
-        "ColdPhaseIdentitySource",
-    }
+def test_4gc_t19_nothing_imports_the_orchestrator(tmp_path: Path) -> None:
+    """T19 reverse fence: only two consumers import exact public ``two_phase`` names.
 
-    def two_phase_imports(tree: ast.Module) -> list[tuple[str, tuple[str, ...]]]:
-        found: list[tuple[str, tuple[str, ...]]] = []
+    The cold composition may import the four composition names (the only path to
+    the orchestrator); the cold runner may import only the result type and three
+    enums.  Every real-package check and every synthetic control goes through the
+    same nested predicates.
+    """
+    module = "roastpilot_agent.cold_characterisation.two_phase"
+    composition_public = frozenset(
+        {
+            "run_two_phase_characterisation",
+            "ColdTwoPhaseResult",
+            "ColdChildLifecycle",
+            "ColdPhaseIdentitySource",
+        }
+    )
+    runner_public = frozenset(
+        {
+            "ColdChildOwnership",
+            "ColdTwoPhaseOutcome",
+            "ColdTwoPhaseProviderCheck",
+            "ColdTwoPhaseResult",
+        }
+    )
+    expected: dict[str, frozenset[str]] = {
+        "cold_composition.py": composition_public,
+        "cold_runner.py": runner_public,
+    }
+    reflective = frozenset({"importlib", "import_module", "__import__"})
+
+    def two_phase_imports(tree: ast.AST) -> list[ast.Import | ast.ImportFrom]:
+        found: list[ast.Import | ast.ImportFrom] = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
-                found.extend((alias.name, ()) for alias in node.names if "two_phase" in alias.name)
+                if any("two_phase" in alias.name for alias in node.names):
+                    found.append(node)
             elif isinstance(node, ast.ImportFrom) and (
                 "two_phase" in (node.module or "")
                 or any("two_phase" in alias.name for alias in node.names)
             ):
-                found.append((node.module or "", tuple(alias.name for alias in node.names)))
+                found.append(node)
         return found
 
-    def admitted(tree: ast.Module) -> bool:
+    def admitted(tree: ast.AST, allowed: frozenset[str]) -> bool:
         found = two_phase_imports(tree)
-        return (
-            len(found) == 1
-            and found[0][0] == "roastpilot_agent.cold_characterisation.two_phase"
-            and bool(found[0][1])
-            and set(found[0][1]) <= public
-        )
+        if len(found) != 1:
+            return False
+        node = found[0]
+        if not isinstance(node, ast.ImportFrom):
+            return False
+        if node.level != 0:
+            return False
+        if node.module != module:
+            return False
+        names = [alias.name for alias in node.names]
+        if not names:
+            return False
+        if "*" in names:
+            return False
+        if any(alias.asname is not None for alias in node.names):
+            return False
+        if any(name.startswith("_") for name in names):
+            return False
+        return set(names) <= allowed
 
-    composition = ast.parse((package / "cold_composition.py").read_text(encoding="utf-8"))
-    assert admitted(composition)
-    forged = ast.parse(
-        "from roastpilot_agent.cold_characterisation.two_phase import _TwoPhaseRun\n"
+    def reflection_free(tree: ast.AST) -> bool:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id in reflective:
+                return False
+            if isinstance(node, ast.Attribute):
+                if node.attr in reflective:
+                    return False
+                if (
+                    node.attr == "modules"
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "sys"
+                ):
+                    return False
+            if isinstance(node, ast.Import | ast.ImportFrom):
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and (node.module or "").split(".")[0] in reflective
+                ):
+                    return False
+                for alias in node.names:
+                    if alias.name.split(".")[0] in reflective or alias.asname in reflective:
+                        return False
+        return True
+
+    def consumers_admitted(
+        package: Path, exclude: Path, mapping: dict[str, frozenset[str]]
+    ) -> bool:
+        consumers = {
+            path.relative_to(package).as_posix()
+            for path in package.rglob("*.py")
+            if path != exclude and "two_phase" in path.read_text(encoding="utf-8")
+        }
+        if consumers != set(mapping):
+            return False
+        for name in sorted(consumers & set(mapping)):
+            tree = ast.parse((package / name).read_text(encoding="utf-8"))
+            if not admitted(tree, mapping[name]):
+                return False
+            if not reflection_free(tree):
+                return False
+        return True
+
+    package = SOURCE.parents[1]
+    assert consumers_admitted(package, SOURCE, expected), "primary"
+    for name in expected:
+        real = ast.parse((package / name).read_text(encoding="utf-8"))
+        assert reflection_free(real), name
+
+    def parsed(source: str) -> ast.Module:
+        return ast.parse(source)
+
+    composition_source = (
+        f"from {module} import (\n"
+        "    ColdChildLifecycle,\n"
+        "    ColdPhaseIdentitySource,\n"
+        "    ColdTwoPhaseResult,\n"
+        "    run_two_phase_characterisation,\n"
+        ")\n"
     )
-    assert not admitted(forged)
-    assert not admitted(ast.parse("from roastpilot_agent.cold_characterisation import two_phase\n"))
+    runner_source = (
+        f"from {module} import (\n"
+        "    ColdChildOwnership,\n"
+        "    ColdTwoPhaseOutcome,\n"
+        "    ColdTwoPhaseProviderCheck,\n"
+        "    ColdTwoPhaseResult,\n"
+        ")\n"
+    )
+
+    def synthetic(case: str, files: dict[str, str | None]) -> tuple[Path, Path]:
+        root = tmp_path / case / "pkg"
+        root.mkdir(parents=True)
+        excluded = root / "two_phase.py"
+        excluded.write_text("# two_phase itself\n", encoding="utf-8")
+        baseline: dict[str, str | None] = {
+            "cold_composition.py": composition_source,
+            "cold_runner.py": runner_source,
+        }
+        baseline.update(files)
+        for name, text in baseline.items():
+            if text is not None:
+                (root / name).write_text(text, encoding="utf-8")
+        return root, excluded
+
+    assert consumers_admitted(*synthetic("p", {}), expected), "P"
+    assert not consumers_admitted(
+        *synthetic("u", {"cold_cli.py": "# mentions two_phase\n"}), expected
+    ), "U"
+    wrong_consumers: list[tuple[str, dict[str, str | None]]] = [
+        ("w1", {"cold_runner.py": f"from {module} import run_two_phase_characterisation\n"}),
+        ("w2", {"cold_runner.py": f"from {module} import ColdChildLifecycle\n"}),
+        ("w3", {"cold_composition.py": f"from {module} import ColdTwoPhaseProviderCheck\n"}),
+        ("w4", {"cold_composition.py": f"from {module} import ColdChildOwnership\n"}),
+    ]
+    for case, files in wrong_consumers:
+        assert not consumers_admitted(*synthetic(case, files), expected), case.upper()
+    assert not consumers_admitted(*synthetic("m", {"cold_runner.py": None}), expected), "M"
+    reflective_runner = runner_source + "import importlib\nimportlib.import_module('x')\n"
+    shared_root, shared_excluded = synthetic("r", {"cold_runner.py": reflective_runner})
+    assert admitted(parsed(reflective_runner), runner_public), "R-admitted"
+    assert not consumers_admitted(shared_root, shared_excluded, expected), "R-shared"
+
+    either = (composition_public, runner_public)
+    for allowed in either:
+        for control in (
+            f"from {module} import _TwoPhaseRun\n",
+            "from roastpilot_agent.cold_characterisation import two_phase\n",
+            f"import {module}\n",
+            "from .cold_characterisation.two_phase import ColdTwoPhaseResult\n",
+            f"from {module} import *\n",
+            (f"from {module} import ColdTwoPhaseResult\nfrom {module} import ColdTwoPhaseResult\n"),
+            (
+                f"from {module} import ColdTwoPhaseResult\n"
+                f"def f():\n    from {module} import ColdTwoPhaseResult\n"
+            ),
+        ):
+            assert not admitted(parsed(control), allowed), control
+        level = f"from .{module} import ColdTwoPhaseResult\n"
+        assert not admitted(parsed(level), allowed), "level"
+        alias = f"from {module} import ColdTwoPhaseResult as R\n"
+        assert not admitted(parsed(alias), allowed), "alias"
+    for name in (
+        "run_two_phase_characterisation",
+        "ColdChildLifecycle",
+        "ColdPhaseIdentitySource",
+    ):
+        assert not admitted(parsed(f"from {module} import {name}\n"), runner_public), name
+    for name in ("ColdTwoPhaseProviderCheck", "ColdChildOwnership"):
+        assert not admitted(parsed(f"from {module} import {name}\n"), composition_public), name
+
+    valid_runner = f"from {module} import ColdTwoPhaseResult\n"
+    for extra in (
+        "import importlib\nimportlib.import_module('x')\n",
+        "__import__('x')\n",
+        "import sys\nsys.modules['x']\n",
+        "from importlib import import_module\n",
+    ):
+        assert not reflection_free(parsed(valid_runner + extra)), extra
 
 
 def _reachable(*roots: type[pydantic.BaseModel]) -> tuple[set[type], set[type]]:
