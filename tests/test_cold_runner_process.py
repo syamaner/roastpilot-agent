@@ -214,6 +214,15 @@ def test_p3_real_uvicorn_never_logs_request_detail(
     port = int(driver.expect("PORT *").split()[1])
     base = f"http://127.0.0.1:{port}"
     with httpx.Client(timeout=BOUND_SECONDS) as client:
+        with client.stream(
+            "GET",
+            base + "/api/cold-characterisation/events",
+            params={"last_event_id": MARKER},
+        ) as events:
+            assert events.status_code == 200
+            assert events.headers["content-type"].startswith("text/event-stream")
+            first = next(events.iter_text())
+            assert first.startswith(": connected")
         head = client.head(
             base + "/api/cold-characterisation/events", params={"last_event_id": MARKER}
         )

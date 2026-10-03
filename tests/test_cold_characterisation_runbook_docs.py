@@ -152,3 +152,55 @@ def test_registry_records_954_as_software_only_and_open() -> None:
 def test_pi_appliance_guide_links_the_runbook() -> None:
     text = PI_APPLIANCE.read_text(encoding="utf-8")
     assert "(cold-characterisation-runbook.md)" in text
+
+
+@pytest.mark.docs
+def test_e11_s3_active_acceptance_keeps_the_locked_d191_limits_and_authorises_no_tuning() -> None:
+    """The active D194 acceptance states the locked limits; tuning is never in scope."""
+    epic = EPIC.read_text(encoding="utf-8")
+    s3 = epic[epic.index(S3_HEADING) : epic.index("## Status")]
+    active = _flat(s3[s3.index("Acceptance criteria") : s3.index("**History")])
+    history = _flat(s3[s3.index("**History") :])
+    for phrase in (
+        "the locked D191 limits apply unchanged",
+        "30-minute recording-off phase followed by the 30-minute recording-on phase",
+        "at most N = 1 consecutive overflow",
+        "at most X = 200 ms of peak trailing-60-second lost audio",
+        "The production fatal consecutive-overflow streak of 30 is unchanged.",
+        "failing to meet them fails qualification",
+        "no limit is loosened in the light of results",
+        "This cold run authorises no tuning.",
+        "separately authorised change, never part of this run",
+        "requires a fresh characterisation",
+    ):
+        assert phrase in active, phrase
+    assert "well under the fatal threshold" not in active
+    assert "any overflow fails" not in active.casefold()
+    assert "apply the optimisation levers" not in active
+    assert "Record which lever" not in active
+    assert "historical context only and are not authorised by the cold run" in history
+    status = _flat(epic[epic.index("## Status") :])
+    assert "logged (historical; superseded by the D194 scope" in status
+
+
+@pytest.mark.docs
+def test_runbook_verifier_signals_and_spa_boundaries() -> None:
+    """Verifier interpreter, protected roots, SPA trust and signal timing are stated."""
+    raw = RUNBOOK.read_text(encoding="utf-8")
+    text = _flat(raw)
+    assert "RP_COLD_PYTHON='/absolute/path/to/installed/roastpilot-agent/venv/bin/python'" in raw
+    assert '"$RP_COLD_PYTHON" -c' in raw
+    assert not any(line.lstrip().startswith("python -c") for line in raw.splitlines())
+    assert "protected_roots=(" in raw
+    assert "never a bare `python`" in text
+    assert "every file under it is served to unauthenticated clients" in text
+    assert (
+        "A usage error prints only the fixed usage line on stderr (exit 2), never a summary."
+        in text
+    )
+    assert "a 30-minute recording-off phase followed by a 30-minute recording-on phase" in text
+    assert "prescribes no stimulus content, no other duration and no run authority" in text
+    assert "may only be handled after the run has been invoked" in text
+    assert "it can exit 1 with `signal=none`" in text
+    assert "Exit 130 is not guaranteed for every early timing." in text
+    assert "the software adds no automatic exclusion" in text
