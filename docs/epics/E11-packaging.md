@@ -107,20 +107,28 @@ physical cold run itself is not started, and this story stays not started.
 
 Acceptance criteria:
 
+These are the active D194 criteria; the locked D191 limits apply unchanged.
+
 - [ ] A supervised cold run on the Pi 5 complete appliance, with the single
-  primary mono 16 kHz / 16-bit stream and the detector active, keeps the
-  consecutive-overflow counter well under the fatal threshold, and the audio
-  never faults. Method: the `audio.py` "overflowed (N consecutive)" log and the
-  dashboard mic status, recorded as run evidence.
+  primary mono 16 kHz / 16-bit stream and the detector active, across the full
+  30-minute recording-off phase followed by the 30-minute recording-on phase,
+  meets the locked D191 limits unchanged: at most N = 1 consecutive overflow,
+  and at most X = 200 ms of peak trailing-60-second lost audio. The production
+  fatal consecutive-overflow streak of 30 is unchanged. These locked limits
+  permit their stated margin; failing to meet them fails qualification, and no
+  limit is loosened in the light of results. Method: the `audio.py`
+  "overflowed (N consecutive)" log and the dashboard mic status, recorded as
+  run evidence.
 - [ ] Both retained evidence copies verify against the externally recorded
   receipt, and independent Pi evidence review clears.
-- [ ] If the Pi overflows, apply the optimisation levers in order and re-run:
-  **(a)** move the teed WAV write off the detector read loop (bounded queue and
-  a separate writer thread); **(b)** lower the recording flush threshold;
-  **(c)** trim the detector cost (window, overlap, threads); **(d)** fall back
-  to a separate capture process. Record which lever the Pi needed.
-- [ ] The deployment doc notes the recording CPU cost and the appliance
-  configuration the evidence supports (`onnx_threads`, flush threshold).
+- [ ] The deployment doc notes the recording CPU cost and the frozen appliance
+  configuration the run characterised (`onnx_threads`, flush threshold).
+
+This cold run authorises no tuning. Any optimisation (for example the teed
+WAV writer, the flush threshold, the detector window, overlap or threads, or a
+separate capture process) is a separate, separately authorised change, never
+part of this run. A material change to the frozen hardware, software, device or
+configuration identity requires a fresh characterisation.
 
 **History (superseded by D194; retained as history only).** The story was
 originally a Pi 5 dual-mic recording plus FC-detection CPU soak. The dual-mic
@@ -137,7 +145,11 @@ and no fault. The Pi 5 is far tighter (RP1 xHCI, fewer and slower cores,
 sufficient there. Recording shipped in MCP 0.1.9 (#176), 0.1.10 (#180, #162)
 and 0.1.11 (#181, #178); the agent pin has since moved to 0.2.2. The earlier
 research (27 Jun) found no published Pi 5 CPU numbers and noted that the CM4
-dwc2 USB gap does not apply to the Pi 5's RP1 xHCI.
+dwc2 USB gap does not apply to the Pi 5's RP1 xHCI. The original optimisation
+levers considered then (move the teed WAV write off the detector read loop,
+lower the flush threshold, trim the detector cost, fall back to a separate
+capture process) are historical context only and are not authorised by the
+cold run.
 
 ## Status
 
@@ -166,7 +178,7 @@ release the development group pins for its mock-driver mirrors and fixtures (#95
 native-hosted ARM64 smoke builds a wheel independently, installs `wheel[pi]` separately,
 verifies its denylist and exact pin, and runs CLI/replay SPA smokes. This is package evidence
 only, not validation on Pi hardware. **E11-S3
-logged:** the recording bundle it soaks shipped in MCP 0.1.10/0.1.11
+logged (historical; superseded by the D194 scope in the E11-S3 story above):** the recording bundle it soaks shipped in MCP 0.1.10/0.1.11
 (#180/#162/#181/#178; agent pinned 0.1.11), so the Mac side is validated and the Pi-5 CPU
 soak is the open work. Re-sliced for native-only + torch-free + bundled-model distribution
 (D27, 11 Jun 2026); manual-test gate recorded as D28 (13 Jun 2026), cleared 28 Jun 2026.

@@ -18,6 +18,11 @@ recorded evidence of a supervised run. Nothing here authorises beans, a live
 roast, a readiness claim, a detector-accuracy claim or a deployment-acoustics
 claim. #954 stays open, and E11-S3 is not started.
 
+One cold run has two fixed phases: a 30-minute recording-off phase followed by
+a 30-minute recording-on phase, under the approved music stimulus (recorded in
+`--stimulus-block`). This runbook prescribes no stimulus content, no other
+duration and no run authority of its own.
+
 ## 2. Prerequisites
 
 - The roaster is empty and cold, and the run is supervised in person.
@@ -25,7 +30,10 @@ claim. #954 stays open, and E11-S3 is not started.
   The hosted app is read-only and cannot actuate an emergency stop.
 - The appliance service is stopped, so neither the serial port nor port 8000 is
   held by another process. A successful bind does not prove that the service
-  was stopped; confirm it independently.
+  was stopped; confirm it independently. A different HTTP port does not
+  prevent contention for the shared serial port or the provider quota, and the
+  software adds no automatic exclusion. The managed-service commands (stop, logs) are
+  in the [Pi appliance guide](pi-appliance.md) (Upgrade and maintenance; Logs).
 - The shell exports no `COFFEE_*` variable, and the configured `mcp.env` is
   empty. The cold composition refuses either one.
 - `ROASTPILOT_CONFIG_FILE` names a cold-specific configuration file whose
@@ -74,7 +82,8 @@ roastpilot-agent cold-characterisation \
   `sdist`, and refused for `editable_source`.
 - `--host` defaults to `127.0.0.1` and `--port` to `8000`. `--spa-dir` is
   optional; without it the bundled SPA build is used, and a missing build
-  refuses the run.
+  refuses the run. Point `--spa-dir` only at a trusted built SPA directory:
+  every file under it is served to unauthenticated clients.
 - The provenance options (`--source-revision`, `--source-tree`,
   `--artefact-kind`, `--artefact-sha256`) are an **operator assertion**, not an
   attestation. The self-reported versions, the temporary directories and the
@@ -105,7 +114,9 @@ the run.
 
 ## 5. Exit codes and summary
 
-Every ordinary exit prints one closed summary of exactly 15 `key=value` lines:
+A usage error prints only the fixed usage line on stderr (exit 2), never a
+summary. Every other ordinary path that reaches the reporter attempts one closed
+summary of exactly 15 `key=value` lines (delivery may be incomplete, as below):
 `mode`, `run_invoked`, `result`, `cli_refusal`, `composition_refusal`,
 `outcome`, `start_refusal`, `termination_reason`, `child_ownership`,
 `advisory_path`, `provider_check`, `conformance_outcome`, `manifest_sha256`,
@@ -159,21 +170,34 @@ was printed, there is no receipt for that run.
 The software writes only the primary root. The operator copies the run tree to
 the secondary root. The run directory under the primary root is named by the
 run ID. There is no CLI verifier; verification uses the existing Python
-function:
+function, run with the interpreter of the installed `roastpilot-agent`
+environment (the pipx venv when it was deployed by pipx), never a bare
+`python`. Resolve that interpreter's actual absolute path on the host first;
+the path below is a placeholder, not a universal location. Pass
+`protected_roots` exactly matching the run's repeated `--protected-root` values,
+in order (an empty tuple only if there were none):
 
 ```bash
-python -c 'from roastpilot_agent.cold_characterisation.evidence_store import verify_retained_copies; print(verify_retained_copies("/absolute/primary/evidence/root", "/absolute/secondary/evidence/root", run_id="<run ID>", expected_manifest_sha256="<recorded receipt>"))'
+RP_COLD_PYTHON='/absolute/path/to/installed/roastpilot-agent/venv/bin/python'
+"$RP_COLD_PYTHON" -c 'from roastpilot_agent.cold_characterisation.evidence_store import verify_retained_copies; print(verify_retained_copies("/absolute/primary/evidence/root", "/absolute/secondary/evidence/root", run_id="<run ID>", expected_manifest_sha256="<recorded receipt>", protected_roots=("/absolute/protected/root",)))'
 ```
 
 Independent Pi evidence review follows separately.
 
 ## 7. Signals
 
-- The first Ctrl-C or SIGTERM before the run starts means the run is never
-  invoked; the process cleans up and exits 130 or 143.
+- A first Ctrl-C or SIGTERM handled during the pre-engine awaits prevents the
+  run from being invoked; the process cleans up and exits 130 or 143.
+- A signal that arrives while the synchronous start line is being written may
+  only be handled after the run has been invoked. The existing cleanup then
+  applies, and the summary truthfully reports `run_invoked=true` with the child
+  `unknown`.
 - A SIGTERM that arrives before the cold runner has installed its handlers keeps
-  the default disposition: the process ends with no summary. A Ctrl-C at that
-  point exits 130 with a closed summary that records `signal=none`.
+  the default disposition: the process ends with no summary. An early Ctrl-C at
+  that point usually exits 130 with a closed summary recording `signal=none`,
+  but if Python's own interrupt handling cancels the task while the runner is
+  starting and that cancellation is absorbed, it can exit 1 with `signal=none`.
+  Exit 130 is not guaranteed for every early timing.
 - The first signal during the run triggers the engine's shielded cleanup and
   then the ordinary teardown.
 - **Repeated signals neither force an exit nor cancel again.** There is no
