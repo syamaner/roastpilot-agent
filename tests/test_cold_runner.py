@@ -649,7 +649,12 @@ async def test_no_exit_authority_without_an_admitted_pending_row(
     result: str,
 ) -> None:
     """C3/C4/C5: laundered, look-alike, unadmitted and non-pending values never exit."""
-    assert await hosted(ports, returning(raw_factory())) == code
+    try:
+        observed = await hosted(ports, returning(raw_factory()))
+    except ExitCalled as exc:
+        await ports.cleanup()
+        pytest.fail(f"exit authority granted without an admitted pending row: {exc.code}")
+    assert observed == code
     assert not any(entry.startswith("exit:") for entry in LOG)
     out = capsys.readouterr().out
     assert out.startswith(cold_runner.MODE_LINE)
