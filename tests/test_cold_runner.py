@@ -423,6 +423,7 @@ def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
     monkeypatch.setattr(api, "_enumerate_audio_inputs", forbidden)
     monkeypatch.setattr(cold_runner, "_CONSUMED", False)
     monkeypatch.setattr(cold_runner, "_REPORTED_EXIT", None)
+    monkeypatch.setattr(cold_runner, "_RUN_INVOKED", False)
     temp_root = tmp_path / "tmp"
     temp_root.mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
@@ -1089,11 +1090,16 @@ async def test_signal_while_the_startup_barrier_is_pending_prevents_the_run(
 ) -> None:
     ports.server_mode = "stall"
     task = asyncio.create_task(hosted(ports, returning(ADVISORY_CONFORMANT)))
-    while not ports.servers:
+    try:
+        while not ports.servers and not task.done():
+            await asyncio.sleep(0)
+        assert not task.done(), "the hosted run ended before its server existed"
+        assert len(ports.servers) == 1
         await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    ports.signals.fire(signal.SIGINT, times=4)
-    assert await task == 130
+        ports.signals.fire(signal.SIGINT, times=4)
+        assert await task == 130
+    finally:
+        await _settle_owned(task, ports)
     assert task.cancelling() == 1
     assert "run" not in LOG
     summary = parse_summary(capsys.readouterr().out)
@@ -1278,7 +1284,11 @@ async def test_real_server_with_should_exit_preset_resolves_the_barrier_negative
     assert parse_summary(capsys.readouterr().out)["cli_refusal"] == "http_start_failed"
 
 
-@pytest.mark.parametrize("error", [OSError(MARKER), SystemExit(3)], ids=["oserror", "sysexit"])
+@pytest.mark.parametrize(
+    "error",
+    [OSError(MARKER), SystemExit(3), OverflowError(MARKER), TypeError(MARKER)],
+    ids=["oserror", "sysexit", "overflow", "type"],
+)
 @pytest.mark.asyncio
 async def test_bind_failure_means_the_run_is_never_invoked(
     ports: Ports, capsys: pytest.CaptureFixture[str], error: BaseException
@@ -1300,6 +1310,55 @@ async def test_bind_failure_means_the_run_is_never_invoked(
     out = capsys.readouterr().out
     assert MARKER not in out
     assert parse_summary(out)["cli_refusal"] == "bind_failed"
+    assert "signals.restore" in LOG
+    assert all(not Path(directory.name).exists() for directory in TEMP_DIRS)
+    assert cold_runner.run_invoked() is False
+
+
+@pytest.mark.parametrize("port", [70000, -1])
+@pytest.mark.asyncio
+async def test_out_of_range_integer_ports_refuse_as_bind_failed(
+    ports: Ports, capsys: pytest.CaptureFixture[str], port: int
+) -> None:
+    """C23: the real uvicorn bind rejects these ports with no listener; no run."""
+    code = await hosted(
+        ports,
+        returning(ADVISORY_CONFORMANT),
+        config_factory=ports.real_config,
+        bind_port=port,
+    )
+    assert code == 3
+    assert "run" not in LOG
+    assert ports.servers == []
+    assert parse_summary(capsys.readouterr().out)["cli_refusal"] == "bind_failed"
+    assert all(not Path(directory.name).exists() for directory in TEMP_DIRS)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [SystemExit(0), KeyboardInterrupt(), GeneratorExit()],
+    ids=["system-exit-0", "keyboard-interrupt", "generator-exit"],
+)
+@pytest.mark.asyncio
+async def test_other_engine_base_exceptions_are_propagated_never_exit_authority(
+    ports: Ports, logged: None, capsys: pytest.CaptureFixture[str], error: BaseException
+) -> None:
+    """C27: after the engine's own cleanup, any other BaseException is exit 8, child unknown."""
+
+    async def engine(*_args: object, **_kwargs: object) -> object:
+        try:
+            raise error
+        finally:
+            LOG.append("engine-cleanup")
+
+    assert await hosted(ports, engine) == 8
+    assert not any(entry.startswith("exit:") for entry in LOG)
+    assert LOG.index("engine-cleanup") < LOG.index("summary")
+    assert LOG[-2:] == ["signals.restore", "filters.restore"]
+    out = capsys.readouterr().out
+    summary = parse_summary(out[len(cold_runner.MODE_LINE) :])
+    assert (summary["result"], summary["run_invoked"]) == ("propagated", "true")
+    assert (summary["child_ownership"], summary["exit_code"]) == ("unknown", "8")
 
 
 def _raiser(*_args: object, **_kwargs: object) -> typing.NoReturn:
@@ -1365,16 +1424,29 @@ async def test_teardown_steps_are_contained_and_retried_through_cancellation(
     task = asyncio.create_task(
         hosted(ports, returning(ADVISORY_CONFORMANT), resources_factory=FailingResources)
     )
-    while not (ports.servers and ports.servers[0].should_exit):
+    try:
+        while not (ports.servers and ports.servers[0].should_exit) and not task.done():
+            await asyncio.sleep(0)
+        assert not task.done(), "the hosted run ended before teardown reached the server"
+        assert ports.servers[0].should_exit
+        task.cancel()
         await asyncio.sleep(0)
-    task.cancel()
-    await asyncio.sleep(0)
-    task.cancel()
-    await asyncio.sleep(0)
-    ports.serve_release.set()
-    assert await task == 0
+        task.cancel()
+        await asyncio.sleep(0)
+        ports.serve_release.set()
+        assert await task == 0
+    finally:
+        await _settle_owned(task, ports)
     assert MARKER not in capsys.readouterr().out
     assert all(not Path(directory.name).exists() for directory in TEMP_DIRS)
+
+
+async def _settle_owned(task: "asyncio.Task[int]", ports: Ports) -> None:
+    """Release the test's fakes and settle its own task, whatever the outcome."""
+    ports.serve_release.set()
+    if not task.done():
+        task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -1756,3 +1828,146 @@ def test_new_modules_avoid_normal_mode_wiring() -> None:
             "_configure_access_log",
         }
         assert not (names | imported) & forbidden, path.name
+
+
+# --- the outer fallback for an interrupt escaping asyncio.run (cold_cli) ------------------
+
+
+class NoDbStore(LoggingStore):
+    """A store with no database thread, so an interrupted run leaves nothing running."""
+
+    interrupt_on_initialize = False
+
+    async def initialize(self) -> None:
+        if type(self).interrupt_on_initialize:
+            raise KeyboardInterrupt
+
+    async def close(self) -> None:
+        LOG.append("store.close")
+
+
+def _cli_with_ports(monkeypatch: pytest.MonkeyPatch, ports: Ports, run: RunFn) -> None:
+    """Route ``cold_cli.main`` into the real runner with these injected test ports."""
+    from roastpilot_agent import cold_cli
+
+    def load() -> tuple[AppConfig, frozenset[str]]:
+        return AppConfig(), frozenset()
+
+    real = cold_runner.run_hosted
+
+    async def run_hosted(
+        config: AppConfig, inputs: ColdCompositionInputs, **kwargs: typing.Any
+    ) -> int:
+        kwargs.update(
+            run=run,
+            exit_process=ports.exit_process,
+            server_factory=ports.server_factory,
+            config_factory=ports.config_factory,
+            store_factory=ports.store_factory,
+            signals=ports.signal_port,
+        )
+        return await real(config, inputs, **kwargs)
+
+    monkeypatch.setattr(cold_cli, "load_app_config", load)
+    monkeypatch.setattr(cold_cli, "read_host_facts", lambda: make_inputs().host_facts)
+    monkeypatch.setattr(cold_cli, "LinuxHostBoundsReader", FakeHost)
+    monkeypatch.setattr(cold_cli, "default_spa_dir", lambda: ports.spa_dir)
+    monkeypatch.setattr(cold_runner, "run_hosted", run_hosted)
+
+
+def _cli_argv() -> list[str]:
+    from tests.test_cold_cli import base_argv
+
+    return base_argv()
+
+
+@pytest.fixture
+def sync_ports(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Ports:
+    spa = tmp_path / "spa"
+    spa.mkdir()
+    (spa / "index.html").write_text("<html>cold-spa</html>", encoding="utf-8")
+    state = Ports(spa)
+    state.store_class = NoDbStore
+    monkeypatch.setattr(NoDbStore, "interrupt_on_initialize", False)
+    return state
+
+
+def _summaries(out: str) -> int:
+    return out.count("mode=cold_characterisation\n")
+
+
+def test_interrupt_after_the_engine_before_the_report_says_invoked(
+    sync_ports: Ports, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """C28a: an interrupt at teardown entry reports cancelled, invoked, child unknown."""
+    from roastpilot_agent import cold_cli
+
+    def interrupted(_summary: cold_runner.ColdRunSummary) -> int:
+        raise KeyboardInterrupt
+
+    _cli_with_ports(monkeypatch, sync_ports, returning(ADVISORY_CONFORMANT))
+    monkeypatch.setattr(cold_runner, "_report", interrupted)
+    assert cold_cli.main(_cli_argv()) == 130
+    out = capsys.readouterr().out
+    assert "run" in LOG
+    assert _summaries(out) == 1
+    summary = parse_summary(out[len(cold_runner.MODE_LINE) :])
+    assert (summary["result"], summary["run_invoked"]) == ("cancelled", "true")
+    assert (summary["child_ownership"], summary["signal"]) == ("unknown", "none")
+    assert summary["exit_code"] == "130"
+
+
+def test_interrupt_after_the_latch_before_the_engine_says_not_invoked(
+    sync_ports: Ports, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """C28b: an interrupt inside store initialisation reports the run never invoked."""
+    from roastpilot_agent import cold_cli
+
+    monkeypatch.setattr(NoDbStore, "interrupt_on_initialize", True)
+    _cli_with_ports(monkeypatch, sync_ports, returning(ADVISORY_CONFORMANT))
+    assert cold_cli.main(_cli_argv()) == 130
+    out = capsys.readouterr().out
+    assert "run" not in LOG
+    assert _summaries(out) == 1
+    summary = parse_summary(out)
+    assert (summary["result"], summary["run_invoked"]) == ("cancelled_before_run", "false")
+    assert (summary["child_ownership"], summary["signal"]) == ("none", "none")
+
+
+def test_interrupt_while_emitting_the_report_writes_no_second_summary(
+    sync_ports: Ports, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """C29(i): once a report attempt began, the fallback never writes another summary."""
+    from roastpilot_agent import cold_cli
+
+    real_emit = cold_runner.emit
+    raised: list[bool] = []
+
+    def emit(text: str) -> None:
+        if text != cold_runner.MODE_LINE and not raised:
+            raised.append(True)
+            raise KeyboardInterrupt
+        real_emit(text)
+
+    _cli_with_ports(monkeypatch, sync_ports, returning(ADVISORY_CONFORMANT))
+    monkeypatch.setattr(cold_runner, "emit", emit)
+    assert cold_cli.main(_cli_argv()) == 130
+    assert raised == [True]
+    assert _summaries(capsys.readouterr().out) == 0
+
+
+def test_interrupt_during_handler_restore_keeps_exactly_one_summary(
+    sync_ports: Ports, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """C29(ii): an interrupt after the summary returns 130 with no second summary."""
+    from roastpilot_agent import cold_cli
+
+    def interrupted() -> None:
+        raise KeyboardInterrupt
+
+    _cli_with_ports(monkeypatch, sync_ports, returning(ADVISORY_CONFORMANT))
+    monkeypatch.setattr(sync_ports.signals, "restore", interrupted)
+    assert cold_cli.main(_cli_argv()) == 130
+    out = capsys.readouterr().out
+    assert _summaries(out) == 1
+    assert parse_summary(out[len(cold_runner.MODE_LINE) :])["exit_code"] == "0"

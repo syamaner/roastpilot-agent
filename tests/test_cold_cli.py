@@ -117,6 +117,7 @@ def isolated(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(name)
     monkeypatch.setattr(cold_runner, "_CONSUMED", False)
     monkeypatch.setattr(cold_runner, "_REPORTED_EXIT", None)
+    monkeypatch.setattr(cold_runner, "_RUN_INVOKED", False)
 
     def forbidden(*_args: object, **_kwargs: object) -> typing.NoReturn:
         raise AssertionError("normal-mode live wiring reached")
@@ -280,31 +281,60 @@ def test_malformed_values_are_fixed_usage_errors_without_echo(
     assert harness.config_loads == 0
 
 
+#: Every single-use flag with two VALID values, so only the duplicate rule can refuse
+#: it.  Free-text values carry the marker, which must never be echoed.
+DUPLICATE_ROWS: list[tuple[str, list[str]]] = [
+    ("profile", [*base_argv(**{"--profile-name": "a"}), "--profile-name", f"b-{MARKER}"]),
+    ("drop", [*base_argv(), "--target-drop-temp-c", "201.0"]),
+    ("evidence", [*base_argv(), "--evidence-dir", f"/srv/{MARKER}"]),
+    ("secondary", [*base_argv(), "--secondary-evidence-dir", f"/srv/2-{MARKER}"]),
+    ("audio", [*base_argv(), "--audio-device-identity", f"mic-{MARKER}"]),
+    ("serial", [*base_argv(), "--serial-port-path", f"/dev/{MARKER}"]),
+    ("stimulus", [*base_argv(), "--stimulus-block", f"s-{MARKER}"]),
+    ("host-notes", [*base_argv(), "--operator-host-notes", f"h-{MARKER}"]),
+    ("psu-notes", [*base_argv(), "--operator-psu-notes", f"p-{MARKER}"]),
+    ("cooling-notes", [*base_argv(), "--operator-cooling-notes", f"c-{MARKER}"]),
+    ("revision", [*base_argv(), "--source-revision", "f" * 40]),
+    ("tree", [*base_argv(**{"--source-tree": "clean"}), "--source-tree", "dirty"]),
+    ("kind", [*base_argv(**{"--artefact-kind": "wheel"}), "--artefact-kind", "sdist"]),
+    ("digest", [*base_argv(), "--artefact-sha256", DIGEST, "--artefact-sha256", "cd" * 32]),
+    ("host", [*base_argv(), "--host", "127.0.0.1", "--host", "0.0.0.0"]),
+    ("port", [*base_argv(), "--port", "8001", "--port", "8002"]),
+    ("spa", [*base_argv(), "--spa-dir", "/srv/a", "--spa-dir", f"/srv/{MARKER}"]),
+]
+
+
+def exit_status(argv: list[str]) -> object:
+    """The CLI's exit status: a ``SystemExit`` code or the returned code."""
+    try:
+        return cold_cli.main(argv)
+    except SystemExit as exc:
+        return exc.code
+
+
 @pytest.mark.parametrize(
-    "argv",
-    [
-        [*base_argv(**{"--profile-name": "a"}), "--profile-name", MARKER],
-        [*base_argv(), "--target-drop-temp-c", "201.0"],
-        [*base_argv(), "--evidence-dir", f"/{MARKER}"],
-        [*base_argv(**{"--artefact-kind": "wheel"}), "--artefact-kind", MARKER],
-        [*base_argv(), "--artefact-sha256", DIGEST, "--artefact-sha256", DIGEST],
-        [*base_argv(), "--host", "127.0.0.1", "--host", MARKER],
-        [*base_argv(), "--port", "8001", "--port", "8002"],
-        [*base_argv(), "--spa-dir", "/a", "--spa-dir", f"/{MARKER}"],
-    ],
-    ids=["profile", "drop", "evidence", "kind", "digest", "host", "port", "spa"],
+    "argv", [row for _, row in DUPLICATE_ROWS], ids=[name for name, _ in DUPLICATE_ROWS]
 )
 def test_duplicate_single_use_options_are_fixed_usage_errors(
     harness: Harness, capsys: pytest.CaptureFixture[str], argv: list[str]
 ) -> None:
-    """C22: every option except ``--protected-root`` is single-use."""
-    with pytest.raises(SystemExit) as exc:
-        cold_cli.main(argv)
-    assert exc.value.code == 2
+    """C22/C30: every option except ``--protected-root`` is single-use, even when valid."""
+    assert exit_status(argv) == 2
     captured = capsys.readouterr()
     assert captured.err == cold_cli.USAGE_ERROR_LINE
     assert MARKER not in captured.out + captured.err
     assert harness.config_loads == 0
+
+
+def test_every_single_use_flag_has_an_all_valid_duplicate_row() -> None:
+    """The duplicate rows cover every option except the repeatable ``--protected-root``."""
+    flags = {
+        action.option_strings[0]
+        for action in cold_cli.build_parser()._actions
+        if action.option_strings and action.dest not in {"help", "protected_root"}
+    }
+    duplicated = {flag for _, row in DUPLICATE_ROWS for flag in flags if row.count(flag) == 2}
+    assert duplicated == flags
 
 
 def test_help_is_fixed_grammar_with_only_host_and_port_defaults(
@@ -418,10 +448,13 @@ def _config_errors() -> list[BaseException]:
     validation = pydantic.ValidationError.from_exception_data(
         MARKER, [{"type": "missing", "loc": (MARKER,), "input": MARKER}]
     )
-    return [ConfigFileError(MARKER), validation, OSError(MARKER)]
+    decode = UnicodeDecodeError("utf-8", MARKER.encode(), 0, 1, MARKER)
+    return [ConfigFileError(MARKER), validation, OSError(MARKER), decode]
 
 
-@pytest.mark.parametrize("error", _config_errors(), ids=["file", "validation", "os"])
+@pytest.mark.parametrize(
+    "error", _config_errors(), ids=["file", "validation", "os", "unicode-decode"]
+)
 def test_config_failures_print_fixed_text_only(
     harness: Harness,
     monkeypatch: pytest.MonkeyPatch,
@@ -626,6 +659,34 @@ def test_missing_spa_refuses_before_the_run(
     assert harness.hosted == []
 
 
+@pytest.mark.parametrize(
+    "fault", ["default-permission", "default-value", "probe-permission", "probe-value"]
+)
+def test_spa_probe_errors_refuse_before_the_run(
+    harness: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fault: str,
+) -> None:
+    """C26: an unreadable or malformed SPA path refuses with fixed text only."""
+    error: Exception = PermissionError(MARKER) if "permission" in fault else ValueError(MARKER)
+
+    def raising(*_args: object, **_kwargs: object) -> typing.NoReturn:
+        raise error
+
+    if fault.startswith("default"):
+        monkeypatch.setattr(cold_cli, "default_spa_dir", raising)
+        argv = base_argv()
+    else:
+        monkeypatch.setattr(Path, "is_file", raising)
+        argv = [*base_argv(), "--spa-dir", f"/srv/{MARKER}"]
+    assert cold_cli.main(argv) == 3
+    captured = capsys.readouterr()
+    assert MARKER not in captured.out + captured.err
+    assert parse_summary(captured.out)["cli_refusal"] == "spa_not_found"
+    assert harness.hosted == []
+
+
 # --- interrupts -------------------------------------------------------------------------
 
 
@@ -640,22 +701,37 @@ def test_interrupt_before_the_runner_maps_to_cancelled_before_run(
     summary = parse_summary(capsys.readouterr().out)
     assert summary["result"] == "cancelled_before_run"
     assert summary["run_invoked"] == "false"
-    assert summary["signal"] == "sigint"
+    assert summary["child_ownership"] == "none"
+    assert summary["signal"] == "none"
     assert summary["exit_code"] == "130"
 
 
-def test_interrupt_after_the_runner_reported_keeps_the_reported_code(
+def test_interrupt_after_a_report_attempt_writes_nothing_more_and_returns_130(
     harness: Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A late interrupt neither changes the reported code nor prints a second summary."""
+    """A late interrupt never appends a second summary or keeps an unproven code."""
 
     async def reported_then_interrupted(*_args: object, **_kwargs: object) -> int:
         monkeypatch.setattr(cold_runner, "_REPORTED_EXIT", 6)
         raise KeyboardInterrupt
 
     monkeypatch.setattr(cold_runner, "run_hosted", reported_then_interrupted)
-    assert cold_cli.main(base_argv()) == 6
+    assert cold_cli.main(base_argv()) == 130
     assert capsys.readouterr().out == ""
+
+
+def test_interrupt_after_the_engine_was_reached_reports_the_child_unknown(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def invoked_then_interrupted(*_args: object, **_kwargs: object) -> int:
+        monkeypatch.setattr(cold_runner, "_RUN_INVOKED", True)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cold_runner, "run_hosted", invoked_then_interrupted)
+    assert cold_cli.main(base_argv()) == 130
+    summary = parse_summary(capsys.readouterr().out)
+    assert (summary["result"], summary["run_invoked"]) == ("cancelled", "true")
+    assert (summary["child_ownership"], summary["signal"]) == ("unknown", "none")
 
 
 def test_main_dispatch_returns_the_runner_code(

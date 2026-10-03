@@ -113,8 +113,10 @@ _PENDING_CODES: Mapping[tuple[ColdTwoPhaseOutcome, ColdChildOwnership], int] = (
 
 #: The per-interpreter latch; set by the first :func:`run_hosted` and never reset.
 _CONSUMED = False
-#: The exit code of the last summary :func:`run_hosted` reported, if any.
+#: The exit code of the last summary :func:`run_hosted` began to report, if any.
 _REPORTED_EXIT: int | None = None
+#: Set immediately before the engine await; monotonic, never reset or derived.
+_RUN_INVOKED = False
 
 
 class CliRefusal(enum.Enum):
@@ -232,8 +234,27 @@ def emit(text: str) -> None:
 
 
 def reported_exit_code() -> int | None:
-    """The exit code of the summary :func:`run_hosted` already reported, if any."""
+    """The exit code of the summary whose report attempt began, if any.
+
+    This records only that a report attempt began; it never proves that the
+    summary was delivered and is never a receipt.
+    """
     return _REPORTED_EXIT
+
+
+def run_invoked() -> bool:
+    """Whether this interpreter's runner reached the engine await.
+
+    Monotonic: set immediately before the engine await and never reset or derived
+    from the per-interpreter latch.
+    """
+    return _RUN_INVOKED
+
+
+def _mark_run_invoked() -> None:
+    """Record that the engine await is about to begin."""
+    global _RUN_INVOKED
+    _RUN_INVOKED = True  # pyright: ignore[reportConstantRedefinition]
 
 
 def _report(summary: ColdRunSummary) -> int:
@@ -525,7 +546,9 @@ class _HostedRun:
             return self._refused(CliRefusal.HTTP_START_FAILED)
         try:
             self.sock = uv.bind_socket()
-        except (OSError, SystemExit):
+        except (Exception, SystemExit):
+            # Any bind failure (OSError, an out-of-range port's OverflowError, an
+            # unencodable host's TypeError/ValueError, uvicorn's SystemExit) refuses.
             return self._refused(CliRefusal.BIND_FAILED)
         started: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         try:
@@ -545,6 +568,7 @@ class _HostedRun:
             # await above; this check only keeps the run uninvoked if it did not.
             return self._cancelled(run_invoked=False)
         self.state.phase = _Phase.ENGINE
+        _mark_run_invoked()
         try:
             raw: object = await self.run(
                 self.config,
@@ -557,7 +581,10 @@ class _HostedRun:
         except asyncio.CancelledError:
             self.state.phase = _Phase.POST_ENGINE
             return self._cancelled(run_invoked=True)
-        except Exception:
+        except BaseException:
+            # Any other BaseException (SystemExit of any code, KeyboardInterrupt,
+            # GeneratorExit) arrives after the engine's own shielded cleanup; it is
+            # a propagated failure with the child unknown, never exit authority.
             self.state.phase = _Phase.POST_ENGINE
             return ColdRunSummary(
                 run_invoked=True, result=SummaryResult.PROPAGATED, exit_code=_UNKNOWN_CHILD_EXIT

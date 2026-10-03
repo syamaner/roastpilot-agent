@@ -327,9 +327,15 @@ def _refuse(refusal: cold_runner.CliRefusal, code: int) -> int:
 
 
 def _resolve_spa_dir(explicit: str | None) -> Path | None:
-    """The SPA directory holding ``index.html``, else ``None``."""
-    candidate = default_spa_dir() if explicit is None else Path(explicit)
-    if candidate is None or not (candidate / "index.html").is_file():
+    """The SPA directory holding ``index.html``, else ``None``.
+
+    An unreadable, over-long or NUL-bearing path refuses like a missing build.
+    """
+    try:
+        candidate = default_spa_dir() if explicit is None else Path(explicit)
+        if candidate is None or not (candidate / "index.html").is_file():
+            return None
+    except (OSError, ValueError):
         return None
     return candidate
 
@@ -354,7 +360,7 @@ def _run(argv: Sequence[str]) -> int:
         return _refuse(cold_runner.CliRefusal.INPUT_NOT_ADMITTED, _INPUT_EXIT)
     try:
         config, _injected = load_app_config()
-    except (ConfigFileError, pydantic.ValidationError, OSError):
+    except (ConfigFileError, pydantic.ValidationError, OSError, ValueError):
         return _refuse(cold_runner.CliRefusal.CONFIG_NOT_LOADED, _REFUSAL_EXIT)
     facts = read_host_facts()
     if facts is None:
@@ -400,9 +406,11 @@ def main(argv: Sequence[str]) -> int:
     """Run the cold-characterisation action.
 
     A usage error or ``--help`` exits through ``SystemExit`` (2 with one fixed
-    line, or 0).  An interrupt that escapes before the runner installs its signal
-    handlers maps to the closed ``cancelled_before_run`` summary and 130; one that
-    arrives after the runner already reported keeps the reported code.
+    line, or 0).  An interrupt or cancellation that escapes returns 130.  If the
+    runner had already begun a report attempt, nothing more is written (the
+    earlier output may be partial and is never a receipt).  Otherwise one closed
+    summary is written: ``cancelled_before_run`` when the engine await was never
+    reached, else ``cancelled`` with the child unknown.  No signal is claimed.
 
     Args:
         argv: The arguments after ``cold-characterisation``.
@@ -413,16 +421,19 @@ def main(argv: Sequence[str]) -> int:
     try:
         return _run(argv)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        reported = cold_runner.reported_exit_code()
-        if reported is not None:
-            return reported
+        if cold_runner.reported_exit_code() is not None:
+            return _CANCELLED_EXIT
+        invoked = cold_runner.run_invoked()
         cold_runner.emit(
             cold_runner.render_summary(
                 cold_runner.ColdRunSummary(
-                    run_invoked=False,
-                    result=cold_runner.SummaryResult.CANCELLED_BEFORE_RUN,
+                    run_invoked=invoked,
+                    result=(
+                        cold_runner.SummaryResult.CANCELLED
+                        if invoked
+                        else cold_runner.SummaryResult.CANCELLED_BEFORE_RUN
+                    ),
                     exit_code=_CANCELLED_EXIT,
-                    signal_number=2,
                 )
             )
         )
