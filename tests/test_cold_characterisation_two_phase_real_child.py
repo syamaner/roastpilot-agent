@@ -11,6 +11,13 @@ hardware, microphone, model download or sensor is touched.  Recording-on flags
 are rendered but inert here (first crack is disabled).  Phase admission is not
 attempted: the frozen identity refuses a disabled first-crack mode, which is
 the honest scope of this test.
+
+Published 0.2.2 carries no ``cold_temperature_projection``, so each cycle's one
+read must fail closed with ``PROJECTION_KEY_MISSING`` and return no
+observation.  The cycle then calls ``client.finalise_session`` directly.  That
+is a direct-client call after a direct-client error; it is not, and is not
+evidence about, finalisation after a retained engine abort, which the engine
+never performs (proved by the engine's own T7/T16 real-client cases).
 """
 
 # pyright: reportPrivateUsage=false
@@ -28,9 +35,13 @@ from roastpilot_agent.cold_characterisation import two_phase
 from roastpilot_agent.cold_characterisation.evidence_schema import ColdPhaseKind
 from roastpilot_agent.cold_characterisation.mcp import (
     ColdCharacterisationMCPClient,
+    ColdTickTemperatureProjectionError,
     SessionFinalisationResult,
     finalisation_has_required_safety_evidence,
     finalisation_is_clean,
+)
+from roastpilot_agent.cold_characterisation.temperature_projection import (
+    ColdTemperatureProjectionFailure,
 )
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceConfig
 from roastpilot_agent.mcp_client import MCPServerProcess, resolve_mcp_command
@@ -158,8 +169,10 @@ async def test_t_rc_one_process_and_client_across_tasks_finalise_clean_and_stop(
         started = await client.start_cold_session()
         session = started.session.session_id
         await client.mark_beans_added()
-        observation = await client.get_roast_state()
-        assert observation.session.session_id == session
+        with pytest.raises(ColdTickTemperatureProjectionError) as raised:
+            await client.get_roast_state()
+        assert raised.value.failure is ColdTemperatureProjectionFailure.PROJECTION_KEY_MISSING
+        # Direct-client finalisation after a direct-client error, not an engine sequence.
         results[phase] = await client.finalise_session(session)
 
     async def task_a() -> None:
