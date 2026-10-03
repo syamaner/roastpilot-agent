@@ -14,6 +14,7 @@ RUNBOOK = REPO_ROOT / "docs/deployment/cold-characterisation-runbook.md"
 EPIC = REPO_ROOT / "docs/epics/E11-packaging.md"
 REGISTRY = REPO_ROOT / "docs/state/registry.md"
 PI_APPLIANCE = REPO_ROOT / "docs/deployment/pi-appliance.md"
+ROUTES = REPO_ROOT / "web/src/routes.tsx"
 S3_HEADING = (
     "### E11-S3 — Pi 5 single-primary-mic complete-appliance cold characterisation "
     "(overflow validation)"
@@ -240,3 +241,29 @@ def test_runbook_states_the_http_server_snapshot_without_health_or_qualification
         "view was healthy",
     ):
         assert overclaim not in text.casefold()
+
+
+def _section(raw: str, heading: str) -> str:
+    """Return one ``## `` section of the runbook, up to the next ``## `` heading."""
+    start = raw.index(heading)
+    end = raw.find("\n## ", start + len(heading))
+    return raw[start:] if end == -1 else raw[start:end]
+
+
+@pytest.mark.docs
+def test_runbook_route_empty_host_and_distinct_evidence_roots() -> None:
+    """A6: the cold URL matches the frozen route; roots must not overlap; empty host refused."""
+    raw = RUNBOOK.read_text(encoding="utf-8")
+    command = _flat(_section(raw, "## 3. Command"))
+    monitoring = _flat(_section(raw, "## 4. Monitoring"))
+    evidence = _flat(_section(raw, "## 6. Evidence"))
+    assert "`http://127.0.0.1:8000/cold-characterisation`" in monitoring
+    assert 'path: "/cold-characterisation"' in ROUTES.read_text(encoding="utf-8")
+    assert "`ROOTS_OVERLAP`" in evidence
+    secondary = command[command.index("`--secondary-evidence-dir` is recorded only") :]
+    secondary = secondary[: secondary.index(" - `--protected-root`")]
+    assert "never opens or writes" in secondary
+    assert "distinct and non-overlapping" in secondary
+    for word in ("nested", "aliased", "hard-linked"):
+        assert word in secondary, word
+    assert "An explicitly empty `--host` is a usage error" in command

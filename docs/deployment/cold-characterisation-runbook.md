@@ -76,14 +76,22 @@ roastpilot-agent cold-characterisation \
   is no default and no range: the target drop only has to be a finite Celsius
   value. No charge guidance is accepted.
 - `--secondary-evidence-dir` is recorded only; the software never opens or
-  writes it.
+  writes it. Before choosing the roots, make the primary and secondary roots
+  **distinct and non-overlapping**: neither root is the same as the other or
+  nested inside it, neither is the same directory reached through another path
+  (an aliased root via a symlink, bind mount or other alias), and the copied run
+  directory and its files are never the same directory as, or hard-linked to,
+  the primary's. The software records the secondary path only; it never opens,
+  writes or compares it, and it does not check for overlap when the run starts.
 - `--protected-root` is optional and repeatable; nothing is added implicitly.
 - `--artefact-sha256` is required exactly when `--artefact-kind` is `wheel` or
   `sdist`, and refused for `editable_source`.
 - `--host` defaults to `127.0.0.1` and `--port` to `8000`. `--spa-dir` is
   optional; without it the bundled SPA build is used, and a missing build
   refuses the run. Point `--spa-dir` only at a trusted built SPA directory:
-  every file under it is served to unauthenticated clients.
+  every file under it is served to unauthenticated clients. An explicitly empty
+  `--host` is a usage error; any non-loopback bind must name its address
+  explicitly and is covered by the LAN residual in §4.
 - The provenance options (`--source-revision`, `--source-tree`,
   `--artefact-kind`, `--artefact-sha256`) are an **operator assertion**, not an
   attestation. The self-reported versions, the temporary directories and the
@@ -98,6 +106,12 @@ the run.
 - Prefer the loopback bind with an SSH tunnel. With a LAN bind, up to **four
   unauthenticated display clients** can occupy every cold-stream slot. That
   limits display availability; it does not affect run safety.
+- With the default loopback bind, the cold view is at
+  `http://127.0.0.1:8000/cold-characterisation`, opened on the host itself or
+  through an operator-managed SSH local port forward to the host's loopback
+  port. If `--port` or the tunnel's local port differs, only the port changes;
+  the path stays `/cold-characterisation`. The cold view has no navigation link:
+  `/` opens the normal home view, not the cold view.
 - The cold stream shows **retained display ticks before engine
   classification**. A displayed tick is never an accepted, safe or qualified
   tick, and the stream is never proof that observation continues during a clock
@@ -196,7 +210,9 @@ was printed, there is no receipt for that run.
 
 The software writes only the primary root. The operator copies the run tree to
 the secondary root. The run directory under the primary root is named by the
-run ID. There is no CLI verifier; verification uses the existing Python
+run ID. The verifier below refuses overlapping, aliased or shared-file copies
+with `ROOTS_OVERLAP`; that check is a same-host software check and does not
+prove physical storage separation. There is no CLI verifier; verification uses the existing Python
 function, run with the interpreter of the installed `roastpilot-agent`
 environment (the pipx venv when it was deployed by pipx), never a bare
 `python`. Resolve that interpreter's actual absolute path on the host first;
