@@ -45,7 +45,7 @@ from roastpilot_agent.cold_characterisation.engine_policy import (
     COLD_OBSERVATION_INTERVAL_SECONDS,
 )
 from roastpilot_agent.cold_characterisation.evidence_lifecycle import is_admissible_utc_instant
-from roastpilot_agent.cold_characterisation.evidence_schema import ColdPhaseKind
+from roastpilot_agent.cold_characterisation.evidence_schema import ColdPhaseKind, ColdTickRecord
 from roastpilot_agent.cold_characterisation.evidence_store import (
     ColdAdmittedRoot,
     admit_evidence_root,
@@ -1019,6 +1019,7 @@ async def run_cold_characterisation(
     host: ColdEngineHost,
     advisor_builder: Callable[[AppConfig], RoastAdvisor | None] = build_advisor,
     run_suffix: Callable[[], str] = random_run_suffix,
+    tick_observer: Callable[[ColdTickRecord], None] | None = None,
 ) -> ColdTwoPhaseResult | ColdCompositionRefusal:
     """Admit everything, construct one child and client, and run both cold phases.
 
@@ -1047,6 +1048,10 @@ async def run_cold_characterisation(
         host: The host-bound port (one instance for both phases).
         advisor_builder: Builds the advisor once; production is the real builder.
         run_suffix: Supplies the run-ID suffix.
+        tick_observer: Optional synchronous display-only observer passed through
+            verbatim to the runtime; it receives an exclusive copy of each retained
+            tick, and its failure fails the run with no abort.  ``None`` changes
+            nothing.
 
     Returns:
         The runtime's closed result, or the first refusal.
@@ -1119,4 +1124,5 @@ async def run_cold_characterisation(
         configured_call_bound_seconds=float(config.controller.advisory_timeout_seconds),
         configured_dwell_seconds=float(config.controller.post_fc_min_consult_interval_seconds),
         evaluator=SafetyPolicy(config.safety),
+        tick_observer=tick_observer,
     )

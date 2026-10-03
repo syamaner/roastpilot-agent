@@ -439,6 +439,44 @@ async def _run(
 
 
 @pytest.mark.asyncio
+async def test_t_c1_tick_observer_is_passed_through_verbatim(
+    tmp_path: Path,
+    resources: ColdCompositionResources,
+    spawns: _Spawns,
+    runtime: _RuntimeStub,
+) -> None:
+    """T-C1 (U2): the identical observer reaches the runtime; the result is returned as-is."""
+
+    def observer(tick: typing.Any) -> None:
+        raise AssertionError("never called by the runtime stub")
+
+    result = await cold_composition.run_cold_characterisation(
+        AppConfig(),
+        _inputs(tmp_path),
+        resources=resources,
+        clock=_Clock(),
+        host=_Host(),
+        advisor_builder=_Builder(),
+        run_suffix=lambda: "abc",
+        tick_observer=observer,
+    )
+    assert result is runtime.result
+    assert len(runtime.calls) == 1 and len(spawns.processes) == 1
+    assert runtime.calls[0]["tick_observer"] is observer
+
+
+def test_t_c1_tick_observer_defaults_to_none_and_is_the_last_keyword() -> None:
+    """T-C1 (U2): the new keyword is keyword-only, last, and defaults to ``None``."""
+    parameters = list(
+        inspect.signature(cold_composition.run_cold_characterisation).parameters.values()
+    )
+    last = parameters[-1]
+    assert last.name == "tick_observer"
+    assert last.kind is inspect.Parameter.KEYWORD_ONLY
+    assert last.default is None
+
+
+@pytest.mark.asyncio
 async def test_t_c1_valid_inputs_call_the_runtime_once_with_single_instances(
     tmp_path: Path,
     resources: ColdCompositionResources,
@@ -471,7 +509,9 @@ async def test_t_c1_valid_inputs_call_the_runtime_once_with_single_instances(
         "configured_call_bound_seconds",
         "configured_dwell_seconds",
         "evaluator",
+        "tick_observer",
     }
+    assert kwargs["tick_observer"] is None
     client, child, identities = kwargs["mcp"], kwargs["child"], kwargs["identities"]
     assert type(client) is ColdCharacterisationMCPClient
     assert client._call_tool == process.call_tool
