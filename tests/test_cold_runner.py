@@ -13,6 +13,7 @@ temporary directory lands under ``tmp_path``.  No serial port, MCP child, provid
 import ast
 import asyncio
 import contextlib
+import dataclasses
 import enum
 import gc
 import inspect
@@ -22,6 +23,7 @@ import signal
 import socket
 import stat
 import tempfile
+import textwrap
 import types
 import typing
 from collections.abc import Awaitable, Callable, Iterator
@@ -310,6 +312,16 @@ class FakeServer:
                 self._started.set_result(False)
             elif mode != "stall":
                 self._started.set_result(True)
+            if mode == "end_after_start":
+                return
+            if mode == "raise_after_start":
+                raise RuntimeError(MARKER)
+            if mode == "sysexit_after_start":
+                raise SystemExit(3)
+            if mode == "start_then_signal":
+                # The barrier is now True; the signal cancels the main task's await
+                # on the shield before the copy to it is scheduled (call_soon).
+                self._ports.signals.fire(signal.SIGINT)
             await self._exit.wait()
             await self._ports.serve_release.wait()
         finally:
@@ -829,6 +841,7 @@ async def test_ordinary_teardown_order_and_run_wiring(
         "conformance_outcome": "none",
         "manifest_sha256": DIGEST,
         "signal": "none",
+        "http_server": "task_pending_at_report",
         "exit_code": "6",
     }
 
@@ -868,6 +881,7 @@ def _value_sets() -> dict[str, set[str]]:
         "provider_check": tokens(Check),
         "conformance_outcome": tokens(advisory_conformance.ColdAdvisoryConformanceOutcome),
         "signal": {"sigint", "sigterm", "none"},
+        "http_server": tokens(cold_runner.HttpServerStatus) - {"none"} | {"unknown"},
     }
 
 
@@ -877,14 +891,14 @@ def _value_sets() -> dict[str, set[str]]:
     ids=["conformant", "refused", "not-sealed", "composition", "none"],
 )
 @pytest.mark.asyncio
-async def test_summary_has_fifteen_closed_keys_and_closed_values(
+async def test_summary_has_sixteen_closed_keys_and_closed_values(
     ports: Ports, capsys: pytest.CaptureFixture[str], raw: object
 ) -> None:
     code = await hosted(ports, returning(raw))
     text = capsys.readouterr().out[len(cold_runner.MODE_LINE) :]
     summary = parse_summary(text)
     assert tuple(summary) == SUMMARY_KEYS
-    assert len(SUMMARY_KEYS) == 15
+    assert len(SUMMARY_KEYS) == 16
     allowed = _value_sets()
     for key, value in summary.items():
         if key == "manifest_sha256":
@@ -1813,6 +1827,8 @@ def test_step_seven_has_no_await_between_handback_and_exit() -> None:
     assert "await" not in window
     assert "yield" not in window
     assert "emit(" not in window
+    for http_read in ("_http_server_status", "serve_task", "started", "http_server"):
+        assert http_read not in window, http_read
 
 
 def test_new_modules_avoid_normal_mode_wiring() -> None:
@@ -1989,3 +2005,321 @@ def test_interrupt_during_handler_restore_keeps_exactly_one_summary(
     out = capsys.readouterr().out
     assert _summaries(out) == 1
     assert parse_summary(out[len(cold_runner.MODE_LINE) :])["exit_code"] == "0"
+
+
+# --- A5/D208: the http_server snapshot at the report attempt --------------------------------
+
+
+def _engine_waiting_for_server_end(ports: Ports, seen: list[asyncio.Task[typing.Any]]) -> RunFn:
+    """A fake run that waits for the fake server's own ``finished`` event, then returns."""
+
+    async def fake(*_args: object, **_kwargs: object) -> object:
+        LOG.append("run")
+        current = asyncio.current_task()
+        assert current is not None
+        seen.append(current)
+        await ports.servers[0].finished.wait()
+        return ADVISORY_CONFORMANT
+
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_h2_server_task_ended_after_start_is_reported_without_changing_the_run(
+    ports: Ports, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """H2: a normal return after a positive start is ``task_ended_at_report``; exit 0 kept."""
+    ports.server_mode = "end_after_start"
+    seen: list[asyncio.Task[typing.Any]] = []
+    assert await hosted_outcome(ports, _engine_waiting_for_server_end(ports, seen)) == 0
+    summary = parse_summary(capsys.readouterr().out[len(cold_runner.MODE_LINE) :])
+    assert summary["http_server"] == "task_ended_at_report"
+    assert (summary["result"], summary["exit_code"]) == ("admitted", "0")
+    assert seen[0].cancelling() == 0
+
+
+@pytest.mark.parametrize("mode", ["raise_after_start", "sysexit_after_start"])
+@pytest.mark.asyncio
+async def test_h3_server_failure_after_start_is_contained_and_never_changes_the_run(
+    ports: Ports,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    mode: str,
+) -> None:
+    """H3: a contained server failure is ``task_ended_at_report``; exit, result unchanged."""
+    ports.server_mode = mode
+    seen: list[asyncio.Task[typing.Any]] = []
+    assert await hosted_outcome(ports, _engine_waiting_for_server_end(ports, seen)) == 0
+    captured = capsys.readouterr()
+    summary = parse_summary(captured.out[len(cold_runner.MODE_LINE) :])
+    assert summary["http_server"] == "task_ended_at_report"
+    assert (summary["result"], summary["exit_code"]) == ("admitted", "0")
+    assert seen[0].cancelling() == 0
+    assert MARKER not in captured.out + captured.err + caplog.text
+
+
+def test_h3b_server_system_exit_after_start_never_escapes_the_loop(
+    sync_ports: Ports, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """H3b (C48): a contained harness; a ``SystemExit`` from serve never escapes the run."""
+    sync_ports.server_mode = "sysexit_after_start"
+    seen: list[asyncio.Task[typing.Any]] = []
+    outcome: object
+    try:
+        outcome = asyncio.run(hosted(sync_ports, _engine_waiting_for_server_end(sync_ports, seen)))
+    except BaseException as escaped:
+        outcome = escaped
+    assert outcome == 0
+    out = capsys.readouterr().out
+    assert parse_summary(out[len(cold_runner.MODE_LINE) :])["http_server"] == (
+        "task_ended_at_report"
+    )
+    assert sync_ports.servers[0].finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_h4_negative_barrier_is_start_not_confirmed(
+    ports: Ports, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """H4: a barrier resolved ``False`` (task still running) is ``start_not_confirmed``."""
+    ports.server_mode = "refuse"
+    assert await hosted_outcome(ports, returning(ADVISORY_CONFORMANT)) == 3
+    assert "run" not in LOG
+    summary = parse_summary(capsys.readouterr().out)
+    assert (summary["cli_refusal"], summary["http_server"]) == (
+        "http_start_failed",
+        "start_not_confirmed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_h5_signal_while_the_barrier_is_pending_is_start_not_confirmed(
+    ports: Ports, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """H5: a pending barrier at the report attempt is ``start_not_confirmed``."""
+    ports.server_mode = "stall"
+    task = asyncio.create_task(hosted(ports, returning(ADVISORY_CONFORMANT)))
+    try:
+        while not ports.servers and not task.done():
+            await asyncio.sleep(0)
+        assert not task.done(), "the hosted run ended before its server existed"
+        assert len(ports.servers) == 1
+        ports.signals.fire(signal.SIGINT)
+        assert await task == 130
+    finally:
+        await _settle_owned(task, ports)
+    summary = parse_summary(capsys.readouterr().out)
+    assert (summary["result"], summary["http_server"]) == (
+        "cancelled_before_run",
+        "start_not_confirmed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_h6_positive_barrier_never_consumed_is_task_pending(
+    ports: Ports, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """H6: the barrier became True but drive never consumed it; the snapshot is honest."""
+    ports.server_mode = "start_then_signal"
+    code = await hosted_outcome(ports, returning(ADVISORY_CONFORMANT))
+    out = capsys.readouterr().out
+    # Preconditions: the cancellation landed at the barrier await (not C9b).
+    assert ports.servers[0]._started.result() is True
+    assert "run" not in LOG
+    assert cold_runner.MODE_LINE not in out
+    summary = parse_summary(out)
+    assert (summary["result"], summary["run_invoked"]) == ("cancelled_before_run", "false")
+    assert (summary["signal"], code) == ("sigint", 130)
+    # The guarded fact.
+    assert summary["http_server"] == "task_pending_at_report"
+
+
+@pytest.mark.parametrize("fault", ["store_init", "bind"])
+@pytest.mark.asyncio
+async def test_h7_refusals_before_the_server_task_are_task_not_created(
+    ports: Ports, capsys: pytest.CaptureFixture[str], fault: str
+) -> None:
+    """H7: no server task was created, so the snapshot is ``task_not_created``."""
+
+    class FailingStore(LoggingStore):
+        async def initialize(self) -> None:
+            raise RuntimeError(MARKER)
+
+    def config_factory(app: typing.Any, **kwargs: typing.Any) -> uvicorn.Config:
+        config = uvicorn.Config(app, **kwargs)
+
+        def failing() -> socket.socket:
+            raise OSError(MARKER)
+
+        config.bind_socket = failing
+        return config
+
+    extra: dict[str, typing.Any] = {}
+    if fault == "store_init":
+        ports.store_class = FailingStore
+    else:
+        extra["config_factory"] = config_factory
+    assert await hosted_outcome(ports, returning(ADVISORY_CONFORMANT), **extra) == 3
+    summary = parse_summary(capsys.readouterr().out)
+    assert summary["http_server"] == "task_not_created"
+    assert summary["run_invoked"] == "false"
+
+
+@pytest.mark.asyncio
+async def test_h8_already_run_reports_task_not_created(
+    ports: Ports, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """H8: the latch refusal created no server task for that call."""
+    assert await hosted_outcome(ports, returning(ADVISORY_CONFORMANT)) == 0
+    capsys.readouterr()
+    assert await hosted_outcome(ports, returning(ADVISORY_CONFORMANT)) == 3
+    summary = parse_summary(capsys.readouterr().out)
+    assert (summary["cli_refusal"], summary["http_server"]) == ("already_run", "task_not_created")
+
+
+def test_h8_fallback_summaries_render_unknown(
+    sync_ports: Ports, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """H8: the CLI fallback takes no snapshot, whether or not the engine was reached."""
+    monkeypatch.setattr(NoDbStore, "interrupt_on_initialize", True)
+    _cli_with_ports(monkeypatch, sync_ports, returning(ADVISORY_CONFORMANT))
+    assert cold_cli.main(_cli_argv()) == 130
+    summary = parse_summary(capsys.readouterr().out)
+    assert (summary["result"], summary["http_server"]) == ("cancelled_before_run", "unknown")
+
+
+async def _pending_task(release: asyncio.Event) -> None:
+    await release.wait()
+
+
+@pytest.mark.asyncio
+async def test_h10_http_server_status_is_pure_over_every_barrier_and_task_state() -> None:
+    """H10: every barrier state maps closed; no barrier read ever raises."""
+    status = cold_runner._http_server_status
+    loop = asyncio.get_running_loop()
+    release = asyncio.Event()
+    pending = asyncio.create_task(_pending_task(release))
+    try:
+
+        def barrier(state: str) -> "asyncio.Future[bool]":
+            future: asyncio.Future[bool] = loop.create_future()
+            if state == "true":
+                future.set_result(True)
+            elif state == "false":
+                future.set_result(False)
+            elif state == "cancelled":
+                future.cancel()
+            elif state == "exception":
+                future.set_exception(RuntimeError(MARKER))
+            return future
+
+        def outcome(task: object, started: object) -> object:
+            try:
+                return status(
+                    typing.cast("asyncio.Task[None] | None", task),
+                    typing.cast("asyncio.Future[bool] | None", started),
+                )
+            except Exception as exc:
+                return exc
+
+        TASK_NOT_CREATED = cold_runner.HttpServerStatus.TASK_NOT_CREATED
+        NOT_CONFIRMED = cold_runner.HttpServerStatus.START_NOT_CONFIRMED
+        assert outcome(None, barrier("true")) is TASK_NOT_CREATED
+        for state in ("pending", "false", "cancelled", "exception"):
+            assert outcome(pending, barrier(state)) is NOT_CONFIRMED, state
+        assert outcome(pending, None) is NOT_CONFIRMED
+        assert outcome(pending, barrier("true")) is (
+            cold_runner.HttpServerStatus.TASK_PENDING_AT_REPORT
+        )
+
+        async def returns() -> None:
+            return None
+
+        async def raises() -> None:
+            raise RuntimeError(MARKER)
+
+        done_ok = asyncio.create_task(returns())
+        done_err = asyncio.create_task(raises())
+        done_cancelled = asyncio.create_task(_pending_task(asyncio.Event()))
+        await asyncio.sleep(0)
+        done_cancelled.cancel()
+        await asyncio.gather(done_ok, done_err, done_cancelled, return_exceptions=True)
+        for done in (done_ok, done_err, done_cancelled):
+            assert outcome(done, barrier("true")) is (
+                cold_runner.HttpServerStatus.TASK_ENDED_AT_REPORT
+            )
+    finally:
+        release.set()
+        await pending
+
+
+def test_h12_serve_keeps_containment_and_no_failure_flag() -> None:
+    """H12 (static): no ``serve_failed`` field; ``_serve`` contains and resolves in finally."""
+    assert "serve_failed" not in {
+        field.name for field in dataclasses.fields(cold_runner._HostedRun)
+    }
+    assert _serve_containment_violations(inspect.getsource(cold_runner._HostedRun._serve)) == []
+
+
+def _serve_containment_violations(source: str) -> list[str]:
+    """C48 structural: the serve handler catches a tuple of SystemExit and Exception."""
+    tree = ast.parse(textwrap.dedent(source))
+    problems: list[str] = []
+    tries = [node for node in ast.walk(tree) if isinstance(node, ast.Try)]
+    if len(tries) != 1:
+        return ["try-count"]
+    handlers = tries[0].handlers
+    caught: set[str] = set()
+    for handler in handlers:
+        kind = handler.type
+        names = kind.elts if isinstance(kind, ast.Tuple) else [kind] if kind is not None else []
+        caught |= {ast.unparse(name) for name in names}
+        if any(isinstance(node, ast.Raise) for node in ast.walk(handler)):
+            problems.append("re-raise")
+    if not {"SystemExit", "Exception"} <= caught:
+        problems.append("catch")
+    if not tries[0].finalbody:
+        problems.append("finally")
+    return problems
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "try:\n    pass\nexcept Exception:\n    pass\nfinally:\n    pass\n",
+        "try:\n    pass\nexcept SystemExit:\n    pass\nfinally:\n    pass\n",
+        "try:\n    pass\nexcept (SystemExit, Exception):\n    raise\nfinally:\n    pass\n",
+        "try:\n    pass\nexcept (SystemExit, Exception):\n    pass\n",
+    ],
+    ids=["exception-only", "systemexit-only", "re-raise", "no-finally"],
+)
+def test_serve_containment_checker_flags_negative_controls(snippet: str) -> None:
+    assert _serve_containment_violations(snippet) != []
+
+
+def _snapshot_order_violations(source: str) -> list[str]:
+    """C41 (static): snapshot, then report attempt, then the intended shutdown."""
+    try:
+        snapshot = source.index("_http_server_status(")
+        report = source.index("report_summary(")
+        shutdown = source.index("server.should_exit = True")
+    except ValueError:
+        return ["missing"]
+    return [] if snapshot < report < shutdown else ["order"]
+
+
+def test_snapshot_precedes_the_report_and_the_intended_shutdown() -> None:
+    assert _snapshot_order_violations(inspect.getsource(cold_runner._HostedRun.teardown)) == []
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "report_summary(x)\n_http_server_status(t, s)\nserver.should_exit = True\n",
+        "report_summary(x)\nserver.should_exit = True\n_http_server_status(t, s)\n",
+        "report_summary(x)\nserver.should_exit = True\n",
+    ],
+    ids=["after-report", "after-shutdown", "absent"],
+)
+def test_snapshot_order_checker_flags_negative_controls(snippet: str) -> None:
+    assert _snapshot_order_violations(snippet) != []

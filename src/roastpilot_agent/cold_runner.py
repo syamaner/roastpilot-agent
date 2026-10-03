@@ -145,6 +145,21 @@ class SummaryResult(enum.Enum):
     CLI_REFUSED = "cli_refused"
 
 
+class HttpServerStatus(enum.Enum):
+    """One synchronous snapshot of this invocation's HTTP server task at the report attempt.
+
+    It is never uptime, health, client delivery or evidence; it is never persisted
+    and never affects the result, exit code, cancellation or teardown.
+    ``START_NOT_CONFIRMED`` never proves the server never bound or answered;
+    ``TASK_PENDING_AT_REPORT`` never proves it served anything.
+    """
+
+    TASK_NOT_CREATED = "task_not_created"
+    START_NOT_CONFIRMED = "start_not_confirmed"
+    TASK_PENDING_AT_REPORT = "task_pending_at_report"
+    TASK_ENDED_AT_REPORT = "task_ended_at_report"
+
+
 @dataclasses.dataclass(frozen=True)
 class ColdRunSummary:
     """One closed summary; every rendered value is a member value or a fixed token.
@@ -157,6 +172,8 @@ class ColdRunSummary:
         composition_refusal: The admitted composition refusal, if any.
         row: The freshly re-admitted run result, if any.
         signal_number: The first recorded SIGINT/SIGTERM, if any.
+        http_server: The HTTP server snapshot; ``None`` (no snapshot) renders as
+            ``unknown``.
     """
 
     run_invoked: bool
@@ -166,6 +183,7 @@ class ColdRunSummary:
     composition_refusal: ColdCompositionRefusal | None = None
     row: ColdTwoPhaseResult | None = None
     signal_number: int | None = None
+    http_server: HttpServerStatus | None = None
 
 
 def _token(member: enum.Enum | None) -> str:
@@ -176,7 +194,7 @@ def _token(member: enum.Enum | None) -> str:
 
 
 def render_summary(summary: ColdRunSummary) -> str:
-    """Render the closed 15-key summary.
+    """Render the closed 16-key summary.
 
     ``child_ownership=none`` means the run was not invoked; ``unknown`` means it
     was invoked without an admitted row.  Neither, nor any member value, proves
@@ -217,6 +235,7 @@ def render_summary(summary: ColdRunSummary) -> str:
         ("conformance_outcome", _token(conformance)),
         ("manifest_sha256", "none" if digest is None else digest),
         ("signal", signal_token),
+        ("http_server", "unknown" if summary.http_server is None else _token(summary.http_server)),
         ("exit_code", str(summary.exit_code)),
     )
     return "".join(f"{key}={value}\n" for key, value in lines)
@@ -461,6 +480,38 @@ async def _settle(task: "asyncio.Future[typing.Any]") -> None:
         task.exception()
 
 
+def _http_server_status(
+    task: "asyncio.Task[None] | None", started: "asyncio.Future[bool] | None"
+) -> HttpServerStatus:
+    """Snapshot the HTTP server task and its startup barrier; pure, never raises.
+
+    The start counts as confirmed only when the barrier is done, not cancelled,
+    carries no exception and its result is exactly ``True``.  The task's own
+    outcome is never read; only whether it had finished.
+
+    Args:
+        task: This invocation's server task, if one was created.
+        started: The startup barrier, if one was created.
+
+    Returns:
+        The closed snapshot.
+    """
+    if task is None:
+        return HttpServerStatus.TASK_NOT_CREATED
+    confirmed = (
+        started is not None
+        and started.done()
+        and not started.cancelled()
+        and started.exception() is None
+        and started.result() is True
+    )
+    if not confirmed:
+        return HttpServerStatus.START_NOT_CONFIRMED
+    if task.done():
+        return HttpServerStatus.TASK_ENDED_AT_REPORT
+    return HttpServerStatus.TASK_PENDING_AT_REPORT
+
+
 def _contain(step: Callable[[], object]) -> None:
     """Run one synchronous teardown step; its exception is contained."""
     with contextlib.suppress(Exception):
@@ -494,7 +545,7 @@ class _HostedRun:
     sock: socket.socket | None = None
     server: _ServerPort | None = None
     serve_task: asyncio.Task[None] | None = None
-    serve_failed: bool = False
+    started: asyncio.Future[bool] | None = None
 
     def _refused(self, refusal: CliRefusal) -> ColdRunSummary:
         return ColdRunSummary(
@@ -515,11 +566,11 @@ class _HostedRun:
     async def _serve(
         self, server: _ServerPort, sock: socket.socket, started: "asyncio.Future[bool]"
     ) -> None:
-        """Serve; any failure becomes a closed flag and resolves the barrier negative."""
+        """Serve; any failure is contained (never retained) and resolves the barrier negative."""
         try:
             await server.serve(sockets=[sock])
         except (SystemExit, Exception):
-            self.serve_failed = True
+            pass
         finally:
             if not started.done():
                 started.set_result(False)
@@ -565,6 +616,7 @@ class _HostedRun:
             # unencodable host's TypeError/ValueError, uvicorn's SystemExit) refuses.
             return self._refused(CliRefusal.BIND_FAILED)
         started: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self.started = started
         try:
             self.server = self.server_factory(uv, started)
         except Exception:
@@ -638,7 +690,12 @@ class _HostedRun:
     async def teardown(self, summary: ColdRunSummary) -> int:
         """Step 8: summary, then reverse-order teardown; every step is contained."""
         self.state.phase = _Phase.POST_ENGINE
-        code = report_summary(dataclasses.replace(summary, signal_number=self.state.signal_number))
+        http_server = _http_server_status(self.serve_task, self.started)
+        code = report_summary(
+            dataclasses.replace(
+                summary, signal_number=self.state.signal_number, http_server=http_server
+            )
+        )
         hub, server, task, sock = self.hub, self.server, self.serve_task, self.sock
         if hub is not None:
             _contain(hub.close)
@@ -711,6 +768,7 @@ async def run_hosted(
                 result=SummaryResult.CLI_REFUSED,
                 exit_code=_CLI_REFUSAL_EXIT,
                 cli_refusal=CliRefusal.ALREADY_RUN,
+                http_server=HttpServerStatus.TASK_NOT_CREATED,
             )
         )
     _CONSUMED = True  # pyright: ignore[reportConstantRedefinition]

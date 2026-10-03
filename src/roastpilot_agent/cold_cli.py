@@ -335,6 +335,7 @@ def _refuse(refusal: cold_runner.CliRefusal, code: int) -> int:
             result=cold_runner.SummaryResult.CLI_REFUSED,
             exit_code=code,
             cli_refusal=refusal,
+            http_server=cold_runner.HttpServerStatus.TASK_NOT_CREATED,
         )
     )
 

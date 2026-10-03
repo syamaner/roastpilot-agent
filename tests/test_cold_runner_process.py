@@ -237,6 +237,7 @@ def test_p3_real_uvicorn_never_logs_request_detail(
     driver.release()
     code, stdout, stderr = driver.finish()
     assert code == 6
+    assert summary_of(stdout)["http_server"] == "task_pending_at_report"
     assert MARKER not in stdout
     assert MARKER not in stderr
     assert "cold-http WARNING" in stderr

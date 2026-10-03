@@ -49,6 +49,7 @@ SUMMARY_KEYS = (
     "conformance_outcome",
     "manifest_sha256",
     "signal",
+    "http_server",
     "exit_code",
 )
 REVISION = "0123456789abcdef0123456789abcdef01234567"
@@ -82,7 +83,7 @@ def base_argv(**overrides: str | None) -> list[str]:
 
 
 def parse_summary(text: str) -> dict[str, str]:
-    """Parse the closed summary, asserting the exact 15 keys in order."""
+    """Parse the closed summary, asserting the exact 16 keys in order."""
     lines = [line for line in text.splitlines() if "=" in line]
     keys = tuple(line.split("=", 1)[0] for line in lines)
     assert keys == SUMMARY_KEYS
@@ -496,6 +497,7 @@ def test_config_failures_print_fixed_text_only(
     assert MARKER not in captured.out + captured.err
     summary = parse_summary(captured.out)
     assert summary["cli_refusal"] == "config_not_loaded"
+    assert summary["http_server"] == "task_not_created"
     assert summary["result"] == "cli_refused"
     assert harness.hosted == []
 
@@ -728,6 +730,7 @@ def test_interrupt_before_the_runner_maps_to_cancelled_before_run(
     assert summary["child_ownership"] == "none"
     assert summary["signal"] == "none"
     assert summary["exit_code"] == "130"
+    assert summary["http_server"] == "unknown"
 
 
 def test_interrupt_after_a_report_attempt_writes_nothing_more_and_returns_130(
@@ -756,6 +759,7 @@ def test_interrupt_after_the_engine_was_reached_reports_the_child_unknown(
     summary = parse_summary(capsys.readouterr().out)
     assert (summary["result"], summary["run_invoked"]) == ("cancelled", "true")
     assert (summary["child_ownership"], summary["signal"]) == ("unknown", "none")
+    assert summary["http_server"] == "unknown"
 
 
 def test_main_dispatch_returns_the_runner_code(
