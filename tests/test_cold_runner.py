@@ -382,6 +382,14 @@ def returning(raw: object, *, before: Callable[[], Awaitable[None]] | None = Non
     return fake
 
 
+async def hosted_outcome(ports: Ports, run: RunFn, **overrides: typing.Any) -> object:
+    """``hosted``'s code, or ``escaped <Type>`` if a non-exit exception escaped it."""
+    try:
+        return await hosted(ports, run, **overrides)
+    except (Exception, SystemExit, KeyboardInterrupt, GeneratorExit) as exc:
+        return f"escaped {type(exc).__name__}"
+
+
 async def hosted(ports: Ports, run: RunFn, **overrides: typing.Any) -> int:
     kwargs: dict[str, typing.Any] = {
         "host_reader": FakeHost(),
@@ -1304,7 +1312,10 @@ async def test_bind_failure_means_the_run_is_never_invoked(
         config.bind_socket = failing
         return config
 
-    assert await hosted(ports, returning(ADVISORY_CONFORMANT), config_factory=config_factory) == 3
+    outcome = await hosted_outcome(
+        ports, returning(ADVISORY_CONFORMANT), config_factory=config_factory
+    )
+    assert outcome == 3
     assert "run" not in LOG
     assert ports.servers == []
     out = capsys.readouterr().out
@@ -1321,7 +1332,7 @@ async def test_out_of_range_integer_ports_refuse_as_bind_failed(
     ports: Ports, capsys: pytest.CaptureFixture[str], port: int
 ) -> None:
     """C23: the real uvicorn bind rejects these ports with no listener; no run."""
-    code = await hosted(
+    code = await hosted_outcome(
         ports,
         returning(ADVISORY_CONFORMANT),
         config_factory=ports.real_config,
@@ -1351,7 +1362,7 @@ async def test_other_engine_base_exceptions_are_propagated_never_exit_authority(
         finally:
             LOG.append("engine-cleanup")
 
-    assert await hosted(ports, engine) == 8
+    assert await hosted_outcome(ports, engine) == 8
     assert not any(entry.startswith("exit:") for entry in LOG)
     assert LOG.index("engine-cleanup") < LOG.index("summary")
     assert LOG[-2:] == ["signals.restore", "filters.restore"]

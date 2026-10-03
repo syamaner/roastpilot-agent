@@ -305,11 +305,13 @@ DUPLICATE_ROWS: list[tuple[str, list[str]]] = [
 
 
 def exit_status(argv: list[str]) -> object:
-    """The CLI's exit status: a ``SystemExit`` code or the returned code."""
+    """The CLI's exit status, or ``escaped <Type>`` if an exception escaped it."""
     try:
         return cold_cli.main(argv)
     except SystemExit as exc:
         return exc.code
+    except Exception as exc:
+        return f"escaped {type(exc).__name__}"
 
 
 @pytest.mark.parametrize(
@@ -467,7 +469,7 @@ def test_config_failures_print_fixed_text_only(
         raise error
 
     monkeypatch.setattr(cold_cli, "load_app_config", failing)
-    assert cold_cli.main(base_argv()) == 3
+    assert exit_status(base_argv()) == 3
     captured = capsys.readouterr()
     assert MARKER not in captured.out + captured.err
     summary = parse_summary(captured.out)
@@ -680,7 +682,7 @@ def test_spa_probe_errors_refuse_before_the_run(
     else:
         monkeypatch.setattr(Path, "is_file", raising)
         argv = [*base_argv(), "--spa-dir", f"/srv/{MARKER}"]
-    assert cold_cli.main(argv) == 3
+    assert exit_status(argv) == 3
     captured = capsys.readouterr()
     assert MARKER not in captured.out + captured.err
     assert parse_summary(captured.out)["cli_refusal"] == "spa_not_found"
