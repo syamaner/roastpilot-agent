@@ -33,6 +33,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from roastpilot_agent import cold_composition
 from roastpilot_agent.advisor import AdvisorDescriptor, PydanticAIAdvisor, RoastAdvisor
+from roastpilot_agent.cold_characterisation import identity as identity_module
 from roastpilot_agent.cold_characterisation.advisory_sampler import ColdAdvisorySpec
 from roastpilot_agent.cold_characterisation.host import HostBoundSample
 from roastpilot_agent.cold_characterisation.identity import AgentBuildProvenance, ColdArtefactKind
@@ -241,11 +242,14 @@ async def test_t_u1_rc_real_child_closed_environment_and_committed_bytes(
 
     client_calls: list[str] = []
     runtimes: list[RuntimeConfigSnapshot] = []
+    servers: list[ServerInfo] = []
 
     class _SpyClient(ColdCharacterisationMCPClient):
         async def get_server_info(self) -> ServerInfo:
             client_calls.append("get_server_info")
-            return await super().get_server_info()
+            server = await super().get_server_info()
+            servers.append(server)
+            return server
 
         async def get_runtime_config(self) -> RuntimeConfigSnapshot:
             client_calls.append("get_runtime_config")
@@ -293,6 +297,13 @@ async def test_t_u1_rc_real_child_closed_environment_and_committed_bytes(
         factory_calls.append(1)
         return original_factory_call(self)
 
+    freeze_calls: list[int] = []
+    original_freeze_identity = identity_module.freeze_identity
+
+    def counting_freeze_identity(**kwargs: typing.Any) -> typing.Any:
+        freeze_calls.append(1)
+        return original_freeze_identity(**kwargs)
+
     socket_attempts: list[object] = []
 
     def refuse_connect(self: socket.socket, address: object) -> None:
@@ -305,6 +316,7 @@ async def test_t_u1_rc_real_child_closed_environment_and_committed_bytes(
         cold_composition._SingleUseAdvisorFactory, "__call__", counting_factory_call
     )
     monkeypatch.setattr(socket.socket, "connect", refuse_connect)
+    monkeypatch.setattr(cold_composition, "freeze_identity", counting_freeze_identity)
 
     sdk = mcp_stdio
     true_original = typing.cast(
@@ -373,6 +385,12 @@ async def test_t_u1_rc_real_child_closed_environment_and_committed_bytes(
     assert len(runtimes) == 1
     assert runtimes[0].first_crack_mode == "disabled"
     assert runtimes[0].roaster_driver == "mock"
+    # R5: the real 0.2.2 child self-reports the pin and the exact bound active path,
+    # so both identity guards pass and the existing refusal comes from one delegation.
+    assert len(servers) == 1
+    assert servers[0].version == "0.2.2"
+    assert runtimes[0].config_source == str(active_path)
+    assert freeze_calls == [1]
 
     assert sdk._create_platform_compatible_process is true_original
     expected_env = {

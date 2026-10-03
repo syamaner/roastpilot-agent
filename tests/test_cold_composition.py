@@ -42,6 +42,7 @@ from roastpilot_agent.advisor import (
     RoastAdvisor,
     RoastDecision,
 )
+from roastpilot_agent.cold_characterisation import identity as identity_module
 from roastpilot_agent.cold_characterisation.advisory_sampler import ColdAdvisorySpec
 from roastpilot_agent.cold_characterisation.evidence_lifecycle import ColdRunTerminationReason
 from roastpilot_agent.cold_characterisation.evidence_schema import ColdPhaseKind, ColdRunHeader
@@ -313,6 +314,46 @@ def resources() -> typing.Iterator[ColdCompositionResources]:
         yield entered
 
 
+class _FreezeCounter:
+    """Counts delegations to the real ``freeze_identity`` (wrapped, not replaced)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+
+@pytest.fixture
+def freezes(monkeypatch: pytest.MonkeyPatch) -> _FreezeCounter:
+    counter = _FreezeCounter()
+    original = identity_module.freeze_identity
+
+    def counting_delegate(**kwargs: typing.Any) -> typing.Any:
+        counter.calls += 1
+        return original(**kwargs)
+
+    monkeypatch.setattr(cold_composition, "freeze_identity", counting_delegate)
+    return counter
+
+
+def _active_source(resources: ColdCompositionResources) -> str:
+    """The exact expected config-source string: the bound private ``active.yaml``."""
+    directory = resources.directory
+    assert directory is not None
+    return str(directory / "active.yaml")
+
+
+def _runtime_payload(spawns: _Spawns) -> dict[str, object]:
+    return typing.cast(dict[str, object], spawns.payloads["get_runtime_config"])
+
+
+def _server_payload(spawns: _Spawns) -> dict[str, object]:
+    return typing.cast(dict[str, object], spawns.payloads["get_server_info"])
+
+
+def _bind_exact_source(spawns: _Spawns, resources: ColdCompositionResources) -> None:
+    """Set the in-memory runtime payload's ``config_source`` to the exact active path."""
+    _runtime_payload(spawns)["config_source"] = _active_source(resources)
+
+
 def _source(tmp_path: Path, text: str | bytes = TEMPLATE_YAML) -> Path:
     path = tmp_path / "operator" / "coffee-roaster-mcp.yaml"
     path.parent.mkdir(exist_ok=True)
@@ -454,6 +495,12 @@ async def test_t_c1_valid_inputs_call_the_runtime_once_with_single_instances(
     assert dict(process.child_environment)["COFFEE_ROASTER_MCP_CONFIG"] == str(
         resources.directory and resources.directory / "active.yaml"
     )
+    # T-I5: one bound active path feeds the child environment and the identity source.
+    bound = identities._expected_config_source
+    assert type(bound) is str
+    assert bound == process.child_environment["COFFEE_ROASTER_MCP_CONFIG"]
+    assert bound == str(child._active)
+    assert bound == _active_source(resources)
     assert process.started == 0 and spawns.calls == []
 
 
@@ -846,6 +893,7 @@ async def test_t_u1_alt_non_pydantic_advisor_admitted_and_descriptor_frozen(
 ) -> None:
     """T-U1-ALT: a non-PydanticAI advisor is admitted; the identity carries its descriptor."""
     advisor = _AltAdvisor()
+    _bind_exact_source(spawns, resources)
     result = await _run(tmp_path, resources, builder=_Builder(advisor))
     assert result is runtime.result
     assert advisor.descriptor_calls == [RoastPhase.PREHEATING]
@@ -859,6 +907,9 @@ async def test_t_u1_alt_non_pydantic_advisor_admitted_and_descriptor_frozen(
 
 # -------------------------------------------------------------- T-C3 identity source
 
+#: The exact resources inventory after a stubbed-runtime run (no ``configure_phase``).
+_STUB_RUN_INVENTORY: typing.Final = ["phase-off.yaml", "phase-on.yaml", "source.yaml"]
+
 
 @pytest.mark.asyncio
 async def test_t_c3_identity_freezes_from_same_client_reads_and_inputs(
@@ -866,16 +917,19 @@ async def test_t_c3_identity_freezes_from_same_client_reads_and_inputs(
     resources: ColdCompositionResources,
     spawns: _Spawns,
     runtime: _RuntimeStub,
+    freezes: _FreezeCounter,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """T-C3: same-client reads, explicit inputs, credential name and presence only."""
     caplog.set_level(logging.DEBUG)
     inputs = _inputs(tmp_path)
+    _bind_exact_source(spawns, resources)
     await _run(tmp_path, resources, inputs=inputs)
     identities = runtime.calls[0]["identities"]
     off = await identities.freeze(OFF)
     on = await identities.freeze(ON)
     assert spawns.calls == ["get_server_info", "get_runtime_config"] * 2
+    assert freezes.calls == 2
     directory = resources.directory
     assert directory is not None
     for identity, phase, name in ((off, OFF, "phase-off.yaml"), (on, ON, "phase-on.yaml")):
@@ -899,9 +953,39 @@ async def test_t_c3_identity_freezes_from_same_client_reads_and_inputs(
         assert identity.boot_id == "01234567-89ab-cdef-0123-456789abcdef"
         dumped = identity.model_dump_json()
         assert CANARY not in dumped
-    for path in directory.iterdir():
-        assert CANARY.encode() not in path.read_bytes()
+    _assert_generated_files_canary_free(directory)
     assert CANARY not in caplog.text
+
+
+def _assert_generated_files_canary_free(directory: Path) -> None:
+    """Exact generated inventory first (any unexpected file fails), then literal-name reads."""
+    assert sorted(path.name for path in directory.iterdir()) == _STUB_RUN_INVENTORY
+    for data in (
+        (directory / "source.yaml").read_bytes(),
+        (directory / "phase-off.yaml").read_bytes(),
+        (directory / "phase-on.yaml").read_bytes(),
+    ):
+        assert CANARY.encode() not in data
+
+
+@pytest.mark.parametrize("seeded", [*_STUB_RUN_INVENTORY, "unexpected.yaml"])
+@pytest.mark.asyncio
+async def test_t_c3_leak_scan_catches_every_listed_file_and_any_extra_file(
+    tmp_path: Path,
+    resources: ColdCompositionResources,
+    spawns: _Spawns,
+    runtime: _RuntimeStub,
+    seeded: str,
+) -> None:
+    """T-C3 negative control: a canary in any listed file, or any extra file, is caught."""
+    await _run(tmp_path, resources)
+    directory = resources.directory
+    assert directory is not None
+    _assert_generated_files_canary_free(directory)
+    # Write-only seeding: the listed file's content is replaced by a canary line.
+    (directory / seeded).write_bytes(f"# {CANARY}\n".encode())
+    with pytest.raises(AssertionError):
+        _assert_generated_files_canary_free(directory)
 
 
 @pytest.mark.asyncio
@@ -910,13 +994,202 @@ async def test_t_c3_identity_exceptions_propagate_unchanged(
     resources: ColdCompositionResources,
     spawns: _Spawns,
     runtime: _RuntimeStub,
+    freezes: _FreezeCounter,
 ) -> None:
-    """T-C3: a disabled first-crack mode refusal propagates from ``freeze``."""
+    """T-C3: with matching versions and source, a disabled-mode refusal propagates."""
     spawns.payloads = _payloads(mode="disabled")
+    _bind_exact_source(spawns, resources)
     await _run(tmp_path, resources)
     with pytest.raises(Exception) as raised:
         await runtime.calls[0]["identities"].freeze(OFF)
     assert type(raised.value).__name__ == "ColdIdentityError"
+    assert freezes.calls == 1
+
+
+# ---------------------------------------------- T-I1..T-I6 identity cross-checks (R5)
+
+
+_IDENTITY_REFUSED = r"\ACold identity refused\.\Z"
+
+
+async def _identity_source(
+    tmp_path: Path,
+    resources: ColdCompositionResources,
+    runtime: _RuntimeStub,
+    *,
+    host_version: str = "0.2.2",
+) -> ColdIdentitySource:
+    inputs = _inputs(tmp_path)
+    if host_version != "0.2.2":
+        facts = inputs.host_facts.model_copy(update={"coffee_roaster_mcp_version": host_version})
+        inputs = inputs.model_copy(update={"host_facts": facts})
+    await _run(tmp_path, resources, inputs=inputs)
+    identities = runtime.calls[0]["identities"]
+    assert type(identities) is ColdIdentitySource
+    return identities
+
+
+@pytest.mark.asyncio
+async def test_t_i1_matching_versions_and_exact_source_freeze_both_phases(
+    tmp_path: Path,
+    resources: ColdCompositionResources,
+    spawns: _Spawns,
+    runtime: _RuntimeStub,
+    freezes: _FreezeCounter,
+) -> None:
+    """T-I1: server and host ``0.2.2`` plus the exact source => both phases freeze."""
+    _bind_exact_source(spawns, resources)
+    identities = await _identity_source(tmp_path, resources, runtime)
+    off = await identities.freeze(OFF)
+    on = await identities.freeze(ON)
+    assert freezes.calls == 2
+    assert spawns.calls == ["get_server_info", "get_runtime_config"] * 2
+    for identity in (off, on):
+        assert identity.coffee_roaster_mcp_version == "0.2.2"
+        assert identity.server_info.version == "0.2.2"
+        assert identity.runtime_config.config_source == _active_source(resources)
+
+
+@pytest.mark.parametrize(
+    ("server_version", "host_version"),
+    [
+        ("0.2.3", "0.2.2"),
+        ("0.2.2", "0.2.3"),
+        ("0.2.3", "0.2.3"),
+        ("0.2.2 ", "0.2.2"),
+        ("v0.2.2", "0.2.2"),
+    ],
+    ids=[
+        "server-differs",
+        "host-differs",
+        "both-equal-not-pin",
+        "server-trailing-space",
+        "v-prefix",
+    ],
+)
+@pytest.mark.asyncio
+async def test_t_i2_version_mismatch_refused_before_freeze_identity(
+    tmp_path: Path,
+    resources: ColdCompositionResources,
+    spawns: _Spawns,
+    runtime: _RuntimeStub,
+    freezes: _FreezeCounter,
+    server_version: str,
+    host_version: str,
+) -> None:
+    """T-I2: any version not exactly the pin on both sides => fixed refusal, no delegation."""
+    _bind_exact_source(spawns, resources)
+    _server_payload(spawns)["version"] = server_version
+    identities = await _identity_source(tmp_path, resources, runtime, host_version=host_version)
+    with pytest.raises(ColdCompositionChildError, match=_IDENTITY_REFUSED) as raised:
+        await identities.freeze(OFF)
+    assert str(raised.value) == "Cold identity refused."
+    assert freezes.calls == 0
+    assert spawns.calls == ["get_server_info", "get_runtime_config"]
+
+
+_SourceCase = Callable[[Path, Path], "str | None"]
+_SOURCE_CASES: typing.Final[dict[str, _SourceCase]] = {
+    "none": lambda directory, operator: None,
+    "wrong-absolute": lambda directory, operator: "/nonexistent-rp954/active.yaml",
+    "relative": lambda directory, operator: "active.yaml",
+    "phase-off": lambda directory, operator: str(directory / "phase-off.yaml"),
+    "source": lambda directory, operator: str(directory / "source.yaml"),
+    "staging": lambda directory, operator: str(directory / "active.yaml.next"),
+    "operator-source": lambda directory, operator: str(operator),
+    "trailing-separator": lambda directory, operator: str(directory / "active.yaml") + "/",
+    "double-slash": lambda directory, operator: f"{directory}//active.yaml",
+    "dot-segment": lambda directory, operator: f"{directory}/./active.yaml",
+    "dotdot-segment": lambda directory, operator: f"{directory}/../{directory.name}/active.yaml",
+}
+
+
+@pytest.mark.parametrize("case", sorted(_SOURCE_CASES))
+@pytest.mark.asyncio
+async def test_t_i3_config_source_mismatch_refused_before_freeze_identity(
+    tmp_path: Path,
+    resources: ColdCompositionResources,
+    spawns: _Spawns,
+    runtime: _RuntimeStub,
+    freezes: _FreezeCounter,
+    case: str,
+) -> None:
+    """T-I3: ``None``, other paths and lexical aliases are refused; nothing normalises."""
+    directory = resources.directory
+    assert directory is not None
+    operator = tmp_path / "operator" / "coffee-roaster-mcp.yaml"
+    _runtime_payload(spawns)["config_source"] = _SOURCE_CASES[case](directory, operator)
+    identities = await _identity_source(tmp_path, resources, runtime)
+    with pytest.raises(ColdCompositionChildError, match=_IDENTITY_REFUSED) as raised:
+        await identities.freeze(OFF)
+    assert str(raised.value) == "Cold identity refused."
+    assert freezes.calls == 0
+    assert spawns.calls == ["get_server_info", "get_runtime_config"]
+
+
+@pytest.mark.parametrize("field", ["version", "config_source"])
+@pytest.mark.asyncio
+async def test_t_i4_guards_run_on_every_phase(
+    tmp_path: Path,
+    resources: ColdCompositionResources,
+    spawns: _Spawns,
+    runtime: _RuntimeStub,
+    freezes: _FreezeCounter,
+    field: str,
+) -> None:
+    """T-I4: OFF freezes, then a drifted ON read is refused; no per-instance latch."""
+    _bind_exact_source(spawns, resources)
+    identities = await _identity_source(tmp_path, resources, runtime)
+    await identities.freeze(OFF)
+    assert freezes.calls == 1
+    if field == "version":
+        _server_payload(spawns)["version"] = "0.2.3"
+    else:
+        _runtime_payload(spawns)["config_source"] = "/nonexistent-rp954/other.yaml"
+    with pytest.raises(ColdCompositionChildError, match=_IDENTITY_REFUSED):
+        await identities.freeze(ON)
+    assert freezes.calls == 1
+    assert spawns.calls == ["get_server_info", "get_runtime_config"] * 2
+
+
+@pytest.mark.parametrize("field", ["version", "config_source"])
+@pytest.mark.asyncio
+async def test_t_i6_real_runtime_identity_refusal_stops_the_owned_child(
+    tmp_path: Path,
+    resources: ColdCompositionResources,
+    spawns: _Spawns,
+    freezes: _FreezeCounter,
+    caplog: pytest.LogCaptureFixture,
+    field: str,
+) -> None:
+    """T-I6: unstubbed runtime; a refused identity => IDENTITY_NOT_FROZEN, owned stop."""
+    caplog.set_level(logging.DEBUG)
+    if field == "version":
+        _bind_exact_source(spawns, resources)
+        _server_payload(spawns)["version"] = "0.2.3"
+    else:
+        _runtime_payload(spawns)["config_source"] = "/nonexistent-rp954/active.yaml"
+    result = await _run(tmp_path, resources)
+    assert _project(result) == (
+        ColdTwoPhaseOutcome.REFUSED_BEFORE_EVIDENCE,
+        ColdRunStartRefusal.IDENTITY_NOT_FROZEN,
+        None,
+        ColdChildOwnership.OWNED_STOP_CONFIRMED,
+        None,
+        None,
+        ColdTwoPhaseAdvisoryPath.NOT_APPLICABLE,
+        ColdTwoPhaseProviderCheck.NOT_CHECKED,
+    )
+    assert len(spawns.processes) == 1
+    process = spawns.processes[0]
+    assert (process.started, process.stopped) == (1, 1)
+    assert process.running is False
+    assert freezes.calls == 0
+    assert spawns.calls == ["get_server_info", "get_runtime_config"]
+    assert list((tmp_path / "evidence").iterdir()) == []
+    projected = " ".join(str(item) for item in _project(result))
+    assert CANARY not in projected
+    assert CANARY not in caplog.text
 
 
 # ------------------------------------------------ T-E1/T-E3/T-E4 closed child environment
@@ -1849,6 +2122,7 @@ async def test_t_c8_run_id_minted_once_for_both_phases(
         calls.append(1)
         return "abc"
 
+    _bind_exact_source(spawns, resources)
     await _run(tmp_path, resources, suffix=suffix)
     identities = runtime.calls[0]["identities"]
     assert identities._run_id == "20261003T120000Z-abc"

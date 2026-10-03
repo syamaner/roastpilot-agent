@@ -51,6 +51,7 @@ from roastpilot_agent.cold_characterisation.evidence_store import (
     admit_evidence_root,
 )
 from roastpilot_agent.cold_characterisation.identity import (
+    REQUIRED_MCP_VERSION,
     AgentBuildProvenance,
     ColdRunIdentity,
     EffectiveMCPProfile,
@@ -895,6 +896,7 @@ class ColdIdentitySource:
         descriptor: AdvisorDescriptor,
         credential_env_var_name: str,
         credential_present: bool,
+        expected_config_source: str,
     ) -> None:
         """Bind the identity inputs.
 
@@ -909,6 +911,8 @@ class ColdIdentitySource:
             descriptor: The admitted advisor descriptor.
             credential_env_var_name: The credential variable name only.
             credential_present: The snapshot presence boolean only.
+            expected_config_source: The exact active-YAML path string bound into
+                the child environment; compared to the reported source verbatim.
         """
         self._client = client
         self._inputs = inputs
@@ -920,19 +924,37 @@ class ColdIdentitySource:
         self._descriptor = descriptor
         self._credential_env_var_name = credential_env_var_name
         self._credential_present = credential_present
+        self._expected_config_source = expected_config_source
 
     async def freeze(self, phase: ColdPhaseKind) -> ColdRunIdentity:
-        """Read server info then runtime config, and freeze the phase identity.
+        """Read server info then runtime config, cross-check, and freeze the phase identity.
+
+        On every phase, before delegating to ``freeze_identity``, the reported
+        server version and the declared host version must both equal the public
+        pin exactly, and the reported config source must equal the bound active
+        path exactly (no normalisation or filesystem use).
 
         Args:
             phase: The phase being frozen.
 
         Returns:
-            The frozen identity; exceptions propagate unchanged.
+            The frozen identity.
+
+        Raises:
+            ColdCompositionChildError: If a version or the config source does not
+                match exactly (fixed message, no response content).  Read and
+                freeze exceptions propagate unchanged.
         """
         server = await self._client.get_server_info()
         runtime = await self._client.get_runtime_config()
         inputs, host = self._inputs, self._inputs.host_facts
+        if not (
+            server.version == REQUIRED_MCP_VERSION
+            and host.coffee_roaster_mcp_version == REQUIRED_MCP_VERSION
+        ):
+            raise ColdCompositionChildError("Cold identity refused.")
+        if runtime.config_source != self._expected_config_source:
+            raise ColdCompositionChildError("Cold identity refused.")
         return freeze_identity(
             run_id=self._run_id,
             started_at_utc=self._started_at_utc,
@@ -1000,9 +1022,12 @@ async def run_cold_characterisation(
 ) -> ColdTwoPhaseResult | ColdCompositionRefusal:
     """Admit everything, construct one child and client, and run both cold phases.
 
-    Every check runs before the child process object is constructed; a refusal
-    returns its closed member with nothing constructed.  The runtime's result,
-    including a pending provider check, is returned as-is.
+    Every :class:`ColdCompositionRefusal` check runs before the child process
+    object is constructed; such a refusal returns its closed member with nothing
+    constructed.  The per-phase identity guards (MCP version and config source)
+    run later, after the child starts, and surface through the runtime as an
+    identity-not-frozen refusal with the owned child stopped.  The runtime's
+    result, including a pending provider check, is returned as-is.
 
     Caller obligation: do not start another cold run while a preceding child's
     shutdown remains unconfirmed.  This function keeps no process-wide retry
@@ -1051,9 +1076,10 @@ async def run_cold_characterisation(
     profiles = _admit_profiles(rendered)
     if isinstance(profiles, ColdCompositionRefusal):
         return profiles
+    active_path = directory / _ACTIVE_NAME
     process = _construct_process(
         config.mcp,
-        _cold_child_environment(snapshot.values, family, directory / _ACTIVE_NAME),
+        _cold_child_environment(snapshot.values, family, active_path),
         family,
     )
     if isinstance(process, ColdCompositionRefusal):
@@ -1075,6 +1101,7 @@ async def run_cold_characterisation(
         descriptor=descriptor,
         credential_env_var_name=config.advisor.api_key_env,
         credential_present=snapshot.credential_present,
+        expected_config_source=str(active_path),
     )
     return await run_two_phase_characterisation(
         root=root,
