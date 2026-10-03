@@ -67,7 +67,9 @@ test.describe("Flow B — production route over real fixture frames", () => {
     if (first === undefined || last === undefined || heartbeat === undefined) {
       throw new Error("cold contract fixture is missing frames");
     }
-    const lastData = JSON.parse(last.data) as Record<string, unknown>;
+    // The final frame is the fixture's public-model-only case; its values are pinned
+    // here as independently known literals, not recomputed with the view's formatter.
+    expect(last.name).toBe("observed_null_level");
     const canonical = JSON.parse(first.data) as Record<string, unknown>;
     const observationFrame = (id: string, data: string) =>
       `id: ${id}\nevent: observation\ndata: ${data}\n\n`;
@@ -82,14 +84,18 @@ test.describe("Flow B — production route over real fixture frames", () => {
       malformedHeartbeat: 'event: heartbeat\ndata: {"HOSTILE":1}\n\n',
       bidiUtc: observationFrame(
         "0123456789abcdef-1003",
-        JSON.stringify({ ...canonical, recorded_at_utc: "2026-01-01T00:00:01‮+00:00" }),
+        JSON.stringify({ ...canonical, recorded_at_utc: "2026-01-01T00:00:01\u202e+00:00" }),
       ),
     };
+    // An event name with no registered listener: the browser never delivers it to
+    // the page, so it is neither shown nor counted.
+    const unknownEvent = 'event: unknown_kind\ndata: {"UNKNOWN-EVENT-CANARY":1}\n\n';
     const body = [
       ": connected\n\n",
       first.frame_text,
       hostile.duplicateId,
       hostile.extraKey,
+      unknownEvent,
       ...observations.slice(1, -1).map((frame) => frame.frame_text),
       heartbeat.frame_text,
       hostile.oversize,
@@ -123,15 +129,13 @@ test.describe("Flow B — production route over real fixture frames", () => {
     await expect(page.getByTestId("cold-refused-count")).toHaveText(
       String(Object.keys(hostile).length),
     );
-    await expect(page.getByTestId("cold-last-utc")).toHaveText(String(lastData.recorded_at_utc));
-    await expect(page.getByTestId("cold-phase")).toHaveText(
-      lastData.cold_phase === "recording_on" ? "Recording on" : "Recording off",
-    );
-    await expect(page.getByTestId("cold-bean")).toHaveText(
-      `${(lastData.bean_temp_c as number).toFixed(1)} °C`,
-    );
+    await expect(page.getByTestId("cold-last-utc")).toHaveText("2026-01-01T00:00:01.250000+00:00");
+    await expect(page.getByTestId("cold-phase")).toHaveText("Recording on");
+    await expect(page.getByTestId("cold-bean")).toHaveText("21.5 °C");
+    await expect(page.getByTestId("cold-roast-fan")).toHaveText("Observed");
     await expect(page.getByTestId("cold-synthetic-banner")).toHaveCount(0);
     await expect(page.locator("body")).not.toContainText("HOSTILE");
+    await expect(page.locator("body")).not.toContainText("UNKNOWN-EVENT-CANARY");
 
     // The explicit reconnect carries the exact last ID string, and an empty 200
     // stream is reported honestly as reconnecting.

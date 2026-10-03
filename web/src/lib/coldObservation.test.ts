@@ -125,10 +125,10 @@ describe("admitObservation — P2 refusals", () => {
     ["UTC with newline", frame({ recorded_at_utc: "2026-01-01T00:00:01\n+00:00" })],
     ["UTC with DEL", frame({ recorded_at_utc: "2026-01-01T00:00:01\u007f+00:00" })],
     ["UTC with C1", frame({ recorded_at_utc: "2026-01-01T00:00:01\u0085+00:00" })],
-    ["UTC with RLO", frame({ recorded_at_utc: "2026-01-01T00:00:01‮+00:00" })],
-    ["UTC with LRE", frame({ recorded_at_utc: "‪2026-01-01T00:00:01+00:00" })],
-    ["UTC with FSI", frame({ recorded_at_utc: "2026-01-01T00:00:01⁨+00:00" })],
-    ["UTC with PDI", frame({ recorded_at_utc: "2026-01-01T00:00:01⁩+00:00" })],
+    ["UTC with RLO", frame({ recorded_at_utc: "2026-01-01T00:00:01\u202e+00:00" })],
+    ["UTC with LRE", frame({ recorded_at_utc: "\u202a2026-01-01T00:00:01+00:00" })],
+    ["UTC with FSI", frame({ recorded_at_utc: "2026-01-01T00:00:01\u2068+00:00" })],
+    ["UTC with PDI", frame({ recorded_at_utc: "2026-01-01T00:00:01\u2069+00:00" })],
   ];
 
   it.each(refused)("refuses %s", (_label, data) => {

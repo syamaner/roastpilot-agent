@@ -13,6 +13,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { act, render, renderHook, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -118,15 +119,60 @@ class RecordingSource implements ColdEventSourceLike {
   }
 }
 
-function renderRoute(path: string) {
-  return render(
-    <MemoryRouter initialEntries={[path]}>
-      <App />
-    </MemoryRouter>,
+/**
+ * A bounded synthetic `fetch`: every call resolves at once to a valid empty JSON
+ * 200, so a regression that adds a REST query renders normally and is caught by
+ * the call assertion rather than by a crash, a rejection or a timeout.
+ */
+function syntheticFetch() {
+  return vi.fn(
+    async () =>
+      new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }),
   );
 }
 
+let routeQueryClient: QueryClient | null = null;
+
+/**
+ * Render the real `App` router at `path` inside the providers the production entry
+ * point supplies (a fresh per-test QueryClient, no retries or refetching) with the
+ * synthetic `fetch` installed. Returns the render result and the fetch spy.
+ */
+function renderRoute(path: string) {
+  const fetchSpy = syntheticFetch();
+  vi.stubGlobal("fetch", fetchSpy);
+  routeQueryClient = new QueryClient({
+    defaultOptions: {
+      queries: {
+        retry: false,
+        refetchOnWindowFocus: false,
+        refetchOnReconnect: false,
+        refetchOnMount: false,
+        gcTime: 0,
+      },
+    },
+  });
+  const rendered = render(
+    <QueryClientProvider client={routeQueryClient}>
+      <MemoryRouter initialEntries={[path]}>
+        <App />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  return { ...rendered, fetchSpy };
+}
+
+/** Let any effect-scheduled request start before asserting there was none. */
+async function settle(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+}
+
 afterEach(() => {
+  routeQueryClient?.clear();
+  routeQueryClient = null;
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   RecordingSource.instances = [];
@@ -318,7 +364,7 @@ describe("V5 refused content never reaches the DOM or console", () => {
       source.emit("observation", valid.replace("}", ',"x":"CANARY-EXTRA"}'), "0123456789abcdef-2");
       source.emit(
         "observation",
-        valid.replace("2026-01-01T00:00:01.250000+00:00", "CANARY-UTC‮"),
+        valid.replace("2026-01-01T00:00:01.250000+00:00", "CANARY-UTC\u202e"),
         "0123456789abcdef-3",
       );
       source.emit("observation", valid.replace("recording_on", "CANARY-PHASE"), "0123456789abcdef-4");
@@ -391,7 +437,10 @@ describe("H5b harness source microtask deferral", () => {
     expect(heartbeat).not.toHaveBeenCalled();
   });
 
-  it("contrast control: a source emitting synchronously in its constructor loses the frames", () => {
+  // Illustrative only: this self-contained class is not the harness code. It shows
+  // why the harness defers with a microtask; the behavioural proof is the harness
+  // tests above and the synchronous-emission mutant of the real harness source.
+  it("illustrative contrast: a source emitting synchronously in its constructor loses the frames", () => {
     class SynchronousSource {
       onopen: (() => void) | null = null;
       readonly listeners: ((ev: MessageEvent) => void)[] = [];
@@ -434,14 +483,12 @@ describe("H5b harness source microtask deferral", () => {
 
 describe("H6 one event source; no REST, XHR or storage", () => {
   it("the product route constructs exactly one source and touches nothing else", async () => {
-    const fetchSpy = vi.fn();
-    vi.stubGlobal("fetch", fetchSpy);
     const xhrOpen = vi.spyOn(XMLHttpRequest.prototype, "open");
     const storageCalls = (["getItem", "setItem", "removeItem", "clear", "key"] as const).map(
       (method) => vi.spyOn(Storage.prototype, method),
     );
     vi.stubGlobal("EventSource", RecordingSource);
-    renderRoute("/cold-characterisation");
+    const { fetchSpy } = renderRoute("/cold-characterisation");
     expect(await screen.findByTestId("cold-view")).toBeInTheDocument();
     expect(RecordingSource.instances.map((source) => source.url)).toEqual([
       "/api/cold-characterisation/events",
@@ -449,6 +496,7 @@ describe("H6 one event source; no REST, XHR or storage", () => {
     const [source] = RecordingSource.instances;
     source?.emit("observation", JSON.stringify(OBSERVATION), "0123456789abcdef-1");
     source?.emit("heartbeat", "{}");
+    await settle();
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(xhrOpen).not.toHaveBeenCalled();
     for (const spy of storageCalls) expect(spy).not.toHaveBeenCalled();
@@ -525,11 +573,13 @@ describe("F2 route placement", () => {
     expect(nestedPaths).not.toContain("/__cold-characterisation-harness");
   });
 
-  it("the product route renders through App without the nav or any query provider", async () => {
+  it("the product route renders through App as a top-level page with no operator navigation", async () => {
     vi.stubGlobal("EventSource", RecordingSource);
-    renderRoute("/cold-characterisation");
+    const { fetchSpy } = renderRoute("/cold-characterisation");
     const view = await screen.findByTestId("cold-view");
     expect(within(view).getByRole("heading", { name: "Cold characterisation" })).toBeInTheDocument();
     expect(screen.queryByRole("navigation")).toBeNull();
+    await settle();
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

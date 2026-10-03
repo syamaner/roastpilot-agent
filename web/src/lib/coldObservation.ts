@@ -39,7 +39,7 @@ export const MAX_UTC_UTF8_BYTES = 2048;
  * surrounding text.
  */
 // eslint-disable-next-line no-control-regex
-const UTC_DISPLAY_REFUSED = /[\u0000-\u001f\u007f-\u009f‪-‮⁦-⁩]/;
+const UTC_DISPLAY_REFUSED = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/;
 
 /** The public cold phase vocabulary. */
 export type ColdPhase = "recording_off" | "recording_on";

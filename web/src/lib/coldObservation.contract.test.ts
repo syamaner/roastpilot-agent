@@ -37,7 +37,26 @@ const heartbeats = fixture.frames.filter((frame) => frame.event === "heartbeat")
 
 describe("cold contract fixture", () => {
   it("carries retained ticks, one public-model-only case and the heartbeat", () => {
-    expect(observations.length).toBeGreaterThanOrEqual(10);
+    expect(observations.map((frame) => frame.name)).toEqual([
+      "canonical_isoformat_micros",
+      "utc_without_micros",
+      "utc_zulu",
+      "device_absent",
+      "device_temperatures_null",
+      "heat_max_exact_int",
+      "heat_min_exact_int",
+      "heat_beyond_exact_int_projects_null",
+      "outcome_observed",
+      "outcome_not_eligible",
+      "outcome_unsupported",
+      "outcome_unreadable",
+      "outcome_malformed",
+      "observed_level_0",
+      "observed_level_100",
+      "cooling_on_true",
+      "cooling_on_false",
+      "observed_null_level",
+    ]);
     expect(heartbeats).toHaveLength(1);
     expect(
       fixture.frames.filter((frame) => frame.source === "public_model_only").map((f) => f.name),
