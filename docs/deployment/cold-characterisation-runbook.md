@@ -111,17 +111,44 @@ the run.
   enumeration, stay reachable. This is a known residual.
 - The HTTP access log is off and every uvicorn log record is detail-free
   (`cold-http <LEVEL>`). Other package loggers are unchanged.
+- The HTTP view runs on the same event loop as the run. Nothing this software
+  prints shows that the view stayed available for the whole run.
 
 ## 5. Exit codes and summary
 
 A usage error prints only the fixed usage line on stderr (exit 2), never a
 summary. Every other ordinary path that reaches the reporter attempts one closed
-summary of exactly 15 `key=value` lines (delivery may be incomplete, as below):
+summary of exactly 16 `key=value` lines (delivery may be incomplete, as below):
 `mode`, `run_invoked`, `result`, `cli_refusal`, `composition_refusal`,
 `outcome`, `start_refusal`, `termination_reason`, `child_ownership`,
 `advisory_path`, `provider_check`, `conformance_outcome`, `manifest_sha256`,
-`signal` and `exit_code`. Values are closed tokens; no host, port, path,
-profile, note, credential or exception text is printed.
+`signal`, `http_server` and `exit_code`. Values are closed tokens; no host,
+port, path, profile, note, credential or exception text is printed.
+
+`http_server` is one synchronous snapshot, taken at the single report attempt,
+of this invocation's HTTP server task and its startup barrier:
+
+| Token | Meaning | What it does not mean |
+|---|---|---|
+| `task_not_created` | This invocation created no HTTP server task (including an `already_run` refusal, for that call only) | Says nothing about another process or an earlier call |
+| `start_not_confirmed` | A server task was created, but the startup barrier was not observed resolved to true (pending, false, cancelled or failed) | Not proof that the server never bound, listened or answered |
+| `task_pending_at_report` | The start was confirmed and the server task had not finished at the report attempt | Not HTTP health, client connections, rendering, delivery or uptime |
+| `task_ended_at_report` | The start was confirmed and the server task had already finished at the report attempt (normally or after a contained failure) | Not when or why it ended |
+| `unknown` | No snapshot was taken (the fallback after an interrupt escaped) | Hosting status is not inferred from anything else |
+
+- `http_server` is not uptime, health, client delivery or rendering, and it is
+  not evidence. It is never written to the store, the evidence or any
+  qualification input.
+- It never changes the outcome, result or exit code, and it is absent when exit
+  codes 80-83 apply (nothing is printed then). An HTTP server that ends does
+  not stop, cancel or reclassify the run.
+- Neither the engine outcome nor exit 0 is proof of view availability or of
+  qualification.
+- It is a single snapshot, not monitoring and not a watchdog. A failure that
+  has not yet finished the server task still shows as pending; a failure that
+  does not end the server task (for example one failing request) is never
+  visible; a failure after the snapshot (during output or teardown) is not
+  reported.
 
 | Code | Meaning | What it does not mean |
 |---|---|---|

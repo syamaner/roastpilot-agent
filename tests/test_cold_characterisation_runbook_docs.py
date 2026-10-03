@@ -99,6 +99,7 @@ def test_runbook_lists_every_exit_code_and_the_closed_summary_keys() -> None:
         "conformance_outcome",
         "manifest_sha256",
         "signal",
+        "http_server",
         "exit_code",
     ):
         assert f"`{key}`" in text, key
@@ -204,3 +205,38 @@ def test_runbook_verifier_signals_and_spa_boundaries() -> None:
     assert "it can exit 1 with `signal=none`" in text
     assert "Exit 130 is not guaranteed for every early timing." in text
     assert "the software adds no automatic exclusion" in text
+
+
+@pytest.mark.docs
+def test_runbook_states_the_http_server_snapshot_without_health_or_qualification_claims() -> None:
+    """H13: the 16th key, its closed tokens and every non-meaning are stated."""
+    raw = RUNBOOK.read_text(encoding="utf-8")
+    text = _flat(raw)
+    assert "summary of exactly 16 `key=value` lines" in text
+    assert "summary of exactly 15" not in text
+    for token in (
+        "task_not_created",
+        "start_not_confirmed",
+        "task_pending_at_report",
+        "task_ended_at_report",
+    ):
+        assert f"| `{token}` |" in raw, token
+    for phrase in (
+        "`http_server` is not uptime, health, client delivery or rendering, "
+        "and it is not evidence.",
+        "It is never written to the store, the evidence or any qualification input.",
+        "It never changes the outcome, result or exit code, and it is absent when exit codes "
+        "80-83 apply",
+        "An HTTP server that ends does not stop, cancel or reclassify the run.",
+        "Neither the engine outcome nor exit 0 is proof of view availability or of qualification.",
+        "It is a single snapshot, not monitoring and not a watchdog.",
+        "a failure after the snapshot (during output or teardown) is not reported",
+        "Nothing this software prints shows that the view stayed available for the whole run.",
+    ):
+        assert phrase in text, phrase
+    for overclaim in (
+        "operator observation proves",
+        "observation is acceptance",
+        "view was healthy",
+    ):
+        assert overclaim not in text.casefold()
