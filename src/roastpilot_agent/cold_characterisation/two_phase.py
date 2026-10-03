@@ -53,6 +53,12 @@ process stop or a failed append never proves a safe commanded state; v1 cannot
 prove append provenance beyond the discipline enforced here.  Cleanup is bounded
 only by the child port's own stop contract; a stalled dependency is not
 guaranteed to finish.
+
+An optional :class:`ColdRetainedTickObserver` receives a freshly re-admitted copy of
+each durably retained tick, synchronously and on the run's loop.  It is
+display-only: an observer failure records ``UNEXPECTED_FAILURE`` with no retained
+abort, stops further publication and fails the run; it is never a liveness,
+freshness or safety signal and never authorises a phase, a finalisation or an exit.
 """
 
 import asyncio
@@ -149,7 +155,13 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdHostAbortReason,
     ColdPhaseKind,
     ColdRunHeader,
+    ColdTickAudioSample,
+    ColdTickDeviceEvidence,
     ColdTickRecord,
+    ColdTickRoastFanEvidence,
+    ColdTickRoastFanOutcome,
+    ColdTickSessionEvidence,
+    ColdTickSessionPhase,
     validate_record,
 )
 from roastpilot_agent.cold_characterisation.evidence_store import (
@@ -200,6 +212,22 @@ _INT_BOUND: typing.Final = 10**MAX_INT_DIGITS - 1
 _HEX: typing.Final = frozenset("0123456789abcdef")
 
 # ------------------------------------------------------------------ ports
+
+
+class ColdRetainedTickObserver(typing.Protocol):
+    """Display-only observer of each durably retained tick (#954 U2).
+
+    It is called synchronously on the run's own event loop, after the tick's durable
+    append, with an exclusive freshly re-admitted copy that shares nothing with the
+    retained record.  It must not block, perform I/O or await, and must return
+    ``None``.  Any raised ``Exception`` or non-``None`` return fails the run
+    (``UNEXPECTED_FAILURE``, no retained abort) and stops further calls.  It is
+    never a liveness, freshness, continuity or safety signal.
+    """
+
+    def __call__(self, tick: ColdTickRecord, /) -> None:
+        """Observe one retained tick copy."""
+        ...
 
 
 class ColdTwoPhaseMcp(ColdEngineMcp, typing.Protocol):
@@ -530,6 +558,16 @@ _ADVISORY: typing.Final = _carrier(
         ColdAdvisoryProviderTaskState,
         ColdAdvisoryCallFact,
     ),
+)
+_TICK: typing.Final = _carrier(
+    (
+        ColdTickRecord,
+        ColdTickDeviceEvidence,
+        ColdTickRoastFanEvidence,
+        ColdTickSessionEvidence,
+        ColdTickAudioSample,
+    ),
+    (ColdPhaseKind, ColdTickRoastFanOutcome, ColdTickSessionPhase),
 )
 _ENGINE_ROOTS: typing.Final[tuple[type[pydantic.BaseModel], ...]] = (
     ColdPhaseCompleted,
@@ -902,6 +940,8 @@ class _RunSink:
         self.poisoned = False
         self.seal_attempted = False
         self.sealed_digest: str | None = None
+        #: Display-only hook called after each durable tick append; ``None`` by default.
+        self.after_tick: typing.Callable[[ColdTickRecord], None] | None = None
 
     @property
     def usable(self) -> bool:
@@ -989,6 +1029,8 @@ class _RunSink:
             self._guards[fresh.phase].header = True
         elif type(fresh) is ColdTickRecord:
             self._latest_tick[fresh.phase] = fresh
+            if self.after_tick is not None:
+                self.after_tick(fresh)
         elif type(fresh) is ColdAbortRecord:
             self._guards[fresh.phase].abort_seen = True
         elif type(fresh) is ColdFinalisationRecord:
@@ -1284,8 +1326,10 @@ class _TwoPhaseRun:
         configured_call_bound_seconds: float,
         configured_dwell_seconds: float,
         evaluator: ColdAdvisoryEvaluatorPort,
+        tick_observer: ColdRetainedTickObserver | None = None,
     ) -> None:
         self._root = root
+        self._observer = tick_observer
         self._mcp = mcp
         self._child = _ChildOwner(child)
         self._identities = identities
@@ -1316,6 +1360,52 @@ class _TwoPhaseRun:
         self._ends: dict[ColdPhaseKind, float] = {}
 
     # ------------------------------------------------------------ helpers
+
+    def _after_tick(self, stored: ColdTickRecord) -> None:
+        """Publish one exclusive copy of a durably retained tick to the observer.
+
+        Display-only.  A session mismatch only stops publication (the engine
+        classifies the tick).  Any refused copy or identity, observer ``Exception``
+        or non-``None`` return stops publication and records ``UNEXPECTED_FAILURE``
+        with no abort.  A ``BaseException`` propagates unchanged.  Nothing is logged
+        or formatted.
+        """
+        try:
+            observer = self._observer
+            if observer is None:
+                return
+            sink = self._sink
+            if sink is None or sink.phase is None or stored.phase is not sink.phase:
+                self._observer = None
+                self._fail(_R.UNEXPECTED_FAILURE)
+                return
+            session = self._sessions.get(sink.phase)
+            if session is None or not _same_session(stored.session.session_id, session):
+                self._observer = None
+                return
+            header = self._headers.get(sink.phase)
+            copy = _admit_carrier(stored, ColdTickRecord, _TICK)
+            if (
+                copy is None
+                or copy is stored
+                or header is None
+                or copy.phase is not sink.phase
+                or copy.run_id != header.run_id
+                or copy.identity_sha256 != header.identity_sha256
+                or not _same_session(copy.session.session_id, session)
+            ):
+                self._observer = None
+                self._fail(_R.UNEXPECTED_FAILURE)
+                return
+            result: object = observer(copy)
+            if result is not None:
+                self._observer = None
+                self._fail(_R.UNEXPECTED_FAILURE)
+                if asyncio.iscoroutine(result):
+                    result.close()
+        except Exception:
+            self._observer = None
+            self._fail(_R.UNEXPECTED_FAILURE)
 
     def _fail(self, reason: ColdRunTerminationReason) -> None:
         """Record the first failure; later failures never overwrite it."""
@@ -1851,6 +1941,8 @@ class _TwoPhaseRun:
         except Exception:
             return await self._teardown()
         self._sink = _RunSink(writer)
+        if self._observer is not None:
+            self._sink.after_tick = self._after_tick
         if await self._run_off(admission) and self._advance_permitted():
             await self._run_on()
         return await self._teardown()
@@ -2104,6 +2196,7 @@ async def run_two_phase_characterisation(
     configured_call_bound_seconds: float,
     configured_dwell_seconds: float,
     evaluator: ColdAdvisoryEvaluatorPort,
+    tick_observer: ColdRetainedTickObserver | None = None,
 ) -> ColdTwoPhaseResult:
     """Run one hardware-free-testable two-phase cold characterisation.
 
@@ -2125,6 +2218,9 @@ async def run_two_phase_characterisation(
         configured_call_bound_seconds: The sampler's configured per-call bound.
         configured_dwell_seconds: The sampler's configured post-completion dwell.
         evaluator: The typed safety-evaluation port for returned requests.
+        tick_observer: Optional display-only observer of each retained tick copy;
+            its failure fails the run with no abort (see
+            :class:`ColdRetainedTickObserver`).  ``None`` changes nothing.
 
     Returns:
         The closed result; ``ADVISORY_CONFORMANT`` is never qualification.
@@ -2144,5 +2240,6 @@ async def run_two_phase_characterisation(
         configured_call_bound_seconds=configured_call_bound_seconds,
         configured_dwell_seconds=configured_dwell_seconds,
         evaluator=evaluator,
+        tick_observer=tick_observer,
     )
     return await run.execute()
