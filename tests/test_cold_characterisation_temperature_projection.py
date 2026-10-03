@@ -406,6 +406,14 @@ def _shape_cases() -> list[tuple[str, dict[str, object]]]:
         ),
         ("sh3-retained-env-absent", celsius_agree(retained_env_temp_c=None)),
         ("sh3-retained-bean-absent", celsius_agree(retained_bean_temp_c=None)),
+        # The next two break only the retained-pair rule: bean presence still
+        # matches the ignored/status relation, and no unit or agreement rule
+        # reads the retained environment temperature.
+        ("sh3-retained-pair-fahrenheit-env-absent", fahrenheit(retained_env_temp_c=None)),
+        (
+            "sh3-retained-pair-unknown-bean-absent",
+            unknown_all_ignored(retained_env_temp_c=21.0),
+        ),
         (
             "sh3-retained-when-all-ignored",
             unknown_all_ignored(retained_bean_temp_c=20.0, retained_env_temp_c=21.0),
