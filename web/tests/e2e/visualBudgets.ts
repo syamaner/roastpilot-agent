@@ -41,6 +41,8 @@ export interface ScreenshotInventoryEntry {
 
 /** Complete, closed visual-regression inventory. */
 export const SCREENSHOT_INVENTORY = [
+  { specFile: "cold-characterisation.spec.ts", snapshotName: "cold-characterisation-observed.png", screenshotClass: SCREENSHOT_CLASSES.DOM_PAGE },
+  { specFile: "cold-characterisation.spec.ts", snapshotName: "cold-characterisation-awaiting.png", screenshotClass: SCREENSHOT_CLASSES.DOM_PAGE },
   { specFile: "config.spec.ts", snapshotName: "config.png", screenshotClass: SCREENSHOT_CLASSES.DOM_PAGE },
   { specFile: "config.spec.ts", snapshotName: "config-safety.png", screenshotClass: SCREENSHOT_CLASSES.DOM_PAGE },
   { specFile: "dashboard.spec.ts", snapshotName: "dashboard-live.png", screenshotClass: SCREENSHOT_CLASSES.CANVAS_PAGE },
