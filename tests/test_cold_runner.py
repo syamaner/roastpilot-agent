@@ -12,6 +12,7 @@ temporary directory lands under ``tmp_path``.  No serial port, MCP child, provid
 
 import ast
 import asyncio
+import contextlib
 import enum
 import gc
 import inspect
@@ -28,6 +29,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import pytest_asyncio
 import uvicorn
 from starlette.types import Message
 
@@ -270,7 +272,8 @@ class Ports:
         for server in self.servers:
             await server.finished.wait()
         for store in self.stores:
-            await store.close()
+            with contextlib.suppress(Exception):
+                await store.close()
         for sock in self.sockets:
             sock.close()
 
@@ -438,12 +441,15 @@ def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
         logger.propagate = propagate
 
 
-@pytest.fixture
-def ports(tmp_path: Path) -> Ports:
+@pytest_asyncio.fixture
+async def ports(tmp_path: Path) -> typing.AsyncIterator[Ports]:
+    """The ports; teardown releases anything a pending exit (or a failed test) left."""
     spa = tmp_path / "spa"
     spa.mkdir()
     (spa / "index.html").write_text("<html>cold-spa</html>", encoding="utf-8")
-    return Ports(spa)
+    state = Ports(spa)
+    yield state
+    await state.cleanup()
 
 
 @pytest.fixture
@@ -602,6 +608,28 @@ NO_EXIT_CASES: list[tuple[str, Callable[[], object], int, str]] = [
                 _pending_values(),
                 advisory_path=Path_.PROVIDER_OUTSTANDING_FAILED,
                 conformance=types.SimpleNamespace(outcome=CONFORMANT.outcome),
+            )
+        ),
+        8,
+        "unadmitted",
+    ),
+    (
+        "construct-bad-digest",
+        lambda: ColdTwoPhaseResult.model_construct(
+            **_merged(_pending_values(), manifest_sha256="NOT-A-DIGEST")
+        ),
+        8,
+        "unadmitted",
+    ),
+    (
+        "construct-row-consistent-unadmitted-carrier",
+        lambda: ColdTwoPhaseResult.model_construct(
+            **_merged(
+                _pending_values(),
+                advisory_path=Path_.PROVIDER_OUTSTANDING_FAILED,
+                conformance=types.SimpleNamespace(
+                    outcome=advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT
+                ),
             )
         ),
         8,
@@ -1679,6 +1707,7 @@ def test_static_pending_contract_accepts_the_single_identity_form() -> None:
 def test_pre_run_signal_check_precedes_the_engine_phase_and_await() -> None:
     """C9b (static, defensive): the pre-run signal check sits before the engine await."""
     source = inspect.getsource(cold_runner._HostedRun.drive)
+    assert "if self.state.signal_number is not None:" in source
     check = source.index("if self.state.signal_number is not None:")
     phase = source.index("self.state.phase = _Phase.ENGINE")
     engine = source.index("raw: object = await self.run(")
