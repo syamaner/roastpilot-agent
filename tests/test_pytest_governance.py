@@ -891,7 +891,7 @@ def test_e11_packaging_status_is_current_and_honest() -> None:
     assert "E11-S1 | Wheel with bundled SPA + the `[pi]` extra | done" in epic
     assert "E11-S2 | Native installer, systemd unit, bundled model, deploy doc | done" in epic
     assert (
-        "E11-S3 | Pi 5 dual-mic recording + FC-detection CPU soak "
+        "E11-S3 | Pi 5 single-primary-mic complete-appliance cold characterisation "
         "(overflow validation) | not started" in epic
     )
     assert "Hosted ARM64 evidence is package compatibility" in epic

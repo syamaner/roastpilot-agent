@@ -226,3 +226,5 @@ while a roast could be active.
 D191/D192 characterisation, independent Pi evidence review,
 complete-appliance validation, and separately authorised supervised live-roast
 acceptance remain outstanding. This guide does not change those boundaries.
+
+The supervised cold characterisation procedure is in the [cold characterisation runbook](cold-characterisation-runbook.md); it is unexecuted.

@@ -37,6 +37,15 @@ corrects D180's final implementation and evidence clauses. This closure
 supersedes the in-progress or stays-open-pending language in all earlier #702
 (D180) entries below, which are now historical.
 
+**3 Oct 2026 — #954 cold characterisation software delivered (#954 stays
+OPEN):** the software for the supervised cold characterisation is delivered
+across U1 (PR #993), U2 (PR #994), the U3 cold view and U4 (the
+`roastpilot-agent cold-characterisation` action, same-loop hosting of the
+read-only app, and `docs/deployment/cold-characterisation-runbook.md`). No
+hardware, Pi or physical cold run has taken place: the supervised gate chain
+is outstanding and unexecuted, E11-S3 is not started, and #954 is open. This
+is software and documentation evidence only.
+
 **12 Sep 2026 — #138 E11-S2 native installer and deployment-documentation
 completion:** the four planned software/documentation slices are complete. The
 native installer and managed service/configuration paths, pinned local model,

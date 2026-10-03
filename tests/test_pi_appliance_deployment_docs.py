@@ -150,7 +150,7 @@ def test_new_deployment_artefacts_exclude_prohibited_public_claims() -> None:
     registry = REGISTRY_DOC.read_text(encoding="utf-8")
     test_content = Path(__file__).read_text(encoding="utf-8").casefold()
     e11_s2_heading = "### E11-S2 — Native installer, systemd unit, bundled model, deploy doc"
-    e11_s3_heading = "### E11-S3 — Pi 5 dual-mic recording + FC-detection CPU soak"
+    e11_s3_heading = "### E11-S3 — Pi 5 single-primary-mic complete-appliance cold characterisation"
     d27_callout_heading = "> **D27 E11-S1 dependency/publication gate — ✅ CLEARED:"
     epic_story = epic[epic.index(e11_s2_heading) : epic.index(e11_s3_heading)].casefold()
     epic_d27_callout = epic[epic.index(d27_callout_heading) : epic.index("## Stories")].casefold()
@@ -184,7 +184,7 @@ def test_e11_s2_status_updates_without_recasting_d191_thresholds() -> None:
     epic = (REPO_ROOT / "docs/epics/E11-packaging.md").read_text(encoding="utf-8")
     assert "E11-S2 | Native installer, systemd unit, bundled model, deploy doc | done" in epic
     assert (
-        "E11-S3 | Pi 5 dual-mic recording + FC-detection CPU soak "
+        "E11-S3 | Pi 5 single-primary-mic complete-appliance cold characterisation "
         "(overflow validation) | not started" in epic
     )
     assert "N/X" not in epic
