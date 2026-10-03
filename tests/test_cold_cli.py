@@ -434,6 +434,32 @@ def test_packaged_provenance_and_explicit_hosting_options(harness: Harness, tmp_
 
 @pytest.mark.parametrize(
     "argv",
+    [[*base_argv(), "--host", ""], [*base_argv(), "--host="]],
+    ids=["separate", "equals"],
+)
+def test_explicit_empty_host_is_a_fixed_usage_error_before_any_resource(
+    harness: Harness, capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    """A6 E1: an explicitly empty ``--host`` never reaches an all-interfaces bind."""
+    assert exit_status(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == cold_cli.USAGE_ERROR_LINE
+    assert captured.out == ""
+    assert harness.config_loads == 0
+    assert harness.hosted == []
+
+
+@pytest.mark.parametrize("host", ["::", " "], ids=["ipv6-any", "space-not-trimmed"])
+def test_explicit_non_empty_host_reaches_the_runner_verbatim(harness: Harness, host: str) -> None:
+    """A6 E2: only the empty string is refused; no trimming, coercion or allow-list."""
+    harness.code = 6
+    assert exit_status([*base_argv(), "--host", host]) == 6
+    _config, _inputs, kwargs = harness.hosted[0]
+    assert kwargs["bind_host"] == host
+
+
+@pytest.mark.parametrize(
+    "argv",
     [
         base_argv(**{"--artefact-kind": "wheel"}),
         [*base_argv(), "--artefact-sha256", DIGEST],

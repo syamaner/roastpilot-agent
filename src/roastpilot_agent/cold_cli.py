@@ -179,7 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=False,
         help="asserted 64-hex artefact digest (packaged kinds only)",
     )
-    single("--host", required=False, help="bind host (default 127.0.0.1)")
+    single("--host", type=_non_empty, required=False, help="bind host (default 127.0.0.1)")
     single("--port", type=int, required=False, help="bind port (default 8000)")
     single("--spa-dir", required=False, help="built SPA directory (bundled build if omitted)")
     return parser
