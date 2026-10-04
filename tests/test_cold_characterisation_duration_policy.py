@@ -1,12 +1,18 @@
 """D210 generation separation with independently authored retained V6 runs."""
 
+import ast
 import math
 from pathlib import Path
 
 import pydantic
 import pytest
 
-from roastpilot_agent.cold_characterisation import advisory_conformance, conformance, engine_policy
+from roastpilot_agent.cold_characterisation import (
+    advisory_conformance,
+    conformance,
+    duration_policy,
+    engine_policy,
+)
 from roastpilot_agent.cold_characterisation import evidence_lifecycle as lifecycle
 from roastpilot_agent.cold_characterisation import evidence_reader as reader
 from roastpilot_agent.cold_characterisation import evidence_schema as schema
@@ -34,6 +40,24 @@ from tests.test_cold_characterisation_evidence_temperature_run import candidate_
 from tests.test_cold_characterisation_temperature_conformance import written
 from tests.test_cold_characterisation_temperature_screen import obs
 from tests.test_cold_characterisation_two_phase import admit_checker, forged
+
+
+def test_duration_policy_imports_only_pure_stdlib_dependencies() -> None:
+    """The duration leaf depends only on enum, math and typing, never runtime or I/O."""
+    tree = ast.parse(Path(duration_policy.__file__).read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0
+            imported.add(node.module or "")
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                assert node.func.id != "__import__"
+            elif isinstance(node.func, ast.Attribute):
+                assert node.func.attr != "import_module"
+    assert imported == {"enum", "math", "typing"}
 
 
 @pytest.mark.parametrize(
@@ -145,15 +169,32 @@ def test_historical_current_rejection_matrix(tmp_path: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("case", ["mixed", "missing", "duplicate", "unknown", "substituted"])
-def test_current_generation_lifecycle_substitution_refused(tmp_path: Path, case: str) -> None:
-    """Tampered V6 lifecycle cannot produce current conformance."""
-    run = current_run(tmp_path)
+@pytest.mark.parametrize("generation", ["historical", "current"])
+@pytest.mark.parametrize("phase", [OFF, ON])
+@pytest.mark.parametrize(
+    "case",
+    ["mixed", "missing", "duplicate", "unknown", "substituted", "nan", "inf", "int", "bool", "str"],
+)
+def test_generation_lifecycle_substitution_refused_by_all_public_policies(
+    tmp_path: Path, generation: str, phase: schema.ColdPhaseKind, case: str
+) -> None:
+    """Both phases fail closed in policies 1–4, including bound elapsed-end mutations."""
+    run = written(tmp_path) if generation == "historical" else current_run(tmp_path)
+    anchors = (
+        [(10.0, 1810.0), (1830.0, 3630.0)]
+        if generation == "historical"
+        else [(10.0, 610.0), (630.0, 1230.0)]
+    )
+    assert [
+        (r.event_monotonic_seconds, r.scheduled_end_monotonic)
+        for r in run.lifecycle
+        if r.event is lifecycle.ColdLifecycleEvent.PHASE_ACTIVATED
+    ] == anchors
     records = list(run.lifecycle)
     index = next(
         i
         for i, record in enumerate(records)
-        if record.event is lifecycle.ColdLifecycleEvent.PHASE_ACTIVATED
+        if record.event is lifecycle.ColdLifecycleEvent.PHASE_ACTIVATED and record.phase is phase
     )
     record = records[index]
     if case == "missing":
@@ -161,11 +202,69 @@ def test_current_generation_lifecycle_substitution_refused(tmp_path: Path, case:
     elif case == "duplicate":
         records.insert(index, record)
     else:
-        end = {"mixed": 1810.0, "unknown": 1210.0, "substituted": 610.0000000000001}[case]
+        # Literal opposite-generation and unknown ends are independent of runtime policy.
+        mixed = {
+            ("historical", OFF): 610.0,
+            ("historical", ON): 2430.0,
+            ("current", OFF): 1810.0,
+            ("current", ON): 2430.0,
+        }
+        unknown = {
+            ("historical", OFF): 1210.0,
+            ("historical", ON): 3030.0,
+            ("current", OFF): 1210.0,
+            ("current", ON): 1830.0,
+        }
+        baseline_end = anchors[0 if phase is OFF else 1][1]
+        end: object = {
+            "mixed": mixed[generation, phase],
+            "unknown": unknown[generation, phase],
+            "substituted": math.nextafter(baseline_end, 0.0),
+            "nan": math.nan,
+            "inf": math.inf,
+            "int": int(baseline_end),
+            "bool": True,
+            "str": str(baseline_end),
+        }[case]
         records[index] = forged(record, scheduled_end_monotonic=end)
-    result = tc.check_current_conformance(forged(run, lifecycle=tuple(records)))
-    assert result.outcome is tc.ColdTemperatureConformanceOutcome.NOT_CONFORMANT
-    assert result.findings
+        if case in {"mixed", "unknown", "substituted"}:
+            elapsed_index = next(
+                i
+                for i, item in enumerate(records)
+                if item.event is lifecycle.ColdLifecycleEvent.OBSERVATION_WINDOW_ELAPSED
+                and item.phase is phase
+            )
+            records[elapsed_index] = forged(records[elapsed_index], scheduled_end_monotonic=end)
+            assert records[elapsed_index].scheduled_end_monotonic == (
+                records[index].scheduled_end_monotonic
+            )
+    tampered = forged(run, lifecycle=tuple(records))
+    # Bypass constructors so the public checkers themselves must reject hostile records.
+    v2 = reader.ColdRetainedRunV2.model_construct(
+        run=tampered.run, lifecycle_state=tampered.lifecycle_state, lifecycle=tampered.lifecycle
+    )
+    v3 = reader.ColdRetainedRunV3.model_construct(
+        run=tampered.run,
+        lifecycle_state=tampered.lifecycle_state,
+        lifecycle=tampered.lifecycle,
+        advisory_attempt_state=tampered.advisory_attempt_state,
+        advisory_attempts=tampered.advisory_attempts,
+    )
+    first = conformance.check_pre_advisory_conformance(v2)
+    second = advisory_conformance.check_advisory_conformance(v3)
+    historical = tc.check_temperature_conformance(tampered)
+    current = tc.check_current_conformance(tampered)
+    assert [r.policy_version for r in (first, second, historical, current)] == [1, 2, 3, 4]
+    for result in (first, second, historical, current):
+        assert result.findings
+    assert first.outcome is conformance.ColdConformanceOutcome.NOT_CONFORMANT
+    assert historical.outcome is tc.ColdTemperatureConformanceOutcome.NOT_CONFORMANT
+    assert current.outcome is tc.ColdTemperatureConformanceOutcome.NOT_CONFORMANT
+    if generation == "historical" and phase is ON and case == "mixed":
+        # All records remain individually valid and elapsed-end binding is unchanged.
+        for item in records:
+            lifecycle.validate_lifecycle_record(item)
+        assert first.findings == (conformance.ColdConformanceFinding.SCHEDULED_END_MISMATCH,)
 
 
 def test_runtime_refuses_historical_and_forged_policy3_results() -> None:
