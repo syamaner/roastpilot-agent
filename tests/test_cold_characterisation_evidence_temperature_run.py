@@ -1269,6 +1269,57 @@ def test_rw3_terminal_and_seal_refusals_come_first(tmp_path: Path) -> None:
     )
 
 
+def header_only_on(tmp_path: Path) -> tuple[store.ColdEvidenceWriter, schema.ColdRunHeader]:
+    """Open a writer whose latest phase is ON with only its header: no candidate, no tick."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    writer, root = open_writer(tmp_path)
+    writer.append(header_for(tmp_path, root, OFF))
+    on = on_header(tmp_path, root)
+    writer.append(on)
+    return writer, on
+
+
+def test_rw3_a_header_only_candidate_is_appendable(tmp_path: Path) -> None:
+    """RW3 (L4) positive control: the same candidate appends on an equivalent writer."""
+    writer, on = header_only_on(tmp_path)
+    writer.append_mcp_candidate(candidate_for(on))
+    assert _private(writer)._candidate_phases == {ON}
+
+
+@pytest.mark.parametrize("guard", ["terminal", "sealed"])
+def test_rw3_a_header_only_candidate_is_refused_after_terminal_or_seal(
+    tmp_path: Path, guard: str
+) -> None:
+    """RW3 (L4): with no candidate or tick in ON, only the appendability guard can refuse.
+
+    Each guard runs on its own fresh writer.  The terminal and the seal are first shown
+    to succeed on the header-only phase; nothing here claims a sealed writer could
+    durably append.
+    """
+    writer, on = header_only_on(tmp_path)
+    candidate = candidate_for(on)
+    if guard == "terminal":
+        writer.append_failed_run_terminal(
+            terminal.build_failed_run_terminal_record(
+                on,
+                advisory_settlement=terminal.ColdFailedRunAdvisorySettlement.RECORDED_UNRESOLVED_NOT_INVOKED,
+                provider_cancellation=terminal.ColdFailedRunProviderCancellation.NO_PROVIDER_TASK,
+                lifecycle_records_retained=0,
+                advisory_attempt_records_retained=0,
+            )
+        )
+        assert _private(writer)._terminal_appended is True
+        with pytest.raises(terminal.ColdFailedRunTerminalError) as raised:
+            writer.append_mcp_candidate(candidate)
+        assert raised.value.failure is terminal.ColdFailedRunTerminalFailure.APPENDED_AFTER_TERMINAL
+    else:
+        sealed = writer.seal()
+        assert sealed.run_id == RUN_ID
+        assert len(sealed.identity_bindings) == 2
+        expect_store(Failure.WRITER_SEALED, lambda: writer.append_mcp_candidate(candidate))
+    assert _private(writer)._candidate_phases == set()
+
+
 # ------------------------------------------------------------------ RV reader
 
 
