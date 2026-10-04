@@ -50,8 +50,10 @@ end (which includes any overrun) to recording-on activation, and is checked at
 every transition checkpoint and at activation, before the first recording-on
 read.  It never applies after recording-on activation.
 
-Residuals: per-tick observation covers heat, roast fan and cooling; main fan,
-drum and solenoid are checked only at D195 finalisation.  Clock progress is a
+Residuals: per-tick software observation checks commanded heat, main fan, roast
+fan and cooling.  Drum and solenoid/drop appear only in eligible D195
+six-dimension finalisation evidence.  These are commanded software values, not
+physical sensing or proof of physical response.  Clock progress is a
 port contract with no watchdog: a stall that never resumes leaves the run
 unfinished, and a resumed stall can leave sparse ticks in a completed phase, so
 no continuous observation is claimed.  The D209 temperature screen (bean and

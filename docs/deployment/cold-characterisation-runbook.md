@@ -81,6 +81,158 @@ duration and no run authority of its own.
   and its quantisation. Self-reported identities and software evidence are not
   physical proof.
 
+### 2.1 Select artifacts before installation
+
+Preparation starts by selecting two exact artifacts and recording their identities
+outside version-only reasoning:
+
+1. Record one Agent artifact's kind, source revision, clean-tree assertion where
+   applicable, and byte length and SHA-256 where applicable.
+2. Record the reviewed MCP candidate identified above: source revision, merged-tree
+   record, candidate wheel byte length and SHA-256. Published MCP 0.2.2 lacks the
+   D209 temperature projection; the reviewed, unreleased candidate reports the same
+   0.2.2 version and includes the typed projection.
+3. Treat the selected Agent artifact, reviewed MCP candidate, published MCP
+   distribution and resulting installed bytes as separate facts. A version, wheel
+   name, declared digest, `--artefact-*` value or `--mcp-candidate-*` value is an
+   assertion or selected-artifact fact; none attests the bytes imported by the
+   intended interpreter.
+4. Keep installation and verification that the resulting installed distributions
+   correspond to both selected artifacts as a **separately authorised installed-byte
+   gate**. That gate remains unexecuted here.
+
+An unknown, missing or mismatched artifact identity refuses preparation: the
+physical gate remains unexecuted and the run must not be described as prepared.
+This section supplies no installation transaction or installed-files attestor.
+
+### 2.2 Prepare and check the cold configuration
+
+Use a dedicated saved configuration. Replace every angle-bracketed placeholder
+below with the frozen non-secret value selected for the supervised run. The serial
+device and both YAML paths must be absolute. The primary microphone entry is
+deliberately repeated. `recording_enabled` and `recording_autocapture` must remain
+absent, rather than being set to either boolean. The operator's MCP YAML continues
+to own its frozen inference and device values.
+
+<!-- story-1002-cold-config-template -->
+```yaml
+advisor:
+  provider: <frozen provider>
+  provider_base_url: <frozen provider endpoint>
+  model_slug: <frozen model slug>
+  prompt_version: <frozen prompt version>
+
+mcp:
+  env: {}
+
+mcp_device:
+  serial_port: <frozen absolute device path>
+  roaster_driver: hottop_kn8828b_2k_plus
+  audio_input_device: <frozen primary microphone identity>
+  recording_devices:
+    - <frozen primary microphone identity>
+  fc_mode: audio
+  mcp_yaml_source_path: <absolute path to frozen MCP YAML>
+```
+
+Set `ROASTPILOT_CONFIG_FILE` to the saved file's absolute path. The saved-config
+loader does not admit `advisor.api_key_env` from YAML. To use a credential name
+other than the schema default, set
+`ROASTPILOT_ADVISOR__API_KEY_ENV='<frozen credential variable name>'`, then export
+the credential only under that configured name. The effective configuration uses
+environment-over-file-over-default precedence. Therefore freeze and inspect every
+applicable `ROASTPILOT_...__...` override as part of preparation; an environment
+override wins over the value shown in the saved YAML. Export no environment name
+beginning `COFFEE_`, in any mixture of case.
+
+Run the following with the interpreter from the intended Agent environment after
+replacing its expected placeholders with the same frozen non-secret values. It
+reads the credential only for truthiness and emits exactly one closed line. A
+refusal exits nonzero without printing configuration, environment, provider or
+result objects, credential values, or exception details.
+
+<!-- story-1002-cold-config-preflight -->
+```python
+import os
+from pathlib import Path
+
+from roastpilot_agent.cold_composition import (
+    ColdCompositionRefusal,
+    _admit_device_config,
+    _admit_environment,
+)
+from roastpilot_agent.config_store import load_app_config
+
+EXPECTED_PROVIDER = "<frozen provider>"
+EXPECTED_PROVIDER_ENDPOINT = "<frozen provider endpoint>"
+EXPECTED_CREDENTIAL_NAME = "<frozen credential variable name>"
+EXPECTED_MODEL = "<frozen model slug>"
+EXPECTED_PROMPT = "<frozen prompt version>"
+EXPECTED_SERIAL = "<frozen absolute device path>"
+EXPECTED_DRIVER = "hottop_kn8828b_2k_plus"
+EXPECTED_AUDIO = "<frozen primary microphone identity>"
+EXPECTED_MCP_YAML = Path("<absolute path to frozen MCP YAML>")
+
+
+def main() -> int:
+    try:
+        selected = os.environ.get("ROASTPILOT_CONFIG_FILE")
+        if selected is None:
+            raise ValueError
+        selected_path = Path(selected)
+        if not selected_path.is_absolute() or not selected_path.is_file():
+            raise ValueError
+        with selected_path.open("rb") as selected_file:
+            selected_file.read(1)
+
+        config, _ = load_app_config()
+        device = config.mcp_device
+        if (
+            config.advisor.provider != EXPECTED_PROVIDER
+            or config.advisor.provider_base_url != EXPECTED_PROVIDER_ENDPOINT
+            or config.advisor.api_key_env != EXPECTED_CREDENTIAL_NAME
+            or config.advisor.model_slug != EXPECTED_MODEL
+            or config.advisor.prompt_version != EXPECTED_PROMPT
+            or config.mcp.env != {}
+            or device.serial_port != EXPECTED_SERIAL
+            or device.serial_port is None
+            or not Path(device.serial_port).is_absolute()
+            or device.roaster_driver != EXPECTED_DRIVER
+            or device.audio_input_device != EXPECTED_AUDIO
+            or device.recording_devices != (EXPECTED_AUDIO,)
+            or device.fc_mode != "audio"
+            or device.recording_enabled is not None
+            or device.recording_autocapture is not None
+            or device.mcp_yaml_source_path != EXPECTED_MCP_YAML
+            or not EXPECTED_MCP_YAML.is_absolute()
+        ):
+            raise ValueError
+
+        environment = _admit_environment(config, os.name)
+        if (
+            isinstance(environment, ColdCompositionRefusal)
+            or environment.credential_present is not True
+        ):
+            raise ValueError
+        phases = _admit_device_config(device)
+        if isinstance(phases, ColdCompositionRefusal):
+            raise ValueError
+    except Exception:
+        print("cold configuration preflight: REFUSED")
+        return 1
+    print("cold configuration preflight: ADMITTED")
+    return 0
+
+
+raise SystemExit(main())
+```
+
+This is a hardware-free and provider-free configuration preparation check. It
+does not build or call the advisor, spawn MCP, open the MCP YAML, or access a
+device. It does not verify the files behind configured paths, installed Agent or
+MCP distributions, the loaded ONNX model, provider reachability, physical
+identity, hardware state, calibration, readiness, accuracy or physical safety.
+
 ## 3. Command
 
 Every option except `--protected-root` may appear only once; a repeat, an
@@ -338,11 +490,10 @@ Independent Pi evidence review follows separately.
 - The acceptance interpretation of the inner run does not include the
   temperature screen; the screen is judged by temperature conformance policy 3.
 - Clock progress is a port contract, not a watchdog.
-- The **D195 six-dimension envelope (heat, roast fan, main fan, drum, cooling,
-  solenoid/drop) is checked only at eligible finalisation, never after a
-  retained abort.**
-- Per tick, only **heat, roast fan (D197) and cooling** are observed, and they
-  are commanded state, not sensing.
+- Per-tick software observation checks commanded heat, main fan, roast fan and
+  cooling. Drum and solenoid/drop appear only in eligible D195 six-dimension
+  finalisation evidence, never after a retained abort. These are commanded
+  software values, not physical sensing or proof of physical response.
 - The independent operator emergency stop governs throughout.
 
 ## 9. Deployment residuals

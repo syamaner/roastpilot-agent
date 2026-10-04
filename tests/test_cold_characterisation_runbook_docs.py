@@ -4,10 +4,14 @@ These are literal checks that the safety-relevant statements are present and tha
 the public-accuracy boundaries hold; they are not a semantic audit of the prose.
 """
 
+import os
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+
+from roastpilot_agent import cold_composition
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = REPO_ROOT / "docs/deployment/cold-characterisation-runbook.md"
@@ -15,6 +19,8 @@ EPIC = REPO_ROOT / "docs/epics/E11-packaging.md"
 REGISTRY = REPO_ROOT / "docs/state/registry.md"
 PI_APPLIANCE = REPO_ROOT / "docs/deployment/pi-appliance.md"
 ROUTES = REPO_ROOT / "web/src/routes.tsx"
+TWO_PHASE = REPO_ROOT / "src/roastpilot_agent/cold_characterisation/two_phase.py"
+COLD_STREAM = REPO_ROOT / "src/roastpilot_agent/cold_observation_stream.py"
 S3_HEADING = (
     "### E11-S3 — Pi 5 single-primary-mic complete-appliance cold characterisation "
     "(overflow validation)"
@@ -46,10 +52,10 @@ def _flat(text: str) -> str:
 def test_runbook_states_the_safety_boundaries() -> None:
     text = _flat(RUNBOOK.read_text(encoding="utf-8"))
     for phrase in (
-        "The D195 six-dimension envelope (heat, roast fan, main fan, drum, cooling, "
-        "solenoid/drop) is checked only at eligible finalisation, never after a retained abort.",
-        "only heat, roast fan (D197) and cooling are observed, and they are commanded state, "
-        "not sensing",
+        "Per-tick software observation checks commanded heat, main fan, roast fan and cooling. "
+        "Drum and solenoid/drop appear only in eligible D195 six-dimension finalisation "
+        "evidence, never after a retained abort. These are commanded software values, "
+        "not physical sensing or proof of physical response.",
         "The independent operator emergency stop is required throughout the run.",
         "Exit codes 80-83",
         "no trusted receipt",
@@ -74,6 +80,286 @@ def test_runbook_states_the_safety_boundaries() -> None:
         "without a recorded first signal",
     ):
         assert phrase.replace("**", "") in text.replace("**", ""), phrase
+
+
+def _marked_fence(marker: str, language: str) -> str:
+    """Extract the one fenced block immediately following a story marker."""
+    raw = RUNBOOK.read_text(encoding="utf-8")
+    pattern = rf"<!-- {re.escape(marker)} -->\s*```{language}\n(.*?)\n```"
+    matches = re.findall(pattern, raw, flags=re.DOTALL)
+    assert len(matches) == 1
+    return matches[0]
+
+
+_PLACEHOLDERS = {
+    "<frozen provider>": "openai_compatible",
+    "<frozen provider endpoint>": "https://cold.invalid/v1",
+    "<frozen credential variable name>": "RP_COLD_TEST_KEY",
+    "<frozen model slug>": "frozen/model",
+    "<frozen prompt version>": "cold-v1",
+    "<frozen absolute device path>": "/dev/cold-test-roaster",
+    "<frozen primary microphone identity>": "Cold Test Primary Mic",
+    "<absolute path to frozen MCP YAML>": "/nonexistent/cold-test-mcp.yaml",
+}
+_CANARY = "cold-preflight-secret-canary"
+
+
+def _replace_placeholders(text: str, *, saved_model: str = "frozen/model") -> str:
+    """Replace the documented operator placeholders with synthetic frozen values."""
+    replacements = {**_PLACEHOLDERS, "<frozen model slug>": saved_model}
+    for placeholder, value in replacements.items():
+        text = text.replace(placeholder, value)
+    assert "<frozen " not in text and "<absolute path" not in text
+    return text
+
+
+def _controlled_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Install only synthetic process values needed by the closed environment admission."""
+    for name in tuple(os.environ):
+        upper = name.upper()
+        if upper.startswith("ROASTPILOT_") or upper.startswith("COFFEE_"):
+            monkeypatch.delenv(name)
+    for name, value in {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/nonexistent/cold-test-home",
+        "USER": "cold-test",
+        "LOGNAME": "cold-test",
+        "TMPDIR": "/nonexistent/cold-test-tmp",
+        "SHELL": "/bin/synthetic-shell",
+        "TERM": "synthetic-term",
+        "RP_COLD_TEST_KEY": _CANARY,
+        "ROASTPILOT_ADVISOR__API_KEY_ENV": "RP_COLD_TEST_KEY",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+
+def _run_documented_preflight(
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    yaml_mutator: Callable[[str], str] = lambda text: text,
+    environment: dict[str, str | None] | None = None,
+    config_path: str | None = "absolute",
+) -> tuple[int, str, str]:
+    """Execute the actual marked fences under closed synthetic process state."""
+    _controlled_environment(monkeypatch)
+    yaml_text = _replace_placeholders(
+        _marked_fence("story-1002-cold-config-template", "yaml"), saved_model="saved/model"
+    )
+    config_file = tmp_path / "cold-config.yaml"
+    config_file.write_text(yaml_mutator(yaml_text), encoding="utf-8")
+    if config_path == "absolute":
+        monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(config_file))
+    elif config_path == "missing":
+        monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "missing.yaml"))
+    elif config_path == "relative":
+        monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", "relative-cold-config.yaml")
+    elif config_path is None:
+        monkeypatch.delenv("ROASTPILOT_CONFIG_FILE", raising=False)
+    else:  # pragma: no cover - closed helper vocabulary
+        raise AssertionError(config_path)
+    monkeypatch.setenv("ROASTPILOT_ADVISOR__MODEL_SLUG", "frozen/model")
+    for name, value in (environment or {}).items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    forbidden_calls: list[str] = []
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        forbidden_calls.append("called")
+        raise AssertionError("provider, MCP or hardware construction attempted")
+
+    monkeypatch.setattr(cold_composition, "build_advisor", forbidden)
+    monkeypatch.setattr(cold_composition, "ColdMCPServerProcess", forbidden)
+    script = _replace_placeholders(_marked_fence("story-1002-cold-config-preflight", "python"))
+    with pytest.raises(SystemExit) as stopped:
+        exec(compile(script, "<documented-cold-preflight>", "exec"), {"__name__": "__main__"})
+    captured = capsys.readouterr()
+    assert forbidden_calls == []
+    return int(stopped.value.code), captured.out, captured.err
+
+
+@pytest.mark.docs
+def test_story_1002_artifact_selection_and_installed_bytes_are_separate_gates() -> None:
+    """Selected artifacts remain distinct from separately authorised installed-byte proof."""
+    raw = RUNBOOK.read_text(encoding="utf-8")
+    section = raw[raw.index("### 2.1") : raw.index("### 2.2")]
+    for phrase in (
+        "Agent artifact",
+        "reviewed MCP candidate",
+        "Published MCP 0.2.2 lacks the D209 temperature projection",
+        "installed bytes as separate facts",
+        "none attests the bytes imported by the intended interpreter",
+        "separately authorised installed-byte gate",
+        "That gate remains unexecuted here.",
+    ):
+        assert phrase in _flat(section)
+    for overclaim in ("is installed", "matches installed bytes", "has been verified"):
+        assert overclaim not in section
+
+
+@pytest.mark.docs
+def test_story_1002_template_uses_supported_credential_name_configuration() -> None:
+    """The read-only saved field stays absent; the effective env override is explicit."""
+    template = _marked_fence("story-1002-cold-config-template", "yaml")
+    section = RUNBOOK.read_text(encoding="utf-8").split("### 2.2", maxsplit=1)[1]
+    assert "api_key_env" not in template
+    assert "ROASTPILOT_ADVISOR__API_KEY_ENV='<frozen credential variable name>'" in section
+    assert "config.advisor.api_key_env != EXPECTED_CREDENTIAL_NAME" in section
+
+
+def test_story_1002_commanded_state_sibling_prose_matches_engine_and_projection() -> None:
+    """The engine checks main fan while the public display field remains intentionally null."""
+    two_phase = _flat(TWO_PHASE.read_text(encoding="utf-8"))
+    stream = _flat(COLD_STREAM.read_text(encoding="utf-8"))
+    corrected = (
+        "per-tick software observation checks commanded heat, main fan, roast fan and cooling. "
+        "Drum and solenoid/drop appear only in eligible D195 six-dimension finalisation "
+        "evidence. These are commanded software values, not physical sensing or proof of "
+        "physical response."
+    )
+    assert corrected in two_phase
+    assert (
+        "engine's per-tick commanded-state check covers heat, main fan, roast fan and cooling"
+        in stream
+    )
+    assert (
+        "public display projection still leaves ``fan_percent`` (the main fan) as ``null``"
+        in stream
+    )
+
+
+@pytest.mark.docs
+def test_story_1002_documented_preflight_admits_effective_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """The exact documented fences load env-over-file config and admit without side effects."""
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch, capsys=capsys, tmp_path=tmp_path
+    )
+    assert (code, stdout, stderr) == (0, "cold configuration preflight: ADMITTED\n", "")
+    assert _CANARY not in stdout + stderr
+
+
+@pytest.mark.docs
+@pytest.mark.parametrize("config_path", [None, "relative", "missing"])
+def test_story_1002_documented_preflight_refuses_missing_or_unusable_config_file(
+    config_path: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        config_path=config_path,
+    )
+    assert (code, stdout, stderr) == (1, "cold configuration preflight: REFUSED\n", "")
+
+
+@pytest.mark.docs
+@pytest.mark.parametrize(
+    ("mutation", "environment"),
+    [
+        (lambda text: _CANARY + "\n: malformed", None),
+        (lambda text: text.replace("  env: {}", "  env: {EXTRA: canary}"), None),
+        (lambda text: text + "\n  recording_enabled: true\n", None),
+        (
+            lambda text: text.replace(
+                "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml",
+                "  mcp_yaml_source_path: relative.yaml",
+            ),
+            None,
+        ),
+        (
+            lambda text: text.replace(
+                "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml", ""
+            ),
+            None,
+        ),
+        (lambda text: text, {"coffee_hidden": _CANARY}),
+        (lambda text: text, {"RP_COLD_TEST_KEY": ""}),
+        (lambda text: text.replace("provider: openai_compatible", "provider: openai"), None),
+        (
+            lambda text: text.replace(
+                "provider_base_url: https://cold.invalid/v1",
+                "provider_base_url: https://other.invalid/v1",
+            ),
+            None,
+        ),
+        (lambda text: text, {"ROASTPILOT_ADVISOR__MODEL_SLUG": "other/model"}),
+        (lambda text: text.replace("prompt_version: cold-v1", "prompt_version: other"), None),
+        (lambda text: text, {"ROASTPILOT_ADVISOR__API_KEY_ENV": "OTHER_KEY"}),
+        (
+            lambda text: text.replace(
+                "serial_port: /dev/cold-test-roaster", "serial_port: /dev/other"
+            ),
+            None,
+        ),
+        (
+            lambda text: text.replace(
+                "roaster_driver: hottop_kn8828b_2k_plus", "roaster_driver: mock"
+            ),
+            None,
+        ),
+        (
+            lambda text: text.replace(
+                "audio_input_device: Cold Test Primary Mic", "audio_input_device: Other Mic"
+            ),
+            None,
+        ),
+        (
+            lambda text: text.replace("    - Cold Test Primary Mic", "    - Other Recording Mic"),
+            None,
+        ),
+        (lambda text: text.replace("fc_mode: audio", "fc_mode: manual"), None),
+        (lambda text: text + "\n  recording_autocapture: false\n", None),
+    ],
+    ids=(
+        "malformed-yaml",
+        "nonempty-mcp-env",
+        "recording-field-set",
+        "relative-mcp-yaml",
+        "missing-mcp-yaml",
+        "ambient-coffee-name",
+        "empty-credential",
+        "provider-mismatch",
+        "endpoint-mismatch",
+        "model-mismatch",
+        "prompt-mismatch",
+        "credential-name-mismatch",
+        "serial-mismatch",
+        "driver-mismatch",
+        "audio-mismatch",
+        "recording-device-mismatch",
+        "fc-mode-mismatch",
+        "recording-autocapture-set",
+    ),
+)
+def test_story_1002_documented_preflight_refuses_closed_without_leaking(
+    mutation: Callable[[str], str],
+    environment: dict[str, str | None] | None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Every malformed, mismatched or helper-refused case has one content-free result."""
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        yaml_mutator=mutation,
+        environment=environment,
+    )
+    assert (code, stdout, stderr) == (1, "cold configuration preflight: REFUSED\n", "")
+    assert _CANARY not in stdout + stderr
 
 
 @pytest.mark.docs
