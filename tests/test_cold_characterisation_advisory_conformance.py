@@ -24,6 +24,7 @@ from roastpilot_agent.cold_characterisation import evidence_builders as builders
 from roastpilot_agent.cold_characterisation import evidence_lifecycle as lifecycle
 from roastpilot_agent.cold_characterisation import evidence_reader as reader
 from roastpilot_agent.cold_characterisation import evidence_schema as schema
+from roastpilot_agent.cold_characterisation import evidence_store as store
 from tests.test_cold_characterisation_conformance import (
     T0,
     Plan,
@@ -236,15 +237,37 @@ def records_for(
     return built
 
 
-def write_v3(tmp_path: Path, run: Plan, attempts: Chains) -> V3:
-    """Mirror the conformance ``write``, appending each phase's attempts before its lifecycle."""
+AfterHeader = typing.Callable[[store.ColdEvidenceWriter, schema.ColdRunHeader], None]
+AfterTick = typing.Callable[
+    [store.ColdEvidenceWriter, schema.ColdRunHeader, schema.ColdTickRecord], None
+]
+
+
+def _write_run(
+    tmp_path: Path,
+    run: Plan,
+    attempts: Chains,
+    *,
+    after_header: AfterHeader | None = None,
+    after_tick: AfterTick | None = None,
+) -> tuple[str, str]:
+    """Write and seal ``run`` with ``attempts``; return the root and digest without reading.
+
+    ``after_header`` runs right after each phase header is appended and ``after_tick``
+    right after each tick; with both ``None`` the written bytes are unchanged.
+    """
     writer, root = open_writer(tmp_path)
     sequence = 0
     for phase in run.phases:
         header = header_of(run.documents[phase], phase, run.headers[phase])
         writer.append(header)
+        if after_header is not None:
+            after_header(writer, header)
         for tick in run.ticks[phase]:
-            writer.append(tick_record(header, tick))
+            record = tick_record(header, tick)
+            writer.append(record)
+            if after_tick is not None:
+                after_tick(writer, header, record)
         for position, mono in enumerate(run.hosts[phase]):
             writer.append(
                 host_record(header, mono, **run.host_overrides.get((phase, position), {}))
@@ -275,7 +298,12 @@ def write_v3(tmp_path: Path, run: Plan, attempts: Chains) -> V3:
                 )
             )
             sequence += 1
-    digest = writer.seal().manifest_sha256
+    return root, writer.seal().manifest_sha256
+
+
+def write_v3(tmp_path: Path, run: Plan, attempts: Chains) -> V3:
+    """Mirror the conformance ``write``, appending each phase's attempts before its lifecycle."""
+    root, digest = _write_run(tmp_path, run, attempts)
     return reader.read_retained_run_v3(root, run_id=RUN_ID, expected_manifest_sha256=digest)
 
 
@@ -1551,7 +1579,8 @@ def test_f_imp_only_the_advisory_checker_imports_the_window() -> None:
         "cold_characterisation/advisory_sampler.py",
     ]
     assert _checker_consumers(package, "roastpilot_agent", module="advisory_conformance") == [
-        "cold_characterisation/two_phase.py"
+        "cold_characterisation/temperature_conformance.py",
+        "cold_characterisation/two_phase.py",
     ]
 
 

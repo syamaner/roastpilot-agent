@@ -54,6 +54,17 @@ from roastpilot_agent.cold_characterisation.evidence_temperature import (
     pairs_with,
     validate_tick_temperature_record,
 )
+from roastpilot_agent.cold_characterisation.evidence_temperature_run import (
+    MCP_CANDIDATE_STREAM,
+    TEMPERATURE_ABORT_STREAM,
+    ColdMcpCandidateRecord,
+    ColdTemperatureAbortRecord,
+    ColdTemperatureRunError,
+    ColdTemperatureRunFailure,
+    ColdTemperatureScreenReason,
+    validate_mcp_candidate_record,
+    validate_temperature_abort_record,
+)
 from roastpilot_agent.cold_characterisation.evidence_terminal import (
     ColdFailedRunTerminalError,
     ColdFailedRunTerminalFailure,
@@ -1055,6 +1066,26 @@ def check_tick_temperature_binding(
     _phase_header_for(state, phase=record.phase, identity_sha256=record.identity_sha256)
 
 
+def check_temperature_run_binding(
+    state: ColdBindingState, record: ColdTemperatureAbortRecord | ColdMcpCandidateRecord
+) -> None:
+    """Bind one validated temperature-abort or MCP candidate record to its phase header.
+
+    It never binds a header and never mutates ``state``.
+
+    Args:
+        state: Binding state holding the already bound phase headers.
+        record: A snapshot returned by ``validate_temperature_abort_record`` or
+            ``validate_mcp_candidate_record``.
+
+    Raises:
+        ColdEvidenceStoreError: If the run id, phase header, or identity digest fails.
+    """
+    if record.run_id != state.run_id:
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.RUN_ID_MISMATCHED)
+    _phase_header_for(state, phase=record.phase, identity_sha256=record.identity_sha256)
+
+
 # ------------------------------------------------------------ tree primitives
 
 
@@ -1483,6 +1514,8 @@ class ColdEvidenceWriter:
         self._terminal_appended = False
         self._last_tick: dict[ColdPhaseKind, ColdTickRecord] = {}
         self._paired_tick: dict[ColdPhaseKind, ColdTickRecord] = {}
+        self._candidate_phases: set[ColdPhaseKind] = set()
+        self._abort_keys: set[tuple[ColdPhaseKind, int, ColdTemperatureScreenReason]] = set()
         self._poisoned = False
         self._sealed = False
 
@@ -1783,6 +1816,117 @@ class ColdEvidenceWriter:
             self._abandon()
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
         self._paired_tick[snapshot.phase] = latest_tick
+
+    def append_mcp_candidate(self, record: ColdMcpCandidateRecord) -> None:
+        """Validate, bind, order, and durably append one phase's MCP candidate line.
+
+        The record must belong to the latest bound phase, which carries no candidate
+        line yet and no retained tick.  Re-admission, binding, and ordering refusals
+        leave the writer usable; a write fault poisons it.  The candidate state
+        advances only after the line is durably written, with the same persistence
+        guarantee as every other append; this is not a filesystem transaction.
+
+        Honest limit: the candidate is an operator assertion; nothing here attests
+        authenticity or installed bytes, and a reader cannot prove this append order
+        across files.
+
+        Args:
+            record: One in-process MCP candidate record.
+
+        Raises:
+            ColdEvidenceError: If content re-admission fails (propagated unchanged).
+            ColdEvidenceStoreError: If binding fails, or a write fails (then poisoned).
+            ColdTemperatureRunError: If the record is not in the latest phase, its phase
+                already has a candidate, or its phase already retains a tick.
+            ColdFailedRunTerminalError: If a failed-run terminal was already appended.
+        """
+        run_fd = self._require_appendable()
+        snapshot = validate_mcp_candidate_record(record)
+        try:
+            check_temperature_run_binding(self._state, snapshot)
+            if snapshot.phase is not self._state.headers[-1][0].phase:
+                raise ColdTemperatureRunError(ColdTemperatureRunFailure.PHASE_NOT_LATEST)
+            if snapshot.phase in self._candidate_phases:
+                raise ColdTemperatureRunError(ColdTemperatureRunFailure.CANDIDATE_DUPLICATED)
+            if self._last_tick.get(snapshot.phase) is not None:
+                raise ColdTemperatureRunError(ColdTemperatureRunFailure.CANDIDATE_AFTER_TICK)
+        except (ColdEvidenceStoreError, ColdTemperatureRunError):
+            raise
+        except BaseException:
+            self._abandon()
+            raise
+        failed = False
+        try:
+            line = (canonical_json(snapshot.model_dump(mode="json")) + "\n").encode("utf-8")
+            _write_all(self._stream_fd(run_fd, snapshot.phase, MCP_CANDIDATE_STREAM), line)
+        except (OSError, ValueError, ColdEvidenceStoreError):
+            failed = True
+        except BaseException:
+            self._abandon()
+            raise
+        if failed:
+            self._abandon()
+            raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
+        self._candidate_phases.add(snapshot.phase)
+
+    def append_temperature_abort(self, record: ColdTemperatureAbortRecord) -> None:
+        """Validate, bind, order, and durably append one temperature-abort line.
+
+        The record must belong to the latest bound phase, name that phase's latest
+        retained tick, which must already be paired with its tick-temperature line,
+        and carry a ``(phase, tick, reason)`` not appended before.  Several distinct
+        reasons for one tick are valid; a repeated reason is refused.  Re-admission,
+        binding, and ordering refusals leave the writer usable; a write fault poisons
+        it.  The abort state advances only after the line is durably written, with the
+        same persistence guarantee as every other append.
+
+        Honest limits: this proves format consistency, not a safety verdict.  The
+        abort's own recording instant is never compared with its tick's.
+
+        Args:
+            record: One in-process temperature-abort record.
+
+        Raises:
+            ColdEvidenceError: If content re-admission fails (propagated unchanged).
+            ColdEvidenceStoreError: If binding fails, or a write fails (then poisoned).
+            ColdTemperatureRunError: If the record is not in the latest phase, does not
+                name the phase's latest paired tick, or repeats an appended reason.
+            ColdFailedRunTerminalError: If a failed-run terminal was already appended.
+        """
+        run_fd = self._require_appendable()
+        snapshot = validate_temperature_abort_record(record)
+        key = (snapshot.phase, snapshot.tick, snapshot.reason)
+        try:
+            check_temperature_run_binding(self._state, snapshot)
+            if snapshot.phase is not self._state.headers[-1][0].phase:
+                raise ColdTemperatureRunError(ColdTemperatureRunFailure.PHASE_NOT_LATEST)
+            latest = self._last_tick.get(snapshot.phase)
+            if (
+                latest is None
+                or self._paired_tick.get(snapshot.phase) is not latest
+                or snapshot.tick != latest.tick
+            ):
+                raise ColdTemperatureRunError(ColdTemperatureRunFailure.TICK_NOT_PAIRED)
+            if key in self._abort_keys:
+                raise ColdTemperatureRunError(ColdTemperatureRunFailure.ABORT_DUPLICATED)
+        except (ColdEvidenceStoreError, ColdTemperatureRunError):
+            raise
+        except BaseException:
+            self._abandon()
+            raise
+        failed = False
+        try:
+            line = (canonical_json(snapshot.model_dump(mode="json")) + "\n").encode("utf-8")
+            _write_all(self._stream_fd(run_fd, snapshot.phase, TEMPERATURE_ABORT_STREAM), line)
+        except (OSError, ValueError, ColdEvidenceStoreError):
+            failed = True
+        except BaseException:
+            self._abandon()
+            raise
+        if failed:
+            self._abandon()
+            raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
+        self._abort_keys.add(key)
 
     def seal(self) -> ColdSealedRun:
         """Seal the run: two-pass enumeration, hashing, and the manifest pair.

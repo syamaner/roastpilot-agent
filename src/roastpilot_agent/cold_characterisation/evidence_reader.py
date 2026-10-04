@@ -59,6 +59,7 @@ from roastpilot_agent.cold_characterisation.evidence_store import (
     check_failed_run_terminal_binding,
     check_lifecycle_binding,
     check_record_binding,
+    check_temperature_run_binding,
     check_tick_temperature_binding,
     load_strict_json,
     read_verified_lines,
@@ -75,6 +76,21 @@ from roastpilot_agent.cold_characterisation.evidence_temperature import (
     check_tick_temperature_pairing,
     decode_tick_temperature_document,
     validate_tick_temperature_record,
+)
+from roastpilot_agent.cold_characterisation.evidence_temperature_run import (
+    MCP_CANDIDATE_FILE_NAME,
+    MCP_CANDIDATE_STREAM,
+    TEMPERATURE_ABORT_FILE_NAME,
+    TEMPERATURE_ABORT_STREAM,
+    ColdMcpCandidateRecord,
+    ColdTemperatureAbortRecord,
+    ColdTemperatureRunError,
+    ColdTemperatureRunFailure,
+    ColdTemperatureScreenReason,
+    decode_mcp_candidate_document,
+    decode_temperature_abort_document,
+    validate_mcp_candidate_record,
+    validate_temperature_abort_record,
 )
 from roastpilot_agent.cold_characterisation.evidence_terminal import (
     ColdFailedRunTerminalError,
@@ -103,6 +119,12 @@ _TERMINAL_SCHEMA_VERSIONS = frozenset({3})
 _TICK_TEMPERATURE_FILE_NAME = TICK_TEMPERATURE_FILE_NAME
 _TICK_TEMPERATURE_STREAM = TICK_TEMPERATURE_STREAM
 _TICK_TEMPERATURE_SCHEMA_VERSIONS = frozenset({4})
+_TEMPERATURE_ABORT_FILE_NAME = TEMPERATURE_ABORT_FILE_NAME
+_TEMPERATURE_ABORT_STREAM = TEMPERATURE_ABORT_STREAM
+_TEMPERATURE_ABORT_SCHEMA_VERSIONS = frozenset({5})
+_MCP_CANDIDATE_FILE_NAME = MCP_CANDIDATE_FILE_NAME
+_MCP_CANDIDATE_STREAM = MCP_CANDIDATE_STREAM
+_MCP_CANDIDATE_SCHEMA_VERSIONS = frozenset({6})
 
 
 class _ReadProfile(enum.Enum):
@@ -121,6 +143,16 @@ class _ReadProfile(enum.Enum):
             _ADVISORY_FILE_NAME,
             _TERMINAL_FILE_NAME,
             _TICK_TEMPERATURE_FILE_NAME,
+        }
+    )
+    V6 = frozenset(
+        {
+            _LIFECYCLE_FILE_NAME,
+            _ADVISORY_FILE_NAME,
+            _TERMINAL_FILE_NAME,
+            _TICK_TEMPERATURE_FILE_NAME,
+            _TEMPERATURE_ABORT_FILE_NAME,
+            _MCP_CANDIDATE_FILE_NAME,
         }
     )
 
@@ -301,6 +333,55 @@ class ColdRetainedRunV5(pydantic.BaseModel):
             self.tick_temperatures == ()
         ):
             raise ValueError("tick temperature state does not match its records")
+        return self
+
+
+class ColdRetainedRunV6(pydantic.BaseModel):
+    """A verified retained run with V5's streams plus D209 temperature aborts and candidates.
+
+    Integrity data only: this carrier is flat, nests no earlier carrier, and is the
+    sole input to temperature conformance policy 3.  A retained temperature abort
+    requires ``PRESENT`` tick temperatures.  A candidate record is an operator
+    assertion, never attestation of authenticity or installed bytes.  ``ABSENT``
+    neither proves historical origin nor satisfies any screening.  A hand-built or
+    ``model_construct`` instance carries no manifest provenance, so a consumer must
+    check the exact type and re-admit every record.
+    """
+
+    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
+
+    run: ColdRetainedRun
+    lifecycle_state: ColdLifecycleEvidenceState
+    lifecycle: tuple[ColdLifecycleRecord, ...]
+    advisory_attempt_state: ColdAdvisoryAttemptEvidenceState
+    advisory_attempts: tuple[ColdAdvisoryIntentRecord | ColdAdvisoryResolutionRecord, ...]
+    terminal_state: ColdFailedRunTerminalEvidenceState
+    terminal: ColdFailedRunTerminalRecord | None
+    tick_temperature_state: ColdTickTemperatureEvidenceState
+    tick_temperatures: tuple[ColdTickTemperatureRecord, ...]
+    temperature_aborts: tuple[ColdTemperatureAbortRecord, ...]
+    mcp_candidates: tuple[ColdMcpCandidateRecord, ...]
+
+    @pydantic.model_validator(mode="after")
+    def _require_states_match_records(self) -> typing.Self:
+        """Require each stream state to match its records, and aborts to follow temperatures."""
+        if (self.lifecycle_state is ColdLifecycleEvidenceState.ABSENT) != (self.lifecycle == ()):
+            raise ValueError("lifecycle state does not match its records")
+        if self.advisory_attempt_state is not _advisory_state(self.advisory_attempts):
+            raise ValueError("advisory attempt state does not match its records")
+        if (self.terminal_state is ColdFailedRunTerminalEvidenceState.ABSENT) != (
+            self.terminal is None
+        ):
+            raise ValueError("terminal state does not match its record")
+        if (self.tick_temperature_state is ColdTickTemperatureEvidenceState.ABSENT) != (
+            self.tick_temperatures == ()
+        ):
+            raise ValueError("tick temperature state does not match its records")
+        if (
+            self.temperature_aborts != ()
+            and self.tick_temperature_state is not ColdTickTemperatureEvidenceState.PRESENT
+        ):
+            raise ValueError("temperature aborts require paired tick temperatures")
         return self
 
 
@@ -596,6 +677,137 @@ def _read_tick_temperatures(
     return tuple(record for records in by_phase.values() for record in records)
 
 
+def _temperature_run_document(
+    line: bytes, *, versions: frozenset[int], stream: str
+) -> dict[str, object]:
+    """Frame one D209 line up to its exact stream token, in the pinned precedence.
+
+    Precedence: an empty line, strict JSON as an exact object, the shared walker,
+    the exact integer version (which wins over every later malformation), then the
+    exact stream.
+    """
+    if not line:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    decoded = load_strict_json(line, malformed=ColdEvidenceStoreFailure.LINE_MALFORMED)
+    if type(decoded) is not dict:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    document = typing.cast(dict[str, object], decoded)
+    walk_json_value(typing.cast(pydantic.JsonValue, document))
+    version = document.get("schema_version")
+    if type(version) is not int or version not in versions:
+        raise _closed(ColdEvidenceStoreFailure.SCHEMA_VERSION_UNKNOWN)
+    stream_value = document.get("stream")
+    if type(stream_value) is not str or stream_value != stream:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    return document
+
+
+def _require_line(
+    validated: ColdTemperatureAbortRecord | ColdMcpCandidateRecord | None,
+    *,
+    phase: ColdPhaseKind,
+    line: bytes,
+) -> None:
+    """Refuse a failed decode, a foreign directory phase, or a non-canonical line."""
+    if validated is None:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    if validated.phase is not phase:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    if canonical_json(validated.model_dump(mode="json")).encode("utf-8") != line:
+        raise _closed(ColdEvidenceStoreFailure.LINE_NOT_CANONICAL)
+
+
+def _read_temperature_abort_line(
+    line: bytes, *, phase: ColdPhaseKind, state: ColdBindingState
+) -> ColdTemperatureAbortRecord:
+    """Strictly decode, losslessly re-prove, re-admit, and bind one temperature-abort line.
+
+    Precedence is pinned as for tick-temperature lines: framing up to the stream,
+    the closed decode, the directory phase, the canonical re-proof, re-admission,
+    and finally binding.
+    """
+    document = _temperature_run_document(
+        line, versions=_TEMPERATURE_ABORT_SCHEMA_VERSIONS, stream=_TEMPERATURE_ABORT_STREAM
+    )
+    validated = decode_temperature_abort_document(document)
+    _require_line(validated, phase=phase, line=line)
+    snapshot = validate_temperature_abort_record(validated)
+    check_temperature_run_binding(state, snapshot)
+    return snapshot
+
+
+def _read_mcp_candidate_line(
+    line: bytes, *, phase: ColdPhaseKind, state: ColdBindingState
+) -> ColdMcpCandidateRecord:
+    """Strictly decode, losslessly re-prove, re-admit, and bind one MCP candidate line.
+
+    Precedence is pinned as for tick-temperature lines.
+    """
+    document = _temperature_run_document(
+        line, versions=_MCP_CANDIDATE_SCHEMA_VERSIONS, stream=_MCP_CANDIDATE_STREAM
+    )
+    validated = decode_mcp_candidate_document(document)
+    _require_line(validated, phase=phase, line=line)
+    snapshot = validate_mcp_candidate_record(validated)
+    check_temperature_run_binding(state, snapshot)
+    return snapshot
+
+
+def _read_temperature_run(
+    tree: ColdVerifiedTree,
+    layout: "_RecordLayout",
+    *,
+    state: ColdBindingState,
+    streams: list["ColdRetainedStream"],
+    tick_temperatures: tuple[ColdTickTemperatureRecord, ...],
+) -> tuple[tuple[ColdTemperatureAbortRecord, ...], tuple[ColdMcpCandidateRecord, ...]]:
+    """Read every candidate and temperature-abort file in phase order, then check them.
+
+    Each present candidate file must frame exactly one line.  A real empty or blank
+    file is refused earlier, as ``LINE_MALFORMED``, by the shared line framing; the
+    zero-line case of ``CANDIDATE_NOT_UNIQUE`` is only a local defensive guard.
+    Every abort must name a retained tick of its phase while tick temperatures are
+    retained (whole-run pairing has already held), and no ``(phase, tick, reason)``
+    may repeat.  The reader cannot order lines across files, so it cannot prove a
+    candidate preceded the ticks, and it never compares an abort's recording instant
+    with its tick's.
+    """
+    candidates: list[ColdMcpCandidateRecord] = []
+    for phase in ColdPhaseKind:
+        path = layout.mcp_candidate.get(phase)
+        if path is None:
+            continue
+        records = tuple(
+            _read_mcp_candidate_line(line, phase=phase, state=state)
+            for line in read_verified_lines(tree, path, max_line_bytes=MAX_LINE_BYTES)
+        )
+        if len(records) != 1:
+            raise ColdTemperatureRunError(ColdTemperatureRunFailure.CANDIDATE_NOT_UNIQUE)
+        candidates.extend(records)
+    aborts: list[ColdTemperatureAbortRecord] = []
+    seen: set[tuple[ColdPhaseKind, int, ColdTemperatureScreenReason]] = set()
+    for phase in ColdPhaseKind:
+        path = layout.temperature_abort.get(phase)
+        if path is None:
+            continue
+        retained_ticks = {
+            typing.cast(ColdTickRecord, record).tick
+            for stream in streams
+            if stream.phase is phase and stream.stream is ColdEvidenceStream.TICK
+            for record in stream.records
+        }
+        for line in read_verified_lines(tree, path, max_line_bytes=MAX_LINE_BYTES):
+            record = _read_temperature_abort_line(line, phase=phase, state=state)
+            if tick_temperatures == () or record.tick not in retained_ticks:
+                raise ColdTemperatureRunError(ColdTemperatureRunFailure.TICK_NOT_PAIRED)
+            key = (record.phase, record.tick, record.reason)
+            if key in seen:
+                raise ColdTemperatureRunError(ColdTemperatureRunFailure.ABORT_DUPLICATED)
+            seen.add(key)
+            aborts.append(record)
+    return tuple(aborts), tuple(candidates)
+
+
 class _RecordLayout(typing.NamedTuple):
     """Every ``records/`` entry mapped to its closed phase and stream or extra file."""
 
@@ -604,6 +816,8 @@ class _RecordLayout(typing.NamedTuple):
     advisory: dict[ColdPhaseKind, str]
     terminal: dict[ColdPhaseKind, str]
     tick_temperature: dict[ColdPhaseKind, str]
+    temperature_abort: dict[ColdPhaseKind, str]
+    mcp_candidate: dict[ColdPhaseKind, str]
 
 
 def _record_layout(tree: ColdVerifiedTree, *, profile: _ReadProfile) -> _RecordLayout:
@@ -613,12 +827,14 @@ def _record_layout(tree: ColdVerifiedTree, *, profile: _ReadProfile) -> _RecordL
     advisory-attempt, failed-run terminal, or tick-temperature stream; every other
     unknown entry is refused.
     """
-    layout = _RecordLayout({}, {}, {}, {}, {})
+    layout = _RecordLayout({}, {}, {}, {}, {}, {}, {})
     extras = {
         _LIFECYCLE_FILE_NAME: layout.lifecycle,
         _ADVISORY_FILE_NAME: layout.advisory,
         _TERMINAL_FILE_NAME: layout.terminal,
         _TICK_TEMPERATURE_FILE_NAME: layout.tick_temperature,
+        _TEMPERATURE_ABORT_FILE_NAME: layout.temperature_abort,
+        _MCP_CANDIDATE_FILE_NAME: layout.mcp_candidate,
     }
     for entry in tree.manifest.entries:
         segments = entry.relative_path.split("/")
@@ -644,6 +860,8 @@ class _VerifiedRead(typing.NamedTuple):
     advisory: tuple[ColdAdvisoryAttemptRecord, ...]
     terminal: ColdFailedRunTerminalRecord | None
     tick_temperatures: tuple[ColdTickTemperatureRecord, ...]
+    temperature_aborts: tuple[ColdTemperatureAbortRecord, ...]
+    mcp_candidates: tuple[ColdMcpCandidateRecord, ...]
 
 
 def _read_verified_run(
@@ -724,6 +942,12 @@ def _read_verified_run(
         tick_temperatures = _read_tick_temperatures(
             tree, layout.tick_temperature, state=state, streams=streams
         )
+    temperature_aborts: tuple[ColdTemperatureAbortRecord, ...] = ()
+    mcp_candidates: tuple[ColdMcpCandidateRecord, ...] = ()
+    if layout.temperature_abort or layout.mcp_candidate:
+        temperature_aborts, mcp_candidates = _read_temperature_run(
+            tree, layout, state=state, streams=streams, tick_temperatures=tick_temperatures
+        )
     run = ColdRetainedRun(
         run_id=run_id,
         manifest_sha256=tree.manifest_sha256,
@@ -734,7 +958,14 @@ def _read_verified_run(
         streams=tuple(streams),
     )
     return _VerifiedRead(
-        run, tuple(lifecycle), bool(layout.lifecycle), tuple(advisory), terminal, tick_temperatures
+        run,
+        tuple(lifecycle),
+        bool(layout.lifecycle),
+        tuple(advisory),
+        terminal,
+        tick_temperatures,
+        temperature_aborts,
+        mcp_candidates,
     )
 
 
@@ -1046,4 +1277,89 @@ def read_retained_run_v5(
             else ColdTickTemperatureEvidenceState.PRESENT
         ),
         tick_temperatures=read.tick_temperatures,
+    )
+
+
+def read_retained_run_v6(
+    root: str,
+    *,
+    run_id: str,
+    expected_manifest_sha256: str,
+    protected_roots: tuple[str, ...] = (),
+) -> ColdRetainedRunV6:
+    """Verify one retained tree, then strictly read V5's streams and the D209 run evidence.
+
+    Trust boundary: ``expected_manifest_sha256`` must be the externally recorded
+    ``ColdSealedRun.manifest_sha256`` returned by a successful seal.  It must never be
+    derived from the candidate tree, its ``manifest.json`` or its sidecar, which would
+    verify a tree against itself.  A seal that fails after creating manifest artefacts
+    can leave internally consistent bytes but returns no digest, so such a tree has no
+    trusted receipt.  None of this is a filesystem transaction.
+
+    The whole tree is verified before anything is parsed.  The V5 grammar, order,
+    terminal, and whole-run tick-temperature pairing rules are unchanged;
+    ``temperature_abort.jsonl`` accepts its per-stream version 5 only and
+    ``mcp_candidate.jsonl`` its per-stream version 6 only; any other ``records/``
+    entry is refused.  After tick-temperature pairing, each present candidate file
+    must hold exactly one line, every abort must name a retained tick of its phase
+    while tick temperatures are retained, and no ``(phase, tick, reason)`` may repeat.
+    This reader never calls an earlier reader and nests no earlier carrier; the
+    result is integrity data and the sole input to temperature conformance policy 3.
+
+    Honest limits: the reader cannot order lines across files, so it cannot prove a
+    candidate was appended before the phase's ticks; an abort's recording instant is
+    never compared with its tick's.  A candidate is an operator assertion; digest
+    verification detects alteration relative to the supplied digest and proves
+    neither authenticity nor installed bytes.
+
+    Args:
+        root: Absolute evidence root holding the run directory.
+        run_id: The run identifier.
+        expected_manifest_sha256: The recorded ``manifest.json`` digest.
+        protected_roots: Additional absolute roots evidence may never occupy.
+
+    Returns:
+        The V5 streams and states plus the temperature aborts and MCP candidates.
+
+    Raises:
+        ColdEvidenceStoreError: If verification, decoding, or binding fails.
+        ColdEvidenceError: If a decoded record fails schema revalidation.
+        ColdLifecycleError: If lifecycle records break the run-wide order.
+        ColdAdvisoryAttemptError: If attempt records break the run-wide order.
+        ColdFailedRunTerminalError: If terminals are duplicated or contradict the run.
+        ColdTickTemperatureError: If tick temperatures do not pair with the ticks.
+        ColdTemperatureRunError: If a candidate is not unique in its file, or an
+            abort names no retained paired tick or repeats a reason.
+    """
+    read = _read_verified_run(
+        root,
+        run_id=run_id,
+        expected_manifest_sha256=expected_manifest_sha256,
+        protected_roots=protected_roots,
+        profile=_ReadProfile.V6,
+    )
+    return ColdRetainedRunV6(
+        run=read.run,
+        lifecycle_state=(
+            ColdLifecycleEvidenceState.PRESENT
+            if read.lifecycle_present
+            else ColdLifecycleEvidenceState.ABSENT
+        ),
+        lifecycle=read.lifecycle,
+        advisory_attempt_state=_advisory_state(read.advisory),
+        advisory_attempts=read.advisory,
+        terminal_state=(
+            ColdFailedRunTerminalEvidenceState.ABSENT
+            if read.terminal is None
+            else ColdFailedRunTerminalEvidenceState.PRESENT
+        ),
+        terminal=read.terminal,
+        tick_temperature_state=(
+            ColdTickTemperatureEvidenceState.ABSENT
+            if read.tick_temperatures == ()
+            else ColdTickTemperatureEvidenceState.PRESENT
+        ),
+        tick_temperatures=read.tick_temperatures,
+        temperature_aborts=read.temperature_aborts,
+        mcp_candidates=read.mcp_candidates,
     )

@@ -1046,6 +1046,14 @@ def test_t31_frozen_grammars_and_profiles_are_not_widened() -> None:
             "failed_run_terminal.jsonl",
             "tick_temperature.jsonl",
         },
+        "V6": {
+            "lifecycle.jsonl",
+            "advisory_attempt.jsonl",
+            "failed_run_terminal.jsonl",
+            "tick_temperature.jsonl",
+            "temperature_abort.jsonl",
+            "mcp_candidate.jsonl",
+        },
     }
     versions = (
         reader._SCHEMA_VERSIONS,  # pyright: ignore[reportPrivateUsage]
@@ -1054,6 +1062,11 @@ def test_t31_frozen_grammars_and_profiles_are_not_widened() -> None:
         reader._TERMINAL_SCHEMA_VERSIONS,  # pyright: ignore[reportPrivateUsage]
     )
     assert versions == (frozenset({1}), frozenset({2}), frozenset({2}), frozenset({3}))
+    temperature_run_versions = (
+        reader._TEMPERATURE_ABORT_SCHEMA_VERSIONS,  # pyright: ignore[reportPrivateUsage]
+        reader._MCP_CANDIDATE_SCHEMA_VERSIONS,  # pyright: ignore[reportPrivateUsage]
+    )
+    assert temperature_run_versions == (frozenset({5}), frozenset({6}))
 
 
 # ------------------------------------------------------------ T32-T45 reader
