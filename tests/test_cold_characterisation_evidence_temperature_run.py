@@ -476,8 +476,12 @@ def test_rr2_document_shape_guards() -> None:
     assert run_ev.admit_mcp_candidate_document(missing) is None
 
 
-def test_rr2_document_count_is_checked_before_any_key_is_hashed() -> None:
-    """RR2: a mismatched count with a hostile key never calls the key's hooks."""
+def test_rr2_a_hostile_key_is_refused_without_calling_its_hooks() -> None:
+    """RR2: a document with an extra hostile key is refused and its hooks never run.
+
+    This proves hostile-key hook refusal only.  That the count is checked before the
+    key scan is static source evidence, not a measured mutation kill.
+    """
     document: dict[object, object] = {key: value for key, value in provenance_doc().items()}
     document[HostileKey("hostile")] = 1
     HostileKey.calls = 0
@@ -1002,16 +1006,27 @@ def test_rw2_candidate_after_a_tick_is_refused(tmp_path: Path) -> None:
     writer.append_tick_temperature(temperature_for(tick))
 
 
-def test_rw2_records_for_an_earlier_phase_are_refused(tmp_path: Path) -> None:
-    """RW2: both methods refuse a record for a phase that is no longer the latest."""
+def test_rw2_a_candidate_for_an_earlier_phase_is_refused(tmp_path: Path) -> None:
+    """RW2 (L3): OFF has no candidate and no tick, so only the latest-phase guard refuses."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    writer, root = open_writer(tmp_path)
+    off = header_for(tmp_path, root, OFF)
+    on = on_header(tmp_path, root)
+    writer.append(off)
+    writer.append(on)
+    expect_run(RFail.PHASE_NOT_LATEST, lambda: writer.append_mcp_candidate(candidate_for(off)))
+    writer.append_mcp_candidate(candidate_for(on))
+    writer.append(tick_for(on, 0))
+
+
+def test_rw2_an_abort_for_an_earlier_phase_is_refused(tmp_path: Path) -> None:
+    """RW2: the OFF latest tick is paired, so only the latest-phase guard refuses."""
     run = v6_run(tmp_path, candidates=False)
-    expect_run(
-        RFail.PHASE_NOT_LATEST, lambda: run.writer.append_mcp_candidate(candidate_for(run.off))
-    )
     expect_run(
         RFail.PHASE_NOT_LATEST,
         lambda: run.writer.append_temperature_abort(abort_for(run.off_ticks[-1])),
     )
+    run.writer.append_temperature_abort(abort_for(run.on_ticks[-1]))
     _usable(run)
 
 
@@ -1066,23 +1081,48 @@ def test_rw2_a_repeated_abort_reason_is_refused(tmp_path: Path) -> None:
         ({"identity_sha256": FOREIGN_DIGEST}, Failure.IDENTITY_DIGEST_MISMATCHED),
     ],
 )
-def test_rw2_binding_refusals_leave_the_writer_usable(
+def test_rw2_candidate_binding_refusals_are_isolated(
     tmp_path: Path, update: dict[str, object], failure: store.ColdEvidenceStoreFailure
 ) -> None:
-    """RW2: run-id and digest binding refusals for both methods (only that value differs)."""
+    """RW2 (L3): header only, no candidate or tick, so binding is the only refusing guard.
+
+    Only the run id or the identity digest differs from a valid candidate, and a
+    following valid candidate append succeeds.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    writer, root = open_writer(tmp_path)
+    off = header_for(tmp_path, root, OFF)
+    writer.append(off)
+    forged = candidate_for(off, **update)
+    assert run_ev.validate_mcp_candidate_record(forged) == forged
+    expect_store(failure, lambda: writer.append_mcp_candidate(forged))
+    writer.append_mcp_candidate(candidate_for(off))
+
+
+@pytest.mark.parametrize(
+    ("update", "failure"),
+    [
+        ({"run_id": OTHER_RUN_ID}, Failure.RUN_ID_MISMATCHED),
+        ({"identity_sha256": FOREIGN_DIGEST}, Failure.IDENTITY_DIGEST_MISMATCHED),
+    ],
+)
+def test_rw2_abort_binding_refusals_are_isolated(
+    tmp_path: Path, update: dict[str, object], failure: store.ColdEvidenceStoreFailure
+) -> None:
+    """RW2 (L3): the latest ON tick is paired, so binding is the only refusing guard."""
     run = v6_run(tmp_path, candidates=False, ticks=1)
-    expect_store(failure, lambda: run.writer.append_mcp_candidate(candidate_for(run.on, **update)))
-    expect_store(
-        failure,
-        lambda: run.writer.append_temperature_abort(
-            abort_for(run.on_ticks[-1], R.OUTSIDE_SCREEN, **update)
-        ),
-    )
+    forged = abort_for(run.on_ticks[-1], R.OUTSIDE_SCREEN, **update)
+    assert run_ev.validate_temperature_abort_record(forged) == forged
+    expect_store(failure, lambda: run.writer.append_temperature_abort(forged))
     run.writer.append_temperature_abort(abort_for(run.on_ticks[-1]))
 
 
 def test_rw2_records_before_their_header_are_refused(tmp_path: Path) -> None:
-    """RW2: ``HEADER_MISSING`` for both methods before the phase header is bound."""
+    """RW2: refusal-order evidence: ``HEADER_MISSING`` precedes the latest-phase check.
+
+    The ON records are both header-less and not in the latest phase, so this shows
+    which refusal wins; it is not a single-guard acceptance probe.
+    """
     tmp_path.mkdir(parents=True, exist_ok=True)
     writer, root = open_writer(tmp_path)
     off = header_for(tmp_path, root, OFF)
@@ -1312,7 +1352,6 @@ def _abort_lines(run: Run) -> bytes:
         ),
         ("stream", {"stream": "tick"}, Failure.LINE_MALFORMED),
         ("decode", {"run_id": "not a run id"}, Failure.LINE_MALFORMED),
-        ("directory-phase", {"phase": "other"}, Failure.LINE_MALFORMED),
         ("digest", {"identity_sha256": FOREIGN_DIGEST}, Failure.IDENTITY_DIGEST_MISMATCHED),
     ],
 )
@@ -1334,12 +1373,47 @@ def test_rv3_v6_line_refusals(
             del document[key]
         elif value == "float":
             document[key] = float(own)
-        elif value == "other":
-            document[key] = (ON if path == CANDIDATE_OFF else OFF).value
         else:
             document[key] = value
     crafted = _rewrite(run, path, document)
     expect_store(failure, lambda: read6(run.root, crafted))
+
+
+def _genuine_other_phase(run: Run, kind: str) -> tuple[str, str, bytes]:
+    """Return (wrong directory, proper directory, line) for a genuine other-phase record.
+
+    The candidate is the run's genuine ON candidate; the abort is a genuine OFF abort
+    naming OFF's latest paired tick.  Both carry their own phase's identity digest.
+    """
+    if kind == "candidate":
+        return CANDIDATE_OFF, CANDIDATE_ON, line_of(doc(candidate_for(run.on)))
+    return ABORT_ON, ABORT_OFF, line_of(doc(abort_for(run.off_ticks[-1], R.OUTSIDE_SCREEN)))
+
+
+@pytest.mark.parametrize("kind", ["candidate", "abort"])
+def test_rv3_a_genuine_record_in_its_proper_directory_is_readable(
+    tmp_path: Path, kind: str
+) -> None:
+    """RV3 (L3) positive control: the same line in its own phase's directory reads."""
+    run, _ = sealed_v6(tmp_path)
+    _, proper, line = _genuine_other_phase(run, kind)
+    crafted = craft(run.root, {proper: line})
+    retained = read6(run.root, crafted)
+    records = retained.mcp_candidates if kind == "candidate" else retained.temperature_aborts
+    assert line_of(doc(records[-1] if kind == "candidate" else records[0])) == line
+
+
+@pytest.mark.parametrize("kind", ["candidate", "abort"])
+def test_rv3_a_genuine_record_in_the_wrong_directory_is_refused(tmp_path: Path, kind: str) -> None:
+    """RV3 (L3): only the directory phase is wrong; binding, pairing and uniqueness hold.
+
+    The wrong directory's file holds that single self-consistent line, so removing the
+    directory-phase guard would let the read succeed rather than fail elsewhere.
+    """
+    run, _ = sealed_v6(tmp_path)
+    wrong, _, line = _genuine_other_phase(run, kind)
+    crafted = _rewrite(run, wrong, line)
+    expect_store(Failure.LINE_MALFORMED, lambda: read6(run.root, crafted))
 
 
 @pytest.mark.parametrize("path", [CANDIDATE_OFF, ABORT_ON])

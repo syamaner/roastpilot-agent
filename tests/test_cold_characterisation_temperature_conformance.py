@@ -23,6 +23,7 @@ from roastpilot_agent.cold_characterisation import evidence_reader as reader
 from roastpilot_agent.cold_characterisation import evidence_schema as schema
 from roastpilot_agent.cold_characterisation import evidence_store as store
 from roastpilot_agent.cold_characterisation import evidence_temperature as temperature
+from roastpilot_agent.cold_characterisation import evidence_temperature_run as run_ev
 from roastpilot_agent.cold_characterisation import evidence_terminal as terminal
 from roastpilot_agent.cold_characterisation import temperature_conformance as tc
 from roastpilot_agent.cold_characterisation.identity import REQUIRED_MCP_VERSION
@@ -39,6 +40,7 @@ from tests.test_cold_characterisation_evidence_builders import RUN_ID
 from tests.test_cold_characterisation_evidence_store import OFF, ON
 from tests.test_cold_characterisation_evidence_temperature import temperature_for
 from tests.test_cold_characterisation_evidence_temperature_run import (
+    OTHER_RUN_ID,
     abort_for,
     candidate_for,
     provenance,
@@ -245,6 +247,60 @@ def terminal_for(run: reader.ColdRetainedRunV6) -> terminal.ColdFailedRunTermina
     )
 
 
+#: Every stage-5 legacy read and binding the module calls by name (L3).
+STAGE_5_READS: typing.Final = (
+    "validate_record",
+    "check_record_binding",
+    "check_tick_temperature_binding",
+    "check_temperature_run_binding",
+    "check_tick_temperature_pairing",
+)
+
+
+def watch_stage_5(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[object]]:
+    """Replace each stage-5 name with a recording spy that delegates to the real function.
+
+    The spies never refuse anything themselves, so they cannot cause a refusal.
+    """
+    reads: dict[str, list[object]] = {name: [] for name in STAGE_5_READS}
+    for name in STAGE_5_READS:
+        real: typing.Callable[..., object] = getattr(tc, name)
+        record = reads[name]
+
+        def spy(
+            *args: object,
+            _real: typing.Callable[..., object] = real,
+            _record: list[object] = record,
+            **kwargs: object,
+        ) -> object:
+            _record.append(args)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(tc, name, spy)
+    return reads
+
+
+def expected_stage_5_reads(run: reader.ColdRetainedRunV6) -> dict[str, int]:
+    """Derive the stage-5 call counts of an accepted run from its own records.
+
+    ``validate_record`` re-validates each header for binding and each retained v1
+    tick; each header binds once; each temperature and each candidate or abort
+    binds once; pairing runs once per phase.
+    """
+    ticks = sum(
+        len(stream.records)
+        for stream in run.run.streams
+        if stream.stream is schema.ColdEvidenceStream.TICK
+    )
+    return {
+        "validate_record": len(run.run.headers) + ticks,
+        "check_record_binding": len(run.run.headers),
+        "check_tick_temperature_binding": len(run.tick_temperatures),
+        "check_temperature_run_binding": len(run.mcp_candidates) + len(run.temperature_aborts),
+        "check_tick_temperature_pairing": len(schema.ColdPhaseKind),
+    }
+
+
 # ------------------------------------------------------------ PC1 positive
 
 
@@ -387,10 +443,27 @@ def test_pc2_an_eligible_temperature_outside_the_screen(tmp_path: Path) -> None:
     expect(check(written(tmp_path, schedule=hot)), (F.TEMPERATURE_SCREEN_VIOLATED,))
 
 
+def test_pc2_a_foreign_candidate_run_id_is_inconsistent_and_unbound(
+    conformant: reader.ColdRetainedRunV6,
+) -> None:
+    """PC2 (L3): a re-admissible ON candidate whose run id alone differs.
+
+    The altered record re-admits, so no parse refusal can mask the classification:
+    stage 3 records the inconsistency and stage 5 the binding refusal.
+    """
+    on_header = header(conformant, ON)
+    altered = candidate_for(on_header, run_id=OTHER_RUN_ID)
+    assert altered.run_id == OTHER_RUN_ID != conformant.mcp_candidates[1].run_id
+    assert altered.candidate == conformant.mcp_candidates[1].candidate
+    assert run_ev.validate_mcp_candidate_record(altered) == altered
+    run = conformant.model_copy(update={"mcp_candidates": (conformant.mcp_candidates[0], altered)})
+    expect(check(run), (F.MCP_CANDIDATE_INCONSISTENT, F.EVIDENCE_BINDING_REFUSED))
+
+
 def test_pc2_a_terminal_skips_policy_2(
     monkeypatch: pytest.MonkeyPatch, conformant: reader.ColdRetainedRunV6
 ) -> None:
-    """PC2 (L2): a retained failed-run terminal is recorded and policy 2 never runs."""
+    """PC2 (L2, L3): a retained terminal is recorded; policy 2 and every stage-5 read never run."""
     calls: list[object] = []
 
     def spy(run: object) -> object:
@@ -398,6 +471,7 @@ def test_pc2_a_terminal_skips_policy_2(
         return ac.check_advisory_conformance(run)
 
     monkeypatch.setattr(tc, "check_advisory_conformance", spy)
+    reads = watch_stage_5(monkeypatch)
     run = conformant.model_copy(
         update={
             "terminal_state": terminal.ColdFailedRunTerminalEvidenceState.PRESENT,
@@ -406,6 +480,7 @@ def test_pc2_a_terminal_skips_policy_2(
     )
     expect(check(run), (F.FAILED_RUN_TERMINAL_PRESENT,))
     assert calls == []
+    assert {name: len(items) for name, items in reads.items()} == dict.fromkeys(STAGE_5_READS, 0)
 
 
 # -------------------------------------------------------------- PC3 replay
@@ -664,7 +739,7 @@ def test_pc6_only_the_fully_determined_conformant_result_is_accepted(
     name: str,
     result: object,
 ) -> None:
-    """PC6: each other policy-2 result stops before any legacy read."""
+    """PC6 (L3): each other policy-2 result stops before any legacy read or binding."""
     del name
     lifecycle_reads: list[object] = []
 
@@ -677,8 +752,10 @@ def test_pc6_only_the_fully_determined_conformant_result_is_accepted(
 
     monkeypatch.setattr(tc, "check_advisory_conformance", forged_policy_2)
     monkeypatch.setattr(tc, "validate_lifecycle_record", spy_lifecycle)
+    reads = watch_stage_5(monkeypatch)
     expect(check(conformant), (F.ADVISORY_POLICY_NOT_CONFORMANT,))
     assert lifecycle_reads == []
+    assert {name: len(items) for name, items in reads.items()} == dict.fromkeys(STAGE_5_READS, 0)
 
 
 def test_pc6_positive_control_the_real_policy_2_is_called_once_on_the_projection(
@@ -698,7 +775,17 @@ def test_pc6_positive_control_the_real_policy_2_is_called_once_on_the_projection
 
     monkeypatch.setattr(tc, "check_advisory_conformance", spy)
     monkeypatch.setattr(tc, "validate_lifecycle_record", spy_lifecycle)
+    reads = watch_stage_5(monkeypatch)
     expect(check(conformant), ())
+    counts = {name: len(items) for name, items in reads.items()}
+    assert counts == expected_stage_5_reads(conformant)
+    assert counts == {
+        "validate_record": 2 + 2 * TICKS_PER_PHASE,
+        "check_record_binding": 2,
+        "check_tick_temperature_binding": 2 * TICKS_PER_PHASE,
+        "check_temperature_run_binding": 2,
+        "check_tick_temperature_pairing": 2,
+    }
     assert len(calls) == 1
     projection = typing.cast(reader.ColdRetainedRunV3, calls[0])
     assert type(projection) is reader.ColdRetainedRunV3
@@ -801,6 +888,14 @@ def test_pc7_identity_version_reads_refuse_hostile_shapes() -> None:
 # -------------------------------------------------------------- PC8 result
 
 
+def _fabricated_finding() -> object:
+    """An exact-class finding object that is not a real member."""
+    value = object.__new__(F)
+    assert type(value) is F
+    assert all(value is not member for member in F)
+    return value
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -812,11 +907,17 @@ def test_pc7_identity_version_reads_refuse_hostile_shapes() -> None:
         {"findings": (F.TICK_TEMPERATURE_NOT_PAIRED, F.TICK_TEMPERATURE_ABSENT)},
         {"findings": (F.CARRIER_NOT_ADMITTED, F.CARRIER_NOT_ADMITTED)},
         {"findings": ("carrier_not_admitted",)},
+        {"findings": (_fabricated_finding(),)},
+        {"findings": (AF.CARRIER_NOT_ADMITTED,)},
         {"outcome": Outcome.TEMPERATURE_SCREENED_CONFORMANT},
+        {"findings": ()},
     ],
 )
 def test_pc8_the_result_model_refuses_each_disagreement(values: dict[str, object]) -> None:
-    """PC8: version, members, order, uniqueness and outcome agreement are enforced."""
+    """PC8: version, members, order, uniqueness and outcome agreement are enforced.
+
+    The base is a valid not-conformant result; each case changes one value.
+    """
     base_values: dict[str, object] = {
         "policy_version": 3,
         "outcome": Outcome.NOT_CONFORMANT,
@@ -825,12 +926,6 @@ def test_pc8_the_result_model_refuses_each_disagreement(values: dict[str, object
     Result(**typing.cast(typing.Any, base_values))
     with pytest.raises(pydantic.ValidationError):
         Result(**typing.cast(typing.Any, {**base_values, **values}))
-    with pytest.raises(pydantic.ValidationError):
-        Result(
-            policy_version=3,
-            outcome=Outcome.NOT_CONFORMANT,
-            findings=(),
-        )
 
 
 # ------------------------------------------------------------ PC9 history
