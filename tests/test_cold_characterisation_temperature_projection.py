@@ -9,6 +9,7 @@ import json
 import math
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -786,3 +787,216 @@ def test_t13_hostile_mapping_shapes_return_failures_without_raising() -> None:
     assert admit_cold_temperature_projection(_DictSubclass()) is Failure.PROJECTION_NOT_OBJECT
     assert admit_cold_temperature_projection({None: 1}) is Failure.FIELD_SET_MISMATCH
     assert admit_cold_temperature_projection({(1, 2): 1}) is Failure.FIELD_SET_MISMATCH
+
+
+# ------------------------------------------------------- R1-R4 re-admission (S2a)
+
+
+class _SubProjection(ColdTickTemperatureProjection):
+    """A projection subclass with identical fields (never re-admitted)."""
+
+
+class _EmptyDictSubclass(dict[str, object]):
+    """A non-exact (empty) extra-state mapping."""
+
+
+def _state_of(projection: ColdTickTemperatureProjection) -> dict[object, object]:
+    """Return a copy of a projection's raw ``__dict__``."""
+    return dict(object.__getattribute__(projection, "__dict__"))
+
+
+def _with_state(data: object) -> ColdTickTemperatureProjection:
+    """Return a copy of a valid projection whose raw ``__dict__`` is replaced."""
+    copy = valid_projection().model_copy()
+    object.__setattr__(copy, "__dict__", data)
+    return copy
+
+
+def _with_extra(extra: object) -> ColdTickTemperatureProjection:
+    """Return a copy of a valid projection whose ``__pydantic_extra__`` is replaced."""
+    copy = valid_projection().model_copy()
+    object.__setattr__(copy, "__pydantic_extra__", extra)
+    return copy
+
+
+def _str_subclass_keyed() -> ColdTickTemperatureProjection:
+    """Return a valid projection whose ``outcome`` key is a ``str`` subclass."""
+    data = _state_of(valid_projection())
+    data[_StrSubclass("outcome")] = data.pop("outcome")
+    assert {str(key) for key in data} == set(FIELD_NAMES)
+    return _with_state(data)
+
+
+def _missing_one_field() -> ColdTickTemperatureProjection:
+    """Return a ``model_construct`` projection that omits one declared field."""
+    values: dict[str, Any] = members(celsius_agree())
+    del values["status_read_error_count"]
+    return ColdTickTemperatureProjection.model_construct(**values)
+
+
+def _fabricated(enum_type: type[Enum]) -> object:
+    """Return an exact-class enum object that is not one of the enum's members."""
+    fabricated = object.__new__(enum_type)
+    assert type(fabricated) is enum_type
+    assert all(fabricated is not member for member in enum_type)
+    return fabricated
+
+
+def _all_null_observed() -> ColdTickTemperatureProjection:
+    """Return a ``model_construct`` observed projection whose every value is null."""
+    nulls: dict[str, Any] = dict(_NULL_VALUES)
+    return ColdTickTemperatureProjection.model_construct(
+        projection_version=1, outcome=ColdTemperatureOutcome.OBSERVED, **nulls
+    )
+
+
+def _copy(**update: object) -> ColdTickTemperatureProjection:
+    """Return an unvalidated ``model_copy`` of the valid projection with updates."""
+    return valid_projection().model_copy(update=update)
+
+
+def _readmission_refusals() -> list[tuple[str, object, Failure]]:
+    """Return one isolated re-admission refusal per guard (every other part is valid)."""
+    return [
+        ("null", None, Failure.PROJECTION_NULL),
+        ("raw-dict", celsius_agree(), Failure.PROJECTION_NOT_OBJECT),
+        (
+            "subclass",
+            _SubProjection.model_validate(members(celsius_agree())),
+            Failure.PROJECTION_NOT_OBJECT,
+        ),
+        (
+            "uninitialised",
+            ColdTickTemperatureProjection.__new__(ColdTickTemperatureProjection),
+            Failure.FIELD_SET_MISMATCH,
+        ),
+        ("missing-field", _missing_one_field(), Failure.FIELD_SET_MISMATCH),
+        (
+            "extra-state-key",
+            _with_state({**_state_of(valid_projection()), "extra": None}),
+            Failure.FIELD_SET_MISMATCH,
+        ),
+        ("dict-subclass-state", _with_state(_DictSubclass()), Failure.FIELD_SET_MISMATCH),
+        (
+            "non-str-state-key",
+            _with_state({**_state_of(valid_projection()), 1: 1}),
+            Failure.FIELD_SET_MISMATCH,
+        ),
+        ("str-subclass-key", _str_subclass_keyed(), Failure.FIELD_SET_MISMATCH),
+        ("extra-non-empty", _with_extra({"extra": None}), Failure.FIELD_SET_MISMATCH),
+        ("extra-list", _with_extra([]), Failure.FIELD_SET_MISMATCH),
+        (
+            "extra-empty-dict-subclass",
+            _with_extra(_EmptyDictSubclass()),
+            Failure.FIELD_SET_MISMATCH,
+        ),
+        ("outcome-raw-string", _copy(outcome="observed"), Failure.VALUE_TYPE_NOT_EXACT),
+        (
+            "configured-holds-reported-member",
+            _copy(configured_temperature_unit=ColdTemperatureReportedUnit.CELSIUS),
+            Failure.VALUE_TYPE_NOT_EXACT,
+        ),
+        (
+            "outcome-fabricated",
+            _copy(outcome=_fabricated(ColdTemperatureOutcome)),
+            Failure.VALUE_TYPE_NOT_EXACT,
+        ),
+        (
+            "agreement-fabricated",
+            _copy(value_agreement=_fabricated(ColdTemperatureAgreement)),
+            Failure.VALUE_TYPE_NOT_EXACT,
+        ),
+        ("all-null-observed", _all_null_observed(), Failure.SHAPE_INCONSISTENT),
+        ("version-two", _copy(projection_version=2), Failure.VERSION_NOT_ADMITTED),
+        ("counter-negative", _copy(status_packet_count=-1), Failure.VALUE_NOT_ADMITTED),
+        ("counter-bool", _copy(status_packet_count=True), Failure.VALUE_TYPE_NOT_EXACT),
+        (
+            "last-float-subclass",
+            _copy(last_packet_bean_temp_c=_FloatSubclass(21.0)),
+            Failure.VALUE_TYPE_NOT_EXACT,
+        ),
+    ]
+
+
+_READMISSION_REFUSALS = _readmission_refusals()
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "expected"),
+    _READMISSION_REFUSALS,
+    ids=[case[0] for case in _READMISSION_REFUSALS],
+)
+def test_r2_each_readmission_guard_refuses_in_isolation(
+    name: str, value: object, expected: Failure
+) -> None:
+    """R2: each guard returns its closed failure as a value; nothing is raised."""
+    del name
+    assert leaf.readmit_cold_temperature_projection(value) is expected
+
+
+@pytest.mark.parametrize(
+    ("name", "raw"), ACCEPTED_SHAPES, ids=[case[0] for case in ACCEPTED_SHAPES]
+)
+def test_r1_every_accepted_shape_is_readmitted_as_a_fresh_equal_snapshot(
+    name: str, raw: dict[str, object]
+) -> None:
+    """R1: re-admission returns an equal, fresh model carrying the identical members."""
+    del name
+    admitted = admit_cold_temperature_projection(raw)
+    assert type(admitted) is ColdTickTemperatureProjection
+
+    readmitted = leaf.readmit_cold_temperature_projection(admitted)
+
+    assert type(readmitted) is ColdTickTemperatureProjection
+    assert readmitted == admitted
+    assert readmitted is not admitted
+    for field in FIELD_NAMES:
+        before: object = getattr(admitted, field)
+        after: object = getattr(readmitted, field)
+        if field in _ENUM_FIELDS:
+            assert after is before, field
+        else:
+            assert type(after) is type(before), field
+            assert after == before, field
+
+
+def test_r1_valid_content_with_an_exact_empty_extra_mapping_is_readmitted() -> None:
+    """R1: an exact empty extra-state dict carries no undeclared state and is admitted."""
+    projection = _with_extra({})
+    readmitted = leaf.readmit_cold_temperature_projection(projection)
+    assert readmitted == valid_projection()
+    assert readmitted is not projection
+
+
+def test_r1_honest_limit_a_constructed_instance_with_valid_content_is_readmitted() -> None:
+    """R1: content, not provenance, is re-admitted; a valid ``model_construct`` is accepted."""
+    values: dict[str, Any] = members(celsius_agree())
+    constructed = ColdTickTemperatureProjection.model_construct(**values)
+    readmitted = leaf.readmit_cold_temperature_projection(constructed)
+    assert type(readmitted) is ColdTickTemperatureProjection
+    assert readmitted == valid_projection()
+    assert readmitted is not constructed
+
+
+def test_r3_model_validate_on_an_instance_is_not_readmission() -> None:
+    """R3: ``model_validate`` returns a forged instance unchanged; re-admission refuses it.
+
+    The model's after-validator still runs on an instance, so the forgery keeps a
+    consistent shape and breaks only a field rule the field validators would apply.
+    """
+    forged = _copy(projection_version=2)
+    assert ColdTickTemperatureProjection.model_validate(forged) is forged
+    assert leaf.readmit_cold_temperature_projection(forged) is Failure.VERSION_NOT_ADMITTED
+    with pytest.raises(ValidationError):
+        ColdTickTemperatureProjection.model_validate(_copy(status_packet_count=-1))
+
+
+def test_r4_readmission_adds_no_failure_member_and_keeps_the_leaf_fences() -> None:
+    """R4: the failure vocabulary is unchanged and the new function is a leaf function."""
+    assert len(Failure) == 10
+    source = Path(leaf.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    assert "readmit_cold_temperature_projection" in functions
+    test_t7_vocabularies_are_closed_plain_enums()
+    test_t8_leaf_imports_no_project_or_io_module()

@@ -1,10 +1,11 @@
 """Closed version-1 admission of the per-tick cold temperature projection.
 
 This pure leaf owns the closed vocabulary, the shared rule predicates, the
-strict model, and the total raw-admission function for the temperature
-projection object a cold MCP tick carries.  It imports no project, transport,
-or I/O module; the cold MCP adapter is its only production caller and alone
-reads the raw tick tree.
+strict model, the total raw-admission function, and the in-process content
+re-admission function for the temperature projection object a cold MCP tick
+carries.  It imports no project, transport, or I/O module.  The cold MCP adapter
+alone reads the raw tick tree; the versioned tick-temperature evidence module
+re-admits already constructed projections and admits retained JSON documents.
 
 Admission records and decides nothing.  It applies no temperature envelope,
 freshness, liveness, or readiness policy: every admitted outcome, unit,
@@ -510,3 +511,75 @@ def admit_cold_temperature_projection(
     else:
         return projection
     return ColdTemperatureProjectionFailure.SHAPE_INCONSISTENT
+
+
+#: The four member-valued fields with their exact enum class, in canonical order.
+_MEMBER_FIELD_TYPES: Final[tuple[tuple[str, type[Enum]], ...]] = (
+    ("outcome", ColdTemperatureOutcome),
+    ("configured_temperature_unit", ColdTemperatureConfiguredUnit),
+    ("reported_temperature_unit", ColdTemperatureReportedUnit),
+    ("value_agreement", ColdTemperatureAgreement),
+)
+
+
+def _is_real_member(value: object, enum_type: type[Enum]) -> bool:
+    """Whether a value is exactly one of an enum's own members, found by identity."""
+    return type(value) is enum_type and any(value is member for member in enum_type)
+
+
+def readmit_cold_temperature_projection(
+    value: object,
+) -> ColdTickTemperatureProjection | ColdTemperatureProjectionFailure:
+    """Re-admit one in-process projection's content, or return its closed failure.
+
+    Only an exact ``ColdTickTemperatureProjection`` instance is considered.  Its
+    raw declared state is read without attribute hooks; undeclared, missing, or
+    non-``str``-keyed state is refused before any key is hashed or compared.  Each
+    member field must be ``None`` or a real member of its own enum, established by
+    identity before its value is read.  The resulting raw document then runs the
+    whole :func:`admit_cold_temperature_projection` grammar again, so a fresh,
+    validated projection is returned and the input instance is never returned.
+
+    The function never raises for an exact instance, never logs, and never renders
+    its input.  Honest limit: this re-admits content, not provenance.  An exact
+    class instance built by ``model_construct`` or ``model_copy`` whose content is
+    valid is admitted as a fresh snapshot, because it is the same as validated
+    content.
+
+    Args:
+        value: Any in-process candidate projection.
+
+    Returns:
+        A freshly validated projection, or the first closed failure.
+        ``PROJECTION_KEY_MISSING`` is never returned here.
+    """
+    if value is None:
+        return ColdTemperatureProjectionFailure.PROJECTION_NULL
+    if type(value) is not ColdTickTemperatureProjection:
+        return ColdTemperatureProjectionFailure.PROJECTION_NOT_OBJECT
+    try:
+        data: object = object.__getattribute__(value, "__dict__")
+        extra: object = object.__getattribute__(value, "__pydantic_extra__")
+    except AttributeError:
+        # An uninitialised instance has no declared state to re-admit.
+        data = extra = None
+    if type(data) is not dict:
+        return ColdTemperatureProjectionFailure.FIELD_SET_MISMATCH
+    if extra is not None and (type(extra) is not dict or extra):
+        return ColdTemperatureProjectionFailure.FIELD_SET_MISMATCH
+    state = cast("dict[object, object]", data)
+    for key in state:
+        if type(key) is not str:
+            return ColdTemperatureProjectionFailure.FIELD_SET_MISMATCH
+    fields = cast("dict[str, object]", state)
+    if frozenset(fields) != _FIELD_NAME_SET:
+        return ColdTemperatureProjectionFailure.FIELD_SET_MISMATCH
+    raw: dict[str, object] = {name: fields[name] for name in FIELD_NAMES}
+    for name, enum_type in _MEMBER_FIELD_TYPES:
+        member = fields[name]
+        if member is None:
+            continue
+        if not _is_real_member(member, enum_type):
+            return ColdTemperatureProjectionFailure.VALUE_TYPE_NOT_EXACT
+        raw[name] = cast("Enum", member).value
+    return admit_cold_temperature_projection(raw)

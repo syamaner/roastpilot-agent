@@ -43,7 +43,16 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdPhaseKind,
     ColdRunHeader,
     ColdSealedEnvelope,
+    ColdTickRecord,
     validate_record,
+)
+from roastpilot_agent.cold_characterisation.evidence_temperature import (
+    TICK_TEMPERATURE_STREAM,
+    ColdTickTemperatureError,
+    ColdTickTemperatureFailure,
+    ColdTickTemperatureRecord,
+    pairs_with,
+    validate_tick_temperature_record,
 )
 from roastpilot_agent.cold_characterisation.evidence_terminal import (
     ColdFailedRunTerminalError,
@@ -1027,6 +1036,25 @@ def check_failed_run_terminal_binding(
     _phase_header_for(state, phase=record.phase, identity_sha256=record.identity_sha256)
 
 
+def check_tick_temperature_binding(
+    state: ColdBindingState, record: ColdTickTemperatureRecord
+) -> None:
+    """Bind one validated tick-temperature record to its run and bound phase header.
+
+    It never binds a header and never mutates ``state``.
+
+    Args:
+        state: Binding state holding the already bound phase headers.
+        record: A snapshot returned by ``validate_tick_temperature_record``.
+
+    Raises:
+        ColdEvidenceStoreError: If the run id, phase header, or identity digest fails.
+    """
+    if record.run_id != state.run_id:
+        raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.RUN_ID_MISMATCHED)
+    _phase_header_for(state, phase=record.phase, identity_sha256=record.identity_sha256)
+
+
 # ------------------------------------------------------------ tree primitives
 
 
@@ -1453,6 +1481,8 @@ class ColdEvidenceWriter:
         self._advisory = ColdAdvisorySequence()
         self._advisory_records = 0
         self._terminal_appended = False
+        self._last_tick: dict[ColdPhaseKind, ColdTickRecord] = {}
+        self._paired_tick: dict[ColdPhaseKind, ColdTickRecord] = {}
         self._poisoned = False
         self._sealed = False
 
@@ -1560,6 +1590,8 @@ class ColdEvidenceWriter:
         if failed:
             self._abandon()
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
+        if type(snapshot) is ColdTickRecord:
+            self._last_tick[snapshot.phase] = snapshot
 
     def append_lifecycle(self, record: ColdLifecycleRecord) -> None:
         """Validate, bind, order, and durably append one v2 lifecycle line.
@@ -1694,6 +1726,63 @@ class ColdEvidenceWriter:
             self._abandon()
             raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
         self._terminal_appended = True
+
+    def append_tick_temperature(self, record: ColdTickTemperatureRecord) -> None:
+        """Validate, bind, pair, and durably append one tick-temperature line.
+
+        The record must belong to the latest bound phase and pair exactly with that
+        phase's most recently written v1 tick, which no earlier temperature line has
+        paired.  Re-admission, binding, and pairing refusals leave the writer usable;
+        a write fault poisons it.  The pairing state advances only after the line is
+        durably written.
+
+        Honest limits: pairing here is local to the latest tick.  The writer does not
+        refuse a later unpaired tick; the V5 reader's whole-run pairing is the global
+        guard.  The tick line and this line are two separate durable writes, never a
+        transaction.
+
+        Args:
+            record: One in-process tick-temperature record.
+
+        Raises:
+            ColdEvidenceError: If content re-admission fails (propagated unchanged).
+            ColdEvidenceStoreError: If binding fails, or a write fails (then poisoned).
+            ColdTickTemperatureError: If the record is not in the latest phase, no tick
+                is retained in its phase, the latest tick is already paired, or the
+                record does not pair with the latest tick.
+            ColdFailedRunTerminalError: If a failed-run terminal was already appended.
+        """
+        run_fd = self._require_appendable()
+        snapshot = validate_tick_temperature_record(record)
+        try:
+            check_tick_temperature_binding(self._state, snapshot)
+            if snapshot.phase is not self._state.headers[-1][0].phase:
+                raise ColdTickTemperatureError(ColdTickTemperatureFailure.PHASE_NOT_LATEST)
+            latest_tick = self._last_tick.get(snapshot.phase)
+            if latest_tick is None:
+                raise ColdTickTemperatureError(ColdTickTemperatureFailure.TICK_NOT_RETAINED)
+            if self._paired_tick.get(snapshot.phase) is latest_tick:
+                raise ColdTickTemperatureError(ColdTickTemperatureFailure.TEMPERATURE_DUPLICATED)
+            if not pairs_with(latest_tick, snapshot):
+                raise ColdTickTemperatureError(ColdTickTemperatureFailure.PAIRING_MISMATCHED)
+        except (ColdEvidenceStoreError, ColdTickTemperatureError):
+            raise
+        except BaseException:
+            self._abandon()
+            raise
+        failed = False
+        try:
+            line = (canonical_json(snapshot.model_dump(mode="json")) + "\n").encode("utf-8")
+            _write_all(self._stream_fd(run_fd, snapshot.phase, TICK_TEMPERATURE_STREAM), line)
+        except (OSError, ValueError, ColdEvidenceStoreError):
+            failed = True
+        except BaseException:
+            self._abandon()
+            raise
+        if failed:
+            self._abandon()
+            raise ColdEvidenceStoreError(ColdEvidenceStoreFailure.WRITE_FAILED)
+        self._paired_tick[snapshot.phase] = latest_tick
 
     def seal(self) -> ColdSealedRun:
         """Seal the run: two-pass enumeration, hashing, and the manifest pair.
