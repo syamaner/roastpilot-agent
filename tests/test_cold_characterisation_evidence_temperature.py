@@ -1317,8 +1317,24 @@ def test_s2_vocabularies_are_closed_plain_enums() -> None:
 
 def test_s2_no_runtime_module_reaches_the_new_api() -> None:
     """S2: no production caller exists; only the store and reader name the new stream."""
-    texts = ("read_retained_run_v5", "append_tick_temperature", "evidence_temperature")
-    allowed = {"evidence_store.py", "evidence_reader.py", "evidence_temperature.py"}
+    texts = (
+        "read_retained_run_v5",
+        "append_tick_temperature",
+        "evidence_temperature",
+        "read_retained_run_v6",
+        "append_mcp_candidate",
+        "append_temperature_abort",
+        "check_temperature_conformance",
+        "evaluate_temperature",
+    )
+    allowed = {
+        "evidence_store.py",
+        "evidence_reader.py",
+        "evidence_temperature.py",
+        "evidence_temperature_run.py",
+        "temperature_screen.py",
+        "temperature_conformance.py",
+    }
     for path in sorted(COLD_PACKAGE.glob("*.py")):
         if path.name in allowed:
             continue
