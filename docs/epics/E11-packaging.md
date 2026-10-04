@@ -111,7 +111,7 @@ These are the active D194 criteria; the locked D191 limits apply unchanged.
 
 - [ ] A supervised cold run on the Pi 5 complete appliance, with the single
   primary mono 16 kHz / 16-bit stream and the detector active, across the full
-  30-minute recording-off phase followed by the 30-minute recording-on phase,
+  10-minute recording-off phase followed by the 10-minute recording-on phase,
   meets the locked D191 limits unchanged: at most N = 1 consecutive overflow,
   and at most X = 200 ms of peak trailing-60-second lost audio. The production
   fatal consecutive-overflow streak of 30 is unchanged. These locked limits
@@ -203,7 +203,11 @@ and T2 (the runtime activation and this runbook, registry and epic
 reconciliation): each tick retains a paired temperature record, the D209 5 to
 40 °C engineering screen aborts a phase without finalisation, an
 operator-asserted reviewed MCP candidate is recorded per phase, and runtime
-success requires temperature conformance policy 3. The installed package still
+success now requires D210 conformance policy 4 for fixed 600-second phases.
+Historical 30+30 evidence remains under policies 1–3; current advisory minutes
+are 4–9 and the transition budget remains 60 seconds. This is a local candidate
+only, pending independent review and tomorrow-only (5 October 2026) installation;
+physical qualification remains unpassed. The installed package still
 pins `coffee-roaster-mcp==0.2.2`; installing the reviewed candidate is a
 separately authorised gate. The physical cold run and E11-S3 are not started,
 every operator-supervised gate is unexecuted, and #954 stays open.

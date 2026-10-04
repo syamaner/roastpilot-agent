@@ -52,7 +52,7 @@ T0 = "2026-09-26T12:00:00Z"
 S_OFF = "session-recording-off"
 S_ON = "session-recording-on"
 DRIVER = "hottop_kn8828b_2k_plus"
-PHASE_SECONDS = engine_policy.COLD_PHASE_OBSERVATION_SECONDS
+PHASE_SECONDS = 1800.0  # Literal archived generation; never the execution constant.
 BUDGET = lifecycle.COLD_TRANSITION_BUDGET_SECONDS
 CANARY = "sk-live-Canary0123456789AbCdEfGh"
 
@@ -143,6 +143,7 @@ def plan(
     tmp_path: Path,
     *,
     e_off: float = 1810.0,
+    phase_seconds: float = 1800.0,
     a_on: float | None = None,
     t_start: float | None = None,
     s_on: str = S_ON,
@@ -153,9 +154,9 @@ def plan(
     tmp_path.mkdir(parents=True, exist_ok=True)
     root = str(tmp_path.resolve() / "pi")
     a_off = 10.0
-    scheduled_off = a_off + PHASE_SECONDS
+    scheduled_off = a_off + phase_seconds
     a_on = e_off + 20.0 if a_on is None else a_on
-    e_on = a_on + PHASE_SECONDS
+    e_on = a_on + phase_seconds
     ticks = {OFF: ticks_from(a_off, s_off, driver), ON: ticks_from(a_on, s_on, driver)}
     return Plan(
         documents={
@@ -301,6 +302,16 @@ def finalisation(
     )
 
 
+def historical_lifecycle_record(**fields: typing.Any) -> lifecycle.ColdLifecycleRecord:
+    """Author archived activation fields independently of current execution duration."""
+    record = builders.build_lifecycle_record(**fields)
+    if record.event is Event.PHASE_ACTIVATED:
+        values = record.model_dump()
+        values["scheduled_end_monotonic"] = record.event_monotonic_seconds + 1800.0
+        return lifecycle.ColdLifecycleRecord.model_validate(values)
+    return record
+
+
 def write(tmp_path: Path, run: Plan) -> reader.ColdRetainedRunV2:
     """Write the plan through the real writer, seal it, and read it back strictly (v2)."""
     writer, root = open_writer(tmp_path)
@@ -327,7 +338,7 @@ def write(tmp_path: Path, run: Plan) -> reader.ColdRetainedRunV2:
             if entry.event is Event.OBSERVATION_WINDOW_ELAPSED:
                 fields.setdefault("tick_count", len(run.ticks[phase]))
             writer.append_lifecycle(
-                builders.build_lifecycle_record(
+                historical_lifecycle_record(
                     header=header,
                     sequence=sequence,
                     event=entry.event,
@@ -1851,6 +1862,7 @@ SOURCE_PATH = Path(conformance.__file__)
 TREE = ast.parse(SOURCE_PATH.read_text(encoding="utf-8"))
 _COLD = "roastpilot_agent.cold_characterisation."
 ALLOWED_IMPORTS: dict[str, frozenset[str]] = {
+    _COLD + "duration_policy": frozenset({"ColdDurationGeneration", "admit_duration_generation"}),
     _COLD + "acceptance": frozenset(
         {
             "interpret_retained_run",

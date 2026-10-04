@@ -995,6 +995,7 @@ _MODULE_IMPORT_ALLOW_LIST: dict[str, frozenset[str]] = {
     "evidence_builders.py": frozenset(
         {
             _COLD + "evidence_schema",
+            _COLD + "engine_policy",
             _COLD + "evidence_store",
             _COLD + "identity",
             _COLD + "mcp",

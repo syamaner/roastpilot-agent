@@ -5,7 +5,7 @@ ports over the real advisory run owner and sampler, evidence writer, seal, V3/V4
 readers and advisory conformance checker under ``tmp_path``.  Nothing touches
 hardware, a serial port, a microphone, a live provider or a child process.
 Expected facts are authored independently of the code under test: instants follow
-from the fixed 1800 s window, the 450 s scripted reads, the fixed 60 s budget and
+from the fixed 600 s window, the 150 s scripted reads, the fixed 60 s budget and
 the D200 window ``[end - 360, end - 60]`` with a 60 s dwell, never from values the
 orchestrator computed.
 """
@@ -53,6 +53,7 @@ from roastpilot_agent.cold_characterisation import evidence_reader as reader
 from roastpilot_agent.cold_characterisation import evidence_schema as schema
 from roastpilot_agent.cold_characterisation import evidence_store as store
 from roastpilot_agent.cold_characterisation import evidence_terminal as terminal_module
+from roastpilot_agent.cold_characterisation.duration_policy import ColdDurationGeneration
 from roastpilot_agent.cold_characterisation.evidence_temperature import (
     ColdTickTemperatureError,
     ColdTickTemperatureFailure,
@@ -128,11 +129,11 @@ PROVIDER_CANARY = "PROVIDER-CANARY-5cii-b7"
 SESSIONS: typing.Final = {OFF: f"session-{CANARY}-off", ON: f"session-{CANARY}-on"}
 T0 = 100.0
 BASE_UTC = datetime(2026, 9, 26, 12, 0, 0, tzinfo=UTC)
-READ_SECONDS = 450.0
-#: Independently authored: OFF activates at T0, so its scheduled end is T0 + 1800.
-OFF_END = 1900.0
-#: Independently authored D200 window for the OFF phase: [1900 - 360, 1900 - 60].
-OFF_WINDOW = (1540.0, 1840.0)
+READ_SECONDS = 150.0
+#: Independently authored: OFF activates at T0, so its scheduled end is T0 + 600.
+OFF_END = 700.0
+#: Independently authored D200 window for the OFF phase: [700 - 360, 700 - 60].
+OFF_WINDOW = (340.0, 640.0)
 #: The configured per-call bound and post-completion dwell used by every run.
 CALL_BOUND = 30.0
 DWELL = 60.0
@@ -280,9 +281,9 @@ def conforming_tick(phase: Phase, index: int) -> ColdTickObservation:
 
 
 #: The first read ends 30 s after activation (before the 60-second screen boundary)
-#: and the second 420 s later, so the four original 450 s tick instants are kept and
-#: one pre-boundary tick precedes them: 130, 550, 1000, 1450, 1900 for recording-off.
-_BASE_READS: typing.Final = {0: 30.0, 1: 420.0}
+#: and the second 420 s later, so the four original 150 s tick instants are kept and
+#: one pre-boundary tick precedes them: 130, 250, 400, 550, 700 for recording-off.
+_BASE_READS: typing.Final = {0: 30.0, 1: 120.0}
 
 
 def read_schedule(**late: float) -> Callable[[Phase, int], float]:
@@ -774,14 +775,20 @@ def assert_no_canary(result: two_phase.ColdTwoPhaseResult) -> None:
 def findings_of(
     result: two_phase.ColdTwoPhaseResult,
 ) -> set[temperature_conformance.ColdTemperatureConformanceFinding]:
-    """The policy-3 findings carried by the admitted runtime result."""
+    """The policy-4 findings carried by the admitted runtime result."""
     assert result.conformance is not None
     return set(result.conformance.findings)
 
 
-def advisory_view(
-    world: World, result: two_phase.ColdTwoPhaseResult
-) -> advisory_conformance.ColdAdvisoryConformanceResult:
+class _AdvisoryView(typing.NamedTuple):
+    """Internal current rule findings; no historical policy success result."""
+
+    outcome: advisory_conformance.ColdAdvisoryConformanceOutcome
+    findings: tuple[advisory_conformance.ColdAdvisoryConformanceFinding, ...]
+    pre_advisory_findings: tuple[conformance.ColdConformanceFinding, ...]
+
+
+def advisory_view(world: World, result: two_phase.ColdTwoPhaseResult) -> _AdvisoryView:
     """Test-only: policy 2 over a validated V3 carrier built from the sealed V6 run.
 
     Production exposes no V6-to-policy-2 path; this view lets existing guards keep
@@ -795,7 +802,19 @@ def advisory_view(
         advisory_attempt_state=v6.advisory_attempt_state,
         advisory_attempts=v6.advisory_attempts,
     )
-    return advisory_conformance.check_advisory_conformance(v3)
+    evaluate: typing.Any = advisory_conformance._evaluate  # pyright: ignore[reportPrivateUsage]
+    found, pre = evaluate(v3, ColdDurationGeneration.D210)
+    return _AdvisoryView(
+        advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT
+        if found
+        else advisory_conformance.ColdAdvisoryConformanceOutcome.ADVISORY_CONFORMANT,
+        tuple(
+            member
+            for member in advisory_conformance.ColdAdvisoryConformanceFinding
+            if member in found
+        ),
+        pre,
+    )
 
 
 def advisory_findings_of(
@@ -823,7 +842,7 @@ def assert_failed(
     assert terminal["termination"] == "failed"
     assert terminal["termination_reason"] == reason.value
     retained = world.retained(result.manifest_sha256)
-    checked = temperature_conformance.check_temperature_conformance(retained)
+    checked = temperature_conformance.check_current_conformance(retained)
     assert checked.outcome is TemperatureOutcome.NOT_CONFORMANT
     advisory = advisory_view(world, result)
     assert advisory.outcome is advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT
@@ -1027,7 +1046,7 @@ def identity_forgeries(genuine: ColdRunIdentity) -> dict[str, object]:
             ),
         ),
         "over_nodes": forged(
-            genuine, server_info=forged(server, available_bootstrap_tools=wide_lists(5, 1000))
+            genuine, server_info=forged(server, available_bootstrap_tools=wide_lists(5, 400))
         ),
         "cycle": forged(genuine, server_info=forged(server, available_bootstrap_tools=cyclic)),
         "repeated_node": forged(
@@ -1064,10 +1083,10 @@ def test_4gc_t16_genuine_carriers_are_admitted_fresh(tmp_path: Path) -> None:
 
 
 def admit_checker(value: object) -> object:
-    """Admit one candidate policy-3 result exactly as the orchestrator does."""
+    """Admit one candidate policy-4 result exactly as the orchestrator does."""
     return two_phase._admit_carrier(
         value,
-        temperature_conformance.ColdTemperatureConformanceResult,
+        temperature_conformance.ColdCurrentConformanceResult,
         two_phase._CHECKER,
         flat_identity=True,
     )
@@ -1370,7 +1389,7 @@ def test_4gc_t16_forged_engine_and_checker_carriers_are_refused() -> None:
     checker_forgeries: dict[str, object] = {
         "bool_version": forged(genuine, policy_version=True),
         "policy_two": forged(genuine, policy_version=2),
-        "float_version": forged(genuine, policy_version=3.0),
+        "float_version": forged(genuine, policy_version=4.0),
         "foreign_outcome": forged(genuine, outcome=ForeignOutcome.ADVISORY_CONFORMANT),
         "fabricated_outcome": forged(genuine, outcome=object.__new__(TemperatureOutcome)),
         "contradictory": forged(genuine, findings=(Finding.TICK_TEMPERATURE_ABSENT,)),
@@ -1387,16 +1406,16 @@ def test_4gc_t16_forged_engine_and_checker_carriers_are_refused() -> None:
             failing,
             findings=(Finding.TICK_TEMPERATURE_ABSENT, Finding.TICK_TEMPERATURE_ABSENT),
         ),
-        # The policy-3 result's own validators admit an exact tuple of real members
+        # The policy-4 result's own validators admit an exact tuple of real members
         # only, so a list or a value string is refused (not coerced through JSON).
         "listed_findings": forged(failing, findings=[Finding.TICK_TEMPERATURE_ABSENT]),
         "extra": with_slot(genuine, "__pydantic_extra__", {"x": 1}),
         "constructed_without_findings": TemperatureResult.model_construct(
-            policy_version=3, outcome=TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT
+            policy_version=4, outcome=TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT
         ),
         "uninitialised": object.__new__(TemperatureResult),
         "subclass": subclass(
-            policy_version=3,
+            policy_version=4,
             outcome=TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT,
             findings=(),
         ),
@@ -1529,17 +1548,17 @@ def _independent_row(
     return True
 
 
-TemperatureResult = temperature_conformance.ColdTemperatureConformanceResult
-#: Policy-3 checker results (the runtime result's only admitted conformance carrier).
+TemperatureResult = temperature_conformance.ColdCurrentConformanceResult
+#: Policy-4 checker results (the runtime result's only admitted conformance carrier).
 CHECKED: typing.Final[dict[str | None, TemperatureResult | None]] = {
     None: None,
     "conformant": TemperatureResult(
-        policy_version=3,
+        policy_version=4,
         outcome=TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT,
         findings=(),
     ),
     "not_conformant": TemperatureResult(
-        policy_version=3,
+        policy_version=4,
         outcome=TemperatureOutcome.NOT_CONFORMANT,
         findings=(TemperatureFinding.TICK_TEMPERATURE_ABSENT,),
     ),
@@ -1791,7 +1810,7 @@ def test_4gc_t19_imports_stay_inside_the_contract_allowlist() -> None:
             "temperature_conformance",
         )
     } | {"roastpilot_agent.mcp_client"}
-    # D209 activation: the reload reads only V6 and judges only policy 3.
+    # D209 activation: the reload reads only V6 and judges only policy 4.
     assert modules[_COLD + "evidence_reader"] == {"read_retained_run_v6"}
     assert modules[_COLD + "conformance"] == {"masked_identity_text"}
     assert modules["roastpilot_agent.mcp_client"] <= {
@@ -2088,7 +2107,7 @@ def _reachable(*roots: type[pydantic.BaseModel]) -> tuple[set[type], set[type]]:
             "_ENGINE",
             (engine.ColdPhaseCompleted, engine.ColdPhaseAborted, engine.ColdPhaseActivationRefused),
         ),
-        ("_CHECKER", (temperature_conformance.ColdTemperatureConformanceResult,)),
+        ("_CHECKER", (temperature_conformance.ColdCurrentConformanceResult,)),
         (
             "_ADVISORY",
             (
@@ -2273,7 +2292,7 @@ async def test_4gc_t16_forged_engine_results_are_never_finalised(
     """T16 boundary: a forged engine result after a genuine activation is not finalised."""
 
     async def behaviour(admission: typing.Any, sink: typing.Any, clock: Clock) -> object:
-        clock.t += 1800.0
+        clock.t += 600.0
         return engine_forgeries()[name]
 
     monkeypatch.setattr(two_phase, "observe_cold_phase", scripted_observer(OFF, behaviour))
@@ -2309,7 +2328,7 @@ async def test_4gc_t16_a_forged_or_failing_checker_is_never_conformant(
         del run
         return produce(returned[checker])
 
-    monkeypatch.setattr(two_phase, "check_temperature_conformance", check)
+    monkeypatch.setattr(two_phase, "check_current_conformance", check)
     world = World(tmp_path)
     result = await world.run()
     assert result.outcome is Outcome.NOT_CONFORMANT
@@ -2625,7 +2644,7 @@ class SinkRig:
             phase,
             Event.OBSERVATION_WINDOW_ELAPSED,
             session_id=SESSIONS[phase],
-            scheduled_end_monotonic=1900.0,
+            scheduled_end_monotonic=700.0,
             tick_count=1,
         )
 
@@ -3201,7 +3220,7 @@ async def test_4gc_t6_a_regressed_completion_is_clock_invalid(
     """T6: a completion below the floor is not recorded and the phase is not finalised."""
 
     async def behaviour(admission: typing.Any, sink: typing.Any, clock: Clock) -> object:
-        clock.t += 1800.0
+        clock.t += 600.0
         return engine.ColdPhaseCompleted(
             session_id=SESSIONS[OFF],
             observation_end_monotonic=T0 - 10.0,
@@ -3781,7 +3800,7 @@ async def test_4gc_t1_the_happy_path_is_advisory_conformant(
     assert result.termination_reason is None and result.start_refusal is None
     assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
     assert result.conformance == TemperatureResult(
-        policy_version=3,
+        policy_version=4,
         outcome=TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT,
         findings=(),
     )
@@ -3802,7 +3821,7 @@ async def test_4gc_t1_the_happy_path_is_advisory_conformant(
         assert candidates[0]["candidate"]["installed_bytes_attested"] is False
     assert world.records("temperature_abort") == []
     assert len(retained.tick_temperatures) == 10 and len(retained.mcp_candidates) == 2
-    checked = temperature_conformance.check_temperature_conformance(retained)
+    checked = temperature_conformance.check_current_conformance(retained)
     assert checked.outcome is TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT
     for legacy in (
         reader.read_retained_run,
@@ -3826,7 +3845,7 @@ async def test_4gc_t1_the_happy_path_is_advisory_conformant(
     assert [p for name, p in world.mcp.calls if name == "get_roast_state"] == [OFF] * 5 + [ON] * 5
     assert seen == [(id(world.mcp), id(world.host), id(world.clock))] * 4
     assert sorted(path.name for path in Path(world.root).iterdir()) == [RUN_ID]
-    # Independently authored instants: OFF 100 -> 1900, finalise +1, ON 1901 -> 3701.
+    # Independently authored instants: OFF 100 -> 700, finalise +1, ON 701 -> 1301.
     off_activated = world.event(OFF, "phase_activated")
     assert (off_activated["event_monotonic_seconds"], off_activated["scheduled_end_monotonic"]) == (
         T0,
@@ -3835,29 +3854,29 @@ async def test_4gc_t1_the_happy_path_is_advisory_conformant(
     off_elapsed = world.event(OFF, "observation_window_elapsed")
     assert (off_elapsed["event_monotonic_seconds"], off_elapsed["tick_count"]) == (OFF_END, 5)
     assert off_elapsed["scheduled_end_monotonic"] == OFF_END
-    assert world.event(OFF, "finalisation_returned")["event_monotonic_seconds"] == 1901.0
+    assert world.event(OFF, "finalisation_returned")["event_monotonic_seconds"] == 701.0
     measured = world.event(ON, "transition_measured")
     assert measured["transition_start_monotonic"] == OFF_END
-    assert measured["transition_end_monotonic"] == 1901.0
+    assert measured["transition_end_monotonic"] == 701.0
     assert measured["transition_seconds"] == 1.0 and measured["transition_within_budget"] is True
     assert measured["previous_phase_session_id"] == SESSIONS[OFF]
     assert measured["session_id"] == SESSIONS[ON]
     on_activated = world.event(ON, "phase_activated")
-    assert on_activated["scheduled_end_monotonic"] == 3701.0
-    assert world.event(ON, "observation_window_elapsed")["event_monotonic_seconds"] == 3701.0
+    assert on_activated["scheduled_end_monotonic"] == 1301.0
+    assert world.event(ON, "observation_window_elapsed")["event_monotonic_seconds"] == 1301.0
     terminal = world.event(ON, "run_terminated")
     assert (terminal["termination"], terminal["termination_reason"]) == ("completed", None)
-    assert terminal["event_monotonic_seconds"] == 3702.0
+    assert terminal["event_monotonic_seconds"] == 1302.0
     headers = world.records("header")
-    assert [h["monotonic_seconds"] for h in headers] == [T0, 1901.0]
-    assert world.event(OFF, "child_started")["event_monotonic_seconds"] == 1901.0
+    assert [h["monotonic_seconds"] for h in headers] == [T0, 701.0]
+    assert world.event(OFF, "child_started")["event_monotonic_seconds"] == 701.0
     finalisations = world.records("finalisation")
     assert [f["session_id"] for f in finalisations] == [SESSIONS[OFF], SESSIONS[ON]]
     # Advisory: one factory call; attempts at the window open, then every 60 s dwell,
-    # through the window close (OFF [1540, 1840]; ON 3701 - 360 = 3341 to 3641).
+    # through the window close (OFF [340, 640]; ON 1301 - 360 = 941 to 1241).
     assert world.factory_calls == 1
-    off_calls = [1540.0 + 60.0 * index for index in range(6)]
-    on_calls = [3341.0 + 60.0 * index for index in range(6)]
+    off_calls = [340.0 + 60.0 * index for index in range(6)]
+    on_calls = [941.0 + 60.0 * index for index in range(6)]
     assert [call[0] for call in world.advisor.calls] == off_calls + on_calls
     assert {call[1] for call in world.advisor.calls} == {RoastPhase.PREHEATING}
     assert world.evaluator.calls == 12
@@ -3892,8 +3911,8 @@ async def test_4gc_t2_the_budget_boundaries_conform(tmp_path: Path, case: str) -
     elif case == "sixty_at_stop":
         world.child.before_stop[0] = set_time(world, OFF_END + 60.0)
     else:
-        # The OFF window overruns: its last read ends at 1950, 50 s after the scheduled end.
-        world.mcp.read_seconds = read_schedule(off_4=500.0)
+        # The OFF window overruns: its last read ends at 750, 50 s after the scheduled end.
+        world.mcp.read_seconds = read_schedule(off_4=200.0)
         world.mcp.before["mark_beans_added:recording_on"] = set_time(world, OFF_END + 60.0)
     result = await world.run()
     assert result.outcome is Outcome.ADVISORY_CONFORMANT, findings_of(result)
@@ -3902,7 +3921,7 @@ async def test_4gc_t2_the_budget_boundaries_conform(tmp_path: Path, case: str) -
     assert measured["transition_seconds"] == expected_seconds
     assert world.event(OFF, "phase_activated")["scheduled_end_monotonic"] == OFF_END
     if case.startswith("overrun"):
-        assert world.event(OFF, "observation_window_elapsed")["event_monotonic_seconds"] == 1950.0
+        assert world.event(OFF, "observation_window_elapsed")["event_monotonic_seconds"] == 750.0
 
 
 @pytest.mark.asyncio
@@ -3910,12 +3929,12 @@ async def test_4gc_t20_an_on_overrun_never_meets_the_off_budget(tmp_path: Path) 
     """T20: ON at OFF_END + 60 and an ON completion 500 s late still conforms."""
     world = World(tmp_path)
     world.mcp.before["mark_beans_added:recording_on"] = set_time(world, OFF_END + 60.0)
-    world.mcp.read_seconds = read_schedule(on_4=950.0)
+    world.mcp.read_seconds = read_schedule(on_4=650.0)
     result = await world.run()
     assert result.outcome is Outcome.ADVISORY_CONFORMANT, findings_of(result)
-    # ON activation 1960; scheduled end 3760; last read ends 1960 + 1350 + 950 = 4260
-    # (30 + 420 + 450 + 450 = 1350 before the late fifth read).
-    assert world.event(ON, "observation_window_elapsed")["event_monotonic_seconds"] == 4260.0
+    # ON activation 760; scheduled end 1360; last read ends 760 + 450 + 650 = 1860.
+    # (30 + 120 + 150 + 150 = 450 before the late fifth read).
+    assert world.event(ON, "observation_window_elapsed")["event_monotonic_seconds"] == 1860.0
     assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
 
 
@@ -3932,8 +3951,8 @@ async def test_4gc_t3_an_activation_past_the_budget_reads_nothing(
     starts = record_starts(monkeypatch)
     activation = math.nextafter(OFF_END + 60.0, math.inf)
     if overrun:
-        # OFF completes at 1950: the activation is only 10.5 s after completion.
-        world.mcp.read_seconds = read_schedule(off_4=500.0)
+        # OFF completes at 750: the activation is only 10.5 s after completion.
+        world.mcp.read_seconds = read_schedule(off_4=200.0)
         activation = OFF_END + 60.5
     world.mcp.before["mark_beans_added:recording_on"] = set_time(world, activation)
     result = await world.run()
@@ -4378,7 +4397,7 @@ class Counters:
         self.seals = self.reads = self.checks = 0
         real_seal = store.ColdEvidenceWriter.seal
         real_read = reader.read_retained_run_v6
-        real_check = temperature_conformance.check_temperature_conformance
+        real_check = temperature_conformance.check_current_conformance
 
         def counted_seal(writer: store.ColdEvidenceWriter) -> typing.Any:
             self.seals += 1
@@ -4394,7 +4413,7 @@ class Counters:
 
         monkeypatch.setattr(store.ColdEvidenceWriter, "seal", counted_seal)
         monkeypatch.setattr(two_phase, "read_retained_run_v6", counted_read)
-        monkeypatch.setattr(two_phase, "check_temperature_conformance", counted_check)
+        monkeypatch.setattr(two_phase, "check_current_conformance", counted_check)
 
     @property
     def counts(self) -> tuple[int, int, int]:
@@ -4661,7 +4680,7 @@ async def test_4gc_a2_s7_a_post_seal_refusal_is_final_for_the_run(
 ) -> None:
     """S7: a post-seal reader/checker refusal is final; a later diagnostic never upgrades it."""
     real_read = reader.read_retained_run_v6
-    real_check = temperature_conformance.check_temperature_conformance
+    real_check = temperature_conformance.check_current_conformance
 
     def refuse_read(*args: typing.Any, **kwargs: typing.Any) -> typing.NoReturn:
         raise store.ColdEvidenceStoreError(store.ColdEvidenceStoreFailure.HEADER_MISSING)
@@ -5045,7 +5064,7 @@ def retained_abort(domain: schema.ColdAbortDomain, reason: enum.Enum, completed:
                 monotonic_seconds=clock.t,
             )
         )
-        clock.t += 1800.0
+        clock.t += 600.0
         session = SESSIONS[admission.phase]
         if completed:
             return engine.ColdPhaseCompleted(
@@ -5103,7 +5122,7 @@ async def test_4gc_t14_t21_any_retained_abort_forbids_finalisation(
 
 def _heat(phase: Phase) -> Callable[[Phase, int], object]:
     def tick(current: Phase, index: int) -> object:
-        # Index 2 is the read ending 1000 s into OFF (index 1 before the pre-boundary tick).
+        # Index 2 is the read ending 400 s into OFF (index 1 before the pre-boundary tick).
         if current is phase and index == 2:
             return observation(
                 device_state(driver=DRIVER, heat_level_percent=5),
@@ -5169,7 +5188,7 @@ async def test_4gc_t14_an_empty_window_is_finalised_then_failed(
     world = World(tmp_path)
     # P1, then the hook's recording sample, then the first loop sample jumps past the end.
     world.mcp.before[f"mark_beans_added:{phase.value}"] = lambda: world.clock.pending.extend(
-        ["", "", "jump:1800"]
+        ["", "", "jump:600"]
     )
     result = await world.run()
     assert_failed(world, result, R.PHASE_FAILED_UNEXPECTEDLY)
@@ -5200,7 +5219,7 @@ async def test_4gc_t14_an_empty_window_is_finalised_then_failed(
 
 def _completion(session: str) -> Behaviour:
     async def behaviour(admission: typing.Any, sink: typing.Any, clock: Clock) -> object:
-        clock.t += 1800.0
+        clock.t += 600.0
         return engine.ColdPhaseCompleted(
             session_id=session,
             observation_end_monotonic=clock.t,
@@ -5327,7 +5346,7 @@ async def test_4gc_t22_a_conformant_checker_never_overrides_a_failure(
         del run
         return CHECKED["conformant"]
 
-    monkeypatch.setattr(two_phase, "check_temperature_conformance", check)
+    monkeypatch.setattr(two_phase, "check_current_conformance", check)
     world = World(tmp_path)
     if failure == "on_not_clean":
         world.mcp.finalise = lambda p, s: not_clean_result(p, s) if p is ON else clean_result(p, s)
@@ -5369,7 +5388,7 @@ async def test_4gc_t22_end_handling_suppresses_a_contradictory_checker_itself(
         return CHECKED["conformant"]
 
     monkeypatch.setattr(two_phase._TwoPhaseRun, "_end", end)
-    monkeypatch.setattr(two_phase, "check_temperature_conformance", check)
+    monkeypatch.setattr(two_phase, "check_current_conformance", check)
     world = World(tmp_path)
     world.mcp.finalise = lambda p, s: not_clean_result(p, s) if p is ON else clean_result(p, s)
     result = await world.run()
@@ -5550,7 +5569,7 @@ def terminal_record(world: World) -> Json:
 
 
 def unresolved_invoked_at_off_end(world: World) -> None:
-    """The last OFF call (1840) is still running at the OFF end (1900 < 1840 + 100).
+    """The last OFF call (640) is still running at the OFF end (700 < 640 + 100).
 
     The child stop yields a few loop turns, so a requested cancellation of a
     cancellable provider can land before the post-seal check.
@@ -5587,7 +5606,7 @@ def assert_failed_run_terminal(
 
 
 def set_unresolved_not_invoked(world: World) -> None:
-    world.advisor.usage_raises_at = 1840.0
+    world.advisor.usage_raises_at = 640.0
 
 
 def set_completion_unknown(world: World) -> None:
@@ -5674,7 +5693,7 @@ async def test_954_t2_each_od5_closure_on_off_writes_only_the_failed_run_termina
 async def test_954_t2f_an_unresolved_invoked_on_attempt_ends_with_the_on_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T2f (AC5): the last ON call (3641) still runs at the ON end (3701 < 3741)."""
+    """T2f (AC5): the last ON call (1241) still runs at the ON end (1301 < 3741)."""
     world = World(tmp_path)
     world.bound = 100.0
     world.advisor.steps[11] = hang
@@ -5706,7 +5725,7 @@ async def test_954_t3_pre_invocation_mechanics_never_claim_a_pending_provider(
         if variant == "no_intent" and name == "Clock.sleep":
             fired.append(name)
             return "cancel_current"
-        if name == "_provider_call" and world.clock.t == 1840.0 and variant != "no_intent":
+        if name == "_provider_call" and world.clock.t == 640.0 and variant != "no_intent":
             fired.append(name)
             return "raise" if variant == "run_raised_unpublished" else "cancel_both"
         return None
@@ -5757,9 +5776,9 @@ async def test_954_t4_class_a_an_outstanding_provider_ends_v2_failed_and_pending
     assert result.provider_check is Check.PENDING_AT_CHECK
     assert log.observes == [OFF]
     assert log.order[-3:] == ["seal", "observe", "read_v6"]
-    # The retained ABANDONED_AFTER_BOUND line, at the bound (1840 + 30), stays as written.
+    # The retained ABANDONED_AFTER_BOUND line, at the bound (640 + 30), stays as written.
     last = world.records("advisory_attempt")[-1]
-    assert (last["resolution"], last["monotonic_seconds"]) == ("abandoned_after_bound", 1870.0)
+    assert (last["resolution"], last["monotonic_seconds"]) == ("abandoned_after_bound", 670.0)
     terminal = world.lifecycle()[-1]
     assert (terminal["event"], terminal["termination"], terminal["termination_reason"]) == (
         "run_terminated",
@@ -5907,9 +5926,9 @@ async def test_954_t7b_an_unconfirmed_run_keeps_a_real_pending_provider_path(
 
     The task factory creates the real sampler run task, keeps it and then raises an
     ordinary ``RuntimeError`` (the owner's ``TASK_CREATION_UNCONFIRMED``; O-T14).  The
-    orphaned run still samples, and its last OFF call (1840) is a genuine published
-    provider task that ignores cancellation and is unresolved at the OFF end (1900 <
-    1840 + 100).  The start failure fails the run but never clears the real OD5 path:
+    orphaned run still samples, and its last OFF call (640) is a genuine published
+    provider task that ignores cancellation and is unresolved at the OFF end (700 <
+    640 + 100).  The start failure fails the run but never clears the real OD5 path:
     the failed-run terminal is written and the one check reports the real pending
     provider.
     """
@@ -5953,8 +5972,8 @@ async def test_954_t7b_an_unconfirmed_run_keeps_a_real_pending_provider_path(
         result = await world.run()
         Start = advisory_run_owner.ColdAdvisoryPhaseStart
         assert starts == [(OFF, Start.TASK_CREATION_UNCONFIRMED)] and len(orphans) == 1
-        # The orphaned run really sampled: six OFF calls, the last one at 1840.
-        assert [call[0] for call in world.advisor.calls] == [1540.0 + 60.0 * i for i in range(6)]
+        # The orphaned run really sampled: six OFF calls, the last one at 640.
+        assert [call[0] for call in world.advisor.calls] == [340.0 + 60.0 * i for i in range(6)]
         (settlement,) = settlements
         assert (
             settlement.run_at_settlement.state
@@ -6454,12 +6473,12 @@ async def test_954_t17_a_base_exception_mid_phase_settles_and_reraises_the_same_
     """T17 (AC10): close, settle the open attempt, clean up, re-raise; nothing else."""
     world = World(tmp_path)
     world.advisor.steps[0] = hang
-    world.mcp.read_seconds = read_schedule(off_4=100.0, on_4=100.0, off_5=100.0, on_5=100.0)
+    world.mcp.read_seconds = read_schedule(off_2=100.0)
     halt = Halt()
 
     def interrupt() -> None:
-        # The sixth OFF read starts at 1550, as the fifth did before the pre-boundary tick.
-        if world.mcp.reads == 5:
+        # The fourth OFF read starts at 350, before the first call bound at 370.
+        if world.mcp.reads == 3:
             raise halt
 
     world.mcp.before["get_roast_state:recording_off"] = interrupt
@@ -6472,7 +6491,7 @@ async def test_954_t17_a_base_exception_mid_phase_settles_and_reraises_the_same_
     assert world.records("failed_run_terminal") == []
     assert not any(event == "run_terminated" for _phase, event in world.events())
     assert not world.manifest_exists()
-    # The open attempt (1540) stays an open intent: the sink was closed before settling.
+    # The open attempt (340) stays an open intent: the sink was closed before settling.
     assert [r.get("resolution") for r in world.records("advisory_attempt")] == [None]
     assert world.child.stops == 1 and world.advisor.cancelled == 1
 
@@ -7129,9 +7148,9 @@ async def test_997_en5_the_screen_anchor_is_the_persisted_activation(
     world.mcp.before["mark_beans_added:recording_off"] = advance(world, _EN5_ACTIVATED - T0)
     second_end = _EN5_ENDS[case]
     # Tick 0: 107 -> 137 (pre-boundary); tick 1 ends at ``second_end``; the OFF window
-    # (end 1907) then closes after three 450 s reads and one 400 s read.
+    # (end 707) then closes after three 150 s reads and one 100 s read.
     world.mcp.read_seconds = read_schedule(
-        off_1=second_end - 137.0, off_2=450.0, off_3=450.0, off_4=450.0, off_5=400.0
+        off_1=second_end - 137.0, off_2=150.0, off_3=150.0, off_4=150.0, off_5=100.0
     )
     world.mcp.tick = lambda current, index: (
         screened_tick(current, index, **_HOT)
@@ -7239,7 +7258,7 @@ async def test_997_tp3_tp4_a_screen_violation_aborts_without_finalisation(
 async def test_997_tp5_a_failed_run_terminal_is_verified_by_v6_and_never_checked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """TP5: the OD5 terminal reloads once through V6; policy 3 never runs; no V4 path."""
+    """TP5: the OD5 terminal reloads once through V6; policy 4 never runs; no V4 path."""
     world = World(tmp_path)
     unresolved_invoked_at_off_end(world)
     reads: list[object] = []
@@ -7251,7 +7270,7 @@ async def test_997_tp5_a_failed_run_terminal_is_verified_by_v6_and_never_checked
         return real_read(*args, **kwargs)
 
     monkeypatch.setattr(two_phase, "read_retained_run_v6", read)
-    monkeypatch.setattr(two_phase, "check_temperature_conformance", checks.append)
+    monkeypatch.setattr(two_phase, "check_current_conformance", checks.append)
     result = await world.run()
     assert result.advisory_path is AdvisoryPath.FAILED_RUN_TERMINAL
     assert result.outcome is Outcome.NOT_CONFORMANT and result.conformance is None

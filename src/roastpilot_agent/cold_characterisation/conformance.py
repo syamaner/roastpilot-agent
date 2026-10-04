@@ -66,6 +66,10 @@ from roastpilot_agent.cold_characterisation.acceptance import (
     ColdReboundPhase,
     interpret_retained_run,
 )
+from roastpilot_agent.cold_characterisation.duration_policy import (
+    ColdDurationGeneration,
+    admit_duration_generation,
+)
 from roastpilot_agent.cold_characterisation.engine_policy import evaluate_tick
 from roastpilot_agent.cold_characterisation.evidence_lifecycle import (
     ADMITTED_ENUM_TYPES as LIFECYCLE_ENUM_TYPES,
@@ -826,6 +830,7 @@ def _check_matched(
     interpretation: ColdInterpretation,
     snapshots: _Snapshots,
     found: set[ColdConformanceFinding],
+    generation: ColdDurationGeneration,
 ) -> None:
     """Session, window, transition, causal-order and post-terminal rules (grammar matched).
 
@@ -834,6 +839,12 @@ def _check_matched(
     """
     a_off, e_off, f_off, cs_off, ct_off, a_on, measured, e_on, f_on, cs_on, terminal = snapshots
     off, on = interpretation.rebound.phases
+    if any(
+        admit_duration_generation(record.event_monotonic_seconds, record.scheduled_end_monotonic)
+        is not generation
+        for record in (a_off, a_on)
+    ):
+        found.add(_F.SCHEDULED_END_MISMATCH)
     s_off, s_on = a_off.session_id, a_on.session_id
     pairs = [
         (e_off.session_id, s_off),
@@ -965,28 +976,19 @@ def _result(found: set[ColdConformanceFinding]) -> ColdConformanceResult:
     )
 
 
-def check_pre_advisory_conformance(run: object) -> ColdConformanceResult:
-    """Check one retained v2 run against the pre-advisory conformance policy v1.
-
-    The run conforms if and only if no finding is recorded.  A rejection, parser
-    refusal or internal exception never conforms; ``BaseException`` that is not an
-    ``Exception`` propagates.  The result carries enums and the version only.
-
-    Args:
-        run: A candidate ``ColdRetainedRunV2``, as the strict v2 reader returns it.
-
-    Returns:
-        The closed conformance result.
-    """
+def _evaluate_generation(
+    run: object, generation: ColdDurationGeneration
+) -> set[ColdConformanceFinding]:
+    """Apply shared rules after strict admission for the selected closed generation."""
     found: set[ColdConformanceFinding] = set()
     if not _guarded(found, _F.CARRIER_NOT_ADMITTED, lambda: _admit(run)):
-        return _result({_F.CARRIER_NOT_ADMITTED})
+        return {_F.CARRIER_NOT_ADMITTED}
     carrier = typing.cast(ColdRetainedRunV2, run)
     interpretation = _guarded(
         found, _F.INTERPRETATION_REFUSED, lambda: interpret_retained_run(carrier.run)
     )
     if interpretation is None:
-        return _result({_F.INTERPRETATION_REFUSED})
+        return {_F.INTERPRETATION_REFUSED}
     internal = _F.CHECKER_INTERNAL_FAILURE
     _guarded(found, internal, lambda: _check_phases(interpretation, found))
     _guarded(
@@ -1000,6 +1002,24 @@ def check_pre_advisory_conformance(run: object) -> ColdConformanceResult:
     if snapshots is not None and _guarded(
         found, internal, lambda: _check_lifecycle_fields(snapshots, found)
     ):
-        _guarded(found, internal, lambda: _check_matched(interpretation, snapshots, found))
+        _guarded(
+            found, internal, lambda: _check_matched(interpretation, snapshots, found, generation)
+        )
         _guarded(found, internal, lambda: _replay_ticks(interpretation, snapshots, found))
-    return _result(found)
+    return found
+
+
+def check_pre_advisory_conformance(run: object) -> ColdConformanceResult:
+    """Check one retained v2 run against the pre-advisory conformance policy v1.
+
+    The run conforms if and only if no finding is recorded.  A rejection, parser
+    refusal or internal exception never conforms; ``BaseException`` that is not an
+    ``Exception`` propagates.  The result carries enums and the version only.
+
+    Args:
+        run: A candidate ``ColdRetainedRunV2``, as the strict v2 reader returns it.
+
+    Returns:
+        The closed conformance result.
+    """
+    return _result(_evaluate_generation(run, ColdDurationGeneration.HISTORICAL))

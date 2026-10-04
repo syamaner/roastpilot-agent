@@ -15,9 +15,7 @@ from datetime import datetime, timedelta
 
 import pydantic
 
-from roastpilot_agent.cold_characterisation.engine_policy import (
-    COLD_PHASE_OBSERVATION_SECONDS as COLD_PHASE_OBSERVATION_SECONDS,
-)
+from roastpilot_agent.cold_characterisation.duration_policy import admit_duration_generation
 from roastpilot_agent.cold_characterisation.evidence_schema import (
     MAX_TEXT_FIELD_BYTES,
     ColdEvidenceError,
@@ -411,7 +409,7 @@ class ColdLifecycleRecord(pydantic.BaseModel):
         event_instant = self.event_monotonic_seconds
         scheduled_end = typing.cast(float, self.scheduled_end_monotonic)
         if self.event is ColdLifecycleEvent.PHASE_ACTIVATED:
-            if scheduled_end != event_instant + COLD_PHASE_OBSERVATION_SECONDS:
+            if admit_duration_generation(event_instant, scheduled_end) is None:
                 raise ValueError("scheduled end is not activation plus the phase length")
         elif self.event is ColdLifecycleEvent.OBSERVATION_WINDOW_ELAPSED:
             if event_instant < scheduled_end:

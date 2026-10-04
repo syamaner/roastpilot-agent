@@ -18,10 +18,38 @@ recorded evidence of a supervised run. Nothing here authorises beans, a live
 roast, a readiness claim, a detector-accuracy claim or a deployment-acoustics
 claim. #954 stays open, and E11-S3 is not started.
 
-One cold run has two fixed phases: a 30-minute recording-off phase followed by
-a 30-minute recording-on phase, under the approved music stimulus (recorded in
+One cold run has two fixed phases: a 10-minute recording-off phase followed by
+a 10-minute recording-on phase, under the approved music stimulus (recorded in
 `--stimulus-block`). This runbook prescribes no stimulus content, no other
 duration and no run authority of its own.
+
+### Local D210 candidate (4 October 2026)
+
+This local candidate uses fixed 600-second phases with a 1.0-second observation
+interval. Each scheduled end is activation +600 seconds; the relative advisory
+window is activation +240 through +540 seconds (minutes 4–9), exactly 300 seconds.
+The recording-off scheduled end still anchors the unchanged 60-second transition
+budget. There is no duration option, configuration field or environment override.
+
+Historical 30+30 evidence retains its original bytes and policies 1–3. Exact
+manifest-bound `PHASE_ACTIVATED` activation/scheduled-end relations distinguish
+1800-second historical phases from 600-second D210 phases. Current success requires
+policy 4; historical/current substitution, mixed phases and unknown relations fail
+closed. All temperature, advisory, audio, identity, provenance and cleanup criteria
+remain unchanged. Elapsed time and ticks do not prove uninterrupted monitoring or
+a maximum tick gap.
+
+The source base is `f081dda675f84dc078d98c52fdd299df50933753`, bound to local plan
+D210 commit `6a4d2321b737491f7f25a428efd2cefa95b3d34b` and unchanged MCP binding
+`6b54f6a83b03a66c33fa4d86106d9e3123acb8ee`. The lead must record the exact reviewed
+candidate source commit/tree and artifact SHA-256 before installation. No artifact
+is identified by this source document, and no installed-byte claim is made.
+Installation of that exact candidate is tomorrow-only, **5 October 2026**, after
+independent safety, security and QA review and lead disposition. The machine is off
+tonight: no physical startup or provider run. No PR, CI or slow/full suite precedes
+the operator-owned 10+10 qualification. Passing it does not authorise publication.
+All supervised physical gates and the separate live acceptance of at least 20
+continuous minutes remain unexecuted; #954 stays open and E11-S3 is not started.
 
 ## 2. Prerequisites
 
@@ -456,7 +484,7 @@ summary of exactly 16 `key=value` lines (delivery may be incomplete, as below):
 `signal`, `http_server` and `exit_code`. Values are closed tokens; no host,
 port, path, profile, note, credential or exception text is printed.
 
-`conformance_outcome` reports temperature conformance policy 3
+`conformance_outcome` reports temperature conformance policy 4
 (`temperature_screened_conformant` or `not_conformant`), which composes the
 advisory policy. Exit 0 (`ADVISORY_CONFORMANT`) requires
 `temperature_screened_conformant`. `composition_refusal` may be
@@ -595,7 +623,7 @@ Independent Pi evidence review follows separately.
   transaction; a process kill between them leaves an unsealed tree with no
   receipt.
 - The acceptance interpretation of the inner run does not include the
-  temperature screen; the screen is judged by temperature conformance policy 3.
+  temperature screen; the screen is judged by temperature conformance policy 4.
 - Clock progress is a port contract, not a watchdog.
 - Per-tick software observation checks commanded heat, main fan, roast fan and
   cooling. Drum and solenoid/drop appear only in eligible D195 six-dimension

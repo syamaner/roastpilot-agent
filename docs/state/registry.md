@@ -37,6 +37,19 @@ corrects D180's final implementation and evidence clauses. This closure
 supersedes the in-progress or stays-open-pending language in all earlier #702
 (D180) entries below, which are now historical.
 
+**4 Oct 2026 — #954 D210 local candidate:** current cold phases are fixed
+600 seconds each (recording-off then recording-on), with relative advisory
+minutes 4–9 and the unchanged 60-second transition budget. Current success
+requires strict policy 4. Historical 30+30 evidence keeps its original policies
+1–3; mixed, unknown or substituted generations fail closed. Local plan binding:
+`6a4d2321b737491f7f25a428efd2cefa95b3d34b`. Independent safety, security and QA
+review and exact candidate/artifact freezing belong to the lead. Installation
+is tomorrow-only (5 October 2026); the machine is off tonight. No physical
+qualification has passed; #954 remains open and E11-S3 remains unstarted.
+No PR, CI or slow/full suite precedes operator-owned 10+10 qualification.
+This entry supersedes only current runtime policy/duration wording below;
+historical evidence and all other gates retain their original meaning.
+
 **4 Oct 2026 — #997 D209 cold temperature activation (software only; #954 is
 open):** the cold temperature work is delivered as software across S1 (PR
 #998), S2a (PR #999), T1 (PR #1000) and T2 (the runtime activation plus the

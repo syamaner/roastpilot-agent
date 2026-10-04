@@ -978,6 +978,7 @@ def test_pc10_imports_are_the_allow_list() -> None:
         cold + name
         for name in (
             "advisory_conformance",
+            "duration_policy",
             "evidence_reader",
             "evidence_schema",
             "evidence_lifecycle",
@@ -1004,7 +1005,7 @@ def test_pc10_syntax_fences() -> None:
         and isinstance(node.type, ast.Name)
         and node.type.id == "Exception"
     ]
-    assert len(broad) == 2
+    assert len(broad) == 3
     owners = {
         function.name
         for function in ast.walk(TREE)
@@ -1012,7 +1013,7 @@ def test_pc10_syntax_fences() -> None:
         for node in ast.walk(function)
         if node in broad
     }
-    assert owners == {"_guarded", "check_temperature_conformance"}
+    assert owners == {"_guarded", "check_temperature_conformance", "check_current_conformance"}
     assert source.count("model_construct") == 1
     for text in ("isinstance(", "subprocess", "StrEnum", "print(", "two_phase"):
         assert text not in source, text

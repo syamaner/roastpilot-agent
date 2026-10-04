@@ -1,4 +1,4 @@
-"""Pure, versioned temperature conformance policy 3 over one retained V6 cold run (D209).
+"""Pure temperature conformance: archived policy 3 and current D210 policy 4 over V6.
 
 ``check_temperature_conformance`` decides whether one retained V6 run is internally
 conformant temperature-screened cold-characterisation evidence.  It performs no
@@ -8,7 +8,11 @@ surface, and never logs, formats or renders a caller value.
 not qualification, readiness, calibration, liveness, hardware, physical-safety or
 provenance evidence, and it attests no installed bytes.
 
-Policy 2 is preserved by composition, never copied, and policy 1 is reached only
+The historical entry point pins 1800-second phases; the current entry point pins
+600-second phases through shared internal checks without historical success results.
+Both require the same strict admission, temperature and provenance rules.
+
+Historical policy 2 is preserved by composition, never copied, and policy 1 is reached only
 through it: after hostile-carrier admission and re-admission of every new record, an
 exact V3 projection of the admitted slots is judged by the unmodified advisory
 policy 2, and only its fully determined conformant result is accepted.  That
@@ -48,6 +52,10 @@ from roastpilot_agent.cold_characterisation.advisory_conformance import (
     ColdAdvisoryConformanceResult,
     check_advisory_conformance,
 )
+from roastpilot_agent.cold_characterisation.advisory_conformance import (
+    _evaluate as _evaluate_advisory,  # pyright: ignore[reportPrivateUsage]
+)
+from roastpilot_agent.cold_characterisation.duration_policy import ColdDurationGeneration
 from roastpilot_agent.cold_characterisation.evidence_advisory import (
     ColdAdvisoryAttemptEvidenceState,
     ColdAdvisoryIntentRecord,
@@ -103,7 +111,12 @@ __all__ = (
     "ColdTemperatureConformanceOutcome",
     "ColdTemperatureConformanceResult",
     "check_temperature_conformance",
+    "CURRENT_CONFORMANCE_POLICY_VERSION",
+    "ColdCurrentConformanceResult",
+    "check_current_conformance",
 )
+
+CURRENT_CONFORMANCE_POLICY_VERSION: typing.Final = 4
 
 TEMPERATURE_CONFORMANCE_POLICY_VERSION: typing.Final = 3
 """Temperature conformance policy 3.
@@ -182,6 +195,57 @@ class ColdTemperatureConformanceResult(pydantic.BaseModel):
         if type(value) is int and value == TEMPERATURE_CONFORMANCE_POLICY_VERSION:
             return value
         raise ValueError("policy version must be the exact int 3")
+
+    @pydantic.field_validator("outcome", mode="before")
+    @classmethod
+    def _require_outcome_member(cls, value: object) -> object:
+        """Refuse anything but a real outcome member, by identity."""
+        if _is_member(value, _OUTCOME_MEMBERS):
+            return value
+        raise ValueError("outcome must be a closed member")
+
+    @pydantic.field_validator("findings", mode="before")
+    @classmethod
+    def _require_finding_members(cls, value: object) -> object:
+        """Refuse anything but an exact tuple of real finding members."""
+        if type(value) is not tuple:
+            raise ValueError("findings must be an exact tuple")
+        items = typing.cast(tuple[object, ...], value)
+        if all(_is_member(item, _FINDING_MEMBERS) for item in items):
+            return items
+        raise ValueError("findings must be closed members")
+
+    @pydantic.model_validator(mode="after")
+    def _require_closed_agreement(self) -> typing.Self:
+        """Require ordered unique findings and outcome agreement."""
+        if not _strictly_declared(self.findings, _FINDING_MEMBERS):
+            raise ValueError("findings are not unique and ordered")
+        conformant = (
+            self.outcome is ColdTemperatureConformanceOutcome.TEMPERATURE_SCREENED_CONFORMANT
+        )
+        if conformant != (self.findings == ()):
+            raise ValueError("findings and outcome disagree")
+        return self
+
+
+class ColdCurrentConformanceResult(pydantic.BaseModel):
+    """One closed temperature conformance result holding enums and the version only."""
+
+    model_config = pydantic.ConfigDict(
+        frozen=True, extra="forbid", strict=True, allow_inf_nan=False
+    )
+
+    policy_version: typing.Literal[4]
+    outcome: ColdTemperatureConformanceOutcome
+    findings: tuple[ColdTemperatureConformanceFinding, ...]
+
+    @pydantic.field_validator("policy_version", mode="before")
+    @classmethod
+    def _require_exact_version(cls, value: object) -> object:
+        """Refuse ``True``, ``4.0`` or any value that is not the exact int ``4``."""
+        if type(value) is int and value == CURRENT_CONFORMANCE_POLICY_VERSION:
+            return value
+        raise ValueError("policy version must be the exact int 4")
 
     @pydantic.field_validator("outcome", mode="before")
     @classmethod
@@ -596,7 +660,9 @@ def _guarded(found: set[_F], call: typing.Callable[[], _T]) -> _T | None:
     return value
 
 
-def _evaluate(run: object) -> set[_F]:
+def _evaluate(
+    run: object, generation: ColdDurationGeneration = ColdDurationGeneration.HISTORICAL
+) -> set[_F]:
     """Stages 1 to 5 with their early returns; stage-5 rule groups are individually guarded."""
     admitted = _admit(run)
     if admitted is None:
@@ -608,7 +674,12 @@ def _evaluate(run: object) -> set[_F]:
     _record_findings(admitted, fresh, found)
     if admitted.terminal is not None:
         return found
-    if not _advisory_conformant(check_advisory_conformance(_project(admitted))):
+    advisory_ok = (
+        _advisory_conformant(check_advisory_conformance(_project(admitted)))
+        if generation is ColdDurationGeneration.HISTORICAL
+        else _evaluate_advisory(_project(admitted), generation) == (set(), ())
+    )
+    if not advisory_ok:
         found.add(_F.ADVISORY_POLICY_NOT_CONFORMANT)
         return found
     retained = typing.cast(ColdRetainedRun, admitted.run)
@@ -651,6 +722,31 @@ def check_temperature_conformance(run: object) -> ColdTemperatureConformanceResu
     findings = tuple(member for member in _FINDING_MEMBERS if member in found)
     return ColdTemperatureConformanceResult(
         policy_version=TEMPERATURE_CONFORMANCE_POLICY_VERSION,
+        outcome=(
+            ColdTemperatureConformanceOutcome.NOT_CONFORMANT
+            if findings
+            else ColdTemperatureConformanceOutcome.TEMPERATURE_SCREENED_CONFORMANT
+        ),
+        findings=findings,
+    )
+
+
+def check_current_conformance(run: object) -> ColdCurrentConformanceResult:
+    """Check retained V6 evidence against current D210 policy 4.
+
+    Args:
+        run: Candidate retained V6 run, admitted before semantic use.
+
+    Returns:
+        Strict policy-4 result; software conformance only.
+    """
+    try:
+        found = _evaluate(run, ColdDurationGeneration.D210)
+    except Exception:
+        found = {_F.CHECKER_INTERNAL_FAILURE}
+    findings = tuple(member for member in _FINDING_MEMBERS if member in found)
+    return ColdCurrentConformanceResult(
+        policy_version=CURRENT_CONFORMANCE_POLICY_VERSION,
         outcome=(
             ColdTemperatureConformanceOutcome.NOT_CONFORMANT
             if findings

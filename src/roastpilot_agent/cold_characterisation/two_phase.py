@@ -1,9 +1,9 @@
 """Two-phase cold-characterisation orchestration (#954 slices 4g-c and 5c-ii-b).
 
 One run identity, one evidence directory and two MCP sessions: recording-off
-observation for 1800 s, clean D195 finalisation, a confirmed child stop, a
+observation for 600 s, clean D195 finalisation, a confirmed child stop, a
 respawn with the recording-on configuration, recording-on observation for
-1800 s, clean finalisation, a confirmed final stop and one terminal record.  The
+600 s, clean finalisation, a confirmed final stop and one terminal record.  The
 orchestrator owns only the child it starts, admits every runtime carrier before
 use, enforces run-wide write discipline the v1 grammar cannot prove, and returns
 closed members and a manifest digest only.
@@ -33,9 +33,9 @@ exit signal for the caller only, never a stop or delivery proof.
 
 ``ADVISORY_CONFORMANT`` requires a completed terminal record, a confirmed final
 stop, no advisory failure path, a sealed digest, a reload through the V6 reader
-and an admitted conformant temperature policy-3 result (which composes advisory
-policy 2 and so policy 1).  It is never qualification, readiness, hardware
-acceptance or recording-on acceptance.
+and an admitted conformant D210 policy-4 result (which shares the unchanged advisory,
+lifecycle and temperature checks with the historical policies). It is never
+qualification, readiness, hardware acceptance or recording-on acceptance.
 
 D209 activation: the operator-asserted reviewed MCP candidate is re-admitted before
 any child action, each frozen phase identity must name its reported version, and
@@ -226,10 +226,10 @@ from roastpilot_agent.cold_characterisation.mcp import (
     finalisation_is_clean,
 )
 from roastpilot_agent.cold_characterisation.temperature_conformance import (
+    ColdCurrentConformanceResult,
     ColdTemperatureConformanceFinding,
     ColdTemperatureConformanceOutcome,
-    ColdTemperatureConformanceResult,
-    check_temperature_conformance,
+    check_current_conformance,
 )
 from roastpilot_agent.mcp_client import RuntimeConfigSnapshot, ServerInfo
 
@@ -398,7 +398,7 @@ def _is_digest(value: object) -> bool:
 
 
 class ColdTwoPhaseResult(pydantic.BaseModel):
-    """The closed run result: enum members, a digest and an admitted policy-3 checker result."""
+    """The closed run result: enum members, a digest and an admitted policy-4 checker result."""
 
     model_config = pydantic.ConfigDict(
         frozen=True, extra="forbid", strict=True, allow_inf_nan=False
@@ -409,7 +409,7 @@ class ColdTwoPhaseResult(pydantic.BaseModel):
     termination_reason: ColdRunTerminationReason | None
     child_ownership: ColdChildOwnership
     manifest_sha256: str | None
-    conformance: ColdTemperatureConformanceResult | None
+    conformance: ColdCurrentConformanceResult | None
     advisory_path: ColdTwoPhaseAdvisoryPath
     provider_check: ColdTwoPhaseProviderCheck
 
@@ -427,9 +427,7 @@ class ColdTwoPhaseResult(pydantic.BaseModel):
         """Replace a checker result with its admitted fresh snapshot, or refuse it."""
         if value is None:
             return None
-        fresh = _admit_carrier(
-            value, ColdTemperatureConformanceResult, _CHECKER, flat_identity=True
-        )
+        fresh = _admit_carrier(value, ColdCurrentConformanceResult, _CHECKER, flat_identity=True)
         if fresh is None:
             raise ValueError("conformance result not admitted")
         return fresh
@@ -576,7 +574,7 @@ _ENGINE: typing.Final = _carrier(
     ),
 )
 _CHECKER: typing.Final = _carrier(
-    (ColdTemperatureConformanceResult,),
+    (ColdCurrentConformanceResult,),
     (ColdTemperatureConformanceOutcome, ColdTemperatureConformanceFinding),
 )
 _ADVISORY: typing.Final = _carrier(
@@ -2189,7 +2187,7 @@ class _TwoPhaseRun:
         self,
         outcome: ColdTwoPhaseOutcome,
         digest: str | None = None,
-        conformance: ColdTemperatureConformanceResult | None = None,
+        conformance: ColdCurrentConformanceResult | None = None,
     ) -> ColdTwoPhaseResult:
         """Build one evidence-bearing result row from admitted closed fields."""
         return ColdTwoPhaseResult(
@@ -2251,11 +2249,11 @@ class _TwoPhaseRun:
                 run_id=self._headers[_OFF].run_id,
                 expected_manifest_sha256=digest,
             )
-            checked: object = check_temperature_conformance(retained)
+            checked: object = check_current_conformance(retained)
         except Exception:
             checked = None
         conformance = _admit_carrier(
-            checked, ColdTemperatureConformanceResult, _CHECKER, flat_identity=True
+            checked, ColdCurrentConformanceResult, _CHECKER, flat_identity=True
         )
         conformant = (
             conformance is not None

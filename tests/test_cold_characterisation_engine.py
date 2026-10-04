@@ -564,12 +564,12 @@ async def test_t1_happy_path_observes_the_full_window_and_round_trips(tmp_path: 
         "mark_beans_added",
         *["get_roast_state"] * reads,
     ]
-    assert reads == 1800
+    assert reads == 600
     assert result == engine.ColdPhaseCompleted(
         session_id=SID,
-        observation_end_monotonic=T0 + 1800.0,
-        observation_end_utc=(BASE_UTC + timedelta(seconds=T0 + 1800.0)).isoformat(),
-        tick_count=1800,
+        observation_end_monotonic=T0 + 600.0,
+        observation_end_utc=(BASE_UTC + timedelta(seconds=T0 + 600.0)).isoformat(),
+        tick_count=600,
     )
     assert streams(sink) == ["header", *["tick", "host"] * reads]
     ticks = [r for r in sink.records if type(r) is schema.ColdTickRecord]
@@ -657,7 +657,7 @@ async def test_t2c_a_window_already_elapsed_completes_with_zero_ticks(tmp_path: 
     def late() -> float:
         value = original()
         if clock.samples == 3:
-            clock.t += 1800.0
+            clock.t += 600.0
             return clock.t
         return value
 
@@ -681,7 +681,7 @@ async def test_t2d_an_in_flight_read_crossing_the_deadline_is_fully_processed(
     """
     rig = make_rig(
         tmp_path,
-        durations=lambda index: 0.05 if index == 0 else 1800.5,
+        durations=lambda index: 0.05 if index == 0 else 600.5,
         ticks=lambda index: clean(index, heat_level_percent=1 if unsafe and index == 1 else 0),
     )
     result, sink = await run_phase(rig)
@@ -2119,6 +2119,7 @@ def test_t20_new_modules_are_fenced() -> None:
         "typing",
         "pydantic",
         "roastpilot_agent.cold_characterisation.evidence_schema",
+        "roastpilot_agent.cold_characterisation.duration_policy",
     }
     assert imported <= allowed
     engine_mcp_client_imports = [
@@ -2144,7 +2145,7 @@ def test_fixed_constants_are_never_shortened() -> None:
     """AC-C1/C3: the interval, startup deadline and window are fixed."""
     assert policy.COLD_OBSERVATION_INTERVAL_SECONDS == 1.0
     assert policy.COLD_STARTUP_TELEMETRY_DEADLINE_SECONDS == 60.0
-    assert policy.COLD_PHASE_OBSERVATION_SECONDS == 1800.0
+    assert policy.COLD_PHASE_OBSERVATION_SECONDS == 600.0
     assert issubclass(engine.ColdAdmissionFailure, enum.Enum)
     assert not issubclass(engine.ColdAdmissionFailure, str)
 
@@ -2207,11 +2208,11 @@ async def test_4gc_t5_hook_runs_once_after_activation_and_before_any_read(
     assert hook.mcp_calls_at_call == [
         ["get_server_info", "get_runtime_config", "start_roast_session", "mark_beans_added"]
     ]
-    assert done.tick_count == 1800
-    assert done.observation_end_monotonic == T0 + 1800.0
-    assert done.observation_end_utc == (BASE_UTC + timedelta(seconds=T0 + 1800.0)).isoformat()
+    assert done.tick_count == 600
+    assert done.observation_end_monotonic == T0 + 600.0
+    assert done.observation_end_utc == (BASE_UTC + timedelta(seconds=T0 + 600.0)).isoformat()
     assert done.observation_end_utc == rig.clock.good[-1][1]
-    assert streams(sink) == ["header", *["tick", "host"] * 1800]
+    assert streams(sink) == ["header", *["tick", "host"] * 600]
 
 
 @pytest.mark.asyncio
@@ -2376,7 +2377,7 @@ def screened_rig(
     temperatures: dict[int, dict[str, object]] | None = None,
     *,
     durations: dict[int, float] | None = None,
-    late: float = 1800.0,
+    late: float = 600.0,
     heat: dict[int, int] | None = None,
     clock: FakeClock | None = None,
 ) -> Rig:
@@ -2426,7 +2427,7 @@ async def test_en1_every_tick_retains_one_paired_temperature_from_its_own_read(
     rig = make_rig(tmp_path, ticks=ticks)
     result, sink = await run_phase(rig)
     count = completed(result).tick_count
-    assert count == 1800 == rig.mcp.calls.count("get_roast_state") == len(returned)
+    assert count == 600 == rig.mcp.calls.count("get_roast_state") == len(returned)
     ticks_retained = [r for r in sink.records if type(r) is schema.ColdTickRecord]
     assert len(ticks_retained) == len(sink.temperatures) == count
     assert sink.temperature_aborts == []
