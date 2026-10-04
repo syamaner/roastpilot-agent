@@ -1,8 +1,9 @@
 """Contained construction of cold-characterisation evidence records.
 
 Every builder inherits run id, phase, and identity digest from the phase header
-it binds to, and returns only after ``validate_record``.  Builders compute no
-outcome and never call the D195 clean conjunction.
+(or, for a tick temperature, the tick) it binds to, and returns only after its
+record's own public re-admission boundary.  Builders compute no outcome and never
+call the D195 clean conjunction.
 """
 
 import hashlib
@@ -62,6 +63,18 @@ from roastpilot_agent.cold_characterisation.evidence_store import (
     derive_finalisation_index,
     parse_finalisation_envelope,
     run_id_is_valid,
+)
+from roastpilot_agent.cold_characterisation.evidence_temperature import (
+    ColdTickTemperatureRecord,
+    validate_tick_temperature_record,
+)
+from roastpilot_agent.cold_characterisation.evidence_temperature_run import (
+    ColdMcpCandidateProvenance,
+    ColdMcpCandidateRecord,
+    ColdTemperatureAbortRecord,
+    ColdTemperatureScreenReason,
+    validate_mcp_candidate_record,
+    validate_temperature_abort_record,
 )
 from roastpilot_agent.cold_characterisation.host import HostBoundSample
 from roastpilot_agent.cold_characterisation.identity import ColdRunIdentity, identity_sha256
@@ -423,6 +436,171 @@ def build_abort_record(
             strict=True,
         ),
         ColdAbortRecord,
+    )
+
+
+_SnapshotT = typing.TypeVar(
+    "_SnapshotT", ColdTickTemperatureRecord, ColdTemperatureAbortRecord, ColdMcpCandidateRecord
+)
+
+
+def _readmitted(
+    build: typing.Callable[[], _SnapshotT], readmit: typing.Callable[[object], _SnapshotT]
+) -> _SnapshotT:
+    """Construct one schema-4, -5 or -6 record, then return only its re-admitted snapshot.
+
+    A construction refusal (which may embed input) is discarded and raised as the
+    fixed ``RECORD_NOT_VALIDATED`` outside the handler, so it carries no cause or
+    context; the record boundary's own closed errors propagate unchanged.
+    """
+    try:
+        record = build()
+    except (pydantic.ValidationError, AttributeError):
+        pass
+    else:
+        return readmit(record)
+    raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+
+
+def _bound_header(header: ColdRunHeader) -> ColdRunHeader:
+    """Return an exact header's fresh ``validate_record`` snapshot, or refuse."""
+    _require_type(header, ColdRunHeader)
+    bound = validate_record(header)
+    if type(bound) is not ColdRunHeader:  # pragma: no cover - validate_record keeps the class.
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    return bound
+
+
+def build_tick_temperature_record(
+    *, tick: ColdTickRecord, observation: ColdTickObservation
+) -> ColdTickTemperatureRecord:
+    """Build one schema-4 tick-temperature record pairing one tick with its observation.
+
+    The tick's identity values come from its fresh ``validate_record`` snapshot and
+    the temperature projection from the same observation the tick was built from;
+    the projection is re-admitted by the record boundary.  Nothing is judged here.
+
+    Args:
+        tick: The tick record built from ``observation``.
+        observation: The one cold observation of that tick.
+
+    Returns:
+        The re-admitted tick-temperature snapshot (never a constructed instance).
+
+    Raises:
+        ColdEvidenceError: ``RECORD_NOT_VALIDATED`` for a refused input, or the
+            boundary's own closed member; no input content, cause or context.
+    """
+    _require_type(tick, ColdTickRecord)
+    source = validate_record(tick)
+    if type(source) is not ColdTickRecord:  # pragma: no cover - validate_record keeps the class.
+        raise ColdEvidenceError(ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    _require_type(observation, ColdTickObservation)
+    return _readmitted(
+        lambda: ColdTickTemperatureRecord.model_validate(
+            {
+                "schema_version": 4,
+                "stream": "tick_temperature",
+                "run_id": source.run_id,
+                "phase": source.phase,
+                "recorded_at_utc": source.recorded_at_utc,
+                "monotonic_seconds": source.monotonic_seconds,
+                "identity_sha256": source.identity_sha256,
+                "tick": source.tick,
+                "temperature": object.__getattribute__(observation, "temperature"),
+            },
+            strict=True,
+        ),
+        validate_tick_temperature_record,
+    )
+
+
+def build_temperature_abort_record(
+    *,
+    header: ColdRunHeader,
+    tick: int,
+    reason: ColdTemperatureScreenReason,
+    recorded_at_utc: str,
+    monotonic_seconds: float,
+) -> ColdTemperatureAbortRecord:
+    """Build one schema-5 temperature-abort record in the existing ``ENGINE`` domain.
+
+    Args:
+        header: The bound phase header.
+        tick: The index of the phase's latest paired tick.
+        reason: One closed temperature screen reason.
+        recorded_at_utc: Recording timestamp.
+        monotonic_seconds: Recording monotonic time.
+
+    Returns:
+        The re-admitted temperature-abort snapshot.
+
+    Raises:
+        ColdEvidenceError: ``RECORD_NOT_VALIDATED`` for a refused input, or the
+            boundary's own closed member; no input content, cause or context.
+    """
+    source = _bound_header(header)
+    return _readmitted(
+        lambda: ColdTemperatureAbortRecord.model_validate(
+            {
+                "schema_version": 5,
+                "stream": "temperature_abort",
+                "run_id": source.run_id,
+                "phase": source.phase,
+                "recorded_at_utc": recorded_at_utc,
+                "monotonic_seconds": monotonic_seconds,
+                "identity_sha256": source.identity_sha256,
+                "tick": tick,
+                "domain": ColdAbortDomain.ENGINE,
+                "reason": reason,
+            },
+            strict=True,
+        ),
+        validate_temperature_abort_record,
+    )
+
+
+def build_mcp_candidate_record(
+    *,
+    header: ColdRunHeader,
+    candidate: ColdMcpCandidateProvenance,
+    recorded_at_utc: str,
+    monotonic_seconds: float,
+) -> ColdMcpCandidateRecord:
+    """Build one schema-6 MCP candidate record binding an operator assertion to a phase.
+
+    The candidate is re-admitted by the record model; it stays an operator assertion
+    and never attests authenticity or installed bytes.
+
+    Args:
+        header: The bound phase header.
+        candidate: The operator-asserted reviewed candidate provenance.
+        recorded_at_utc: Recording timestamp.
+        monotonic_seconds: Recording monotonic time.
+
+    Returns:
+        The re-admitted MCP candidate snapshot.
+
+    Raises:
+        ColdEvidenceError: ``RECORD_NOT_VALIDATED`` for a refused input, or the
+            boundary's own closed member; no input content, cause or context.
+    """
+    source = _bound_header(header)
+    return _readmitted(
+        lambda: ColdMcpCandidateRecord.model_validate(
+            {
+                "schema_version": 6,
+                "stream": "mcp_candidate",
+                "run_id": source.run_id,
+                "phase": source.phase,
+                "recorded_at_utc": recorded_at_utc,
+                "monotonic_seconds": monotonic_seconds,
+                "identity_sha256": source.identity_sha256,
+                "candidate": candidate,
+            },
+            strict=True,
+        ),
+        validate_mcp_candidate_record,
     )
 
 

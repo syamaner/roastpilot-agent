@@ -28,7 +28,15 @@ from roastpilot_agent.cold_characterisation import evidence_schema as schema
 from roastpilot_agent.cold_characterisation import evidence_store as store
 from roastpilot_agent.cold_characterisation.evidence_reader import (
     ABORT_REASON_BY_DOMAIN,
-    read_retained_run,
+    read_retained_run_v6,
+)
+from roastpilot_agent.cold_characterisation.evidence_temperature import (
+    ColdTickTemperatureRecord,
+    pairs_with,
+)
+from roastpilot_agent.cold_characterisation.evidence_temperature_run import (
+    ColdTemperatureAbortRecord,
+    ColdTemperatureScreenReason,
 )
 from roastpilot_agent.cold_characterisation.host import (
     ColdHostBoundError,
@@ -49,6 +57,7 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdTickSessionProjectionError,
     ColdTickTemperatureProjectionError,
 )
+from roastpilot_agent.cold_characterisation.temperature_screen import evaluate_temperature
 from roastpilot_agent.config import MCPConfig
 from roastpilot_agent.mcp_client import (
     EventCommandResult,
@@ -68,6 +77,7 @@ from tests.test_cold_characterisation_evidence_builders import (
     make_identity,
     observation,
     roast_fan_state,
+    screened_temperature,
     session_metadata,
 )
 from tests.test_cold_characterisation_evidence_store import make_root
@@ -141,17 +151,20 @@ def marked_document() -> dict[str, typing.Any]:
 
 
 def clean(index: int = 0, **overrides: typing.Any) -> ColdTickObservation:
-    """Return one clean strict tick whose heartbeat advances with ``index``."""
+    """Return one clean strict tick whose heartbeat and packet count advance with ``index``."""
     session = overrides.pop("session", None) or session_metadata(
         elapsed_monotonic_seconds=1.0 + index
     )
     audio = overrides.pop("audio", None)
     roast_fan = overrides.pop("roast_fan", None)
+    temperature = overrides.pop("temperature", None) or screened_temperature(index)
     device = overrides.pop("device", "default")
     if device == "default":
         overrides.setdefault("driver", DRIVER)
         device = device_state(**overrides)
-    return observation(device, roast_fan=roast_fan, audio=audio, session=session)
+    return observation(
+        device, roast_fan=roast_fan, audio=audio, session=session, temperature=temperature
+    )
 
 
 class FakeClock:
@@ -337,7 +350,11 @@ class FakeHost:
 
 
 class SpySink:
-    """Delegates to the real writer; an injected failure replaces one attempt."""
+    """Delegates to the real writer; an injected failure replaces one attempt.
+
+    Paired tick-temperature and temperature-abort records are kept in their own
+    lists, so ``records`` keeps listing v1 records only.
+    """
 
     def __init__(
         self,
@@ -346,13 +363,31 @@ class SpySink:
         fail_at: int | None = None,
         error: BaseException | None = None,
         on_append: Callable[[schema.ColdEvidenceRecord], None] | None = None,
+        temperature_error: BaseException | None = None,
     ) -> None:
         self.writer = writer
         self.fail_at = fail_at
         self.error = error
         self.on_append = on_append
+        self.temperature_error = temperature_error
         self.attempts = 0
         self.records: list[schema.ColdEvidenceRecord] = []
+        self.temperatures: list[ColdTickTemperatureRecord] = []
+        self.temperature_aborts: list[ColdTemperatureAbortRecord] = []
+        #: Every durable append's stream, across all three methods, in order.
+        self.order: list[str] = []
+
+    def append_tick_temperature(self, record: ColdTickTemperatureRecord) -> None:
+        if self.temperature_error is not None:
+            raise self.temperature_error
+        self.writer.append_tick_temperature(record)
+        self.temperatures.append(record)
+        self.order.append(record.stream)
+
+    def append_temperature_abort(self, record: ColdTemperatureAbortRecord) -> None:
+        self.writer.append_temperature_abort(record)
+        self.temperature_aborts.append(record)
+        self.order.append(record.stream)
 
     def append(self, record: schema.ColdEvidenceRecord) -> None:
         index = self.attempts
@@ -363,6 +398,7 @@ class SpySink:
             raise self.error
         self.writer.append(record)
         self.records.append(record)
+        self.order.append(record.stream)
 
 
 class Rig(typing.NamedTuple):
@@ -540,14 +576,19 @@ async def test_t1_happy_path_observes_the_full_window_and_round_trips(tmp_path: 
     assert [r.tick for r in ticks] == list(range(reads))
     assert all(start < T0 + policy.COLD_PHASE_OBSERVATION_SECONDS for start in rig.mcp.read_starts)
     assert rig.host.start_calls == 1 and rig.host.sample_calls == reads
+    assert len(sink.temperatures) == reads and sink.temperature_aborts == []
     sealed = writer.seal()
-    retained = read_retained_run(
+    # The tree now carries the paired tick-temperature stream, so it reads through V6.
+    v6 = read_retained_run_v6(
         rig.root, run_id=RUN_ID, expected_manifest_sha256=sealed.manifest_sha256
     )
+    retained = v6.run
     assert [h.header for h in retained.headers] == [admission.header]
     by_stream = {stream.stream.value: stream.records for stream in retained.streams}
     assert list(by_stream["tick"]) == ticks
     assert len(by_stream["host"]) == reads
+    assert list(v6.tick_temperatures) == sink.temperatures
+    assert v6.temperature_aborts == () and v6.mcp_candidates == ()
 
 
 @pytest.mark.asyncio
@@ -632,20 +673,26 @@ async def test_t2c_a_window_already_elapsed_completes_with_zero_ticks(tmp_path: 
 async def test_t2d_an_in_flight_read_crossing_the_deadline_is_fully_processed(
     tmp_path: Path, unsafe: bool
 ) -> None:
-    """T2d: a read started before the deadline is retained and evaluated, never early-clean."""
+    """T2d: a read started before the deadline is retained and evaluated, never early-clean.
+
+    EN0 adaptation: a short pre-boundary first read supplies the D209 screen's
+    previous snapshot, so the crossing second read is judged only on its own
+    command state (a single crossing read would otherwise be ``PRIOR_MISSING``).
+    """
     rig = make_rig(
         tmp_path,
-        durations=lambda index: 1800.5,
-        ticks=lambda index: clean(index, heat_level_percent=1 if unsafe else 0),
+        durations=lambda index: 0.05 if index == 0 else 1800.5,
+        ticks=lambda index: clean(index, heat_level_percent=1 if unsafe and index == 1 else 0),
     )
     result, sink = await run_phase(rig)
-    assert rig.mcp.read_starts == [T0]
+    assert rig.mcp.read_starts == [T0, T0 + 1.0]
+    assert [record.tick for record in sink.temperatures] == [0, 1]
     if unsafe:
         assert aborted(result).aborts == engine_aborts(Reason.COMMAND_STATE_NON_ZERO)
-        assert streams(sink) == ["header", "tick", "abort"]
+        assert streams(sink) == ["header", "tick", "host", "tick", "abort"]
     else:
-        assert completed(result).tick_count == 1
-        assert streams(sink) == ["header", "tick", "host"]
+        assert completed(result).tick_count == 2
+        assert streams(sink) == ["header", "tick", "host", "tick", "host"]
 
 
 # -------------------------------------------------------------------- T3
@@ -2317,3 +2364,416 @@ def test_4gc_activation_refused_result_is_strict_and_bounded() -> None:
                     "tick_count": 0,
                 }
             )
+
+
+# ------------------------------------------- #997 T2: D209 runtime activation (EN1-EN10)
+
+Screen = ColdTemperatureScreenReason
+
+
+def screened_rig(
+    tmp_path: Path,
+    temperatures: dict[int, dict[str, object]] | None = None,
+    *,
+    durations: dict[int, float] | None = None,
+    late: float = 1800.0,
+    heat: dict[int, int] | None = None,
+    clock: FakeClock | None = None,
+) -> Rig:
+    """A rig whose tick ``i`` carries ``screened_temperature(i, **temperatures[i])``.
+
+    ``durations`` maps read indices to read durations (default 0.05); any later read
+    lasts ``late`` seconds, so a phase that survives its scripted ticks ends at once.
+    """
+    changes = temperatures or {}
+    lengths = durations or {}
+    heats = heat or {}
+    last = max(lengths, default=-1)
+    return make_rig(
+        tmp_path,
+        clock=clock,
+        durations=lambda index: lengths.get(index, 0.05 if index <= last else late),
+        ticks=lambda index: clean(
+            index,
+            heat_level_percent=heats.get(index, 0),
+            temperature=screened_temperature(index, **changes.get(index, {})),
+        ),
+    )
+
+
+#: Read durations that end tick 0 before and tick 1 after the 60-second boundary
+#: (activation 100.0; tick 0 ends at 100.05, tick 1 starts at 101.0, ends at 161.0).
+ELIGIBLE_SECOND = {0: 0.05, 1: 60.0}
+
+
+def screen_aborts(*reasons: Screen) -> tuple[engine.ColdAbortClassification, ...]:
+    """Return ENGINE classifications carrying temperature screen reasons, in order."""
+    return tuple(engine.ColdAbortClassification(domain=Domain.ENGINE, reason=r) for r in reasons)
+
+
+@pytest.mark.asyncio
+async def test_en1_every_tick_retains_one_paired_temperature_from_its_own_read(
+    tmp_path: Path,
+) -> None:
+    """EN1 (AC1-AC5, O1): one read per tick; both records come from that read and instant."""
+    returned: list[ColdTickObservation] = []
+
+    def ticks(index: int) -> ColdTickObservation:
+        item = clean(index)
+        returned.append(item)
+        return item
+
+    rig = make_rig(tmp_path, ticks=ticks)
+    result, sink = await run_phase(rig)
+    count = completed(result).tick_count
+    assert count == 1800 == rig.mcp.calls.count("get_roast_state") == len(returned)
+    ticks_retained = [r for r in sink.records if type(r) is schema.ColdTickRecord]
+    assert len(ticks_retained) == len(sink.temperatures) == count
+    assert sink.temperature_aborts == []
+    for tick, temperature, read in zip(ticks_retained, sink.temperatures, returned, strict=True):
+        assert pairs_with(tick, temperature)
+        assert (
+            temperature.run_id,
+            temperature.phase,
+            temperature.identity_sha256,
+            temperature.tick,
+            temperature.recorded_at_utc,
+            temperature.monotonic_seconds,
+        ) == (
+            tick.run_id,
+            tick.phase,
+            tick.identity_sha256,
+            tick.tick,
+            tick.recorded_at_utc,
+            tick.monotonic_seconds,
+        )
+        assert temperature.temperature == read.temperature
+        assert temperature.temperature is not read.temperature
+    # Each tick's temperature line directly follows its tick line.
+    assert sink.order[:5] == ["header", "tick", "tick_temperature", "host", "tick"]
+
+
+@pytest.mark.asyncio
+async def test_en2_a_newly_counted_read_error_at_the_first_eligible_tick_aborts(
+    tmp_path: Path,
+) -> None:
+    """EN2: pre-boundary tick 0, then a read error +1 at tick 1 is one schema-5 abort."""
+    rig = screened_rig(tmp_path, {1: {"status_read_error_count": 1}}, durations=ELIGIBLE_SECOND)
+    result, sink = await run_phase(rig)
+    aborted_result = aborted(result)
+    assert aborted_result.aborts == screen_aborts(Screen.FAULT_COUNTED)
+    assert aborted_result.abort_recorded is True
+    assert [(r.tick, r.reason, r.domain) for r in sink.temperature_aborts] == [
+        (1, Screen.FAULT_COUNTED, Domain.ENGINE)
+    ]
+    assert aborts_of(sink) == []
+    assert sink.order[-3:] == ["tick", "tick_temperature", "temperature_abort"]
+
+
+@pytest.mark.asyncio
+async def test_en3_a_first_read_ending_at_the_boundary_has_no_prior(tmp_path: Path) -> None:
+    """EN3: a first observation at or after 60 s has no previous snapshot."""
+    rig = screened_rig(tmp_path, durations={0: 60.0})
+    result, sink = await run_phase(rig)
+    assert aborted(result).aborts == screen_aborts(Screen.PRIOR_MISSING)
+    assert [(r.tick, r.reason) for r in sink.temperature_aborts] == [(0, Screen.PRIOR_MISSING)]
+
+
+_MALFORMED = dict.fromkeys(
+    (
+        "configured_temperature_unit",
+        "reported_temperature_unit",
+        "last_packet_valid",
+        "last_packet_bean_temp_c",
+        "last_packet_env_temp_c",
+        "retained_bean_temp_c",
+        "retained_env_temp_c",
+        "value_agreement",
+        "status_packet_count",
+        "ignored_temperature_packet_count",
+        "status_read_error_count",
+        "command_loop_error_count",
+    )
+)
+
+#: (id, per-tick raw overrides, durations, expected reasons, abort tick).
+EN4_CASES: list[
+    tuple[str, dict[int, dict[str, object]], dict[int, float], tuple[Screen, ...], int]
+] = [
+    (
+        "bean_below_screen",
+        {1: {"last_packet_bean_temp_c": 4.0, "retained_bean_temp_c": 4.0}},
+        ELIGIBLE_SECOND,
+        (Screen.OUTSIDE_SCREEN,),
+        1,
+    ),
+    (
+        "env_above_screen",
+        {1: {"last_packet_env_temp_c": 41.0, "retained_env_temp_c": 41.0}},
+        ELIGIBLE_SECOND,
+        (Screen.OUTSIDE_SCREEN,),
+        1,
+    ),
+    (
+        "values_disagree",
+        {1: {"retained_bean_temp_c": 21.0, "value_agreement": "disagree"}},
+        ELIGIBLE_SECOND,
+        (Screen.VALUES_DISAGREE,),
+        1,
+    ),
+    (
+        "non_celsius_reported_unit",
+        {
+            1: {
+                "configured_temperature_unit": "auto",
+                "reported_temperature_unit": "fahrenheit",
+                "last_packet_bean_temp_c": None,
+                "last_packet_env_temp_c": None,
+                "value_agreement": "indeterminate",
+            }
+        },
+        ELIGIBLE_SECOND,
+        (Screen.LAST_PACKET_NOT_VALID_CELSIUS,),
+        1,
+    ),
+    (
+        "packet_not_progressed",
+        {1: {"status_packet_count": 1}},
+        ELIGIBLE_SECOND,
+        (Screen.PACKET_NOT_PROGRESSED,),
+        1,
+    ),
+    (
+        "loop_error_counted",
+        {1: {"command_loop_error_count": 1}},
+        ELIGIBLE_SECOND,
+        (Screen.FAULT_COUNTED,),
+        1,
+    ),
+    (
+        "ignored_packet_counted",
+        {1: {"status_packet_count": 3, "ignored_temperature_packet_count": 1}},
+        ELIGIBLE_SECOND,
+        (Screen.FAULT_COUNTED,),
+        1,
+    ),
+    (
+        "malformed_at_tick_zero",
+        {0: {"outcome": "malformed", **_MALFORMED}},
+        {0: 0.05},
+        (Screen.PROJECTION_MALFORMED,),
+        0,
+    ),
+    (
+        "unsupported_at_tick_zero",
+        {0: {"outcome": "unsupported", **_MALFORMED}},
+        {0: 0.05},
+        (Screen.NOT_OBSERVABLE,),
+        0,
+    ),
+    (
+        "pre_boundary_ignored_count_regressed",
+        {
+            0: {"status_packet_count": 2, "ignored_temperature_packet_count": 1},
+            1: {"status_packet_count": 3, "ignored_temperature_packet_count": 0},
+        },
+        {0: 0.05, 1: 0.05},
+        (Screen.COUNTER_REGRESSED,),
+        1,
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changes", "durations", "expected", "abort_tick"),
+    [case[1:] for case in EN4_CASES],
+    ids=[case[0] for case in EN4_CASES],
+)
+async def test_en4_each_screen_reason_aborts_alone_at_its_tick(
+    tmp_path: Path,
+    changes: dict[int, dict[str, object]],
+    durations: dict[int, float],
+    expected: tuple[Screen, ...],
+    abort_tick: int,
+) -> None:
+    """EN4: each isolated screen fact gives exactly its own reason at its own tick."""
+    rig = screened_rig(tmp_path, changes, durations=durations)
+    result, sink = await run_phase(rig)
+    assert aborted(result).aborts == screen_aborts(*expected)
+    assert [(r.tick, r.reason) for r in sink.temperature_aborts] == [
+        (abort_tick, reason) for reason in expected
+    ]
+    assert [r.tick for r in sink.temperatures] == list(range(abort_tick + 1))
+
+
+@pytest.mark.asyncio
+async def test_en4_the_inclusive_screen_bounds_do_not_abort(tmp_path: Path) -> None:
+    """EN4: bean 5.0 °C and environment 40.0 °C at an eligible tick are inside the screen."""
+    bounds: dict[str, object] = {
+        "last_packet_bean_temp_c": 5.0,
+        "retained_bean_temp_c": 5.0,
+        "last_packet_env_temp_c": 40.0,
+        "retained_env_temp_c": 40.0,
+    }
+    rig = screened_rig(tmp_path, {1: bounds}, durations=ELIGIBLE_SECOND)
+    result, sink = await run_phase(rig)
+    assert completed(result).tick_count == 3
+    assert sink.temperature_aborts == []
+
+
+# Anchor 0.0 keeps the instants representable: 1.0 + (t - 1.0) == t for both cases.
+_BELOW = math.nextafter(60.0, 0.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_end", [_BELOW, 60.0], ids=["below", "at"])
+async def test_en5_engine_and_replay_share_one_activation_anchor(
+    tmp_path: Path, second_end: float
+) -> None:
+    """EN5: the engine's screen equals a replay from the stored tick and activation instants."""
+    clock = FakeClock()
+    clock.t = 0.0
+    hot: dict[str, object] = {"last_packet_bean_temp_c": 41.0, "retained_bean_temp_c": 41.0}
+    rig = screened_rig(tmp_path, {1: hot}, durations={0: 0.05, 1: second_end - 1.0}, clock=clock)
+    hook = RecordingHook(rig)
+    admission = await admit(rig)
+    writer = engine.open_phase_evidence(admission)
+    sink = SpySink(writer)
+    result = await engine.observe_cold_phase(
+        admission=admission,
+        sink=sink,
+        mcp=rig.mcp,
+        host=rig.host,
+        clock=rig.clock,
+        activation_hook=hook,
+    )
+    activated = hook.calls[0][1]
+    writer.seal()
+    stored = [r for r in sink.records if type(r) is schema.ColdTickRecord]
+    since = stored[1].monotonic_seconds - activated
+    if second_end == 60.0:
+        assert since == 60.0
+    else:
+        assert since < 60.0
+    replay = evaluate_temperature(
+        sink.temperatures[1].temperature,
+        previous=sink.temperatures[0].temperature,
+        since_activation_seconds=since,
+    )
+    engine_reasons = (
+        tuple(typing.cast(Screen, abort.reason) for abort in aborted(result).aborts)
+        if type(result) is engine.ColdPhaseAborted
+        else ()
+    )
+    assert engine_reasons == replay
+    assert replay == ((Screen.OUTSIDE_SCREEN,) if second_end == 60.0 else ())
+
+
+@pytest.mark.asyncio
+async def test_en6_v1_reasons_precede_temperature_reasons_on_one_tick(tmp_path: Path) -> None:
+    """EN6 (precedence check): the v1 abort record is retained before the schema-5 one."""
+    hot: dict[str, object] = {"last_packet_bean_temp_c": 41.0, "retained_bean_temp_c": 41.0}
+    rig = screened_rig(tmp_path, {1: hot}, durations=ELIGIBLE_SECOND, heat={1: 1})
+    result, sink = await run_phase(rig)
+    assert aborted(result).aborts == (
+        *engine_aborts(Reason.COMMAND_STATE_NON_ZERO),
+        *screen_aborts(Screen.OUTSIDE_SCREEN),
+    )
+    assert sink.order[-4:] == ["tick", "tick_temperature", "abort", "temperature_abort"]
+
+
+@pytest.mark.asyncio
+async def test_en7_a_temperature_builder_refusal_writes_no_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EN7: the temperature record is built before any write; its refusal is EVIDENCE."""
+
+    def refuse(**_kwargs: object) -> typing.NoReturn:
+        raise schema.ColdEvidenceError(schema.ColdEvidenceFailure.TEXT_FIELD_TOO_LARGE)
+
+    monkeypatch.setattr(engine, "build_tick_temperature_record", refuse)
+    rig = make_rig(tmp_path)
+    result, sink = await run_phase(rig)
+    assert aborted(result).aborts == (
+        engine.ColdAbortClassification(
+            domain=Domain.EVIDENCE, reason=schema.ColdEvidenceFailure.TEXT_FIELD_TOO_LARGE
+        ),
+    )
+    assert [r for r in sink.records if type(r) is schema.ColdTickRecord] == []
+    assert sink.temperatures == []
+    assert streams(sink) == ["header", "abort"]
+
+
+@pytest.mark.asyncio
+async def test_en8_a_failed_temperature_append_is_unexpected_and_leaves_a_raw_tail(
+    tmp_path: Path,
+) -> None:
+    """EN8: the raw writer keeps one unpaired tick (the documented raw-writer residual)."""
+    rig = make_rig(tmp_path)
+    with pytest.raises(engine.ColdEngineUnexpectedError) as caught:
+        await run_phase(rig, temperature_error=RuntimeError(CANARY))
+    assert caught.value.abort_recorded is False
+    assert caught.value.session_id == SID
+    assert_contained(caught.value, "Cold engine failed unexpectedly.")
+    assert rig.mcp.calls.count("get_roast_state") == 1
+    assert rig.host.sample_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_en8_the_raw_writer_retains_the_unpaired_tick(tmp_path: Path) -> None:
+    """EN8: the tick line is on disk with no temperature line and no abort."""
+    rig = make_rig(tmp_path)
+    admission = await admit(rig)
+    sink = SpySink(engine.open_phase_evidence(admission), temperature_error=RuntimeError(CANARY))
+    with pytest.raises(engine.ColdEngineUnexpectedError):
+        await engine.observe_cold_phase(
+            admission=admission, sink=sink, mcp=rig.mcp, host=rig.host, clock=rig.clock
+        )
+    assert streams(sink) == ["header", "tick"]
+    assert sink.temperatures == [] and sink.temperature_aborts == []
+
+
+_PAIR_SAMPLES: tuple[enum.Enum, ...] = (
+    next(iter(schema.ColdHostAbortReason)),
+    schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED,
+    Reason.CANCELLED,
+    Screen.OUTSIDE_SCREEN,
+)
+_ADMITTED_PAIRS = {
+    (Domain.HOST, schema.ColdHostAbortReason),
+    (Domain.EVIDENCE, schema.ColdEvidenceFailure),
+    (Domain.ENGINE, schema.ColdEngineAbortReason),
+    (Domain.ENGINE, ColdTemperatureScreenReason),
+}
+
+
+def test_en9_abort_classification_admits_exactly_the_engine_pairs() -> None:
+    """EN9: every domain/reason-class pairing is admitted or refused exactly."""
+    for domain in Domain:
+        for reason in _PAIR_SAMPLES:
+            payload = {"domain": domain, "reason": reason}
+            if (domain, type(reason)) in _ADMITTED_PAIRS:
+                admitted = engine.ColdAbortClassification.model_validate(payload)
+                assert admitted.domain is domain and admitted.reason is reason
+            else:
+                with pytest.raises(pydantic.ValidationError):
+                    engine.ColdAbortClassification.model_validate(payload)
+
+
+@pytest.mark.asyncio
+async def test_en10_the_previous_snapshot_advances_on_every_screened_tick(
+    tmp_path: Path,
+) -> None:
+    """EN10: t1 (eligible) compares with pre-boundary t0; t2 with t1, and stalls only there."""
+    rig = screened_rig(
+        tmp_path,
+        {2: {"status_packet_count": 2}},
+        durations={0: 0.05, 1: 60.0, 2: 0.05},
+    )
+    result, sink = await run_phase(rig)
+    assert aborted(result).aborts == screen_aborts(Screen.PACKET_NOT_PROGRESSED)
+    assert [(r.tick, r.reason) for r in sink.temperature_aborts] == [
+        (2, Screen.PACKET_NOT_PROGRESSED)
+    ]
+    assert [r.temperature.status_packet_count for r in sink.temperatures] == [1, 2, 2]

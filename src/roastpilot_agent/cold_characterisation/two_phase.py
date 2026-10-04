@@ -32,10 +32,18 @@ one synchronous provider observation follows the seal step on that path; it is a
 exit signal for the caller only, never a stop or delivery proof.
 
 ``ADVISORY_CONFORMANT`` requires a completed terminal record, a confirmed final
-stop, no advisory failure path, a sealed digest, a reload through the V3 reader
-and an admitted conformant advisory policy-2 result (which composes policy 1).  It
-is never qualification, readiness, hardware acceptance or recording-on
-acceptance.
+stop, no advisory failure path, a sealed digest, a reload through the V6 reader
+and an admitted conformant temperature policy-3 result (which composes advisory
+policy 2 and so policy 1).  It is never qualification, readiness, hardware
+acceptance or recording-on acceptance.
+
+D209 activation: the operator-asserted reviewed MCP candidate is re-admitted before
+any child action, each frozen phase identity must name its reported version, and
+one candidate record is retained per phase at its activation instant before any
+tick.  Every tick is retained with one paired tick-temperature record from the
+same read; the guarded sink holds the pair pending between the two writes, so
+neither seal nor finalisation can follow an unpaired tick, and a temperature
+screen reason ends the phase with a retained abort and no finalisation.
 
 The transition budget runs from the recording-off ``PHASE_ACTIVATED`` scheduled
 end (which includes any overrun) to recording-on activation, and is checked at
@@ -46,8 +54,16 @@ Residuals: per-tick observation covers heat, roast fan and cooling; main fan,
 drum and solenoid are checked only at D195 finalisation.  Clock progress is a
 port contract with no watchdog: a stall that never resumes leaves the run
 unfinished, and a resumed stall can leave sparse ticks in a completed phase, so
-no continuous observation is claimed.  A finite temperature is not a
-plausibility claim.  An independent operator emergency stop is required.
+no continuous observation is claimed.  The D209 temperature screen (bean and
+environment temperatures within 5 to 40 °C from the 60-second startup boundary,
+accepted-packet progress, Celsius, raw/typed agreement, no newly counted fault) is
+engineering screening, not calibration or physical-safety evidence: progress is
+arrival between observations, not a watchdog; agreement is consistency, not
+corroboration; ``observed`` does not imply liveness; bad-checksum frames the driver
+skips without counting remain invisible; and the tick and its temperature are two
+durable writes, not a transaction (a kill between them leaves an unsealed tree).
+The candidate is an operator assertion that never attests installed bytes.  An
+independent operator emergency stop is required.
 ``session_id=None`` or ``NOT_ADMITTED`` never proves that no session exists; a
 process stop or a failed append never proves a safe commanded state; v1 cannot
 prove append provenance beyond the discipline enforced here.  Cleanup is bounded
@@ -55,7 +71,9 @@ only by the child port's own stop contract; a stalled dependency is not
 guaranteed to finish.
 
 An optional :class:`ColdRetainedTickObserver` receives a freshly re-admitted copy of
-each durably retained tick, synchronously and on the run's loop.  It is
+each durably retained tick, synchronously and on the run's loop, only after the
+tick's paired temperature record is also durable (so publication follows one more
+durable write, and a tick whose pair failed is never published).  It is
 display-only: an observer failure records ``UNEXPECTED_FAILURE`` with no retained
 abort, stops further publication and fails the run; it is never a liveness,
 freshness or safety signal and never authorises a phase, a finalisation or an exit.
@@ -68,12 +86,6 @@ import typing
 
 import pydantic
 
-from roastpilot_agent.cold_characterisation.advisory_conformance import (
-    ColdAdvisoryConformanceFinding,
-    ColdAdvisoryConformanceOutcome,
-    ColdAdvisoryConformanceResult,
-    check_advisory_conformance,
-)
 from roastpilot_agent.cold_characterisation.advisory_run_owner import (
     ColdAdvisoryPhaseObservation,
     ColdAdvisoryPhaseRun,
@@ -95,10 +107,7 @@ from roastpilot_agent.cold_characterisation.advisory_sampler import (
     ColdAdvisorySettlementClosure,
     ColdAdvisorySpec,
 )
-from roastpilot_agent.cold_characterisation.conformance import (
-    ColdConformanceFinding,
-    masked_identity_text,
-)
+from roastpilot_agent.cold_characterisation.conformance import masked_identity_text
 from roastpilot_agent.cold_characterisation.engine import (
     ColdAbortClassification,
     ColdActivationHook,
@@ -120,6 +129,7 @@ from roastpilot_agent.cold_characterisation.engine import (
 from roastpilot_agent.cold_characterisation.evidence_builders import (
     build_finalisation_record,
     build_lifecycle_record,
+    build_mcp_candidate_record,
 )
 from roastpilot_agent.cold_characterisation.evidence_lifecycle import (
     COLD_TRANSITION_BUDGET_SECONDS,
@@ -135,10 +145,7 @@ from roastpilot_agent.cold_characterisation.evidence_lifecycle import (
     is_admissible_utc_instant,
     validate_lifecycle_record,
 )
-from roastpilot_agent.cold_characterisation.evidence_reader import (
-    read_retained_run_v3,
-    read_retained_run_v4,
-)
+from roastpilot_agent.cold_characterisation.evidence_reader import read_retained_run_v6
 from roastpilot_agent.cold_characterisation.evidence_schema import (
     MAX_COLLECTION_LENGTH,
     MAX_ENVELOPE_BYTES,
@@ -149,6 +156,7 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdAbortRecord,
     ColdAdvisoryRecord,
     ColdEngineAbortReason,
+    ColdEvidenceError,
     ColdEvidenceFailure,
     ColdEvidenceRecord,
     ColdFinalisationRecord,
@@ -168,6 +176,20 @@ from roastpilot_agent.cold_characterisation.evidence_store import (
     ColdAdmittedRoot,
     ColdEvidenceWriter,
     canonical_json,
+)
+from roastpilot_agent.cold_characterisation.evidence_temperature import (
+    ColdTickTemperatureRecord,
+    pairs_with,
+    validate_tick_temperature_record,
+)
+from roastpilot_agent.cold_characterisation.evidence_temperature_run import (
+    ColdMcpCandidateProvenance,
+    ColdMcpCandidateRecord,
+    ColdTemperatureAbortRecord,
+    ColdTemperatureScreenReason,
+    readmit_mcp_candidate_provenance,
+    validate_mcp_candidate_record,
+    validate_temperature_abort_record,
 )
 from roastpilot_agent.cold_characterisation.evidence_terminal import (
     ColdFailedRunAdvisorySettlement,
@@ -201,6 +223,12 @@ from roastpilot_agent.cold_characterisation.mcp import (
     finalisation_has_required_safety_evidence,
     finalisation_is_clean,
 )
+from roastpilot_agent.cold_characterisation.temperature_conformance import (
+    ColdTemperatureConformanceFinding,
+    ColdTemperatureConformanceOutcome,
+    ColdTemperatureConformanceResult,
+    check_temperature_conformance,
+)
 from roastpilot_agent.mcp_client import RuntimeConfigSnapshot, ServerInfo
 
 _M = typing.TypeVar("_M", bound=pydantic.BaseModel)
@@ -217,8 +245,9 @@ _HEX: typing.Final = frozenset("0123456789abcdef")
 class ColdRetainedTickObserver(typing.Protocol):
     """Display-only observer of each durably retained tick (#954 U2).
 
-    It is called synchronously on the run's own event loop, after the tick's durable
-    append, with an exclusive freshly re-admitted copy that shares nothing with the
+    It is called synchronously on the run's own event loop, after the tick and its
+    paired tick-temperature record are both durable, with an exclusive freshly
+    re-admitted copy that shares nothing with the
     retained record.  It must not block, perform I/O or await, and must return
     ``None``.  Any raised ``Exception`` or non-``None`` return fails the run
     (``UNEXPECTED_FAILURE``, no retained abort) and stops further calls.  It is
@@ -367,7 +396,7 @@ def _is_digest(value: object) -> bool:
 
 
 class ColdTwoPhaseResult(pydantic.BaseModel):
-    """The closed run result: enum members, a digest and an admitted checker result."""
+    """The closed run result: enum members, a digest and an admitted policy-3 checker result."""
 
     model_config = pydantic.ConfigDict(
         frozen=True, extra="forbid", strict=True, allow_inf_nan=False
@@ -378,7 +407,7 @@ class ColdTwoPhaseResult(pydantic.BaseModel):
     termination_reason: ColdRunTerminationReason | None
     child_ownership: ColdChildOwnership
     manifest_sha256: str | None
-    conformance: ColdAdvisoryConformanceResult | None
+    conformance: ColdTemperatureConformanceResult | None
     advisory_path: ColdTwoPhaseAdvisoryPath
     provider_check: ColdTwoPhaseProviderCheck
 
@@ -396,7 +425,9 @@ class ColdTwoPhaseResult(pydantic.BaseModel):
         """Replace a checker result with its admitted fresh snapshot, or refuse it."""
         if value is None:
             return None
-        fresh = _admit_carrier(value, ColdAdvisoryConformanceResult, _CHECKER, flat_identity=True)
+        fresh = _admit_carrier(
+            value, ColdTemperatureConformanceResult, _CHECKER, flat_identity=True
+        )
         if fresh is None:
             raise ValueError("conformance result not admitted")
         return fresh
@@ -432,7 +463,7 @@ def _row_admits(result: ColdTwoPhaseResult) -> bool:
     owned = owner is not ColdChildOwnership.NOT_OWNED
     conformant = (
         checked is not None
-        and checked.outcome is ColdAdvisoryConformanceOutcome.ADVISORY_CONFORMANT
+        and checked.outcome is ColdTemperatureConformanceOutcome.TEMPERATURE_SCREENED_CONFORMANT
     )
     if outcome is ColdTwoPhaseOutcome.ADVISORY_CONFORMANT:
         return (
@@ -458,8 +489,8 @@ def _advisory_path_admits(result: ColdTwoPhaseResult) -> bool:
 
     The run failed (a primary reason is set) with retained or attempted evidence,
     the one provider check was taken (AC7/D203: one of the three ``*_AT_CHECK``
-    values, never ``NOT_CHECKED``), and a failed-run terminal carries no policy-2
-    result (the V3 reader refuses it).
+    values, never ``NOT_CHECKED``), and a failed-run terminal carries no checker
+    result (it is verified, never checked).
     """
     outcome = result.outcome
     if not (
@@ -534,11 +565,17 @@ _FINALISATION: typing.Final = _carrier(
 )
 _ENGINE: typing.Final = _carrier(
     (ColdPhaseCompleted, ColdPhaseAborted, ColdPhaseActivationRefused, ColdAbortClassification),
-    (ColdAbortDomain, ColdHostAbortReason, ColdEvidenceFailure, ColdEngineAbortReason),
+    (
+        ColdAbortDomain,
+        ColdHostAbortReason,
+        ColdEvidenceFailure,
+        ColdEngineAbortReason,
+        ColdTemperatureScreenReason,
+    ),
 )
 _CHECKER: typing.Final = _carrier(
-    (ColdAdvisoryConformanceResult,),
-    (ColdAdvisoryConformanceOutcome, ColdAdvisoryConformanceFinding, ColdConformanceFinding),
+    (ColdTemperatureConformanceResult,),
+    (ColdTemperatureConformanceOutcome, ColdTemperatureConformanceFinding),
 )
 _ADVISORY: typing.Final = _carrier(
     (
@@ -927,12 +964,22 @@ class _PhaseGuard:
 
 
 class _RunSink:
-    """Run-private guard over the single writer; a poisoned sink may only be closed."""
+    """Run-private guard over the single writer; a poisoned sink may only be closed.
+
+    It owns the tick/tick-temperature pair state: a tick is pending from just before
+    its write until its paired temperature record is durable, and only then is it
+    the latest retained tick and published.  A pending pair makes the sink unusable,
+    so no terminal, seal or finalisation can follow an unpaired tick.  The two
+    writes are not a transaction; this coordinator, not the raw writer, holds the
+    pair state.
+    """
 
     def __init__(self, writer: ColdEvidenceWriter) -> None:
         self._writer = writer
         self._guards = {_OFF: _PhaseGuard(), _ON: _PhaseGuard()}
         self._latest_tick: dict[ColdPhaseKind, ColdTickRecord] = {}
+        self._pending: ColdTickRecord | None = None
+        self._candidate_phases: set[ColdPhaseKind] = set()
         self.phase: ColdPhaseKind | None = None
         self.next_sequence = 0
         self.advisory_count = 0
@@ -940,16 +987,21 @@ class _RunSink:
         self.poisoned = False
         self.seal_attempted = False
         self.sealed_digest: str | None = None
-        #: Display-only hook called after each durable tick append; ``None`` by default.
+        #: Display-only hook called after each durable tick pair; ``None`` by default.
         self.after_tick: typing.Callable[[ColdTickRecord], None] | None = None
 
     @property
     def usable(self) -> bool:
-        """Whether another append may be attempted."""
-        return not self.poisoned and not self.terminated
+        """Whether another append may be attempted (never while a pair is pending)."""
+        return not self.poisoned and not self.terminated and self._pending is None
 
     def abort_retained(self, phase: ColdPhaseKind) -> bool:
-        """Whether any v1 abort (any of the seven domains) was retained for ``phase``."""
+        """Whether any abort was retained, or a temperature abort attempted, for ``phase``.
+
+        A v1 abort (any of the seven domains) sets this after its write; a
+        temperature abort sets it before its write, as conservative finalisation
+        inhibition only, never as proof that the abort was durably retained.
+        """
         return self._guards[phase].abort_seen
 
     def finalisation_eligible(self, phase: ColdPhaseKind) -> bool:
@@ -1005,10 +1057,16 @@ class _RunSink:
                 or guard.aborted_not_finalised
                 or guard.abort_seen
             )
+        if type(record) is ColdTickRecord:
+            return not guard.window_closed and record.phase in self._candidate_phases
         return not guard.window_closed
 
     def append(self, record: ColdEvidenceRecord) -> None:
         """Admit, guard and durably append one v1 record (the engine's sink port).
+
+        A tick is admitted only after its phase's durable MCP candidate record; it
+        becomes pending just before its write and is neither the latest retained
+        tick nor published until its paired temperature record is durable.
 
         Raises:
             ColdRunSinkRefusedError: On any refusal or writer fault (then poisoned).
@@ -1023,14 +1081,12 @@ class _RunSink:
         if snapshot is None or not self._admits(snapshot):
             self._refuse()
         fresh = snapshot
+        if type(fresh) is ColdTickRecord:
+            self._pending = fresh
         self._write(lambda: self._writer.append(fresh))
         if type(fresh) is ColdRunHeader:
             self.phase = fresh.phase
             self._guards[fresh.phase].header = True
-        elif type(fresh) is ColdTickRecord:
-            self._latest_tick[fresh.phase] = fresh
-            if self.after_tick is not None:
-                self.after_tick(fresh)
         elif type(fresh) is ColdAbortRecord:
             self._guards[fresh.phase].abort_seen = True
         elif type(fresh) is ColdFinalisationRecord:
@@ -1107,8 +1163,104 @@ class _RunSink:
         self._write(lambda: self._writer.append_advisory_attempt(typing.cast(typing.Any, record)))
         self.advisory_count += 1
 
+    def append_tick_temperature(self, record: ColdTickTemperatureRecord) -> None:
+        """Durably append the pending tick's paired temperature record, then publish it.
+
+        Only after this write is the pending tick the phase's latest retained tick and
+        handed to the display hook.  Lifecycle checks run first, then fresh
+        re-admission, then the pairing guards, then the write.
+
+        Raises:
+            ColdRunSinkRefusedError: On any refusal or writer fault (then poisoned).
+        """
+        pending = self._pending
+        if self.poisoned or self.terminated or pending is None:
+            self._refuse()
+        snapshot: ColdTickTemperatureRecord | None = None
+        try:
+            snapshot = validate_tick_temperature_record(record)
+        except Exception:
+            snapshot = None
+        if (
+            snapshot is None
+            or snapshot.phase is not self.phase
+            or not pairs_with(pending, snapshot)
+        ):
+            self._refuse()
+        fresh = snapshot
+        self._write(lambda: self._writer.append_tick_temperature(fresh))
+        self._latest_tick[pending.phase] = pending
+        self._pending = None
+        if self.after_tick is not None:
+            self.after_tick(pending)
+
+    def append_mcp_candidate(self, record: ColdMcpCandidateRecord) -> None:
+        """Durably append the bound phase's one MCP candidate record, before any tick.
+
+        Lifecycle checks run first, then fresh re-admission, then the record guards
+        (current phase, header bound, window open, no candidate and no retained tick
+        yet), then the write; the phase is admitted for ticks only after the write.
+
+        Raises:
+            ColdRunSinkRefusedError: On any refusal or writer fault (then poisoned).
+        """
+        if not self.usable or self.phase is None:
+            self._refuse()
+        snapshot: ColdMcpCandidateRecord | None = None
+        try:
+            snapshot = validate_mcp_candidate_record(record)
+        except Exception:
+            snapshot = None
+        guard = self._guards[self.phase]
+        if (
+            snapshot is None
+            or snapshot.phase is not self.phase
+            or not guard.header
+            or guard.window_closed
+            or snapshot.phase in self._candidate_phases
+            or self._latest_tick.get(snapshot.phase) is not None
+        ):
+            self._refuse()
+        fresh = snapshot
+        self._write(lambda: self._writer.append_mcp_candidate(fresh))
+        self._candidate_phases.add(fresh.phase)
+
+    def append_temperature_abort(self, record: ColdTemperatureAbortRecord) -> None:
+        """Durably append one temperature-abort record against the latest paired tick.
+
+        Lifecycle checks run first, then fresh re-admission, then the record guards
+        (current phase, header bound, window open, naming the latest paired tick).
+        Finalisation is then inhibited before the write, conservatively: a failed
+        write poisons the sink, so nothing can seal, and the inhibition is never
+        proof of durable retention.
+
+        Raises:
+            ColdRunSinkRefusedError: On any refusal or writer fault (then poisoned).
+        """
+        if not self.usable or self.phase is None:
+            self._refuse()
+        snapshot: ColdTemperatureAbortRecord | None = None
+        try:
+            snapshot = validate_temperature_abort_record(record)
+        except Exception:
+            snapshot = None
+        guard = self._guards[self.phase]
+        latest = self._latest_tick.get(self.phase)
+        if (
+            snapshot is None
+            or snapshot.phase is not self.phase
+            or not guard.header
+            or guard.window_closed
+            or latest is None
+            or snapshot.tick != latest.tick
+        ):
+            self._refuse()
+        fresh = snapshot
+        guard.abort_seen = True
+        self._write(lambda: self._writer.append_temperature_abort(fresh))
+
     def latest_retained_tick(self) -> ColdTickRecord | None:
-        """The latest durably appended tick of the current phase only (the tick port)."""
+        """The latest durably paired tick of the current phase only (the tick port)."""
         if self.phase is None:
             return None
         return self._latest_tick.get(self.phase)
@@ -1326,9 +1478,12 @@ class _TwoPhaseRun:
         configured_call_bound_seconds: float,
         configured_dwell_seconds: float,
         evaluator: ColdAdvisoryEvaluatorPort,
+        mcp_candidate: object,
         tick_observer: ColdRetainedTickObserver | None = None,
     ) -> None:
         self._root = root
+        self._raw_candidate = mcp_candidate
+        self._candidate: ColdMcpCandidateProvenance | None = None
         self._observer = tick_observer
         self._mcp = mcp
         self._child = _ChildOwner(child)
@@ -1460,7 +1615,11 @@ class _TwoPhaseRun:
     def _activated(
         self, phase: ColdPhaseKind, session: object, mono: object, utc: object
     ) -> _Instant:
-        """Re-admit hook arguments, then record ``PHASE_ACTIVATED`` for ``phase``."""
+        """Re-admit hook arguments, then record ``PHASE_ACTIVATED`` and the MCP candidate.
+
+        The candidate record uses the already-admitted activation instant (no extra
+        clock sample) and precedes every tick of the phase.
+        """
         if not (
             is_admissible_session_id(session)
             and is_admissible_monotonic(mono)
@@ -1476,6 +1635,19 @@ class _TwoPhaseRun:
         if record is None:
             raise _HookFailed
         self._ends[phase] = typing.cast(float, record.scheduled_end_monotonic)
+        recorded = True
+        try:
+            candidate = build_mcp_candidate_record(
+                header=self._headers[phase],
+                candidate=typing.cast(ColdMcpCandidateProvenance, self._candidate),
+                recorded_at_utc=at.utc,
+                monotonic_seconds=at.monotonic,
+            )
+            typing.cast(_RunSink, self._sink).append_mcp_candidate(candidate)
+        except (ColdRunSinkRefusedError, ColdEvidenceError):
+            recorded = False
+        if not recorded:
+            raise _HookFailed
         return at
 
     def _off_hook(self, *, session_id: str, activated_monotonic: float, activated_utc: str) -> bool:
@@ -1638,12 +1810,19 @@ class _TwoPhaseRun:
     # -------------------------------------------------------------- phases
 
     async def _freeze(self, phase: ColdPhaseKind) -> ColdRunIdentity | None:
-        """Freeze and admit one phase identity, or ``None``."""
+        """Freeze and admit one phase identity naming the candidate's version, or ``None``."""
         try:
             raw: object = await self._identities.freeze(phase)
         except Exception:
             return None
-        return _admit_carrier(raw, ColdRunIdentity, _IDENTITY)
+        identity = _admit_carrier(raw, ColdRunIdentity, _IDENTITY)
+        candidate = typing.cast(ColdMcpCandidateProvenance, self._candidate)
+        if (
+            identity is not None
+            and identity.coffee_roaster_mcp_version != candidate.reported_version
+        ):
+            return None
+        return identity
 
     async def _admit(
         self, identity: ColdRunIdentity, phase: ColdPhaseKind
@@ -1922,6 +2101,9 @@ class _TwoPhaseRun:
         refusal = self._entry_refusal()
         if refusal is not None:
             return self._refused(refusal)
+        self._candidate = readmit_mcp_candidate_provenance(self._raw_candidate)
+        if self._candidate is None:
+            return self._refused(ColdRunStartRefusal.UNEXPECTED_FAILURE)
         if not self._child.configure(_OFF):
             return self._refused(ColdRunStartRefusal.CHILD_START_FAILED)
         self._refusal = ColdRunStartRefusal.CHILD_START_FAILED
@@ -2005,7 +2187,7 @@ class _TwoPhaseRun:
         self,
         outcome: ColdTwoPhaseOutcome,
         digest: str | None = None,
-        conformance: ColdAdvisoryConformanceResult | None = None,
+        conformance: ColdTemperatureConformanceResult | None = None,
     ) -> ColdTwoPhaseResult:
         """Build one evidence-bearing result row from admitted closed fields."""
         return ColdTwoPhaseResult(
@@ -2045,9 +2227,9 @@ class _TwoPhaseRun:
         return self._reload(digest)
 
     def _verify_failed_run_terminal(self, digest: str) -> bool:
-        """Reload a failed-run terminal through the V4 reader; verification only."""
+        """Reload a failed-run terminal through the V6 reader; verification only."""
         try:
-            read_retained_run_v4(
+            read_retained_run_v6(
                 self._root.path,
                 run_id=self._headers[_OFF].run_id,
                 expected_manifest_sha256=digest,
@@ -2062,20 +2244,21 @@ class _TwoPhaseRun:
             self._verify_failed_run_terminal(digest)
             return self._result(ColdTwoPhaseOutcome.NOT_CONFORMANT, digest)
         try:
-            retained = read_retained_run_v3(
+            retained = read_retained_run_v6(
                 self._root.path,
                 run_id=self._headers[_OFF].run_id,
                 expected_manifest_sha256=digest,
             )
-            checked: object = check_advisory_conformance(retained)
+            checked: object = check_temperature_conformance(retained)
         except Exception:
             checked = None
         conformance = _admit_carrier(
-            checked, ColdAdvisoryConformanceResult, _CHECKER, flat_identity=True
+            checked, ColdTemperatureConformanceResult, _CHECKER, flat_identity=True
         )
         conformant = (
             conformance is not None
-            and conformance.outcome is ColdAdvisoryConformanceOutcome.ADVISORY_CONFORMANT
+            and conformance.outcome
+            is ColdTemperatureConformanceOutcome.TEMPERATURE_SCREENED_CONFORMANT
         )
         if (
             conformant
@@ -2196,6 +2379,7 @@ async def run_two_phase_characterisation(
     configured_call_bound_seconds: float,
     configured_dwell_seconds: float,
     evaluator: ColdAdvisoryEvaluatorPort,
+    mcp_candidate: object,
     tick_observer: ColdRetainedTickObserver | None = None,
 ) -> ColdTwoPhaseResult:
     """Run one hardware-free-testable two-phase cold characterisation.
@@ -2218,6 +2402,10 @@ async def run_two_phase_characterisation(
         configured_call_bound_seconds: The sampler's configured per-call bound.
         configured_dwell_seconds: The sampler's configured post-completion dwell.
         evaluator: The typed safety-evaluation port for returned requests.
+        mcp_candidate: The operator-asserted reviewed MCP candidate provenance; it is
+            re-admitted before any child action (a refusal is an unowned
+            ``UNEXPECTED_FAILURE``), and each frozen phase identity must name its
+            reported version.  It never attests installed bytes.
         tick_observer: Optional display-only observer of each retained tick copy;
             its failure fails the run with no abort (see
             :class:`ColdRetainedTickObserver`).  ``None`` changes nothing.
@@ -2240,6 +2428,7 @@ async def run_two_phase_characterisation(
         configured_call_bound_seconds=configured_call_bound_seconds,
         configured_dwell_seconds=configured_dwell_seconds,
         evaluator=evaluator,
+        mcp_candidate=mcp_candidate,
         tick_observer=tick_observer,
     )
     return await run.execute()

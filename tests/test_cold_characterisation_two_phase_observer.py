@@ -20,7 +20,12 @@ from pathlib import Path
 import pytest
 
 from roastpilot_agent import cold_observation_stream as stream
-from roastpilot_agent.cold_characterisation import advisory_conformance, engine, two_phase
+from roastpilot_agent.cold_characterisation import (
+    advisory_conformance,
+    engine,
+    temperature_conformance,
+    two_phase,
+)
 from roastpilot_agent.cold_characterisation import evidence_builders as builders
 from roastpilot_agent.cold_characterisation import evidence_lifecycle as lifecycle
 from roastpilot_agent.cold_characterisation import evidence_schema as schema
@@ -30,6 +35,7 @@ from tests.test_cold_characterisation_evidence_builders import (
     device_state,
     observation,
     roast_fan_state,
+    screened_temperature,
     session_metadata,
 )
 from tests.test_cold_characterisation_two_phase import (
@@ -43,9 +49,11 @@ from tests.test_cold_characterisation_two_phase import (
     Outcome,
     R,
     World,
+    advisory_view,
     audio,
     conforming_tick,
     make_run,
+    phase_lines,
     retained_abort,
     scripted_observer,
     utc_at,
@@ -314,7 +322,8 @@ def test_t_d5_text_key_and_scalar_extremes() -> None:
 
 Phase = schema.ColdPhaseKind
 STREAMS: typing.Final = ("header", "tick", "host", "advisory", "finalisation", "abort", "lifecycle")
-TICKS_PER_PHASE: typing.Final = 4
+#: One pre-boundary tick plus the four 450 s instants (see the two-phase read schedule).
+TICKS_PER_PHASE: typing.Final = 5
 
 
 class PlainWorld(World):
@@ -428,12 +437,11 @@ def public_result_is_closed(result: two_phase.ColdTwoPhaseResult) -> bool:
     checked = result.conformance
     if checked is None:
         return True
-    findings = (*checked.findings, *checked.pre_advisory_findings)
     return (
-        type(checked) is advisory_conformance.ColdAdvisoryConformanceResult
+        type(checked) is temperature_conformance.ColdTemperatureConformanceResult
         and type(checked.policy_version) is int
         and _closed_member(checked.outcome)
-        and all(_closed_member(finding) for finding in findings)
+        and all(_closed_member(finding) for finding in checked.findings)
     )
 
 
@@ -456,8 +464,10 @@ def assert_failed_safely(
     sealed = digest is not None and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
     assert sealed
     retained = world.retained(digest)
-    checked = advisory_conformance.check_advisory_conformance(retained).outcome
-    assert checked is advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT
+    checked = temperature_conformance.check_temperature_conformance(retained).outcome
+    assert checked is temperature_conformance.ColdTemperatureConformanceOutcome.NOT_CONFORMANT
+    advisory = advisory_view(world, result).outcome
+    assert advisory is advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT
     closed = public_result_is_closed(result)
     assert closed
 
@@ -531,7 +541,8 @@ async def test_t_d2_a_no_op_observer_changes_nothing_and_absence_admits_no_tick(
     assert schema.ColdTickRecord not in roots
     (plain_sink,) = CapturingSink.created
     assert plain_sink.after_tick is None
-    assert len(typing.cast(dict[str, list[object]], plain["records"])["tick"]) == 8
+    plain_ticks = typing.cast(dict[str, list[object]], plain["records"])["tick"]
+    assert len(plain_ticks) == 2 * TICKS_PER_PHASE
 
     roots.clear()
     CapturingSink.created.clear()
@@ -581,13 +592,31 @@ async def test_t_d2b_capturing_sink_substitution_works_with_an_observer(
 
 
 class FailingWriter:
-    """Delegates to the real writer; the ``fail_at``-th tick append raises."""
+    """Delegates to the real writer; the ``fail_at``-th tick append raises.
 
-    def __init__(self, writer: store.ColdEvidenceWriter, fail_at: int, log: list[str]) -> None:
+    ``fail_temperature_at`` makes the N-th tick-temperature append raise instead.
+    """
+
+    def __init__(
+        self,
+        writer: store.ColdEvidenceWriter,
+        fail_at: int,
+        log: list[str],
+        fail_temperature_at: int = 0,
+    ) -> None:
         self.writer = writer
         self.fail_at = fail_at
+        self.fail_temperature_at = fail_temperature_at
         self.ticks = 0
+        self.temperatures = 0
         self.log = log
+
+    def append_tick_temperature(self, record: typing.Any) -> None:
+        self.temperatures += 1
+        if self.temperatures == self.fail_temperature_at:
+            raise RuntimeError("synthetic writer fault")
+        self.writer.append_tick_temperature(record)
+        self.log.append("write:tick_temperature")
 
     def append(self, record: schema.ColdEvidenceRecord) -> None:
         if type(record) is schema.ColdTickRecord:
@@ -605,25 +634,32 @@ class FailingWriter:
 
 
 def install_writer(
-    monkeypatch: pytest.MonkeyPatch, fail_at: int = 0, log: list[str] | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    fail_at: int = 0,
+    log: list[str] | None = None,
+    fail_temperature_at: int = 0,
 ) -> list[str]:
     """Wrap the run's real writer; returns the shared write log."""
     shared: list[str] = [] if log is None else log
     real_open = engine.open_phase_evidence
 
     def wrapped(admission: typing.Any) -> typing.Any:
-        return FailingWriter(real_open(admission), fail_at, shared)
+        return FailingWriter(real_open(admission), fail_at, shared, fail_temperature_at)
 
     monkeypatch.setattr(two_phase, "open_phase_evidence", wrapped)
     return shared
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fail_at", [1, 3, 6])
+@pytest.mark.parametrize("fail_at", [2, 4, 7])
 async def test_t_d3_no_call_for_a_failed_tick_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_at: int
 ) -> None:
-    """T-D3: a writer fault at tick N gives N-1 calls and the no-observer classification."""
+    """T-D3: a writer fault at tick N gives N-1 calls and the no-observer classification.
+
+    The ticks are the 550 s and 1450 s OFF ticks and the 450 s ON tick (each one
+    later than before the pre-boundary tick was added).
+    """
     install_writer(monkeypatch, fail_at)
     plain = await baseline(tmp_path)
     recorder = Recorder()
@@ -694,6 +730,7 @@ def foreign_session_tick(phase: Phase, at: int) -> Callable[[Phase, int], object
                 session=session_metadata(
                     session_id="session-foreign", elapsed_monotonic_seconds=float(index + 1)
                 ),
+                temperature=screened_temperature(index),
             )
         return conforming_tick(current, index)
 
@@ -701,7 +738,7 @@ def foreign_session_tick(phase: Phase, at: int) -> Callable[[Phase, int], object
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("phase", "at"), [(OFF, 0), (OFF, 2), (ON, 1)])
+@pytest.mark.parametrize(("phase", "at"), [(OFF, 1), (OFF, 3), (ON, 2)])
 async def test_t_d6_a_session_mismatch_suppresses_publication_without_failing(
     tmp_path: Path, phase: Phase, at: int
 ) -> None:
@@ -979,14 +1016,18 @@ async def test_t_d10_a_retained_abort_still_forbids_finalisation(
     """T-D10: observer failure, then an abort in any domain: that phase is never finalised."""
 
     async def behaviour(admission: typing.Any, sink: typing.Any, clock: Clock) -> object:
-        sink.append(
-            builders.build_tick_record(
-                header=admission.header,
-                tick=0,
-                recorded_at_utc=clock.utc_now_iso(),
-                monotonic_seconds=clock.t,
-                observation=conforming_tick(admission.phase, 0),
-            )
+        read = conforming_tick(admission.phase, 0)
+        tick = builders.build_tick_record(
+            header=admission.header,
+            tick=0,
+            recorded_at_utc=clock.utc_now_iso(),
+            monotonic_seconds=clock.t,
+            observation=read,
+        )
+        sink.append(tick)
+        # The tick is published only once its paired temperature is durable.
+        sink.append_tick_temperature(
+            builders.build_tick_temperature_record(tick=tick, observation=read)
         )
         return await retained_abort(domain, reason, True)(admission, sink, clock)
 
@@ -1022,7 +1063,7 @@ async def test_t_d11_a_base_exception_propagates_identically_after_cleanup(
 ) -> None:
     """T-D11: the identical object propagates; cleanup stop; no terminal, seal or check."""
     checks: list[object] = []
-    monkeypatch.setattr(two_phase, "check_advisory_conformance", checks.append)
+    monkeypatch.setattr(two_phase, "check_temperature_conformance", checks.append)
     interrupt = ObserverInterrupt()
 
     def boom(_tick: schema.ColdTickRecord, _count: int) -> None:
@@ -1040,6 +1081,8 @@ async def test_t_d11_a_base_exception_propagates_identically_after_cleanup(
     assert not world.manifest_exists()
     assert checks == []
     assert len(world.records("abort")) == 0
+    # OB3: the interrupt follows a durable pair, so no unpaired tick is left behind.
+    assert len(world.records("tick")) == len(world.records("tick_temperature")) == 1
 
 
 @pytest.mark.asyncio
@@ -1071,7 +1114,10 @@ async def test_t_d12_cancellation_from_the_observer_records_cancelled_and_reaps(
 async def test_t_d13_read_write_observer_host_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T-D13: read, tick write, observer, host sample; no sleep between write and observer."""
+    """T-D13 / OB1: read, tick write, temperature write, observer, host sample; no sleep.
+
+    Publication now follows one more durable write: the paired temperature line.
+    """
     log: list[str] = []
     install_writer(monkeypatch, log=log)
     instants: list[tuple[float, float]] = []
@@ -1097,10 +1143,33 @@ async def test_t_d13_read_write_observer_host_order(
     for index in writes:
         assert "read" in log[:index]
         assert log[index - 1] == "read"
-        assert log[index : index + 3] == ["write:tick", "observer", "host"]
+        assert log[index : index + 4] == [
+            "write:tick",
+            "write:tick_temperature",
+            "observer",
+            "host",
+        ]
+    assert log.count("observer") == log.count("write:tick_temperature") == 2 * TICKS_PER_PHASE
     # No clock movement (hence no engine sleep) between the read's completion and the call.
     assert len(instants) == 2 * TICKS_PER_PHASE
     assert all(now == recorded for now, recorded in instants)
+
+
+@pytest.mark.asyncio
+async def test_ob2_a_tick_whose_pair_failed_is_never_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OB2: the third temperature write fails; its durable tick is never displayed."""
+    install_writer(monkeypatch, fail_temperature_at=3)
+    recorder = Recorder()
+    world = ObservedWorld(tmp_path, recorder)
+    result = await world.run()
+    assert recorder.phases == [(OFF, 0), (OFF, 1)]
+    assert len(phase_lines(world, "tick", OFF)) == 3
+    assert len(phase_lines(world, "tick_temperature", OFF)) == 2
+    outcome = result.outcome
+    assert outcome is Outcome.EVIDENCE_NOT_SEALED
+    assert finalised_phases(world) == [] and not world.manifest_exists()
 
 
 # ------------------------------------------------------------------ T-D14

@@ -37,6 +37,21 @@ corrects D180's final implementation and evidence clauses. This closure
 supersedes the in-progress or stays-open-pending language in all earlier #702
 (D180) entries below, which are now historical.
 
+**4 Oct 2026 — #997 D209 cold temperature activation (software only; #954 is
+open):** the cold temperature work is delivered as software across S1 (PR
+#998), S2a (PR #999), T1 (PR #1000) and T2 (the runtime activation plus the
+runbook, registry and E11 reconciliation). Every cold tick now retains a paired
+tick-temperature record from the same read; the D209 engineering screen (bean
+and environment temperatures within 5 to 40 °C from the 60-second boundary,
+accepted-packet progress, a Celsius last packet, raw/typed agreement and no
+newly counted fault) aborts a phase without finalisation; an operator-asserted
+reviewed MCP candidate is recorded for each phase; and runtime success requires
+temperature conformance policy 3. The candidate is an operator assertion and
+does not attest the bytes that are installed. No release, installation,
+hardware, Pi or physical cold run has taken place: E11-S3 is not started, #954
+is open, and every supervised gate is unexecuted. This is software and
+documentation evidence only.
+
 **3 Oct 2026 — #954 cold characterisation software delivered (#954 stays
 OPEN):** the software for the supervised cold characterisation is delivered
 across U1 (PR #993), U2 (PR #994), the U3 cold view (PR #995) and U4 (the

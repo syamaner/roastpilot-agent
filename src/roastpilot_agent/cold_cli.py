@@ -8,8 +8,10 @@ means only that this invocation started no cold child.
 
 Output hygiene: a usage error prints one fixed line and never echoes argv; help is
 fixed grammar; config, input and host-fact failures print fixed closed tokens and
-never exception text.  Provenance flags are an operator assertion, never an
-attestation of the live bytes.  Temperatures are Celsius.
+never exception text.  Provenance flags, including the four reviewed MCP candidate
+flags, are an operator assertion, never an attestation of the live or installed
+bytes; the candidate's version must equal the installed self-reported MCP version.
+Temperatures are Celsius.
 """
 
 import argparse
@@ -29,6 +31,10 @@ import pydantic
 from roastpilot_agent import cold_runner
 from roastpilot_agent.cold_characterisation.advisory_sampler import ColdAdvisorySpec
 from roastpilot_agent.cold_characterisation.engine import ColdEngineHost
+from roastpilot_agent.cold_characterisation.evidence_temperature_run import (
+    MCP_CANDIDATE_DISTRIBUTION,
+    admit_mcp_candidate_document,
+)
 from roastpilot_agent.cold_characterisation.host import ColdHostBoundError, LinuxHostBoundsReader
 from roastpilot_agent.cold_characterisation.identity import (
     BOOT_ID_PATH,
@@ -123,6 +129,13 @@ def _sha256(text: str) -> str:
     return text
 
 
+def _byte_length(text: str) -> int:
+    """Admit a positive decimal byte length of at most ten digits, no leading zero."""
+    if re.fullmatch(r"[1-9][0-9]{0,9}", text) is None:
+        raise ValueError("not a byte length")
+    return int(text)
+
+
 def _tcp_port(text: str) -> int:
     """Admit a TCP port 1-65535 using the existing ``int`` syntax; 0 is refused."""
     value = int(text)
@@ -186,6 +199,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=_sha256,
         required=False,
         help="asserted 64-hex artefact digest (packaged kinds only)",
+    )
+    single(
+        "--mcp-candidate-version",
+        type=_non_empty,
+        help="reported version of the reviewed MCP candidate (operator assertion)",
+    )
+    single(
+        "--mcp-candidate-wheel-sha256",
+        type=_sha256,
+        help="64-hex digest of the reviewed MCP candidate wheel (operator assertion)",
+    )
+    single(
+        "--mcp-candidate-wheel-bytes",
+        type=_byte_length,
+        help="byte length of the reviewed MCP candidate wheel (operator assertion)",
+    )
+    single(
+        "--mcp-candidate-reviewed-revision",
+        type=_revision,
+        help="40-hex reviewed source revision of the MCP candidate (operator assertion)",
     )
     single("--host", type=_non_empty, required=False, help="bind host (default 127.0.0.1)")
     single("--port", type=_tcp_port, required=False, help="bind port (default 8000)")
@@ -385,6 +418,20 @@ def _run(argv: Sequence[str]) -> int:
         )
     except (pydantic.ValidationError, ColdIdentityError):
         return _refuse(cold_runner.CliRefusal.INPUT_NOT_ADMITTED, _INPUT_EXIT)
+    candidate = admit_mcp_candidate_document(
+        {
+            "distribution": MCP_CANDIDATE_DISTRIBUTION,
+            "reported_version": args.mcp_candidate_version,
+            "artefact_kind": "wheel",
+            "artefact_byte_length": args.mcp_candidate_wheel_bytes,
+            "artefact_sha256": args.mcp_candidate_wheel_sha256,
+            "reviewed_source_revision": args.mcp_candidate_reviewed_revision,
+            "assertion": "operator_asserted_reviewed_candidate",
+            "installed_bytes_attested": False,
+        }
+    )
+    if candidate is None:
+        return _refuse(cold_runner.CliRefusal.INPUT_NOT_ADMITTED, _INPUT_EXIT)
     try:
         config, _injected = load_app_config()
     except (ConfigFileError, pydantic.ValidationError, OSError, ValueError):
@@ -414,6 +461,7 @@ def _run(argv: Sequence[str]) -> int:
             operator_host_notes=args.operator_host_notes,
             operator_psu_notes=args.operator_psu_notes,
             operator_cooling_notes=args.operator_cooling_notes,
+            mcp_candidate=candidate,
         )
     except pydantic.ValidationError:
         return _refuse(cold_runner.CliRefusal.INPUT_NOT_ADMITTED, _INPUT_EXIT)

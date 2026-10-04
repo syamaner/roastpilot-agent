@@ -77,6 +77,7 @@ from roastpilot_agent.mcp_client import MCPServerProcess, resolve_mcp_command
 from roastpilot_agent.mcp_yaml import render_mcp_yaml
 from roastpilot_agent.models import AdvisorHealth, RoastPhase
 from roastpilot_agent.safety import SafetyPolicy
+from tests.test_cold_characterisation_evidence_builders import reviewed_candidate
 
 R = ColdCompositionRefusal
 OFF = ColdPhaseKind.RECORDING_OFF
@@ -411,6 +412,7 @@ def _inputs(
         operator_host_notes="none",
         operator_psu_notes="none",
         operator_cooling_notes="none",
+        mcp_candidate=reviewed_candidate(),
     )
 
 
@@ -509,9 +511,12 @@ async def test_t_c1_valid_inputs_call_the_runtime_once_with_single_instances(
         "configured_call_bound_seconds",
         "configured_dwell_seconds",
         "evaluator",
+        "mcp_candidate",
         "tick_observer",
     }
     assert kwargs["tick_observer"] is None
+    expected_candidate = reviewed_candidate()
+    assert kwargs["mcp_candidate"] == expected_candidate
     client, child, identities = kwargs["mcp"], kwargs["child"], kwargs["identities"]
     assert type(client) is ColdCharacterisationMCPClient
     assert client._call_tool == process.call_tool
@@ -1062,7 +1067,10 @@ async def _identity_source(
     inputs = _inputs(tmp_path)
     if host_version != "0.2.2":
         facts = inputs.host_facts.model_copy(update={"coffee_roaster_mcp_version": host_version})
-        inputs = inputs.model_copy(update={"host_facts": facts})
+        # The asserted candidate names the same version, so the run reaches the
+        # identity source and its pin check (not the composition candidate check).
+        candidate = reviewed_candidate(reported_version=host_version)
+        inputs = inputs.model_copy(update={"host_facts": facts, "mcp_candidate": candidate})
     await _run(tmp_path, resources, inputs=inputs)
     identities = runtime.calls[0]["identities"]
     assert type(identities) is ColdIdentitySource
@@ -2339,7 +2347,7 @@ async def test_t_c12_base_exception_propagates_unchanged(
 
 
 def test_t_c12_refusal_enum_is_closed_plain_and_ordered() -> None:
-    """T-C12: eleven plain-``Enum`` members in check order."""
+    """T-C12: twelve plain-``Enum`` members in check order (the D209 candidate last)."""
     assert [member.name for member in R] == [
         "RESOURCES_NOT_ADMITTED",
         "MCP_ENV_NOT_ADMITTED",
@@ -2352,8 +2360,215 @@ def test_t_c12_refusal_enum_is_closed_plain_and_ordered() -> None:
         "ROOT_NOT_ADMITTED",
         "MCP_SOURCE_NOT_ADMITTED",
         "PROFILE_NOT_ADMITTED",
+        "MCP_CANDIDATE_NOT_ADMITTED",
     ]
+    assert R.MCP_CANDIDATE_NOT_ADMITTED.value == "mcp_candidate_not_admitted"
     assert R.__mro__[1:] == (enum.Enum, object)
+
+
+# ------------------------------------- #997 T2: MCP candidate consumer (CO1-CO4)
+
+
+def _constructed(tmp_path: Path, **changes: object) -> ColdCompositionInputs:
+    """Inputs built by ``model_construct`` (no validator runs) with fields replaced.
+
+    Every other field is the valid ``_inputs`` value, so only the change can refuse.
+    """
+    valid = _inputs(tmp_path)
+    values: dict[str, typing.Any] = {
+        name: getattr(valid, name) for name in ColdCompositionInputs.model_fields
+    }
+    values.update(changes)
+    return ColdCompositionInputs.model_construct(**values)
+
+
+def _facts(version: object) -> ColdHostFacts:
+    """Host facts naming ``version``, constructed without validation."""
+    boot = Path("/nonexistent-rp954/boot_id")
+    return ColdHostFacts.model_construct(
+        coffee_roaster_mcp_version=version,
+        python_version="3.11.9",
+        platform="test-platform",
+        machine="aarch64",
+        operating_system="test-os",
+        kernel="test-kernel",
+        pi_model="test-pi",
+        pi_revision="test-rev",
+        boot_id_path=boot,
+    )
+
+
+class _Trap:
+    """Records every hook a hostile carrier would run."""
+
+    calls: typing.ClassVar[list[str]] = []
+
+    def __getattribute__(self, name: str) -> typing.Any:
+        _Trap.calls.append(f"getattr:{name}")
+        return object.__getattribute__(self, name)
+
+    def __eq__(self, other: object) -> bool:
+        _Trap.calls.append("eq")
+        return True
+
+    def __hash__(self) -> int:
+        _Trap.calls.append("hash")
+        return 0
+
+
+class _TrapStr(str):
+    """A ``str`` subclass recording equality and hashing."""
+
+    def __eq__(self, other: object) -> bool:
+        _Trap.calls.append("str-eq")
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        _Trap.calls.append("str-ne")
+        return False
+
+    def __hash__(self) -> int:
+        _Trap.calls.append("str-hash")
+        return 0
+
+
+class _TrapDict(dict[object, object]):
+    """A ``dict`` subclass recording lookups and iteration."""
+
+    def __getitem__(self, key: object) -> object:
+        _Trap.calls.append("dict-getitem")
+        return super().__getitem__(key)
+
+    def __iter__(self) -> typing.Iterator[object]:
+        _Trap.calls.append("dict-iter")
+        return super().__iter__()
+
+    def __contains__(self, key: object) -> bool:
+        _Trap.calls.append("dict-contains")
+        return super().__contains__(key)
+
+
+class _InputsSub(ColdCompositionInputs):
+    """A non-exact inputs class."""
+
+
+class _FactsSub(ColdHostFacts):
+    """A non-exact host-facts class."""
+
+
+def _with_dict(model: pydantic.BaseModel, data: object) -> typing.Any:
+    """A constructed copy whose raw ``__dict__`` is replaced by ``data``."""
+    copy = type(model).model_construct(**dict(object.__getattribute__(model, "__dict__")))
+    object.__setattr__(copy, "__dict__", data)
+    return copy
+
+
+def test_997_the_candidate_predicate_refuses_hostile_carriers_without_hooks(
+    tmp_path: Path,
+) -> None:
+    """L1: foreign, subclass, uninitialised, forged-nested and malformed carriers refuse."""
+    valid = _inputs(tmp_path)
+    raw = dict(object.__getattribute__(valid, "__dict__"))
+    subclass = _InputsSub.model_construct(**raw)
+    cases: dict[str, object] = {
+        "foreign": _Trap(),
+        "subclass": subclass,
+        "uninitialised": object.__new__(ColdCompositionInputs),
+        "nested_foreign": _constructed(tmp_path, host_facts=_Trap()),
+        "nested_subclass": _constructed(
+            tmp_path,
+            host_facts=_FactsSub.model_construct(
+                **dict(object.__getattribute__(valid.host_facts, "__dict__"))
+            ),
+        ),
+        "nested_uninitialised": _constructed(tmp_path, host_facts=object.__new__(ColdHostFacts)),
+        "version_str_subclass": _constructed(tmp_path, host_facts=_facts(_TrapStr("0.2.2"))),
+        "version_not_text": _constructed(tmp_path, host_facts=_facts(22)),
+        "non_str_key": _with_dict(valid, {**raw, 1: "x"}),
+        "dict_subclass_state": _with_dict(valid, _TrapDict(raw)),
+        "missing_candidate": _with_dict(
+            valid, {key: value for key, value in raw.items() if key != "mcp_candidate"}
+        ),
+        "nested_dict_subclass": _constructed(
+            tmp_path,
+            host_facts=_with_dict(
+                valid.host_facts,
+                _TrapDict(dict(object.__getattribute__(valid.host_facts, "__dict__"))),
+            ),
+        ),
+        "candidate_foreign": _constructed(tmp_path, mcp_candidate=_Trap()),
+        "candidate_forged": _constructed(
+            tmp_path,
+            mcp_candidate=reviewed_candidate().model_copy(
+                update={"installed_bytes_attested": True}
+            ),
+        ),
+        "version_mismatch": _constructed(
+            tmp_path, mcp_candidate=reviewed_candidate(reported_version="0.2.3")
+        ),
+    }
+    for name, value in cases.items():
+        _Trap.calls.clear()
+        assert cold_composition._admit_candidate(value) is None, name
+        assert _Trap.calls == [], name
+    fresh = cold_composition._admit_candidate(valid)
+    assert fresh is not None
+    assert fresh == valid.mcp_candidate and fresh is not valid.mcp_candidate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["forged_copy", "version_mismatch"])
+async def test_997_co1_co2_the_consumer_refuses_a_bypassed_candidate(
+    tmp_path: Path,
+    resources: ColdCompositionResources,
+    spawns: _Spawns,
+    runtime: _RuntimeStub,
+    case: str,
+) -> None:
+    """CO1/CO2: a constructed forged or mismatched candidate refuses before any process."""
+    candidate = (
+        reviewed_candidate().model_copy(update={"installed_bytes_attested": True})
+        if case == "forged_copy"
+        else reviewed_candidate(reported_version="0.2.3")
+    )
+    inputs = _constructed(tmp_path, mcp_candidate=candidate)
+    result = await _run(tmp_path, resources, inputs=inputs)
+    assert result is R.MCP_CANDIDATE_NOT_ADMITTED
+    assert spawns.processes == [] and runtime.calls == []
+
+
+@pytest.mark.asyncio
+async def test_997_co3_a_matching_candidate_reaches_the_runtime_fresh(
+    tmp_path: Path,
+    resources: ColdCompositionResources,
+    spawns: _Spawns,
+    runtime: _RuntimeStub,
+) -> None:
+    """CO3 positive control: one process; the runtime receives a fresh equal candidate."""
+    candidate = reviewed_candidate()
+    inputs = _constructed(tmp_path, mcp_candidate=candidate)
+    result = await _run(tmp_path, resources, inputs=inputs)
+    assert result is runtime.result
+    assert len(spawns.processes) == 1 and len(runtime.calls) == 1
+    passed = runtime.calls[0]["mcp_candidate"]
+    assert passed == candidate and passed is not candidate
+
+
+@pytest.mark.parametrize("case", ["forged_copy", "version_mismatch", "raw_document"])
+def test_997_co4_normal_construction_refuses_a_bad_candidate(tmp_path: Path, case: str) -> None:
+    """CO4: the early validators refuse a forged, mismatched or undocumented candidate."""
+    valid = _inputs(tmp_path)
+    data = {name: getattr(valid, name) for name in ColdCompositionInputs.model_fields}
+    candidate: object = {
+        "forged_copy": reviewed_candidate().model_copy(update={"installed_bytes_attested": True}),
+        "version_mismatch": reviewed_candidate(reported_version="0.2.3"),
+        "raw_document": reviewed_candidate().model_dump(mode="json"),
+    }[case]
+    with pytest.raises(pydantic.ValidationError):
+        ColdCompositionInputs.model_validate({**data, "mcp_candidate": candidate})
+    accepted = ColdCompositionInputs.model_validate(data)
+    assert accepted.mcp_candidate == valid.mcp_candidate
+    assert accepted.mcp_candidate is not valid.mcp_candidate
 
 
 # ------------------------------------------------------------------- resources

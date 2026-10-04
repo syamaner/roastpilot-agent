@@ -1572,7 +1572,10 @@ def test_f_imp_imports_attributes_and_public_surface() -> None:
 
 
 def test_f_imp_only_the_advisory_checker_imports_the_window() -> None:
-    """Only the checker and the 5c-i sampler import the window; two_phase imports the checker."""
+    """Only the checker and the 5c-i sampler import the window; policy 3 imports the checker.
+
+    FX4 (#997 T2): the orchestrator judges only policy 3, which composes policy 2.
+    """
     package = SOURCE.parents[1]
     assert _checker_consumers(package, "roastpilot_agent", module="advisory_window") == [
         "cold_characterisation/advisory_conformance.py",
@@ -1580,7 +1583,6 @@ def test_f_imp_only_the_advisory_checker_imports_the_window() -> None:
     ]
     assert _checker_consumers(package, "roastpilot_agent", module="advisory_conformance") == [
         "cold_characterisation/temperature_conformance.py",
-        "cold_characterisation/two_phase.py",
     ]
 
 

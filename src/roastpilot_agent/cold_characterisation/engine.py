@@ -3,8 +3,14 @@
 The engine admits one phase without creating anything, then observes it:
 ``start_cold_session``, ``mark_beans_added``, and ``get_roast_state`` at the
 fixed 1.0 s interval for 1800.0 s from the admitted activation instant.  Each
-read is retained as exactly one tick record before the pure policy evaluates
-it.  Aborts are durable, closed, and text-free; nothing is ever deleted.
+read is retained as one tick and one paired tick-temperature record, both built
+from that one read and one completion instant before either is written, and only
+then do the pure tick policy and the D209 temperature screen evaluate it with one
+shared seconds-since-activation value.  The screen's 5 to 40 °C range is
+engineering screening, not calibration; packet progress is not a watchdog.  The
+two writes are not a transaction.  Aborts are durable, closed, and text-free;
+temperature screen reasons are recorded in the existing ``ENGINE`` domain against
+the latest paired tick; nothing is ever deleted.
 
 The engine never finalises, stops, respawns, seals, or closes anything, and it
 reaches exactly five non-actuating MCP operations through ``ColdEngineMcp``.
@@ -43,7 +49,9 @@ from roastpilot_agent.cold_characterisation.evidence_builders import (
     build_abort_record,
     build_host_record,
     build_run_header,
+    build_temperature_abort_record,
     build_tick_record,
+    build_tick_temperature_record,
 )
 from roastpilot_agent.cold_characterisation.evidence_schema import (
     MAX_TEXT_FIELD_BYTES,
@@ -66,6 +74,11 @@ from roastpilot_agent.cold_characterisation.evidence_store import (
     check_record_binding,
     open_run,
 )
+from roastpilot_agent.cold_characterisation.evidence_temperature import ColdTickTemperatureRecord
+from roastpilot_agent.cold_characterisation.evidence_temperature_run import (
+    ColdTemperatureAbortRecord,
+    ColdTemperatureScreenReason,
+)
 from roastpilot_agent.cold_characterisation.host import ColdHostBoundError, HostBoundSample
 from roastpilot_agent.cold_characterisation.identity import ColdRunIdentity, identity_sha256
 from roastpilot_agent.cold_characterisation.mcp import (
@@ -76,6 +89,10 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdSessionPurposeError,
     ColdTickObservation,
 )
+from roastpilot_agent.cold_characterisation.temperature_projection import (
+    ColdTickTemperatureProjection,
+)
+from roastpilot_agent.cold_characterisation.temperature_screen import evaluate_temperature
 from roastpilot_agent.mcp_client import (
     EventCommandResult,
     RuntimeConfigSnapshot,
@@ -154,6 +171,14 @@ class ColdEngineSink(typing.Protocol):
 
     def append(self, record: ColdEvidenceRecord) -> None:
         """Durably append one record."""
+        ...
+
+    def append_tick_temperature(self, record: ColdTickTemperatureRecord) -> None:
+        """Durably append the tick-temperature record paired with the latest tick."""
+        ...
+
+    def append_temperature_abort(self, record: ColdTemperatureAbortRecord) -> None:
+        """Durably append one temperature-abort record against the latest paired tick."""
         ...
 
 
@@ -269,22 +294,36 @@ class ColdEngineUnexpectedError(RuntimeError):
 
 
 class ColdAbortClassification(pydantic.BaseModel):
-    """One closed abort classification in the HOST, EVIDENCE or ENGINE domain."""
+    """One closed abort classification in the HOST, EVIDENCE or ENGINE domain.
+
+    The ENGINE domain carries either an engine abort reason or a D209 temperature
+    screen reason; no new abort domain exists.
+    """
 
     model_config = _RESULT_CONFIG
 
     domain: ColdAbortDomain
-    reason: ColdHostAbortReason | ColdEvidenceFailure | ColdEngineAbortReason
+    reason: (
+        ColdHostAbortReason
+        | ColdEvidenceFailure
+        | ColdEngineAbortReason
+        | ColdTemperatureScreenReason
+    )
 
     @pydantic.model_validator(mode="after")
     def _require_pair(self) -> typing.Self:
-        """Admit exactly the three domain/reason-class pairs the engine produces."""
-        pairs: dict[ColdAbortDomain, type[enum.Enum]] = {
-            ColdAbortDomain.HOST: ColdHostAbortReason,
-            ColdAbortDomain.EVIDENCE: ColdEvidenceFailure,
-            ColdAbortDomain.ENGINE: ColdEngineAbortReason,
-        }
-        if type(self.reason) is not pairs.get(self.domain):
+        """Admit exactly the domain/reason-class pairs the engine produces, by identity."""
+        kind = type(self.reason)
+        domain = self.domain
+        if domain is ColdAbortDomain.HOST:
+            admitted = kind is ColdHostAbortReason
+        elif domain is ColdAbortDomain.EVIDENCE:
+            admitted = kind is ColdEvidenceFailure
+        elif domain is ColdAbortDomain.ENGINE:
+            admitted = kind is ColdEngineAbortReason or kind is ColdTemperatureScreenReason
+        else:
+            admitted = False
+        if not admitted:
             raise ValueError("abort domain and reason are not a closed pair")
         return self
 
@@ -717,8 +756,12 @@ class _HookResultNotAdmitted(Exception):
     """Internal signal: the activation hook returned a non-``bool``."""
 
 
-def _engine(reason: ColdEngineAbortReason) -> ColdAbortClassification:
-    """Return one ENGINE-domain classification."""
+class _NoPairedTick(Exception):
+    """Internal signal: a temperature abort has no paired tick to name."""
+
+
+def _engine(reason: ColdEngineAbortReason | ColdTemperatureScreenReason) -> ColdAbortClassification:
+    """Return one ENGINE-domain classification (an engine or temperature screen reason)."""
     return ColdAbortClassification(domain=ColdAbortDomain.ENGINE, reason=reason)
 
 
@@ -745,13 +788,25 @@ class _PhaseRun:
             admitted.header.monotonic_seconds, admitted.header.recorded_at_utc
         )
         self._session_id: str | None = None
+        #: This phase's previous screened projection; reset per phase by construction.
+        self._previous_temperature: ColdTickTemperatureProjection | None = None
+        #: The index of this phase's latest durably paired tick, if any.
+        self._paired_tick: int | None = None
 
     def _append(self, record: ColdEvidenceRecord) -> None:
         """Append one tick or host record; any failure disables the sink."""
+        self._deliver(lambda: self._sink.append(record))
+
+    def _append_temperature(self, record: ColdTickTemperatureRecord) -> None:
+        """Append the tick's paired temperature record with the same failure mapping."""
+        self._deliver(lambda: self._sink.append_tick_temperature(record))
+
+    def _deliver(self, append: Callable[[], None]) -> None:
+        """Run one sink append; any failure disables the sink and is classified."""
         failure: ColdEvidenceFailure | None = None
         typed = False
         try:
-            self._sink.append(record)
+            append()
         except ColdEvidenceError as error:
             self._sink_usable = False
             typed, failure = True, error.failure
@@ -775,21 +830,51 @@ class _PhaseRun:
         instant = self._last_valid
         for abort in aborts:
             try:
-                record = build_abort_record(
-                    header=self._admitted.header,
-                    domain=abort.domain,
-                    reason=abort.reason,
-                    recorded_at_utc=instant.utc,
-                    monotonic_seconds=instant.monotonic,
-                )
+                append = self._abort_append(abort, instant)
             except Exception:
                 return False
             try:
-                self._sink.append(record)
+                append()
             except Exception:
                 self._sink_usable = False
                 return False
         return True
+
+    def _abort_append(
+        self, abort: ColdAbortClassification, instant: _Instant
+    ) -> Callable[[], None]:
+        """Build one abort record and return its append.
+
+        A temperature screen reason becomes a schema-5 record against this phase's
+        latest paired tick (with no paired tick nothing is recorded); every other
+        reason becomes a v1 abort record.
+
+        Raises:
+            _NoPairedTick: For a temperature screen reason with no paired tick.
+        """
+        reason = abort.reason
+        if type(reason) is ColdTemperatureScreenReason:
+            tick = self._paired_tick
+            if tick is None:  # pragma: no cover - screen reasons follow a paired tick.
+                raise _NoPairedTick
+            screened = build_temperature_abort_record(
+                header=self._admitted.header,
+                tick=tick,
+                reason=reason,
+                recorded_at_utc=instant.utc,
+                monotonic_seconds=instant.monotonic,
+            )
+            return lambda: self._sink.append_temperature_abort(screened)
+        record = build_abort_record(
+            header=self._admitted.header,
+            domain=abort.domain,
+            reason=typing.cast(
+                ColdHostAbortReason | ColdEvidenceFailure | ColdEngineAbortReason, reason
+            ),
+            recorded_at_utc=instant.utc,
+            monotonic_seconds=instant.monotonic,
+        )
+        return lambda: self._sink.append(record)
 
     def _sample(self) -> _Instant:
         """Admit one clock sample at a sampled position, or classify ``CLOCK_INVALID``."""
@@ -868,6 +953,18 @@ class _PhaseRun:
                 monotonic_seconds=done.monotonic,
                 observation=observation,
             )
+        except ColdEvidenceError as error:
+            failure = error.failure
+        raise _Classified(ColdAbortClassification(domain=ColdAbortDomain.EVIDENCE, reason=failure))
+
+    @staticmethod
+    def _build_temperature(
+        record: ColdTickRecord, observation: ColdTickObservation
+    ) -> ColdTickTemperatureRecord:
+        """Build the tick's paired temperature record; a refusal is an EVIDENCE abort."""
+        failure: ColdEvidenceFailure
+        try:
+            return build_tick_temperature_record(tick=record, observation=observation)
         except ColdEvidenceError as error:
             failure = error.failure
         raise _Classified(ColdAbortClassification(domain=ColdAbortDomain.EVIDENCE, reason=failure))
@@ -972,17 +1069,31 @@ class _PhaseRun:
             read_start = now
             observation = await self._read(session_id)
             done = self._sample()
+            # Both records come from this one read and one instant, before any write.
             record = self._build_tick(tick, done, observation)
+            temperature = self._build_temperature(record, observation)
             self._append(record)
+            self._append_temperature(temperature)
+            self._paired_tick = tick
+            since = done.monotonic - activation.monotonic
             decision: ColdTickDecision = evaluate_tick(
                 record,
                 established_session_id=session_id,
                 frozen_driver=self._admitted.frozen_driver,
-                since_activation_seconds=done.monotonic - activation.monotonic,
+                since_activation_seconds=since,
                 previous_elapsed=previous,
             )
-            if decision.reasons:
-                raise _Classified(*(_engine(reason) for reason in decision.reasons))
+            screen = evaluate_temperature(
+                temperature.temperature,
+                previous=self._previous_temperature,
+                since_activation_seconds=since,
+            )
+            if decision.reasons or screen:
+                raise _Classified(
+                    *(_engine(reason) for reason in decision.reasons),
+                    *(_engine(reason) for reason in screen),
+                )
+            self._previous_temperature = temperature.temperature
             after = await self._host_record()
             previous = decision.next_previous_elapsed_seconds
             tick += 1

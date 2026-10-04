@@ -197,6 +197,13 @@ outstanding. E11-S3 remains the unstarted Pi soak.
 **#954 cold characterisation (Oct 2026):** the software for the supervised
 cold characterisation is delivered across U1 (PR #993), U2 (PR #994), the U3
 cold view (PR #995) and U4 (the cold CLI, same-loop hosting and
-`docs/deployment/cold-characterisation-runbook.md`). The physical cold run and
-E11-S3 are not started, every operator-supervised gate is unexecuted, and #954
-stays open.
+`docs/deployment/cold-characterisation-runbook.md`). #997 (D209) then delivered
+the cold temperature software across S1 (PR #998), S2a (PR #999), T1 (PR #1000)
+and T2 (the runtime activation and this runbook, registry and epic
+reconciliation): each tick retains a paired temperature record, the D209 5 to
+40 °C engineering screen aborts a phase without finalisation, an
+operator-asserted reviewed MCP candidate is recorded per phase, and runtime
+success requires temperature conformance policy 3. The installed package still
+pins `coffee-roaster-mcp==0.2.2`; installing the reviewed candidate is a
+separately authorised gate. The physical cold run and E11-S3 are not started,
+every operator-supervised gate is unexecuted, and #954 stays open.

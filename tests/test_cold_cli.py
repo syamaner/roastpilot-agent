@@ -55,6 +55,10 @@ SUMMARY_KEYS = (
 REVISION = "0123456789abcdef0123456789abcdef01234567"
 DIGEST = "ab" * 32
 SECONDARY = "/srv/secondary-evidence-root"
+#: Synthetic operator-asserted MCP candidate values (never a reviewed artefact).
+CANDIDATE_DIGEST = "cd" * 32
+CANDIDATE_REVISION = "fedcba9876543210fedcba9876543210fedcba98"
+CANDIDATE_BYTES = "2147483647"
 
 
 def base_argv(**overrides: str | None) -> list[str]:
@@ -73,6 +77,10 @@ def base_argv(**overrides: str | None) -> list[str]:
         "--source-revision": REVISION,
         "--source-tree": "clean",
         "--artefact-kind": "editable_source",
+        "--mcp-candidate-version": "0.2.2",
+        "--mcp-candidate-wheel-sha256": CANDIDATE_DIGEST,
+        "--mcp-candidate-wheel-bytes": CANDIDATE_BYTES,
+        "--mcp-candidate-reviewed-revision": CANDIDATE_REVISION,
     }
     values.update(overrides)
     argv: list[str] = []
@@ -239,6 +247,10 @@ def test_normal_parser_grammar_is_unchanged() -> None:
         "--source-revision",
         "--source-tree",
         "--artefact-kind",
+        "--mcp-candidate-version",
+        "--mcp-candidate-wheel-sha256",
+        "--mcp-candidate-wheel-bytes",
+        "--mcp-candidate-reviewed-revision",
     ],
 )
 def test_each_missing_required_flag_is_a_fixed_usage_error(
@@ -324,6 +336,10 @@ DUPLICATE_ROWS: list[tuple[str, list[str]]] = [
     ("host", [*base_argv(), "--host", "127.0.0.1", "--host", "0.0.0.0"]),
     ("port", [*base_argv(), "--port", "8001", "--port", "8002"]),
     ("spa", [*base_argv(), "--spa-dir", "/srv/a", "--spa-dir", f"/srv/{MARKER}"]),
+    ("candidate-version", [*base_argv(), "--mcp-candidate-version", "0.2.3"]),
+    ("candidate-digest", [*base_argv(), "--mcp-candidate-wheel-sha256", "ef" * 32]),
+    ("candidate-bytes", [*base_argv(), "--mcp-candidate-wheel-bytes", "169948"]),
+    ("candidate-revision", [*base_argv(), "--mcp-candidate-reviewed-revision", "a" * 40]),
 ]
 
 
@@ -375,6 +391,101 @@ def test_help_is_fixed_grammar_with_only_host_and_port_defaults(
     assert len(defaults) == 2
     assert any("default 127.0.0.1" in line for line in defaults)
     assert any("default 8000" in line for line in defaults)
+
+
+def test_997_cl1_the_candidate_flags_reach_the_inputs_exactly(harness: Harness) -> None:
+    """CL1: the four asserted values become the admitted candidate, never installed bytes."""
+    assert cold_cli.main(base_argv()) == 0
+    _config, inputs, _kwargs = harness.hosted[0]
+    candidate = inputs.mcp_candidate
+    assert (
+        candidate.distribution,
+        candidate.reported_version,
+        candidate.artefact_kind.value,
+        candidate.artefact_byte_length,
+        candidate.artefact_sha256,
+        candidate.reviewed_source_revision,
+        candidate.assertion.value,
+        candidate.installed_bytes_attested,
+    ) == (
+        "coffee-roaster-mcp",
+        "0.2.2",
+        "wheel",
+        int(CANDIDATE_BYTES),
+        CANDIDATE_DIGEST,
+        CANDIDATE_REVISION,
+        "operator_asserted_reviewed_candidate",
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--mcp-candidate-version", ""),
+        ("--mcp-candidate-wheel-sha256", CANDIDATE_DIGEST.upper()),
+        ("--mcp-candidate-wheel-sha256", "c" * 63),
+        ("--mcp-candidate-wheel-bytes", "0"),
+        ("--mcp-candidate-wheel-bytes", "-1"),
+        ("--mcp-candidate-wheel-bytes", "01"),
+        ("--mcp-candidate-wheel-bytes", "12345678901"),
+        ("--mcp-candidate-wheel-bytes", f"1{MARKER}"),
+        ("--mcp-candidate-reviewed-revision", "a" * 39),
+        ("--mcp-candidate-reviewed-revision", MARKER),
+    ],
+    ids=[
+        "empty-version",
+        "uppercase-digest",
+        "short-digest",
+        "zero-bytes",
+        "negative-bytes",
+        "leading-zero-bytes",
+        "eleven-digit-bytes",
+        "text-bytes",
+        "short-revision",
+        "text-revision",
+    ],
+)
+def test_997_cl2_parser_refusals_are_the_fixed_usage_line(
+    harness: Harness, capsys: pytest.CaptureFixture[str], flag: str, value: str
+) -> None:
+    """CL2: a grammar refusal is the fixed line with no summary, config load or echo."""
+    assert exit_status(base_argv(**{flag: value})) == 2
+    captured = capsys.readouterr()
+    assert captured.err == cold_cli.USAGE_ERROR_LINE
+    assert captured.out == "" and MARKER not in captured.err
+    assert harness.config_loads == 0 and harness.hosted == []
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [("--mcp-candidate-wheel-bytes", "2147483648"), ("--mcp-candidate-version", "v0.2.2")],
+    ids=["bytes-over-limit", "v-prefixed-version"],
+)
+def test_997_cl3_candidate_admission_refuses_before_the_config(
+    harness: Harness, capsys: pytest.CaptureFixture[str], flag: str, value: str
+) -> None:
+    """CL3: parser-valid values the candidate grammar refuses: closed summary, exit 2."""
+    assert cold_cli.main(base_argv(**{flag: value})) == 2
+    output = capsys.readouterr().out
+    summary = parse_summary(output)
+    assert (summary["cli_refusal"], summary["run_invoked"], summary["exit_code"]) == (
+        "input_not_admitted",
+        "false",
+        "2",
+    )
+    assert value not in output
+    assert harness.config_loads == 0 and harness.hosted == []
+
+
+def test_997_cl4_a_candidate_naming_another_installed_version_is_not_admitted(
+    harness: Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CL4: a grammar-valid version differing from the host's refuses after one config load."""
+    assert cold_cli.main(base_argv(**{"--mcp-candidate-version": "0.2.3"})) == 2
+    summary = parse_summary(capsys.readouterr().out)
+    assert (summary["cli_refusal"], summary["exit_code"]) == ("input_not_admitted", "2")
+    assert harness.config_loads == 1 and harness.hosted == []
 
 
 @pytest.mark.parametrize("drop", ["-40.0", "1000.0"])
