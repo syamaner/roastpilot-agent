@@ -40,7 +40,26 @@ duration and no run authority of its own.
   recording fields are unset and whose MCP YAML source is an absolute path.
 - The advisor credential is present in the environment under its configured
   variable name. Never paste it into the command line.
-- The installed package pins `coffee-roaster-mcp==0.2.2`.
+- **The MCP package: three different things.** Keep them apart.
+  1. *Published distribution metadata.* The `[pi]` extra and the development
+     group pin `coffee-roaster-mcp==0.2.2`; the published 0.2.2 wheel digest is
+     `25f4164027afc9d336e8726465ad3c702c39dc40a905c9f83a2c36f3473d4de3`.
+     Published 0.2.2 lacks the temperature projection, so every cold run
+     against it **fails closed at its first tick** (`NOT_CONFORMANT`).
+  2. *Reviewed candidate bytes*, as recorded by the #997 review: reviewed source
+     revision `0fc5e6d2e2a677c392b0706267e154f5780b96b0`; merged MCP main
+     `96f8916407ec8d31bbed9637e824c3cd2b0cf24a` (tree
+     `02bfa739a4cc3975295540c7df98ac844b5abbb7`); a retained candidate wheel
+     of 169948 bytes with SHA-256
+     `4f52048efa4c368e785c30acface04356dd943583a251e02a9b635905dec476a`. Its
+     self-reported version is also 0.2.2, so only the digest, byte length and
+     reviewed revision distinguish it from the published wheel.
+  3. *Installed bytes*, which this software never attests.
+
+  Installing the candidate is **a separately authorised gate** and is not
+  authorised by this runbook. No authenticity, rebuild or installation claim is
+  made, and no relation between the reviewed and merged trees is claimed beyond
+  the recorded values.
 - The terminal session survives a disconnect (for example `tmux` or `screen`).
   SIGHUP is not handled.
 - **Complete appliance (D194, E11-S3).** A Raspberry Pi 5 runs the installed
@@ -86,6 +105,10 @@ roastpilot-agent cold-characterisation \
   --source-tree clean \
   --artefact-kind wheel \
   --artefact-sha256 <64 lowercase hex> \
+  --mcp-candidate-version <installed self-reported MCP version> \
+  --mcp-candidate-wheel-sha256 <64 lowercase hex> \
+  --mcp-candidate-wheel-bytes <positive byte length> \
+  --mcp-candidate-reviewed-revision <40 lowercase hex> \
   --host 127.0.0.1 \
   --port 8000
 ```
@@ -117,6 +140,13 @@ roastpilot-agent cold-characterisation \
   `--artefact-kind`, `--artefact-sha256`) are an **operator assertion**, not an
   attestation. The self-reported versions, the temporary directories and the
   source checkout do not attest the bytes or packages that actually run.
+- The four `--mcp-candidate-*` options are required. Copy them from the
+  reviewed-candidate record of the artefact that the separately authorised gate
+  actually installed. `--mcp-candidate-version` must equal the installed
+  self-reported MCP version; otherwise the CLI refuses with
+  `input_not_admitted`, exit 2. These values are an **operator assertion** and
+  the software does not attest the bytes that are installed. Each phase's
+  evidence records the asserted candidate before its first tick.
 
 Once the HTTP server has started, the process prints one fixed line,
 `roastpilot-agent cold-characterisation: run starting`, and only then invokes
@@ -137,6 +167,10 @@ the run.
   classification**. A displayed tick is never an accepted, safe or qualified
   tick, and the stream is never proof that observation continues during a clock
   stall.
+- A tick is published only after both its tick record and its paired
+  tick-temperature record are retained, so publication follows one extra
+  durable write. If the temperature record cannot be written, that tick may be
+  retained on disk but is never displayed, and the run fails unsealed.
 - A disconnected client's slot is released at the next tick or heartbeat, when
   the server sees the ASGI disconnect. That is a bounded release, not a
   watchdog.
@@ -162,6 +196,13 @@ summary of exactly 16 `key=value` lines (delivery may be incomplete, as below):
 `advisory_path`, `provider_check`, `conformance_outcome`, `manifest_sha256`,
 `signal`, `http_server` and `exit_code`. Values are closed tokens; no host,
 port, path, profile, note, credential or exception text is printed.
+
+`conformance_outcome` reports temperature conformance policy 3
+(`temperature_screened_conformant` or `not_conformant`), which composes the
+advisory policy. Exit 0 (`ADVISORY_CONFORMANT`) requires
+`temperature_screened_conformant`. `composition_refusal` may be
+`mcp_candidate_not_admitted` (exit 4) when the run consumer re-admits the
+candidate and refuses it.
 
 `http_server` is one synchronous snapshot, taken at the single report attempt,
 of this invocation's HTTP server task and its startup barrier:
@@ -276,8 +317,26 @@ Independent Pi evidence review follows separately.
 
 ## 8. Safety residuals
 
-- Numeric roaster-temperature plausibility is **unresolved**: values are
-  checked for finiteness only, with no range.
+- **D209 temperature screen.** From the 60-second startup boundary, bean and
+  environment temperatures must each lie within 5 to 40 °C inclusive, and
+  every observation must show accepted-packet progress since the previous one,
+  a valid last packet in Celsius, raw/typed agreement and no newly counted
+  ignored-temperature packet, serial-read error or command-loop error. Any
+  screen reason aborts the phase with a retained abort and no finalisation.
+  The range is engineering screening, not calibration, and not a
+  physical-safety statement.
+- Packet progress means at least one accepted packet arrived between two
+  observations. It is not a watchdog and not a sample-age bound.
+- Raw/typed agreement is consistency, not independent sensor corroboration, and
+  an `observed` projection does not imply liveness.
+- A non-Celsius reported unit fails the screen.
+- Bad-checksum frames that the device driver skips without counting them are
+  invisible to every counter: a disclosed residual.
+- The tick and its tick-temperature record are two durable writes, not a
+  transaction; a process kill between them leaves an unsealed tree with no
+  receipt.
+- The acceptance interpretation of the inner run does not include the
+  temperature screen; the screen is judged by temperature conformance policy 3.
 - Clock progress is a port contract, not a watchdog.
 - The **D195 six-dimension envelope (heat, roast fan, main fan, drum, cooling,
   solenoid/drop) is checked only at eligible finalisation, never after a

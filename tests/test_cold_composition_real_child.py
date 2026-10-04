@@ -55,6 +55,7 @@ from roastpilot_agent.config import (
 from roastpilot_agent.mcp_client import RuntimeConfigSnapshot, ServerInfo, resolve_mcp_command
 from roastpilot_agent.mcp_yaml import render_mcp_yaml
 from roastpilot_agent.models import RoastPhase
+from tests.test_cold_characterisation_evidence_builders import reviewed_candidate
 
 pytestmark = [
     pytest.mark.slow,
@@ -212,6 +213,7 @@ async def test_t_u1_rc_real_child_closed_environment_and_committed_bytes(
         operator_host_notes="none",
         operator_psu_notes="none",
         operator_cooling_notes="none",
+        mcp_candidate=reviewed_candidate(),
     )
     config = AppConfig(mcp=MCPConfig(startup_timeout_seconds=15.0, call_timeout_seconds=5.0))
 

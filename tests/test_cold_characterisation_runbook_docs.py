@@ -51,7 +51,6 @@ def test_runbook_states_the_safety_boundaries() -> None:
         "only heat, roast fan (D197) and cooling are observed, and they are commanded state, "
         "not sensing",
         "The independent operator emergency stop is required throughout the run.",
-        "Numeric roaster-temperature plausibility is unresolved",
         "Exit codes 80-83",
         "no trusted receipt",
         "Repeated signals neither force an exit nor cancel again.",
@@ -292,3 +291,94 @@ def test_runbook_states_complete_appliance_preconditions_and_interrupted_usage_o
         "the interrupt rule instead: exit 130 with one `cancelled_before_run` summary"
     )
     assert 0 < interrupted - usage < 200
+
+
+# ----------------------------------------- #997 T2: D209 reconciliation (DC1-DC4)
+
+_RETIRED_PHRASES = ("plausibility is unresolved", "values are checked for finiteness only")
+
+
+def _normalised(text: str) -> str:
+    """Whitespace-normalised text with Markdown bold markers removed."""
+    return _flat(text).replace("**", "")
+
+
+@pytest.mark.docs
+def test_997_dc1_the_runbook_states_the_d209_screen_and_its_residuals() -> None:
+    """DC1: the finiteness-only residual is retired; the screen and its limits are stated.
+
+    Literal checks only (positive control: both retired phrases are present in the
+    base runbook); the product audit is the semantic lens.
+    """
+    raw = RUNBOOK.read_text(encoding="utf-8")
+    text = _normalised(raw)
+    for retired in _RETIRED_PHRASES:
+        assert retired not in text, retired
+    for phrase in (
+        "5 to 40 °C",
+        "engineering screening, not calibration",
+        "not a watchdog",
+        "Bad-checksum frames",
+        "operator assertion",
+        "does not attest the bytes that are installed",
+        "fails closed at its first tick",
+        "a separately authorised gate",
+        "A non-Celsius reported unit fails the screen.",
+        "not a transaction",
+        "`temperature_screened_conformant`",
+        "`mcp_candidate_not_admitted` (exit 4)",
+    ):
+        assert phrase in text, phrase
+    command = _section(raw, "## 3. Command")
+    block = command[command.index("```bash") : command.index("```", command.index("```bash") + 3)]
+    for flag in (
+        "--mcp-candidate-version",
+        "--mcp-candidate-wheel-sha256",
+        "--mcp-candidate-wheel-bytes",
+        "--mcp-candidate-reviewed-revision",
+    ):
+        assert flag in block, flag
+    assert "0 | `ADVISORY_CONFORMANT` | Not qualification" in raw
+
+
+@pytest.mark.docs
+def test_997_dc2_the_runbook_distinguishes_reviewed_candidate_and_published_bytes() -> None:
+    """DC2: the reviewed-candidate record values and the published 0.2.2 digest differ."""
+    prerequisites = _normalised(_section(RUNBOOK.read_text(encoding="utf-8"), "## 2. Prereq"))
+    published = "25f4164027afc9d336e8726465ad3c702c39dc40a905c9f83a2c36f3473d4de3"
+    reviewed = "4f52048efa4c368e785c30acface04356dd943583a251e02a9b635905dec476a"
+    for value in (
+        published,
+        reviewed,
+        "169948 bytes",
+        "0fc5e6d2e2a677c392b0706267e154f5780b96b0",
+        "96f8916407ec8d31bbed9637e824c3cd2b0cf24a",
+        "02bfa739a4cc3975295540c7df98ac844b5abbb7",
+        "Published distribution metadata",
+        "Reviewed candidate bytes",
+        "Installed bytes",
+    ):
+        assert value in prerequisites, value
+    assert prerequisites.index(published) < prerequisites.index(reviewed)
+
+
+@pytest.mark.docs
+def test_997_dc3_e11_records_the_997_slices_and_keeps_e11_s3_unstarted() -> None:
+    """DC3: E11 names the #997 slices, keeps the published pin and an unstarted E11-S3."""
+    epic = _flat(EPIC.read_text(encoding="utf-8"))
+    for value in ("#998", "#999", "#1000", "T2", "`coffee-roaster-mcp==0.2.2`"):
+        assert value in epic, value
+    assert "E11-S3 are not started" in epic
+
+
+@pytest.mark.docs
+def test_997_dc4_the_registry_records_997_as_software_only_and_954_open() -> None:
+    """DC4: a dated #997 entry, software only, #954 open, E11-S3 unstarted, no overclaim."""
+    registry = REGISTRY.read_text(encoding="utf-8")
+    start = registry.index("**4 Oct 2026 — #997")
+    entry = _flat(registry[start : registry.index("\n\n", start)])
+    for phrase in ("software", "#954 is open", "E11-S3 is not started"):
+        assert phrase in entry, phrase
+    assert all(phrase.casefold() not in entry.casefold() for phrase in PROHIBITED)
+    assert registry.index("D-ToS-1 governance reconciliation") < start
+    assert start < registry.index("**3 Oct 2026 — #954")

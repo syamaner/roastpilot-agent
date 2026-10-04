@@ -28,6 +28,7 @@ from pathlib import Path
 import pydantic
 import pytest
 
+from roastpilot_agent import cold_runner
 from roastpilot_agent.advisor import (
     AdvisorContext,
     AdvisorDescriptor,
@@ -41,6 +42,7 @@ from roastpilot_agent.cold_characterisation import (
     advisory_sampler,
     conformance,
     engine,
+    temperature_conformance,
     two_phase,
 )
 from roastpilot_agent.cold_characterisation import evidence_advisory as advisory_builders
@@ -50,7 +52,20 @@ from roastpilot_agent.cold_characterisation import evidence_reader as reader
 from roastpilot_agent.cold_characterisation import evidence_schema as schema
 from roastpilot_agent.cold_characterisation import evidence_store as store
 from roastpilot_agent.cold_characterisation import evidence_terminal as terminal_module
-from roastpilot_agent.cold_characterisation.identity import ColdArtefactKind, ColdRunIdentity
+from roastpilot_agent.cold_characterisation.evidence_temperature import (
+    ColdTickTemperatureError,
+    ColdTickTemperatureFailure,
+)
+from roastpilot_agent.cold_characterisation.evidence_temperature_run import (
+    ColdTemperatureRunError,
+    ColdTemperatureRunFailure,
+    ColdTemperatureScreenReason,
+)
+from roastpilot_agent.cold_characterisation.identity import (
+    ColdArtefactKind,
+    ColdIdentityError,
+    ColdRunIdentity,
+)
 from roastpilot_agent.cold_characterisation.mcp import (
     ColdFinalisationNotCleanError,
     ColdFinalisationSafetyError,
@@ -58,8 +73,13 @@ from roastpilot_agent.cold_characterisation.mcp import (
     ColdSessionIdentityError,
     ColdSessionPurposeError,
     ColdTickObservation,
+    ColdTickTemperatureProjectionError,
     SessionFinalisationResult,
 )
+from roastpilot_agent.cold_characterisation.temperature_projection import (
+    ColdTemperatureProjectionFailure,
+)
+from roastpilot_agent.cold_characterisation.temperature_screen import evaluate_temperature
 from roastpilot_agent.config import SafetyLimits
 from roastpilot_agent.mcp_client import (
     EventCommandResult,
@@ -76,12 +96,16 @@ from tests.test_cold_characterisation_evidence_builders import (
     RUN_ID,
     device_state,
     observation,
+    reviewed_candidate,
     roast_fan_state,
+    screened_temperature,
     session_metadata,
 )
 from tests.test_cold_characterisation_evidence_store import make_root
 
 Phase = schema.ColdPhaseKind
+TemperatureOutcome = temperature_conformance.ColdTemperatureConformanceOutcome
+TemperatureFinding = temperature_conformance.ColdTemperatureConformanceFinding
 OFF = Phase.RECORDING_OFF
 ON = Phase.RECORDING_ON
 Event = lifecycle.ColdLifecycleEvent
@@ -239,7 +263,10 @@ class Clock:
 
 
 def conforming_tick(phase: Phase, index: int) -> ColdTickObservation:
-    """One replay-clean tick whose heartbeat and audio counters rise with ``index``."""
+    """One replay-clean tick whose heartbeat, audio and packet counters rise with ``index``.
+
+    The packet counters restart per phase with the per-phase read index.
+    """
     return observation(
         device_state(driver=DRIVER),
         roast_fan=roast_fan_state(level=0),
@@ -247,7 +274,24 @@ def conforming_tick(phase: Phase, index: int) -> ColdTickObservation:
         session=session_metadata(
             session_id=SESSIONS[phase], elapsed_monotonic_seconds=float(index + 1)
         ),
+        temperature=screened_temperature(index),
     )
+
+
+#: The first read ends 30 s after activation (before the 60-second screen boundary)
+#: and the second 420 s later, so the four original 450 s tick instants are kept and
+#: one pre-boundary tick precedes them: 130, 550, 1000, 1450, 1900 for recording-off.
+_BASE_READS: typing.Final = {0: 30.0, 1: 420.0}
+
+
+def read_schedule(**late: float) -> Callable[[Phase, int], float]:
+    """The per-phase read durations; ``late`` maps ``"off_<i>"``/``"on_<i>"`` to a duration."""
+
+    def seconds(phase: Phase, index: int) -> float:
+        key = f"{'off' if phase is OFF else 'on'}_{index}"
+        return late.get(key, _BASE_READS.get(index, READ_SECONDS))
+
+    return seconds
 
 
 def clean_result(phase: Phase, session_id: str, **changes: object) -> SessionFinalisationResult:
@@ -298,7 +342,7 @@ class Mcp:
         self.calls: list[tuple[str, Phase | None]] = []
         self.finalised: list[str] = []
         self.before: dict[str, Callable[[], None]] = {}
-        self.read_seconds: Callable[[Phase, int], float] = lambda _phase, _index: READ_SECONDS
+        self.read_seconds: Callable[[Phase, int], float] = read_schedule()
         self.tick: Callable[[Phase, int], object] = conforming_tick
         self.finalise_advance = 1.0
         self.finalise: Callable[[Phase, str], object] = clean_result
@@ -636,6 +680,8 @@ class World:
         self.spec: object = SPEC
         self.bound: object = CALL_BOUND
         self.dwell: object = DWELL
+        #: The operator-asserted MCP candidate the run re-admits before any child action.
+        self.candidate: object = reviewed_candidate()
         self.finished = False
 
     def advisor_factory(self) -> Advisor:
@@ -661,6 +707,7 @@ class World:
                 identities=self.identities,
                 host=self.host,
                 clock=self.clock,
+                mcp_candidate=self.candidate,
                 **self.advisory_arguments(),
             )
         finally:
@@ -695,15 +742,10 @@ class World:
     def manifest_exists(self) -> bool:
         return (Path(self.root) / RUN_ID / "manifest.json").exists()
 
-    def retained(self, digest: str | None) -> reader.ColdRetainedRunV3:
+    def retained(self, digest: str | None) -> reader.ColdRetainedRunV6:
+        """The sealed run through the production V6 reader."""
         assert digest is not None
-        return reader.read_retained_run_v3(
-            self.root, run_id=RUN_ID, expected_manifest_sha256=digest
-        )
-
-    def retained_v4(self, digest: str | None) -> reader.ColdRetainedRunV4:
-        assert digest is not None
-        return reader.read_retained_run_v4(
+        return reader.read_retained_run_v6(
             self.root, run_id=RUN_ID, expected_manifest_sha256=digest
         )
 
@@ -730,17 +772,43 @@ def assert_no_canary(result: two_phase.ColdTwoPhaseResult) -> None:
 
 def findings_of(
     result: two_phase.ColdTwoPhaseResult,
-) -> set[advisory_conformance.ColdAdvisoryConformanceFinding]:
+) -> set[temperature_conformance.ColdTemperatureConformanceFinding]:
+    """The policy-3 findings carried by the admitted runtime result."""
     assert result.conformance is not None
     return set(result.conformance.findings)
 
 
+def advisory_view(
+    world: World, result: two_phase.ColdTwoPhaseResult
+) -> advisory_conformance.ColdAdvisoryConformanceResult:
+    """Test-only: policy 2 over a validated V3 carrier built from the sealed V6 run.
+
+    Production exposes no V6-to-policy-2 path; this view lets existing guards keep
+    asserting their exact advisory and pre-advisory findings.
+    """
+    v6 = world.retained(result.manifest_sha256)
+    v3 = reader.ColdRetainedRunV3(
+        run=v6.run,
+        lifecycle_state=v6.lifecycle_state,
+        lifecycle=v6.lifecycle,
+        advisory_attempt_state=v6.advisory_attempt_state,
+        advisory_attempts=v6.advisory_attempts,
+    )
+    return advisory_conformance.check_advisory_conformance(v3)
+
+
+def advisory_findings_of(
+    world: World, result: two_phase.ColdTwoPhaseResult
+) -> set[advisory_conformance.ColdAdvisoryConformanceFinding]:
+    """The policy-2 findings of the sealed run (test-only advisory view)."""
+    return set(advisory_view(world, result).findings)
+
+
 def pre_findings_of(
-    result: two_phase.ColdTwoPhaseResult,
+    world: World, result: two_phase.ColdTwoPhaseResult
 ) -> set[conformance.ColdConformanceFinding]:
-    """The composed policy-1 findings carried by the admitted policy-2 result."""
-    assert result.conformance is not None
-    return set(result.conformance.pre_advisory_findings)
+    """The composed policy-1 findings of the sealed run (test-only advisory view)."""
+    return set(advisory_view(world, result).pre_advisory_findings)
 
 
 def assert_failed(
@@ -754,8 +822,10 @@ def assert_failed(
     assert terminal["termination"] == "failed"
     assert terminal["termination_reason"] == reason.value
     retained = world.retained(result.manifest_sha256)
-    checked = advisory_conformance.check_advisory_conformance(retained)
-    assert checked.outcome is advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT
+    checked = temperature_conformance.check_temperature_conformance(retained)
+    assert checked.outcome is TemperatureOutcome.NOT_CONFORMANT
+    advisory = advisory_view(world, result)
+    assert advisory.outcome is advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT
     assert_no_canary(result)
 
 
@@ -993,10 +1063,10 @@ def test_4gc_t16_genuine_carriers_are_admitted_fresh(tmp_path: Path) -> None:
 
 
 def admit_checker(value: object) -> object:
-    """Admit one candidate policy-2 result exactly as the orchestrator does."""
+    """Admit one candidate policy-3 result exactly as the orchestrator does."""
     return two_phase._admit_carrier(
         value,
-        advisory_conformance.ColdAdvisoryConformanceResult,
+        temperature_conformance.ColdTemperatureConformanceResult,
         two_phase._CHECKER,
         flat_identity=True,
     )
@@ -1022,6 +1092,9 @@ def engine_carriers() -> list[pydantic.BaseModel]:
                 ),
                 engine.ColdAbortClassification(
                     domain=Domain.ENGINE, reason=schema.ColdEngineAbortReason.CANCELLED
+                ),
+                engine.ColdAbortClassification(
+                    domain=Domain.ENGINE, reason=ColdTemperatureScreenReason.OUTSIDE_SCREEN
                 ),
             ),
             session_id=None,
@@ -1291,25 +1364,46 @@ def test_4gc_t16_forged_engine_and_checker_carriers_are_refused() -> None:
         assert spy_calls() == [], name
     genuine = typing.cast(pydantic.BaseModel, CHECKED["conformant"])
     failing = typing.cast(pydantic.BaseModel, CHECKED["not_conformant"])
-    Finding = advisory_conformance.ColdAdvisoryConformanceFinding
+    Finding = TemperatureFinding
+    subclass = type("TemperatureResultSub", (TemperatureResult,), {})
     checker_forgeries: dict[str, object] = {
         "bool_version": forged(genuine, policy_version=True),
-        "policy_one": forged(genuine, policy_version=1),
+        "policy_two": forged(genuine, policy_version=2),
+        "float_version": forged(genuine, policy_version=3.0),
         "foreign_outcome": forged(genuine, outcome=ForeignOutcome.ADVISORY_CONFORMANT),
-        "fabricated_outcome": forged(
-            genuine, outcome=object.__new__(advisory_conformance.ColdAdvisoryConformanceOutcome)
+        "fabricated_outcome": forged(genuine, outcome=object.__new__(TemperatureOutcome)),
+        "contradictory": forged(genuine, findings=(Finding.TICK_TEMPERATURE_ABSENT,)),
+        "string_finding": forged(failing, findings=("tick_temperature_absent",)),
+        "fabricated_finding": forged(failing, findings=(object.__new__(Finding),)),
+        "foreign_finding": forged(
+            failing, findings=(advisory_conformance.ColdAdvisoryConformanceFinding.ATTEMPTS_ABSENT,)
         ),
-        "contradictory": forged(genuine, findings=(Finding.WINDOW_CALL_MISSING,)),
-        "string_finding": forged(failing, findings=("pre_advisory_not_conformant",)),
-        "foreign_pre_finding": forged(failing, pre_advisory_findings=(ForeignArtefactKind.WHEEL,)),
-        "unflagged_pre_findings": forged(failing, findings=(Finding.WINDOW_CALL_MISSING,)),
-        # The policy-2 result's own validators admit an exact tuple of real members
+        "unordered_findings": forged(
+            failing,
+            findings=(Finding.MCP_CANDIDATE_MISSING, Finding.TICK_TEMPERATURE_ABSENT),
+        ),
+        "duplicated_findings": forged(
+            failing,
+            findings=(Finding.TICK_TEMPERATURE_ABSENT, Finding.TICK_TEMPERATURE_ABSENT),
+        ),
+        # The policy-3 result's own validators admit an exact tuple of real members
         # only, so a list or a value string is refused (not coerced through JSON).
-        "listed_findings": forged(genuine, findings=[]),
-        "policy_one_result": conformance.ColdConformanceResult(
-            policy_version=1,
-            outcome=conformance.ColdConformanceOutcome.PRE_ADVISORY_CONFORMANT,
+        "listed_findings": forged(failing, findings=[Finding.TICK_TEMPERATURE_ABSENT]),
+        "extra": with_slot(genuine, "__pydantic_extra__", {"x": 1}),
+        "constructed_without_findings": TemperatureResult.model_construct(
+            policy_version=3, outcome=TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT
+        ),
+        "uninitialised": object.__new__(TemperatureResult),
+        "subclass": subclass(
+            policy_version=3,
+            outcome=TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT,
             findings=(),
+        ),
+        "policy_two_result": advisory_conformance.ColdAdvisoryConformanceResult(
+            policy_version=2,
+            outcome=advisory_conformance.ColdAdvisoryConformanceOutcome.ADVISORY_CONFORMANT,
+            findings=(),
+            pre_advisory_findings=(),
         ),
     }
     for name, value in checker_forgeries.items():
@@ -1323,7 +1417,7 @@ def test_4gc_t16_forged_engine_and_checker_carriers_are_refused() -> None:
     with pytest.raises(TypeError):
         two_phase._validated_flat(
             with_dict(genuine, {"x": 1}),
-            advisory_conformance.ColdAdvisoryConformanceResult,
+            TemperatureResult,
             two_phase._CHECKER,
         )
 
@@ -1396,7 +1490,7 @@ def _independent_row(
     Authored independently of ``_row_admits``: no path means no check; a path means a
     failed (reason-bearing) run that is ``NOT_CONFORMANT`` or ``EVIDENCE_NOT_SEALED``
     whose one provider check was taken (AC7/D203: never ``NOT_CHECKED``), and a
-    failed-run terminal never carries a policy-2 result.
+    failed-run terminal never carries a checker result.
     """
     if path is AdvisoryPath.NOT_APPLICABLE:
         if check is not Check.NOT_CHECKED:
@@ -1434,21 +1528,19 @@ def _independent_row(
     return True
 
 
-CHECKED: typing.Final[
-    dict[str | None, advisory_conformance.ColdAdvisoryConformanceResult | None]
-] = {
+TemperatureResult = temperature_conformance.ColdTemperatureConformanceResult
+#: Policy-3 checker results (the runtime result's only admitted conformance carrier).
+CHECKED: typing.Final[dict[str | None, TemperatureResult | None]] = {
     None: None,
-    "conformant": advisory_conformance.ColdAdvisoryConformanceResult(
-        policy_version=2,
-        outcome=advisory_conformance.ColdAdvisoryConformanceOutcome.ADVISORY_CONFORMANT,
+    "conformant": TemperatureResult(
+        policy_version=3,
+        outcome=TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT,
         findings=(),
-        pre_advisory_findings=(),
     ),
-    "not_conformant": advisory_conformance.ColdAdvisoryConformanceResult(
-        policy_version=2,
-        outcome=advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT,
-        findings=(advisory_conformance.ColdAdvisoryConformanceFinding.PRE_ADVISORY_NOT_CONFORMANT,),
-        pre_advisory_findings=(conformance.ColdConformanceFinding.TICKS_ABSENT,),
+    "not_conformant": TemperatureResult(
+        policy_version=3,
+        outcome=TemperatureOutcome.NOT_CONFORMANT,
+        findings=(TemperatureFinding.TICK_TEMPERATURE_ABSENT,),
     ),
 }
 
@@ -1588,7 +1680,7 @@ def test_4gc_t18_forged_fields_are_refused_and_results_hold_no_text() -> None:
     assert two_phase.ColdTwoPhaseResult.model_validate(base).termination_reason is R.PHASE_ABORTED
     contradicted = forged(
         typing.cast(pydantic.BaseModel, CHECKED["conformant"]),
-        findings=(advisory_conformance.ColdAdvisoryConformanceFinding.WINDOW_CALL_MISSING,),
+        findings=(TemperatureFinding.TICK_TEMPERATURE_ABSENT,),
     )
     bad: list[dict[str, object]] = [
         {"manifest_sha256": "A" * 64},
@@ -1681,7 +1773,6 @@ def test_4gc_t19_imports_stay_inside_the_contract_allowlist() -> None:
     assert set(modules) == {
         _COLD + name
         for name in (
-            "advisory_conformance",
             "advisory_run_owner",
             "advisory_sampler",
             "conformance",
@@ -1691,11 +1782,17 @@ def test_4gc_t19_imports_stay_inside_the_contract_allowlist() -> None:
             "evidence_reader",
             "evidence_schema",
             "evidence_store",
+            "evidence_temperature",
+            "evidence_temperature_run",
             "evidence_terminal",
             "identity",
             "mcp",
+            "temperature_conformance",
         )
     } | {"roastpilot_agent.mcp_client"}
+    # D209 activation: the reload reads only V6 and judges only policy 3.
+    assert modules[_COLD + "evidence_reader"] == {"read_retained_run_v6"}
+    assert modules[_COLD + "conformance"] == {"masked_identity_text"}
     assert modules["roastpilot_agent.mcp_client"] <= {
         "EventCommandResult",
         "RuntimeConfigSnapshot",
@@ -1990,7 +2087,7 @@ def _reachable(*roots: type[pydantic.BaseModel]) -> tuple[set[type], set[type]]:
             "_ENGINE",
             (engine.ColdPhaseCompleted, engine.ColdPhaseAborted, engine.ColdPhaseActivationRefused),
         ),
-        ("_CHECKER", (advisory_conformance.ColdAdvisoryConformanceResult,)),
+        ("_CHECKER", (temperature_conformance.ColdTemperatureConformanceResult,)),
         (
             "_ADVISORY",
             (
@@ -2199,19 +2296,19 @@ async def test_4gc_t16_a_forged_or_failing_checker_is_never_conformant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, checker: str
 ) -> None:
     """T16 boundary: an inadmissible checker result is NOT_CONFORMANT with no result."""
-    genuine = typing.cast(conformance.ColdConformanceResult, CHECKED["conformant"])
+    genuine = typing.cast(TemperatureResult, CHECKED["conformant"])
     returned: dict[str, object] = {
         "forged_conformant": forged(genuine, policy_version=True),
         "foreign_outcome": forged(genuine, outcome=ForeignOutcome.ADVISORY_CONFORMANT),
         "raises": RuntimeError(CANARY),
-        "wrong_type": {"outcome": "pre_advisory_conformant"},
+        "wrong_type": {"outcome": "temperature_screened_conformant"},
     }
 
     def check(run: object) -> object:
         del run
         return produce(returned[checker])
 
-    monkeypatch.setattr(two_phase, "check_advisory_conformance", check)
+    monkeypatch.setattr(two_phase, "check_temperature_conformance", check)
     world = World(tmp_path)
     result = await world.run()
     assert result.outcome is Outcome.NOT_CONFORMANT
@@ -2231,7 +2328,7 @@ async def test_4gc_t16_a_reload_failure_is_never_conformant(
     def refuse(*args: object, **kwargs: object) -> typing.NoReturn:
         raise store.ColdEvidenceStoreError(store.ColdEvidenceStoreFailure.HEADER_MISSING)
 
-    monkeypatch.setattr(two_phase, "read_retained_run_v3", refuse)
+    monkeypatch.setattr(two_phase, "read_retained_run_v6", refuse)
     world = World(tmp_path)
     result = await world.run()
     assert result.outcome is Outcome.NOT_CONFORMANT and result.conformance is None
@@ -2247,6 +2344,7 @@ def make_run(world: World) -> two_phase._TwoPhaseRun:
         identities=world.identities,
         host=world.host,
         clock=world.clock,
+        mcp_candidate=world.candidate,
         **world.advisory_arguments(),
     )
 
@@ -2367,22 +2465,44 @@ def test_4gc_ledger_facts_are_admitted_exactly(
 
 
 class WriterProxy:
-    """Delegates to a real writer and records every call; ``fail`` injects a fault."""
+    """Delegates to a real writer and records every call; ``fail`` injects a fault.
+
+    ``fail_base`` raises the named ``BaseException`` before delegating; ``raise_after``
+    delegates (so the line is written) and then raises it.
+    """
 
     def __init__(self, writer: store.ColdEvidenceWriter) -> None:
         self.writer = writer
         self.calls: list[str] = []
         self.fail: set[str] = set()
+        self.fail_base: dict[str, BaseException] = {}
+        self.raise_after: dict[str, BaseException] = {}
         self.digest: object = None
 
     def _call(self, name: str, action: Callable[[], object]) -> typing.Any:
         self.calls.append(name)
         if name in self.fail:
             raise RuntimeError(CANARY)
-        return action()
+        before = self.fail_base.get(name)
+        if before is not None:
+            raise before
+        value = action()
+        after = self.raise_after.get(name)
+        if after is not None:
+            raise after
+        return value
 
     def append(self, record: schema.ColdEvidenceRecord) -> None:
         self._call("append", lambda: self.writer.append(record))
+
+    def append_tick_temperature(self, record: typing.Any) -> None:
+        self._call("append_tick_temperature", lambda: self.writer.append_tick_temperature(record))
+
+    def append_mcp_candidate(self, record: typing.Any) -> None:
+        self._call("append_mcp_candidate", lambda: self.writer.append_mcp_candidate(record))
+
+    def append_temperature_abort(self, record: typing.Any) -> None:
+        self._call("append_temperature_abort", lambda: self.writer.append_temperature_abort(record))
 
     def append_lifecycle(self, record: lifecycle.ColdLifecycleRecord) -> None:
         self._call("append_lifecycle", lambda: self.writer.append_lifecycle(record))
@@ -2449,6 +2569,30 @@ class SinkRig:
             monotonic_seconds=2.0,
             observation=conforming_tick(phase, 0),
         )
+
+    def candidate(self, phase: Phase) -> typing.Any:
+        """One genuine MCP candidate record for ``phase``."""
+        return builders.build_mcp_candidate_record(
+            header=self.headers[phase],
+            candidate=reviewed_candidate(),
+            recorded_at_utc=utc_at(2.0),
+            monotonic_seconds=2.0,
+        )
+
+    def temperature(self, tick: schema.ColdTickRecord) -> typing.Any:
+        """The paired temperature record of a ``tick(phase)`` record, from the same read."""
+        return builders.build_tick_temperature_record(
+            tick=tick, observation=conforming_tick(tick.phase, 0)
+        )
+
+    def pair(self, phase: Phase) -> schema.ColdTickRecord:
+        """Retain one tick pair (with the phase's candidate first, if not yet retained)."""
+        if phase not in self.sink._candidate_phases:
+            self.sink.append_mcp_candidate(self.candidate(phase))
+        tick = self.tick(phase)
+        self.sink.append(tick)
+        self.sink.append_tick_temperature(self.temperature(tick))
+        return tick
 
     def host(self, phase: Phase) -> schema.ColdHostRecord:
         return builders.build_host_record(
@@ -2541,7 +2685,7 @@ def test_4gc_t15_a_full_grammar_passes_the_guard_and_seals(tmp_path: Path) -> No
             sink.append_lifecycle(rig.started())
             sink.append(rig.headers[ON])
         sink.append_lifecycle(rig.lc(phase, Event.PHASE_ACTIVATED, session_id=SESSIONS[phase]))
-        sink.append(rig.tick(phase))
+        rig.pair(phase)
         sink.append(rig.host(phase))
         assert not sink.finalisation_eligible(phase)
         sink.append_lifecycle(rig.elapsed(phase))
@@ -2649,9 +2793,14 @@ def test_4gc_t15_r6_advisory_evidence_is_refused(tmp_path: Path) -> None:
 def test_4gc_t15_r7_no_observation_after_the_window_closes(
     tmp_path: Path, closer: str, kind: str
 ) -> None:
-    """R7: ticks, hosts and aborts are refused once the window is closed."""
+    """R7: ticks, hosts and aborts are refused once the window is closed.
+
+    The phase's candidate is retained first, so a tick is refused for the closed
+    window alone, never for a missing candidate.
+    """
     rig = SinkRig(tmp_path)
     rig.bind_off()
+    rig.sink.append_mcp_candidate(rig.candidate(OFF))
     rig.sink.append_lifecycle(rig.elapsed(OFF) if closer == "elapsed" else rig.aborted(OFF))
     record = {"tick": rig.tick, "host": rig.host, "abort": rig.abort}[kind](OFF)
     rig.refused(lambda: rig.sink.append(record))
@@ -2737,6 +2886,8 @@ def test_4gc_t15_writer_faults_poison_with_the_fixed_error(tmp_path: Path, metho
     """T15: any writer exception poisons the guard and is replaced by the fixed refusal."""
     rig = SinkRig(tmp_path)
     rig.bind_off()
+    # The candidate comes first, so the tick reaches the writer and its fault.
+    rig.sink.append_mcp_candidate(rig.candidate(OFF))
     if method == "seal":
         rig.sink.append_lifecycle(rig.terminal(OFF))
     rig.proxy.fail.add(method)
@@ -3628,11 +3779,10 @@ async def test_4gc_t1_the_happy_path_is_advisory_conformant(
     assert result.outcome is Outcome.ADVISORY_CONFORMANT
     assert result.termination_reason is None and result.start_refusal is None
     assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
-    assert result.conformance == advisory_conformance.ColdAdvisoryConformanceResult(
-        policy_version=2,
-        outcome=advisory_conformance.ColdAdvisoryConformanceOutcome.ADVISORY_CONFORMANT,
+    assert result.conformance == TemperatureResult(
+        policy_version=3,
+        outcome=TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT,
         findings=(),
-        pre_advisory_findings=(),
     )
     assert (result.advisory_path, result.provider_check) == (
         AdvisoryPath.NOT_APPLICABLE,
@@ -3640,12 +3790,39 @@ async def test_4gc_t1_the_happy_path_is_advisory_conformant(
     )
     retained = world.retained(result.manifest_sha256)
     assert retained.run.manifest_sha256 == result.manifest_sha256
+    # TP1 (AC1-AC6, O2): five paired ticks and one candidate per phase, read by V6 only.
+    for phase in (OFF, ON):
+        ticks = [r for r in world.records("tick") if r["phase"] == phase.value]
+        temperatures = [r for r in world.records("tick_temperature") if r["phase"] == phase.value]
+        candidates = [r for r in world.records("mcp_candidate") if r["phase"] == phase.value]
+        assert len(ticks) == len(temperatures) == 5 and len(candidates) == 1
+        assert [t["tick"] for t in temperatures] == [t["tick"] for t in ticks] == list(range(5))
+        assert candidates[0]["candidate"] == reviewed_candidate().model_dump(mode="json")
+        assert candidates[0]["candidate"]["installed_bytes_attested"] is False
+    assert world.records("temperature_abort") == []
+    assert len(retained.tick_temperatures) == 10 and len(retained.mcp_candidates) == 2
+    checked = temperature_conformance.check_temperature_conformance(retained)
+    assert checked.outcome is TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT
+    for legacy in (
+        reader.read_retained_run,
+        reader.read_retained_run_v2,
+        reader.read_retained_run_v3,
+        reader.read_retained_run_v4,
+        reader.read_retained_run_v5,
+    ):
+        with pytest.raises(store.ColdEvidenceStoreError) as refused:
+            legacy(
+                world.root,
+                run_id=RUN_ID,
+                expected_manifest_sha256=typing.cast(str, result.manifest_sha256),
+            )
+        assert refused.value.failure is store.ColdEvidenceStoreFailure.ENTRY_PATH_INVALID
     assert world.events() == GRAMMAR
     assert world.child_ops() == NORMAL_CHILD_OPS
     assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
     assert world.identities.calls == [OFF, ON]
-    assert world.host.start_calls == 2 and world.host.samples == 8
-    assert [p for name, p in world.mcp.calls if name == "get_roast_state"] == [OFF] * 4 + [ON] * 4
+    assert world.host.start_calls == 2 and world.host.samples == 10
+    assert [p for name, p in world.mcp.calls if name == "get_roast_state"] == [OFF] * 5 + [ON] * 5
     assert seen == [(id(world.mcp), id(world.host), id(world.clock))] * 4
     assert sorted(path.name for path in Path(world.root).iterdir()) == [RUN_ID]
     # Independently authored instants: OFF 100 -> 1900, finalise +1, ON 1901 -> 3701.
@@ -3655,7 +3832,7 @@ async def test_4gc_t1_the_happy_path_is_advisory_conformant(
         OFF_END,
     )
     off_elapsed = world.event(OFF, "observation_window_elapsed")
-    assert (off_elapsed["event_monotonic_seconds"], off_elapsed["tick_count"]) == (OFF_END, 4)
+    assert (off_elapsed["event_monotonic_seconds"], off_elapsed["tick_count"]) == (OFF_END, 5)
     assert off_elapsed["scheduled_end_monotonic"] == OFF_END
     assert world.event(OFF, "finalisation_returned")["event_monotonic_seconds"] == 1901.0
     measured = world.event(ON, "transition_measured")
@@ -3715,7 +3892,7 @@ async def test_4gc_t2_the_budget_boundaries_conform(tmp_path: Path, case: str) -
         world.child.before_stop[0] = set_time(world, OFF_END + 60.0)
     else:
         # The OFF window overruns: its last read ends at 1950, 50 s after the scheduled end.
-        world.mcp.read_seconds = lambda phase, index: 500.0 if (phase, index) == (OFF, 3) else 450.0
+        world.mcp.read_seconds = read_schedule(off_4=500.0)
         world.mcp.before["mark_beans_added:recording_on"] = set_time(world, OFF_END + 60.0)
     result = await world.run()
     assert result.outcome is Outcome.ADVISORY_CONFORMANT, findings_of(result)
@@ -3732,10 +3909,11 @@ async def test_4gc_t20_an_on_overrun_never_meets_the_off_budget(tmp_path: Path) 
     """T20: ON at OFF_END + 60 and an ON completion 500 s late still conforms."""
     world = World(tmp_path)
     world.mcp.before["mark_beans_added:recording_on"] = set_time(world, OFF_END + 60.0)
-    world.mcp.read_seconds = lambda phase, index: 950.0 if (phase, index) == (ON, 3) else 450.0
+    world.mcp.read_seconds = read_schedule(on_4=950.0)
     result = await world.run()
     assert result.outcome is Outcome.ADVISORY_CONFORMANT, findings_of(result)
-    # ON activation 1960; scheduled end 3760; last read ends 1960 + 1350 + 950 = 4260.
+    # ON activation 1960; scheduled end 3760; last read ends 1960 + 1350 + 950 = 4260
+    # (30 + 420 + 450 + 450 = 1350 before the late fifth read).
     assert world.event(ON, "observation_window_elapsed")["event_monotonic_seconds"] == 4260.0
     assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
 
@@ -3754,7 +3932,7 @@ async def test_4gc_t3_an_activation_past_the_budget_reads_nothing(
     activation = math.nextafter(OFF_END + 60.0, math.inf)
     if overrun:
         # OFF completes at 1950: the activation is only 10.5 s after completion.
-        world.mcp.read_seconds = lambda phase, index: 500.0 if (phase, index) == (OFF, 3) else 450.0
+        world.mcp.read_seconds = read_schedule(off_4=500.0)
         activation = OFF_END + 60.5
     world.mcp.before["mark_beans_added:recording_on"] = set_time(world, activation)
     result = await world.run()
@@ -3782,7 +3960,7 @@ async def test_4gc_t3_an_activation_past_the_budget_reads_nothing(
 
 
 def _late_completion(world: World) -> None:
-    world.mcp.read_seconds = lambda phase, index: 511.0 if (phase, index) == (OFF, 3) else 450.0
+    world.mcp.read_seconds = read_schedule(off_4=511.0)
 
 
 def _late_finalisation(world: World) -> None:
@@ -3919,10 +4097,11 @@ async def test_4gc_t7b_a_reused_session_is_refused_by_the_checker(tmp_path: Path
     result = await world.run()
     assert result.outcome is Outcome.NOT_CONFORMANT
     assert result.termination_reason is None
-    assert findings_of(result) == {
+    assert TemperatureFinding.ADVISORY_POLICY_NOT_CONFORMANT in findings_of(result)
+    assert advisory_findings_of(world, result) == {
         advisory_conformance.ColdAdvisoryConformanceFinding.PRE_ADVISORY_NOT_CONFORMANT
     }
-    assert pre_findings_of(result) == {
+    assert pre_findings_of(world, result) == {
         conformance.ColdConformanceFinding.PHASE_SESSIONS_NOT_DISTINCT
     }
     assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[OFF]]
@@ -4197,8 +4376,8 @@ class Counters:
     ) -> None:
         self.seals = self.reads = self.checks = 0
         real_seal = store.ColdEvidenceWriter.seal
-        real_read = reader.read_retained_run_v3
-        real_check = advisory_conformance.check_advisory_conformance
+        real_read = reader.read_retained_run_v6
+        real_check = temperature_conformance.check_temperature_conformance
 
         def counted_seal(writer: store.ColdEvidenceWriter) -> typing.Any:
             self.seals += 1
@@ -4213,8 +4392,8 @@ class Counters:
             return (check or real_check)(run)
 
         monkeypatch.setattr(store.ColdEvidenceWriter, "seal", counted_seal)
-        monkeypatch.setattr(two_phase, "read_retained_run_v3", counted_read)
-        monkeypatch.setattr(two_phase, "check_advisory_conformance", counted_check)
+        monkeypatch.setattr(two_phase, "read_retained_run_v6", counted_read)
+        monkeypatch.setattr(two_phase, "check_temperature_conformance", counted_check)
 
     @property
     def counts(self) -> tuple[int, int, int]:
@@ -4480,8 +4659,8 @@ async def test_4gc_a2_s7_a_post_seal_refusal_is_final_for_the_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
 ) -> None:
     """S7: a post-seal reader/checker refusal is final; a later diagnostic never upgrades it."""
-    real_read = reader.read_retained_run_v3
-    real_check = advisory_conformance.check_advisory_conformance
+    real_read = reader.read_retained_run_v6
+    real_check = temperature_conformance.check_temperature_conformance
 
     def refuse_read(*args: typing.Any, **kwargs: typing.Any) -> typing.NoReturn:
         raise store.ColdEvidenceStoreError(store.ColdEvidenceStoreFailure.HEADER_MISSING)
@@ -4509,10 +4688,7 @@ async def test_4gc_a2_s7_a_post_seal_refusal_is_final_for_the_run(
     diagnostic = real_check(
         real_read(world.root, run_id=RUN_ID, expected_manifest_sha256=result.manifest_sha256)
     )
-    assert (
-        diagnostic.outcome
-        is advisory_conformance.ColdAdvisoryConformanceOutcome.ADVISORY_CONFORMANT
-    )
+    assert diagnostic.outcome is TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT
     assert result.outcome is Outcome.NOT_CONFORMANT
     assert_contained(result)
 
@@ -4926,7 +5102,8 @@ async def test_4gc_t14_t21_any_retained_abort_forbids_finalisation(
 
 def _heat(phase: Phase) -> Callable[[Phase, int], object]:
     def tick(current: Phase, index: int) -> object:
-        if current is phase and index == 1:
+        # Index 2 is the read ending 1000 s into OFF (index 1 before the pre-boundary tick).
+        if current is phase and index == 2:
             return observation(
                 device_state(driver=DRIVER, heat_level_percent=5),
                 roast_fan=roast_fan_state(level=0),
@@ -4934,6 +5111,7 @@ def _heat(phase: Phase) -> Callable[[Phase, int], object]:
                 session=session_metadata(
                     session_id=SESSIONS[current], elapsed_monotonic_seconds=float(index + 1)
                 ),
+                temperature=screened_temperature(index),
             )
         return conforming_tick(current, index)
 
@@ -5003,11 +5181,20 @@ async def test_4gc_t14_an_empty_window_is_finalised_then_failed(
         assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
         assert world.child_ops() == NORMAL_CHILD_OPS
     # 5c-ii-b T15: an empty-tick phase is never ADVISORY_CONFORMANT (policy 1 composed).
-    checked = advisory_conformance.check_advisory_conformance(
-        world.retained(result.manifest_sha256)
-    )
-    assert conformance.ColdConformanceFinding.TICKS_ABSENT in checked.pre_advisory_findings
+    assert conformance.ColdConformanceFinding.TICKS_ABSENT in pre_findings_of(world, result)
     assert result.outcome is Outcome.NOT_CONFORMANT
+    # Policy 3 needs a candidate for each phase even when recording-on never ran.
+    assert result.conformance is not None
+    expected = (
+        (
+            TemperatureFinding.TICK_TEMPERATURE_ABSENT,
+            TemperatureFinding.MCP_CANDIDATE_MISSING,
+            TemperatureFinding.ADVISORY_POLICY_NOT_CONFORMANT,
+        )
+        if phase is OFF
+        else (TemperatureFinding.ADVISORY_POLICY_NOT_CONFORMANT,)
+    )
+    assert result.conformance.findings == expected
 
 
 def _completion(session: str) -> Behaviour:
@@ -5139,7 +5326,7 @@ async def test_4gc_t22_a_conformant_checker_never_overrides_a_failure(
         del run
         return CHECKED["conformant"]
 
-    monkeypatch.setattr(two_phase, "check_advisory_conformance", check)
+    monkeypatch.setattr(two_phase, "check_temperature_conformance", check)
     world = World(tmp_path)
     if failure == "on_not_clean":
         world.mcp.finalise = lambda p, s: not_clean_result(p, s) if p is ON else clean_result(p, s)
@@ -5181,7 +5368,7 @@ async def test_4gc_t22_end_handling_suppresses_a_contradictory_checker_itself(
         return CHECKED["conformant"]
 
     monkeypatch.setattr(two_phase._TwoPhaseRun, "_end", end)
-    monkeypatch.setattr(two_phase, "check_advisory_conformance", check)
+    monkeypatch.setattr(two_phase, "check_temperature_conformance", check)
     world = World(tmp_path)
     world.mcp.finalise = lambda p, s: not_clean_result(p, s) if p is ON else clean_result(p, s)
     result = await world.run()
@@ -5232,7 +5419,7 @@ class OwnerLog:
         real_settle, real_observe = Owner.settle_phase, Owner.observe_phase
         real_seal, real_close = two_phase._RunSink.seal, two_phase._RunSink.close
         real_writer_seal = store.ColdEvidenceWriter.seal
-        real_v3, real_v4 = reader.read_retained_run_v3, reader.read_retained_run_v4
+        real_v6 = reader.read_retained_run_v6
 
         def settle(owner: typing.Any, phase: Phase) -> typing.Any:
             self.settles.append(phase)
@@ -5255,21 +5442,16 @@ class OwnerLog:
             self.writer_seals += 1
             return real_writer_seal(writer)
 
-        def v3(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
-            self.order.append("read_v3")
-            return real_v3(*args, **kwargs)
-
-        def v4(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
-            self.order.append("read_v4")
-            return real_v4(*args, **kwargs)
+        def v6(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+            self.order.append("read_v6")
+            return real_v6(*args, **kwargs)
 
         monkeypatch.setattr(Owner, "settle_phase", settle)
         monkeypatch.setattr(Owner, "observe_phase", observe)
         monkeypatch.setattr(two_phase._RunSink, "seal", seal)
         monkeypatch.setattr(two_phase._RunSink, "close", close)
         monkeypatch.setattr(store.ColdEvidenceWriter, "seal", writer_seal)
-        monkeypatch.setattr(two_phase, "read_retained_run_v3", v3)
-        monkeypatch.setattr(two_phase, "read_retained_run_v4", v4)
+        monkeypatch.setattr(two_phase, "read_retained_run_v6", v6)
 
     def check_followed_seal(self) -> None:
         """Exactly one observation, immediately after the one seal step."""
@@ -5397,7 +5579,7 @@ def assert_failed_run_terminal(
     assert record["lifecycle_records_retained"] == len(world.lifecycle())
     assert record["advisory_attempt_records_retained"] == len(world.records("advisory_attempt"))
     assert not any(event == "run_terminated" for _phase, event in world.events())
-    retained = world.retained_v4(result.manifest_sha256)
+    retained = world.retained(result.manifest_sha256)
     assert retained.terminal is not None and retained.terminal.phase is phase
     assert {name for name, _phase in world.mcp.calls} <= CALL_NAMES
     assert_no_canary(result)
@@ -5471,7 +5653,7 @@ async def test_954_t2_each_od5_closure_on_off_writes_only_the_failed_run_termina
     assert result.provider_check is check
     assert log.settles == [OFF] and log.observes == [OFF]
     log.check_followed_seal()
-    assert log.order[-3:] == ["seal", "observe", "read_v4"]
+    assert log.order[-3:] == ["seal", "observe", "read_v6"]
     # D205: the unresolved attempt does not forbid the eligible OFF finalisation.
     assert world.mcp.finalised == [SESSIONS[OFF]]
     assert world.event(OFF, "finalisation_returned")["finalisation_result"] == "clean_recorded"
@@ -5504,7 +5686,7 @@ async def test_954_t2f_an_unresolved_invoked_on_attempt_ends_with_the_on_termina
     assert world.mcp.finalised == [SESSIONS[OFF], SESSIONS[ON]]
     # One pre-respawn gate observation of OFF, then the one post-seal check of ON.
     assert log.observes == [OFF, ON] and log.settles == [OFF, ON]
-    assert log.order[-3:] == ["seal", "observe", "read_v4"]
+    assert log.order[-3:] == ["seal", "observe", "read_v6"]
     await release(world)
 
 
@@ -5539,8 +5721,10 @@ async def test_954_t3_pre_invocation_mechanics_never_claim_a_pending_provider(
             Check.NOT_CHECKED,
         )
         assert result.outcome is Outcome.NOT_CONFORMANT and result.termination_reason is None
-        assert advisory_conformance.ColdAdvisoryConformanceFinding.ATTEMPTS_ABSENT in findings_of(
-            result
+        assert TemperatureFinding.ADVISORY_POLICY_NOT_CONFORMANT in findings_of(result)
+        assert (
+            advisory_conformance.ColdAdvisoryConformanceFinding.ATTEMPTS_ABSENT
+            in advisory_findings_of(world, result)
         )
         assert world.child_ops() == NORMAL_CHILD_OPS
         assert log.observes == [OFF]
@@ -5571,7 +5755,7 @@ async def test_954_t4_class_a_an_outstanding_provider_ends_v2_failed_and_pending
     assert result.advisory_path is AdvisoryPath.PROVIDER_OUTSTANDING_FAILED
     assert result.provider_check is Check.PENDING_AT_CHECK
     assert log.observes == [OFF]
-    assert log.order[-3:] == ["seal", "observe", "read_v3"]
+    assert log.order[-3:] == ["seal", "observe", "read_v6"]
     # The retained ABANDONED_AFTER_BOUND line, at the bound (1840 + 30), stays as written.
     last = world.records("advisory_attempt")[-1]
     assert (last["resolution"], last["monotonic_seconds"]) == ("abandoned_after_bound", 1870.0)
@@ -5583,8 +5767,9 @@ async def test_954_t4_class_a_an_outstanding_provider_ends_v2_failed_and_pending
     )
     assert world.records("failed_run_terminal") == []
     assert result.conformance is not None
+    assert result.conformance.outcome is TemperatureOutcome.NOT_CONFORMANT
     assert (
-        result.conformance.outcome
+        advisory_view(world, result).outcome
         is advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT
     )
     assert world.child_ops() == OFF_ONLY_OPS
@@ -5786,7 +5971,7 @@ async def test_954_t7b_an_unconfirmed_run_keeps_a_real_pending_provider_path(
         # Exactly one owner observation, immediately after the seal, of the real provider.
         assert log.observes == [OFF] and log.settles == [OFF]
         log.check_followed_seal()
-        assert log.order[-3:] == ["seal", "observe", "read_v4"]
+        assert log.order[-3:] == ["seal", "observe", "read_v6"]
         (observed,) = observations
         assert observed.provider is not None
         assert observed.provider.task is TaskState.OUTSTANDING
@@ -5825,7 +6010,8 @@ async def test_954_t8_an_ordinary_returned_provider_failure_is_not_od5(
         AdvisoryPath.NOT_APPLICABLE,
         Check.NOT_CHECKED,
     )
-    assert findings_of(result) == {
+    assert findings_of(result) == {TemperatureFinding.ADVISORY_POLICY_NOT_CONFORMANT}
+    assert advisory_findings_of(world, result) == {
         advisory_conformance.ColdAdvisoryConformanceFinding.ATTEMPT_RETURNED_FAILURE
     }
     assert world.child_ops() == NORMAL_CHILD_OPS and len(world.advisor.calls) == 12
@@ -5930,8 +6116,7 @@ async def test_954_t11_a_pending_check_survives_a_reload_failure(
         log.order.append("refused_reload")
         raise store.ColdEvidenceStoreError(store.ColdEvidenceStoreFailure.HEADER_MISSING)
 
-    monkeypatch.setattr(two_phase, "read_retained_run_v4", refuse)
-    monkeypatch.setattr(two_phase, "read_retained_run_v3", refuse)
+    monkeypatch.setattr(two_phase, "read_retained_run_v6", refuse)
     result = await world.run()
     assert result.provider_check is Check.PENDING_AT_CHECK
     assert result.outcome is Outcome.NOT_CONFORMANT and result.manifest_sha256 is not None
@@ -6104,8 +6289,7 @@ def test_954_t16_the_tick_port_never_falls_back_to_another_phase(tmp_path: Path)
     assert rig.sink.latest_retained_tick() is None
     rig.bind_off()
     assert rig.sink.latest_retained_tick() is None
-    first = rig.tick(OFF)
-    rig.sink.append(first)
+    first = rig.pair(OFF)
     latest = rig.sink.latest_retained_tick()
     assert latest == first and latest is not None and latest.phase is OFF
     rig.sink.append(rig.host(OFF))
@@ -6113,14 +6297,19 @@ def test_954_t16_the_tick_port_never_falls_back_to_another_phase(tmp_path: Path)
     rig.sink.append_lifecycle(rig.started())
     rig.sink.append(rig.headers[ON])
     assert rig.sink.latest_retained_tick() is None
+    rig.sink.append_mcp_candidate(rig.candidate(ON))
+    read = observation(None)
     null_device = builders.build_tick_record(
         header=rig.headers[ON],
         tick=0,
         recorded_at_utc=utc_at(3.0),
         monotonic_seconds=3.0,
-        observation=observation(None),
+        observation=read,
     )
     rig.sink.append(null_device)
+    rig.sink.append_tick_temperature(
+        builders.build_tick_temperature_record(tick=null_device, observation=read)
+    )
     returned = rig.sink.latest_retained_tick()
     assert returned == null_device and returned is not None and returned.device is None
 
@@ -6264,11 +6453,12 @@ async def test_954_t17_a_base_exception_mid_phase_settles_and_reraises_the_same_
     """T17 (AC10): close, settle the open attempt, clean up, re-raise; nothing else."""
     world = World(tmp_path)
     world.advisor.steps[0] = hang
-    world.mcp.read_seconds = lambda phase, index: 450.0 if index < 3 else 100.0
+    world.mcp.read_seconds = read_schedule(off_4=100.0, on_4=100.0, off_5=100.0, on_5=100.0)
     halt = Halt()
 
     def interrupt() -> None:
-        if world.mcp.reads == 4:
+        # The sixth OFF read starts at 1550, as the fifth did before the pre-boundary tick.
+        if world.mcp.reads == 5:
             raise halt
 
     world.mcp.before["get_roast_state:recording_off"] = interrupt
@@ -6329,7 +6519,7 @@ async def test_954_t17_cancellation_at_the_on_read_settles_both_phases_and_nothi
     assert len(log.observes) == observes_before
     cleanup = log.order[order_before:]
     assert "observe" not in cleanup and "seal" not in cleanup
-    assert not {"read_v3", "read_v4"} & set(cleanup)
+    assert "read_v6" not in cleanup
     assert log.writer_seals == 0 and not world.manifest_exists()
     assert world.records("failed_run_terminal") == []
     assert not any(event == "run_terminated" for _phase, event in world.events())
@@ -6585,9 +6775,9 @@ async def test_954_a_refused_on_start_keeps_the_activation_and_fails_at_settleme
         AdvisoryPath.NOT_APPLICABLE,
         Check.NOT_CHECKED,
     )
-    # ON activated within budget and ran its whole window: four reads, elapsed, finalised.
+    # ON activated within budget and ran its whole window: five reads, elapsed, finalised.
     assert world.events() == GRAMMAR
-    assert [p for name, p in world.mcp.calls if name == "get_roast_state"] == [OFF] * 4 + [ON] * 4
+    assert [p for name, p in world.mcp.calls if name == "get_roast_state"] == [OFF] * 5 + [ON] * 5
     assert world.event(ON, "transition_measured")["transition_within_budget"] is True
     returned = world.event(ON, "finalisation_returned")
     assert (returned["finalisation_result"], returned["session_id"]) == (
@@ -6621,3 +6811,699 @@ def test_954_the_first_od5_trigger_fixes_the_path(tmp_path: Path) -> None:
     assert run._path is AdvisoryPath.FAILED_RUN_TERMINAL and run._path_phase is OFF
     assert run._path_settlement == off and run._path_settlement is not off
     assert run._primary is R.UNEXPECTED_FAILURE
+
+
+# ------------------------------------- #997 T2: guarded tick pairs (SK1-SK5, unit)
+
+Screen = ColdTemperatureScreenReason
+
+
+def temperature_abort(rig: SinkRig, phase: Phase, tick: int = 0) -> typing.Any:
+    """One genuine schema-5 abort record naming ``tick``."""
+    return builders.build_temperature_abort_record(
+        header=rig.headers[phase],
+        tick=tick,
+        reason=Screen.OUTSIDE_SCREEN,
+        recorded_at_utc=utc_at(3.0),
+        monotonic_seconds=3.0,
+    )
+
+
+def retained_lines(rig: SinkRig, phase: Phase, stream: str) -> list[str]:
+    """The raw lines of one stream file, read from disk (absent file: none)."""
+    path = Path(rig.world.root) / RUN_ID / "records" / phase.value / f"{stream}.jsonl"
+    return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+
+def test_997_sk1_one_candidate_per_phase_after_its_header(tmp_path: Path) -> None:
+    """SK1 positive: the bound phase's first candidate is durable and admits ticks."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.sink.append_mcp_candidate(rig.candidate(OFF))
+    assert rig.proxy.calls[-1] == "append_mcp_candidate"
+    assert rig.sink.usable and len(retained_lines(rig, OFF, "mcp_candidate")) == 1
+    rig.sink.append(rig.tick(OFF))
+    assert rig.proxy.calls[-1] == "append"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "before_header",
+        "wrong_phase",
+        "duplicate",
+        "after_retained_tick",
+        "window_closed",
+        "forged_record",
+        "terminated",
+        "poisoned",
+    ],
+)
+def test_997_sk1_a_misplaced_candidate_is_refused_before_the_writer(
+    tmp_path: Path, case: str
+) -> None:
+    """SK1: every misplaced or forged candidate poisons without reaching the writer."""
+    rig = SinkRig(tmp_path)
+    record = rig.candidate(OFF)
+    if case == "before_header":
+        rig.refused(lambda: rig.sink.append_mcp_candidate(record))
+        return
+    if case == "wrong_phase":
+        rig.bind_on()
+        rig.refused(lambda: rig.sink.append_mcp_candidate(record))
+        return
+    rig.bind_off()
+    if case == "duplicate":
+        rig.sink.append_mcp_candidate(record)
+    elif case == "after_retained_tick":
+        # Forged private state: the writer's own ordering also refuses this.
+        rig.sink._latest_tick[OFF] = rig.tick(OFF)
+    elif case == "window_closed":
+        rig.sink.append_lifecycle(rig.elapsed(OFF))
+    elif case == "forged_record":
+        record = forged(record, phase="recording_off")
+    elif case == "terminated":
+        rig.sink.append_lifecycle(rig.terminal(OFF))
+    else:
+        rig.sink.poisoned = True
+    rig.refused(lambda: rig.sink.append_mcp_candidate(record))
+    assert len(retained_lines(rig, OFF, "mcp_candidate")) == (1 if case == "duplicate" else 0)
+
+
+def test_997_sk1_a_candidate_write_fault_poisons_and_admits_no_tick(tmp_path: Path) -> None:
+    """SK1: a writer fault poisons; the phase is never admitted for ticks."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.proxy.fail_base["append_mcp_candidate"] = OSError(CANARY)
+    with pytest.raises(two_phase.ColdRunSinkRefusedError) as caught:
+        rig.sink.append_mcp_candidate(rig.candidate(OFF))
+    assert caught.value.__context__ is None and CANARY not in repr(caught.value)
+    assert rig.sink.poisoned and OFF not in rig.sink._candidate_phases
+
+
+def test_997_sk2_a_tick_needs_its_phase_candidate(tmp_path: Path) -> None:
+    """SK2: a tick without a durable candidate is refused; the same tick is admitted after one."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.refused(lambda: rig.sink.append(rig.tick(OFF)))
+    control = SinkRig(tmp_path / "control")
+    control.bind_off()
+    control.sink.append_mcp_candidate(control.candidate(OFF))
+    control.sink.append(control.tick(OFF))
+    assert control.proxy.calls[-1] == "append" and not control.sink.poisoned
+
+
+def test_997_sk2_a_pending_tick_is_neither_latest_nor_followed_by_another(tmp_path: Path) -> None:
+    """SK2: while a pair is pending the tick port is empty and every append is refused."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.sink.append_mcp_candidate(rig.candidate(OFF))
+    rig.sink.append(rig.tick(OFF))
+    assert rig.sink.latest_retained_tick() is None
+    assert not rig.sink.usable and not rig.sink.poisoned
+    rig.refused(lambda: rig.sink.append(rig.tick(OFF)))
+
+
+def _pending_rig(tmp_path: Path, phase: Phase = OFF) -> tuple[SinkRig, schema.ColdTickRecord]:
+    """A rig whose ``phase`` tick is pending (candidate and tick written)."""
+    rig = SinkRig(tmp_path)
+    if phase is OFF:
+        rig.bind_off()
+    else:
+        rig.bind_on()
+    rig.sink.append_mcp_candidate(rig.candidate(phase))
+    tick = rig.tick(phase)
+    rig.sink.append(tick)
+    return rig, tick
+
+
+@pytest.mark.parametrize("case", ["nothing_pending", "not_pairing", "wrong_phase", "forged"])
+def test_997_sk3_only_the_pending_ticks_pair_is_admitted(tmp_path: Path, case: str) -> None:
+    """SK3: no pending tick, a non-pairing, wrong-phase or forged record is refused."""
+    if case == "nothing_pending":
+        rig = SinkRig(tmp_path)
+        rig.bind_off()
+        rig.sink.append_mcp_candidate(rig.candidate(OFF))
+        record = rig.temperature(rig.tick(OFF))
+    elif case == "wrong_phase":
+        rig, _tick = _pending_rig(tmp_path, ON)
+        record = rig.temperature(rig.tick(OFF))
+    else:
+        rig, tick = _pending_rig(tmp_path)
+        if case == "not_pairing":
+            other = builders.build_tick_record(
+                header=rig.headers[OFF],
+                tick=1,
+                recorded_at_utc=tick.recorded_at_utc,
+                monotonic_seconds=tick.monotonic_seconds,
+                observation=conforming_tick(OFF, 0),
+            )
+            record = rig.temperature(other)
+        else:
+            record = forged(rig.temperature(tick), tick=True)
+    phase = ON if case == "wrong_phase" else OFF
+    rig.refused(lambda: rig.sink.append_tick_temperature(record))
+    assert retained_lines(rig, phase, "tick_temperature") == []
+    assert rig.sink.latest_retained_tick() is None
+
+
+def test_997_sk3_the_pair_is_published_only_after_its_temperature_is_durable(
+    tmp_path: Path,
+) -> None:
+    """SK3: the pending tick becomes the latest and is published once, after both lines."""
+    rig, tick = _pending_rig(tmp_path)
+    seen: list[tuple[schema.ColdTickRecord, int, int]] = []
+
+    def spy(published: schema.ColdTickRecord) -> None:
+        seen.append(
+            (
+                published,
+                len(retained_lines(rig, OFF, "tick")),
+                len(retained_lines(rig, OFF, "tick_temperature")),
+            )
+        )
+
+    rig.sink.after_tick = spy
+    assert retained_lines(rig, OFF, "tick_temperature") == []
+    rig.sink.append_tick_temperature(rig.temperature(tick))
+    assert seen == [(tick, 1, 1)]
+    assert rig.sink.latest_retained_tick() == tick
+    assert rig.sink.usable and rig.sink._pending is None
+
+
+def test_997_sk4_a_temperature_abort_inhibits_finalisation(tmp_path: Path) -> None:
+    """SK4 positive: a retained temperature abort forbids the elapsed fact and finalisation."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.pair(OFF)
+    rig.sink.append_temperature_abort(temperature_abort(rig, OFF))
+    assert rig.sink.abort_retained(OFF) and not rig.sink.abort_retained(ON)
+    assert not rig.sink.finalisation_eligible(OFF)
+    assert len(retained_lines(rig, OFF, "temperature_abort")) == 1
+    rig.refused(lambda: rig.sink.append_lifecycle(rig.elapsed(OFF)))
+    other = SinkRig(tmp_path / "fin")
+    other.bind_off()
+    other.pair(OFF)
+    other.sink.append_temperature_abort(temperature_abort(other, OFF))
+    other.refused(lambda: other.sink.append(other.fin(OFF)))
+
+
+@pytest.mark.parametrize(
+    "case", ["unpaired", "wrong_tick", "wrong_phase", "window_closed", "forged", "pending"]
+)
+def test_997_sk4_a_misplaced_temperature_abort_is_refused(tmp_path: Path, case: str) -> None:
+    """SK4: an abort must name the bound phase's latest paired tick inside its window."""
+    rig = SinkRig(tmp_path)
+    phase = ON if case == "wrong_phase" else OFF
+    if case == "wrong_phase":
+        rig.bind_on()
+        rig.pair(ON)
+    elif case == "pending":
+        rig, _tick = _pending_rig(tmp_path / "pending")
+    else:
+        rig.bind_off()
+        if case != "unpaired":
+            rig.pair(OFF)
+    record = temperature_abort(rig, OFF, tick=1 if case == "wrong_tick" else 0)
+    if case == "window_closed":
+        rig.sink.append_lifecycle(rig.elapsed(OFF))
+    elif case == "forged":
+        record = forged(record, reason="temperature_outside_screen")
+    rig.refused(lambda: rig.sink.append_temperature_abort(record))
+    assert retained_lines(rig, phase, "temperature_abort") == []
+
+
+def test_997_sk4_a_failed_abort_write_still_inhibits_finalisation(tmp_path: Path) -> None:
+    """SK4: inhibition is set before the write; a writer fault poisons with no abort line."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.pair(OFF)
+    rig.proxy.fail_base["append_temperature_abort"] = OSError(CANARY)
+    with pytest.raises(two_phase.ColdRunSinkRefusedError):
+        rig.sink.append_temperature_abort(temperature_abort(rig, OFF))
+    assert rig.sink.poisoned and rig.sink.abort_retained(OFF)
+    assert retained_lines(rig, OFF, "temperature_abort") == []
+
+
+def test_997_sk5_an_interrupted_tick_write_leaves_the_pair_pending(tmp_path: Path) -> None:
+    """SK5: a BaseException after the tick line leaves it pending: no terminal, seal or publish."""
+    rig = SinkRig(tmp_path)
+    rig.bind_off()
+    rig.sink.append_mcp_candidate(rig.candidate(OFF))
+    published: list[schema.ColdTickRecord] = []
+    rig.sink.after_tick = published.append
+    halt = Halt()
+    rig.proxy.raise_after["append"] = halt
+    with pytest.raises(Halt) as caught:
+        rig.sink.append(rig.tick(OFF))
+    assert caught.value is halt
+    assert len(retained_lines(rig, OFF, "tick")) == 1
+    assert rig.sink._pending is not None and not rig.sink.poisoned and not rig.sink.usable
+    rig.proxy.raise_after.clear()
+    rig.refused(lambda: rig.sink.append_lifecycle(rig.terminal(OFF)))
+    rig.refused(rig.sink.seal)
+    assert published == [] and rig.proxy.calls.count("seal") == 0
+
+
+@pytest.mark.parametrize("interrupt", [Halt, asyncio.CancelledError], ids=["halt", "cancelled"])
+def test_997_sk5_an_interrupted_temperature_write_stays_pending(
+    tmp_path: Path, interrupt: type[BaseException]
+) -> None:
+    """SK5: a BaseException before the temperature write keeps the tick pending, unusable."""
+    rig, tick = _pending_rig(tmp_path)
+    rig.proxy.fail_base["append_tick_temperature"] = interrupt()
+    with pytest.raises(interrupt):
+        rig.sink.append_tick_temperature(rig.temperature(tick))
+    assert rig.sink._pending is not None and not rig.sink.poisoned and not rig.sink.usable
+    assert rig.sink.latest_retained_tick() is None
+    assert retained_lines(rig, OFF, "tick_temperature") == []
+
+
+# ---------------------------------- #997 T2: two-phase activation (TP2-TP13, FX6)
+
+
+def screened_tick(phase: Phase, index: int, **changes: object) -> ColdTickObservation:
+    """``conforming_tick`` with raw temperature projection fields replaced."""
+    return observation(
+        device_state(driver=DRIVER),
+        roast_fan=roast_fan_state(level=0),
+        audio=audio(index),
+        session=session_metadata(
+            session_id=SESSIONS[phase], elapsed_monotonic_seconds=float(index + 1)
+        ),
+        temperature=screened_temperature(index, **changes),
+    )
+
+
+_HOT: typing.Final[dict[str, object]] = {
+    "last_packet_bean_temp_c": 41.0,
+    "retained_bean_temp_c": 41.0,
+}
+
+
+def phase_lines(world: World, stream: str, phase: Phase) -> list[Json]:
+    """One phase's retained lines of one stream."""
+    return [r for r in world.records(stream) if r["phase"] == phase.value]
+
+
+#: Admission (header) at 100.0; activation 7 s later at 107.0; tick 0 ends at 137.0.
+_EN5_ACTIVATED: typing.Final = 107.0
+#: The second OFF tick ends exactly at, or one ulp below, 60 s after activation.
+#: All instants lie in [64, 256), so every subtraction and addition below is exact.
+_EN5_ENDS: typing.Final = {"at": 167.0, "below": math.nextafter(167.0, 0.0)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["below", "at"])
+async def test_997_en5_the_screen_anchor_is_the_persisted_activation(
+    tmp_path: Path, case: str
+) -> None:
+    """EN5 (persisted): the engine screens with tick time minus the retained activation.
+
+    Admission and activation are 7 s apart, so the retained header and
+    ``PHASE_ACTIVATED`` instants differ; the hot second tick is judged only from the
+    retained activation.  Every compared value is read back from the sealed V6 tree.
+    """
+    world = World(tmp_path)
+    world.mcp.before["mark_beans_added:recording_off"] = advance(world, _EN5_ACTIVATED - T0)
+    second_end = _EN5_ENDS[case]
+    # Tick 0: 107 -> 137 (pre-boundary); tick 1 ends at ``second_end``; the OFF window
+    # (end 1907) then closes after three 450 s reads and one 400 s read.
+    world.mcp.read_seconds = read_schedule(
+        off_1=second_end - 137.0, off_2=450.0, off_3=450.0, off_4=450.0, off_5=400.0
+    )
+    world.mcp.tick = lambda current, index: (
+        screened_tick(current, index, **_HOT)
+        if (current, index) == (OFF, 1)
+        else conforming_tick(current, index)
+    )
+    result = await world.run()
+    v6 = world.retained(result.manifest_sha256)
+    header = next(item.header for item in v6.run.headers if item.header.phase is OFF)
+    activated = next(
+        record
+        for record in v6.lifecycle
+        if record.phase is OFF and record.event is Event.PHASE_ACTIVATED
+    )
+    assert activated.event_monotonic_seconds == _EN5_ACTIVATED
+    assert header.monotonic_seconds == T0 != activated.event_monotonic_seconds
+    ticks = [
+        typing.cast(schema.ColdTickRecord, record)
+        for stream in v6.run.streams
+        if stream.phase is OFF and stream.stream is schema.ColdEvidenceStream.TICK
+        for record in stream.records
+    ]
+    temperatures = [record for record in v6.tick_temperatures if record.phase is OFF]
+    assert ticks[1].monotonic_seconds == second_end
+    since = ticks[1].monotonic_seconds - activated.event_monotonic_seconds
+    if case == "at":
+        assert since == 60.0
+    else:
+        assert since < 60.0
+    # A header anchor would put this tick 67 s after the anchor, past the boundary.
+    assert ticks[1].monotonic_seconds - header.monotonic_seconds > 60.0
+    replay = evaluate_temperature(
+        temperatures[1].temperature,
+        previous=temperatures[0].temperature,
+        since_activation_seconds=since,
+    )
+    engine_reasons = tuple(record.reason for record in v6.temperature_aborts if record.phase is OFF)
+    assert engine_reasons == replay
+    if case == "at":
+        assert replay == (Screen.OUTSIDE_SCREEN,)
+        assert [record.tick for record in v6.temperature_aborts] == [1]
+        assert result.termination_reason is R.PHASE_ABORTED
+    else:
+        assert replay == ()
+        assert (OFF.value, "observation_window_elapsed") in world.events()
+        assert len(ticks) == len(temperatures) == 6
+
+
+@pytest.mark.asyncio
+async def test_997_tp2_recording_on_counters_restart_below_recording_off(tmp_path: Path) -> None:
+    """TP2: per-phase screening starts again, so lower ON counters still conform."""
+    world = World(tmp_path)
+    result = await world.run()
+    assert result.outcome is Outcome.ADVISORY_CONFORMANT
+    off_last = phase_lines(world, "tick_temperature", OFF)[-1]["temperature"]
+    on_first = phase_lines(world, "tick_temperature", ON)[0]["temperature"]
+    assert on_first["status_packet_count"] < off_last["status_packet_count"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", [OFF, ON])
+async def test_997_tp3_tp4_a_screen_violation_aborts_without_finalisation(
+    tmp_path: Path, phase: Phase
+) -> None:
+    """TP3/TP4: bean 41 °C at the 450-second tick aborts that phase; no D195 finalisation."""
+    world = World(tmp_path)
+    world.mcp.tick = lambda current, index: (
+        screened_tick(current, index, **_HOT)
+        if (current, index) == (phase, 1)
+        else conforming_tick(current, index)
+    )
+    result = await world.run()
+    assert_failed(world, result, R.PHASE_ABORTED)
+    assert cold_runner.OUTCOME_EXIT_CODES[result.outcome] == 6
+    (abort,) = world.records("temperature_abort")
+    assert (abort["phase"], abort["tick"], abort["domain"], abort["reason"]) == (
+        phase.value,
+        1,
+        "engine",
+        "temperature_outside_screen",
+    )
+    assert world.records("abort") == []
+    assert (phase.value, "observation_window_elapsed") not in world.events()
+    assert result.conformance is not None
+    if phase is OFF:
+        assert world.mcp.finalised == []
+        assert not any(called is ON for _name, called in world.mcp.calls)
+        assert result.conformance.findings == (
+            TemperatureFinding.TEMPERATURE_ABORT_RECORDED,
+            TemperatureFinding.MCP_CANDIDATE_MISSING,
+            TemperatureFinding.ADVISORY_POLICY_NOT_CONFORMANT,
+        )
+    else:
+        assert world.mcp.finalised == [SESSIONS[OFF]]
+        assert world.event(OFF, "finalisation_returned")["finalisation_result"] == (
+            "clean_recorded"
+        )
+        assert result.conformance.findings == (
+            TemperatureFinding.TEMPERATURE_ABORT_RECORDED,
+            TemperatureFinding.ADVISORY_POLICY_NOT_CONFORMANT,
+        )
+
+
+@pytest.mark.asyncio
+async def test_997_tp5_a_failed_run_terminal_is_verified_by_v6_and_never_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TP5: the OD5 terminal reloads once through V6; policy 3 never runs; no V4 path."""
+    world = World(tmp_path)
+    unresolved_invoked_at_off_end(world)
+    reads: list[object] = []
+    checks: list[object] = []
+    real_read = reader.read_retained_run_v6
+
+    def read(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        reads.append(kwargs["expected_manifest_sha256"])
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(two_phase, "read_retained_run_v6", read)
+    monkeypatch.setattr(two_phase, "check_temperature_conformance", checks.append)
+    result = await world.run()
+    assert result.advisory_path is AdvisoryPath.FAILED_RUN_TERMINAL
+    assert result.outcome is Outcome.NOT_CONFORMANT and result.conformance is None
+    assert reads == [result.manifest_sha256] and checks == []
+    assert not hasattr(two_phase, "read_retained_run_v4")
+    await release(world)
+
+
+@pytest.mark.asyncio
+async def test_997_tp6_a_failed_pair_write_is_never_sealed_or_finalised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TP6: the third OFF temperature write fails: an unsealed tree with one unpaired tick."""
+    real = store.ColdEvidenceWriter.append_tick_temperature
+    count: list[int] = []
+
+    def append(writer: store.ColdEvidenceWriter, record: typing.Any) -> None:
+        count.append(1)
+        if len(count) == 3:
+            raise OSError(CANARY)
+        real(writer, record)
+
+    monkeypatch.setattr(store.ColdEvidenceWriter, "append_tick_temperature", append)
+    world = World(tmp_path)
+    result = await world.run()
+    assert result.outcome is Outcome.EVIDENCE_NOT_SEALED and result.manifest_sha256 is None
+    assert result.termination_reason is R.PHASE_FAILED_UNEXPECTEDLY
+    assert world.mcp.finalised == [] and world.child.stops == 1
+    assert not world.manifest_exists()
+    assert len(phase_lines(world, "tick", OFF)) == 3
+    assert len(phase_lines(world, "tick_temperature", OFF)) == 2
+    assert_no_canary(result)
+
+
+@pytest.mark.asyncio
+async def test_997_tp7_an_interrupt_after_a_tick_write_reraises_unsealed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TP7: a BaseException after the third tick line is re-raised; nothing seals or finalises."""
+    real = store.ColdEvidenceWriter.append
+    halt = Halt()
+    ticks: list[int] = []
+
+    def append(writer: store.ColdEvidenceWriter, record: typing.Any) -> None:
+        real(writer, record)
+        if type(record) is schema.ColdTickRecord:
+            ticks.append(1)
+            if len(ticks) == 3:
+                raise halt
+
+    monkeypatch.setattr(store.ColdEvidenceWriter, "append", append)
+    world = World(tmp_path)
+    with pytest.raises(Halt) as caught:
+        await world.run()
+    assert caught.value is halt
+    assert not world.manifest_exists() and world.mcp.finalised == []
+    assert world.child.stops == 1
+    assert len(phase_lines(world, "tick", OFF)) == 3
+    assert len(phase_lines(world, "tick_temperature", OFF)) == 2
+    assert not any(event == "run_terminated" for _phase, event in world.events())
+
+
+@pytest.mark.asyncio
+async def test_997_tp8_a_forged_candidate_refuses_before_any_child_action(tmp_path: Path) -> None:
+    """TP8: an installed-bytes forgery is refused unowned; the genuine one is TP1."""
+    world = World(tmp_path)
+    world.candidate = reviewed_candidate().model_copy(update={"installed_bytes_attested": True})
+    result = await world.run()
+    assert (result.outcome, result.start_refusal, result.child_ownership) == (
+        Outcome.REFUSED_BEFORE_EVIDENCE,
+        Refusal.UNEXPECTED_FAILURE,
+        Own.NOT_OWNED,
+    )
+    assert world.child_ops() == [] and world.mcp.calls == []
+    assert not (Path(world.root) / RUN_ID).exists()
+
+
+@pytest.mark.asyncio
+async def test_997_tp9_an_off_identity_naming_another_version_is_not_frozen(
+    tmp_path: Path,
+) -> None:
+    """TP9: candidate 0.2.3 against 0.2.2 identities stops the child before any session."""
+    world = World(tmp_path)
+    world.candidate = reviewed_candidate(reported_version="0.2.3")
+    result = await world.run()
+    assert (result.outcome, result.start_refusal, result.child_ownership) == (
+        Outcome.REFUSED_BEFORE_EVIDENCE,
+        Refusal.IDENTITY_NOT_FROZEN,
+        Own.OWNED_STOP_CONFIRMED,
+    )
+    assert world.child_ops() == OFF_ONLY_OPS
+    assert ("start_cold_session", OFF) not in world.mcp.calls
+    assert not (Path(world.root) / RUN_ID).exists()
+
+
+def test_997_tp9_no_admissible_on_identity_can_name_another_version(tmp_path: Path) -> None:
+    """TP9 redundancy rationale: the ON branch of ``_freeze`` needs no separate run.
+
+    Every admitted identity pins its MCP version, so no strictly admissible ON
+    identity can differ from an admitted OFF identity's version; the ON branch
+    runs the same ``_freeze`` comparison the OFF test exercises.
+    """
+    world = World(tmp_path)
+    with pytest.raises(ColdIdentityError):
+        on_identity(tmp_path, world.root, coffee_roaster_mcp_version="0.2.3")
+
+
+@pytest.mark.asyncio
+async def test_997_tp10_a_refused_candidate_append_reads_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TP10: a candidate write fault in the hook fails the phase before any tick."""
+
+    def refuse(writer: store.ColdEvidenceWriter, record: typing.Any) -> typing.NoReturn:
+        raise RuntimeError(CANARY)
+
+    monkeypatch.setattr(store.ColdEvidenceWriter, "append_mcp_candidate", refuse)
+    world = World(tmp_path)
+    result = await world.run()
+    assert result.outcome is Outcome.EVIDENCE_NOT_SEALED
+    assert result.termination_reason is R.PHASE_FAILED_UNEXPECTEDLY
+    assert world.records("tick") == [] and world.records("mcp_candidate") == []
+    assert ("get_roast_state", OFF) not in world.mcp.calls
+    assert world.mcp.finalised == []
+    assert_no_canary(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        ColdTemperatureRunError(ColdTemperatureRunFailure.CANDIDATE_NOT_UNIQUE),
+        ColdTickTemperatureError(ColdTickTemperatureFailure.PAIRING_MISMATCHED),
+    ],
+    ids=["temperature_run", "tick_temperature"],
+)
+async def test_997_tp11_a_closed_reader_error_is_never_conformant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """TP11: a closed V6 reader error is NOT_CONFORMANT with no checker result."""
+
+    def refuse(*args: object, **kwargs: object) -> typing.NoReturn:
+        raise error
+
+    monkeypatch.setattr(two_phase, "read_retained_run_v6", refuse)
+    world = World(tmp_path)
+    result = await world.run()
+    assert result.outcome is Outcome.NOT_CONFORMANT and result.conformance is None
+    assert result.manifest_sha256 is not None
+
+
+@pytest.mark.asyncio
+async def test_997_tp12_cancellation_at_a_read_leaves_no_unpaired_tick(tmp_path: Path) -> None:
+    """TP12: CANCELLED is recorded and re-raised; every retained tick is paired."""
+    world = World(tmp_path)
+    key = "get_roast_state:recording_off"
+
+    def arm_third() -> None:
+        if world.mcp.reads == 2:
+            world.gates.arm(key)
+
+    world.mcp.before[key] = arm_third
+    task = asyncio.ensure_future(world.run())
+    for _ in range(200):
+        await asyncio.sleep(0)
+        if key in world.gates.entered and world.gates.entered[key].is_set():
+            break
+    assert world.gates.entered[key].is_set()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [a["reason"] for a in world.records("abort")] == ["cancelled"]
+    assert len(phase_lines(world, "tick", OFF)) == len(phase_lines(world, "tick_temperature", OFF))
+    assert len(phase_lines(world, "tick", OFF)) == 2
+    assert not world.manifest_exists()
+
+
+@pytest.mark.asyncio
+async def test_997_tp13_a_projection_missing_read_is_not_admitted(tmp_path: Path) -> None:
+    """TP13 (S1 retained): a missing projection aborts as MCP_RESPONSE_NOT_ADMITTED."""
+    world = World(tmp_path)
+    missing = ColdTickTemperatureProjectionError(
+        ColdTemperatureProjectionFailure.PROJECTION_KEY_MISSING
+    )
+    world.mcp.tick = lambda phase, index: (
+        missing if (phase, index) == (OFF, 1) else conforming_tick(phase, index)
+    )
+    result = await world.run()
+    assert_failed(world, result, R.PHASE_ABORTED)
+    assert [a["reason"] for a in world.records("abort")] == ["mcp_response_not_admitted"]
+    assert len(world.records("tick")) == len(world.records("tick_temperature")) == 1
+
+
+def _calls(tree: ast.AST, attribute: str) -> list[ast.Call]:
+    """Every call whose callee is an attribute named ``attribute``."""
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == attribute
+    ]
+
+
+def _method(tree: ast.AST, owner: str, name: str) -> ast.AST:
+    """One (possibly async) method of one class."""
+    cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == owner)
+    return next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef) and n.name == name
+    )
+
+
+def test_997_fx6_one_read_one_publication_one_latest_tick_and_no_construct() -> None:
+    """FX6: the single read, single publication and latest-tick site; no ``model_construct``."""
+    package = SOURCE.parents[1]
+    engine_tree = ast.parse((SOURCE.parent / "engine.py").read_text(encoding="utf-8"))
+    reads = _calls(engine_tree, "get_roast_state")
+    assert len(reads) == 1
+    inside_read = {id(node) for node in ast.walk(_method(engine_tree, "_PhaseRun", "_read"))}
+    assert id(reads[0]) in inside_read
+    publications = [
+        call
+        for call in _calls(TREE, "after_tick")
+        if isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "self"
+    ]
+    assert len(publications) == 1
+    pair_method = _method(TREE, "_RunSink", "append_tick_temperature")
+    inside_pair = {id(node) for node in ast.walk(pair_method)}
+    assert id(publications[0]) in inside_pair
+    latest = [
+        target
+        for node in ast.walk(TREE)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Subscript)
+        and isinstance(target.value, ast.Attribute)
+        and target.value.attr == "_latest_tick"
+    ]
+    assert len(latest) == 1 and id(latest[0]) in inside_pair
+    composition = ast.parse((package / "cold_composition.py").read_text(encoding="utf-8"))
+    trees = {
+        "engine.py": engine_tree,
+        "two_phase.py": TREE,
+        "evidence_builders.py": ast.parse(
+            (SOURCE.parent / "evidence_builders.py").read_text(encoding="utf-8")
+        ),
+        "cold_cli.py": ast.parse((package / "cold_cli.py").read_text(encoding="utf-8")),
+        "cold_composition.py": composition,
+    }
+    for name, tree in trees.items():
+        assert _calls(tree, "model_construct") == [], name
+    assert len(_calls(composition, "model_copy")) == 2

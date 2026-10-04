@@ -17,6 +17,18 @@ from roastpilot_agent.advisor import AdvisorDescriptor
 from roastpilot_agent.cold_characterisation import evidence_builders as builders
 from roastpilot_agent.cold_characterisation import evidence_schema as schema
 from roastpilot_agent.cold_characterisation import evidence_store as store
+from roastpilot_agent.cold_characterisation.evidence_temperature import (
+    ColdTickTemperatureRecord,
+    pairs_with,
+)
+from roastpilot_agent.cold_characterisation.evidence_temperature_run import (
+    ColdMcpCandidateProvenance,
+    ColdMcpCandidateRecord,
+    ColdTemperatureAbortRecord,
+    ColdTemperatureScreenReason,
+    admit_mcp_candidate_document,
+    validate_temperature_abort_record,
+)
 from roastpilot_agent.cold_characterisation.host import HostBoundSample
 from roastpilot_agent.cold_characterisation.identity import (
     REQUIRED_MCP_VERSION,
@@ -37,6 +49,7 @@ from roastpilot_agent.cold_characterisation.mcp import (
 )
 from roastpilot_agent.cold_characterisation.temperature_projection import (
     ColdTickTemperatureProjection,
+    admit_cold_temperature_projection,
 )
 from roastpilot_agent.config import MCPDeviceConfig
 from roastpilot_agent.mcp_client import (
@@ -246,6 +259,60 @@ def observation(
         session=session_metadata() if session is None else session,
         temperature=valid_projection() if temperature is None else temperature,
     )
+
+
+def screened_temperature(index: int, **overrides: object) -> ColdTickTemperatureProjection:
+    """Return one admitted observed-Celsius projection that passes the D209 screen.
+
+    Values are 20.0 °C (raw and typed agree), ``status_packet_count`` is
+    ``index + 1`` (so consecutive indices progress) and every other counter is 0.
+    ``overrides`` replace raw fields before admission through the real grammar.
+    """
+    raw: dict[str, object] = {
+        "projection_version": 1,
+        "outcome": "observed",
+        "configured_temperature_unit": "celsius",
+        "reported_temperature_unit": "celsius",
+        "last_packet_valid": True,
+        "last_packet_bean_temp_c": 20.0,
+        "last_packet_env_temp_c": 20.0,
+        "retained_bean_temp_c": 20.0,
+        "retained_env_temp_c": 20.0,
+        "value_agreement": "agree",
+        "status_packet_count": index + 1,
+        "ignored_temperature_packet_count": 0,
+        "status_read_error_count": 0,
+        "command_loop_error_count": 0,
+    }
+    for name, value in overrides.items():
+        assert name in raw, name
+        raw[name] = value
+    projection = admit_cold_temperature_projection(raw)
+    assert type(projection) is ColdTickTemperatureProjection, projection
+    return projection
+
+
+def reviewed_candidate(**update: object) -> ColdMcpCandidateProvenance:
+    """Return one admitted synthetic operator-asserted MCP candidate provenance.
+
+    The values are synthetic test data (never a reviewed artefact's digest); the
+    reported version defaults to the pinned MCP version.  ``update`` replaces raw
+    document fields before admission through the shared candidate grammar.
+    """
+    document: dict[str, object] = {
+        "distribution": "coffee-roaster-mcp",
+        "reported_version": REQUIRED_MCP_VERSION,
+        "artefact_kind": "wheel",
+        "artefact_byte_length": 4096,
+        "artefact_sha256": "d" * 64,
+        "reviewed_source_revision": "e" * 40,
+        "assertion": "operator_asserted_reviewed_candidate",
+        "installed_bytes_attested": False,
+        **update,
+    }
+    admitted = admit_mcp_candidate_document(document)
+    assert admitted is not None
+    return admitted
 
 
 def finalisation_payload(*, streaming: bool | None = False) -> dict[str, typing.Any]:
@@ -933,6 +1000,8 @@ _MODULE_IMPORT_ALLOW_LIST: dict[str, frozenset[str]] = {
             _COLD + "mcp",
             _COLD + "host",
             _COLD + "evidence_lifecycle",
+            _COLD + "evidence_temperature",
+            _COLD + "evidence_temperature_run",
         }
     ),
 }
@@ -1369,3 +1438,219 @@ def test_t_b10_session_id_beyond_the_bound_refuses_without_truncation(
     with pytest.raises(schema.ColdEvidenceError) as raised:
         build_tick(header, forged)
     _assert_closed(raised.value, failure)
+
+
+# ------------------------------------------ #997 T2: D209 record builders (BL1, BL2)
+
+_BL_CANARY = "CANARY-997-t2-builders"
+_RECORDED = "2026-09-26T12:05:00Z"
+Screen = ColdTemperatureScreenReason
+
+
+def _paired_inputs(
+    tmp_path: Path, index: int = 3
+) -> tuple[schema.ColdRunHeader, schema.ColdTickRecord, ColdTickObservation]:
+    """One header, one observation and the tick built from that observation."""
+    header = header_for(tmp_path, str(tmp_path), schema.ColdPhaseKind.RECORDING_OFF)
+    source = observation(device_state(), temperature=screened_temperature(index))
+    tick = builders.build_tick_record(
+        header=header,
+        tick=index,
+        recorded_at_utc="2026-09-26T12:00:04Z",
+        monotonic_seconds=5.0,
+        observation=source,
+    )
+    return header, tick, source
+
+
+def _assert_refused(
+    raised: pytest.ExceptionInfo[schema.ColdEvidenceError], failure: schema.ColdEvidenceFailure
+) -> None:
+    """The closed refusal carries no canary anywhere a caller could render it."""
+    _assert_closed(raised.value, failure)
+    rendered = (str(raised.value), repr(raised.value), repr(raised.value.args), str(raised))
+    assert all(_BL_CANARY not in text for text in rendered)
+
+
+def test_bl1_tick_temperature_builder_copies_the_tick_and_readmits_the_projection(
+    tmp_path: Path,
+) -> None:
+    """BL1: a fresh snapshot whose identity values are the tick's, projection the read's."""
+    _header, tick, source = _paired_inputs(tmp_path)
+    built = builders.build_tick_temperature_record(tick=tick, observation=source)
+    assert type(built) is ColdTickTemperatureRecord
+    assert pairs_with(tick, built)
+    assert (built.schema_version, built.stream, built.tick) == (4, "tick_temperature", 3)
+    assert built.temperature == source.temperature
+    assert built.temperature is not source.temperature
+    again = builders.build_tick_temperature_record(tick=tick, observation=source)
+    assert again == built and again is not built
+
+
+def test_bl1_abort_and_candidate_builders_bind_to_the_header(tmp_path: Path) -> None:
+    """BL1: header-bound schema-5 and schema-6 snapshots; the candidate is re-admitted fresh."""
+    header, _tick, _source = _paired_inputs(tmp_path)
+    abort = builders.build_temperature_abort_record(
+        header=header,
+        tick=3,
+        reason=Screen.OUTSIDE_SCREEN,
+        recorded_at_utc=_RECORDED,
+        monotonic_seconds=6.0,
+    )
+    assert type(abort) is ColdTemperatureAbortRecord
+    assert (abort.run_id, abort.phase, abort.identity_sha256) == (
+        header.run_id,
+        header.phase,
+        header.identity_sha256,
+    )
+    assert (abort.tick, abort.reason, abort.domain) == (
+        3,
+        Screen.OUTSIDE_SCREEN,
+        schema.ColdAbortDomain.ENGINE,
+    )
+    assert (abort.recorded_at_utc, abort.monotonic_seconds) == (_RECORDED, 6.0)
+    candidate = reviewed_candidate()
+    record = builders.build_mcp_candidate_record(
+        header=header, candidate=candidate, recorded_at_utc=_RECORDED, monotonic_seconds=6.0
+    )
+    assert type(record) is ColdMcpCandidateRecord
+    assert (record.run_id, record.phase, record.identity_sha256) == (
+        header.run_id,
+        header.phase,
+        header.identity_sha256,
+    )
+    assert record.candidate == candidate and record.candidate is not candidate
+    assert record.candidate.installed_bytes_attested is False
+
+
+def _forged_observations(source: ColdTickObservation) -> dict[str, object]:
+    """Observations whose temperature slot is missing, raw, or a forged projection."""
+    construct = typing.cast(typing.Any, ColdTickObservation).model_construct
+    values = {name: getattr(source, name) for name in ColdTickObservation.model_fields}
+    projection = typing.cast(typing.Any, source.temperature)
+    return {
+        "uninitialised": object.__new__(ColdTickObservation),
+        "raw-dict-temperature": construct(**{**values, "temperature": {"value": _BL_CANARY}}),
+        "copied-version-2": source.model_copy(
+            update={"temperature": projection.model_copy(update={"projection_version": 2})}
+        ),
+    }
+
+
+@pytest.mark.parametrize("name", ["uninitialised", "raw-dict-temperature", "copied-version-2"])
+def test_bl2_tick_temperature_builder_refuses_forged_observations(
+    tmp_path: Path, name: str
+) -> None:
+    """BL2: a missing slot or a forged projection is ``RECORD_NOT_VALIDATED``."""
+    _header, tick, source = _paired_inputs(tmp_path)
+    forged = _forged_observations(source)[name]
+    with pytest.raises(schema.ColdEvidenceError) as raised:
+        builders.build_tick_temperature_record(
+            tick=tick, observation=typing.cast(ColdTickObservation, forged)
+        )
+    _assert_refused(raised, schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+
+
+def test_bl2_tick_temperature_builder_refuses_a_forged_tick(tmp_path: Path) -> None:
+    """BL2: a tick copied to an invalid index refuses at ``validate_record``."""
+    _header, tick, source = _paired_inputs(tmp_path)
+    forged = tick.model_copy(update={"tick": -1})
+    with pytest.raises(schema.ColdEvidenceError) as raised:
+        builders.build_tick_temperature_record(tick=forged, observation=source)
+    _assert_refused(raised, schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+
+
+def test_bl2_header_builders_refuse_a_header_subclass(tmp_path: Path) -> None:
+    """BL2: only an exact ``ColdRunHeader`` binds a schema-5 or schema-6 record."""
+    header, _tick, _source = _paired_inputs(tmp_path)
+    subclass = typing.cast(typing.Any, _HeaderSub).model_construct(**dict(header))
+    with pytest.raises(schema.ColdEvidenceError) as raised:
+        builders.build_temperature_abort_record(
+            header=subclass,
+            tick=0,
+            reason=Screen.OUTSIDE_SCREEN,
+            recorded_at_utc=_RECORDED,
+            monotonic_seconds=6.0,
+        )
+    _assert_refused(raised, schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+    with pytest.raises(schema.ColdEvidenceError) as raised:
+        builders.build_mcp_candidate_record(
+            header=subclass,
+            candidate=reviewed_candidate(),
+            recorded_at_utc=_RECORDED,
+            monotonic_seconds=6.0,
+        )
+    _assert_refused(raised, schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"tick": True},
+        {"tick": -1},
+        {"monotonic_seconds": 5},
+        {"reason": "temperature_outside_screen"},
+        {"recorded_at_utc": _BL_CANARY + "x" * 2049},
+    ],
+    ids=["bool-tick", "negative-tick", "int-seconds", "raw-reason", "over-long-ascii-text"],
+)
+def test_bl2_abort_builder_refuses_inexact_scalars(
+    tmp_path: Path, update: dict[str, object]
+) -> None:
+    """BL2: the record model refuses non-exact scalars; nothing of the input escapes."""
+    header, _tick, _source = _paired_inputs(tmp_path)
+    values: dict[str, object] = {
+        "tick": 0,
+        "reason": Screen.OUTSIDE_SCREEN,
+        "recorded_at_utc": _RECORDED,
+        "monotonic_seconds": 6.0,
+        **update,
+    }
+    with pytest.raises(schema.ColdEvidenceError) as raised:
+        builders.build_temperature_abort_record(header=header, **typing.cast(typing.Any, values))
+    _assert_refused(raised, schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED)
+
+
+def test_bl2_an_over_bound_utf8_text_propagates_the_boundary_member(tmp_path: Path) -> None:
+    """BL2: 2049 UTF-8 bytes in 1025 characters refuses with the boundary's own member."""
+    header, _tick, _source = _paired_inputs(tmp_path)
+    text = "é" * 1024 + "a"
+    assert len(text.encode("utf-8")) == 2049
+    direct = ColdTemperatureAbortRecord.model_validate(
+        {
+            "schema_version": 5,
+            "stream": "temperature_abort",
+            "run_id": header.run_id,
+            "phase": header.phase,
+            "recorded_at_utc": text,
+            "monotonic_seconds": 6.0,
+            "identity_sha256": header.identity_sha256,
+            "tick": 0,
+            "domain": schema.ColdAbortDomain.ENGINE,
+            "reason": Screen.OUTSIDE_SCREEN,
+        },
+        strict=True,
+    )
+    with pytest.raises(schema.ColdEvidenceError) as boundary:
+        validate_temperature_abort_record(direct)
+    assert boundary.value.failure is schema.ColdEvidenceFailure.TEXT_FIELD_TOO_LARGE
+    with pytest.raises(schema.ColdEvidenceError) as raised:
+        builders.build_temperature_abort_record(
+            header=header,
+            tick=0,
+            reason=Screen.OUTSIDE_SCREEN,
+            recorded_at_utc=text,
+            monotonic_seconds=6.0,
+        )
+    _assert_refused(raised, boundary.value.failure)
+
+
+def test_bl2_candidate_builder_refuses_an_installed_bytes_forgery(tmp_path: Path) -> None:
+    """BL2: a copied candidate claiming installed-byte attestation is refused."""
+    header, _tick, _source = _paired_inputs(tmp_path)
+    forged = reviewed_candidate().model_copy(update={"installed_bytes_attested": True})
+    with pytest.raises(schema.ColdEvidenceError) as raised:
+        builders.build_mcp_candidate_record(
+            header=header, candidate=forged, recorded_at_utc=_RECORDED, monotonic_seconds=6.0
+        )
+    _assert_refused(raised, schema.ColdEvidenceFailure.RECORD_NOT_VALIDATED)

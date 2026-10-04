@@ -37,7 +37,7 @@ from starlette.types import Message
 
 from roastpilot_agent import api, cold_cli, cold_runner
 from roastpilot_agent.cold_app import COLD_OBSERVATION_EVENTS_PATH
-from roastpilot_agent.cold_characterisation import advisory_conformance
+from roastpilot_agent.cold_characterisation import temperature_conformance
 from roastpilot_agent.cold_characterisation.advisory_sampler import ColdAdvisorySpec
 from roastpilot_agent.cold_characterisation.engine import MonotonicEngineClock
 from roastpilot_agent.cold_characterisation.evidence_lifecycle import ColdRunTerminationReason
@@ -64,6 +64,7 @@ from roastpilot_agent.cold_composition import (
 from roastpilot_agent.cold_observation_stream import ColdObservationHub
 from roastpilot_agent.config import AppConfig, MCPDeviceConfig
 from roastpilot_agent.store import RoastStore
+from tests.test_cold_characterisation_evidence_builders import reviewed_candidate
 from tests.test_cold_cli import SUMMARY_KEYS, parse_summary
 
 Outcome = ColdTwoPhaseOutcome
@@ -73,11 +74,16 @@ Check = ColdTwoPhaseProviderCheck
 MARKER = "PLANTEDMARKER9d1e"
 DIGEST = "c" * 64
 RUNNER_SOURCE = Path(cold_runner.__file__)
-CONFORMANT = advisory_conformance.ColdAdvisoryConformanceResult(
-    policy_version=2,
-    outcome=advisory_conformance.ColdAdvisoryConformanceOutcome.ADVISORY_CONFORMANT,
+#: Runtime success requires temperature policy 3 (which composes advisory policy 2).
+CONFORMANT = temperature_conformance.ColdTemperatureConformanceResult(
+    policy_version=3,
+    outcome=temperature_conformance.ColdTemperatureConformanceOutcome.TEMPERATURE_SCREENED_CONFORMANT,
     findings=(),
-    pre_advisory_findings=(),
+)
+NOT_CONFORMANT_RESULT = temperature_conformance.ColdTemperatureConformanceResult(
+    policy_version=3,
+    outcome=temperature_conformance.ColdTemperatureConformanceOutcome.NOT_CONFORMANT,
+    findings=(temperature_conformance.ColdTemperatureConformanceFinding.TICK_TEMPERATURE_ABSENT,),
 )
 EIGHT_FIELDS = {
     "outcome",
@@ -367,6 +373,7 @@ def make_inputs(**overrides: str) -> ColdCompositionInputs:
         ),
         device_config=MCPDeviceConfig(),
         protected_roots=(),
+        mcp_candidate=reviewed_candidate(),
         **values,
     )
 
@@ -650,7 +657,7 @@ NO_EXIT_CASES: list[tuple[str, Callable[[], object], int, str]] = [
                 _pending_values(),
                 advisory_path=Path_.PROVIDER_OUTSTANDING_FAILED,
                 conformance=types.SimpleNamespace(
-                    outcome=advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT
+                    outcome=temperature_conformance.ColdTemperatureConformanceOutcome.NOT_CONFORMANT
                 ),
             )
         ),
@@ -879,7 +886,7 @@ def _value_sets() -> dict[str, set[str]]:
         "child_ownership": tokens(Own) | {"unknown"},
         "advisory_path": tokens(Path_),
         "provider_check": tokens(Check),
-        "conformance_outcome": tokens(advisory_conformance.ColdAdvisoryConformanceOutcome),
+        "conformance_outcome": tokens(temperature_conformance.ColdTemperatureConformanceOutcome),
         "signal": {"sigint", "sigterm", "none"},
         "http_server": tokens(cold_runner.HttpServerStatus) - {"none"} | {"unknown"},
     }
@@ -1021,13 +1028,30 @@ def test_unknown_signal_number_renders_none() -> None:
 
 
 def test_conformance_outcome_is_rendered_from_the_admitted_row() -> None:
+    """RN1: success renders the policy-3 token; keys and outcome token are unchanged."""
     summary = cold_runner.ColdRunSummary(
         run_invoked=True,
         result=cold_runner.SummaryResult.ADMITTED,
         exit_code=0,
         row=ADVISORY_CONFORMANT,
     )
-    assert "conformance_outcome=advisory_conformant\n" in cold_runner.render_summary(summary)
+    text = cold_runner.render_summary(summary)
+    assert "conformance_outcome=temperature_screened_conformant\n" in text
+    assert "outcome=advisory_conformant\n" in text and "exit_code=0\n" in text
+    assert tuple(line.split("=", 1)[0] for line in text.splitlines()) == SUMMARY_KEYS
+
+
+def test_997_rn2_a_not_conformant_policy_three_result_renders_not_conformant() -> None:
+    """RN2: a carried policy-3 refusal renders ``not_conformant`` with exit 6."""
+    not_conformant = row(fields(Outcome.NOT_CONFORMANT, conformance=NOT_CONFORMANT_RESULT))
+    summary = cold_runner.ColdRunSummary(
+        run_invoked=True,
+        result=cold_runner.SummaryResult.ADMITTED,
+        exit_code=cold_runner.OUTCOME_EXIT_CODES[Outcome.NOT_CONFORMANT],
+        row=not_conformant,
+    )
+    text = cold_runner.render_summary(summary)
+    assert "conformance_outcome=not_conformant\n" in text and "exit_code=6\n" in text
 
 
 # --- 7. latch ----------------------------------------------------------------------------

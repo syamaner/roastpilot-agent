@@ -26,6 +26,10 @@ import uvicorn
 from roastpilot_agent import cold_runner
 from roastpilot_agent.cold_characterisation.advisory_sampler import ColdAdvisorySpec
 from roastpilot_agent.cold_characterisation.evidence_lifecycle import ColdRunTerminationReason
+from roastpilot_agent.cold_characterisation.evidence_temperature_run import (
+    ColdMcpCandidateProvenance,
+    admit_mcp_candidate_document,
+)
 from roastpilot_agent.cold_characterisation.host import HostBoundSample
 from roastpilot_agent.cold_characterisation.identity import (
     BOOT_ID_PATH,
@@ -110,7 +114,26 @@ def inputs() -> ColdCompositionInputs:
         operator_host_notes="driver",
         operator_psu_notes="driver",
         operator_cooling_notes="driver",
+        mcp_candidate=candidate(),
     )
+
+
+def candidate() -> ColdMcpCandidateProvenance:
+    """One synthetic operator-asserted MCP candidate naming the host's version."""
+    admitted = admit_mcp_candidate_document(
+        {
+            "distribution": "coffee-roaster-mcp",
+            "reported_version": "0.2.2",
+            "artefact_kind": "wheel",
+            "artefact_byte_length": 4096,
+            "artefact_sha256": "d" * 64,
+            "reviewed_source_revision": "e" * 40,
+            "assertion": "operator_asserted_reviewed_candidate",
+            "installed_bytes_attested": False,
+        }
+    )
+    assert admitted is not None
+    return admitted
 
 
 class NeverHost:

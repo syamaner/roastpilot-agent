@@ -668,7 +668,10 @@ def test_create_cold_app_refuses_a_bad_heartbeat(heartbeat: float) -> None:
 async def test_t_a13_end_to_end_one_frame_per_retained_tick(tmp_path: Path) -> None:
     """T-A13: a run publishing to the hub yields one frame per retained tick, matching."""
     from tests.test_cold_characterisation_two_phase import Outcome
-    from tests.test_cold_characterisation_two_phase_observer import ObservedWorld
+    from tests.test_cold_characterisation_two_phase_observer import (
+        TICKS_PER_PHASE,
+        ObservedWorld,
+    )
 
     hub = stream.ColdObservationHub(queue_frames=16, ring_frames=16)
     subscription = hub.subscribe(None)
@@ -681,7 +684,7 @@ async def test_t_a13_end_to_end_one_frame_per_retained_tick(tmp_path: Path) -> N
     while not subscription.queue.empty():
         frames.append(subscription.queue.get_nowait())
     ticks = world.records("tick")
-    assert len(frames) == len(ticks) == 8 == len(hub._ring)
+    assert len(frames) == len(ticks) == 2 * TICKS_PER_PHASE == len(hub._ring)
     for frame, tick in zip(frames, ticks, strict=True):
         data = frame_data(frame)
         assert data["bean_temp_c"] == tick["device"]["bean_temp_c"]

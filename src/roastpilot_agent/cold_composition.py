@@ -50,6 +50,10 @@ from roastpilot_agent.cold_characterisation.evidence_store import (
     ColdAdmittedRoot,
     admit_evidence_root,
 )
+from roastpilot_agent.cold_characterisation.evidence_temperature_run import (
+    ColdMcpCandidateProvenance,
+    readmit_mcp_candidate_provenance,
+)
 from roastpilot_agent.cold_characterisation.identity import (
     REQUIRED_MCP_VERSION,
     AgentBuildProvenance,
@@ -211,6 +215,7 @@ class ColdCompositionRefusal(enum.Enum):
     ROOT_NOT_ADMITTED = "root_not_admitted"
     MCP_SOURCE_NOT_ADMITTED = "mcp_source_not_admitted"
     PROFILE_NOT_ADMITTED = "profile_not_admitted"
+    MCP_CANDIDATE_NOT_ADMITTED = "mcp_candidate_not_admitted"
 
 
 class ColdCompositionChildError(RuntimeError):
@@ -234,7 +239,14 @@ class ColdHostFacts(pydantic.BaseModel):
 
 
 class ColdCompositionInputs(pydantic.BaseModel):
-    """Explicit caller inputs for one cold run; nothing here is defaulted or inferred."""
+    """Explicit caller inputs for one cold run; nothing here is defaulted or inferred.
+
+    ``mcp_candidate`` is the operator-asserted reviewed MCP candidate; its reported
+    version must equal the host's installed self-reported MCP version.  These
+    validators are the early surface only: the run consumer re-admits both values
+    itself (see :func:`run_cold_characterisation`).  The candidate never attests
+    installed bytes.
+    """
 
     model_config = _INPUT_MODEL_CONFIG
 
@@ -251,6 +263,73 @@ class ColdCompositionInputs(pydantic.BaseModel):
     operator_host_notes: str
     operator_psu_notes: str
     operator_cooling_notes: str
+    mcp_candidate: ColdMcpCandidateProvenance
+
+    @pydantic.field_validator("mcp_candidate", mode="before")
+    @classmethod
+    def _readmit_candidate(cls, value: object) -> object:
+        """Replace the candidate with its fresh re-admitted copy, or refuse it."""
+        fresh = readmit_mcp_candidate_provenance(value)
+        if fresh is None:
+            raise ValueError("MCP candidate not admitted")
+        return fresh
+
+    @pydantic.model_validator(mode="after")
+    def _require_candidate_version(self) -> typing.Self:
+        """Require the candidate's reported version to equal the host MCP version."""
+        if _admit_candidate(self) is None:
+            raise ValueError("MCP candidate not admitted")
+        return self
+
+
+def _declared_values(
+    value: object, kind: type[object], names: tuple[str, ...]
+) -> tuple[object, ...] | None:
+    """Return an exact instance's named raw field values, or ``None``.
+
+    The class is matched by identity and the raw state is read without attribute
+    hooks; an uninitialised instance (whose instance dictionary is empty), a
+    non-``dict`` state, a non-``str`` key or a missing name refuses.  No caller
+    equality, hashing, ``repr`` or iterator runs.
+    """
+    if type(value) is not kind:
+        return None
+    # An exact model class always exposes an instance dictionary (empty when
+    # uninitialised), so this read never raises for the admitted classes.
+    data: object = object.__getattribute__(value, "__dict__")
+    if type(data) is not dict:
+        return None
+    raw = typing.cast(dict[object, object], data)
+    for key in raw:
+        if type(key) is not str:
+            return None
+    fields = typing.cast(dict[str, object], raw)
+    if not all(name in fields for name in names):
+        return None
+    return tuple(fields[name] for name in names)
+
+
+def _admit_candidate(inputs: object) -> ColdMcpCandidateProvenance | None:
+    """Re-admit the inputs' MCP candidate against the host MCP version, or ``None``.
+
+    Only an exact :class:`ColdCompositionInputs` holding an exact
+    :class:`ColdHostFacts` is read, without attribute hooks; only the candidate and
+    the host version are extracted.  The candidate is re-admitted freshly through its
+    public boundary and its reported version must equal the exact-``str`` host
+    version.  Other inputs are not re-validated here.
+    """
+    top = _declared_values(inputs, ColdCompositionInputs, ("mcp_candidate", "host_facts"))
+    if top is None:
+        return None
+    candidate, facts = top
+    nested = _declared_values(facts, ColdHostFacts, ("coffee_roaster_mcp_version",))
+    if nested is None:
+        return None
+    version = nested[0]
+    fresh = readmit_mcp_candidate_provenance(candidate)
+    if fresh is None or type(version) is not str or version != fresh.reported_version:
+        return None
+    return fresh
 
 
 class ColdCompositionResources:
@@ -1025,8 +1104,11 @@ async def run_cold_characterisation(
 
     Every :class:`ColdCompositionRefusal` check runs before the child process
     object is constructed; such a refusal returns its closed member with nothing
-    constructed.  The per-phase identity guards (MCP version and config source)
-    run later, after the child starts, and surface through the runtime as an
+    constructed.  The MCP candidate and the host MCP version are re-read and
+    re-admitted here (``MCP_CANDIDATE_NOT_ADMITTED``), not trusted from the inputs'
+    construction, and the fresh candidate is what the runtime receives.  The
+    per-phase identity guards (MCP version and config source) run later, after
+    the child starts, and surface through the runtime as an
     identity-not-frozen refusal; the runtime then attempts to stop the child and
     reports the resulting ownership status, which may be unconfirmed (a port can
     also stall), so no physically safe state is inferred from it.  The runtime's
@@ -1085,6 +1167,9 @@ async def run_cold_characterisation(
     profiles = _admit_profiles(rendered)
     if isinstance(profiles, ColdCompositionRefusal):
         return profiles
+    candidate = _admit_candidate(inputs)
+    if candidate is None:
+        return ColdCompositionRefusal.MCP_CANDIDATE_NOT_ADMITTED
     active_path = directory / _ACTIVE_NAME
     process = _construct_process(
         config.mcp,
@@ -1124,5 +1209,6 @@ async def run_cold_characterisation(
         configured_call_bound_seconds=float(config.controller.advisory_timeout_seconds),
         configured_dwell_seconds=float(config.controller.post_fc_min_consult_interval_seconds),
         evaluator=SafetyPolicy(config.safety),
+        mcp_candidate=candidate,
         tick_observer=tick_observer,
     )

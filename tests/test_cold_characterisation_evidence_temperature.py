@@ -1315,8 +1315,12 @@ def test_s2_vocabularies_are_closed_plain_enums() -> None:
     )
 
 
-def test_s2_no_runtime_module_reaches_the_new_api() -> None:
-    """S2: no production caller exists; only the store and reader name the new stream."""
+def test_s2_runtime_callers_name_only_their_contracted_api() -> None:
+    """FX2 (#997 T2): each runtime cold module names exactly its contracted D209 API.
+
+    The owners are unconstrained; the engine, the orchestrator and the builders name
+    exactly their sets (docstrings included); every other cold module names none.
+    """
     texts = (
         "read_retained_run_v5",
         "append_tick_temperature",
@@ -1327,7 +1331,7 @@ def test_s2_no_runtime_module_reaches_the_new_api() -> None:
         "check_temperature_conformance",
         "evaluate_temperature",
     )
-    allowed = {
+    owners = {
         "evidence_store.py",
         "evidence_reader.py",
         "evidence_temperature.py",
@@ -1335,10 +1339,30 @@ def test_s2_no_runtime_module_reaches_the_new_api() -> None:
         "temperature_screen.py",
         "temperature_conformance.py",
     }
+    contracted: dict[str, set[str]] = {
+        "engine.py": {
+            "evidence_temperature",
+            "append_tick_temperature",
+            "append_temperature_abort",
+            "evaluate_temperature",
+        },
+        "two_phase.py": {
+            "evidence_temperature",
+            "append_tick_temperature",
+            "append_temperature_abort",
+            "append_mcp_candidate",
+            "read_retained_run_v6",
+            "check_temperature_conformance",
+        },
+        "evidence_builders.py": {"evidence_temperature"},
+    }
+    seen: set[str] = set()
     for path in sorted(COLD_PACKAGE.glob("*.py")):
-        if path.name in allowed:
+        if path.name in owners:
             continue
         source = path.read_text(encoding="utf-8")
-        for text in texts:
-            assert text not in source, (path.name, text)
+        present = {text for text in texts if text in source}
+        assert present == contracted.get(path.name, set()), path.name
+        seen.add(path.name)
+    assert set(contracted) <= seen
     assert ColdTemperatureOutcome.OBSERVED.value == "observed"
