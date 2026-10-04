@@ -638,6 +638,68 @@ def test_rr4_every_screen_reason_is_an_admitted_abort_reason(tmp_path: Path) -> 
         assert abort_for(tick, reason).domain is Domain.ENGINE
 
 
+def _forbid_public_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make either public record boundary fail loudly if direct construction reached it."""
+
+    def forbidden(record: object) -> typing.NoReturn:
+        raise AssertionError("a public record boundary was called")
+
+    monkeypatch.setattr(run_ev, "validate_mcp_candidate_record", forbidden)
+    monkeypatch.setattr(run_ev, "validate_temperature_abort_record", forbidden)
+
+
+def test_rr4_direct_candidate_construction_readmits_the_nested_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RR4 (L2) positive control: the nested provenance is a fresh, equal re-admission."""
+    _forbid_public_boundaries(monkeypatch)
+    header = genuine_header(tmp_path)
+    good = provenance()
+    record = Candidate.model_validate(candidate_values(header, candidate=good), strict=True)
+    assert type(record.candidate) is Provenance
+    assert record.candidate == good
+    assert record.candidate is not good
+    assert record.candidate.installed_bytes_attested is False
+
+
+def _forged_nested_provenances() -> list[tuple[str, object]]:
+    """Exact-class provenances whose content is not admitted, one isolated fault each."""
+    good = provenance()
+    return [
+        ("attested-true", good.model_copy(update={"installed_bytes_attested": True})),
+        ("raw-kind-token", good.model_copy(update={"artefact_kind": "wheel"})),
+        ("raw-assertion-token", good.model_copy(update={"assertion": PROVENANCE_DOC["assertion"]})),
+        ("fabricated-kind", good.model_copy(update={"artefact_kind": fabricated(Kind)})),
+        ("construct-zero-length", CONSTRUCT(**provenance_members(artefact_byte_length=0))),
+        ("construct-upper-sha", CONSTRUCT(**provenance_members(artefact_sha256="A" * 64))),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "forged_provenance"),
+    _forged_nested_provenances(),
+    ids=[case[0] for case in _forged_nested_provenances()],
+)
+def test_rr4_direct_candidate_construction_refuses_a_forged_nested_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, forged_provenance: object
+) -> None:
+    """RR4 (L2): direct construction itself re-admits the nested provenance.
+
+    Only the nested provenance differs from a valid record, and neither public
+    record boundary is called, so returning the instance unchanged (or a same-type
+    copy) instead of re-admitting it is detected here, not by a later boundary.
+    """
+    del name
+    _forbid_public_boundaries(monkeypatch)
+    header = genuine_header(tmp_path)
+    assert type(forged_provenance) is Provenance
+    assert run_ev.readmit_mcp_candidate_provenance(forged_provenance) is None
+    control = Candidate.model_validate(candidate_values(header), strict=True)
+    assert control.candidate == provenance()
+    with pytest.raises(pydantic.ValidationError):
+        Candidate.model_validate(candidate_values(header, candidate=forged_provenance), strict=True)
+
+
 # ---------------------------------------------------------- RR5 boundaries
 
 
