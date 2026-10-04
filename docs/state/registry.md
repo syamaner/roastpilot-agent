@@ -26,6 +26,17 @@ review itself still runs unskipped, all now marked historical. D108-D118
 already retired that SHA-scoped mechanism; D-ToS-1 is unrelated to that
 retirement; it must not be restored.
 
+**1 Sep 2026 — #702 (D180/D181) closure:** PR #872 merged at
+`fdb354cd7b697261faf55212eee73e9504528281`; the issue is closed and the
+project item is Done. Main CI run `33542699280` and CodeQL run `33542699137`
+are green; disposable proofs #930, #931, and #933 completed. All 98 threads
+are resolved; the final 22 were independently classified as 17 addressed and
+5 deferred to #932 under the finite approved AST boundary. Plan PR #55 merged
+to main at `44996e047f9b76ec702ecf535448da03b738e859`. D181 narrows and
+corrects D180's final implementation and evidence clauses. This closure
+supersedes the in-progress or stays-open-pending language in all earlier #702
+(D180) entries below, which are now historical.
+
 **4 Oct 2026 — #997 D209 cold temperature activation (software only; #954 is
 open):** the cold temperature work is delivered as software across S1 (PR
 #998), S2a (PR #999), T1 (PR #1000) and T2 (the runtime activation plus the
@@ -40,17 +51,6 @@ does not attest the bytes that are installed. No release, installation,
 hardware, Pi or physical cold run has taken place: E11-S3 is not started, #954
 is open, and every supervised gate is unexecuted. This is software and
 documentation evidence only.
-
-**1 Sep 2026 — #702 (D180/D181) closure:** PR #872 merged at
-`fdb354cd7b697261faf55212eee73e9504528281`; the issue is closed and the
-project item is Done. Main CI run `33542699280` and CodeQL run `33542699137`
-are green; disposable proofs #930, #931, and #933 completed. All 98 threads
-are resolved; the final 22 were independently classified as 17 addressed and
-5 deferred to #932 under the finite approved AST boundary. Plan PR #55 merged
-to main at `44996e047f9b76ec702ecf535448da03b738e859`. D181 narrows and
-corrects D180's final implementation and evidence clauses. This closure
-supersedes the in-progress or stays-open-pending language in all earlier #702
-(D180) entries below, which are now historical.
 
 **3 Oct 2026 — #954 cold characterisation software delivered (#954 stays
 OPEN):** the software for the supervised cold characterisation is delivered
