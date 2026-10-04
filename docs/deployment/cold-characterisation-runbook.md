@@ -109,10 +109,13 @@ This section supplies no installation transaction or installed-files attestor.
 
 Use a dedicated saved configuration. Replace every angle-bracketed placeholder
 below with the frozen non-secret value selected for the supervised run. The serial
-device and both YAML paths must be absolute. The primary microphone entry is
-deliberately repeated. `recording_enabled` and `recording_autocapture` must remain
-absent, rather than being set to either boolean. The operator's MCP YAML continues
-to own its frozen inference and device values.
+device, MCP entry point and both YAML paths must be absolute. The primary microphone
+entry is deliberately repeated. `model_slug_by_phase`, `recording_enabled`,
+`recording_autocapture`, `fc_confidence_threshold`, `auto_t0_detection_enabled`,
+`auto_t0_drop_threshold_c`, `ambient_mode`, `ambient_device` and
+`ambient_poll_interval_seconds` must remain absent. This leaves the base model as
+the sole frozen advisor model and leaves the inference/device values not expressly
+managed here under the operator's MCP YAML.
 
 <!-- story-1002-cold-config-template -->
 ```yaml
@@ -123,6 +126,7 @@ advisor:
   prompt_version: <frozen prompt version>
 
 mcp:
+  command: <frozen absolute MCP entry point>
   env: {}
 
 mcp_device:
@@ -140,10 +144,16 @@ loader does not admit `advisor.api_key_env` from YAML. To use a credential name
 other than the schema default, set
 `ROASTPILOT_ADVISOR__API_KEY_ENV='<frozen credential variable name>'`, then export
 the credential only under that configured name. The effective configuration uses
-environment-over-file-over-default precedence. Therefore freeze and inspect every
-applicable `ROASTPILOT_...__...` override as part of preparation; an environment
-override wins over the value shown in the saved YAML. Export no environment name
-beginning `COFFEE_`, in any mixture of case.
+environment-over-file-over-default precedence. This recipe compares only the
+effective provider, endpoint, credential-variable name, base model, empty phase
+model map, prompt, MCP command, empty MCP environment, and the device fields shown
+or expressly required to remain unset above. Inspect `ROASTPILOT_...__...`
+overrides for those fields as part of preparation because an environment override
+wins over the value shown in the saved YAML. Export no environment name beginning
+`COFFEE_`, in any mixture of case. Do not set a phase-specific advisor model
+override: a nonempty effective `model_slug_by_phase` refuses preparation. The
+selected MCP entry point must remain the exact absolute path recorded here; an
+alternate absolute path, a relative path or the bare default is refused.
 
 Run the following with the interpreter from the intended Agent environment after
 replacing its expected placeholders with the same frozen non-secret values. It
@@ -174,6 +184,7 @@ EXPECTED_PROVIDER_ENDPOINT = "<frozen provider endpoint>"
 EXPECTED_CREDENTIAL_NAME = "<frozen credential variable name>"
 EXPECTED_MODEL = "<frozen model slug>"
 EXPECTED_PROMPT = "<frozen prompt version>"
+EXPECTED_MCP_COMMAND = Path("<frozen absolute MCP entry point>")
 EXPECTED_SERIAL = "<frozen absolute device path>"
 EXPECTED_DRIVER = "hottop_kn8828b_2k_plus"
 EXPECTED_AUDIO = "<frozen primary microphone identity>"
@@ -198,7 +209,10 @@ def main() -> int:
             or config.advisor.provider_base_url != EXPECTED_PROVIDER_ENDPOINT
             or config.advisor.api_key_env != EXPECTED_CREDENTIAL_NAME
             or config.advisor.model_slug != EXPECTED_MODEL
+            or config.advisor.model_slug_by_phase != {}
             or config.advisor.prompt_version != EXPECTED_PROMPT
+            or config.mcp.command != str(EXPECTED_MCP_COMMAND)
+            or not EXPECTED_MCP_COMMAND.is_absolute()
             or config.mcp.env != {}
             or device.serial_port != EXPECTED_SERIAL
             or device.serial_port is None
@@ -207,10 +221,16 @@ def main() -> int:
             or device.audio_input_device != EXPECTED_AUDIO
             or device.recording_devices != (EXPECTED_AUDIO,)
             or device.fc_mode != "audio"
+            or device.fc_confidence_threshold is not None
+            or device.auto_t0_detection_enabled is not None
+            or device.auto_t0_drop_threshold_c is not None
             or device.recording_enabled is not None
             or device.recording_autocapture is not None
             or device.mcp_yaml_source_path != EXPECTED_MCP_YAML
             or not EXPECTED_MCP_YAML.is_absolute()
+            or device.ambient_mode is not None
+            or device.ambient_device is not None
+            or device.ambient_poll_interval_seconds is not None
         ):
             raise ValueError
 
@@ -238,6 +258,9 @@ does not build or call the advisor, spawn MCP, open the MCP YAML, or access a
 device. It does not verify the files behind configured paths, installed Agent or
 MCP distributions, the loaded ONNX model, provider reachability, physical
 identity, hardware state, calibration, readiness, accuracy or physical safety.
+The selected MCP command path is compared as configuration text only: the recipe
+does not resolve, open or execute it, or attest its existence, installed bytes,
+code or provenance.
 
 ## 3. Command
 

@@ -97,6 +97,7 @@ _PLACEHOLDERS = {
     "<frozen credential variable name>": "RP_COLD_TEST_KEY",
     "<frozen model slug>": "frozen/model",
     "<frozen prompt version>": "cold-v1",
+    "<frozen absolute MCP entry point>": "/opt/cold/bin/coffee-roaster-mcp",
     "<frozen absolute device path>": "/dev/cold-test-roaster",
     "<frozen primary microphone identity>": "Cold Test Primary Mic",
     "<absolute path to frozen MCP YAML>": "/nonexistent/cold-test-mcp.yaml",
@@ -220,6 +221,28 @@ def test_story_1002_template_uses_supported_credential_name_configuration() -> N
     assert "does not protect against concurrent replacement" in _flat(section)
 
 
+@pytest.mark.docs
+def test_story_1002_template_closes_frozen_model_device_and_command_boundaries() -> None:
+    """The documented fences close every L8 effective-configuration gap."""
+    template = _marked_fence("story-1002-cold-config-template", "yaml")
+    section = _flat(RUNBOOK.read_text(encoding="utf-8").split("### 2.2", maxsplit=1)[1])
+    assert "command: <frozen absolute MCP entry point>" in template
+    for omitted in (
+        "model_slug_by_phase",
+        "fc_confidence_threshold",
+        "auto_t0_detection_enabled",
+        "auto_t0_drop_threshold_c",
+        "ambient_mode",
+        "ambient_device",
+        "ambient_poll_interval_seconds",
+    ):
+        assert omitted not in template
+        assert f"{omitted} is not None" in section or f"{omitted} != {{}}" in section
+    assert "an alternate absolute path, a relative path or the bare default is refused" in section
+    assert "does not resolve, open or execute it" in section
+    assert "attest its existence, installed bytes, code or provenance" in section
+
+
 def test_story_1002_commanded_state_sibling_prose_matches_engine_and_projection() -> None:
     """The engine checks main fan while the public display field remains intentionally null."""
     two_phase = _flat(TWO_PHASE.read_text(encoding="utf-8"))
@@ -299,6 +322,21 @@ _REFUSAL_CASES: list[tuple[Callable[[str], str], dict[str, str | None] | None]] 
         None,
     ),
     (lambda text: text, {"ROASTPILOT_ADVISOR__MODEL_SLUG": "other/model"}),
+    (
+        lambda text: text.replace(
+            "  prompt_version: cold-v1",
+            "  prompt_version: cold-v1\n  model_slug_by_phase:\n    development: other/model",
+        ),
+        None,
+    ),
+    (
+        lambda text: text,
+        {"ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE": '{"preheating":"other/model"}'},
+    ),
+    (
+        lambda text: text,
+        {"ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE": '{"development":"other/model"}'},
+    ),
     (lambda text: text.replace("prompt_version: cold-v1", "prompt_version: other"), None),
     (lambda text: text, {"ROASTPILOT_ADVISOR__API_KEY_ENV": "OTHER_KEY"}),
     (
@@ -321,6 +359,77 @@ _REFUSAL_CASES: list[tuple[Callable[[str], str], dict[str, str | None] | None]] 
     ),
     (lambda text: text.replace("fc_mode: audio", "fc_mode: manual"), None),
     (lambda text: text + "\n  recording_autocapture: false\n", None),
+    (
+        lambda text: text.replace(
+            "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml",
+            "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml\n"
+            "  fc_confidence_threshold: 0.0",
+        ),
+        None,
+    ),
+    (lambda text: text, {"ROASTPILOT_MCP_DEVICE__FC_CONFIDENCE_THRESHOLD": "0"}),
+    (
+        lambda text: text.replace(
+            "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml",
+            "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml\n"
+            "  auto_t0_detection_enabled: false",
+        ),
+        None,
+    ),
+    (lambda text: text, {"ROASTPILOT_MCP_DEVICE__AUTO_T0_DETECTION_ENABLED": "false"}),
+    (
+        lambda text: text.replace(
+            "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml",
+            "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml\n"
+            "  auto_t0_drop_threshold_c: 1.0",
+        ),
+        None,
+    ),
+    (lambda text: text, {"ROASTPILOT_MCP_DEVICE__AUTO_T0_DROP_THRESHOLD_C": "1"}),
+    (
+        lambda text: text.replace(
+            "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml",
+            "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml\n  ambient_mode: disabled",
+        ),
+        None,
+    ),
+    (lambda text: text, {"ROASTPILOT_MCP_DEVICE__AMBIENT_MODE": "disabled"}),
+    (
+        lambda text: text.replace(
+            "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml",
+            "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml\n  ambient_device: SYNTHETIC",
+        ),
+        None,
+    ),
+    (lambda text: text, {"ROASTPILOT_MCP_DEVICE__AMBIENT_DEVICE": "SYNTHETIC"}),
+    (
+        lambda text: text.replace(
+            "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml",
+            "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml\n"
+            "  ambient_poll_interval_seconds: 1.0",
+        ),
+        None,
+    ),
+    (lambda text: text, {"ROASTPILOT_MCP_DEVICE__AMBIENT_POLL_INTERVAL_SECONDS": "1"}),
+    (
+        lambda text: text.replace(
+            "command: /opt/cold/bin/coffee-roaster-mcp",
+            "command: /opt/other/bin/coffee-roaster-mcp",
+        ),
+        None,
+    ),
+    (
+        lambda text: text.replace(
+            "command: /opt/cold/bin/coffee-roaster-mcp", "command: relative/coffee-roaster-mcp"
+        ),
+        None,
+    ),
+    (
+        lambda text: text.replace(
+            "command: /opt/cold/bin/coffee-roaster-mcp", "command: coffee-roaster-mcp"
+        ),
+        None,
+    ),
 ]
 
 
@@ -340,6 +449,9 @@ _REFUSAL_CASES: list[tuple[Callable[[str], str], dict[str, str | None] | None]] 
         "provider-mismatch",
         "endpoint-mismatch",
         "model-mismatch",
+        "saved-development-model-override",
+        "environment-preheating-model-override",
+        "environment-development-model-override",
         "prompt-mismatch",
         "credential-name-mismatch",
         "serial-mismatch",
@@ -348,6 +460,21 @@ _REFUSAL_CASES: list[tuple[Callable[[str], str], dict[str, str | None] | None]] 
         "recording-device-mismatch",
         "fc-mode-mismatch",
         "recording-autocapture-set",
+        "saved-zero-fc-confidence",
+        "environment-zero-fc-confidence",
+        "saved-disabled-auto-t0",
+        "environment-disabled-auto-t0",
+        "saved-auto-t0-threshold",
+        "environment-auto-t0-threshold",
+        "saved-disabled-ambient-mode",
+        "environment-disabled-ambient-mode",
+        "saved-ambient-device",
+        "environment-ambient-device",
+        "saved-ambient-poll-interval",
+        "environment-ambient-poll-interval",
+        "alternate-absolute-mcp-command",
+        "relative-mcp-command",
+        "bare-default-mcp-command",
     ),
 )
 def test_story_1002_documented_preflight_refuses_closed_without_leaking(
