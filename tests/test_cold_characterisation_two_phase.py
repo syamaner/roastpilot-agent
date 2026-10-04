@@ -14,6 +14,7 @@ orchestrator computed.
 
 import ast
 import asyncio
+import contextlib
 import enum
 import gc
 import itertools
@@ -7402,30 +7403,53 @@ async def test_997_tp11_a_closed_reader_error_is_never_conformant(
     assert result.manifest_sha256 is not None
 
 
+async def _run_after_scheduler_turns(
+    world: World, start_turns: int
+) -> two_phase.ColdTwoPhaseResult:
+    """Start ``world`` after a test-controlled number of scheduler turns."""
+    for _ in range(start_turns):
+        await asyncio.sleep(0)
+    return await world.run()
+
+
 @pytest.mark.asyncio
-async def test_997_tp12_cancellation_at_a_read_leaves_no_unpaired_tick(tmp_path: Path) -> None:
+@pytest.mark.parametrize("start_turns", [0, 250], ids=["normal", "delayed_start"])
+async def test_997_tp12_cancellation_at_a_read_leaves_no_unpaired_tick(
+    tmp_path: Path, start_turns: int
+) -> None:
     """TP12: CANCELLED is recorded and re-raised; every retained tick is paired."""
     world = World(tmp_path)
     key = "get_roast_state:recording_off"
+    third_read_entered = asyncio.Event()
 
     def arm_third() -> None:
         if world.mcp.reads == 2:
             world.gates.arm(key)
+            third_read_entered.set()
 
     world.mcp.before[key] = arm_third
-    task = asyncio.ensure_future(world.run())
-    for _ in range(200):
-        await asyncio.sleep(0)
-        if key in world.gates.entered and world.gates.entered[key].is_set():
-            break
-    assert world.gates.entered[key].is_set()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert [a["reason"] for a in world.records("abort")] == ["cancelled"]
-    assert len(phase_lines(world, "tick", OFF)) == len(phase_lines(world, "tick_temperature", OFF))
-    assert len(phase_lines(world, "tick", OFF)) == 2
-    assert not world.manifest_exists()
+    task = asyncio.create_task(_run_after_scheduler_turns(world, start_turns))
+    try:
+        if start_turns:
+            for _ in range(200):
+                await asyncio.sleep(0)
+            assert not third_read_entered.is_set()
+        await asyncio.wait_for(third_read_entered.wait(), timeout=10.0)
+        assert world.gates.entered[key].is_set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert [a["reason"] for a in world.records("abort")] == ["cancelled"]
+        assert len(phase_lines(world, "tick", OFF)) == len(
+            phase_lines(world, "tick_temperature", OFF)
+        )
+        assert len(phase_lines(world, "tick", OFF)) == 2
+        assert not world.manifest_exists()
+    finally:
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 @pytest.mark.asyncio
