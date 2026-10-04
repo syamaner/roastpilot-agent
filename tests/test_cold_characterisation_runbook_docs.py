@@ -298,7 +298,7 @@ def test_story_1002_template_closes_every_cold_runtime_consumer() -> None:
         "config.mcp.call_timeout_seconds != EXPECTED_MCP_CALL_TIMEOUT_SECONDS",
         "config.mcp.startup_timeout_seconds != EXPECTED_MCP_STARTUP_TIMEOUT_SECONDS",
         "config.mcp.stop_timeout_seconds != EXPECTED_MCP_STOP_TIMEOUT_SECONDS",
-        "config.safety != EXPECTED_SAFETY",
+        "config.safety != expected_safety",
     ):
         assert guard in recipe
     for field in (
@@ -368,8 +368,6 @@ def test_story_1002_preflight_has_a_closed_import_and_call_surface() -> None:
     }
     calls = {_ast_name(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
     assert calls == {
-        "EXPECTED_MCP_COMMAND.is_absolute",
-        "EXPECTED_MCP_YAML.is_absolute",
         "Path",
         "Path().is_absolute",
         "SafetyLimits",
@@ -382,6 +380,8 @@ def test_story_1002_preflight_has_a_closed_import_and_call_surface() -> None:
         "main",
         "math.isfinite",
         "os.environ.get",
+        "expected_mcp_command.is_absolute",
+        "expected_mcp_yaml.is_absolute",
         "print",
         "selected_file.read",
         "selected_path.is_absolute",
@@ -777,6 +777,41 @@ def test_story_1002_documented_preflight_refuses_every_effective_safety_override
     assert _CANARY not in stdout + stderr
 
 
+_INVALID_EXPECTED_SAFETY_MUTATORS: list[Callable[[str], str]] = [
+    lambda script: script.replace(
+        "bitter_ceiling_temp_c=196.0,\n            emergency_drop_temp_c=198.0,",
+        "bitter_ceiling_temp_c=199.0,\n            emergency_drop_temp_c=198.0,",
+    ),
+    lambda script: script.replace(
+        'pre_t0_overrun_severity="recovery"',
+        f'pre_t0_overrun_severity="{_CANARY}"',
+    ),
+]
+
+
+@pytest.mark.docs
+@pytest.mark.parametrize(
+    "script_mutator",
+    _INVALID_EXPECTED_SAFETY_MUTATORS,
+    ids=("inverted-expected-ceilings", "canary-bearing-invalid-expected-type"),
+)
+def test_story_1002_documented_preflight_contains_invalid_expected_safety(
+    script_mutator: Callable[[str], str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Invalid operator-recorded expected limits refuse without validation leakage."""
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        script_mutator=script_mutator,
+    )
+    assert (code, stdout, stderr) == (1, "cold configuration preflight: REFUSED\n", "")
+    assert _CANARY not in stdout + stderr
+
+
 def _remove_script_guard(script: str, guard: str) -> str:
     """Delete exactly one guard from the actual marked recipe for mutation proof."""
     assert script.count(guard) == 1
@@ -1015,7 +1050,7 @@ def test_story_1002_mutation_complete_safety_equality_is_effective(
         tmp_path=tmp_path,
         environment={"ROASTPILOT_SAFETY__MAX_ENV_TEMP_C": "241.0"},
         script_mutator=lambda script: _remove_script_guard(
-            script, "            or config.safety != EXPECTED_SAFETY\n"
+            script, "            or config.safety != expected_safety\n"
         ),
     )
     assert (code, stdout, stderr) == (0, "cold configuration preflight: ADMITTED\n", "")

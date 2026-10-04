@@ -224,30 +224,30 @@ EXPECTED_TEMPERATURE = <frozen advisor temperature>
 EXPECTED_REASONING_EFFORT = None
 EXPECTED_CALL_BOUND_SECONDS = <frozen advisory call bound seconds>
 EXPECTED_DWELL_SECONDS = <frozen post-completion dwell seconds>
-EXPECTED_MCP_COMMAND = Path("<frozen absolute MCP entry point>")
 EXPECTED_MCP_CALL_TIMEOUT_SECONDS = <frozen MCP call timeout seconds>
 EXPECTED_MCP_STARTUP_TIMEOUT_SECONDS = <frozen MCP startup timeout seconds>
 EXPECTED_MCP_STOP_TIMEOUT_SECONDS = <frozen MCP stop timeout seconds>
 EXPECTED_SERIAL = "<frozen absolute device path>"
 EXPECTED_DRIVER = "hottop_kn8828b_2k_plus"
 EXPECTED_AUDIO = "<frozen primary microphone identity>"
-EXPECTED_MCP_YAML = Path("<absolute path to frozen MCP YAML>")
-EXPECTED_SAFETY = SafetyLimits(
-    max_bean_temp_c=230.0,
-    max_env_temp_c=240.0,
-    pre_t0_max_bean_temp_c=200.0,
-    overrun_safe_fan_percent=100,
-    pre_t0_overrun_severity="recovery",
-    min_seconds_between_commands=2.0,
-    max_consecutive_mcp_failures=3,
-    max_consecutive_advisor_failures=3,
-    bitter_ceiling_temp_c=196.0,
-    emergency_drop_temp_c=198.0,
-)
 
 
 def main() -> int:
     try:
+        expected_mcp_command = Path("<frozen absolute MCP entry point>")
+        expected_mcp_yaml = Path("<absolute path to frozen MCP YAML>")
+        expected_safety = SafetyLimits(
+            max_bean_temp_c=230.0,
+            max_env_temp_c=240.0,
+            pre_t0_max_bean_temp_c=200.0,
+            overrun_safe_fan_percent=100,
+            pre_t0_overrun_severity="recovery",
+            min_seconds_between_commands=2.0,
+            max_consecutive_mcp_failures=3,
+            max_consecutive_advisor_failures=3,
+            bitter_ceiling_temp_c=196.0,
+            emergency_drop_temp_c=198.0,
+        )
         selected = os.environ.get("ROASTPILOT_CONFIG_FILE")
         if selected is None:
             raise ValueError
@@ -276,13 +276,13 @@ def main() -> int:
             != EXPECTED_DWELL_SECONDS
             or config.controller.post_fc_min_consult_interval_seconds
             < MIN_POST_COMPLETION_DWELL_SECONDS
-            or config.mcp.command != str(EXPECTED_MCP_COMMAND)
-            or not EXPECTED_MCP_COMMAND.is_absolute()
+            or config.mcp.command != str(expected_mcp_command)
+            or not expected_mcp_command.is_absolute()
             or config.mcp.call_timeout_seconds != EXPECTED_MCP_CALL_TIMEOUT_SECONDS
             or config.mcp.startup_timeout_seconds != EXPECTED_MCP_STARTUP_TIMEOUT_SECONDS
             or config.mcp.stop_timeout_seconds != EXPECTED_MCP_STOP_TIMEOUT_SECONDS
             or config.mcp.env != {}
-            or config.safety != EXPECTED_SAFETY
+            or config.safety != expected_safety
             or device.serial_port != EXPECTED_SERIAL
             or device.serial_port is None
             or not Path(device.serial_port).is_absolute()
@@ -295,8 +295,8 @@ def main() -> int:
             or device.auto_t0_drop_threshold_c is not None
             or device.recording_enabled is not None
             or device.recording_autocapture is not None
-            or device.mcp_yaml_source_path != EXPECTED_MCP_YAML
-            or not EXPECTED_MCP_YAML.is_absolute()
+            or device.mcp_yaml_source_path != expected_mcp_yaml
+            or not expected_mcp_yaml.is_absolute()
             or device.ambient_mode is not None
             or device.ambient_device is not None
             or device.ambient_poll_interval_seconds is not None
