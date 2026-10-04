@@ -59,10 +59,22 @@ from roastpilot_agent.cold_characterisation.evidence_store import (
     check_failed_run_terminal_binding,
     check_lifecycle_binding,
     check_record_binding,
+    check_tick_temperature_binding,
     load_strict_json,
     read_verified_lines,
     run_id_is_valid,
     verify_retained_tree,
+)
+from roastpilot_agent.cold_characterisation.evidence_temperature import (
+    TICK_TEMPERATURE_FILE_NAME,
+    TICK_TEMPERATURE_STREAM,
+    ColdTickTemperatureError,
+    ColdTickTemperatureEvidenceState,
+    ColdTickTemperatureFailure,
+    ColdTickTemperatureRecord,
+    check_tick_temperature_pairing,
+    decode_tick_temperature_document,
+    validate_tick_temperature_record,
 )
 from roastpilot_agent.cold_characterisation.evidence_terminal import (
     ColdFailedRunTerminalError,
@@ -88,6 +100,9 @@ _ADVISORY_SCHEMA_VERSIONS = frozenset({2})
 _TERMINAL_FILE_NAME = "failed_run_terminal.jsonl"
 _TERMINAL_STREAM = "failed_run_terminal"
 _TERMINAL_SCHEMA_VERSIONS = frozenset({3})
+_TICK_TEMPERATURE_FILE_NAME = TICK_TEMPERATURE_FILE_NAME
+_TICK_TEMPERATURE_STREAM = TICK_TEMPERATURE_STREAM
+_TICK_TEMPERATURE_SCHEMA_VERSIONS = frozenset({4})
 
 
 class _ReadProfile(enum.Enum):
@@ -100,6 +115,14 @@ class _ReadProfile(enum.Enum):
     V2 = frozenset({_LIFECYCLE_FILE_NAME})
     V3 = frozenset({_LIFECYCLE_FILE_NAME, _ADVISORY_FILE_NAME})
     V4 = frozenset({_LIFECYCLE_FILE_NAME, _ADVISORY_FILE_NAME, _TERMINAL_FILE_NAME})
+    V5 = frozenset(
+        {
+            _LIFECYCLE_FILE_NAME,
+            _ADVISORY_FILE_NAME,
+            _TERMINAL_FILE_NAME,
+            _TICK_TEMPERATURE_FILE_NAME,
+        }
+    )
 
 
 #: Reader-local abort pairing; a contract test pins it to ``ColdAbortRecord``'s validator.
@@ -236,6 +259,48 @@ class ColdRetainedRunV4(pydantic.BaseModel):
             self.terminal is None
         ):
             raise ValueError("terminal state does not match its record")
+        return self
+
+
+class ColdRetainedRunV5(pydantic.BaseModel):
+    """A verified retained run with V4's streams plus positionally paired tick temperatures.
+
+    Integrity data only: this carrier is flat, nests no earlier carrier, and is the
+    input to no policy.  ``PRESENT`` means only that every retained v1 tick pairs
+    one-to-one, in order, with a tick-temperature record; it is neither screening
+    nor provenance.  ``ABSENT`` neither proves historical origin nor satisfies any
+    screening: a stripped and re-sealed tree also reads ``ABSENT``.  A hand-built
+    or ``model_construct`` instance carries no manifest provenance, so a later
+    consumer must check the exact type and re-admit every record.
+    """
+
+    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
+
+    run: ColdRetainedRun
+    lifecycle_state: ColdLifecycleEvidenceState
+    lifecycle: tuple[ColdLifecycleRecord, ...]
+    advisory_attempt_state: ColdAdvisoryAttemptEvidenceState
+    advisory_attempts: tuple[ColdAdvisoryIntentRecord | ColdAdvisoryResolutionRecord, ...]
+    terminal_state: ColdFailedRunTerminalEvidenceState
+    terminal: ColdFailedRunTerminalRecord | None
+    tick_temperature_state: ColdTickTemperatureEvidenceState
+    tick_temperatures: tuple[ColdTickTemperatureRecord, ...]
+
+    @pydantic.model_validator(mode="after")
+    def _require_states_match_records(self) -> typing.Self:
+        """Require each stream state to be exactly the one its records imply."""
+        if (self.lifecycle_state is ColdLifecycleEvidenceState.ABSENT) != (self.lifecycle == ()):
+            raise ValueError("lifecycle state does not match its records")
+        if self.advisory_attempt_state is not _advisory_state(self.advisory_attempts):
+            raise ValueError("advisory attempt state does not match its records")
+        if (self.terminal_state is ColdFailedRunTerminalEvidenceState.ABSENT) != (
+            self.terminal is None
+        ):
+            raise ValueError("terminal state does not match its record")
+        if (self.tick_temperature_state is ColdTickTemperatureEvidenceState.ABSENT) != (
+            self.tick_temperatures == ()
+        ):
+            raise ValueError("tick temperature state does not match its records")
         return self
 
 
@@ -458,6 +523,79 @@ def _read_failed_run_terminal_line(
     return snapshot
 
 
+def _read_tick_temperature_line(
+    line: bytes, *, phase: ColdPhaseKind, state: ColdBindingState
+) -> ColdTickTemperatureRecord:
+    """Strictly decode, losslessly re-prove, validate, and bind one tick-temperature line.
+
+    Precedence is pinned: an empty line, strict JSON as an exact object, the shared
+    walker, the exact integer version (which wins over every later malformation),
+    the exact stream, the closed decode, the directory phase, the canonical
+    re-proof, re-admission, and finally binding.
+    """
+    if not line:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    decoded = load_strict_json(line, malformed=ColdEvidenceStoreFailure.LINE_MALFORMED)
+    if type(decoded) is not dict:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    document = typing.cast(dict[str, object], decoded)
+    walk_json_value(typing.cast(pydantic.JsonValue, document))
+    version = document.get("schema_version")
+    if type(version) is not int or version not in _TICK_TEMPERATURE_SCHEMA_VERSIONS:
+        raise _closed(ColdEvidenceStoreFailure.SCHEMA_VERSION_UNKNOWN)
+    stream_value = document.get("stream")
+    if type(stream_value) is not str or stream_value != _TICK_TEMPERATURE_STREAM:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    validated = decode_tick_temperature_document(document)
+    if validated is None:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    if validated.phase is not phase:
+        raise _closed(ColdEvidenceStoreFailure.LINE_MALFORMED)
+    if canonical_json(validated.model_dump(mode="json")).encode("utf-8") != line:
+        raise _closed(ColdEvidenceStoreFailure.LINE_NOT_CANONICAL)
+    snapshot = validate_tick_temperature_record(validated)
+    check_tick_temperature_binding(state, snapshot)
+    return snapshot
+
+
+def _read_tick_temperatures(
+    tree: ColdVerifiedTree,
+    paths: dict[ColdPhaseKind, str],
+    *,
+    state: ColdBindingState,
+    streams: list["ColdRetainedStream"],
+) -> tuple[ColdTickTemperatureRecord, ...]:
+    """Read every tick-temperature file, then require whole-run positional pairing.
+
+    Files are read in phase order.  A real empty or blank file is refused earlier,
+    as ``LINE_MALFORMED``, by the shared line framing; ``STREAM_EMPTY`` is only a
+    local defensive guard against a framed read that yields no line.  Once any
+    record is read, every phase's already admitted v1 ticks must pair one-to-one,
+    in order, with that phase's temperature records (a missing file pairs as empty).
+    """
+    by_phase: dict[ColdPhaseKind, tuple[ColdTickTemperatureRecord, ...]] = {}
+    for phase in ColdPhaseKind:
+        path = paths.get(phase)
+        if path is None:
+            continue
+        records = tuple(
+            _read_tick_temperature_line(line, phase=phase, state=state)
+            for line in read_verified_lines(tree, path, max_line_bytes=MAX_LINE_BYTES)
+        )
+        if not records:
+            raise ColdTickTemperatureError(ColdTickTemperatureFailure.STREAM_EMPTY)
+        by_phase[phase] = records
+    for phase in ColdPhaseKind:
+        ticks = tuple(
+            typing.cast(ColdTickRecord, record)
+            for stream in streams
+            if stream.phase is phase and stream.stream is ColdEvidenceStream.TICK
+            for record in stream.records
+        )
+        check_tick_temperature_pairing(ticks, by_phase.get(phase, ()))
+    return tuple(record for records in by_phase.values() for record in records)
+
+
 class _RecordLayout(typing.NamedTuple):
     """Every ``records/`` entry mapped to its closed phase and stream or extra file."""
 
@@ -465,20 +603,22 @@ class _RecordLayout(typing.NamedTuple):
     lifecycle: dict[ColdPhaseKind, str]
     advisory: dict[ColdPhaseKind, str]
     terminal: dict[ColdPhaseKind, str]
+    tick_temperature: dict[ColdPhaseKind, str]
 
 
 def _record_layout(tree: ColdVerifiedTree, *, profile: _ReadProfile) -> _RecordLayout:
     """Map every ``records/`` entry to its closed phase and stream, refusing others.
 
     Only the exact extra file names the profile admits map to a phase's lifecycle,
-    advisory-attempt, or failed-run terminal stream; every other unknown entry is
-    refused.
+    advisory-attempt, failed-run terminal, or tick-temperature stream; every other
+    unknown entry is refused.
     """
-    layout = _RecordLayout({}, {}, {}, {})
+    layout = _RecordLayout({}, {}, {}, {}, {})
     extras = {
         _LIFECYCLE_FILE_NAME: layout.lifecycle,
         _ADVISORY_FILE_NAME: layout.advisory,
         _TERMINAL_FILE_NAME: layout.terminal,
+        _TICK_TEMPERATURE_FILE_NAME: layout.tick_temperature,
     }
     for entry in tree.manifest.entries:
         segments = entry.relative_path.split("/")
@@ -503,6 +643,7 @@ class _VerifiedRead(typing.NamedTuple):
     lifecycle_present: bool
     advisory: tuple[ColdAdvisoryAttemptRecord, ...]
     terminal: ColdFailedRunTerminalRecord | None
+    tick_temperatures: tuple[ColdTickTemperatureRecord, ...]
 
 
 def _read_verified_run(
@@ -578,6 +719,11 @@ def _read_verified_run(
     recorded = {(item.phase, item.identity_sha256) for item in tree.manifest.identity_bindings}
     if bound != recorded:
         raise _closed(ColdEvidenceStoreFailure.HEADER_BINDING_MISMATCHED)
+    tick_temperatures: tuple[ColdTickTemperatureRecord, ...] = ()
+    if layout.tick_temperature:
+        tick_temperatures = _read_tick_temperatures(
+            tree, layout.tick_temperature, state=state, streams=streams
+        )
     run = ColdRetainedRun(
         run_id=run_id,
         manifest_sha256=tree.manifest_sha256,
@@ -587,7 +733,9 @@ def _read_verified_run(
         ),
         streams=tuple(streams),
     )
-    return _VerifiedRead(run, tuple(lifecycle), bool(layout.lifecycle), tuple(advisory), terminal)
+    return _VerifiedRead(
+        run, tuple(lifecycle), bool(layout.lifecycle), tuple(advisory), terminal, tick_temperatures
+    )
 
 
 def read_retained_run(
@@ -814,4 +962,88 @@ def read_retained_run_v4(
             else ColdFailedRunTerminalEvidenceState.PRESENT
         ),
         terminal=read.terminal,
+    )
+
+
+def read_retained_run_v5(
+    root: str,
+    *,
+    run_id: str,
+    expected_manifest_sha256: str,
+    protected_roots: tuple[str, ...] = (),
+) -> ColdRetainedRunV5:
+    """Verify one retained tree, then strictly read V4's streams and tick temperatures.
+
+    Trust boundary: ``expected_manifest_sha256`` must be the externally recorded
+    ``ColdSealedRun.manifest_sha256`` returned by a successful seal.  It must never be
+    derived from the candidate tree, its ``manifest.json`` or its sidecar, which would
+    verify a tree against itself.  A seal that fails after creating manifest artefacts
+    can leave internally consistent bytes but returns no digest, so such a tree has no
+    trusted receipt.  None of this is a filesystem transaction.
+
+    The whole tree is verified before anything is parsed.  The V4 grammar, order,
+    and terminal rules are unchanged, and ``tick_temperature.jsonl`` accepts its
+    per-stream version 4 only; any other ``records/`` entry is refused.  After the
+    shared read and the manifest binding check, every tick-temperature file is read
+    in phase order (a real empty or blank file is refused as ``LINE_MALFORMED`` by
+    the shared line framing) and, across every phase, each retained v1 tick must
+    pair one-to-one and in order with one temperature record.
+    This reader never calls an earlier reader and nests no earlier carrier; the
+    result is integrity data and the input to no policy.  A tree with no
+    tick-temperature file reads as ``ABSENT``, which is never proof of origin and
+    never satisfies screening.
+
+    Honest limits: pairing is positional within each phase, and the reader cannot
+    order lines across files.  Temperature lines added after a failed-run terminal
+    are not counted by the terminal; writer refusal after the terminal is the guard.
+    Digest verification detects alteration relative to the supplied digest; it
+    proves neither authenticity nor installed bytes.
+
+    Args:
+        root: Absolute evidence root holding the run directory.
+        run_id: The run identifier.
+        expected_manifest_sha256: The recorded ``manifest.json`` digest.
+        protected_roots: Additional absolute roots evidence may never occupy.
+
+    Returns:
+        The V4 streams and states plus the tick-temperature state and records.
+
+    Raises:
+        ColdEvidenceStoreError: If verification, decoding, or binding fails.
+        ColdEvidenceError: If a decoded record fails schema revalidation.
+        ColdLifecycleError: If lifecycle records break the run-wide order.
+        ColdAdvisoryAttemptError: If attempt records break the run-wide order.
+        ColdFailedRunTerminalError: If terminals are duplicated or contradict the run.
+        ColdTickTemperatureError: If the records do not pair positionally with the
+            retained ticks, or (defensively) a framed read yields no line.
+    """
+    read = _read_verified_run(
+        root,
+        run_id=run_id,
+        expected_manifest_sha256=expected_manifest_sha256,
+        protected_roots=protected_roots,
+        profile=_ReadProfile.V5,
+    )
+    return ColdRetainedRunV5(
+        run=read.run,
+        lifecycle_state=(
+            ColdLifecycleEvidenceState.PRESENT
+            if read.lifecycle_present
+            else ColdLifecycleEvidenceState.ABSENT
+        ),
+        lifecycle=read.lifecycle,
+        advisory_attempt_state=_advisory_state(read.advisory),
+        advisory_attempts=read.advisory,
+        terminal_state=(
+            ColdFailedRunTerminalEvidenceState.ABSENT
+            if read.terminal is None
+            else ColdFailedRunTerminalEvidenceState.PRESENT
+        ),
+        terminal=read.terminal,
+        tick_temperature_state=(
+            ColdTickTemperatureEvidenceState.ABSENT
+            if read.tick_temperatures == ()
+            else ColdTickTemperatureEvidenceState.PRESENT
+        ),
+        tick_temperatures=read.tick_temperatures,
     )

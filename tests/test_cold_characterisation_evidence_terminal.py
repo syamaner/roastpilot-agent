@@ -1040,6 +1040,12 @@ def test_t31_frozen_grammars_and_profiles_are_not_widened() -> None:
         "V2": {"lifecycle.jsonl"},
         "V3": {"lifecycle.jsonl", "advisory_attempt.jsonl"},
         "V4": {"lifecycle.jsonl", "advisory_attempt.jsonl", "failed_run_terminal.jsonl"},
+        "V5": {
+            "lifecycle.jsonl",
+            "advisory_attempt.jsonl",
+            "failed_run_terminal.jsonl",
+            "tick_temperature.jsonl",
+        },
     }
     versions = (
         reader._SCHEMA_VERSIONS,  # pyright: ignore[reportPrivateUsage]
