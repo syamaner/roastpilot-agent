@@ -380,6 +380,19 @@ def test_e2_the_record_temperature_is_a_fresh_readmitted_projection(tmp_path: Pa
     assert record.temperature is not supplied
 
 
+def test_e2_direct_construction_readmits_nested_field_content(tmp_path: Path) -> None:
+    """E2: a shape-consistent forged projection is refused by nested field re-admission.
+
+    The forgery changes only ``projection_version``, so the projection's own
+    after-validator (shape rules) still passes and ``model_validate`` returns it
+    unchanged; only field-level re-admission inside the record can refuse it.
+    """
+    forged = valid_projection().model_copy(update={"projection_version": 2})
+    assert ColdTickTemperatureProjection.model_validate(forged) is forged
+    with pytest.raises(pydantic.ValidationError):
+        temperature_for(genuine_tick(tmp_path), temperature=forged)
+
+
 # ------------------------------------------------- E3 shared re-admission
 
 
