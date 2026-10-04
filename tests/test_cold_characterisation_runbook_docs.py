@@ -4,14 +4,18 @@ These are literal checks that the safety-relevant statements are present and tha
 the public-accuracy boundaries hold; they are not a semantic audit of the prose.
 """
 
+import ast
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
-from roastpilot_agent import cold_composition
+from roastpilot_agent import advisor as advisor_module
+from roastpilot_agent import cold_composition, mcp_client
+from roastpilot_agent.cold_characterisation import identity
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = REPO_ROOT / "docs/deployment/cold-characterisation-runbook.md"
@@ -94,10 +98,15 @@ def _marked_fence(marker: str, language: str) -> str:
 _PLACEHOLDERS = {
     "<frozen provider>": "openai_compatible",
     "<frozen provider endpoint>": "https://cold.invalid/v1",
-    "<frozen credential variable name>": "RP_COLD_TEST_KEY",
     "<frozen model slug>": "frozen/model",
-    "<frozen prompt version>": "cold-v1",
+    "<supported frozen prompt version>": "c3",
+    "<frozen advisor temperature>": "0.0",
+    "<frozen advisory call bound seconds>": "5.0",
+    "<frozen post-completion dwell seconds>": "5.0",
     "<frozen absolute MCP entry point>": "/opt/cold/bin/coffee-roaster-mcp",
+    "<frozen MCP call timeout seconds>": "5.0",
+    "<frozen MCP startup timeout seconds>": "15.0",
+    "<frozen MCP stop timeout seconds>": "10.0",
     "<frozen absolute device path>": "/dev/cold-test-roaster",
     "<frozen primary microphone identity>": "Cold Test Primary Mic",
     "<absolute path to frozen MCP YAML>": "/nonexistent/cold-test-mcp.yaml",
@@ -128,8 +137,7 @@ def _controlled_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "TMPDIR": "/nonexistent/cold-test-tmp",
         "SHELL": "/bin/synthetic-shell",
         "TERM": "synthetic-term",
-        "RP_COLD_TEST_KEY": _CANARY,
-        "ROASTPILOT_ADVISOR__API_KEY_ENV": "RP_COLD_TEST_KEY",
+        "OPENROUTER_API_KEY": _CANARY,
     }.items():
         monkeypatch.setenv(name, value)
 
@@ -140,8 +148,10 @@ def _run_documented_preflight(
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
     yaml_mutator: Callable[[str], str] = lambda text: text,
-    environment: dict[str, str | None] | None = None,
+    environment: Mapping[str, str | None] | None = None,
     config_path: str | None = "absolute",
+    script_mutator: Callable[[str], str] = lambda text: text,
+    allowed_credential_names: frozenset[str] | None = None,
 ) -> tuple[int, str, str]:
     """Execute the actual marked fences under closed synthetic process state."""
     _controlled_environment(monkeypatch)
@@ -176,10 +186,26 @@ def _run_documented_preflight(
 
     monkeypatch.setattr(cold_composition, "build_advisor", forbidden)
     monkeypatch.setattr(cold_composition, "ColdMCPServerProcess", forbidden)
-    script = _replace_placeholders(_marked_fence("story-1002-cold-config-preflight", "python"))
+    monkeypatch.setattr(advisor_module, "build_model", forbidden)
+    monkeypatch.setattr(advisor_module, "PydanticAIAdvisor", forbidden)
+    monkeypatch.setattr(mcp_client, "MCPServerProcess", forbidden)
+    script = script_mutator(
+        _replace_placeholders(_marked_fence("story-1002-cold-config-preflight", "python"))
+    )
+    real_path_open = Path.open
+
+    def config_only_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path != config_file:
+            return forbidden(path, *args, **kwargs)
+        return cast(Any, real_path_open)(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", config_only_open)
+    if allowed_credential_names is not None:
+        monkeypatch.setattr(identity, "_ALLOWED_CREDENTIAL_ENV_NAMES", allowed_credential_names)
     with pytest.raises(SystemExit) as stopped:
         exec(compile(script, "<documented-cold-preflight>", "exec"), {"__name__": "__main__"})
     captured = capsys.readouterr()
+    monkeypatch.setattr(Path, "open", real_path_open)
     assert forbidden_calls == []
     exit_code = stopped.value.code
     assert type(exit_code) is int
@@ -207,12 +233,18 @@ def test_story_1002_artifact_selection_and_installed_bytes_are_separate_gates() 
 
 @pytest.mark.docs
 def test_story_1002_template_uses_supported_credential_name_configuration() -> None:
-    """The read-only saved field stays absent; the effective env override is explicit."""
+    """The read-only saved field stays absent and cold identity fixes its one name."""
     template = _marked_fence("story-1002-cold-config-template", "yaml")
     section = RUNBOOK.read_text(encoding="utf-8").split("### 2.2", maxsplit=1)[1]
     assert "api_key_env" not in template
-    assert "ROASTPILOT_ADVISOR__API_KEY_ENV='<frozen credential variable name>'" in section
+    assert (
+        "only currently admitted effective credential-variable name is `OPENROUTER_API_KEY`"
+        in _flat(section)
+    )
+    assert "Do not set `ROASTPILOT_ADVISOR__API_KEY_ENV` to another name" in _flat(section)
+    assert 'EXPECTED_CREDENTIAL_NAME = "OPENROUTER_API_KEY"' in section
     assert "config.advisor.api_key_env != EXPECTED_CREDENTIAL_NAME" in section
+    assert "config.advisor.api_key_env not in _ALLOWED_CREDENTIAL_ENV_NAMES" in section
     assert (
         "assumes an operator-controlled configuration file that is kept stable for the "
         "duration of the check" in _flat(section)
@@ -241,6 +273,122 @@ def test_story_1002_template_closes_frozen_model_device_and_command_boundaries()
     assert "an alternate absolute path, a relative path or the bare default is refused" in section
     assert "does not resolve, open or execute it" in section
     assert "attest its existence, installed bytes, code or provenance" in section
+
+
+@pytest.mark.docs
+def test_story_1002_template_closes_every_cold_runtime_consumer() -> None:
+    """The marked fences freeze the complete effective configuration consumed by cold mode."""
+    template = _marked_fence("story-1002-cold-config-template", "yaml")
+    recipe = _marked_fence("story-1002-cold-config-preflight", "python")
+    for yaml_field in (
+        "advisory_timeout_seconds",
+        "post_fc_min_consult_interval_seconds",
+        "temperature",
+        "call_timeout_seconds",
+        "startup_timeout_seconds",
+        "stop_timeout_seconds",
+    ):
+        assert yaml_field in template
+    for guard in (
+        "instructions_for(config.advisor.prompt_version)",
+        "MIN_POST_COMPLETION_DWELL_SECONDS",
+        "config.advisor.temperature != EXPECTED_TEMPERATURE",
+        "config.advisor.reasoning_effort != EXPECTED_REASONING_EFFORT",
+        "config.controller.advisory_timeout_seconds != EXPECTED_CALL_BOUND_SECONDS",
+        "config.mcp.call_timeout_seconds != EXPECTED_MCP_CALL_TIMEOUT_SECONDS",
+        "config.mcp.startup_timeout_seconds != EXPECTED_MCP_STARTUP_TIMEOUT_SECONDS",
+        "config.mcp.stop_timeout_seconds != EXPECTED_MCP_STOP_TIMEOUT_SECONDS",
+        "config.safety != EXPECTED_SAFETY",
+    ):
+        assert guard in recipe
+    for field in (
+        "max_bean_temp_c",
+        "max_env_temp_c",
+        "pre_t0_max_bean_temp_c",
+        "overrun_safe_fan_percent",
+        "pre_t0_overrun_severity",
+        "min_seconds_between_commands",
+        "max_consecutive_mcp_failures",
+        "max_consecutive_advisor_failures",
+        "bitter_ceiling_temp_c",
+        "emergency_drop_temp_c",
+    ):
+        assert field in recipe
+    assert "SafetyPolicy" not in recipe
+    assert "safety:" not in template
+    assert "reasoning_effort" not in template
+    assert "EXPECTED_REASONING_EFFORT = None" in recipe
+    assert 'YAML `null` becomes the string `"null"` and is refused' in _flat(
+        RUNBOOK.read_text(encoding="utf-8")
+    )
+
+
+def _ast_name(node: ast.expr) -> str:
+    """Return a stable dotted name for a call-boundary assertion."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return f"{_ast_name(node.value)}.{node.attr}"
+    if isinstance(node, ast.Call):
+        return f"{_ast_name(node.func)}()"
+    raise AssertionError(ast.dump(node))
+
+
+@pytest.mark.docs
+def test_story_1002_preflight_has_a_closed_import_and_call_surface() -> None:
+    """The actual marked fence admits only pure config checks and its selected-file read."""
+    script = _replace_placeholders(_marked_fence("story-1002-cold-config-preflight", "python"))
+    tree = ast.parse(script)
+    imports: set[tuple[str, str | None]] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update((alias.name, alias.asname) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.module is not None
+            imports.update((f"{node.module}.{alias.name}", alias.asname) for alias in node.names)
+    assert imports == {
+        ("math", None),
+        ("os", None),
+        ("pathlib.Path", None),
+        ("roastpilot_agent.advisor.instructions_for", None),
+        (
+            "roastpilot_agent.cold_characterisation.advisory_sampler."
+            "MIN_POST_COMPLETION_DWELL_SECONDS",
+            None,
+        ),
+        (
+            "roastpilot_agent.cold_characterisation.identity._ALLOWED_CREDENTIAL_ENV_NAMES",
+            None,
+        ),
+        ("roastpilot_agent.cold_composition.ColdCompositionRefusal", None),
+        ("roastpilot_agent.cold_composition._admit_device_config", None),
+        ("roastpilot_agent.cold_composition._admit_environment", None),
+        ("roastpilot_agent.config.SafetyLimits", None),
+        ("roastpilot_agent.config_store.load_app_config", None),
+    }
+    calls = {_ast_name(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    assert calls == {
+        "EXPECTED_MCP_COMMAND.is_absolute",
+        "EXPECTED_MCP_YAML.is_absolute",
+        "Path",
+        "Path().is_absolute",
+        "SafetyLimits",
+        "SystemExit",
+        "_admit_device_config",
+        "_admit_environment",
+        "instructions_for",
+        "isinstance",
+        "load_app_config",
+        "main",
+        "math.isfinite",
+        "os.environ.get",
+        "print",
+        "selected_file.read",
+        "selected_path.is_absolute",
+        "selected_path.is_file",
+        "selected_path.open",
+        "str",
+    }
 
 
 def test_story_1002_commanded_state_sibling_prose_matches_engine_and_projection() -> None:
@@ -279,6 +427,27 @@ def test_story_1002_documented_preflight_admits_effective_environment_override(
 
 
 @pytest.mark.docs
+def test_story_1002_documented_preflight_admits_matched_concrete_reasoning_choice(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """A deliberate admitted reasoning value passes when effective and expected agree."""
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        yaml_mutator=lambda text: text.replace(
+            "  temperature: 0.0", "  temperature: 0.0\n  reasoning_effort: low"
+        ),
+        script_mutator=lambda script: script.replace(
+            "EXPECTED_REASONING_EFFORT = None", 'EXPECTED_REASONING_EFFORT = "low"'
+        ),
+    )
+    assert (code, stdout, stderr) == (0, "cold configuration preflight: ADMITTED\n", "")
+
+
+@pytest.mark.docs
 @pytest.mark.parametrize("config_path", [None, "relative", "missing"])
 def test_story_1002_documented_preflight_refuses_missing_or_unusable_config_file(
     config_path: str | None,
@@ -312,7 +481,8 @@ _REFUSAL_CASES: list[tuple[Callable[[str], str], dict[str, str | None] | None]] 
         None,
     ),
     (lambda text: text, {"coffee_hidden": _CANARY}),
-    (lambda text: text, {"RP_COLD_TEST_KEY": ""}),
+    (lambda text: text, {"OPENROUTER_API_KEY": ""}),
+    (lambda text: text, {"OPENROUTER_API_KEY": None}),
     (lambda text: text.replace("provider: openai_compatible", "provider: openai"), None),
     (
         lambda text: text.replace(
@@ -324,8 +494,8 @@ _REFUSAL_CASES: list[tuple[Callable[[str], str], dict[str, str | None] | None]] 
     (lambda text: text, {"ROASTPILOT_ADVISOR__MODEL_SLUG": "other/model"}),
     (
         lambda text: text.replace(
-            "  prompt_version: cold-v1",
-            "  prompt_version: cold-v1\n  model_slug_by_phase:\n    development: other/model",
+            "  prompt_version: c3",
+            "  prompt_version: c3\n  model_slug_by_phase:\n    development: other/model",
         ),
         None,
     ),
@@ -337,8 +507,65 @@ _REFUSAL_CASES: list[tuple[Callable[[str], str], dict[str, str | None] | None]] 
         lambda text: text,
         {"ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE": '{"development":"other/model"}'},
     ),
-    (lambda text: text.replace("prompt_version: cold-v1", "prompt_version: other"), None),
-    (lambda text: text, {"ROASTPILOT_ADVISOR__API_KEY_ENV": "OTHER_KEY"}),
+    (lambda text: text.replace("prompt_version: c3", "prompt_version: other"), None),
+    (lambda text: text, {"ROASTPILOT_ADVISOR__PROMPT_VERSION": "other"}),
+    (lambda text: text.replace("temperature: 0.0", "temperature: 0.5"), None),
+    (lambda text: text, {"ROASTPILOT_ADVISOR__TEMPERATURE": "0.5"}),
+    (
+        lambda text: text.replace(
+            "  temperature: 0.0", "  temperature: 0.0\n  reasoning_effort: low"
+        ),
+        None,
+    ),
+    (lambda text: text, {"ROASTPILOT_ADVISOR__REASONING_EFFORT": "low"}),
+    (
+        lambda text: text.replace(
+            "  temperature: 0.0", "  temperature: 0.0\n  reasoning_effort: null"
+        ),
+        None,
+    ),
+    (
+        lambda text: text,
+        {"ROASTPILOT_ADVISOR__API_KEY_ENV": "OTHER_KEY", "OTHER_KEY": _CANARY},
+    ),
+    (
+        lambda text: text.replace("advisory_timeout_seconds: 5.0", "advisory_timeout_seconds: 6.0"),
+        None,
+    ),
+    (lambda text: text, {"ROASTPILOT_CONTROLLER__ADVISORY_TIMEOUT_SECONDS": "6.0"}),
+    (
+        lambda text: text.replace(
+            "post_fc_min_consult_interval_seconds: 5.0",
+            "post_fc_min_consult_interval_seconds: 6.0",
+        ),
+        None,
+    ),
+    (
+        lambda text: text,
+        {"ROASTPILOT_CONTROLLER__POST_FC_MIN_CONSULT_INTERVAL_SECONDS": "6.0"},
+    ),
+    (
+        lambda text: text.replace(
+            "post_fc_min_consult_interval_seconds: 5.0",
+            "post_fc_min_consult_interval_seconds: 4.0",
+        ),
+        None,
+    ),
+    (
+        lambda text: text.replace("call_timeout_seconds: 5.0", "call_timeout_seconds: 6.0"),
+        None,
+    ),
+    (lambda text: text, {"ROASTPILOT_MCP__CALL_TIMEOUT_SECONDS": "6.0"}),
+    (
+        lambda text: text.replace("startup_timeout_seconds: 15.0", "startup_timeout_seconds: 16.0"),
+        None,
+    ),
+    (lambda text: text, {"ROASTPILOT_MCP__STARTUP_TIMEOUT_SECONDS": "16.0"}),
+    (
+        lambda text: text.replace("stop_timeout_seconds: 10.0", "stop_timeout_seconds: 11.0"),
+        None,
+    ),
+    (lambda text: text, {"ROASTPILOT_MCP__STOP_TIMEOUT_SECONDS": "11.0"}),
     (
         lambda text: text.replace("serial_port: /dev/cold-test-roaster", "serial_port: /dev/other"),
         None,
@@ -446,6 +673,7 @@ _REFUSAL_CASES: list[tuple[Callable[[str], str], dict[str, str | None] | None]] 
         "missing-mcp-yaml",
         "ambient-coffee-name",
         "empty-credential",
+        "missing-credential",
         "provider-mismatch",
         "endpoint-mismatch",
         "model-mismatch",
@@ -453,7 +681,24 @@ _REFUSAL_CASES: list[tuple[Callable[[str], str], dict[str, str | None] | None]] 
         "environment-preheating-model-override",
         "environment-development-model-override",
         "prompt-mismatch",
+        "environment-prompt-mismatch",
+        "saved-temperature-mismatch",
+        "environment-temperature-mismatch",
+        "saved-reasoning-mismatch",
+        "environment-reasoning-mismatch",
+        "saved-yaml-null-reasoning-refused",
         "credential-name-mismatch",
+        "saved-call-bound-mismatch",
+        "environment-call-bound-mismatch",
+        "saved-dwell-mismatch",
+        "environment-dwell-mismatch",
+        "saved-subminimum-dwell",
+        "saved-mcp-call-timeout-mismatch",
+        "environment-mcp-call-timeout-mismatch",
+        "saved-mcp-startup-timeout-mismatch",
+        "environment-mcp-startup-timeout-mismatch",
+        "saved-mcp-stop-timeout-mismatch",
+        "environment-mcp-stop-timeout-mismatch",
         "serial-mismatch",
         "driver-mismatch",
         "audio-mismatch",
@@ -494,6 +739,286 @@ def test_story_1002_documented_preflight_refuses_closed_without_leaking(
     )
     assert (code, stdout, stderr) == (1, "cold configuration preflight: REFUSED\n", "")
     assert _CANARY not in stdout + stderr
+
+
+_SAFETY_OVERRIDE_CASES = {
+    "max-bean-temp": {"ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C": "231.0"},
+    "max-env-temp": {"ROASTPILOT_SAFETY__MAX_ENV_TEMP_C": "241.0"},
+    "pre-t0-max-bean-temp": {"ROASTPILOT_SAFETY__PRE_T0_MAX_BEAN_TEMP_C": "201.0"},
+    "overrun-safe-fan": {"ROASTPILOT_SAFETY__OVERRUN_SAFE_FAN_PERCENT": "99"},
+    "pre-t0-overrun-severity": {"ROASTPILOT_SAFETY__PRE_T0_OVERRUN_SEVERITY": "fault"},
+    "min-command-interval": {"ROASTPILOT_SAFETY__MIN_SECONDS_BETWEEN_COMMANDS": "2.5"},
+    "max-mcp-failures": {"ROASTPILOT_SAFETY__MAX_CONSECUTIVE_MCP_FAILURES": "4"},
+    "max-advisor-failures": {"ROASTPILOT_SAFETY__MAX_CONSECUTIVE_ADVISOR_FAILURES": "4"},
+    "bitter-ceiling": {"ROASTPILOT_SAFETY__BITTER_CEILING_TEMP_C": "195.0"},
+    "emergency-drop": {"ROASTPILOT_SAFETY__EMERGENCY_DROP_TEMP_C": "199.0"},
+    "top-level-json-section": {"ROASTPILOT_SAFETY": '{"max_env_temp_c":241.0}'},
+}
+
+
+@pytest.mark.docs
+@pytest.mark.parametrize(
+    "environment", _SAFETY_OVERRIDE_CASES.values(), ids=_SAFETY_OVERRIDE_CASES.keys()
+)
+def test_story_1002_documented_preflight_refuses_every_effective_safety_override(
+    environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Every current SafetyLimits field is frozen through the real loader precedence path."""
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        environment=environment,
+    )
+    assert (code, stdout, stderr) == (1, "cold configuration preflight: REFUSED\n", "")
+    assert _CANARY not in stdout + stderr
+
+
+def _remove_script_guard(script: str, guard: str) -> str:
+    """Delete exactly one guard from the actual marked recipe for mutation proof."""
+    assert script.count(guard) == 1
+    mutated = script.replace(guard, "")
+    assert mutated != script
+    assert guard not in mutated
+    return mutated
+
+
+@pytest.mark.docs
+def test_story_1002_mutation_credential_allow_list_guard_is_effective(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """A runtime allow-list narrowed away from the expected credential refuses."""
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        allowed_credential_names=frozenset(),
+    )
+    assert (code, stdout, stderr) == (1, "cold configuration preflight: REFUSED\n", "")
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        allowed_credential_names=frozenset(),
+        script_mutator=lambda script: _remove_script_guard(
+            script,
+            "            or config.advisor.api_key_env not in _ALLOWED_CREDENTIAL_ENV_NAMES\n",
+        ),
+    )
+    assert (code, stdout, stderr) == (0, "cold configuration preflight: ADMITTED\n", "")
+
+
+@pytest.mark.docs
+def test_story_1002_mutation_prompt_resolver_is_independent_of_expected_equality(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """An unknown selected prompt refuses even when effective and expected values agree."""
+
+    def yaml_mutator(text: str) -> str:
+        return text.replace("prompt_version: c3", "prompt_version: unknown")
+
+    def expected_mutator(script: str) -> str:
+        return script.replace('EXPECTED_PROMPT = "c3"', 'EXPECTED_PROMPT = "unknown"')
+
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        yaml_mutator=yaml_mutator,
+        script_mutator=expected_mutator,
+    )
+    assert (code, stdout, stderr) == (1, "cold configuration preflight: REFUSED\n", "")
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        yaml_mutator=yaml_mutator,
+        script_mutator=lambda script: _remove_script_guard(
+            expected_mutator(script), "        instructions_for(config.advisor.prompt_version)\n"
+        ),
+    )
+    assert (code, stdout, stderr) == (0, "cold configuration preflight: ADMITTED\n", "")
+
+
+@pytest.mark.docs
+@pytest.mark.parametrize(
+    ("yaml_old", "yaml_new", "guard"),
+    [
+        (
+            "temperature: 0.0",
+            "temperature: 0.5",
+            "            or config.advisor.temperature != EXPECTED_TEMPERATURE\n",
+        ),
+        (
+            "  temperature: 0.0",
+            "  temperature: 0.0\n  reasoning_effort: low",
+            "            or config.advisor.reasoning_effort != EXPECTED_REASONING_EFFORT\n",
+        ),
+    ],
+    ids=("temperature", "reasoning-effort"),
+)
+def test_story_1002_mutation_advisor_payload_equalities_are_effective(
+    yaml_old: str,
+    yaml_new: str,
+    guard: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Removing either advisor payload comparison makes its mismatched value admit."""
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        yaml_mutator=lambda text: text.replace(yaml_old, yaml_new),
+        script_mutator=lambda script: _remove_script_guard(script, guard),
+    )
+    assert (code, stdout, stderr) == (0, "cold configuration preflight: ADMITTED\n", "")
+
+
+@pytest.mark.docs
+@pytest.mark.parametrize(
+    ("yaml_old", "yaml_new", "guard"),
+    [
+        (
+            "advisory_timeout_seconds: 5.0",
+            "advisory_timeout_seconds: 6.0",
+            "            or config.controller.advisory_timeout_seconds "
+            "!= EXPECTED_CALL_BOUND_SECONDS\n",
+        ),
+        (
+            "post_fc_min_consult_interval_seconds: 5.0",
+            "post_fc_min_consult_interval_seconds: 6.0",
+            "            or config.controller.post_fc_min_consult_interval_seconds\n"
+            "            != EXPECTED_DWELL_SECONDS\n",
+        ),
+    ],
+    ids=("call-bound", "dwell"),
+)
+def test_story_1002_mutation_workload_timing_equalities_are_effective(
+    yaml_old: str,
+    yaml_new: str,
+    guard: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Removing either workload equality makes a valid mismatched value admit."""
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        yaml_mutator=lambda text: text.replace(yaml_old, yaml_new),
+        script_mutator=lambda script: _remove_script_guard(script, guard),
+    )
+    assert (code, stdout, stderr) == (0, "cold configuration preflight: ADMITTED\n", "")
+
+
+@pytest.mark.docs
+def test_story_1002_mutation_minimum_dwell_is_independent_of_expected_equality(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """A schema-valid sub-five-second selected dwell still fails the sampler minimum."""
+
+    def yaml_mutator(text: str) -> str:
+        return text.replace(
+            "post_fc_min_consult_interval_seconds: 5.0",
+            "post_fc_min_consult_interval_seconds: 4.0",
+        )
+
+    def expected_mutator(script: str) -> str:
+        return script.replace("EXPECTED_DWELL_SECONDS = 5.0", "EXPECTED_DWELL_SECONDS = 4.0")
+
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        yaml_mutator=yaml_mutator,
+        script_mutator=expected_mutator,
+    )
+    assert (code, stdout, stderr) == (1, "cold configuration preflight: REFUSED\n", "")
+    minimum = (
+        "            or config.controller.post_fc_min_consult_interval_seconds\n"
+        "            < MIN_POST_COMPLETION_DWELL_SECONDS\n"
+    )
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        yaml_mutator=yaml_mutator,
+        script_mutator=lambda script: _remove_script_guard(expected_mutator(script), minimum),
+    )
+    assert (code, stdout, stderr) == (0, "cold configuration preflight: ADMITTED\n", "")
+
+
+@pytest.mark.docs
+@pytest.mark.parametrize(
+    ("yaml_old", "yaml_new", "guard"),
+    [
+        (
+            "call_timeout_seconds: 5.0",
+            "call_timeout_seconds: 6.0",
+            "            or config.mcp.call_timeout_seconds != EXPECTED_MCP_CALL_TIMEOUT_SECONDS\n",
+        ),
+        (
+            "startup_timeout_seconds: 15.0",
+            "startup_timeout_seconds: 16.0",
+            "            or config.mcp.startup_timeout_seconds "
+            "!= EXPECTED_MCP_STARTUP_TIMEOUT_SECONDS\n",
+        ),
+        (
+            "stop_timeout_seconds: 10.0",
+            "stop_timeout_seconds: 11.0",
+            "            or config.mcp.stop_timeout_seconds != EXPECTED_MCP_STOP_TIMEOUT_SECONDS\n",
+        ),
+    ],
+    ids=("call", "startup", "stop"),
+)
+def test_story_1002_mutation_mcp_timeout_equalities_are_effective(
+    yaml_old: str,
+    yaml_new: str,
+    guard: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Removing one MCP timeout equality makes that lifecycle mismatch admit."""
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        yaml_mutator=lambda text: text.replace(yaml_old, yaml_new),
+        script_mutator=lambda script: _remove_script_guard(script, guard),
+    )
+    assert (code, stdout, stderr) == (0, "cold configuration preflight: ADMITTED\n", "")
+
+
+@pytest.mark.docs
+def test_story_1002_mutation_complete_safety_equality_is_effective(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Removing the full SafetyLimits equality makes a valid effective override admit."""
+    code, stdout, stderr = _run_documented_preflight(
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+        tmp_path=tmp_path,
+        environment={"ROASTPILOT_SAFETY__MAX_ENV_TEMP_C": "241.0"},
+        script_mutator=lambda script: _remove_script_guard(
+            script, "            or config.safety != EXPECTED_SAFETY\n"
+        ),
+    )
+    assert (code, stdout, stderr) == (0, "cold configuration preflight: ADMITTED\n", "")
 
 
 @pytest.mark.docs

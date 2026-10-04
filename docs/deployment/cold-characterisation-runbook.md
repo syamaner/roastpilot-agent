@@ -119,14 +119,22 @@ managed here under the operator's MCP YAML.
 
 <!-- story-1002-cold-config-template -->
 ```yaml
+controller:
+  advisory_timeout_seconds: <frozen advisory call bound seconds>
+  post_fc_min_consult_interval_seconds: <frozen post-completion dwell seconds>
+
 advisor:
   provider: <frozen provider>
   provider_base_url: <frozen provider endpoint>
   model_slug: <frozen model slug>
-  prompt_version: <frozen prompt version>
+  prompt_version: <supported frozen prompt version>
+  temperature: <frozen advisor temperature>
 
 mcp:
   command: <frozen absolute MCP entry point>
+  call_timeout_seconds: <frozen MCP call timeout seconds>
+  startup_timeout_seconds: <frozen MCP startup timeout seconds>
+  stop_timeout_seconds: <frozen MCP stop timeout seconds>
   env: {}
 
 mcp_device:
@@ -140,20 +148,39 @@ mcp_device:
 ```
 
 Set `ROASTPILOT_CONFIG_FILE` to the saved file's absolute path. The saved-config
-loader does not admit `advisor.api_key_env` from YAML. To use a credential name
-other than the schema default, set
-`ROASTPILOT_ADVISOR__API_KEY_ENV='<frozen credential variable name>'`, then export
-the credential only under that configured name. The effective configuration uses
-environment-over-file-over-default precedence. This recipe compares only the
-effective provider, endpoint, credential-variable name, base model, empty phase
-model map, prompt, MCP command, empty MCP environment, and the device fields shown
-or expressly required to remain unset above. Inspect `ROASTPILOT_...__...`
-overrides for those fields as part of preparation because an environment override
-wins over the value shown in the saved YAML. Export no environment name beginning
-`COFFEE_`, in any mixture of case. Do not set a phase-specific advisor model
-override: a nonempty effective `model_slug_by_phase` refuses preparation. The
-selected MCP entry point must remain the exact absolute path recorded here; an
-alternate absolute path, a relative path or the bare default is refused.
+loader does not admit `advisor.api_key_env` from YAML. The only currently admitted
+effective credential-variable name is `OPENROUTER_API_KEY`. Do not set
+`ROASTPILOT_ADVISOR__API_KEY_ENV` to another name; export the credential only under
+`OPENROUTER_API_KEY`. The preflight checks only that its value is nonempty and never
+prints it. The effective configuration uses environment-over-file-over-default
+precedence. This recipe compares the effective provider, endpoint,
+credential-variable name, base model, empty phase model map, supported prompt,
+advisor temperature and reasoning effort; the controller's cold advisory call bound
+and post-completion dwell; the MCP command, three lifecycle timeouts and empty MCP
+environment; every current safety limit; and the device fields shown or expressly
+required to remain unset above. Inspect `ROASTPILOT_...__...` overrides for those
+fields as part of preparation because an environment override wins over the value
+shown in the saved YAML. Export no environment name beginning `COFFEE_`, in any
+mixture of case. Do not set a phase-specific advisor model override: a nonempty
+effective `model_slug_by_phase` refuses preparation. The selected MCP entry point
+must remain the exact absolute path recorded here; an alternate absolute path, a
+relative path or the bare default is refused.
+
+The baseline leaves `advisor.reasoning_effort` absent so the effective setting is
+the runtime default `None`, recorded exactly in the recipe. With this loader, YAML
+`null` becomes the string `"null"` and is refused; it is not a way to select `None`.
+If the operator deliberately selects a concrete schema-admitted reasoning effort,
+add that value to the saved YAML (or its environment override) and record the same
+value in `EXPECTED_REASONING_EFFORT`. The numeric values shown are source-verified
+preparation examples which the operator records and freezes; they do not introduce
+new accepted safety limits or hardware policy. The saved-config loader deliberately
+ignores a saved `safety:` section, so do not add one to this template. A deliberate
+safety change must be supplied through an operator-set `ROASTPILOT_SAFETY__...`
+environment value and must exactly match the ten recorded expectations in the
+recipe. `advisor.timeout_seconds` and
+`advisor.healthcheck_timeout_seconds` are outside this preflight's workload claim:
+cold mode passes the two controller timing values directly to its sampler and does
+not run the normal provider health check.
 
 Run the following with the interpreter from the intended Agent environment after
 replacing its expected placeholders with the same frozen non-secret values. It
@@ -169,26 +196,54 @@ persisted-state or installed-byte attestation.
 
 <!-- story-1002-cold-config-preflight -->
 ```python
+import math
 import os
 from pathlib import Path
 
+from roastpilot_agent.advisor import instructions_for
+from roastpilot_agent.cold_characterisation.advisory_sampler import (
+    MIN_POST_COMPLETION_DWELL_SECONDS,
+)
+from roastpilot_agent.cold_characterisation.identity import (
+    _ALLOWED_CREDENTIAL_ENV_NAMES,
+)
 from roastpilot_agent.cold_composition import (
     ColdCompositionRefusal,
     _admit_device_config,
     _admit_environment,
 )
+from roastpilot_agent.config import SafetyLimits
 from roastpilot_agent.config_store import load_app_config
 
 EXPECTED_PROVIDER = "<frozen provider>"
 EXPECTED_PROVIDER_ENDPOINT = "<frozen provider endpoint>"
-EXPECTED_CREDENTIAL_NAME = "<frozen credential variable name>"
+EXPECTED_CREDENTIAL_NAME = "OPENROUTER_API_KEY"
 EXPECTED_MODEL = "<frozen model slug>"
-EXPECTED_PROMPT = "<frozen prompt version>"
+EXPECTED_PROMPT = "<supported frozen prompt version>"
+EXPECTED_TEMPERATURE = <frozen advisor temperature>
+EXPECTED_REASONING_EFFORT = None
+EXPECTED_CALL_BOUND_SECONDS = <frozen advisory call bound seconds>
+EXPECTED_DWELL_SECONDS = <frozen post-completion dwell seconds>
 EXPECTED_MCP_COMMAND = Path("<frozen absolute MCP entry point>")
+EXPECTED_MCP_CALL_TIMEOUT_SECONDS = <frozen MCP call timeout seconds>
+EXPECTED_MCP_STARTUP_TIMEOUT_SECONDS = <frozen MCP startup timeout seconds>
+EXPECTED_MCP_STOP_TIMEOUT_SECONDS = <frozen MCP stop timeout seconds>
 EXPECTED_SERIAL = "<frozen absolute device path>"
 EXPECTED_DRIVER = "hottop_kn8828b_2k_plus"
 EXPECTED_AUDIO = "<frozen primary microphone identity>"
 EXPECTED_MCP_YAML = Path("<absolute path to frozen MCP YAML>")
+EXPECTED_SAFETY = SafetyLimits(
+    max_bean_temp_c=230.0,
+    max_env_temp_c=240.0,
+    pre_t0_max_bean_temp_c=200.0,
+    overrun_safe_fan_percent=100,
+    pre_t0_overrun_severity="recovery",
+    min_seconds_between_commands=2.0,
+    max_consecutive_mcp_failures=3,
+    max_consecutive_advisor_failures=3,
+    bitter_ceiling_temp_c=196.0,
+    emergency_drop_temp_c=198.0,
+)
 
 
 def main() -> int:
@@ -208,12 +263,26 @@ def main() -> int:
             config.advisor.provider != EXPECTED_PROVIDER
             or config.advisor.provider_base_url != EXPECTED_PROVIDER_ENDPOINT
             or config.advisor.api_key_env != EXPECTED_CREDENTIAL_NAME
+            or config.advisor.api_key_env not in _ALLOWED_CREDENTIAL_ENV_NAMES
             or config.advisor.model_slug != EXPECTED_MODEL
             or config.advisor.model_slug_by_phase != {}
             or config.advisor.prompt_version != EXPECTED_PROMPT
+            or config.advisor.temperature != EXPECTED_TEMPERATURE
+            or config.advisor.reasoning_effort != EXPECTED_REASONING_EFFORT
+            or config.controller.advisory_timeout_seconds != EXPECTED_CALL_BOUND_SECONDS
+            or not math.isfinite(config.controller.advisory_timeout_seconds)
+            or config.controller.advisory_timeout_seconds <= 0.0
+            or config.controller.post_fc_min_consult_interval_seconds
+            != EXPECTED_DWELL_SECONDS
+            or config.controller.post_fc_min_consult_interval_seconds
+            < MIN_POST_COMPLETION_DWELL_SECONDS
             or config.mcp.command != str(EXPECTED_MCP_COMMAND)
             or not EXPECTED_MCP_COMMAND.is_absolute()
+            or config.mcp.call_timeout_seconds != EXPECTED_MCP_CALL_TIMEOUT_SECONDS
+            or config.mcp.startup_timeout_seconds != EXPECTED_MCP_STARTUP_TIMEOUT_SECONDS
+            or config.mcp.stop_timeout_seconds != EXPECTED_MCP_STOP_TIMEOUT_SECONDS
             or config.mcp.env != {}
+            or config.safety != EXPECTED_SAFETY
             or device.serial_port != EXPECTED_SERIAL
             or device.serial_port is None
             or not Path(device.serial_port).is_absolute()
@@ -233,6 +302,8 @@ def main() -> int:
             or device.ambient_poll_interval_seconds is not None
         ):
             raise ValueError
+
+        instructions_for(config.advisor.prompt_version)
 
         environment = _admit_environment(config, os.name)
         if (
@@ -261,6 +332,13 @@ identity, hardware state, calibration, readiness, accuracy or physical safety.
 The selected MCP command path is compared as configuration text only: the recipe
 does not resolve, open or execute it, or attest its existence, installed bytes,
 code or provenance.
+`ADMITTED` means only that the locally effective configuration matches the
+operator-recorded preparation values and the locally callable closed admissions.
+It does not attest provider or model existence, dependencies, response latency,
+cancellation delivery, spend, executable or YAML existence/content, installed
+Agent or MCP bytes, the ONNX model actually loaded, runtime identity, complete
+phase execution, evidence sealing, qualification, calibration, readiness,
+accuracy, physical devices, roaster state or physical safety.
 
 ## 3. Command
 
