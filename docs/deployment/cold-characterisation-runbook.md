@@ -81,6 +81,265 @@ duration and no run authority of its own.
   and its quantisation. Self-reported identities and software evidence are not
   physical proof.
 
+### 2.1 Select artifacts before installation
+
+Preparation starts by selecting two exact artifacts and recording their identities
+outside version-only reasoning:
+
+1. Record one Agent artifact's kind, source revision, clean-tree assertion where
+   applicable, and byte length and SHA-256 where applicable.
+2. Record the reviewed MCP candidate identified above: source revision, merged-tree
+   record, candidate wheel byte length and SHA-256. Published MCP 0.2.2 lacks the
+   D209 temperature projection; the reviewed, unreleased candidate reports the same
+   0.2.2 version and includes the typed projection.
+3. Treat the selected Agent artifact, reviewed MCP candidate, published MCP
+   distribution and resulting installed bytes as separate facts. A version, wheel
+   name, declared digest, `--artefact-*` value or `--mcp-candidate-*` value is an
+   assertion or selected-artifact fact; none attests the bytes imported by the
+   intended interpreter.
+4. Keep installation and verification that the resulting installed distributions
+   correspond to both selected artifacts as a **separately authorised installed-byte
+   gate**. That gate remains unexecuted here.
+
+An unknown, missing or mismatched artifact identity refuses preparation: the
+physical gate remains unexecuted and the run must not be described as prepared.
+This section supplies no installation transaction or installed-files attestor.
+
+### 2.2 Prepare and check the cold configuration
+
+Use a dedicated saved configuration. Replace every angle-bracketed placeholder
+below with the frozen non-secret value selected for the supervised run. The serial
+device, MCP entry point and both YAML paths must be absolute. The primary microphone
+entry is deliberately repeated. `model_slug_by_phase`, `recording_enabled`,
+`recording_autocapture`, `fc_confidence_threshold`, `auto_t0_detection_enabled`,
+`auto_t0_drop_threshold_c`, `ambient_mode`, `ambient_device` and
+`ambient_poll_interval_seconds` must remain absent. This leaves the base model as
+the sole frozen advisor model and leaves the inference/device values not expressly
+managed here under the operator's MCP YAML.
+
+<!-- story-1002-cold-config-template -->
+```yaml
+controller:
+  advisory_timeout_seconds: <frozen advisory call bound seconds>
+  post_fc_min_consult_interval_seconds: <frozen post-completion dwell seconds>
+
+advisor:
+  provider: <frozen provider>
+  provider_base_url: <frozen provider endpoint>
+  model_slug: <frozen model slug>
+  prompt_version: <supported frozen prompt version>
+  temperature: <frozen advisor temperature>
+
+mcp:
+  command: <frozen absolute MCP entry point>
+  call_timeout_seconds: <frozen MCP call timeout seconds>
+  startup_timeout_seconds: <frozen MCP startup timeout seconds>
+  stop_timeout_seconds: <frozen MCP stop timeout seconds>
+  env: {}
+
+mcp_device:
+  serial_port: <frozen absolute device path>
+  roaster_driver: hottop_kn8828b_2k_plus
+  audio_input_device: <frozen primary microphone identity>
+  recording_devices:
+    - <frozen primary microphone identity>
+  fc_mode: audio
+  mcp_yaml_source_path: <absolute path to frozen MCP YAML>
+```
+
+Set `ROASTPILOT_CONFIG_FILE` to the saved file's absolute path. The saved-config
+loader does not admit `advisor.api_key_env` from YAML. The only currently admitted
+effective credential-variable name is `OPENROUTER_API_KEY`. Do not set
+`ROASTPILOT_ADVISOR__API_KEY_ENV` to another name; export the credential only under
+`OPENROUTER_API_KEY`. The preflight checks only that its value is nonempty and never
+prints it. The effective configuration uses environment-over-file-over-default
+precedence. This recipe compares the effective provider, endpoint,
+credential-variable name, base model, empty phase model map, supported prompt,
+advisor temperature and reasoning effort; the controller's cold advisory call bound
+and post-completion dwell; the MCP command, three lifecycle timeouts and empty MCP
+environment; every current safety limit; and the device fields shown or expressly
+required to remain unset above. Inspect `ROASTPILOT_...__...` overrides for those
+fields as part of preparation because an environment override wins over the value
+shown in the saved YAML. Export no environment name beginning `COFFEE_`, in any
+mixture of case. Do not set a phase-specific advisor model override: a nonempty
+effective `model_slug_by_phase` refuses preparation. The selected MCP entry point
+must remain the exact absolute path recorded here; an alternate absolute path, a
+relative path or the bare default is refused.
+
+The baseline leaves `advisor.reasoning_effort` absent so the effective setting is
+the runtime default `None`, recorded exactly in the recipe. With this loader, YAML
+`null` becomes the string `"null"` and is refused; it is not a way to select `None`.
+If the operator deliberately selects a concrete schema-admitted reasoning effort,
+add that value to the saved YAML (or its environment override) and record the same
+value in `EXPECTED_REASONING_EFFORT`. The numeric values shown are source-verified
+preparation examples which the operator records and freezes; they do not introduce
+new accepted safety limits or hardware policy. The saved-config loader deliberately
+ignores a saved `safety:` section, so do not add one to this template. A deliberate
+safety change must be supplied through an operator-set `ROASTPILOT_SAFETY__...`
+environment value and must exactly match the ten recorded expectations in the
+recipe. `advisor.timeout_seconds` and
+`advisor.healthcheck_timeout_seconds` are outside this preflight's workload claim:
+cold mode passes the two controller timing values directly to its sampler and does
+not run the normal provider health check.
+
+Run the following with the interpreter from the intended Agent environment after
+replacing its expected placeholders with the same frozen non-secret values. It
+reads the credential only for truthiness and emits exactly one closed line. A
+refusal exits nonzero without printing configuration, environment, provider or
+result objects, credential values, or exception details.
+
+This local preparation recipe assumes an operator-controlled configuration file
+that is kept stable for the duration of the check. It does not lock or atomically
+snapshot the selected pathname, and it does not protect against concurrent
+replacement. The result is a configuration preparation observation, not a
+persisted-state or installed-byte attestation.
+
+<!-- story-1002-cold-config-preflight -->
+```python
+import math
+import os
+from pathlib import Path
+
+from roastpilot_agent.advisor import instructions_for
+from roastpilot_agent.cold_characterisation.advisory_sampler import (
+    MIN_POST_COMPLETION_DWELL_SECONDS,
+)
+from roastpilot_agent.cold_characterisation.identity import (
+    _ALLOWED_CREDENTIAL_ENV_NAMES,
+)
+from roastpilot_agent.cold_composition import (
+    ColdCompositionRefusal,
+    _admit_device_config,
+    _admit_environment,
+)
+from roastpilot_agent.config import SafetyLimits
+from roastpilot_agent.config_store import load_app_config
+
+EXPECTED_PROVIDER = "<frozen provider>"
+EXPECTED_PROVIDER_ENDPOINT = "<frozen provider endpoint>"
+EXPECTED_CREDENTIAL_NAME = "OPENROUTER_API_KEY"
+EXPECTED_MODEL = "<frozen model slug>"
+EXPECTED_PROMPT = "<supported frozen prompt version>"
+EXPECTED_TEMPERATURE = <frozen advisor temperature>
+EXPECTED_REASONING_EFFORT = None
+EXPECTED_CALL_BOUND_SECONDS = <frozen advisory call bound seconds>
+EXPECTED_DWELL_SECONDS = <frozen post-completion dwell seconds>
+EXPECTED_MCP_CALL_TIMEOUT_SECONDS = <frozen MCP call timeout seconds>
+EXPECTED_MCP_STARTUP_TIMEOUT_SECONDS = <frozen MCP startup timeout seconds>
+EXPECTED_MCP_STOP_TIMEOUT_SECONDS = <frozen MCP stop timeout seconds>
+EXPECTED_SERIAL = "<frozen absolute device path>"
+EXPECTED_DRIVER = "hottop_kn8828b_2k_plus"
+EXPECTED_AUDIO = "<frozen primary microphone identity>"
+
+
+def main() -> int:
+    try:
+        expected_mcp_command = Path("<frozen absolute MCP entry point>")
+        expected_mcp_yaml = Path("<absolute path to frozen MCP YAML>")
+        expected_safety = SafetyLimits(
+            max_bean_temp_c=230.0,
+            max_env_temp_c=240.0,
+            pre_t0_max_bean_temp_c=200.0,
+            overrun_safe_fan_percent=100,
+            pre_t0_overrun_severity="recovery",
+            min_seconds_between_commands=2.0,
+            max_consecutive_mcp_failures=3,
+            max_consecutive_advisor_failures=3,
+            bitter_ceiling_temp_c=196.0,
+            emergency_drop_temp_c=198.0,
+        )
+        selected = os.environ.get("ROASTPILOT_CONFIG_FILE")
+        if selected is None:
+            raise ValueError
+        selected_path = Path(selected)
+        if not selected_path.is_absolute() or not selected_path.is_file():
+            raise ValueError
+        with selected_path.open("rb") as selected_file:
+            selected_file.read(1)
+
+        config, _ = load_app_config()
+        device = config.mcp_device
+        if (
+            config.advisor.provider != EXPECTED_PROVIDER
+            or config.advisor.provider_base_url != EXPECTED_PROVIDER_ENDPOINT
+            or config.advisor.api_key_env != EXPECTED_CREDENTIAL_NAME
+            or config.advisor.api_key_env not in _ALLOWED_CREDENTIAL_ENV_NAMES
+            or config.advisor.model_slug != EXPECTED_MODEL
+            or config.advisor.model_slug_by_phase != {}
+            or config.advisor.prompt_version != EXPECTED_PROMPT
+            or config.advisor.temperature != EXPECTED_TEMPERATURE
+            or config.advisor.reasoning_effort != EXPECTED_REASONING_EFFORT
+            or config.controller.advisory_timeout_seconds != EXPECTED_CALL_BOUND_SECONDS
+            or not math.isfinite(config.controller.advisory_timeout_seconds)
+            or config.controller.advisory_timeout_seconds <= 0.0
+            or config.controller.post_fc_min_consult_interval_seconds
+            != EXPECTED_DWELL_SECONDS
+            or config.controller.post_fc_min_consult_interval_seconds
+            < MIN_POST_COMPLETION_DWELL_SECONDS
+            or config.mcp.command != str(expected_mcp_command)
+            or not expected_mcp_command.is_absolute()
+            or config.mcp.call_timeout_seconds != EXPECTED_MCP_CALL_TIMEOUT_SECONDS
+            or config.mcp.startup_timeout_seconds != EXPECTED_MCP_STARTUP_TIMEOUT_SECONDS
+            or config.mcp.stop_timeout_seconds != EXPECTED_MCP_STOP_TIMEOUT_SECONDS
+            or config.mcp.env != {}
+            or config.safety != expected_safety
+            or device.serial_port != EXPECTED_SERIAL
+            or device.serial_port is None
+            or not Path(device.serial_port).is_absolute()
+            or device.roaster_driver != EXPECTED_DRIVER
+            or device.audio_input_device != EXPECTED_AUDIO
+            or device.recording_devices != (EXPECTED_AUDIO,)
+            or device.fc_mode != "audio"
+            or device.fc_confidence_threshold is not None
+            or device.auto_t0_detection_enabled is not None
+            or device.auto_t0_drop_threshold_c is not None
+            or device.recording_enabled is not None
+            or device.recording_autocapture is not None
+            or device.mcp_yaml_source_path != expected_mcp_yaml
+            or not expected_mcp_yaml.is_absolute()
+            or device.ambient_mode is not None
+            or device.ambient_device is not None
+            or device.ambient_poll_interval_seconds is not None
+        ):
+            raise ValueError
+
+        instructions_for(config.advisor.prompt_version)
+
+        environment = _admit_environment(config, os.name)
+        if (
+            isinstance(environment, ColdCompositionRefusal)
+            or environment.credential_present is not True
+        ):
+            raise ValueError
+        phases = _admit_device_config(device)
+        if isinstance(phases, ColdCompositionRefusal):
+            raise ValueError
+    except Exception:
+        print("cold configuration preflight: REFUSED")
+        return 1
+    print("cold configuration preflight: ADMITTED")
+    return 0
+
+
+raise SystemExit(main())
+```
+
+This is a hardware-free and provider-free configuration preparation check. It
+does not build or call the advisor, spawn MCP, open the MCP YAML, or access a
+device. It does not verify the files behind configured paths, installed Agent or
+MCP distributions, the loaded ONNX model, provider reachability, physical
+identity, hardware state, calibration, readiness, accuracy or physical safety.
+The selected MCP command path is compared as configuration text only: the recipe
+does not resolve, open or execute it, or attest its existence, installed bytes,
+code or provenance.
+`ADMITTED` means only that the locally effective configuration matches the
+operator-recorded preparation values and the locally callable closed admissions.
+It does not attest provider or model existence, dependencies, response latency,
+cancellation delivery, spend, executable or YAML existence/content, installed
+Agent or MCP bytes, the ONNX model actually loaded, runtime identity, complete
+phase execution, evidence sealing, qualification, calibration, readiness,
+accuracy, physical devices, roaster state or physical safety.
+
 ## 3. Command
 
 Every option except `--protected-root` may appear only once; a repeat, an
@@ -338,11 +597,10 @@ Independent Pi evidence review follows separately.
 - The acceptance interpretation of the inner run does not include the
   temperature screen; the screen is judged by temperature conformance policy 3.
 - Clock progress is a port contract, not a watchdog.
-- The **D195 six-dimension envelope (heat, roast fan, main fan, drum, cooling,
-  solenoid/drop) is checked only at eligible finalisation, never after a
-  retained abort.**
-- Per tick, only **heat, roast fan (D197) and cooling** are observed, and they
-  are commanded state, not sensing.
+- Per-tick software observation checks commanded heat, main fan, roast fan and
+  cooling. Drum and solenoid/drop appear only in eligible D195 six-dimension
+  finalisation evidence, never after a retained abort. These are commanded
+  software values, not physical sensing or proof of physical response.
 - The independent operator emergency stop governs throughout.
 
 ## 9. Deployment residuals

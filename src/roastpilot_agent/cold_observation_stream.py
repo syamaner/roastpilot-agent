@@ -6,8 +6,10 @@ plus an identity digest.  Only the closed, versioned eleven-field
 rendered once into an SSE frame and no reference to the tick is retained.
 
 Temperatures are Celsius, exact finite floats or ``null``; finiteness is not a
-plausibility claim and no range is applied.  ``fan_percent`` (the main fan) is
-always ``null``: per-tick observation covers heat, roast fan and cooling only.
+plausibility claim and no range is applied.  The engine's per-tick commanded-state
+check covers heat, main fan, roast fan and cooling.  The unchanged public display
+projection still leaves ``fan_percent`` (the main fan) as ``null``; that projection
+is not the engine's admission evidence.
 
 :class:`ColdObservationHub` is bounded everywhere: admission, per-subscriber
 queues, the replay ring and ``Last-Event-ID`` parsing.  Over a limit it refuses

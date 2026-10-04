@@ -106,9 +106,10 @@ PROTOCOL_INTENT = (
         "actuation did or did not occur."
     ),
     (
-        "Per-tick software observation covers heat, roast fan and cooling only; all six "
-        "command dimensions appear only in D195 finalisation evidence, which this report "
-        "does not evaluate."
+        "Per-tick software observation checks commanded heat, main fan, roast fan and cooling. "
+        "Drum and solenoid/drop appear only in eligible D195 six-dimension finalisation "
+        "evidence. These are commanded software values, not physical sensing or proof of "
+        "physical response."
     ),
     (
         "This report renders per-check results and states no run verdict; D191 limits are "
