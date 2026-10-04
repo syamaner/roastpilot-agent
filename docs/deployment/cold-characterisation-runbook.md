@@ -151,6 +151,12 @@ reads the credential only for truthiness and emits exactly one closed line. A
 refusal exits nonzero without printing configuration, environment, provider or
 result objects, credential values, or exception details.
 
+This local preparation recipe assumes an operator-controlled configuration file
+that is kept stable for the duration of the check. It does not lock or atomically
+snapshot the selected pathname, and it does not protect against concurrent
+replacement. The result is a configuration preparation observation, not a
+persisted-state or installed-byte attestation.
+
 <!-- story-1002-cold-config-preflight -->
 ```python
 import os

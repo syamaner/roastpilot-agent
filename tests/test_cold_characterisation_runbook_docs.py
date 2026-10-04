@@ -212,6 +212,12 @@ def test_story_1002_template_uses_supported_credential_name_configuration() -> N
     assert "api_key_env" not in template
     assert "ROASTPILOT_ADVISOR__API_KEY_ENV='<frozen credential variable name>'" in section
     assert "config.advisor.api_key_env != EXPECTED_CREDENTIAL_NAME" in section
+    assert (
+        "assumes an operator-controlled configuration file that is kept stable for the "
+        "duration of the check" in _flat(section)
+    )
+    assert "does not lock or atomically snapshot the selected pathname" in _flat(section)
+    assert "does not protect against concurrent replacement" in _flat(section)
 
 
 def test_story_1002_commanded_state_sibling_prose_matches_engine_and_projection() -> None:
@@ -268,6 +274,7 @@ def test_story_1002_documented_preflight_refuses_missing_or_unusable_config_file
 
 _REFUSAL_CASES: list[tuple[Callable[[str], str], dict[str, str | None] | None]] = [
     (lambda text: _CANARY + "\n: malformed", None),
+    (lambda text: f"- {_CANARY}\n- genuine-non-mapping-yaml", None),
     (lambda text: text.replace("  env: {}", "  env: {EXTRA: canary}"), None),
     (lambda text: text + "\n  recording_enabled: true\n", None),
     (
@@ -323,6 +330,7 @@ _REFUSAL_CASES: list[tuple[Callable[[str], str], dict[str, str | None] | None]] 
     _REFUSAL_CASES,
     ids=(
         "malformed-yaml",
+        "non-mapping-yaml-list",
         "nonempty-mcp-env",
         "recording-field-set",
         "relative-mcp-yaml",
