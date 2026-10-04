@@ -33,9 +33,16 @@ from roastpilot_agent.cold_characterisation.temperature_projection import (
 from tests.test_cold_characterisation_advisory_conformance import (
     _write_run,  # pyright: ignore[reportPrivateUsage]
     base,
+)
+from tests.test_cold_characterisation_conformance import (
+    DRIVER,
+    S_OFF,
+    S_ON,
+    Plan,
+    Tick,
+    audio,
     plan,
 )
-from tests.test_cold_characterisation_conformance import DRIVER, S_OFF, S_ON, Plan, Tick, audio
 from tests.test_cold_characterisation_evidence_builders import RUN_ID
 from tests.test_cold_characterisation_evidence_store import OFF, ON
 from tests.test_cold_characterisation_evidence_temperature import temperature_for
