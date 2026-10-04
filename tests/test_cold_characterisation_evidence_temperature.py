@@ -396,6 +396,19 @@ def test_e2_direct_construction_readmits_nested_field_content(tmp_path: Path) ->
 # ------------------------------------------------- E3 shared re-admission
 
 
+def _str_subclass_keyed(record: pydantic.BaseModel) -> typing.Any:
+    """Return a copy whose exact ``"tick"`` key is re-keyed as an equal ``str`` subclass.
+
+    The field set still compares equal, so only the exact-key guard can refuse it.
+    """
+    data = state_of(record)
+    value = data.pop("tick")
+    data[Str("tick")] = value
+    assert [type(key) for key in data if key == "tick"] == [Str]
+    assert set(data) == set(Record.model_fields)
+    return with_state(record, data)
+
+
 def _e3_refusals(
     tick: schema.ColdTickRecord,
 ) -> list[tuple[str, object, schema.ColdEvidenceFailure]]:
@@ -416,6 +429,7 @@ def _e3_refusals(
         ("dict-subclass-state", with_state(valid, DictSubclass(state_of(valid))), not_validated),
         ("non-str-key", with_state(valid, {**state_of(valid), 1: 1}), not_validated),
         ("extra-key", with_state(valid, {**state_of(valid), "extra": 1}), not_validated),
+        ("str-subclass-key", _str_subclass_keyed(valid), not_validated),
         ("tick-negative", valid.model_copy(update={"tick": -1}), not_validated),
         ("tick-list", valid.model_copy(update={"tick": [1]}), not_validated),
         (
@@ -962,75 +976,98 @@ def test_h3_a_file_in_a_phase_without_a_header_is_refused(tmp_path: Path) -> Non
     expect(Failure.HEADER_MISSING, lambda: read5(root, digest))
 
 
-def _reread(tmp_path: Path, document: dict[str, typing.Any]) -> tuple[str, str]:
-    """Seal the paired run, then replace the recording-on file with one crafted line."""
+Document = dict[str, typing.Any]
+Change = typing.Callable[[Document], object]
+
+
+def _set(**update: object) -> Change:
+    """Return a change that replaces top-level document values."""
+    return lambda base: {**base, **update}
+
+
+def _set_projection(**update: object) -> Change:
+    """Return a change that replaces values inside the nested projection."""
+    return lambda base: {**base, "temperature": {**base["temperature"], **update}}
+
+
+def _drop(key: str) -> Change:
+    """Return a change that removes one top-level key."""
+    return lambda base: {name: value for name, value in base.items() if name != key}
+
+
+def _reread(
+    tmp_path: Path,
+    change: Change,
+    render: typing.Callable[[object], bytes] = line_of,
+) -> tuple[str, str]:
+    """Seal the paired run, then re-craft its first recording-on line from that same run.
+
+    The first line is the run's own genuine recording-on document (valid run,
+    phase, digest, and pairing with ``on_ticks[0]``) with only the intended change
+    applied; the second line stays genuine, so every other rule holds.
+    """
     run, _digest = sealed_run(tmp_path)
-    return run.root, rewrite(run.root, TEMPERATURE_ON, line_of(document))
+    first = doc(temperature_for(run.on_ticks[0]))
+    second = lines(temperature_for(run.on_ticks[1]))
+    return run.root, rewrite(run.root, TEMPERATURE_ON, render(change(first)) + second)
 
 
-def _on_document(tmp_path: Path) -> dict[str, typing.Any]:
-    """Return a genuine recording-on temperature document bound to the shared run."""
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    root = str(tmp_path.resolve() / "pi")
-    return doc(temperature_for(tick_for(on_header(tmp_path, root), 0)))
+def test_h3_re_sealed_genuine_lines_from_the_same_run_read_present(tmp_path: Path) -> None:
+    """H3 control: the unchanged re-crafted lines re-seal and read ``PRESENT``."""
+    run, _digest = sealed_run(tmp_path)
+    expected = tuple(temperature_for(tick) for tick in (*run.off_ticks, *run.on_ticks))
+    first = doc(temperature_for(run.on_ticks[0]))
+    second = lines(temperature_for(run.on_ticks[1]))
+    digest = rewrite(run.root, TEMPERATURE_ON, line_of(first) + second)
+
+    v5 = read5(run.root, digest)
+
+    assert v5.tick_temperature_state is TState.PRESENT
+    assert v5.tick_temperatures == expected
+    assert all(record.temperature == valid_projection() for record in v5.tick_temperatures)
 
 
 def test_h3_unknown_versions_are_refused_before_any_other_malformation(tmp_path: Path) -> None:
     """H3: missing, other, float, and bool versions are unknown; that wins over later faults."""
-    base = _on_document(tmp_path / "doc")
-    documents: list[dict[str, typing.Any]] = [
-        {key: value for key, value in base.items() if key != "schema_version"},
-        *({**base, "schema_version": version} for version in (1, 2, 3, 5, 4.0, True)),
-        {**base, "schema_version": 5, "stream": "tick", "extra": 1, "temperature": None},
+    changes: list[Change] = [
+        _drop("schema_version"),
+        *(_set(schema_version=version) for version in (1, 2, 3, 5, 4.0, True)),
+        _set(schema_version=5, stream="tick", extra=1, temperature=None),
     ]
-    for index, document in enumerate(documents):
-        root, digest = _reread(tmp_path / str(index), document)
+    for index, change in enumerate(changes):
+        root, digest = _reread(tmp_path / str(index), change)
         expect(Failure.SCHEMA_VERSION_UNKNOWN, functools.partial(read5, root, digest))
 
 
-def _malformed_documents(base: dict[str, typing.Any]) -> list[tuple[str, dict[str, typing.Any]]]:
-    """Return one malformed document per closed decode refusal."""
-    projection = base["temperature"]
-    missing = {key: value for key, value in base.items() if key != "tick"}
-    return [
-        ("stream-tick", {**base, "stream": "tick"}),
-        ("stream-not-text", {**base, "stream": 4}),
-        ("extra-key", {**base, "extra": 1}),
-        ("missing-key", missing),
-        ("unknown-phase", {**base, "phase": "recording_sideways"}),
-        ("phase-not-text", {**base, "phase": 1}),
-        ("projection-null", {**base, "temperature": None}),
-        ("projection-not-object", {**base, "temperature": []}),
-        ("projection-version", {**base, "temperature": {**projection, "projection_version": 2}}),
-        ("projection-field-set", {**base, "temperature": {**projection, "extra": None}}),
-        ("projection-outcome", {**base, "temperature": {**projection, "outcome": "stale"}}),
-        ("projection-type", {**base, "temperature": {**projection, "status_packet_count": "5"}}),
-        (
-            "projection-integer-temperature",
-            {**base, "temperature": {**projection, "last_packet_bean_temp_c": 20}},
-        ),
-        (
-            "projection-token",
-            {**base, "temperature": {**projection, "reported_temperature_unit": "auto"}},
-        ),
-        ("projection-value", {**base, "temperature": {**projection, "status_packet_count": -1}}),
-        (
-            "projection-shape",
-            {**base, "temperature": {**projection, "value_agreement": "disagree"}},
-        ),
-        ("tick-negative", {**base, "tick": -1}),
-        ("tick-float", {**base, "tick": 0.0}),
-        ("monotonic-integer", {**base, "monotonic_seconds": 2}),
-        ("bad-run-id", {**base, "run_id": "cold"}),
-        ("bad-digest", {**base, "identity_sha256": "F" * 64}),
-    ]
+_MALFORMED_CHANGES: list[tuple[str, Change]] = [
+    ("stream-tick", _set(stream="tick")),
+    ("stream-not-text", _set(stream=4)),
+    ("extra-key", _set(extra=1)),
+    ("missing-key", _drop("tick")),
+    ("unknown-phase", _set(phase="recording_sideways")),
+    ("phase-not-text", _set(phase=1)),
+    ("projection-null", _set(temperature=None)),
+    ("projection-not-object", _set(temperature=[])),
+    ("projection-version", _set_projection(projection_version=2)),
+    ("projection-field-set", _set_projection(extra=None)),
+    ("projection-outcome", _set_projection(outcome="stale")),
+    ("projection-type", _set_projection(status_packet_count="5")),
+    ("projection-integer-temperature", _set_projection(last_packet_bean_temp_c=20)),
+    ("projection-token", _set_projection(reported_temperature_unit="auto")),
+    ("projection-value", _set_projection(status_packet_count=-1)),
+    ("projection-shape", _set_projection(value_agreement="disagree")),
+    ("tick-negative", _set(tick=-1)),
+    ("tick-float", _set(tick=0.0)),
+    ("monotonic-integer", _set(monotonic_seconds=2)),
+    ("bad-run-id", _set(run_id="cold")),
+    ("bad-digest", _set(identity_sha256="F" * 64)),
+]
 
 
 def test_h3_malformed_lines_are_refused(tmp_path: Path) -> None:
     """H3: every closed decode refusal reads as ``LINE_MALFORMED``."""
-    base = _on_document(tmp_path / "doc")
-    for index, (name, document) in enumerate(_malformed_documents(base)):
-        root, digest = _reread(tmp_path / str(index), document)
+    for index, (name, change) in enumerate(_MALFORMED_CHANGES):
+        root, digest = _reread(tmp_path / str(index), change)
         with pytest.raises(store.ColdEvidenceStoreError) as raised:
             read5(root, digest)
         assert raised.value.failure is Failure.LINE_MALFORMED, name
@@ -1052,32 +1089,32 @@ def test_h3_non_object_and_invalid_json_lines_are_refused(tmp_path: Path, data: 
 
 
 def test_h3_non_canonical_lines_are_refused(tmp_path: Path) -> None:
-    """H3: unsorted keys or non-compact separators are not canonical."""
-    run, _digest = sealed_run(tmp_path / "base")
-    document = doc(temperature_for(run.on_ticks[0]))
-    for index, data in enumerate(
-        (json.dumps(document, separators=(",", ":")), json.dumps(document, sort_keys=True))
-    ):
-        assert data.encode() + b"\n" != line_of(document)
-        run, _digest = sealed_run(tmp_path / str(index))
-        on1 = lines(temperature_for(run.on_ticks[1]))
-        digest = rewrite(run.root, TEMPERATURE_ON, data.encode() + b"\n" + on1)
-        expect(Failure.LINE_NOT_CANONICAL, functools.partial(read5, run.root, digest))
+    """H3: unsorted keys or non-compact separators are not canonical; only spelling differs."""
+
+    def unsorted(document: object) -> bytes:
+        return json.dumps(document, separators=(",", ":")).encode() + b"\n"
+
+    def spaced(document: object) -> bytes:
+        return json.dumps(document, sort_keys=True).encode() + b"\n"
+
+    for index, render in enumerate((unsorted, spaced)):
+        root, digest = _reread(tmp_path / str(index), lambda base: base, render)
+        first = (run_dir(root) / TEMPERATURE_ON).read_bytes().split(b"\n")[0] + b"\n"
+        assert first != line_of(json.loads(first))
+        expect(Failure.LINE_NOT_CANONICAL, functools.partial(read5, root, digest))
 
 
 def test_h3_reader_binding_refusals(tmp_path: Path) -> None:
-    """H3: another valid run id, or a wrong valid-hex digest, is refused by binding."""
-    base = _on_document(tmp_path / "doc")
-    root, digest = _reread(tmp_path / "run", {**base, "run_id": OTHER_RUN_ID})
+    """H3: another valid run id, or a wrong valid-hex digest alone, is refused by binding."""
+    root, digest = _reread(tmp_path / "run", _set(run_id=OTHER_RUN_ID))
     expect(Failure.RUN_ID_MISMATCHED, lambda: read5(root, digest))
-    root, digest = _reread(tmp_path / "digest", {**base, "identity_sha256": "f" * 64})
+    root, digest = _reread(tmp_path / "digest", _set(identity_sha256="f" * 64))
     expect(Failure.IDENTITY_DIGEST_MISMATCHED, lambda: read5(root, digest))
 
 
 def test_h3_walker_bounds_apply_before_decoding(tmp_path: Path) -> None:
     """H3: a crafted ``10**32`` tick keeps the shared walker's member."""
-    base = _on_document(tmp_path / "doc")
-    root, digest = _reread(tmp_path / "beyond", {**base, "tick": INT_BOUND + 1})
+    root, digest = _reread(tmp_path / "beyond", _set(tick=INT_BOUND + 1))
     expect_evidence(EFail.JSON_VALUE_TYPE_NOT_ADMITTED, lambda: read5(root, digest))
 
 
@@ -1191,8 +1228,7 @@ def test_h5_decode_is_total_over_json_derived_values(tmp_path: Path) -> None:
 @pytest.mark.parametrize("value", [None, True, 0, 1.5, "x", [], [1], {}, {"k": 1}])
 def test_h5_each_json_kind_as_the_projection_reads_malformed(tmp_path: Path, value: object) -> None:
     """H5: an invalid projection of every JSON kind reads exactly as ``LINE_MALFORMED``."""
-    base = _on_document(tmp_path / "doc")
-    root, digest = _reread(tmp_path / "run", {**base, "temperature": value})
+    root, digest = _reread(tmp_path / "run", _set(temperature=value))
     expect(Failure.LINE_MALFORMED, lambda: read5(root, digest))
 
 
