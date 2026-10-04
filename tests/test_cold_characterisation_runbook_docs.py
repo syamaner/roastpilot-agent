@@ -180,7 +180,9 @@ def _run_documented_preflight(
         exec(compile(script, "<documented-cold-preflight>", "exec"), {"__name__": "__main__"})
     captured = capsys.readouterr()
     assert forbidden_calls == []
-    return int(stopped.value.code), captured.out, captured.err
+    exit_code = stopped.value.code
+    assert type(exit_code) is int
+    return exit_code, captured.out, captured.err
 
 
 @pytest.mark.docs
@@ -264,64 +266,61 @@ def test_story_1002_documented_preflight_refuses_missing_or_unusable_config_file
     assert (code, stdout, stderr) == (1, "cold configuration preflight: REFUSED\n", "")
 
 
+_REFUSAL_CASES: list[tuple[Callable[[str], str], dict[str, str | None] | None]] = [
+    (lambda text: _CANARY + "\n: malformed", None),
+    (lambda text: text.replace("  env: {}", "  env: {EXTRA: canary}"), None),
+    (lambda text: text + "\n  recording_enabled: true\n", None),
+    (
+        lambda text: text.replace(
+            "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml",
+            "  mcp_yaml_source_path: relative.yaml",
+        ),
+        None,
+    ),
+    (
+        lambda text: text.replace("  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml", ""),
+        None,
+    ),
+    (lambda text: text, {"coffee_hidden": _CANARY}),
+    (lambda text: text, {"RP_COLD_TEST_KEY": ""}),
+    (lambda text: text.replace("provider: openai_compatible", "provider: openai"), None),
+    (
+        lambda text: text.replace(
+            "provider_base_url: https://cold.invalid/v1",
+            "provider_base_url: https://other.invalid/v1",
+        ),
+        None,
+    ),
+    (lambda text: text, {"ROASTPILOT_ADVISOR__MODEL_SLUG": "other/model"}),
+    (lambda text: text.replace("prompt_version: cold-v1", "prompt_version: other"), None),
+    (lambda text: text, {"ROASTPILOT_ADVISOR__API_KEY_ENV": "OTHER_KEY"}),
+    (
+        lambda text: text.replace("serial_port: /dev/cold-test-roaster", "serial_port: /dev/other"),
+        None,
+    ),
+    (
+        lambda text: text.replace("roaster_driver: hottop_kn8828b_2k_plus", "roaster_driver: mock"),
+        None,
+    ),
+    (
+        lambda text: text.replace(
+            "audio_input_device: Cold Test Primary Mic", "audio_input_device: Other Mic"
+        ),
+        None,
+    ),
+    (
+        lambda text: text.replace("    - Cold Test Primary Mic", "    - Other Recording Mic"),
+        None,
+    ),
+    (lambda text: text.replace("fc_mode: audio", "fc_mode: manual"), None),
+    (lambda text: text + "\n  recording_autocapture: false\n", None),
+]
+
+
 @pytest.mark.docs
 @pytest.mark.parametrize(
     ("mutation", "environment"),
-    [
-        (lambda text: _CANARY + "\n: malformed", None),
-        (lambda text: text.replace("  env: {}", "  env: {EXTRA: canary}"), None),
-        (lambda text: text + "\n  recording_enabled: true\n", None),
-        (
-            lambda text: text.replace(
-                "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml",
-                "  mcp_yaml_source_path: relative.yaml",
-            ),
-            None,
-        ),
-        (
-            lambda text: text.replace(
-                "  mcp_yaml_source_path: /nonexistent/cold-test-mcp.yaml", ""
-            ),
-            None,
-        ),
-        (lambda text: text, {"coffee_hidden": _CANARY}),
-        (lambda text: text, {"RP_COLD_TEST_KEY": ""}),
-        (lambda text: text.replace("provider: openai_compatible", "provider: openai"), None),
-        (
-            lambda text: text.replace(
-                "provider_base_url: https://cold.invalid/v1",
-                "provider_base_url: https://other.invalid/v1",
-            ),
-            None,
-        ),
-        (lambda text: text, {"ROASTPILOT_ADVISOR__MODEL_SLUG": "other/model"}),
-        (lambda text: text.replace("prompt_version: cold-v1", "prompt_version: other"), None),
-        (lambda text: text, {"ROASTPILOT_ADVISOR__API_KEY_ENV": "OTHER_KEY"}),
-        (
-            lambda text: text.replace(
-                "serial_port: /dev/cold-test-roaster", "serial_port: /dev/other"
-            ),
-            None,
-        ),
-        (
-            lambda text: text.replace(
-                "roaster_driver: hottop_kn8828b_2k_plus", "roaster_driver: mock"
-            ),
-            None,
-        ),
-        (
-            lambda text: text.replace(
-                "audio_input_device: Cold Test Primary Mic", "audio_input_device: Other Mic"
-            ),
-            None,
-        ),
-        (
-            lambda text: text.replace("    - Cold Test Primary Mic", "    - Other Recording Mic"),
-            None,
-        ),
-        (lambda text: text.replace("fc_mode: audio", "fc_mode: manual"), None),
-        (lambda text: text + "\n  recording_autocapture: false\n", None),
-    ],
+    _REFUSAL_CASES,
     ids=(
         "malformed-yaml",
         "nonempty-mcp-env",
