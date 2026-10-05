@@ -89,6 +89,7 @@ __all__ = (
     "ColdReboundPhase",
     "ColdReboundRun",
     "interpret_retained_run",
+    "interpret_retained_run_revision1",
 )
 
 #: Policy v2 requires MCP 0.2.2 because 0.2.1 lacks per-tick commanded roast-fan
@@ -1100,7 +1101,20 @@ def _has_detection(sample: _Sample) -> bool:
     return sample.detected_at_utc is not None or sample.detected_monotonic_seconds is not None
 
 
-def _evaluate_inference_runtime(rebound: ColdReboundPhase) -> ColdCheckResult:
+def _prepared_pending(sample: _Sample) -> bool:
+    """Recognise the one D211 literal in active, pending, non-detected audio only."""
+    return (
+        sample.reason == "Audio first-crack detection is prepared for this session."
+        and sample.mode == "audio"
+        and sample.status == "pending"
+        and sample.audio_running is True
+        and not _has_detection(sample)
+    )
+
+
+def _evaluate_inference_runtime(
+    rebound: ColdReboundPhase, *, revised: bool = False
+) -> ColdCheckResult:
     """G16 ``INFERENCE_RUNTIME`` over ``L``, the runtime outcome and the final status.
 
     It requires active flags on every observed sample and at least one processed
@@ -1120,7 +1134,7 @@ def _evaluate_inference_runtime(rebound: ColdReboundPhase) -> ColdCheckResult:
             found.add(status_failure)
         if _has_detection(sample):
             found.add(ColdCheckFailure.FIRST_CRACK_CONFIRMED)
-        if sample.reason is not None:
+        if sample.reason is not None and not (revised and _prepared_pending(sample)):
             found.add(ColdCheckFailure.MICROPHONE_OR_FATAL_ERROR)
     if evidence.pre is not None and evidence.pre.processed_window_count < 1:
         found.add(ColdCheckFailure.NO_PROCESSED_WINDOW)
@@ -1283,7 +1297,9 @@ def _derive_d191(rebound: ColdReboundPhase) -> ColdD191Metrics | None:
     )
 
 
-def _interpret_phase(rebound: ColdReboundPhase) -> ColdPhaseInterpretation:
+def _interpret_phase(
+    rebound: ColdReboundPhase, *, revised: bool = False
+) -> ColdPhaseInterpretation:
     """Evaluate the five checks and the D191 derivation for one rebound phase."""
     qualification, facts = _qualify_identity_v1(
         rebound._identity  # pyright: ignore[reportPrivateUsage]
@@ -1293,7 +1309,7 @@ def _interpret_phase(rebound: ColdReboundPhase) -> ColdPhaseInterpretation:
         identity_sha256=rebound.header.identity_sha256,
         results=(
             qualification,
-            _evaluate_inference_runtime(rebound),
+            _evaluate_inference_runtime(rebound, revised=revised),
             _evaluate_audio_counters(rebound),
             _evaluate_inference_duration(rebound),
             _evaluate_recording_artefacts(rebound),
@@ -1326,4 +1342,24 @@ def interpret_retained_run(run: ColdRetainedRun) -> ColdInterpretation:
         token=_REBIND_TOKEN,
         rebound=rebound,
         phases=tuple(_interpret_phase(phase) for phase in rebound.phases),
+    )
+
+
+def interpret_retained_run_revision1(run: ColdRetainedRun) -> ColdInterpretation:
+    """Rebind and interpret with the fixed D211 live/pre-finalisation exception.
+
+    Args:
+        run: Retained run admitted by the strict reader.
+
+    Returns:
+        Fresh interpretations; raw reasons and all other rules are preserved.
+
+    Raises:
+        ColdInterpretationError: If rebinding or header admission fails.
+    """
+    rebound = _rebind(run)
+    return ColdInterpretation(
+        token=_REBIND_TOKEN,
+        rebound=rebound,
+        phases=tuple(_interpret_phase(phase, revised=True) for phase in rebound.phases),
     )

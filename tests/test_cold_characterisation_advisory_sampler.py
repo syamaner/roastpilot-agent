@@ -43,7 +43,6 @@ from roastpilot_agent.advisor import (
 from roastpilot_agent.cold_characterisation import advisory_conformance as ac
 from roastpilot_agent.cold_characterisation import advisory_sampler as sampler_module
 from roastpilot_agent.cold_characterisation import evidence_advisory as advisory
-from roastpilot_agent.cold_characterisation import evidence_builders as builders
 from roastpilot_agent.cold_characterisation import evidence_lifecycle as lifecycle
 from roastpilot_agent.cold_characterisation import evidence_reader as reader
 from roastpilot_agent.cold_characterisation import evidence_schema as schema
@@ -78,6 +77,7 @@ from tests.test_cold_characterisation_conformance import (
     Plan,
     finalisation,
     header_of,
+    historical_lifecycle_record,
     host_record,
     plan,
     tick_record,
@@ -4595,7 +4595,7 @@ async def write_v3_sampled(
             if entry.event is lifecycle.ColdLifecycleEvent.OBSERVATION_WINDOW_ELAPSED:
                 fields.setdefault("tick_count", len(run.ticks[phase]))
             writer.append_lifecycle(
-                builders.build_lifecycle_record(
+                historical_lifecycle_record(
                     header=header,
                     sequence=sequence,
                     event=entry.event,
@@ -4697,6 +4697,14 @@ async def test_sampler_records_conform_policy_2_both_phases(tmp_path: Path) -> N
     clock = ManualClock(13.5)
     v3, recorded = await write_v3_sampled(tmp_path, run, driver(run, clock, Shape(), []))
     assert v3.advisory_attempts == tuple(recorded)
+    activations = [
+        record
+        for record in v3.lifecycle
+        if record.event is lifecycle.ColdLifecycleEvent.PHASE_ACTIVATED
+    ]
+    assert len(activations) == 2
+    assert [record.scheduled_end_monotonic for record in activations] == [1810.0, 3630.0]
+    assert [record.event_monotonic_seconds for record in activations] == [10.0, 1830.0]
     for phase in (OFF, ON):
         intents = [r for r in recorded if type(r) is Intent and r.phase is phase]
         assert len(intents) == 41

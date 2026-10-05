@@ -1,5 +1,22 @@
 # RoastPilot Agent Project State Registry
 
+**5 Oct 2026 — D210/D211 retrospective cold qualification:** the original
+completed supervised 10+10 cold run returned `NOT_CONFORMANT`, exit 6, because
+its original D210 evaluator misclassified the exact MCP prepared-session reason.
+That result, original evaluator/wheel identities and sealed bytes remain unchanged.
+A separate offline policy 4 interpretation revision 1 assessment returned
+`temperature_screened_conformant` with zero findings; the corrected wheel was
+not installed on Pi. Independent safety, MCP-contract, QA, security and direct
+Pi-evidence reviews completed. The final independent Pi reviewer returned PASS
+for the narrow retrospective 10+10 cold qualification, accepting the separate
+supplementary artifact receipt as host attestation. #954 stays OPEN; E11-S3 is
+in progress. The separately authorised live acceptance and release gates remain
+outstanding. This supersedes earlier E11-S3 physical-run and review status
+snapshots. Historical policies 1–3 and original policy 4 remain reproducible.
+Current runtime requires the revised exact result class/revision. See the D211
+section of `docs/deployment/cold-characterisation-runbook.md` for evidence limits.
+
+
 ## Active Epic
 
 **6 Sep 2026 — D-ToS-1 governance reconciliation (#938).** Verified live
@@ -37,8 +54,25 @@ corrects D180's final implementation and evidence clauses. This closure
 supersedes the in-progress or stays-open-pending language in all earlier #702
 (D180) entries below, which are now historical.
 
+**4 Oct 2026 — #954 D210 local candidate:** **Historical snapshot — physical-run,
+review and sequencing status superseded by the 5 Oct D210/D211 entry above.**
+At that time, cold phases were fixed at
+600 seconds each (recording-off then recording-on), with relative advisory
+minutes 4–9 and the unchanged 60-second transition budget. Current success
+requires strict policy 4. Historical 30+30 evidence keeps its original policies
+1–3; mixed, unknown or substituted generations fail closed. Local plan binding:
+`6a4d2321b737491f7f25a428efd2cefa95b3d34b`. Independent safety, security and QA
+review and exact candidate/artifact freezing belong to the lead. Installation
+is tomorrow-only (5 October 2026); the machine is off tonight. No physical
+qualification has passed; #954 remains open and E11-S3 remains unstarted.
+No PR, CI or slow/full suite precedes operator-owned 10+10 qualification.
+This entry supersedes only current runtime policy/duration wording below;
+historical evidence and all other gates retain their original meaning.
+
 **4 Oct 2026 — #997 D209 cold temperature activation (software only; #954 is
-open):** the cold temperature work is delivered as software across S1 (PR
+open):** **Historical snapshot — physical-run,
+review and sequencing status superseded by the 5 Oct D210/D211 entry above.**
+At that time, the cold temperature work was delivered as software across S1 (PR
 #998), S2a (PR #999), T1 (PR #1000) and T2 (the runtime activation plus the
 runbook, registry and E11 reconciliation). Every cold tick now retains a paired
 tick-temperature record from the same read; the D209 engineering screen (bean
@@ -53,7 +87,9 @@ is open, and every supervised gate is unexecuted. This is software and
 documentation evidence only.
 
 **3 Oct 2026 — #954 cold characterisation software delivered (#954 stays
-OPEN):** the software for the supervised cold characterisation is delivered
+OPEN):** **Historical snapshot — physical-run,
+review and sequencing status superseded by the 5 Oct D210/D211 entry above.**
+At that time, the software for the supervised cold characterisation was delivered
 across U1 (PR #993), U2 (PR #994), the U3 cold view (PR #995) and U4 (the
 `roastpilot-agent cold-characterisation` action, same-loop hosting of the
 read-only app, and `docs/deployment/cold-characterisation-runbook.md`). No

@@ -438,8 +438,11 @@ def public_result_is_closed(result: two_phase.ColdTwoPhaseResult) -> bool:
     if checked is None:
         return True
     return (
-        type(checked) is temperature_conformance.ColdTemperatureConformanceResult
+        type(checked) is temperature_conformance.ColdRevisedConformanceResult
         and type(checked.policy_version) is int
+        and checked.policy_version == 4
+        and type(checked.interpretation_revision) is int
+        and checked.interpretation_revision == 1
         and _closed_member(checked.outcome)
         and all(_closed_member(finding) for finding in checked.findings)
     )
@@ -464,7 +467,7 @@ def assert_failed_safely(
     sealed = digest is not None and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
     assert sealed
     retained = world.retained(digest)
-    checked = temperature_conformance.check_temperature_conformance(retained).outcome
+    checked = temperature_conformance.check_revised_conformance(retained).outcome
     assert checked is temperature_conformance.ColdTemperatureConformanceOutcome.NOT_CONFORMANT
     advisory = advisory_view(world, result).outcome
     assert advisory is advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT
@@ -1063,7 +1066,7 @@ async def test_t_d11_a_base_exception_propagates_identically_after_cleanup(
 ) -> None:
     """T-D11: the identical object propagates; cleanup stop; no terminal, seal or check."""
     checks: list[object] = []
-    monkeypatch.setattr(two_phase, "check_temperature_conformance", checks.append)
+    monkeypatch.setattr(two_phase, "check_revised_conformance", checks.append)
     interrupt = ObserverInterrupt()
 
     def boom(_tick: schema.ColdTickRecord, _count: int) -> None:

@@ -62,8 +62,10 @@ from roastpilot_agent.cold_characterisation.conformance import (
     ColdConformanceFinding,
     ColdConformanceOutcome,
     ColdConformanceResult,
+    _evaluate_generation,  # pyright: ignore[reportPrivateUsage]
     check_pre_advisory_conformance,
 )
+from roastpilot_agent.cold_characterisation.duration_policy import ColdDurationGeneration
 from roastpilot_agent.cold_characterisation.evidence_advisory import (
     ADMITTED_ENUM_TYPES,
     MAX_ADVISORY_CONTEXT_BYTES,
@@ -691,7 +693,12 @@ def _guarded(found: set[_F], call: typing.Callable[[], _T]) -> _T | None:
     return value
 
 
-def _evaluate(run: object) -> tuple[set[_F], _PreFindings]:
+def _evaluate(
+    run: object,
+    generation: ColdDurationGeneration = ColdDurationGeneration.HISTORICAL,
+    *,
+    revised: bool = False,
+) -> tuple[set[_F], _PreFindings]:
     """Stages 1 to 4 with their early returns; rule groups are individually guarded."""
     admitted = _admit_v3(run)
     if admitted is None:
@@ -703,11 +710,16 @@ def _evaluate(run: object) -> tuple[set[_F], _PreFindings]:
             return {_F.ATTEMPT_NOT_ADMITTED}, ()
         collected.append(snapshot)
     snapshots = tuple(collected)
-    pre = _admit_pre_advisory_result(check_pre_advisory_conformance(_project(admitted)))
-    if pre is None:
-        return {_F.CHECKER_INTERNAL_FAILURE}, ()
-    if pre.outcome is not ColdConformanceOutcome.PRE_ADVISORY_CONFORMANT:
-        return {_F.PRE_ADVISORY_NOT_CONFORMANT}, pre.findings
+    if generation is ColdDurationGeneration.HISTORICAL:
+        pre = _admit_pre_advisory_result(check_pre_advisory_conformance(_project(admitted)))
+        if pre is None:
+            return {_F.CHECKER_INTERNAL_FAILURE}, ()
+        pre_findings = pre.findings
+    else:
+        found_pre = _evaluate_generation(_project(admitted), generation, revised=revised)
+        pre_findings = tuple(member for member in ColdConformanceFinding if member in found_pre)
+    if pre_findings:
+        return {_F.PRE_ADVISORY_NOT_CONFORMANT}, pre_findings
     identities = _bind(typing.cast(ColdRetainedRun, admitted.run), snapshots)
     if identities is None:
         return {_F.ATTEMPT_BINDING_REFUSED}, ()

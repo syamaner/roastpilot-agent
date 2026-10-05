@@ -1329,6 +1329,7 @@ def test_s2_runtime_callers_name_only_their_contracted_api() -> None:
         "append_mcp_candidate",
         "append_temperature_abort",
         "check_temperature_conformance",
+        "check_revised_conformance",
         "evaluate_temperature",
     )
     owners = {
@@ -1352,7 +1353,7 @@ def test_s2_runtime_callers_name_only_their_contracted_api() -> None:
             "append_temperature_abort",
             "append_mcp_candidate",
             "read_retained_run_v6",
-            "check_temperature_conformance",
+            "check_revised_conformance",
         },
         "evidence_builders.py": {"evidence_temperature"},
     }

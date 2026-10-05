@@ -11,8 +11,8 @@ import typing
 
 import pydantic
 
+from roastpilot_agent.cold_characterisation.engine_policy import COLD_PHASE_OBSERVATION_SECONDS
 from roastpilot_agent.cold_characterisation.evidence_lifecycle import (
-    COLD_PHASE_OBSERVATION_SECONDS,
     COLD_TRANSITION_BUDGET_SECONDS,
     ColdLifecycleChildStart,
     ColdLifecycleChildStop,

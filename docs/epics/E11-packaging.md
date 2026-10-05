@@ -1,5 +1,22 @@
 # E11 — Packaging
 
+**5 Oct 2026 — D210/D211 retrospective cold qualification:** the original
+completed supervised 10+10 cold run returned `NOT_CONFORMANT`, exit 6, because
+its original D210 evaluator misclassified the exact MCP prepared-session reason.
+That result, original evaluator/wheel identities and sealed bytes remain unchanged.
+A separate offline policy 4 interpretation revision 1 assessment returned
+`temperature_screened_conformant` with zero findings; the corrected wheel was
+not installed on Pi. Independent safety, MCP-contract, QA, security and direct
+Pi-evidence reviews completed. The final independent Pi reviewer returned PASS
+for the narrow retrospective 10+10 cold qualification, accepting the separate
+supplementary artifact receipt as host attestation. #954 stays OPEN; E11-S3 is
+in progress. The separately authorised live acceptance and release gates remain
+outstanding. This supersedes earlier E11-S3 physical-run and review status
+snapshots. Historical policies 1–3 and original policy 4 remain reproducible.
+Current runtime requires the revised exact result class/revision. See the D211
+section of `docs/deployment/cold-characterisation-runbook.md` for evidence limits.
+
+
 ## Goal
 
 Ship RoastPilot as a **headless Raspberry Pi 5 appliance, installed NATIVELY** (D27):
@@ -27,9 +44,10 @@ child, per D6), mDNS, and a deployment doc. **No Docker image; no PyTorch on the
 >
 > **D27 E11-S1 dependency/publication gate — ✅ CLEARED:** the published torch-free
 > `coffee-roaster-mcp==0.2.0` release permits the exact `[pi]` pin delivered here.
-> E11-S2 is complete; E11-S3 remains not started. E11-S3 (the Pi soak) still depends on the
-> recording bundle that shipped in MCP 0.1.10/0.1.11 (see below); prove the harness
-> on real hardware and devices before making any hardware-readiness or acceptance claim.
+> E11-S2 is complete; E11-S3 is in progress. E11-S3 (the Pi soak) still depends on the
+> recording bundle that shipped in MCP 0.1.10/0.1.11 (see below); the narrow
+> D210/D211 cold qualification is recorded below, with separate
+> live acceptance and release gates still outstanding.
 
 ## Plan links
 
@@ -103,24 +121,33 @@ stream, on the complete appliance (Pi 5, Hottop serial link, first-crack
 detector and advisory-only advisor), run under
 `docs/deployment/cold-characterisation-runbook.md`. Multi-microphone capture is
 deferred. The #954 software for the supervised cold run is delivered; the
-physical cold run itself is not started, and this story stays not started.
+completed supervised 10+10 cold run now has narrow retrospective qualification
+under policy 4 interpretation revision 1. This story is in progress, not done.
 
 Acceptance criteria:
 
 These are the active D194 criteria; the locked D191 limits apply unchanged.
 
-- [ ] A supervised cold run on the Pi 5 complete appliance, with the single
+- [x] A supervised cold run on the Pi 5 complete appliance, with the single
   primary mono 16 kHz / 16-bit stream and the detector active, across the full
-  30-minute recording-off phase followed by the 30-minute recording-on phase,
+  10-minute recording-off phase followed by the 10-minute recording-on phase,
   meets the locked D191 limits unchanged: at most N = 1 consecutive overflow,
   and at most X = 200 ms of peak trailing-60-second lost audio. The production
   fatal consecutive-overflow streak of 30 is unchanged. These locked limits
   permit their stated margin; failing to meet them fails qualification, and no
   limit is loosened in the light of results. Method: the `audio.py`
   "overflowed (N consecutive)" log and the dashboard mic status, recorded as
-  run evidence.
-- [ ] Both retained evidence copies verify against the externally recorded
-  receipt, and independent Pi evidence review clears.
+  run evidence. Cleared by the narrow D210/D211 retrospective policy 4
+  interpretation revision 1 assessment of the completed supervised 10+10 run;
+  the original `NOT_CONFORMANT`, exit 6, result and original evaluator identity
+  remain unchanged.
+- [x] Both retained evidence copies verify against the externally recorded
+  receipt, and independent Pi evidence review clears. Cleared for the same
+  narrow revision-1 qualification by contemporaneous two-copy SHA-256 equality
+  proof and the final independent Pi review PASS. The separate supplementary
+  artifact receipt was accepted as host attestation; the reviewer did not hear
+  the audio or independently inspect the recovered WAV bytes. The original
+  sealed tree and exit-6 result remain unchanged.
 - [ ] The deployment doc notes the recording CPU cost and the frozen appliance
   configuration the run characterised (`onnx_threads`, flush threshold).
 
@@ -157,9 +184,9 @@ cold run.
 |-------|-------|--------|
 | E11-S1 | Wheel with bundled SPA + the `[pi]` extra | done — base-wheel, `[pi]`, and native hosted ARM64 package smokes delivered 5 Sep 2026; hosted-runner evidence is not Pi hardware validation |
 | E11-S2 | Native installer, systemd unit, bundled model, deploy doc | done — native installer, managed service/configuration, pinned local model, and deployment guide delivered 12 Sep 2026; package and documentation evidence is not Pi or physical-device validation |
-| E11-S3 | Pi 5 single-primary-mic complete-appliance cold characterisation (overflow validation) | not started |
+| E11-S3 | Pi 5 single-primary-mic complete-appliance cold characterisation (overflow validation) | in progress |
 
-Epic status: **in progress — E11-S1 and E11-S2 are done; E11-S3 is not started.**
+Epic status: **in progress — E11-S1 and E11-S2 are done; E11-S3 is in progress.**
 The **operator manual tests** (D28) are
 both Done — **#135 ✅** (device SSE) and **#134 ✅ validated by roast 6** (27 Jun).
 **E11-S1 is complete:** a hatchling custom build hook (`hatch_build.py`) runs the
@@ -189,12 +216,13 @@ unit and configuration, pinned local model installation, and
 `--set-hostname roastpilot` consent, inactive-only maintenance, rollback
 messages, local data/configuration paths, air-gapped model sources, logs, mDNS,
 and the trusted-home-LAN boundary. It does not turn hosted, mocked, package, or
-documentation evidence into Pi or physical-device evidence. D191/D192
-characterisation, independent Pi evidence review, complete-appliance
-validation, and separately authorised supervised live-roast acceptance remain
-outstanding. E11-S3 remains the unstarted Pi soak.
+documentation evidence into Pi or physical-device evidence. The narrow
+D210/D211 retrospective cold qualification and independent Pi evidence review
+are recorded above. Broader complete-appliance validation and separately
+authorised supervised live-roast acceptance remain outstanding; E11-S3 is in progress.
 
-**#954 cold characterisation (Oct 2026):** the software for the supervised
+**#954 cold characterisation (Oct 2026):**
+At that time, the software for the supervised
 cold characterisation is delivered across U1 (PR #993), U2 (PR #994), the U3
 cold view (PR #995) and U4 (the cold CLI, same-loop hosting and
 `docs/deployment/cold-characterisation-runbook.md`). #997 (D209) then delivered
@@ -203,7 +231,20 @@ and T2 (the runtime activation and this runbook, registry and epic
 reconciliation): each tick retains a paired temperature record, the D209 5 to
 40 °C engineering screen aborts a phase without finalisation, an
 operator-asserted reviewed MCP candidate is recorded per phase, and runtime
-success requires temperature conformance policy 3. The installed package still
-pins `coffee-roaster-mcp==0.2.2`; installing the reviewed candidate is a
-separately authorised gate. The physical cold run and E11-S3 are not started,
-every operator-supervised gate is unexecuted, and #954 stays open.
+success now requires D210 conformance policy 4 for fixed 600-second phases.
+Historical 30+30 evidence remains under policies 1–3; current advisory minutes
+are 4–9 and the transition budget remains 60 seconds. The original D210 run
+returned `NOT_CONFORMANT`, exit 6; its result and evaluator identity are preserved.
+The separate D211 offline interpretation revision 1 returned
+`temperature_screened_conformant`, zero findings, on the same unchanged sealed
+records. The final independent Pi review passed the narrow retrospective 10+10
+cold qualification, with supplementary artifact receipt accepted as host
+attestation. The corrected wheel was not installed on Pi. The declared package
+pin remains `coffee-roaster-mcp==0.2.2`; it does not prove installed bytes.
+PR work is now permitted by operator sequencing. #954 stays OPEN and E11-S3 is
+in progress; release and the separately authorised 20-minute live acceptance
+remain outstanding. This establishes neither detector accuracy, calibration,
+uninterrupted observation, deployment acoustics, full hardware readiness nor
+30+30 completion. Bad-checksum frames skipped without a counter and
+stalled-clock/observation residuals remain; independent operator emergency stop
+is still required.

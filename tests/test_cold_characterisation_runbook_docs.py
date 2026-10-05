@@ -68,7 +68,7 @@ def test_runbook_states_the_safety_boundaries() -> None:
         "retained display ticks before engine classification",
         "four unauthenticated display clients",
         "this invocation started no cold child",
-        "Every operator-supervised gate in this runbook is unexecuted",
+        "The separate live acceptance and release gates remain outstanding.",
         "#954 stays open",
         "operator assertion",
         "advisory only",
@@ -224,7 +224,7 @@ def test_story_1002_artifact_selection_and_installed_bytes_are_separate_gates() 
         "installed bytes as separate facts",
         "none attests the bytes imported by the intended interpreter",
         "separately authorised installed-byte gate",
-        "That gate remains unexecuted here.",
+        "this procedure itself attests no installed bytes.",
     ):
         assert phrase in _flat(section)
     for overclaim in ("is installed", "matches installed bytes", "has been verified"):
@@ -1098,12 +1098,12 @@ def test_cold_docs_exclude_prohibited_public_claims() -> None:
 
 
 @pytest.mark.docs
-def test_e11_s3_is_single_primary_mic_and_not_started() -> None:
+def test_e11_s3_is_single_primary_mic_and_in_progress() -> None:
     epic = EPIC.read_text(encoding="utf-8")
     assert S3_HEADING in epic
     assert (
         "| E11-S3 | Pi 5 single-primary-mic complete-appliance cold characterisation "
-        "(overflow validation) | not started |" in epic
+        "(overflow validation) | in progress |" in epic
     )
     s3 = epic[epic.index(S3_HEADING) : epic.index("## Status")]
     acceptance = s3[s3.index("Acceptance criteria:") : s3.index("**History")]
@@ -1114,7 +1114,7 @@ def test_e11_s3_is_single_primary_mic_and_not_started() -> None:
     assert "dual-mic" not in epic[: epic.index("## Status")].split(S3_HEADING)[0]
     assert "`coffee-roaster-mcp==0.2.2`" in epic
     assert "0.1.13" not in epic
-    assert "E11-S3 are not started" in _flat(epic)
+    assert "E11-S3 is in progress" in _flat(epic)
 
 
 @pytest.mark.docs
@@ -1124,6 +1124,8 @@ def test_registry_records_954_as_software_only_and_open() -> None:
     entry = _flat(registry[start : registry.index("\n\n", start)])
     assert "software" in entry
     assert "not started" in entry
+    assert "Historical snapshot" in entry
+    assert "superseded by the 5 Oct D210/D211 entry above" in entry
     assert "#954 is open" in entry
     assert "approv" not in entry.casefold()
     assert registry.index("D-ToS-1 governance reconciliation") < start
@@ -1144,7 +1146,7 @@ def test_e11_s3_active_acceptance_keeps_the_locked_d191_limits_and_authorises_no
     history = _flat(s3[s3.index("**History") :])
     for phrase in (
         "the locked D191 limits apply unchanged",
-        "30-minute recording-off phase followed by the 30-minute recording-on phase",
+        "10-minute recording-off phase followed by the 10-minute recording-on phase",
         "at most N = 1 consecutive overflow",
         "at most X = 200 ms of peak trailing-60-second lost audio",
         "The production fatal consecutive-overflow streak of 30 is unchanged.",
@@ -1155,6 +1157,17 @@ def test_e11_s3_active_acceptance_keeps_the_locked_d191_limits_and_authorises_no
         "requires a fresh characterisation",
     ):
         assert phrase in active, phrase
+    assert "- [x] A supervised cold run" in active
+    assert "- [x] Both retained evidence copies verify" in active
+    assert "- [ ] The deployment doc notes" in active
+    assert "original `NOT_CONFORMANT`, exit 6, result" in active
+    assert "interpretation revision 1 assessment" in active
+    assert "contemporaneous two-copy SHA-256 equality proof" in active
+    assert "final independent Pi review PASS" in active
+    assert "accepted as host attestation" in active
+    assert (
+        "reviewer did not hear the audio or independently inspect the recovered WAV bytes" in active
+    )
     assert "well under the fatal threshold" not in active
     assert "any overflow fails" not in active.casefold()
     assert "apply the optimisation levers" not in active
@@ -1179,7 +1192,7 @@ def test_runbook_verifier_signals_and_spa_boundaries() -> None:
         "A usage error prints only the fixed usage line on stderr (exit 2), never a summary."
         in text
     )
-    assert "a 30-minute recording-off phase followed by a 30-minute recording-on phase" in text
+    assert "a 10-minute recording-off phase followed by a 10-minute recording-on phase" in text
     assert "prescribes no stimulus content, no other duration and no run authority" in text
     assert "may only be handled after the run has been invoked" in text
     assert "it can exit 1 with `signal=none`" in text
@@ -1343,12 +1356,12 @@ def test_997_dc2_the_runbook_distinguishes_reviewed_candidate_and_published_byte
 
 
 @pytest.mark.docs
-def test_997_dc3_e11_records_the_997_slices_and_keeps_e11_s3_unstarted() -> None:
-    """DC3: E11 names the #997 slices, keeps the published pin and an unstarted E11-S3."""
+def test_997_dc3_e11_records_the_997_slices_and_keeps_e11_s3_in_progress() -> None:
+    """DC3: E11 names the #997 slices, keeps the published pin and an in-progress E11-S3."""
     epic = _flat(EPIC.read_text(encoding="utf-8"))
     for value in ("#998", "#999", "#1000", "T2", "`coffee-roaster-mcp==0.2.2`"):
         assert value in epic, value
-    assert "E11-S3 are not started" in epic
+    assert "E11-S3 is in progress" in epic
 
 
 @pytest.mark.docs
@@ -1362,3 +1375,42 @@ def test_997_dc4_the_registry_records_997_as_software_only_and_954_open() -> Non
     assert all(phrase.casefold() not in entry.casefold() for phrase in PROHIBITED)
     assert registry.index("D-ToS-1 governance reconciliation") < start
     assert start < registry.index("**3 Oct 2026 — #954")
+
+
+@pytest.mark.docs
+def test_d210_d211_docs_preserve_original_result_and_narrow_qualification() -> None:
+    """Current state distinguishes retrospective qualification from original failure."""
+    for path in (RUNBOOK, EPIC, REGISTRY):
+        text = _flat(path.read_text(encoding="utf-8"))
+        for phrase in (
+            "`NOT_CONFORMANT`, exit 6",
+            "`temperature_screened_conformant`",
+            "policy 4 interpretation revision 1",
+            "corrected wheel was not installed on Pi",
+            "supplementary artifact receipt as host attestation",
+            "E11-S3 is in progress",
+        ):
+            assert phrase in text, (path.name, phrase)
+    runbook = _flat(RUNBOOK.read_text(encoding="utf-8"))
+    completed = runbook[runbook.index("### Completed D210/D211 reconciliation") :]
+    for phrase in (
+        "original evaluator and wheel identities",
+        "Both phases were scheduled 600 seconds",
+        "6.078 seconds, within the 60-second budget",
+        "All 18 sealed laptop files remained unchanged",
+        "contemporaneous two-copy Pi/laptop SHA-256 equality proof",
+        "separate private supplementary folder outside the original sealed tree",
+        "without a new run, roaster command, install or release",
+        "Each Pi-source/laptop SHA-256 matches",
+        "complete 600.7-second mono 16 kHz/16-bit primary audio",
+        "both sidecars parse and match its session and format",
+        "reviewer did not hear the audio or independently inspect the recovered WAV bytes",
+        "shutdown are attestations",
+        "#954 stays OPEN",
+        "in progress, not done",
+        "20-minute live acceptance",
+        "Bad-checksum frames skipped without a counter",
+        "stalled-clock/observation residuals",
+        "Independent operator emergency stop remains required",
+    ):
+        assert phrase in completed, phrase

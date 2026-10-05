@@ -21,6 +21,7 @@ import typing
 
 import pydantic
 
+from roastpilot_agent.cold_characterisation.duration_policy import CURRENT_PHASE_SECONDS
 from roastpilot_agent.cold_characterisation.evidence_schema import (
     ColdEngineAbortReason,
     ColdTickRecord,
@@ -33,7 +34,7 @@ COLD_OBSERVATION_INTERVAL_SECONDS: typing.Final = 1.0
 #: Fixed D197 startup interval during which only absent telemetry is tolerated.
 COLD_STARTUP_TELEMETRY_DEADLINE_SECONDS: typing.Final = 60.0
 #: Fixed length of one observed phase, measured from the admitted activation instant.
-COLD_PHASE_OBSERVATION_SECONDS: typing.Final = 1800.0
+COLD_PHASE_OBSERVATION_SECONDS: typing.Final = CURRENT_PHASE_SECONDS
 
 
 class ColdTickDecision(pydantic.BaseModel):

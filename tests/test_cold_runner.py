@@ -74,14 +74,16 @@ Check = ColdTwoPhaseProviderCheck
 MARKER = "PLANTEDMARKER9d1e"
 DIGEST = "c" * 64
 RUNNER_SOURCE = Path(cold_runner.__file__)
-#: Runtime success requires temperature policy 3 (which composes advisory policy 2).
-CONFORMANT = temperature_conformance.ColdTemperatureConformanceResult(
-    policy_version=3,
+#: Current runtime requires policy 4, interpretation revision 1 (D211).
+CONFORMANT = temperature_conformance.ColdRevisedConformanceResult(
+    policy_version=4,
+    interpretation_revision=1,
     outcome=temperature_conformance.ColdTemperatureConformanceOutcome.TEMPERATURE_SCREENED_CONFORMANT,
     findings=(),
 )
-NOT_CONFORMANT_RESULT = temperature_conformance.ColdTemperatureConformanceResult(
-    policy_version=3,
+NOT_CONFORMANT_RESULT = temperature_conformance.ColdRevisedConformanceResult(
+    policy_version=4,
+    interpretation_revision=1,
     outcome=temperature_conformance.ColdTemperatureConformanceOutcome.NOT_CONFORMANT,
     findings=(temperature_conformance.ColdTemperatureConformanceFinding.TICK_TEMPERATURE_ABSENT,),
 )
@@ -590,6 +592,32 @@ def _pending_values() -> dict[str, typing.Any]:
 
 
 NO_EXIT_CASES: list[tuple[str, Callable[[], object], int, str]] = [
+    (
+        "legacy-policy-four-success",
+        lambda: ColdTwoPhaseResult.model_construct(
+            **fields(
+                Outcome.ADVISORY_CONFORMANT,
+                conformance=temperature_conformance.ColdCurrentConformanceResult(
+                    **CONFORMANT.model_dump(exclude={"interpretation_revision"})
+                ),
+            )
+        ),
+        8,
+        "unadmitted",
+    ),
+    (
+        "legacy-policy-four-refusal",
+        lambda: ColdTwoPhaseResult.model_construct(
+            **fields(
+                Outcome.NOT_CONFORMANT,
+                conformance=temperature_conformance.ColdCurrentConformanceResult(
+                    **NOT_CONFORMANT_RESULT.model_dump(exclude={"interpretation_revision"})
+                ),
+            )
+        ),
+        8,
+        "unadmitted",
+    ),
     ("subclass", lambda: SubResult(**_pending_values()), 8, "unadmitted"),
     (
         "construct-pending-not-applicable",
@@ -1028,7 +1056,7 @@ def test_unknown_signal_number_renders_none() -> None:
 
 
 def test_conformance_outcome_is_rendered_from_the_admitted_row() -> None:
-    """RN1: success renders the policy-3 token; keys and outcome token are unchanged."""
+    """RN1: success renders the revised policy-4 token; keys and outcome token are unchanged."""
     summary = cold_runner.ColdRunSummary(
         run_invoked=True,
         result=cold_runner.SummaryResult.ADMITTED,
@@ -1041,8 +1069,8 @@ def test_conformance_outcome_is_rendered_from_the_admitted_row() -> None:
     assert tuple(line.split("=", 1)[0] for line in text.splitlines()) == SUMMARY_KEYS
 
 
-def test_997_rn2_a_not_conformant_policy_three_result_renders_not_conformant() -> None:
-    """RN2: a carried policy-3 refusal renders ``not_conformant`` with exit 6."""
+def test_997_rn2_a_not_conformant_policy_four_result_renders_not_conformant() -> None:
+    """RN2: a carried revision-1 policy-4 refusal renders ``not_conformant`` with exit 6."""
     not_conformant = row(fields(Outcome.NOT_CONFORMANT, conformance=NOT_CONFORMANT_RESULT))
     summary = cold_runner.ColdRunSummary(
         run_invoked=True,

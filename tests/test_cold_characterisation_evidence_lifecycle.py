@@ -12,7 +12,7 @@ from pathlib import Path
 import pydantic
 import pytest
 
-from roastpilot_agent.cold_characterisation import engine, engine_policy
+from roastpilot_agent.cold_characterisation import engine
 from roastpilot_agent.cold_characterisation import evidence_builders as builders
 from roastpilot_agent.cold_characterisation import evidence_lifecycle as lifecycle
 from roastpilot_agent.cold_characterisation import evidence_reader as reader
@@ -67,7 +67,7 @@ def lc(
     **fields: typing.Any,
 ) -> lifecycle.ColdLifecycleRecord:
     """Build one lifecycle record through the real builder."""
-    return builders.build_lifecycle_record(
+    record = builders.build_lifecycle_record(
         header=header,
         sequence=sequence,
         event=event,
@@ -77,6 +77,12 @@ def lc(
         monotonic_seconds=at,
         **fields,
     )
+
+    if event is Event.PHASE_ACTIVATED:
+        values = record.model_dump()
+        values["scheduled_end_monotonic"] = record.event_monotonic_seconds + 1800.0
+        return lifecycle.ColdLifecycleRecord.model_validate(values)
+    return record
 
 
 def activated(session: str = OFF_SESSION, at: float = 10.0) -> Spec:
@@ -1777,7 +1783,7 @@ def test_lifecycle_module_imports_exactly_its_allow_list() -> None:
         "datetime",
         "pydantic",
         cold + "evidence_schema",
-        cold + "engine_policy",
+        cold + "duration_policy",
     }
 
 
@@ -1805,7 +1811,7 @@ def test_lifecycle_module_carries_no_forbidden_names() -> None:
     }
     assert "COLD_PHASE_OBSERVATION_SECONDS" not in assigned
     assert "COLD_TRANSITION_BUDGET_SECONDS" in assigned
-    assert lifecycle.COLD_PHASE_OBSERVATION_SECONDS is engine_policy.COLD_PHASE_OBSERVATION_SECONDS
+    assert "COLD_PHASE_OBSERVATION_SECONDS" not in _LIFECYCLE_SOURCE
 
 
 #: The builders test's actuator/limit/clean-conjunction text fence, plus ``subprocess``.

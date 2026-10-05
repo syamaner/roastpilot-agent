@@ -12,16 +12,45 @@ controls hardware.
 The cold mode is explicit and default-off (D194). Nothing starts it except the
 command below, and normal `serve` behaviour is unchanged.
 
-The software for #954 is delivered. **Every operator-supervised gate in this
-runbook is unexecuted**, and each one is evidence-led: it passes only on the
-recorded evidence of a supervised run. Nothing here authorises beans, a live
-roast, a readiness claim, a detector-accuracy claim or a deployment-acoustics
-claim. #954 stays open, and E11-S3 is not started.
+The software for #954 is delivered. The completed supervised D210 10+10 cold
+run has narrow retrospective qualification under D211 policy 4 interpretation
+revision 1, as recorded below. The original `NOT_CONFORMANT`, exit 6, remains
+unchanged. Nothing here authorises beans, a live roast, a readiness claim, a
+detector-accuracy claim or a deployment-acoustics claim. #954 stays open, and
+E11-S3 is in progress, not done. The separate live acceptance and release gates
+remain outstanding.
 
-One cold run has two fixed phases: a 30-minute recording-off phase followed by
-a 30-minute recording-on phase, under the approved music stimulus (recorded in
+One cold run has two fixed phases: a 10-minute recording-off phase followed by
+a 10-minute recording-on phase, under the approved music stimulus (recorded in
 `--stimulus-block`). This runbook prescribes no stimulus content, no other
 duration and no run authority of its own.
+
+### Local D210 candidate (4 October 2026)
+
+This local candidate uses fixed 600-second phases with a 1.0-second observation
+interval. Each scheduled end is activation +600 seconds; the relative advisory
+window is activation +240 through +540 seconds (minutes 4–9), exactly 300 seconds.
+The recording-off scheduled end still anchors the unchanged 60-second transition
+budget. There is no duration option, configuration field or environment override.
+
+Historical 30+30 evidence retains its original bytes and policies 1–3. Exact
+manifest-bound `PHASE_ACTIVATED` activation/scheduled-end relations distinguish
+1800-second historical phases from 600-second D210 phases. Current success requires
+policy 4; historical/current substitution, mixed phases and unknown relations fail
+closed. All temperature, advisory, audio, identity, provenance and cleanup criteria
+remain unchanged. Elapsed time and ticks do not prove uninterrupted monitoring or
+a maximum tick gap.
+
+The source base is `f081dda675f84dc078d98c52fdd299df50933753`, bound to local plan
+D210 commit `6a4d2321b737491f7f25a428efd2cefa95b3d34b` and unchanged MCP binding
+`6b54f6a83b03a66c33fa4d86106d9e3123acb8ee`. The exact original
+candidate and installed-byte evidence are retained privately by the parent;
+this source document does not publish artifact identities or attest installed
+bytes. The completed run and separate retrospective assessment are recorded
+in the D211 section. The corrected wheel was not installed on Pi. Operator
+sequencing now permits PR work after the narrow qualification; publication,
+release and the separately authorised live acceptance of at least 20 continuous
+minutes remain separate gates. #954 stays open and E11-S3 is in progress.
 
 ## 2. Prerequisites
 
@@ -99,10 +128,11 @@ outside version-only reasoning:
    intended interpreter.
 4. Keep installation and verification that the resulting installed distributions
    correspond to both selected artifacts as a **separately authorised installed-byte
-   gate**. That gate remains unexecuted here.
+   gate**. Original-run installed-byte evidence was reconciled by the lead
+   for the retrospective qualification; this procedure itself attests no installed bytes.
 
 An unknown, missing or mismatched artifact identity refuses preparation: the
-physical gate remains unexecuted and the run must not be described as prepared.
+physical preparation gate fails closed and the run must not be described as prepared.
 This section supplies no installation transaction or installed-files attestor.
 
 ### 2.2 Prepare and check the cold configuration
@@ -456,7 +486,7 @@ summary of exactly 16 `key=value` lines (delivery may be incomplete, as below):
 `signal`, `http_server` and `exit_code`. Values are closed tokens; no host,
 port, path, profile, note, credential or exception text is printed.
 
-`conformance_outcome` reports temperature conformance policy 3
+`conformance_outcome` reports temperature conformance policy 4
 (`temperature_screened_conformant` or `not_conformant`), which composes the
 advisory policy. Exit 0 (`ADVISORY_CONFORMANT`) requires
 `temperature_screened_conformant`. `composition_refusal` may be
@@ -549,7 +579,8 @@ RP_COLD_PYTHON='/absolute/path/to/installed/roastpilot-agent/venv/bin/python'
 "$RP_COLD_PYTHON" -c 'from roastpilot_agent.cold_characterisation.evidence_store import verify_retained_copies; print(verify_retained_copies("/absolute/primary/evidence/root", "/absolute/secondary/evidence/root", run_id="<run ID>", expected_manifest_sha256="<recorded receipt>", protected_roots=("/absolute/protected/root",)))'
 ```
 
-Independent Pi evidence review follows separately.
+Independent Pi evidence review is a separate gate; the completed D210/D211
+review is recorded below.
 
 ## 7. Signals
 
@@ -595,7 +626,7 @@ Independent Pi evidence review follows separately.
   transaction; a process kill between them leaves an unsealed tree with no
   receipt.
 - The acceptance interpretation of the inner run does not include the
-  temperature screen; the screen is judged by temperature conformance policy 3.
+  temperature screen; the screen is judged by temperature conformance policy 4.
 - Clock progress is a port contract, not a watchdog.
 - Per-tick software observation checks commanded heat, main fan, roast fan and
   cooling. Drum and solenoid/drop appear only in eligible D195 six-dimension
@@ -617,7 +648,8 @@ Independent Pi evidence review follows separately.
 
 ## 10. Gate chain
 
-The gate chain is evidence-led and is **not executed**:
+The gate chain is evidence-led. Items 1–3 passed for the narrow D210/D211
+retrospective cold qualification; items 4–5 remain outstanding for live acceptance:
 
 1. The cold run's acceptance criteria hold on its recorded evidence.
 2. Both retained copies verify against the externally recorded receipt.
@@ -626,3 +658,117 @@ The gate chain is evidence-led and is **not executed**:
 5. The operator gives a separate, immediate live GO.
 
 Supervised live acceptance is at least 20 continuous minutes.
+
+
+## D211 retrospective technical assessment
+
+Policy 4 interpretation revision 1 recognises exactly
+`Audio first-crack detection is prepared for this session.` only in live or
+pre-finalisation audio samples that are pending, running and carry neither
+detection field. All other non-null reasons fail closed. The original public
+interpreter and policies 1–3, and the original policy-4 entry point/result,
+retain their historical semantics. Future runtime evaluation requires the exact
+revised policy-4 result class with integer interpretation revision 1.
+
+The original completed run's `NOT_CONFORMANT`, exit 6, original evaluator and
+wheel identity, raw reasons and sealed evidence remain immutable. Revision 1
+recomputes every criterion from strictly admitted records; it grants no credit to
+aborted, interrupted, combined or failed-terminal runs. It changes no D191,
+D209, temperature, recording, advisory, host, containment or hardware rule.
+
+After independent review of the frozen source, the parent may run the offline
+assessor on the authorised laptop copy with an externally recorded seal receipt:
+
+```sh
+.venv/bin/python scripts/assess_cold_evidence_retrospectively.py \
+  --root "$EVIDENCE_ROOT" --run-id "$RETAINED_RUN_ID" \
+  --receipt "$EXTERNAL_MANIFEST_RECEIPT" --output "$SEPARATE_ASSESSMENT_FILE" \
+  --original-candidate-sha256 "$ORIGINAL_WHEEL_SHA256" \
+  --evaluator-commit "$CORRECTED_COMMIT" --evaluator-tree "$CORRECTED_TREE" \
+  --evaluator-wheel-sha256 "$CORRECTED_WHEEL_SHA256" \
+  --review-attestations-sha256 "$REVIEW_BUNDLE_SHA256"
+```
+
+The caller must provision a separate output parent outside the sealed evidence
+root before invoking the assessor. It must be owned by the current UID with mode
+0700 or stricter (no group/other permissions or special mode bits), and its
+ancestors must belong to root or the current UID. They must not be group/other
+writable unless sticky and root-owned. The assessor opens every directory
+component without following symlinks and admits
+these permissions through the held descriptors. The output file must be new;
+exclusive descriptor-relative creation prevents overwrite and uses mode 0600.
+The final name can exist while writing; treat it as partial until the assessor
+returns success after writing, fsync and identity/ancestry checks. Refusal removes
+partial output through the held parent descriptor.
+
+The caller must verify the complete sealed source inventory before and after
+assessment, including names and content hashes, and preserve that comparison
+outside the sealed tree. Ancestry and identity rechecks detect observed moves;
+no repeated pathname check guarantees atomic separation if a hostile same-UID
+process can rename both directories after the last check. Such a process already
+has direct write access to the sealed evidence and is outside the operational
+trust boundary. Do not claim an atomic cross-directory separation guarantee.
+
+The assessor strictly verifies the receipt and every manifested byte before
+evaluation and
+again before writing, emits both baseline and revised closed results, and
+binds the supplied candidate/evaluator/review digests. These digests are parent
+assertions; the assessor cannot authenticate them or prove installed bytes.
+The manifest receipt binds all sealed input hashes. It must never be derived
+from the candidate's own manifest or sidecar. Inputs must remain immutable;
+verification is not an atomic filesystem snapshot. Errors are sanitised.
+
+The assessment is technical conformance only and always reports physical
+qualification as not assessed. Qualification additionally requires the lead to
+reconcile original
+installed-byte evidence, two-copy SHA equality, supervision, music/stream
+stimulus and mandatory independent Pi-evidence review. A corrected evaluator
+artifact does not establish that it ran on hardware. A technical result alone
+does not establish physical qualification; the
+completed lead reconciliation for this run is recorded below. No second
+certification run,
+physical rerun, installation or release is authorised by this correction.
+
+
+### Completed D210/D211 reconciliation (5 October 2026)
+
+The original completed run conforms under retrospective policy 4,
+interpretation revision 1. This is the narrow retrospective 10+10 cold
+qualification, reconciled by the lead from parent-owned private evidence and
+independent reviews. The original D210 candidate returned `NOT_CONFORMANT`,
+exit 6, because the exact MCP prepared-session reason was misclassified. Its
+original evaluator and wheel identities, findings and exit-6 result remain
+preserved; the separate corrected evaluator identity is retained with the
+assessment. The corrected wheel was not installed on Pi.
+
+The separate offline assessment strictly re-evaluated the same sealed records
+and returned `temperature_screened_conformant`, zero findings, under policy 4
+interpretation revision 1. Both phases were scheduled 600 seconds; the
+transition took 6.078 seconds, within the 60-second budget. Every other revised
+policy criterion passed. All 18 sealed laptop files remained unchanged, with
+contemporaneous two-copy Pi/laptop SHA-256 equality proof.
+
+The already-existing primary WAV and two sidecars were later recovered
+read-only from Pi under explicit operator authority, without a new run,
+roaster command, install or release. They are retained in a separate private
+supplementary folder outside the original sealed tree. Each Pi-source/laptop
+SHA-256 matches. The WAV is complete 600.7-second mono 16 kHz/16-bit primary
+audio; both sidecars parse and match its session and format. This supplementary
+recovery changes neither the sealed tree nor the original exit-6 result.
+
+Independent GPT safety, MCP-contract, QA, security and direct Pi-evidence
+reviews completed. The final independent Pi reviewer returned PASS for
+D210/D211's narrow retrospective 10+10 cold qualification under policy 4
+interpretation revision 1, accepting the supplementary artifact receipt as
+host attestation. The reviewer did not hear the audio or independently inspect
+the recovered WAV bytes. Operator cold/empty, heat-off, supervision, independent
+stop, same setup and shutdown are attestations.
+
+#954 stays OPEN; E11-S3 is in progress, not done. Operator sequencing now permits
+PR work after qualification. This result does not establish detector accuracy,
+calibration, uninterrupted observation between samples, deployment acoustics,
+full hardware readiness, release/installation, 30+30 completion or the separately
+authorised 20-minute live acceptance. Bad-checksum frames skipped without a
+counter and stalled-clock/observation residuals remain disclosed. Independent
+operator emergency stop remains required. No new physical run, installation
+or release is authorised by this reconciliation.

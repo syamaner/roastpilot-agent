@@ -33,6 +33,7 @@ from tests.test_cold_characterisation_conformance import (
     advisory_for_at,
     finalisation,
     header_of,
+    historical_lifecycle_record,
     host_record,
     plan,
     tick_record,
@@ -250,6 +251,7 @@ def _write_run(
     *,
     after_header: AfterHeader | None = None,
     after_tick: AfterTick | None = None,
+    current: bool = False,
 ) -> tuple[str, str]:
     """Write and seal ``run`` with ``attempts``; return the root and digest without reading.
 
@@ -285,8 +287,11 @@ def _write_run(
             fields = dict(entry.fields)
             if entry.event is Event.OBSERVATION_WINDOW_ELAPSED:
                 fields.setdefault("tick_count", len(run.ticks[phase]))
+            make_lifecycle = (
+                builders.build_lifecycle_record if current else historical_lifecycle_record
+            )
             writer.append_lifecycle(
-                builders.build_lifecycle_record(
+                make_lifecycle(
                     header=header,
                     sequence=sequence,
                     event=entry.event,
@@ -1434,6 +1439,7 @@ TREE = ast.parse(SOURCE.read_text(encoding="utf-8"))
 ABSENT_LINE = 10**9
 _COLD = "roastpilot_agent.cold_characterisation."
 ALLOWED: dict[str, frozenset[str]] = {
+    _COLD + "duration_policy": frozenset({"ColdDurationGeneration"}),
     _COLD + "advisory_window": frozenset(
         {
             "ADVISORY_INVOCATION_ALLOWANCE_SECONDS",
@@ -1448,6 +1454,7 @@ ALLOWED: dict[str, frozenset[str]] = {
             "ColdConformanceOutcome",
             "ColdConformanceResult",
             "check_pre_advisory_conformance",
+            "_evaluate_generation",
         }
     ),
     _COLD + "evidence_advisory": frozenset(

@@ -2,7 +2,7 @@
 
 The engine admits one phase without creating anything, then observes it:
 ``start_cold_session``, ``mark_beans_added``, and ``get_roast_state`` at the
-fixed 1.0 s interval for 1800.0 s from the admitted activation instant.  Each
+fixed 1.0 s interval for 600.0 s from the admitted activation instant.  Each
 read is retained as one tick and one paired tick-temperature record, both built
 from that one read and one completion instant before either is written, and only
 then do the pure tick policy and the D209 temperature screen evaluate it with one
@@ -331,7 +331,7 @@ class ColdAbortClassification(pydantic.BaseModel):
 class ColdPhaseCompleted(pydantic.BaseModel):
     """The phase observation window ended without an abort.
 
-    Completed means the 1800 s observation window elapsed without an abort. It is
+    Completed means the 600 s observation window elapsed without an abort. It is
     not qualification: tick_count may be 0, and 4g G25 must reject an empty tick
     stream and perform finalisation-equality checks.
     """
