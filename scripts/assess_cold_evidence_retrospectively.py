@@ -4,12 +4,20 @@ Use an external seal receipt, not a digest derived from the input manifest.
 The output is separate from sealed evidence and contains closed outcomes and
 content digests only. Supplied artifact/review digests are assertions, not proof
 that a wheel was installed or that independent physical gates passed.
+
+The caller provisions a separate, current-UID private output parent (0700 or
+stricter) and verifies the sealed source inventory before and after the run.
+Other-writable ancestors are refused unless sticky and root-owned. Descriptor
+and identity checks detect observed substitutions; they cannot give atomic
+cross-directory separation against a hostile same-UID process, which already
+has direct write access to the sealed evidence. That actor is outside this
+operational trust boundary. Partial output is not a successful assessment.
 """
 
 import argparse
 import json
 import os
-import secrets
+import stat
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -47,6 +55,17 @@ def _identity(fd: int) -> tuple[int, int]:
     return stat.st_dev, stat.st_ino
 
 
+def _admit_directory(fd: int, *, private: bool = False) -> None:
+    """Require a private owned parent or an ancestor protected from other writers."""
+    metadata = os.fstat(fd)
+    mode = stat.S_IMODE(metadata.st_mode)
+    if private:
+        if metadata.st_uid != os.getuid() or mode & ~0o700:
+            raise AssessmentRefusedError
+    elif mode & 0o022 and not (metadata.st_uid == 0 and mode & stat.S_ISVTX):
+        raise AssessmentRefusedError
+
+
 @contextmanager
 def _parent_descriptors(parent: Path, source: tuple[int, int]) -> Generator[list[int]]:
     """Hold every output ancestor, refusing links and evidence-root aliases."""
@@ -58,6 +77,9 @@ def _parent_descriptors(parent: Path, source: tuple[int, int]) -> Generator[list
             if component == "..":
                 raise AssessmentRefusedError
             descriptors.append(os.open(component, flags, dir_fd=descriptors[-1]))
+        for fd in descriptors:
+            _admit_directory(fd)
+        _admit_directory(descriptors[-1], private=True)
         if any(_identity(fd) == source for fd in descriptors):
             raise AssessmentRefusedError
         yield descriptors
@@ -73,6 +95,7 @@ def _recheck_parent(parent: Path, descriptors: list[int], source: tuple[int, int
     fd = os.dup(descriptors[-1])
     try:
         while True:
+            _admit_directory(fd)
             identity = _identity(fd)
             if identity == source:
                 raise AssessmentRefusedError
@@ -92,35 +115,29 @@ def _recheck_parent(parent: Path, descriptors: list[int], source: tuple[int, int
 def _publish(
     parent: Path, name: str, descriptors: list[int], source: tuple[int, int], payload: bytes
 ) -> None:
-    """Stage privately and publish exclusively relative to the held parent."""
+    """Create the final name exclusively; return success only after durable checks."""
     parent_fd = descriptors[-1]
-    temporary = ".cold-assessment-" + secrets.token_hex(16)
-    staged = False
-    published = False
+    created = False
     complete = False
     try:
         _recheck_parent(parent, descriptors, source)
         fd = os.open(
-            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd
         )
-        staged = True
+        created = True
         with os.fdopen(fd, "wb") as handle:
             os.fchmod(handle.fileno(), 0o600)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        _recheck_parent(parent, descriptors, source)
-        os.link(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
-        published = True
-        _recheck_parent(parent, descriptors, source)
-        os.unlink(temporary, dir_fd=parent_fd)
-        staged = False
+            _recheck_parent(parent, descriptors, source)
+            named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (named.st_dev, named.st_ino) != _identity(handle.fileno()):
+                raise AssessmentRefusedError
         complete = True
     finally:
-        if published and not complete:
+        if created and not complete:
             os.unlink(name, dir_fd=parent_fd)
-        if staged:
-            os.unlink(temporary, dir_fd=parent_fd)
 
 
 def assess(
@@ -141,7 +158,8 @@ def assess(
         root: Authorised immutable evidence root, containing the run directory.
         run_id: Identifier used only for strict reader lookup; never emitted.
         receipt: Externally recorded manifest SHA-256 receipt.
-        output: New assessment file outside the evidence root; never overwritten.
+        output: New file outside evidence in a pre-existing current-UID private
+            parent (0700 or stricter); never overwritten.
         original_candidate_sha256: Digest of the original tested candidate artifact.
         evaluator_commit: Corrected evaluator source commit assertion.
         evaluator_tree: Corrected evaluator source tree assertion.

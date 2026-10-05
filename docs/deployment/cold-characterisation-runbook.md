@@ -685,8 +685,27 @@ assessor on the authorised laptop copy with an externally recorded seal receipt:
   --review-attestations-sha256 "$REVIEW_BUNDLE_SHA256"
 ```
 
-The output file must be new and outside the sealed evidence root. The assessor
-strictly verifies the receipt and every manifested byte before evaluation and
+The caller must provision a separate output parent outside the sealed evidence
+root before invoking the assessor. It must be owned by the current UID with mode
+0700 or stricter (no group/other permissions or special mode bits), and its
+ancestors must not be group/other writable unless sticky and root-owned. The
+assessor opens every directory component without following symlinks and admits
+these permissions through the held descriptors. The output file must be new;
+exclusive descriptor-relative creation prevents overwrite and uses mode 0600.
+The final name can exist while writing; treat it as partial until the assessor
+returns success after writing, fsync and identity/ancestry checks. Refusal removes
+partial output through the held parent descriptor.
+
+The caller must verify the complete sealed source inventory before and after
+assessment, including names and content hashes, and preserve that comparison
+outside the sealed tree. Ancestry and identity rechecks detect observed moves;
+no repeated pathname check guarantees atomic separation if a hostile same-UID
+process can rename both directories after the last check. Such a process already
+has direct write access to the sealed evidence and is outside the operational
+trust boundary. Do not claim an atomic cross-directory separation guarantee.
+
+The assessor strictly verifies the receipt and every manifested byte before
+evaluation and
 again before writing, emits both baseline and revised closed results, and
 binds the supplied candidate/evaluator/review digests. These digests are parent
 assertions; the assessor cannot authenticate them or prove installed bytes.

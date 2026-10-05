@@ -29,11 +29,12 @@ def hashes(root: Path) -> dict[str, str]:
 def arguments(tmp_path: Path) -> dict[str, str]:
     """Generate synthetic evidence; take the receipt from the successful seal/read chain."""
     run = current_run(tmp_path / "input", prepared)
+    (tmp_path / "output").mkdir(mode=0o700)
     return {
         "root": str(tmp_path / "input" / "pi"),
         "run_id": RUN_ID,
         "receipt": run.run.manifest_sha256,
-        "output": str(tmp_path / "assessment.json"),
+        "output": str(tmp_path / "output" / "assessment.json"),
         "original_candidate_sha256": "a" * 64,
         "evaluator_commit": "b" * 40,
         "evaluator_tree": "c" * 40,
@@ -170,7 +171,7 @@ def test_destination_swap_during_assessment_refuses_without_output(
     args = arguments(tmp_path)
     ancestor = tmp_path / "destination"
     parent = ancestor / "child"
-    parent.mkdir(parents=True)
+    parent.mkdir(mode=0o700, parents=True)
     args["output"] = str(parent / "assessment.json")
     source = Path(args["root"])
     before = hashes(source)
@@ -184,9 +185,9 @@ def test_destination_swap_during_assessment_refuses_without_output(
         if component == "symlink":
             target.symlink_to(source, target_is_directory=True)
         else:
-            target.mkdir()
+            target.mkdir(mode=0o700)
             if component == "ancestor":
-                (target / "child").mkdir()
+                (target / "child").mkdir(mode=0o700)
         return result
 
     monkeypatch.setattr(assessor, "check_revised_conformance", swap)
@@ -222,42 +223,105 @@ def test_sealed_evidence_mutation_after_admission_refuses(
     assert not list(tmp_path.rglob(".cold-assessment-*"))
 
 
-@pytest.mark.parametrize("stage", ["write", "before-link", "after-link"])
-def test_publication_swap_or_failure_cleans_private_staging(
+@pytest.mark.parametrize("stage", ["write", "relocate", "substitute-file", "substitute-link"])
+def test_direct_publication_failure_cleans_partial_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
 ) -> None:
-    """Refusal during staging/publication removes files through the held descriptor."""
+    """Hold the written inode; refuse detected late relocation or name substitution."""
     args = arguments(tmp_path)
-    parent = tmp_path / "destination"
-    parent.mkdir()
-    args["output"] = str(parent / "assessment.json")
-    moved = tmp_path / "moved"
+    parent = Path(args["output"]).parent
+    output = Path(args["output"])
+    source = Path(args["root"])
+    moved = source / "moved-output"
     original_sync = os.fsync
-    original_link = os.link
+    original = source / RUN_ID / "manifest.json"
+    before = hashes(source)
+    reached_boundary = False
 
     def sync(fd: int) -> None:
+        nonlocal reached_boundary
+        # This boundary follows write/flush and immediately precedes the final
+        # location checks, while the final output descriptor is still held.
+        assert output.is_file()
+        reached_boundary = True
         if stage == "write":
             raise OSError("private-path-or-error")
         original_sync(fd)
-        if stage == "before-link":
+        if stage == "relocate":
             parent.rename(moved)
-            parent.mkdir()
-
-    def link(
-        src: str, dst: str, *, src_dir_fd: int, dst_dir_fd: int, follow_symlinks: bool
-    ) -> None:
-        if stage == "after-link":
-            parent.rename(moved)
-            parent.mkdir()
-        original_link(
-            src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=follow_symlinks
-        )
+            parent.mkdir(mode=0o700)
+        elif stage == "substitute-file":
+            output.unlink()
+            output.write_bytes(b"substituted bytes")
+        else:
+            output.unlink()
+            output.symlink_to(original)
 
     monkeypatch.setattr(os, "fsync", sync)
-    monkeypatch.setattr(os, "link", link)
+    with pytest.raises(assessor.AssessmentRefusedError, match="^Offline assessment refused.$"):
+        assessor.assess(**args)
+    assert reached_boundary
+    assert hashes(source) == before
+    assert not list(tmp_path.rglob("assessment.json"))
+    assert not list(tmp_path.rglob(".cold-assessment-*"))
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o750, 0o710, 0o770, 0o777, 0o1700])
+def test_output_parent_must_be_private(tmp_path: Path, mode: int) -> None:
+    """The caller's output parent cannot grant any group/other access or special bits."""
+    args = arguments(tmp_path)
+    parent = Path(args["output"]).parent
+    parent.chmod(mode)
     before = hashes(Path(args["root"]))
     with pytest.raises(assessor.AssessmentRefusedError, match="^Offline assessment refused.$"):
         assessor.assess(**args)
     assert hashes(Path(args["root"])) == before
-    assert not list(tmp_path.rglob("assessment.json"))
-    assert not list(tmp_path.rglob(".cold-assessment-*"))
+    assert not Path(args["output"]).exists()
+
+
+def test_output_parent_must_belong_to_current_uid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A synthetic mismatched caller UID refuses before evidence is read or written."""
+    args = arguments(tmp_path)
+    actual = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: actual + 1)
+    with pytest.raises(assessor.AssessmentRefusedError, match="^Offline assessment refused.$"):
+        assessor.assess(**args)
+    assert not Path(args["output"]).exists()
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o777, 0o1777])
+def test_other_writable_output_ancestor_is_refused(tmp_path: Path, mode: int) -> None:
+    """Group/world writers are refused; sticky alone does not grant the exception."""
+    args = arguments(tmp_path)
+    ancestor = tmp_path / "shared"
+    parent = ancestor / "private"
+    parent.mkdir(mode=0o700, parents=True)
+    ancestor.chmod(mode)
+    args["output"] = str(parent / "assessment.json")
+    if os.getuid() == 0 and mode == 0o1777:
+        pytest.skip("Root-owned sticky directories are explicitly admitted")
+    before = hashes(Path(args["root"]))
+    with pytest.raises(assessor.AssessmentRefusedError, match="^Offline assessment refused.$"):
+        assessor.assess(**args)
+    assert hashes(Path(args["root"])) == before
+    assert not Path(args["output"]).exists()
+
+
+def test_parent_permissions_are_rechecked_after_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Permission drift observed at the last check refuses and removes partial output."""
+    args = arguments(tmp_path)
+    parent = Path(args["output"]).parent
+    original_sync = os.fsync
+
+    def sync(fd: int) -> None:
+        original_sync(fd)
+        parent.chmod(0o755)
+
+    monkeypatch.setattr(os, "fsync", sync)
+    with pytest.raises(assessor.AssessmentRefusedError, match="^Offline assessment refused.$"):
+        assessor.assess(**args)
+    assert not Path(args["output"]).exists()
