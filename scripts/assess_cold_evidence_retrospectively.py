@@ -137,10 +137,12 @@ def _publish(
             named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             if (named.st_dev, named.st_ino) != _identity(handle.fileno()):
                 raise AssessmentRefusedError
+            os.fsync(parent_fd)
         complete = True
     finally:
         if created and not complete:
             os.unlink(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
 
 
 def assess(

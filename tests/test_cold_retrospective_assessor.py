@@ -5,6 +5,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from typing import Any, cast
 
 import assess_cold_evidence_retrospectively as assessor
 import pytest
@@ -107,6 +108,69 @@ def test_bad_cli_arguments_never_echo_private_values(capsys: pytest.CaptureFixtu
     captured = capsys.readouterr()
     assert captured.out == "Offline assessment refused.\n"
     assert captured.err == ""
+
+
+@pytest.mark.parametrize("failure", ["none", "publication", "persistent"])
+def test_publication_syncs_parent_after_checks_and_durably_cleans_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    """Directory sync gates success; failed publication unlinks and retries that sync."""
+    args = arguments(tmp_path)
+    output = Path(args["output"])
+    parent_identity = output.parent.stat()
+    before = hashes(Path(args["root"]))
+    original_sync = os.fsync
+    original_check = cast(Any, assessor)._recheck_parent  # White-box publication boundary spy.
+    events: list[str] = []
+
+    def check(parent: Path, descriptors: list[int], source: tuple[int, int]) -> None:
+        original_check(parent, descriptors, source)
+        if events:
+            events.append("final-check")
+
+    def sync(fd: int) -> None:
+        metadata = os.fstat(fd)
+        if stat.S_ISREG(metadata.st_mode):
+            assert stat.S_IMODE(metadata.st_mode) == 0o600
+            events.append("file-sync")
+        else:
+            assert stat.S_ISDIR(metadata.st_mode)
+            assert (metadata.st_dev, metadata.st_ino) == (
+                parent_identity.st_dev,
+                parent_identity.st_ino,
+            )
+            assert events[:2] == ["file-sync", "final-check"]
+            assert capsys.readouterr().out == ""
+            if output.exists():
+                events.append("parent-sync")
+                if failure != "none":
+                    raise OSError("private-sync-error")
+            else:
+                events.append("cleanup-sync")
+                if failure == "persistent":
+                    raise OSError("private-cleanup-error")
+        original_sync(fd)
+
+    monkeypatch.setattr(assessor, "_recheck_parent", check)
+    monkeypatch.setattr(os, "fsync", sync)
+    argv = [item for key, value in args.items() for item in ("--" + key.replace("_", "-"), value)]
+    assert assessor.main(argv) == (0 if failure == "none" else 1)
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    if failure == "none":
+        assert events == ["file-sync", "final-check", "parent-sync"]
+        assert output.is_file()
+        assert captured.out == (
+            "Offline technical assessment written; physical qualification not assessed.\n"
+        )
+    else:
+        assert events == ["file-sync", "final-check", "parent-sync", "cleanup-sync"]
+        assert not output.exists()
+        assert captured.out == "Offline assessment refused.\n"
+    assert hashes(Path(args["root"])) == before
 
 
 def test_script_entry_point_is_in_process_and_sanitised(
@@ -240,6 +304,9 @@ def test_direct_publication_failure_cleans_partial_output(
 
     def sync(fd: int) -> None:
         nonlocal reached_boundary
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            original_sync(fd)
+            return
         # This boundary follows write/flush and immediately precedes the final
         # location checks, while the final output descriptor is still held.
         assert output.is_file()
