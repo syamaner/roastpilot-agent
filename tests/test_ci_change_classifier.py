@@ -3301,6 +3301,7 @@ def _analyse_function(
     module_aliases: set[str],
     module_partial_aliases: set[str],
     module_value_sources: dict[str, ast.expr],
+    module_non_docs_aliases: set[str],
     known_functions: set[str],
     filename: str,
     class_name: str | None = None,
@@ -3441,13 +3442,7 @@ def _analyse_function(
     ambiguous_reader_aliases: set[str] = set()
     builtin_open_aliases: set[str] = set(builtin_open_import_aliases or set())
     ambiguous_builtin_open_aliases: set[str] = set()
-    non_docs_aliases = {
-        name
-        for name, value in module_value_sources.items()
-        if _string_constants(value)
-        and not _expression_is_docs_markdown(value, aliases)
-        and not _expression_has_docs_root(value)
-    }
+    non_docs_aliases = set(module_non_docs_aliases)
     working_directory_state = "none"
     imported_class_instances: set[str] = set()
     ambiguous_imported_class_instances: set[str] = set()
@@ -5158,6 +5153,16 @@ def _docs_reading_test_modules_in_call(
         tree, filename, imported_analyses, ambiguous_imports
     )
     module_value_sources = _module_value_sources(tree)
+    # Literal-bearing expressions are independent of function-local aliases:
+    # only a bare Name consults aliases, and a bare Name has no string constants.
+    # Compute this once for this AST; each function gets its own mutable copy.
+    module_non_docs_aliases = {
+        name
+        for name, value in module_value_sources.items()
+        if _string_constants(value)
+        and not _expression_is_docs_markdown(value, set())
+        and not _expression_has_docs_root(value)
+    }
     plugin_modules = _pytest_plugin_modules(tree, module_value_sources)
     (
         imported_fixture_by_name,
@@ -5566,6 +5571,7 @@ def _docs_reading_test_modules_in_call(
             module_aliases,
             module_partial_aliases,
             module_value_sources,
+            module_non_docs_aliases,
             known_functions,
             filename,
             class_name,
@@ -6261,6 +6267,35 @@ def test_docs_reading_tests_carry_the_exact_docs_marker_and_nothing_else() -> No
         )
         == set()
     )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_module_literal_scans_are_bounded_per_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Module literal scans do not grow with function count or leak across audits."""
+    original = _string_constants
+    scans = 0
+
+    def counting(expression: ast.expr) -> list[str]:
+        nonlocal scans
+        if isinstance(expression, ast.List) and expression.lineno == 2:
+            scans += 1
+        return original(expression)
+
+    monkeypatch.setattr(sys.modules[__name__], "_string_constants", counting)
+    source = (
+        "from pathlib import Path\n"
+        "CORPUS = ['config/x.md', 'ordinary']\n"
+        "DOC = Path('docs/x.md')\n"
+        + "".join(f"def test_plain_{i}():\n    assert CORPUS\n" for i in range(12))
+        + "def test_reader():\n    DOC.read_text()\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_reader"}
+    assert scans == 3
+    scans = 0
+    assert _docs_reading_test_modules(source.replace("docs/x.md", "config/x.md")) == set()
+    assert scans == 3
 
 
 @pytest.mark.docs_ci
