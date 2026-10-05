@@ -128,7 +128,7 @@ Acceptance criteria:
 
 These are the active D194 criteria; the locked D191 limits apply unchanged.
 
-- [ ] A supervised cold run on the Pi 5 complete appliance, with the single
+- [x] A supervised cold run on the Pi 5 complete appliance, with the single
   primary mono 16 kHz / 16-bit stream and the detector active, across the full
   10-minute recording-off phase followed by the 10-minute recording-on phase,
   meets the locked D191 limits unchanged: at most N = 1 consecutive overflow,
@@ -137,9 +137,17 @@ These are the active D194 criteria; the locked D191 limits apply unchanged.
   permit their stated margin; failing to meet them fails qualification, and no
   limit is loosened in the light of results. Method: the `audio.py`
   "overflowed (N consecutive)" log and the dashboard mic status, recorded as
-  run evidence.
-- [ ] Both retained evidence copies verify against the externally recorded
-  receipt, and independent Pi evidence review clears.
+  run evidence. Cleared by the narrow D210/D211 retrospective policy 4
+  interpretation revision 1 assessment of the completed supervised 10+10 run;
+  the original `NOT_CONFORMANT`, exit 6, result and original evaluator identity
+  remain unchanged.
+- [x] Both retained evidence copies verify against the externally recorded
+  receipt, and independent Pi evidence review clears. Cleared for the same
+  narrow revision-1 qualification by contemporaneous two-copy SHA-256 equality
+  proof and the final independent Pi review PASS. The separate supplementary
+  artifact receipt was accepted as host attestation; the reviewer did not hear
+  the audio or independently inspect the recovered WAV bytes. The original
+  sealed tree and exit-6 result remain unchanged.
 - [ ] The deployment doc notes the recording CPU cost and the frozen appliance
   configuration the run characterised (`onnx_threads`, flush threshold).
 

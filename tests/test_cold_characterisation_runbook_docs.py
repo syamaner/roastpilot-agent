@@ -1157,6 +1157,17 @@ def test_e11_s3_active_acceptance_keeps_the_locked_d191_limits_and_authorises_no
         "requires a fresh characterisation",
     ):
         assert phrase in active, phrase
+    assert "- [x] A supervised cold run" in active
+    assert "- [x] Both retained evidence copies verify" in active
+    assert "- [ ] The deployment doc notes" in active
+    assert "original `NOT_CONFORMANT`, exit 6, result" in active
+    assert "interpretation revision 1 assessment" in active
+    assert "contemporaneous two-copy SHA-256 equality proof" in active
+    assert "final independent Pi review PASS" in active
+    assert "accepted as host attestation" in active
+    assert (
+        "reviewer did not hear the audio or independently inspect the recovered WAV bytes" in active
+    )
     assert "well under the fatal threshold" not in active
     assert "any overflow fails" not in active.casefold()
     assert "apply the optimisation levers" not in active
