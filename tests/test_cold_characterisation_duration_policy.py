@@ -260,12 +260,15 @@ def test_generation_lifecycle_substitution_refused_by_all_public_policies(
     second = advisory_conformance.check_advisory_conformance(v3)
     historical = tc.check_temperature_conformance(tampered)
     current = tc.check_current_conformance(tampered)
+    revised = tc.check_revised_conformance(tampered)
     assert [r.policy_version for r in (first, second, historical, current)] == [1, 2, 3, 4]
-    for result in (first, second, historical, current):
+    assert revised.policy_version == 4 and revised.interpretation_revision == 1
+    for result in (first, second, historical, current, revised):
         assert result.findings
     assert first.outcome is conformance.ColdConformanceOutcome.NOT_CONFORMANT
     assert historical.outcome is tc.ColdTemperatureConformanceOutcome.NOT_CONFORMANT
     assert current.outcome is tc.ColdTemperatureConformanceOutcome.NOT_CONFORMANT
+    assert revised.outcome is tc.ColdTemperatureConformanceOutcome.NOT_CONFORMANT
     if generation == "historical" and phase is ON and case == "mixed":
         # All records remain individually valid and elapsed-end binding is unchanged.
         for item in records:

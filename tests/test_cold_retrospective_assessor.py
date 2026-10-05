@@ -2,11 +2,16 @@
 
 import hashlib
 import json
+import os
+import stat
 from pathlib import Path
 
 import assess_cold_evidence_retrospectively as assessor
 import pytest
 
+from roastpilot_agent.cold_characterisation.temperature_conformance import (
+    ColdRevisedConformanceResult,
+)
 from tests.test_cold_characterisation_duration_policy import current_run
 from tests.test_cold_characterisation_evidence_builders import RUN_ID
 from tests.test_cold_characterisation_revision1 import P, prepared
@@ -43,6 +48,7 @@ def test_assessment_recomputes_baseline_preserves_bytes_and_sanitises(tmp_path: 
     before = hashes(Path(args["root"]))
     assessor.assess(**args)
     assert hashes(Path(args["root"])) == before
+    assert stat.S_IMODE(Path(args["output"]).stat().st_mode) == 0o600
     payload = Path(args["output"]).read_text()
     document = json.loads(payload)
     assert document["original_policy4_baseline"]["outcome"] == "not_conformant"
@@ -115,3 +121,143 @@ def test_script_entry_point_is_in_process_and_sanitised(
         runpy.run_path(assessor.__file__, run_name="__main__")
     assert stopped.value.code == 1
     assert capsys.readouterr().out == "Offline assessment refused.\n"
+
+
+def test_case_alias_cannot_place_output_in_sealed_tree(tmp_path: Path) -> None:
+    """Case-insensitive filesystem identities override lexical path separation."""
+    args = arguments(tmp_path)
+    source = Path(args["root"])
+    alias = source.with_name(source.name.upper())
+    if not alias.exists() or not alias.samefile(source):
+        pytest.skip("Filesystem does not provide case-insensitive aliases")
+    args["output"] = str(alias / RUN_ID / "assessment.json")
+    before = hashes(source)
+    with pytest.raises(assessor.AssessmentRefusedError, match="^Offline assessment refused.$"):
+        assessor.assess(**args)
+    assert hashes(source) == before
+    assert not Path(args["output"]).exists()
+
+
+@pytest.mark.parametrize("case", ["parent-link", "ancestor-link", "traversal"])
+def test_output_ancestry_refuses_links_and_traversal(tmp_path: Path, case: str) -> None:
+    """Every output component is opened without following links."""
+    args = arguments(tmp_path)
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "child").mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    args["output"] = str(
+        alias / "assessment.json"
+        if case == "parent-link"
+        else alias / "child" / "assessment.json"
+        if case == "ancestor-link"
+        else real / ".." / "assessment.json"
+    )
+    before = hashes(Path(args["root"]))
+    with pytest.raises(assessor.AssessmentRefusedError, match="^Offline assessment refused.$"):
+        assessor.assess(**args)
+    assert hashes(Path(args["root"])) == before
+    assert list(real.rglob("*.json")) == []
+    assert not (tmp_path / "assessment.json").exists()
+
+
+@pytest.mark.parametrize("component", ["parent", "ancestor", "into-evidence", "symlink"])
+def test_destination_swap_during_assessment_refuses_without_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str
+) -> None:
+    """Replace an admitted parent/ancestor deterministically during evaluation."""
+    args = arguments(tmp_path)
+    ancestor = tmp_path / "destination"
+    parent = ancestor / "child"
+    parent.mkdir(parents=True)
+    args["output"] = str(parent / "assessment.json")
+    source = Path(args["root"])
+    before = hashes(source)
+    original = assessor.check_revised_conformance
+
+    def swap(retained: object) -> ColdRevisedConformanceResult:
+        result = original(retained)
+        target = ancestor if component == "ancestor" else parent
+        moved = source / "moved" if component == "into-evidence" else tmp_path / "moved"
+        target.rename(moved)
+        if component == "symlink":
+            target.symlink_to(source, target_is_directory=True)
+        else:
+            target.mkdir()
+            if component == "ancestor":
+                (target / "child").mkdir()
+        return result
+
+    monkeypatch.setattr(assessor, "check_revised_conformance", swap)
+    with pytest.raises(assessor.AssessmentRefusedError, match="^Offline assessment refused.$"):
+        assessor.assess(**args)
+    assert hashes(source) == before
+    assert not list(tmp_path.rglob("assessment.json"))
+    assert not list(tmp_path.rglob(".cold-assessment-*"))
+
+
+def test_sealed_evidence_mutation_after_admission_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final reader detects mutation after both evaluations admitted the input."""
+    args = arguments(tmp_path)
+    target = next((Path(args["root"]) / RUN_ID / "records").rglob("*.jsonl"))
+    original = assessor.check_revised_conformance
+    evaluated = False
+
+    def mutate(retained: object) -> ColdRevisedConformanceResult:
+        nonlocal evaluated
+        result = original(retained)
+        assert result.findings == ()
+        target.write_bytes(target.read_bytes() + b"\n")
+        evaluated = True
+        return result
+
+    monkeypatch.setattr(assessor, "check_revised_conformance", mutate)
+    with pytest.raises(assessor.AssessmentRefusedError, match="^Offline assessment refused.$"):
+        assessor.assess(**args)
+    assert evaluated
+    assert not Path(args["output"]).exists()
+    assert not list(tmp_path.rglob(".cold-assessment-*"))
+
+
+@pytest.mark.parametrize("stage", ["write", "before-link", "after-link"])
+def test_publication_swap_or_failure_cleans_private_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    """Refusal during staging/publication removes files through the held descriptor."""
+    args = arguments(tmp_path)
+    parent = tmp_path / "destination"
+    parent.mkdir()
+    args["output"] = str(parent / "assessment.json")
+    moved = tmp_path / "moved"
+    original_sync = os.fsync
+    original_link = os.link
+
+    def sync(fd: int) -> None:
+        if stage == "write":
+            raise OSError("private-path-or-error")
+        original_sync(fd)
+        if stage == "before-link":
+            parent.rename(moved)
+            parent.mkdir()
+
+    def link(
+        src: str, dst: str, *, src_dir_fd: int, dst_dir_fd: int, follow_symlinks: bool
+    ) -> None:
+        if stage == "after-link":
+            parent.rename(moved)
+            parent.mkdir()
+        original_link(
+            src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=follow_symlinks
+        )
+
+    monkeypatch.setattr(os, "fsync", sync)
+    monkeypatch.setattr(os, "link", link)
+    before = hashes(Path(args["root"]))
+    with pytest.raises(assessor.AssessmentRefusedError, match="^Offline assessment refused.$"):
+        assessor.assess(**args)
+    assert hashes(Path(args["root"])) == before
+    assert not list(tmp_path.rglob("assessment.json"))
+    assert not list(tmp_path.rglob(".cold-assessment-*"))
