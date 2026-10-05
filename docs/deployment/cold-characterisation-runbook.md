@@ -688,8 +688,9 @@ assessor on the authorised laptop copy with an externally recorded seal receipt:
 The caller must provision a separate output parent outside the sealed evidence
 root before invoking the assessor. It must be owned by the current UID with mode
 0700 or stricter (no group/other permissions or special mode bits), and its
-ancestors must not be group/other writable unless sticky and root-owned. The
-assessor opens every directory component without following symlinks and admits
+ancestors must belong to root or the current UID. They must not be group/other
+writable unless sticky and root-owned. The assessor opens every directory
+component without following symlinks and admits
 these permissions through the held descriptors. The output file must be new;
 exclusive descriptor-relative creation prevents overwrite and uses mode 0600.
 The final name can exist while writing; treat it as partial until the assessor

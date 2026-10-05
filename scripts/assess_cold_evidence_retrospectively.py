@@ -7,8 +7,9 @@ that a wheel was installed or that independent physical gates passed.
 
 The caller provisions a separate, current-UID private output parent (0700 or
 stricter) and verifies the sealed source inventory before and after the run.
-Other-writable ancestors are refused unless sticky and root-owned. Descriptor
-and identity checks detect observed substitutions; they cannot give atomic
+Ancestors must belong to root or the current UID; other-writable ancestors
+are refused unless sticky and root-owned. Descriptor and identity checks detect
+observed substitutions; they cannot give atomic
 cross-directory separation against a hostile same-UID process, which already
 has direct write access to the sealed evidence. That actor is outside this
 operational trust boundary. Partial output is not a successful assessment.
@@ -62,7 +63,9 @@ def _admit_directory(fd: int, *, private: bool = False) -> None:
     if private:
         if metadata.st_uid != os.getuid() or mode & ~0o700:
             raise AssessmentRefusedError
-    elif mode & 0o022 and not (metadata.st_uid == 0 and mode & stat.S_ISVTX):
+    elif metadata.st_uid not in {0, os.getuid()} or (
+        mode & 0o022 and not (metadata.st_uid == 0 and mode & stat.S_ISVTX)
+    ):
         raise AssessmentRefusedError
 
 

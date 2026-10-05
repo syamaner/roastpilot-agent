@@ -325,3 +325,54 @@ def test_parent_permissions_are_rechecked_after_writing(
     with pytest.raises(assessor.AssessmentRefusedError, match="^Offline assessment refused.$"):
         assessor.assess(**args)
     assert not Path(args["output"]).exists()
+
+
+@pytest.mark.parametrize("owner", ["root", "current", "foreign"])
+@pytest.mark.parametrize("timing", ["admission", "after-write"])
+def test_output_ancestor_ownership_is_admitted_and_rechecked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: str, timing: str
+) -> None:
+    """Synthetic foreign ownership refuses even a non-writable ancestor, without chown."""
+    args = arguments(tmp_path)
+    ancestor = tmp_path / "ancestor"
+    parent = ancestor / "private"
+    parent.mkdir(mode=0o700, parents=True)
+    ancestor.chmod(0o755)
+    args["output"] = str(parent / "assessment.json")
+    identity = ancestor.stat()
+    uid = {"root": 0, "current": os.getuid(), "foreign": os.getuid() + 1}[owner]
+    original_stat = os.fstat
+    original_sync = os.fsync
+    active = timing == "admission"
+    observed = False
+
+    def fstat(fd: int) -> os.stat_result:
+        nonlocal observed
+        metadata = original_stat(fd)
+        if active and (metadata.st_dev, metadata.st_ino) == (identity.st_dev, identity.st_ino):
+            observed = True
+            fields = list(metadata)
+            fields[4] = uid  # st_uid in the portable stat_result tuple
+            return os.stat_result(fields)
+        return metadata
+
+    def sync(fd: int) -> None:
+        nonlocal active
+        original_sync(fd)
+        active = True
+
+    monkeypatch.setattr(os, "fstat", fstat)
+    monkeypatch.setattr(os, "fsync", sync)
+    source = Path(args["root"])
+    before = hashes(source)
+    if owner == "foreign":
+        with pytest.raises(assessor.AssessmentRefusedError, match="^Offline assessment refused.$"):
+            assessor.assess(**args)
+        assert not Path(args["output"]).exists()
+    else:
+        assessor.assess(**args)
+        assert json.loads(Path(args["output"]).read_text())["revised_policy4"]["findings"] == []
+        assert stat.S_IMODE(Path(args["output"]).stat().st_mode) == 0o600
+    assert observed
+    assert hashes(source) == before
+    assert not list(tmp_path.rglob(".cold-assessment-*"))
