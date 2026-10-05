@@ -124,7 +124,25 @@ def test_publication_syncs_parent_after_checks_and_durably_cleans_failure(
     before = hashes(Path(args["root"]))
     original_sync = os.fsync
     original_check = cast(Any, assessor)._recheck_parent  # White-box publication boundary spy.
+    original_identity = cast(Any, assessor)._identity
     events: list[str] = []
+
+    class ObservedFileIdentity(tuple[int, int]):
+        """Observe the actual named-file comparison against the held file inode."""
+
+        def __ne__(self, other: object) -> bool:
+            """Record the final comparison before any parent sync can succeed."""
+            unequal = super().__ne__(other)
+            assert events == ["file-sync", "final-check"]
+            assert other == tuple(self)
+            events.append("named-inode-comparison")
+            return unequal
+
+    def identity(fd: int) -> tuple[int, int]:
+        value = original_identity(fd)
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            return ObservedFileIdentity(value)
+        return value
 
     def check(parent: Path, descriptors: list[int], source: tuple[int, int]) -> None:
         original_check(parent, descriptors, source)
@@ -142,8 +160,10 @@ def test_publication_syncs_parent_after_checks_and_durably_cleans_failure(
                 parent_identity.st_dev,
                 parent_identity.st_ino,
             )
-            assert events[:2] == ["file-sync", "final-check"]
-            assert capsys.readouterr().out == ""
+            assert events[:3] == ["file-sync", "final-check", "named-inode-comparison"]
+            intermediate = capsys.readouterr()
+            assert intermediate.out == ""
+            assert intermediate.err == ""
             if output.exists():
                 events.append("parent-sync")
                 if failure != "none":
@@ -155,19 +175,26 @@ def test_publication_syncs_parent_after_checks_and_durably_cleans_failure(
         original_sync(fd)
 
     monkeypatch.setattr(assessor, "_recheck_parent", check)
+    monkeypatch.setattr(assessor, "_identity", identity)
     monkeypatch.setattr(os, "fsync", sync)
     argv = [item for key, value in args.items() for item in ("--" + key.replace("_", "-"), value)]
     assert assessor.main(argv) == (0 if failure == "none" else 1)
     captured = capsys.readouterr()
     assert captured.err == ""
     if failure == "none":
-        assert events == ["file-sync", "final-check", "parent-sync"]
+        assert events == ["file-sync", "final-check", "named-inode-comparison", "parent-sync"]
         assert output.is_file()
         assert captured.out == (
             "Offline technical assessment written; physical qualification not assessed.\n"
         )
     else:
-        assert events == ["file-sync", "final-check", "parent-sync", "cleanup-sync"]
+        assert events == [
+            "file-sync",
+            "final-check",
+            "named-inode-comparison",
+            "parent-sync",
+            "cleanup-sync",
+        ]
         assert not output.exists()
         assert captured.out == "Offline assessment refused.\n"
     assert hashes(Path(args["root"])) == before
