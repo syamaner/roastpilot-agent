@@ -892,7 +892,7 @@ def test_e11_packaging_status_is_current_and_honest() -> None:
     assert "E11-S2 | Native installer, systemd unit, bundled model, deploy doc | done" in epic
     assert (
         "E11-S3 | Pi 5 single-primary-mic complete-appliance cold characterisation "
-        "(overflow validation) | not started" in epic
+        "(overflow validation) | in progress" in epic
     )
     assert "Hosted ARM64 evidence is package compatibility" in epic
     assert "not Raspberry Pi hardware validation" in registry

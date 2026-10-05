@@ -179,13 +179,13 @@ def test_new_deployment_artefacts_exclude_prohibited_public_claims() -> None:
 
 @pytest.mark.docs
 def test_e11_s2_status_updates_without_recasting_d191_thresholds() -> None:
-    """T27: E11-S2 is done while the unstarted soak and D191 values remain untouched."""
+    """T27: E11-S2 stays done; the cold story is in progress with unchanged D191 values."""
 
     epic = (REPO_ROOT / "docs/epics/E11-packaging.md").read_text(encoding="utf-8")
     assert "E11-S2 | Native installer, systemd unit, bundled model, deploy doc | done" in epic
     assert (
         "E11-S3 | Pi 5 single-primary-mic complete-appliance cold characterisation "
-        "(overflow validation) | not started" in epic
+        "(overflow validation) | in progress" in epic
     )
     assert "N/X" not in epic
     assert "streak-30" not in epic
