@@ -1866,6 +1866,7 @@ ALLOWED_IMPORTS: dict[str, frozenset[str]] = {
     _COLD + "acceptance": frozenset(
         {
             "interpret_retained_run",
+            "interpret_retained_run_revision1",
             "ColdCheckOutcome",
             "D191_N_LIMIT",
             "D191_X_LIMIT_MS",

@@ -654,3 +654,50 @@ The gate chain is evidence-led and is **not executed**:
 5. The operator gives a separate, immediate live GO.
 
 Supervised live acceptance is at least 20 continuous minutes.
+
+
+## D211 retrospective technical assessment
+
+Policy 4 interpretation revision 1 recognises exactly
+`Audio first-crack detection is prepared for this session.` only in live or
+pre-finalisation audio samples that are pending, running and carry neither
+detection field. All other non-null reasons fail closed. The original public
+interpreter and policies 1–3, and the original policy-4 entry point/result,
+retain their historical semantics. Future runtime evaluation requires the exact
+revised policy-4 result class with integer interpretation revision 1.
+
+The original completed run's `NOT_CONFORMANT`, exit 6, original evaluator and
+wheel identity, raw reasons and sealed evidence remain immutable. Revision 1
+recomputes every criterion from strictly admitted records; it grants no credit to
+aborted, interrupted, combined or failed-terminal runs. It changes no D191,
+D209, temperature, recording, advisory, host, containment or hardware rule.
+
+After independent review of the frozen source, the parent may run the offline
+assessor on the authorised laptop copy with an externally recorded seal receipt:
+
+```sh
+.venv/bin/python scripts/assess_cold_evidence_retrospectively.py \
+  --root "$EVIDENCE_ROOT" --run-id "$RETAINED_RUN_ID" \
+  --receipt "$EXTERNAL_MANIFEST_RECEIPT" --output "$SEPARATE_ASSESSMENT_FILE" \
+  --original-candidate-sha256 "$ORIGINAL_WHEEL_SHA256" \
+  --evaluator-commit "$CORRECTED_COMMIT" --evaluator-tree "$CORRECTED_TREE" \
+  --evaluator-wheel-sha256 "$CORRECTED_WHEEL_SHA256" \
+  --review-attestations-sha256 "$REVIEW_BUNDLE_SHA256"
+```
+
+The output file must be new and outside the sealed evidence root. The assessor
+strictly verifies the receipt and every manifested byte before evaluation and
+again before writing, emits both baseline and revised closed results, and
+binds the supplied candidate/evaluator/review digests. These digests are parent
+assertions; the assessor cannot authenticate them or prove installed bytes.
+The manifest receipt binds all sealed input hashes. It must never be derived
+from the candidate's own manifest or sidecar. Inputs must remain immutable;
+verification is not an atomic filesystem snapshot. Errors are sanitised.
+
+The assessment is technical conformance only and always reports physical
+qualification as not assessed. The lead must independently reconcile original
+installed-byte evidence, two-copy SHA equality, supervision, music/stream
+stimulus and mandatory independent Pi-evidence review. A corrected evaluator
+artifact does not establish that it ran on hardware. Qualification remains
+unestablished until every existing gate passes. No second certification run,
+physical rerun, installation or release is authorised by this correction.

@@ -2,6 +2,7 @@
 
 import ast
 import math
+import typing
 from pathlib import Path
 
 import pydantic
@@ -29,6 +30,7 @@ from tests.test_cold_characterisation_advisory_conformance import (
 from tests.test_cold_characterisation_conformance import (
     S_OFF,
     S_ON,
+    Plan,
     Tick,
     audio,
     plan,
@@ -110,7 +112,9 @@ def test_generation_admission_never_calls_numeric_subclass_hooks() -> None:
     assert admit_duration_generation(10.0, HostileFloat(610.0)) is None
 
 
-def current_run(tmp_path: Path) -> reader.ColdRetainedRunV6:
+def current_run(
+    tmp_path: Path, edit: typing.Callable[[Plan], None] | None = None
+) -> reader.ColdRetainedRunV6:
     """Write current anchors 10/610 and 630/1230, windows 250–550 and 870–1170."""
     run = plan(tmp_path, e_off=610.0, phase_seconds=600.0)
     for phase, activation, session in ((OFF, 10.0, S_OFF), (ON, 630.0, S_ON)):
@@ -147,6 +151,8 @@ def current_run(tmp_path: Path) -> reader.ColdRetainedRunV6:
         del header
         writer.append_tick_temperature(temperature_for(tick, temperature=obs(tick.tick + 1)))
 
+    if edit is not None:
+        edit(run)
     root, digest = _write_run(
         tmp_path, run, attempts, after_header=candidate, after_tick=temperature, current=True
     )
@@ -280,7 +286,11 @@ def test_runtime_refuses_historical_and_forged_policy3_results() -> None:
     assert admit_checker(historic) is None
     assert admit_checker(forged(current, policy_version=3)) is None
     assert admit_checker(forged(historic, policy_version=4)) is None
-    assert admit_checker(current) == current
+    assert admit_checker(current) is None
+    revised = tc.ColdRevisedConformanceResult(
+        policy_version=4, interpretation_revision=1, outcome=historic.outcome, findings=()
+    )
+    assert admit_checker(revised) == revised
     for version in (True, 4.0, 3, "4"):
         with pytest.raises(pydantic.ValidationError):
             tc.ColdCurrentConformanceResult.model_validate(

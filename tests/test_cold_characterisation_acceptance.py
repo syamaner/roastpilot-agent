@@ -883,6 +883,7 @@ def test_run_is_read_only_while_rebinding() -> None:
     """
     for function_name, callee in (
         ("interpret_retained_run", "_rebind"),
+        ("interpret_retained_run_revision1", "_rebind"),
         ("_rebind", "_check_containers"),
     ):
         function = _function(function_name)
@@ -907,7 +908,12 @@ def test_run_is_read_only_while_rebinding() -> None:
             for argument in node.args.args
         )
     }
-    assert readers == {"interpret_retained_run", "_rebind", "_check_containers"}
+    assert readers == {
+        "interpret_retained_run",
+        "interpret_retained_run_revision1",
+        "_rebind",
+        "_check_containers",
+    }
 
 
 EVALUATORS = (
@@ -925,9 +931,18 @@ EVALUATORS = (
 def test_private_evaluators_accept_only_the_capability(name: str) -> None:
     """R4 and G16 symmetry: each evaluator takes one rebound phase and no phase kind."""
     signature = inspect.signature(getattr(acceptance, name))
-    assert [
-        (parameter.name, parameter.annotation) for parameter in signature.parameters.values()
-    ] == [("rebound", acceptance.ColdReboundPhase)]
+    parameters = list(signature.parameters.values())
+    assert (parameters[0].name, parameters[0].annotation) == (
+        "rebound",
+        acceptance.ColdReboundPhase,
+    )
+    if name in {"_evaluate_inference_runtime", "_interpret_phase"}:
+        assert len(parameters) == 2
+        assert parameters[1].name == "revised"
+        assert parameters[1].kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameters[1].annotation is bool and parameters[1].default is False
+    else:
+        assert len(parameters) == 1
 
 
 CapabilityType = (
@@ -2725,7 +2740,7 @@ def test_no_verdict_qualified_pass_or_aggregate_field_or_callable() -> None:
     assert not any(token in name for name in lowered for token in FORBIDDEN_NAME_TOKENS)
     assert [
         name for name in acceptance.__all__ if inspect.isfunction(getattr(acceptance, name))
-    ] == ["interpret_retained_run"]
+    ] == ["interpret_retained_run", "interpret_retained_run_revision1"]
     assert "outcome" in acceptance.ColdCheckResult.model_fields
     assert not any("outcome" in name for name in acceptance.ColdPhaseInterpretation.model_fields)
 

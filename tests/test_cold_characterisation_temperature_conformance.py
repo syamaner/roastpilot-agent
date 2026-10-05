@@ -1005,7 +1005,7 @@ def test_pc10_syntax_fences() -> None:
         and isinstance(node.type, ast.Name)
         and node.type.id == "Exception"
     ]
-    assert len(broad) == 3
+    assert len(broad) == 4
     owners = {
         function.name
         for function in ast.walk(TREE)
@@ -1013,7 +1013,12 @@ def test_pc10_syntax_fences() -> None:
         for node in ast.walk(function)
         if node in broad
     }
-    assert owners == {"_guarded", "check_temperature_conformance", "check_current_conformance"}
+    assert owners == {
+        "_guarded",
+        "check_temperature_conformance",
+        "check_current_conformance",
+        "check_revised_conformance",
+    }
     assert source.count("model_construct") == 1
     for text in ("isinstance(", "subprocess", "StrEnum", "print(", "two_phase"):
         assert text not in source, text

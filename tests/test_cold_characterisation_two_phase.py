@@ -842,7 +842,7 @@ def assert_failed(
     assert terminal["termination"] == "failed"
     assert terminal["termination_reason"] == reason.value
     retained = world.retained(result.manifest_sha256)
-    checked = temperature_conformance.check_current_conformance(retained)
+    checked = temperature_conformance.check_revised_conformance(retained)
     assert checked.outcome is TemperatureOutcome.NOT_CONFORMANT
     advisory = advisory_view(world, result)
     assert advisory.outcome is advisory_conformance.ColdAdvisoryConformanceOutcome.NOT_CONFORMANT
@@ -1086,7 +1086,7 @@ def admit_checker(value: object) -> object:
     """Admit one candidate policy-4 result exactly as the orchestrator does."""
     return two_phase._admit_carrier(
         value,
-        temperature_conformance.ColdCurrentConformanceResult,
+        temperature_conformance.ColdRevisedConformanceResult,
         two_phase._CHECKER,
         flat_identity=True,
     )
@@ -1411,11 +1411,14 @@ def test_4gc_t16_forged_engine_and_checker_carriers_are_refused() -> None:
         "listed_findings": forged(failing, findings=[Finding.TICK_TEMPERATURE_ABSENT]),
         "extra": with_slot(genuine, "__pydantic_extra__", {"x": 1}),
         "constructed_without_findings": TemperatureResult.model_construct(
-            policy_version=4, outcome=TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT
+            policy_version=4,
+            interpretation_revision=1,
+            outcome=TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT,
         ),
         "uninitialised": object.__new__(TemperatureResult),
         "subclass": subclass(
             policy_version=4,
+            interpretation_revision=1,
             outcome=TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT,
             findings=(),
         ),
@@ -1548,17 +1551,19 @@ def _independent_row(
     return True
 
 
-TemperatureResult = temperature_conformance.ColdCurrentConformanceResult
+TemperatureResult = temperature_conformance.ColdRevisedConformanceResult
 #: Policy-4 checker results (the runtime result's only admitted conformance carrier).
 CHECKED: typing.Final[dict[str | None, TemperatureResult | None]] = {
     None: None,
     "conformant": TemperatureResult(
         policy_version=4,
+        interpretation_revision=1,
         outcome=TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT,
         findings=(),
     ),
     "not_conformant": TemperatureResult(
         policy_version=4,
+        interpretation_revision=1,
         outcome=TemperatureOutcome.NOT_CONFORMANT,
         findings=(TemperatureFinding.TICK_TEMPERATURE_ABSENT,),
     ),
@@ -2107,7 +2112,7 @@ def _reachable(*roots: type[pydantic.BaseModel]) -> tuple[set[type], set[type]]:
             "_ENGINE",
             (engine.ColdPhaseCompleted, engine.ColdPhaseAborted, engine.ColdPhaseActivationRefused),
         ),
-        ("_CHECKER", (temperature_conformance.ColdCurrentConformanceResult,)),
+        ("_CHECKER", (temperature_conformance.ColdRevisedConformanceResult,)),
         (
             "_ADVISORY",
             (
@@ -2328,7 +2333,7 @@ async def test_4gc_t16_a_forged_or_failing_checker_is_never_conformant(
         del run
         return produce(returned[checker])
 
-    monkeypatch.setattr(two_phase, "check_current_conformance", check)
+    monkeypatch.setattr(two_phase, "check_revised_conformance", check)
     world = World(tmp_path)
     result = await world.run()
     assert result.outcome is Outcome.NOT_CONFORMANT
@@ -3801,6 +3806,7 @@ async def test_4gc_t1_the_happy_path_is_advisory_conformant(
     assert result.child_ownership is Own.OWNED_STOP_CONFIRMED
     assert result.conformance == TemperatureResult(
         policy_version=4,
+        interpretation_revision=1,
         outcome=TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT,
         findings=(),
     )
@@ -3821,7 +3827,7 @@ async def test_4gc_t1_the_happy_path_is_advisory_conformant(
         assert candidates[0]["candidate"]["installed_bytes_attested"] is False
     assert world.records("temperature_abort") == []
     assert len(retained.tick_temperatures) == 10 and len(retained.mcp_candidates) == 2
-    checked = temperature_conformance.check_current_conformance(retained)
+    checked = temperature_conformance.check_revised_conformance(retained)
     assert checked.outcome is TemperatureOutcome.TEMPERATURE_SCREENED_CONFORMANT
     for legacy in (
         reader.read_retained_run,
@@ -4397,7 +4403,7 @@ class Counters:
         self.seals = self.reads = self.checks = 0
         real_seal = store.ColdEvidenceWriter.seal
         real_read = reader.read_retained_run_v6
-        real_check = temperature_conformance.check_current_conformance
+        real_check = temperature_conformance.check_revised_conformance
 
         def counted_seal(writer: store.ColdEvidenceWriter) -> typing.Any:
             self.seals += 1
@@ -4413,7 +4419,7 @@ class Counters:
 
         monkeypatch.setattr(store.ColdEvidenceWriter, "seal", counted_seal)
         monkeypatch.setattr(two_phase, "read_retained_run_v6", counted_read)
-        monkeypatch.setattr(two_phase, "check_current_conformance", counted_check)
+        monkeypatch.setattr(two_phase, "check_revised_conformance", counted_check)
 
     @property
     def counts(self) -> tuple[int, int, int]:
@@ -4680,7 +4686,7 @@ async def test_4gc_a2_s7_a_post_seal_refusal_is_final_for_the_run(
 ) -> None:
     """S7: a post-seal reader/checker refusal is final; a later diagnostic never upgrades it."""
     real_read = reader.read_retained_run_v6
-    real_check = temperature_conformance.check_current_conformance
+    real_check = temperature_conformance.check_revised_conformance
 
     def refuse_read(*args: typing.Any, **kwargs: typing.Any) -> typing.NoReturn:
         raise store.ColdEvidenceStoreError(store.ColdEvidenceStoreFailure.HEADER_MISSING)
@@ -5346,7 +5352,7 @@ async def test_4gc_t22_a_conformant_checker_never_overrides_a_failure(
         del run
         return CHECKED["conformant"]
 
-    monkeypatch.setattr(two_phase, "check_current_conformance", check)
+    monkeypatch.setattr(two_phase, "check_revised_conformance", check)
     world = World(tmp_path)
     if failure == "on_not_clean":
         world.mcp.finalise = lambda p, s: not_clean_result(p, s) if p is ON else clean_result(p, s)
@@ -5388,7 +5394,7 @@ async def test_4gc_t22_end_handling_suppresses_a_contradictory_checker_itself(
         return CHECKED["conformant"]
 
     monkeypatch.setattr(two_phase._TwoPhaseRun, "_end", end)
-    monkeypatch.setattr(two_phase, "check_current_conformance", check)
+    monkeypatch.setattr(two_phase, "check_revised_conformance", check)
     world = World(tmp_path)
     world.mcp.finalise = lambda p, s: not_clean_result(p, s) if p is ON else clean_result(p, s)
     result = await world.run()
@@ -7270,7 +7276,7 @@ async def test_997_tp5_a_failed_run_terminal_is_verified_by_v6_and_never_checked
         return real_read(*args, **kwargs)
 
     monkeypatch.setattr(two_phase, "read_retained_run_v6", read)
-    monkeypatch.setattr(two_phase, "check_current_conformance", checks.append)
+    monkeypatch.setattr(two_phase, "check_revised_conformance", checks.append)
     result = await world.run()
     assert result.advisory_path is AdvisoryPath.FAILED_RUN_TERMINAL
     assert result.outcome is Outcome.NOT_CONFORMANT and result.conformance is None

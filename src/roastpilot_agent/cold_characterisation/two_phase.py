@@ -226,10 +226,10 @@ from roastpilot_agent.cold_characterisation.mcp import (
     finalisation_is_clean,
 )
 from roastpilot_agent.cold_characterisation.temperature_conformance import (
-    ColdCurrentConformanceResult,
+    ColdRevisedConformanceResult,
     ColdTemperatureConformanceFinding,
     ColdTemperatureConformanceOutcome,
-    check_current_conformance,
+    check_revised_conformance,
 )
 from roastpilot_agent.mcp_client import RuntimeConfigSnapshot, ServerInfo
 
@@ -409,7 +409,7 @@ class ColdTwoPhaseResult(pydantic.BaseModel):
     termination_reason: ColdRunTerminationReason | None
     child_ownership: ColdChildOwnership
     manifest_sha256: str | None
-    conformance: ColdCurrentConformanceResult | None
+    conformance: ColdRevisedConformanceResult | None
     advisory_path: ColdTwoPhaseAdvisoryPath
     provider_check: ColdTwoPhaseProviderCheck
 
@@ -427,7 +427,7 @@ class ColdTwoPhaseResult(pydantic.BaseModel):
         """Replace a checker result with its admitted fresh snapshot, or refuse it."""
         if value is None:
             return None
-        fresh = _admit_carrier(value, ColdCurrentConformanceResult, _CHECKER, flat_identity=True)
+        fresh = _admit_carrier(value, ColdRevisedConformanceResult, _CHECKER, flat_identity=True)
         if fresh is None:
             raise ValueError("conformance result not admitted")
         return fresh
@@ -574,7 +574,7 @@ _ENGINE: typing.Final = _carrier(
     ),
 )
 _CHECKER: typing.Final = _carrier(
-    (ColdCurrentConformanceResult,),
+    (ColdRevisedConformanceResult,),
     (ColdTemperatureConformanceOutcome, ColdTemperatureConformanceFinding),
 )
 _ADVISORY: typing.Final = _carrier(
@@ -2187,7 +2187,7 @@ class _TwoPhaseRun:
         self,
         outcome: ColdTwoPhaseOutcome,
         digest: str | None = None,
-        conformance: ColdCurrentConformanceResult | None = None,
+        conformance: ColdRevisedConformanceResult | None = None,
     ) -> ColdTwoPhaseResult:
         """Build one evidence-bearing result row from admitted closed fields."""
         return ColdTwoPhaseResult(
@@ -2249,11 +2249,11 @@ class _TwoPhaseRun:
                 run_id=self._headers[_OFF].run_id,
                 expected_manifest_sha256=digest,
             )
-            checked: object = check_current_conformance(retained)
+            checked: object = check_revised_conformance(retained)
         except Exception:
             checked = None
         conformance = _admit_carrier(
-            checked, ColdCurrentConformanceResult, _CHECKER, flat_identity=True
+            checked, ColdRevisedConformanceResult, _CHECKER, flat_identity=True
         )
         conformant = (
             conformance is not None

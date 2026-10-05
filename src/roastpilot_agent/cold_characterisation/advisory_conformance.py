@@ -694,7 +694,10 @@ def _guarded(found: set[_F], call: typing.Callable[[], _T]) -> _T | None:
 
 
 def _evaluate(
-    run: object, generation: ColdDurationGeneration = ColdDurationGeneration.HISTORICAL
+    run: object,
+    generation: ColdDurationGeneration = ColdDurationGeneration.HISTORICAL,
+    *,
+    revised: bool = False,
 ) -> tuple[set[_F], _PreFindings]:
     """Stages 1 to 4 with their early returns; rule groups are individually guarded."""
     admitted = _admit_v3(run)
@@ -713,7 +716,7 @@ def _evaluate(
             return {_F.CHECKER_INTERNAL_FAILURE}, ()
         pre_findings = pre.findings
     else:
-        found_pre = _evaluate_generation(_project(admitted), generation)
+        found_pre = _evaluate_generation(_project(admitted), generation, revised=revised)
         pre_findings = tuple(member for member in ColdConformanceFinding if member in found_pre)
     if pre_findings:
         return {_F.PRE_ADVISORY_NOT_CONFORMANT}, pre_findings

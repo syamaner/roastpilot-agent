@@ -1144,7 +1144,7 @@ def test_e11_s3_active_acceptance_keeps_the_locked_d191_limits_and_authorises_no
     history = _flat(s3[s3.index("**History") :])
     for phrase in (
         "the locked D191 limits apply unchanged",
-        "30-minute recording-off phase followed by the 30-minute recording-on phase",
+        "10-minute recording-off phase followed by the 10-minute recording-on phase",
         "at most N = 1 consecutive overflow",
         "at most X = 200 ms of peak trailing-60-second lost audio",
         "The production fatal consecutive-overflow streak of 30 is unchanged.",
@@ -1179,7 +1179,7 @@ def test_runbook_verifier_signals_and_spa_boundaries() -> None:
         "A usage error prints only the fixed usage line on stderr (exit 2), never a summary."
         in text
     )
-    assert "a 30-minute recording-off phase followed by a 30-minute recording-on phase" in text
+    assert "a 10-minute recording-off phase followed by a 10-minute recording-on phase" in text
     assert "prescribes no stimulus content, no other duration and no run authority" in text
     assert "may only be handled after the run has been invoked" in text
     assert "it can exit 1 with `signal=none`" in text

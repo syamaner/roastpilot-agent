@@ -1,5 +1,16 @@
 # RoastPilot Agent Project State Registry
 
+**5 Oct 2026 — D211 local correction:** policy 4 interpretation revision 1 adds
+one exact prepared-session reason exception in active, pending, non-detected
+live/pre-finalisation audio. Historical policies 1–3 and original policy 4 remain
+reproducible. Current runtime requires the revised exact result class/revision.
+A separate offline technical assessment preserves the original `NOT_CONFORMANT`,
+exit 6, evaluator/wheel identities and sealed bytes. Independent reviews and the
+parent's sealed-evidence assessment remain outstanding. No physical qualification
+is asserted; #954 remains open and E11-S3 remains unstarted. See the D211 section
+of `docs/deployment/cold-characterisation-runbook.md`.
+
+
 ## Active Epic
 
 **6 Sep 2026 — D-ToS-1 governance reconciliation (#938).** Verified live

@@ -65,6 +65,7 @@ from roastpilot_agent.cold_characterisation.acceptance import (
     ColdInterpretation,
     ColdReboundPhase,
     interpret_retained_run,
+    interpret_retained_run_revision1,
 )
 from roastpilot_agent.cold_characterisation.duration_policy import (
     ColdDurationGeneration,
@@ -977,7 +978,7 @@ def _result(found: set[ColdConformanceFinding]) -> ColdConformanceResult:
 
 
 def _evaluate_generation(
-    run: object, generation: ColdDurationGeneration
+    run: object, generation: ColdDurationGeneration, *, revised: bool = False
 ) -> set[ColdConformanceFinding]:
     """Apply shared rules after strict admission for the selected closed generation."""
     found: set[ColdConformanceFinding] = set()
@@ -985,7 +986,13 @@ def _evaluate_generation(
         return {_F.CARRIER_NOT_ADMITTED}
     carrier = typing.cast(ColdRetainedRunV2, run)
     interpretation = _guarded(
-        found, _F.INTERPRETATION_REFUSED, lambda: interpret_retained_run(carrier.run)
+        found,
+        _F.INTERPRETATION_REFUSED,
+        lambda: (
+            interpret_retained_run_revision1(carrier.run)
+            if revised
+            else interpret_retained_run(carrier.run)
+        ),
     )
     if interpretation is None:
         return {_F.INTERPRETATION_REFUSED}
