@@ -4455,6 +4455,19 @@ class RoastController:
             self.transition_to(RoastPhase.COMPLETE)
             self._events.emit(RoastEventKind.RUN_COMPLETED, {})
 
+    async def authorize_fault_acknowledgement_stop_cooling(self) -> bool:
+        """Persist and return the policy decision for a fault acknowledgement.
+
+        The application runner owns the post-fault read/command/read sequence,
+        while the controller remains the sole owner of the safety decision for
+        its possible roaster write.
+        """
+        evaluation = self._safety.evaluate_command_phase(
+            command=RoastCommand.STOP_COOLING, phase=self._phase
+        )
+        await self._snapshots.persist_evaluation(evaluation)
+        return evaluation.verdict is SafetyVerdict.ALLOW
+
     async def operator_emergency_stop(self, reason: str | None = None) -> None:
         """Operator e-stop: always available, from every phase (E3-S4)."""
         evaluation = self._safety.evaluate_emergency_stop(phase=self._phase, operator_reason=reason)

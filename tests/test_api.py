@@ -80,6 +80,8 @@ from roastpilot_agent.models import (
     BeanProfileInput,
     ChargeWeightRequest,
     ClearStaleSessionRequest,
+    FaultAcknowledgementState,
+    FaultCoolingStopResult,
     HardwareClearAcknowledgementRequest,
     MicHealth,
     OperatorAction,
@@ -3213,6 +3215,26 @@ def _live_decision() -> RoastDecision:
     )
 
 
+def _fault_ack_state(
+    *,
+    session_id: str = "session-1",
+    active: bool = False,
+    device_connected: bool = True,
+    heat_level_percent: int = 0,
+    fan_level_percent: int = 0,
+    cooling_on: bool = False,
+) -> FaultAcknowledgementState:
+    """Build one closed post-fault control-state proof for queue tests."""
+    return FaultAcknowledgementState(
+        session_id=session_id,
+        active=active,
+        device_connected=device_connected,
+        heat_level_percent=heat_level_percent,
+        fan_level_percent=fan_level_percent,
+        cooling_on=cooling_on,
+    )
+
+
 async def _live_service(
     store: RoastStore,
     *,
@@ -3245,6 +3267,29 @@ async def _tick(service: RoastService, clock: FakeClock) -> bool:
     assert service.runner is not None
     clock.advance(3.0)
     return await service.runner.tick_once()
+
+
+async def _faulted_live_service(
+    store: RoastStore,
+    *,
+    states: list[FaultAcknowledgementState | Exception] | None = None,
+    stop_results: list[FaultCoolingStopResult | Exception] | None = None,
+) -> tuple[RoastService, FakeMCPClient, FakeClock, str]:
+    """Create one operable fault with a scripted acknowledgement capability."""
+    clock = FakeClock()
+    mcp = FakeMCPClient(
+        [_reading(178.0, 185.0)],
+        fault_acknowledgement_states=states,
+        fault_acknowledgement_stop_results=stop_results,
+    )
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"})
+    )
+    assert not await _tick(service, clock)
+    faulted = await store.read_run(run_id)
+    assert faulted is not None and faulted.agent_phase is RoastPhase.FAULTED
+    return service, mcp, clock, run_id
 
 
 def _start_session_roast_nums(mcp: FakeMCPClient) -> list[int | None]:
@@ -3649,6 +3694,8 @@ async def test_recover_on_start_auto_finalizes_a_stale_faulted_run(
     (the roast-3 boot-onto-"test 6" bug). It is moved terminal (outcome ``faulted``,
     fault_reason preserved) so it lands in history, the boot is clean (no active
     run), and no heat/fan/MCP write is issued (restart-never-auto-resumes intact).
+    This historical-session finalisation is not an MCP safe-zero or physical-safety
+    proof; the live current-session acknowledgement path supplies that gate.
     Supersedes the prior #206 "re-enter operable-faulted on restart" behaviour: the
     in-SESSION operable-faulted path is unchanged; this is only the cross-restart
     stale-fault case."""
@@ -5757,10 +5804,182 @@ async def test_acknowledge_fault_is_audit_only_issues_no_mcp_write(store: RoastS
 
 
 @pytest.mark.asyncio
+async def test_acknowledge_fault_stops_cooling_then_reads_matching_safe_zero(
+    store: RoastStore,
+) -> None:
+    """A fault ends only after one authorised stop and its fresh safe readback."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store,
+        states=[_fault_ack_state(cooling_on=True), _fault_ack_state(cooling_on=False)],
+    )
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+
+    assert await _tick(service, clock)
+    assert mcp.commands().count("stop_cooling") == 1
+    final = await store.read_run(run_id)
+    assert final is not None and final.outcome == "faulted"
+    evaluations = await store.read_timeline(run_id)
+    assert any(
+        item.verdict == SafetyVerdict.ALLOW.value and item.rule == "command_phase_validity"
+        for item in evaluations.safety_evaluations
+    )
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_already_off_reads_twice_without_stop_write(
+    store: RoastStore,
+) -> None:
+    """An already-off fault still needs fresh matching safe-zero reads."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store, states=[_fault_ack_state(), _fault_ack_state()]
+    )
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+
+    assert await _tick(service, clock)
+    assert "stop_cooling" not in mcp.commands()
+    assert mcp._log.count("fault_acknowledgement_read") == 2  # noqa: SLF001 - fake trace
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_policy_refusal_issues_no_stop_write(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused STOP_COOLING evaluation cannot reach the MCP adapter."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store, states=[_fault_ack_state(cooling_on=True)]
+    )
+    assert service.runner is not None
+
+    async def refuse() -> bool:
+        return False
+
+    monkeypatch.setattr(
+        service.runner._controller,  # pyright: ignore[reportPrivateUsage]
+        "authorize_fault_acknowledgement_stop_cooling",
+        refuse,
+    )
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+
+    assert not await _tick(service, clock)
+    assert "stop_cooling" not in mcp.commands()
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.FAULTED  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("states", "stop_results", "session_missing"),
+    [
+        ([_fault_ack_state(active=True)], None, False),
+        ([_fault_ack_state(device_connected=False)], None, False),
+        ([_fault_ack_state(heat_level_percent=1)], None, False),
+        ([_fault_ack_state(fan_level_percent=1)], None, False),
+        ([_fault_ack_state(session_id="other")], None, False),
+        ([RuntimeError("read timeout")], None, False),
+        ([_fault_ack_state(cooling_on=True)], [RuntimeError("write timeout")], False),
+        ([_fault_ack_state(cooling_on=True)], [FaultCoolingStopResult(session_id="other")], False),
+        ([_fault_ack_state(cooling_on=True), _fault_ack_state(session_id="other")], None, False),
+        ([_fault_ack_state(cooling_on=True), RuntimeError("read timeout")], None, False),
+        ([_fault_ack_state(cooling_on=True), _fault_ack_state(cooling_on=True)], None, False),
+        ([_fault_ack_state()], None, True),
+    ],
+)
+async def test_acknowledge_fault_fail_closed_on_unconfirmed_state_or_command(
+    store: RoastStore,
+    states: list[FaultAcknowledgementState | Exception],
+    stop_results: list[FaultCoolingStopResult | Exception] | None,
+    session_missing: bool,
+) -> None:
+    """Every unavailable, mismatched, unsafe, or indeterminate branch keeps faulted."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store, states=states, stop_results=stop_results
+    )
+    if session_missing:
+        mcp._latest_fault_session_id = None  # noqa: SLF001 - explicit no-session proof
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+
+    assert not await _tick(service, clock)
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.agent_phase is RoastPhase.FAULTED
+    assert detail.completed_at_utc is None
+    assert await store.active_run() is not None
+    with pytest.raises(RoastRunConflictError):
+        await service.start_roast(_profile())
+    assert not await service.runner.tick_once()  # type: ignore[union-attr]
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.FAULTED  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_duplicate_requests_issue_at_most_one_stop(
+    store: RoastStore,
+) -> None:
+    """Two queued clicks cannot turn a single acknowledgement into two writes."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store,
+        states=[_fault_ack_state(cooling_on=True), _fault_ack_state(cooling_on=False)],
+    )
+    request = OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    await service.submit_operator_action(run_id, request)
+    await service.submit_operator_action(run_id, request)
+
+    assert await _tick(service, clock)
+    assert mcp.commands().count("stop_cooling") == 1
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_retry_does_not_repeat_a_confirmed_cooling_stop(
+    store: RoastStore,
+) -> None:
+    """A later explicit retry re-reads and completes without a second stop write."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store,
+        states=[
+            _fault_ack_state(cooling_on=True),
+            RuntimeError("read timeout after confirmed stop"),
+            _fault_ack_state(cooling_on=False),
+            _fault_ack_state(cooling_on=False),
+        ],
+    )
+    request = OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    await service.submit_operator_action(run_id, request)
+    assert not await _tick(service, clock)
+    assert mcp.commands().count("stop_cooling") == 1
+
+    await service.submit_operator_action(run_id, request)
+    assert await _tick(service, clock)
+    assert mcp.commands().count("stop_cooling") == 1
+
+
+@pytest.mark.asyncio
+async def test_emergency_stop_is_dispatched_before_queued_acknowledgement(
+    store: RoastStore,
+) -> None:
+    """Emergency stop retains queue priority over a same-tick acknowledgement."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"})
+    )
+
+    assert await _tick(service, clock)
+    assert mcp.commands().index("emergency_stop") < mcp._log.index("fault_acknowledgement_read")  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_acknowledge_fault_clears_promptly_under_wedged_mcp(store: RoastStore) -> None:
-    """#332: ``acknowledge_fault`` must finalise the run on the SAME tick it is
-    drained, without blocking on a fresh escalation read, even when the MCP child
-    is wedged (slow/failed reads).
+    """A wedged acknowledgement-state read must keep the faulted run operable.
 
     Repro of the roast-3 "slow to clear" report: a FAULT-latched run (not e-stop —
     consecutive MCP read failures, so ``_latched_verdict`` is FAULT) re-reads the
@@ -5772,15 +5991,20 @@ async def test_acknowledge_fault_clears_promptly_under_wedged_mcp(store: RoastSt
     acknowledged — the run is being torn down and heat is already off, so there is
     nothing to escalate into.
 
-    Hardware-free + deterministic: a read-counting fake whose reads RAISE (a
-    dead/failed child). The assertion is on the READ COUNT, not wall-clock — the
-    acknowledge tick must NOT issue a fresh escalation read."""
+    The controller's old #332 escalation probe remains suppressed only after a
+    *confirmed* acknowledgement. A fresh state proof is now mandatory, so a
+    wedged MCP cannot be treated as acknowledgement success.
+    """
     clock = FakeClock()
     log: list[str] = []
     # Every read raises → after max_consecutive_mcp_failures (3) the run FAULTs,
     # latched at the FAULT verdict (the escalation-re-read case, not e-stop). The
     # explicit log records every ``read`` so the assertion is on the read count.
-    mcp = FakeMCPClient([RuntimeError("wedged child")], log=log)
+    mcp = FakeMCPClient(
+        [RuntimeError("wedged child")],
+        log=log,
+        fault_acknowledgement_states=[RuntimeError("wedged child")],
+    )
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)
     # Tick to the fault: 3 consecutive failing reads cross the threshold.
     for _ in range(3):
@@ -5792,19 +6016,16 @@ async def test_acknowledge_fault_clears_promptly_under_wedged_mcp(store: RoastSt
     reads_before = log.count("read")
     await _tick(service, clock)
     assert log.count("read") > reads_before, "latched tick should probe for escalation"
-    # Now acknowledge + tick: the ack tick must FINALISE and must NOT issue another
-    # escalation read (that read is the wedged-child latency the operator hit).
+    # Acknowledge + tick: state proof fails, so the run stays faulted and the
+    # controller still treats the fault as operable rather than finalising it.
     ack = await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
     )
     assert ack.result == "accepted"
-    reads_at_ack = log.count("read")
-    assert await _tick(service, clock)  # finalises on the ack tick
-    assert log.count("read") == reads_at_ack, (
-        "acknowledge tick must not block on a fresh escalation read"
-    )
+    assert not await _tick(service, clock)
     final = await store.read_run(run_id)
-    assert final is not None and final.outcome == "faulted"
+    assert final is not None and final.outcome is None
+    assert final.agent_phase is RoastPhase.FAULTED
 
 
 @pytest.mark.asyncio

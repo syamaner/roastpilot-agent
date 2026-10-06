@@ -3897,6 +3897,70 @@ async def test_adapter_set_targets_writes_heat_then_fan() -> None:
 
 
 @pytest.mark.asyncio
+async def test_adapter_projects_fault_acknowledgement_state_for_exact_session() -> None:
+    """The fault-ack capability reads the caller-bound session and hides MCP types."""
+    session_id = "fault-session"
+    state = {
+        **SESSION_STATE_PAYLOAD,
+        "session_id": session_id,
+        "active": False,
+        "heat_level_percent": 0,
+        "fan_level_percent": 0,
+        "cooling_on": True,
+        "device_state": {
+            **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+            "connected": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 0,
+            "cooling_on": True,
+        },
+    }
+    stop_result = {**EVENT_RESULT_PAYLOAD, "session_id": session_id}
+    caller = _SequenceCaller([state, state, stop_result])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    await adapter.read_telemetry()
+    assert adapter.latest_fault_session_id == session_id
+    proof = await adapter.read_fault_acknowledgement_state(session_id)
+    stopped = await adapter.stop_cooling_for_fault_acknowledgement()
+
+    assert proof.session_id == session_id
+    assert proof.active is False
+    assert proof.device_connected is True
+    assert proof.heat_level_percent == 0
+    assert proof.fan_level_percent == 0
+    assert proof.cooling_on is True
+    assert stopped.session_id == session_id
+    assert caller.calls == [
+        ("get_roast_state", {}),
+        ("get_roast_state", {"session_id": session_id}),
+        ("stop_cooling", {}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fault_acknowledgement_rejects_malformed_or_disagreeing_controls() -> None:
+    """The adapter fails closed before a fault acknowledgement sees bad state."""
+    malformed = {**SESSION_STATE_PAYLOAD, "active": "false"}
+    client = RoasterMCPClient(_SequenceCaller([malformed]))
+    with pytest.raises(ValidationError):
+        await client.get_roast_state()
+
+    disagreeing = {
+        **SESSION_STATE_PAYLOAD,
+        "device_state": {
+            **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+            "heat_level_percent": 0,
+        },
+    }
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([disagreeing])))
+    with pytest.raises(ValueError, match="controls disagree"):
+        await adapter.read_fault_acknowledgement_state(
+            cast("str", SESSION_STATE_PAYLOAD["session_id"])
+        )
+
+
+@pytest.mark.asyncio
 async def test_adapter_read_telemetry_propagates_transport_error() -> None:
     """Transport failures must propagate so the controller's consecutive-failure
     rules see a read fault — never a silent reconnect-and-continue."""

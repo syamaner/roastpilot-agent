@@ -45,14 +45,20 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Annotated, Any, Literal, Protocol, cast
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceConfig
-from roastpilot_agent.models import AppliedRoasterState, MicStatus, RoastTelemetry
+from roastpilot_agent.models import (
+    AppliedRoasterState,
+    FaultAcknowledgementState,
+    FaultCoolingStopResult,
+    MicStatus,
+    RoastTelemetry,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -142,12 +148,12 @@ class RoasterDeviceState(MCPMirror):
     """Mirror of mcp_server.RoasterDeviceState."""
 
     driver: str
-    connected: bool
+    connected: StrictBool
     bean_temp_c: float | None
     env_temp_c: float | None
-    heat_level_percent: int
-    fan_level_percent: int
-    cooling_on: bool
+    heat_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    fan_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    cooling_on: StrictBool
     raw_vendor_data: dict[str, EventPayloadValue]
 
 
@@ -214,14 +220,14 @@ class RoastSessionState(MCPMirror):
     the controller's tick consumes (via RoastTelemetry projection)."""
 
     session_id: str
-    active: bool
+    active: StrictBool
     phase: MCPPhase
     created_at_utc: str
     stopped_at_utc: str | None
     elapsed_monotonic_seconds: float
-    heat_level_percent: int
-    fan_level_percent: int
-    cooling_on: bool
+    heat_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    fan_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    cooling_on: StrictBool
     beans_added_at_utc: str | None
     first_crack_at_utc: str | None
     beans_dropped_at_utc: str | None
@@ -1095,6 +1101,38 @@ class RoasterControlAdapter:
         first read). Source of the persisted ``raw_state_json`` / dev% / MCP
         phase fields the projected telemetry drops."""
         return self._last_state
+
+    @property
+    def latest_fault_session_id(self) -> str | None:
+        """Return the latest current-run identity, or ``None`` when unknown."""
+        state = self._last_state
+        return None if state is None else state.session_id
+
+    async def read_fault_acknowledgement_state(self, session_id: str) -> FaultAcknowledgementState:
+        """Read one exact MCP session for a fault acknowledgement proof."""
+        state = await self._client.get_roast_state(session_id)
+        device = state.device_state
+        if device is None:
+            raise ValueError("fault acknowledgement state has no device state")
+        if (
+            state.heat_level_percent != device.heat_level_percent
+            or state.fan_level_percent != device.fan_level_percent
+            or state.cooling_on is not device.cooling_on
+        ):
+            raise ValueError("fault acknowledgement state controls disagree")
+        return FaultAcknowledgementState(
+            session_id=state.session_id,
+            active=state.active,
+            device_connected=device.connected,
+            heat_level_percent=device.heat_level_percent,
+            fan_level_percent=device.fan_level_percent,
+            cooling_on=device.cooling_on,
+        )
+
+    async def stop_cooling_for_fault_acknowledgement(self) -> FaultCoolingStopResult:
+        """Issue one cooling-stop command and return only its session identity."""
+        result = await self._client.stop_cooling()
+        return FaultCoolingStopResult(session_id=result.session_id)
 
     async def read_telemetry(self) -> RoastTelemetry | None:
         state = await self._client.get_roast_state()

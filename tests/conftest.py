@@ -25,6 +25,8 @@ from roastpilot_agent.mcp_client import (
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
     AppliedRoasterState,
+    FaultAcknowledgementState,
+    FaultCoolingStopResult,
     RoastEventKind,
     RoastTelemetry,
 )
@@ -84,6 +86,8 @@ class FakeMCPClient:
         drop_applied_state: AppliedRoasterState | None = DEFAULT_DROP_APPLIED_STATE,
         emergency_stop_applied_state: AppliedRoasterState
         | None = DEFAULT_EMERGENCY_STOP_APPLIED_STATE,
+        fault_acknowledgement_states: list[FaultAcknowledgementState | Exception] | None = None,
+        fault_acknowledgement_stop_results: list[FaultCoolingStopResult | Exception] | None = None,
     ) -> None:
         self.frames: list[RoastTelemetry | None | Exception] = list(frames or [])
         self._log = log if log is not None else []
@@ -95,6 +99,9 @@ class FakeMCPClient:
         #: (the RoasterControlAdapter.None-on-malformed-payload contract).
         self.drop_applied_state = drop_applied_state
         self.emergency_stop_applied_state = emergency_stop_applied_state
+        self._fault_acknowledgement_states = list(fault_acknowledgement_states or [])
+        self._fault_acknowledgement_stop_results = list(fault_acknowledgement_stop_results or [])
+        self._latest_fault_session_id: str | None = "session-1"
 
     async def read_telemetry(self) -> RoastTelemetry | None:
         self._log.append("read")
@@ -142,6 +149,50 @@ class FakeMCPClient:
     async def stop_cooling(self) -> None:
         self._log.append("stop_cooling")
         self.calls.append(("stop_cooling", {}))
+
+    @property
+    def latest_fault_session_id(self) -> str | None:
+        """Return the scripted current-session identity for fault acknowledgement."""
+        return self._latest_fault_session_id
+
+    async def read_fault_acknowledgement_state(self, session_id: str) -> FaultAcknowledgementState:
+        """Return the next hardware-free state proof for fault acknowledgement."""
+        self._log.append("fault_acknowledgement_read")
+        if not self._fault_acknowledgement_states:
+            return FaultAcknowledgementState(
+                session_id=session_id,
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=False,
+            )
+        state = (
+            self._fault_acknowledgement_states.pop(0)
+            if len(self._fault_acknowledgement_states) > 1
+            else self._fault_acknowledgement_states[0]
+        )
+        if isinstance(state, Exception):
+            raise state
+        return state
+
+    async def stop_cooling_for_fault_acknowledgement(self) -> FaultCoolingStopResult:
+        """Record one scripted acknowledgement cooling stop."""
+        self._log.append("fault_acknowledgement_stop_cooling")
+        self.calls.append(("stop_cooling", {}))
+        if not self._fault_acknowledgement_stop_results:
+            session_id = self._latest_fault_session_id
+            if session_id is None:
+                raise RuntimeError("fault acknowledgement has no session")
+            return FaultCoolingStopResult(session_id=session_id)
+        result = (
+            self._fault_acknowledgement_stop_results.pop(0)
+            if len(self._fault_acknowledgement_stop_results) > 1
+            else self._fault_acknowledgement_stop_results[0]
+        )
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
         self._log.append("emergency_stop")

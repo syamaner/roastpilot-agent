@@ -17,7 +17,15 @@ from enum import Enum
 from typing import Annotated, Any, Literal, cast
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, PrivateAttr, StrictBool, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 
 class RoastPhase(Enum):
@@ -510,6 +518,32 @@ class AppliedRoasterState(BaseModel):
     heat_level_percent: int = Field(ge=0, le=100)
     fan_level_percent: int = Field(ge=0, le=100)
     cooling_on: bool
+
+
+class FaultAcknowledgementState(BaseModel):
+    """Closed post-fault control state used to authorise final acknowledgement.
+
+    The MCP adapter projects its current session into this application-owned
+    shape. It deliberately contains only the session identity and controls
+    whose safe-zero state is required before a faulted Agent run may finish.
+    """
+
+    session_id: str = Field(min_length=1)
+    active: StrictBool
+    device_connected: StrictBool
+    heat_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    fan_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    cooling_on: StrictBool
+
+
+class FaultCoolingStopResult(BaseModel):
+    """Typed identity returned by a fault-acknowledgement cooling stop.
+
+    The result proves only which MCP session accepted the command. The runner
+    always follows it with a fresh :class:`FaultAcknowledgementState` read.
+    """
+
+    session_id: str = Field(min_length=1)
 
 
 # Bean species (botanical) — a constrained ``Literal`` deliberately, NOT a

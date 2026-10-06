@@ -105,6 +105,8 @@ from roastpilot_agent.models import (
     ChargeWeightRequest,
     ClearStaleSessionRequest,
     ClearStaleSessionResult,
+    FaultAcknowledgementState,
+    FaultCoolingStopResult,
     HardwareClearAcknowledgementRequest,
     HardwareClearAcknowledgementResult,
     HealthResponse,
@@ -212,7 +214,24 @@ DEFAULT_HTTP_ACCESS_LOG_QUIET_PATHS: tuple[str, ...] = (
 #: A roaster control surface satisfies both controller protocols (read + write).
 #: The E9 live stack wires either the real ``RoasterControlAdapter`` (over the
 #: MCP child) or a test fake here — the controller never sees the MCP client.
-class RoasterControl(StateReader, CommandExecutor, Protocol): ...
+class FaultAcknowledgementControl(Protocol):
+    """Consumer-owned post-fault state and command capability."""
+
+    @property
+    def latest_fault_session_id(self) -> str | None:
+        """Return the current-run session identity, or ``None`` when unknown."""
+        ...
+
+    async def read_fault_acknowledgement_state(self, session_id: str) -> FaultAcknowledgementState:
+        """Read the exact session state required for acknowledgement."""
+        ...
+
+    async def stop_cooling_for_fault_acknowledgement(self) -> FaultCoolingStopResult:
+        """Issue one post-fault cooling stop and return its session identity."""
+        ...
+
+
+class RoasterControl(StateReader, CommandExecutor, FaultAcknowledgementControl, Protocol): ...
 
 
 class LogExporter(Protocol):
@@ -681,6 +700,7 @@ class RoastRunner:
         clock: Callable[[], float],
         exporter: LogExporter | None = None,
         raw_state: RawStateSource | None = None,
+        fault_acknowledgement: FaultAcknowledgementControl | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         configured_doctrine_enabled: bool | None = None,
     ) -> None:
@@ -694,6 +714,7 @@ class RoastRunner:
         self._clock = clock
         self._exporter = exporter
         self._raw_state = raw_state
+        self._fault_acknowledgement = fault_acknowledgement
         self._sleep = sleep
         self._finalized = False
         # Whether the operator has acknowledged a fault (#206). A fault no longer
@@ -1008,7 +1029,13 @@ class RoastRunner:
             if item.run_id == self._run_id:
                 batch.append(item)
         batch.sort(key=lambda item: item.action is not OperatorAction.EMERGENCY_STOP)
+        fault_acknowledgement_seen = False
         for item in batch:
+            if item.action is OperatorAction.ACKNOWLEDGE_FAULT:
+                if fault_acknowledgement_seen:
+                    await self._record_fault_acknowledgement_failure("duplicate")
+                    continue
+                fault_acknowledgement_seen = True
             await self._dispatch(item)
 
     async def _dispatch(self, item: QueuedOperatorAction) -> None:
@@ -1080,36 +1107,76 @@ class RoastRunner:
         )
 
     async def _dispatch_acknowledge_fault(self, payload: dict[str, Any]) -> None:
-        """Phase-based ``acknowledge_fault`` (#206): from ``faulted`` it flips the
-        ``_fault_acknowledged`` flag so :meth:`_handle_completion` finalises the
-        run this tick (outcome ``faulted``) and the loop stops; it issues NO MCP
-        write (heat is already off in ``faulted`` and stays off). Any other phase
-        records a failed operator action — acknowledging a fault is meaningless
-        outside ``faulted``.
-
-        Records the execution-outcome ``operator_actions`` row (the queue-
-        acceptance row was already written at submit) so the trace carries the
-        only meaningful outcome signal for a control-only action with no matrix
-        pre-check, mirroring :meth:`_dispatch_acknowledge`."""
-        if self._controller.phase is RoastPhase.FAULTED:
-            self._fault_acknowledged = True
-            # #332: tell the controller too, so THIS tick's latched tick() skips the
-            # upward-escalation re-read (a wedged-child read there would otherwise
-            # sit between this drain and the same-tick finalise, delaying the
-            # acknowledge from clearing — the roast-3 "slow to clear" latency).
-            self._controller.note_fault_acknowledged()
-            await self._store.record_operator_action(
-                action=OperatorAction.ACKNOWLEDGE_FAULT.value,
-                result="accepted",
-                run_id=self._run_id,
-                payload=payload or None,
-            )
+        """Complete a fault only after a matching MCP safe-zero proof."""
+        del payload  # Bounded execution diagnostics must not repeat operator input.
+        if self._controller.phase is not RoastPhase.FAULTED or self._fault_acknowledged:
+            await self._record_fault_acknowledgement_failure("not_faulted")
             return
+        capability = self._fault_acknowledgement
+        if capability is None:
+            await self._record_fault_acknowledgement_failure("state_unavailable")
+            return
+        session_id = capability.latest_fault_session_id
+        if session_id is None:
+            await self._record_fault_acknowledgement_failure("no_session")
+            return
+        try:
+            before = await capability.read_fault_acknowledgement_state(session_id)
+        except Exception:  # noqa: BLE001 - MCP timeout/error/malformed state fails closed
+            await self._record_fault_acknowledgement_failure("state_unavailable")
+            return
+        if not self._fault_acknowledgement_controls_are_safe(before, session_id):
+            await self._record_fault_acknowledgement_failure("unsafe_state")
+            return
+        if before.cooling_on:
+            if not await self._controller.authorize_fault_acknowledgement_stop_cooling():
+                await self._record_fault_acknowledgement_failure("policy_rejected")
+                return
+            try:
+                stopped = await capability.stop_cooling_for_fault_acknowledgement()
+            except Exception:  # noqa: BLE001 - no automatic retry after uncertain write
+                await self._record_fault_acknowledgement_failure("stop_unconfirmed")
+                return
+            if stopped.session_id != session_id:
+                await self._record_fault_acknowledgement_failure("session_mismatch")
+                return
+        try:
+            after = await capability.read_fault_acknowledgement_state(session_id)
+        except Exception:  # noqa: BLE001 - a command result is never sufficient proof
+            await self._record_fault_acknowledgement_failure("state_unavailable")
+            return
+        if not self._fault_acknowledgement_controls_are_safe(after, session_id) or after.cooling_on:
+            await self._record_fault_acknowledgement_failure("unsafe_state")
+            return
+        self._fault_acknowledged = True
+        self._controller.note_fault_acknowledged()
+        await self._store.record_operator_action(
+            action=OperatorAction.ACKNOWLEDGE_FAULT.value,
+            result="accepted",
+            run_id=self._run_id,
+            payload={"fault_acknowledgement": "confirmed"},
+        )
+
+    @staticmethod
+    def _fault_acknowledgement_controls_are_safe(
+        state: FaultAcknowledgementState, session_id: str
+    ) -> bool:
+        """Return whether one exact inactive session proves safe-zero controls."""
+        return (
+            state.session_id == session_id
+            and not state.active
+            and state.device_connected
+            and state.heat_level_percent == 0
+            and state.fan_level_percent == 0
+        )
+
+    async def _record_fault_acknowledgement_failure(self, outcome: str) -> None:
+        """Record a bounded failure without MCP identity or error details."""
         await self._store.record_operator_action(
             action=OperatorAction.ACKNOWLEDGE_FAULT.value,
             result="failed",
             run_id=self._run_id,
-            payload=payload or None,
+            payload={"fault_acknowledgement": outcome},
         )
 
     async def _record_dispatch_command(
@@ -2259,6 +2326,7 @@ class RoastService:
             clock=self._clock,
             exporter=self._exporter,
             raw_state=self._raw_state,
+            fault_acknowledgement=roaster,
             configured_doctrine_enabled=configured_doctrine_enabled,
         )
         self.runner = runner
