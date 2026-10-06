@@ -6084,6 +6084,103 @@ async def test_acknowledge_retry_does_not_repeat_a_confirmed_cooling_stop(
 
 
 @pytest.mark.asyncio
+async def test_queued_emergency_stop_preempts_blocked_fault_acknowledgement_final_read(
+    store: RoastStore,
+) -> None:
+    """An e-stop admitted after drain survives an ACK's blocked final read."""
+    service, mcp, clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_read = mcp.read_fault_acknowledgement_state
+    reads = 0
+
+    async def block_final_read(session_id: str) -> FaultAcknowledgementState:
+        nonlocal reads
+        reads += 1
+        state = await original_read(session_id)
+        if reads == 2:
+            entered.set()
+            await release.wait()
+        return state
+
+    mcp.read_fault_acknowledgement_state = block_final_read
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    pending_tick = asyncio.create_task(service.runner.tick_once())
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    e_stop = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"})
+    )
+    assert e_stop.result == "accepted" and e_stop.queued is True
+
+    release.set()
+    assert not await asyncio.wait_for(pending_tick, timeout=1.0)
+    detail = await store.read_run(run_id)
+    assert detail is not None and detail.completed_at_utc is None
+
+    assert not await _tick(service, clock)
+    assert mcp.commands().count("emergency_stop") == 2
+
+    fresh = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    assert fresh.result == "accepted"
+    assert await _tick(service, clock)
+
+
+@pytest.mark.asyncio
+async def test_emergency_stop_is_rejected_once_fault_finalization_has_started(
+    store: RoastStore,
+) -> None:
+    """No e-stop can be accepted after the runner has reserved fault completion."""
+    service, mcp, _clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_complete = store.complete_run
+
+    async def block_completion(
+        *,
+        run_id: str,
+        outcome: Literal["completed", "aborted", "faulted"],
+        agent_phase: RoastPhase,
+        fault_reason: str | None = None,
+        log_dir: str | None = None,
+        export_manifest: object = None,
+    ) -> None:
+        entered.set()
+        await release.wait()
+        await original_complete(
+            run_id=run_id,
+            outcome=outcome,
+            agent_phase=agent_phase,
+            fault_reason=fault_reason,
+            log_dir=log_dir,
+            export_manifest=export_manifest,
+        )
+
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    with mock.patch.object(store, "complete_run", block_completion):
+        pending_tick = asyncio.create_task(service.runner.tick_once())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        e_stop = await service.submit_operator_action(
+            run_id,
+            OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"}),
+        )
+        assert e_stop.result == "rejected"
+        assert e_stop.queued is False
+        assert "finalization" in e_stop.reason
+        release.set()
+        assert await asyncio.wait_for(pending_tick, timeout=1.0)
+
+    assert mcp.commands().count("emergency_stop") == 1
+
+
+@pytest.mark.asyncio
 async def test_acknowledge_fault_is_rejected_before_fault_then_emergency_stop(
     store: RoastStore,
 ) -> None:

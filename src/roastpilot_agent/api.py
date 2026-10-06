@@ -682,6 +682,28 @@ class _TickCounter:
         self.value = 0
 
 
+class _FaultAcknowledgementGate:
+    """Synchronize fault acknowledgement with admitted emergency-stop intent."""
+
+    def __init__(self) -> None:
+        self.emergency_request_epoch = 0
+        self.fault_finalization_started = False
+
+    def admit_emergency_stop(self) -> bool:
+        """Record an enqueued e-stop unless fault finalization has started."""
+        if self.fault_finalization_started:
+            return False
+        self.emergency_request_epoch += 1
+        return True
+
+    def begin_fault_finalization(self, acknowledgement_epoch: int) -> bool:
+        """Atomically reserve finalization when no newer e-stop is queued."""
+        if self.emergency_request_epoch != acknowledgement_epoch:
+            return False
+        self.fault_finalization_started = True
+        return True
+
+
 # The MCP ambient reading is cached for about 30 seconds, so one bad read can
 # shadow charge for a full cache period.  Three periods with margin allow a
 # truthful charge-room capture while room drift remains negligible.  This is
@@ -715,6 +737,7 @@ class RoastRunner:
         exporter: LogExporter | None = None,
         raw_state: RawStateSource | None = None,
         fault_acknowledgement: FaultAcknowledgementControl | None = None,
+        fault_acknowledgement_gate: _FaultAcknowledgementGate | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         configured_doctrine_enabled: bool | None = None,
     ) -> None:
@@ -729,6 +752,8 @@ class RoastRunner:
         self._exporter = exporter
         self._raw_state = raw_state
         self._fault_acknowledgement = fault_acknowledgement
+        self._fault_acknowledgement_gate = fault_acknowledgement_gate or _FaultAcknowledgementGate()
+        self._fault_acknowledgement_epoch: int | None = None
         self._sleep = sleep
         self._finalized = False
         # Whether the operator has acknowledged a fault (#206). A fault no longer
@@ -1075,6 +1100,9 @@ class RoastRunner:
         if item.action is OperatorAction.EMERGENCY_STOP:
             reason = payload.get("reason")
             await controller.operator_emergency_stop(reason if isinstance(reason, str) else None)
+            # An e-stop starts a new cooling cycle even if the MCP retains the
+            # same session identity, so an earlier stop proof cannot be reused.
+            self._confirmed_fault_cooling_stop_sessions.clear()
             tool = RoastCommand.EMERGENCY_STOP
         elif item.action is OperatorAction.MARK_BEANS_ADDED:
             await controller.operator_mark_beans_added()
@@ -1136,6 +1164,7 @@ class RoastRunner:
     async def _dispatch_acknowledge_fault(self, payload: dict[str, Any]) -> None:
         """Complete a fault only after a matching MCP safe-zero proof."""
         del payload  # Bounded execution diagnostics must not repeat operator input.
+        acknowledgement_epoch = self._fault_acknowledgement_gate.emergency_request_epoch
         if self._controller.phase is not RoastPhase.FAULTED or self._fault_acknowledged:
             await self._record_fault_acknowledgement_failure("not_faulted")
             return
@@ -1159,6 +1188,9 @@ class RoastRunner:
             if not await self._controller.authorize_fault_acknowledgement_stop_cooling():
                 await self._record_fault_acknowledgement_failure("policy_rejected")
                 return
+            if self._fault_acknowledgement_gate.emergency_request_epoch != acknowledgement_epoch:
+                await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
+                return
             # Bind the unscoped MCP stop to the still-current session immediately
             # before the write. The runner is the Agent's sole serialized command
             # client, so no Agent write can interleave this proof and the write.
@@ -1173,6 +1205,12 @@ class RoastRunner:
                 await self._record_fault_acknowledgement_failure("unsafe_state")
                 return
             if immediately_before_stop.cooling_on:
+                if (
+                    self._fault_acknowledgement_gate.emergency_request_epoch
+                    != acknowledgement_epoch
+                ):
+                    await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
+                    return
                 try:
                     stopped = await capability.stop_cooling_for_fault_acknowledgement()
                 except Exception:  # noqa: BLE001 - no automatic retry after uncertain write
@@ -1190,14 +1228,23 @@ class RoastRunner:
         if not self._fault_acknowledgement_controls_are_safe(after, session_id):
             await self._record_fault_acknowledgement_failure("unsafe_state")
             return
-        self._fault_acknowledged = True
-        self._controller.note_fault_acknowledged()
+        if self._fault_acknowledgement_gate.emergency_request_epoch != acknowledgement_epoch:
+            await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
+            return
         await self._store.record_operator_action(
             action=OperatorAction.ACKNOWLEDGE_FAULT.value,
             result="accepted",
             run_id=self._run_id,
             payload={"fault_acknowledgement": "confirmed"},
         )
+        # The persistence write above awaits, so it too is a preemption point.
+        # There is no await from this final check through the completion gate.
+        if self._fault_acknowledgement_gate.emergency_request_epoch != acknowledgement_epoch:
+            await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
+            return
+        self._fault_acknowledged = True
+        self._fault_acknowledgement_epoch = acknowledgement_epoch
+        self._controller.note_fault_acknowledged()
         self._emitter.emit(RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED, {"outcome": "confirmed"})
 
     @staticmethod
@@ -1306,6 +1353,19 @@ class RoastRunner:
             return False
         if self._finalized:
             return True
+        if phase is RoastPhase.FAULTED:
+            acknowledgement_epoch = self._fault_acknowledgement_epoch
+            if (
+                acknowledgement_epoch is None
+                or not self._fault_acknowledgement_gate.begin_fault_finalization(
+                    acknowledgement_epoch
+                )
+            ):
+                # A newer admitted e-stop remains queued for the next drain. It
+                # supersedes this acknowledgement and keeps the fault operable.
+                self._fault_acknowledged = False
+                self._fault_acknowledgement_epoch = None
+                return False
         self._finalized = True
         if phase is RoastPhase.COMPLETE:
             manifest = await self._export_logs()
@@ -1799,6 +1859,7 @@ class RoastService:
         self.operator_queue: asyncio.Queue[QueuedOperatorAction] = asyncio.Queue(
             maxsize=self.OPERATOR_QUEUE_MAX
         )
+        self._fault_acknowledgement_gate = _FaultAcknowledgementGate()
         # The mcp_device config that the MCP child was most recently spawned
         # with.  Compared against the freshly-reloaded config at each
         # start_roast: when they differ the child is respawned with the new
@@ -2372,6 +2433,9 @@ class RoastService:
         roaster = self._roaster
         if roaster is None:  # pragma: no cover — guarded by the caller
             return None
+        # Gates are per live run: a completed prior run must never reject the
+        # independent operator e-stop for a newly constructed runner.
+        self._fault_acknowledgement_gate = _FaultAcknowledgementGate()
         run_config = config or self._config
         run_safety = safety or self._safety
         reference_roast = await self._retrieve_reference_for(
@@ -2404,6 +2468,7 @@ class RoastService:
             exporter=self._exporter,
             raw_state=self._raw_state,
             fault_acknowledgement=roaster,
+            fault_acknowledgement_gate=self._fault_acknowledgement_gate,
             configured_doctrine_enabled=configured_doctrine_enabled,
         )
         self.runner = runner
@@ -3376,19 +3441,35 @@ class RoastService:
 
         queued = False
         if result == "accepted":
-            try:
-                self.operator_queue.put_nowait(
-                    QueuedOperatorAction(
-                        run_id=run_id, action=request.action, payload=request.payload
+            # No await occurs from this final check through enqueue + epoch
+            # increment, so a fault finalization cannot race an accepted e-stop
+            # into a queue that will no longer drain.
+            if (
+                request.action is OperatorAction.EMERGENCY_STOP
+                and self._fault_acknowledgement_gate.fault_finalization_started
+            ):
+                result = "rejected"
+                reason = "emergency_stop cannot be queued while fault finalization is completing"
+            else:
+                try:
+                    self.operator_queue.put_nowait(
+                        QueuedOperatorAction(
+                            run_id=run_id, action=request.action, payload=request.payload
+                        )
                     )
-                )
-                queued = True
-            except asyncio.QueueFull:
-                # Backstop bound hit (pathological spam). Report failed rather
-                # than 500 or silently drop — the operator sees the action did
-                # not take. The stored row reflects the final outcome (below).
-                result = "failed"
-                reason = "operator action queue is full; action not accepted"
+                    if request.action is OperatorAction.EMERGENCY_STOP:
+                        admitted = self._fault_acknowledgement_gate.admit_emergency_stop()
+                        if not admitted:  # pragma: no cover - no await since pre-check
+                            raise RuntimeError(
+                                "fault finalization started during emergency-stop enqueue"
+                            )
+                    queued = True
+                except asyncio.QueueFull:
+                    # Backstop bound hit (pathological spam). Report failed rather
+                    # than 500 or silently drop — the operator sees the action did
+                    # not take. The stored row reflects the final outcome (below).
+                    result = "failed"
+                    reason = "operator action queue is full; action not accepted"
 
         await self._store.record_operator_action(
             action=request.action.value,
