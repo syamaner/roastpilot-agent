@@ -6131,6 +6131,58 @@ async def test_queued_emergency_stop_preempts_blocked_fault_acknowledgement_fina
 
 
 @pytest.mark.asyncio
+async def test_emergency_stop_after_ack_proof_cancels_without_confirmed_outcome(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An e-stop admitted after safe proof cancels ACK before any success report."""
+    service, mcp, clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def block_controller_tick() -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(
+        service.runner._controller,  # pyright: ignore[reportPrivateUsage]
+        "tick",
+        block_controller_tick,
+    )
+    subscriber = service.events.subscribe()
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    pending_tick = asyncio.create_task(service.runner.tick_once())
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    e_stop = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"})
+    )
+    assert e_stop.result == "accepted" and e_stop.queued is True
+
+    release.set()
+    assert not await asyncio.wait_for(pending_tick, timeout=1.0)
+    detail = await store.read_run(run_id)
+    assert detail is not None and detail.completed_at_utc is None
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in events
+    )
+    timeline = await store.read_timeline(run_id)
+    assert not any(
+        event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.payload == {"outcome": "confirmed"}
+        for event in timeline.events
+    )
+
+    monkeypatch.undo()
+    assert not await _tick(service, clock)
+    assert mcp.commands().count("emergency_stop") == 2
+
+
+@pytest.mark.asyncio
 async def test_emergency_stop_is_rejected_once_fault_finalization_has_started(
     store: RoastStore,
 ) -> None:

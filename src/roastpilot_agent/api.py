@@ -1231,21 +1231,10 @@ class RoastRunner:
         if self._fault_acknowledgement_gate.emergency_request_epoch != acknowledgement_epoch:
             await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
             return
-        await self._store.record_operator_action(
-            action=OperatorAction.ACKNOWLEDGE_FAULT.value,
-            result="accepted",
-            run_id=self._run_id,
-            payload={"fault_acknowledgement": "confirmed"},
-        )
-        # The persistence write above awaits, so it too is a preemption point.
-        # There is no await from this final check through the completion gate.
-        if self._fault_acknowledgement_gate.emergency_request_epoch != acknowledgement_epoch:
-            await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
-            return
-        self._fault_acknowledged = True
+        # The proof is pending until _handle_completion atomically reserves
+        # fault finalization. Reporting confirmation here would let a later tick
+        # await admit an e-stop and then cancel a success the UI already saw.
         self._fault_acknowledgement_epoch = acknowledgement_epoch
-        self._controller.note_fault_acknowledged()
-        self._emitter.emit(RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED, {"outcome": "confirmed"})
 
     @staticmethod
     def _fault_acknowledgement_controls_are_safe(state: object, session_id: str) -> bool:
@@ -1328,8 +1317,8 @@ class RoastRunner:
         """Finalise the run on a terminal phase — but a fault no longer
         auto-finalises (#206).
 
-        ``complete`` finalises immediately. ``faulted`` finalises ONLY after the
-        operator has acknowledged it (``self._fault_acknowledged``): until then
+        ``complete`` finalises immediately. ``faulted`` finalises ONLY after a
+        safe-zero acknowledgement proof reserves finalization: until then
         the faulted run stays live (the loop keeps ticking and draining the
         queue, heat already forced to 0) so the operator can still engage or stop
         cooling on a physically-running machine — a fault must never strand a hot
@@ -1347,7 +1336,7 @@ class RoastRunner:
             # the flush has drained it (#206).
             self._captured_fault_reason = self._last_fault_reason()
         finalise = phase is RoastPhase.COMPLETE or (
-            phase is RoastPhase.FAULTED and self._fault_acknowledged
+            phase is RoastPhase.FAULTED and self._fault_acknowledgement_epoch is not None
         )
         if not finalise:
             return False
@@ -1365,7 +1354,21 @@ class RoastRunner:
                 # supersedes this acknowledgement and keeps the fault operable.
                 self._fault_acknowledged = False
                 self._fault_acknowledgement_epoch = None
+                await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
                 return False
+            # The gate now rejects new e-stops, so this is the first point at
+            # which a confirmed audit row and SSE event may be published.
+            self._fault_acknowledged = True
+            self._controller.note_fault_acknowledged()
+            await self._store.record_operator_action(
+                action=OperatorAction.ACKNOWLEDGE_FAULT.value,
+                result="accepted",
+                run_id=self._run_id,
+                payload={"fault_acknowledgement": "confirmed"},
+            )
+            self._emitter.emit(
+                RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED, {"outcome": "confirmed"}
+            )
         self._finalized = True
         if phase is RoastPhase.COMPLETE:
             manifest = await self._export_logs()
