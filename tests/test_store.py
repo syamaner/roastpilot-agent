@@ -416,11 +416,11 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
 
 
 @pytest.mark.asyncio
-async def test_fresh_store_is_v16(tmp_store: RoastStore) -> None:
-    """A brand-new store lands on the current (v16) schema version."""
+async def test_fresh_store_is_v17(tmp_store: RoastStore) -> None:
+    """A brand-new store lands on the current (v17) schema version."""
     await tmp_store.initialize()
     try:
-        assert await tmp_store.schema_version() == 16 == len(MIGRATIONS)
+        assert await tmp_store.schema_version() == 17 == len(MIGRATIONS)
     finally:
         await tmp_store.close()
 

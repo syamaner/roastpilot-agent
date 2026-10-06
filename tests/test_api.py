@@ -6183,10 +6183,10 @@ async def test_emergency_stop_after_ack_proof_cancels_without_confirmed_outcome(
 
 
 @pytest.mark.asyncio
-async def test_emergency_stop_is_rejected_once_fault_finalization_has_started(
+async def test_emergency_stop_is_dispatched_once_fault_finalization_has_started(
     store: RoastStore,
 ) -> None:
-    """No e-stop can be accepted after the runner has reserved fault completion."""
+    """An e-stop remains controller-dispatched while completion persists."""
     service, mcp, _clock, run_id = await _faulted_live_service(store)
     assert service.runner is not None
     entered = asyncio.Event()
@@ -6223,13 +6223,63 @@ async def test_emergency_stop_is_rejected_once_fault_finalization_has_started(
             run_id,
             OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"}),
         )
-        assert e_stop.result == "rejected"
+        assert e_stop.result == "accepted"
         assert e_stop.queued is False
-        assert "finalization" in e_stop.reason
+        assert "dispatched" in e_stop.reason
+        assert mcp.commands().count("emergency_stop") == 2
+        # The normal tick is still blocked before its final flush. Direct
+        # dispatch drains the shared emitter, so the already-confirmed event is
+        # persisted rather than stranded when completion later resumes.
+        timeline_while_blocked = await store.read_timeline(run_id)
+        assert any(
+            event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
+            and event.payload == {"outcome": "confirmed"}
+            for event in timeline_while_blocked.events
+        )
         release.set()
         assert await asyncio.wait_for(pending_tick, timeout=1.0)
 
+    assert mcp.commands().count("emergency_stop") == 2
+    detail = await store.read_run(run_id)
+    assert detail is not None and detail.outcome == "faulted"
+    async with store.connection.execute(
+        "SELECT result FROM operator_actions WHERE run_id = ? AND action = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (run_id, OperatorAction.EMERGENCY_STOP.value),
+    ) as cursor:
+        e_stop_action = await cursor.fetchone()
+    assert e_stop_action is not None and e_stop_action[0] == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_controller_emergency_escalation_invalidates_pending_fault_acknowledgement(
+    store: RoastStore,
+) -> None:
+    """A same-tick hard ceiling escalation cannot confirm an earlier safe proof."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([RuntimeError("fault")])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    for _ in range(3):
+        assert not await _tick(service, clock)
+    faulted = await store.read_run(run_id)
+    assert faulted is not None and faulted.agent_phase is RoastPhase.FAULTED
+    mcp.frames = [_reading(235.0, 200.0)]
+    subscriber = service.events.subscribe()
+    acknowledgement = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    assert acknowledgement.result == "accepted"
+
+    assert not await _tick(service, clock)
+    detail = await store.read_run(run_id)
+    assert detail is not None and detail.completed_at_utc is None
     assert mcp.commands().count("emergency_stop") == 1
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in events
+    )
 
 
 @pytest.mark.asyncio

@@ -703,6 +703,10 @@ class _FaultAcknowledgementGate:
         self.fault_finalization_started = True
         return True
 
+    def invalidate_fault_acknowledgement(self) -> None:
+        """Invalidate pending acknowledgement proof for an emergency stop."""
+        self.emergency_request_epoch += 1
+
 
 # The MCP ambient reading is cached for about 30 seconds, so one bad read can
 # shadow charge for a full cache period.  Three periods with margin allow a
@@ -754,6 +758,7 @@ class RoastRunner:
         self._fault_acknowledgement = fault_acknowledgement
         self._fault_acknowledgement_gate = fault_acknowledgement_gate or _FaultAcknowledgementGate()
         self._fault_acknowledgement_epoch: int | None = None
+        self._event_flush_lock = asyncio.Lock()
         self._sleep = sleep
         self._finalized = False
         # Whether the operator has acknowledged a fault (#206). A fault no longer
@@ -1049,7 +1054,11 @@ class RoastRunner:
         ``logs_exported`` are never emitted-but-unpersisted) → telemetry."""
         self._counter.value += 1
         await self._drain_queue()
+        events_before_controller_tick = len(self._emitter.peek())
         await self._controller.tick()
+        if self._controller_tick_emergency_stop_emitted(events_before_controller_tick):
+            self._fault_acknowledgement_gate.invalidate_fault_acknowledgement()
+            self._confirmed_fault_cooling_stop_sessions.clear()
         finalized = await self._handle_completion()
         await self._flush_events()
         await self._publish_and_persist_telemetry()
@@ -1129,6 +1138,41 @@ class RoastRunner:
             await self._dispatch_acknowledge_fault(payload)
         if tool is not None:
             await self._record_dispatch_command(tool, item, since=before)
+
+    async def dispatch_emergency_stop_during_fault_finalization(
+        self, item: QueuedOperatorAction
+    ) -> bool:
+        """Execute an admitted e-stop while fault completion awaits persistence.
+
+        This bypasses no safety policy: it calls the same controller-owned
+        emergency-stop dispatch as the queue. It is used only after a fault
+        finalization reservation, when accepting another queue item would leave
+        it undrained if completion wins its persistence race.
+        """
+        if self._finalized or not self._fault_acknowledgement_gate.fault_finalization_started:
+            return False
+        self._fault_acknowledgement_gate.invalidate_fault_acknowledgement()
+        await self._dispatch(item)
+        # The normal tick may already have passed its final event flush while
+        # awaiting completion persistence. Drain under the shared flush lock so
+        # direct emergency dispatch cannot leave a buffered event behind.
+        await self._flush_events()
+        return True
+
+    def _controller_tick_emergency_stop_emitted(self, start: int) -> bool:
+        """Return whether this controller tick invalidated safe-zero proof."""
+        for event in self._emitter.peek()[start:]:
+            payload = _as_event_data(event.payload)
+            if (
+                event.kind in (RoastEventKind.COMMAND_EXECUTED, RoastEventKind.COMMAND_FAILED)
+                and payload.get("command") == "emergency_stop"
+            ):
+                return True
+            if event.kind is RoastEventKind.FAULT:
+                verdict = payload.get("verdict")
+                if verdict in (SafetyVerdict.EMERGENCY_STOP, SafetyVerdict.EMERGENCY_STOP.value):
+                    return True
+        return False
 
     async def _dispatch_acknowledge(self, payload: dict[str, Any]) -> None:
         """Phase-based ``acknowledge_recovery``: from ``operator_recovery_required``
@@ -1369,7 +1413,6 @@ class RoastRunner:
             self._emitter.emit(
                 RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED, {"outcome": "confirmed"}
             )
-        self._finalized = True
         if phase is RoastPhase.COMPLETE:
             manifest = await self._export_logs()
             await self._store.complete_run(
@@ -1390,6 +1433,7 @@ class RoastRunner:
                 fault_reason=self._captured_fault_reason or self._last_fault_reason(),
             )
         self._last_persisted_phase = phase
+        self._finalized = True
         return True
 
     async def _export_logs(self) -> LogManifest | None:
@@ -1425,20 +1469,21 @@ class RoastRunner:
         return None  # pragma: no cover — every fault evaluation carries a reason
 
     async def _flush_events(self) -> None:
-        for event in self._emitter.drain():
-            try:
-                payload = self._event_payload_for_persistence(event)
-                await self._store.record_event(
-                    run_id=self._run_id,
-                    kind=event.kind,
-                    source=_event_source(event),
-                    monotonic_seconds=event.monotonic_seconds,
-                    payload=payload,
-                )
-            except Exception:
-                # One bad row never crashes the safety tick loop or drops a
-                # sibling event already delivered to SSE.
-                continue
+        async with self._event_flush_lock:
+            for event in self._emitter.drain():
+                try:
+                    payload = self._event_payload_for_persistence(event)
+                    await self._store.record_event(
+                        run_id=self._run_id,
+                        kind=event.kind,
+                        source=_event_source(event),
+                        monotonic_seconds=event.monotonic_seconds,
+                        payload=payload,
+                    )
+                except Exception:
+                    # One bad row never crashes the safety tick loop or drops a
+                    # sibling event already delivered to SSE.
+                    continue
 
     def _event_payload_for_persistence(self, event: _BufferedEvent) -> object:
         """Add recovery evidence to the persisted copy without changing SSE bytes."""
@@ -3443,36 +3488,45 @@ class RoastService:
                 reason = evaluation.reason
 
         queued = False
-        if result == "accepted":
+        if (
+            result == "accepted"
+            and request.action is OperatorAction.EMERGENCY_STOP
+            and self._fault_acknowledgement_gate.fault_finalization_started
+        ):
+            runner = self.runner
+            if runner is None:
+                result = "rejected"
+                reason = "emergency_stop cannot be dispatched after fault finalization"
+            else:
+                dispatched = await runner.dispatch_emergency_stop_during_fault_finalization(
+                    QueuedOperatorAction(
+                        run_id=run_id, action=request.action, payload=request.payload
+                    )
+                )
+                if dispatched:
+                    reason = "emergency_stop accepted and dispatched during fault finalization"
+                else:
+                    result = "rejected"
+                    reason = "emergency_stop cannot be dispatched after fault finalization"
+        elif result == "accepted":
             # No await occurs from this final check through enqueue + epoch
             # increment, so a fault finalization cannot race an accepted e-stop
             # into a queue that will no longer drain.
-            if (
-                request.action is OperatorAction.EMERGENCY_STOP
-                and self._fault_acknowledgement_gate.fault_finalization_started
-            ):
-                result = "rejected"
-                reason = "emergency_stop cannot be queued while fault finalization is completing"
-            else:
-                try:
-                    self.operator_queue.put_nowait(
-                        QueuedOperatorAction(
-                            run_id=run_id, action=request.action, payload=request.payload
-                        )
+            try:
+                self.operator_queue.put_nowait(
+                    QueuedOperatorAction(
+                        run_id=run_id, action=request.action, payload=request.payload
                     )
-                    if request.action is OperatorAction.EMERGENCY_STOP:
-                        admitted = self._fault_acknowledgement_gate.admit_emergency_stop()
-                        if not admitted:  # pragma: no cover - no await since pre-check
-                            raise RuntimeError(
-                                "fault finalization started during emergency-stop enqueue"
-                            )
-                    queued = True
-                except asyncio.QueueFull:
-                    # Backstop bound hit (pathological spam). Report failed rather
-                    # than 500 or silently drop — the operator sees the action did
-                    # not take. The stored row reflects the final outcome (below).
-                    result = "failed"
-                    reason = "operator action queue is full; action not accepted"
+                )
+                if request.action is OperatorAction.EMERGENCY_STOP:
+                    self._fault_acknowledgement_gate.admit_emergency_stop()
+                queued = True
+            except asyncio.QueueFull:
+                # Backstop bound hit (pathological spam). Report failed rather
+                # than 500 or silently drop — the operator sees the action did
+                # not take. The stored row reflects the final outcome (below).
+                result = "failed"
+                reason = "operator action queue is full; action not accepted"
 
         await self._store.record_operator_action(
             action=request.action.value,
