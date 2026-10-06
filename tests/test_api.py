@@ -3241,7 +3241,7 @@ def _fault_stop_result(
     session_id: str = "session-1",
     heat_level_percent: int = 0,
     fan_level_percent: int = 0,
-    cooling_on: bool = False,
+    cooling_on: Literal[False] = False,
 ) -> FaultCoolingStopResult:
     """Build one typed cooling-stop result for fault acknowledgement tests."""
     return FaultCoolingStopResult(
@@ -5899,7 +5899,7 @@ async def test_acknowledge_fault_already_off_reads_twice_without_stop_write(
 
     assert await _tick(service, clock)
     assert "stop_cooling" not in mcp.commands()
-    assert mcp._log.count("fault_acknowledgement_read") == 2  # noqa: SLF001 - fake trace
+    assert mcp.fault_acknowledgement_read_count == 2
 
 
 @pytest.mark.asyncio
@@ -5937,9 +5937,7 @@ async def test_acknowledge_fault_rejects_malformed_stop_result_without_retry(
     service, mcp, clock, run_id = await _faulted_live_service(
         store, states=[_fault_ack_state(cooling_on=True)]
     )
-    mcp._fault_acknowledgement_stop_results = [  # noqa: SLF001 - malformed adapter boundary
-        cast("FaultCoolingStopResult | Exception", {"session_id": "session-1"})
-    ]
+    mcp.set_fault_acknowledgement_stop_results([{"session_id": "session-1"}])
     await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
     )
@@ -5961,7 +5959,7 @@ async def test_acknowledge_fault_rejects_changed_latest_session_before_write(
 
     async def read_then_change_session(session_id: str) -> FaultAcknowledgementState:
         state = await original_read(session_id)
-        mcp._latest_fault_session_id = "other"  # noqa: SLF001 - identity-race simulation
+        mcp.set_latest_fault_session_id("other")
         return state
 
     mcp.read_fault_acknowledgement_state = read_then_change_session
@@ -6027,7 +6025,7 @@ async def test_acknowledge_fault_fail_closed_on_unconfirmed_state_or_command(
         store, states=states, stop_results=stop_results
     )
     if session_missing:
-        mcp._latest_fault_session_id = None  # noqa: SLF001 - explicit no-session proof
+        mcp.set_latest_fault_session_id(None)
     await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
     )
@@ -6102,7 +6100,9 @@ async def test_emergency_stop_is_dispatched_before_queued_acknowledgement(
     )
 
     assert await _tick(service, clock)
-    assert mcp.commands().index("emergency_stop") < mcp._log.index("fault_acknowledgement_read")  # noqa: SLF001
+    assert mcp.commands().index("emergency_stop") < mcp.log_entries().index(
+        "fault_acknowledgement_read"
+    )
 
 
 @pytest.mark.asyncio

@@ -1120,6 +1120,8 @@ class RoasterControlAdapter:
             or state.cooling_on is not device.cooling_on
         ):
             raise ValueError("fault acknowledgement state controls disagree")
+        if state.phase != "fault":
+            raise ValueError("fault acknowledgement state is not faulted")
         return FaultAcknowledgementState(
             session_id=state.session_id,
             mcp_phase=state.phase,
@@ -1134,14 +1136,27 @@ class RoasterControlAdapter:
         """Issue one cooling-stop command and project its typed proof."""
         result = await self._client.stop_cooling()
         payload = result.event.payload
+        recovery_after_fault = payload.get("recovery_after_fault")
+        heat_level_percent = payload.get("heat_level_percent")
+        fan_level_percent = payload.get("fan_level_percent")
+        cooling_on = payload.get("cooling_on")
+        if (
+            result.phase != "fault"
+            or result.event.kind != "cooling_stopped"
+            or recovery_after_fault is not True
+            or type(heat_level_percent) is not int
+            or type(fan_level_percent) is not int
+            or cooling_on is not False
+        ):
+            raise ValueError("fault acknowledgement cooling stop result is malformed")
         return FaultCoolingStopResult(
             session_id=result.session_id,
             phase=result.phase,
             event_kind=result.event.kind,
-            recovery_after_fault=payload.get("recovery_after_fault"),
-            heat_level_percent=payload.get("heat_level_percent"),
-            fan_level_percent=payload.get("fan_level_percent"),
-            cooling_on=payload.get("cooling_on"),
+            recovery_after_fault=recovery_after_fault,
+            heat_level_percent=heat_level_percent,
+            fan_level_percent=fan_level_percent,
+            cooling_on=cooling_on,
         )
 
     async def read_telemetry(self) -> RoastTelemetry | None:

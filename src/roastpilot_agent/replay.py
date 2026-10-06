@@ -81,6 +81,8 @@ from roastpilot_agent.mcp_client import (
 )
 from roastpilot_agent.models import (
     AppliedRoasterState,
+    FaultAcknowledgementState,
+    FaultCoolingStopResult,
     MicStatus,
     OperatorAction,
     RoastEventKind,
@@ -535,6 +537,11 @@ class ReplayRoasterControl:
         """No raw ``RoastSessionState`` from a flat export (runner tolerates)."""
         return None
 
+    @property
+    def latest_fault_session_id(self) -> None:
+        """Replay has no live MCP session identity for fault acknowledgement."""
+        return None
+
     async def read_telemetry(self) -> RoastTelemetry | None:
         if not self._frames:
             return None
@@ -574,6 +581,15 @@ class ReplayRoasterControl:
 
     async def stop_cooling(self) -> None:
         self.commands.append(("stop_cooling", {}))
+
+    async def read_fault_acknowledgement_state(self, session_id: str) -> FaultAcknowledgementState:
+        """Refuse live fault-acknowledgement proof in a no-hardware replay."""
+        del session_id
+        raise RuntimeError("replay has no live fault acknowledgement state")
+
+    async def stop_cooling_for_fault_acknowledgement(self) -> FaultCoolingStopResult:
+        """Refuse a replay acknowledgement cooling write without recording one."""
+        raise RuntimeError("replay cannot stop physical cooling")
 
     async def emergency_stop(self, *, reason: str) -> AppliedRoasterState:
         self.commands.append(("emergency_stop", {"reason": reason}))

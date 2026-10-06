@@ -177,6 +177,13 @@
     },
     {
       "data": {
+        "outcome": "confirmed"
+      },
+      "event": "fault_acknowledgement_executed",
+      "id": 0
+    },
+    {
+      "data": {
         "csv_path": "/tmp/roast-export/roast.csv",
         "jsonl_path": "/tmp/roast-export/roast.jsonl",
         "log_dir": "/tmp/roast-export",

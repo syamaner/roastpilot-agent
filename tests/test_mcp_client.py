@@ -3993,7 +3993,7 @@ async def test_fault_acknowledgement_rejects_malformed_stop_result() -> None:
     }
     adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([malformed_stop])))
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValueError, match="cooling stop result is malformed"):
         await adapter.stop_cooling_for_fault_acknowledgement()
 
 

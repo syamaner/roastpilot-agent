@@ -9,6 +9,7 @@ scripted MCP contract (E4/E5), advisor fixtures (E8), temp SQLite store
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -217,6 +218,25 @@ class FakeMCPClient:
 
     def commands(self) -> list[str]:
         return [name for name, _ in self.calls]
+
+    def log_entries(self) -> list[str]:
+        """Return the recorded fake operation log for test assertions."""
+        return list(self._log)
+
+    @property
+    def fault_acknowledgement_read_count(self) -> int:
+        """Return how often the fault-acknowledgement state was read."""
+        return self._log.count("fault_acknowledgement_read")
+
+    def set_latest_fault_session_id(self, session_id: str | None) -> None:
+        """Set the scripted latest fault identity for an acknowledgement test."""
+        self._latest_fault_session_id = session_id
+
+    def set_fault_acknowledgement_stop_results(self, results: list[object]) -> None:
+        """Install scripted stop results, including malformed adapter-boundary data."""
+        self._fault_acknowledgement_stop_results = [
+            cast("FaultCoolingStopResult | Exception", result) for result in results
+        ]
 
 
 class ScriptedStateReader:
