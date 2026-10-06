@@ -5832,6 +5832,7 @@ async def test_acknowledge_fault_stops_cooling_then_reads_matching_safe_zero(
         store,
         states=[
             _fault_ack_state(cooling_on=True, fan_level_percent=100),
+            _fault_ack_state(cooling_on=True, fan_level_percent=100),
             _fault_ack_state(cooling_on=False),
         ],
     )
@@ -5948,21 +5949,14 @@ async def test_acknowledge_fault_rejects_malformed_stop_result_without_retry(
 
 
 @pytest.mark.asyncio
-async def test_acknowledge_fault_rejects_changed_latest_session_before_write(
+async def test_acknowledge_fault_rejects_changed_session_on_immediate_pre_stop_read(
     store: RoastStore,
 ) -> None:
-    """A current identity change after the first read blocks the cooling stop."""
+    """A fresh session mismatch immediately before stop reaches no MCP write."""
     service, mcp, clock, run_id = await _faulted_live_service(
-        store, states=[_fault_ack_state(cooling_on=True)]
+        store,
+        states=[_fault_ack_state(cooling_on=True), _fault_ack_state(session_id="other")],
     )
-    original_read = mcp.read_fault_acknowledgement_state
-
-    async def read_then_change_session(session_id: str) -> FaultAcknowledgementState:
-        state = await original_read(session_id)
-        mcp.set_latest_fault_session_id("other")
-        return state
-
-    mcp.read_fault_acknowledgement_state = read_then_change_session
     await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
     )
@@ -6050,7 +6044,11 @@ async def test_acknowledge_fault_duplicate_requests_issue_at_most_one_stop(
     """Two queued clicks cannot turn a single acknowledgement into two writes."""
     service, mcp, clock, run_id = await _faulted_live_service(
         store,
-        states=[_fault_ack_state(cooling_on=True), _fault_ack_state(cooling_on=False)],
+        states=[
+            _fault_ack_state(cooling_on=True),
+            _fault_ack_state(cooling_on=True),
+            _fault_ack_state(cooling_on=False),
+        ],
     )
     request = OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
     await service.submit_operator_action(run_id, request)
@@ -6069,8 +6067,9 @@ async def test_acknowledge_retry_does_not_repeat_a_confirmed_cooling_stop(
         store,
         states=[
             _fault_ack_state(cooling_on=True),
+            _fault_ack_state(cooling_on=True),
             RuntimeError("read timeout after confirmed stop"),
-            _fault_ack_state(cooling_on=False),
+            _fault_ack_state(cooling_on=True),
             _fault_ack_state(cooling_on=False),
         ],
     )
@@ -6085,24 +6084,56 @@ async def test_acknowledge_retry_does_not_repeat_a_confirmed_cooling_stop(
 
 
 @pytest.mark.asyncio
-async def test_emergency_stop_is_dispatched_before_queued_acknowledgement(
+async def test_acknowledge_fault_is_rejected_before_fault_then_emergency_stop(
     store: RoastStore,
 ) -> None:
-    """Emergency stop retains queue priority over a same-tick acknowledgement."""
+    """A pre-fault acknowledgement cannot wait for a later e-stop fault cycle."""
     clock = FakeClock()
     mcp = FakeMCPClient([_reading(178.0, 185.0)])
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)
-    await service.submit_operator_action(
+    acknowledgement = await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
     )
+    assert acknowledgement.result == "rejected"
+    assert acknowledgement.queued is False
     await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"})
     )
 
-    assert await _tick(service, clock)
-    assert mcp.commands().index("emergency_stop") < mcp.log_entries().index(
-        "fault_acknowledgement_read"
+    assert not await _tick(service, clock)
+    assert mcp.commands().count("emergency_stop") == 1
+    assert "fault_acknowledgement_read" not in mcp.log_entries()
+
+
+@pytest.mark.asyncio
+async def test_same_drain_emergency_stop_suppresses_previously_admitted_fault_acknowledgement(
+    store: RoastStore,
+) -> None:
+    """A new e-stop cooling cycle needs a fresh acknowledgement after the drain."""
+    service, mcp, clock, run_id = await _faulted_live_service(store)
+    subscriber = service.events.subscribe()
+    acknowledged = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
     )
+    assert acknowledged.result == "accepted"
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"})
+    )
+
+    assert not await _tick(service, clock)
+    assert "fault_acknowledgement_stop_cooling" not in mcp.log_entries()
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "failed", "reason": "superseded_by_emergency_stop"}
+        for event in events
+    )
+
+    fresh = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    assert fresh.result == "accepted"
+    assert await _tick(service, clock)
 
 
 @pytest.mark.asyncio

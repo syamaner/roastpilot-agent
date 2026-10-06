@@ -269,6 +269,7 @@ FaultAcknowledgementFailureReason = Literal[
     "session_mismatch",
     "policy_rejected",
     "stop_unconfirmed",
+    "superseded_by_emergency_stop",
 ]
 """Closed public reason codes for failed fault-acknowledgement execution."""
 
@@ -734,6 +735,10 @@ class RoastRunner:
         # auto-finalises: the run stays live (loop ticking, heat at 0) until
         # acknowledge_fault flips this and _handle_completion finalises it.
         self._fault_acknowledged = False
+        # A typed MCP stop result is durable command evidence for this runner.
+        # A later read timeout must not turn an idempotent retry into another
+        # unscoped cooling-stop write against the same fault session.
+        self._confirmed_fault_cooling_stop_sessions: set[str] = set()
         # The fault reason latched on FAULTED entry (#206). A fault finalises on a
         # later tick (after ack), by which point the FAULT event was already flushed
         # from the emitter buffer — so the reason must be captured before the flush.
@@ -1042,9 +1047,18 @@ class RoastRunner:
             if item.run_id == self._run_id:
                 batch.append(item)
         batch.sort(key=lambda item: item.action is not OperatorAction.EMERGENCY_STOP)
+        emergency_stop_wins_batch = any(
+            item.action is OperatorAction.EMERGENCY_STOP for item in batch
+        )
         fault_acknowledgement_seen = False
         for item in batch:
             if item.action is OperatorAction.ACKNOWLEDGE_FAULT:
+                # An e-stop in this drain creates or refreshes the fault cooling
+                # cycle. A confirmation captured before it cannot terminate that
+                # new cycle; require a fresh operator acknowledgement afterwards.
+                if emergency_stop_wins_batch:
+                    await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
+                    continue
                 if fault_acknowledgement_seen:
                     await self._record_fault_acknowledgement_failure("duplicate")
                     continue
@@ -1141,30 +1155,39 @@ class RoastRunner:
         if not self._fault_acknowledgement_state_is_ready(before, session_id):
             await self._record_fault_acknowledgement_failure("unsafe_state")
             return
-        if capability.latest_fault_session_id != session_id:
-            await self._record_fault_acknowledgement_failure("session_mismatch")
-            return
-        if before.cooling_on:
+        if before.cooling_on and session_id not in self._confirmed_fault_cooling_stop_sessions:
             if not await self._controller.authorize_fault_acknowledgement_stop_cooling():
                 await self._record_fault_acknowledgement_failure("policy_rejected")
                 return
+            # Bind the unscoped MCP stop to the still-current session immediately
+            # before the write. The runner is the Agent's sole serialized command
+            # client, so no Agent write can interleave this proof and the write.
             try:
-                stopped = await capability.stop_cooling_for_fault_acknowledgement()
-            except Exception:  # noqa: BLE001 - no automatic retry after uncertain write
-                await self._record_fault_acknowledgement_failure("stop_unconfirmed")
+                immediately_before_stop = await capability.read_fault_acknowledgement_state(
+                    session_id
+                )
+            except Exception:  # noqa: BLE001 - latest-state timeout/mismatch fails closed
+                await self._record_fault_acknowledgement_failure("state_unavailable")
                 return
-            if not self._fault_cooling_stop_is_confirmed(stopped, session_id):
-                await self._record_fault_acknowledgement_failure("stop_unconfirmed")
+            if not self._fault_acknowledgement_state_is_ready(immediately_before_stop, session_id):
+                await self._record_fault_acknowledgement_failure("unsafe_state")
                 return
+            if immediately_before_stop.cooling_on:
+                try:
+                    stopped = await capability.stop_cooling_for_fault_acknowledgement()
+                except Exception:  # noqa: BLE001 - no automatic retry after uncertain write
+                    await self._record_fault_acknowledgement_failure("stop_unconfirmed")
+                    return
+                if not self._fault_cooling_stop_is_confirmed(stopped, session_id):
+                    await self._record_fault_acknowledgement_failure("stop_unconfirmed")
+                    return
+                self._confirmed_fault_cooling_stop_sessions.add(session_id)
         try:
             after = await capability.read_fault_acknowledgement_state(session_id)
         except Exception:  # noqa: BLE001 - a command result is never sufficient proof
             await self._record_fault_acknowledgement_failure("state_unavailable")
             return
-        if (
-            capability.latest_fault_session_id != session_id
-            or not self._fault_acknowledgement_controls_are_safe(after, session_id)
-        ):
+        if not self._fault_acknowledgement_controls_are_safe(after, session_id):
             await self._record_fault_acknowledgement_failure("unsafe_state")
             return
         self._fault_acknowledged = True
@@ -3306,9 +3329,11 @@ class RoastService:
         held). 404s an unknown run id.
 
         Control actions with no MCP write (``pause_advisory`` /
-        ``resume_advisory`` / ``acknowledge_recovery`` / ``acknowledge_fault``)
-        skip the matrix check and are accepted for the controller to interpret on
-        drain.
+        ``resume_advisory`` / ``acknowledge_recovery``) skip the matrix check and
+        are accepted for the controller to interpret on drain.
+        ``acknowledge_fault`` is accepted only while the persisted run is
+        ``faulted`` so a stale queued request cannot be retained for a future
+        fault cycle.
 
         A faulted-but-unacknowledged run (#206) is NOT terminal here — its
         ``completed_at_utc`` is null until the operator acknowledges it — so it is
@@ -3328,8 +3353,15 @@ class RoastService:
             )
 
         command = _ACTION_COMMAND.get(request.action)
-        if command is None:
-            result: Literal["accepted", "rejected", "failed"] = "accepted"
+        if request.action is OperatorAction.ACKNOWLEDGE_FAULT:
+            if detail.agent_phase is RoastPhase.FAULTED:
+                result: Literal["accepted", "rejected", "failed"] = "accepted"
+                reason = f"{request.action.value} accepted: queued for the controller"
+            else:
+                result = "rejected"
+                reason = "acknowledge_fault requires a faulted run"
+        elif command is None:
+            result = "accepted"
             reason = f"{request.action.value} accepted: queued for the controller"
         else:
             evaluation = self._safety.evaluate_command_phase(

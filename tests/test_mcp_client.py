@@ -3951,9 +3951,40 @@ async def test_adapter_projects_fault_acknowledgement_state_for_exact_session() 
     assert stopped.event_kind == "cooling_stopped"
     assert caller.calls == [
         ("get_roast_state", {}),
-        ("get_roast_state", {"session_id": session_id}),
+        ("get_roast_state", {}),
         ("stop_cooling", {}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_fault_acknowledgement_rejects_latest_session_change_before_stop() -> None:
+    """An unscoped latest-state read cannot validate a historical fault session."""
+    expected = {
+        **SESSION_STATE_PAYLOAD,
+        "session_id": "fault-a",
+        "phase": "fault",
+        "active": False,
+        "heat_level_percent": 0,
+        "fan_level_percent": 100,
+        "cooling_on": True,
+        "device_state": {
+            **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+            "connected": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+    }
+    latest_other = {**expected, "session_id": "fault-b"}
+    caller = _SequenceCaller([expected, latest_other])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    await adapter.read_telemetry()
+    with pytest.raises(ValueError, match="does not match latest state"):
+        await adapter.read_fault_acknowledgement_state("fault-a")
+
+    assert caller.calls == [("get_roast_state", {}), ("get_roast_state", {})]
+    assert all(tool != "stop_cooling" for tool, _ in caller.calls)
 
 
 @pytest.mark.asyncio

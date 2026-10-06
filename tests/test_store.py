@@ -542,6 +542,53 @@ async def test_v16_migration_adds_nullable_d96_trace_to_real_v15_database(
 
 
 @pytest.mark.asyncio
+async def test_v17_migration_preserves_historical_event_ids_and_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The v17 event-table rebuild retains old IDs, index coverage, and writes."""
+    db_path = tmp_path / "v17upgrade.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:16])
+    old = RoastStore(db_path)
+    await old.initialize()
+    try:
+        assert await old.schema_version() == 16
+        await seeded_store(old)
+        await old.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FAULT,
+            source=RoastEventSource.CONTROLLER,
+            payload={"reason": "historical"},
+        )
+        historical = await fetch_one(old, "SELECT id FROM roast_events WHERE run_id = 'run-1'")
+    finally:
+        await old.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == 17 == len(MIGRATIONS)
+        assert (
+            await fetch_one(upgraded, "SELECT id FROM roast_events WHERE run_id = 'run-1'")
+            == historical
+        )
+        assert "idx_roast_events_run_kind" in await fetch_names(upgraded, "index")
+        await upgraded.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED,
+            source=RoastEventSource.OPERATOR,
+            payload={"outcome": "confirmed"},
+        )
+        assert await fetch_one(
+            upgraded,
+            "SELECT kind, source FROM roast_events WHERE kind = ?",
+            (RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED.value,),
+        ) == ("fault_acknowledgement_executed", "operator")
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
 async def test_set_ambient_sets_the_explicit_captured_flag(tmp_store: RoastStore) -> None:
     """#463: a real reading marks the explicit ``ambient_captured`` flag, and
     ``PersistedRun.ambient_captured`` (the recovery read) reflects it — not the

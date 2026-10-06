@@ -1109,8 +1109,14 @@ class RoasterControlAdapter:
         return None if state is None else state.session_id
 
     async def read_fault_acknowledgement_state(self, session_id: str) -> FaultAcknowledgementState:
-        """Read one exact MCP session for a fault acknowledgement proof."""
-        state = await self._client.get_roast_state(session_id)
+        """Read and bind the MCP's current session for a fault acknowledgement proof."""
+        # ``stop_cooling`` is deliberately unscoped in the MCP and always targets
+        # its latest session. Read that same authoritative target here; querying a
+        # historical session would prove controls for an object the write cannot
+        # address. The runner serializes this read and its possible write.
+        state = await self._client.get_roast_state()
+        if state.session_id != session_id:
+            raise ValueError("fault acknowledgement session does not match latest state")
         device = state.device_state
         if device is None:
             raise ValueError("fault acknowledgement state has no device state")
