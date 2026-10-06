@@ -100,6 +100,9 @@ describe("useRoastStream", () => {
     const es = FakeEventSource.last!;
     await act(async () => es.open());
     expect(latest!.status).toBe("live");
+    // Every declared SSE event needs a named EventSource listener; otherwise the
+    // browser drops it because `onmessage` only receives unnamed frames.
+    expect(es.listeners.has("fault_acknowledgement_executed")).toBe(true);
 
     // A telemetry frame claiming a different phase must NOT move state.phase.
     await act(async () =>

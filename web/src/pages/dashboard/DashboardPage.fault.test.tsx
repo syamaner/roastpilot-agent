@@ -8,13 +8,11 @@
  * suites whose code paths still exist and still run in production:
  *   - the #124 faulted-run sticky banner (a health refetch must not drop the
  *     fault banner before the operator acknowledges it),
- *   - the #206/#117/#513 acknowledge_fault flow, including its confirm-retry
- *     loop (transient failure, exhausted retries, no-double-submit, and the
- *     unmount-mid-confirm cache-write guard),
+ *   - the #206/#117 fault acknowledgement flow,
  *   - the #329 restored/reloaded-fault snapshot fallback (booting or
  *     reloading onto an already-faulted run with no live SSE `fault` frame),
  *   - the #423 P2-1 `run_completed` → health-invalidation drain callback.
- * `stickyFaultedRunId`, `handleAcknowledgeFault`, the hydrated-snapshot fault
+ * `stickyFaultedRunId`, the guarded acknowledgement control, the hydrated-snapshot fault
  * fallback (`snapshotFault`), and the drain callback all still live in
  * `DashboardPage.tsx` — only the idle/active-wiring describe (the genuinely
  * dead ~158-line branch, plus its own bean-profile/start-roast mocks) was
@@ -27,8 +25,8 @@
  * own any more and unconditionally renders the dashboard shell; `LivePage`
  * (the sole mount point) is the one that swaps this component out once
  * `active_run_id` clears. So the post-acknowledge assertions here check what
- * THIS component is actually responsible for — the acknowledge action firing,
- * the confirm loop resolving, and the sticky-faulted pin clearing (so a LATER
+ * THIS component is actually responsible for — queueing the acknowledge action,
+ * handling its current-stream executed event, and the sticky-faulted pin clearing (so a LATER
  * `active_run_id`→null resolves `runId` to `null` rather than staying pinned
  * to the acknowledged run) — not a form this page hasn't shown since #513.
  * The bean-profile CRUD hooks the idle branch needed are also gone from the
@@ -63,14 +61,6 @@ const operatorActionMock = vi.hoisted(() =>
     queued: true,
   })),
 );
-const healthApiMock = vi.hoisted(() =>
-  vi.fn(async () => ({
-    status: "ok" as const,
-    version: "test",
-    mcp_child: "connected" as const,
-    active_run_id: "run-new" as string | null,
-  })),
-);
 const timelineApiMock = vi.hoisted(() =>
   vi.fn<(runId: string) => Promise<RoastTimeline>>(),
 );
@@ -81,7 +71,6 @@ vi.mock("@/lib/api", async () => {
     api: {
       ...actual.api,
       operatorAction: operatorActionMock,
-      health: healthApiMock,
       timeline: timelineApiMock,
     },
   };
@@ -154,7 +143,7 @@ const streamState: {
 // run_completed → health invalidation drain (#423). We stub it so:
 //   a. The common wiring tests get a no-op (frameCount is 0; the callback never fires).
 //   b. The drain-callback test can capture the registered callback and invoke it.
-type DrainCb = (frame: { event: string }) => void;
+type DrainCb = (frame: { event: string; data?: Record<string, unknown> }) => void;
 let capturedDrainCallback: DrainCb | null = null;
 vi.mock("@/hooks/useRoastStream", () => ({
   useRoastStream: () => streamState,
@@ -249,13 +238,6 @@ beforeEach(() => {
     commands: [],
   });
   operatorActionMock.mockClear();
-  healthApiMock.mockClear();
-  healthApiMock.mockImplementation(async () => ({
-    status: "ok" as const,
-    version: "test",
-    mcp_child: "connected" as const,
-    active_run_id: "run-new",
-  }));
 });
 
 describe("DashboardPage FC timeline subscription barrier (#592)", () => {
@@ -524,43 +506,30 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
     expect(screen.getByTestId("fault-banner")).toBeInTheDocument();
   });
 
-  it("#523: acknowledges the fault by POSTing acknowledge_fault, then confirms the run cleared — LivePage (not this component) owns the swap away", async () => {
-    // Faulted, with a live active run (post-#206 a fault stays operable until ack).
+  it("queues acknowledgement only after cooling-safe confirmation, then stays pending until the server event", async () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
     viewState.fault = { reason: "env ceiling exceeded" };
-    // #117: the affordance is driven by the server's enabled_actions mirror — the
-    // faulted-phase SSE frame carries acknowledge_fault.
-    streamState.enabledActions = ["acknowledge_fault", "emergency_stop"];
-    // #513: the confirm loop polls api.health() directly — resolve it with
-    // active_run_id: null so the loop terminates on its first attempt instead
-    // of spinning through its full retry budget in the background (the default
-    // beforeEach mock resolves active_run_id: "run-new", which never satisfies
-    // the confirm condition and would leak a live retry loop past this test,
-        // polluting a LATER test's mockRejectedValueOnce/mockResolvedValueOnce
-    // queue on the same shared mock).
-    healthApiMock.mockResolvedValue({
-      status: "ok",
-      version: "test",
-      mcp_child: "connected",
-      active_run_id: null,
-    });
+    streamState.enabledActions = ["acknowledge_fault", "stop_cooling", "emergency_stop"];
     renderPage();
+
     fireEvent.click(screen.getByTestId("fault-acknowledge"));
-    // #206: the affordance dispatches the genuine acknowledge_fault control action.
+    expect(operatorActionMock).not.toHaveBeenCalled();
+    expect(screen.getByTestId("fault-acknowledgement-confirmation")).toHaveTextContent(
+      "safe to end cooling",
+    );
+    fireEvent.click(screen.getByTestId("fault-acknowledge"));
     await waitFor(() =>
       expect(operatorActionMock).toHaveBeenCalledWith("run-fault", {
         action: "acknowledge_fault",
       }),
     );
-    // #523: DashboardPage has no idle branch of its own any more — it never
-    // shows a start form. What THIS component owns is: the action dispatches,
-    // and the confirm loop resolves against the real api.health(). The swap
-    // away from the dashboard (to LivePage's own idle/summary state) happens
-    // one level up, once LivePage's own `active_run_id` read goes null — out
-    // of scope for a DashboardPage-only render test.
-    await waitFor(() => expect(healthApiMock).toHaveBeenCalled());
-    expect(screen.getByTestId("dashboard")).toBeInTheDocument();
+    expect(screen.getByTestId("fault-acknowledgement-pending")).toBeInTheDocument();
+    expect(screen.queryByTestId("fault-acknowledgement-completed")).toBeNull();
+    expect(screen.getByTestId("fault-banner")).toBeInTheDocument();
+    // The independent cooling and emergency-stop controls remain operable.
+    expect(screen.getByTestId("action-stop_cooling")).toBeEnabled();
+    expect(screen.getByTestId("action-emergency_stop")).toBeEnabled();
   });
 
   it("hides the acknowledge affordance when the server does not enable acknowledge_fault (#117)", () => {
@@ -576,128 +545,58 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
     expect(screen.queryByTestId("fault-acknowledge")).toBeNull();
   });
 
-  it("#513: disables the acknowledge button while confirming (no double-submit)", async () => {
+  it("renders a completed result only for the current pending acknowledgement event", async () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
     viewState.fault = { reason: "env ceiling exceeded" };
     streamState.enabledActions = ["acknowledge_fault", "emergency_stop"];
-    // api.health() stalls only long enough to assert the pending state, then
-    // resolves — a truly-eternal pending promise would leak the component's
-    // background retry loop past this test's cleanup and pollute the NEXT
-    // test's mock queue (its retry keeps firing and consuming that test's
-    // mockRejectedValueOnce/mockResolvedValueOnce slots before it even runs).
-    let resolveHealth: (v: {
-      status: "ok";
-      version: string;
-      mcp_child: "connected";
-      active_run_id: string | null;
-    }) => void = () => {};
-    healthApiMock.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          resolveHealth = resolve;
-        }),
-    );
     renderPage();
 
-    fireEvent.click(screen.getByTestId("fault-acknowledge"));
-    await waitFor(() => expect(screen.getByTestId("fault-acknowledge")).toBeDisabled());
-    expect(screen.getByTestId("fault-acknowledge")).toHaveTextContent(/acknowledging/i);
-
-    // Let the pending confirm resolve so the component's retry loop terminates
-    // cleanly before the next test runs.
-    resolveHealth({
-      status: "ok",
-      version: "test",
-      mcp_child: "connected",
-      active_run_id: null,
+    // A replayed/old event before this page queued an action is ignored.
+    capturedDrainCallback?.({
+      event: "fault_acknowledgement_executed",
+      data: { outcome: "confirmed" },
     });
-    await waitFor(() => expect(screen.getByTestId("fault-acknowledge")).toBeEnabled());
+    expect(screen.queryByTestId("fault-acknowledgement-completed")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("fault-acknowledge"));
+    fireEvent.click(screen.getByTestId("fault-acknowledge"));
+    await waitFor(() => expect(screen.getByTestId("fault-acknowledgement-pending")).toBeInTheDocument());
+    // Untrusted/malformed event data cannot resolve the sticky fault.
+    capturedDrainCallback?.({
+      event: "fault_acknowledgement_executed",
+      data: { outcome: "failed", reason: "unsafe-state" },
+    });
+    expect(screen.getByTestId("fault-acknowledgement-pending")).toBeInTheDocument();
+    capturedDrainCallback?.({
+      event: "fault_acknowledgement_executed",
+      data: { outcome: "confirmed" },
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("fault-acknowledgement-completed")).toBeInTheDocument(),
+    );
   });
 
-  it("#513: retries a transient post-acknowledge api.health() failure, then confirms", async () => {
+  it("keeps the fault and controls available when the server reports a closed failure code", async () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
     viewState.fault = { reason: "env ceiling exceeded" };
-    streamState.enabledActions = ["acknowledge_fault", "emergency_stop"];
-    healthApiMock
-      .mockRejectedValueOnce(new Error("503 starting up"))
-      .mockResolvedValueOnce({
-        status: "ok",
-        version: "test",
-        mcp_child: "connected",
-        active_run_id: null,
-      });
+    streamState.enabledActions = ["acknowledge_fault", "stop_cooling", "emergency_stop"];
     renderPage();
 
     fireEvent.click(screen.getByTestId("fault-acknowledge"));
-    await waitFor(() =>
-      expect(operatorActionMock).toHaveBeenCalledWith("run-fault", { action: "acknowledge_fault" }),
-    );
-    await waitFor(() => expect(healthApiMock).toHaveBeenCalledTimes(2), { timeout: 5000 });
-    expect(screen.queryByTestId("fault-acknowledge-confirm-failed")).toBeNull();
-    // The button must re-enable, not stay stuck on "Acknowledging…".
-    await waitFor(() => expect(screen.getByTestId("fault-acknowledge")).toBeEnabled());
-  }, 8000);
-
-  it("#513: shows a visible failure note (never a silently-stale banner) when every confirm attempt fails, and stays retryable", async () => {
-    healthState.isSuccess = true;
-    healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
-    viewState.fault = { reason: "env ceiling exceeded" };
-    streamState.enabledActions = ["acknowledge_fault", "emergency_stop"];
-    healthApiMock.mockRejectedValue(new Error("still down"));
-    renderPage();
-
     fireEvent.click(screen.getByTestId("fault-acknowledge"));
-    await waitFor(() => expect(screen.getByTestId("fault-acknowledge")).toBeDisabled());
-    await waitFor(
-      () => expect(screen.getByTestId("fault-acknowledge-confirm-failed")).toBeInTheDocument(),
-      { timeout: 10000 },
-    );
-    // The FaultBanner is still visibly present (never a stranded blank state) and
-    // the button re-enables for a manual retry — never permanently stuck.
-    expect(screen.getByTestId("fault-banner")).toBeInTheDocument();
-    expect(screen.getByTestId("fault-acknowledge")).toBeEnabled();
-  }, 12000);
-
-  it("#513: unmounting mid-confirm never lets the orphaned acknowledge loop write the cache", async () => {
-    healthState.isSuccess = true;
-    healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
-    viewState.fault = { reason: "env ceiling exceeded" };
-    streamState.enabledActions = ["acknowledge_fault", "emergency_stop"];
-    let resolveHealth: (v: {
-      status: "ok";
-      version: string;
-      mcp_child: "connected";
-      active_run_id: string | null;
-    }) => void = () => {};
-    healthApiMock.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          resolveHealth = resolve;
-        }),
-    );
-    const { client, unmount } = renderPage();
-    const setQueryDataSpy = vi.spyOn(client, "setQueryData");
-
-    fireEvent.click(screen.getByTestId("fault-acknowledge"));
-    await waitFor(() =>
-      expect(operatorActionMock).toHaveBeenCalledWith("run-fault", { action: "acknowledge_fault" }),
-    );
-    await waitFor(() => expect(healthApiMock).toHaveBeenCalledTimes(1));
-    setQueryDataSpy.mockClear();
-
-    // Unmount WHILE the confirm attempt is still in flight.
-    unmount();
-    resolveHealth({
-      status: "ok",
-      version: "test",
-      mcp_child: "connected",
-      active_run_id: null,
+    await waitFor(() => expect(screen.getByTestId("fault-acknowledgement-pending")).toBeInTheDocument());
+    capturedDrainCallback?.({
+      event: "fault_acknowledgement_executed",
+      data: { outcome: "failed", reason: "unsafe_state" },
     });
-    await new Promise((r) => setTimeout(r, 50));
-
-    expect(setQueryDataSpy).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(screen.getByTestId("fault-acknowledgement-failed")).toHaveTextContent("unsafe_state"),
+    );
+    expect(screen.getByTestId("fault-banner")).toBeInTheDocument();
+    expect(screen.getByTestId("action-stop_cooling")).toBeEnabled();
+    expect(screen.getByTestId("action-emergency_stop")).toBeEnabled();
   });
 });
 
@@ -728,9 +627,7 @@ describe("DashboardPage restored/reloaded fault (#329)", () => {
     expect(screen.getByTestId("fault-acknowledge")).toBeInTheDocument();
   });
 
-  it("#523: acknowledges a snapshot-restored fault (no live frame) via the real acknowledge_fault action", async () => {
-    // The whole point of #329: the restored-fault ACKNOWLEDGE must dispatch the same
-    // genuine control action as the live path, clearing the run.
+  it("queues a snapshot-restored fault acknowledgement through the same guarded action", async () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
     viewState.fault = null;
@@ -743,26 +640,16 @@ describe("DashboardPage restored/reloaded fault (#329)", () => {
       enabled_actions: ["acknowledge_fault", "emergency_stop"],
       profile: SNAPSHOT_PROFILE,
     };
-    // #513: resolve the confirm loop so it terminates on its first attempt
-    // rather than leaking a background retry loop past this test — see the
-    // matching comment on the earlier acknowledge test.
-    healthApiMock.mockResolvedValue({
-      status: "ok",
-      version: "test",
-      mcp_child: "connected",
-      active_run_id: null,
-    });
     renderPage();
+    fireEvent.click(screen.getByTestId("fault-acknowledge"));
+    expect(operatorActionMock).not.toHaveBeenCalled();
     fireEvent.click(screen.getByTestId("fault-acknowledge"));
     await waitFor(() =>
       expect(operatorActionMock).toHaveBeenCalledWith("run-fault", {
         action: "acknowledge_fault",
       }),
     );
-    // #523: as above — this component's responsibility ends at dispatching the
-    // real action and confirming the health transition; it never renders its
-    // own idle form (LivePage owns that swap).
-    await waitFor(() => expect(healthApiMock).toHaveBeenCalled());
+    expect(screen.getByTestId("fault-acknowledgement-pending")).toBeInTheDocument();
   });
 
   it("shows NO fault banner on a non-faulted hydrate (snapshot fallback is faulted-only)", () => {

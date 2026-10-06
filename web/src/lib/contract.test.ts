@@ -169,6 +169,7 @@ describe("SSE contract — every event type has a real frame", () => {
     "fault",
     "recovery_required",
     "recovery_acknowledged",
+    "fault_acknowledgement_executed",
     "logs_exported",
     "run_completed",
     "telemetry",

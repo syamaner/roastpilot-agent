@@ -45,6 +45,7 @@ export type SseEventType =
   | "fault"
   | "recovery_required"
   | "recovery_acknowledged"
+  | "fault_acknowledgement_executed"
   | "logs_exported"
   | "run_completed"
   | "telemetry"
@@ -56,6 +57,11 @@ export interface SseEvent<T = Record<string, unknown>> {
   data: T;
   id?: number | null;
 }
+
+/** Bounded server outcome for a queued fault acknowledgement action. */
+export type FaultAcknowledgementExecutedEventData =
+  | { outcome: "confirmed" }
+  | { outcome: "failed"; reason: string };
 
 // --- Microphone / first-crack capture-alive health (models.MicHealth /
 // models.MicStatus, #197). Pure observability: a read-only projection of the MCP

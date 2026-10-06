@@ -369,6 +369,7 @@ const SSE_EVENT_TYPES: SseEvent["event"][] = [
   "fault",
   "recovery_required",
   "recovery_acknowledged",
+  "fault_acknowledgement_executed",
   "logs_exported",
   "run_completed",
   "telemetry",
