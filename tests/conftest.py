@@ -161,6 +161,7 @@ class FakeMCPClient:
         if not self._fault_acknowledgement_states:
             return FaultAcknowledgementState(
                 session_id=session_id,
+                mcp_phase="fault",
                 active=False,
                 device_connected=True,
                 heat_level_percent=0,
@@ -184,7 +185,15 @@ class FakeMCPClient:
             session_id = self._latest_fault_session_id
             if session_id is None:
                 raise RuntimeError("fault acknowledgement has no session")
-            return FaultCoolingStopResult(session_id=session_id)
+            return FaultCoolingStopResult(
+                session_id=session_id,
+                phase="fault",
+                event_kind="cooling_stopped",
+                recovery_after_fault=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=False,
+            )
         result = (
             self._fault_acknowledgement_stop_results.pop(0)
             if len(self._fault_acknowledgement_stop_results) > 1

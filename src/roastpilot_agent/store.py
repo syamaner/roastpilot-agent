@@ -561,6 +561,35 @@ ALTER TABLE telemetry_snapshots ADD COLUMN post_fc_effective_heat_ceiling_percen
          post_fc_effective_heat_ceiling_percent BETWEEN 0 AND 100);
 """
 
+SCHEMA_V17_FAULT_ACKNOWLEDGEMENT_EVENT = """
+-- #954: persist the bounded execution outcome for the explicit post-fault
+-- cooling-stop acknowledgement. The event is a server-authoritative UI signal;
+-- it contains only a closed outcome/reason code and never hardware identity or
+-- exception text. SQLite requires a rebuild to extend the event-kind CHECK.
+CREATE TABLE roast_events_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES roast_runs(id),
+  kind TEXT NOT NULL CHECK (kind IN (
+    'run_started', 'phase_changed', 'charge_guidance', 't0_detected',
+    'turning_point', 'drying_end', 'first_crack', 'advisory',
+    'command_executed', 'command_failed', 'safety_alert', 'fault',
+    'recovery_required', 'recovery_acknowledged',
+    'fault_acknowledgement_executed', 'logs_exported', 'run_completed')),
+  source TEXT NOT NULL CHECK (source IN (
+    'controller', 'mcp', 'operator', 'advisor', 'safety')),
+  monotonic_seconds REAL,
+  recorded_at_utc TEXT NOT NULL,
+  payload_json TEXT
+);
+INSERT INTO roast_events_new
+  (id, run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json)
+  SELECT id, run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json
+  FROM roast_events;
+DROP TABLE roast_events;
+ALTER TABLE roast_events_new RENAME TO roast_events;
+CREATE INDEX idx_roast_events_run_kind ON roast_events(run_id, kind);
+"""
+
 _BEAN_SOURCING_LEASE_DURATION = timedelta(minutes=2)
 _BEAN_SOURCING_LEASE_CONFIRMATION = timedelta(seconds=60)
 
@@ -584,6 +613,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V14_BEAN_SOURCING_ATTEMPTS,
     SCHEMA_V15_CATALOGUE_ATTEMPT_COUNTS,
     SCHEMA_V16_D96_VALIDATION_TRACE,
+    SCHEMA_V17_FAULT_ACKNOWLEDGEMENT_EVENT,
 )
 
 

@@ -3227,8 +3227,28 @@ def _fault_ack_state(
     """Build one closed post-fault control-state proof for queue tests."""
     return FaultAcknowledgementState(
         session_id=session_id,
+        mcp_phase="fault",
         active=active,
         device_connected=device_connected,
+        heat_level_percent=heat_level_percent,
+        fan_level_percent=fan_level_percent,
+        cooling_on=cooling_on,
+    )
+
+
+def _fault_stop_result(
+    *,
+    session_id: str = "session-1",
+    heat_level_percent: int = 0,
+    fan_level_percent: int = 0,
+    cooling_on: bool = False,
+) -> FaultCoolingStopResult:
+    """Build one typed cooling-stop result for fault acknowledgement tests."""
+    return FaultCoolingStopResult(
+        session_id=session_id,
+        phase="fault",
+        event_kind="cooling_stopped",
+        recovery_after_fault=True,
         heat_level_percent=heat_level_percent,
         fan_level_percent=fan_level_percent,
         cooling_on=cooling_on,
@@ -5810,8 +5830,12 @@ async def test_acknowledge_fault_stops_cooling_then_reads_matching_safe_zero(
     """A fault ends only after one authorised stop and its fresh safe readback."""
     service, mcp, clock, run_id = await _faulted_live_service(
         store,
-        states=[_fault_ack_state(cooling_on=True), _fault_ack_state(cooling_on=False)],
+        states=[
+            _fault_ack_state(cooling_on=True, fan_level_percent=100),
+            _fault_ack_state(cooling_on=False),
+        ],
     )
+    subscriber = service.events.subscribe()
     await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
     )
@@ -5820,10 +5844,44 @@ async def test_acknowledge_fault_stops_cooling_then_reads_matching_safe_zero(
     assert mcp.commands().count("stop_cooling") == 1
     final = await store.read_run(run_id)
     assert final is not None and final.outcome == "faulted"
+    execution_events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in execution_events
+    )
     evaluations = await store.read_timeline(run_id)
     assert any(
         item.verdict == SafetyVerdict.ALLOW.value and item.rule == "command_phase_validity"
         for item in evaluations.safety_evaluations
+    )
+    assert any(
+        event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.source is RoastEventSource.OPERATOR
+        and event.payload == {"outcome": "confirmed"}
+        for event in evaluations.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_failure_emits_bounded_execution_outcome(
+    store: RoastStore,
+) -> None:
+    """A failed proof publishes its execution result, never queue acceptance."""
+    service, _, clock, run_id = await _faulted_live_service(
+        store, states=[_fault_ack_state(heat_level_percent=1)]
+    )
+    subscriber = service.events.subscribe()
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+
+    assert not await _tick(service, clock)
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "failed", "reason": "unsafe_state"}
+        for event in events
     )
 
 
@@ -5872,20 +5930,89 @@ async def test_acknowledge_fault_policy_refusal_issues_no_stop_write(
 
 
 @pytest.mark.asyncio
+async def test_acknowledge_fault_rejects_malformed_stop_result_without_retry(
+    store: RoastStore,
+) -> None:
+    """An untyped stop result cannot acknowledge or trigger a second write."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store, states=[_fault_ack_state(cooling_on=True)]
+    )
+    mcp._fault_acknowledgement_stop_results = [  # noqa: SLF001 - malformed adapter boundary
+        cast("FaultCoolingStopResult | Exception", {"session_id": "session-1"})
+    ]
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+
+    assert not await _tick(service, clock)
+    assert mcp.commands().count("stop_cooling") == 1
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.FAULTED  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_rejects_changed_latest_session_before_write(
+    store: RoastStore,
+) -> None:
+    """A current identity change after the first read blocks the cooling stop."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store, states=[_fault_ack_state(cooling_on=True)]
+    )
+    original_read = mcp.read_fault_acknowledgement_state
+
+    async def read_then_change_session(session_id: str) -> FaultAcknowledgementState:
+        state = await original_read(session_id)
+        mcp._latest_fault_session_id = "other"  # noqa: SLF001 - identity-race simulation
+        return state
+
+    mcp.read_fault_acknowledgement_state = read_then_change_session
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+
+    assert not await _tick(service, clock)
+    assert "stop_cooling" not in mcp.commands()
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.FAULTED  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("states", "stop_results", "session_missing"),
     [
         ([_fault_ack_state(active=True)], None, False),
         ([_fault_ack_state(device_connected=False)], None, False),
         ([_fault_ack_state(heat_level_percent=1)], None, False),
-        ([_fault_ack_state(fan_level_percent=1)], None, False),
+        ([_fault_ack_state(fan_level_percent=1, cooling_on=False)], None, False),
         ([_fault_ack_state(session_id="other")], None, False),
         ([RuntimeError("read timeout")], None, False),
         ([_fault_ack_state(cooling_on=True)], [RuntimeError("write timeout")], False),
-        ([_fault_ack_state(cooling_on=True)], [FaultCoolingStopResult(session_id="other")], False),
+        (
+            [_fault_ack_state(cooling_on=True)],
+            [
+                FaultCoolingStopResult(
+                    session_id="other",
+                    phase="fault",
+                    event_kind="cooling_stopped",
+                    recovery_after_fault=True,
+                    heat_level_percent=0,
+                    fan_level_percent=0,
+                    cooling_on=False,
+                )
+            ],
+            False,
+        ),
         ([_fault_ack_state(cooling_on=True), _fault_ack_state(session_id="other")], None, False),
         ([_fault_ack_state(cooling_on=True), RuntimeError("read timeout")], None, False),
         ([_fault_ack_state(cooling_on=True), _fault_ack_state(cooling_on=True)], None, False),
+        (
+            [_fault_ack_state(cooling_on=True)],
+            [_fault_stop_result(heat_level_percent=1)],
+            False,
+        ),
+        (
+            [_fault_ack_state(cooling_on=True)],
+            [_fault_stop_result(fan_level_percent=1)],
+            False,
+        ),
         ([_fault_ack_state()], None, True),
     ],
 )
@@ -5911,6 +6038,7 @@ async def test_acknowledge_fault_fail_closed_on_unconfirmed_state_or_command(
     assert detail.agent_phase is RoastPhase.FAULTED
     assert detail.completed_at_utc is None
     assert await store.active_run() is not None
+    assert mcp.commands().count("stop_cooling") <= 1
     with pytest.raises(RoastRunConflictError):
         await service.start_roast(_profile())
     assert not await service.runner.tick_once()  # type: ignore[union-attr]

@@ -260,6 +260,18 @@ class RawStateSource(Protocol):
 #: queue and validated by the controller on drain.
 _ACTION_COMMAND = OPERATOR_ACTION_COMMAND
 
+FaultAcknowledgementFailureReason = Literal[
+    "duplicate",
+    "not_faulted",
+    "state_unavailable",
+    "no_session",
+    "unsafe_state",
+    "session_mismatch",
+    "policy_rejected",
+    "stop_unconfirmed",
+]
+"""Closed public reason codes for failed fault-acknowledgement execution."""
+
 
 class QueuedOperatorAction(BaseModel):
     """One operator action placed on the controller queue (E7-S2).
@@ -549,6 +561,7 @@ _EVENT_SOURCE: dict[RoastEventKind, RoastEventSource] = {
     RoastEventKind.RECOVERY_REQUIRED: RoastEventSource.SAFETY,
     RoastEventKind.SAFETY_ALERT: RoastEventSource.SAFETY,
     RoastEventKind.T0_DETECTED: RoastEventSource.MCP,
+    RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED: RoastEventSource.OPERATOR,
 }
 
 
@@ -1125,8 +1138,11 @@ class RoastRunner:
         except Exception:  # noqa: BLE001 - MCP timeout/error/malformed state fails closed
             await self._record_fault_acknowledgement_failure("state_unavailable")
             return
-        if not self._fault_acknowledgement_controls_are_safe(before, session_id):
+        if not self._fault_acknowledgement_state_is_ready(before, session_id):
             await self._record_fault_acknowledgement_failure("unsafe_state")
+            return
+        if capability.latest_fault_session_id != session_id:
+            await self._record_fault_acknowledgement_failure("session_mismatch")
             return
         if before.cooling_on:
             if not await self._controller.authorize_fault_acknowledgement_stop_cooling():
@@ -1137,15 +1153,18 @@ class RoastRunner:
             except Exception:  # noqa: BLE001 - no automatic retry after uncertain write
                 await self._record_fault_acknowledgement_failure("stop_unconfirmed")
                 return
-            if stopped.session_id != session_id:
-                await self._record_fault_acknowledgement_failure("session_mismatch")
+            if not self._fault_cooling_stop_is_confirmed(stopped, session_id):
+                await self._record_fault_acknowledgement_failure("stop_unconfirmed")
                 return
         try:
             after = await capability.read_fault_acknowledgement_state(session_id)
         except Exception:  # noqa: BLE001 - a command result is never sufficient proof
             await self._record_fault_acknowledgement_failure("state_unavailable")
             return
-        if not self._fault_acknowledgement_controls_are_safe(after, session_id) or after.cooling_on:
+        if (
+            capability.latest_fault_session_id != session_id
+            or not self._fault_acknowledgement_controls_are_safe(after, session_id)
+        ):
             await self._record_fault_acknowledgement_failure("unsafe_state")
             return
         self._fault_acknowledged = True
@@ -1156,22 +1175,57 @@ class RoastRunner:
             run_id=self._run_id,
             payload={"fault_acknowledgement": "confirmed"},
         )
+        self._emitter.emit(RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED, {"outcome": "confirmed"})
 
     @staticmethod
-    def _fault_acknowledgement_controls_are_safe(
-        state: FaultAcknowledgementState, session_id: str
-    ) -> bool:
+    def _fault_acknowledgement_controls_are_safe(state: object, session_id: str) -> bool:
         """Return whether one exact inactive session proves safe-zero controls."""
         return (
-            state.session_id == session_id
+            isinstance(state, FaultAcknowledgementState)
+            and state.session_id == session_id
+            and state.mcp_phase == "fault"
             and not state.active
             and state.device_connected
             and state.heat_level_percent == 0
             and state.fan_level_percent == 0
+            and not state.cooling_on
         )
 
-    async def _record_fault_acknowledgement_failure(self, outcome: str) -> None:
+    @staticmethod
+    def _fault_acknowledgement_state_is_ready(state: object, session_id: str) -> bool:
+        """Return whether an exact fault session is safe to stop cooling once."""
+        return (
+            isinstance(state, FaultAcknowledgementState)
+            and state.session_id == session_id
+            and state.mcp_phase == "fault"
+            and not state.active
+            and state.device_connected
+            and state.heat_level_percent == 0
+            and 0 <= state.fan_level_percent <= 100
+        )
+
+    @staticmethod
+    def _fault_cooling_stop_is_confirmed(result: object, session_id: str) -> bool:
+        """Return whether one exact stop result reports safe-zero fault recovery."""
+        return (
+            isinstance(result, FaultCoolingStopResult)
+            and result.session_id == session_id
+            and result.phase == "fault"
+            and result.event_kind == "cooling_stopped"
+            and result.recovery_after_fault is True
+            and result.heat_level_percent == 0
+            and result.fan_level_percent == 0
+            and result.cooling_on is False
+        )
+
+    async def _record_fault_acknowledgement_failure(
+        self, outcome: FaultAcknowledgementFailureReason
+    ) -> None:
         """Record a bounded failure without MCP identity or error details."""
+        self._emitter.emit(
+            RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED,
+            {"outcome": "failed", "reason": outcome},
+        )
         await self._store.record_operator_action(
             action=OperatorAction.ACKNOWLEDGE_FAULT.value,
             result="failed",

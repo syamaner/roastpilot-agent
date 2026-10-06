@@ -165,6 +165,7 @@ class RoastEventKind(Enum):
     FAULT = "fault"
     RECOVERY_REQUIRED = "recovery_required"
     RECOVERY_ACKNOWLEDGED = "recovery_acknowledged"
+    FAULT_ACKNOWLEDGEMENT_EXECUTED = "fault_acknowledgement_executed"
     LOGS_EXPORTED = "logs_exported"
     RUN_COMPLETED = "run_completed"
 
@@ -529,6 +530,7 @@ class FaultAcknowledgementState(BaseModel):
     """
 
     session_id: str = Field(min_length=1)
+    mcp_phase: Literal["fault"]
     active: StrictBool
     device_connected: StrictBool
     heat_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
@@ -537,13 +539,20 @@ class FaultAcknowledgementState(BaseModel):
 
 
 class FaultCoolingStopResult(BaseModel):
-    """Typed identity returned by a fault-acknowledgement cooling stop.
+    """Typed proof returned by a fault-acknowledgement cooling stop.
 
-    The result proves only which MCP session accepted the command. The runner
-    always follows it with a fresh :class:`FaultAcknowledgementState` read.
+    The runner requires the exact fault session, event kind, recovery marker,
+    and returned safe-zero controls before it performs its fresh
+    :class:`FaultAcknowledgementState` read.
     """
 
     session_id: str = Field(min_length=1)
+    phase: Literal["fault"]
+    event_kind: Literal["cooling_stopped"]
+    recovery_after_fault: Literal[True]
+    heat_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    fan_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    cooling_on: Literal[False]
 
 
 # Bean species (botanical) — a constrained ``Literal`` deliberately, NOT a
@@ -2030,6 +2039,7 @@ class SseEventType(Enum):
     FAULT = "fault"
     RECOVERY_REQUIRED = "recovery_required"
     RECOVERY_ACKNOWLEDGED = "recovery_acknowledged"
+    FAULT_ACKNOWLEDGEMENT_EXECUTED = "fault_acknowledgement_executed"
     LOGS_EXPORTED = "logs_exported"
     RUN_COMPLETED = "run_completed"
     TELEMETRY = "telemetry"

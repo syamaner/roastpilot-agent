@@ -3903,6 +3903,7 @@ async def test_adapter_projects_fault_acknowledgement_state_for_exact_session() 
     state = {
         **SESSION_STATE_PAYLOAD,
         "session_id": session_id,
+        "phase": "fault",
         "active": False,
         "heat_level_percent": 0,
         "fan_level_percent": 0,
@@ -3915,7 +3916,22 @@ async def test_adapter_projects_fault_acknowledgement_state_for_exact_session() 
             "cooling_on": True,
         },
     }
-    stop_result = {**EVENT_RESULT_PAYLOAD, "session_id": session_id}
+    stop_result = {
+        **EVENT_RESULT_PAYLOAD,
+        "session_id": session_id,
+        "phase": "fault",
+        "event": {
+            "kind": "cooling_stopped",
+            "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+            "monotonic_seconds": 1228.9,
+            "payload": {
+                "recovery_after_fault": True,
+                "heat_level_percent": 0,
+                "fan_level_percent": 0,
+                "cooling_on": False,
+            },
+        },
+    }
     caller = _SequenceCaller([state, state, stop_result])
     adapter = RoasterControlAdapter(RoasterMCPClient(caller))
 
@@ -3925,12 +3941,14 @@ async def test_adapter_projects_fault_acknowledgement_state_for_exact_session() 
     stopped = await adapter.stop_cooling_for_fault_acknowledgement()
 
     assert proof.session_id == session_id
+    assert proof.mcp_phase == "fault"
     assert proof.active is False
     assert proof.device_connected is True
     assert proof.heat_level_percent == 0
     assert proof.fan_level_percent == 0
     assert proof.cooling_on is True
     assert stopped.session_id == session_id
+    assert stopped.event_kind == "cooling_stopped"
     assert caller.calls == [
         ("get_roast_state", {}),
         ("get_roast_state", {"session_id": session_id}),
@@ -3958,6 +3976,25 @@ async def test_fault_acknowledgement_rejects_malformed_or_disagreeing_controls()
         await adapter.read_fault_acknowledgement_state(
             cast("str", SESSION_STATE_PAYLOAD["session_id"])
         )
+
+
+@pytest.mark.asyncio
+async def test_fault_acknowledgement_rejects_malformed_stop_result() -> None:
+    """The adapter rejects incomplete cooling-stop proof fields before the runner."""
+    malformed_stop = {
+        **EVENT_RESULT_PAYLOAD,
+        "phase": "fault",
+        "event": {
+            "kind": "cooling_stopped",
+            "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+            "monotonic_seconds": 1228.9,
+            "payload": {"recovery_after_fault": True},
+        },
+    }
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([malformed_stop])))
+
+    with pytest.raises(ValidationError):
+        await adapter.stop_cooling_for_fault_acknowledgement()
 
 
 @pytest.mark.asyncio

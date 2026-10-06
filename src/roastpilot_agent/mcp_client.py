@@ -1122,6 +1122,7 @@ class RoasterControlAdapter:
             raise ValueError("fault acknowledgement state controls disagree")
         return FaultAcknowledgementState(
             session_id=state.session_id,
+            mcp_phase=state.phase,
             active=state.active,
             device_connected=device.connected,
             heat_level_percent=device.heat_level_percent,
@@ -1130,9 +1131,18 @@ class RoasterControlAdapter:
         )
 
     async def stop_cooling_for_fault_acknowledgement(self) -> FaultCoolingStopResult:
-        """Issue one cooling-stop command and return only its session identity."""
+        """Issue one cooling-stop command and project its typed proof."""
         result = await self._client.stop_cooling()
-        return FaultCoolingStopResult(session_id=result.session_id)
+        payload = result.event.payload
+        return FaultCoolingStopResult(
+            session_id=result.session_id,
+            phase=result.phase,
+            event_kind=result.event.kind,
+            recovery_after_fault=payload.get("recovery_after_fault"),
+            heat_level_percent=payload.get("heat_level_percent"),
+            fan_level_percent=payload.get("fan_level_percent"),
+            cooling_on=payload.get("cooling_on"),
+        )
 
     async def read_telemetry(self) -> RoastTelemetry | None:
         state = await self._client.get_roast_state()
