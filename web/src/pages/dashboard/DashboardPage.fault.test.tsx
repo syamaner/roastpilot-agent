@@ -545,19 +545,24 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
     expect(screen.queryByTestId("fault-acknowledge")).toBeNull();
   });
 
-  it("renders a completed result only for the current pending acknowledgement event", async () => {
+  it("accepts a current-run server execution outcome even when it arrives before the POST resolves", async () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
     viewState.fault = { reason: "env ceiling exceeded" };
     streamState.enabledActions = ["acknowledge_fault", "emergency_stop"];
+    let resolvePost: ((value: {
+      action: "acknowledge_fault";
+      result: "accepted";
+      reason: string;
+      queued: boolean;
+    }) => void) | undefined;
+    operatorActionMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolvePost = resolve;
+        }),
+    );
     renderPage();
-
-    // A replayed/old event before this page queued an action is ignored.
-    capturedDrainCallback?.({
-      event: "fault_acknowledgement_executed",
-      data: { outcome: "confirmed" },
-    });
-    expect(screen.queryByTestId("fault-acknowledgement-completed")).toBeNull();
 
     fireEvent.click(screen.getByTestId("fault-acknowledge"));
     fireEvent.click(screen.getByTestId("fault-acknowledge"));
@@ -575,6 +580,14 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
     await waitFor(() =>
       expect(screen.getByTestId("fault-acknowledgement-completed")).toBeInTheDocument(),
     );
+    resolvePost?.({
+      action: "acknowledge_fault",
+      result: "accepted",
+      reason: "acknowledged",
+      queued: true,
+    });
+    await waitFor(() => expect(timelineRefetchMock).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("fault-acknowledgement-completed")).toBeInTheDocument();
   });
 
   it("keeps the fault and controls available when the server reports a closed failure code", async () => {
@@ -601,6 +614,59 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
 });
 
 describe("DashboardPage restored/reloaded fault (#329)", () => {
+  it("restores a persisted acknowledgement outcome for the exact faulted run", async () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
+    viewState.fault = { reason: "env ceiling exceeded" };
+    streamState.enabledActions = ["acknowledge_fault", "emergency_stop"];
+    timelineState.data = {
+      run_id: "run-fault",
+      events: [
+        {
+          kind: "fault_acknowledgement_executed",
+          source: "operator",
+          monotonic_seconds: 10,
+          recorded_at_utc: "2026-10-06T12:00:00Z",
+          payload: { outcome: "confirmed" },
+        },
+      ],
+      safety_evaluations: [],
+      advisor_decisions: [],
+      commands: [],
+    };
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("fault-acknowledgement-completed")).toBeInTheDocument(),
+    );
+  });
+
+  it("ignores a persisted acknowledgement outcome from a different run", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
+    viewState.fault = { reason: "env ceiling exceeded" };
+    streamState.enabledActions = ["acknowledge_fault", "emergency_stop"];
+    timelineState.data = {
+      run_id: "run-previous",
+      events: [
+        {
+          kind: "fault_acknowledgement_executed",
+          source: "operator",
+          monotonic_seconds: 10,
+          recorded_at_utc: "2026-10-06T12:00:00Z",
+          payload: { outcome: "confirmed" },
+        },
+      ],
+      safety_evaluations: [],
+      advisor_decisions: [],
+      commands: [],
+    };
+    renderPage();
+
+    expect(screen.queryByTestId("fault-acknowledgement-completed")).toBeNull();
+    expect(screen.getByTestId("fault-acknowledge")).toBeInTheDocument();
+  });
+
   it("renders the FaultBanner + ACKNOWLEDGE from the hydrated snapshot, with NO live fault frame", () => {
     // The boot-onto-faulted / reload-while-faulted case: SSE never replays the
     // one-shot `fault` frame, so `view.fault` is null — but the snapshot hydrates

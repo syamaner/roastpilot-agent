@@ -48,7 +48,7 @@ describe("FaultAcknowledgementControl", () => {
 
     rerender(<FaultAcknowledgementControl status={{ kind: "completed" }} onConfirm={() => {}} />);
     expect(screen.getByTestId("fault-acknowledgement-completed")).toHaveTextContent(
-      "confirmed by the server",
+      "Verified cooling is off and fault acknowledged",
     );
   });
 });

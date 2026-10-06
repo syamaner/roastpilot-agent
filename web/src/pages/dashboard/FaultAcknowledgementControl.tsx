@@ -44,7 +44,7 @@ export function FaultAcknowledgementControl({
         data-testid="fault-acknowledgement-completed"
         className="max-w-xs text-right text-xs font-medium text-foreground"
       >
-        Cooling stop and fault acknowledgement confirmed by the server.
+        Verified cooling is off and fault acknowledged by the server.
       </p>
     );
   }

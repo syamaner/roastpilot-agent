@@ -28,7 +28,11 @@ import { roastKeys, useHealth, useRoast, useTimeline } from "@/hooks/queries";
 import { useFrameDrain, useRoastStream } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
 import { smoothCurveForDisplay } from "@/lib/rorSmoothing";
-import type { FaultAcknowledgementExecutedEventData, OperatorAction } from "@/lib/types";
+import type {
+  FaultAcknowledgementExecutedEventData,
+  OperatorAction,
+  RoastTimeline,
+} from "@/lib/types";
 import { AdvisoryPanel } from "./AdvisoryPanel";
 import { ChargeBanner } from "./ChargeBanner";
 import { chargeCueState } from "./chargeWindow";
@@ -76,6 +80,11 @@ export function DashboardPage(): React.JSX.Element {
   // make a stale fault look resolved.
   const [faultAcknowledgement, setFaultAcknowledgement] =
     useState<FaultAcknowledgementStatus>({ kind: "ready" });
+  const faultAcknowledgementRef = useRef<FaultAcknowledgementStatus>({ kind: "ready" });
+  const setFaultAcknowledgementState = useCallback((next: FaultAcknowledgementStatus) => {
+    faultAcknowledgementRef.current = next;
+    setFaultAcknowledgement(next);
+  }, []);
 
   // Live SSE stream — phase/telemetry/enabledActions are server-derived; the
   // page-local reducer folds the NON-LOSSY frame buffer (frames/frameCount) so a
@@ -133,16 +142,16 @@ export function DashboardPage(): React.JSX.Element {
     }
     if (
       frame.event === "fault_acknowledgement_executed" &&
-      faultAcknowledgement.kind === "pending"
+      runId !== null
     ) {
       const outcome = faultAcknowledgementOutcome(frame.data);
       if (outcome?.outcome === "confirmed") {
         // The exact current stream, not a POST response or timeout, proved
         // completion. The normal `run_completed` frame revalidates health.
-        setFaultAcknowledgement({ kind: "completed" });
+        setFaultAcknowledgementState({ kind: "completed" });
         setStickyFaultedRunId(null);
       } else if (outcome?.outcome === "failed") {
-        setFaultAcknowledgement({ kind: "failed", reason: outcome.reason });
+        setFaultAcknowledgementState({ kind: "failed", reason: outcome.reason });
       }
     }
   });
@@ -156,25 +165,40 @@ export function DashboardPage(): React.JSX.Element {
   const persistedFirstCrack = firstCrackFromTimeline(timeline.data);
   const firstCrack = view.firstCrack ?? persistedFirstCrack;
 
+  // A named SSE stream is scoped to `runId`, but a reconnect/reload can miss its
+  // one-shot acknowledgement outcome. The timeline is the same persisted server
+  // record, and is therefore the only reload fallback we accept. A timeline for a
+  // different run, malformed payload, or non-operator source is ignored.
+  const persistedAcknowledgement = useMemo(
+    () => faultAcknowledgementFromTimeline(timeline.data, runId),
+    [runId, timeline.data],
+  );
+
   // Operator action POST result (the action bar surfaces its typed reason).
   const [lastResult, setLastResult] = useState<OperatorActionResultView | null>(null);
   const handleAcknowledgeFault = useCallback(async () => {
     const ackRunId = runId;
     if (ackRunId === null) return;
+    // Mark pending before the POST. The runner can execute and publish its SSE
+    // outcome before the queue-acceptance response resolves; acceptance remains
+    // non-terminal and is never used as completion evidence.
+    setFaultAcknowledgementState({ kind: "pending" });
     try {
       const result = await api.operatorAction(ackRunId, { action: "acknowledge_fault" });
       if (!mountedRef.current) return;
-      setFaultAcknowledgement(
-        result.result === "accepted" && result.queued
-          ? { kind: "pending" }
-          : { kind: "failed", reason: "not_queued" },
-      );
+      if (result.result === "accepted" && result.queued) {
+        // One persisted-server refresh closes the event/subscription race without
+        // treating elapsed time or queue acceptance as an execution outcome.
+        void timeline.refetch();
+      } else if (faultAcknowledgementRef.current.kind === "pending") {
+        setFaultAcknowledgementState({ kind: "failed", reason: "not_queued" });
+      }
     } catch {
-      if (mountedRef.current) {
-        setFaultAcknowledgement({ kind: "failed", reason: "not_queued" });
+      if (mountedRef.current && faultAcknowledgementRef.current.kind === "pending") {
+        setFaultAcknowledgementState({ kind: "failed", reason: "not_queued" });
       }
     }
-  }, [runId]);
+  }, [runId, setFaultAcknowledgementState, timeline]);
 
   const dispatchAction = useCallback(
     async (action: OperatorAction) => {
@@ -213,8 +237,18 @@ export function DashboardPage(): React.JSX.Element {
   useEffect(() => {
     setChargeEnteredElapsed(null);
     setLastResult(null);
-    setFaultAcknowledgement({ kind: "ready" });
-  }, [runId]);
+    setFaultAcknowledgementState({ kind: "ready" });
+  }, [runId, setFaultAcknowledgementState]);
+
+  useEffect(() => {
+    if (persistedAcknowledgement === null) return;
+    if (persistedAcknowledgement.outcome === "confirmed") {
+      setFaultAcknowledgementState({ kind: "completed" });
+      setStickyFaultedRunId(null);
+    } else {
+      setFaultAcknowledgementState({ kind: "failed", reason: persistedAcknowledgement.reason });
+    }
+  }, [persistedAcknowledgement, setFaultAcknowledgementState]);
 
   // #329: the fault that drives the FaultBanner — the LIVE evaluation (`view.fault`,
   // the real SafetyEvaluation off the one-shot `fault` SSE frame) when we witnessed
@@ -461,4 +495,31 @@ function faultAcknowledgementOutcome(
     return { outcome: "failed", reason: value.reason };
   }
   return null;
+}
+
+/**
+ * Read the latest bounded acknowledgement outcome recorded for this exact run.
+ *
+ * A timeline contains server-persisted events only. It deliberately cannot
+ * represent a still-queued request, so callers leave that state as pending only
+ * while the current page owns the request and never reconstruct it after reload.
+ */
+function faultAcknowledgementFromTimeline(
+  timeline: RoastTimeline | undefined,
+  runId: string | null,
+): FaultAcknowledgementExecutedEventData | null {
+  if (timeline === undefined || runId === null || timeline.run_id !== runId) return null;
+
+  let latest: FaultAcknowledgementExecutedEventData | null = null;
+  for (const event of timeline.events) {
+    if (
+      event.kind === "fault_acknowledgement_executed" &&
+      event.source === "operator" &&
+      event.payload !== null
+    ) {
+      const outcome = faultAcknowledgementOutcome(event.payload);
+      if (outcome !== null) latest = outcome;
+    }
+  }
+  return latest;
 }
