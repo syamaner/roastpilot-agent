@@ -46,6 +46,8 @@ export type SseEventType =
   | "recovery_required"
   | "recovery_acknowledged"
   | "fault_acknowledgement_executed"
+  | "fault_controls_changed"
+  | "fault_controls_acknowledged"
   | "logs_exported"
   | "run_completed"
   | "telemetry"
@@ -195,7 +197,9 @@ export type OperatorAction =
   | "stop_cooling"
   | "emergency_stop"
   | "acknowledge_recovery"
-  | "acknowledge_fault";
+  | "acknowledge_fault"
+  /** D212: one confirmed, server-verified terminal fault action. */
+  | "stop_cooling_and_acknowledge";
 
 export interface OperatorActionRequest {
   action: OperatorAction;
@@ -207,6 +211,65 @@ export interface OperatorActionResult {
   result: "accepted" | "rejected" | "failed";
   reason: string;
   queued: boolean;
+}
+
+/** Result of the current-process restart-clearance confirmation.
+ *
+ * A successful response records an operator statement only. It never proves
+ * the physical state and never performs a roaster write.
+ */
+export interface RestartClearanceResult {
+  cleared: true;
+  restart_clearance_required: false;
+}
+
+/** Current-process restart-clearance state, rendered directly from `/health`. */
+export type RestartClearanceState = "required" | "cleared" | "unknown";
+
+export interface RestartClearance {
+  state: RestartClearanceState;
+  /** Whether the server permits a new start in this process. */
+  eligible: boolean;
+}
+
+/** Durable fault-control lease status projected without private identifiers. */
+export type FaultControlsStatus = "closed" | "open" | "unknown";
+
+/**
+ * Server-owned terminal fault controls. `generation` is an opaque monotonic
+ * lease generation for display/event correlation, never a run or device id.
+ */
+export interface FaultControls {
+  status: FaultControlsStatus;
+  generation: number | null;
+  enabled_actions: OperatorAction[];
+}
+
+/** Global terminal-fault action request. The server resolves the current lease. */
+export interface FaultControlsActionRequest {
+  action: OperatorAction;
+  /** Required only by D212's stop-cooling-and-acknowledge action. */
+  confirmation?: true;
+}
+
+/**
+ * Bounded admission result for a global terminal-fault action.
+ *
+ * `accepted` is not completion. The authoritative lease state remains the
+ * subsequent `/health` snapshot or fault-controls event.
+ */
+export interface FaultControlsActionResult {
+  action: OperatorAction;
+  result: "accepted" | "confirmed" | "rejected" | "failed";
+  reason: string;
+  queued?: boolean;
+}
+
+/** Event payload for server-authoritative terminal-fault state changes. */
+export interface FaultControlsEventData {
+  status: FaultControlsStatus;
+  generation: number | null;
+  outcome?: "confirmed" | "failed";
 }
 
 // --- Safety verdicts (safety.SafetyVerdict / D15) — six values, three badges.
@@ -906,6 +969,16 @@ export interface HealthResponse {
   mcp_hardware_clear_required: boolean;
   mcp_teardown_incident_id: string | null;
   active_run_id: string | null;
+  /**
+   * D213's fresh-process gate. Optional at this untrusted wire boundary so an
+   * older or malformed response can be rendered as UNKNOWN and fail closed.
+   */
+  restart_clearance?: RestartClearance;
+  /**
+   * D212/D213 terminal fault-control projection. Missing data is rendered as
+   * UNKNOWN; the SPA never manufactures enabled controls from phase/history.
+   */
+  fault_controls?: FaultControls;
 }
 
 // --- Config (config_store.AppConfigSnapshot / GET + PUT /api/config) ---

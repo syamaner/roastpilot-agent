@@ -40,6 +40,17 @@ const acknowledgeHardwareClearMock = vi.hoisted(() =>
     fresh_spawn_permitted: true,
   })),
 );
+const acknowledgeRestartClearanceMock = vi.hoisted(() =>
+  vi.fn(async () => ({ cleared: true, restart_clearance_required: false })),
+);
+const faultControlsActionMock = vi.hoisted(() =>
+  vi.fn(async (request: { action: string }) => ({
+    action: request.action,
+    result: "accepted",
+    reason: "queued for server confirmation",
+    queued: true,
+  })),
+);
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
@@ -49,6 +60,8 @@ vi.mock("@/lib/api", async () => {
       startRoast: startRoastMock,
       clearStaleSession: clearStaleSessionMock,
       acknowledgeHardwareClear: acknowledgeHardwareClearMock,
+      acknowledgeRestartClearance: acknowledgeRestartClearanceMock,
+      faultControlsAction: faultControlsActionMock,
     },
   };
 });
@@ -64,6 +77,15 @@ const healthState: {
         active_run_id: string | null;
         mcp_hardware_clear_required?: boolean;
         mcp_teardown_incident_id?: string | null;
+        restart_clearance?: {
+          state: "required" | "cleared" | "unknown";
+          eligible: boolean;
+        };
+        fault_controls?: {
+          status: "closed" | "open" | "unknown";
+          generation: number | null;
+          enabled_actions: string[];
+        };
       }
     | undefined;
   isSuccess: boolean;
@@ -99,6 +121,8 @@ vi.mock("@/hooks/queries", async () => {
           : {
               mcp_hardware_clear_required: false,
               mcp_teardown_incident_id: null,
+              restart_clearance: { state: "cleared", eligible: true },
+              fault_controls: { status: "closed", generation: null, enabled_actions: [] },
               ...healthState.data,
             },
     }),
@@ -148,6 +172,8 @@ beforeEach(() => {
   startRoastMock.mockClear();
   clearStaleSessionMock.mockClear();
   acknowledgeHardwareClearMock.mockClear();
+  acknowledgeRestartClearanceMock.mockClear();
+  faultControlsActionMock.mockClear();
   clearStaleSessionMock.mockResolvedValue({
     run_id: "run-stranded",
     outcome: "aborted",
@@ -286,6 +312,61 @@ describe("StartRoastView (#324)", () => {
     expect(screen.getByTestId("start-roast-status-unknown")).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
     expect(screen.queryByTestId("start-roast-active-run-banner")).toBeNull();
+  });
+});
+
+describe("StartRoastView — restart clearance and terminal lease (#954)", () => {
+  it("fails closed when the fresh health projection omits restart clearance", () => {
+    healthState.data = { active_run_id: null, restart_clearance: undefined };
+    renderView();
+
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("replaces the start form with the per-process physical confirmation gate", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "required", eligible: false },
+    };
+    renderView();
+
+    expect(screen.getByTestId("restart-clearance-required")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("keeps an OPEN terminal lease reachable before restart clearance", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "required", eligible: false },
+      fault_controls: {
+        status: "open",
+        generation: 7,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderView();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute("data-status", "open");
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("routes terminal actions globally and does not send a run identity", async () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: true },
+      fault_controls: {
+        status: "open",
+        generation: 7,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderView();
+    fireEvent.click(screen.getByTestId("terminal-fault-action-emergency_stop"));
+    await waitFor(() =>
+      expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }),
+    );
   });
 });
 

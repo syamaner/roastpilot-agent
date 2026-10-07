@@ -102,6 +102,8 @@ import type {
 import type { LiveNavigationState } from "@/pages/live/LivePage";
 
 import { StartRoastForm } from "@/pages/dashboard/StartRoastForm";
+import { RestartClearanceCard } from "./RestartClearanceCard";
+import { TerminalFaultControls } from "./TerminalFaultControls";
 
 interface HardwareClearAcknowledgementCardProps {
   incidentId: string;
@@ -295,6 +297,31 @@ function HardwareClearStatusIncomplete(): React.JSX.Element {
           RoastPilot received inconsistent teardown status. Starting remains blocked. Reload the
           page or perform a controlled agent restart after physically verifying the roaster is
           inactive.
+        </p>
+      </div>
+    </AppFrame>
+  );
+}
+
+/** Fail closed when the fresh Agent process does not provide a coherent D213 gate. */
+function RestartClearanceStatusIncomplete(): React.JSX.Element {
+  return (
+    <AppFrame
+      headerRight={
+        <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+          Start blocked
+        </span>
+      }
+    >
+      <div
+        className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-fault/50 bg-roast-fault/10 p-8 text-center"
+        data-testid="restart-clearance-status-unknown"
+      >
+        <h2 className="text-lg font-bold uppercase tracking-wide">Restart clearance status unknown</h2>
+        <p className="text-sm text-muted-foreground">
+          RoastPilot cannot confirm this Agent process has a valid restart clearance. Starting
+          remains blocked. If the Hottop may be active, use the independent physical emergency
+          stop and reload to obtain current status.
         </p>
       </div>
     </AppFrame>
@@ -563,6 +590,80 @@ export function StartRoastView(): React.JSX.Element {
             Open live dashboard
           </Link>
         </div>
+      </AppFrame>
+    );
+  }
+
+  // A terminal fault lease is independent of historical roast completion and
+  // of this process's restart-clearance gate. It takes precedence here so an
+  // operator who lands on `/start` still has the server-enumerated fault path.
+  // The component receives no IDs and cannot invent an enabled command.
+  if (
+    health.isSuccess &&
+    health.data.fault_controls !== undefined &&
+    health.data.fault_controls.status !== "closed"
+  ) {
+    return (
+      <AppFrame
+        headerRight={
+          <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+            Fault controls
+          </span>
+        }
+      >
+        <TerminalFaultControls
+          controls={health.data.fault_controls}
+          onAction={async (action, confirmation) => {
+            try {
+              const result = await api.faultControlsAction(
+                confirmation === true ? { action, confirmation } : { action },
+              );
+              await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+              return result;
+            } catch (error) {
+              await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+              throw error;
+            }
+          }}
+        />
+      </AppFrame>
+    );
+  }
+
+  // Missing and incoherent D213 state fail closed. A response from an older
+  // server is never evidence that the new process gate has been cleared.
+  const restartClearance = health.isSuccess ? health.data.restart_clearance : undefined;
+  if (
+    health.isSuccess &&
+    (restartClearance === undefined ||
+      restartClearance.state === "unknown" ||
+      (restartClearance.state === "required" && restartClearance.eligible) ||
+      (restartClearance.state === "cleared" && !restartClearance.eligible))
+  ) {
+    return <RestartClearanceStatusIncomplete />;
+  }
+
+  if (health.isSuccess && restartClearance?.state === "required") {
+    return (
+      <AppFrame
+        headerRight={
+          <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+            Start blocked
+          </span>
+        }
+      >
+        <RestartClearanceCard
+          onAcknowledge={async () => {
+            try {
+              const result = await api.acknowledgeRestartClearance();
+              await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+              return result;
+            } catch (error) {
+              await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+              throw error;
+            }
+          }}
+        />
       </AppFrame>
     );
   }

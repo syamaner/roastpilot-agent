@@ -58,6 +58,37 @@ describe("api client", () => {
     });
   });
 
+  it("POST /api/restart-clearance records only the fixed physical confirmation", async () => {
+    mockFetch(200, { cleared: true, restart_clearance_required: false });
+    await api.acknowledgeRestartClearance();
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/restart-clearance",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+      physical_confirmation: true,
+    });
+  });
+
+  it("POST /api/fault-controls/actions sends no run or device identifier", async () => {
+    mockFetch(202, {
+      action: "emergency_stop",
+      result: "accepted",
+      reason: "queued for server confirmation",
+      queued: true,
+    });
+    await api.faultControlsAction({ action: "emergency_stop" });
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/fault-controls/actions",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+      action: "emergency_stop",
+    });
+  });
+
   it("draft-correlated profile create preserves JSON and attempt headers", async () => {
     mockFetch(201, { id: "bean-1", name: "Kenya" });
     const input = { name: "Kenya" } as never;

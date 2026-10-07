@@ -19,6 +19,8 @@ import type {
   ClearStaleSessionRequest,
   ClearStaleSessionResult,
   DevicesSnapshot,
+  FaultControlsActionRequest,
+  FaultControlsActionResult,
   HealthResponse,
   HardwareClearAcknowledgementRequest,
   HardwareClearAcknowledgementResult,
@@ -30,6 +32,7 @@ import type {
   RoastedWeightRequest,
   RoastProfile,
   RoastTimeline,
+  RestartClearanceResult,
   TastingEntryRequest,
   TastingList,
   TelemetrySeries,
@@ -159,6 +162,16 @@ export const api = {
       },
     ),
 
+  /**
+   * `POST /api/restart-clearance` — records one explicit physical
+   * confirmation for this fresh Agent process. It never actuates hardware.
+   */
+  acknowledgeRestartClearance: () =>
+    request<RestartClearanceResult>("/api/restart-clearance", {
+      method: "POST",
+      body: JSON.stringify({ physical_confirmation: true }),
+    }),
+
   /** `GET /api/roasts/{id}/tastings` — the run's tasting entries (#522, D91). */
   tastings: (runId: string) => request<TastingList>(`/api/roasts/${runId}/tastings`),
 
@@ -174,6 +187,16 @@ export const api = {
   /** `POST /api/roasts/{id}/operator-actions` — queue an operator action. */
   operatorAction: (runId: string, action: OperatorActionRequest) =>
     request<OperatorActionResult>(`/api/roasts/${runId}/operator-actions`, {
+      method: "POST",
+      body: JSON.stringify(action),
+    }),
+
+  /**
+   * `POST /api/fault-controls/actions` — act on the server-resolved current
+   * fault lease. The SPA supplies no run, session, or device identifier.
+   */
+  faultControlsAction: (action: FaultControlsActionRequest) =>
+    request<FaultControlsActionResult>("/api/fault-controls/actions", {
       method: "POST",
       body: JSON.stringify(action),
     }),

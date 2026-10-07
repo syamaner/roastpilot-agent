@@ -4,9 +4,11 @@ import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "@/lib/api";
+import type { HealthResponse } from "@/lib/types";
 import { FIXTURE_DETAIL } from "@/pages/detail/fixture";
 import {
   roastKeys,
+  needsBoundedHealthRefresh,
   useAddTasting,
   useFreshHealthGate,
   useHistory,
@@ -367,5 +369,77 @@ describe("useFreshHealthGate", () => {
         expect.objectContaining({ active_run_id: null }),
       ),
     );
+  });
+
+  it("polls an unsettled restart gate and reflects an independent clear from fresh health", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let response: HealthResponse = {
+      status: "ok",
+      version: "t",
+      instance_id: "server-a",
+      mcp_child: "running",
+      mcp_hardware_clear_required: false,
+      mcp_teardown_incident_id: null,
+      active_run_id: null,
+      restart_clearance: { state: "required", eligible: false },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    };
+    const healthSpy = vi
+      .spyOn(api, "health")
+      .mockImplementation(async () => response);
+    const { result } = renderHook(() => useFreshHealthGate(), { wrapper: appDefaultsWrapper().Wrapper });
+
+    await vi.waitFor(() => expect(result.current.data?.restart_clearance?.state).toBe("required"));
+    response = {
+      ...response,
+      restart_clearance: { state: "cleared", eligible: true },
+    };
+    await vi.advanceTimersByTimeAsync(3_000);
+    await vi.waitFor(() => expect(result.current.data?.restart_clearance?.state).toBe("cleared"));
+    expect(healthSpy).toHaveBeenCalledTimes(2);
+
+    // Once the server reports both gate and fault lease settled, bounded
+    // polling stops; this is not a background physical-state monitor.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(healthSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not poll a closed, cleared health projection", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const healthSpy = vi.spyOn(api, "health").mockResolvedValue({
+      status: "ok",
+      version: "t",
+      instance_id: "server-a",
+      mcp_child: "running",
+      mcp_hardware_clear_required: false,
+      mcp_teardown_incident_id: null,
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: true },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    } satisfies HealthResponse);
+    renderHook(() => useFreshHealthGate(), { wrapper: appDefaultsWrapper().Wrapper });
+
+    await vi.waitFor(() => expect(healthSpy).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(healthSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("needsBoundedHealthRefresh", () => {
+  it("fails closed for an absent or UNKNOWN projection", () => {
+    expect(needsBoundedHealthRefresh(undefined)).toBe(true);
+    expect(
+      needsBoundedHealthRefresh({
+        status: "ok",
+        version: "t",
+        instance_id: "server-a",
+        mcp_child: "running",
+        mcp_hardware_clear_required: false,
+        mcp_teardown_incident_id: null,
+        active_run_id: null,
+        restart_clearance: { state: "unknown", eligible: false },
+        fault_controls: { status: "unknown", generation: null, enabled_actions: [] },
+      }),
+    ).toBe(true);
   });
 });
