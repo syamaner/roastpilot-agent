@@ -1541,6 +1541,77 @@ class RoastStore:
         await self.connection.commit()
         return cursor.rowcount == 1
 
+    async def begin_fault_controls_acknowledgement_event(self, run_id: str, generation: int) -> int:
+        """Persist a revocable candidate for one fault-lease close event.
+
+        A closed lease can be superseded by a global e-stop while this durable
+        event write awaits.  The candidate is therefore deliberately not a
+        confirmed close until its caller resolves it through the current
+        in-memory generation fence.
+        """
+        cursor = await self.connection.execute(
+            "INSERT INTO roast_events"
+            " (run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json)"
+            " VALUES (?, ?, ?, NULL, ?, ?)",
+            (
+                run_id,
+                RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED.value,
+                RoastEventSource.OPERATOR.value,
+                _utc_now(),
+                json.dumps(
+                    {
+                        "generation": generation,
+                        "status": "pending_confirmation",
+                        "outcome": "pending",
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        )
+        await self.connection.commit()
+        event_id = cursor.lastrowid
+        assert event_id is not None  # pragma: no cover - SQLite assigns INTEGER PRIMARY KEY
+        return int(event_id)
+
+    async def resolve_fault_controls_acknowledgement_event(
+        self, event_id: int, *, generation: int, confirmed: bool
+    ) -> bool:
+        """Resolve one pending fault-lease close event without stale success."""
+        payload = (
+            {"generation": generation, "status": "closed", "outcome": "confirmed"}
+            if confirmed
+            else {
+                "generation": generation,
+                "status": "superseded_by_emergency_stop",
+                "outcome": "failed",
+            }
+        )
+        pending = json.dumps(
+            {
+                "generation": generation,
+                "status": "pending_confirmation",
+                "outcome": "pending",
+            },
+            sort_keys=True,
+        )
+        confirmed_payload = json.dumps(
+            {"generation": generation, "status": "closed", "outcome": "confirmed"},
+            sort_keys=True,
+        )
+        cursor = await self.connection.execute(
+            "UPDATE roast_events SET payload_json = ? WHERE id = ? AND kind = ? "
+            "AND payload_json IN (?, ?)",
+            (
+                json.dumps(payload, sort_keys=True),
+                event_id,
+                RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED.value,
+                pending,
+                confirmed_payload,
+            ),
+        )
+        await self.connection.commit()
+        return cursor.rowcount == 1
+
     @staticmethod
     def _dump(model: BaseModel) -> dict[str, object]:
         return model.model_dump(mode="json")

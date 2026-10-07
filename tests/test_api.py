@@ -6550,13 +6550,12 @@ async def test_global_estop_fences_d212_close_event_persistence(
     assert service.runner is not None
     entered = asyncio.Event()
     release = asyncio.Event()
-    original_record_event = store.record_event
+    original_begin_event = store.begin_fault_controls_acknowledgement_event
 
-    async def block_closed_lease_event(*args: Any, **kwargs: Any) -> None:
-        if kwargs.get("kind") is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED:
-            entered.set()
-            await release.wait()
-        await original_record_event(*args, **kwargs)
+    async def block_closed_lease_event(run_id: str, generation: int) -> int:
+        entered.set()
+        await release.wait()
+        return await original_begin_event(run_id, generation)
 
     subscriber = service.events.subscribe()
     await service.submit_operator_action(
@@ -6566,7 +6565,9 @@ async def test_global_estop_fences_d212_close_event_persistence(
             payload={"confirmation": True},
         ),
     )
-    with mock.patch.object(store, "record_event", block_closed_lease_event):
+    with mock.patch.object(
+        store, "begin_fault_controls_acknowledgement_event", block_closed_lease_event
+    ):
         pending = asyncio.create_task(service.runner.tick_once())
         await asyncio.wait_for(entered.wait(), timeout=1.0)
         e_stop = await service.submit_fault_controls_action(
@@ -6583,6 +6584,76 @@ async def test_global_estop_fences_d212_close_event_persistence(
         event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
         and event.data == {"outcome": "confirmed"}
         for event in events
+    )
+    timeline = await store.read_timeline(run_id)
+    assert not any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED
+        and event.payload == {"generation": 1, "status": "closed", "outcome": "confirmed"}
+        for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_d212_close_event_is_superseded_by_global_estop(
+    store: RoastStore,
+) -> None:
+    """A terminal D212 action cannot leave a stale confirmed close event."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "terminal-fault-run"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1")
+    await service.health()
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_begin_event = store.begin_fault_controls_acknowledgement_event
+
+    async def block_closed_lease_event(run_id: str, generation: int) -> int:
+        entered.set()
+        await release.wait()
+        return await original_begin_event(run_id, generation)
+
+    subscriber = service.events.subscribe()
+    with mock.patch.object(
+        store, "begin_fault_controls_acknowledgement_event", block_closed_lease_event
+    ):
+        acknowledgement = asyncio.create_task(
+            service.submit_fault_controls_action(
+                FaultControlsActionRequest(
+                    action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE, confirmation=True
+                )
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        e_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert e_stop.result == "confirmed"
+        release.set()
+        acknowledgement_result = await asyncio.wait_for(acknowledgement, timeout=1.0)
+
+    assert acknowledgement_result.result == "failed"
+    controls = await service._fault_controls_projection_after_action()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert controls.status is FaultLeaseStatus.OPEN
+    assert OperatorAction.START_COOLING in controls.enabled_actions
+    resumed_cooling = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.START_COOLING)
+    )
+    assert resumed_cooling.result == "confirmed"
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(event.event is SseEventType.FAULT_CONTROLS_ACKNOWLEDGED for event in events)
+    timeline = await store.read_timeline(run_id)
+    assert not any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED
+        and event.payload == {"generation": 1, "status": "closed", "outcome": "confirmed"}
+        for event in timeline.events
     )
 
 

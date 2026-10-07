@@ -2729,20 +2729,32 @@ class RoastService:
         )
         if lease.run_id is not None:
             payload = {"generation": generation, "status": "closed", "outcome": "confirmed"}
-            await self._store.record_event(
-                run_id=lease.run_id,
-                kind=RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED,
-                source=RoastEventSource.OPERATOR,
-                payload=payload,
+            event_id = await self._store.begin_fault_controls_acknowledgement_event(
+                lease.run_id, generation
             )
-            # A global e-stop may have synchronously advanced the in-memory
-            # generation while the durable event write awaited.  The stored
-            # close is historical evidence, but it cannot produce a current
-            # closed projection, success result, or SSE confirmation.
             if (
                 self._fault_lease_cache.generation != generation
                 or self._fault_lease_cache.status is not FaultLeaseStatus.CLOSED
             ):
+                await self._store.resolve_fault_controls_acknowledgement_event(
+                    event_id, generation=generation, confirmed=False
+                )
+                return False
+            if not await self._store.resolve_fault_controls_acknowledgement_event(
+                event_id, generation=generation, confirmed=True
+            ):
+                return False
+            # A global e-stop may have synchronously advanced the in-memory
+            # generation while either durable event write awaited.  Compensate
+            # the candidate before returning so the timeline cannot retain a
+            # stale confirmed close, and never emit its SSE frame.
+            if (
+                self._fault_lease_cache.generation != generation
+                or self._fault_lease_cache.status is not FaultLeaseStatus.CLOSED
+            ):
+                await self._store.resolve_fault_controls_acknowledgement_event(
+                    event_id, generation=generation, confirmed=False
+                )
                 return False
             self.events.emit(RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED, payload)
         return True
