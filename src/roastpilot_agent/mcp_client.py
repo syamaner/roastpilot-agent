@@ -260,12 +260,7 @@ class RoastSessionState(MCPMirror):
 
 
 class ServerInfo(MCPMirror):
-    """Mirror of mcp_server.ServerInfo.
-
-    ``session_presence`` is optional so the published 0.2.2 health response
-    remains compatible.  Restart clearance treats an absent value as failed
-    evidence; only the separately typed adapter read may use ``"none"``.
-    """
+    """Frozen mirror of mcp_server.ServerInfo for identity and health reads."""
 
     product_name: str
     package_name: str
@@ -280,7 +275,18 @@ class ServerInfo(MCPMirror):
     bootstrap_safe: bool
     available_bootstrap_tools: tuple[str, ...]
     started_at_utc: str
-    session_presence: SessionPresence | None = None
+
+
+class SessionPresenceSnapshot(MCPMirror):
+    """Typed session-presence projection from a fresh ``get_server_info`` read.
+
+    This is intentionally separate from :class:`ServerInfo`: the latter is a
+    frozen cold-characterisation identity component.  The current MCP adds
+    this field to the same wire response, while a published older MCP omits it
+    and is therefore rejected by this required projection.
+    """
+
+    session_presence: SessionPresence
 
 
 class RuntimeConfigSnapshot(MCPMirror):
@@ -440,6 +446,16 @@ class RoasterMCPClient:
 
     async def get_server_info(self) -> ServerInfo:
         return ServerInfo.model_validate(await self._call("get_server_info", {}))
+
+    async def _get_session_presence(self) -> SessionPresence:
+        """Return required typed presence from one fresh server-info response.
+
+        The method intentionally has no generic tool or field-selection input:
+        restart clearance can only read the MCP's fixed ``get_server_info``
+        response and an omitted field from an older MCP is invalid evidence.
+        """
+        result = await self._call("get_server_info", {})
+        return SessionPresenceSnapshot.model_validate(result).session_presence
 
     async def get_runtime_config(self) -> RuntimeConfigSnapshot:
         return RuntimeConfigSnapshot.model_validate(await self._call("get_runtime_config", {}))
@@ -1240,10 +1256,7 @@ class RoasterControlAdapter:
         failed ``get_roast_state`` call.  Older MCP responses omit the field
         and therefore fail closed.
         """
-        presence = (await self._client.get_server_info()).session_presence
-        if presence is None:
-            raise ValueError("MCP server info has no typed session presence")
-        return presence
+        return await self._client._get_session_presence()  # pyright: ignore[reportPrivateUsage]
 
     async def read_fault_acknowledgement_state(self, session_id: str) -> FaultAcknowledgementState:
         """Read and bind the MCP's current session for a fault acknowledgement proof."""

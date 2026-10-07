@@ -45,6 +45,7 @@ from roastpilot_agent.mcp_client import (
     RoastSessionState,
     RuntimeConfigSnapshot,
     ServerInfo,
+    SessionPresenceSnapshot,
     SetRecordingMetadataResult,
     StartRoastSessionResult,
     ambient_reading_is_live,
@@ -389,16 +390,21 @@ def test_session_state_mirror_round_trips() -> None:
     assert state.ambient_status.pressure_hpa == 1008.56
 
 
-def test_server_info_session_presence_is_closed_and_backwards_compatible() -> None:
-    """0.2.2 health remains valid; clearance accepts only the four new values."""
+def test_session_presence_snapshot_is_closed_without_changing_frozen_server_info() -> None:
+    """Clearance has a required projection while cold identity stays at v1."""
     server_info = cast("dict[str, object]", CANNED["get_server_info"])
-    assert ServerInfo.model_validate(server_info).session_presence is None
+    with_presence = {**server_info, "session_presence": "none"}
+
+    assert "session_presence" not in ServerInfo.model_fields
     assert (
-        ServerInfo.model_validate({**server_info, "session_presence": "none"}).session_presence
-        == "none"
+        ServerInfo.model_validate(with_presence).model_dump()
+        == ServerInfo.model_validate(server_info).model_dump()
     )
+    assert SessionPresenceSnapshot.model_validate(with_presence).session_presence == "none"
     with pytest.raises(ValidationError):
-        ServerInfo.model_validate({**server_info, "session_presence": "unknown"})
+        SessionPresenceSnapshot.model_validate(server_info)
+    with pytest.raises(ValidationError):
+        SessionPresenceSnapshot.model_validate({**server_info, "session_presence": "unknown"})
 
 
 @pytest.mark.asyncio
