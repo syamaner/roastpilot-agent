@@ -4088,10 +4088,6 @@ class RoastService:
         ):
             return await self._submit_live_emergency_stop(run_id, request)
 
-        guarded = await self._submit_open_fault_lease_action(run_id, request)
-        if guarded is not None:
-            return guarded
-
         detail = await self._store.read_run(run_id)
         if detail is None:
             raise RoastRunNotFoundError(run_id)
@@ -4102,6 +4098,10 @@ class RoastService:
                 f"run {run_id} is {detail.outcome or 'terminal'}; operator actions "
                 f"are no longer accepted"
             )
+
+        guarded = await self._submit_open_fault_lease_action(run_id, request)
+        if guarded is not None:
+            return guarded
 
         command = _ACTION_COMMAND.get(request.action)
         if request.action in (
@@ -4244,7 +4244,17 @@ class RoastService:
         executor = self._fault_control_executor
         session_id = lease.mcp_session_id
         if executor is None or session_id is None:
-            return None
+            result: Literal["accepted", "rejected", "failed"] = "failed"
+            reason = "exact fault-session control is unavailable"
+            await self._store.record_operator_action(
+                action=request.action.value,
+                result=result,
+                run_id=run_id,
+                payload=request.payload,
+            )
+            return OperatorActionResult(
+                action=request.action, result=result, reason=reason, queued=False
+            )
         try:
             state = await executor.execute(
                 request.action,

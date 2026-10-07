@@ -3347,7 +3347,7 @@ async def test_start_write_is_fenced_when_estop_arrives_after_run_row_creation(
     store: RoastStore,
 ) -> None:
     """An admitted e-stop invalidates Start before its first MCP write."""
-    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
     service = RoastService(
         store,
         roaster=mcp,
@@ -3379,7 +3379,7 @@ async def test_start_write_is_fenced_when_estop_arrives_after_run_row_creation(
 async def test_per_run_estop_bypasses_saturated_routine_queue(store: RoastStore) -> None:
     """A full routine queue cannot reject a per-run emergency stop."""
     clock = FakeClock()
-    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)
     for _ in range(service.OPERATOR_QUEUE_MAX):
         service.operator_queue.put_nowait(
@@ -3423,6 +3423,27 @@ async def test_open_lease_fault_action_uses_exact_session_and_rejects_changed_se
     assert not any(
         name == "fault_control" and args["action"] == "start_cooling" for name, args in mcp.calls
     )
+
+
+@pytest.mark.asyncio
+async def test_open_lease_missing_exact_executor_does_not_fall_back_to_queue(
+    store: RoastStore,
+) -> None:
+    """OPEN leases fail ordinary fault controls when exact execution is unavailable."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    service._admit_fault_control_lease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        run_id, session_id="session-1"
+    )
+    await asyncio.sleep(0)
+    result = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.STOP_COOLING)
+    )
+    assert result.result == "failed"
+    assert result.queued is False
+    assert service.operator_queue.empty()
+    assert "stop_cooling" not in mcp.commands()
 
 
 def _start_session_roast_nums(mcp: FakeMCPClient) -> list[int | None]:
@@ -5686,7 +5707,7 @@ async def test_emergency_stop_via_queue_faults_but_stays_operable(store: RoastSt
     — so the operator can still engage/stop cooling on a physically-running machine
     before acknowledging the fault."""
     clock = FakeClock()
-    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)
     await service.submit_operator_action(
         run_id,
@@ -5859,7 +5880,7 @@ async def test_206_estop_in_preheating_then_cool_then_acknowledge(store: RoastSt
     the still-live faulted run (accepted, MCP write issued), then ACKNOWLEDGES the
     fault, which finalises the run (outcome ``faulted``) and stops the loop."""
     clock = FakeClock()
-    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)  # preheating
 
     # 1) E-stop in preheating → fault, but the run stays live (not finalised).
@@ -5873,14 +5894,16 @@ async def test_206_estop_in_preheating_then_cool_then_acknowledge(store: RoastSt
     assert faulted.completed_at_utc is None
     assert "emergency_stop" in mcp.commands()
 
-    # 2) STOP COOLING is accepted on the faulted run (no power cycle) and the MCP
-    #    write is issued on the next tick — the run stays faulted, not completed.
+    # 2) STOP COOLING is exact-session guarded on the faulted run (no power
+    #    cycle) — the run stays faulted, not completed.
     accepted = await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.STOP_COOLING)
     )
     assert accepted.result == "accepted"
     assert not await _tick(service, clock)
-    assert "stop_cooling" in mcp.commands()
+    assert any(
+        name == "fault_control" and args["action"] == "stop_cooling" for name, args in mcp.calls
+    )
     still_faulted = await store.read_run(run_id)
     assert still_faulted is not None
     assert still_faulted.agent_phase is RoastPhase.FAULTED
