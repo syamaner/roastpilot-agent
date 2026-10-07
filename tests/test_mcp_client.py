@@ -391,23 +391,23 @@ def test_session_state_mirror_round_trips() -> None:
 
 def test_server_info_session_presence_is_closed_and_backwards_compatible() -> None:
     """0.2.2 health remains valid; clearance accepts only the four new values."""
-    assert ServerInfo.model_validate(CANNED["get_server_info"]).session_presence is None
+    server_info = cast("dict[str, object]", CANNED["get_server_info"])
+    assert ServerInfo.model_validate(server_info).session_presence is None
     assert (
-        ServerInfo.model_validate(
-            {**CANNED["get_server_info"], "session_presence": "none"}
-        ).session_presence
+        ServerInfo.model_validate({**server_info, "session_presence": "none"}).session_presence
         == "none"
     )
     with pytest.raises(ValidationError):
-        ServerInfo.model_validate({**CANNED["get_server_info"], "session_presence": "unknown"})
+        ServerInfo.model_validate({**server_info, "session_presence": "unknown"})
 
 
 @pytest.mark.asyncio
 async def test_adapter_reads_presence_from_a_fresh_server_info_call() -> None:
     """Clearance reads one typed server-info snapshot and never cached telemetry."""
     caller = FakeToolCaller()
+    server_info = cast("dict[str, object]", CANNED["get_server_info"])
     caller.responses["get_server_info"] = {
-        **CANNED["get_server_info"],
+        **server_info,
         "session_presence": "none",
     }
     adapter = RoasterControlAdapter(RoasterMCPClient(caller))

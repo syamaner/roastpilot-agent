@@ -2368,6 +2368,14 @@ class RoastService:
             await self._ensure_restart_epoch()
             lease = await self._read_fault_lease_fail_closed()
             active = await self._store.active_run()
+            expected_cached_lease = self._fault_lease_cache
+            expected_active_run_id = None if active is None else active.run_id
+            # An OPEN lease follows its separate exact-session proof, but it
+            # can still be backed by this child.  Capture its identity before
+            # either proof so a replacement during durable confirmation cannot
+            # publish a stale process clearance.
+            expected_child = self._mcp
+            expected_child_epoch = None if expected_child is None else expected_child.child_epoch
             if active is not None and not (
                 lease.status is FaultLeaseStatus.OPEN
                 and lease.run_id == active.run_id
@@ -2394,25 +2402,30 @@ class RoastService:
                             "exact fault session has no safe-zero recovery proof"
                         )
                 else:
-                    mcp = self._mcp
-                    if mcp is None or not mcp.running:
+                    mcp = expected_child
+                    if mcp is None:
                         raise RoastRunConflictError(
                             "restart clearance requires a current MCP child"
                         )
-                    child_epoch = mcp.child_epoch
+                    if not mcp.running:
+                        raise RoastRunConflictError(
+                            "restart clearance requires a current MCP child"
+                        )
                     if (await roaster.read_session_presence()) != "none":
                         raise RoastRunConflictError(
                             "current MCP child has no typed no-session proof"
                         )
-                    if not mcp.running or mcp.child_epoch != child_epoch:
+                    if (
+                        self._mcp is not mcp
+                        or not mcp.running
+                        or mcp.child_epoch != expected_child_epoch
+                    ):
                         raise RoastRunConflictError("MCP child changed during no-session proof")
             except RoastRunConflictError:
                 raise
             except Exception as exc:  # noqa: BLE001 - current MCP proof is mandatory
                 raise RoastRunConflictError("current MCP state could not be confirmed") from exc
-            if not await self._restart_clearance_context_is_current(
-                lease, None if active is None else active.run_id
-            ):
+            if not await self._restart_clearance_context_is_current(lease, expected_active_run_id):
                 raise RoastRunConflictError("restart clearance evidence became stale")
             try:
                 confirmed = await self._store.confirm_process_restart_clearance(self.instance_id)
@@ -2422,6 +2435,17 @@ class RoastService:
             if not confirmed:
                 self._restart_clearance_state = RestartClearanceState.UNKNOWN
                 raise RoastRunConflictError("restart clearance was not durably recorded")
+            # Confirmation itself awaits SQLite.  An e-stop admission advances
+            # this cache synchronously and a child replacement updates the
+            # process identity while that await is suspended.  Fence both
+            # without yielding before publishing this process as cleared.
+            if not self._restart_clearance_admission_is_current(
+                expected_cached_lease,
+                expected_child,
+                expected_child_epoch,
+            ):
+                self._restart_clearance_state = RestartClearanceState.UNKNOWN
+                raise RoastRunConflictError("restart clearance evidence became stale")
             self._restart_clearance_state = RestartClearanceState.CLEARED
             return RestartClearanceResult(
                 outcome="confirmed",
@@ -2430,6 +2454,35 @@ class RoastService:
                 restart_clearance=self._restart_clearance_projection(lease),
                 fault_controls=await self._fault_controls_projection(lease),
             )
+
+    def _restart_clearance_admission_is_current(
+        self,
+        expected_cached_lease: FaultControlLease,
+        expected_child: MCPServerProcess | None,
+        expected_child_epoch: int | None,
+    ) -> bool:
+        """Return whether the no-await clearance publication fence still holds.
+
+        The durable process-gate CAS is necessarily awaited.  This check runs
+        immediately after it, before the in-memory state can become ``CLEARED``.
+        It relies only on admission state updated synchronously by competing
+        local operations, especially emergency-stop admission and MCP-child
+        replacement.
+        """
+        if (
+            not self._restart_epoch_initialized
+            or self._restart_clearance_state is not RestartClearanceState.REQUIRED
+            or self._fault_lease_cache != expected_cached_lease
+        ):
+            return False
+        if expected_child is None:
+            return True
+        return (
+            self._mcp is expected_child
+            and expected_child.running
+            and expected_child_epoch is not None
+            and expected_child.child_epoch == expected_child_epoch
+        )
 
     async def _restart_clearance_context_is_current(
         self, expected_lease: FaultControlLease, expected_active_run_id: str | None

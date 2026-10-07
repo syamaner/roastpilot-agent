@@ -77,6 +77,7 @@ from roastpilot_agent.live import mount_spa
 from roastpilot_agent.mcp_client import (
     EventSnapshot,
     MalformedCommandResultError,
+    SessionPresence,
     applied_state_from_event,
 )
 from roastpilot_agent.models import (
@@ -541,6 +542,10 @@ class ReplayRoasterControl:
     def latest_fault_session_id(self) -> None:
         """Replay has no live MCP session identity for fault acknowledgement."""
         return None
+
+    async def read_session_presence(self) -> SessionPresence:
+        """Refuse live no-session proof because replay has no MCP child."""
+        raise RuntimeError("replay has no live MCP session-presence proof")
 
     async def read_telemetry(self) -> RoastTelemetry | None:
         if not self._frames:

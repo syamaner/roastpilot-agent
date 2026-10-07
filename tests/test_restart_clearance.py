@@ -281,6 +281,131 @@ async def test_no_session_clearance_fails_closed_when_persistence_fails(
 
 
 @pytest.mark.asyncio
+async def test_no_session_clearance_rejects_child_replacement_during_durable_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child replacement while the durable confirmation awaits cannot clear memory."""
+    store = RoastStore(tmp_path / "restart-confirm-child-race.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, child = await _presence_service(store, "none")
+        confirmation_started = asyncio.Event()
+        release_confirmation = asyncio.Event()
+        original_confirm = store.confirm_process_restart_clearance
+
+        async def delayed_confirmation(process_id: str) -> bool:
+            confirmation_started.set()
+            await release_confirmation.wait()
+            return await original_confirm(process_id)
+
+        monkeypatch.setattr(store, "confirm_process_restart_clearance", delayed_confirmation)
+        clearance = asyncio.create_task(
+            service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await confirmation_started.wait()
+        child.child_epoch += 1
+        release_confirmation.set()
+
+        with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+            await clearance
+        health = await service.health()
+        assert health.restart_clearance.state is RestartClearanceState.UNKNOWN
+        assert not health.restart_clearance.eligible
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_rejects_estop_admission_during_durable_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Synchronous e-stop admission during durable confirmation keeps Start blocked."""
+    store = RoastStore(tmp_path / "restart-confirm-estop-race.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, _child = await _presence_service(store, "none")
+        confirmation_started = asyncio.Event()
+        release_confirmation = asyncio.Event()
+        original_confirm = store.confirm_process_restart_clearance
+
+        async def delayed_confirmation(process_id: str) -> bool:
+            confirmation_started.set()
+            await release_confirmation.wait()
+            return await original_confirm(process_id)
+
+        monkeypatch.setattr(store, "confirm_process_restart_clearance", delayed_confirmation)
+        clearance = asyncio.create_task(
+            service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await confirmation_started.wait()
+        service.active_run_id = "private-run"
+        emergency_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert emergency_stop.result == "failed"
+        release_confirmation.set()
+
+        with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+            await clearance
+        await asyncio.sleep(0)
+        health = await service.health()
+        assert health.restart_clearance.state is RestartClearanceState.UNKNOWN
+        assert not health.restart_clearance.eligible
+        assert health.fault_controls.status is FaultLeaseStatus.UNKNOWN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_open_fault_clearance_rejects_child_replacement_during_durable_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exact-session proof cannot survive replacement of its current MCP child."""
+    store = RoastStore(tmp_path / "restart-confirm-open-child-race.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, child = await _presence_service(store, "none")
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await store.open_fault_control_lease(run_id="private-run", mcp_session_id="private-session")
+        confirmation_started = asyncio.Event()
+        release_confirmation = asyncio.Event()
+        original_confirm = store.confirm_process_restart_clearance
+
+        async def delayed_confirmation(process_id: str) -> bool:
+            confirmation_started.set()
+            await release_confirmation.wait()
+            return await original_confirm(process_id)
+
+        monkeypatch.setattr(store, "confirm_process_restart_clearance", delayed_confirmation)
+        clearance = asyncio.create_task(
+            service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await confirmation_started.wait()
+        child.child_epoch += 1
+        release_confirmation.set()
+
+        with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+            await clearance
+        health = await service.health()
+        assert health.restart_clearance.state is RestartClearanceState.UNKNOWN
+        assert not health.restart_clearance.eligible
+        assert health.fault_controls.status is FaultLeaseStatus.OPEN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_open_fault_clearance_keeps_existing_exact_session_path(tmp_path: Path) -> None:
     """No-session evidence is not required for the separate OPEN-lease proof."""
     store = RoastStore(tmp_path / "restart-open-fault.sqlite3")
