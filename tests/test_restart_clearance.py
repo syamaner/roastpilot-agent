@@ -187,6 +187,45 @@ async def test_no_session_clearance_confirms_current_child_none_and_persists(
 
 
 @pytest.mark.asyncio
+async def test_clean_predecessor_clearance_cannot_clear_a_fresh_process(
+    tmp_path: Path,
+) -> None:
+    """A clean predecessor leaves the next Agent process gated until reproved."""
+    store = RoastStore(tmp_path / "restart-fresh-process.sqlite3")
+    await store.initialize()
+    try:
+        predecessor, predecessor_roaster, _predecessor_child = await _presence_service(
+            store, "none"
+        )
+        predecessor_result = await predecessor.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert predecessor_result.cleared
+        assert predecessor_roaster.presence_reads == 1
+        assert await store.active_run() is None
+
+        successor, successor_roaster, _successor_child = await _presence_service(store, "none")
+        successor_health = await successor.health()
+        assert successor_health.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert not successor_health.restart_clearance.eligible
+        assert successor_roaster.presence_reads == 0
+        with pytest.raises(RoastRunConflictError, match="restart clearance"):
+            await successor.start_roast(_profile())
+
+        successor_result = await successor.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert successor_result.cleared
+        assert successor_roaster.presence_reads == 1
+        assert (
+            await store.read_process_restart_clearance(successor.instance_id)
+            is RestartClearanceState.CLEARED
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "presence",
     [None, "starting", "active", "stopped", "unknown", RuntimeError("MCP timeout")],
@@ -663,6 +702,130 @@ class _PriorityEmergencyRunner:
         assert item.action is OperatorAction.EMERGENCY_STOP
         self.calls.append(item.action)
         return True
+
+
+@pytest.mark.asyncio
+async def test_global_estop_dispatches_before_delayed_open_lease_persists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E-stop dispatch and Start blocking do not wait for the real OPEN lease write."""
+    store = RoastStore(tmp_path / "delayed-open-lease.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001 - admission harness  # pyright: ignore[reportPrivateUsage]
+        service._restart_epoch_initialized = True  # noqa: SLF001 - admission harness  # pyright: ignore[reportPrivateUsage]
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        runner = _PriorityEmergencyRunner()
+        service.runner = runner  # type: ignore[assignment]  # noqa: SLF001 - narrow runner seam
+        service.active_run_id = "private-run"
+        service._fault_lease_cache = FaultControlLease(  # noqa: SLF001 - admission harness  # pyright: ignore[reportPrivateUsage]
+            generation=1,
+            status=FaultLeaseStatus.OPEN,
+            run_id="private-run",
+            mcp_session_id="private-session",
+        )
+        write_started = asyncio.Event()
+        release_write = asyncio.Event()
+        write_finished = asyncio.Event()
+        original_open = store.open_fault_control_lease
+
+        async def delayed_open(
+            run_id: str, mcp_session_id: str, *, generation: int | None = None
+        ) -> FaultControlLease:
+            write_started.set()
+            await release_write.wait()
+            lease = await original_open(
+                run_id=run_id, mcp_session_id=mcp_session_id, generation=generation
+            )
+            write_finished.set()
+            return lease
+
+        monkeypatch.setattr(store, "open_fault_control_lease", delayed_open)
+        emergency = asyncio.create_task(
+            service.submit_fault_controls_action(
+                FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+        )
+        await asyncio.wait_for(write_started.wait(), timeout=1.0)
+
+        assert runner.calls == [OperatorAction.EMERGENCY_STOP]
+        assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001 - admission assertion  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+            await service.start_roast(_profile())
+
+        release_write.set()
+        result = await emergency
+        await asyncio.wait_for(write_finished.wait(), timeout=1.0)
+        persisted = await store.read_fault_control_lease()
+        assert result.result == "accepted"
+        assert persisted.generation == 2
+        assert persisted.status is FaultLeaseStatus.OPEN
+        assert persisted.mcp_session_id == "private-session"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_global_estop_failed_open_lease_write_remains_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real failed OPEN write never turns an admitted e-stop into durable success."""
+    store = RoastStore(tmp_path / "failed-open-lease.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001 - admission harness  # pyright: ignore[reportPrivateUsage]
+        service._restart_epoch_initialized = True  # noqa: SLF001 - admission harness  # pyright: ignore[reportPrivateUsage]
+        runner = _PriorityEmergencyRunner()
+        service.runner = runner  # type: ignore[assignment]  # noqa: SLF001 - narrow runner seam
+        service.active_run_id = "private-run"
+        service._fault_lease_cache = FaultControlLease(  # noqa: SLF001 - admission harness  # pyright: ignore[reportPrivateUsage]
+            generation=1,
+            status=FaultLeaseStatus.OPEN,
+            run_id="private-run",
+            mcp_session_id="private-session",
+        )
+        persistence_failed = asyncio.Event()
+        callback_ran = asyncio.Event()
+        original_callback = service._log_fault_lease_persistence_failure  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        async def fail_open(
+            run_id: str, mcp_session_id: str, *, generation: int | None = None
+        ) -> FaultControlLease:
+            assert run_id == "private-run"
+            assert mcp_session_id == "private-session"
+            assert generation == 2
+            persistence_failed.set()
+            raise RuntimeError("synthetic OPEN persistence failure")
+
+        def observe_failure(task: asyncio.Task[None], generation: int) -> None:
+            original_callback(task, generation)
+            callback_ran.set()
+
+        monkeypatch.setattr(store, "open_fault_control_lease", fail_open)
+        monkeypatch.setattr(service, "_log_fault_lease_persistence_failure", observe_failure)
+        result = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        await asyncio.wait_for(persistence_failed.wait(), timeout=1.0)
+        await asyncio.wait_for(callback_ran.wait(), timeout=1.0)
+
+        assert result.result == "accepted"
+        assert runner.calls == [OperatorAction.EMERGENCY_STOP]
+        assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001 - failure assertion  # pyright: ignore[reportPrivateUsage]
+        persisted = await store.read_fault_control_lease()
+        assert persisted.generation == 0
+        assert persisted.status is FaultLeaseStatus.CLOSED
+        with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+            await service.start_roast(_profile())
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio

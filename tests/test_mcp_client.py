@@ -4206,6 +4206,41 @@ async def test_execute_fault_control_rejects_wrong_command_event_kind(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "safety_called,driver_error", [(None, None), (False, None), (True, "driver rejected")]
+)
+async def test_execute_fault_control_rejects_unconfirmed_emergency_stop_driver_evidence(
+    safety_called: bool | None, driver_error: str | None
+) -> None:
+    """Safe-looking fallback controls cannot substitute for driver e-stop evidence."""
+    session_id = "fault-session"
+    result = _fault_control_result_payload(session_id, "fault", emergency_stop=True)
+    payload = cast("dict[str, object]", cast("dict[str, object]", result["event"])["payload"])
+    if safety_called is None:
+        del payload["driver_safety_method_called"]
+    else:
+        payload["driver_safety_method_called"] = safety_called
+    if driver_error is not None:
+        payload["driver_error"] = driver_error
+    payload.update(
+        {
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        }
+    )
+    caller = _SequenceCaller([result])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    with pytest.raises(ValueError, match="terminal emergency stop is unconfirmed"):
+        await adapter.execute_fault_control(
+            OperatorAction.EMERGENCY_STOP, expected_session_id=session_id
+        )
+
+    assert [call[0] for call in caller.calls] == ["emergency_stop"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("path", "value"),
     [
         (("session_id",), 7),
