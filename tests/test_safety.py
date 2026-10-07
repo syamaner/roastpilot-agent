@@ -752,12 +752,17 @@ def test_enabled_actions_in_faulted_allow_cooling_drop_and_acknowledge() -> None
 
 
 def test_every_operator_action_is_reachable_in_some_phase() -> None:
-    """Exhaustiveness: every OperatorAction is enabled in at least one phase. The
-    derivation fails OFF for an unwired action (the safe default), so this turns
-    "someone added an action and forgot to wire it into enabled_operator_actions"
-    into a red build rather than a silently-always-disabled button."""
+    """Every direct controller action is enabled in at least one phase.
+
+    D212's composite action is deliberately absent: it belongs to the current
+    OPEN fault lease projection and requires API-owned exact-session proof, not
+    a controller phase.  Keeping it out of this matrix prevents a future
+    controller-only route from bypassing that proof.
+    """
     reachable = {a for phase in RoastPhase for a in enabled_operator_actions(phase)}
-    assert reachable == set(OperatorAction)
+    direct_actions = set(OperatorAction) - {OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE}
+    assert reachable == direct_actions
+    assert OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE not in reachable
 
 
 def test_emergency_stop_matrix_row_is_every_phase() -> None:

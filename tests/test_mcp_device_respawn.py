@@ -391,55 +391,28 @@ async def test_respawn_does_not_auto_resume_heat_fan(
     controller tick loop AFTER start_session (operator action) — never from
     the respawn.
 
-    The test wires a real roaster fake (FakeMCPClient) so _begin_live_run
-    runs and the controller is active — meaning the assertion cannot trivially
-    pass because _roaster is None.  Only the respawn window (before
-    _begin_live_run → start_session) is checked for heat/fan calls.
+    A fresh live Agent process must obtain D213 restart clearance before
+    ``start_roast``.  The reviewed MCP candidate cannot provide the required
+    typed no-session proof, so this test drives only the between-roast respawn
+    primitive.  That isolates the #431 guarantee without weakening the
+    fail-closed start gate.
     """
-    from tests.conftest import FakeMCPClient
-
-    # FakeMCPClient is the roaster/exporter/raw_state: implements RoasterControl.
-    # run_loop=False so the controller's tick loop does not run in the background
-    # (we just need start_session to execute, not the full tick).
-    roaster = FakeMCPClient()
-
     fake_mcp = FakeMCPProcess(device_config=MCPDeviceConfig())
     svc = RoastService(
         store,
         mcp=fake_mcp,  # type: ignore[arg-type]
-        roaster=roaster,  # type: ignore[arg-type]
-        exporter=roaster,  # type: ignore[arg-type]
-        raw_state=roaster,  # type: ignore[arg-type]
         live_serve_mode=True,
-        run_loop=False,
     )
     svc.set_spawned_mcp_device(MCPDeviceConfig())
 
-    persist_config_edit(AppConfigEdit(mcp_device=MCPDeviceConfigEdit(serial_port="/dev/ttyUSB1")))
-
-    await svc.start_roast(RoastProfile(**_profile()))
+    await svc._respawn_mcp_for_device_config(  # pyright: ignore[reportPrivateUsage]
+        MCPDeviceConfig(serial_port="/dev/ttyUSB1")
+    )
 
     # The respawn (stop → set_device_config → start) must appear in fake_mcp.calls,
     # but no heat/fan command may appear there.
     assert "stop" in fake_mcp.calls
     assert set(fake_mcp.calls).issubset({"stop", "set_device_config", "start"})
-
-    # The roaster (FakeMCPClient) must not have received set_targets during the
-    # respawn window.  start_session is called by _begin_live_run (normal path)
-    # and is acceptable; only set_targets before start_session would be a violation.
-    roaster_call_names = [name for name, _ in roaster.calls]
-    set_targets_idx = [i for i, n in enumerate(roaster_call_names) if n == "set_targets"]
-    start_session_idx = next(
-        (i for i, n in enumerate(roaster_call_names) if n == "start_session"), None
-    )
-    # No set_targets should precede the first start_session (or appear at all
-    # before the controller tick loop fires, which is not running here).
-    if start_session_idx is not None:
-        assert all(idx > start_session_idx for idx in set_targets_idx), (
-            "set_targets appeared before start_session — heat/fan issued during respawn"
-        )
-    else:
-        assert set_targets_idx == [], "set_targets issued with no start_session — auto-resume"
 
 
 # ---------------------------------------------------------------------------

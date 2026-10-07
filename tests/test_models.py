@@ -226,6 +226,8 @@ def test_event_kinds_match_plan() -> None:
         "recovery_required",
         "recovery_acknowledged",
         "fault_acknowledgement_executed",
+        "fault_controls_changed",
+        "fault_controls_acknowledged",
         "logs_exported",
         "run_completed",
     }
