@@ -722,6 +722,19 @@ class _FaultAcknowledgementGate:
         """Release a failed durable-finalisation reservation for a later retry."""
         self.fault_finalization_started = False
 
+    def finalization_is_current(self, acknowledgement_epoch: int) -> bool:
+        """Return whether no emergency stop superseded this finalization.
+
+        The reservation only prevents two acknowledgement finalizers from
+        proceeding together.  It does not make a later admitted emergency stop
+        stale: that action must fence every acknowledgement success report that
+        follows an awaited immutable-history write.
+        """
+        return (
+            self.fault_finalization_started
+            and self.emergency_request_epoch == acknowledgement_epoch
+        )
+
 
 # The MCP ambient reading is cached for about 30 seconds, so one bad read can
 # shadow charge for a full cache period.  Three periods with margin allow a
@@ -1443,22 +1456,6 @@ class RoastRunner:
             d212_acknowledgement = self._d212_acknowledgement_requested
             if d212_acknowledgement and self._current_fault_lease_generation is not None:
                 d212_generation = self._current_fault_lease_generation()
-            if not d212_acknowledgement:
-                # Legacy ACK has no lease close; preserve its established
-                # fault-finalisation semantics. D212 confirmation is deferred
-                # until after immutable history is written and the lease
-                # generation is rechecked below.
-                self._fault_acknowledged = True
-                self._controller.note_fault_acknowledged()
-                await self._store.record_operator_action(
-                    action=OperatorAction.ACKNOWLEDGE_FAULT.value,
-                    result="accepted",
-                    run_id=self._run_id,
-                    payload={"fault_acknowledgement": "confirmed"},
-                )
-                self._emitter.emit(
-                    RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED, {"outcome": "confirmed"}
-                )
         if phase is RoastPhase.COMPLETE:
             manifest = await self._export_logs()
             await self._store.complete_run(
@@ -1478,40 +1475,73 @@ class RoastRunner:
                 agent_phase=phase,
                 fault_reason=self._captured_fault_reason or self._last_fault_reason(),
             )
-        if d212_acknowledgement:
-            # History is immutable evidence only. A late e-stop may have
-            # synchronously advanced the in-memory lease while complete_run
-            # awaited; close only the still-current generation and never emit a
-            # D212 confirmation when that fence fails.
-            if self._fault_lease_close is not None and await self._fault_lease_close(
-                d212_generation
-            ):
-                confirmation_generation = (
-                    None
-                    if self._closed_fault_lease_generation is None
-                    else self._closed_fault_lease_generation()
+        if phase is RoastPhase.FAULTED:
+            # A row can become terminal while this await is in flight, but it
+            # is history only.  A direct e-stop advances the fault lease and
+            # invalidates this epoch synchronously; terminal exact-session
+            # controls must remain available and the older acknowledgement
+            # must never be reported as confirmed.
+            acknowledgement_epoch = self._fault_acknowledgement_epoch
+            if (
+                acknowledgement_epoch is None
+                or not self._fault_acknowledgement_gate.finalization_is_current(
+                    acknowledgement_epoch
                 )
+            ):
+                self._fault_acknowledged = False
+                self._fault_acknowledgement_epoch = None
+                await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
+            elif d212_acknowledgement:
+                # History is immutable evidence only. A late e-stop may have
+                # synchronously advanced the in-memory lease while complete_run
+                # awaited; close only the still-current generation and never emit a
+                # D212 confirmation when that fence fails.
+                if self._fault_lease_close is not None and await self._fault_lease_close(
+                    d212_generation
+                ):
+                    confirmation_generation = (
+                        None
+                        if self._closed_fault_lease_generation is None
+                        else self._closed_fault_lease_generation()
+                    )
+                    await self._store.record_operator_action(
+                        action=OperatorAction.ACKNOWLEDGE_FAULT.value,
+                        result="accepted",
+                        run_id=self._run_id,
+                        payload={"fault_acknowledgement": "confirmed"},
+                    )
+                    if (
+                        confirmation_generation is not None
+                        and self._fault_lease_generation_is_current is not None
+                        and self._fault_lease_generation_is_current(confirmation_generation)
+                    ):
+                        self._fault_acknowledged = True
+                        self._controller.note_fault_acknowledged()
+                        self._emitter.emit(
+                            RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED,
+                            {"outcome": "confirmed"},
+                        )
+                    else:
+                        await self._record_fault_acknowledgement_failure(
+                            "superseded_by_emergency_stop"
+                        )
+                else:
+                    await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
+            else:
+                # Legacy acknowledgement still must wait for the durable row
+                # and the same post-await e-stop fence before it becomes a
+                # confirmed operator outcome.
+                self._fault_acknowledged = True
+                self._controller.note_fault_acknowledged()
                 await self._store.record_operator_action(
                     action=OperatorAction.ACKNOWLEDGE_FAULT.value,
                     result="accepted",
                     run_id=self._run_id,
                     payload={"fault_acknowledgement": "confirmed"},
                 )
-                if (
-                    confirmation_generation is not None
-                    and self._fault_lease_generation_is_current is not None
-                    and self._fault_lease_generation_is_current(confirmation_generation)
-                ):
-                    self._fault_acknowledged = True
-                    self._controller.note_fault_acknowledged()
-                    self._emitter.emit(
-                        RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED,
-                        {"outcome": "confirmed"},
-                    )
-                else:
-                    await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
-            else:
-                await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
+                self._emitter.emit(
+                    RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED, {"outcome": "confirmed"}
+                )
         self._last_persisted_phase = phase
         self._finalized = True
         return True

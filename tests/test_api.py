@@ -6322,8 +6322,15 @@ async def test_emergency_stop_after_ack_proof_cancels_without_confirmed_outcome(
 async def test_emergency_stop_is_dispatched_once_fault_finalization_has_started(
     store: RoastStore,
 ) -> None:
-    """An e-stop remains controller-dispatched while completion persists."""
-    service, mcp, _clock, run_id = await _faulted_live_service(store)
+    """A delayed completion cannot confirm an ACK after an admitted e-stop."""
+    clock = FakeClock()
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"}),
+    )
+    assert not await _tick(service, clock)
     assert service.runner is not None
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -6364,11 +6371,11 @@ async def test_emergency_stop_is_dispatched_once_fault_finalization_has_started(
         assert "dispatched" in e_stop.reason
         assert mcp.commands().count("emergency_stop") == 2
         assert service._fault_lease_cache.status is not FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        # The normal tick is still blocked before its final flush. Direct
-        # dispatch drains the shared emitter, so the already-confirmed event is
-        # persisted rather than stranded when completion later resumes.
+        # The normal tick is still blocked before its final flush.  Its
+        # acknowledgement has not become confirmed: the direct e-stop fenced
+        # it before immutable history could be recorded.
         timeline_while_blocked = await store.read_timeline(run_id)
-        assert any(
+        assert not any(
             event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
             and event.payload == {"outcome": "confirmed"}
             for event in timeline_while_blocked.events
@@ -6377,9 +6384,26 @@ async def test_emergency_stop_is_dispatched_once_fault_finalization_has_started(
         assert await asyncio.wait_for(pending_tick, timeout=1.0)
 
     assert mcp.commands().count("emergency_stop") == 2
-    assert service._fault_lease_cache.status is not FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     detail = await store.read_run(run_id)
     assert detail is not None and detail.outcome == "faulted"
+    timeline = await store.read_timeline(run_id)
+    assert not any(
+        event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.payload == {"outcome": "confirmed"}
+        for event in timeline.events
+    )
+    # The immutable row is terminal, but the newer OPEN lease retains its
+    # exact-session terminal control path.  This is a real policy-evaluated
+    # guarded action rather than merely checking an in-memory lease field.
+    cooling = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.START_COOLING)
+    )
+    assert cooling.result == "confirmed"
+    assert (
+        "fault_control",
+        {"action": "start_cooling", "expected_session_id": "session-1"},
+    ) in mcp.calls
     async with store.connection.execute(
         "SELECT result FROM operator_actions WHERE run_id = ? AND action = ? "
         "ORDER BY id DESC LIMIT 1",
