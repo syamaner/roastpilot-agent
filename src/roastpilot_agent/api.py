@@ -1210,6 +1210,16 @@ class RoastRunner:
             return False
         return await self.dispatch_priority_emergency_stop(item)
 
+    def invalidate_fault_acknowledgement_for_emergency_stop(self) -> None:
+        """Fence fault acknowledgement before a global e-stop can await.
+
+        A terminal exact-session e-stop may bypass this runner's command
+        queue.  Its admission still supersedes every pending acknowledgement
+        proof, including one currently awaiting a durable audit write.
+        """
+        self._fault_acknowledgement_gate.invalidate_fault_acknowledgement()
+        self._confirmed_fault_cooling_stop_sessions.clear()
+
     def _controller_tick_emergency_stop_emitted(self, start: int) -> bool:
         """Return whether this controller tick invalidated safe-zero proof."""
         for event in self._emitter.peek()[start:]:
@@ -1387,6 +1397,27 @@ class RoastRunner:
             payload={"fault_acknowledgement": outcome},
         )
 
+    async def _commit_fault_acknowledgement_confirmation(self, acknowledgement_epoch: int) -> bool:
+        """Durably resolve and publish an acknowledgement only if still current.
+
+        The audit row begins as a non-success candidate.  Every await is
+        followed by an epoch fence, so a global e-stop admitted mid-write is
+        recorded as superseded and cannot leave either a confirmed audit or a
+        confirmation SSE frame behind.
+        """
+        audit_id = await self._store.begin_fault_acknowledgement_confirmation(self._run_id)
+        if not self._fault_acknowledgement_gate.finalization_is_current(acknowledgement_epoch):
+            await self._store.resolve_fault_acknowledgement_confirmation(audit_id, confirmed=False)
+            return False
+        if not await self._store.resolve_fault_acknowledgement_confirmation(
+            audit_id, confirmed=True
+        ):
+            return False
+        if not self._fault_acknowledgement_gate.finalization_is_current(acknowledgement_epoch):
+            await self._store.resolve_fault_acknowledgement_confirmation(audit_id, confirmed=False)
+            return False
+        return True
+
     async def _record_dispatch_command(
         self, tool: RoastCommand, item: QueuedOperatorAction, *, since: int
     ) -> None:
@@ -1496,19 +1527,15 @@ class RoastRunner:
                 # synchronously advanced the in-memory lease while complete_run
                 # awaited; close only the still-current generation and never emit a
                 # D212 confirmation when that fence fails.
-                if self._fault_lease_close is not None and await self._fault_lease_close(
-                    d212_generation
+                if (
+                    self._fault_lease_close is not None
+                    and await self._fault_lease_close(d212_generation)
+                    and await self._commit_fault_acknowledgement_confirmation(acknowledgement_epoch)
                 ):
                     confirmation_generation = (
                         None
                         if self._closed_fault_lease_generation is None
                         else self._closed_fault_lease_generation()
-                    )
-                    await self._store.record_operator_action(
-                        action=OperatorAction.ACKNOWLEDGE_FAULT.value,
-                        result="accepted",
-                        run_id=self._run_id,
-                        payload={"fault_acknowledgement": "confirmed"},
                     )
                     if (
                         confirmation_generation is not None
@@ -1531,17 +1558,15 @@ class RoastRunner:
                 # Legacy acknowledgement still must wait for the durable row
                 # and the same post-await e-stop fence before it becomes a
                 # confirmed operator outcome.
-                self._fault_acknowledged = True
-                self._controller.note_fault_acknowledged()
-                await self._store.record_operator_action(
-                    action=OperatorAction.ACKNOWLEDGE_FAULT.value,
-                    result="accepted",
-                    run_id=self._run_id,
-                    payload={"fault_acknowledgement": "confirmed"},
-                )
-                self._emitter.emit(
-                    RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED, {"outcome": "confirmed"}
-                )
+                if await self._commit_fault_acknowledgement_confirmation(acknowledgement_epoch):
+                    self._fault_acknowledged = True
+                    self._controller.note_fault_acknowledged()
+                    self._emitter.emit(
+                        RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED,
+                        {"outcome": "confirmed"},
+                    )
+                else:
+                    await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
         self._last_persisted_phase = phase
         self._finalized = True
         return True
@@ -2523,6 +2548,12 @@ class RoastService:
         # immediate controller executor; the lease itself stays UNKNOWN until
         # its asynchronous persistence confirms it.
         admitted = self._admit_fault_control_lease(run_id, session_id=previous.mcp_session_id)
+        runner = self.runner
+        if runner is not None and self.active_run_id == run_id:
+            # This global route may use the terminal exact-session executor
+            # rather than the runner queue.  Fence the runner synchronously
+            # before any executor or persistence await can yield.
+            runner.invalidate_fault_acknowledgement_for_emergency_stop()
         executor = self._fault_control_executor
         session_id = previous.mcp_session_id
         if executor is not None and session_id is not None:
@@ -2551,7 +2582,6 @@ class RoastService:
         # no runner would leave a queue item undrained and must never report an
         # admitted software stop. This direct controller route bypasses the
         # bounded routine queue, whose capacity must not starve an e-stop.
-        runner = self.runner
         if runner is None or self.active_run_id != run_id:
             return FaultControlsActionResult(
                 action=OperatorAction.EMERGENCY_STOP,
@@ -2705,6 +2735,15 @@ class RoastService:
                 source=RoastEventSource.OPERATOR,
                 payload=payload,
             )
+            # A global e-stop may have synchronously advanced the in-memory
+            # generation while the durable event write awaited.  The stored
+            # close is historical evidence, but it cannot produce a current
+            # closed projection, success result, or SSE confirmation.
+            if (
+                self._fault_lease_cache.generation != generation
+                or self._fault_lease_cache.status is not FaultLeaseStatus.CLOSED
+            ):
+                return False
             self.events.emit(RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED, payload)
         return True
 

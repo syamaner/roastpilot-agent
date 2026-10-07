@@ -3295,16 +3295,18 @@ async def _tick(service: RoastService, clock: FakeClock) -> bool:
 async def _faulted_live_service(
     store: RoastStore,
     *,
+    mcp: FakeMCPClient | None = None,
     states: list[FaultAcknowledgementState | Exception] | None = None,
     stop_results: list[FaultCoolingStopResult | Exception] | None = None,
 ) -> tuple[RoastService, FakeMCPClient, FakeClock, str]:
     """Create one operable fault with a scripted acknowledgement capability."""
     clock = FakeClock()
-    mcp = FakeMCPClient(
-        [_reading(178.0, 185.0)],
-        fault_acknowledgement_states=states,
-        fault_acknowledgement_stop_results=stop_results,
-    )
+    if mcp is None:
+        mcp = FakeMCPClient(
+            [_reading(178.0, 185.0)],
+            fault_acknowledgement_states=states,
+            fault_acknowledgement_stop_results=stop_results,
+        )
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)
     await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"})
@@ -6322,68 +6324,35 @@ async def test_emergency_stop_after_ack_proof_cancels_without_confirmed_outcome(
 async def test_emergency_stop_is_dispatched_once_fault_finalization_has_started(
     store: RoastStore,
 ) -> None:
-    """A delayed completion cannot confirm an ACK after an admitted e-stop."""
-    clock = FakeClock()
+    """A global e-stop supersedes legacy ACK during its durable audit write."""
     mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
-    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
-    await service.submit_operator_action(
-        run_id,
-        OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"}),
-    )
-    assert not await _tick(service, clock)
+    service, _mcp, _clock, run_id = await _faulted_live_service(store, mcp=mcp)
     assert service.runner is not None
     entered = asyncio.Event()
     release = asyncio.Event()
-    original_complete = store.complete_run
+    original_begin = store.begin_fault_acknowledgement_confirmation
 
-    async def block_completion(
-        *,
-        run_id: str,
-        outcome: Literal["completed", "aborted", "faulted"],
-        agent_phase: RoastPhase,
-        fault_reason: str | None = None,
-        log_dir: str | None = None,
-        export_manifest: object = None,
-    ) -> None:
+    async def block_audit(run_id: str) -> int:
         entered.set()
         await release.wait()
-        await original_complete(
-            run_id=run_id,
-            outcome=outcome,
-            agent_phase=agent_phase,
-            fault_reason=fault_reason,
-            log_dir=log_dir,
-            export_manifest=export_manifest,
-        )
+        return await original_begin(run_id)
 
     await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
     )
-    with mock.patch.object(store, "complete_run", block_completion):
+    with mock.patch.object(store, "begin_fault_acknowledgement_confirmation", block_audit):
         pending_tick = asyncio.create_task(service.runner.tick_once())
         await asyncio.wait_for(entered.wait(), timeout=1.0)
-        e_stop = await service.submit_operator_action(
-            run_id,
-            OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"}),
+        e_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
         )
-        assert e_stop.result == "accepted"
+        assert e_stop.result == "confirmed"
         assert e_stop.queued is False
-        assert "dispatched" in e_stop.reason
-        assert mcp.commands().count("emergency_stop") == 2
+        assert "exact-session proof" in e_stop.reason
         assert service._fault_lease_cache.status is not FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        # The normal tick is still blocked before its final flush.  Its
-        # acknowledgement has not become confirmed: the direct e-stop fenced
-        # it before immutable history could be recorded.
-        timeline_while_blocked = await store.read_timeline(run_id)
-        assert not any(
-            event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
-            and event.payload == {"outcome": "confirmed"}
-            for event in timeline_while_blocked.events
-        )
         release.set()
         assert await asyncio.wait_for(pending_tick, timeout=1.0)
 
-    assert mcp.commands().count("emergency_stop") == 2
     assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     detail = await store.read_run(run_id)
     assert detail is not None and detail.outcome == "faulted"
@@ -6405,12 +6374,15 @@ async def test_emergency_stop_is_dispatched_once_fault_finalization_has_started(
         {"action": "start_cooling", "expected_session_id": "session-1"},
     ) in mcp.calls
     async with store.connection.execute(
-        "SELECT result FROM operator_actions WHERE run_id = ? AND action = ? "
-        "ORDER BY id DESC LIMIT 1",
-        (run_id, OperatorAction.EMERGENCY_STOP.value),
+        "SELECT payload_json FROM operator_actions WHERE run_id = ? AND action = ?",
+        (run_id, OperatorAction.ACKNOWLEDGE_FAULT.value),
     ) as cursor:
-        e_stop_action = await cursor.fetchone()
-    assert e_stop_action is not None and e_stop_action[0] == "accepted"
+        acknowledgement_rows = await cursor.fetchall()
+    assert all(
+        json.loads(str(row[0])) != {"fault_acknowledgement": "confirmed"}
+        for row in acknowledgement_rows
+        if row[0] is not None
+    )
 
 
 @pytest.mark.asyncio
@@ -6459,22 +6431,75 @@ async def test_d212_never_confirms_after_delayed_completion_is_superseded_by_est
 
 
 @pytest.mark.asyncio
-async def test_d212_confirmation_is_suppressed_when_estop_arrives_after_close_cas(
+async def test_global_estop_rewrites_legacy_confirmation_resolved_during_audit_await(
     store: RoastStore,
 ) -> None:
-    """A post-CAS e-stop fences the acknowledgement audit and SSE confirmation."""
-    service, _mcp, _clock, run_id = await _faulted_live_service(store)
+    """An e-stop during a resolved legacy audit leaves only superseded evidence."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _mcp, _clock, run_id = await _faulted_live_service(store, mcp=mcp)
     assert service.runner is not None
     entered = asyncio.Event()
     release = asyncio.Event()
-    original_record = store.record_operator_action
+    original_resolve = store.resolve_fault_acknowledgement_confirmation
 
-    async def block_confirmation_audit(*args: Any, **kwargs: Any) -> None:
-        payload = kwargs.get("payload")
-        if payload == {"fault_acknowledgement": "confirmed"}:
+    async def block_confirmed_resolution(action_id: int, *, confirmed: bool) -> bool:
+        if confirmed:
             entered.set()
             await release.wait()
-        await original_record(*args, **kwargs)
+        return await original_resolve(action_id, confirmed=confirmed)
+
+    subscriber = service.events.subscribe()
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    with mock.patch.object(
+        store, "resolve_fault_acknowledgement_confirmation", block_confirmed_resolution
+    ):
+        pending = asyncio.create_task(service.runner.tick_once())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        e_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert e_stop.result == "confirmed"
+        release.set()
+        assert await asyncio.wait_for(pending, timeout=1.0)
+
+    assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in events
+    )
+    async with store.connection.execute(
+        "SELECT payload_json, result FROM operator_actions WHERE run_id = ? AND action = ? "
+        "ORDER BY id ASC",
+        (run_id, OperatorAction.ACKNOWLEDGE_FAULT.value),
+    ) as cursor:
+        acknowledgement_rows = await cursor.fetchall()
+    resolved_rows = [
+        (json.loads(str(row[0])), str(row[1])) for row in acknowledgement_rows if row[0] is not None
+    ]
+    assert ({"fault_acknowledgement": "confirmed"}, "accepted") not in resolved_rows
+    assert ({"fault_acknowledgement": "superseded_by_emergency_stop"}, "failed") in resolved_rows
+
+
+@pytest.mark.asyncio
+async def test_d212_confirmation_is_suppressed_when_estop_arrives_after_close_cas(
+    store: RoastStore,
+) -> None:
+    """A global e-stop fences D212 while its confirmation audit awaits."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _mcp, _clock, run_id = await _faulted_live_service(store, mcp=mcp)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_begin = store.begin_fault_acknowledgement_confirmation
+
+    async def block_confirmation_audit(run_id: str) -> int:
+        entered.set()
+        await release.wait()
+        return await original_begin(run_id)
 
     subscriber = service.events.subscribe()
     await service.submit_operator_action(
@@ -6484,15 +6509,76 @@ async def test_d212_confirmation_is_suppressed_when_estop_arrives_after_close_ca
             payload={"confirmation": True},
         ),
     )
-    with mock.patch.object(store, "record_operator_action", block_confirmation_audit):
+    with mock.patch.object(
+        store, "begin_fault_acknowledgement_confirmation", block_confirmation_audit
+    ):
         pending = asyncio.create_task(service.runner.tick_once())
         await asyncio.wait_for(entered.wait(), timeout=1.0)
-        service._admit_fault_control_lease(run_id)  # noqa: SLF001 - admission race harness  # pyright: ignore[reportPrivateUsage]
+        e_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert e_stop.result == "confirmed"
         release.set()
         assert await asyncio.wait_for(pending, timeout=1.0)
 
-    assert service._fault_lease_cache.status is not FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in events
+    )
+    async with store.connection.execute(
+        "SELECT payload_json FROM operator_actions WHERE run_id = ? AND action = ?",
+        (run_id, OperatorAction.ACKNOWLEDGE_FAULT.value),
+    ) as cursor:
+        acknowledgement_rows = await cursor.fetchall()
+    assert all(
+        json.loads(str(row[0])) != {"fault_acknowledgement": "confirmed"}
+        for row in acknowledgement_rows
+        if row[0] is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_global_estop_fences_d212_close_event_persistence(
+    store: RoastStore,
+) -> None:
+    """A global e-stop prevents a stale D212 closed-lease SSE confirmation."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _mcp, _clock, run_id = await _faulted_live_service(store, mcp=mcp)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_record_event = store.record_event
+
+    async def block_closed_lease_event(*args: Any, **kwargs: Any) -> None:
+        if kwargs.get("kind") is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED:
+            entered.set()
+            await release.wait()
+        await original_record_event(*args, **kwargs)
+
+    subscriber = service.events.subscribe()
+    await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True},
+        ),
+    )
+    with mock.patch.object(store, "record_event", block_closed_lease_event):
+        pending = asyncio.create_task(service.runner.tick_once())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        e_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert e_stop.result == "confirmed"
+        release.set()
+        assert await asyncio.wait_for(pending, timeout=1.0)
+
+    assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(event.event is SseEventType.FAULT_CONTROLS_ACKNOWLEDGED for event in events)
     assert not any(
         event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
         and event.data == {"outcome": "confirmed"}

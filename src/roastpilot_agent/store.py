@@ -1490,6 +1490,57 @@ class RoastStore:
         )
         await self.connection.commit()
 
+    async def begin_fault_acknowledgement_confirmation(self, run_id: str) -> int:
+        """Persist a revocable acknowledgement-confirmation audit candidate.
+
+        A fault acknowledgement crosses several awaited boundaries.  The
+        candidate is deliberately not a confirmation: an admitted emergency
+        stop can still supersede it before the runner emits a success event.
+        Only :meth:`resolve_fault_acknowledgement_confirmation` may turn this
+        row into the closed outcome.
+        """
+        cursor = await self.connection.execute(
+            "INSERT INTO operator_actions (run_id, action, payload_json, result,"
+            " recorded_at_utc) VALUES (?, ?, ?, ?, ?)",
+            (
+                run_id,
+                "acknowledge_fault",
+                json.dumps({"fault_acknowledgement": "pending_confirmation"}, sort_keys=True),
+                "accepted",
+                _utc_now(),
+            ),
+        )
+        await self.connection.commit()
+        action_id = cursor.lastrowid
+        assert action_id is not None  # pragma: no cover - SQLite assigns INTEGER PRIMARY KEY
+        return int(action_id)
+
+    async def resolve_fault_acknowledgement_confirmation(
+        self, action_id: int, *, confirmed: bool
+    ) -> bool:
+        """Resolve one pending acknowledgement candidate to its final outcome.
+
+        The update is narrowly guarded so an unrelated audit row cannot be
+        rewritten.  A superseded candidate stays durable as failed evidence;
+        it never remains a false successful confirmation.
+        """
+        outcome = "confirmed" if confirmed else "superseded_by_emergency_stop"
+        result: Literal["accepted", "rejected", "failed"] = "accepted" if confirmed else "failed"
+        cursor = await self.connection.execute(
+            "UPDATE operator_actions SET payload_json = ?, result = ? "
+            "WHERE id = ? AND action = ? AND payload_json IN (?, ?)",
+            (
+                json.dumps({"fault_acknowledgement": outcome}, sort_keys=True),
+                result,
+                action_id,
+                "acknowledge_fault",
+                json.dumps({"fault_acknowledgement": "pending_confirmation"}, sort_keys=True),
+                json.dumps({"fault_acknowledgement": "confirmed"}, sort_keys=True),
+            ),
+        )
+        await self.connection.commit()
+        return cursor.rowcount == 1
+
     @staticmethod
     def _dump(model: BaseModel) -> dict[str, object]:
         return model.model_dump(mode="json")

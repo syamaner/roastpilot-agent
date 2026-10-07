@@ -330,6 +330,11 @@ class _PriorityEmergencyRunner:
 
     def __init__(self) -> None:
         self.calls: list[OperatorAction] = []
+        self.fault_acknowledgement_invalidations = 0
+
+    def invalidate_fault_acknowledgement_for_emergency_stop(self) -> None:
+        """Model the live runner's synchronous acknowledgement fence."""
+        self.fault_acknowledgement_invalidations += 1
 
     async def dispatch_priority_emergency_stop(self, item: QueuedOperatorAction) -> bool:
         """Record the controller-owned priority dispatch."""
@@ -366,6 +371,7 @@ async def test_global_estop_bypasses_full_routine_queue_for_live_runner(tmp_path
         assert result.result == "accepted"
         assert not result.queued
         assert runner.calls == [OperatorAction.EMERGENCY_STOP]
+        assert runner.fault_acknowledgement_invalidations == 1
     finally:
         await store.close()
 
