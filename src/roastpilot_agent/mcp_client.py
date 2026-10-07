@@ -55,8 +55,10 @@ from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceCon
 from roastpilot_agent.models import (
     AppliedRoasterState,
     FaultAcknowledgementState,
+    FaultControlState,
     FaultCoolingStopResult,
     MicStatus,
+    OperatorAction,
     RoastTelemetry,
 )
 
@@ -386,23 +388,39 @@ class RoasterMCPClient:
     async def mark_first_crack(self) -> EventCommandResult:
         return EventCommandResult.model_validate(await self._call("mark_first_crack", {}))
 
-    async def drop_beans(self) -> EventCommandResult:
-        return EventCommandResult.model_validate(await self._call("drop_beans", {}))
+    async def drop_beans(self, *, expected_session_id: str | None = None) -> EventCommandResult:
+        """Drop beans, optionally bound to the current exact MCP session."""
+        args: dict[str, object] = {}
+        if expected_session_id is not None:
+            args["expected_session_id"] = expected_session_id
+        return EventCommandResult.model_validate(await self._call("drop_beans", args))
 
-    async def start_cooling(self) -> EventCommandResult:
-        return EventCommandResult.model_validate(await self._call("start_cooling", {}))
+    async def start_cooling(self, *, expected_session_id: str | None = None) -> EventCommandResult:
+        """Start cooling, optionally bound to the current exact MCP session."""
+        args: dict[str, object] = {}
+        if expected_session_id is not None:
+            args["expected_session_id"] = expected_session_id
+        return EventCommandResult.model_validate(await self._call("start_cooling", args))
 
-    async def stop_cooling(self) -> EventCommandResult:
-        return EventCommandResult.model_validate(await self._call("stop_cooling", {}))
+    async def stop_cooling(self, *, expected_session_id: str | None = None) -> EventCommandResult:
+        """Stop cooling, optionally bound to the current exact MCP session."""
+        args: dict[str, object] = {}
+        if expected_session_id is not None:
+            args["expected_session_id"] = expected_session_id
+        return EventCommandResult.model_validate(await self._call("stop_cooling", args))
 
     async def export_roast_log(self, session_id: str | None = None) -> ExportRoastLogResult:
         args: dict[str, object] = {} if session_id is None else {"session_id": session_id}
         return ExportRoastLogResult.model_validate(await self._call("export_roast_log", args))
 
-    async def emergency_stop(self, reason: str = "manual emergency stop") -> EventCommandResult:
-        return EventCommandResult.model_validate(
-            await self._call("emergency_stop", {"reason": reason})
-        )
+    async def emergency_stop(
+        self, reason: str = "manual emergency stop", *, expected_session_id: str | None = None
+    ) -> EventCommandResult:
+        """Emergency-stop, optionally bound to the current exact MCP session."""
+        args: dict[str, object] = {"reason": reason}
+        if expected_session_id is not None:
+            args["expected_session_id"] = expected_session_id
+        return EventCommandResult.model_validate(await self._call("emergency_stop", args))
 
     async def set_recording_metadata(
         self, origin: str, roast_num: int
@@ -1140,7 +1158,10 @@ class RoasterControlAdapter:
 
     async def stop_cooling_for_fault_acknowledgement(self) -> FaultCoolingStopResult:
         """Issue one cooling-stop command and project its typed proof."""
-        result = await self._client.stop_cooling()
+        expected_session_id = self.latest_fault_session_id
+        if expected_session_id is None:
+            raise ValueError("fault acknowledgement has no exact current session")
+        result = await self._client.stop_cooling(expected_session_id=expected_session_id)
         payload = result.event.payload
         recovery_after_fault = payload.get("recovery_after_fault")
         heat_level_percent = payload.get("heat_level_percent")
@@ -1164,6 +1185,63 @@ class RoasterControlAdapter:
             fan_level_percent=fan_level_percent,
             cooling_on=cooling_on,
         )
+
+    async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+        """Read one exact MCP fault session for a terminal lease action."""
+        state = await self._client.get_roast_state(session_id)
+        if state.session_id != session_id or state.phase != "fault":
+            raise ValueError("terminal fault control session does not match a fault state")
+        device = state.device_state
+        if device is None or not device.connected:
+            raise ValueError("terminal fault control state has no connected device")
+        if (
+            state.heat_level_percent != device.heat_level_percent
+            or state.fan_level_percent != device.fan_level_percent
+            or state.cooling_on is not device.cooling_on
+        ):
+            raise ValueError("terminal fault control state controls disagree")
+        return FaultControlState(
+            session_id=state.session_id,
+            mcp_phase=state.phase,
+            active=state.active,
+            device_connected=device.connected,
+            heat_level_percent=device.heat_level_percent,
+            fan_level_percent=device.fan_level_percent,
+            cooling_on=device.cooling_on,
+            beans_added=state.beans_added_at_utc is not None,
+            beans_dropped=state.beans_dropped_at_utc is not None,
+        )
+
+    async def execute_fault_control(
+        self, action: OperatorAction, *, expected_session_id: str
+    ) -> FaultControlState:
+        """Issue one exact-session terminal fault write and return fresh state."""
+        if action is OperatorAction.EMERGENCY_STOP:
+            result = await self._client.emergency_stop(
+                "terminal fault control", expected_session_id=expected_session_id
+            )
+            if (
+                result.session_id != expected_session_id
+                or result.phase != "fault"
+                or result.event.payload.get("driver_safety_method_called") is not True
+                or result.event.payload.get("driver_error") is not None
+            ):
+                raise ValueError("terminal emergency stop is unconfirmed")
+        elif action is OperatorAction.START_COOLING:
+            result = await self._client.start_cooling(expected_session_id=expected_session_id)
+            if result.session_id != expected_session_id or result.phase != "fault":
+                raise ValueError("terminal start cooling is unconfirmed")
+        elif action in (OperatorAction.STOP_COOLING, OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE):
+            result = await self._client.stop_cooling(expected_session_id=expected_session_id)
+            if result.session_id != expected_session_id or result.phase != "fault":
+                raise ValueError("terminal stop cooling is unconfirmed")
+        elif action is OperatorAction.DROP_BEANS:
+            result = await self._client.drop_beans(expected_session_id=expected_session_id)
+            if result.session_id != expected_session_id or result.phase != "fault":
+                raise ValueError("terminal drop is unconfirmed")
+        else:
+            raise ValueError("unsupported terminal fault action")
+        return await self.read_fault_control_state(expected_session_id)
 
     async def read_telemetry(self) -> RoastTelemetry | None:
         state = await self._client.get_roast_state()

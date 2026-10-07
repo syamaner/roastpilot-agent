@@ -77,6 +77,8 @@ from roastpilot_agent.controller import (
     TRANSITION_TABLE,
     CommandExecutor,
     ControllerSnapshot,
+    FaultControlExecutor,
+    FaultControlPort,
     RoastController,
     StateReader,
     TickScheduler,
@@ -106,7 +108,11 @@ from roastpilot_agent.models import (
     ClearStaleSessionRequest,
     ClearStaleSessionResult,
     FaultAcknowledgementState,
+    FaultControlsActionRequest,
+    FaultControlsActionResult,
+    FaultControlsProjection,
     FaultCoolingStopResult,
+    FaultLeaseStatus,
     HardwareClearAcknowledgementRequest,
     HardwareClearAcknowledgementResult,
     HealthResponse,
@@ -119,6 +125,10 @@ from roastpilot_agent.models import (
     OperatorRatingRequest,
     ProcessingMethod,
     ReferenceRoast,
+    RestartClearanceProjection,
+    RestartClearanceRequest,
+    RestartClearanceResult,
+    RestartClearanceState,
     RoastCommand,
     RoastDetail,
     RoastedWeightRequest,
@@ -149,6 +159,7 @@ from roastpilot_agent.store import (
     BeanDraftAttemptAlreadyClaimedError,
     BeanDraftAttemptClaimError,
     BeanProfileNotFoundError,
+    FaultControlLease,
     FrozenRunConfig,
     PhysicallyImpossibleWeightError,
     RoastStore,
@@ -707,6 +718,10 @@ class _FaultAcknowledgementGate:
         """Invalidate pending acknowledgement proof for an emergency stop."""
         self.emergency_request_epoch += 1
 
+    def abort_fault_finalization(self) -> None:
+        """Release a failed durable-finalisation reservation for a later retry."""
+        self.fault_finalization_started = False
+
 
 # The MCP ambient reading is cached for about 30 seconds, so one bad read can
 # shadow charge for a full cache period.  Three periods with margin allow a
@@ -742,6 +757,10 @@ class RoastRunner:
         raw_state: RawStateSource | None = None,
         fault_acknowledgement: FaultAcknowledgementControl | None = None,
         fault_acknowledgement_gate: _FaultAcknowledgementGate | None = None,
+        fault_lease_close: Callable[[int | None], Awaitable[bool]] | None = None,
+        current_fault_lease_generation: Callable[[], int | None] | None = None,
+        closed_fault_lease_generation: Callable[[], int | None] | None = None,
+        fault_lease_generation_is_current: Callable[[int], bool] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         configured_doctrine_enabled: bool | None = None,
     ) -> None:
@@ -757,7 +776,12 @@ class RoastRunner:
         self._raw_state = raw_state
         self._fault_acknowledgement = fault_acknowledgement
         self._fault_acknowledgement_gate = fault_acknowledgement_gate or _FaultAcknowledgementGate()
+        self._fault_lease_close = fault_lease_close
+        self._current_fault_lease_generation = current_fault_lease_generation
+        self._closed_fault_lease_generation = closed_fault_lease_generation
+        self._fault_lease_generation_is_current = fault_lease_generation_is_current
         self._fault_acknowledgement_epoch: int | None = None
+        self._d212_acknowledgement_requested = False
         self._event_flush_lock = asyncio.Lock()
         self._sleep = sleep
         self._finalized = False
@@ -1086,7 +1110,10 @@ class RoastRunner:
         )
         fault_acknowledgement_seen = False
         for item in batch:
-            if item.action is OperatorAction.ACKNOWLEDGE_FAULT:
+            if item.action in (
+                OperatorAction.ACKNOWLEDGE_FAULT,
+                OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            ):
                 # An e-stop in this drain creates or refreshes the fault cooling
                 # cycle. A confirmation captured before it cannot terminate that
                 # new cycle; require a fresh operator acknowledgement afterwards.
@@ -1134,22 +1161,25 @@ class RoastRunner:
             controller.operator_resume_advisory()
         elif item.action is OperatorAction.ACKNOWLEDGE_RECOVERY:
             await self._dispatch_acknowledge(payload)
-        elif item.action is OperatorAction.ACKNOWLEDGE_FAULT:  # pragma: no cover — exhaustive chain
+        elif item.action in (
+            OperatorAction.ACKNOWLEDGE_FAULT,
+            OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+        ):  # pragma: no cover — exhaustive chain
+            if item.action is OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE:
+                self._d212_acknowledgement_requested = True
             await self._dispatch_acknowledge_fault(payload)
         if tool is not None:
             await self._record_dispatch_command(tool, item, since=before)
 
-    async def dispatch_emergency_stop_during_fault_finalization(
-        self, item: QueuedOperatorAction
-    ) -> bool:
-        """Execute an admitted e-stop while fault completion awaits persistence.
+    async def dispatch_priority_emergency_stop(self, item: QueuedOperatorAction) -> bool:
+        """Execute an already-admitted e-stop outside the bounded routine queue.
 
-        This bypasses no safety policy: it calls the same controller-owned
-        emergency-stop dispatch as the queue. It is used only after a fault
-        finalization reservation, when accepting another queue item would leave
-        it undrained if completion wins its persistence race.
+        A write already executing cannot be interrupted, but this controller-owned
+        route issues the next emergency command without waiting for queued routine
+        actions or available queue capacity. It preserves the ordinary safety
+        evaluation because :meth:`_dispatch` reaches ``operator_emergency_stop``.
         """
-        if self._finalized or not self._fault_acknowledgement_gate.fault_finalization_started:
+        if self._finalized:
             return False
         self._fault_acknowledgement_gate.invalidate_fault_acknowledgement()
         await self._dispatch(item)
@@ -1158,6 +1188,14 @@ class RoastRunner:
         # direct emergency dispatch cannot leave a buffered event behind.
         await self._flush_events()
         return True
+
+    async def dispatch_emergency_stop_during_fault_finalization(
+        self, item: QueuedOperatorAction
+    ) -> bool:
+        """Execute an admitted e-stop while fault completion awaits persistence."""
+        if not self._fault_acknowledgement_gate.fault_finalization_started:
+            return False
+        return await self.dispatch_priority_emergency_stop(item)
 
     def _controller_tick_emergency_stop_emitted(self, start: int) -> bool:
         """Return whether this controller tick invalidated safe-zero proof."""
@@ -1269,7 +1307,7 @@ class RoastRunner:
         except Exception:  # noqa: BLE001 - a command result is never sufficient proof
             await self._record_fault_acknowledgement_failure("state_unavailable")
             return
-        if not self._fault_acknowledgement_controls_are_safe(after, session_id):
+        if not self.fault_acknowledgement_controls_are_safe(after, session_id):
             await self._record_fault_acknowledgement_failure("unsafe_state")
             return
         if self._fault_acknowledgement_gate.emergency_request_epoch != acknowledgement_epoch:
@@ -1281,7 +1319,7 @@ class RoastRunner:
         self._fault_acknowledgement_epoch = acknowledgement_epoch
 
     @staticmethod
-    def _fault_acknowledgement_controls_are_safe(state: object, session_id: str) -> bool:
+    def fault_acknowledgement_controls_are_safe(state: object, session_id: str) -> bool:
         """Return whether one exact inactive session proves safe-zero controls."""
         return (
             isinstance(state, FaultAcknowledgementState)
@@ -1386,6 +1424,8 @@ class RoastRunner:
             return False
         if self._finalized:
             return True
+        d212_acknowledgement = False
+        d212_generation: int | None = None
         if phase is RoastPhase.FAULTED:
             acknowledgement_epoch = self._fault_acknowledgement_epoch
             if (
@@ -1400,19 +1440,25 @@ class RoastRunner:
                 self._fault_acknowledgement_epoch = None
                 await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
                 return False
-            # The gate now rejects new e-stops, so this is the first point at
-            # which a confirmed audit row and SSE event may be published.
-            self._fault_acknowledged = True
-            self._controller.note_fault_acknowledged()
-            await self._store.record_operator_action(
-                action=OperatorAction.ACKNOWLEDGE_FAULT.value,
-                result="accepted",
-                run_id=self._run_id,
-                payload={"fault_acknowledgement": "confirmed"},
-            )
-            self._emitter.emit(
-                RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED, {"outcome": "confirmed"}
-            )
+            d212_acknowledgement = self._d212_acknowledgement_requested
+            if d212_acknowledgement and self._current_fault_lease_generation is not None:
+                d212_generation = self._current_fault_lease_generation()
+            if not d212_acknowledgement:
+                # Legacy ACK has no lease close; preserve its established
+                # fault-finalisation semantics. D212 confirmation is deferred
+                # until after immutable history is written and the lease
+                # generation is rechecked below.
+                self._fault_acknowledged = True
+                self._controller.note_fault_acknowledged()
+                await self._store.record_operator_action(
+                    action=OperatorAction.ACKNOWLEDGE_FAULT.value,
+                    result="accepted",
+                    run_id=self._run_id,
+                    payload={"fault_acknowledgement": "confirmed"},
+                )
+                self._emitter.emit(
+                    RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED, {"outcome": "confirmed"}
+                )
         if phase is RoastPhase.COMPLETE:
             manifest = await self._export_logs()
             await self._store.complete_run(
@@ -1432,6 +1478,40 @@ class RoastRunner:
                 agent_phase=phase,
                 fault_reason=self._captured_fault_reason or self._last_fault_reason(),
             )
+        if d212_acknowledgement:
+            # History is immutable evidence only. A late e-stop may have
+            # synchronously advanced the in-memory lease while complete_run
+            # awaited; close only the still-current generation and never emit a
+            # D212 confirmation when that fence fails.
+            if self._fault_lease_close is not None and await self._fault_lease_close(
+                d212_generation
+            ):
+                confirmation_generation = (
+                    None
+                    if self._closed_fault_lease_generation is None
+                    else self._closed_fault_lease_generation()
+                )
+                await self._store.record_operator_action(
+                    action=OperatorAction.ACKNOWLEDGE_FAULT.value,
+                    result="accepted",
+                    run_id=self._run_id,
+                    payload={"fault_acknowledgement": "confirmed"},
+                )
+                if (
+                    confirmation_generation is not None
+                    and self._fault_lease_generation_is_current is not None
+                    and self._fault_lease_generation_is_current(confirmation_generation)
+                ):
+                    self._fault_acknowledged = True
+                    self._controller.note_fault_acknowledged()
+                    self._emitter.emit(
+                        RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED,
+                        {"outcome": "confirmed"},
+                    )
+                else:
+                    await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
+            else:
+                await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
         self._last_persisted_phase = phase
         self._finalized = True
         return True
@@ -1845,6 +1925,10 @@ class RoastService:
         #: fake). When ``None`` the service is API-only (E7 mode): roasts persist a
         #: ``starting`` row but no controller loop drives them.
         self._roaster = roaster
+        # API-only/replay construction has no physical control surface and is
+        # not an Agent process capable of starting a hardware session.  The
+        # process gate is enforced whenever a live roaster is wired.
+        self._requires_live_restart_clearance = live_serve_mode and roaster is not None
         self._advisor = advisor
         # True only when set by ``build_live_service`` in ``live.py``, meaning both
         # the config and the advisor were produced by the live-serve path and should
@@ -1867,6 +1951,18 @@ class RoastService:
         #: never re-minted. See ``HealthResponse.instance_id``'s docstring for
         #: the full port-impostor-defence rationale (#513 follow-up).
         self.instance_id = uuid.uuid4().hex
+        # Every freshly constructed Agent process starts gated.  This in-memory
+        # conservative value is deliberately set before any store await so a
+        # failed initial persistence cannot accidentally admit a Start request.
+        self._restart_clearance_state = RestartClearanceState.REQUIRED
+        self._restart_epoch_initialized = False
+        self._restart_epoch_lock = asyncio.Lock()
+        self._fault_lease_cache = FaultControlLease(
+            generation=0,
+            status=FaultLeaseStatus.CLOSED,
+            run_id=None,
+            mcp_session_id=None,
+        )
         #: The active run's live loop, attached by :meth:`start_roast` once a
         #: roaster is wired; ``None`` between runs and in API-only mode.
         self.runner: RoastRunner | None = None
@@ -1899,6 +1995,13 @@ class RoastService:
         # The phase-validity pre-check shares the run's configured safety
         # limits, so the queue's verdict matches the controller's on drain.
         self._safety = SafetyPolicy(self._config.safety)
+        self._fault_control_executor: FaultControlExecutor | None = (
+            FaultControlExecutor(self._safety, cast(FaultControlPort, roaster))
+            if roaster is not None
+            and hasattr(roaster, "read_fault_control_state")
+            and hasattr(roaster, "execute_fault_control")
+            else None
+        )
         #: The controller action queue (plan §6: action → operator_actions row
         #: → controller queue → safety → MCP). The API enqueues phase-valid
         #: actions; the controller tick loop drains and executes them (E9).
@@ -2089,7 +2192,14 @@ class RoastService:
         construction — see :class:`~roastpilot_agent.models.HealthResponse`'s
         docstring for the port-impostor-defence rationale.
         """
-        active = await self._store.active_run()
+        if self._requires_live_restart_clearance:
+            await self._ensure_restart_epoch()
+        try:
+            active = await self._store.active_run()
+        except Exception:  # noqa: BLE001 - health must retain fail-closed controls
+            _log.exception("could not read active run for health projection")
+            active = None
+        lease = await self._read_fault_lease_fail_closed()
         return HealthResponse(
             version=__version__,
             instance_id=self.instance_id,
@@ -2100,7 +2210,488 @@ class RoastService:
             ),
             active_run_id=None if active is None else active.run_id,
             advisor=self._advisor_health,
+            restart_clearance=self._restart_clearance_projection(lease),
+            restart_clearance_required=not self._restart_clearance_projection(lease).eligible,
+            fault_controls=await self._fault_controls_projection(lease),
         )
+
+    async def _ensure_restart_epoch(self) -> None:
+        """Persist the required gate for this fresh process, failing closed."""
+        if self._restart_epoch_initialized:
+            return
+        async with self._restart_epoch_lock:
+            if self._restart_epoch_initialized:
+                return
+            try:
+                await self._store.begin_process_restart_clearance(self.instance_id)
+            except Exception:  # noqa: BLE001 - persistence ambiguity blocks Start
+                self._restart_clearance_state = RestartClearanceState.UNKNOWN
+                _log.exception("could not persist fresh process restart gate")
+            else:
+                self._restart_clearance_state = RestartClearanceState.REQUIRED
+            self._restart_epoch_initialized = True
+
+    async def _read_fault_lease_fail_closed(self) -> FaultControlLease:
+        """Load the current lease, treating any store failure as UNKNOWN."""
+        try:
+            lease = await self._store.read_fault_control_lease()
+        except Exception:  # noqa: BLE001 - read failure must not permit control
+            _log.exception("could not read fault-control lease")
+            lease = FaultControlLease(
+                generation=max(1, self._fault_lease_cache.generation),
+                status=FaultLeaseStatus.UNKNOWN,
+                run_id=None,
+                mcp_session_id=None,
+            )
+        cached = self._fault_lease_cache
+        # An admitted e-stop advances this in-memory generation synchronously.
+        # Never overwrite it with an older durable row while its persistence
+        # task is outstanding or failed: that would reopen Start after admission.
+        if cached.generation > lease.generation:
+            return cached
+        self._fault_lease_cache = lease
+        return lease
+
+    def _restart_clearance_projection(self, lease: FaultControlLease) -> RestartClearanceProjection:
+        """Project the process gate; OPEN/UNKNOWN leases keep Start ineligible."""
+        return RestartClearanceProjection(
+            state=self._restart_clearance_state,
+            eligible=(
+                self._restart_clearance_state is RestartClearanceState.CLEARED
+                and lease.status is FaultLeaseStatus.CLOSED
+            ),
+        )
+
+    async def _fault_controls_projection(self, lease: FaultControlLease) -> FaultControlsProjection:
+        """Return a conservative server-owned control projection for one lease."""
+        actions: list[OperatorAction] = []
+        if lease.status is FaultLeaseStatus.UNKNOWN:
+            actions = [OperatorAction.EMERGENCY_STOP]
+        elif lease.status is FaultLeaseStatus.OPEN:
+            # Immutable roast history cannot prove charge/drop/cooling state.
+            # Without a fresh exact-session proof, only an e-stop attempt is
+            # advertised.  The executor validates again at execution.
+            actions = [OperatorAction.EMERGENCY_STOP]
+            if lease.mcp_session_id is not None and self._fault_control_executor is not None:
+                try:
+                    state = await cast(FaultControlPort, self._roaster).read_fault_control_state(
+                        lease.mcp_session_id
+                    )
+                except Exception:  # noqa: BLE001 - uncertain state exposes e-stop only
+                    pass
+                else:
+                    if state.session_id == lease.mcp_session_id and state.mcp_phase == "fault":
+                        if state.cooling_on:
+                            actions.append(OperatorAction.STOP_COOLING)
+                        else:
+                            actions.append(OperatorAction.START_COOLING)
+                        if state.beans_added and not state.beans_dropped:
+                            actions.append(OperatorAction.DROP_BEANS)
+                        actions.append(OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE)
+        return FaultControlsProjection(
+            status=lease.status,
+            generation=None if lease.generation == 0 else lease.generation,
+            enabled_actions=actions,
+        )
+
+    async def acknowledge_restart_clearance(
+        self, request: RestartClearanceRequest
+    ) -> RestartClearanceResult:
+        """Record physical confirmation after fresh no-session or exact-fault proof.
+
+        This does not close an OPEN fault lease and therefore cannot by itself
+        make Start eligible after a fault.  No MCP write occurs here.
+        """
+        del request  # literal validation is the explicit operator confirmation
+        await self._ensure_restart_epoch()
+        lease = await self._read_fault_lease_fail_closed()
+        active = await self._store.active_run()
+        if active is not None and not (
+            lease.status is FaultLeaseStatus.OPEN
+            and lease.run_id == active.run_id
+            and active.agent_phase is RoastPhase.FAULTED
+        ):
+            raise RoastRunConflictError("restart clearance requires no active run")
+        roaster = self._roaster
+        if roaster is None:
+            raise RoastRunConflictError("restart clearance requires a current MCP control surface")
+        if lease.status is FaultLeaseStatus.UNKNOWN:
+            raise RoastRunConflictError(
+                "fault controls are unknown; physical-clear procedure is required"
+            )
+        try:
+            if lease.status is FaultLeaseStatus.OPEN:
+                session_id = lease.mcp_session_id
+                if session_id is None:
+                    raise RoastRunConflictError("exact fault session is unavailable")
+                proof = await roaster.read_fault_acknowledgement_state(session_id)
+                if not RoastRunner.fault_acknowledgement_controls_are_safe(proof, session_id):
+                    raise RoastRunConflictError(
+                        "exact fault session has no safe-zero recovery proof"
+                    )
+            else:
+                # v0.2.3 cannot make a typed no-session statement: its
+                # get_roast_state call raises when no session exists.  A
+                # transport exception is not affirmative evidence, so ordinary
+                # clearance remains fail-closed until MCP supplies that
+                # read-only capability (D213 follow-up).
+                raise RoastRunConflictError(
+                    "current MCP child cannot provide typed no-session proof"
+                )
+        except RoastRunConflictError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - current MCP proof is mandatory
+            raise RoastRunConflictError("current MCP state could not be confirmed") from exc
+        try:
+            confirmed = await self._store.confirm_process_restart_clearance(self.instance_id)
+        except Exception as exc:  # noqa: BLE001 - do not retain an uncertain clear
+            self._restart_clearance_state = RestartClearanceState.UNKNOWN
+            raise RoastRunConflictError("restart clearance persistence is unconfirmed") from exc
+        if not confirmed:
+            self._restart_clearance_state = RestartClearanceState.UNKNOWN
+            raise RoastRunConflictError("restart clearance was not durably recorded")
+        self._restart_clearance_state = RestartClearanceState.CLEARED
+        return RestartClearanceResult(
+            outcome="confirmed",
+            cleared=True,
+            restart_clearance_required=not self._restart_clearance_projection(lease).eligible,
+            restart_clearance=self._restart_clearance_projection(lease),
+            fault_controls=await self._fault_controls_projection(lease),
+        )
+
+    async def submit_fault_controls_action(
+        self, request: FaultControlsActionRequest
+    ) -> FaultControlsActionResult:
+        """Admit one control against the server-selected current fault lease.
+
+        This endpoint deliberately takes no run or session identifier.  A
+        command can be admitted for the controller queue, but that admission is
+        never represented as a completed physical action.
+        """
+        if request.action is OperatorAction.EMERGENCY_STOP:
+            return await self._submit_fault_controls_emergency_stop()
+        lease = await self._read_fault_lease_fail_closed()
+        projection = await self._fault_controls_projection(lease)
+        if request.action not in projection.enabled_actions:
+            return FaultControlsActionResult(
+                action=request.action,
+                result="rejected",
+                reason="action is not enabled for the current fault controls",
+                fault_controls=projection,
+            )
+        if (
+            request.action is OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE
+            and request.confirmation is not True
+        ):
+            return FaultControlsActionResult(
+                action=request.action,
+                result="rejected",
+                reason="stop_cooling_and_acknowledge requires explicit confirmation",
+                fault_controls=projection,
+            )
+        run_id = lease.run_id
+        if run_id is None:
+            return FaultControlsActionResult(
+                action=request.action,
+                result="failed",
+                reason="current fault lease has no runnable Agent record",
+                fault_controls=projection,
+            )
+        detail = await self._store.read_run(run_id)
+        if detail is not None and detail.completed_at_utc is not None:
+            executor = self._fault_control_executor
+            session_id = lease.mcp_session_id
+            if executor is None or session_id is None:
+                return FaultControlsActionResult(
+                    action=request.action,
+                    result="failed",
+                    reason="exact terminal fault control is unavailable",
+                    fault_controls=await self._fault_controls_projection_after_action(),
+                )
+            try:
+                state = await executor.execute(
+                    request.action,
+                    session_id,
+                    is_current_generation=lambda: (
+                        self._fault_lease_cache.generation == lease.generation
+                        and self._fault_lease_cache.status is FaultLeaseStatus.OPEN
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - no unverified terminal action succeeds
+                state = None
+            if state is None:
+                return FaultControlsActionResult(
+                    action=request.action,
+                    result="failed",
+                    reason="terminal fault action was not confirmed",
+                    fault_controls=await self._fault_controls_projection_after_action(),
+                )
+            safe_zero = RoastRunner.fault_acknowledgement_controls_are_safe(
+                FaultAcknowledgementState(
+                    session_id=state.session_id,
+                    mcp_phase=state.mcp_phase,
+                    active=state.active,
+                    device_connected=state.device_connected,
+                    heat_level_percent=state.heat_level_percent,
+                    fan_level_percent=state.fan_level_percent,
+                    cooling_on=state.cooling_on,
+                ),
+                session_id,
+            )
+            if request.action is OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE and (
+                not safe_zero
+                or not await self._close_current_fault_lease_for_acknowledgement(lease.generation)
+            ):
+                return FaultControlsActionResult(
+                    action=request.action,
+                    result="failed",
+                    reason="terminal acknowledgement did not close the current lease",
+                    fault_controls=await self._fault_controls_projection_after_action(),
+                )
+            return FaultControlsActionResult(
+                action=request.action,
+                result="confirmed",
+                reason="terminal fault action has fresh exact-session proof",
+                fault_controls=await self._fault_controls_projection_after_action(),
+            )
+        payload: dict[str, Any] = {}
+        if request.confirmation is True:
+            payload["confirmation"] = True
+        result = await self.submit_operator_action(
+            run_id, OperatorActionRequest(action=request.action, payload=payload or None)
+        )
+        return FaultControlsActionResult(
+            action=request.action,
+            result="accepted" if result.result == "accepted" else "rejected",
+            reason=result.reason,
+            queued=result.queued,
+            fault_controls=await self._fault_controls_projection_after_action(),
+        )
+
+    async def _submit_fault_controls_emergency_stop(self) -> FaultControlsActionResult:
+        """Synchronously admit a global e-stop before every awaited operation.
+
+        The lease generation is the first write-side arbitration point.  It
+        blocks Start while the controller-owned dispatch either confirms an
+        exact terminal session or queues the active-run emergency command.
+        """
+        previous = self._fault_lease_cache
+        run_id = previous.run_id or self.active_run_id
+        if run_id is None:
+            return FaultControlsActionResult(
+                action=OperatorAction.EMERGENCY_STOP,
+                result="failed",
+                reason="no controller-owned run is available for a software e-stop attempt",
+                fault_controls=FaultControlsProjection(
+                    status=FaultLeaseStatus.UNKNOWN,
+                    generation=None,
+                    enabled_actions=[OperatorAction.EMERGENCY_STOP],
+                ),
+            )
+        # No store read, telemetry read, or projection read may precede this
+        # generation advance. Retain the prior exact session solely for the
+        # immediate controller executor; the lease itself stays UNKNOWN until
+        # its asynchronous persistence confirms it.
+        admitted = self._admit_fault_control_lease(run_id, session_id=previous.mcp_session_id)
+        executor = self._fault_control_executor
+        session_id = previous.mcp_session_id
+        if executor is not None and session_id is not None:
+            try:
+                state = await executor.execute(
+                    OperatorAction.EMERGENCY_STOP,
+                    session_id,
+                    is_current_generation=lambda: (
+                        self._fault_lease_cache.generation == admitted.generation
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - e-stop attempt remains unconfirmed
+                state = None
+            return FaultControlsActionResult(
+                action=OperatorAction.EMERGENCY_STOP,
+                result="confirmed" if state is not None else "failed",
+                reason=(
+                    "terminal emergency stop has fresh exact-session proof"
+                    if state is not None
+                    else "software e-stop attempt was not confirmed"
+                ),
+                fault_controls=await self._fault_controls_projection_after_action(),
+            )
+        # No exact terminal session is available. Only a currently owned live
+        # runner may make the controller emergency attempt; a terminal row with
+        # no runner would leave a queue item undrained and must never report an
+        # admitted software stop. This direct controller route bypasses the
+        # bounded routine queue, whose capacity must not starve an e-stop.
+        runner = self.runner
+        if runner is None or self.active_run_id != run_id:
+            return FaultControlsActionResult(
+                action=OperatorAction.EMERGENCY_STOP,
+                result="failed",
+                reason=("no live controller owns this fault; use the independent physical stop"),
+                fault_controls=await self._fault_controls_projection_after_action(),
+            )
+        dispatched = await runner.dispatch_priority_emergency_stop(
+            QueuedOperatorAction(run_id=run_id, action=OperatorAction.EMERGENCY_STOP)
+        )
+        return FaultControlsActionResult(
+            action=OperatorAction.EMERGENCY_STOP,
+            result="accepted" if dispatched else "failed",
+            reason=(
+                "emergency_stop accepted for controller priority dispatch"
+                if dispatched
+                else "software e-stop attempt was not confirmed"
+            ),
+            queued=False,
+            fault_controls=await self._fault_controls_projection_after_action(),
+        )
+
+    async def _fault_controls_projection_after_action(self) -> FaultControlsProjection:
+        """Refresh the server-owned lease projection after a control admission."""
+        return await self._fault_controls_projection(await self._read_fault_lease_fail_closed())
+
+    def _admit_fault_control_lease(
+        self, run_id: str, *, session_id: str | None = None
+    ) -> FaultControlLease:
+        """Synchronously block Start, then persist e-stop lease evidence off-path.
+
+        The e-stop queue admission never waits for SQLite.  Until the bounded
+        persistence task succeeds, the in-process state is UNKNOWN and Start
+        remains blocked.
+        """
+        cached = self._fault_lease_cache
+        generation = max(1, cached.generation + 1)
+        if session_id is None:
+            session_id = None if self._roaster is None else self._roaster.latest_fault_session_id
+        self._fault_lease_cache = FaultControlLease(
+            generation=generation,
+            status=FaultLeaseStatus.UNKNOWN,
+            run_id=run_id,
+            mcp_session_id=session_id,
+        )
+        task = asyncio.create_task(
+            self._persist_admitted_fault_control_lease(run_id, session_id, generation)
+        )
+        task.add_done_callback(
+            lambda completed: self._log_fault_lease_persistence_failure(completed, generation)
+        )
+        return self._fault_lease_cache
+
+    async def _persist_admitted_fault_control_lease(
+        self, run_id: str, session_id: str | None, generation: int
+    ) -> None:
+        """Persist an e-stop lease; absent exact identity stays fail-closed UNKNOWN."""
+        if session_id is None:
+            lease = await self._store.replace_fault_control_lease_unknown(
+                run_id, generation=generation
+            )
+        else:
+            lease = await self._store.open_fault_control_lease(
+                run_id=run_id, mcp_session_id=session_id, generation=generation
+            )
+        # A newer e-stop won the in-process arbitration.  Its durable write
+        # must be the only one allowed to alter the current projection/event.
+        if lease.generation != generation or self._fault_lease_cache.generation != generation:
+            return
+        self._fault_lease_cache = lease
+        payload = {
+            "generation": lease.generation,
+            "status": lease.status.value,
+            "outcome": "confirmed",
+        }
+        await self._store.record_event(
+            run_id=run_id,
+            kind=RoastEventKind.FAULT_CONTROLS_CHANGED,
+            source=RoastEventSource.SAFETY,
+            payload=payload,
+        )
+        self.events.emit(RoastEventKind.FAULT_CONTROLS_CHANGED, payload)
+
+    def _log_fault_lease_persistence_failure(
+        self, task: asyncio.Task[None], generation: int
+    ) -> None:
+        """Keep only the failed current e-stop lease fail-closed.
+
+        A task from an older emergency-stop admission must never erase the
+        exact-session controls supplied by a newer generation.
+        """
+        if task.cancelled():
+            _log.error("fault-control lease persistence was cancelled")
+            return
+        error = task.exception()
+        if error is None:
+            return
+        current = self._fault_lease_cache
+        if current.generation != generation:
+            _log.error(
+                "stale fault-control lease persistence failed",
+                exc_info=error,
+                extra={"fault_lease_generation": generation},
+            )
+            return
+        self._fault_lease_cache = FaultControlLease(
+            generation=generation,
+            status=FaultLeaseStatus.UNKNOWN,
+            run_id=current.run_id,
+            mcp_session_id=None,
+        )
+        _log.error(
+            "fault-control lease persistence failed",
+            exc_info=error,
+            extra={"fault_lease_generation": generation},
+        )
+
+    async def _close_current_fault_lease_for_acknowledgement(
+        self, expected_generation: int | None = None
+    ) -> bool:
+        """CAS-close the latest OPEN lease before publishing D212 confirmation."""
+        lease = self._fault_lease_cache
+        if lease.status is not FaultLeaseStatus.OPEN or lease.generation < 1:
+            return False
+        generation = lease.generation
+        if expected_generation is not None and generation != expected_generation:
+            return False
+        try:
+            closed = await self._store.close_fault_control_lease(generation)
+        except Exception:  # noqa: BLE001 - persistence uncertainty is unsafe
+            self._fault_lease_cache = FaultControlLease(
+                generation=generation,
+                status=FaultLeaseStatus.UNKNOWN,
+                run_id=lease.run_id,
+                mcp_session_id=None,
+            )
+            return False
+        if not closed or self._fault_lease_cache.generation != generation:
+            return False
+        self._fault_lease_cache = FaultControlLease(
+            generation=generation,
+            status=FaultLeaseStatus.CLOSED,
+            run_id=lease.run_id,
+            mcp_session_id=lease.mcp_session_id,
+        )
+        if lease.run_id is not None:
+            payload = {"generation": generation, "status": "closed", "outcome": "confirmed"}
+            await self._store.record_event(
+                run_id=lease.run_id,
+                kind=RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED,
+                source=RoastEventSource.OPERATOR,
+                payload=payload,
+            )
+            self.events.emit(RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED, payload)
+        return True
+
+    def _closed_fault_lease_generation(self) -> int | None:
+        """Return the current generation only when D212 closed it durably."""
+        lease = self._fault_lease_cache
+        return lease.generation if lease.status is FaultLeaseStatus.CLOSED else None
+
+    def _open_fault_lease_generation(self) -> int | None:
+        """Return the current OPEN generation captured before D212 history writes."""
+        lease = self._fault_lease_cache
+        return lease.generation if lease.status is FaultLeaseStatus.OPEN else None
+
+    def _fault_lease_generation_is_closed_current(self, generation: int) -> bool:
+        """Fence a delayed D212 confirmation against a newer e-stop admission."""
+        lease = self._fault_lease_cache
+        return lease.generation == generation and lease.status is FaultLeaseStatus.CLOSED
 
     async def start_roast(self, profile: RoastProfile) -> RoastDetail:
         """Start a roast: reload saved config, respawn MCP if needed, persist the run.
@@ -2140,7 +2731,22 @@ class RoastService:
         that advances it. The active-run check reads persisted state, so the
         guard holds across an agent restart.
         """
+        if self._requires_live_restart_clearance:
+            await self._ensure_restart_epoch()
         async with self._start_lock:
+            lease = await self._read_fault_lease_fail_closed()
+            if (
+                self._requires_live_restart_clearance
+                and self._restart_clearance_state is not RestartClearanceState.CLEARED
+            ):
+                raise RoastRunConflictError("restart clearance is required before starting a roast")
+            if (
+                self._requires_live_restart_clearance
+                and lease.status is not FaultLeaseStatus.CLOSED
+            ):
+                raise RoastRunConflictError(
+                    "fault controls are not closed; starting a roast remains blocked"
+                )
             active = await self._store.active_run()
             if active is not None:
                 raise RoastRunConflictError(
@@ -2517,6 +3123,10 @@ class RoastService:
             raw_state=self._raw_state,
             fault_acknowledgement=roaster,
             fault_acknowledgement_gate=self._fault_acknowledgement_gate,
+            fault_lease_close=self._close_current_fault_lease_for_acknowledgement,
+            current_fault_lease_generation=self._open_fault_lease_generation,
+            closed_fault_lease_generation=self._closed_fault_lease_generation,
+            fault_lease_generation_is_current=self._fault_lease_generation_is_closed_current,
             configured_doctrine_enabled=configured_doctrine_enabled,
         )
         self.runner = runner
@@ -2910,6 +3520,11 @@ class RoastService:
             mic_status = self._live_mic_status(run_id)
             if mic_status is not None:
                 detail = detail.model_copy(update={"mic_status": mic_status})
+        lease = await self._read_fault_lease_fail_closed()
+        if lease.run_id == run_id:
+            detail = detail.model_copy(
+                update={"fault_controls": await self._fault_controls_projection(lease)}
+            )
         return detail
 
     async def _preempt_bean_drafts_for_roast_start(self) -> None:
@@ -3466,13 +4081,20 @@ class RoastService:
             )
 
         command = _ACTION_COMMAND.get(request.action)
-        if request.action is OperatorAction.ACKNOWLEDGE_FAULT:
-            if detail.agent_phase is RoastPhase.FAULTED:
+        if request.action in (
+            OperatorAction.ACKNOWLEDGE_FAULT,
+            OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+        ):
+            confirmed = (request.payload or {}).get("confirmation") is True
+            if request.action is OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE and not confirmed:
+                result = "rejected"
+                reason = "stop_cooling_and_acknowledge requires explicit confirmation"
+            elif detail.agent_phase is RoastPhase.FAULTED:
                 result: Literal["accepted", "rejected", "failed"] = "accepted"
                 reason = f"{request.action.value} accepted: queued for the controller"
             else:
                 result = "rejected"
-                reason = "acknowledge_fault requires a faulted run"
+                reason = f"{request.action.value} requires a faulted run"
         elif command is None:
             result = "accepted"
             reason = f"{request.action.value} accepted: queued for the controller"
@@ -3498,6 +4120,10 @@ class RoastService:
                 result = "rejected"
                 reason = "emergency_stop cannot be dispatched after fault finalization"
             else:
+                # Admission synchronously advances the in-process lease before
+                # the controller can await its priority dispatch.  A delayed
+                # completion therefore cannot close the preceding generation.
+                self._admit_fault_control_lease(run_id)
                 dispatched = await runner.dispatch_emergency_stop_during_fault_finalization(
                     QueuedOperatorAction(
                         run_id=run_id, action=request.action, payload=request.payload
@@ -3513,13 +4139,19 @@ class RoastService:
             # increment, so a fault finalization cannot race an accepted e-stop
             # into a queue that will no longer drain.
             try:
+                if request.action is OperatorAction.EMERGENCY_STOP:
+                    # The queue is checked before admission so a rejected-full
+                    # request does not fabricate an e-stop lease.  From this
+                    # point no await occurs before the controller sees it.
+                    if self.operator_queue.full():
+                        raise asyncio.QueueFull
+                    self._fault_acknowledgement_gate.admit_emergency_stop()
+                    self._admit_fault_control_lease(run_id)
                 self.operator_queue.put_nowait(
                     QueuedOperatorAction(
                         run_id=run_id, action=request.action, payload=request.payload
                     )
                 )
-                if request.action is OperatorAction.EMERGENCY_STOP:
-                    self._fault_acknowledgement_gate.admit_emergency_stop()
                 queued = True
             except asyncio.QueueFull:
                 # Backstop bound hit (pathological spam). Report failed rather
@@ -4360,6 +4992,30 @@ async def rate_roast(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+async def acknowledge_restart_clearance(
+    request: RestartClearanceRequest, service: ServiceDep
+) -> RestartClearanceResult:
+    """``POST /api/restart-clearance`` — record physical restart clearance.
+
+    The UI must pair this literal confirmation with copy requiring a stopped,
+    empty Hottop and an engaged or immediately-ready independent stop.
+    """
+    try:
+        return await service.acknowledge_restart_clearance(request)
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+async def submit_fault_controls_action(
+    request: FaultControlsActionRequest, service: ServiceDep
+) -> FaultControlsActionResult:
+    """``POST /api/fault-controls/actions`` — act on the current lease only."""
+    try:
+        return await service.submit_fault_controls_action(request)
+    except (RoastRunConflictError, RoastRunGoneError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 async def set_roasted_weight(
     run_id: str,
     request: RoastedWeightRequest,
@@ -5195,6 +5851,8 @@ def create_app(
     app.get(CONFIG_PATH)(get_config)
     app.put(CONFIG_PATH)(put_config)
     app.get(DEVICES_PATH)(get_devices)
+    app.post("/api/restart-clearance")(acknowledge_restart_clearance)
+    app.post("/api/fault-controls/actions")(submit_fault_controls_action)
     app.post("/api/roasts", status_code=201)(start_roast)
     app.get("/api/roasts")(list_roasts)
     app.get("/api/roasts/{run_id}")(get_roast)

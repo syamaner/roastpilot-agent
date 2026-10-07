@@ -19,7 +19,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from unittest import mock
 
 import pytest
@@ -82,6 +82,7 @@ from roastpilot_agent.models import (
     ClearStaleSessionRequest,
     FaultAcknowledgementState,
     FaultCoolingStopResult,
+    FaultLeaseStatus,
     HardwareClearAcknowledgementRequest,
     MicHealth,
     OperatorAction,
@@ -6227,6 +6228,7 @@ async def test_emergency_stop_is_dispatched_once_fault_finalization_has_started(
         assert e_stop.queued is False
         assert "dispatched" in e_stop.reason
         assert mcp.commands().count("emergency_stop") == 2
+        assert service._fault_lease_cache.status is not FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         # The normal tick is still blocked before its final flush. Direct
         # dispatch drains the shared emitter, so the already-confirmed event is
         # persisted rather than stranded when completion later resumes.
@@ -6240,6 +6242,7 @@ async def test_emergency_stop_is_dispatched_once_fault_finalization_has_started(
         assert await asyncio.wait_for(pending_tick, timeout=1.0)
 
     assert mcp.commands().count("emergency_stop") == 2
+    assert service._fault_lease_cache.status is not FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     detail = await store.read_run(run_id)
     assert detail is not None and detail.outcome == "faulted"
     async with store.connection.execute(
@@ -6249,6 +6252,93 @@ async def test_emergency_stop_is_dispatched_once_fault_finalization_has_started(
     ) as cursor:
         e_stop_action = await cursor.fetchone()
     assert e_stop_action is not None and e_stop_action[0] == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_d212_never_confirms_after_delayed_completion_is_superseded_by_estop(
+    store: RoastStore,
+) -> None:
+    """A later e-stop keeps terminal controls current after D212's history write."""
+    service, _mcp, _clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_complete = store.complete_run
+
+    async def block_completion(*args: Any, **kwargs: Any) -> None:
+        entered.set()
+        await release.wait()
+        await original_complete(*args, **kwargs)
+
+    subscriber = service.events.subscribe()
+    accepted = await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True},
+        ),
+    )
+    assert accepted.result == "accepted"
+    with mock.patch.object(store, "complete_run", block_completion):
+        pending = asyncio.create_task(service.runner.tick_once())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        # Model the synchronous admission performed before a controller e-stop
+        # dispatch. The terminal history row is already durable at this point,
+        # so this is the critical lease-generation fence rather than a second
+        # ordinary run-bound action submission.
+        service._admit_fault_control_lease(run_id)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        release.set()
+        assert await asyncio.wait_for(pending, timeout=1.0)
+
+    assert service._fault_lease_cache.status is not FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_d212_confirmation_is_suppressed_when_estop_arrives_after_close_cas(
+    store: RoastStore,
+) -> None:
+    """A post-CAS e-stop fences the acknowledgement audit and SSE confirmation."""
+    service, _mcp, _clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_record = store.record_operator_action
+
+    async def block_confirmation_audit(*args: Any, **kwargs: Any) -> None:
+        payload = kwargs.get("payload")
+        if payload == {"fault_acknowledgement": "confirmed"}:
+            entered.set()
+            await release.wait()
+        await original_record(*args, **kwargs)
+
+    subscriber = service.events.subscribe()
+    await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True},
+        ),
+    )
+    with mock.patch.object(store, "record_operator_action", block_confirmation_audit):
+        pending = asyncio.create_task(service.runner.tick_once())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        service._admit_fault_control_lease(run_id)  # noqa: SLF001 - admission race harness  # pyright: ignore[reportPrivateUsage]
+        release.set()
+        assert await asyncio.wait_for(pending, timeout=1.0)
+
+    assert service._fault_lease_cache.status is not FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in events
+    )
 
 
 @pytest.mark.asyncio

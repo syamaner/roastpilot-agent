@@ -166,6 +166,8 @@ class RoastEventKind(Enum):
     RECOVERY_REQUIRED = "recovery_required"
     RECOVERY_ACKNOWLEDGED = "recovery_acknowledged"
     FAULT_ACKNOWLEDGEMENT_EXECUTED = "fault_acknowledgement_executed"
+    FAULT_CONTROLS_CHANGED = "fault_controls_changed"
+    FAULT_CONTROLS_ACKNOWLEDGED = "fault_controls_acknowledged"
     LOGS_EXPORTED = "logs_exported"
     RUN_COMPLETED = "run_completed"
 
@@ -553,6 +555,26 @@ class FaultCoolingStopResult(BaseModel):
     heat_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
     fan_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
     cooling_on: Literal[False]
+
+
+class FaultControlState(BaseModel):
+    """Exact-session state used by the terminal fault-control executor.
+
+    This is deliberately a narrow projection of an MCP session.  It gives the
+    controller enough information to fail closed on an empty dry run and to
+    validate D212's final safe-zero proof without exposing the raw MCP object
+    through the API layer.
+    """
+
+    session_id: str = Field(min_length=1)
+    mcp_phase: Literal["fault"]
+    active: StrictBool
+    device_connected: StrictBool
+    heat_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    fan_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    cooling_on: StrictBool
+    beans_added: StrictBool
+    beans_dropped: StrictBool
 
 
 # Bean species (botanical) — a constrained ``Literal`` deliberately, NOT a
@@ -1258,6 +1280,97 @@ class AdvisorHealth(BaseModel):
     error: str | None = None
 
 
+class RestartClearanceState(Enum):
+    """Durable clearance state for the current Agent process (#954/D213)."""
+
+    REQUIRED = "required"
+    CLEARED = "cleared"
+    UNKNOWN = "unknown"
+
+
+class FaultLeaseStatus(Enum):
+    """Durable state of the one current fault-control lease (#954/D213)."""
+
+    CLOSED = "closed"
+    OPEN = "open"
+    UNKNOWN = "unknown"
+
+
+class RestartClearanceProjection(BaseModel):
+    """Public current-process restart gate without physical identifiers."""
+
+    state: RestartClearanceState
+    eligible: StrictBool
+
+
+class OperatorAction(Enum):
+    """The operator actions the API accepts (plan §6 enum).
+
+    Plain ``Enum`` (D15): the SPA sends these wire forms, but a string
+    comparison against a member in core logic is a pyright strict error.
+
+    "Recovery-only" in plan §6 means *manual fallback*, not a single phase, and
+    the two are not symmetric (see ``safety.COMMAND_PHASE_MATRIX``):
+    ``mark_beans_added`` is the manual-T0 fallback accepted only in
+    ``preheating`` (NOT in ``operator_recovery_required``), while
+    ``start_cooling`` is accepted in ``cooling`` or ``operator_recovery_required``.
+    ``pause_advisory`` / ``resume_advisory`` / ``acknowledge_recovery`` /
+    ``acknowledge_fault`` are control actions with no direct MCP write.
+
+    ``acknowledge_fault`` (#206) finalises an operable-faulted run: a fault no
+    longer auto-finalises the run (so the operator can still engage/stop cooling
+    on a physically-running machine), and acknowledging it is what stamps the
+    ``faulted`` outcome and stops the loop. It is enabled iff the phase is
+    ``faulted`` (mirror of ``acknowledge_recovery`` vs ``operator_recovery_required``).
+
+    Declared here (before :class:`RoastDetail`) because that response model's
+    ``enabled_actions`` field references it (E10 option (a))."""
+
+    MARK_BEANS_ADDED = "mark_beans_added"
+    MARK_FIRST_CRACK = "mark_first_crack"
+    PAUSE_ADVISORY = "pause_advisory"
+    RESUME_ADVISORY = "resume_advisory"
+    DROP_BEANS = "drop_beans"
+    START_COOLING = "start_cooling"
+    STOP_COOLING = "stop_cooling"
+    EMERGENCY_STOP = "emergency_stop"
+    ACKNOWLEDGE_RECOVERY = "acknowledge_recovery"
+    ACKNOWLEDGE_FAULT = "acknowledge_fault"
+    STOP_COOLING_AND_ACKNOWLEDGE = "stop_cooling_and_acknowledge"
+
+
+def _empty_fault_control_actions() -> list[OperatorAction]:
+    """Return the typed default action projection for a closed lease."""
+    return []
+
+
+class FaultControlsProjection(BaseModel):
+    """Public projection of the current fault-control lease.
+
+    Session and private run identifiers intentionally remain in the store only.
+    """
+
+    status: FaultLeaseStatus
+    generation: Annotated[StrictInt, Field(ge=0)] | None = None
+    enabled_actions: list[OperatorAction] = Field(default_factory=_empty_fault_control_actions)
+
+
+class RestartClearanceRequest(BaseModel):
+    """Explicit physical confirmation needed to clear a fresh process gate."""
+
+    physical_confirmation: Literal[True]
+
+
+class RestartClearanceResult(BaseModel):
+    """Outcome of one restart-clearance attempt."""
+
+    outcome: Literal["confirmed", "failed"]
+    cleared: bool
+    restart_clearance_required: bool
+    restart_clearance: RestartClearanceProjection
+    fault_controls: FaultControlsProjection
+
+
 class HealthResponse(BaseModel):
     """``GET /api/health``: liveness + MCP child status + active run id.
 
@@ -1295,6 +1408,20 @@ class HealthResponse(BaseModel):
     """Opaque ID the explicit acknowledgement must echo for this incident."""
     active_run_id: str | None = None
     advisor: AdvisorHealth | None = None
+    restart_clearance: "RestartClearanceProjection" = Field(
+        default_factory=lambda: RestartClearanceProjection(
+            state=RestartClearanceState.REQUIRED, eligible=False
+        )
+    )
+    """The current process's durable pre-start clearance state (#954/D213)."""
+    restart_clearance_required: bool = True
+    """Compatibility projection of ``restart_clearance.state == 'required'``."""
+    fault_controls: "FaultControlsProjection" = Field(
+        default_factory=lambda: FaultControlsProjection(
+            status=FaultLeaseStatus.CLOSED, generation=None, enabled_actions=[]
+        )
+    )
+    """Current durable fault-control lease projection; contains no private IDs."""
 
 
 class LogManifest(BaseModel):
@@ -1398,39 +1525,21 @@ class RoastHistory(BaseModel):
     runs: list[RoastSummary]
 
 
-class OperatorAction(Enum):
-    """The operator actions the API accepts (plan §6 enum).
+class FaultControlsActionRequest(BaseModel):
+    """Global fault-control request resolved against the current lease only."""
 
-    Plain ``Enum`` (D15): the SPA sends these wire forms, but a string
-    comparison against a member in core logic is a pyright strict error.
+    action: OperatorAction
+    confirmation: Literal[True] | None = None
 
-    "Recovery-only" in plan §6 means *manual fallback*, not a single phase, and
-    the two are not symmetric (see ``safety.COMMAND_PHASE_MATRIX``):
-    ``mark_beans_added`` is the manual-T0 fallback accepted only in
-    ``preheating`` (NOT in ``operator_recovery_required``), while
-    ``start_cooling`` is accepted in ``cooling`` or ``operator_recovery_required``.
-    ``pause_advisory`` / ``resume_advisory`` / ``acknowledge_recovery`` /
-    ``acknowledge_fault`` are control actions with no direct MCP write.
 
-    ``acknowledge_fault`` (#206) finalises an operable-faulted run: a fault no
-    longer auto-finalises the run (so the operator can still engage/stop cooling
-    on a physically-running machine), and acknowledging it is what stamps the
-    ``faulted`` outcome and stops the loop. It is enabled iff the phase is
-    ``faulted`` (mirror of ``acknowledge_recovery`` vs ``operator_recovery_required``).
+class FaultControlsActionResult(BaseModel):
+    """Admission or confirmed completion of a current fault-control action."""
 
-    Declared here (before :class:`RoastDetail`) because that response model's
-    ``enabled_actions`` field references it (E10 option (a))."""
-
-    MARK_BEANS_ADDED = "mark_beans_added"
-    MARK_FIRST_CRACK = "mark_first_crack"
-    PAUSE_ADVISORY = "pause_advisory"
-    RESUME_ADVISORY = "resume_advisory"
-    DROP_BEANS = "drop_beans"
-    START_COOLING = "start_cooling"
-    STOP_COOLING = "stop_cooling"
-    EMERGENCY_STOP = "emergency_stop"
-    ACKNOWLEDGE_RECOVERY = "acknowledge_recovery"
-    ACKNOWLEDGE_FAULT = "acknowledge_fault"
+    action: OperatorAction
+    result: Literal["accepted", "confirmed", "rejected", "failed"]
+    reason: str
+    queued: bool = False
+    fault_controls: FaultControlsProjection
 
 
 def _empty_actions() -> list[OperatorAction]:
@@ -1476,6 +1585,12 @@ class RoastDetail(BaseModel):
     is ``corrected_charge_grams`` when present (#520), else
     ``profile.bean_weight_grams``."""
     export_manifest: LogManifest | None = None
+    fault_controls: FaultControlsProjection = Field(
+        default_factory=lambda: FaultControlsProjection(
+            status=FaultLeaseStatus.CLOSED, generation=None, enabled_actions=[]
+        )
+    )
+    """Current server-owned terminal fault controls for this run, if any."""
     enabled_actions: list[OperatorAction] = Field(default_factory=_empty_actions)
     mic_status: MicStatus | None = None
     """Capture-alive mic / first-crack health (#197), mirroring the
@@ -2040,6 +2155,8 @@ class SseEventType(Enum):
     RECOVERY_REQUIRED = "recovery_required"
     RECOVERY_ACKNOWLEDGED = "recovery_acknowledged"
     FAULT_ACKNOWLEDGEMENT_EXECUTED = "fault_acknowledgement_executed"
+    FAULT_CONTROLS_CHANGED = "fault_controls_changed"
+    FAULT_CONTROLS_ACKNOWLEDGED = "fault_controls_acknowledged"
     LOGS_EXPORTED = "logs_exported"
     RUN_COMPLETED = "run_completed"
     TELEMETRY = "telemetry"

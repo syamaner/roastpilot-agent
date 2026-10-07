@@ -3952,7 +3952,7 @@ async def test_adapter_projects_fault_acknowledgement_state_for_exact_session() 
     assert caller.calls == [
         ("get_roast_state", {}),
         ("get_roast_state", {}),
-        ("stop_cooling", {}),
+        ("stop_cooling", {"expected_session_id": session_id}),
     ]
 
 
@@ -4022,7 +4022,12 @@ async def test_fault_acknowledgement_rejects_malformed_stop_result() -> None:
             "payload": {"recovery_after_fault": True},
         },
     }
-    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([malformed_stop])))
+    adapter = RoasterControlAdapter(
+        RoasterMCPClient(
+            _SequenceCaller([{**SESSION_STATE_PAYLOAD, "phase": "fault"}, malformed_stop])
+        )
+    )
+    await adapter.read_telemetry()
 
     with pytest.raises(ValueError, match="cooling stop result is malformed"):
         await adapter.stop_cooling_for_fault_acknowledgement()

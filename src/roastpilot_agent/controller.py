@@ -46,6 +46,8 @@ from roastpilot_agent.models import (
     AdvisorTraceStatus,
     AppliedRoasterState,
     DropReason,
+    FaultControlState,
+    OperatorAction,
     PostFcHeatAuthorityState,
     ReferenceRoast,
     RoastCommand,
@@ -89,6 +91,8 @@ __all__ = [
     "AdvisoryTrigger",
     "CommandExecutor",
     "ControllerSnapshot",
+    "FaultControlExecutor",
+    "FaultControlPort",
     "EventEmitter",
     "InvalidTransitionError",
     "RoastController",
@@ -280,6 +284,117 @@ class CommandExecutor(Protocol):
         mirroring :meth:`drop_beans` — including the ``None``-on-malformed-
         payload contract."""
         ...
+
+
+class FaultControlPort(Protocol):
+    """Exact-session actuator boundary for a durable terminal fault lease."""
+
+    async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+        """Read one exact fault session's typed state."""
+        ...
+
+    async def execute_fault_control(
+        self, action: OperatorAction, *, expected_session_id: str
+    ) -> FaultControlState:
+        """Execute one guarded write and return fresh exact-session state."""
+        ...
+
+
+class FaultControlExecutor:
+    """Controller-owned, single-writer executor for an OPEN terminal lease.
+
+    It is deliberately smaller than :class:`RoastController`: the historical
+    row is immutable and there is no live roast loop to resume.  Every write
+    still receives a typed safety evaluation for the faulted phase before the
+    exact-session port can issue it.
+    """
+
+    def __init__(self, safety: SafetyPolicy, port: FaultControlPort) -> None:
+        self._safety = safety
+        self._port = port
+        self._queue: asyncio.PriorityQueue[
+            tuple[
+                int,
+                int,
+                OperatorAction,
+                str,
+                Callable[[], bool],
+                asyncio.Future[FaultControlState | None],
+            ]
+        ] = asyncio.PriorityQueue()
+        self._sequence = 0
+        self._worker: asyncio.Task[None] | None = None
+
+    async def execute(
+        self,
+        action: OperatorAction,
+        session_id: str,
+        *,
+        is_current_generation: Callable[[], bool],
+    ) -> FaultControlState | None:
+        """Execute one allowed terminal fault action, serialized with its proof."""
+        self._sequence += 1
+        future: asyncio.Future[FaultControlState | None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        # An MCP call in flight cannot be interrupted, but the next dispatch
+        # always takes an admitted e-stop before queued recovery controls.
+        priority = 0 if action is OperatorAction.EMERGENCY_STOP else 1
+        self._queue.put_nowait(
+            (priority, self._sequence, action, session_id, is_current_generation, future)
+        )
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+        return await future
+
+    async def _drain(self) -> None:
+        """Drain fault actions in priority order until no admitted work remains."""
+        while not self._queue.empty():
+            _, _, action, session_id, generation_current, future = await self._queue.get()
+            if future.cancelled():
+                continue
+            try:
+                result = await self._execute_one(action, session_id, generation_current)
+            except Exception as exc:  # noqa: BLE001 - failed exact proof is fail-closed
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+    async def _execute_one(
+        self, action: OperatorAction, session_id: str, generation_current: Callable[[], bool]
+    ) -> FaultControlState | None:
+        """Evaluate and execute one current generation's exact-session action."""
+        command_by_action = {
+            OperatorAction.DROP_BEANS: RoastCommand.DROP_BEANS,
+            OperatorAction.START_COOLING: RoastCommand.START_COOLING,
+            OperatorAction.STOP_COOLING: RoastCommand.STOP_COOLING,
+            OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE: RoastCommand.STOP_COOLING,
+        }
+        if action is OperatorAction.EMERGENCY_STOP:
+            evaluation = self._safety.evaluate_emergency_stop(
+                phase=RoastPhase.FAULTED, operator_reason="terminal fault control"
+            )
+            if evaluation.verdict is not SafetyVerdict.EMERGENCY_STOP or not generation_current():
+                return None
+            # No pre-read may postpone an e-stop attempt.  The guarded command
+            # result and its fresh exact-session readback are the proof.
+            return await self._port.execute_fault_control(action, expected_session_id=session_id)
+        command = command_by_action.get(action)
+        if command is None:
+            return None
+        evaluation = self._safety.evaluate_command_phase(command=command, phase=RoastPhase.FAULTED)
+        if evaluation.verdict is not SafetyVerdict.ALLOW:
+            return None
+        before = await self._port.read_fault_control_state(session_id)
+        if before.session_id != session_id or before.mcp_phase != "fault":
+            return None
+        if action is OperatorAction.DROP_BEANS and (not before.beans_added or before.beans_dropped):
+            return None
+        if action is OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE and not before.cooling_on:
+            return before
+        if not generation_current():
+            return None
+        return await self._port.execute_fault_control(action, expected_session_id=session_id)
 
 
 class SnapshotSink(Protocol):

@@ -35,12 +35,14 @@ from roastpilot_agent.models import (
     BrewMethod,
     CommandTraceSource,
     CommandTraceStatus,
+    FaultLeaseStatus,
     LogManifest,
     PostFcHeatAuthorityState,
     ProcessingMethod,
     ReferenceCurveSample,
     ReferenceLandmarks,
     ReferenceRoast,
+    RestartClearanceState,
     RoastCommand,
     RoastDetail,
     RoastEventKind,
@@ -590,6 +592,52 @@ ALTER TABLE roast_events_new RENAME TO roast_events;
 CREATE INDEX idx_roast_events_run_kind ON roast_events(run_id, kind);
 """
 
+SCHEMA_V18_FAULT_LEASE_AND_PROCESS_CLEARANCE = """
+-- #954 / D213: process-local clearance is durable audit state, while the
+-- single current fault-control lease retains private Agent/MCP identities.
+CREATE TABLE process_restart_clearance (
+  process_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL CHECK (state IN ('required', 'cleared', 'unknown')),
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL
+);
+CREATE TABLE fault_control_lease (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  run_id TEXT REFERENCES roast_runs(id),
+  mcp_session_id TEXT,
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  status TEXT NOT NULL CHECK (status IN ('closed', 'open', 'unknown')),
+  updated_at_utc TEXT NOT NULL
+);
+"""
+
+SCHEMA_V19_FAULT_CONTROL_EVENTS = """
+-- #954 / D213: server-authoritative lease state changes reach persisted SSE.
+CREATE TABLE roast_events_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES roast_runs(id),
+  kind TEXT NOT NULL CHECK (kind IN (
+    'run_started', 'phase_changed', 'charge_guidance', 't0_detected',
+    'turning_point', 'drying_end', 'first_crack', 'advisory',
+    'command_executed', 'command_failed', 'safety_alert', 'fault',
+    'recovery_required', 'recovery_acknowledged',
+    'fault_acknowledgement_executed', 'fault_controls_changed',
+    'fault_controls_acknowledged', 'logs_exported', 'run_completed')),
+  source TEXT NOT NULL CHECK (source IN (
+    'controller', 'mcp', 'operator', 'advisor', 'safety')),
+  monotonic_seconds REAL,
+  recorded_at_utc TEXT NOT NULL,
+  payload_json TEXT
+);
+INSERT INTO roast_events_new
+  (id, run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json)
+  SELECT id, run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json
+  FROM roast_events;
+DROP TABLE roast_events;
+ALTER TABLE roast_events_new RENAME TO roast_events;
+CREATE INDEX idx_roast_events_run_kind ON roast_events(run_id, kind);
+"""
+
 _BEAN_SOURCING_LEASE_DURATION = timedelta(minutes=2)
 _BEAN_SOURCING_LEASE_CONFIRMATION = timedelta(seconds=60)
 
@@ -614,6 +662,8 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V15_CATALOGUE_ATTEMPT_COUNTS,
     SCHEMA_V16_D96_VALIDATION_TRACE,
     SCHEMA_V17_FAULT_ACKNOWLEDGEMENT_EVENT,
+    SCHEMA_V18_FAULT_LEASE_AND_PROCESS_CLEARANCE,
+    SCHEMA_V19_FAULT_CONTROL_EVENTS,
 )
 
 
@@ -701,6 +751,17 @@ class PersistedRun(BaseModel):
     #: corpus reading with a transient post-restart probe hiccup). Corpus-only;
     #: nothing safety-gating reads it.
     ambient_captured: bool = False
+
+
+class FaultControlLease(BaseModel):
+    """Private durable lease binding the Agent run to an exact MCP session."""
+
+    model_config = ConfigDict(frozen=True)
+
+    generation: int
+    status: FaultLeaseStatus
+    run_id: str | None
+    mcp_session_id: str | None
 
 
 class RoastStore:
@@ -853,6 +914,138 @@ class RoastStore:
         if self._connection is not None:
             await self._connection.close()
             self._connection = None
+
+    async def begin_process_restart_clearance(self, process_id: str) -> RestartClearanceState:
+        """Durably create this fresh process's required restart gate.
+
+        A process identifier is minted in memory and never reused.  Therefore a
+        prior clean marker can never waive this new process's physical-clearance
+        obligation.
+        """
+        now = _utc_now()
+        await self.connection.execute(
+            "INSERT INTO process_restart_clearance "
+            "(process_id, state, created_at_utc, updated_at_utc) VALUES (?, ?, ?, ?)",
+            (process_id, RestartClearanceState.REQUIRED.value, now, now),
+        )
+        await self.connection.commit()
+        return RestartClearanceState.REQUIRED
+
+    async def read_process_restart_clearance(self, process_id: str) -> RestartClearanceState:
+        """Read this process's durable restart gate, failing closed if absent."""
+        async with self.connection.execute(
+            "SELECT state FROM process_restart_clearance WHERE process_id = ?", (process_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return RestartClearanceState.UNKNOWN
+        try:
+            return RestartClearanceState(str(row["state"]))
+        except ValueError:
+            return RestartClearanceState.UNKNOWN
+
+    async def confirm_process_restart_clearance(self, process_id: str) -> bool:
+        """CAS the current process gate from required to cleared."""
+        cursor = await self.connection.execute(
+            "UPDATE process_restart_clearance SET state = ?, updated_at_utc = ? "
+            "WHERE process_id = ? AND state = ?",
+            (
+                RestartClearanceState.CLEARED.value,
+                _utc_now(),
+                process_id,
+                RestartClearanceState.REQUIRED.value,
+            ),
+        )
+        await self.connection.commit()
+        return cursor.rowcount == 1
+
+    async def read_fault_control_lease(self) -> FaultControlLease:
+        """Read the current fault lease; absence is the safe closed baseline."""
+        async with self.connection.execute(
+            "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease "
+            "WHERE singleton = 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return FaultControlLease(
+                generation=0,
+                status=FaultLeaseStatus.CLOSED,
+                run_id=None,
+                mcp_session_id=None,
+            )
+        try:
+            status = FaultLeaseStatus(str(row["status"]))
+        except ValueError:
+            status = FaultLeaseStatus.UNKNOWN
+        return FaultControlLease(
+            generation=int(row["generation"]),
+            status=status,
+            run_id=None if row["run_id"] is None else str(row["run_id"]),
+            mcp_session_id=(None if row["mcp_session_id"] is None else str(row["mcp_session_id"])),
+        )
+
+    async def open_fault_control_lease(
+        self, *, run_id: str | None, mcp_session_id: str | None, generation: int | None = None
+    ) -> FaultControlLease:
+        """Durably open a newer current lease without allowing stale writers."""
+        if generation is None:
+            generation = (await self.read_fault_control_lease()).generation + 1
+        await self.connection.execute(
+            "INSERT INTO fault_control_lease "
+            "(singleton, run_id, mcp_session_id, generation, status, updated_at_utc) "
+            "VALUES (1, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(singleton) DO UPDATE SET run_id=excluded.run_id, "
+            "mcp_session_id=excluded.mcp_session_id, generation=excluded.generation, "
+            "status=excluded.status, updated_at_utc=excluded.updated_at_utc "
+            "WHERE excluded.generation > fault_control_lease.generation",
+            (run_id, mcp_session_id, generation, FaultLeaseStatus.OPEN.value, _utc_now()),
+        )
+        await self.connection.commit()
+        return await self.read_fault_control_lease()
+
+    async def mark_fault_control_lease_unknown(self, generation: int) -> bool:
+        """Fail closed after an unconfirmed lease persistence attempt."""
+        cursor = await self.connection.execute(
+            "UPDATE fault_control_lease SET status = ?, updated_at_utc = ? "
+            "WHERE singleton = 1 AND generation = ?",
+            (FaultLeaseStatus.UNKNOWN.value, _utc_now(), generation),
+        )
+        await self.connection.commit()
+        return cursor.rowcount == 1
+
+    async def replace_fault_control_lease_unknown(
+        self, run_id: str | None, *, generation: int | None = None
+    ) -> FaultControlLease:
+        """Advance the lease into UNKNOWN when no exact session can be bound."""
+        if generation is None:
+            generation = (await self.read_fault_control_lease()).generation + 1
+        await self.connection.execute(
+            "INSERT INTO fault_control_lease "
+            "(singleton, run_id, mcp_session_id, generation, status, updated_at_utc) "
+            "VALUES (1, ?, NULL, ?, ?, ?) "
+            "ON CONFLICT(singleton) DO UPDATE SET run_id=excluded.run_id, "
+            "mcp_session_id=NULL, generation=excluded.generation, "
+            "status=excluded.status, updated_at_utc=excluded.updated_at_utc "
+            "WHERE excluded.generation > fault_control_lease.generation",
+            (run_id, generation, FaultLeaseStatus.UNKNOWN.value, _utc_now()),
+        )
+        await self.connection.commit()
+        return await self.read_fault_control_lease()
+
+    async def close_fault_control_lease(self, generation: int) -> bool:
+        """Close only the current OPEN lease generation through a durable CAS."""
+        cursor = await self.connection.execute(
+            "UPDATE fault_control_lease SET status = ?, updated_at_utc = ? "
+            "WHERE singleton = 1 AND generation = ? AND status = ?",
+            (
+                FaultLeaseStatus.CLOSED.value,
+                _utc_now(),
+                generation,
+                FaultLeaseStatus.OPEN.value,
+            ),
+        )
+        await self.connection.commit()
+        return cursor.rowcount == 1
 
     # --- E6-S2: write paths ---
     #
