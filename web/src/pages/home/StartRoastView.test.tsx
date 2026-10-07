@@ -324,6 +324,34 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
   });
 
+  it("fails closed when the fresh health projection omits fault controls", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: true },
+      fault_controls: undefined,
+    };
+    renderView();
+
+    expect(screen.getByTestId("fault-controls-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("fails closed when CLOSED fault controls carry an unexpected enabled action", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: true },
+      fault_controls: {
+        status: "closed",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderView();
+
+    expect(screen.getByTestId("fault-controls-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
   it("replaces the start form with the per-process physical confirmation gate", () => {
     healthState.data = {
       active_run_id: null,

@@ -95,6 +95,7 @@ import {
 import { api } from "@/lib/api";
 import type {
   BeanProfileInput,
+  FaultControls,
   HardwareClearAcknowledgementRequest,
   HardwareClearAcknowledgementResult,
   RoastProfile,
@@ -326,6 +327,62 @@ function RestartClearanceStatusIncomplete(): React.JSX.Element {
       </div>
     </AppFrame>
   );
+}
+
+/** Fail closed when the public D212 lease projection is missing or incoherent. */
+function FaultControlsStatusIncomplete(): React.JSX.Element {
+  return (
+    <AppFrame
+      headerRight={
+        <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+          Start blocked
+        </span>
+      }
+    >
+      <div
+        className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-fault/50 bg-roast-fault/10 p-8 text-center"
+        data-testid="fault-controls-status-unknown"
+      >
+        <h2 className="text-lg font-bold uppercase tracking-wide">Fault control status unknown</h2>
+        <p className="text-sm text-muted-foreground">
+          RoastPilot cannot confirm the current fault-control lease. Starting remains blocked. If
+          the Hottop may be active, use the independent physical emergency stop and reload to
+          obtain current status.
+        </p>
+      </div>
+    </AppFrame>
+  );
+}
+
+const TERMINAL_FAULT_ACTIONS = new Set<string>([
+  "emergency_stop",
+  "start_cooling",
+  "stop_cooling",
+  "drop_beans",
+  "stop_cooling_and_acknowledge",
+]);
+
+/** Narrow untrusted JSON before using the fault lease as a Start admission gate. */
+function isCoherentFaultControls(value: unknown): value is FaultControls {
+  if (value === null || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  const status = candidate.status;
+  const generation = candidate.generation;
+  const actions = candidate.enabled_actions;
+  if (status !== "closed" && status !== "open" && status !== "unknown") return false;
+  if (
+    generation !== null &&
+    (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0)
+  ) {
+    return false;
+  }
+  if (!Array.isArray(actions) || !actions.every((action) => typeof action === "string")) {
+    return false;
+  }
+  if (!actions.every((action) => TERMINAL_FAULT_ACTIONS.has(action))) return false;
+  if (new Set(actions).size !== actions.length) return false;
+  if (status === "closed" && actions.length !== 0) return false;
+  return !(status === "unknown" && actions.some((action) => action !== "emergency_stop"));
 }
 
 /**
@@ -597,12 +654,13 @@ export function StartRoastView(): React.JSX.Element {
   // A terminal fault lease is independent of historical roast completion and
   // of this process's restart-clearance gate. It takes precedence here so an
   // operator who lands on `/start` still has the server-enumerated fault path.
-  // The component receives no IDs and cannot invent an enabled command.
-  if (
-    health.isSuccess &&
-    health.data.fault_controls !== undefined &&
-    health.data.fault_controls.status !== "closed"
-  ) {
+  // Missing/malformed data is unknown, never evidence of a closed lease.
+  const faultControls = health.isSuccess ? health.data.fault_controls : undefined;
+  const coherentFaultControls = isCoherentFaultControls(faultControls) ? faultControls : null;
+  if (health.isSuccess && coherentFaultControls === null) {
+    return <FaultControlsStatusIncomplete />;
+  }
+  if (health.isSuccess && coherentFaultControls !== null && coherentFaultControls.status !== "closed") {
     return (
       <AppFrame
         headerRight={
@@ -612,7 +670,7 @@ export function StartRoastView(): React.JSX.Element {
         }
       >
         <TerminalFaultControls
-          controls={health.data.fault_controls}
+          controls={coherentFaultControls}
           onAction={async (action, confirmation) => {
             try {
               const result = await api.faultControlsAction(

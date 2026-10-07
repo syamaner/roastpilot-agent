@@ -19,7 +19,7 @@ import {
 } from "@tanstack/react-query";
 
 import { api } from "@/lib/api";
-import type { BeanProfileInput, HealthResponse, TastingEntryRequest } from "@/lib/types";
+import type { BeanProfileInput, TastingEntryRequest } from "@/lib/types";
 
 export const roastKeys = {
   health: ["health"] as const,
@@ -44,24 +44,6 @@ export const beanProfileKeys = {
 
 export function useHealth() {
   return useQuery({ queryKey: roastKeys.health, queryFn: api.health });
-}
-
-/**
- * Whether the current health projection needs bounded refreshes.
- *
- * An absent/malformed D212/D213 projection is UNKNOWN at this wire boundary,
- * so it keeps polling while the start surface remains fail-closed. Polling
- * reads only server state; it does not establish physical proof or infer an
- * actuator state from a local phase.
- */
-export function needsBoundedHealthRefresh(health: HealthResponse | undefined): boolean {
-  const restart = health?.restart_clearance;
-  const faultControls = health?.fault_controls;
-  return (
-    restart?.state !== "cleared" ||
-    restart?.eligible !== true ||
-    faultControls?.status !== "closed"
-  );
 }
 
 /**
@@ -122,14 +104,14 @@ export function useFreshHealthGate() {
     queryKey: roastKeys.health,
     queryFn: api.health,
     refetchOnMount: "always",
-    // D212/D213: terminal lease and restart clearance can change in another
-    // tab/process. While either state is unsettled, re-read the authoritative
-    // health projection every three seconds and on focus/reconnect. Closed,
-    // cleared state keeps the app's normal non-polling health behaviour.
-    refetchInterval: (current) =>
-      needsBoundedHealthRefresh(current.state.data) ? 3_000 : false,
-    refetchOnWindowFocus: (current) => needsBoundedHealthRefresh(current.state.data),
-    refetchOnReconnect: (current) => needsBoundedHealthRefresh(current.state.data),
+    // D212/D213: a terminal lease can open after this surface receives a
+    // closed/cleared snapshot (another browser's e-stop or a controller fault).
+    // Keep the mounted gate on a bounded server-health refresh so Start does
+    // not stay stale and hide that server-enumerated terminal-control path.
+    // This is a read-only projection, never a physical-state proof.
+    refetchInterval: 3_000,
+    refetchOnWindowFocus: true,
+    refetchOnReconnect: true,
   });
   return useFreshGate(query);
 }
