@@ -3356,7 +3356,7 @@ async def test_start_write_is_fenced_when_estop_arrives_after_run_row_creation(
     )
     entered = asyncio.Event()
     release = asyncio.Event()
-    original = service._begin_live_run  # noqa: SLF001 - deterministic start boundary
+    original = service._begin_live_run  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
 
     async def blocked_begin(profile: RoastProfile, run_id: str, *, lease_generation: int) -> None:
         entered.set()
@@ -3401,7 +3401,9 @@ async def test_open_lease_fault_action_uses_exact_session_and_rejects_changed_se
     clock = FakeClock()
     mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)
-    service._admit_fault_control_lease(run_id, session_id="session-1")  # noqa: SLF001
+    service._admit_fault_control_lease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        run_id, session_id="session-1"
+    )
     await asyncio.sleep(0)
     accepted = await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
