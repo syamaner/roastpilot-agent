@@ -16,7 +16,11 @@
  *    that first frame, since `useEffect` runs post-paint).
  * 2. Active run — the full live dashboard (DashboardPage). A reload on this
  *    URL re-hydrates from the server snapshot + SSE — the reload-safe guarantee.
- * 3. No active run — the last completed run's summary (`LiveFinishedView`),
+ * 3. No active run with an open or unknown terminal-fault lease — the
+ *    server-projected global terminal controls. They use the global lease
+ *    endpoint and never a historical run id.
+ * 4. No active run with a closed terminal-fault lease — the last completed
+ *    run's summary (`LiveFinishedView`),
  *    PERSISTENT across reload: sourced from the history API
  *    (`GET /api/roasts`, newest-first), not session state. The just-finished
  *    run from THIS session (`stickyCompletedRunId`) is preferred while set —
@@ -39,10 +43,11 @@
  * `/start` (StartRoastView.tsx) is the ONLY start-form surface under the
  * #523 IA; `/live` never renders one.
  *
- * INVARIANTS: active-run presence comes from the SERVER's `/health` snapshot
- * (`active_run_id`) — never inferred client-side (D8). Phase is not read here;
- * DashboardPage owns phase via SSE + snapshot. Operator actions and MCP access
- * live entirely in DashboardPage.
+ * INVARIANTS: active-run presence and terminal-fault controls come from the
+ * SERVER's `/health` snapshot — never inferred client-side (D8). Phase is not
+ * read here; DashboardPage owns phase via SSE + snapshot. The SPA never calls
+ * MCP. Run-scoped operator actions remain in DashboardPage only while a run is
+ * active; terminal actions use the server-resolved global lease endpoint.
  *
  * IMPOSTOR-PROCESS DEFENCE (#516, follow-up to the #513 port-impostor
  * incident — docs/recent-fixes.md, 12 Jul): a second process wildcard-bound
@@ -119,7 +124,10 @@ import {
   useTelemetry,
 } from "@/hooks/queries";
 import { api } from "@/lib/api";
+import { isCoherentFaultControls } from "@/lib/faultControls";
+import type { FaultControls } from "@/lib/types";
 import { DashboardPage } from "@/pages/dashboard/DashboardPage";
+import { TerminalFaultControls } from "@/pages/home/TerminalFaultControls";
 import { headlineStats, toCurveMarkers, toCurvePoints } from "@/pages/detail/traceModel";
 
 /**
@@ -560,6 +568,18 @@ export function LivePage(): React.JSX.Element {
     return <DashboardPage />;
   }
 
+  // Once health reports no active run, a D212/D213 lease is the sole
+  // authority for terminal controls. Do not keep a sticky dashboard mounted:
+  // its run-scoped endpoint could address historical state after the active
+  // run has gone null. A reload takes this same health-projected path.
+  const faultControls = health.data?.fault_controls;
+  if (!isCoherentFaultControls(faultControls)) {
+    return <LiveFaultControlsStatusUnknownView />;
+  }
+  if (faultControls.status !== "closed") {
+    return <LiveTerminalFaultControls controls={faultControls} />;
+  }
+
   // No active run: never a form (#523). Hold while a terminal-outcome fetch
   // for the just-finished run is in flight — see the transition-flash note
   // above — so an older completed run's summary never renders as a flash
@@ -667,6 +687,60 @@ export function LivePage(): React.JSX.Element {
   // No active run, and no completed run exists (ever) — a neutral, still-not-
   // a-form state pointing to /start, the only start-form surface (#523).
   return <LiveNoRoastsView />;
+}
+
+/** Server-projected global terminal controls for `/live` after active-run closure. */
+function LiveTerminalFaultControls({ controls }: { controls: FaultControls }): React.JSX.Element {
+  const queryClient = useQueryClient();
+  return (
+    <AppFrame
+      headerRight={
+        <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+          Fault controls
+        </span>
+      }
+    >
+      <TerminalFaultControls
+        controls={controls}
+        onAction={async (action, confirmation) => {
+          try {
+            const result = await api.faultControlsAction(
+              confirmation === true ? { action, confirmation } : { action },
+            );
+            await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+            return result;
+          } catch (error) {
+            await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+            throw error;
+          }
+        }}
+      />
+    </AppFrame>
+  );
+}
+
+/** Missing or malformed fault-controls data cannot be treated as a closed lease. */
+function LiveFaultControlsStatusUnknownView(): React.JSX.Element {
+  return (
+    <AppFrame
+      headerRight={
+        <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+          Fault controls unknown
+        </span>
+      }
+    >
+      <div
+        className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-fault/50 bg-roast-fault/10 p-8 text-center"
+        data-testid="live-fault-controls-status-unknown"
+      >
+        <h2 className="text-lg font-bold uppercase tracking-wide">Fault control status unknown</h2>
+        <p className="text-sm text-muted-foreground">
+          RoastPilot cannot confirm the current fault-control lease. If the Hottop may be active,
+          use the independent physical emergency stop and reload to obtain current status.
+        </p>
+      </div>
+    </AppFrame>
+  );
 }
 
 // --- LiveStatusUnknownView: shown at /live when /health persistently errors. ---

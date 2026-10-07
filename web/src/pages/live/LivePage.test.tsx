@@ -39,13 +39,19 @@
  * the roast history list (both from the server).
  */
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { RoastDetail, RoastHistory, TelemetrySeries } from "@/lib/types";
+import type {
+  FaultControls,
+  OperatorAction,
+  RoastDetail,
+  RoastHistory,
+  TelemetrySeries,
+} from "@/lib/types";
 import { LivePage } from "./LivePage";
 import {
   FIXTURE_FINISHED_DETAIL,
@@ -59,7 +65,13 @@ import {
 // only from a stale cache entry with the genuinely fresh refetch still in
 // flight — see StartRoastView.test.tsx's matching stub for the fuller doc. ---
 const healthState: {
-  data: { active_run_id: string | null; instance_id?: string } | undefined;
+  data:
+    | {
+        active_run_id: string | null;
+        instance_id?: string;
+        fault_controls?: FaultControls;
+      }
+    | undefined;
   isSuccess: boolean;
   isError: boolean;
   isFresh: boolean;
@@ -87,7 +99,23 @@ vi.mock("@/hooks/queries", async () => {
   const actual = await vi.importActual<typeof import("@/hooks/queries")>("@/hooks/queries");
   return {
     ...actual,
-    useFreshHealthGate: () => healthState,
+    useFreshHealthGate: () => ({
+      ...healthState,
+      // The pre-D212 fixtures in this file model ordinary idle/active state.
+      // Their omitted terminal projection represents the valid closed lease
+      // only in this test seam; production JSON still fails closed in LivePage.
+      data:
+        healthState.data === undefined
+          ? undefined
+          : {
+              fault_controls: {
+                status: "closed",
+                generation: null,
+                enabled_actions: [],
+              },
+              ...healthState.data,
+            },
+    }),
     useFreshHistoryGate: () => historyState,
     useRoast: () => roastState,
     // Return full-res stub for downsample=1 (stats), curve stub for downsample=5.
@@ -139,11 +167,24 @@ const roastApiMock = vi.hoisted(() =>
     outcome: "completed",
   })),
 );
+const faultControlsActionMock = vi.hoisted(() =>
+  vi.fn(async (request: { action: OperatorAction }) => ({
+    action: request.action,
+    result: "accepted" as const,
+    reason: "accepted for processing",
+  })),
+);
+const operatorActionMock = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
     ...actual,
-    api: { ...actual.api, roast: roastApiMock },
+    api: {
+      ...actual.api,
+      roast: roastApiMock,
+      faultControlsAction: faultControlsActionMock,
+      operatorAction: operatorActionMock,
+    },
   };
 });
 
@@ -162,6 +203,8 @@ beforeEach(() => {
   // the loading-hold-specific tests below override it to false.
   historyState.isFresh = true;
   roastApiMock.mockClear();
+  faultControlsActionMock.mockClear();
+  operatorActionMock.mockClear();
   // Reset stubs to defaults (null data, no-op traceModel).
   roastState.data = null;
   telemetryFullState.data = undefined;
@@ -360,6 +403,84 @@ describe("LivePage — active run", () => {
     expect(screen.queryByTestId("live-page-loading")).toBeNull();
     expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
     expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+  });
+});
+
+describe("LivePage — terminal fault lease", () => {
+  it("replaces a sticky active dashboard with global controls when an open lease follows active-run closure", async () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-live" };
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+
+    healthState.data = {
+      active_run_id: null,
+      fault_controls: {
+        status: "open",
+        generation: 7,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    rerender();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-status",
+      "open",
+    );
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("terminal-fault-action-emergency_stop"));
+    await waitFor(() =>
+      expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }),
+    );
+    expect(operatorActionMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps global open-lease controls after a reload/remount", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: null,
+      fault_controls: {
+        status: "open",
+        generation: 8,
+        enabled_actions: ["emergency_stop", "stop_cooling"],
+      },
+    };
+    const { remount } = renderPage();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-status",
+      "open",
+    );
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+
+    remount();
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-status",
+      "open",
+    );
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+  });
+
+  it("retains only a server-listed emergency stop for an unknown terminal lease", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: null,
+      fault_controls: {
+        status: "unknown",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-status",
+      "unknown",
+    );
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-fault-action-start_cooling")).toBeNull();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
   });
 });
 
