@@ -8,7 +8,8 @@ import json
 import os
 import pwd
 import re
-import select
+import resource
+import selectors
 import shutil
 import stat
 import subprocess
@@ -763,8 +764,13 @@ def _assert_installer_recorder_uses_complete_write() -> None:
 def _wait_for_framing_writer(process: subprocess.Popen[str]) -> None:
     """Wait a bounded time for a framing writer's deterministic rendezvous."""
     assert process.stdout is not None
-    readable, _, _ = select.select([process.stdout], [], [], 2.0)
-    assert readable, "framing writer did not reach its bounded rendezvous"
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        ready = selector.select(timeout=2.0)
+    finally:
+        selector.close()
+    assert ready, "framing writer did not reach its bounded rendezvous"
     assert process.stdout.readline() == "ready\n", "framing writer rendezvous was malformed"
 
 
@@ -888,6 +894,41 @@ def test_fake_log_grammar_fails_closed_for_forced_concurrency(
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=2.0)
+
+
+@pytest.mark.serial
+def test_framing_writer_wait_handles_high_pipe_descriptor() -> None:
+    """Keep the rendezvous wait portable above select's descriptor ceiling."""
+    descriptor_ceiling = 1024
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit <= descriptor_ceiling + 16:
+        pytest.skip("host file-descriptor limit cannot safely force a high pipe descriptor")
+
+    descriptors: list[int] = []
+    process: subprocess.Popen[str] | None = None
+    try:
+        for _ in range(descriptor_ceiling + 1):
+            descriptors.append(os.open(os.devnull, os.O_RDONLY))
+        process = subprocess.Popen(
+            ["bash", "-c", "printf 'ready\\n'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert process.stdout is not None
+        assert process.stdout.fileno() >= descriptor_ceiling
+
+        _wait_for_framing_writer(process)
+        assert process.wait(timeout=2.0) == 0
+    finally:
+        if process is not None:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=2.0)
+        for descriptor in descriptors:
+            os.close(descriptor)
 
 
 def _has_service_mutation(events: list[str]) -> bool:
