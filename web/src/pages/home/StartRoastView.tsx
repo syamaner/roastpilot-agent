@@ -98,6 +98,7 @@ import type {
   FaultControls,
   HardwareClearAcknowledgementRequest,
   HardwareClearAcknowledgementResult,
+  RestartClearance,
   RoastProfile,
 } from "@/lib/types";
 import type { LiveNavigationState } from "@/pages/live/LivePage";
@@ -382,7 +383,26 @@ function isCoherentFaultControls(value: unknown): value is FaultControls {
   if (!actions.every((action) => TERMINAL_FAULT_ACTIONS.has(action))) return false;
   if (new Set(actions).size !== actions.length) return false;
   if (status === "closed" && actions.length !== 0) return false;
+  if (status === "open" && generation === null) return false;
   return !(status === "unknown" && actions.some((action) => action !== "emergency_stop"));
+}
+
+/** Narrow untrusted JSON before using the process gate as Start admission evidence. */
+function isCoherentRestartClearance(value: unknown): value is RestartClearance {
+  if (value === null || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.eligible !== "boolean") return false;
+  switch (candidate.state) {
+    case "required":
+    case "unknown":
+      return candidate.eligible === false;
+    case "cleared":
+      // A cleared process gate can still be ineligible because a separate
+      // server-side Start barrier remains. It is coherent, but not permission.
+      return true;
+    default:
+      return false;
+  }
 }
 
 /**
@@ -691,17 +711,19 @@ export function StartRoastView(): React.JSX.Element {
   // Missing and incoherent D213 state fail closed. A response from an older
   // server is never evidence that the new process gate has been cleared.
   const restartClearance = health.isSuccess ? health.data.restart_clearance : undefined;
+  const coherentRestartClearance = isCoherentRestartClearance(restartClearance)
+    ? restartClearance
+    : null;
   if (
     health.isSuccess &&
-    (restartClearance === undefined ||
-      restartClearance.state === "unknown" ||
-      (restartClearance.state === "required" && restartClearance.eligible) ||
-      (restartClearance.state === "cleared" && !restartClearance.eligible))
+    (coherentRestartClearance === null ||
+      coherentRestartClearance.state === "unknown" ||
+      (coherentRestartClearance.state === "cleared" && !coherentRestartClearance.eligible))
   ) {
     return <RestartClearanceStatusIncomplete />;
   }
 
-  if (health.isSuccess && restartClearance?.state === "required") {
+  if (health.isSuccess && coherentRestartClearance?.state === "required") {
     return (
       <AppFrame
         headerRight={

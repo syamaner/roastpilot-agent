@@ -324,6 +324,42 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
   });
 
+  it("fails closed when restart clearance has an unrecognised state or nonboolean eligibility", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "invented", eligible: "yes" } as never,
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    };
+    renderView();
+
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("keeps a coherent cleared-but-ineligible process gate blocked", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: false },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    };
+    renderView();
+
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("fails closed when a required restart clearance claims eligibility", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "required", eligible: true },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    };
+    renderView();
+
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+  });
+
   it("fails closed when the fresh health projection omits fault controls", () => {
     healthState.data = {
       active_run_id: null,
@@ -350,6 +386,22 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
 
     expect(screen.getByTestId("fault-controls-status-unknown")).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("fails closed when an OPEN fault lease omits its generation", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: true },
+      fault_controls: {
+        status: "open",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderView();
+
+    expect(screen.getByTestId("fault-controls-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-fault-controls")).toBeNull();
   });
 
   it("replaces the start form with the per-process physical confirmation gate", () => {
