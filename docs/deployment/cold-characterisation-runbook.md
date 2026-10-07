@@ -127,6 +127,15 @@ minutes remain separate gates. #954 stays open and E11-S3 is in progress.
   and its quantisation. Self-reported identities and software evidence are not
   physical proof.
 
+### 2.0 Fresh Agent process clearance
+
+After every fresh Agent process, before Start, the operator must explicitly
+confirm that the Hottop is stopped and empty and that the independent stop is
+engaged or immediately ready. Clearance also requires a fresh current-child MCP
+`session_presence: none` proof and durable confirmation for that Agent process.
+This is not a hardware safe-zero or readiness proof. An OPEN fault lease remains
+separate and requires its exact-session Stop cooling and acknowledge procedure.
+
 ### 2.1 Select artifacts before installation
 
 Preparation starts by selecting two exact artifacts and recording their identities
