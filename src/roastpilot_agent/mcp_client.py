@@ -1223,21 +1223,34 @@ class RoasterControlAdapter:
             if (
                 result.session_id != expected_session_id
                 or result.phase != "fault"
+                or result.event.kind != "fault"
                 or result.event.payload.get("driver_safety_method_called") is not True
                 or result.event.payload.get("driver_error") is not None
             ):
                 raise ValueError("terminal emergency stop is unconfirmed")
         elif action is OperatorAction.START_COOLING:
             result = await self._client.start_cooling(expected_session_id=expected_session_id)
-            if result.session_id != expected_session_id or result.phase != "fault":
+            if (
+                result.session_id != expected_session_id
+                or result.phase != "fault"
+                or result.event.kind != "cooling_started"
+            ):
                 raise ValueError("terminal start cooling is unconfirmed")
         elif action in (OperatorAction.STOP_COOLING, OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE):
             result = await self._client.stop_cooling(expected_session_id=expected_session_id)
-            if result.session_id != expected_session_id or result.phase != "fault":
+            if (
+                result.session_id != expected_session_id
+                or result.phase != "fault"
+                or result.event.kind != "cooling_stopped"
+            ):
                 raise ValueError("terminal stop cooling is unconfirmed")
         elif action is OperatorAction.DROP_BEANS:
             result = await self._client.drop_beans(expected_session_id=expected_session_id)
-            if result.session_id != expected_session_id or result.phase != "fault":
+            if (
+                result.session_id != expected_session_id
+                or result.phase != "fault"
+                or result.event.kind != "beans_dropped"
+            ):
                 raise ValueError("terminal drop is unconfirmed")
         else:
             raise ValueError("unsupported terminal fault action")

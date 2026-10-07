@@ -60,7 +60,7 @@ from roastpilot_agent.mcp_client import (
     project_session_state,
     resolve_mcp_command,
 )
-from roastpilot_agent.models import AppliedRoasterState, MicHealth
+from roastpilot_agent.models import AppliedRoasterState, MicHealth, OperatorAction
 
 FIXTURES = Path(__file__).parent / "fixtures" / "live-roast-2026-06-07"
 
@@ -4031,6 +4031,107 @@ async def test_fault_acknowledgement_rejects_malformed_stop_result() -> None:
 
     with pytest.raises(ValueError, match="cooling stop result is malformed"):
         await adapter.stop_cooling_for_fault_acknowledgement()
+
+
+def _fault_control_state_payload(session_id: str) -> dict[str, object]:
+    """Build one connected, exact-session fault readback payload for adapter tests."""
+    return {
+        **SESSION_STATE_PAYLOAD,
+        "session_id": session_id,
+        "phase": "fault",
+        "active": False,
+        "heat_level_percent": 0,
+        "fan_level_percent": 100,
+        "cooling_on": True,
+        "device_state": {
+            **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+            "connected": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+    }
+
+
+def _fault_control_result_payload(
+    session_id: str, event_kind: str, *, emergency_stop: bool = False
+) -> dict[str, object]:
+    """Build one typed terminal-control result payload with an arbitrary event kind."""
+    payload: dict[str, object] = {}
+    if emergency_stop:
+        payload["driver_safety_method_called"] = True
+    return {
+        **EVENT_RESULT_PAYLOAD,
+        "session_id": session_id,
+        "phase": "fault",
+        "event": {
+            "kind": event_kind,
+            "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+            "monotonic_seconds": 1228.9,
+            "payload": payload,
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "tool", "event_kind"),
+    [
+        (OperatorAction.EMERGENCY_STOP, "emergency_stop", "fault"),
+        (OperatorAction.START_COOLING, "start_cooling", "cooling_started"),
+        (OperatorAction.STOP_COOLING, "stop_cooling", "cooling_stopped"),
+        (OperatorAction.DROP_BEANS, "drop_beans", "beans_dropped"),
+    ],
+)
+async def test_execute_fault_control_accepts_the_exact_command_event_kind(
+    action: OperatorAction, tool: str, event_kind: str
+) -> None:
+    """Terminal commands require their matching MCP event before accepting fresh state."""
+    session_id = "fault-session"
+    result = _fault_control_result_payload(
+        session_id, event_kind, emergency_stop=action is OperatorAction.EMERGENCY_STOP
+    )
+    readback = _fault_control_state_payload(session_id)
+    caller = _SequenceCaller([result, readback])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    state = await adapter.execute_fault_control(action, expected_session_id=session_id)
+
+    assert state.session_id == session_id
+    assert caller.calls == [
+        (tool, {"reason": "terminal fault control", "expected_session_id": session_id})
+        if action is OperatorAction.EMERGENCY_STOP
+        else (tool, {"expected_session_id": session_id}),
+        ("get_roast_state", {"session_id": session_id}),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "tool", "expected_event_kind", "wrong_event_kind"),
+    [
+        (OperatorAction.EMERGENCY_STOP, "emergency_stop", "fault", "cooling_started"),
+        (OperatorAction.START_COOLING, "start_cooling", "cooling_started", "fault"),
+        (OperatorAction.STOP_COOLING, "stop_cooling", "cooling_stopped", "beans_dropped"),
+        (OperatorAction.DROP_BEANS, "drop_beans", "beans_dropped", "cooling_stopped"),
+    ],
+)
+async def test_execute_fault_control_rejects_wrong_command_event_kind(
+    action: OperatorAction, tool: str, expected_event_kind: str, wrong_event_kind: str
+) -> None:
+    """A valid-shaped result for another terminal command fails closed."""
+    session_id = "fault-session"
+    result = _fault_control_result_payload(
+        session_id, wrong_event_kind, emergency_stop=action is OperatorAction.EMERGENCY_STOP
+    )
+    caller = _SequenceCaller([result])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    with pytest.raises(ValueError, match="is unconfirmed"):
+        await adapter.execute_fault_control(action, expected_session_id=session_id)
+
+    assert expected_event_kind != wrong_event_kind
+    assert [call[0] for call in caller.calls] == [tool]
 
 
 @pytest.mark.asyncio
