@@ -81,6 +81,8 @@ from roastpilot_agent.models import (
     ChargeWeightRequest,
     ClearStaleSessionRequest,
     FaultAcknowledgementState,
+    FaultControlsActionRequest,
+    FaultControlState,
     FaultCoolingStopResult,
     FaultLeaseStatus,
     HardwareClearAcknowledgementRequest,
@@ -3311,6 +3313,114 @@ async def _faulted_live_service(
     faulted = await store.read_run(run_id)
     assert faulted is not None and faulted.agent_phase is RoastPhase.FAULTED
     return service, mcp, clock, run_id
+
+
+class _ExactFaultMCP(FakeMCPClient):
+    """Fake fault port that records the exact-session guard used for a write."""
+
+    async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+        return FaultControlState(
+            session_id=cast("str", self.latest_fault_session_id),
+            mcp_phase="fault",
+            active=False,
+            device_connected=True,
+            heat_level_percent=0,
+            fan_level_percent=0,
+            cooling_on=False,
+            beans_added=True,
+            beans_dropped=False,
+        )
+
+    async def execute_fault_control(
+        self, action: OperatorAction, *, expected_session_id: str
+    ) -> FaultControlState:
+        self.calls.append(
+            ("fault_control", {"action": action.value, "expected_session_id": expected_session_id})
+        )
+        if self.latest_fault_session_id != expected_session_id:
+            raise RuntimeError("stale exact-session guard")
+        return await self.read_fault_control_state(expected_session_id)
+
+
+@pytest.mark.asyncio
+async def test_start_write_is_fenced_when_estop_arrives_after_run_row_creation(
+    store: RoastStore,
+) -> None:
+    """An admitted e-stop invalidates Start before its first MCP write."""
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = service._begin_live_run  # noqa: SLF001 - deterministic start boundary
+
+    async def blocked_begin(profile: RoastProfile, run_id: str, *, lease_generation: int) -> None:
+        entered.set()
+        await release.wait()
+        await original(profile, run_id, lease_generation=lease_generation)
+
+    service._begin_live_run = blocked_begin  # type: ignore[method-assign]  # noqa: SLF001
+    starting = asyncio.create_task(service.start_roast(_profile()))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    stopped = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert stopped.result == "failed"
+    release.set()
+    await asyncio.wait_for(starting, timeout=1.0)
+    assert "start_session" not in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_per_run_estop_bypasses_saturated_routine_queue(store: RoastStore) -> None:
+    """A full routine queue cannot reject a per-run emergency stop."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    for _ in range(service.OPERATOR_QUEUE_MAX):
+        service.operator_queue.put_nowait(
+            QueuedOperatorAction(run_id=run_id, action=OperatorAction.PAUSE_ADVISORY)
+        )
+    result = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"})
+    )
+    assert result.result == "accepted"
+    assert result.queued is False
+    assert mcp.commands().count("emergency_stop") == 1
+
+
+@pytest.mark.asyncio
+async def test_open_lease_fault_action_uses_exact_session_and_rejects_changed_session(
+    store: RoastStore,
+) -> None:
+    """Live-run fault controls never fall back to the unguarded action queue."""
+    clock = FakeClock()
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    service._admit_fault_control_lease(run_id, session_id="session-1")  # noqa: SLF001
+    await asyncio.sleep(0)
+    accepted = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
+    )
+    assert accepted.result == "accepted"
+    assert accepted.queued is False
+    assert (
+        "fault_control",
+        {"action": "drop_beans", "expected_session_id": "session-1"},
+    ) in mcp.calls
+
+    mcp.set_latest_fault_session_id("new-session")
+    rejected = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.START_COOLING)
+    )
+    assert rejected.result == "failed"
+    assert not any(
+        name == "fault_control" and args["action"] == "start_cooling" for name, args in mcp.calls
+    )
 
 
 def _start_session_roast_nums(mcp: FakeMCPClient) -> list[int | None]:

@@ -769,6 +769,7 @@ class RoastController:
         advisor: RoastAdvisor | None = None,
         clock: Clock = time.monotonic,
         reference_roast: ReferenceRoast | None = None,
+        start_write_permitted: Callable[[], bool] | None = None,
     ) -> None:
         self._config = config
         self._safety = safety
@@ -778,6 +779,12 @@ class RoastController:
         self._events = event_emitter
         self._advisor = advisor
         self._clock = clock
+        # The service binds this to the lease generation reserved for this run.
+        # It is rechecked immediately before the first MCP start write, after
+        # all setup awaits have completed.  An admitted e-stop advances that
+        # generation synchronously, so this controller boundary cannot start a
+        # session from an invalidated reservation.
+        self._start_write_permitted = start_write_permitted
         # #567 Slice B: a DIFFERENT completed, well-rated roast of THIS SAME
         # bean, retrieved ONCE by the caller (RoastService, fail-soft, flag-
         # gated) before construction and cached here for the run's entire
@@ -4210,6 +4217,10 @@ class RoastController:
         # after store-derived 4 would use per-process counter 2 → collision).
         if recording_roast_num is not None:
             self._recording_roast_num = max(self._recording_roast_num, recording_roast_num)
+        if self._start_write_permitted is not None and not self._start_write_permitted():
+            self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "start_roast_session"})
+            self.transition_to(RoastPhase.FAULTED)
+            return
         try:
             await self._executor.start_session(
                 recording_origin=recording_origin,

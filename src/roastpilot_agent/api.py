@@ -2856,7 +2856,7 @@ class RoastService:
             )
             self.active_run_id = run_id
         if self._roaster is not None:
-            await self._begin_live_run(profile, run_id)
+            await self._begin_live_run(profile, run_id, lease_generation=lease.generation)
         detail = await self._store.read_run(run_id)
         if detail is None:  # pragma: no cover — read immediately after create
             raise RuntimeError(f"read_run returned None for just-created run {run_id}")
@@ -2949,7 +2949,9 @@ class RoastService:
         finally:
             self._hardware_clear_request_in_flight = False
 
-    async def _begin_live_run(self, profile: RoastProfile, run_id: str) -> None:
+    async def _begin_live_run(
+        self, profile: RoastProfile, run_id: str, *, lease_generation: int
+    ) -> None:
         """Construct and start the live controller loop for a run (E9).
 
         Builds a fresh controller bound to this run id, wired to the roaster
@@ -2958,7 +2960,14 @@ class RoastService:
         controller's idle→preheating start runs before returning; the per-tick
         loop runs as a background task when ``run_loop`` is set (tests drive
         ``service.runner.tick_once()`` directly with ``run_loop=False``)."""
-        runner = await self._build_runner(run_id, profile)
+        runner = await self._build_runner(
+            run_id,
+            profile,
+            start_write_permitted=lambda: (
+                self._fault_lease_cache.generation == lease_generation
+                and self._fault_lease_cache.status is FaultLeaseStatus.CLOSED
+            ),
+        )
         if runner is None:  # pragma: no cover — guarded by the caller
             return
         recording_roast_num = await self._recording_roast_num(profile)
@@ -3068,6 +3077,7 @@ class RoastService:
         config: AppConfig | None = None,
         safety: SafetyPolicy | None = None,
         configured_doctrine_enabled: bool | None = None,
+        start_write_permitted: Callable[[], bool] | None = None,
     ) -> "RoastRunner | None":
         """Construct a controller + runner bound to ``run_id`` (shared by the
         fresh-start and restart-recovery paths). ``None`` in API-only mode.
@@ -3109,6 +3119,7 @@ class RoastService:
             advisor=self._advisor,
             clock=self._clock,
             reference_roast=reference_roast,
+            start_write_permitted=start_write_permitted,
         )
         runner = RoastRunner(
             controller=controller,
@@ -4069,6 +4080,18 @@ class RoastService:
         ``emergency_stop`` / ``acknowledge_fault`` so a fault never strands a
         physically-running machine.
         """
+        if (
+            request.action is OperatorAction.EMERGENCY_STOP
+            and self.runner is not None
+            and self.active_run_id == run_id
+            and self.operator_queue.full()
+        ):
+            return await self._submit_live_emergency_stop(run_id, request)
+
+        guarded = await self._submit_open_fault_lease_action(run_id, request)
+        if guarded is not None:
+            return guarded
+
         detail = await self._store.read_run(run_id)
         if detail is None:
             raise RoastRunNotFoundError(run_id)
@@ -4168,6 +4191,87 @@ class RoastService:
         )
         return OperatorActionResult(
             action=request.action, result=result, reason=reason, queued=queued
+        )
+
+    async def _submit_live_emergency_stop(
+        self, run_id: str, request: OperatorActionRequest
+    ) -> OperatorActionResult:
+        """Admit a per-run e-stop without waiting on the routine queue or SQLite."""
+        # Admission is deliberately first: an e-stop must invalidate a pending
+        # Start reservation even when its audit persistence later fails.
+        self._admit_fault_control_lease(run_id)
+        runner = self.runner
+        dispatched = (
+            runner is not None
+            and self.active_run_id == run_id
+            and await runner.dispatch_priority_emergency_stop(
+                QueuedOperatorAction(run_id=run_id, action=request.action, payload=request.payload)
+            )
+        )
+        result: Literal["accepted", "rejected", "failed"] = "accepted" if dispatched else "failed"
+        reason = (
+            "emergency_stop accepted for controller priority dispatch"
+            if dispatched
+            else "software e-stop attempt was not confirmed"
+        )
+        await self._store.record_operator_action(
+            action=request.action.value,
+            result=result,
+            run_id=run_id,
+            payload=request.payload,
+        )
+        return OperatorActionResult(
+            action=request.action, result=result, reason=reason, queued=False
+        )
+
+    async def _submit_open_fault_lease_action(
+        self, run_id: str, request: OperatorActionRequest
+    ) -> OperatorActionResult | None:
+        """Direct ordinary fault actuators through the exact-session executor.
+
+        D212 acknowledgement deliberately remains with the live runner: it owns
+        its safe-zero proof, finalisation, and CAS-close sequence.
+        """
+        if request.action not in {
+            OperatorAction.DROP_BEANS,
+            OperatorAction.START_COOLING,
+            OperatorAction.STOP_COOLING,
+        }:
+            return None
+        lease = await self._read_fault_lease_fail_closed()
+        if lease.status is not FaultLeaseStatus.OPEN or lease.run_id != run_id:
+            return None
+        executor = self._fault_control_executor
+        session_id = lease.mcp_session_id
+        if executor is None or session_id is None:
+            return None
+        try:
+            state = await executor.execute(
+                request.action,
+                session_id,
+                is_current_generation=lambda: (
+                    self._fault_lease_cache.generation == lease.generation
+                    and self._fault_lease_cache.status is FaultLeaseStatus.OPEN
+                ),
+            )
+        except Exception:  # noqa: BLE001 - exact-session proof fails closed
+            state = None
+        result: Literal["accepted", "rejected", "failed"] = (
+            "accepted" if state is not None else "failed"
+        )
+        reason = (
+            "fault action accepted through exact-session controller dispatch"
+            if state is not None
+            else "exact fault-session action was not confirmed"
+        )
+        await self._store.record_operator_action(
+            action=request.action.value,
+            result=result,
+            run_id=run_id,
+            payload=request.payload,
+        )
+        return OperatorActionResult(
+            action=request.action, result=result, reason=reason, queued=False
         )
 
     # --- #303: bean-profile library CRUD (D45) ---
