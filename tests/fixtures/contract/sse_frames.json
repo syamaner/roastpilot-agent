@@ -184,6 +184,24 @@
     },
     {
       "data": {
+        "generation": 1,
+        "outcome": "confirmed",
+        "status": "open"
+      },
+      "event": "fault_controls_changed",
+      "id": 0
+    },
+    {
+      "data": {
+        "generation": 1,
+        "outcome": "confirmed",
+        "status": "closed"
+      },
+      "event": "fault_controls_acknowledged",
+      "id": 0
+    },
+    {
+      "data": {
         "csv_path": "/tmp/roast-export/roast.csv",
         "jsonl_path": "/tmp/roast-export/roast.jsonl",
         "log_dir": "/tmp/roast-export",

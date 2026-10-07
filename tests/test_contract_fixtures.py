@@ -388,6 +388,17 @@ def _gap_fill_frames() -> list[SseEvent]:
         {"outcome": "confirmed"},
     )
 
+    # api.py fault-lease persistence and D212 acknowledgement emit sites. The
+    # lease generation/status/outcome projection contains no run or session ID.
+    broadcaster.emit(
+        RoastEventKind.FAULT_CONTROLS_CHANGED,
+        {"generation": 1, "status": "open", "outcome": "confirmed"},
+    )
+    broadcaster.emit(
+        RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED,
+        {"generation": 1, "status": "closed", "outcome": "confirmed"},
+    )
+
     # controller.py command-failure emit site shape (a rejected e-stop carries a reason).
     broadcaster.emit(
         RoastEventKind.COMMAND_FAILED,

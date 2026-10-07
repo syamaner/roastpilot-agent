@@ -49,6 +49,11 @@
     ],
     "excluded": false,
     "export_manifest": null,
+    "fault_controls": {
+      "enabled_actions": [],
+      "generation": null,
+      "status": "closed"
+    },
     "fault_reason": null,
     "id": "00000000000000000000000000000000",
     "instance_id": null,
