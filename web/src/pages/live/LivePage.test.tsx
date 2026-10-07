@@ -407,6 +407,68 @@ describe("LivePage — active run", () => {
 });
 
 describe("LivePage — terminal fault lease", () => {
+  it("uses global controls instead of the dashboard while an active run has an open terminal lease", async () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: "run-awaiting-terminal-action",
+      fault_controls: {
+        status: "open",
+        generation: 6,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-status",
+      "open",
+    );
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("terminal-fault-action-emergency_stop"));
+    await waitFor(() =>
+      expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }),
+    );
+    expect(operatorActionMock).not.toHaveBeenCalled();
+  });
+
+  it("retains only a server-listed emergency stop when an active run has an unknown lease", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: "run-awaiting-terminal-action",
+      fault_controls: {
+        status: "unknown",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-status",
+      "unknown",
+    );
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-fault-action-start_cooling")).toBeNull();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+  });
+
+  it("fails closed when an active run has a malformed terminal lease projection", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: "run-awaiting-terminal-action",
+      fault_controls: {
+        status: "open",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      } as unknown as FaultControls,
+    };
+    renderPage();
+
+    expect(screen.getByTestId("live-fault-controls-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+  });
+
   it("replaces a sticky active dashboard with global controls when an open lease follows active-run closure", async () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-live" };

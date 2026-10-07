@@ -16,9 +16,10 @@
  *    that first frame, since `useEffect` runs post-paint).
  * 2. Active run — the full live dashboard (DashboardPage). A reload on this
  *    URL re-hydrates from the server snapshot + SSE — the reload-safe guarantee.
- * 3. No active run with an open or unknown terminal-fault lease — the
- *    server-projected global terminal controls. They use the global lease
- *    endpoint and never a historical run id.
+ * 3. An open or unknown terminal-fault lease — the server-projected global
+ *    terminal controls. This takes precedence even while `active_run_id`
+ *    remains non-null during an admitted terminal action. The controls use
+ *    the global lease endpoint and never a historical run id.
  * 4. No active run with a closed terminal-fault lease — the last completed
  *    run's summary (`LiveFinishedView`),
  *    PERSISTENT across reload: sourced from the history API
@@ -563,21 +564,22 @@ export function LivePage(): React.JSX.Element {
     return <LiveStatusUnknownView variant="instance-mismatch" />;
   }
 
-  // Active run: the full live dashboard.
-  if (activeRunId !== null) {
-    return <DashboardPage />;
-  }
-
-  // Once health reports no active run, a D212/D213 lease is the sole
-  // authority for terminal controls. Do not keep a sticky dashboard mounted:
-  // its run-scoped endpoint could address historical state after the active
-  // run has gone null. A reload takes this same health-projected path.
+  // A D212/D213 lease is the sole authority for terminal controls while it is
+  // open or unknown, even if an admitted terminal action has not yet cleared
+  // `active_run_id`. Do not keep a dashboard mounted in that overlap: its
+  // run-scoped endpoint could address a run the server has placed under the
+  // terminal lease. A reload takes this same health-projected path.
   const faultControls = health.data?.fault_controls;
   if (!isCoherentFaultControls(faultControls)) {
     return <LiveFaultControlsStatusUnknownView />;
   }
   if (faultControls.status !== "closed") {
     return <LiveTerminalFaultControls controls={faultControls} />;
+  }
+
+  // Active run with a coherently CLOSED terminal lease: the full live dashboard.
+  if (activeRunId !== null) {
+    return <DashboardPage />;
   }
 
   // No active run: never a form (#523). Hold while a terminal-outcome fetch
