@@ -45,11 +45,11 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any, Literal, Protocol, cast
+from typing import Annotated, Any, Literal, Protocol, TypeVar, cast
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceConfig
 from roastpilot_agent.models import (
@@ -150,12 +150,12 @@ class RoasterDeviceState(MCPMirror):
     """Mirror of mcp_server.RoasterDeviceState."""
 
     driver: str
-    connected: StrictBool
+    connected: bool
     bean_temp_c: float | None
     env_temp_c: float | None
-    heat_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
-    fan_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
-    cooling_on: StrictBool
+    heat_level_percent: int
+    fan_level_percent: int
+    cooling_on: bool
     raw_vendor_data: dict[str, EventPayloadValue]
 
 
@@ -222,14 +222,14 @@ class RoastSessionState(MCPMirror):
     the controller's tick consumes (via RoastTelemetry projection)."""
 
     session_id: str
-    active: StrictBool
+    active: bool
     phase: MCPPhase
     created_at_utc: str
     stopped_at_utc: str | None
     elapsed_monotonic_seconds: float
-    heat_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
-    fan_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
-    cooling_on: StrictBool
+    heat_level_percent: int
+    fan_level_percent: int
+    cooling_on: bool
     beans_added_at_utc: str | None
     first_crack_at_utc: str | None
     beans_dropped_at_utc: str | None
@@ -328,6 +328,80 @@ class EventCommandResult(MCPMirror):
     event_count: int
 
 
+class FaultControlDeviceReadback(BaseModel):
+    """Strict control fields read from one fault-session device snapshot."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore", strict=True)
+
+    connected: StrictBool
+    heat_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    fan_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    cooling_on: StrictBool
+
+
+class FaultControlReadback(BaseModel):
+    """Strict minimal projection used only by the fault-control boundary.
+
+    Ordinary roast and cold-characterisation reads intentionally keep using
+    :class:`RoastSessionState`, whose tolerant mirror supports compatible MCP
+    additions and feeds the cold boundary's independent strict projector.  A
+    fault acknowledgement or terminal fault command, however, must not base a
+    safe-zero proof on values that Pydantic coerced at the shared mirror.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore", strict=True)
+
+    session_id: StrictStr
+    active: StrictBool
+    phase: Literal["fault"]
+    heat_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    fan_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    cooling_on: StrictBool
+    beans_added_at_utc: StrictStr | None
+    beans_dropped_at_utc: StrictStr | None
+    device_state: FaultControlDeviceReadback | None
+
+
+class FaultControlEvent(BaseModel):
+    """Strict event fields from one fault-control command result."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore", strict=True)
+
+    kind: StrictStr
+    recorded_at_utc: StrictStr
+    monotonic_seconds: float
+    payload: dict[str, object]
+
+
+class FaultControlCommandResult(BaseModel):
+    """Strict result projection used only by exact fault-control writes."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore", strict=True)
+
+    session_id: StrictStr
+    phase: Literal["fault"]
+    event: FaultControlEvent
+    event_count: StrictInt
+
+
+_FaultControlModelT = TypeVar("_FaultControlModelT", bound=BaseModel)
+
+
+def _validate_fault_control_payload(
+    model: type[_FaultControlModelT], payload: object
+) -> _FaultControlModelT:
+    """Validate a safety-critical fault payload without exposing raw values.
+
+    The fixed exception deliberately contains no MCP response fragments.  The
+    controller can therefore preserve a fail-closed fault lease without
+    propagating private device data into diagnostics.
+    """
+    try:
+        return model.model_validate(payload)
+    except ValidationError:
+        raise ValueError("fault control MCP evidence is malformed") from None
+
+
 class ExportRoastLogResult(MCPMirror):
     """Mirror of mcp_server.ExportRoastLogResult."""
 
@@ -421,6 +495,31 @@ class RoasterMCPClient:
         if expected_session_id is not None:
             args["expected_session_id"] = expected_session_id
         return EventCommandResult.model_validate(await self._call("emergency_stop", args))
+
+    async def _get_fault_control_readback(
+        self, session_id: str | None = None
+    ) -> FaultControlReadback:
+        """Return one exact-typed fault-state readback for a guarded action.
+
+        This deliberately bypasses the tolerant session mirror.  It is the
+        narrow safety boundary used to prove fault controls, while the regular
+        session client remains compatible with raw MCP telemetry used by the
+        cold-characterisation projector.
+        """
+        args: dict[str, object] = {} if session_id is None else {"session_id": session_id}
+        return _validate_fault_control_payload(
+            FaultControlReadback, await self._call("get_roast_state", args)
+        )
+
+    async def _execute_fault_control(
+        self,
+        tool: Literal["emergency_stop", "start_cooling", "stop_cooling", "drop_beans"],
+        arguments: dict[str, object],
+    ) -> FaultControlCommandResult:
+        """Execute one guarded fault action and require an exact typed result."""
+        return _validate_fault_control_payload(
+            FaultControlCommandResult, await self._call(tool, arguments)
+        )
 
     async def set_recording_metadata(
         self, origin: str, roast_num: int
@@ -1132,7 +1231,7 @@ class RoasterControlAdapter:
         # its latest session. Read that same authoritative target here; querying a
         # historical session would prove controls for an object the write cannot
         # address. The runner serializes this read and its possible write.
-        state = await self._client.get_roast_state()
+        state = await self._client._get_fault_control_readback()  # pyright: ignore[reportPrivateUsage]
         if state.session_id != session_id:
             raise ValueError("fault acknowledgement session does not match latest state")
         device = state.device_state
@@ -1161,7 +1260,9 @@ class RoasterControlAdapter:
         expected_session_id = self.latest_fault_session_id
         if expected_session_id is None:
             raise ValueError("fault acknowledgement has no exact current session")
-        result = await self._client.stop_cooling(expected_session_id=expected_session_id)
+        result = await self._client._execute_fault_control(  # pyright: ignore[reportPrivateUsage]
+            "stop_cooling", {"expected_session_id": expected_session_id}
+        )
         payload = result.event.payload
         recovery_after_fault = payload.get("recovery_after_fault")
         heat_level_percent = payload.get("heat_level_percent")
@@ -1188,8 +1289,10 @@ class RoasterControlAdapter:
 
     async def read_fault_control_state(self, session_id: str) -> FaultControlState:
         """Read one exact MCP fault session for a terminal lease action."""
-        state = await self._client.get_roast_state(session_id)
-        if state.session_id != session_id or state.phase != "fault":
+        state = await self._client._get_fault_control_readback(  # pyright: ignore[reportPrivateUsage]
+            session_id
+        )
+        if state.session_id != session_id:
             raise ValueError("terminal fault control session does not match a fault state")
         device = state.device_state
         if device is None or not device.connected:
@@ -1217,8 +1320,9 @@ class RoasterControlAdapter:
     ) -> FaultControlState:
         """Issue one exact-session terminal fault write and return fresh state."""
         if action is OperatorAction.EMERGENCY_STOP:
-            result = await self._client.emergency_stop(
-                "terminal fault control", expected_session_id=expected_session_id
+            result = await self._client._execute_fault_control(  # pyright: ignore[reportPrivateUsage]
+                "emergency_stop",
+                {"reason": "terminal fault control", "expected_session_id": expected_session_id},
             )
             if (
                 result.session_id != expected_session_id
@@ -1229,7 +1333,9 @@ class RoasterControlAdapter:
             ):
                 raise ValueError("terminal emergency stop is unconfirmed")
         elif action is OperatorAction.START_COOLING:
-            result = await self._client.start_cooling(expected_session_id=expected_session_id)
+            result = await self._client._execute_fault_control(  # pyright: ignore[reportPrivateUsage]
+                "start_cooling", {"expected_session_id": expected_session_id}
+            )
             if (
                 result.session_id != expected_session_id
                 or result.phase != "fault"
@@ -1237,7 +1343,9 @@ class RoasterControlAdapter:
             ):
                 raise ValueError("terminal start cooling is unconfirmed")
         elif action in (OperatorAction.STOP_COOLING, OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE):
-            result = await self._client.stop_cooling(expected_session_id=expected_session_id)
+            result = await self._client._execute_fault_control(  # pyright: ignore[reportPrivateUsage]
+                "stop_cooling", {"expected_session_id": expected_session_id}
+            )
             if (
                 result.session_id != expected_session_id
                 or result.phase != "fault"
@@ -1245,7 +1353,9 @@ class RoasterControlAdapter:
             ):
                 raise ValueError("terminal stop cooling is unconfirmed")
         elif action is OperatorAction.DROP_BEANS:
-            result = await self._client.drop_beans(expected_session_id=expected_session_id)
+            result = await self._client._execute_fault_control(  # pyright: ignore[reportPrivateUsage]
+                "drop_beans", {"expected_session_id": expected_session_id}
+            )
             if (
                 result.session_id != expected_session_id
                 or result.phase != "fault"

@@ -3990,13 +3990,21 @@ async def test_fault_acknowledgement_rejects_latest_session_change_before_stop()
 @pytest.mark.asyncio
 async def test_fault_acknowledgement_rejects_malformed_or_disagreeing_controls() -> None:
     """The adapter fails closed before a fault acknowledgement sees bad state."""
-    malformed = {**SESSION_STATE_PAYLOAD, "active": "false"}
+    malformed = {**SESSION_STATE_PAYLOAD, "phase": "fault", "active": "false"}
     client = RoasterMCPClient(_SequenceCaller([malformed]))
-    with pytest.raises(ValidationError):
-        await client.get_roast_state()
+    # The ordinary mirror remains intentionally tolerant: cold
+    # characterisation projects its own raw strict evidence after this parse.
+    assert (await client.get_roast_state()).active is False
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([malformed])))
+    with pytest.raises(ValueError, match="fault control MCP evidence is malformed"):
+        await adapter.read_fault_acknowledgement_state(
+            cast("str", SESSION_STATE_PAYLOAD["session_id"])
+        )
 
     disagreeing = {
         **SESSION_STATE_PAYLOAD,
+        "phase": "fault",
         "device_state": {
             **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
             "heat_level_percent": 0,
@@ -4007,6 +4015,40 @@ async def test_fault_acknowledgement_rejects_malformed_or_disagreeing_controls()
         await adapter.read_fault_acknowledgement_state(
             cast("str", SESSION_STATE_PAYLOAD["session_id"])
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("active",), "false"),
+        (("heat_level_percent",), "0"),
+        (("fan_level_percent",), 0.0),
+        (("cooling_on",), 0),
+        (("device_state", "connected"), "true"),
+        (("device_state", "heat_level_percent"), "0"),
+        (("device_state", "fan_level_percent"), 0.0),
+        (("device_state", "cooling_on"), 0),
+    ],
+)
+async def test_fault_control_readback_rejects_coercible_shared_mirror_values(
+    path: tuple[str, ...], value: object
+) -> None:
+    """The fault boundary proves raw types instead of shared-mirror coercions."""
+    state = _fault_control_state_payload("fault-session")
+    destination: dict[str, object] = state
+    for key in path[:-1]:
+        destination = cast("dict[str, object]", destination[key])
+    destination[path[-1]] = value
+
+    # The regular MCP reader intentionally remains compatible with these raw
+    # MCP values.  Fault-control proof must still decline every one.
+    regular = await RoasterMCPClient(_SequenceCaller([state])).get_roast_state("fault-session")
+    assert regular.session_id == "fault-session"
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([state])))
+    with pytest.raises(ValueError, match="fault control MCP evidence is malformed"):
+        await adapter.read_fault_control_state("fault-session")
 
 
 @pytest.mark.asyncio
@@ -4132,6 +4174,38 @@ async def test_execute_fault_control_rejects_wrong_command_event_kind(
 
     assert expected_event_kind != wrong_event_kind
     assert [call[0] for call in caller.calls] == [tool]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("session_id",), 7),
+        (("event_count",), "3"),
+        (("event", "kind"), 7),
+        (("event", "recorded_at_utc"), 7),
+        (("event", "monotonic_seconds"), "1228.9"),
+    ],
+)
+async def test_execute_fault_control_rejects_coercible_command_result_values(
+    path: tuple[str, ...], value: object
+) -> None:
+    """Exact fault commands never accept a shared-event mirror coercion."""
+    session_id = "fault-session"
+    result = _fault_control_result_payload(session_id, "cooling_started")
+    destination: dict[str, object] = result
+    for key in path[:-1]:
+        destination = cast("dict[str, object]", destination[key])
+    destination[path[-1]] = value
+    caller = _SequenceCaller([result])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    with pytest.raises(ValueError, match="fault control MCP evidence is malformed"):
+        await adapter.execute_fault_control(
+            OperatorAction.START_COOLING, expected_session_id=session_id
+        )
+
+    assert caller.calls == [("start_cooling", {"expected_session_id": session_id})]
 
 
 @pytest.mark.asyncio
