@@ -1,12 +1,15 @@
 """D213 process-clearance and fault-control lease tests (hardware-free)."""
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from roastpilot_agent.api import QueuedOperatorAction, RoastRunConflictError, RoastService
 from roastpilot_agent.config import AppConfig, ControllerConfig
+from roastpilot_agent.mcp_client import MCPServerProcess, SessionPresence
 from roastpilot_agent.models import (
     FaultControlsActionRequest,
     FaultControlState,
@@ -44,6 +47,53 @@ async def _service(store: RoastStore) -> RoastService:
         run_loop=False,
         clock=FakeClock(),
     )
+
+
+class _CurrentChild:
+    """Minimal current-child identity seam for no-session clearance tests."""
+
+    def __init__(self) -> None:
+        self.running = True
+        self.child_epoch = 1
+        self.stop_unconfirmed = False
+        self.teardown_incident_id: str | None = None
+
+
+class _PresenceMCP(FakeMCPClient):
+    """Fake control surface with an explicit, current typed presence snapshot."""
+
+    def __init__(self, presence: object) -> None:
+        super().__init__()
+        self.presence = presence
+        self.presence_reads = 0
+        self.on_read: Callable[[], Awaitable[SessionPresence]] | None = None
+
+    async def read_session_presence(self) -> SessionPresence:
+        """Return one scripted typed-presence result or its failure."""
+        self.presence_reads += 1
+        if self.on_read is not None:
+            return await self.on_read()
+        if isinstance(self.presence, Exception):
+            raise self.presence
+        return cast("SessionPresence", self.presence)
+
+
+async def _presence_service(
+    store: RoastStore, presence: object
+) -> tuple[RoastService, _PresenceMCP, _CurrentChild]:
+    """Build a live service with a current child and scripted presence proof."""
+    child = _CurrentChild()
+    roaster = _PresenceMCP(presence)
+    service = RoastService(
+        store,
+        config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+        mcp=cast("MCPServerProcess", child),
+        roaster=roaster,
+        live_serve_mode=True,
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    return service, roaster, child
 
 
 class _TerminalFaultPort(FakeMCPClient):
@@ -87,7 +137,7 @@ async def _terminal_service(store: RoastStore, port: _TerminalFaultPort) -> Roas
 
 
 @pytest.mark.asyncio
-async def test_no_session_clearance_fails_closed_without_typed_mcp_proof(tmp_path: Path) -> None:
+async def test_no_session_clearance_fails_closed_without_a_current_child(tmp_path: Path) -> None:
     """Physical confirmation cannot convert an MCP exception into no-session proof."""
     store = RoastStore(tmp_path / "restart.sqlite3")
     await store.initialize()
@@ -99,13 +149,160 @@ async def test_no_session_clearance_fails_closed_without_typed_mcp_proof(tmp_pat
         with pytest.raises(RoastRunConflictError, match="restart clearance"):
             await first.start_roast(_profile())
 
-        with pytest.raises(RoastRunConflictError, match="typed no-session proof"):
+        with pytest.raises(RoastRunConflictError, match="current MCP child"):
             await first.acknowledge_restart_clearance(
                 RestartClearanceRequest(physical_confirmation=True)
             )
         after = await first.health()
         assert after.restart_clearance.state is RestartClearanceState.REQUIRED
         assert not after.restart_clearance.eligible
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_confirms_current_child_none_and_persists(
+    tmp_path: Path,
+) -> None:
+    """A fresh ``none`` proof plus physical confirmation clears only this process."""
+    store = RoastStore(tmp_path / "restart-none.sqlite3")
+    await store.initialize()
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+
+        result = await service.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+
+        assert result.outcome == "confirmed"
+        assert result.cleared
+        assert result.restart_clearance.eligible
+        assert roaster.presence_reads == 1
+        assert (
+            await store.read_process_restart_clearance(service.instance_id)
+            is RestartClearanceState.CLEARED
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "presence",
+    [None, "starting", "active", "stopped", "unknown", RuntimeError("MCP timeout")],
+)
+async def test_no_session_clearance_rejects_absent_malformed_or_non_none_presence(
+    tmp_path: Path, presence: object
+) -> None:
+    """Only the exact typed ``none`` value is affirmative no-session evidence."""
+    store = RoastStore(tmp_path / "restart-invalid-presence.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, _child = await _presence_service(store, presence)
+
+        with pytest.raises(RoastRunConflictError):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+
+        health = await service.health()
+        assert health.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert not health.restart_clearance.eligible
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_rejects_child_replacement_during_proof(tmp_path: Path) -> None:
+    """A response from a replaced child cannot clear the process gate."""
+    store = RoastStore(tmp_path / "restart-child-race.sqlite3")
+    await store.initialize()
+    try:
+        service, roaster, child = await _presence_service(store, "none")
+
+        async def replace_child() -> SessionPresence:
+            child.child_epoch += 1
+            return "none"
+
+        roaster.on_read = replace_child
+        with pytest.raises(RoastRunConflictError, match="child changed"):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        assert (await service.health()).restart_clearance.state is RestartClearanceState.REQUIRED
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_rejects_lease_change_during_proof(tmp_path: Path) -> None:
+    """A concurrent fault lease change invalidates a previously clean proof."""
+    store = RoastStore(tmp_path / "restart-lease-race.sqlite3")
+    await store.initialize()
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+
+        async def change_lease() -> SessionPresence:
+            await store.replace_fault_control_lease_unknown(None)
+            return "none"
+
+        roaster.on_read = change_lease
+        with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        assert (await service.health()).fault_controls.status is FaultLeaseStatus.UNKNOWN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_fails_closed_when_persistence_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful current-child proof cannot survive unconfirmed persistence."""
+    store = RoastStore(tmp_path / "restart-persistence.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, _child = await _presence_service(store, "none")
+
+        async def fail_confirmation(process_id: str) -> bool:
+            del process_id
+            raise RuntimeError("synthetic SQLite failure")
+
+        monkeypatch.setattr(store, "confirm_process_restart_clearance", fail_confirmation)
+        with pytest.raises(RoastRunConflictError, match="persistence is unconfirmed"):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        assert (await service.health()).restart_clearance.state is RestartClearanceState.UNKNOWN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_open_fault_clearance_keeps_existing_exact_session_path(tmp_path: Path) -> None:
+    """No-session evidence is not required for the separate OPEN-lease proof."""
+    store = RoastStore(tmp_path / "restart-open-fault.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await store.open_fault_control_lease(run_id="private-run", mcp_session_id="private-session")
+
+        result = await service.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+
+        assert result.outcome == "confirmed"
+        assert result.restart_clearance.state is RestartClearanceState.CLEARED
+        assert not result.restart_clearance.eligible
+        assert result.fault_controls.status is FaultLeaseStatus.OPEN
     finally:
         await store.close()
 

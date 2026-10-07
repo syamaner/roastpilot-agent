@@ -95,6 +95,7 @@ MCPPhase = Literal[
     "complete",
     "fault",
 ]
+SessionPresence = Literal["none", "starting", "active", "stopped"]
 
 FirstCrackMode = Literal["disabled", "audio", "manual"]
 FirstCrackRuntimeStatus = Literal[
@@ -259,7 +260,12 @@ class RoastSessionState(MCPMirror):
 
 
 class ServerInfo(MCPMirror):
-    """Mirror of mcp_server.ServerInfo."""
+    """Mirror of mcp_server.ServerInfo.
+
+    ``session_presence`` is optional so the published 0.2.2 health response
+    remains compatible.  Restart clearance treats an absent value as failed
+    evidence; only the separately typed adapter read may use ``"none"``.
+    """
 
     product_name: str
     package_name: str
@@ -274,6 +280,7 @@ class ServerInfo(MCPMirror):
     bootstrap_safe: bool
     available_bootstrap_tools: tuple[str, ...]
     started_at_utc: str
+    session_presence: SessionPresence | None = None
 
 
 class RuntimeConfigSnapshot(MCPMirror):
@@ -1225,6 +1232,19 @@ class RoasterControlAdapter:
         state = self._last_state
         return None if state is None else state.session_id
 
+    async def read_session_presence(self) -> SessionPresence:
+        """Read the current child's typed MCP session-presence snapshot.
+
+        This deliberately calls ``get_server_info`` for every clearance proof;
+        the adapter never derives no-session state from cached telemetry or a
+        failed ``get_roast_state`` call.  Older MCP responses omit the field
+        and therefore fail closed.
+        """
+        presence = (await self._client.get_server_info()).session_presence
+        if presence is None:
+            raise ValueError("MCP server info has no typed session presence")
+        return presence
+
     async def read_fault_acknowledgement_state(self, session_id: str) -> FaultAcknowledgementState:
         """Read and bind the MCP's current session for a fault acknowledgement proof."""
         # ``stop_cooling`` is deliberately unscoped in the MCP and always targets
@@ -1869,6 +1889,10 @@ class MCPServerProcess:
         self._config = config or MCPConfig()
         self._device_config: MCPDeviceConfig | None = device_config
         self._session: ToolSession | None = session  # injectable test seam
+        #: Monotonic in-process identity of the attached child/session.  API
+        #: clearance records this before a fresh read and rejects a proof when
+        #: a stop or replacement changes it before durable confirmation.
+        self._child_epoch = 1 if session is not None else 0
         self._session_factory: SessionFactory = (
             session_factory if session_factory is not None else self._default_session_factory
         )
@@ -2075,6 +2099,23 @@ class MCPServerProcess:
         return self._session is not None
 
     @property
+    def child_epoch(self) -> int:
+        """Return the identity epoch of the currently attached MCP child.
+
+        The value changes whenever this transport attaches or detaches a
+        session.  It is an in-process freshness fence, never a hardware-state
+        assertion or a persistent child identifier.
+        """
+        return self._child_epoch
+
+    def _replace_session(self, session: ToolSession | None) -> None:
+        """Set the attached session and advance its in-process identity."""
+        if self._session is session:
+            return
+        self._session = session
+        self._child_epoch += 1
+
+    @property
     def stop_unconfirmed(self) -> bool:
         """Whether the most recent child lifecycle lacked confirmed clean teardown.
 
@@ -2183,11 +2224,11 @@ class MCPServerProcess:
                         await asyncio.wait_for(
                             session.initialize(), timeout=self._config.startup_timeout_seconds
                         )
-                        self._session = session
+                        self._replace_session(session)
                         # Health check through the public surface before we report ready.
                         await self.call_tool("get_server_info", {})
                     except Exception as exc:  # startup failure: unwind + report to start()
-                        self._session = None
+                        self._replace_session(None)
                         # First (and only) resolution on this path — ready is still
                         # pending here (nothing else resolves it), so set directly; a
                         # hypothetical double-set would raise InvalidStateError, which
@@ -2231,7 +2272,7 @@ class MCPServerProcess:
                 )
             raise
         finally:
-            self._session = None
+            self._replace_session(None)
             # Absolute backstop: if some path left ``ready`` unresolved (should be
             # impossible after the guards above), fail it closed rather than hang.
             if not ready.done():  # pragma: no cover - defensive: unreachable
@@ -2503,7 +2544,7 @@ class MCPServerProcess:
                 if owner.done():
                     self._owner_task = None
                     self._stop_requested = None
-                self._session = None
+                self._replace_session(None)
                 # Clean up the rendered yaml temp dir (D78-4, #420); best-effort —
                 # a leftover temp dir is harmless, never blocks shutdown.
                 if self._rendered_yaml_dir is not None:
@@ -2544,11 +2585,12 @@ class MCPServerProcess:
 
     async def call_tool(self, name: str, arguments: dict[str, object]) -> object:
         """ToolCaller implementation: timeout-bounded, typed failures only."""
-        if self._session is None:
+        session = self._session
+        if session is None:
             raise MCPConnectionError("MCP server process is not running")
         try:
             result = await asyncio.wait_for(
-                self._session.call_tool(name, dict(arguments)),
+                session.call_tool(name, dict(arguments)),
                 timeout=self._config.call_timeout_seconds,
             )
             # Parsed inside the try: a malformed text block (JSONDecodeError)

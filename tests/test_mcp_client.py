@@ -271,10 +271,11 @@ CANNED: dict[str, object] = {
 class FakeToolCaller:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.responses: dict[str, object] = dict(CANNED)
 
     async def __call__(self, tool: str, arguments: dict[str, object]) -> object:
         self.calls.append((tool, arguments))
-        return CANNED[tool]
+        return self.responses[tool]
 
 
 @pytest.fixture
@@ -386,6 +387,33 @@ def test_session_state_mirror_round_trips() -> None:
     assert state.ambient_status.temperature_c == 28.49
     assert state.ambient_status.humidity_percent == 38.6
     assert state.ambient_status.pressure_hpa == 1008.56
+
+
+def test_server_info_session_presence_is_closed_and_backwards_compatible() -> None:
+    """0.2.2 health remains valid; clearance accepts only the four new values."""
+    assert ServerInfo.model_validate(CANNED["get_server_info"]).session_presence is None
+    assert (
+        ServerInfo.model_validate(
+            {**CANNED["get_server_info"], "session_presence": "none"}
+        ).session_presence
+        == "none"
+    )
+    with pytest.raises(ValidationError):
+        ServerInfo.model_validate({**CANNED["get_server_info"], "session_presence": "unknown"})
+
+
+@pytest.mark.asyncio
+async def test_adapter_reads_presence_from_a_fresh_server_info_call() -> None:
+    """Clearance reads one typed server-info snapshot and never cached telemetry."""
+    caller = FakeToolCaller()
+    caller.responses["get_server_info"] = {
+        **CANNED["get_server_info"],
+        "session_presence": "none",
+    }
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    assert await adapter.read_session_presence() == "none"
+    assert caller.calls == [("get_server_info", {})]
 
 
 def test_ambient_status_mirror_round_trips_unavailable() -> None:

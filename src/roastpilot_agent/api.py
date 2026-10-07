@@ -88,6 +88,7 @@ from roastpilot_agent.mcp_client import (
     MCPConnectionError,
     MCPServerProcess,
     RoastSessionState,
+    SessionPresence,
     ambient_reading_is_live,
     ambient_reading_is_malformed,
     project_mic_status,
@@ -239,6 +240,10 @@ class FaultAcknowledgementControl(Protocol):
 
     async def stop_cooling_for_fault_acknowledgement(self) -> FaultCoolingStopResult:
         """Issue one post-fault cooling stop and return its session identity."""
+        ...
+
+    async def read_session_presence(self) -> SessionPresence:
+        """Read the current child's typed MCP session-presence snapshot."""
         ...
 
 
@@ -2012,6 +2017,7 @@ class RoastService:
         self._restart_clearance_state = RestartClearanceState.REQUIRED
         self._restart_epoch_initialized = False
         self._restart_epoch_lock = asyncio.Lock()
+        self._restart_clearance_lock = asyncio.Lock()
         self._fault_lease_cache = FaultControlLease(
             generation=0,
             status=FaultLeaseStatus.CLOSED,
@@ -2358,60 +2364,108 @@ class RoastService:
         make Start eligible after a fault.  No MCP write occurs here.
         """
         del request  # literal validation is the explicit operator confirmation
-        await self._ensure_restart_epoch()
-        lease = await self._read_fault_lease_fail_closed()
-        active = await self._store.active_run()
-        if active is not None and not (
-            lease.status is FaultLeaseStatus.OPEN
-            and lease.run_id == active.run_id
-            and active.agent_phase is RoastPhase.FAULTED
-        ):
-            raise RoastRunConflictError("restart clearance requires no active run")
-        roaster = self._roaster
-        if roaster is None:
-            raise RoastRunConflictError("restart clearance requires a current MCP control surface")
-        if lease.status is FaultLeaseStatus.UNKNOWN:
-            raise RoastRunConflictError(
-                "fault controls are unknown; physical-clear procedure is required"
-            )
-        try:
-            if lease.status is FaultLeaseStatus.OPEN:
-                session_id = lease.mcp_session_id
-                if session_id is None:
-                    raise RoastRunConflictError("exact fault session is unavailable")
-                proof = await roaster.read_fault_acknowledgement_state(session_id)
-                if not RoastRunner.fault_acknowledgement_controls_are_safe(proof, session_id):
-                    raise RoastRunConflictError(
-                        "exact fault session has no safe-zero recovery proof"
-                    )
-            else:
-                # v0.2.3 cannot make a typed no-session statement: its
-                # get_roast_state call raises when no session exists.  A
-                # transport exception is not affirmative evidence, so ordinary
-                # clearance remains fail-closed until MCP supplies that
-                # read-only capability (D213 follow-up).
+        async with self._restart_clearance_lock:
+            await self._ensure_restart_epoch()
+            lease = await self._read_fault_lease_fail_closed()
+            active = await self._store.active_run()
+            if active is not None and not (
+                lease.status is FaultLeaseStatus.OPEN
+                and lease.run_id == active.run_id
+                and active.agent_phase is RoastPhase.FAULTED
+            ):
+                raise RoastRunConflictError("restart clearance requires no active run")
+            roaster = self._roaster
+            if roaster is None:
                 raise RoastRunConflictError(
-                    "current MCP child cannot provide typed no-session proof"
+                    "restart clearance requires a current MCP control surface"
                 )
-        except RoastRunConflictError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - current MCP proof is mandatory
-            raise RoastRunConflictError("current MCP state could not be confirmed") from exc
+            if lease.status is FaultLeaseStatus.UNKNOWN:
+                raise RoastRunConflictError(
+                    "fault controls are unknown; physical-clear procedure is required"
+                )
+            try:
+                if lease.status is FaultLeaseStatus.OPEN:
+                    session_id = lease.mcp_session_id
+                    if session_id is None:
+                        raise RoastRunConflictError("exact fault session is unavailable")
+                    proof = await roaster.read_fault_acknowledgement_state(session_id)
+                    if not RoastRunner.fault_acknowledgement_controls_are_safe(proof, session_id):
+                        raise RoastRunConflictError(
+                            "exact fault session has no safe-zero recovery proof"
+                        )
+                else:
+                    mcp = self._mcp
+                    if mcp is None or not mcp.running:
+                        raise RoastRunConflictError(
+                            "restart clearance requires a current MCP child"
+                        )
+                    child_epoch = mcp.child_epoch
+                    if (await roaster.read_session_presence()) != "none":
+                        raise RoastRunConflictError(
+                            "current MCP child has no typed no-session proof"
+                        )
+                    if not mcp.running or mcp.child_epoch != child_epoch:
+                        raise RoastRunConflictError("MCP child changed during no-session proof")
+            except RoastRunConflictError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - current MCP proof is mandatory
+                raise RoastRunConflictError("current MCP state could not be confirmed") from exc
+            if not await self._restart_clearance_context_is_current(
+                lease, None if active is None else active.run_id
+            ):
+                raise RoastRunConflictError("restart clearance evidence became stale")
+            try:
+                confirmed = await self._store.confirm_process_restart_clearance(self.instance_id)
+            except Exception as exc:  # noqa: BLE001 - do not retain an uncertain clear
+                self._restart_clearance_state = RestartClearanceState.UNKNOWN
+                raise RoastRunConflictError("restart clearance persistence is unconfirmed") from exc
+            if not confirmed:
+                self._restart_clearance_state = RestartClearanceState.UNKNOWN
+                raise RoastRunConflictError("restart clearance was not durably recorded")
+            self._restart_clearance_state = RestartClearanceState.CLEARED
+            return RestartClearanceResult(
+                outcome="confirmed",
+                cleared=True,
+                restart_clearance_required=not self._restart_clearance_projection(lease).eligible,
+                restart_clearance=self._restart_clearance_projection(lease),
+                fault_controls=await self._fault_controls_projection(lease),
+            )
+
+    async def _restart_clearance_context_is_current(
+        self, expected_lease: FaultControlLease, expected_active_run_id: str | None
+    ) -> bool:
+        """Recheck clearance admission context immediately before durable confirmation."""
+        if (
+            not self._restart_epoch_initialized
+            or self._restart_clearance_state is not RestartClearanceState.REQUIRED
+        ):
+            return False
         try:
-            confirmed = await self._store.confirm_process_restart_clearance(self.instance_id)
-        except Exception as exc:  # noqa: BLE001 - do not retain an uncertain clear
-            self._restart_clearance_state = RestartClearanceState.UNKNOWN
-            raise RoastRunConflictError("restart clearance persistence is unconfirmed") from exc
-        if not confirmed:
-            self._restart_clearance_state = RestartClearanceState.UNKNOWN
-            raise RoastRunConflictError("restart clearance was not durably recorded")
-        self._restart_clearance_state = RestartClearanceState.CLEARED
-        return RestartClearanceResult(
-            outcome="confirmed",
-            cleared=True,
-            restart_clearance_required=not self._restart_clearance_projection(lease).eligible,
-            restart_clearance=self._restart_clearance_projection(lease),
-            fault_controls=await self._fault_controls_projection(lease),
+            persisted_state = await self._store.read_process_restart_clearance(self.instance_id)
+        except Exception:  # noqa: BLE001 - a failed durable recheck must block
+            _log.exception("could not recheck restart gate for clearance")
+            return False
+        if persisted_state is not RestartClearanceState.REQUIRED:
+            return False
+        lease = await self._read_fault_lease_fail_closed()
+        if (
+            lease.generation != expected_lease.generation
+            or lease.status is not expected_lease.status
+            or lease.run_id != expected_lease.run_id
+            or lease.mcp_session_id != expected_lease.mcp_session_id
+        ):
+            return False
+        try:
+            active = await self._store.active_run()
+        except Exception:  # noqa: BLE001 - a failed durable recheck must block
+            _log.exception("could not recheck active run for restart clearance")
+            return False
+        if expected_active_run_id is None:
+            return active is None
+        return (
+            active is not None
+            and active.run_id == expected_active_run_id
+            and active.agent_phase is RoastPhase.FAULTED
         )
 
     async def submit_fault_controls_action(

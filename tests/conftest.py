@@ -21,6 +21,7 @@ from roastpilot_agent.advisor import (
 )
 from roastpilot_agent.mcp_client import (
     ExportRoastLogResult,
+    SessionPresence,
     reset_non_finite_telemetry_warnings,
 )
 from roastpilot_agent.models import (
@@ -155,6 +156,10 @@ class FakeMCPClient:
     def latest_fault_session_id(self) -> str | None:
         """Return the scripted current-session identity for fault acknowledgement."""
         return self._latest_fault_session_id
+
+    async def read_session_presence(self) -> SessionPresence:
+        """Refuse no-session clearance unless a test supplies the new proof."""
+        raise RuntimeError("FakeMCPClient has no typed session-presence proof")
 
     async def read_fault_acknowledgement_state(self, session_id: str) -> FaultAcknowledgementState:
         """Return the next hardware-free state proof for fault acknowledgement."""
