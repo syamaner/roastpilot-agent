@@ -5,7 +5,7 @@ import type { FaultControlsActionResult, OperatorAction } from "@/lib/types";
 import { TerminalFaultControls } from "./TerminalFaultControls";
 
 describe("TerminalFaultControls", () => {
-  it("renders only server-enumerated terminal actions and never equates admission with completion", async () => {
+  it("renders only server-enumerated terminal actions and fails closed after admission", async () => {
     const onAction = vi.fn(async (action: OperatorAction): Promise<FaultControlsActionResult> => ({
       action,
       result: "accepted" as const,
@@ -28,7 +28,13 @@ describe("TerminalFaultControls", () => {
     fireEvent.click(screen.getByTestId("terminal-fault-action-emergency_stop"));
     await waitFor(() => expect(onAction).toHaveBeenCalledWith("emergency_stop", undefined));
     expect(screen.getByTestId("terminal-fault-controls-result")).toHaveTextContent(
-      /admitted.*waiting for the server to confirm/i,
+      /admitted.*completion is not confirmed/i,
+    );
+    expect(screen.getByTestId("terminal-fault-controls-result")).toHaveTextContent(
+      /no later execution outcome/i,
+    );
+    expect(screen.getByTestId("terminal-fault-controls-result")).not.toHaveTextContent(
+      /waiting for the server/i,
     );
   });
 

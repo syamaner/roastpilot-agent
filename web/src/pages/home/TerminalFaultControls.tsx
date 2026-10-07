@@ -169,7 +169,7 @@ export function TerminalFaultControls({
           }
         >
           {result.result === "accepted"
-            ? "Action admitted. Waiting for the server to confirm the resulting fault-control state."
+            ? "Action admitted. Completion is not confirmed. This terminal view has no later execution outcome; check the current server status and use the independent physical emergency stop if the roaster may still be active."
             : `${ACTION_LABELS[result.action as (typeof TERMINAL_ACTIONS)[number]]}: ${result.reason}`}
         </p>
       )}
