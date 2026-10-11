@@ -67,8 +67,9 @@ pinned exactly to a torch-free `coffee-roaster-mcp` release; it was delivered
 against `0.2.0`, and #954 has since unified the `[pi]` extra and the
 development group on the same published `coffee-roaster-mcp==0.2.3`. The base
 wheel remains lean: it has no unconditional MCP, `torch`, `torchaudio`, or
-`transformers` requirement. The regenerated contract fixtures validate that
-single release, and the Pi smokes still use their own separate venvs. The
+`transformers` requirement. Live 0.2.3 mock-child tests validate the current
+package surface; retained contract fixtures remain historical 0.2.2 evidence.
+The Pi smokes still use their own separate venvs. The
 package lane covers the base wheel on x86 and a
 native hosted ARM64 runner covers `wheel[pi]`, its exact MCP pin, the CLI, and
 the replay-mode bundled SPA. Hosted ARM64 evidence is package compatibility
