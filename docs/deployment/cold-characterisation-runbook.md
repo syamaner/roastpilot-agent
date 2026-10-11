@@ -82,8 +82,9 @@ minutes remain separate gates. #954 stays open and E11-S3 is in progress.
      `02bfa739a4cc3975295540c7df98ac844b5abbb7`); a retained candidate wheel
      of 169948 bytes with SHA-256
      `4f52048efa4c368e785c30acface04356dd943583a251e02a9b635905dec476a`. Its
-     self-reported version is also 0.2.2, so only the digest, byte length and
-     reviewed revision distinguish it from the published wheel.
+     self-reported version is also 0.2.2, matching the historical published
+     0.2.2 wheel rather than the current published 0.2.3 wheel. The digest,
+     byte length and reviewed revision distinguish it from that historical wheel.
   3. *Installed bytes*, which this software never attests.
 
   Installing the candidate is **a separately authorised gate** and is not
