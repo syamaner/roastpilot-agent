@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import errno
 import grp
 import json
 import os
 import pwd
 import re
-import select
+import resource
+import selectors
 import shutil
 import stat
 import subprocess
@@ -139,7 +141,7 @@ case "$name" in
       [ "${FAKE_PIPX_MCP_MISSING:-}" != 1 ] || exit 24
       case "${3:-}" in
         show)
-          mcp_version="${FAKE_PIPX_MCP_VERSION:-0.2.2}"
+          mcp_version="${FAKE_PIPX_MCP_VERSION:-0.2.3}"
           mcp_shape=normal
           if [[ "$venv" == *-roastpilot-stage-* ]]; then
             if [ -n "${FAKE_PIPX_STAGE_MCP_VERSION:-}" ]; then
@@ -152,6 +154,9 @@ case "$name" in
           elif [ -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] && [ "$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")" -ge 2 ] && [ -n "${FAKE_PIPX_RESTORE_MCP_VERSION:-}" ]; then
             mcp_version="$FAKE_PIPX_RESTORE_MCP_VERSION"
             printf 'FAKE_RESTORE_MCP_VERSION <%s>\\n' "$mcp_version" >> "$FAKE_LOG"
+          fi
+          if [ -e "$FAKE_PIPX_NORMAL_INSTALL_COUNT" ] && [ "$(cat "$FAKE_PIPX_NORMAL_INSTALL_COUNT")" = 1 ]; then
+            printf 'FAKE_FINAL_MCP_VERSION <%s>\\n' "$mcp_version" >> "$FAKE_LOG"
           fi
           if [[ "$venv" == *-roastpilot-stage-* ]]; then
             if [ -n "${FAKE_PIPX_STAGE_MCP_SHAPE:-}" ]; then
@@ -177,9 +182,9 @@ case "$name" in
         freeze)
           if [ -n "${FAKE_PIPX_FREEZE_DIRECT_REFERENCE:-}" ]; then
             printf 'FAKE_PIPX_FREEZE_DIRECT_REFERENCE <%s>\\n' "$FAKE_PIPX_FREEZE_DIRECT_REFERENCE" >> "$FAKE_LOG"
-            printf 'roastpilot-agent @ file://%s\\ncoffee-roaster-mcp==%s\\n' "$FAKE_PIPX_FREEZE_DIRECT_REFERENCE" "${FAKE_PIPX_MCP_VERSION:-0.2.2}"
+            printf 'roastpilot-agent @ file://%s\\ncoffee-roaster-mcp==%s\\n' "$FAKE_PIPX_FREEZE_DIRECT_REFERENCE" "${FAKE_PIPX_MCP_VERSION:-0.2.3}"
           else
-            printf 'roastpilot-agent==1.2\\ncoffee-roaster-mcp==%s\\n' "${FAKE_PIPX_MCP_VERSION:-0.2.2}"
+            printf 'roastpilot-agent==1.2\\ncoffee-roaster-mcp==%s\\n' "${FAKE_PIPX_MCP_VERSION:-0.2.3}"
           fi ;;
         wheel)
           [ "${FAKE_PIPX_FAIL_WHEELHOUSE:-}" != 1 ] || { printf 'FAKE_PIPX_WHEELHOUSE_FAILURE\\n' >> "$FAKE_LOG"; exit 54; }
@@ -763,8 +768,10 @@ def _assert_installer_recorder_uses_complete_write() -> None:
 def _wait_for_framing_writer(process: subprocess.Popen[str]) -> None:
     """Wait a bounded time for a framing writer's deterministic rendezvous."""
     assert process.stdout is not None
-    readable, _, _ = select.select([process.stdout], [], [], 2.0)
-    assert readable, "framing writer did not reach its bounded rendezvous"
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        ready = selector.select(timeout=2.0)
+    assert ready, "framing writer did not reach its bounded rendezvous"
     assert process.stdout.readline() == "ready\n", "framing writer rendezvous was malformed"
 
 
@@ -888,6 +895,52 @@ def test_fake_log_grammar_fails_closed_for_forced_concurrency(
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=2.0)
+
+
+@pytest.mark.serial
+def test_framing_writer_wait_supports_a_high_pipe_descriptor() -> None:
+    """Keep the framing rendezvous independent of the legacy select descriptor ceiling."""
+    legacy_select_fd_limit = 1024
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit <= legacy_select_fd_limit + 8:
+        pytest.skip("host descriptor limit cannot safely allocate a high pipe descriptor")
+
+    descriptors: list[int] = []
+    process: subprocess.Popen[str] | None = None
+    try:
+        while max(descriptors, default=-1) < legacy_select_fd_limit:
+            try:
+                descriptors.extend(os.pipe())
+            except OSError as error:
+                if error.errno in {errno.EMFILE, errno.ENFILE}:
+                    pytest.skip(f"host could not allocate a high pipe descriptor: {error}")
+                raise
+        remaining_descriptor_slots = soft_limit - max(descriptors) - 1
+        if remaining_descriptor_slots < 32:
+            pytest.skip("host lacks descriptor headroom for the framing-writer subprocess")
+
+        process = subprocess.Popen(
+            ["bash", "-c", "printf 'ready\\n'; IFS= read -r _ || true"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert process.stdout is not None
+        assert process.stdout.fileno() >= legacy_select_fd_limit
+        _wait_for_framing_writer(process)
+        assert process.stdin is not None
+        process.stdin.close()
+        assert process.wait(timeout=2.0) == 0
+    finally:
+        if process is not None:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=2.0)
+        for descriptor in descriptors:
+            os.close(descriptor)
 
 
 def _has_service_mutation(events: list[str]) -> bool:
@@ -4104,7 +4157,7 @@ def test_indexed_prior_wheelhouse_failure_aborts_before_uninstall(
 
 
 @pytest.mark.serial
-@pytest.mark.parametrize("mcp_version", ("0.1.9", "0.2.0", "0.2.1"))
+@pytest.mark.parametrize("mcp_version", ("0.1.9", "0.2.0", "0.2.1", "0.2.2"))
 def test_mcp_version_must_match_the_e11_pin_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], mcp_version: str
 ) -> None:
@@ -4177,6 +4230,108 @@ def test_staged_and_restored_mcp_versions_must_match_the_e11_pin(
     restored_events = _delta(log, start)
     assert restored.returncode != 0 and "prior application could not be restored" in restored.stderr
     assert "FAKE_RESTORE_MCP_VERSION <0.1.9>" in restored_events
+
+
+@pytest.mark.serial
+def test_upgrade_from_mcp_022_stages_and_finishes_at_the_current_pin(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A prior 0.2.2 application upgrades only after final 0.2.3 verification."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+
+    result = _run(
+        environment | {"FAKE_PIPX_PRIOR_MCP_VERSION": "0.2.2"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+
+    assert result.returncode == 0, result.stderr
+    events = log.read_text().splitlines()
+    assert "FAKE_PRIOR_MCP_VERSION <0.2.2>" in events
+    assert "FAKE_FINAL_MCP_VERSION <0.2.3>" in events
+    assert events.index("FAKE_PRIOR_MCP_VERSION <0.2.2>") < events.index(
+        "pipx <uninstall> <--> <roastpilot-agent>"
+    )
+    assert events.index("pipx <install> <--> <roastpilot-agent[pi]==2.0>") < events.index(
+        "FAKE_FINAL_MCP_VERSION <0.2.3>"
+    )
+    staged_cleanup = next(
+        index
+        for index, event in enumerate(events)
+        if "roastpilot-stage-" in event and "<uninstall>" in event
+    )
+    assert events.index("FAKE_FINAL_MCP_VERSION <0.2.3>") < staged_cleanup
+
+
+@pytest.mark.serial
+def test_staged_mcp_022_rejection_preserves_the_prior_application(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A staged 0.2.2 replacement cannot displace the existing application."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+
+    result = _run(
+        environment | {"FAKE_PIPX_STAGE_MCP_VERSION": "0.2.2"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+
+    assert result.returncode != 0
+    assert "staged replacement lacks required Pi/MCP capability" in result.stderr
+    events = log.read_text().splitlines()
+    assert "FAKE_STAGE_MCP_VERSION <0.2.2>" in events
+    assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
+    assert any("roastpilot-stage-" in event and "<uninstall>" in event for event in events)
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_idle_mcp_022_rejection_precedes_package_or_agent_side_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """An idle retained 0.2.2 application is refused before package or agent effects."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+
+    result = _run(environment | {"FAKE_PIPX_MCP_VERSION": "0.2.2"}, "--set-hostname", "roastpilot")
+
+    assert (
+        result.returncode != 0
+        and "installed roastpilot-agent lacks required Pi/MCP" in result.stderr
+    )
+    events = log.read_text().splitlines()
+    assert "pipx <runpip> <roastpilot-agent> <show> <coffee-roaster-mcp>" in events
+    assert not any(
+        event.startswith(("apt-get ", "roastpilot-agent ", "systemctl <enable>"))
+        for event in events
+    )
+    assert not any(event.startswith(("pipx <install>", "pipx <uninstall>")) for event in events)
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+@pytest.mark.serial
+def test_fresh_mcp_022_install_is_removed_before_appliance_work(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A fresh 0.2.2 install is cleaned up instead of leaving a wedged environment."""
+    _, environment, log, _ = installer_harness
+
+    result = _run(environment | {"FAKE_PIPX_MCP_VERSION": "0.2.2"}, "--set-hostname", "roastpilot")
+
+    assert (
+        result.returncode != 0
+        and "installed roastpilot-agent lacks required Pi/MCP" in result.stderr
+    )
+    events = log.read_text().splitlines()
+    assert "pipx <uninstall> <--> <roastpilot-agent>" in events
+    assert not any(event.startswith("roastpilot-agent <appliance>") for event in events)
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial

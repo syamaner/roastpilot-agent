@@ -22,18 +22,15 @@ from roastpilot_agent.cold_characterisation.evidence_schema import (
     MAX_VENDOR_BLOB_BYTES,
     ColdAudioField,
     ColdEvidenceFailure,
-    ColdJsonValue,
     ColdPhaseKind,
     ColdTickAudioSample,
     ColdTickDeviceEvidence,
-    ColdTickProjection,
     ColdTickRecord,
     ColdTickRoastFanEvidence,
     ColdTickRoastFanOutcome,
     ColdTickSessionEvidence,
     ColdTickSessionPhase,
     _canonical_json,  # pyright: ignore[reportPrivateUsage]
-    project_tick_audio,
     validate_record,
 )
 from roastpilot_agent.cold_characterisation.mcp import (
@@ -2059,41 +2056,6 @@ async def test_json_floats_in_every_float_audio_field_are_accepted() -> None:
         assert value == 1.5, field
 
 
-class _RealProjections(typing.NamedTuple):
-    """The strict non-temperature projections of one raw real-child tick."""
-
-    state: RoastSessionState
-    audio: ColdTickProjection
-    device: ColdTickDeviceState | None
-    roast_fan: ColdTickRoastFanObservation
-    session: ColdTickSessionMetadata
-
-
-async def _real_projections_without_temperature(
-    process: MCPServerProcess, session_id: str
-) -> _RealProjections:
-    """Read one raw real-child tick and apply every strict projector but temperature.
-
-    This keeps exact-type evidence for the existing projectors against the
-    published MCP, whose responses the public read now refuses in full.
-    """
-    raw = await process.call_tool("get_roast_state", {"session_id": session_id})
-    client_type = ColdCharacterisationMCPClient
-    state, tree = client_type._parse_tick(raw)  # pyright: ignore[reportPrivateUsage]
-    mapping = cast("dict[str, object]", tree)
-    assert "cold_" + "temperature_projection" not in mapping
-    raw_audio = cast("dict[str, ColdJsonValue]", mapping["first_crack_status"])
-    audio = project_tick_audio(raw_audio)
-    client_type._require_lossless_audio_types(raw_audio, audio)  # pyright: ignore[reportPrivateUsage]
-    return _RealProjections(
-        state=state,
-        audio=audio,
-        device=client_type._project_device(mapping["device_state"]),  # pyright: ignore[reportPrivateUsage]
-        roast_fan=client_type._project_roast_fan(mapping),  # pyright: ignore[reportPrivateUsage]
-        session=client_type._project_session(mapping),  # pyright: ignore[reportPrivateUsage]
-    )
-
-
 @pytest.mark.asyncio
 @pytest.mark.slow
 @pytest.mark.serial(reason="drives a real MCP process group; must not run concurrently")
@@ -2102,28 +2064,25 @@ async def test_real_child_cold_tick_projects_strictly(
     monkeypatch: pytest.MonkeyPatch,
     record_property: Callable[[str, object], None],
 ) -> None:
-    """T9/AC-P6, T-S8/AC-S6, #997 T17: the published mock MCP cold tick.
+    """T9/AC-P6, T-S8/AC-S6, #997 T17: the published 0.2.3 mock MCP cold tick.
 
-    Published 0.2.2 carries no temperature projection, so the public read fails
-    closed with ``PROJECTION_KEY_MISSING`` and returns no observation.  The
-    other strict projectors are then applied to raw responses read directly
-    from the same real child, so their exact-type evidence against the
-    published MCP is retained: the session metadata has exact types, and the
-    MCP session clock strictly advances between two reads at least 1.0 s
-    apart (the heartbeat premise).
+    The public read admits the child-provided typed temperature projection and
+    retains strict audio, device, roast-fan, and session projectors from that
+    same response.  This is mock-child software evidence only: it neither
+    admits the separately pinned cold identity nor establishes hardware
+    readiness.  The MCP session clock strictly advances between two reads at
+    least 1.0 s apart (the heartbeat premise).
     """
     monkeypatch.chdir(tmp_path)
     process = MCPServerProcess()
     await process.start()
     try:
         client = ColdCharacterisationMCPClient(process.call_tool)
-        session_id = (await client.start_cold_session()).session.session_id
+        await client.start_cold_session()
         await client.mark_beans_added()
-        with pytest.raises(ColdTickTemperatureProjectionError) as raised:
-            await client.get_roast_state()
-        assert raised.value.failure is ColdTemperatureProjectionFailure.PROJECTION_KEY_MISSING
-        observation = await _real_projections_without_temperature(process, session_id)
+        observation = await client.get_roast_state()
         assert observation.state.session_purpose == "cold_characterisation"
+        assert type(observation.temperature) is ColdTickTemperatureProjection
         assert type(observation.audio.audio) is ColdTickAudioSample
         audio = observation.audio.audio
         assert type(audio.max_consecutive_overflow_count) is int
@@ -2151,7 +2110,7 @@ async def test_real_child_cold_tick_projects_strictly(
             assert roast_fan.roast_fan_level_percent is None
         first = observation.session
         await asyncio.sleep(1.1)
-        second = (await _real_projections_without_temperature(process, session_id)).session
+        second = (await client.get_roast_state()).session
         for session in (first, second):
             assert type(session) is ColdTickSessionMetadata
             assert type(session.session_id) is str

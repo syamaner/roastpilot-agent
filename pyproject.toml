@@ -60,7 +60,7 @@ dependencies = [
   # declare the runtime requirement instead of relying on sourcing transitive deps.
   "lxml>=5.0,<7",
   "mcp>=1.0.0,<2",
-  "pydantic>=2.10,<3",
+  "pydantic>=2.10,<2.14",
   # D18: the lean core covers the default openai_compatible path (OpenRouter
   # via base_url), Ollama (OpenAI-compatible), and the native openai
   # provider. Native anthropic/google are optional extras below.
@@ -133,9 +133,10 @@ all-providers = [
   "pydantic-ai-slim[google]>=1.0,<2"
 ]
 # #954: the appliance and development/mock-driver paths deliberately share the
-# published 0.2.2 MCP surface. Regenerated contract fixtures validate that
-# single release, so the groups can be installed together in one venv.
-pi = ["coffee-roaster-mcp==0.2.2"]
+# published 0.2.3 MCP surface, so the groups can be installed together in one
+# venv. Historical cold fixtures remain bound to the reviewed 0.2.2 candidate;
+# real mock-child tests validate the packaged interface without admitting it.
+pi = ["coffee-roaster-mcp==0.2.3"]
 
 [project.urls]
 Homepage = "https://github.com/syamaner/roastpilot-agent"
@@ -181,11 +182,11 @@ dev = [
   "pydantic-ai-slim[google]>=1.0,<2",
   # The real MCP server, spawned as a stdio child in mock-driver mode for the
   # E9-S2 vertical slice (D6). #954 pins this development/mock-driver surface
-  # to the same published 0.2.2 release as [pi]; their exact pins no longer
-  # conflict and the 15 captured fixture/mirror pairs are regenerated together.
+  # to the same published 0.2.3 release as [pi], so the groups can be
+  # installed together in one venv.
   # It pulls heavy ML/audio deps (transformers/onnxruntime/sounddevice) that
   # mock mode never activates; CI installs libportaudio2 for sounddevice's import.
-  "coffee-roaster-mcp==0.2.2",
+  "coffee-roaster-mcp==0.2.3",
   # Analysis-harness numeric core (scripts/curve_feature_eval.py, #229). numpy
   # is already present transitively (via the MCP server's ML stack), but the
   # curve-feature analysis imports it directly, so declare it explicitly here:

@@ -1,4 +1,4 @@
-"""T-RC: two-phase child ownership against the real ``coffee-roaster-mcp`` 0.2.2 mock.
+"""T-RC: two-phase child ownership against the real ``coffee-roaster-mcp`` 0.2.3 mock.
 
 Software integration evidence only, never recording-on acceptance.  One
 ``MCPServerProcess`` and one cold client are driven across three asyncio tasks
@@ -12,12 +12,11 @@ are rendered but inert here (first crack is disabled).  Phase admission is not
 attempted: the frozen identity refuses a disabled first-crack mode, which is
 the honest scope of this test.
 
-Published 0.2.2 carries no ``cold_temperature_projection``, so each cycle's one
-read must fail closed with ``PROJECTION_KEY_MISSING`` and return no
-observation.  The cycle then calls ``client.finalise_session`` directly.  That
-is a direct-client call after a direct-client error; it is not, and is not
-evidence about, finalisation after a retained engine abort, which the engine
-never performs (proved by the engine's own T7/T16 real-client cases).
+Published 0.2.3 supplies a typed ``cold_temperature_projection``, so each
+cycle verifies one admitted read before calling ``client.finalise_session``
+directly.  This remains direct-client mock evidence only: first crack stays
+disabled, recording-on flags remain inert, and no cold recording or phase
+admission is attempted.
 """
 
 # pyright: reportPrivateUsage=false
@@ -35,13 +34,12 @@ from roastpilot_agent.cold_characterisation import two_phase
 from roastpilot_agent.cold_characterisation.evidence_schema import ColdPhaseKind
 from roastpilot_agent.cold_characterisation.mcp import (
     ColdCharacterisationMCPClient,
-    ColdTickTemperatureProjectionError,
     SessionFinalisationResult,
     finalisation_has_required_safety_evidence,
     finalisation_is_clean,
 )
 from roastpilot_agent.cold_characterisation.temperature_projection import (
-    ColdTemperatureProjectionFailure,
+    ColdTickTemperatureProjection,
 )
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceConfig
 from roastpilot_agent.mcp_client import MCPServerProcess, resolve_mcp_command
@@ -121,7 +119,7 @@ async def test_t_rc_one_process_and_client_across_tasks_finalise_clean_and_stop(
     record_property: Callable[[str, object], None],
 ) -> None:
     """T-RC: OFF and ON cycles finalise clean and both children stop confirmed."""
-    assert importlib.metadata.version("coffee-roaster-mcp") == "0.2.2"
+    assert importlib.metadata.version("coffee-roaster-mcp") == "0.2.3"
     assert Path(resolve_mcp_command(DEFAULT_MCP_COMMAND)).is_file()
     monkeypatch.chdir(tmp_path)
     for name in list(os.environ):
@@ -169,10 +167,9 @@ async def test_t_rc_one_process_and_client_across_tasks_finalise_clean_and_stop(
         started = await client.start_cold_session()
         session = started.session.session_id
         await client.mark_beans_added()
-        with pytest.raises(ColdTickTemperatureProjectionError) as raised:
-            await client.get_roast_state()
-        assert raised.value.failure is ColdTemperatureProjectionFailure.PROJECTION_KEY_MISSING
-        # Direct-client finalisation after a direct-client error, not an engine sequence.
+        observation = await client.get_roast_state()
+        assert type(observation.temperature) is ColdTickTemperatureProjection
+        # Direct-client finalisation after one admitted mock-child read, not an engine sequence.
         results[phase] = await client.finalise_session(session)
 
     async def task_a() -> None:
@@ -214,7 +211,7 @@ async def test_t_rc_one_process_and_client_across_tasks_finalise_clean_and_stop(
     assert off.recording is not None
     assert (off.recording.expected, off.recording.outcome) == (False, "not_configured")
     assert on.recording is not None
-    # Observed with 0.2.2 and first crack disabled: the rendered recording-on flags
+    # Observed with 0.2.3 and first crack disabled: the rendered recording-on flags
     # are inert, so this is never recording-on acceptance.
     assert (on.recording.expected, on.recording.outcome) == (False, "not_configured")
     record_property("pids", tuple(pids))
