@@ -8,7 +8,8 @@ import json
 import os
 import pwd
 import re
-import select
+import resource
+import selectors
 import shutil
 import stat
 import subprocess
@@ -766,8 +767,10 @@ def _assert_installer_recorder_uses_complete_write() -> None:
 def _wait_for_framing_writer(process: subprocess.Popen[str]) -> None:
     """Wait a bounded time for a framing writer's deterministic rendezvous."""
     assert process.stdout is not None
-    readable, _, _ = select.select([process.stdout], [], [], 2.0)
-    assert readable, "framing writer did not reach its bounded rendezvous"
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        ready = selector.select(timeout=2.0)
+    assert ready, "framing writer did not reach its bounded rendezvous"
     assert process.stdout.readline() == "ready\n", "framing writer rendezvous was malformed"
 
 
@@ -891,6 +894,46 @@ def test_fake_log_grammar_fails_closed_for_forced_concurrency(
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=2.0)
+
+
+@pytest.mark.serial
+def test_framing_writer_wait_supports_a_high_pipe_descriptor() -> None:
+    """Keep the framing rendezvous independent of the legacy select descriptor ceiling."""
+    legacy_select_fd_limit = 1024
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit <= legacy_select_fd_limit + 8:
+        pytest.skip("host descriptor limit cannot safely allocate a high pipe descriptor")
+
+    descriptors: list[int] = []
+    process: subprocess.Popen[str] | None = None
+    try:
+        while max(descriptors, default=-1) < legacy_select_fd_limit:
+            descriptors.extend(os.pipe())
+
+        process = subprocess.Popen(
+            ["bash", "-c", "printf 'ready\\n'; IFS= read -r _ || true"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert process.stdout is not None
+        assert process.stdout.fileno() >= legacy_select_fd_limit
+        _wait_for_framing_writer(process)
+        assert process.stdin is not None
+        process.stdin.close()
+        assert process.wait(timeout=2.0) == 0
+    except OSError as error:
+        pytest.skip(f"host could not allocate a high pipe descriptor: {error}")
+    finally:
+        if process is not None:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=2.0)
+        for descriptor in descriptors:
+            os.close(descriptor)
 
 
 def _has_service_mutation(events: list[str]) -> bool:
