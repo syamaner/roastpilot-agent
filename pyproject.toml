@@ -133,8 +133,9 @@ all-providers = [
   "pydantic-ai-slim[google]>=1.0,<2"
 ]
 # #954: the appliance and development/mock-driver paths deliberately share the
-# published 0.2.3 MCP surface. Regenerated contract fixtures validate that
-# single release, so the groups can be installed together in one venv.
+# published 0.2.3 MCP surface, so the groups can be installed together in one
+# venv. Historical cold fixtures remain bound to the reviewed 0.2.2 candidate;
+# real mock-child tests validate the packaged interface without admitting it.
 pi = ["coffee-roaster-mcp==0.2.3"]
 
 [project.urls]
