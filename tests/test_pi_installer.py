@@ -18,6 +18,7 @@ import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -78,7 +79,7 @@ def installer_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Path, Path]
     fake.write_text(
         """#!/usr/bin/env bash
 set -eu
-name=$(basename "$0")
+name=${0##*/}
 if [ "$name" != cat ] || [ "${FAKE_RECORD_CAT:-}" = 1 ]; then
   record=$name
   for arg in "$@"; do record="$record <$arg>"; done
@@ -800,35 +801,35 @@ printf '\\n' >> "$FAKE_LOG"
         writer.write_text(f"{before}  printf 'ready\\n'\n  IFS= read -r _\n{recorder}\nfi\n")
     writer.chmod(0o755)
     writer_environment = {"FAKE_LOG": str(log), "PATH": "/usr/bin:/bin"}
-    process = subprocess.Popen(
+    with subprocess.Popen(
         [str(writer), "source"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         env=writer_environment,
-    )
-    try:
-        _wait_for_framing_writer(process)
-        marker = subprocess.run(
-            ["bash", "-c", "printf 'FAKE_CONCURRENT_MARKER\\n' >> \"$1\"", "marker", str(log)],
-            check=False,
-            capture_output=True,
-            text=True,
-            env={"PATH": "/usr/bin:/bin"},
-        )
-        assert marker.returncode == 0, marker.stderr
-        assert process.stdin is not None
-        process.stdin.write("release\n")
-        process.stdin.flush()
-        process.stdin.close()
-        assert process.wait(timeout=2.0) == 0
-    finally:
-        if process.stdin is not None and not process.stdin.closed:
+    ) as process:
+        try:
+            _wait_for_framing_writer(process)
+            marker = subprocess.run(
+                ["bash", "-c", "printf 'FAKE_CONCURRENT_MARKER\\n' >> \"$1\"", "marker", str(log)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={"PATH": "/usr/bin:/bin"},
+            )
+            assert marker.returncode == 0, marker.stderr
+            assert process.stdin is not None
+            process.stdin.write("release\n")
+            process.stdin.flush()
             process.stdin.close()
-        if process.poll() is None:
-            process.terminate()
-            process.wait(timeout=2.0)
+            assert process.wait(timeout=2.0) == 0
+        finally:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=2.0)
     return log.read_text()
 
 
@@ -846,6 +847,21 @@ def _assert_closed_fake_log_grammar(log: str, fake_names: set[str]) -> None:
         )
 
 
+def _fake_log_executable(event: str) -> str:
+    """Return the fake command executable recorded at the start of an event."""
+
+    return event.partition(" ")[0]
+
+
+def _has_fake_install_for_path(events: list[str], expected_path: str) -> bool:
+    """Return whether fake ``install`` wrote exactly the expected path."""
+
+    return any(
+        _fake_log_executable(event) == "install" and event.endswith(f"<{expected_path}>")
+        for event in events
+    )
+
+
 @pytest.mark.serial
 def test_fake_log_framing_is_deterministic_under_two_writers(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
@@ -860,6 +876,31 @@ def test_fake_log_framing_is_deterministic_under_two_writers(
     assert historical.splitlines() == ["teeFAKE_CONCURRENT_MARKER", " <source>"]
     assert repaired.splitlines() == ["FAKE_CONCURRENT_MARKER", "tee <source>"]
     _assert_closed_fake_log_grammar(repaired, {path.name for path in fake_bin.iterdir()})
+
+
+@pytest.mark.serial
+def test_framing_writer_closes_all_popen_pipes(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The framing helper closes its input and output pipes after a successful run."""
+
+    fake_bin, _, log, _ = installer_harness
+    original_popen = subprocess.Popen
+    observed: list[subprocess.Popen[str]] = []
+
+    def recording_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
+        process = original_popen(*args, **kwargs)
+        observed.append(process)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    _forced_framing_log(log.parent, fake_bin / "tee", historical=False)
+    writer_processes = [process for process in observed if process.stdin is not None]
+    assert len(writer_processes) == 1
+    process = writer_processes[0]
+    assert process.stdin is not None and process.stdin.closed
+    assert process.stdout is not None and process.stdout.closed
+    assert process.stderr is not None and process.stderr.closed
 
 
 @pytest.mark.serial
@@ -1946,7 +1987,11 @@ def test_secret_template_and_no_key_summary_fail_closed(
     )
     assert key_install.returncode == 0
     events = log.read_text().splitlines()
-    assert not any(event.endswith(f"<{env_file}>") and "install" in event for event in events)
+    expected_env_paths = {str(env_file), os.path.realpath(env_file)}
+    assert not any(_has_fake_install_for_path(events, path) for path in expected_env_paths)
+    assert all(
+        _has_fake_install_for_path([f"install <{path}>"], path) for path in expected_env_paths
+    )
     assert any(".roastpilot-env.fake" in event for event in events)
     before = env_file.read_bytes()
     bad = _run(
@@ -1956,6 +2001,17 @@ def test_secret_template_and_no_key_summary_fail_closed(
     )
     assert bad.returncode != 0 and env_file.read_bytes() == before
     assert "two" not in bad.stdout + bad.stderr + log.read_text()
+
+
+@pytest.mark.serial
+def test_fake_log_executable_match_ignores_installer_named_temp_paths(tmp_path: Path) -> None:
+    """A fake-log command check never treats a path substring as the executable."""
+
+    installer_named_base = tmp_path / "installer-named-basetemp"
+    logged_path = os.path.realpath(installer_named_base / "etc/roastpilot-agent.env")
+    event = f"mkdir <{logged_path}>"
+    assert "install" in event, "the regression needs the old broad predicate to match"
+    assert not _has_fake_install_for_path([event], logged_path)
 
 
 @pytest.mark.serial

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 import shlex
 import subprocess
 import sys
 import tomllib
+from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
 
@@ -101,6 +103,8 @@ _COVERAGE_ARGUMENTS = (
     "--cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts "
     "--cov-report="
 )
+_COLLECTION_CACHE_MAX_ENTRIES = 32
+_COLLECTION_CACHE: dict[tuple[Path, tuple[str, ...], str], tuple[int, frozenset[str], str]] = {}
 _ORDINARY_RUN = (
     'python -m pytest -n 4 --dist worksteal -m "not serial and not stress" '
     f"--ignore=tests/test_packaging.py {_COVERAGE_ARGUMENTS}"
@@ -209,8 +213,96 @@ def _collection_arguments(arguments: list[str]) -> list[str]:
     return retained
 
 
+def _collection_source_digest(repository_root: Path) -> str:
+    """Digest known Python, pytest-config, and CI YAML collection inputs.
+
+    The closed collection roots come from pytest's configured ``testpaths`` and
+    ``pythonpath``: Python files under ``tests``, ``src``, ``scripts``, and
+    ``.agents``; root Python modules; root pytest configuration; and GitHub workflow
+    YAML are included. Other known roots may contain documentation or tooling Python,
+    but are neither pytest collection roots nor configured import paths. Generated and
+    vendor directories are never traversed. A new unrecognised top-level Python root
+    raises, rather than permitting an incomplete digest to reuse stale collection.
+    """
+
+    digest = hashlib.sha256()
+    configuration_files = {"pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini"}
+    python_roots = (".agents", "scripts", "src", "tests")
+    yaml_roots = (".github",)
+    excluded_directories = {
+        ".git",
+        ".venv",
+        "node_modules",
+        ".pytest_cache",
+        "build",
+        "dist",
+        "__pycache__",
+    }
+    known_directory_roots = (
+        excluded_directories
+        | set(python_roots)
+        | set(yaml_roots)
+        | {
+            ".claude",
+            ".codex",
+            ".design-sync",
+            "docs",
+            "packaging",
+            "web",
+        }
+    )
+    for child in repository_root.iterdir():
+        if (
+            child.is_dir()
+            and child.name not in known_directory_roots
+            and any(path.suffix == ".py" for path in child.iterdir() if path.is_file())
+        ):
+            raise AssertionError(f"unrecognised collection Python root: {child}")
+
+    paths = {
+        *repository_root.glob("*.py"),
+        *(repository_root / name for name in configuration_files),
+    }
+    for root_name in python_roots:
+        root = repository_root / root_name
+        if root.is_dir():
+            paths.update(root.rglob("*.py"))
+    for root_name in yaml_roots:
+        root = repository_root / root_name
+        if root.is_dir():
+            paths.update(root.rglob("*.yml"))
+    for path in sorted(paths):
+        relative_path = path.relative_to(repository_root)
+        if excluded_directories.intersection(relative_path.parts) or not path.is_file():
+            continue
+        try:
+            contents = path.read_bytes()
+        except OSError as error:
+            raise AssertionError(f"collection input became unreadable: {path}") from error
+        digest.update(relative_path.as_posix().encode())
+        digest.update(b"\0")
+        digest.update(contents)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _collect_nodeids(arguments: list[str]) -> tuple[int, set[str], str]:
-    """Collect one lane and return its status, node IDs, and diagnostic output."""
+    """Collect one lane and return its status, node IDs, and diagnostic output.
+
+    The bounded process-local cache shares equivalent collection probes while all
+    repository-controlled Python and pytest configuration inputs are byte-identical.
+    A source digest invalidates a stale entry when governance mutation tests edit
+    or add a collected file or imported collection dependency.
+    Non-zero collection results are cached too, so every consumer still fails
+    closed when it asserts the returned status.
+    """
+
+    repository_root = REPO_ROOT.resolve()
+    collection_arguments = tuple(_collection_arguments(arguments))
+    cache_key = (repository_root, collection_arguments, _collection_source_digest(repository_root))
+    cached = _COLLECTION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached[0], set(cached[1]), cached[2]
     result = subprocess.run(
         [
             sys.executable,
@@ -222,9 +314,9 @@ def _collect_nodeids(arguments: list[str]) -> tuple[int, set[str], str]:
             "no:cacheprovider",
             "--override-ini",
             "addopts=",
-            *_collection_arguments(arguments),
+            *collection_arguments,
         ],
-        cwd=REPO_ROOT,
+        cwd=repository_root,
         check=False,
         capture_output=True,
         text=True,
@@ -234,7 +326,106 @@ def _collect_nodeids(arguments: list[str]) -> tuple[int, set[str], str]:
         for line in result.stdout.splitlines()
         if re.fullmatch(r"tests/.*::.*", line.strip())
     }
-    return result.returncode, nodeids, result.stdout + result.stderr
+    cached_result = (result.returncode, frozenset(nodeids), result.stdout + result.stderr)
+    _COLLECTION_CACHE[cache_key] = cached_result
+    if len(_COLLECTION_CACHE) > _COLLECTION_CACHE_MAX_ENTRIES:
+        _COLLECTION_CACHE.pop(next(iter(_COLLECTION_CACHE)))
+    return cached_result[0], set(cached_result[1]), cached_result[2]
+
+
+def _clear_collection_cache() -> Iterator[None]:
+    """Isolate process-local collection cache state for a mutation test."""
+
+    _COLLECTION_CACHE.clear()
+    try:
+        yield
+    finally:
+        _COLLECTION_CACHE.clear()
+
+
+cleared_collection_cache = pytest.fixture(_clear_collection_cache)
+
+
+def test_collection_memo_reuses_equivalent_argv_and_invalidates_changed_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleared_collection_cache: None
+) -> None:
+    """Collection reuse is bounded, fail-closed, and cannot survive source edits."""
+
+    first_root = tmp_path / "first"
+    first_test = first_root / "tests/test_collected.py"
+    first_test.parent.mkdir(parents=True)
+    first_test.write_text("def test_original() -> None:\n    pass\n", encoding="utf-8")
+    imported_source = first_root / "src/package.py"
+    imported_source.parent.mkdir()
+    imported_source.write_text("VALUE = 'original'\n", encoding="utf-8")
+    (first_root / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+    workflow = first_root / ".github/workflows/ci.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("name: test\n", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            1 if "broken" in argv else 0,
+            stdout="tests/test_collected.py::test_original\n",
+            stderr="collection failed" if "broken" in argv else "",
+        )
+
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", first_root)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    first = _collect_nodeids(["-m", "docs"])
+    assert first[0] == 0
+    first[1].clear()
+    repeated = _collect_nodeids(["-m", "docs"])
+    assert repeated[1] == {"tests/test_collected.py::test_original"}
+    assert _COLLECTION_CACHE
+    assert len(calls) == 1
+    assert _collect_nodeids(["-m", "serial"])[0] == 0
+    assert len(calls) == 2
+
+    first_test.write_text("def test_edited() -> None:\n    pass\n", encoding="utf-8")
+    assert _collect_nodeids(["-m", "docs"])[0] == 0
+    assert len(calls) == 3
+
+    imported_source.write_text("VALUE = 'edited'\n", encoding="utf-8")
+    assert _collect_nodeids(["-m", "docs"])[0] == 0
+    assert len(calls) == 4
+
+    (first_root / "pyproject.toml").write_text("[tool.pytest.ini_options]\naddopts = '-q'\n")
+    assert _collect_nodeids(["-m", "docs"])[0] == 0
+    assert len(calls) == 5
+    workflow.write_text("name: changed\n", encoding="utf-8")
+    assert _collect_nodeids(["-m", "docs"])[0] == 0
+    assert len(calls) == 6
+
+    unexpected_root = first_root / "new_collection_root"
+    unexpected_root.mkdir()
+    (unexpected_root / "plugin.py").write_text("VALUE = 'new'\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="unrecognised collection Python root"):
+        _collect_nodeids(["-m", "docs"])
+    (unexpected_root / "plugin.py").unlink()
+    unexpected_root.rmdir()
+
+    failed = _collect_nodeids(["-m", "broken"])
+    assert failed[0] == 1
+    assert _collect_nodeids(["-m", "broken"])[0] == 1
+    assert len(calls) == 7
+
+    second_root = tmp_path / "second"
+    for relative_path in (
+        Path("tests/test_collected.py"),
+        Path("src/package.py"),
+        Path("pyproject.toml"),
+        Path(".github/workflows/ci.yml"),
+    ):
+        second_path = second_root / relative_path
+        second_path.parent.mkdir(parents=True, exist_ok=True)
+        second_path.write_bytes((first_root / relative_path).read_bytes())
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", second_root)
+    assert _collect_nodeids(["-m", "docs"])[0] == 0
+    assert len(calls) == 8
 
 
 def _module_has_docs_ci_marker(tree: ast.Module) -> bool:

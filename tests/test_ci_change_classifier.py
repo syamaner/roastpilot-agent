@@ -2522,14 +2522,16 @@ def _memoised_proxy_docs_readers(
 ) -> frozenset[str]:
     """Return one imported proxy's docs readers, reusing work within one audit call.
 
-    The memo lives for exactly one top-level :func:`_docs_reading_test_modules`
-    call and is dropped when that call returns or raises. A hit requires the exact
-    full proxy text, source filename and repository root, because importer-local
-    module resolution depends on the filename. A result is stored only after the
-    analysis returns normally; every exception propagates unchanged and nothing is
-    stored, so a failure is never reused as a success and there is no in-progress
-    placeholder. As with the existing non-atomic source reads, files are assumed
-    not to change during one synchronous analysis.
+    The public :func:`_docs_reading_test_modules` creates a memo for one call;
+    the exact-marker repository audit creates one memo for that complete audit,
+    including conftest probes. The caller drops either memo when its bounded
+    operation returns or raises. A hit requires the exact full proxy text, source
+    filename and repository root, because importer-local module resolution depends
+    on the filename. A result is stored only after the analysis returns normally;
+    every exception propagates unchanged and nothing is stored, so a failure is
+    never reused as a success and there is no in-progress placeholder. As with the
+    existing non-atomic source reads, files are assumed not to change during one
+    synchronous operation.
 
     Args:
         proxy: The imported module source plus its synthetic probe tests.
@@ -5012,6 +5014,21 @@ def _docs_reading_test_modules(
     return _docs_reading_test_modules_in_call(source, filename, repository_root, {})
 
 
+def _docs_reading_test_modules_with_memo(
+    source: str, filename: str, repository_root: Path, memo: _DocsProxyMemo
+) -> set[str]:
+    """Analyse one module using the current repository-wide audit memo.
+
+    This internal entry point is intentionally used only by the exact-marker
+    repository audit.  The public entry point retains a fresh memo for each
+    call, so source edits between ordinary analyses cannot inherit stale proxy
+    evidence.  Imported proxy results are still stored only after normal return
+    by :func:`_memoised_proxy_docs_readers`.
+    """
+
+    return _docs_reading_test_modules_in_call(source, filename, repository_root, memo)
+
+
 def _docs_reading_test_modules_in_call(
     source: str, filename: str, repository_root: Path, memo: _DocsProxyMemo
 ) -> set[str]:
@@ -6195,9 +6212,10 @@ def _conftest_paths(tests_root: Path) -> list[Path]:
     return sorted(tests_root.rglob("conftest.py"))
 
 
-def _assert_conftests_docs_free(tests_root: Path) -> None:
+def _assert_conftests_docs_free(tests_root: Path, memo: _DocsProxyMemo | None = None) -> None:
     """Reject conftest provenance that can hide docs reads from test markers."""
 
+    audit_memo = {} if memo is None else memo
     for path in _conftest_paths(tests_root):
         relative_path = (
             path.relative_to(_REPO).as_posix() if path.is_relative_to(_REPO) else str(path)
@@ -6214,7 +6232,7 @@ def _assert_conftests_docs_free(tests_root: Path) -> None:
             + "\n\ndef test_conftest_docs_provenance_probe() -> None:\n"
             + "".join(f"    {name}().read_text()\n" for name in functions)
         )
-        if _docs_reading_test_modules(probe, filename=relative_path):
+        if _docs_reading_test_modules_with_memo(probe, relative_path, _REPO, audit_memo):
             raise AssertionError(f"{relative_path}: conftest exposes docs Markdown provenance")
 
 
@@ -6229,11 +6247,77 @@ def _assert_default_pytest_collection_options(options: dict[str, object]) -> Non
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_repository_audit_memo_matches_fresh_module_analyses(
+    tmp_path: Path,
+) -> None:
+    """A shared audit memo preserves reader results for modules and conftest probes."""
+
+    shared = tmp_path / "shared.py"
+    shared.write_text(
+        "from pathlib import Path\n\ndef read_docs():\n    return Path('docs/x.md').read_text()\n",
+        encoding="utf-8",
+    )
+    top = "from shared import read_docs\n\ndef test_top():\n    assert read_docs()\n"
+    conftest_probe = (
+        "from shared import read_docs\n\ndef test_conftest_probe():\n    assert read_docs()\n"
+    )
+    memo: _DocsProxyMemo = {}
+    assert _docs_reading_test_modules_with_memo(top, "tests/test_top.py", tmp_path, memo) == {
+        "test_top"
+    }
+    assert _docs_reading_test_modules_with_memo(
+        conftest_probe, "tests/conftest.py", tmp_path, memo
+    ) == {"test_conftest_probe"}
+    assert _docs_reading_test_modules(top, "tests/test_top.py", tmp_path) == {"test_top"}
+    assert _docs_reading_test_modules(conftest_probe, "tests/conftest.py", tmp_path) == {
+        "test_conftest_probe"
+    }
+
+    helper = "from leaf import leaf\n\ndef helper():\n    return leaf()\n"
+    for package, leaf in (
+        (
+            "pkg_a",
+            "from pathlib import Path\n\ndef leaf():\n    return Path('docs/x.md').read_text()\n",
+        ),
+        ("pkg_b", "def leaf():\n    return 'config'\n"),
+    ):
+        package_root = tmp_path / package
+        package_root.mkdir()
+        (package_root / "helper.py").write_text(helper, encoding="utf-8")
+        (package_root / "leaf.py").write_text(leaf, encoding="utf-8")
+    importer_local = (
+        "from pkg_a.helper import helper as helper_a\n"
+        "from pkg_b.helper import helper as helper_b\n\n"
+        "def test_a():\n    assert helper_a()\n\n"
+        "def test_b():\n    assert helper_b()\n"
+    )
+    assert _docs_reading_test_modules_with_memo(
+        importer_local, "tests/test_importer_local.py", tmp_path, memo
+    ) == {"test_a"}
+    assert _docs_reading_test_modules(importer_local, "tests/test_importer_local.py", tmp_path) == {
+        "test_a"
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_repository_audit_memo_never_caches_exceptions(tmp_path: Path) -> None:
+    """A failed imported proxy remains a failure for the next audit consumer."""
+
+    memo: _DocsProxyMemo = {}
+    failing_proxy = "def broken(:\n"
+    for filename in ("tests/test_first.py", "tests/test_second.py"):
+        with pytest.raises(SyntaxError):
+            _memoised_proxy_docs_readers(failing_proxy, filename, tmp_path, memo)
+    assert memo == {}
+
+
+@pytest.mark.docs_ci
 def test_docs_reading_tests_carry_the_exact_docs_marker_and_nothing_else() -> None:
     """Every committed-Markdown reader is marked at the exact function, module-wide."""
 
     markdown_readers: dict[Path, set[str]] = {}
-    _assert_conftests_docs_free(_REPO / "tests")
+    audit_memo: _DocsProxyMemo = {}
+    _assert_conftests_docs_free(_REPO / "tests", audit_memo)
     for path in _test_module_paths(_REPO / "tests"):
         relative_path = path.relative_to(_REPO).as_posix()
         source = path.read_text(encoding="utf-8")
@@ -6242,7 +6326,7 @@ def test_docs_reading_tests_carry_the_exact_docs_marker_and_nothing_else() -> No
             f"{relative_path}: module-level pytestmark is docs-bearing or ambiguous; "
             "only statically proven docs-free literal marker forms are allowed"
         )
-        readers = _docs_reading_test_modules(source, filename=relative_path)
+        readers = _docs_reading_test_modules_with_memo(source, relative_path, _REPO, audit_memo)
         if readers:
             markdown_readers[path] = readers
         _assert_exact_docs_markers(tree, readers, relative_path)
