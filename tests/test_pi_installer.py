@@ -915,6 +915,9 @@ def test_framing_writer_wait_supports_a_high_pipe_descriptor() -> None:
                 if error.errno in {errno.EMFILE, errno.ENFILE}:
                     pytest.skip(f"host could not allocate a high pipe descriptor: {error}")
                 raise
+        remaining_descriptor_slots = soft_limit - max(descriptors) - 1
+        if remaining_descriptor_slots < 32:
+            pytest.skip("host lacks descriptor headroom for the framing-writer subprocess")
 
         process = subprocess.Popen(
             ["bash", "-c", "printf 'ready\\n'; IFS= read -r _ || true"],
