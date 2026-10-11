@@ -24,13 +24,13 @@ so this module cannot introduce a second, driftable copy of the pinned model
 identity (AGENTS.md class-sweep discipline).
 
 **Recording stays off.** The MCP YAML template omits the ``recording:``
-section entirely. Published ``coffee-roaster-mcp==0.2.2``'s
-``RecordingConfig.enabled`` defaults to ``False``, and the reviewed, unreleased
-same-version candidate retains that schema. Neither the version nor this source
-comment attests the installed distribution's bytes. Omission keeps recording off
-under the selected artifact's schema, matching the convention used by the committed
-``docs/examples/coffee-roaster-mcp.known-good.yaml``, which also carries no
-``recording:`` block.
+section entirely. Published ``coffee-roaster-mcp==0.2.3``'s
+``RecordingConfig.enabled`` defaults to ``False``. The reviewed, unreleased
+0.2.2 cold candidate retains that schema, but is a separate historical artifact.
+Neither version nor this source comment attests the installed distribution's bytes.
+Omission keeps recording off under the selected artifact's schema, matching the
+convention used by the committed ``docs/examples/coffee-roaster-mcp.known-good.yaml``,
+which also carries no ``recording:`` block.
 
 **Never auto-resumes heat or fan.** The rendered systemd unit carries no
 ``ExecStartPre``, and its ``ExecStart`` is exactly ``roastpilot-agent serve

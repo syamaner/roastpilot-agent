@@ -71,10 +71,11 @@ minutes remain separate gates. #954 stays open and E11-S3 is in progress.
   variable name. Never paste it into the command line.
 - **The MCP package: three different things.** Keep them apart.
   1. *Published distribution metadata.* The `[pi]` extra and the development
-     group pin `coffee-roaster-mcp==0.2.2`; the published 0.2.2 wheel digest is
-     `25f4164027afc9d336e8726465ad3c702c39dc40a905c9f83a2c36f3473d4de3`.
-     Published 0.2.2 lacks the temperature projection, so every cold run
-     against it **fails closed at its first tick** (`NOT_CONFORMANT`).
+     group pin `coffee-roaster-mcp==0.2.3`; the published 0.2.3 wheel digest is
+     `666fbcee09100939b1cf0e2fd38d6fb5ece528e25f4a0acd715705c208863fa3`.
+     Published 0.2.3 supplies the typed temperature projection in the mock
+     child, but a normal 0.2.3 installation is refused at cold
+     identity/admission until a separately approved candidate exists.
   2. *Reviewed candidate bytes*, as recorded by the #997 review: reviewed source
      revision `0fc5e6d2e2a677c392b0706267e154f5780b96b0`; merged MCP main
      `96f8916407ec8d31bbed9637e824c3cd2b0cf24a` (tree
@@ -118,9 +119,9 @@ outside version-only reasoning:
 1. Record one Agent artifact's kind, source revision, clean-tree assertion where
    applicable, and byte length and SHA-256 where applicable.
 2. Record the reviewed MCP candidate identified above: source revision, merged-tree
-   record, candidate wheel byte length and SHA-256. Published MCP 0.2.2 lacks the
-   D209 temperature projection; the reviewed, unreleased candidate reports the same
-   0.2.2 version and includes the typed projection.
+   record, candidate wheel byte length and SHA-256. Published MCP 0.2.3 supplies the
+   D209 temperature projection, but is not cold-admitted; the reviewed, unreleased
+   0.2.2 candidate remains the separately recorded typed-projection artifact.
 3. Treat the selected Agent artifact, reviewed MCP candidate, published MCP
    distribution and resulting installed bytes as separate facts. A version, wheel
    name, declared digest, `--artefact-*` value or `--mcp-candidate-*` value is an

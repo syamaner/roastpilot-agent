@@ -65,7 +65,7 @@ child, per D6), mDNS, and a deployment doc. **No Docker image; no PyTorch on the
 **Delivered 5 Sep 2026:** E11-S1 publishes a `pi` optional dependency extra
 pinned exactly to a torch-free `coffee-roaster-mcp` release; it was delivered
 against `0.2.0`, and #954 has since unified the `[pi]` extra and the
-development group on the same published `coffee-roaster-mcp==0.2.2`. The base
+development group on the same published `coffee-roaster-mcp==0.2.3`. The base
 wheel remains lean: it has no unconditional MCP, `torch`, `torchaudio`, or
 `transformers` requirement. The regenerated contract fixtures validate that
 single release, and the Pi smokes still use their own separate venvs. The
@@ -86,12 +86,12 @@ Acceptance criteria:
   source-checkout `web/dist` (editable installs skip the hook entirely). CI `package`
   job builds the real wheel + smoke-tests it in a clean venv.
 - [x] A **`pi` optional-dependency extra** declares exactly the pinned,
-  torch-free `coffee-roaster-mcp==0.2.2`; package metadata and clean-venv
+  torch-free `coffee-roaster-mcp==0.2.3`; package metadata and clean-venv
   tests reject `torch`, `torchaudio`, and `transformers`. The base wheel stays
   lean; `roastpilot-agent[pi]` pulls only the appliance MCP dependency.
 - [x] Built-wheel smoke tests in CI: x86_64 installs the base wheel; native
   hosted ARM64 builds its own wheel, installs `wheel[pi]` in a separate clean
-  venv, verifies `aarch64` and MCP 0.2.2, and runs CLI and replay-mode SPA
+  venv, verifies `aarch64` and MCP 0.2.3, and runs CLI and replay-mode SPA
   smokes. This hosted-runner proof is not Pi hardware validation.
 - [x] Build-hook approach recorded in plan §11 (closes open item 3; fallback: commit
   built dist for the first release — **not needed**, the build hook shipped).
@@ -170,7 +170,7 @@ at `onnx_threads=8` with both mics then showed at most 1 consecutive overflow
 and no fault. The Pi 5 is far tighter (RP1 xHCI, fewer and slower cores,
 `onnx_threads=2`, int8), so the #180 fix was judged necessary but possibly not
 sufficient there. Recording shipped in MCP 0.1.9 (#176), 0.1.10 (#180, #162)
-and 0.1.11 (#181, #178); the agent pin has since moved to 0.2.2. The earlier
+and 0.1.11 (#181, #178); the agent pin had moved to 0.2.2 by that point. The earlier
 research (27 Jun) found no published Pi 5 CPU numbers and noted that the CM4
 dwc2 USB gap does not apply to the Pi 5's RP1 xHCI. The original optimisation
 levers considered then (move the teed WAV write off the detector read loop,
@@ -200,8 +200,9 @@ fallback was not needed). **Verified the base wheel stays lean:** the shipped wh
 the wheel's METADATA and from a clean-venv install's `pip list` — so nothing pulls the
 heavy ML stack through transitively; `coffee-roaster-mcp` is a dev-group-only pin (tests
 spawn it in mock-driver mode) and never a runtime dependency of the shipped artifact.
-**E11-S1 now includes the `[pi]` extra:** it pins `coffee-roaster-mcp==0.2.2`, the same
-release the development group pins for its mock-driver mirrors and fixtures (#954). The clean
+**E11-S1 now includes the `[pi]` extra:** it pins `coffee-roaster-mcp==0.2.3`, the same
+release the development group pins for its mock-driver coverage (#954). Historical 0.2.2
+fixtures remain bound to the reviewed cold candidate. The clean
 native-hosted ARM64 smoke builds a wheel independently, installs `wheel[pi]` separately,
 verifies its denylist and exact pin, and runs CLI/replay SPA smokes. This is package evidence
 only, not validation on Pi hardware. **E11-S3
@@ -240,7 +241,8 @@ The separate D211 offline interpretation revision 1 returned
 records. The final independent Pi review passed the narrow retrospective 10+10
 cold qualification, with supplementary artifact receipt accepted as host
 attestation. The corrected wheel was not installed on Pi. The declared package
-pin remains `coffee-roaster-mcp==0.2.2`; it does not prove installed bytes.
+pin is now `coffee-roaster-mcp==0.2.3`; it does not prove installed bytes or
+cold candidate admission.
 PR work is now permitted by operator sequencing. #954 stays OPEN and E11-S3 is
 in progress; release and the separately authorised 20-minute live acceptance
 remain outstanding. This establishes neither detector accuracy, calibration,

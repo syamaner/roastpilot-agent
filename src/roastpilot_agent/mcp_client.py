@@ -339,7 +339,7 @@ ToolCaller = Callable[[str, dict[str, object]], Awaitable[object]]
 
 
 class RoasterMCPClient:
-    """Typed client for exactly the verified 14-tool MCP surface.
+    """Typed client for exactly the verified 15-tool MCP surface.
 
     Every method validates the raw result into its mirror — there is no
     arbitrary tool-execution surface. Child-process lifecycle (spawn,

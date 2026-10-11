@@ -220,7 +220,7 @@ def test_story_1002_artifact_selection_and_installed_bytes_are_separate_gates() 
     for phrase in (
         "Agent artifact",
         "reviewed MCP candidate",
-        "Published MCP 0.2.2 lacks the D209 temperature projection",
+        "Published MCP 0.2.3 supplies the D209 temperature projection, but is not cold-admitted",
         "installed bytes as separate facts",
         "none attests the bytes imported by the intended interpreter",
         "separately authorised installed-byte gate",
@@ -1112,7 +1112,7 @@ def test_e11_s3_is_single_primary_mic_and_in_progress() -> None:
     assert "mono 16 kHz / 16-bit" in _flat(s3)
     assert "Multi-microphone capture is deferred." in _flat(s3)
     assert "dual-mic" not in epic[: epic.index("## Status")].split(S3_HEADING)[0]
-    assert "`coffee-roaster-mcp==0.2.2`" in epic
+    assert "`coffee-roaster-mcp==0.2.3`" in epic
     assert "0.1.13" not in epic
     assert "E11-S3 is in progress" in _flat(epic)
 
@@ -1336,9 +1336,9 @@ def test_997_dc1_the_runbook_states_the_d209_screen_and_its_residuals() -> None:
 
 @pytest.mark.docs
 def test_997_dc2_the_runbook_distinguishes_reviewed_candidate_and_published_bytes() -> None:
-    """DC2: the reviewed-candidate record values and the published 0.2.2 digest differ."""
+    """DC2: the reviewed-candidate record values and the published 0.2.3 digest differ."""
     prerequisites = _normalised(_section(RUNBOOK.read_text(encoding="utf-8"), "## 2. Prereq"))
-    published = "25f4164027afc9d336e8726465ad3c702c39dc40a905c9f83a2c36f3473d4de3"
+    published = "666fbcee09100939b1cf0e2fd38d6fb5ece528e25f4a0acd715705c208863fa3"
     reviewed = "4f52048efa4c368e785c30acface04356dd943583a251e02a9b635905dec476a"
     for value in (
         published,
@@ -1359,7 +1359,7 @@ def test_997_dc2_the_runbook_distinguishes_reviewed_candidate_and_published_byte
 def test_997_dc3_e11_records_the_997_slices_and_keeps_e11_s3_in_progress() -> None:
     """DC3: E11 names the #997 slices, keeps the published pin and an in-progress E11-S3."""
     epic = _flat(EPIC.read_text(encoding="utf-8"))
-    for value in ("#998", "#999", "#1000", "T2", "`coffee-roaster-mcp==0.2.2`"):
+    for value in ("#998", "#999", "#1000", "T2", "`coffee-roaster-mcp==0.2.3`"):
         assert value in epic, value
     assert "E11-S3 is in progress" in epic
 
