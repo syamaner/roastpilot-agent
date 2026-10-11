@@ -4261,6 +4261,8 @@ def test_idle_mcp_022_rejection_precedes_package_or_agent_side_effects(
         event.startswith(("apt-get ", "roastpilot-agent ", "systemctl <enable>"))
         for event in events
     )
+    assert not any(event.startswith(("pipx <install>", "pipx <uninstall>")) for event in events)
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
 @pytest.mark.serial
