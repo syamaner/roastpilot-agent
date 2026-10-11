@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import grp
 import json
 import os
@@ -908,7 +909,12 @@ def test_framing_writer_wait_supports_a_high_pipe_descriptor() -> None:
     process: subprocess.Popen[str] | None = None
     try:
         while max(descriptors, default=-1) < legacy_select_fd_limit:
-            descriptors.extend(os.pipe())
+            try:
+                descriptors.extend(os.pipe())
+            except OSError as error:
+                if error.errno in {errno.EMFILE, errno.ENFILE}:
+                    pytest.skip(f"host could not allocate a high pipe descriptor: {error}")
+                raise
 
         process = subprocess.Popen(
             ["bash", "-c", "printf 'ready\\n'; IFS= read -r _ || true"],
@@ -923,8 +929,6 @@ def test_framing_writer_wait_supports_a_high_pipe_descriptor() -> None:
         assert process.stdin is not None
         process.stdin.close()
         assert process.wait(timeout=2.0) == 0
-    except OSError as error:
-        pytest.skip(f"host could not allocate a high pipe descriptor: {error}")
     finally:
         if process is not None:
             if process.stdin is not None and not process.stdin.closed:
