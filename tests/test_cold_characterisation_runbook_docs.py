@@ -1314,7 +1314,7 @@ def test_997_dc1_the_runbook_states_the_d209_screen_and_its_residuals() -> None:
         "Bad-checksum frames",
         "operator assertion",
         "does not attest the bytes that are installed",
-        "fails closed at its first tick",
+        "a normal 0.2.3 installation is refused at cold identity/admission",
         "a separately authorised gate",
         "A non-Celsius reported unit fails the screen.",
         "not a transaction",
