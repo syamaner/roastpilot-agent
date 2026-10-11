@@ -60,7 +60,7 @@ dependencies = [
   # declare the runtime requirement instead of relying on sourcing transitive deps.
   "lxml>=5.0,<7",
   "mcp>=1.0.0,<2",
-  "pydantic>=2.10,<3",
+  "pydantic>=2.10,<2.14",
   # D18: the lean core covers the default openai_compatible path (OpenRouter
   # via base_url), Ollama (OpenAI-compatible), and the native openai
   # provider. Native anthropic/google are optional extras below.

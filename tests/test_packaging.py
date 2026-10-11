@@ -129,6 +129,10 @@ def test_pi_extra_metadata_preserves_a_lean_base_wheel(built_wheel: Path) -> Non
     unconditional = [requirement for requirement in requirements if ";" not in requirement]
     unconditional_names = {_requirement_name(requirement) for requirement in unconditional}
     assert unconditional_names == _EXPECTED_BASE_REQUIREMENT_NAMES
+    pydantic_requirements = [
+        requirement for requirement in unconditional if _requirement_name(requirement) == "pydantic"
+    ]
+    assert pydantic_requirements == ["pydantic<2.14,>=2.10"]
     assert _DENYLISTED_DISTRIBUTIONS.isdisjoint(
         {_requirement_name(requirement) for requirement in requirements}
     )
