@@ -3808,10 +3808,10 @@ async def test_per_run_estop_bypasses_saturated_routine_queue(store: RoastStore)
 
 
 @pytest.mark.asyncio
-async def test_open_lease_fault_action_uses_exact_session_and_rejects_changed_session(
+async def test_open_lease_rejects_routine_fault_actions_for_active_nonfaulted_run(
     store: RoastStore,
 ) -> None:
-    """Live-run fault controls never fall back to the unguarded action queue."""
+    """An OPEN terminal lease cannot redirect a live non-faulted control write."""
     clock = FakeClock()
     mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)
@@ -3819,31 +3819,32 @@ async def test_open_lease_fault_action_uses_exact_session_and_rejects_changed_se
         run_id=run_id, mcp_session_id="session-1", generation=1
     )
     service._fault_lease_cache = lease  # noqa: SLF001 - durable OPEN fixture  # pyright: ignore[reportPrivateUsage]
-    accepted = await service.submit_operator_action(
+    rejected = await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
     )
-    assert accepted.result == "accepted"
-    assert accepted.queued is False
-    assert (
-        "fault_control",
-        {"action": "drop_beans", "expected_session_id": "session-1"},
-    ) in mcp.calls
+    assert rejected.result == "rejected"
+    assert rejected.queued is False
+    assert rejected.reason == (
+        "current active run is not faulted; terminal fault controls are unavailable"
+    )
+    assert not any(name == "fault_control" for name, _ in mcp.calls)
+    assert "drop_beans" not in mcp.commands()
+    assert service.operator_queue.empty()
 
     mcp.set_latest_fault_session_id("new-session")
-    rejected = await service.submit_operator_action(
+    still_rejected = await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.START_COOLING)
     )
-    assert rejected.result == "failed"
-    assert not any(
-        name == "fault_control" and args["action"] == "start_cooling" for name, args in mcp.calls
-    )
+    assert still_rejected.result == "rejected"
+    assert not any(name == "fault_control" for name, _ in mcp.calls)
+    assert "start_cooling" not in mcp.commands()
 
 
 @pytest.mark.asyncio
 async def test_open_lease_missing_exact_executor_does_not_fall_back_to_queue(
     store: RoastStore,
 ) -> None:
-    """OPEN leases fail ordinary fault controls when exact execution is unavailable."""
+    """A live non-faulted run rejects routine controls before executor lookup."""
     clock = FakeClock()
     mcp = FakeMCPClient([_reading(178.0, 185.0)])
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)
@@ -3854,9 +3855,10 @@ async def test_open_lease_missing_exact_executor_does_not_fall_back_to_queue(
     result = await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.STOP_COOLING)
     )
-    assert result.result == "failed"
+    assert result.result == "rejected"
     assert result.queued is False
     assert service.operator_queue.empty()
+    assert not any(name == "fault_control" for name, _ in mcp.calls)
     assert "stop_cooling" not in mcp.commands()
 
 
