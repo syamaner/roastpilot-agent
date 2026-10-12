@@ -909,8 +909,12 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
     beta_base.mkdir()
     rendezvous = parent / "rendezvous"
     rendezvous.mkdir()
-    alpha_fake, alpha_environment, alpha_log, alpha_hostname = _build_installer_harness(alpha_base)
-    beta_fake, beta_environment, beta_log, beta_hostname = _build_installer_harness(beta_base)
+    alpha_fake_bin, alpha_environment, alpha_log, alpha_hostname = _build_installer_harness(
+        alpha_base
+    )
+    beta_fake_bin, beta_environment, beta_log, beta_hostname = _build_installer_harness(beta_base)
+    alpha_fake = alpha_fake_bin / "fake"
+    beta_fake = beta_fake_bin / "fake"
     alpha = {
         "hostname": "host-alpha-z9",
         "port": "43111",
@@ -1066,7 +1070,7 @@ def test_cross_run_leak_oracle_rejects_synthetic_leaks(tmp_path: Path, case: str
     own = _oracle_run(tmp_path, "own-zebra", port="43111", api_key="KEY_OWN_T9")
     peer = _oracle_run(tmp_path, "peer-lantern", port="43222", api_key="KEY_PEER_R2")
     if case == "peer-root-log":
-        own.log.write_text(f"record {peer.base}\n")
+        own.log.write_text(own.log.read_text() + f"record {peer.base}\n")
     elif case == "peer-key-stderr":
         own = _OverlapRun(**{**own.__dict__, "stderr": f"failure {peer.api_key}"})
     elif case == "peer-hostname-file":
@@ -1093,8 +1097,11 @@ def test_cross_run_leak_oracle_rejects_synthetic_leaks(tmp_path: Path, case: str
     with pytest.raises(AssertionError) as raised:
         _assert_no_cross_run_leak(own, peer)
     message = str(raised.value)
+    formatted = str(raised.getrepr(showlocals=False, funcargs=True))
     assert own.api_key not in message
     assert peer.api_key not in message
+    assert own.api_key not in formatted
+    assert peer.api_key not in formatted
 
 
 def test_hostname_rendezvous_timeout_and_inert_timeout_setting(
