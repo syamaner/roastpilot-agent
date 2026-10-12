@@ -476,6 +476,39 @@ async def test_global_estop_uses_open_exact_terminal_lease_despite_historical_ac
 
 
 @pytest.mark.asyncio
+async def test_finalized_runner_does_not_reuse_closed_terminal_session_after_identity_changes(
+    store: RoastStore,
+) -> None:
+    """A closed lease needs the runner's current exact session for a repeat stop."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _mcp, _clock, run_id = await _faulted_live_service(store, mcp=mcp)
+    assert service.runner is not None
+    lease = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert lease.status is FaultLeaseStatus.OPEN
+    service.runner._finalized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    service._fault_lease_cache = FaultControlLease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        generation=lease.generation,
+        status=FaultLeaseStatus.CLOSED,
+        run_id=run_id,
+        mcp_session_id="session-1",
+    )
+    mcp.set_latest_fault_session_id("new-session")
+    fault_controls_before = [call for call in mcp.calls if call[0] == "fault_control"]
+    assert service._fault_lease_cache.status is FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._fault_lease_cache.mcp_session_id == "session-1"  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service.runner.finalized
+    assert mcp.latest_fault_session_id == "new-session"
+
+    result = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+
+    assert result.result == "failed"
+    assert [call for call in mcp.calls if call[0] == "fault_control"] == fault_controls_before
+
+
+@pytest.mark.asyncio
 async def test_global_estop_rejects_completed_pointer_without_lease_or_start_fence(
     store: RoastStore,
 ) -> None:

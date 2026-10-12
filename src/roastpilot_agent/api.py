@@ -2335,6 +2335,10 @@ class RoastService:
         self.runner: RoastRunner | None = None
         self._loop_task: asyncio.Task[None] | None = None
         self.active_run_id: str | None = None
+        # A new run is published before its controller has been constructed.
+        # Keep that short window explicit so an e-stop can synchronously fence
+        # the pending Start write without treating historical pointers as live.
+        self._starting_run_id: str | None = None
         #: SSE keepalive interval (plan §6: 15 s). Injectable so tests observe
         #: a heartbeat without waiting the full interval.
         self.sse_heartbeat_seconds = sse_heartbeat_seconds
@@ -3187,31 +3191,47 @@ class RoastService:
         previous = self._fault_lease_cache
         was_finalizing = self._fault_acknowledgement_gate.fault_finalization_started
         # Select an actionable target before admitting a durable lease or
-        # reserving arbiter priority.  ``active_run_id`` intentionally remains
+        # reserving arbiter priority. ``active_run_id`` intentionally remains
         # available after completion for history and recovery projections, so
         # it is not itself proof that a controller can still deliver a stop.
-        # A live controller wins; otherwise only an OPEN/UNKNOWN lease with a
-        # retained exact session may address completed history.
+        # A live controller wins. The narrow start-construction window needs
+        # the same synchronous admission fence before its first MCP write.
+        runner = self.runner
+        runner_is_current = (
+            self.active_run_id is not None
+            and runner is not None
+            and getattr(runner, "run_id", self.active_run_id) == self.active_run_id
+        )
         live_runner = (
-            self.runner
-            if (
-                self.active_run_id is not None
-                and self.runner is not None
-                # Narrow test runners implement only the priority-dispatch
-                # seam.  Production RoastRunner always exposes ``finalized``.
-                and not getattr(self.runner, "finalized", False)
-                and getattr(self.runner, "run_id", self.active_run_id) == self.active_run_id
-            )
+            runner
+            # Narrow test runners implement only the priority-dispatch
+            # seam.  Production RoastRunner always exposes ``finalized``.
+            if (runner_is_current and not getattr(runner, "finalized", False))
             else None
+        )
+        starting_run_is_current = self._starting_run_id == self.active_run_id
+        finalized_runner_has_current_exact_session = (
+            runner_is_current
+            and getattr(runner, "finalized", False)
+            and previous.run_id == self.active_run_id
+            and previous.mcp_session_id is not None
+            and self._roaster is not None
+            and self._roaster.latest_fault_session_id == previous.mcp_session_id
         )
         terminal_lease_is_actionable = (
             previous.run_id is not None
             and previous.mcp_session_id is not None
-            and previous.status in (FaultLeaseStatus.OPEN, FaultLeaseStatus.UNKNOWN)
+            and (
+                previous.status in (FaultLeaseStatus.OPEN, FaultLeaseStatus.UNKNOWN)
+                or (
+                    previous.status is FaultLeaseStatus.CLOSED
+                    and finalized_runner_has_current_exact_session
+                )
+            )
         )
         run_id = (
             self.active_run_id
-            if live_runner is not None
+            if live_runner is not None or starting_run_is_current
             else previous.run_id
             if terminal_lease_is_actionable
             else None
@@ -3981,16 +4001,21 @@ class RoastService:
                 agent_phase=RoastPhase.STARTING,
             )
             self.active_run_id = run_id
-        if self._roaster is not None:
-            await self._begin_live_run(profile, run_id, lease_generation=lease.generation)
-        detail = await self._store.read_run(run_id)
-        if detail is None:  # pragma: no cover — read immediately after create
-            raise RuntimeError(f"read_run returned None for just-created run {run_id}")
-        # #516: stamp THIS process's instance_id on the 201 response — the
-        # start-roast confirm loop's capture point (see HealthResponse's
-        # docstring). A store read carries no process identity; the store
-        # layer must stay unaware of this process-scoped value.
-        return detail.model_copy(update={"instance_id": self.instance_id})
+            self._starting_run_id = run_id
+        try:
+            if self._roaster is not None:
+                await self._begin_live_run(profile, run_id, lease_generation=lease.generation)
+            detail = await self._store.read_run(run_id)
+            if detail is None:  # pragma: no cover — read immediately after create
+                raise RuntimeError(f"read_run returned None for just-created run {run_id}")
+            # #516: stamp THIS process's instance_id on the 201 response — the
+            # start-roast confirm loop's capture point (see HealthResponse's
+            # docstring). A store read carries no process identity; the store
+            # layer must stay unaware of this process-scoped value.
+            return detail.model_copy(update={"instance_id": self.instance_id})
+        finally:
+            if self._starting_run_id == run_id:
+                self._starting_run_id = None
 
     async def acknowledge_hardware_clear(
         self, request: HardwareClearAcknowledgementRequest
