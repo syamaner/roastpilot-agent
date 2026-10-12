@@ -332,6 +332,83 @@ async def test_restart_clearance_route_records_no_session_proof_without_roaster_
 
 
 @pytest.mark.asyncio
+async def test_restart_clearance_route_refuses_unknown_lease_without_mcp_probe(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An UNKNOWN fault lease keeps the HTTP clearance gate fail-closed."""
+    roaster = FakeMCPClient()
+    session_presence = mock.AsyncMock(return_value="none")
+    monkeypatch.setattr(roaster, "read_session_presence", session_presence)
+    await store.create_run(
+        run_id="unknown-fault-lease",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(
+        run_id="unknown-fault-lease", outcome="faulted", agent_phase=RoastPhase.FAULTED
+    )
+    await store.replace_fault_control_lease_unknown("unknown-fault-lease", generation=1)
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        run_loop=False,
+    )
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/restart-clearance", json={"physical_confirmation": True}
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "fault controls are unknown; physical-clear procedure is required"
+    }
+    session_presence.assert_not_awaited()
+    assert roaster.calls == []
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_restart_clearance_route_refuses_active_nonfaulted_run_without_mcp_probe(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persisted live run cannot be cleared through the restart endpoint."""
+    await store.create_run(
+        run_id="restart-clearance-active-run",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    roaster = FakeMCPClient()
+    session_presence = mock.AsyncMock(return_value="none")
+    monkeypatch.setattr(roaster, "read_session_presence", session_presence)
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        run_loop=False,
+    )
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/restart-clearance", json={"physical_confirmation": True}
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "restart clearance requires no active run"}
+    session_presence.assert_not_awaited()
+    assert roaster.calls == []
+    active = await store.active_run()
+    assert active is not None and active.run_id == "restart-clearance-active-run"
+
+
+@pytest.mark.asyncio
 async def test_fault_controls_route_dispatches_live_emergency_stop_outside_routine_queue(
     store: RoastStore,
 ) -> None:
