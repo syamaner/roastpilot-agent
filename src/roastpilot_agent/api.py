@@ -2363,7 +2363,10 @@ class RoastService:
         self._command_arbiter = CommandArbiter()
         self._fault_control_executor: FaultControlExecutor | None = (
             FaultControlExecutor(
-                self._safety, cast(FaultControlPort, roaster), arbiter=self._command_arbiter
+                self._safety,
+                cast(FaultControlPort, roaster),
+                arbiter=self._command_arbiter,
+                trace_sink=store,
             )
             if roaster is not None
             and hasattr(roaster, "read_fault_control_state")
@@ -2655,6 +2658,20 @@ class RoastService:
         elif lease.status is FaultLeaseStatus.UNKNOWN:
             actions = [OperatorAction.EMERGENCY_STOP]
         elif lease.status is FaultLeaseStatus.OPEN:
+            try:
+                active = await self._store.active_run()
+            except Exception:  # noqa: BLE001 - uncertain state exposes e-stop only
+                active = None
+            if (
+                active is not None
+                and active.run_id == lease.run_id
+                and active.agent_phase is not RoastPhase.FAULTED
+            ):
+                return FaultControlsProjection(
+                    status=lease.status,
+                    generation=None if lease.generation == 0 else lease.generation,
+                    enabled_actions=[OperatorAction.EMERGENCY_STOP],
+                )
             # Immutable roast history cannot prove charge/drop/cooling state.
             # Without a fresh exact-session proof, only an e-stop attempt is
             # advertised.  The executor validates again at execution.
@@ -2991,6 +3008,7 @@ class RoastService:
                 executor.execute(
                     request.action,
                     session_id,
+                    run_id=run_id,
                     is_current_generation=lambda: (
                         self._fault_lease_cache.generation == lease.generation
                         and self._fault_lease_cache.status is FaultLeaseStatus.OPEN
@@ -3076,6 +3094,7 @@ class RoastService:
             state = await executor.execute(
                 OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
                 session_id,
+                run_id=lease.run_id,
                 is_current_generation=lambda: (
                     self._fault_lease_cache.generation == lease.generation
                     and self._fault_lease_cache.status is FaultLeaseStatus.OPEN
@@ -3337,6 +3356,7 @@ class RoastService:
             state = await executor.execute(
                 OperatorAction.EMERGENCY_STOP,
                 session_id,
+                run_id=self._fault_lease_cache.run_id,
                 is_current_generation=lambda: (
                     self._fault_lease_cache.generation == admitted_generation
                 ),
@@ -3473,6 +3493,7 @@ class RoastService:
             state = await executor.execute(
                 OperatorAction.EMERGENCY_STOP,
                 session_id,
+                run_id=run_id,
                 is_current_generation=lambda: (
                     self._fault_lease_cache.run_id == run_id
                     and self._fault_lease_cache.generation == lease.generation
@@ -4695,6 +4716,16 @@ class RoastService:
             mic_status = self._live_mic_status(run_id)
             if mic_status is not None:
                 detail = detail.model_copy(update={"mic_status": mic_status})
+            if self._requires_live_restart_clearance:
+                await self._ensure_restart_epoch()
+                if self._restart_clearance_state is not RestartClearanceState.CLEARED:
+                    # This is the current server admission projection. A
+                    # recovered row can retain phase-derived actions from the
+                    # prior process, but D213 admits only an e-stop until a
+                    # fresh clearance exists.
+                    detail = detail.model_copy(
+                        update={"enabled_actions": [OperatorAction.EMERGENCY_STOP]}
+                    )
         lease = await self._read_fault_lease_fail_closed()
         if lease.run_id == run_id:
             detail = detail.model_copy(
@@ -5281,6 +5312,18 @@ class RoastService:
                     "restart clearance is required before routine operator actions"
                 )
 
+        # Establish the current persisted phase before an OPEN lease can select
+        # the terminal executor.  A synthetic/stale lease must never convert a
+        # live non-faulted controller action into a historical fault write.
+        admission_detail = await self._store.read_run(run_id)
+        if admission_detail is None:
+            raise RoastRunNotFoundError(run_id)
+        if admission_detail.completed_at_utc is not None:
+            raise RoastRunGoneError(
+                f"run {run_id} is {admission_detail.outcome or 'terminal'}; operator actions "
+                "are no longer accepted"
+            )
+
         # A current lease is an ownership boundary, rather than a phase hint.
         # Do not let generic per-run actions queue behind an OPEN/UNKNOWN
         # lease: only the exact-session terminal executor may actuate an OPEN
@@ -5291,6 +5334,26 @@ class RoastService:
             FaultLeaseStatus.OPEN,
             FaultLeaseStatus.UNKNOWN,
         ):
+            if (
+                lease.status is FaultLeaseStatus.OPEN
+                and admission_detail.agent_phase is not RoastPhase.FAULTED
+                and request.action is not OperatorAction.EMERGENCY_STOP
+            ):
+                result: Literal["accepted", "rejected", "failed"] = "rejected"
+                await self._store.record_operator_action(
+                    action=request.action.value,
+                    result=result,
+                    run_id=run_id,
+                    payload=request.payload,
+                )
+                return OperatorActionResult(
+                    action=request.action,
+                    result=result,
+                    reason=(
+                        "current active run is not faulted; terminal fault controls are unavailable"
+                    ),
+                    queued=False,
+                )
             guarded = await self._submit_open_fault_lease_action(run_id, request, lease=lease)
             if isinstance(guarded, OperatorActionResult):
                 return guarded
@@ -5587,6 +5650,7 @@ class RoastService:
             state = await executor.execute(
                 request.action,
                 session_id,
+                run_id=run_id,
                 is_current_generation=lambda: (
                     self._fault_lease_cache.generation == lease.generation
                     and self._fault_lease_cache.status is FaultLeaseStatus.OPEN

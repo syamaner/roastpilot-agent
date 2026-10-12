@@ -13,6 +13,7 @@ fan (``operator_recovery_required``).
 """
 
 import asyncio
+import contextlib
 import logging
 import math
 import time
@@ -515,6 +516,29 @@ class FaultControlPort(Protocol):
         ...
 
 
+class FaultControlTraceSink(Protocol):
+    """Durable trace boundary for an exact-session fault-control write."""
+
+    async def record_fault_control_evaluation(
+        self, *, run_id: str, evaluation: SafetyEvaluation
+    ) -> int:
+        """Persist the safety admission and return its trace identifier."""
+        ...
+
+    async def record_fault_control_command(
+        self,
+        *,
+        run_id: str,
+        tool: RoastCommand,
+        status: Literal["ok", "failed"],
+        args: object,
+        result: object,
+        safety_evaluation_id: int | None,
+    ) -> None:
+        """Persist the exact-session command outcome linked to its admission."""
+        ...
+
+
 class FaultControlExecutor:
     """Controller-owned, single-writer executor for an OPEN terminal lease.
 
@@ -525,11 +549,17 @@ class FaultControlExecutor:
     """
 
     def __init__(
-        self, safety: SafetyPolicy, port: FaultControlPort, *, arbiter: CommandArbiter | None = None
+        self,
+        safety: SafetyPolicy,
+        port: FaultControlPort,
+        *,
+        arbiter: CommandArbiter | None = None,
+        trace_sink: FaultControlTraceSink | None = None,
     ) -> None:
         self._safety = safety
         self._port = port
         self._arbiter = arbiter or CommandArbiter()
+        self._trace_sink = trace_sink
         self._queue: asyncio.PriorityQueue[
             tuple[
                 int,
@@ -539,6 +569,7 @@ class FaultControlExecutor:
                 int,
                 Callable[[], bool],
                 int | None,
+                str | None,
                 asyncio.Future[FaultControlState | None],
             ]
         ] = asyncio.PriorityQueue()
@@ -550,6 +581,7 @@ class FaultControlExecutor:
         action: OperatorAction,
         session_id: str,
         *,
+        run_id: str | None = None,
         is_current_generation: Callable[[], bool],
         close_reservation: int | None = None,
         emergency_generation: int | None = None,
@@ -579,6 +611,7 @@ class FaultControlExecutor:
                 generation,
                 is_current_generation,
                 close_reservation,
+                run_id,
                 future,
             )
         )
@@ -597,6 +630,7 @@ class FaultControlExecutor:
                 generation,
                 generation_current,
                 close_reservation,
+                run_id,
                 future,
             ) = await self._queue.get()
             if future.cancelled():
@@ -609,6 +643,7 @@ class FaultControlExecutor:
                     session_id,
                     generation,
                     generation_current,
+                    run_id,
                     close_reservation=close_reservation,
                 )
             except Exception as exc:  # noqa: BLE001 - failed exact proof is fail-closed
@@ -624,6 +659,7 @@ class FaultControlExecutor:
         session_id: str,
         generation: int,
         generation_current: Callable[[], bool],
+        run_id: str | None,
         *,
         close_reservation: int | None,
     ) -> FaultControlState | None:
@@ -640,21 +676,65 @@ class FaultControlExecutor:
             )
             if evaluation.verdict is not SafetyVerdict.EMERGENCY_STOP:
                 await self._arbiter.cancel_emergency_stop_admission()
+                self._schedule_estop_trace(
+                    run_id,
+                    evaluation,
+                    "failed",
+                    {
+                        "admission": "rejected",
+                        "dispatch": "not_attempted",
+                        "confirmation": "failed",
+                    },
+                )
                 return None
             # No pre-read may postpone an e-stop attempt.  The guarded command
             # result and its fresh exact-session readback are the proof.
-            await self._arbiter.run_emergency_stop(
-                lambda: self._port.write_fault_control(action, expected_session_id=session_id),
-                admitted=generation_current,
+            try:
+                await self._arbiter.run_emergency_stop(
+                    lambda: self._port.write_fault_control(action, expected_session_id=session_id),
+                    admitted=generation_current,
+                )
+                if not generation_current():
+                    self._schedule_estop_trace(
+                        run_id,
+                        evaluation,
+                        "failed",
+                        {
+                            "admission": "allowed",
+                            "dispatch": "completed",
+                            "confirmation": "superseded",
+                        },
+                    )
+                    return None
+                state = await self._port.read_fault_control_state(session_id)
+            except Exception:
+                self._schedule_estop_trace(
+                    run_id,
+                    evaluation,
+                    "failed",
+                    {"admission": "allowed", "dispatch": "failed", "confirmation": "unconfirmed"},
+                )
+                raise
+            self._schedule_estop_trace(
+                run_id,
+                evaluation,
+                "ok",
+                {"admission": "allowed", "dispatch": "completed", "confirmation": "read_back"},
             )
-            if not generation_current():
-                return None
-            return await self._port.read_fault_control_state(session_id)
+            return state
         command = command_by_action.get(action)
         if command is None:
             return None
         evaluation = self._safety.evaluate_command_phase(command=command, phase=RoastPhase.FAULTED)
+        evaluation_id = await self._record_evaluation(run_id, evaluation)
         if evaluation.verdict is not SafetyVerdict.ALLOW:
+            await self._record_command(
+                run_id,
+                command,
+                "failed",
+                evaluation_id,
+                {"admission": "rejected", "dispatch": "not_attempted", "confirmation": "failed"},
+            )
             return None
         if close_reservation is not None and not await self._arbiter.wait_for_close_proof(
             close_reservation
@@ -706,12 +786,22 @@ class FaultControlExecutor:
             and not self._arbiter.close_reservation_is_current(close_reservation)
         ):
             return None
-        dispatched, _ = await self._arbiter.run_routine(
-            generation,
-            lambda: self._port.write_fault_control(action, expected_session_id=session_id),
-            admitted=generation_current,
-            close_reservation=close_reservation,
-        )
+        try:
+            dispatched, _ = await self._arbiter.run_routine(
+                generation,
+                lambda: self._port.write_fault_control(action, expected_session_id=session_id),
+                admitted=generation_current,
+                close_reservation=close_reservation,
+            )
+        except Exception:
+            await self._record_command(
+                run_id,
+                command,
+                "failed",
+                evaluation_id,
+                {"admission": "allowed", "dispatch": "failed", "confirmation": "unconfirmed"},
+            )
+            raise
         if (
             not dispatched
             or not generation_current()
@@ -720,8 +810,106 @@ class FaultControlExecutor:
                 and not self._arbiter.close_reservation_is_current(close_reservation)
             )
         ):
+            await self._record_command(
+                run_id,
+                command,
+                "failed",
+                evaluation_id,
+                {
+                    "admission": "allowed",
+                    "dispatch": "not_completed",
+                    "confirmation": "unconfirmed",
+                },
+            )
             return None
-        return await self._port.read_fault_control_state(session_id)
+        try:
+            state = await self._port.read_fault_control_state(session_id)
+        except Exception:
+            await self._record_command(
+                run_id,
+                command,
+                "failed",
+                evaluation_id,
+                {
+                    "admission": "allowed",
+                    "dispatch": "completed",
+                    "confirmation": "readback_failed",
+                },
+            )
+            raise
+        await self._record_command(
+            run_id,
+            command,
+            "ok",
+            evaluation_id,
+            {"admission": "allowed", "dispatch": "completed", "confirmation": "read_back"},
+        )
+        return state
+
+    async def _record_evaluation(
+        self, run_id: str | None, evaluation: SafetyEvaluation
+    ) -> int | None:
+        """Persist a fault-control safety admission when its run is known."""
+        if run_id is None or self._trace_sink is None:
+            return None
+        try:
+            return await self._trace_sink.record_fault_control_evaluation(
+                run_id=run_id, evaluation=evaluation
+            )
+        except Exception:  # noqa: BLE001 - audit uncertainty cannot suppress an e-stop outcome
+            logging.getLogger(__name__).exception(
+                "could not persist fault-control safety admission"
+            )
+            return None
+
+    async def _record_command(
+        self,
+        run_id: str | None,
+        tool: RoastCommand,
+        status: Literal["ok", "failed"],
+        evaluation_id: int | None,
+        result: object,
+    ) -> None:
+        """Persist one terminal control outcome without changing command semantics."""
+        if run_id is None or self._trace_sink is None:
+            return
+        try:
+            await self._trace_sink.record_fault_control_command(
+                run_id=run_id,
+                tool=tool,
+                status=status,
+                args={"fault_control": True},
+                result=result,
+                safety_evaluation_id=evaluation_id,
+            )
+        except Exception:  # noqa: BLE001 - audit uncertainty cannot rewrite actuator fact
+            logging.getLogger(__name__).exception("could not persist fault-control command outcome")
+
+    def _schedule_estop_trace(
+        self,
+        run_id: str | None,
+        evaluation: SafetyEvaluation,
+        status: Literal["ok", "failed"],
+        result: object,
+    ) -> None:
+        """Schedule an e-stop audit only after its priority dispatch has run."""
+        if run_id is None or self._trace_sink is None:
+            return
+
+        async def persist() -> None:
+            evaluation_id = await self._record_evaluation(run_id, evaluation)
+            await self._record_command(
+                run_id, RoastCommand.EMERGENCY_STOP, status, evaluation_id, result
+            )
+
+        task = asyncio.create_task(persist())
+        task.add_done_callback(self._consume_estop_trace_task)
+
+    @staticmethod
+    def _consume_estop_trace_task(task: asyncio.Task[None]) -> None:
+        """Consume a background e-stop audit result after safe dispatch."""
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            task.result()
 
 
 class SnapshotSink(Protocol):

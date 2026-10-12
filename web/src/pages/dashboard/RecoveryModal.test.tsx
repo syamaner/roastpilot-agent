@@ -40,8 +40,7 @@ describe("RecoveryModal", () => {
     );
     expect(screen.getByTestId("recovery-acknowledge_recovery")).toHaveAttribute("data-enabled", "true");
     expect(screen.getByTestId("recovery-start_cooling")).toHaveAttribute("data-enabled", "true");
-    expect(screen.getByTestId("recovery-drop_beans")).toHaveAttribute("data-enabled", "false");
-    expect(screen.getByTestId("recovery-drop_beans")).toBeDisabled();
+    expect(screen.queryByTestId("recovery-drop_beans")).toBeNull();
   });
 
   it("keeps emergency stop available regardless of the enabled set", () => {
@@ -59,8 +58,8 @@ describe("RecoveryModal", () => {
         healthStale
       />,
     );
-    expect(screen.getByTestId("recovery-start_cooling")).toBeDisabled();
-    expect(screen.getByTestId("recovery-acknowledge_recovery")).toBeDisabled();
+    expect(screen.queryByTestId("recovery-start_cooling")).toBeNull();
+    expect(screen.queryByTestId("recovery-acknowledge_recovery")).toBeNull();
     expect(screen.getByTestId("recovery-emergency_stop")).toBeEnabled();
     expect(screen.getByTestId("recovery-health-stale")).toHaveTextContent(
       /recovery actions are disabled.*emergency stop remains available/i,
@@ -81,10 +80,10 @@ describe("RecoveryModal", () => {
     expect(onAction).toHaveBeenCalledWith("acknowledge_recovery");
   });
 
-  it("does not dispatch a disabled recovery action", () => {
+  it("does not offer a server-disabled recovery action", () => {
     const onAction = vi.fn();
     render(<RecoveryModal open {...READOUT} enabledActions={[]} onAction={onAction} />);
-    fireEvent.click(screen.getByTestId("recovery-drop_beans"));
+    expect(screen.queryByTestId("recovery-drop_beans")).toBeNull();
     expect(onAction).not.toHaveBeenCalled();
   });
 });

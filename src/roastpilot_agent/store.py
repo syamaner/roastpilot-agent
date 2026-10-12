@@ -1832,6 +1832,39 @@ class RoastStore:
         )
         await self.connection.commit()
 
+    async def record_fault_control_evaluation(
+        self, *, run_id: str, evaluation: SafetyEvaluation
+    ) -> int:
+        """Persist a terminal fault-control admission at its independent tick.
+
+        Historical terminal controls have no live controller tick.  Tick zero is
+        reserved here as the trace-local ordering anchor; the linked command
+        outcome supplies the admission/dispatch/confirmation detail.
+        """
+        return await self.record_safety_evaluation(run_id=run_id, tick=0, evaluation=evaluation)
+
+    async def record_fault_control_command(
+        self,
+        *,
+        run_id: str,
+        tool: RoastCommand,
+        status: Literal["ok", "failed"],
+        args: object,
+        result: object,
+        safety_evaluation_id: int | None,
+    ) -> None:
+        """Append one terminal fault-control outcome linked to its admission."""
+        await self.record_command(
+            run_id=run_id,
+            tick=0,
+            tool=tool,
+            source="recovery",
+            status=status,
+            args=args,
+            result=result,
+            safety_evaluation_id=safety_evaluation_id,
+        )
+
     async def record_operator_action(
         self,
         *,
