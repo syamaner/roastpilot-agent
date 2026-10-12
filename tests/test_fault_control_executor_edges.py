@@ -60,6 +60,7 @@ class FaultPort:
     fail_write: bool = False
     fail_readback: bool = False
     reads: list[str] = field(default_factory=list[str])
+    latest_reads: list[str] = field(default_factory=list[str])
     writes: list[OperatorAction] = field(default_factory=list[OperatorAction])
 
     async def read_fault_control_state(self, session_id: str) -> FaultControlState:
@@ -72,6 +73,7 @@ class FaultPort:
 
     async def read_latest_fault_control_state(self) -> FaultControlState:
         """Return the latest terminal state used by D212."""
+        self.latest_reads.append("latest")
         return self.latest or self.state
 
     async def write_fault_control(
@@ -546,6 +548,108 @@ async def test_routine_generation_stale_after_exact_read_is_traced_without_write
         "dispatch": "not_completed",
         "confirmation": "unconfirmed",
     }
+
+
+@pytest.mark.asyncio
+async def test_d212_close_reservation_revoked_during_exact_read_stops_before_latest_proof() -> None:
+    """An e-stop admitted during D212's exact read cancels its close proof."""
+
+    class EStopDuringExactReadPort(FaultPort):
+        def __init__(self, arbiter: CommandArbiter) -> None:
+            super().__init__(_state(cooling_on=True))
+            self._arbiter = arbiter
+
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            state = await super().read_fault_control_state(session_id)
+            self._arbiter.admit_emergency_stop()
+            return state
+
+    arbiter = CommandArbiter()
+    generation = arbiter.generation
+    assert arbiter.reserve_close(generation)
+    trace = RecordingFaultTrace()
+    port = EStopDuringExactReadPort(arbiter)
+    executor = FaultControlExecutor(
+        SafetyPolicy(SafetyLimits()), port, arbiter=arbiter, trace_sink=trace
+    )
+
+    assert (
+        await executor.execute(
+            OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            "fault-session",
+            run_id="fault-run",
+            is_current_generation=lambda: True,
+            close_reservation=generation,
+        )
+        is None
+    )
+    assert not arbiter.close_reservation_is_current(generation)
+    assert port.reads == ["fault-session"]
+    assert port.latest_reads == []
+    assert port.writes == []
+    assert await executor.settle_audit_tasks()
+    assert trace.commands[0][2] == {
+        "admission": "allowed",
+        "dispatch": "not_completed",
+        "confirmation": "unconfirmed",
+    }
+    await arbiter.cancel_emergency_stop_admission()
+
+
+@pytest.mark.asyncio
+async def test_rejected_estop_releases_priority_reservation_without_a_write() -> None:
+    """A typed non-e-stop policy result releases its reservation and records failure."""
+
+    class RejectingEmergencySafety:
+        def evaluate_emergency_stop(
+            self, *, phase: RoastPhase, operator_reason: str | None = None
+        ) -> SafetyEvaluation:
+            assert phase is RoastPhase.FAULTED
+            assert operator_reason == "terminal fault control"
+            return SafetyEvaluation(
+                rule="test_estop_rejection",
+                verdict=SafetyVerdict.REJECT,
+                reason="test emergency-stop rejection",
+            )
+
+    arbiter = CommandArbiter()
+    trace = RecordingFaultTrace()
+    port = FaultPort(_state())
+    executor = FaultControlExecutor(
+        cast(SafetyPolicy, RejectingEmergencySafety()), port, arbiter=arbiter, trace_sink=trace
+    )
+
+    assert (
+        await executor.execute(
+            OperatorAction.EMERGENCY_STOP,
+            "fault-session",
+            run_id="fault-run",
+            is_current_generation=lambda: True,
+        )
+        is None
+    )
+    assert not arbiter.emergency_stop_active
+    assert port.reads == []
+    assert port.writes == []
+    assert await executor.settle_audit_tasks()
+    assert trace.evaluations == [
+        SafetyEvaluation(
+            rule="test_estop_rejection",
+            verdict=SafetyVerdict.REJECT,
+            reason="test emergency-stop rejection",
+        )
+    ]
+    assert trace.commands == [
+        (
+            RoastCommand.EMERGENCY_STOP,
+            "failed",
+            {
+                "admission": "rejected",
+                "dispatch": "not_attempted",
+                "confirmation": "failed",
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio
