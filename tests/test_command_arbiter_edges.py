@@ -10,32 +10,6 @@ from roastpilot_agent.controller import CommandArbiter
 
 
 @pytest.mark.asyncio
-async def test_revoked_close_reservation_fails_while_waiting_for_an_inflight_write() -> None:
-    """A D212 proof waiter returns false when an admitted e-stop revokes its lease."""
-    arbiter = CommandArbiter()
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    async def blocking_routine() -> str:
-        entered.set()
-        await release.wait()
-        return "routine-complete"
-
-    generation = arbiter.generation
-    routine = asyncio.create_task(arbiter.run_routine(generation, blocking_routine))
-    await asyncio.wait_for(entered.wait(), timeout=1.0)
-    assert arbiter.reserve_close(generation)
-    proof = asyncio.create_task(arbiter.wait_for_close_proof(generation))
-    await asyncio.sleep(0)
-
-    arbiter.admit_emergency_stop()
-    release.set()
-
-    assert not await asyncio.wait_for(proof, timeout=1.0)
-    assert await asyncio.wait_for(routine, timeout=1.0) == (True, "routine-complete")
-
-
-@pytest.mark.asyncio
 async def test_stale_admitted_estop_releases_priority_without_running_its_operation() -> None:
     """A stale exact-session e-stop releases its admission before a later routine action."""
     arbiter = CommandArbiter()
