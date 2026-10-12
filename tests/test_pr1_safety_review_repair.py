@@ -129,6 +129,37 @@ async def test_active_nonfaulted_open_lease_rejects_terminal_controls_before_exe
 
 
 @pytest.mark.asyncio
+async def test_d213_cleared_detail_still_projects_open_nonfaulted_lease_as_estop_only(
+    store: RoastStore,
+) -> None:
+    """A clearance cannot make the detail response advertise an OPEN lease's routine actions."""
+    run_id = "detail-open-nonfaulted"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    service = RoastService(
+        store, roaster=cast(RoasterControl, _FaultPort()), live_serve_mode=True, run_loop=False
+    )
+    lease = await store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="fault-session", generation=1
+    )
+    service._fault_lease_cache = lease  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - durable fixture
+    service._restart_clearance_state = (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - D213-cleared fixture
+        RestartClearanceState.CLEARED
+    )
+    service._restart_epoch_initialized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - D213-cleared fixture
+
+    detail = await service.detail(run_id)
+
+    assert detail.enabled_actions == [OperatorAction.EMERGENCY_STOP]
+    assert detail.fault_controls is not None
+    assert detail.fault_controls.enabled_actions == [OperatorAction.EMERGENCY_STOP]
+
+
+@pytest.mark.asyncio
 async def test_terminal_fault_write_persists_linked_admission_and_failure_trace(
     store: RoastStore,
 ) -> None:

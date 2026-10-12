@@ -4715,6 +4715,7 @@ class RoastService:
         detail = await self._store.read_run(run_id)
         if detail is None:
             raise RoastRunNotFoundError(run_id)
+        lease = await self._read_fault_lease_fail_closed()
         # Only a live (not-yet-completed) run is enriched. ``active_run_id`` is
         # set on start/recovery and not cleared at finalize, so a just-completed
         # run can still match the active pointer with ``raw_state.last_state``
@@ -4734,8 +4735,15 @@ class RoastService:
                     detail = detail.model_copy(
                         update={"enabled_actions": [OperatorAction.EMERGENCY_STOP]}
                     )
-        lease = await self._read_fault_lease_fail_closed()
         if lease.run_id == run_id:
+            if lease.status in (FaultLeaseStatus.OPEN, FaultLeaseStatus.UNKNOWN):
+                # A process clearance proves its own narrow physical check; it
+                # does not reopen controls while this run retains an OPEN or
+                # UNKNOWN fault lease. Keep the top-level server projection in
+                # step with both submit paths and the dedicated fault panel.
+                detail = detail.model_copy(
+                    update={"enabled_actions": [OperatorAction.EMERGENCY_STOP]}
+                )
             detail = detail.model_copy(
                 update={"fault_controls": await self._fault_controls_projection(lease)}
             )
