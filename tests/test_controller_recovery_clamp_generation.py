@@ -1,6 +1,7 @@
 """Generation-fence coverage for the D96 failed-drop recovery clamp."""
 
 import asyncio
+from typing import cast
 
 import pytest
 
@@ -65,14 +66,28 @@ async def test_estop_during_recovery_clamp_audit_cannot_write_or_exit_recovery(
     targets_at_guard: list[tuple[int, int]] | None = None
     heat_writes_at_guard: list[int] | None = None
     fan_writes_at_guard: list[int] | None = None
+    execute_attempts = 0
+    execute_attempts_at_guard: int | None = None
+    original_execute_targets = harness.controller._execute_targets  # pyright: ignore[reportPrivateUsage]
+
+    async def observe_execute_targets(
+        value: SafetyEvaluation, *, generation: int | None = None
+    ) -> bool:
+        """Record attempts while delegating unchanged to the real executor path."""
+        nonlocal execute_attempts
+        execute_attempts += 1
+        return await original_execute_targets(value, generation=generation)
+
+    monkeypatch.setattr(harness.controller, "_execute_targets", observe_execute_targets)
 
     async def park_clamp_evaluation(value: SafetyEvaluation) -> int | None:
-        nonlocal fan_writes_at_guard, heat_writes_at_guard, state_at_guard, targets_at_guard
+        nonlocal execute_attempts_at_guard, fan_writes_at_guard, heat_writes_at_guard
+        nonlocal state_at_guard, targets_at_guard
         failed_drop_recorded = any(
             kind is RoastEventKind.COMMAND_FAILED
             and isinstance(payload, dict)
-            and payload.get("command") == "drop_beans"
-            and payload.get("source") == "advisor"
+            and cast("dict[str, object]", payload).get("command") == "drop_beans"
+            and cast("dict[str, object]", payload).get("source") == "advisor"
             for kind, payload in harness.events.events
         )
         if (
@@ -87,6 +102,7 @@ async def test_estop_during_recovery_clamp_audit_cannot_write_or_exit_recovery(
             targets_at_guard = list(harness.executor.targets)
             heat_writes_at_guard = list(harness.executor.heat_writes)
             fan_writes_at_guard = list(harness.executor.fan_writes)
+            execute_attempts_at_guard = execute_attempts
             entered.set()
             await release.wait()
         return await original(value)
@@ -111,7 +127,9 @@ async def test_estop_during_recovery_clamp_audit_cannot_write_or_exit_recovery(
     assert targets_at_guard is not None
     assert heat_writes_at_guard is not None
     assert fan_writes_at_guard is not None
+    assert execute_attempts_at_guard is not None
     assert harness.executor.targets == targets_at_guard
     assert harness.executor.heat_writes == heat_writes_at_guard
     assert harness.executor.fan_writes == fan_writes_at_guard
+    assert execute_attempts == execute_attempts_at_guard
     assert harness.controller._post_fc_controller.snapshot_state() == state_at_guard  # pyright: ignore[reportPrivateUsage]
