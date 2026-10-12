@@ -946,10 +946,7 @@ def _start_owned_installer(
         text=True,
         start_new_session=True,
     )
-    group_id = os.getpgid(process.pid)
-    if group_id != process.pid:
-        raise AssertionError("installer process did not receive its own process group")
-    return _OwnedInstallerProcess(process, group_id)
+    return _OwnedInstallerProcess(process, process.pid)
 
 
 def _owned_group_live_members(group_id: int) -> tuple[int, ...]:
@@ -958,12 +955,15 @@ def _owned_group_live_members(group_id: int) -> tuple[int, ...]:
         ["ps", "-axo", "pid=,pgid=,stat="], text=True, capture_output=True, check=False
     )
     if listing.returncode != 0:
-        return ()
+        raise AssertionError("owned process-group inspection failed")
+    lines = listing.stdout.splitlines()
+    if not lines:
+        raise AssertionError("owned process-group inspection returned no data")
     members: list[int] = []
-    for line in listing.stdout.splitlines():
+    for line in lines:
         fields = line.split()
         if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
-            continue
+            raise AssertionError("owned process-group inspection was malformed")
         if int(fields[1]) == group_id and not fields[2].startswith("Z"):
             members.append(int(fields[0]))
     return tuple(members)
@@ -1014,11 +1014,40 @@ def _drain_owned_processes(
         raise failure
 
 
-@pytest.mark.parametrize("case", ("success", "partial-launch", "cleanup-continues"))
-def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path, case: str) -> None:
+@pytest.mark.parametrize(
+    "case",
+    (
+        "success",
+        "partial-launch",
+        "cleanup-continues",
+        "inspection-command-failure",
+        "inspection-empty-output",
+        "inspection-malformed-output",
+    ),
+)
+def test_two_installer_runs_overlap_without_cross_run_leaks(
+    tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Two fake installer runs overlap at hostname setup without leaking artefacts."""
     parent = tmp_path / "parallel-parent"
     parent.mkdir()
+    inspection_outputs = {
+        "inspection-command-failure": subprocess.CompletedProcess(["ps"], 1, stdout="", stderr=""),
+        "inspection-empty-output": subprocess.CompletedProcess(["ps"], 0, stdout="", stderr=""),
+        "inspection-malformed-output": subprocess.CompletedProcess(
+            ["ps"], 0, stdout="malformed", stderr=""
+        ),
+    }
+    if case in inspection_outputs:
+
+        def inspected_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            """Return one deliberately unusable process-inspection response."""
+            return inspection_outputs[case]
+
+        monkeypatch.setattr(subprocess, "run", inspected_run)
+        with pytest.raises(AssertionError, match="owned process-group inspection"):
+            _owned_group_live_members(os.getpgrp())
+        return
     alpha_owner = parent / "alpha-run"
     beta_owner = parent / "beta-run"
     alpha_base = alpha_owner / "installer-output"
@@ -1122,6 +1151,7 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path, case
     processes: list[_OwnedInstallerProcess] = []
     outputs: dict[subprocess.Popen[str], tuple[str, str]] = {}
     cleanup_calls: list[int] = []
+    observed_descendant_pids: list[int] = []
     forced_failure: OSError | None = None
 
     def reap_with_first_error(owned: _OwnedInstallerProcess) -> tuple[str, str]:
@@ -1138,7 +1168,12 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path, case
         first = processes[0]
         marker = rendezvous / alpha["self"]
         deadline = time.monotonic() + 35
-        while not marker.exists() or first.process.poll() is not None:
+        while True:
+            live_members = _owned_group_live_members(first.group_id)
+            descendants = [pid for pid in live_members if pid != first.process.pid]
+            if marker.exists() and first.process.poll() is None and descendants:
+                observed_descendant_pids.extend(descendants)
+                break
             if time.monotonic() >= deadline:
                 raise AssertionError("first installer did not retain a live rendezvous descendant")
             time.sleep(0.01)
@@ -1230,6 +1265,7 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path, case
         _assert_owned_group_is_drained(owned.group_id)
     if case == "partial-launch":
         assert forced_failure is not None
+        assert observed_descendant_pids
         return
     if case == "cleanup-continues":
         assert cleanup_calls == [owned.group_id for owned in processes]
