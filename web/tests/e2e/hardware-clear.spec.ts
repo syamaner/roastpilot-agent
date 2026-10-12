@@ -103,9 +103,9 @@ test("required restart clearance keeps a CLOSED server-advertised software e-sto
 }) => {
   let clearanceRequired = true;
   const emergencyStopRequests: unknown[] = [];
-  // `useFreshHealthGate` polls every three seconds. Freeze page time before
-  // navigation so the test controls the sole post-clearance health read.
-  await page.clock.install();
+  // `useFreshHealthGate` polls every three seconds. Let page loading run from
+  // a fixed time, then pause before the assertions and controlled refresh.
+  await page.clock.install({ time: new Date("2026-10-13T04:00:00.000Z") });
   await page.route("**/api/**", async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
@@ -169,6 +169,8 @@ test("required restart clearance keeps a CLOSED server-advertised software e-sto
   });
 
   await page.goto("/start");
+  await page.waitForLoadState("networkidle");
+  await page.clock.pauseAt(new Date("2026-10-13T05:00:00.000Z"));
   await expect(page.getByTestId("restart-clearance-required")).toBeVisible();
   await expect(page.getByTestId("start-roast-form")).toHaveCount(0);
   await expect(page.getByTestId("start-restart-clearance-emergency-stop")).toBeVisible();
@@ -193,6 +195,7 @@ test("required restart clearance keeps a CLOSED server-advertised software e-sto
   // client unlocks Start optimistically from the successful POST response.
   clearanceRequired = false;
   await page.getByTestId("restart-clearance-refresh-status").click();
+  await page.clock.runFor(1);
   await expect(page.getByTestId("start-roast-form")).toBeVisible();
   await expect(page.getByTestId("restart-clearance-required")).toHaveCount(0);
 });
