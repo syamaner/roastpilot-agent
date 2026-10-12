@@ -155,7 +155,12 @@ async def test_estop_during_start_session_cannot_commit_preheat_transition() -> 
     start = asyncio.create_task(controller.start_run(PROFILE))
     await asyncio.wait_for(executor.entered.wait(), timeout=1.0)
 
-    stop = asyncio.create_task(controller.operator_emergency_stop("start race"))
+    prior_generation = controller.command_generation
+    admitted_generation = controller.admit_emergency_stop()
+    assert admitted_generation == prior_generation + 1
+    stop = asyncio.create_task(
+        controller.operator_emergency_stop("start race", already_admitted=True)
+    )
     executor.release.set()
     await asyncio.wait_for(start, timeout=1.0)
     await asyncio.wait_for(stop, timeout=1.0)
@@ -188,7 +193,12 @@ async def test_estop_during_faulted_stop_cooling_cannot_publish_completion() -> 
     stop_cooling = asyncio.create_task(controller.operator_stop_cooling())
     await asyncio.wait_for(executor.entered.wait(), timeout=1.0)
 
-    emergency = asyncio.create_task(controller.operator_emergency_stop("cooling race"))
+    prior_generation = controller.command_generation
+    admitted_generation = controller.admit_emergency_stop()
+    assert admitted_generation == prior_generation + 1
+    emergency = asyncio.create_task(
+        controller.operator_emergency_stop("cooling race", already_admitted=True)
+    )
     executor.release.set()
     await asyncio.wait_for(stop_cooling, timeout=1.0)
     await asyncio.wait_for(emergency, timeout=1.0)
