@@ -373,14 +373,14 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
   });
 
-  it("fails closed when CLOSED fault controls carry an unexpected enabled action", () => {
+  it("fails closed when CLOSED fault controls carry a routine enabled action", () => {
     healthState.data = {
       active_run_id: null,
       restart_clearance: { state: "cleared", eligible: true },
       fault_controls: {
         status: "closed",
         generation: null,
-        enabled_actions: ["emergency_stop"],
+        enabled_actions: ["start_cooling"],
       },
     };
     renderView();
@@ -428,15 +428,41 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
     );
   });
 
-  it("replaces the start form with the per-process physical confirmation gate", () => {
+  it("renders a CLOSED server e-stop alongside required physical clearance, then admits the refreshed cleared projection", async () => {
     healthState.data = {
       active_run_id: null,
       restart_clearance: { state: "required", eligible: false },
+      fault_controls: {
+        status: "closed",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
     };
-    renderView();
+    const { rerender } = renderView();
 
     expect(screen.getByTestId("restart-clearance-required")).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    const emergencyStop = screen.getByTestId("start-restart-clearance-emergency-stop-submit");
+    expect(emergencyStop).toBeEnabled();
+    expect(screen.getByText(/software request cannot confirm physical state here/i)).toBeInTheDocument();
+
+    fireEvent.click(emergencyStop);
+    expect(faultControlsActionMock).not.toHaveBeenCalled();
+    fireEvent.click(emergencyStop);
+    await waitFor(() =>
+      expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }),
+    );
+
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: true },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    };
+    rerender();
+
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.queryByTestId("start-restart-clearance-emergency-stop")).toBeNull();
+    expect(screen.getByTestId("start-roast-form")).toBeInTheDocument();
   });
 
   it("shows restart clearance beside an OPEN terminal lease and keeps routine controls disarmed", () => {

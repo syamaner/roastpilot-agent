@@ -32,7 +32,16 @@ export function isCoherentFaultControls(value: unknown): value is FaultControls 
   }
   if (!actions.every((action) => TERMINAL_FAULT_ACTIONS.has(action))) return false;
   if (new Set(actions).size !== actions.length) return false;
-  if (status === "closed" && actions.length !== 0) return false;
+  // A closed lease normally advertises no terminal actions. The server can
+  // retain its independently resolved software e-stop, however: it is the
+  // sole CLOSED-state action which does not reopen routine controls.
+  if (
+    status === "closed" &&
+    actions.length !== 0 &&
+    !(actions.length === 1 && actions[0] === "emergency_stop")
+  ) {
+    return false;
+  }
   if (status === "open" && generation === null) return false;
   return !(status === "unknown" && actions.some((action) => action !== "emergency_stop"));
 }

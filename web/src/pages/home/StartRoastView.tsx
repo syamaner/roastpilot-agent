@@ -602,6 +602,12 @@ export function StartRoastView(): React.JSX.Element {
   const restartClearanceRequired = coherentRestartClearance?.state === "required";
   const routineControlsDisabled =
     coherentRestartClearance?.state !== "cleared";
+  // The server may retain only its global software e-stop after it closes the
+  // terminal lease. This is a server projection, never a local phase or
+  // eligibility inference.
+  const closedLeaseEmergencyStopAdvertised =
+    coherentFaultControls?.status === "closed" &&
+    coherentFaultControls.enabled_actions.includes("emergency_stop");
 
   if (health.isSuccess && coherentFaultControls === null) {
     return <FaultControlsStatusIncomplete />;
@@ -716,6 +722,9 @@ export function StartRoastView(): React.JSX.Element {
           }}
           onRefreshStatus={() => queryClient.invalidateQueries({ queryKey: roastKeys.health })}
         />
+        {closedLeaseEmergencyStopAdvertised && (
+          <UnknownStatusEmergencyStop testIdPrefix="start-restart-clearance-emergency-stop" />
+        )}
       </AppFrame>
     );
   }

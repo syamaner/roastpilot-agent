@@ -97,3 +97,93 @@ test("route refreshes a rejected stale incident and resets confirmation for the 
   await expect(page.getByTestId("hardware-clear-confirm")).toHaveCount(0);
   expect(submittedIncidents).toEqual(["a".repeat(32)]);
 });
+
+test("required restart clearance keeps a CLOSED server-advertised software e-stop visible", async ({
+  page,
+}) => {
+  let clearanceRequired = true;
+  const emergencyStopRequests: unknown[] = [];
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === "/api/health") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "ok",
+          version: "e2e",
+          instance_id: "e2e-instance",
+          mcp_child: "stopped",
+          mcp_hardware_clear_required: false,
+          mcp_teardown_incident_id: null,
+          active_run_id: null,
+          restart_clearance: clearanceRequired
+            ? { state: "required", eligible: false }
+            : { state: "cleared", eligible: true },
+          fault_controls: clearanceRequired
+            ? { status: "closed", generation: null, enabled_actions: ["emergency_stop"] }
+            : { status: "closed", generation: null, enabled_actions: [] },
+        }),
+      });
+      return;
+    }
+    if (path === "/api/fault-controls/actions") {
+      emergencyStopRequests.push(request.postDataJSON());
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          action: "emergency_stop",
+          result: "accepted",
+          reason: "request accepted",
+          queued: true,
+          fault_controls: { status: "closed", generation: null, enabled_actions: ["emergency_stop"] },
+        }),
+      });
+      return;
+    }
+    if (path === "/api/restart-clearance") {
+      clearanceRequired = false;
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          outcome: "confirmed",
+          cleared: true,
+          restart_clearance_required: false,
+          restart_clearance: { state: "cleared", eligible: true },
+          fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+        }),
+      });
+      return;
+    }
+    if (path === "/api/roasts") {
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify({ runs: [] }) });
+      return;
+    }
+    if (path === "/api/bean-profiles") {
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify({ profiles: [] }) });
+      return;
+    }
+    await route.abort();
+  });
+
+  await page.goto("/start");
+  await expect(page.getByTestId("restart-clearance-required")).toBeVisible();
+  await expect(page.getByTestId("start-roast-form")).toHaveCount(0);
+  await expect(page.getByTestId("start-restart-clearance-emergency-stop")).toBeVisible();
+  await expect(page.getByText(/software request cannot confirm physical state here/i)).toBeVisible();
+
+  const emergencyStop = page.getByTestId("start-restart-clearance-emergency-stop-submit");
+  await emergencyStop.click();
+  await emergencyStop.click();
+  await expect.poll(() => emergencyStopRequests).toEqual([{ action: "emergency_stop" }]);
+
+  await page.getByTestId("restart-clearance-open").click();
+  await page.getByTestId("restart-clearance-stopped").check();
+  await page.getByTestId("restart-clearance-empty").check();
+  await page.getByTestId("restart-clearance-independent-stop").check();
+  await page.getByTestId("restart-clearance-submit").click();
+  await expect(page.getByTestId("restart-clearance-reported")).toBeVisible();
+  await page.getByTestId("restart-clearance-refresh-status").click();
+  await expect(page.getByTestId("start-roast-form")).toBeVisible();
+  await expect(page.getByTestId("restart-clearance-required")).toHaveCount(0);
+});
