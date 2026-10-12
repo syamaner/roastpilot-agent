@@ -153,7 +153,9 @@ async def test_default_generation_prefc_write_is_fenced_after_audit_race(
     entered = asyncio.Event()
     release = asyncio.Event()
     original = snapshots.persist_evaluation
+    original_execute_targets = controller._execute_targets  # pyright: ignore[reportPrivateUsage]
     evaluations = 0
+    execute_target_calls = 0
 
     async def delayed_evaluation(value: SafetyEvaluation) -> int | None:
         nonlocal evaluations
@@ -163,7 +165,15 @@ async def test_default_generation_prefc_write_is_fenced_after_audit_race(
             await release.wait()
         return await original(value)
 
+    async def observe_execute_targets(
+        value: SafetyEvaluation, *, generation: int | None = None
+    ) -> bool:
+        nonlocal execute_target_calls
+        execute_target_calls += 1
+        return await original_execute_targets(value, generation=generation)
+
     monkeypatch.setattr(snapshots, "persist_evaluation", delayed_evaluation)
+    monkeypatch.setattr(controller, "_execute_targets", observe_execute_targets)
     applying = asyncio.create_task(
         controller._apply_deterministic_pre_fc_levers(telemetry)  # pyright: ignore[reportPrivateUsage]
     )
@@ -179,6 +189,7 @@ async def test_default_generation_prefc_write_is_fenced_after_audit_race(
     await asyncio.wait_for(stopping, timeout=1.0)
 
     assert controller.phase is RoastPhase.FAULTED
+    assert execute_target_calls == 0
     assert executor.targets == []
     assert executor.heat_writes == []
     assert executor.fan_writes == []
@@ -199,13 +210,23 @@ async def test_estop_during_post_fc_audit_blocks_the_computed_target(
     entered = asyncio.Event()
     release = asyncio.Event()
     original = snapshots.persist_evaluation
+    original_execute_targets = controller._execute_targets  # pyright: ignore[reportPrivateUsage]
+    execute_target_calls = 0
 
     async def delayed_evaluation(value: SafetyEvaluation) -> int | None:
         entered.set()
         await release.wait()
         return await original(value)
 
+    async def observe_execute_targets(
+        value: SafetyEvaluation, *, generation: int | None = None
+    ) -> bool:
+        nonlocal execute_target_calls
+        execute_target_calls += 1
+        return await original_execute_targets(value, generation=generation)
+
     monkeypatch.setattr(snapshots, "persist_evaluation", delayed_evaluation)
+    monkeypatch.setattr(controller, "_execute_targets", observe_execute_targets)
     generation = controller.command_generation
     applying = asyncio.create_task(
         controller._apply_deterministic_post_fc_levers(  # pyright: ignore[reportPrivateUsage]
@@ -224,6 +245,7 @@ async def test_estop_during_post_fc_audit_blocks_the_computed_target(
     await asyncio.wait_for(stopping, timeout=1.0)
 
     assert controller.phase is RoastPhase.FAULTED
+    assert execute_target_calls == 0
     assert executor.targets == []
     assert executor.heat_writes == []
     assert executor.fan_writes == []

@@ -72,6 +72,10 @@ async def test_estop_invalidates_fault_acknowledgement_close_generation() -> Non
     assert not controller.fault_acknowledgement_close_is_current(generation)
     await controller._arbiter.cancel_emergency_stop_admission()  # pyright: ignore[reportPrivateUsage]
     controller._release_emergency_stop_transition_gate_if_safe()  # pyright: ignore[reportPrivateUsage]
+    next_generation = controller.command_generation
+    assert controller.reserve_fault_acknowledgement_close(next_generation)
+    assert controller.fault_acknowledgement_close_is_current(next_generation)
+    controller.release_fault_acknowledgement_close(next_generation)
 
 
 @pytest.mark.asyncio
@@ -194,6 +198,8 @@ async def test_estop_during_start_target_audit_cannot_apply_initial_targets(
     entered = asyncio.Event()
     release = asyncio.Event()
     original = snapshots.persist_evaluation
+    original_execute_targets = controller._execute_targets  # pyright: ignore[reportPrivateUsage]
+    execute_target_calls = 0
 
     async def delayed_evaluation(value: object) -> int | None:
         if not entered.is_set():
@@ -201,7 +207,15 @@ async def test_estop_during_start_target_audit_cannot_apply_initial_targets(
             await release.wait()
         return await original(value)  # type: ignore[arg-type]
 
+    async def observe_execute_targets(
+        value: SafetyEvaluation, *, generation: int | None = None
+    ) -> bool:
+        nonlocal execute_target_calls
+        execute_target_calls += 1
+        return await original_execute_targets(value, generation=generation)
+
     monkeypatch.setattr(snapshots, "persist_evaluation", delayed_evaluation)
+    monkeypatch.setattr(controller, "_execute_targets", observe_execute_targets)
     start = asyncio.create_task(controller.start_run(PROFILE))
     await asyncio.wait_for(entered.wait(), timeout=1.0)
 
@@ -215,6 +229,7 @@ async def test_estop_during_start_target_audit_cannot_apply_initial_targets(
     await asyncio.wait_for(stop, timeout=1.0)
 
     assert controller.phase is RoastPhase.FAULTED
+    assert execute_target_calls == 0
     assert executor.targets == []
     assert executor.heat_writes == []
     assert executor.fan_writes == []
@@ -523,7 +538,9 @@ async def test_estop_during_prefc_target_audit_cannot_apply_heat_or_fan(
     entered = asyncio.Event()
     release = asyncio.Event()
     original = snapshots.persist_evaluation
+    original_execute_targets = controller._execute_targets  # pyright: ignore[reportPrivateUsage]
     writes_recorded = 0
+    execute_target_calls = 0
 
     async def delay_command_evaluation(value: object) -> int | None:
         nonlocal writes_recorded
@@ -533,7 +550,15 @@ async def test_estop_during_prefc_target_audit_cannot_apply_heat_or_fan(
             await release.wait()
         return await original(value)  # type: ignore[arg-type]
 
+    async def observe_execute_targets(
+        value: SafetyEvaluation, *, generation: int | None = None
+    ) -> bool:
+        nonlocal execute_target_calls
+        execute_target_calls += 1
+        return await original_execute_targets(value, generation=generation)
+
     monkeypatch.setattr(snapshots, "persist_evaluation", delay_command_evaluation)
+    monkeypatch.setattr(controller, "_execute_targets", observe_execute_targets)
     generation = controller.command_generation
     applying = asyncio.create_task(
         controller._apply_deterministic_pre_fc_levers(  # pyright: ignore[reportPrivateUsage]
@@ -551,6 +576,7 @@ async def test_estop_during_prefc_target_audit_cannot_apply_heat_or_fan(
     await asyncio.wait_for(stop, timeout=1.0)
 
     assert controller.phase is RoastPhase.FAULTED
+    assert execute_target_calls == 0
     assert executor.targets == []
     assert executor.heat_writes == []
     assert executor.fan_writes == []
@@ -570,6 +596,8 @@ async def test_estop_during_tick_prefc_control_stops_later_tick_stages(
     release = asyncio.Event()
     original = snapshots.persist_evaluation
     evaluations_recorded = 0
+    original_execute_targets = controller._execute_targets  # pyright: ignore[reportPrivateUsage]
+    execute_target_calls = 0
 
     async def delay_prefc_command_evaluation(value: object) -> int | None:
         nonlocal evaluations_recorded
@@ -579,7 +607,15 @@ async def test_estop_during_tick_prefc_control_stops_later_tick_stages(
             await release.wait()
         return await original(value)  # type: ignore[arg-type]
 
+    async def observe_execute_targets(
+        value: SafetyEvaluation, *, generation: int | None = None
+    ) -> bool:
+        nonlocal execute_target_calls
+        execute_target_calls += 1
+        return await original_execute_targets(value, generation=generation)
+
     monkeypatch.setattr(snapshots, "persist_evaluation", delay_prefc_command_evaluation)
+    monkeypatch.setattr(controller, "_execute_targets", observe_execute_targets)
     tick = asyncio.create_task(controller.tick())
     await asyncio.wait_for(entered.wait(), timeout=1.0)
 
@@ -593,6 +629,7 @@ async def test_estop_during_tick_prefc_control_stops_later_tick_stages(
     await asyncio.wait_for(stop, timeout=1.0)
 
     assert controller.phase is RoastPhase.FAULTED
+    assert execute_target_calls == 0
     assert executor.targets == []
     assert executor.heat_writes == []
     assert executor.fan_writes == []

@@ -1,6 +1,7 @@
 """D213/D215 emergency-stop generation fences in post-first-crack advice."""
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import cast
 
 import pytest
@@ -117,29 +118,57 @@ async def test_estop_during_advisor_drop_audit_cannot_dispatch_drop(
     entered = asyncio.Event()
     release = asyncio.Event()
     original = harness.sink.persist_evaluation
+    original_run_routine_write = harness.controller._run_routine_write  # pyright: ignore[reportPrivateUsage]
     evaluations = 0
+    routine_write_calls = 0
 
     async def blocked_drop_evaluation(value: object) -> int | None:
         nonlocal evaluations
         evaluations += 1
         if evaluations == 2:
+            assert isinstance(value, SafetyEvaluation)
+            assert value.rule == "drop_eligibility"
+            assert value.verdict is SafetyVerdict.ALLOW
             entered.set()
             await release.wait()
         return await original(value)  # type: ignore[arg-type]
 
+    async def observe_routine_write(
+        generation: int,
+        operation: Callable[[], Awaitable[AppliedRoasterState | None]],
+        *,
+        admitted: Callable[[], bool] | None = None,
+        close_reservation: int | None = None,
+        allow_emergency_stop_transition_for_heat_off: bool = False,
+    ) -> tuple[bool, AppliedRoasterState | None]:
+        nonlocal routine_write_calls
+        routine_write_calls += 1
+        return await original_run_routine_write(
+            generation,
+            operation,
+            admitted=admitted,
+            close_reservation=close_reservation,
+            allow_emergency_stop_transition_for_heat_off=(
+                allow_emergency_stop_transition_for_heat_off
+            ),
+        )
+
     monkeypatch.setattr(harness.sink, "persist_evaluation", blocked_drop_evaluation)
+    monkeypatch.setattr(harness.controller, "_run_routine_write", observe_routine_write)
     advisory = asyncio.create_task(
         harness.controller._run_advisory(  # pyright: ignore[reportPrivateUsage]
             reading(), AdvisoryTrigger.MANUAL
         )
     )
     await asyncio.wait_for(entered.wait(), timeout=1.0)
+    routine_writes_before_stop = routine_write_calls
 
     await harness.controller.operator_emergency_stop("advisor drop-audit race")
     release.set()
     await asyncio.wait_for(advisory, timeout=1.0)
 
     assert harness.controller.phase is RoastPhase.FAULTED
+    assert routine_write_calls == routine_writes_before_stop
     assert harness.executor.commands == []
     assert _executed_commands(harness.events.events) == []
 
