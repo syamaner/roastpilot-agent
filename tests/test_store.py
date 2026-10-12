@@ -9,7 +9,7 @@ import json
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, NoReturn, cast
 from unittest import mock
 
 import aiosqlite as aiosqlite_module
@@ -208,6 +208,22 @@ async def test_process_epoch_unclean_or_upgraded_database_keeps_absent_lease_unk
         assert (await upgraded.read_fault_control_lease()).status.value == "unknown"
     finally:
         await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_corrupt_restart_clearance_row_fails_closed(tmp_store: RoastStore) -> None:
+    """A damaged persisted clearance value must never waive the fresh-process gate."""
+    await tmp_store.initialize()
+    await tmp_store.begin_process_restart_clearance("current-process")
+    await tmp_store.connection.execute("PRAGMA ignore_check_constraints = ON")
+    await tmp_store.connection.execute(
+        "UPDATE process_restart_clearance SET state = 'corrupt' WHERE process_id = ?",
+        ("current-process",),
+    )
+    await tmp_store.connection.commit()
+    await tmp_store.connection.execute("PRAGMA ignore_check_constraints = OFF")
+
+    assert (await tmp_store.read_process_restart_clearance("current-process")).value == "unknown"
 
 
 @pytest.mark.asyncio
@@ -6995,6 +7011,75 @@ async def test_atomic_fault_close_commits_lease_audit_and_live_history_together(
 
 
 @pytest.mark.asyncio
+async def test_atomic_fault_close_refuses_a_lease_for_a_missing_run(tmp_store: RoastStore) -> None:
+    """A valid OPEN lease alone cannot close when its persisted run vanished."""
+    await seeded_store(tmp_store, run_id="missing-run")
+    await tmp_store.open_fault_control_lease(
+        run_id="missing-run", mcp_session_id="exact-session", generation=40
+    )
+    await tmp_store.connection.execute("PRAGMA foreign_keys = OFF")
+    await tmp_store.connection.execute("DELETE FROM roast_runs WHERE id = ?", ("missing-run",))
+    await tmp_store.connection.commit()
+    await tmp_store.connection.execute("PRAGMA foreign_keys = ON")
+
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=40,
+        run_id="missing-run",
+        mcp_session_id="exact-session",
+        fault_reason="missing run must retain the fence",
+    )
+
+    assert not result.historically_committed
+    assert not result.confirmed
+    assert not result.run_completed
+    assert (await tmp_store.read_fault_control_lease()).status.value == "open"
+
+
+@pytest.mark.asyncio
+async def test_atomic_fault_close_retains_open_lease_when_its_compare_and_swap_loses(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zero-row lease CAS is an unconfirmed close and must retain the fence."""
+    run_id = "atomic-close-lost-cas"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.FAULTED)
+    await tmp_store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="exact-session", generation=43
+    )
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_execute: Any = connection_type._execute
+    cas_attempted = False
+
+    async def lose_the_lease_compare_and_swap(
+        connection: aiosqlite_module.Connection, function: Any, *args: Any, **kwargs: Any
+    ) -> object:
+        nonlocal cas_attempted
+        sql = args[0] if args else None
+        if (
+            connection is not tmp_store.connection
+            and isinstance(sql, str)
+            and sql.startswith("UPDATE fault_control_lease SET status")
+        ):
+            cas_attempted = True
+            return mock.Mock(rowcount=0)
+        return await original_execute(connection, function, *args, **kwargs)
+
+    monkeypatch.setattr(connection_type, "_execute", lose_the_lease_compare_and_swap)
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=43,
+        run_id=run_id,
+        mcp_session_id="exact-session",
+        fault_reason="lost lease compare and swap",
+    )
+
+    assert cas_attempted
+    assert not result.historically_committed
+    assert not result.confirmed
+    assert not result.run_completed
+    assert (await tmp_store.read_fault_control_lease()).status.value == "open"
+
+
+@pytest.mark.asyncio
 async def test_atomic_fault_close_verifies_from_independent_connection(
     tmp_store: RoastStore,
 ) -> None:
@@ -7061,6 +7146,46 @@ async def test_atomic_fault_close_commit_then_raise_leaves_auditable_durable_clo
     assert any(
         event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED for event in timeline.events
     )
+
+
+@pytest.mark.asyncio
+async def test_atomic_fault_close_keeps_result_unconfirmed_when_postcommit_proof_is_unreadable(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed close remains unavailable to the caller if independent proof cannot open."""
+    run_id = "atomic-verification-unavailable"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.FAULTED)
+    await tmp_store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="exact-session", generation=41
+    )
+    store_aiosqlite = cast("Any", store_module.aiosqlite)  # pyright: ignore[reportPrivateImportUsage]
+    original_connect = store_aiosqlite.connect
+    connect_calls = 0
+
+    async def fail_only_the_postcommit_connection(
+        *args: Any, **kwargs: Any
+    ) -> aiosqlite_module.Connection:
+        nonlocal connect_calls
+        connect_calls += 1
+        if connect_calls == 2:
+            raise OSError("synthetic postcommit verification failure")
+        return await original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(store_aiosqlite, "connect", fail_only_the_postcommit_connection)
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=41,
+        run_id=run_id,
+        mcp_session_id="exact-session",
+        fault_reason="proof must be readable",
+    )
+
+    assert connect_calls == 2
+    assert not result.historically_committed
+    assert not result.confirmed
+    assert result.verification_unavailable
+    assert result.requires_faulted_history
+    assert (await tmp_store.read_fault_control_lease()).status.value == "closed"
 
 
 @pytest.mark.asyncio
@@ -7437,6 +7562,31 @@ async def test_independent_fault_close_verification_requires_the_exact_audited_c
     assert verified.run_completed
     assert not wrong_generation.historically_committed
     assert not wrong_generation.confirmed
+
+
+@pytest.mark.asyncio
+async def test_independent_fault_close_verification_fails_closed_when_the_database_is_unreadable(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recovery retry retains the fence when it cannot obtain a fresh database proof."""
+    await tmp_store.initialize()
+
+    async def unreadable_connection(*_args: Any, **_kwargs: Any) -> NoReturn:
+        raise OSError("synthetic independent verification failure")
+
+    store_aiosqlite = cast("Any", store_module.aiosqlite)  # pyright: ignore[reportPrivateImportUsage]
+    monkeypatch.setattr(store_aiosqlite, "connect", unreadable_connection)
+    result = await tmp_store.verify_fault_control_lease_close(
+        generation=42,
+        run_id="missing-run",
+        mcp_session_id="exact-session",
+        requires_faulted_history=True,
+    )
+
+    assert not result.historically_committed
+    assert not result.confirmed
+    assert not result.run_completed
+    assert result.verification_unavailable
 
 
 @pytest.mark.asyncio
