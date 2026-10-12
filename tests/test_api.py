@@ -4227,6 +4227,44 @@ async def test_start_write_is_fenced_when_estop_arrives_after_run_row_creation(
 
 
 @pytest.mark.asyncio
+async def test_start_write_is_fenced_with_finalized_prior_runner_before_replacement(
+    store: RoastStore,
+) -> None:
+    """A prior final runner cannot hide the next Start construction window."""
+    clock = FakeClock()
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, prior_run_id = await _live_service(store, mcp=mcp, clock=clock)
+    assert service.runner is not None
+    service.runner._finalized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await store.complete_run(
+        run_id=prior_run_id,
+        outcome="completed",
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = service._begin_live_run  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    async def blocked_begin(profile: RoastProfile, run_id: str, *, lease_generation: int) -> None:
+        entered.set()
+        await release.wait()
+        await original(profile, run_id, lease_generation=lease_generation)
+
+    service._begin_live_run = blocked_begin  # type: ignore[method-assign]  # noqa: SLF001
+    commands_before = list(mcp.commands())
+    starting = asyncio.create_task(service.start_roast(_profile(name="Second run")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    stopped = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert stopped.result == "failed"
+    release.set()
+    await asyncio.wait_for(starting, timeout=1.0)
+
+    assert mcp.commands() == commands_before
+
+
+@pytest.mark.asyncio
 async def test_per_run_estop_bypasses_saturated_routine_queue(store: RoastStore) -> None:
     """A full routine queue cannot reject a per-run emergency stop."""
     clock = FakeClock()
