@@ -557,6 +557,48 @@ async def test_estop_during_prefc_target_audit_cannot_apply_heat_or_fan(
 
 
 @pytest.mark.asyncio
+async def test_estop_during_tick_prefc_control_stops_later_tick_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale pre-FC control step cannot let the enclosing tick proceed post-stop."""
+    telemetry = RoastTelemetry.model_validate({"bean_temp_c": 180.0, "env_temp_c": 200.0})
+    controller, executor, snapshots, _ = _controller(readings=[telemetry])
+    controller.load_profile(PROFILE)
+    controller.transition_to(RoastPhase.STARTING)
+    controller.transition_to(RoastPhase.PREHEATING)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = snapshots.persist_evaluation
+    evaluations_recorded = 0
+
+    async def delay_prefc_command_evaluation(value: object) -> int | None:
+        nonlocal evaluations_recorded
+        evaluations_recorded += 1
+        if evaluations_recorded == 3:
+            entered.set()
+            await release.wait()
+        return await original(value)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(snapshots, "persist_evaluation", delay_prefc_command_evaluation)
+    tick = asyncio.create_task(controller.tick())
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+    prior_generation = controller.command_generation
+    assert controller.admit_emergency_stop() == prior_generation + 1
+    stop = asyncio.create_task(
+        controller.operator_emergency_stop("prefc tick race", already_admitted=True)
+    )
+    release.set()
+    await asyncio.wait_for(tick, timeout=1.0)
+    await asyncio.wait_for(stop, timeout=1.0)
+
+    assert controller.phase is RoastPhase.FAULTED
+    assert executor.targets == []
+    assert executor.heat_writes == []
+    assert executor.fan_writes == []
+
+
+@pytest.mark.asyncio
 async def test_estop_during_mcp_first_crack_audit_cannot_publish_development(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
