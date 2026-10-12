@@ -4164,6 +4164,105 @@ async def test_fault_acknowledgement_rejects_malformed_or_disagreeing_controls()
             cast("str", SESSION_STATE_PAYLOAD["session_id"])
         )
 
+    no_device = {**_fault_control_state_payload("fault-session"), "device_state": None}
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([no_device])))
+    with pytest.raises(ValueError, match="has no device state"):
+        await adapter.read_fault_acknowledgement_state("fault-session")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("expected_session_id", "case", "error"),
+    [
+        (
+            "expected-session",
+            "different_session",
+            "does not match a fault state",
+        ),
+        (
+            "fault-session",
+            "disconnected",
+            "no connected device",
+        ),
+        (
+            "fault-session",
+            "fan_disagrees",
+            "controls disagree",
+        ),
+    ],
+)
+async def test_fault_control_state_rejects_unusable_terminal_readback(
+    expected_session_id: str,
+    case: str,
+    error: str,
+) -> None:
+    """Terminal fault control rejects mismatched, disconnected, and inconsistent reads."""
+    state = _fault_control_state_payload("fault-session")
+    device = cast("dict[str, object]", state["device_state"])
+    if case == "different_session":
+        state["session_id"] = "different-session"
+    elif case == "disconnected":
+        device["connected"] = False
+    else:
+        assert case == "fan_disagrees"
+        device["fan_level_percent"] = 0
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([state])))
+
+    with pytest.raises(ValueError, match=error):
+        await adapter.read_fault_control_state(expected_session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "error"),
+    [
+        (
+            "no_device",
+            "latest terminal fault control state is unavailable",
+        ),
+        (
+            "disconnected",
+            "latest terminal fault control state is unavailable",
+        ),
+        (
+            "heat_disagrees",
+            "latest terminal fault control controls disagree",
+        ),
+    ],
+)
+async def test_latest_fault_control_state_rejects_unusable_readback(case: str, error: str) -> None:
+    """The unscoped terminal proof also refuses absent, disconnected, or divergent state."""
+    state = _fault_control_state_payload("fault-session")
+    if case == "no_device":
+        state["device_state"] = None
+    else:
+        device = cast("dict[str, object]", state["device_state"])
+        if case == "disconnected":
+            device["connected"] = False
+        else:
+            assert case == "heat_disagrees"
+            device["heat_level_percent"] = 100
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([state])))
+
+    with pytest.raises(ValueError, match=error):
+        await adapter.read_latest_fault_control_state()
+
+
+@pytest.mark.asyncio
+async def test_latest_fault_control_state_projects_a_valid_unscoped_proof() -> None:
+    """A valid latest-state proof keeps the exact state values for the lease owner."""
+    state = _fault_control_state_payload("fault-session")
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([state])))
+
+    proof = await adapter.read_latest_fault_control_state()
+
+    assert proof.session_id == "fault-session"
+    assert proof.mcp_phase == "fault"
+    assert proof.device_connected is True
+    assert proof.heat_level_percent == 0
+    assert proof.fan_level_percent == 100
+    assert proof.cooling_on is True
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -4295,6 +4394,20 @@ async def test_write_fault_control_accepts_the_exact_command_event_kind(
         else (tool, {"expected_session_id": session_id}),
         ("get_roast_state", {"session_id": session_id}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_write_fault_control_rejects_non_terminal_action_without_a_mcp_write() -> None:
+    """Only the explicitly mapped terminal actions can reach the MCP boundary."""
+    caller = _SequenceCaller([])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    with pytest.raises(ValueError, match="unsupported terminal fault action"):
+        await adapter.write_fault_control(
+            OperatorAction.ACKNOWLEDGE_FAULT, expected_session_id="fault-session"
+        )
+
+    assert caller.calls == []
 
 
 @pytest.mark.asyncio

@@ -291,6 +291,8 @@ async def test_replay_control_refuses_live_fault_clearance_proofs_without_writes
     control = ReplayRoasterControl()
     assert isinstance(control, RecordingReplayControl)
     assert control.latest_fault_session_id is None
+    assert control.last_state is None
+    assert await control.read_telemetry() is None
 
     with pytest.raises(RuntimeError, match="session-presence proof"):
         await control.read_session_presence()
