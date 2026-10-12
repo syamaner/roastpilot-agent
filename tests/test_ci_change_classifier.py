@@ -13,7 +13,7 @@ import time
 import tomllib
 from collections import Counter
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
@@ -2514,7 +2514,17 @@ def _repository_module_candidates(module: str, filename: str, repository_root: P
     return candidates
 
 
-_DocsProxyMemo = dict[tuple[str, str, Path], frozenset[str]]
+_DocsProxyKey = tuple[str, str, Path]
+
+
+@dataclass
+class _DocsProxyMemo:
+    """Keep successful and unavailable imported-proxy batches within one audit."""
+
+    results: dict[_DocsProxyKey, frozenset[str]] = field(
+        default_factory=dict[_DocsProxyKey, frozenset[str]]
+    )
+    unavailable: set[_DocsProxyKey] = field(default_factory=set[_DocsProxyKey])
 
 
 def _memoised_proxy_docs_readers(
@@ -2544,11 +2554,82 @@ def _memoised_proxy_docs_readers(
     """
 
     key = (proxy, filename, repository_root)
-    if key in memo:
-        return memo[key]
+    if key in memo.results:
+        return memo.results[key]
     result = frozenset(_docs_reading_test_modules_in_call(proxy, filename, repository_root, memo))
-    memo[key] = result
+    memo.results[key] = result
     return result
+
+
+def _per_name_imported_function_readers(
+    source: str, name: str, filename: str, repository_root: Path, memo: _DocsProxyMemo
+) -> tuple[bool, bool]:
+    """Return direct and returned docs-reader status through the legacy probe shape."""
+
+    proxy = (
+        source
+        + "\n\ndef test_import_direct() -> None:\n"
+        + f"    {name}()\n\n"
+        + "def test_import_return() -> None:\n"
+        + f"    {name}().read_text()\n"
+    )
+    readers = _memoised_proxy_docs_readers(proxy, filename, repository_root, memo)
+    return "test_import_direct" in readers, "test_import_return" in readers
+
+
+def _batched_imported_function_readers(
+    source: str,
+    name: str,
+    function_names: tuple[str, ...],
+    filename: str,
+    repository_root: Path,
+    memo: _DocsProxyMemo,
+) -> tuple[bool, bool]:
+    """Return one imported function's reader status from a bounded batch when safe.
+
+    One imported module can expose many functions during a single audit.  The batch
+    preserves the legacy direct and returned call probes for every top-level function,
+    then lets each caller construct its own :class:`_FunctionAnalysis`.  Generated
+    probe-name collisions, a missing requested function, or a prior ambiguous batch
+    use the exact legacy probe path.  An ambiguous batch is never a negative result:
+    it is marked unavailable only for this key and retried through that legacy path.
+    """
+
+    direct_prefix = "test_import_direct__"
+    return_prefix = "test_import_return__"
+    use_legacy = direct_prefix in source or return_prefix in source or name not in function_names
+    if not use_legacy:
+        proxy = (
+            source
+            + "\n"
+            + "\n".join(
+                f"\ndef {direct_prefix}{function_name}() -> None:\n"
+                f"    {function_name}()\n\n"
+                f"def {return_prefix}{function_name}() -> None:\n"
+                f"    {function_name}().read_text()\n"
+                for function_name in function_names
+            )
+        )
+        key = (proxy, filename, repository_root)
+        if key in memo.unavailable:
+            use_legacy = True
+        else:
+            try:
+                readers = _memoised_proxy_docs_readers(proxy, filename, repository_root, memo)
+            except AssertionError:
+                memo.unavailable.add(key)
+                use_legacy = True
+            else:
+                return f"{direct_prefix}{name}" in readers, f"{return_prefix}{name}" in readers
+    legacy_proxy = (
+        source
+        + "\n\ndef test_import_direct() -> None:\n"
+        + f"    {name}()\n\n"
+        + "def test_import_return() -> None:\n"
+        + f"    {name}().read_text()\n"
+    )
+    readers = _memoised_proxy_docs_readers(legacy_proxy, filename, repository_root, memo)
+    return "test_import_direct" in readers, "test_import_return" in readers
 
 
 def _repository_imported_fixture_analyses(
@@ -2589,11 +2670,13 @@ def _repository_imported_fixture_analyses(
             pytest_module_aliases,
             ambiguous_pytest_module_aliases,
         ) = _pytest_fixture_aliases(imported_tree)
-        functions = {
-            node.name: node
+        function_nodes = [
+            node
             for node in imported_tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
+        ]
+        function_names = tuple(node.name for node in function_nodes)
+        functions = {node.name: node for node in function_nodes}
         for imported in statement.names:
             if imported.name not in functions:
                 continue
@@ -2609,19 +2692,14 @@ def _repository_imported_fixture_analyses(
             if fixture_name is None:
                 continue
             source = source_path.read_text(encoding="utf-8")
-            proxy = (
-                source
-                + "\n\ndef test_import_direct() -> None:\n"
-                + f"    {function.name}()\n\n"
-                + "def test_import_return() -> None:\n"
-                + f"    {function.name}().read_text()\n"
+            reads_directly, returns_docs = _batched_imported_function_readers(
+                source, function.name, function_names, str(source_path), repository_root, memo
             )
-            readers = _memoised_proxy_docs_readers(proxy, str(source_path), repository_root, memo)
             analysis = _FunctionAnalysis(
-                reads_directly="test_import_direct" in readers,
+                reads_directly=reads_directly,
                 calls=set(),
                 unresolved=[],
-                returns_docs="test_import_return" in readers,
+                returns_docs=returns_docs,
                 return_calls=set(),
                 return_names=set(),
                 call_result_assignments={},
@@ -2660,11 +2738,12 @@ def _repository_imported_fixture_analyses(
             pytest_module_aliases,
             ambiguous_pytest_module_aliases,
         ) = _pytest_fixture_aliases(imported_tree)
-        functions = (
+        functions = [
             node
             for node in imported_tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
+        ]
+        function_names = tuple(node.name for node in functions)
         for function in functions:
             fixture_name = _fixture_exposed_name(
                 function.name,
@@ -2676,19 +2755,14 @@ def _repository_imported_fixture_analyses(
             )
             if fixture_name is None:
                 continue
-            proxy = (
-                source
-                + "\n\ndef test_import_direct() -> None:\n"
-                + f"    {function.name}()\n\n"
-                + "def test_import_return() -> None:\n"
-                + f"    {function.name}().read_text()\n"
+            reads_directly, returns_docs = _batched_imported_function_readers(
+                source, function.name, function_names, str(source_path), repository_root, memo
             )
-            readers = _memoised_proxy_docs_readers(proxy, str(source_path), repository_root, memo)
             analysis = _FunctionAnalysis(
-                reads_directly="test_import_direct" in readers,
+                reads_directly=reads_directly,
                 calls=set(),
                 unresolved=[],
-                returns_docs="test_import_return" in readers,
+                returns_docs=returns_docs,
                 return_calls=set(),
                 return_names=set(),
                 call_result_assignments={},
@@ -2936,11 +3010,13 @@ def _repository_imported_function_analyses(
         """Expose local module members through one explicitly imported alias."""
 
         imported_tree = ast.parse(source_path.read_text(encoding="utf-8"))
-        functions = {
-            node.name: node
+        function_nodes = [
+            node
             for node in imported_tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
+        ]
+        function_names = tuple(node.name for node in function_nodes)
+        functions = {node.name: node for node in function_nodes}
         assignments = {
             target.id: node.value
             for node in imported_tree.body
@@ -2999,19 +3075,14 @@ def _repository_imported_function_analyses(
                 ambiguous_module_calls.add(key)
                 continue
             source = source_path.read_text(encoding="utf-8")
-            proxy = (
-                source
-                + "\n\ndef test_import_direct() -> None:\n"
-                + f"    {function.name}()\n\n"
-                + "def test_import_return() -> None:\n"
-                + f"    {function.name}().read_text()\n"
+            reads_directly, returns_docs = _batched_imported_function_readers(
+                source, function.name, function_names, str(source_path), repository_root, memo
             )
-            readers = _memoised_proxy_docs_readers(proxy, str(source_path), repository_root, memo)
             analyses[qualified] = _FunctionAnalysis(
-                reads_directly="test_import_direct" in readers,
+                reads_directly=reads_directly,
                 calls=set(),
                 unresolved=[],
-                returns_docs="test_import_return" in readers,
+                returns_docs=returns_docs,
                 return_calls=set(),
                 return_names=set(),
                 call_result_assignments={},
@@ -3060,11 +3131,13 @@ def _repository_imported_function_analyses(
             continue
         source_path = candidates.pop()
         imported_tree = ast.parse(source_path.read_text(encoding="utf-8"))
-        functions = {
-            node.name: node
+        function_nodes = [
+            node
             for node in imported_tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
+        ]
+        function_names = tuple(node.name for node in function_nodes)
+        functions = {node.name: node for node in function_nodes}
         assignments = {
             target.id: node.value
             for node in imported_tree.body
@@ -3149,19 +3222,14 @@ def _repository_imported_function_analyses(
                         imported_classes.add(alias)
                 continue
             source = source_path.read_text(encoding="utf-8")
-            proxy = (
-                source
-                + "\n\ndef test_import_direct() -> None:\n"
-                + f"    {imported.name}()\n\n"
-                + "def test_import_return() -> None:\n"
-                + f"    {imported.name}().read_text()\n"
+            reads_directly, returns_docs = _batched_imported_function_readers(
+                source, imported.name, function_names, str(source_path), repository_root, memo
             )
-            readers = _memoised_proxy_docs_readers(proxy, str(source_path), repository_root, memo)
             analyses[alias] = _FunctionAnalysis(
-                reads_directly="test_import_direct" in readers,
+                reads_directly=reads_directly,
                 calls=set(),
                 unresolved=[],
-                returns_docs="test_import_return" in readers,
+                returns_docs=returns_docs,
                 return_calls=set(),
                 return_names=set(),
                 call_result_assignments={},
@@ -3296,6 +3364,22 @@ def _local_helpers(func: _FunctionNode) -> tuple[dict[str, _FunctionNode], set[s
     }
     ambiguous = (set(definitions) - set(helpers)) | (assigned & set(definitions))
     return helpers, ambiguous
+
+
+def _conditional_assignments(func: _FunctionNode) -> list[ast.Assign | ast.AnnAssign]:
+    """Return each assignment nested under an ``if`` anywhere in one function tree."""
+
+    assignments: list[ast.Assign | ast.AnnAssign] = []
+    pending: list[tuple[ast.AST, bool]] = [(func, False)]
+    while pending:
+        node, inside_if = pending.pop()
+        nested_in_if = inside_if or isinstance(node, ast.If)
+        if nested_in_if and isinstance(node, (ast.Assign, ast.AnnAssign)):
+            assignments.append(node)
+        pending.extend(
+            (child, nested_in_if) for child in reversed(list(ast.iter_child_nodes(node)))
+        )
+    return assignments
 
 
 def _analyse_function(
@@ -3460,12 +3544,11 @@ def _analyse_function(
     walk_files_aliases: set[str] = set()
     walk_name_aliases: set[str] = set()
     os_file_descriptors: dict[str, str] = {}
+    conditional_assignments = _conditional_assignments(func)
     control_flow_docs_aliases = {
         target.id
-        for conditional in ast.walk(func)
-        if isinstance(conditional, ast.If)
-        for assignment in ast.walk(conditional)
-        if isinstance(assignment, (ast.Assign, ast.AnnAssign)) and assignment.value is not None
+        for assignment in conditional_assignments
+        if assignment.value is not None
         for target in (
             assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
         )
@@ -3473,10 +3556,8 @@ def _analyse_function(
     }
     control_flow_subprocess_command_aliases = {
         target.id
-        for conditional in ast.walk(func)
-        if isinstance(conditional, ast.If)
-        for assignment in ast.walk(conditional)
-        if isinstance(assignment, (ast.Assign, ast.AnnAssign)) and assignment.value is not None
+        for assignment in conditional_assignments
+        if assignment.value is not None
         for target in (
             assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
         )
@@ -3484,11 +3565,8 @@ def _analyse_function(
     }
     control_flow_reader_aliases = {
         target.id
-        for conditional in ast.walk(func)
-        if isinstance(conditional, ast.If)
-        for assignment in ast.walk(conditional)
-        if isinstance(assignment, (ast.Assign, ast.AnnAssign))
-        and isinstance(assignment.value, ast.Attribute)
+        for assignment in conditional_assignments
+        if isinstance(assignment.value, ast.Attribute)
         and assignment.value.attr in _READ_METHOD_NAMES
         and _expression_is_docs_markdown(assignment.value.value, set())
         for target in (
@@ -3497,39 +3575,31 @@ def _analyse_function(
         if isinstance(target, ast.Name)
     }
     conditional_open_alias_states: dict[str, set[str]] = {}
-    for conditional in ast.walk(func):
-        if not isinstance(conditional, ast.If):
+    for assignment in conditional_assignments:
+        if assignment.value is None:
             continue
-        for assignment in ast.walk(conditional):
-            if not isinstance(assignment, (ast.Assign, ast.AnnAssign)) or assignment.value is None:
-                continue
-            targets = (
-                assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+        targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+        state = (
+            "builtin"
+            if (
+                isinstance(assignment.value, ast.Name)
+                and assignment.value.id in (builtin_open_import_aliases or set()) | {"open"}
             )
-            state = (
-                "builtin"
-                if (
-                    isinstance(assignment.value, ast.Name)
-                    and assignment.value.id in (builtin_open_import_aliases or set()) | {"open"}
-                )
-                or (
-                    isinstance(assignment.value, ast.Attribute)
-                    and assignment.value.attr == "open"
-                    and isinstance(assignment.value.value, ast.Name)
-                    and assignment.value.value.id == "builtins"
-                )
-                else "other"
+            or (
+                isinstance(assignment.value, ast.Attribute)
+                and assignment.value.attr == "open"
+                and isinstance(assignment.value.value, ast.Name)
+                and assignment.value.value.id == "builtins"
             )
-            for target in targets:
-                if isinstance(target, ast.Name):
-                    conditional_open_alias_states.setdefault(target.id, set()).add(state)
+            else "other"
+        )
+        for target in targets:
+            if isinstance(target, ast.Name):
+                conditional_open_alias_states.setdefault(target.id, set()).add(state)
     control_flow_imported_class_instances = {
         target.id
-        for conditional in ast.walk(func)
-        if isinstance(conditional, ast.If)
-        for assignment in ast.walk(conditional)
-        if isinstance(assignment, (ast.Assign, ast.AnnAssign))
-        and isinstance(assignment.value, ast.Call)
+        for assignment in conditional_assignments
+        if isinstance(assignment.value, ast.Call)
         and isinstance(assignment.value.func, ast.Name)
         and assignment.value.func.id in (imported_classes or set())
         for target in (
@@ -5011,7 +5081,7 @@ def _docs_reading_test_modules(
             silently under- or over-marking.
     """
 
-    return _docs_reading_test_modules_in_call(source, filename, repository_root, {})
+    return _docs_reading_test_modules_in_call(source, filename, repository_root, _DocsProxyMemo())
 
 
 def _docs_reading_test_modules_with_memo(
@@ -6215,7 +6285,7 @@ def _conftest_paths(tests_root: Path) -> list[Path]:
 def _assert_conftests_docs_free(tests_root: Path, memo: _DocsProxyMemo | None = None) -> None:
     """Reject conftest provenance that can hide docs reads from test markers."""
 
-    audit_memo = {} if memo is None else memo
+    audit_memo = _DocsProxyMemo() if memo is None else memo
     for path in _conftest_paths(tests_root):
         relative_path = (
             path.relative_to(_REPO).as_posix() if path.is_relative_to(_REPO) else str(path)
@@ -6261,7 +6331,7 @@ def test_docs_governance_repository_audit_memo_matches_fresh_module_analyses(
     conftest_probe = (
         "from shared import read_docs\n\ndef test_conftest_probe():\n    assert read_docs()\n"
     )
-    memo: _DocsProxyMemo = {}
+    memo = _DocsProxyMemo()
     assert _docs_reading_test_modules_with_memo(top, "tests/test_top.py", tmp_path, memo) == {
         "test_top"
     }
@@ -6303,12 +6373,332 @@ def test_docs_governance_repository_audit_memo_matches_fresh_module_analyses(
 def test_docs_governance_repository_audit_memo_never_caches_exceptions(tmp_path: Path) -> None:
     """A failed imported proxy remains a failure for the next audit consumer."""
 
-    memo: _DocsProxyMemo = {}
+    memo = _DocsProxyMemo()
     failing_proxy = "def broken(:\n"
     for filename in ("tests/test_first.py", "tests/test_second.py"):
         with pytest.raises(SyntaxError):
             _memoised_proxy_docs_readers(failing_proxy, filename, tmp_path, memo)
-    assert memo == {}
+    assert memo.results == {}
+    assert memo.unavailable == set()
+
+
+def _legacy_conditional_assignment_ids_for_test(func: _FunctionNode) -> set[int]:
+    """Return the previous nested-walk union for traversal-equivalence tests only."""
+
+    return {
+        id(assignment)
+        for conditional in ast.walk(func)
+        if isinstance(conditional, ast.If)
+        for assignment in ast.walk(conditional)
+        if isinstance(assignment, (ast.Assign, ast.AnnAssign))
+    }
+
+
+@pytest.mark.docs_ci
+def test_conditional_assignments_match_the_old_nested_walk_union() -> None:
+    """One traversal preserves every nested conditional assignment identity."""
+
+    synthetic = ast.parse(
+        "def outer(flag, value):\n"
+        "    if flag:\n"
+        "        direct = 1\n"
+        "    elif value:\n"
+        "        annotated: int = 2\n"
+        "    else:\n"
+        "        def nested():\n"
+        "            if flag:\n"
+        "                nested_assignment = 3\n"
+        "            return lambda: nested_assignment\n"
+        "        class Inner:\n"
+        "            if flag:\n"
+        "                class_assignment = 4\n"
+        "        for item in value:\n"
+        "            if item:\n"
+        "                loop_assignment = item\n"
+        "        try:\n"
+        "            if flag:\n"
+        "                try_assignment = 5\n"
+        "        finally:\n"
+        "            pass\n"
+        "        match value:\n"
+        "            case _ if flag:\n"
+        "                match_assignment = 6\n"
+    )
+    whole_module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    for tree in (synthetic, whole_module):
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                assert {id(assignment) for assignment in _conditional_assignments(node)} == (
+                    _legacy_conditional_assignment_ids_for_test(node)
+                )
+
+
+@pytest.mark.docs_ci
+def test_batched_imported_function_probes_match_legacy_per_name_results(tmp_path: Path) -> None:
+    """One module batch preserves direct and returned reader answers for every name."""
+
+    (tmp_path / "leaf.py").write_text(
+        "from pathlib import Path\n\ndef leaf():\n    return Path('docs/leaf.md').read_text()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "from pathlib import Path\nimport pytest\nfrom leaf import leaf\n\n"
+        "def decorator(function):\n    return function\n\n"
+        "def docs_direct():\n    return Path('docs/direct.md').read_text()\n\n"
+        "def docs_return():\n    return Path('docs/return.md')\n\n"
+        "def non_docs():\n    return Path('config/plain.md').read_text()\n\n"
+        "def chain():\n    return leaf()\n\n"
+        "@decorator\ndef decorated():\n    return Path('docs/decorated.md').read_text()\n\n"
+        "@pytest.fixture\ndef fixture_reader():\n    return Path('docs/fixture.md').read_text()\n\n"
+        "async def async_reader():\n    return Path('docs/async.md')\n\n"
+        "def duplicate():\n    return Path('config/old.md').read_text()\n\n"
+        "def duplicate():\n    return Path('docs/new.md').read_text()\n"
+    )
+    filename = str(tmp_path / "imported.py")
+    function_names = tuple(
+        node.name
+        for node in ast.parse(source).body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
+    batched_memo = _DocsProxyMemo()
+    batch_answers = {}
+    for name in function_names:
+        batch_answers[name] = _batched_imported_function_readers(
+            source, name, function_names, filename, tmp_path, batched_memo
+        )
+        assert batch_answers[name] == _per_name_imported_function_readers(
+            source, name, filename, tmp_path, _DocsProxyMemo()
+        )
+    assert batched_memo.unavailable == set()
+    assert any(
+        "def test_import_direct__docs_direct" in proxy for proxy, _, _ in batched_memo.results
+    )
+    assert batch_answers["chain"] == (True, True)
+    assert batch_answers["decorated"] == (True, True)
+    assert batch_answers["duplicate"] == (True, True)
+    assert batch_answers["non_docs"] == (False, False)
+    docs_direct = _batched_imported_function_readers(
+        source, "docs_direct", function_names, filename, tmp_path, batched_memo
+    )
+    docs_return = _batched_imported_function_readers(
+        source, "docs_return", function_names, filename, tmp_path, batched_memo
+    )
+    assert docs_direct[0]
+    assert docs_return[1]
+    importer = (
+        "from imported import chain, docs_direct, docs_return\n\n"
+        "def test_chain():\n    assert chain()\n\n"
+        "def test_direct():\n    assert docs_direct()\n\n"
+        "def test_returned():\n    docs_return().read_text()\n"
+    )
+    (tmp_path / "imported.py").write_text(source, encoding="utf-8")
+    assert _docs_reading_test_modules(importer, "tests/test_imported.py", tmp_path) == {
+        "test_chain",
+        "test_direct",
+        "test_returned",
+    }
+
+
+@pytest.mark.docs_ci
+def test_batched_imported_function_fallback_is_unavailable_but_never_negative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A depth-limited batch retries each importer through the legacy probe once."""
+
+    depth = _MAX_DOCS_CALL_GRAPH_DEPTH + 1
+    source = (
+        "from pathlib import Path\n\n"
+        "def docs_reader():\n    return Path('docs/reader.md').read_text()\n\n"
+        "def non_reader():\n    return Path('config/plain.md').read_text()\n\n"
+        + "\n\n".join(
+            f"def deep_{index}():\n    return deep_{index + 1}()" for index in range(depth)
+        )
+        + f"\n\ndef deep_{depth}():\n    return Path('docs/deep.md').read_text()\n"
+    )
+    (tmp_path / "helpers.py").write_text(source, encoding="utf-8")
+    function_names = tuple(
+        node.name
+        for node in ast.parse(source).body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
+    batch_attempts = 0
+    original = _memoised_proxy_docs_readers
+
+    def counting(
+        proxy: str, filename: str, repository_root: Path, memo: _DocsProxyMemo
+    ) -> frozenset[str]:
+        nonlocal batch_attempts
+        if "def test_import_direct__docs_reader" in proxy:
+            batch_attempts += 1
+        return original(proxy, filename, repository_root, memo)
+
+    monkeypatch.setattr(sys.modules[__name__], "_memoised_proxy_docs_readers", counting)
+    memo = _DocsProxyMemo()
+    first = "from helpers import docs_reader\n\ndef test_docs():\n    assert docs_reader()\n"
+    second = "from helpers import non_reader\n\ndef test_config():\n    assert non_reader()\n"
+    assert _docs_reading_test_modules_with_memo(first, "tests/test_first.py", tmp_path, memo) == {
+        "test_docs"
+    }
+    assert (
+        _docs_reading_test_modules_with_memo(second, "tests/test_second.py", tmp_path, memo)
+        == set()
+    )
+    assert batch_attempts == 1
+    assert len(memo.unavailable) == 1
+    assert memo.results
+    assert _batched_imported_function_readers(
+        source, "docs_reader", function_names, str(tmp_path / "helpers.py"), tmp_path, memo
+    ) == _per_name_imported_function_readers(
+        source, "docs_reader", str(tmp_path / "helpers.py"), tmp_path, _DocsProxyMemo()
+    )
+
+
+@pytest.mark.docs_ci
+def test_batched_imported_function_guards_use_the_legacy_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generated-name collisions and unknown functions cannot create a batch proxy."""
+
+    proxies: list[str] = []
+    original = _memoised_proxy_docs_readers
+
+    def capture(
+        proxy: str, filename: str, repository_root: Path, memo: _DocsProxyMemo
+    ) -> frozenset[str]:
+        proxies.append(proxy)
+        return original(proxy, filename, repository_root, memo)
+
+    monkeypatch.setattr(sys.modules[__name__], "_memoised_proxy_docs_readers", capture)
+    memo = _DocsProxyMemo()
+    collision = "def test_import_direct__reserved():\n    pass\n\ndef reader():\n    pass\n"
+    assert _batched_imported_function_readers(
+        collision,
+        "reader",
+        ("test_import_direct__reserved", "reader"),
+        "collision.py",
+        tmp_path,
+        memo,
+    ) == (False, False)
+    assert _batched_imported_function_readers(
+        "def reader():\n    pass\n", "missing", ("reader",), "unknown.py", tmp_path, memo
+    ) == (False, False)
+    assert all("def test_import_direct__reader" not in proxy for proxy in proxies)
+    assert len(proxies) == 2
+    assert len(memo.results) == 2
+    assert memo.unavailable == set()
+
+
+@pytest.mark.docs_ci
+def test_batched_imported_function_propagates_non_assertion_failures_without_memo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unexpected batch failures retain neither a result nor an unavailable marker."""
+
+    def fail(
+        proxy: str, filename: str, repository_root: Path, memo: _DocsProxyMemo
+    ) -> frozenset[str]:
+        raise RuntimeError("unexpected proxy failure")
+
+    monkeypatch.setattr(sys.modules[__name__], "_memoised_proxy_docs_readers", fail)
+    memo = _DocsProxyMemo()
+    with pytest.raises(RuntimeError, match="unexpected proxy failure"):
+        _batched_imported_function_readers(
+            "def reader():\n    pass\n",
+            "reader",
+            ("reader",),
+            "helpers.py",
+            tmp_path,
+            memo,
+        )
+    assert memo.results == {}
+    assert memo.unavailable == set()
+
+
+@pytest.mark.docs_ci
+def test_batched_unavailable_markers_keep_importer_and_root_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unavailable batch never suppresses a separately resolved importer batch."""
+
+    depth = _MAX_DOCS_CALL_GRAPH_DEPTH + 1
+    source = (
+        "def safe():\n    return 'config'\n\n"
+        + "\n\n".join(
+            f"def deep_{index}():\n    return deep_{index + 1}()" for index in range(depth)
+        )
+        + f"\n\ndef deep_{depth}():\n    return 'docs/deep.md'\n"
+    )
+    names = ("safe",) + tuple(f"deep_{index}" for index in range(depth + 1))
+    batch_attempts = 0
+    original = _memoised_proxy_docs_readers
+
+    def counting(
+        proxy: str, filename: str, repository_root: Path, memo: _DocsProxyMemo
+    ) -> frozenset[str]:
+        nonlocal batch_attempts
+        if "def test_import_direct__safe" in proxy:
+            batch_attempts += 1
+        return original(proxy, filename, repository_root, memo)
+
+    monkeypatch.setattr(sys.modules[__name__], "_memoised_proxy_docs_readers", counting)
+    memo = _DocsProxyMemo()
+    for filename, root in (
+        ("tests/test_first.py", tmp_path / "shared"),
+        ("tests/test_second.py", tmp_path / "shared"),
+        ("tests/test_shared.py", tmp_path / "first"),
+        ("tests/test_shared.py", tmp_path / "second"),
+    ):
+        assert _batched_imported_function_readers(source, "safe", names, filename, root, memo) == (
+            False,
+            False,
+        )
+    assert batch_attempts == 4
+    assert len(memo.unavailable) == 4
+
+
+@pytest.mark.docs_ci
+def test_batched_imported_function_memo_observes_edits_and_resolution_boundaries(
+    tmp_path: Path,
+) -> None:
+    """Batch keys retain source, imported-module filename, and repository-root provenance."""
+
+    memo = _DocsProxyMemo()
+    docs_source = (
+        "from pathlib import Path\n\ndef reader():\n    return Path('docs/x.md').read_text()\n"
+    )
+    config_source = docs_source.replace("docs/x.md", "config/x.md")
+    names = ("reader",)
+    docs_answer = _batched_imported_function_readers(
+        docs_source, "reader", names, "helpers.py", tmp_path, memo
+    )
+    assert _batched_imported_function_readers(
+        config_source, "reader", names, "helpers.py", tmp_path, memo
+    ) == (False, False)
+    helper_source = "from leaf import leaf\n\ndef reader():\n    return leaf()\n"
+    for root_name, leaf_source in (("docs", docs_source), ("config", config_source)):
+        root = tmp_path / root_name
+        root.mkdir()
+        (root / "leaf.py").write_text(leaf_source.replace("reader", "leaf"), encoding="utf-8")
+        (root / "helpers.py").write_text(helper_source, encoding="utf-8")
+    root_docs_answer = _batched_imported_function_readers(
+        helper_source,
+        "reader",
+        names,
+        str(tmp_path / "docs" / "helpers.py"),
+        tmp_path / "docs",
+        memo,
+    )
+    root_config_answer = _batched_imported_function_readers(
+        helper_source,
+        "reader",
+        names,
+        str(tmp_path / "config" / "helpers.py"),
+        tmp_path / "config",
+        memo,
+    )
+    assert docs_answer[0]
+    assert root_docs_answer[0]
+    assert root_config_answer == (False, False)
 
 
 @pytest.mark.docs_ci
@@ -6316,7 +6706,7 @@ def test_docs_reading_tests_carry_the_exact_docs_marker_and_nothing_else() -> No
     """Every committed-Markdown reader is marked at the exact function, module-wide."""
 
     markdown_readers: dict[Path, set[str]] = {}
-    audit_memo: _DocsProxyMemo = {}
+    audit_memo = _DocsProxyMemo()
     _assert_conftests_docs_free(_REPO / "tests", audit_memo)
     for path in _test_module_paths(_REPO / "tests"):
         relative_path = path.relative_to(_REPO).as_posix()
@@ -6623,7 +7013,7 @@ def test_docs_governance_proxy_memo_bounds_branching_chain_work(
     }
     assert dict(counts) == {
         "<module>": 1,
-        **{str(tmp_path / f"m{level}.py"): 2 for level in range(4)},
+        **{str(tmp_path / f"m{level}.py"): 1 for level in range(4)},
     }
 
 
@@ -6670,7 +7060,7 @@ def test_docs_governance_proxy_memo_is_fresh_per_top_level_call(
             }
         assert dict(counts) == {
             "<module>": 2,
-            **{str(tmp_path / f"m{level}.py"): 4 for level in range(4)},
+            **{str(tmp_path / f"m{level}.py"): 2 for level in range(4)},
         }
         return
     fan_in_paths = [str(tmp_path / f"{name}.py") for name in ("mid_a", "mid_b", "leaf")]
