@@ -559,7 +559,8 @@ async def test_global_estop_rejects_completed_pointer_without_lease_or_start_fen
     assert result.result == "failed"
     assert result.reason == (
         "no live controller or exact-session fault lease is available for a software "
-        "e-stop attempt; use the independent physical stop"
+        "e-stop attempt; any earlier pending roast start was revoked; use the independent "
+        "physical stop"
     )
     assert service._command_arbiter.generation == generation_before  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
