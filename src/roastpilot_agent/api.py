@@ -2339,6 +2339,11 @@ class RoastService:
         # Keep that short window explicit so an e-stop can synchronously fence
         # the pending Start write without treating historical pointers as live.
         self._starting_run_id: str | None = None
+        # A run row can commit before ``create_run`` returns and before this
+        # process publishes it as ``active_run_id``. Keep that exact local
+        # identity so a matching per-run e-stop can revoke the unpublished
+        # Start synchronously instead of entering the routine queue.
+        self._unpublished_start_run_id: str | None = None
         # A global e-stop with no live/exact-session target must still stop a
         # Start that is preparing or waiting for the start lock.  This is
         # process-only admission state: it deliberately does not mint or alter
@@ -3846,6 +3851,13 @@ class RoastService:
         if self._start_admission_generation != admission_generation:
             raise RoastRunConflictError("roast start was superseded by an emergency-stop attempt")
 
+    def _revoke_unpublished_start_for_emergency_stop(self, run_id: str) -> bool:
+        """Revoke the exact locally-owned unpublished Start, if one exists."""
+        if self._unpublished_start_run_id != run_id:
+            return False
+        self._invalidate_pending_start_admissions_for_emergency_stop()
+        return True
+
     async def _retire_never_dispatched_start(self, run_id: str) -> None:
         """Terminally retire a row created after its Start admission was revoked.
 
@@ -4043,15 +4055,27 @@ class RoastService:
             # must always return to the process-current, apply-next-roast config.
             self._safety = SafetyPolicy(self._config.safety)
             run_id = uuid.uuid4().hex
-            await self._store.create_run(
-                run_id=run_id,
-                profile=profile,
-                config=self._config,
-                agent_phase=RoastPhase.STARTING,
-            )
+            self._unpublished_start_run_id = run_id
+            try:
+                await self._store.create_run(
+                    run_id=run_id,
+                    profile=profile,
+                    config=self._config,
+                    agent_phase=RoastPhase.STARTING,
+                )
+            except BaseException:
+                if self._unpublished_start_run_id == run_id:
+                    self._unpublished_start_run_id = None
+                raise
             if self._start_admission_generation != admission_generation:
-                await self._retire_never_dispatched_start(run_id)
+                try:
+                    await self._retire_never_dispatched_start(run_id)
+                finally:
+                    if self._unpublished_start_run_id == run_id:
+                        self._unpublished_start_run_id = None
                 self._require_current_start_admission(admission_generation)
+            if self._unpublished_start_run_id == run_id:
+                self._unpublished_start_run_id = None
             self.active_run_id = run_id
             self._starting_run_id = run_id
         try:
@@ -5392,6 +5416,23 @@ class RoastService:
         physically-running machine.
         """
         if request.action is OperatorAction.EMERGENCY_STOP:
+            if self._revoke_unpublished_start_for_emergency_stop(run_id):
+                # The exact row is already visible, but this process has not
+                # published a controller or session. Revoke first, then audit
+                # the accepted cancellation without leasing or queueing an
+                # unconfirmable hardware stop.
+                await self._store.record_operator_action(
+                    action=request.action.value,
+                    result="accepted",
+                    run_id=run_id,
+                    payload=request.payload,
+                )
+                return OperatorActionResult(
+                    action=request.action,
+                    result="accepted",
+                    reason="emergency_stop accepted: pending roast start was revoked",
+                    queued=False,
+                )
             runner = self.runner
             if self.active_run_id == run_id:
                 if runner is not None and not getattr(runner, "finalized", False):

@@ -4487,6 +4487,171 @@ async def test_global_estop_retires_a_never_dispatched_run_created_during_admiss
 
 
 @pytest.mark.asyncio
+async def test_exact_pending_run_estop_revokes_create_in_flight_without_queueing(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact persisted-but-unpublished run is fenced before Start writes."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    created_run_id: str | None = None
+    original_create_run = store.create_run
+
+    async def create_then_block(**kwargs: Any) -> None:
+        nonlocal created_run_id
+        run_id = cast(str, kwargs["run_id"])
+        await original_create_run(**kwargs)
+        if created_run_id is None:
+            created_run_id = run_id
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr(store, "create_run", create_then_block)
+    starting = asyncio.create_task(service.start_roast(_profile(name="Exact pending stop")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    assert created_run_id is not None
+
+    stopped = await service.submit_operator_action(
+        created_run_id,
+        OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "stop"}),
+    )
+    assert stopped.result == "accepted"
+    assert stopped.queued is False
+    assert service.operator_queue.empty()
+    assert service._fault_lease_cache.status is FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._command_arbiter.generation == 0  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert mcp.commands() == []
+
+    release.set()
+    with pytest.raises(RoastRunConflictError, match="superseded by an emergency-stop"):
+        await asyncio.wait_for(starting, timeout=1.0)
+    retired = await store.read_run(created_run_id)
+    assert retired is not None
+    assert retired.outcome == "aborted"
+    assert retired.agent_phase is RoastPhase.STARTING
+    assert retired.completed_at_utc is not None
+    assert service.active_run_id is None
+    assert service._unpublished_start_run_id is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert mcp.commands() == []
+
+    fresh = await service.start_roast(_profile(name="Fresh after exact pending stop"))
+    assert fresh.id != created_run_id
+    assert "start_session" in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_unrelated_estop_cannot_revoke_create_in_flight_start(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown run ID retains the existing per-run rejection behaviour."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_create_run = store.create_run
+
+    async def create_then_block(**kwargs: Any) -> None:
+        await original_create_run(**kwargs)
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(store, "create_run", create_then_block)
+    starting = asyncio.create_task(service.start_roast(_profile(name="Unrelated stop")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+    with pytest.raises(RoastRunNotFoundError):
+        await service.submit_operator_action(
+            "unrelated-run",
+            OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "stop"}),
+        )
+    assert service._unpublished_start_run_id is not None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert mcp.commands() == []
+
+    release.set()
+    detail = await asyncio.wait_for(starting, timeout=1.0)
+    assert detail.id
+    assert "start_session" in mcp.commands()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audit_outcome", ["cancelled", "failed"])
+async def test_pending_start_revocation_survives_estop_audit_interruption(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    audit_outcome: Literal["cancelled", "failed"],
+) -> None:
+    """E-stop audit cancellation or failure cannot revive an unpublished Start."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    start_entered = asyncio.Event()
+    release_start = asyncio.Event()
+    audit_entered = asyncio.Event()
+    release_audit = asyncio.Event()
+    created_run_id: str | None = None
+    original_create_run = store.create_run
+
+    async def create_then_block(**kwargs: Any) -> None:
+        nonlocal created_run_id
+        created_run_id = cast(str, kwargs["run_id"])
+        await original_create_run(**kwargs)
+        start_entered.set()
+        await release_start.wait()
+
+    async def blocked_audit(**kwargs: Any) -> None:
+        audit_entered.set()
+        await release_audit.wait()
+        if audit_outcome == "failed":
+            raise RuntimeError("synthetic audit failure")
+
+    monkeypatch.setattr(store, "create_run", create_then_block)
+    monkeypatch.setattr(store, "record_operator_action", blocked_audit)
+    starting = asyncio.create_task(service.start_roast(_profile(name="Interrupted e-stop audit")))
+    await asyncio.wait_for(start_entered.wait(), timeout=1.0)
+    assert created_run_id is not None
+    stopping = asyncio.create_task(
+        service.submit_operator_action(
+            created_run_id,
+            OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "stop"}),
+        )
+    )
+    await asyncio.wait_for(audit_entered.wait(), timeout=1.0)
+    if audit_outcome == "cancelled":
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+    else:
+        release_audit.set()
+        with pytest.raises(RuntimeError, match="synthetic audit failure"):
+            await stopping
+
+    release_start.set()
+    with pytest.raises(RoastRunConflictError, match="superseded by an emergency-stop"):
+        await asyncio.wait_for(starting, timeout=1.0)
+    retired = await store.read_run(created_run_id)
+    assert retired is not None and retired.outcome == "aborted"
+    assert service._unpublished_start_run_id is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert mcp.commands() == []
+
+
+@pytest.mark.asyncio
 async def test_per_run_estop_bypasses_saturated_routine_queue(store: RoastStore) -> None:
     """A full routine queue cannot reject a per-run emergency stop."""
     clock = FakeClock()
