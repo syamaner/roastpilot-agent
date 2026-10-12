@@ -16,9 +16,11 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+from io import FileIO, TextIOWrapper
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -769,11 +771,28 @@ def _assert_installer_recorder_uses_complete_write() -> None:
 def _wait_for_framing_writer(process: subprocess.Popen[str]) -> None:
     """Wait a bounded time for a framing writer's deterministic rendezvous."""
     assert process.stdout is not None
-    with selectors.DefaultSelector() as selector:
-        selector.register(process.stdout, selectors.EVENT_READ)
-        ready = selector.select(timeout=2.0)
-    assert ready, "framing writer did not reach its bounded rendezvous"
-    assert process.stdout.readline() == "ready\n", "framing writer rendezvous was malformed"
+    stdout = cast(TextIOWrapper, process.stdout)
+    raw_stdout = FileIO(stdout.fileno(), "rb", closefd=False)
+    selector = selectors.DefaultSelector()
+    rendezvous = bytearray()
+    deadline = time.monotonic() + 2.0
+    try:
+        selector.register(stdout, selectors.EVENT_READ)
+        while b"\n" not in rendezvous:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if not selector.select(timeout=remaining):
+                break
+            chunk = raw_stdout.read(1)
+            if not chunk:
+                break
+            rendezvous.extend(chunk)
+    finally:
+        selector.close()
+        raw_stdout.close()
+    assert rendezvous, "framing writer did not reach its bounded rendezvous"
+    assert bytes(rendezvous) == b"ready\n", "framing writer rendezvous was malformed"
 
 
 def _forced_framing_log(tmp_path: Path, fake_script: Path, *, historical: bool) -> str:
@@ -933,6 +952,20 @@ def test_fake_log_grammar_fails_closed_for_forced_concurrency(
     finally:
         if process.stdin is not None and not process.stdin.closed:
             process.stdin.close()
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=2.0)
+
+    process = subprocess.Popen(
+        ["bash", "-c", "printf ready; sleep 3"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        with pytest.raises(AssertionError, match="rendezvous was malformed"):
+            _wait_for_framing_writer(process)
+    finally:
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=2.0)

@@ -93,6 +93,7 @@ import {
   useUpdateBeanProfile,
 } from "@/hooks/queries";
 import { api } from "@/lib/api";
+import { isCoherentFaultControls, isCoherentRestartClearance } from "@/lib/faultControls";
 import type {
   BeanProfileInput,
   HardwareClearAcknowledgementRequest,
@@ -102,6 +103,9 @@ import type {
 import type { LiveNavigationState } from "@/pages/live/LivePage";
 
 import { StartRoastForm } from "@/pages/dashboard/StartRoastForm";
+import { RestartClearanceCard } from "./RestartClearanceCard";
+import { TerminalFaultControls } from "./TerminalFaultControls";
+import { UnknownStatusEmergencyStop } from "./UnknownStatusEmergencyStop";
 
 interface HardwareClearAcknowledgementCardProps {
   incidentId: string;
@@ -296,6 +300,58 @@ function HardwareClearStatusIncomplete(): React.JSX.Element {
           page or perform a controlled agent restart after physically verifying the roaster is
           inactive.
         </p>
+      </div>
+    </AppFrame>
+  );
+}
+
+/** Fail closed when the fresh Agent process does not provide a coherent D213 gate. */
+function RestartClearanceStatusIncomplete(): React.JSX.Element {
+  return (
+    <AppFrame
+      headerRight={
+        <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+          Start blocked
+        </span>
+      }
+    >
+      <div
+        className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-fault/50 bg-roast-fault/10 p-8 text-center"
+        data-testid="restart-clearance-status-unknown"
+      >
+        <h2 className="text-lg font-bold uppercase tracking-wide">Restart clearance status unknown</h2>
+        <p className="text-sm text-muted-foreground">
+          RoastPilot cannot confirm this Agent process has a valid restart clearance. Starting
+          remains blocked. If the Hottop may be active, use the independent physical emergency
+          stop and reload to obtain current status.
+        </p>
+        <UnknownStatusEmergencyStop testIdPrefix="start-restart-clearance-emergency-stop" />
+      </div>
+    </AppFrame>
+  );
+}
+
+/** Fail closed when the public D212 lease projection is missing or incoherent. */
+function FaultControlsStatusIncomplete(): React.JSX.Element {
+  return (
+    <AppFrame
+      headerRight={
+        <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+          Start blocked
+        </span>
+      }
+    >
+      <div
+        className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-fault/50 bg-roast-fault/10 p-8 text-center"
+        data-testid="fault-controls-status-unknown"
+      >
+        <h2 className="text-lg font-bold uppercase tracking-wide">Fault control status unknown</h2>
+        <p className="text-sm text-muted-foreground">
+          RoastPilot cannot confirm the current fault-control lease. Starting remains blocked. If
+          the Hottop may be active, use the independent physical emergency stop and reload to
+          obtain current status.
+        </p>
+          <UnknownStatusEmergencyStop testIdPrefix="start-fault-controls-emergency-stop" />
       </div>
     </AppFrame>
   );
@@ -534,6 +590,68 @@ export function StartRoastView(): React.JSX.Element {
     );
   }
 
+  // Terminal controls and the restart gate are both direct server projections.
+  // An open lease remains reachable even when the route also sees an active
+  // run, so the independent e-stop is never hidden behind a navigation link.
+  const faultControls = health.isSuccess ? health.data.fault_controls : undefined;
+  const coherentFaultControls = isCoherentFaultControls(faultControls) ? faultControls : null;
+  const restartClearance = health.isSuccess ? health.data.restart_clearance : undefined;
+  const coherentRestartClearance = isCoherentRestartClearance(restartClearance)
+    ? restartClearance
+    : null;
+  const restartClearanceRequired = coherentRestartClearance?.state === "required";
+  const routineControlsDisabled =
+    coherentRestartClearance?.state !== "cleared";
+
+  if (health.isSuccess && coherentFaultControls === null) {
+    return <FaultControlsStatusIncomplete />;
+  }
+  if (health.isSuccess && coherentRestartClearance === null) {
+    return <RestartClearanceStatusIncomplete />;
+  }
+  if (health.isSuccess && coherentFaultControls !== null && coherentFaultControls.status !== "closed") {
+    return (
+      <AppFrame
+        headerRight={
+          <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+            Fault controls
+          </span>
+        }
+      >
+        <TerminalFaultControls
+          controls={coherentFaultControls}
+          routineControlsDisabled={routineControlsDisabled}
+          onAction={async (action, _confirmation, expectedGeneration) => {
+            try {
+              const result =
+                action === "stop_cooling_and_acknowledge"
+                  ? await submitD212FaultAction(expectedGeneration)
+                  : await api.faultControlsAction({ action });
+              await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+              return result;
+            } catch (error) {
+              await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+              throw error;
+            }
+          }}
+        />
+        {restartClearanceRequired && (
+          <RestartClearanceCard
+            onAcknowledge={async () => {
+              try {
+                return await api.acknowledgeRestartClearance();
+              } catch (error) {
+                await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+                throw error;
+              }
+            }}
+            onRefreshStatus={() => queryClient.invalidateQueries({ queryKey: roastKeys.health })}
+          />
+        )}
+      </AppFrame>
+    );
+  }
+
   // #513 defensive layer: the server already reports an active run (this route
   // opened mid-roast, or reloaded after a start) — never show the bare form,
   // which would strand the operator without a path to the live dashboard/
@@ -563,6 +681,41 @@ export function StartRoastView(): React.JSX.Element {
             Open live dashboard
           </Link>
         </div>
+      </AppFrame>
+    );
+  }
+
+  // Missing and incoherent D213 state fail closed. A response from an older
+  // server is never evidence that the new process gate has been cleared.
+  if (
+    health.isSuccess &&
+    (coherentRestartClearance === null ||
+      coherentRestartClearance.state === "unknown" ||
+      (coherentRestartClearance.state === "cleared" && !coherentRestartClearance.eligible))
+  ) {
+    return <RestartClearanceStatusIncomplete />;
+  }
+
+  if (health.isSuccess && coherentRestartClearance?.state === "required") {
+    return (
+      <AppFrame
+        headerRight={
+          <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+            Start blocked
+          </span>
+        }
+      >
+        <RestartClearanceCard
+          onAcknowledge={async () => {
+            try {
+              return await api.acknowledgeRestartClearance();
+            } catch (error) {
+              await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+              throw error;
+            }
+          }}
+          onRefreshStatus={() => queryClient.invalidateQueries({ queryKey: roastKeys.health })}
+        />
       </AppFrame>
     );
   }
@@ -628,6 +781,7 @@ export function StartRoastView(): React.JSX.Element {
             one is running, it is still live and heating — reload to reconnect before
             assuming it is safe to start a new one.
           </p>
+          <UnknownStatusEmergencyStop testIdPrefix="start-health-error-emergency-stop" />
           <a
             href="/start"
             data-testid="start-roast-status-unknown-reload"
@@ -770,4 +924,20 @@ export function StartRoastView(): React.JSX.Element {
       </div>
     </AppFrame>
   );
+}
+
+/** Bind D212's physical acknowledgement to the exact displayed server lease. */
+async function submitD212FaultAction(expectedGeneration: number | undefined) {
+  if (
+    expectedGeneration === undefined ||
+    !Number.isSafeInteger(expectedGeneration) ||
+    expectedGeneration <= 0
+  ) {
+    throw new Error("D212 requires a positive server fault-control lease generation.");
+  }
+  return api.faultControlsAction({
+    action: "stop_cooling_and_acknowledge",
+    confirmation: true,
+    expected_generation: expectedGeneration,
+  });
 }

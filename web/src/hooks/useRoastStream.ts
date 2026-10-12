@@ -16,7 +16,13 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 
 import { api } from "@/lib/api";
-import type { OperatorAction, RoastPhase, SseEvent, TelemetryEventData } from "@/lib/types";
+import type {
+  OperatorAction,
+  RoastPhase,
+  SseEvent,
+  SseEventType,
+  TelemetryEventData,
+} from "@/lib/types";
 import {
   applyEvent,
   hydrate,
@@ -354,7 +360,8 @@ export function useFrameDrain(
   }, [frames, frameCount]);
 }
 
-const SSE_EVENT_TYPES: SseEvent["event"][] = [
+/** Every named server event registered on the browser EventSource. */
+export const SSE_EVENT_TYPES = [
   "run_started",
   "phase_changed",
   "charge_guidance",
@@ -369,11 +376,14 @@ const SSE_EVENT_TYPES: SseEvent["event"][] = [
   "fault",
   "recovery_required",
   "recovery_acknowledged",
+  "fault_acknowledgement_executed",
+  "fault_controls_changed",
+  "fault_controls_acknowledged",
   "logs_exported",
   "run_completed",
   "telemetry",
   "heartbeat",
-];
+] as const satisfies readonly SseEventType[];
 
 function parseData(raw: string): Record<string, unknown> {
   if (!raw) return {};

@@ -52,6 +52,11 @@ test("route refreshes a rejected stale incident and resets confirmation for the 
           mcp_child: "stopped",
           mcp_hardware_clear_required: true,
           mcp_teardown_incident_id: incidentId,
+          // This route test isolates the incident-bound acknowledgement. The
+          // D213 process gate is already cleared, and the lease is closed, so
+          // neither independent gate masks the hardware-clear card.
+          restart_clearance: { state: "cleared", eligible: true },
+          fault_controls: { status: "closed", generation: null, enabled_actions: [] },
           active_run_id: null,
         }),
       });

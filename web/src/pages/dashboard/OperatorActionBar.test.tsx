@@ -62,6 +62,27 @@ describe("OperatorActionBar", () => {
     expect(screen.getByTestId("action-emergency_stop")).toBeEnabled();
   });
 
+  it("disables routine actions while health is stale but preserves emergency stop", () => {
+    const onAction = vi.fn();
+    render(
+      <OperatorActionBar
+        enabledActions={["drop_beans", "emergency_stop"]}
+        phase="development"
+        onAction={onAction}
+        healthStale
+      />,
+    );
+
+    expect(screen.getByTestId("action-drop_beans")).toBeDisabled();
+    expect(screen.getByTestId("action-drop_beans")).toHaveAttribute("data-enabled", "false");
+    expect(screen.getByTestId("action-emergency_stop")).toBeEnabled();
+    expect(screen.getByTestId("operator-actions-health-stale")).toHaveTextContent(
+      /routine actions are disabled/i,
+    );
+    fireEvent.click(screen.getByTestId("action-drop_beans"));
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
   it("hides the permitted-but-meaningless advisory toggles on a terminal phase", () => {
     // pause/resume are enabled in EVERY phase (the server mirror), but on a
     // terminal roast they're meaningless — the page hides them (presentation).

@@ -16,8 +16,11 @@ from typing import Any, NoReturn
 import pytest
 import pytest_asyncio
 
-from roastpilot_agent.api import RoastService
+from roastpilot_agent.api import RoasterControl, RoastRunConflictError, RoastService
 from roastpilot_agent.models import (
+    ACTIVE_ROAST_PHASES,
+    FaultLeaseStatus,
+    RestartClearanceState,
     RoastEventKind,
     RoastPhase,
     RoastTelemetry,
@@ -28,6 +31,7 @@ from roastpilot_agent.replay import (
     MAX_SPEED,
     MIN_SPEED,
     ReplayMarker,
+    ReplayRoasterControl,
     ReplaySource,
     build_replay_service,
     clamp_speed,
@@ -1193,6 +1197,114 @@ async def test_replay_session_never_retrieves_a_live_reference(
     assert calls == 0, "a replay session must never perform a live reference read"
 
 
+@pytest.mark.asyncio
+async def test_replay_unknown_fault_lease_isolated_from_default_and_live_admission(
+    tmp_path: Path,
+    fake_mcp_client: RoasterControl,
+) -> None:
+    """Only explicit replay ignores an UNKNOWN durable lease."""
+    from roastpilot_agent.store import RoastStore
+
+    replay_store_path = tmp_path / "replay-unknown-lease.sqlite3"
+    prior_replay_store = RoastStore(replay_store_path)
+    await prior_replay_store.initialize()
+    await prior_replay_store.close()
+    replay_service, source, replay_store = build_replay_service(
+        _COOLING_COMPLETE, replay_store_path
+    )
+    await replay_store.initialize()
+    try:
+        assert (await replay_store.read_fault_control_lease()).status is FaultLeaseStatus.UNKNOWN
+        assert await source.start()
+        health = await replay_service.health()
+        controls = await replay_service._fault_controls_projection_after_action()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - exercises the action-path lease read
+        assert health.fault_controls.status is FaultLeaseStatus.CLOSED
+        assert controls.status is FaultLeaseStatus.CLOSED
+        source._control.commands.clear()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - isolate post-health replay writes
+        stepped = await source.advance_to(ReplayMarker.FIRST_CRACK)
+        assert stepped.agent_phase in {phase.value for phase in ACTIVE_ROAST_PHASES}
+        assert {"set_heat", "set_fan"} <= set(source.issued_commands)
+    finally:
+        await source.aclose()
+
+    live_store_path = tmp_path / "live-unknown-lease.sqlite3"
+    prior_live_store = RoastStore(live_store_path)
+    await prior_live_store.initialize()
+    await prior_live_store.close()
+    live_store = RoastStore(live_store_path)
+    await live_store.initialize()
+    try:
+        live_service = RoastService(
+            live_store,
+            roaster=ReplayRoasterControl(),
+            live_serve_mode=True,
+            run_loop=False,
+        )
+        live_service._restart_epoch_initialized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - isolate the lease gate
+        live_service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - isolate the lease gate
+        with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+            await live_service.start_roast(load_export(_COOLING_COMPLETE).profile)
+    finally:
+        await live_store.close()
+
+    default_store_path = tmp_path / "default-unknown-lease.sqlite3"
+    prior_default_store = RoastStore(default_store_path)
+    await prior_default_store.initialize()
+    await prior_default_store.close()
+    default_store = RoastStore(default_store_path)
+    await default_store.initialize()
+    try:
+        default_service = RoastService(default_store, roaster=fake_mcp_client, run_loop=False)
+        with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+            await default_service.start_roast(load_export(_COOLING_COMPLETE).profile)
+    finally:
+        await default_store.close()
+
+
+def test_recording_replay_mode_rejects_non_replay_composition(tmp_path: Path) -> None:
+    """The recording-only lease exception cannot be attached to live control."""
+    from typing import cast
+
+    from roastpilot_agent.mcp_client import (
+        MCPServerProcess,
+        RoasterControlAdapter,
+        RoasterMCPClient,
+    )
+    from roastpilot_agent.store import RoastStore
+
+    async def no_hardware_tool_call(_tool: str, _arguments: dict[str, object]) -> object:
+        raise AssertionError("constructor guard must reject before any MCP tool call")
+
+    with pytest.raises(ValueError, match="requires the recording replay control"):
+        RoastService(
+            RoastStore(tmp_path / "invalid-replay.sqlite3"),
+            roaster=ReplayRoasterControl(),
+            live_serve_mode=True,
+            recording_replay_mode=True,
+        )
+    with pytest.raises(ValueError, match="requires the recording replay control"):
+        RoastService(
+            RoastStore(tmp_path / "looped-replay.sqlite3"),
+            roaster=ReplayRoasterControl(),
+            recording_replay_mode=True,
+        )
+    with pytest.raises(ValueError, match="requires the recording replay control"):
+        RoastService(
+            RoastStore(tmp_path / "mcp-replay.sqlite3"),
+            roaster=ReplayRoasterControl(),
+            mcp=cast(MCPServerProcess, object()),
+            recording_replay_mode=True,
+            run_loop=False,
+        )
+    with pytest.raises(ValueError, match="requires the recording replay control"):
+        RoastService(
+            RoastStore(tmp_path / "adapter-replay.sqlite3"),
+            roaster=RoasterControlAdapter(RoasterMCPClient(no_hardware_tool_call)),
+            recording_replay_mode=True,
+            run_loop=False,
+        )
+
+
 async def _drop_commands(service: RoastService, source: ReplaySource) -> list[dict[str, object]]:
     """The ordered ``drop_beans`` COMMAND_EXECUTED payloads the run issued."""
     subscriber = service.events.subscribe()
@@ -1528,17 +1640,24 @@ async def test_trim_engages_once_no_flip_flop_on_session2_replay(tmp_path: Path)
         result = await source.advance_to(ReplayMarker.FIRST_CRACK)
         assert result.agent_phase == "development"  # FC handed off to the post-FC loop
         # The source owns the recording control; read the executed lever writes.
-        set_targets = [args for name, args in source._control.commands if name == "set_targets"]  # pyright: ignore[reportPrivateUsage]
+        lever_writes = [
+            (name, args)
+            for name, args in source._control.commands  # pyright: ignore[reportPrivateUsage]
+            if name in ("set_heat", "set_fan")
+        ]
         # The run-start command (the replay profile's heat 100 / fan 10), then the
         # deterministic pre-FC floor (fan opens to 30), then a SINGLE trim step to
         # 65 — held to FC. The key assertion is no 100↔65 oscillation: heat 65
         # appears exactly once and never reverts to 100 before the FC hand-off.
-        assert set_targets == [
-            {"heat": 100, "fan": 10},
-            {"heat": 100, "fan": 30},
-            {"heat": 65, "fan": 30},
-        ], set_targets
-        heats = [t["heat"] for t in set_targets]
+        assert lever_writes == [
+            ("set_heat", {"heat": 100}),
+            ("set_fan", {"fan": 10}),
+            ("set_heat", {"heat": 100}),
+            ("set_fan", {"fan": 30}),
+            ("set_heat", {"heat": 65}),
+            ("set_fan", {"fan": 30}),
+        ], lever_writes
+        heats = [args["heat"] for name, args in lever_writes if name == "set_heat"]
         assert heats.count(65) == 1  # one engage
         assert heats[-1] == 65  # held trimmed into the FC hand-off (no snap-back)
     finally:

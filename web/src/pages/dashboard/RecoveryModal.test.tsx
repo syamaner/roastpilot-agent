@@ -49,6 +49,24 @@ describe("RecoveryModal", () => {
     expect(screen.getByTestId("recovery-emergency_stop")).toBeEnabled();
   });
 
+  it("disables routine recovery actions while health is stale but retains emergency stop", () => {
+    render(
+      <RecoveryModal
+        open
+        {...READOUT}
+        enabledActions={["start_cooling", "acknowledge_recovery"]}
+        onAction={() => {}}
+        healthStale
+      />,
+    );
+    expect(screen.getByTestId("recovery-start_cooling")).toBeDisabled();
+    expect(screen.getByTestId("recovery-acknowledge_recovery")).toBeDisabled();
+    expect(screen.getByTestId("recovery-emergency_stop")).toBeEnabled();
+    expect(screen.getByTestId("recovery-health-stale")).toHaveTextContent(
+      /recovery actions are disabled.*emergency stop remains available/i,
+    );
+  });
+
   it("dispatches the chosen recovery action", () => {
     const onAction = vi.fn();
     render(

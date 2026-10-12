@@ -19,6 +19,8 @@ import type {
   ClearStaleSessionRequest,
   ClearStaleSessionResult,
   DevicesSnapshot,
+  FaultControlsActionRequest,
+  FaultControlsActionResult,
   HealthResponse,
   HardwareClearAcknowledgementRequest,
   HardwareClearAcknowledgementResult,
@@ -30,6 +32,7 @@ import type {
   RoastedWeightRequest,
   RoastProfile,
   RoastTimeline,
+  RestartClearanceResult,
   TastingEntryRequest,
   TastingList,
   TelemetrySeries,
@@ -39,6 +42,9 @@ import { parseCatalogueRecommendationList } from "./types";
 /** API base. Empty string in the browser: requests are same-origin and Vite
  *  proxies `/api` to the agent in dev. Overridable for tests/SSR. */
 export const API_BASE = "";
+
+/** Health gates cannot wait forever on a hung browser fetch. */
+const HEALTH_REQUEST_TIMEOUT_MS = 5_000;
 
 /** A failed API response, carrying the HTTP status and the server's detail. */
 export class ApiError extends Error {
@@ -69,6 +75,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (text ? JSON.parse(text) : undefined) as T;
 }
 
+/** Bound the safety-gating health read so stale success cannot persist indefinitely. */
+async function healthRequest(): Promise<HealthResponse> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), HEALTH_REQUEST_TIMEOUT_MS);
+  try {
+    return await request<HealthResponse>("/api/health", { signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error("Health request timed out.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function readDetail(response: Response): Promise<string> {
   try {
     const body = (await response.json()) as { detail?: unknown };
@@ -81,7 +103,7 @@ async function readDetail(response: Response): Promise<string> {
 
 export const api = {
   /** `GET /api/health`. */
-  health: () => request<HealthResponse>("/api/health"),
+  health: () => healthRequest(),
 
   /** `POST /api/roasts` — start a roast (409 if one is active). */
   startRoast: (profile: RoastProfile) =>
@@ -159,6 +181,16 @@ export const api = {
       },
     ),
 
+  /**
+   * `POST /api/restart-clearance` — records one explicit physical
+   * confirmation for this fresh Agent process. It never actuates hardware.
+   */
+  acknowledgeRestartClearance: () =>
+    request<RestartClearanceResult>("/api/restart-clearance", {
+      method: "POST",
+      body: JSON.stringify({ physical_confirmation: true }),
+    }),
+
   /** `GET /api/roasts/{id}/tastings` — the run's tasting entries (#522, D91). */
   tastings: (runId: string) => request<TastingList>(`/api/roasts/${runId}/tastings`),
 
@@ -177,6 +209,26 @@ export const api = {
       method: "POST",
       body: JSON.stringify(action),
     }),
+
+  /**
+   * `POST /api/fault-controls/actions` — act on the server-resolved current
+   * fault lease. D212 binds its explicit confirmation to the displayed lease
+   * generation; the SPA supplies no run, session, or device identifier.
+   */
+  faultControlsAction: (action: FaultControlsActionRequest) => {
+    if (
+      action.action === "stop_cooling_and_acknowledge" &&
+      (!Number.isSafeInteger(action.expected_generation) || action.expected_generation <= 0)
+    ) {
+      return Promise.reject(
+        new Error("D212 requires a positive server fault-control lease generation."),
+      );
+    }
+    return request<FaultControlsActionResult>("/api/fault-controls/actions", {
+      method: "POST",
+      body: JSON.stringify(action),
+    });
+  },
 
   /** Download URL for an export artifact (jsonl/csv/summary). */
   logArtifactUrl: (runId: string, artifact: "jsonl" | "csv" | "summary") =>

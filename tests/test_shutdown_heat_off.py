@@ -18,21 +18,23 @@ from typing import cast
 import pytest
 import pytest_asyncio
 
+import roastpilot_agent.api as api_module
 from roastpilot_agent.advisor import FakeAdvisor, RoastDecision
-from roastpilot_agent.api import RoastService
+from roastpilot_agent.api import RoastService, ShutdownHeatOffOutcome
 from roastpilot_agent.cli import _teardown_live  # pyright: ignore[reportPrivateUsage]
 from roastpilot_agent.config import AppConfig, ControllerConfig
 from roastpilot_agent.mcp_client import MCPServerProcess
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
     AppliedRoasterState,
+    FaultLeaseStatus,
     RoastEventKind,
     RoastEventSource,
     RoastPhase,
     RoastProfile,
     RoastTelemetry,
 )
-from roastpilot_agent.store import RoastStore
+from roastpilot_agent.store import FaultControlLease, RoastStore
 from tests.conftest import FakeClock, FakeMCPClient
 
 
@@ -108,7 +110,7 @@ async def test_shutdown_commands_heat_off_through_safety_before_mcp_stop(
 
     issued = await service.safe_shutdown_heat_off()
 
-    assert issued is True
+    assert issued is ShutdownHeatOffOutcome.DISPATCHED
     # heat → 0 was commanded through the controller's e-stop MCP write.
     assert "emergency_stop" in mcp.commands()
     # The controller is now in a hardware-off phase and the typed EMERGENCY_STOP
@@ -119,6 +121,227 @@ async def test_shutdown_commands_heat_off_through_safety_before_mcp_stop(
     assert any(e.verdict == "emergency_stop" for e in timeline.safety_evaluations), (
         "EMERGENCY_STOP verdict persisted"
     )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_exact_session_opens_new_fault_lease_before_dispatch(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An active shutdown supersedes D212 with a fresh exact-session OPEN lease."""
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    service = RoastService(
+        store,
+        config=_config(),
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_decision()),
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    detail = await service.start_roast(_profile())
+    await store.open_fault_control_lease(run_id=detail.id, mcp_session_id="session-1", generation=1)
+    service._fault_lease_cache = FaultControlLease(  # noqa: SLF001 - admission harness  # pyright: ignore[reportPrivateUsage]
+        generation=1,
+        status=FaultLeaseStatus.OPEN,
+        run_id=detail.id,
+        mcp_session_id="session-1",
+    )
+
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+    original_open = store.open_fault_control_lease
+
+    async def parked_open(
+        *, run_id: str, mcp_session_id: str, generation: int | None = None
+    ) -> FaultControlLease:
+        write_started.set()
+        await release_write.wait()
+        return await original_open(
+            run_id=run_id, mcp_session_id=mcp_session_id, generation=generation
+        )
+
+    monkeypatch.setattr(store, "open_fault_control_lease", parked_open)
+    assert await service.safe_shutdown_heat_off() is ShutdownHeatOffOutcome.DISPATCHED
+    await asyncio.wait_for(write_started.wait(), timeout=1.0)
+    assert service._fault_lease_cache.generation == 2  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert "emergency_stop" in mcp.commands()
+    assert service.runner is not None
+    assert service.runner._admitted_emergency_stops == 0  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    release_write.set()
+    assert await service.settle_fault_lease_persistence_for_teardown()
+    persisted = await store.read_fault_control_lease()
+    assert persisted.generation == 2
+    assert persisted.status is FaultLeaseStatus.OPEN
+    assert persisted.mcp_session_id == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_new_live_session_opens_lease_after_ordinary_clearance(
+    store: RoastStore,
+) -> None:
+    """A started live run may bind its first exact session to shutdown OPEN."""
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    service = RoastService(
+        store,
+        config=_config(),
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_decision()),
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    detail = await service.start_roast(_profile())
+
+    assert await service.safe_shutdown_heat_off() is ShutdownHeatOffOutcome.DISPATCHED
+    assert await service.settle_fault_lease_persistence_for_teardown()
+    persisted = await store.read_fault_control_lease()
+    assert persisted.status is FaultLeaseStatus.OPEN
+    assert persisted.run_id == detail.id
+    assert persisted.mcp_session_id == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_changed_cached_session_persists_unknown_without_inheritance(
+    store: RoastStore,
+) -> None:
+    """A same-run session change cannot inherit a stale OPEN lease identity."""
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    service = RoastService(
+        store,
+        config=_config(),
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_decision()),
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    detail = await service.start_roast(_profile())
+    await store.open_fault_control_lease(run_id=detail.id, mcp_session_id="session-1", generation=1)
+    service._fault_lease_cache = FaultControlLease(  # noqa: SLF001 - admission harness  # pyright: ignore[reportPrivateUsage]
+        generation=1,
+        status=FaultLeaseStatus.OPEN,
+        run_id=detail.id,
+        mcp_session_id="session-1",
+    )
+    mcp.set_latest_fault_session_id("session-2")
+
+    assert await service.safe_shutdown_heat_off() is ShutdownHeatOffOutcome.DISPATCHED
+    assert await service.settle_fault_lease_persistence_for_teardown()
+    persisted = await store.read_fault_control_lease()
+    assert persisted.generation == 2
+    assert persisted.status is FaultLeaseStatus.UNKNOWN
+    assert persisted.mcp_session_id is None
+    assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._fault_lease_cache.mcp_session_id is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_without_current_session_persists_unknown_lease(store: RoastStore) -> None:
+    """An active shutdown never turns an absent session into an OPEN lease."""
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    mcp.set_latest_fault_session_id(None)
+    service = RoastService(
+        store,
+        config=_config(),
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_decision()),
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    detail = await service.start_roast(_profile())
+
+    assert await service.safe_shutdown_heat_off() is ShutdownHeatOffOutcome.DISPATCHED
+    assert await service.settle_fault_lease_persistence_for_teardown()
+    persisted = await store.read_fault_control_lease()
+    assert persisted.generation == 1
+    assert persisted.status is FaultLeaseStatus.UNKNOWN
+    assert persisted.run_id == detail.id
+    assert persisted.mcp_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_lease_persistence_failure_stays_unknown(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed shutdown lease write cannot be trusted as a clean epoch."""
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    mcp.set_latest_fault_session_id(None)
+    service = RoastService(
+        store,
+        config=_config(),
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_decision()),
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    await service.start_roast(_profile())
+
+    async def fail_unknown(*_args: object, **_kwargs: object) -> FaultControlLease:
+        raise RuntimeError("synthetic shutdown lease persistence failure")
+
+    monkeypatch.setattr(store, "replace_fault_control_lease_unknown", fail_unknown)
+    assert await service.safe_shutdown_heat_off() is ShutdownHeatOffOutcome.DISPATCHED
+    assert not await service.settle_fault_lease_persistence_for_teardown()
+    assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_teardown_bounds_parked_shutdown_lease_write_and_skips_clean_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parked shutdown lease write cannot hang teardown or produce a clean epoch."""
+    instance = RoastStore(tmp_path / "parked-shutdown-lease.sqlite3")
+    await instance.initialize()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    mcp.set_latest_fault_session_id(None)
+    service = RoastService(
+        instance,
+        config=_config(),
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_decision()),
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    await service.start_roast(_profile())
+    parked = asyncio.Event()
+    cancellation_suppressed = asyncio.Event()
+    release_parked_write = asyncio.Event()
+    clean_epoch_called = False
+
+    async def park_unknown(*_args: object, **_kwargs: object) -> FaultControlLease:
+        parked.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_suppressed.set()
+            await release_parked_write.wait()
+        raise RuntimeError("synthetic parked persistence failure")
+
+    async def record_clean_epoch() -> None:
+        nonlocal clean_epoch_called
+        clean_epoch_called = True
+
+    class _CleanMCP:
+        stop_unconfirmed = False
+
+        async def stop(self) -> None:
+            return None
+
+    monkeypatch.setattr(instance, "replace_fault_control_lease_unknown", park_unknown)
+    monkeypatch.setattr(
+        service, "mark_process_epoch_clean_after_ordered_teardown", record_clean_epoch
+    )
+    monkeypatch.setattr(api_module, "_FAULT_LEASE_TEARDOWN_PERSISTENCE_TIMEOUT_SECONDS", 0.01)
+
+    await asyncio.wait_for(
+        _teardown_live(service, cast(MCPServerProcess, _CleanMCP()), instance), timeout=1.0
+    )
+
+    assert parked.is_set()
+    assert cancellation_suppressed.is_set()
+    assert not clean_epoch_called
+    assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    pending = tuple(service._fault_lease_persistence_tasks)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    release_parked_write.set()
+    await asyncio.gather(*pending, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -159,7 +382,7 @@ async def test_shutdown_heat_off_after_loop_cancelled(store: RoastStore) -> None
         await loop_task
 
     issued = await service.safe_shutdown_heat_off()
-    assert issued is True
+    assert issued is ShutdownHeatOffOutcome.DISPATCHED
     assert "emergency_stop" in mcp.commands()
     assert service.runner is not None
     assert service.runner.controller_snapshot().phase is RoastPhase.FAULTED
@@ -181,7 +404,7 @@ async def test_shutdown_heat_off_is_noop_with_no_active_run(store: RoastStore) -
     )
     # No roast started → service.runner is None.
     assert service.runner is None
-    assert await service.safe_shutdown_heat_off() is False
+    assert await service.safe_shutdown_heat_off() is ShutdownHeatOffOutcome.NO_RUNNER
 
 
 @pytest.mark.asyncio
@@ -202,10 +425,10 @@ async def test_shutdown_heat_off_is_noop_in_inactive_phase(store: RoastStore) ->
     assert service.runner is not None
     # Drive the controller to a terminal, hardware-off phase via e-stop, then
     # confirm a *second* shutdown call is a no-op (no fresh e-stop).
-    assert await service.safe_shutdown_heat_off() is True
+    assert await service.safe_shutdown_heat_off() is ShutdownHeatOffOutcome.DISPATCHED
     assert service.runner.controller_snapshot().phase not in ACTIVE_ROAST_PHASES
     calls_before = len(mcp.calls)
-    assert await service.safe_shutdown_heat_off() is False
+    assert await service.safe_shutdown_heat_off() is ShutdownHeatOffOutcome.NOT_ACTIVE
     assert len(mcp.calls) == calls_before, "no second e-stop from an inactive phase"
 
 
@@ -220,7 +443,12 @@ async def test_shutdown_heat_off_is_bounded_and_persists_unconfirmed_marker(
     clock = FakeClock()
 
     class HangingMCP(FakeMCPClient):
+        def __init__(self, frames: list[RoastTelemetry | None | Exception]) -> None:
+            super().__init__(frames)
+            self.estop_attempts = 0
+
         async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
+            self.estop_attempts += 1
             await asyncio.Event().wait()  # never completes — simulates a wedged child
             raise AssertionError("unreachable — the wait above never returns")
 
@@ -241,7 +469,8 @@ async def test_shutdown_heat_off_is_bounded_and_persists_unconfirmed_marker(
     issued = await asyncio.wait_for(
         service.safe_shutdown_heat_off(timeout_seconds=0.05), timeout=2.0
     )
-    assert issued is False
+    assert issued is ShutdownHeatOffOutcome.UNCONFIRMED
+    assert mcp.estop_attempts == 2
 
     # The give-up persisted an unambiguous trace marker (reused COMMAND_FAILED
     # kind, so no new SSE event kind / FE-contract change).
@@ -272,11 +501,11 @@ async def test_shutdown_heat_off_retry_recovers_without_marker(store: RoastStore
     class TransientHangMCP(FakeMCPClient):
         def __init__(self, frames: list[RoastTelemetry | None | Exception]) -> None:
             super().__init__(frames)
-            self._estop_attempts = 0
+            self.estop_attempts = 0
 
         async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
-            self._estop_attempts += 1
-            if self._estop_attempts == 1:
+            self.estop_attempts += 1
+            if self.estop_attempts == 1:
                 await asyncio.Event().wait()  # first attempt wedges → times out
             return await super().emergency_stop(reason=reason)  # retry confirms
 
@@ -301,10 +530,18 @@ async def test_shutdown_heat_off_retry_recovers_without_marker(store: RoastStore
     issued = await asyncio.wait_for(
         service.safe_shutdown_heat_off(timeout_seconds=1.0), timeout=10.0
     )
-    assert issued is True, "retry confirmed the heat-off"
-    assert "emergency_stop" in mcp.commands()
+    assert issued is ShutdownHeatOffOutcome.DISPATCHED, "retry confirmed the heat-off"
+    assert mcp.estop_attempts == 2
+    assert mcp.commands().count("emergency_stop") == 1
     assert service.runner is not None
     assert service.runner.controller_snapshot().phase is RoastPhase.FAULTED
+    assert service.runner._admitted_emergency_stops == 0  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert await service.settle_fault_lease_persistence_for_teardown()
+    cached = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    persisted = await store.read_fault_control_lease()
+    assert cached.generation == persisted.generation == 2
+    assert cached.status is persisted.status is FaultLeaseStatus.OPEN
+    assert cached.mcp_session_id == persisted.mcp_session_id == "session-1"
 
     # No give-up marker — the retry recovered.
     timeline = await service.timeline(run_id)
@@ -341,13 +578,15 @@ async def test_shutdown_heat_off_fails_closed_on_unexpected_error(
 
     attempts = 0
 
-    async def _boom() -> bool:
+    async def _boom(*, already_admitted: bool = False) -> ShutdownHeatOffOutcome:
         nonlocal attempts
+        assert already_admitted
         attempts += 1
         raise RuntimeError("unexpected runner failure")
 
     monkeypatch.setattr(service.runner, "shutdown_heat_off", _boom)
-    assert await service.safe_shutdown_heat_off() is False
+    monkeypatch.setattr(service.runner, "retry_shutdown_heat_off", _boom)
+    assert await service.safe_shutdown_heat_off() is ShutdownHeatOffOutcome.UNCONFIRMED
     assert attempts == 2, "the heat-off write is retried once before giving up"
 
     timeline = await service.timeline(run_id)
@@ -487,9 +726,9 @@ async def test_teardown_runs_heat_off_before_mcp_stop() -> None:
     order: list[str] = []
 
     class _RecordingService:
-        async def safe_shutdown_heat_off(self) -> bool:
+        async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
             order.append("safe_shutdown_heat_off")
-            return True
+            return ShutdownHeatOffOutcome.DISPATCHED
 
         async def shutdown(self) -> None:
             order.append("service.shutdown")
@@ -499,6 +738,9 @@ async def test_teardown_runs_heat_off_before_mcp_stop() -> None:
             # below; assert the verdict reached it.
             order.append(f"record_child_stop_unconfirmed:{stop_unconfirmed}")
 
+        async def mark_process_epoch_clean_after_ordered_teardown(self) -> None:
+            order.append("mark_process_epoch_clean_after_ordered_teardown")
+
     class _RecordingMCP:
         stop_unconfirmed = True  # the child stop went unconfirmed this teardown
 
@@ -506,6 +748,10 @@ async def test_teardown_runs_heat_off_before_mcp_stop() -> None:
             order.append("mcp.stop")
 
     class _RecordingStore:
+        async def active_run(self) -> None:
+            order.append("store.active_run_before_heat_off")
+            return None
+
         async def close(self) -> None:
             order.append("store.close")
 
@@ -519,6 +765,7 @@ async def test_teardown_runs_heat_off_before_mcp_stop() -> None:
     )
 
     assert order == [
+        "store.active_run_before_heat_off",
         "safe_shutdown_heat_off",
         "service.shutdown",
         "mcp.stop",
@@ -532,16 +779,171 @@ async def test_teardown_runs_heat_off_before_mcp_stop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_teardown_continues_when_heat_off_raises() -> None:
-    """A raising heat-off step is logged-not-raised and never aborts the rest of
-    teardown — the MCP child is still stopped and the store closed (best-effort
-    chain, so one failure cannot orphan the child)."""
+@pytest.mark.parametrize(
+    "outcome", [ShutdownHeatOffOutcome.NO_RUNNER, ShutdownHeatOffOutcome.NOT_ACTIVE]
+)
+async def test_teardown_marks_clean_epoch_after_proven_idle_noop(
+    outcome: ShutdownHeatOffOutcome,
+) -> None:
+    """Either typed no-op may mark clean only when durable state is idle."""
+    order: list[str] = []
+
+    class _IdleService:
+        async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
+            order.append("safe_shutdown_heat_off")
+            return outcome
+
+        async def shutdown(self) -> None:
+            order.append("service.shutdown")
+
+        async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+            order.append(f"record_child_stop_unconfirmed:{stop_unconfirmed}")
+
+        async def mark_process_epoch_clean_after_ordered_teardown(self) -> None:
+            order.append("mark_process_epoch_clean_after_ordered_teardown")
+
+    class _CleanMCP:
+        stop_unconfirmed = False
+
+        async def stop(self) -> None:
+            order.append("mcp.stop")
+
+    class _IdleStore:
+        async def active_run(self) -> None:
+            order.append("store.active_run_before_heat_off")
+            return None
+
+        async def close(self) -> None:
+            order.append("store.close")
+
+    await _teardown_live(
+        cast(RoastService, _IdleService()),
+        cast(MCPServerProcess, _CleanMCP()),
+        cast(RoastStore, _IdleStore()),
+    )
+
+    assert order == [
+        "store.active_run_before_heat_off",
+        "safe_shutdown_heat_off",
+        "service.shutdown",
+        "mcp.stop",
+        "record_child_stop_unconfirmed:False",
+        "mark_process_epoch_clean_after_ordered_teardown",
+        "store.close",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["active", "service", "mcp", "unconfirmed"])
+async def test_teardown_does_not_mark_clean_epoch_when_any_required_proof_fails(
+    failure: str,
+) -> None:
+    """An active or unconfirmed teardown outcome cannot certify a clean epoch."""
+    marked = False
+
+    class _Service:
+        async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
+            return (
+                ShutdownHeatOffOutcome.UNCONFIRMED
+                if failure == "active"
+                else ShutdownHeatOffOutcome.DISPATCHED
+            )
+
+        async def shutdown(self) -> None:
+            if failure == "service":
+                raise RuntimeError("synthetic service shutdown failure")
+
+        async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+            return None
+
+        async def mark_process_epoch_clean_after_ordered_teardown(self) -> None:
+            nonlocal marked
+            marked = True
+
+    class _MCP:
+        stop_unconfirmed = failure == "unconfirmed"
+
+        async def stop(self) -> None:
+            if failure == "mcp":
+                raise RuntimeError("synthetic MCP stop failure")
+
+    class _Store:
+        async def active_run(self) -> object | None:
+            return object() if failure == "active" else None
+
+        async def close(self) -> None:
+            return None
+
+    await _teardown_live(
+        cast(RoastService, _Service()), cast(MCPServerProcess, _MCP()), cast(RoastStore, _Store())
+    )
+
+    assert not marked
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "active_run_failure"),
+    [
+        (ShutdownHeatOffOutcome.NO_RUNNER, False),
+        (ShutdownHeatOffOutcome.NOT_ACTIVE, False),
+        (ShutdownHeatOffOutcome.NO_RUNNER, True),
+        (ShutdownHeatOffOutcome.NOT_ACTIVE, True),
+    ],
+)
+async def test_teardown_does_not_mark_clean_epoch_for_typed_noop_without_durable_idle_proof(
+    outcome: ShutdownHeatOffOutcome, active_run_failure: bool
+) -> None:
+    """A typed no-op cannot certify an active or unreadable durable run state."""
+    marked = False
+
+    class _NoopService:
+        async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
+            return outcome
+
+        async def shutdown(self) -> None:
+            return None
+
+        async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+            return None
+
+        async def mark_process_epoch_clean_after_ordered_teardown(self) -> None:
+            nonlocal marked
+            marked = True
+
+    class _CleanMCP:
+        stop_unconfirmed = False
+
+        async def stop(self) -> None:
+            return None
+
+    class _UncertainStore:
+        async def active_run(self) -> object | None:
+            if active_run_failure:
+                raise RuntimeError("synthetic active-run read failure")
+            return object()
+
+        async def close(self) -> None:
+            return None
+
+    await _teardown_live(
+        cast(RoastService, _NoopService()),
+        cast(MCPServerProcess, _CleanMCP()),
+        cast(RoastStore, _UncertainStore()),
+    )
+
+    assert not marked
+
+
+@pytest.mark.asyncio
+async def test_teardown_continues_after_swallowed_unconfirmed_heat_off() -> None:
+    """A production-style unconfirmed heat-off still stops child and closes store."""
     order: list[str] = []
 
     class _RaisingService:
-        async def safe_shutdown_heat_off(self) -> bool:
+        async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
             order.append("safe_shutdown_heat_off")
-            raise RuntimeError("boom")
+            return ShutdownHeatOffOutcome.UNCONFIRMED
 
         async def shutdown(self) -> None:
             order.append("service.shutdown")
@@ -556,6 +958,10 @@ async def test_teardown_continues_when_heat_off_raises() -> None:
             order.append("mcp.stop")
 
     class _RecordingStore:
+        async def active_run(self) -> None:
+            order.append("store.active_run_before_heat_off")
+            return None
+
         async def close(self) -> None:
             order.append("store.close")
 
@@ -566,12 +972,56 @@ async def test_teardown_continues_when_heat_off_raises() -> None:
     )
 
     assert order == [
+        "store.active_run_before_heat_off",
         "safe_shutdown_heat_off",
         "service.shutdown",
         "mcp.stop",
         "record_child_stop_unconfirmed",
         "store.close",
     ]
+
+
+@pytest.mark.asyncio
+async def test_teardown_rejects_unconfirmed_active_runner_with_empty_store() -> None:
+    """An active in-memory runner cannot be certified by an empty store read."""
+    marked = False
+
+    class _ActiveService:
+        runner = object()
+
+        async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
+            return ShutdownHeatOffOutcome.UNCONFIRMED
+
+        async def shutdown(self) -> None:
+            return None
+
+        async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+            return None
+
+        async def mark_process_epoch_clean_after_ordered_teardown(self) -> None:
+            nonlocal marked
+            marked = True
+
+    class _CleanMCP:
+        stop_unconfirmed = False
+
+        async def stop(self) -> None:
+            return None
+
+    class _EmptyStore:
+        async def active_run(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    await _teardown_live(
+        cast(RoastService, _ActiveService()),
+        cast(MCPServerProcess, _CleanMCP()),
+        cast(RoastStore, _EmptyStore()),
+    )
+
+    assert not marked
 
 
 @pytest.mark.asyncio

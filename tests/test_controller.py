@@ -9,7 +9,7 @@ extend this suite.
 import asyncio
 import logging
 import math
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -41,7 +41,9 @@ from roastpilot_agent.controller import (
     UNIVERSAL_TARGETS,
     AdvisoryCallPolicy,
     AdvisoryTrigger,
+    CommandArbiter,
     ControllerSnapshot,
+    FaultControlExecutor,
     InvalidTransitionError,
     RoastController,
     RoastPhase,
@@ -55,6 +57,7 @@ from roastpilot_agent.models import (
     AdvisorHealthStatus,
     AppliedRoasterState,
     DropReason,
+    FaultControlState,
     JointWindowStatus,
     OperatorAction,
     PostFcHeatAuthorityState,
@@ -476,10 +479,863 @@ async def test_tick_order_with_advisory() -> None:
         "persist_evaluation:all_clear",
         "persist_advisor_decision:ok",
         "emit:advisory",
-        "set_targets",
+        "set_heat",
+        "set_fan",
         "emit:command_executed",
     ]
     assert harness.executor.targets == [(65, 50)]
+
+
+@pytest.mark.asyncio
+async def test_estop_fences_delayed_advisor_before_later_lever_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An admitted e-stop wins while an advisor await is still outstanding."""
+    advisor = FakeAdvisor([decision()])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = advisor.get_recommendation
+
+    async def delayed(context: AdvisorContext) -> RoastDecision:
+        entered.set()
+        await release.wait()
+        return await original(context)
+
+    monkeypatch.setattr(advisor, "get_recommendation", delayed)
+    harness.controller.request_advisory()
+    pending_tick = asyncio.create_task(harness.controller.tick())
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+    await harness.controller.operator_emergency_stop("operator request")
+    assert len(harness.executor.estop_reasons) == 1
+    assert harness.controller.phase is RoastPhase.FAULTED
+
+    release.set()
+    await asyncio.wait_for(pending_tick, timeout=1.0)
+    assert len(harness.executor.estop_reasons) == 1
+    assert harness.executor.targets == []
+    assert harness.controller.phase is RoastPhase.FAULTED
+
+
+@pytest.mark.asyncio
+async def test_estop_actuates_before_delayed_or_failed_evaluation_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trace persistence cannot postpone or undo a typed emergency stop."""
+    harness = make_harness()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed(_evaluation: SafetyEvaluation) -> int | None:
+        entered.set()
+        await release.wait()
+        raise RuntimeError("synthetic SQLite failure")
+
+    monkeypatch.setattr(harness.sink, "persist_evaluation", delayed)
+    stopping = asyncio.create_task(harness.controller.operator_emergency_stop("operator request"))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    assert len(harness.executor.estop_reasons) == 1
+    assert harness.controller.phase is RoastPhase.FAULTED
+
+    release.set()
+    await asyncio.wait_for(stopping, timeout=1.0)
+    assert len(harness.executor.estop_reasons) == 1
+
+
+@pytest.mark.asyncio
+async def test_admitted_estop_runs_after_one_inflight_target_half_and_discards_fan() -> None:
+    """An e-stop never waits for the fan half of a split target update.
+
+    The heat tool call is already in the fake driver when e-stop admission
+    happens.  Releasing it must dispatch the e-stop before the routine task can
+    start its fan tool call; its old generation is discarded at that boundary.
+    """
+
+    class BlockingHeatExecutor(RecordingExecutor):
+        def __init__(self, log: list[str]) -> None:
+            super().__init__(log)
+            self.heat_entered = asyncio.Event()
+            self.release_heat = asyncio.Event()
+
+        async def set_heat(self, heat_percent: int) -> None:
+            await super().set_heat(heat_percent)
+            self.heat_entered.set()
+            await self.release_heat.wait()
+
+    log: list[str] = []
+    executor = BlockingHeatExecutor(log)
+    harness = make_harness(executor=executor)
+    target_task = asyncio.create_task(
+        harness.controller._set_targets(  # pyright: ignore[reportPrivateUsage]
+            heat_percent=70, fan_percent=40
+        )
+    )
+    await asyncio.wait_for(executor.heat_entered.wait(), timeout=1.0)
+    estop_task = asyncio.create_task(harness.controller.operator_emergency_stop("race proof"))
+    await asyncio.sleep(0)
+    executor.release_heat.set()
+
+    assert await asyncio.wait_for(target_task, timeout=1.0) is False
+    await asyncio.wait_for(estop_task, timeout=1.0)
+    assert len(executor.estop_reasons) == 1
+    assert executor.estop_reasons[0].endswith("race proof")
+    assert executor.heat_writes == [70]
+    assert executor.fan_writes == []
+    assert "set_fan" not in log
+    assert harness.controller.phase is RoastPhase.FAULTED
+
+
+@pytest.mark.asyncio
+async def test_estop_discards_targets_after_arbiter_release_before_fault_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A current-generation target cannot write in the post-stop phase window."""
+
+    harness = make_harness()
+    evaluation = SafetyEvaluation(
+        rule="parked_stop_target",
+        verdict=SafetyVerdict.ALLOW,
+        adjusted_heat=70,
+        adjusted_fan=40,
+        reason="deterministic regression proof",
+    )
+    stop_released = asyncio.Event()
+    release_transition = asyncio.Event()
+    original_emergency_write = harness.controller._run_emergency_write  # pyright: ignore[reportPrivateUsage]
+
+    async def park_after_stop(
+        operation: Callable[[], Awaitable[AppliedRoasterState | None]],
+    ) -> AppliedRoasterState | None:
+        applied = await original_emergency_write(operation)
+        stop_released.set()
+        await release_transition.wait()
+        return applied
+
+    monkeypatch.setattr(harness.controller, "_run_emergency_write", park_after_stop)
+
+    stopping = asyncio.create_task(harness.controller.operator_emergency_stop("parked stop"))
+    await asyncio.wait_for(stop_released.wait(), timeout=1.0)
+    assert harness.controller.phase is RoastPhase.IDLE
+    queued_targets = asyncio.create_task(
+        harness.controller._execute_targets(  # pyright: ignore[reportPrivateUsage]
+            evaluation, generation=harness.controller.command_generation
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert await asyncio.wait_for(queued_targets, timeout=1.0) is False
+    assert harness.executor.heat_writes == []
+    assert harness.executor.fan_writes == []
+    release_transition.set()
+    await asyncio.wait_for(stopping, timeout=1.0)
+    assert harness.controller.phase is RoastPhase.FAULTED
+
+
+@pytest.mark.asyncio
+async def test_successful_estop_discards_concurrent_ordinary_fail_safe_fan_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ordinary fault cannot replace successful e-stop cooling fan state."""
+    applied_stop = AppliedRoasterState(heat_level_percent=0, fan_level_percent=100, cooling_on=True)
+    executor = RecordingExecutor(emergency_stop_applied_state=applied_stop)
+    harness = make_harness(
+        executor=executor,
+        limits=SafetyLimits(overrun_safe_fan_percent=30),
+    )
+    ordinary_fault = SafetyEvaluation(
+        rule="ordinary_fault",
+        verdict=SafetyVerdict.FAULT,
+        adjusted_heat=0,
+        adjusted_fan=30,
+        reason="concurrent ordinary fault",
+    )
+    stop_released = asyncio.Event()
+    release_transition = asyncio.Event()
+    original_emergency_write = harness.controller._run_emergency_write  # pyright: ignore[reportPrivateUsage]
+
+    async def park_after_stop(
+        operation: Callable[[], Awaitable[AppliedRoasterState | None]],
+    ) -> AppliedRoasterState | None:
+        applied = await original_emergency_write(operation)
+        stop_released.set()
+        await release_transition.wait()
+        return applied
+
+    monkeypatch.setattr(harness.controller, "_run_emergency_write", park_after_stop)
+    stopping = asyncio.create_task(harness.controller.operator_emergency_stop("successful stop"))
+    await asyncio.wait_for(stop_released.wait(), timeout=1.0)
+
+    await harness.controller._apply_fail_safe(  # pyright: ignore[reportPrivateUsage]
+        ordinary_fault, generation=harness.controller.command_generation
+    )
+
+    assert executor.targets == []
+    assert harness.controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
+    release_transition.set()
+    await asyncio.wait_for(stopping, timeout=1.0)
+    assert harness.controller.snapshot().current_fan == 100
+    assert len(executor.estop_reasons) == 1
+    assert executor.estop_reasons[0].endswith("successful stop")
+    assert executor.targets == []
+
+    await harness.controller.tick()
+
+    assert executor.targets == []
+    assert executor.commands == []
+
+
+@pytest.mark.asyncio
+async def test_estop_release_epoch_discards_routine_created_while_stop_is_parked() -> None:
+    """A routine admitted during the stop call cannot become its first successor."""
+    arbiter = CommandArbiter()
+    stop_entered = asyncio.Event()
+    release_stop = asyncio.Event()
+    commands: list[str] = []
+
+    async def parked_stop() -> None:
+        stop_entered.set()
+        await release_stop.wait()
+        commands.append("emergency_stop")
+
+    generation = arbiter.admit_emergency_stop()
+    stopping = asyncio.create_task(arbiter.run_emergency_stop(parked_stop))
+    await asyncio.wait_for(stop_entered.wait(), timeout=1.0)
+
+    async def queued_heat_operation() -> None:
+        commands.append("heat")
+
+    queued_heat = asyncio.create_task(arbiter.run_routine(generation, queued_heat_operation))
+    await asyncio.sleep(0)
+    release_stop.set()
+
+    await asyncio.wait_for(stopping, timeout=1.0)
+    assert await asyncio.wait_for(queued_heat, timeout=1.0) == (False, None)
+    assert commands == ["emergency_stop"]
+
+
+@pytest.mark.asyncio
+async def test_fault_transition_before_stop_release_keeps_routine_gate_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A concurrent FAULTED transition cannot open a still-active stop boundary."""
+
+    class BlockingEmergencyExecutor(RecordingExecutor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stop_entered = asyncio.Event()
+            self.release_stop = asyncio.Event()
+
+        async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
+            self.stop_entered.set()
+            await self.release_stop.wait()
+            return await super().emergency_stop(reason=reason)
+
+    executor = BlockingEmergencyExecutor()
+    harness = make_harness(executor=executor)
+    evaluation = SafetyEvaluation(
+        rule="overlapping_fault_stop_target",
+        verdict=SafetyVerdict.ALLOW,
+        adjusted_heat=70,
+        adjusted_fan=40,
+        reason="deterministic overlap proof",
+    )
+    stop_released = asyncio.Event()
+    release_transition = asyncio.Event()
+    original_emergency_write = harness.controller._run_emergency_write  # pyright: ignore[reportPrivateUsage]
+
+    async def park_after_stop(
+        operation: Callable[[], Awaitable[AppliedRoasterState | None]],
+    ) -> AppliedRoasterState | None:
+        applied = await original_emergency_write(operation)
+        stop_released.set()
+        await release_transition.wait()
+        return applied
+
+    monkeypatch.setattr(harness.controller, "_run_emergency_write", park_after_stop)
+    stopping = asyncio.create_task(harness.controller.operator_emergency_stop("overlap"))
+    await asyncio.wait_for(executor.stop_entered.wait(), timeout=1.0)
+
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    executor.release_stop.set()
+    await asyncio.wait_for(stop_released.wait(), timeout=1.0)
+    queued_targets = asyncio.create_task(
+        harness.controller._execute_targets(  # pyright: ignore[reportPrivateUsage]
+            evaluation, generation=harness.controller.command_generation
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert await asyncio.wait_for(queued_targets, timeout=1.0) is False
+    assert executor.heat_writes == []
+    assert executor.fan_writes == []
+    release_transition.set()
+    await asyncio.wait_for(stopping, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_parked_estop_fences_pre_fc_tick_before_t0_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tick paused at T0 proof cannot emit or transition after an e-stop."""
+
+    class BlockingEmergencyExecutor(RecordingExecutor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stop_entered = asyncio.Event()
+            self.release_stop = asyncio.Event()
+
+        async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
+            self.stop_entered.set()
+            await self.release_stop.wait()
+            return await super().emergency_stop(reason=reason)
+
+    executor = BlockingEmergencyExecutor()
+    harness = make_harness(
+        executor=executor,
+        config=ControllerConfig(
+            t0_debounce_ticks=1,
+            post_first_crack_control=_BASELINE_POST_FC_CONFIG.post_first_crack_control,
+        ),
+        readings=[reading(bean=180.0, env=185.0, t0_detected=True)],
+    )
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    source_persisted = asyncio.Event()
+    release_source = asyncio.Event()
+    original_persist = harness.sink.persist_evaluation
+
+    async def park_t0_source(evaluation: SafetyEvaluation) -> int | None:
+        result = await original_persist(evaluation)
+        if len(harness.sink.evaluations) == 2:
+            source_persisted.set()
+            await release_source.wait()
+        return result
+
+    monkeypatch.setattr(harness.sink, "persist_evaluation", park_t0_source)
+    ticking = asyncio.create_task(harness.controller.tick())
+    await asyncio.wait_for(source_persisted.wait(), timeout=1.0)
+    stopping = asyncio.create_task(harness.controller.operator_emergency_stop("parked pre-FC"))
+    await asyncio.wait_for(executor.stop_entered.wait(), timeout=1.0)
+    release_source.set()
+    await asyncio.wait_for(ticking, timeout=1.0)
+    executor.release_stop.set()
+    await asyncio.wait_for(stopping, timeout=1.0)
+
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert RoastEventKind.T0_DETECTED not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_tick_parked_behind_estop_does_not_read_or_evaluate_until_stop_releases() -> None:
+    """An admitted e-stop fences a newly started tick before all routine work.
+
+    The stop write remains parked long enough to prove that a concurrent tick
+    neither consumes telemetry nor persists an evaluation or routine command.
+    Once the failed stop releases, the following terminal tick resumes the
+    controller's fail-safe work by writing its held heat-off target.
+    """
+
+    class FailingBlockingEmergencyExecutor(RecordingExecutor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stop_entered = asyncio.Event()
+            self.release_stop = asyncio.Event()
+
+        async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
+            self.stop_entered.set()
+            await self.release_stop.wait()
+            raise RuntimeError("synthetic parked e-stop failure")
+
+    executor = FailingBlockingEmergencyExecutor()
+    harness = make_harness(executor=executor, readings=[reading(), reading()])
+    stopping = asyncio.create_task(harness.controller.operator_emergency_stop("parked tick"))
+    await asyncio.wait_for(executor.stop_entered.wait(), timeout=1.0)
+
+    await harness.controller.tick()
+
+    assert harness.log == []
+    assert harness.sink.evaluations == []
+    assert executor.targets == []
+    assert executor.heat_writes == []
+    assert executor.fan_writes == []
+
+    executor.release_stop.set()
+    await asyncio.wait_for(stopping, timeout=1.0)
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert harness.controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
+
+    await harness.controller.tick()
+
+    assert executor.targets == [(0, SafetyLimits().overrun_safe_fan_percent)]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_admitted_estop_enters_faulted_with_heat_off_retry() -> None:
+    """Cancelling a stop caller cannot leave a writable non-terminal controller."""
+
+    class BlockingEmergencyExecutor(RecordingExecutor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stop_entered = asyncio.Event()
+            self.release_stop = asyncio.Event()
+
+        async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
+            self.stop_entered.set()
+            await self.release_stop.wait()
+            return await super().emergency_stop(reason=reason)
+
+    executor = BlockingEmergencyExecutor()
+    harness = make_harness(executor=executor)
+    stopping = asyncio.create_task(harness.controller.operator_emergency_stop("cancelled"))
+    await asyncio.wait_for(executor.stop_entered.wait(), timeout=1.0)
+
+    stopping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert harness.controller._pending_fail_safe is not None  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._emergency_stop_transition_pending is False  # pyright: ignore[reportPrivateUsage]
+
+    await harness.controller.tick()
+
+    assert harness.executor.targets
+    assert harness.executor.targets[-1][0] == 0
+    assert harness.controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_estop_with_overlapping_fault_retries_heat_off_on_faulted_tick() -> None:
+    """An ordinary overlap cannot replace a cancelled stop's typed retry."""
+
+    class BlockingEmergencyExecutor(RecordingExecutor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stop_entered = asyncio.Event()
+            self.release_stop = asyncio.Event()
+
+        async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
+            self.stop_entered.set()
+            await self.release_stop.wait()
+            return await super().emergency_stop(reason=reason)
+
+    executor = BlockingEmergencyExecutor()
+    harness = make_harness(executor=executor)
+    ordinary_fault = SafetyEvaluation(
+        # Deliberately matches the historical retry trace label: source text
+        # must not grant the transition-gate exception.
+        rule="emergency_stop_retry",
+        verdict=SafetyVerdict.FAULT,
+        adjusted_heat=0,
+        adjusted_fan=SafetyLimits().overrun_safe_fan_percent,
+        reason="ordinary fault overlaps an admitted e-stop",
+    )
+    stopping = asyncio.create_task(harness.controller.operator_emergency_stop("cancelled overlap"))
+    await asyncio.wait_for(executor.stop_entered.wait(), timeout=1.0)
+
+    await harness.controller._apply_fail_safe(  # pyright: ignore[reportPrivateUsage]
+        ordinary_fault, generation=harness.controller.command_generation
+    )
+    assert harness.controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
+
+    stopping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+
+    pending = harness.controller._pending_fail_safe  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert pending is not None
+    assert pending.verdict is SafetyVerdict.FAULT
+    assert pending.adjusted_heat == 0
+    assert harness.controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
+
+    await harness.controller.tick()
+
+    assert executor.targets == [(0, SafetyLimits().overrun_safe_fan_percent)]
+    assert harness.controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_estop_retry_refused_during_pending_transition_remains_queued() -> None:
+    """A still-owned stop leaves its controller-origin retry pending for the next tick."""
+    harness = make_harness()
+    stop_entered = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    async def parked_stop() -> AppliedRoasterState | None:
+        stop_entered.set()
+        await release_stop.wait()
+        return None
+
+    harness.controller.admit_emergency_stop()
+    stopping = asyncio.create_task(
+        harness.controller._run_emergency_write(parked_stop)  # pyright: ignore[reportPrivateUsage]
+    )
+    await asyncio.wait_for(stop_entered.wait(), timeout=1.0)
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    harness.controller.rearm_emergency_stop_fail_safe()
+    pending = harness.controller._pending_fail_safe  # pyright: ignore[reportPrivateUsage]
+    assert pending is not None
+    assert pending.verdict is SafetyVerdict.FAULT
+    assert pending.adjusted_heat == 0
+    assert harness.controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
+
+    try:
+        retrying = asyncio.create_task(
+            harness.controller._apply_fail_safe(  # pyright: ignore[reportPrivateUsage]
+                pending, generation=harness.controller.command_generation
+            )
+        )
+        await asyncio.sleep(0)
+        assert not retrying.done()
+        release_stop.set()
+        await asyncio.wait_for(stopping, timeout=1.0)
+        await asyncio.wait_for(retrying, timeout=1.0)
+    finally:
+        release_stop.set()
+
+    harness.controller._release_emergency_stop_transition_gate_if_safe()  # pyright: ignore[reportPrivateUsage]
+
+    assert harness.executor.targets == []
+    assert harness.controller._pending_fail_safe is pending  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
+
+    await harness.controller.tick()
+
+    assert harness.executor.targets == [(0, SafetyLimits().overrun_safe_fan_percent)]
+    assert harness.controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_estop_priority_discards_all_prior_admitted_waiting_lever_writes() -> None:
+    """D215 fences queued heat, fan and cooling writes at actual dispatch."""
+    arbiter = CommandArbiter()
+    executor = RecordingExecutor()
+    blocker_entered = asyncio.Event()
+    release_blocker = asyncio.Event()
+    command_order: list[str] = []
+
+    async def blocker() -> None:
+        command_order.append("blocker")
+        blocker_entered.set()
+        await release_blocker.wait()
+
+    async def queued_heat() -> None:
+        command_order.append("heat")
+        await executor.set_heat(70)
+
+    async def queued_fan() -> None:
+        command_order.append("fan")
+        await executor.set_fan(40)
+
+    async def queued_cooling() -> None:
+        command_order.append("cooling")
+        await executor.start_cooling()
+
+    first = asyncio.create_task(arbiter.run_routine(0, blocker))
+    await asyncio.wait_for(blocker_entered.wait(), timeout=1.0)
+    waiting = [
+        asyncio.create_task(arbiter.run_routine(0, queued_heat)),
+        asyncio.create_task(arbiter.run_routine(0, queued_fan)),
+        asyncio.create_task(arbiter.run_routine(0, queued_cooling)),
+    ]
+    await asyncio.sleep(0)
+
+    assert arbiter.reserve_close(0)
+    arbiter.admit_emergency_stop()
+    estop = asyncio.create_task(
+        arbiter.run_emergency_stop(lambda: executor.emergency_stop(reason="D215 priority"))
+    )
+    release_blocker.set()
+
+    assert await asyncio.wait_for(first, timeout=1.0) == (True, None)
+    assert await asyncio.gather(*waiting) == [(False, None)] * 3
+    await asyncio.wait_for(estop, timeout=1.0)
+    assert command_order == ["blocker"]
+    assert executor.heat_writes == []
+    assert executor.fan_writes == []
+    assert executor.commands == []
+    assert executor.estop_reasons == ["D215 priority"]
+
+
+@pytest.mark.asyncio
+async def test_d212_close_reservation_discards_waiting_routine_write_after_blocker() -> None:
+    """A D212 reservation fences an already-waiting write without an e-stop."""
+    arbiter = CommandArbiter()
+    executor = RecordingExecutor()
+    blocker_entered = asyncio.Event()
+    release_blocker = asyncio.Event()
+
+    async def blocker() -> None:
+        blocker_entered.set()
+        await release_blocker.wait()
+
+    first = asyncio.create_task(arbiter.run_routine(0, blocker))
+    await asyncio.wait_for(blocker_entered.wait(), timeout=1.0)
+    waiting_heat = asyncio.create_task(arbiter.run_routine(0, lambda: executor.set_heat(70)))
+    await asyncio.sleep(0)
+
+    assert arbiter.reserve_close(0)
+    release_blocker.set()
+    assert await asyncio.wait_for(first, timeout=1.0) == (True, None)
+    assert await asyncio.wait_for(waiting_heat, timeout=1.0) == (False, None)
+    assert arbiter.close_reservation_is_current(0)
+    assert executor.heat_writes == []
+    assert executor.fan_writes == []
+    arbiter.release_close(0)
+
+
+@pytest.mark.asyncio
+async def test_estop_fences_t0_transition_after_delayed_event_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale T0 tick cannot transition out of FAULTED after its audit awaits."""
+    harness = make_harness(
+        readings=[reading(bean=150.0, t0_detected=True)],
+        config=_BASELINE_POST_FC_CONFIG.model_copy(update={"t0_debounce_ticks": 1}),
+    )
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = harness.sink.persist_evaluation
+
+    async def delayed(evaluation: SafetyEvaluation) -> int | None:
+        if evaluation.rule == "event_source_validity":
+            entered.set()
+            await release.wait()
+        return await original(evaluation)
+
+    monkeypatch.setattr(harness.sink, "persist_evaluation", delayed)
+    pending_tick = asyncio.create_task(harness.controller.tick())
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    await harness.controller.operator_emergency_stop("operator request")
+    release.set()
+    await asyncio.wait_for(pending_tick, timeout=1.0)
+
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert RoastEventKind.T0_DETECTED not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_stale_target_generation_is_discarded_after_delayed_safety_audit() -> None:
+    """An e-stop during a safety audit cannot revive that tick's target write."""
+    harness = make_harness()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = harness.sink.persist_evaluation
+    evaluation = SafetyEvaluation(
+        rule="test_target",
+        verdict=SafetyVerdict.ALLOW,
+        adjusted_heat=70,
+        adjusted_fan=40,
+        reason="test target",
+    )
+
+    async def delayed(value: SafetyEvaluation) -> int | None:
+        entered.set()
+        await release.wait()
+        return await original(value)
+
+    async def pending_target() -> bool:
+        generation = harness.controller.command_generation
+        await delayed(evaluation)
+        return await harness.controller._execute_targets(  # pyright: ignore[reportPrivateUsage]
+            evaluation, generation=generation
+        )
+
+    target = asyncio.create_task(pending_target())
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    await harness.controller.operator_emergency_stop("operator request")
+    release.set()
+    assert await asyncio.wait_for(target, timeout=1.0) is False
+    assert harness.executor.targets == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiting_estop_releases_its_arbiter_reservation() -> None:
+    """Cancelling an e-stop before dispatch cannot strand later routine writes."""
+    arbiter = CommandArbiter()
+    routine_entered = asyncio.Event()
+    release_routine = asyncio.Event()
+
+    async def blocked_routine() -> str:
+        routine_entered.set()
+        await release_routine.wait()
+        return "first"
+
+    routine = asyncio.create_task(arbiter.run_routine(0, blocked_routine))
+    await asyncio.wait_for(routine_entered.wait(), timeout=1.0)
+    generation = arbiter.admit_emergency_stop()
+    stop = asyncio.create_task(arbiter.run_emergency_stop(lambda: blocked_routine()))
+    await asyncio.sleep(0)
+    stop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stop
+    release_routine.set()
+    assert await asyncio.wait_for(routine, timeout=1.0) == (True, "first")
+
+    async def later_routine() -> str:
+        return "later"
+
+    assert await arbiter.run_routine(generation, later_routine) == (True, "later")
+
+
+@pytest.mark.asyncio
+async def test_close_reservation_discards_routine_write_admitted_before_d212_proof() -> None:
+    """A D212 reservation fences routine writes until its proof resolves."""
+    arbiter = CommandArbiter()
+    commands: list[str] = []
+
+    async def routine() -> str:
+        commands.append("routine")
+        return "routine"
+
+    generation = arbiter.generation
+    assert arbiter.reserve_close(generation)
+    assert await arbiter.run_routine(generation, routine) == (False, None)
+    assert commands == []
+
+    # The reservation's own policy-authorized stop remains executable.
+    assert await arbiter.run_routine(generation, routine, close_reservation=generation) == (
+        True,
+        "routine",
+    )
+    arbiter.release_close(generation)
+    assert await arbiter.run_routine(generation, routine) == (True, "routine")
+
+
+@pytest.mark.asyncio
+async def test_estop_admission_after_exact_fault_read_prevents_second_proof_read() -> None:
+    """An admitted e-stop owns the next dispatch after an in-flight exact read."""
+
+    class BlockingFaultPort:
+        def __init__(self) -> None:
+            self.first_read_entered = asyncio.Event()
+            self.release_first_read = asyncio.Event()
+            self.calls: list[str] = []
+            self._reads = 0
+
+        @staticmethod
+        def state() -> FaultControlState:
+            return FaultControlState(
+                session_id="fault-session",
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=True,
+                beans_added=False,
+                beans_dropped=False,
+            )
+
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            assert session_id == "fault-session"
+            self.calls.append("exact_read")
+            self._reads += 1
+            if self._reads == 1:
+                self.first_read_entered.set()
+                await self.release_first_read.wait()
+            return self.state()
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            self.calls.append("latest_read")
+            return self.state()
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            assert expected_session_id == "fault-session"
+            self.calls.append(f"write:{action.value}")
+
+    arbiter = CommandArbiter()
+    assert arbiter.reserve_close(arbiter.generation)
+    port = BlockingFaultPort()
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), port, arbiter=arbiter)
+    closing = asyncio.create_task(
+        executor.execute(
+            OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            "fault-session",
+            is_current_generation=lambda: True,
+            close_reservation=0,
+        )
+    )
+    await asyncio.wait_for(port.first_read_entered.wait(), timeout=1.0)
+    stopping = asyncio.create_task(
+        executor.execute(
+            OperatorAction.EMERGENCY_STOP,
+            "fault-session",
+            is_current_generation=lambda: True,
+        )
+    )
+    await asyncio.sleep(0)
+    port.release_first_read.set()
+
+    assert await asyncio.wait_for(closing, timeout=1.0) is None
+    assert await asyncio.wait_for(stopping, timeout=1.0) is not None
+    assert port.calls == [
+        "exact_read",
+        "write:emergency_stop",
+        "exact_read",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("active", "device_connected", "heat_level_percent"),
+    [(True, True, 0), (False, False, 0), (False, True, 1)],
+    ids=["active", "disconnected", "heating"],
+)
+async def test_fault_executor_start_cooling_rechecks_safe_preconditions(
+    active: bool, device_connected: bool, heat_level_percent: int
+) -> None:
+    """Stale fault-control projections cannot start cooling from an unsafe state."""
+
+    class UnsafeFaultPort:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            assert session_id == "fault-session"
+            self.calls.append("exact_read")
+            return FaultControlState(
+                session_id=session_id,
+                mcp_phase="fault",
+                active=active,
+                device_connected=device_connected,
+                heat_level_percent=heat_level_percent,
+                fan_level_percent=0,
+                cooling_on=False,
+                beans_added=False,
+                beans_dropped=False,
+            )
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            raise AssertionError("start cooling must not need a latest-session read")
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            raise AssertionError(
+                f"unsafe state must not write {action.value} for {expected_session_id}"
+            )
+
+    port = UnsafeFaultPort()
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), port)
+
+    assert (
+        await executor.execute(
+            OperatorAction.START_COOLING,
+            "fault-session",
+            is_current_generation=lambda: True,
+        )
+        is None
+    )
+    assert port.calls == ["exact_read"]
 
 
 def _advisory_harness_in_phase(phase: RoastPhase, *, advisor: RoastAdvisor) -> Harness:
@@ -6513,14 +7369,16 @@ async def test_full_mock_roast_with_fake_mcp() -> None:
     await controller.operator_stop_cooling()
     assert controller.phase is RoastPhase.COMPLETE
     commands = mcp.commands()
-    # Lifecycle bookends and the one drop, in order — set_targets recurs as
-    # advisory maintains targets across the roast, so assert the invariants,
-    # not an exact count.
+    # Lifecycle bookends and the one drop, in order. Target updates are
+    # deliberately split into heat then fan so an admitted e-stop can run
+    # between actual MCP calls; assert the paired command invariant rather
+    # than the retired composite adapter helper.
     assert commands[0] == "start_session"
     assert commands[-1] == "stop_cooling"
     assert commands.count("drop_beans") == 1
     assert commands.index("drop_beans") < commands.index("stop_cooling")
-    assert commands.count("set_targets") >= 2  # profile initials + advisory
+    assert commands.count("set_heat") >= 2  # profile initials + advisory
+    assert commands.count("set_heat") == commands.count("set_fan")
     kinds = events.kinds()
     for expected in (
         RoastEventKind.RUN_STARTED,
@@ -7256,7 +8114,13 @@ def _controller_accepts(action: OperatorAction, phase: RoastPhase) -> bool:
       (``RoastRunner._dispatch_acknowledge_fault``) acts iff the controller is in
       ``faulted`` (it flips the runner's finalise flag); the
       controller-observable acceptance condition is exactly "phase is FAULTED".
+    * ``stop_cooling_and_acknowledge`` (D212): deliberately false here.  It is
+      an API-owned, fault-lease operation with an exact-session readback and a
+      durable compare-and-swap; it is not a direct controller action and must
+      never be exposed through this controller permission mirror.
     """
+    if action is OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE:
+        return False
     command = OPERATOR_ACTION_COMMAND.get(action)
     if command is not None:
         policy = SafetyPolicy(SafetyLimits())
@@ -7297,7 +8161,9 @@ def test_enabled_actions_mirror_controller_acceptance(
     the server's ``enabled_actions`` projection includes the action IFF the real
     controller would accept it. Zero carve-outs — a controller change that
     diverges (phase-gating pause/resume, widening acknowledge, a matrix edit)
-    fails here, keeping ``enabled_actions`` an honest permission mirror."""
+    fails here, keeping ``enabled_actions`` an honest permission mirror.  D212's
+    lease-owned composite action is intentionally excluded from that mirror and
+    therefore remains false for every controller phase."""
     in_enabled = action in enabled_operator_actions(phase)
     assert in_enabled is _controller_accepts(action, phase), (
         f"{action.value} in {phase.value}: enabled={in_enabled} but "
@@ -9134,6 +10000,44 @@ async def test_deterministic_drop_anchor_emits_command_failed_on_actuator_failur
     assert {"command": "drop_beans", "source": "policy"} not in executed
 
 
+@pytest.mark.asyncio
+async def test_estop_fences_failed_deterministic_drop_clamp_at_original_generation() -> None:
+    """An e-stop admitted during a failed drop fences its corrective clamp."""
+
+    class ParkedFailingDropExecutor(RecordingExecutor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def drop_beans(self) -> AppliedRoasterState:
+            self.entered.set()
+            await self.release.wait()
+            raise RuntimeError("parked drop failure")
+
+    executor = ParkedFailingDropExecutor()
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent,
+        config=_post_fc_config(),
+        executor=executor,
+    )
+    generation = harness.controller.command_generation
+    drop = asyncio.create_task(
+        harness.controller._execute_deterministic_drop(  # pyright: ignore[reportPrivateUsage]
+            DropReason.DEVELOPMENT_TARGET, generation=generation
+        )
+    )
+    await asyncio.wait_for(executor.entered.wait(), timeout=1.0)
+    emergency = asyncio.create_task(harness.controller.operator_emergency_stop("race"))
+    await asyncio.sleep(0)
+    assert not emergency.done()
+    executor.release.set()
+    assert not await asyncio.wait_for(drop, timeout=1.0)
+    await asyncio.wait_for(emergency, timeout=1.0)
+    assert executor.targets == []
+    assert harness.controller.phase is RoastPhase.FAULTED
+
+
 # --- D88 amendment A1/A2 (#405 Slice C2): the decoupled ceiling-guard drop ---
 
 
@@ -9760,6 +10664,32 @@ async def test_emergency_stop_with_malformed_payload_still_faults() -> None:
     # No pending fail-safe retry latched — the malformed-payload path is NOT
     # the raising-exception path, so it must not queue the emergency_stop
     # retry evaluation (LOW-2).
+    assert harness.controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_rearmed_terminal_estop_fail_safe_retries_typed_heat_off() -> None:
+    """A service-routed unconfirmed e-stop retains the next-tick heat-off retry."""
+    executor = RecordingExecutor()
+    harness = make_harness(readings=[reading(bean=180.0, env=185.0)], executor=executor)
+    harness.controller.load_profile(PROFILE)
+    for phase in NORMAL_PATH[:2]:
+        harness.controller.transition_to(phase)
+    harness.controller.admit_emergency_stop()
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    await harness.controller._run_emergency_write(  # pyright: ignore[reportPrivateUsage]
+        lambda: executor.emergency_stop(reason="terminal external stop")
+    )
+    assert harness.controller._emergency_stop_transition_pending  # pyright: ignore[reportPrivateUsage]
+    harness.controller.rearm_emergency_stop_fail_safe()
+    assert not harness.controller._emergency_stop_transition_pending  # pyright: ignore[reportPrivateUsage]
+
+    await harness.controller.tick()
+
+    assert executor.targets
+    heat, fan = executor.targets[-1]
+    assert heat == 0
+    assert fan == harness.controller.snapshot().current_fan
     assert harness.controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
 
 

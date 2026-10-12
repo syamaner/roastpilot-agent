@@ -20,7 +20,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Literal, Protocol
+from typing import Literal, Protocol, TypeVar
 
 from roastpilot_agent.advisor import (
     AdvisorContext,
@@ -46,6 +46,8 @@ from roastpilot_agent.models import (
     AdvisorTraceStatus,
     AppliedRoasterState,
     DropReason,
+    FaultControlState,
+    OperatorAction,
     PostFcHeatAuthorityState,
     ReferenceRoast,
     RoastCommand,
@@ -88,7 +90,10 @@ __all__ = [
     "AdvisoryCallPolicy",
     "AdvisoryTrigger",
     "CommandExecutor",
+    "CommandArbiter",
     "ControllerSnapshot",
+    "FaultControlExecutor",
+    "FaultControlPort",
     "EventEmitter",
     "InvalidTransitionError",
     "RoastController",
@@ -101,6 +106,203 @@ __all__ = [
 
 Clock = Callable[[], float]
 AsyncSleep = Callable[[float], Awaitable[None]]
+_ActuationT = TypeVar("_ActuationT")
+
+
+class CommandArbiter:
+    """Serialize actual MCP calls and reserve the next dispatch for e-stops.
+
+    The arbiter deliberately locks one MCP call at a time, rather than a
+    controller operation.  An admitted e-stop therefore waits only for the
+    call already in the driver; a split heat/fan update cannot make it wait for
+    its second call.  Routine callers retain the generation they were admitted
+    under and are discarded when an e-stop supersedes that generation.
+    """
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._generation = 0
+        self._in_flight = False
+        self._pending_emergency_stops = 0
+        self._emergency_stop_in_flight = False
+        # A generation fences work admitted before an e-stop.  This separate
+        # epoch fences work that captures the *new* generation while the stop
+        # itself owns the MCP call: it must not become the first post-stop
+        # write merely because the stop leaves that generation unchanged.
+        self._emergency_stop_release_epoch = 0
+        self._close_reservation_generation: int | None = None
+
+    @property
+    def generation(self) -> int:
+        """Return the current e-stop generation without awaiting."""
+        return self._generation
+
+    def admit_emergency_stop(self) -> int:
+        """Synchronously invalidate routine work and reserve e-stop priority."""
+        self._generation += 1
+        # A priority stop supersedes a pending D212 safe-zero proof.  Clearing
+        # the token here means the closing operation cannot use it after the
+        # currently executing MCP call returns.
+        self._close_reservation_generation = None
+        self._pending_emergency_stops += 1
+        return self._generation
+
+    def is_current(self, generation: int) -> bool:
+        """Whether a previously admitted routine operation remains current."""
+        return generation == self._generation
+
+    @property
+    def emergency_stop_active(self) -> bool:
+        """Whether an admitted e-stop still owns or awaits the MCP boundary."""
+        return self._pending_emergency_stops > 0 or self._emergency_stop_in_flight
+
+    def reserve_close(self, generation: int) -> bool:
+        """Fence routine actuator writes while one D212 proof is assembled."""
+        if (
+            generation != self._generation
+            or self._pending_emergency_stops
+            or self._close_reservation_generation is not None
+        ):
+            return False
+        self._close_reservation_generation = generation
+        return True
+
+    def close_reservation_is_current(self, generation: int) -> bool:
+        """Return whether ``generation`` still owns the D212 close interval."""
+        return generation == self._generation and self._close_reservation_generation == generation
+
+    def release_close(self, generation: int) -> None:
+        """Release a completed or safely-blocked D212 close reservation."""
+        if self._close_reservation_generation == generation:
+            self._close_reservation_generation = None
+
+    async def wait_for_close_proof(self, generation: int) -> bool:
+        """Wait until an owned D212 reservation has exclusive MCP observation.
+
+        D212's first safe-zero read is evidence about the actuator state.  It
+        cannot race a routine command that was already dispatched before the
+        reservation was taken.  Once that command returns, the still-owned
+        reservation keeps every routine writer out through the final proof and
+        durable close.
+        """
+        async with self._condition:
+            while self._in_flight:
+                if not self.close_reservation_is_current(generation):
+                    return False
+                await self._condition.wait()
+            return self.close_reservation_is_current(generation)
+
+    async def cancel_emergency_stop_admission(self) -> None:
+        """Release one undeliverable e-stop reservation without writing hardware."""
+        async with self._condition:
+            if self._pending_emergency_stops > 0:
+                self._pending_emergency_stops -= 1
+            # A caller may have captured the new generation while this
+            # reservation was pending.  It was admitted inside the stop's
+            # exclusive interval, so it cannot become a routine dispatch when
+            # that interval is released.
+            self._emergency_stop_release_epoch += 1
+            self._condition.notify_all()
+
+    async def run_routine(
+        self,
+        generation: int,
+        operation: Callable[[], Awaitable[_ActuationT]],
+        *,
+        admitted: Callable[[], bool] | None = None,
+        close_reservation: int | None = None,
+    ) -> tuple[bool, _ActuationT | None]:
+        """Run one non-e-stop MCP call, or discard it before dispatch.
+
+        The check occurs before waiting and again after every wait, which is
+        essential because a routine command can become unsafe while queued.
+        A routine that starts while an admitted e-stop owns the MCP call also
+        captures the stop-release epoch.  Its generation may be current after
+        the stop, but the changed epoch discards it before a post-stop write.
+        """
+        async with self._condition:
+            emergency_stop_release_epoch = self._emergency_stop_release_epoch
+            while self._in_flight:
+                if (
+                    generation != self._generation
+                    or emergency_stop_release_epoch != self._emergency_stop_release_epoch
+                    or self._pending_emergency_stops
+                    or (admitted is not None and not admitted())
+                    or (
+                        self._close_reservation_generation is not None
+                        and close_reservation != self._close_reservation_generation
+                    )
+                    or (
+                        close_reservation is not None
+                        and not self.close_reservation_is_current(close_reservation)
+                    )
+                ):
+                    return False, None
+                await self._condition.wait()
+            if (
+                generation != self._generation
+                or emergency_stop_release_epoch != self._emergency_stop_release_epoch
+                or self._pending_emergency_stops
+                or (admitted is not None and not admitted())
+                or (
+                    self._close_reservation_generation is not None
+                    and close_reservation != self._close_reservation_generation
+                )
+                or (
+                    close_reservation is not None
+                    and not self.close_reservation_is_current(close_reservation)
+                )
+            ):
+                return False, None
+            self._in_flight = True
+        try:
+            return True, await operation()
+        finally:
+            async with self._condition:
+                self._in_flight = False
+                self._condition.notify_all()
+
+    async def run_emergency_stop(
+        self,
+        operation: Callable[[], Awaitable[_ActuationT]],
+        *,
+        admitted: Callable[[], bool] | None = None,
+    ) -> _ActuationT:
+        """Run one admitted e-stop after at most the current MCP call."""
+        reservation_released = False
+        try:
+            async with self._condition:
+                while self._in_flight:
+                    await self._condition.wait()
+                if admitted is not None and not admitted():
+                    # The caller already reserved this priority slot
+                    # synchronously.  Release it when its independent exact-session
+                    # proof has become stale, otherwise it would permanently block
+                    # routine commands without ever dispatching an e-stop.
+                    if self._pending_emergency_stops > 0:
+                        self._pending_emergency_stops -= 1
+                    reservation_released = True
+                    self._emergency_stop_release_epoch += 1
+                    self._condition.notify_all()
+                    raise RuntimeError("emergency-stop admission is no longer current")
+                # Keep any later e-stop reservation visible to routine callers.
+                if self._pending_emergency_stops > 0:
+                    self._pending_emergency_stops -= 1
+                reservation_released = True
+                self._in_flight = True
+                self._emergency_stop_in_flight = True
+        except asyncio.CancelledError:
+            if not reservation_released:
+                await self.cancel_emergency_stop_admission()
+            raise
+        try:
+            return await operation()
+        finally:
+            async with self._condition:
+                self._in_flight = False
+                self._emergency_stop_in_flight = False
+                self._emergency_stop_release_epoch += 1
+                self._condition.notify_all()
 
 
 #: The controller is event-driven rather than log-driven. Logs here are reserved
@@ -199,6 +401,11 @@ UNIVERSAL_TARGETS: frozenset[RoastPhase] = frozenset(
 #: one is ever extended. A test pins the equality so the coupling is intentional.
 TERMINAL_LATCH_PHASES: frozenset[RoastPhase] = UNIVERSAL_TARGETS
 
+#: Source-bound retry evaluation emitted only after an unconfirmed e-stop.
+#: Ordinary FAULT/RECOVERY evaluations, even when they request heat 0 %, do
+#: not receive the narrow transition-gate exception attached to this retry.
+_EMERGENCY_STOP_RETRY_RULE = "emergency_stop_retry"
+
 #: Severity ranking of the terminal-stage verdicts, for the upward-only
 #: escalation a latched controller still performs (safety-reviewer carry-forward
 #: on #206). A latched controller re-reads + re-evaluates each tick and acts ONLY
@@ -243,6 +450,14 @@ class CommandExecutor(Protocol):
         """Apply validated heat/fan targets."""
         ...
 
+    async def set_heat(self, heat_percent: int) -> None:
+        """Set heat through the controller-owned arbiter."""
+        ...
+
+    async def set_fan(self, fan_percent: int) -> None:
+        """Set fan through the controller-owned arbiter."""
+        ...
+
     async def mark_beans_added(self) -> None:
         """Record the manual beans-added (manual-T0 fallback) with MCP."""
         ...
@@ -280,6 +495,233 @@ class CommandExecutor(Protocol):
         mirroring :meth:`drop_beans` — including the ``None``-on-malformed-
         payload contract."""
         ...
+
+
+class FaultControlPort(Protocol):
+    """Exact-session actuator boundary for a durable terminal fault lease."""
+
+    async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+        """Read one exact fault session's typed state."""
+        ...
+
+    async def read_latest_fault_control_state(self) -> FaultControlState:
+        """Read the MCP's current latest fault session with typed controls."""
+        ...
+
+    async def write_fault_control(
+        self, action: OperatorAction, *, expected_session_id: str
+    ) -> None:
+        """Execute one guarded exact-session write without a readback."""
+        ...
+
+
+class FaultControlExecutor:
+    """Controller-owned, single-writer executor for an OPEN terminal lease.
+
+    It is deliberately smaller than :class:`RoastController`: the historical
+    row is immutable and there is no live roast loop to resume.  Every write
+    still receives a typed safety evaluation for the faulted phase before the
+    exact-session port can issue it.
+    """
+
+    def __init__(
+        self, safety: SafetyPolicy, port: FaultControlPort, *, arbiter: CommandArbiter | None = None
+    ) -> None:
+        self._safety = safety
+        self._port = port
+        self._arbiter = arbiter or CommandArbiter()
+        self._queue: asyncio.PriorityQueue[
+            tuple[
+                int,
+                int,
+                OperatorAction,
+                str,
+                int,
+                Callable[[], bool],
+                int | None,
+                asyncio.Future[FaultControlState | None],
+            ]
+        ] = asyncio.PriorityQueue()
+        self._sequence = 0
+        self._worker: asyncio.Task[None] | None = None
+
+    async def execute(
+        self,
+        action: OperatorAction,
+        session_id: str,
+        *,
+        is_current_generation: Callable[[], bool],
+        close_reservation: int | None = None,
+        emergency_generation: int | None = None,
+    ) -> FaultControlState | None:
+        """Execute one allowed terminal fault action, serialized with its proof."""
+        if action is OperatorAction.EMERGENCY_STOP:
+            generation = (
+                self._arbiter.admit_emergency_stop()
+                if emergency_generation is None
+                else emergency_generation
+            )
+        else:
+            generation = self._arbiter.generation
+        self._sequence += 1
+        future: asyncio.Future[FaultControlState | None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        # An MCP call in flight cannot be interrupted, but the next dispatch
+        # always takes an admitted e-stop before queued recovery controls.
+        priority = 0 if action is OperatorAction.EMERGENCY_STOP else 1
+        self._queue.put_nowait(
+            (
+                priority,
+                self._sequence,
+                action,
+                session_id,
+                generation,
+                is_current_generation,
+                close_reservation,
+                future,
+            )
+        )
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+        return await future
+
+    async def _drain(self) -> None:
+        """Drain fault actions in priority order until no admitted work remains."""
+        while not self._queue.empty():
+            (
+                _,
+                _,
+                action,
+                session_id,
+                generation,
+                generation_current,
+                close_reservation,
+                future,
+            ) = await self._queue.get()
+            if future.cancelled():
+                if action is OperatorAction.EMERGENCY_STOP:
+                    await self._arbiter.cancel_emergency_stop_admission()
+                continue
+            try:
+                result = await self._execute_one(
+                    action,
+                    session_id,
+                    generation,
+                    generation_current,
+                    close_reservation=close_reservation,
+                )
+            except Exception as exc:  # noqa: BLE001 - failed exact proof is fail-closed
+                if not future.done():
+                    future.set_exception(exc)
+            else:
+                if not future.done():
+                    future.set_result(result)
+
+    async def _execute_one(
+        self,
+        action: OperatorAction,
+        session_id: str,
+        generation: int,
+        generation_current: Callable[[], bool],
+        *,
+        close_reservation: int | None,
+    ) -> FaultControlState | None:
+        """Evaluate and execute one current generation's exact-session action."""
+        command_by_action = {
+            OperatorAction.DROP_BEANS: RoastCommand.DROP_BEANS,
+            OperatorAction.START_COOLING: RoastCommand.START_COOLING,
+            OperatorAction.STOP_COOLING: RoastCommand.STOP_COOLING,
+            OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE: RoastCommand.STOP_COOLING,
+        }
+        if action is OperatorAction.EMERGENCY_STOP:
+            evaluation = self._safety.evaluate_emergency_stop(
+                phase=RoastPhase.FAULTED, operator_reason="terminal fault control"
+            )
+            if evaluation.verdict is not SafetyVerdict.EMERGENCY_STOP:
+                await self._arbiter.cancel_emergency_stop_admission()
+                return None
+            # No pre-read may postpone an e-stop attempt.  The guarded command
+            # result and its fresh exact-session readback are the proof.
+            await self._arbiter.run_emergency_stop(
+                lambda: self._port.write_fault_control(action, expected_session_id=session_id),
+                admitted=generation_current,
+            )
+            if not generation_current():
+                return None
+            return await self._port.read_fault_control_state(session_id)
+        command = command_by_action.get(action)
+        if command is None:
+            return None
+        evaluation = self._safety.evaluate_command_phase(command=command, phase=RoastPhase.FAULTED)
+        if evaluation.verdict is not SafetyVerdict.ALLOW:
+            return None
+        if close_reservation is not None and not await self._arbiter.wait_for_close_proof(
+            close_reservation
+        ):
+            return None
+        before = await self._port.read_fault_control_state(session_id)
+        if before.session_id != session_id or before.mcp_phase != "fault":
+            return None
+        # An e-stop can be admitted while an exact-state read is in flight.
+        # Do not begin another proof read after that admission: its reserved
+        # dispatch must run next.  The same check preserves D212's exclusive
+        # proof interval when its close reservation has been superseded.
+        if not generation_current() or (
+            close_reservation is not None
+            and not self._arbiter.close_reservation_is_current(close_reservation)
+        ):
+            return None
+        if action is OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE:
+            # The MCP can attach current driver controls to a historical
+            # session snapshot. D212 may close without a write when cooling is
+            # already off, so its proof must also show this lease is latest.
+            latest = await self._port.read_latest_fault_control_state()
+            if latest.session_id != session_id or latest.mcp_phase != "fault":
+                return None
+            if not generation_current() or (
+                close_reservation is not None
+                and not self._arbiter.close_reservation_is_current(close_reservation)
+            ):
+                return None
+        if action in (
+            OperatorAction.STOP_COOLING,
+            OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+        ) and (before.active or not before.device_connected or before.heat_level_percent != 0):
+            # Cooling must remain available while a fault session may still be
+            # active or heating. Both terminal stop paths fail closed here.
+            return None
+        if action is OperatorAction.START_COOLING and (
+            before.active or not before.device_connected or before.heat_level_percent != 0
+        ):
+            # Match the current-state projection at the exact execution
+            # boundary so a stale enabled action can never start cooling.
+            return None
+        if action is OperatorAction.DROP_BEANS and (not before.beans_added or before.beans_dropped):
+            return None
+        if action is OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE and not before.cooling_on:
+            return before
+        if not generation_current() or (
+            close_reservation is not None
+            and not self._arbiter.close_reservation_is_current(close_reservation)
+        ):
+            return None
+        dispatched, _ = await self._arbiter.run_routine(
+            generation,
+            lambda: self._port.write_fault_control(action, expected_session_id=session_id),
+            admitted=generation_current,
+            close_reservation=close_reservation,
+        )
+        if (
+            not dispatched
+            or not generation_current()
+            or (
+                close_reservation is not None
+                and not self._arbiter.close_reservation_is_current(close_reservation)
+            )
+        ):
+            return None
+        return await self._port.read_fault_control_state(session_id)
 
 
 class SnapshotSink(Protocol):
@@ -654,6 +1096,8 @@ class RoastController:
         advisor: RoastAdvisor | None = None,
         clock: Clock = time.monotonic,
         reference_roast: ReferenceRoast | None = None,
+        start_write_permitted: Callable[[], bool] | None = None,
+        actuator_arbiter: CommandArbiter | None = None,
     ) -> None:
         self._config = config
         self._safety = safety
@@ -663,6 +1107,12 @@ class RoastController:
         self._events = event_emitter
         self._advisor = advisor
         self._clock = clock
+        # The service binds this to the lease generation reserved for this run.
+        # It is rechecked immediately before the first MCP start write, after
+        # all setup awaits have completed.  An admitted e-stop advances that
+        # generation synchronously, so this controller boundary cannot start a
+        # session from an invalidated reservation.
+        self._start_write_permitted = start_write_permitted
         # #567 Slice B: a DIFFERENT completed, well-rated roast of THIS SAME
         # bean, retrieved ONCE by the caller (RoastService, fail-soft, flag-
         # gated) before construction and cached here for the run's entire
@@ -740,6 +1190,11 @@ class RoastController:
         # while still killing the re-read / re-eval / re-emit noise loop the latch
         # exists to fix. ``None`` = posture confirmed / nothing pending.
         self._pending_fail_safe: SafetyEvaluation | None = None
+        # Only this controller-owned latch authorizes the one narrow routine
+        # write allowed while an admitted e-stop is still transitioning.  A
+        # safety-rule name is trace data, not authority: a later rule must not
+        # be able to spoof an unconfirmed e-stop retry by reusing its text.
+        self._pending_fail_safe_is_emergency_stop_retry = False
         # The terminal verdict the controller is currently LATCHED on (None when
         # not in a terminal phase). Drives the upward-only escalation in the
         # terminal-phase tick branch: re-evaluation acts only on a STRICTLY more
@@ -942,6 +1397,15 @@ class RoastController:
         # operator advisory pause latch (pause/resume_advisory, D19).
         self._last_telemetry: RoastTelemetry | None = None
         self._advisory_paused = False
+        # Synchronously advanced by an admitted e-stop.  Long advisory work
+        # captures it before awaiting the provider and discards a stale result
+        # before it can write levers or transition phase.
+        self._arbiter = actuator_arbiter or CommandArbiter()
+        # The arbiter releases immediately after the hardware stop returns,
+        # before this controller records the terminal phase.  Keep routine
+        # writes closed over that narrow interval so a concurrently scheduled
+        # tick cannot apply a current-generation target after the stop.
+        self._emergency_stop_transition_pending = False
         # D40.3 / D40.5 (#275): the per-tick control-loop CONTEXT accumulator —
         # the roast-so-far curve (bounded recent full-res window + milestone
         # summary) and the model's own recommendation trace (#218). Context
@@ -1269,6 +1733,8 @@ class RoastController:
             raise InvalidTransitionError(self._phase, target)
         previous = self._phase
         self._phase = target
+        if target is RoastPhase.FAULTED:
+            self._release_emergency_stop_transition_gate_if_safe()
         # Safety-review fix (post-B2, Opus finding, MEDIUM): ``_post_fc_engaged``
         # is True IFF the current DEVELOPMENT dwell was entered via the TRUE
         # first-crack edge (``ROASTING_PRE_FIRST_CRACK -> DEVELOPMENT``) — set
@@ -1341,6 +1807,7 @@ class RoastController:
             # verdict clears too, so a fresh terminal entry later starts its
             # escalation tracking from scratch.
             self._pending_fail_safe = None
+            self._pending_fail_safe_is_emergency_stop_retry = False
             self._latched_verdict = None
         if target in (RoastPhase.STARTING, RoastPhase.PREHEATING):
             # Per-run latches reset (T0 confirmation, debounce streak,
@@ -1542,6 +2009,128 @@ class RoastController:
         the final say on whether the resulting advice can apply)."""
         self._advisory_requested = True
 
+    def admit_emergency_stop(self) -> int:
+        """Fence outstanding advisory work before an emergency-stop attempt."""
+        self._pending_fail_safe = None
+        self._pending_fail_safe_is_emergency_stop_retry = False
+        self._emergency_stop_transition_pending = True
+        return self._arbiter.admit_emergency_stop()
+
+    def _release_emergency_stop_transition_gate_if_safe(self) -> None:
+        """Open routine fault controls only after every admitted stop has released."""
+        if not self._arbiter.emergency_stop_active:
+            self._emergency_stop_transition_pending = False
+
+    def confirm_external_emergency_stop(self) -> None:
+        """Release the controller gate after a confirmed exact-session stop.
+
+        The service may dispatch a live runner's admitted stop through the
+        terminal exact-session executor while D212 finalisation is in flight.
+        That executor owns the same arbiter and has already returned only after
+        proof confirms the stop, so no heat-off retry is required here.
+        """
+        self._release_emergency_stop_transition_gate_if_safe()
+
+    def _generation_is_current(self, generation: int) -> bool:
+        """Return whether an admitted routine operation remains current."""
+        return self._arbiter.is_current(generation)
+
+    @property
+    def command_generation(self) -> int:
+        """Return the controller command generation for an external proof sequence."""
+        return self._arbiter.generation
+
+    async def execute_fault_acknowledgement_stop(
+        self,
+        generation: int,
+        operation: Callable[[], Awaitable[_ActuationT]],
+        *,
+        close_reservation: int,
+    ) -> tuple[bool, _ActuationT | None]:
+        """Run the policy-authorized D212 cooling stop through the shared arbiter."""
+        return await self._run_routine_write(
+            generation,
+            operation,
+            admitted=lambda: self._arbiter.close_reservation_is_current(close_reservation),
+            close_reservation=close_reservation,
+        )
+
+    def reserve_fault_acknowledgement_close(self, generation: int) -> bool:
+        """Reserve the shared arbiter before D212 reads or writes controls."""
+        return self._arbiter.reserve_close(generation)
+
+    def release_fault_acknowledgement_close(self, generation: int) -> None:
+        """Release D212's shared write fence after completion or failure."""
+        self._arbiter.release_close(generation)
+
+    async def wait_for_fault_acknowledgement_proof(self, generation: int) -> bool:
+        """Wait for a D212 reservation to exclude prior routine MCP writes."""
+        return await self._arbiter.wait_for_close_proof(generation)
+
+    def fault_acknowledgement_close_is_current(self, generation: int) -> bool:
+        """Return whether the D212 write fence still belongs to ``generation``."""
+        return self._arbiter.close_reservation_is_current(generation)
+
+    async def _run_routine_write(
+        self,
+        generation: int,
+        operation: Callable[[], Awaitable[_ActuationT]],
+        *,
+        admitted: Callable[[], bool] | None = None,
+        close_reservation: int | None = None,
+        allow_emergency_stop_transition_for_heat_off: bool = False,
+    ) -> tuple[bool, _ActuationT | None]:
+        """Execute one routine write through the controller-owned arbiter."""
+
+        def routine_admission_is_current() -> bool:
+            """Reject writes until an admitted stop has committed FAULTED."""
+            return (
+                allow_emergency_stop_transition_for_heat_off
+                or not self._emergency_stop_transition_pending
+            ) and (admitted is None or admitted())
+
+        return await self._arbiter.run_routine(
+            generation,
+            operation,
+            admitted=routine_admission_is_current,
+            close_reservation=close_reservation,
+        )
+
+    async def _run_emergency_write(
+        self, operation: Callable[[], Awaitable[_ActuationT]]
+    ) -> _ActuationT:
+        """Execute one already-admitted e-stop with priority over routine work."""
+        return await self._arbiter.run_emergency_stop(operation)
+
+    async def _set_targets(
+        self,
+        *,
+        heat_percent: int,
+        fan_percent: int,
+        generation: int | None = None,
+        allow_emergency_stop_transition_for_heat_off: bool = False,
+    ) -> bool:
+        """Write heat then fan, yielding priority to an admitted e-stop between calls."""
+        if generation is None:
+            generation = self._arbiter.generation
+        dispatched, _ = await self._run_routine_write(
+            generation,
+            lambda: self._executor.set_heat(heat_percent),
+            allow_emergency_stop_transition_for_heat_off=(
+                allow_emergency_stop_transition_for_heat_off and heat_percent == 0
+            ),
+        )
+        if not dispatched:
+            return False
+        dispatched, _ = await self._run_routine_write(
+            generation,
+            lambda: self._executor.set_fan(fan_percent),
+            allow_emergency_stop_transition_for_heat_off=(
+                allow_emergency_stop_transition_for_heat_off and heat_percent == 0
+            ),
+        )
+        return dispatched
+
     async def tick(self) -> None:
         """Run one controller tick in the documented order.
 
@@ -1558,6 +2147,13 @@ class RoastController:
         separate, always-available methods, so the latch never reduces what the
         operator can do (#206 operable-faulted intact).
         """
+        generation = self._arbiter.generation
+        # An admitted e-stop owns this controller generation until its hardware
+        # outcome returns.  Starting another tick in that interval could persist
+        # a pre-stop event-source evaluation and then attempt T0/FC after the
+        # e-stop has faulted the phase.
+        if self._emergency_stop_transition_pending:
+            return
         # Tick-scoped historical witness. Operator actions are drained before
         # this method, so clearing here also prevents a prior tick's accepted
         # output leaking through a later operator drop/recovery transition.
@@ -1566,38 +2162,54 @@ class RoastController:
             # If the fail-safe write did not confirm on entry (a transient MCP
             # write failure), re-attempt the heat-off write here — the latch must
             # never strand the roaster hot. Once it confirms, this is silent.
-            await self._retry_pending_fail_safe()
+            await self._retry_pending_fail_safe(generation=generation)
+            if not self._generation_is_current(generation):
+                return
             # Upward-only re-evaluation: escalate to a STRICTLY more severe verdict
             # (FAULT → EMERGENCY_STOP) if the live MCP now reports one; otherwise
             # hold without re-emitting anything (and hold silently if the MCP is
             # dead). This is the only place a latched tick may fire new hardware.
             await self._maybe_escalate_while_latched()
+            if not self._generation_is_current(generation):
+                return
             self._check_operator_timeout()
             # A stale advisory request must not survive the latch into a later
             # resumed/cooling tick (mirrors the fail-closed branch below).
             self._advisory_requested = False
             return
         telemetry, read_failed = await self._read_telemetry()
+        if not self._generation_is_current(generation):
+            return
         # Remember the reading this tick consumed so the runner's post-tick
         # snapshot publishes the same telemetry it acted on (E9).
         self._last_telemetry = telemetry
         await self._snapshots.persist_snapshot(telemetry)
+        if not self._generation_is_current(generation):
+            return
         evaluation = self._evaluate_safety(telemetry, read_failed=read_failed)
         await self._snapshots.persist_evaluation(evaluation)
-        if await self._act_on_safety(evaluation):
+        if not self._generation_is_current(generation):
+            return
+        if await self._act_on_safety(evaluation, generation=generation):
             # Fail-closed action taken: no advisory, no commands — and a
             # stale advisory request must not survive into a later tick
             # (it would otherwise fire in faulted/recovery).
             self._advisory_requested = False
             return
-        await self._apply_phase_rules(telemetry)
+        if not self._generation_is_current(generation):
+            return
+        await self._apply_phase_rules(telemetry, generation=generation)
+        if not self._generation_is_current(generation):
+            return
         self._check_operator_timeout()
         # D35 §3 (#222): pre-FC the controller deterministically sets heat/fan
         # from the policy — runs AFTER _apply_phase_rules so a tick that just
         # charged (PREHEATING → ROASTING_PRE_FIRST_CRACK) actuates the pre-FC
         # lever, and a tick that just hit FC does NOT (it falls to the advisor).
         # The advisory step below is a no-op in these phases (gated out).
-        await self._apply_deterministic_pre_fc_levers(telemetry)
+        await self._apply_deterministic_pre_fc_levers(telemetry, generation=generation)
+        if not self._generation_is_current(generation):
+            return
         # D82/D83 (#405 Slice B2): the deterministic post-FC RoR-target PI
         # loop, called immediately AFTER the pre-FC lever step for the same
         # reason the pre-FC comment documents its own ordering — a tick that
@@ -1608,7 +2220,9 @@ class RoastController:
         # picks the loop up in the SAME tick the phase flips. No-op entirely
         # unless ``post_first_crack_control.enabled`` is True (default False —
         # today's advisor-driven post-FC path is unaffected).
-        await self._apply_deterministic_post_fc_levers(telemetry)
+        await self._apply_deterministic_post_fc_levers(telemetry, generation=generation)
+        if not self._generation_is_current(generation):
+            return
         # D88 amendment A1 (#405): the decoupled ceiling-guard drop, called
         # BEFORE the dev%/temp anchor below. Ordering decision: the guard is
         # the HARDER of the two safety bounds (a run where the loop keeps
@@ -1620,7 +2234,9 @@ class RoastController:
         # (default False — today's fully advisor-driven drop is unaffected) —
         # deliberately its OWN flag, unconnected to the RoR-taper loop's
         # ``enabled``/``_post_fc_engaged`` bundle the anchor below uses.
-        await self._maybe_ceiling_guard_drop(telemetry)
+        await self._maybe_ceiling_guard_drop(telemetry, generation=generation)
+        if not self._generation_is_current(generation):
+            return
         # D84 (#405 Slice C): the deterministic drop anchor, called immediately
         # AFTER the post-FC RoR loop step and the ceiling guard above, and
         # BEFORE the advisory consult below. Ordering decision: this must run
@@ -1640,7 +2256,9 @@ class RoastController:
         # already sees COOLING and no-ops). No-op entirely unless
         # ``post_first_crack_control.enabled`` is True (default False —
         # today's fully advisor-driven drop is unaffected).
-        await self._maybe_deterministic_drop(telemetry)
+        await self._maybe_deterministic_drop(telemetry, generation=generation)
+        if not self._generation_is_current(generation):
+            return
         # D40.3 (#275): accumulate the roast-so-far curve + milestones for the
         # per-tick control-loop context AFTER the phase rules + deterministic
         # pre-FC levers have run, so the sample captures the charge tick itself
@@ -1712,7 +2330,9 @@ class RoastController:
                 },
             )
 
-    async def _apply_deterministic_pre_fc_levers(self, telemetry: RoastTelemetry | None) -> None:
+    async def _apply_deterministic_pre_fc_levers(
+        self, telemetry: RoastTelemetry | None, *, generation: int | None = None
+    ) -> None:
         """Deterministically drive heat/fan from the policy before FC (D35 §3, #222).
 
         The highest-stakes path in the D35 chain: it actuates real heat/fan on the
@@ -1752,6 +2372,8 @@ class RoastController:
                 accumulated curve); ``None`` (a failed read) leaves the window
                 keyed on the last curve sample.
         """
+        if generation is None:
+            generation = self._arbiter.generation
         if self._profile is None:
             return
         # Build the live trim signal (bean-temp + FC-ETA + the per-run latch), arm
@@ -1828,7 +2450,9 @@ class RoastController:
             bounds=box,
         )
         await self._snapshots.persist_evaluation(evaluation)
-        executed = await self._execute_targets(evaluation)
+        if not self._generation_is_current(generation):
+            return
+        executed = await self._execute_targets(evaluation, generation=generation)
         # Advance damping state only after an ACTUALLY EXECUTED write (#412 Fix
         # 2; sharpened by the Codex actuator-failure finding, #405 Slice B2
         # fix round 2): key on ``executed`` — ``_execute_targets``'s own report
@@ -1846,7 +2470,9 @@ class RoastController:
         if damping_active and executed:
             self._trim_depth_applied = evaluation.adjusted_heat
 
-    async def _apply_deterministic_post_fc_levers(self, telemetry: RoastTelemetry | None) -> None:
+    async def _apply_deterministic_post_fc_levers(
+        self, telemetry: RoastTelemetry | None, *, generation: int | None = None
+    ) -> None:
         """Deterministically hold a target RoR post-FC via the PI loop (D82/D83, #405 Slice B2).
 
         Gated end-to-end on ``self._config.post_first_crack_control.enabled``
@@ -1961,6 +2587,8 @@ class RoastController:
             telemetry: The reading this tick consumed, or ``None`` on a
                 failed/sessionless read (the loop does not actuate either way).
         """
+        if generation is None:
+            generation = self._arbiter.generation
         config = self._config.post_first_crack_control
         if (
             not config.enabled
@@ -2280,7 +2908,9 @@ class RoastController:
             bounds=box,
         )
         await self._snapshots.persist_evaluation(evaluation)
-        executed = await self._execute_targets(evaluation)
+        if not self._generation_is_current(generation):
+            return
+        executed = await self._execute_targets(evaluation, generation=generation)
         # Key state-advance on ``executed`` — ``_execute_targets``'s own report
         # of whether the write actually reached the roaster — NOT on
         # ``evaluation.verdict`` alone (Codex actuator-failure finding, #405
@@ -2453,7 +3083,7 @@ class RoastController:
                     output.projection_cutoff_runway_seconds,
                 )
 
-    async def _execute_deterministic_drop(self, reason: DropReason) -> bool:
+    async def _execute_deterministic_drop(self, reason: DropReason, *, generation: int) -> bool:
         """Shared drop-execution sequence for every deterministic (non-advisor,
         non-operator) drop path (D84 Slice C / D88 amendment A1, #405).
 
@@ -2501,7 +3131,9 @@ class RoastController:
         if drop.verdict is not SafetyVerdict.ALLOW:  # pragma: no cover — see above
             return False
         try:
-            applied = await self._executor.drop_beans()
+            dispatched, applied = await self._run_routine_write(
+                generation, self._executor.drop_beans
+            )
         except Exception:
             self._events.emit(
                 RoastEventKind.COMMAND_FAILED,
@@ -2514,7 +3146,9 @@ class RoastController:
             # dev%/temp-anchor callers) fires on EVERY DEVELOPMENT tick with
             # no cadence gate, so a failed corrective write is retried again
             # next tick regardless (Codex round-2 finding #1's distinction).
-            await self._clamp_heat_after_failed_drop(self_healing=True)
+            await self._clamp_heat_after_failed_drop(self_healing=True, generation=generation)
+            return False
+        if not dispatched or not self._generation_is_current(generation):
             return False
         self._adopt_applied_state(applied)
         self._events.emit(
@@ -2524,7 +3158,7 @@ class RoastController:
         self.transition_to(RoastPhase.COOLING)
         return True
 
-    async def _clamp_heat_after_failed_drop(self, *, self_healing: bool) -> None:
+    async def _clamp_heat_after_failed_drop(self, *, self_healing: bool, generation: int) -> None:
         """D96 slice 1.5 (#561): fail-safe-DOWN heat clamp on a FAILED drop
         while D96 recovery authority is elevated.
 
@@ -2728,7 +3362,9 @@ class RoastController:
             bounds=box,
         )
         await self._snapshots.persist_evaluation(evaluation)
-        executed = await self._execute_targets(evaluation)
+        if not self._generation_is_current(generation):
+            return
+        executed = await self._execute_targets(evaluation, generation=generation)
         if executed:
             self._force_recovery_exit(state)
         elif not self_healing:
@@ -2834,7 +3470,9 @@ class RoastController:
         self._last_post_fc_output = None
         self._accepted_post_fc_output = None
 
-    async def _maybe_ceiling_guard_drop(self, telemetry: RoastTelemetry | None) -> None:
+    async def _maybe_ceiling_guard_drop(
+        self, telemetry: RoastTelemetry | None, *, generation: int
+    ) -> None:
         """Decoupled ceiling-guard drop: a bitter-line safety anchor, not a
         taper feature (D88 amendment A1, #405).
 
@@ -2899,9 +3537,11 @@ class RoastController:
             return
         if telemetry.bean_temp_c < config.ceiling_guard_temp_c:
             return
-        await self._execute_deterministic_drop(DropReason.CEILING_GUARD)
+        await self._execute_deterministic_drop(DropReason.CEILING_GUARD, generation=generation)
 
-    async def _maybe_deterministic_drop(self, telemetry: RoastTelemetry | None) -> None:
+    async def _maybe_deterministic_drop(
+        self, telemetry: RoastTelemetry | None, *, generation: int
+    ) -> None:
         """Deterministic drop anchor: guarantees the drop lands at target (D84, #405 Slice C).
 
         Gated end-to-end on the SAME bundle as the post-FC RoR loop
@@ -3000,9 +3640,11 @@ class RoastController:
             or system_dev_percent < self._profile.target_development_percent
         ):
             return
-        await self._execute_deterministic_drop(DropReason.DEVELOPMENT_TARGET)
+        await self._execute_deterministic_drop(DropReason.DEVELOPMENT_TARGET, generation=generation)
 
-    async def _apply_phase_rules(self, telemetry: RoastTelemetry | None) -> None:
+    async def _apply_phase_rules(
+        self, telemetry: RoastTelemetry | None, *, generation: int
+    ) -> None:
         """MCP-driven phase rules: preheating (E4-S3) and roasting (E4-S4).
 
         Preheating: add-beans guidance is emitted exactly once when the bean
@@ -3044,6 +3686,11 @@ class RoastController:
                     transition="t0", source=RoastEventSource.MCP
                 )
                 await self._snapshots.persist_evaluation(source)
+                if (
+                    not self._generation_is_current(generation)
+                    or self._phase is not RoastPhase.PREHEATING
+                ):
+                    return
                 if source.verdict is not SafetyVerdict.ALLOW:
                     return
                 self._t0_confirmed = True
@@ -3089,6 +3736,11 @@ class RoastController:
                     transition="first_crack", source=RoastEventSource.MCP
                 )
                 await self._snapshots.persist_evaluation(source)
+                if (
+                    not self._generation_is_current(generation)
+                    or self._phase is not RoastPhase.ROASTING_PRE_FIRST_CRACK
+                ):
+                    return
                 if source.verdict is not SafetyVerdict.ALLOW:
                     return
                 self._events.emit(
@@ -3217,7 +3869,13 @@ class RoastController:
             t0_confirmed=self._t0_confirmed,
         )
 
-    async def _act_on_safety(self, evaluation: SafetyEvaluation) -> bool:
+    async def _act_on_safety(
+        self,
+        evaluation: SafetyEvaluation,
+        *,
+        generation: int,
+        emergency_already_admitted: bool = False,
+    ) -> bool:
         """Map a telemetry-stage verdict to fail-closed action. Returns True
         when the tick must stop (no advisory, no further commands).
 
@@ -3228,8 +3886,32 @@ class RoastController:
         if verdict is SafetyVerdict.ALLOW:
             return False
         if verdict is SafetyVerdict.EMERGENCY_STOP:
+            if not emergency_already_admitted:
+                self.admit_emergency_stop()
             try:
-                applied = await self._executor.emergency_stop(reason=evaluation.reason)
+                applied = await self._run_emergency_write(
+                    lambda: self._executor.emergency_stop(reason=evaluation.reason)
+                )
+            except asyncio.CancelledError:
+                # Cancellation cannot leave the controller reporting an
+                # ordinary, writable phase after an admitted stop.  The
+                # arbiter has released or retained the physical boundary as
+                # appropriate; record the unresolved hardware outcome as a
+                # fault and retain the heat-off retry posture.
+                self._events.emit(
+                    RoastEventKind.COMMAND_FAILED,
+                    {"command": "emergency_stop", "reason": evaluation.reason},
+                )
+                self._pending_fail_safe = self._heat_off_evaluation(
+                    source_rule=_EMERGENCY_STOP_RETRY_RULE
+                )
+                self._pending_fail_safe_is_emergency_stop_retry = True
+                if self._phase is not RoastPhase.FAULTED:
+                    self.transition_to(RoastPhase.FAULTED)
+                    self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
+                self._latched_verdict = SafetyVerdict.EMERGENCY_STOP
+                self._release_emergency_stop_transition_gate_if_safe()
+                raise
             except Exception:
                 # A raising e-stop must not crash the tick loop or leave
                 # the phase pre-fault: fault anyway and surface the failed
@@ -3243,14 +3925,17 @@ class RoastController:
                 # terminal-phase tick keeps driving toward safety rather than
                 # leaving the roaster potentially hot (#206 / PR review blocker).
                 self._pending_fail_safe = self._heat_off_evaluation(
-                    source_rule="emergency_stop_retry"
+                    source_rule=_EMERGENCY_STOP_RETRY_RULE
                 )
+                self._pending_fail_safe_is_emergency_stop_retry = True
             else:
                 # Confirmed on hardware (#507): adopt the applied heat/fan so the
                 # mirrors — and everything downstream reading them — reflect the
                 # e-stop immediately, the same tick, instead of the last pre-stop
                 # set_targets values.
                 self._adopt_applied_state(applied)
+                self._pending_fail_safe = None
+                self._pending_fail_safe_is_emergency_stop_retry = False
             # Emit ONCE, only on entry into FAULTED — never while already
             # latched there (the tick loop short-circuits before reaching here
             # in a terminal phase, but the guard keeps the emit transition-bound
@@ -3259,9 +3944,12 @@ class RoastController:
                 self.transition_to(RoastPhase.FAULTED)
                 self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
             self._latched_verdict = SafetyVerdict.EMERGENCY_STOP
+            self._release_emergency_stop_transition_gate_if_safe()
             return True
         if verdict is SafetyVerdict.FAULT:
-            await self._apply_fail_safe(evaluation)
+            await self._apply_fail_safe(evaluation, generation=generation)
+            if not self._generation_is_current(generation):
+                return True
             # Emit ONCE, only on entry into FAULTED (see EMERGENCY_STOP above).
             if self._phase is not RoastPhase.FAULTED:
                 self.transition_to(RoastPhase.FAULTED)
@@ -3269,7 +3957,9 @@ class RoastController:
             self._latched_verdict = SafetyVerdict.FAULT
             return True
         if verdict is SafetyVerdict.RECOVERY:
-            await self._apply_fail_safe(evaluation)
+            await self._apply_fail_safe(evaluation, generation=generation)
+            if not self._generation_is_current(generation):
+                return True
             # Emit ONCE, only on entry into OPERATOR_RECOVERY_REQUIRED.
             if self._phase is not RoastPhase.OPERATOR_RECOVERY_REQUIRED:
                 self.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
@@ -3281,7 +3971,7 @@ class RoastController:
         # CLAMP/REJECT never arise from telemetry-stage rules.
         return False
 
-    async def _apply_fail_safe(self, evaluation: SafetyEvaluation) -> None:
+    async def _apply_fail_safe(self, evaluation: SafetyEvaluation, *, generation: int) -> None:
         """Hardware-off on faulted/recovery entry (E3-S2/E4 carry-forward).
 
         Applies the evaluation's adjusted values (heat 0 %, safe fan)
@@ -3299,10 +3989,16 @@ class RoastController:
         """
         if evaluation.adjusted_heat is None or evaluation.adjusted_fan is None:
             return
+        is_emergency_stop_retry = (
+            self._pending_fail_safe_is_emergency_stop_retry
+            and self._pending_fail_safe is evaluation
+        )
         try:
-            await self._executor.set_targets(
+            dispatched = await self._set_targets(
                 heat_percent=evaluation.adjusted_heat,
                 fan_percent=evaluation.adjusted_fan,
+                generation=generation,
+                allow_emergency_stop_transition_for_heat_off=is_emergency_stop_retry,
             )
         except Exception:
             self._events.emit(
@@ -3310,12 +4006,29 @@ class RoastController:
                 {"command": "set_targets", "context": "fail_safe", "rule": evaluation.rule},
             )
             # Posture NOT confirmed: hold it for retry on the next latched tick.
-            self._pending_fail_safe = evaluation
+            if self._generation_is_current(generation):
+                self._pending_fail_safe = evaluation
+                self._pending_fail_safe_is_emergency_stop_retry = is_emergency_stop_retry
+            return
+        if not dispatched:
+            # A concurrently admitted e-stop owns the terminal outcome.  Do
+            # not retain an ordinary FAULT/RECOVERY target for a later tick:
+            # it could lower the fan that a successful e-stop set for cooling.
+            # An unconfirmed stop installs the dedicated retry evaluation
+            # itself, which is the sole source allowed through this gate.
+            if self._emergency_stop_transition_pending and not is_emergency_stop_retry:
+                return
+            if self._generation_is_current(generation):
+                self._pending_fail_safe = evaluation
+                self._pending_fail_safe_is_emergency_stop_retry = is_emergency_stop_retry
+            return
+        if not self._generation_is_current(generation):
             return
         self._current_heat = evaluation.adjusted_heat
         self._current_fan = evaluation.adjusted_fan
         # Posture confirmed on hardware: nothing left to retry.
         self._pending_fail_safe = None
+        self._pending_fail_safe_is_emergency_stop_retry = False
 
     def _adopt_applied_state(self, applied: AppliedRoasterState | None) -> None:
         """Adopt a command's actually-applied heat/fan into the commanded mirrors (#507).
@@ -3380,7 +4093,23 @@ class RoastController:
             reason="fail-closed retry: heat 0 %, overrun-safe fan",
         )
 
-    async def _retry_pending_fail_safe(self) -> None:
+    def rearm_emergency_stop_fail_safe(self) -> None:
+        """Retain a typed heat-off retry after an unconfirmed external stop.
+
+        A service-owned terminal executor can consume a priority e-stop while
+        the live controller is finalising D212.  If that exact-session command
+        is unconfirmed, the controller must still retry its normal typed
+        heat-off posture on the next terminal tick.
+        """
+        self._pending_fail_safe = self._heat_off_evaluation(source_rule=_EMERGENCY_STOP_RETRY_RULE)
+        self._pending_fail_safe_is_emergency_stop_retry = True
+        # The external exact-session executor has returned before it calls
+        # this method.  Its e-stop no longer owns the MCP boundary, so release
+        # the controller transition gate for this one heat-off retry.  Ordinary
+        # target writes still require their normal phase and safety admission.
+        self._release_emergency_stop_transition_gate_if_safe()
+
+    async def _retry_pending_fail_safe(self, *, generation: int) -> None:
         """Re-attempt the latched heat-off write on a terminal-phase tick (#206).
 
         Called only from the terminal-phase short-circuit in :meth:`tick`. It
@@ -3394,7 +4123,7 @@ class RoastController:
         pending = self._pending_fail_safe
         if pending is None:
             return
-        await self._apply_fail_safe(pending)
+        await self._apply_fail_safe(pending, generation=generation)
 
     async def _maybe_escalate_while_latched(self) -> None:
         """Upward-only safety escalation from inside a terminal HOLD phase (#206).
@@ -3474,13 +4203,19 @@ class RoastController:
                 the escalation (already persisted by the caller).
         """
         try:
-            applied = await self._executor.emergency_stop(reason=evaluation.reason)
+            self.admit_emergency_stop()
+            applied = await self._run_emergency_write(
+                lambda: self._executor.emergency_stop(reason=evaluation.reason)
+            )
         except Exception:
             self._events.emit(
                 RoastEventKind.COMMAND_FAILED,
                 {"command": "emergency_stop", "reason": evaluation.reason},
             )
-            self._pending_fail_safe = self._heat_off_evaluation(source_rule="emergency_stop_retry")
+            self._pending_fail_safe = self._heat_off_evaluation(
+                source_rule=_EMERGENCY_STOP_RETRY_RULE
+            )
+            self._pending_fail_safe_is_emergency_stop_retry = True
         else:
             # Confirmed on hardware (#507): adopt the applied heat/fan (see
             # _act_on_safety's identical comment for the full rationale).
@@ -3490,6 +4225,7 @@ class RoastController:
         # `* → faulted` edge; escalating from a FAULT latch is already there.
         if self._phase is not RoastPhase.FAULTED:
             self.transition_to(RoastPhase.FAULTED)
+        self._release_emergency_stop_transition_gate_if_safe()
         # Record the escalation as a single FAULT event and raise the latch to the
         # max verdict so it cannot re-fire on the next identical tick. (Set after
         # the transition: transition_to out of a terminal phase would otherwise
@@ -3552,24 +4288,36 @@ class RoastController:
         # the FC/development slot is flipped to a faster model the trace is honest.
         descriptor = self._advisor.descriptor_for(context.phase)
         started = self._clock()
+        advisory_epoch = self._arbiter.generation
         try:
             decision = await asyncio.wait_for(
                 self._advisor.get_recommendation(context),
                 timeout=self._config.advisory_timeout_seconds,
             )
         except TimeoutError:
-            await self._record_advisor_failure("timeout", trigger, context, started, descriptor)
+            await self._record_advisor_failure(
+                "timeout", trigger, context, started, descriptor, generation=advisory_epoch
+            )
             return
         except AdvisorMalformedOutputError:
-            await self._record_advisor_failure("malformed", trigger, context, started, descriptor)
+            await self._record_advisor_failure(
+                "malformed", trigger, context, started, descriptor, generation=advisory_epoch
+            )
             return
         except AdvisorUnsafeOutputError:
-            await self._record_advisor_failure("unsafe", trigger, context, started, descriptor)
+            await self._record_advisor_failure(
+                "unsafe", trigger, context, started, descriptor, generation=advisory_epoch
+            )
             return
         except Exception:
             await self._record_advisor_failure(
-                "provider_error", trigger, context, started, descriptor
+                "provider_error", trigger, context, started, descriptor, generation=advisory_epoch
             )
+            return
+        if not self._generation_is_current(advisory_epoch):
+            # The e-stop can run while the provider is delayed. Its typed
+            # decision is now stale and must not create a later write or phase
+            # transition after the emergency command.
             return
         # A reachable advisor that returned a usable decision (``ok``) clears
         # the availability-failure streak (D30, #166): the sustained-outage
@@ -3636,6 +4384,8 @@ class RoastController:
             bounds=control_box,
         )
         safety_evaluation_id = await self._snapshots.persist_evaluation(evaluation)
+        if not self._generation_is_current(advisory_epoch):
+            return
         # Persist the advisor decision and link it to the verdict it produced
         # (#167) — the trace lost the provider/model/decision before this wiring.
         await self._snapshots.persist_advisor_decision(
@@ -3646,6 +4396,8 @@ class RoastController:
             status="ok",
             safety_evaluation_id=safety_evaluation_id,
         )
+        if not self._generation_is_current(advisory_epoch):
+            return
         self._events.emit(
             RoastEventKind.ADVISORY,
             {
@@ -3725,7 +4477,9 @@ class RoastController:
                 )
             else:
                 await self._execute_advisor_levers(
-                    heat=evaluation.adjusted_heat, fan=evaluation.adjusted_fan
+                    heat=evaluation.adjusted_heat,
+                    fan=evaluation.adjusted_fan,
+                    generation=advisory_epoch,
                 )
         # Compute the SYSTEM development percent ONCE (the #294 compute-once
         # pattern): the same value decides the block, fills the rejection note,
@@ -3761,6 +4515,8 @@ class RoastController:
                 current_fan=self._current_fan,
             )
             await self._snapshots.persist_evaluation(drop_block)
+            if not self._generation_is_current(advisory_epoch):
+                return
             self._events.emit(
                 RoastEventKind.ADVISORY,
                 {
@@ -3775,6 +4531,8 @@ class RoastController:
         if decision.should_drop:
             drop = self._safety.evaluate_drop_recommendation(phase=self._phase)
             await self._snapshots.persist_evaluation(drop)
+            if not self._generation_is_current(advisory_epoch):
+                return
             # The advisor advice path is reached only in DEVELOPMENT (the sole
             # post-FC advice phase, AUTO_ADVICE_PHASES), and
             # evaluate_drop_recommendation ALLOWs unconditionally in DEVELOPMENT —
@@ -3783,7 +4541,9 @@ class RoastController:
             # an advice phase; the un-taken branch is pragma'd, not the guard logic.
             if drop.verdict is SafetyVerdict.ALLOW:  # pragma: no branch — see above
                 try:
-                    applied = await self._executor.drop_beans()
+                    dispatched, applied = await self._run_routine_write(
+                        advisory_epoch, self._executor.drop_beans
+                    )
                 except Exception:
                     self._events.emit(
                         RoastEventKind.COMMAND_FAILED,
@@ -3797,7 +4557,11 @@ class RoastController:
                     # (AdvisoryCallPolicy) — there is no guaranteed retry next
                     # tick, so the raise-suppression latch must arm here even
                     # if the clamp's own corrective write also fails.
-                    await self._clamp_heat_after_failed_drop(self_healing=False)
+                    await self._clamp_heat_after_failed_drop(
+                        self_healing=False, generation=advisory_epoch
+                    )
+                    return
+                if not dispatched or not self._generation_is_current(advisory_epoch):
                     return
                 self._adopt_applied_state(applied)
                 self._events.emit(
@@ -3806,7 +4570,7 @@ class RoastController:
                 )
                 self.transition_to(RoastPhase.COOLING)
 
-    async def _execute_advisor_levers(self, *, heat: int, fan: int) -> None:
+    async def _execute_advisor_levers(self, *, heat: int, fan: int, generation: int) -> None:
         """Apply a safety-approved advisor heat/fan through the coherence gate (#276).
 
         The SECOND post-FC gate, after the safety box: the values here have
@@ -3888,10 +4652,13 @@ class RoastController:
             # deterministic HOLD — no write, no rate-limit churn. Directions were
             # already recorded above so a sustained damped push still converges.
             return
-        await self._executor.set_targets(
+        dispatched = await self._set_targets(
             heat_percent=heat_result.applied_value,
             fan_percent=fan_result.applied_value,
+            generation=generation,
         )
+        if not dispatched or not self._generation_is_current(generation):
+            return
         self._current_heat = heat_result.applied_value
         self._current_fan = fan_result.applied_value
         self._last_command_monotonic = self._clock()
@@ -3958,7 +4725,11 @@ class RoastController:
         context: AdvisorContext,
         started: float,
         descriptor: AdvisorDescriptor,
+        *,
+        generation: int,
     ) -> None:
+        if not self._generation_is_current(generation):
+            return
         latency_ms = self._elapsed_ms(started)
         # D30 (#166): only the *availability* failures (provider_error /
         # timeout) accrue toward the sustained-outage stop. malformed / unsafe
@@ -3979,6 +4750,8 @@ class RoastController:
                 current_fan=self._current_fan,
             )
         safety_evaluation_id = await self._snapshots.persist_evaluation(evaluation)
+        if not self._generation_is_current(generation):
+            return
         # Persist the failed advisor outcome with no decision, linked to the
         # verdict it produced (#167) — the #134 roast lost every failure's
         # provider/model/status this way. ``unsafe`` (out-of-bounds output) has
@@ -3994,6 +4767,8 @@ class RoastController:
             status=stored_status,
             safety_evaluation_id=safety_evaluation_id,
         )
+        if not self._generation_is_current(generation):
+            return
         self._events.emit(
             RoastEventKind.ADVISORY,
             {"trigger": trigger.value, "evaluation": evaluation.model_dump(mode="json")},
@@ -4009,7 +4784,7 @@ class RoastController:
             # The stop-tick return is deliberately discarded: this is already
             # the last step of the advisory path (the caller returns straight
             # after), so there is no remaining tick work to short-circuit.
-            _ = await self._act_on_safety(evaluation)
+            _ = await self._act_on_safety(evaluation, generation=generation)
 
     def _elapsed_ms(self, started: float) -> int:
         """Milliseconds elapsed since ``started`` on the controller clock."""
@@ -4044,6 +4819,7 @@ class RoastController:
                 failure), the controller falls back to its per-process counter so
                 recording naming is always best-effort and never blocks the roast.
         """
+        generation = self._arbiter.generation
         self.transition_to(RoastPhase.STARTING)  # raises unless idle
         self._profile = profile
         self._run_started_monotonic = self._clock()
@@ -4095,14 +4871,23 @@ class RoastController:
         # after store-derived 4 would use per-process counter 2 → collision).
         if recording_roast_num is not None:
             self._recording_roast_num = max(self._recording_roast_num, recording_roast_num)
+        if self._start_write_permitted is not None and not self._start_write_permitted():
+            self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "start_roast_session"})
+            self.transition_to(RoastPhase.FAULTED)
+            return
         try:
-            await self._executor.start_session(
-                recording_origin=recording_origin,
-                recording_roast_num=(roast_num if recording_origin is not None else None),
+            dispatched, _ = await self._run_routine_write(
+                generation,
+                lambda: self._executor.start_session(
+                    recording_origin=recording_origin,
+                    recording_roast_num=(roast_num if recording_origin is not None else None),
+                ),
             )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "start_roast_session"})
             self.transition_to(RoastPhase.FAULTED)
+            return
+        if not dispatched or not self._generation_is_current(generation):
             return
         self.transition_to(RoastPhase.PREHEATING)
         self._events.emit(RoastEventKind.RUN_STARTED, {"profile": profile.name})
@@ -4123,9 +4908,13 @@ class RoastController:
             bounds=self._control_limits(),
         )
         await self._snapshots.persist_evaluation(evaluation)
-        await self._execute_targets(evaluation)
+        if not self._generation_is_current(generation):
+            return
+        await self._execute_targets(evaluation, generation=generation)
 
-    async def _execute_targets(self, evaluation: SafetyEvaluation) -> bool:
+    async def _execute_targets(
+        self, evaluation: SafetyEvaluation, *, generation: int | None = None
+    ) -> bool:
         """Execute an ALLOW/CLAMP heat/fan evaluation; surface failures.
 
         Returns:
@@ -4155,13 +4944,18 @@ class RoastController:
             or evaluation.adjusted_fan is None
         ):
             return False
+        if generation is None:
+            generation = self._arbiter.generation
         try:
-            await self._executor.set_targets(
+            dispatched = await self._set_targets(
                 heat_percent=evaluation.adjusted_heat,
                 fan_percent=evaluation.adjusted_fan,
+                generation=generation,
             )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "set_targets"})
+            return False
+        if not dispatched or not self._generation_is_current(generation):
             return False
         self._current_heat = evaluation.adjusted_heat
         self._current_fan = evaluation.adjusted_fan
@@ -4329,6 +5123,7 @@ class RoastController:
     async def operator_mark_first_crack(self) -> None:
         """Operator FC override: matrix- and source-validated, then relayed
         to MCP with the true OPERATOR source (E3-S5/D16)."""
+        generation = self._arbiter.generation
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.MARK_FIRST_CRACK, phase=self._phase
         )
@@ -4344,9 +5139,13 @@ class RoastController:
         if not self.can_transition(RoastPhase.DEVELOPMENT):
             raise InvalidTransitionError(self._phase, RoastPhase.DEVELOPMENT)
         try:
-            await self._executor.mark_first_crack()
+            dispatched, _ = await self._run_routine_write(
+                generation, self._executor.mark_first_crack
+            )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "mark_first_crack"})
+            return
+        if not dispatched or not self._generation_is_current(generation):
             return
         event_payload: dict[str, object] = {"source": RoastEventSource.OPERATOR.value}
         # #592 / Codex P2: operator FC is a supported server-authored path too.
@@ -4378,6 +5177,7 @@ class RoastController:
         Hardware is never written unless the resulting state is reachable: the
         transition (when one applies) is guarded first, so a write-then-raise can't
         diverge the FSM from the machine (E4-S4 safety rule)."""
+        generation = self._arbiter.generation
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.DROP_BEANS, phase=self._phase
         )
@@ -4392,7 +5192,9 @@ class RoastController:
         if will_transition and not self.can_transition(RoastPhase.COOLING):
             raise InvalidTransitionError(self._phase, RoastPhase.COOLING)
         try:
-            applied = await self._executor.drop_beans()
+            dispatched, applied = await self._run_routine_write(
+                generation, self._executor.drop_beans
+            )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "drop_beans"})
             # D96 slice 1.5 (#561), Codex round-1 finding #2: the operator's
@@ -4416,7 +5218,9 @@ class RoastController:
                 # operator's drop is one-shot — never automatically retried
                 # — so the raise-suppression latch must arm here even if
                 # the clamp's own corrective write also fails.
-                await self._clamp_heat_after_failed_drop(self_healing=False)
+                await self._clamp_heat_after_failed_drop(self_healing=False, generation=generation)
+            return
+        if not dispatched or not self._generation_is_current(generation):
             return
         self._adopt_applied_state(applied)
         self._events.emit(
@@ -4434,6 +5238,7 @@ class RoastController:
         until the operator acknowledges it, so a fault never strands a running
         cooling fan with no way to stop it. (Log export wires in E5/E9 alongside
         the real MCP client.)"""
+        generation = self._arbiter.generation
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.STOP_COOLING, phase=self._phase
         )
@@ -4444,9 +5249,11 @@ class RoastController:
         if completes and not self.can_transition(RoastPhase.COMPLETE):  # pragma: no cover
             raise InvalidTransitionError(self._phase, RoastPhase.COMPLETE)
         try:
-            await self._executor.stop_cooling()
+            dispatched, _ = await self._run_routine_write(generation, self._executor.stop_cooling)
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "stop_cooling"})
+            return
+        if not dispatched or not self._generation_is_current(generation):
             return
         self._events.emit(
             RoastEventKind.COMMAND_EXECUTED, {"command": "stop_cooling", "source": "operator"}
@@ -4455,11 +5262,34 @@ class RoastController:
             self.transition_to(RoastPhase.COMPLETE)
             self._events.emit(RoastEventKind.RUN_COMPLETED, {})
 
-    async def operator_emergency_stop(self, reason: str | None = None) -> None:
+    async def authorize_fault_acknowledgement_stop_cooling(self) -> bool:
+        """Persist and return the policy decision for a fault acknowledgement.
+
+        The application runner owns the post-fault read/command/read sequence,
+        while the controller remains the sole owner of the safety decision for
+        its possible roaster write.
+        """
+        evaluation = self._safety.evaluate_command_phase(
+            command=RoastCommand.STOP_COOLING, phase=self._phase
+        )
+        await self._snapshots.persist_evaluation(evaluation)
+        return evaluation.verdict is SafetyVerdict.ALLOW
+
+    async def operator_emergency_stop(
+        self, reason: str | None = None, *, already_admitted: bool = False
+    ) -> None:
         """Operator e-stop: always available, from every phase (E3-S4)."""
         evaluation = self._safety.evaluate_emergency_stop(phase=self._phase, operator_reason=reason)
-        await self._snapshots.persist_evaluation(evaluation)
-        await self._act_on_safety(evaluation)
+        generation = (
+            self.admit_emergency_stop() if not already_admitted else self._arbiter.generation
+        )
+        await self._act_on_safety(
+            evaluation, generation=generation, emergency_already_admitted=True
+        )
+        try:
+            await self._snapshots.persist_evaluation(evaluation)
+        except Exception:  # noqa: BLE001 - e-stop must never wait on trace persistence
+            _log.exception("could not persist emergency-stop safety evaluation")
 
     async def operator_mark_beans_added(self) -> None:
         """Operator manual beans-added — the manual-T0 fallback (D19, E9).
@@ -4469,6 +5299,7 @@ class RoastController:
         ``roasting_pre_first_crack`` move still goes through the debounced T0
         path in :meth:`_apply_phase_rules`; this records the charge with MCP so
         its detection logic can proceed."""
+        generation = self._arbiter.generation
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.MARK_BEANS_ADDED, phase=self._phase
         )
@@ -4476,9 +5307,13 @@ class RoastController:
         if phase_validity.verdict is not SafetyVerdict.ALLOW:
             return
         try:
-            await self._executor.mark_beans_added()
+            dispatched, _ = await self._run_routine_write(
+                generation, self._executor.mark_beans_added
+            )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "mark_beans_added"})
+            return
+        if not dispatched or not self._generation_is_current(generation):
             return
         self._events.emit(
             RoastEventKind.COMMAND_EXECUTED, {"command": "mark_beans_added", "source": "operator"}
@@ -4496,6 +5331,7 @@ class RoastController:
         on a hot faulted machine **without a transition** (the run stays faulted,
         heat off, until acknowledged). Hardware is never written unless the
         resulting state is reachable (E4-S4 safety rule)."""
+        generation = self._arbiter.generation
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.START_COOLING, phase=self._phase
         )
@@ -4514,9 +5350,11 @@ class RoastController:
             # includes cooling. Mirrors operator_drop_beans' write-safety guard.
             raise InvalidTransitionError(self._phase, RoastPhase.COOLING)
         try:
-            await self._executor.start_cooling()
+            dispatched, _ = await self._run_routine_write(generation, self._executor.start_cooling)
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "start_cooling"})
+            return
+        if not dispatched or not self._generation_is_current(generation):
             return
         self._events.emit(
             RoastEventKind.COMMAND_EXECUTED, {"command": "start_cooling", "source": "operator"}

@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, cast
 import uvicorn
 
 from roastpilot_agent import __version__
+from roastpilot_agent.api import ShutdownHeatOffOutcome
 
 if TYPE_CHECKING:
     from roastpilot_agent.api import RoastService
@@ -1040,18 +1041,22 @@ async def _teardown_live(
     **before** stopping the MCP child — the write must land while the child is
     still alive to receive it. So the order is load-bearing:
 
-    1. ``safe_shutdown_heat_off`` — heat→0 via the controller's e-stop (bounded,
-       fail-closed; a no-op when no live run is active);
-    2. ``service.shutdown`` — cancel the tick loop;
-    3. ``mcp.stop`` — end the MCP child (after heat-off has landed);
-    4. ``record_child_stop_unconfirmed`` — if ``mcp.stop`` could not confirm
+    1. ``store.active_run`` — establish whether heat-off's no-op result is
+       safe before issuing any shutdown write;
+    2. ``safe_shutdown_heat_off`` — heat→0 via the controller's e-stop (bounded,
+       fail-closed; a no-op only when the durable active-run check was empty);
+    3. ``service.shutdown`` — cancel the tick loop;
+    4. ``mcp.stop`` — end the MCP child (after heat-off has landed);
+    5. ``record_child_stop_unconfirmed`` — if ``mcp.stop`` could not confirm
        clean teardown (``mcp.stop_unconfirmed``), persist a trace marker (#177)
        while the store is still open;
-    5. ``store.close`` — close the decision-trace store.
+    6. ``settle_fault_lease_persistence_for_teardown`` — drain the admitted
+       shutdown e-stop audit before judging the process epoch clean;
+    7. ``store.close`` — close the decision-trace store.
 
-    Step 4 sits between ``mcp.stop`` and ``store.close`` deliberately: the
-    clean-teardown verdict is only known after step 3, and the marker must be
-    written before the store closes in step 5.
+    The child-stop marker and lease-persistence drain sit before ``store.close``
+    deliberately: their outcomes determine whether this process can claim a
+    clean epoch, and both need the store to remain open.
 
     (A hard kill / SIGKILL / power loss is uncatchable and skips this entirely —
     it still relies on restart → ``operator_recovery_required``, never an
@@ -1064,31 +1069,82 @@ async def _teardown_live(
         mcp: The MCP child process to stop after heat-off has landed.
         store: The decision-trace store to close last.
     """
-    await _cleanup_step("safe_shutdown_heat_off", service.safe_shutdown_heat_off)
-    await _cleanup_step("service.shutdown", service.shutdown)
-    await _cleanup_step("mcp.stop", mcp.stop)
+    # Only explicit no-op outcomes may pair with durable idle evidence. An
+    # unconfirmed active e-stop remains fail-closed even if the store read is
+    # unexpectedly empty. The epoch marker rechecks its durable state after
+    # every ordered teardown step.
+    active_run = getattr(store, "active_run", None)
+    if callable(active_run):
+        idle_check_completed, active_before_heat_off = await _cleanup_step(
+            "store.active_run_before_heat_off", cast("Callable[[], Awaitable[object]]", active_run)
+        )
+    else:  # pragma: no cover - real RoastStore always has this method
+        idle_check_completed, active_before_heat_off = False, None
+    idle_before_heat_off = idle_check_completed and active_before_heat_off is None
+    heat_off_completed, heat_off_outcome = await _cleanup_step(
+        "safe_shutdown_heat_off", service.safe_shutdown_heat_off
+    )
+    safe_idle_noop = (
+        heat_off_outcome in (ShutdownHeatOffOutcome.NO_RUNNER, ShutdownHeatOffOutcome.NOT_ACTIVE)
+        and idle_before_heat_off
+    )
+    service_shutdown_completed, _ = await _cleanup_step("service.shutdown", service.shutdown)
+    mcp_stop_completed, _ = await _cleanup_step("mcp.stop", mcp.stop)
+    stop_unconfirmed = getattr(mcp, "stop_unconfirmed", None)
     # After mcp.stop so stop_unconfirmed reflects the just-completed teardown;
     # before store.close so the marker can be written.
-    await _cleanup_step(
-        "record_child_stop_unconfirmed",
-        lambda: service.record_child_stop_unconfirmed(stop_unconfirmed=mcp.stop_unconfirmed),
-    )
+    if isinstance(stop_unconfirmed, bool):
+        await _cleanup_step(
+            "record_child_stop_unconfirmed",
+            lambda: service.record_child_stop_unconfirmed(stop_unconfirmed=stop_unconfirmed),
+        )
+    settle_lease_writes = getattr(service, "settle_fault_lease_persistence_for_teardown", None)
+    if callable(settle_lease_writes):
+        lease_writes_completed, lease_writes_clean = await _cleanup_step(
+            "settle_fault_lease_persistence_for_teardown",
+            cast("Callable[[], Awaitable[object]]", settle_lease_writes),
+        )
+    else:  # pragma: no cover - narrow teardown test doubles omit this seam
+        lease_writes_completed, lease_writes_clean = True, True
+    # An epoch may become clean only after every ordered teardown proof has
+    # completed: safety heat-off was dispatched (or it was a proven typed idle
+    # no-op), service loop stopped, and MCP stop returned without an
+    # unconfirmed child.  A swallowed cleanup exception therefore leaves the
+    # next process fail-closed.
+    if (
+        heat_off_completed
+        and (heat_off_outcome is ShutdownHeatOffOutcome.DISPATCHED or safe_idle_noop)
+        and service_shutdown_completed
+        and mcp_stop_completed
+        and stop_unconfirmed is False
+        and lease_writes_completed
+        and lease_writes_clean is True
+    ):
+        marker = getattr(service, "mark_process_epoch_clean_after_ordered_teardown", None)
+        if callable(marker):
+            await _cleanup_step(
+                "mark_process_epoch_clean_after_ordered_teardown",
+                cast("Callable[[], Awaitable[object]]", marker),
+            )
     await _cleanup_step("store.close", store.close)
 
 
-async def _cleanup_step(name: str, action: Callable[[], Awaitable[object]]) -> None:
+async def _cleanup_step(
+    name: str, action: Callable[[], Awaitable[object]]
+) -> tuple[bool, object | None]:
     """Run one teardown step, logging (not raising) any failure.
 
     A failed ``safe_shutdown_heat_off()`` / ``service.shutdown()`` /
     ``mcp.stop()`` / ``store.close()`` must surface in the log but not abort the
     remaining cleanup or mask the error that triggered teardown — so each step
-    is independently guarded and logged. The action's return value is ignored
-    (``safe_shutdown_heat_off`` returns a bool the chain does not branch on).
+    is independently guarded and logged.  The completion flag lets the process
+    epoch logic distinguish a clean ordered teardown from a swallowed failure.
     """
     try:
-        await action()
+        return True, await action()
     except Exception:  # noqa: BLE001 — best-effort cleanup, logged not raised
         _log.warning("serve teardown step %r failed", name, exc_info=True)
+        return False, None
 
 
 async def _serve_replay(args: argparse.Namespace) -> int:

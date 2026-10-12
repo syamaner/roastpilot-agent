@@ -9,6 +9,7 @@ scripted MCP contract (E4/E5), advisor fixtures (E8), temp SQLite store
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -20,11 +21,14 @@ from roastpilot_agent.advisor import (
 )
 from roastpilot_agent.mcp_client import (
     ExportRoastLogResult,
+    SessionPresence,
     reset_non_finite_telemetry_warnings,
 )
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
     AppliedRoasterState,
+    FaultAcknowledgementState,
+    FaultCoolingStopResult,
     RoastEventKind,
     RoastTelemetry,
 )
@@ -84,6 +88,8 @@ class FakeMCPClient:
         drop_applied_state: AppliedRoasterState | None = DEFAULT_DROP_APPLIED_STATE,
         emergency_stop_applied_state: AppliedRoasterState
         | None = DEFAULT_EMERGENCY_STOP_APPLIED_STATE,
+        fault_acknowledgement_states: list[FaultAcknowledgementState | Exception] | None = None,
+        fault_acknowledgement_stop_results: list[FaultCoolingStopResult | Exception] | None = None,
     ) -> None:
         self.frames: list[RoastTelemetry | None | Exception] = list(frames or [])
         self._log = log if log is not None else []
@@ -95,6 +101,9 @@ class FakeMCPClient:
         #: (the RoasterControlAdapter.None-on-malformed-payload contract).
         self.drop_applied_state = drop_applied_state
         self.emergency_stop_applied_state = emergency_stop_applied_state
+        self._fault_acknowledgement_states = list(fault_acknowledgement_states or [])
+        self._fault_acknowledgement_stop_results = list(fault_acknowledgement_stop_results or [])
+        self._latest_fault_session_id: str | None = "session-1"
 
     async def read_telemetry(self) -> RoastTelemetry | None:
         self._log.append("read")
@@ -122,6 +131,14 @@ class FakeMCPClient:
             ("set_targets", {"heat_percent": heat_percent, "fan_percent": fan_percent})
         )
 
+    async def set_heat(self, heat_percent: int) -> None:
+        self._log.append("set_heat")
+        self.calls.append(("set_heat", {"heat_percent": heat_percent}))
+
+    async def set_fan(self, fan_percent: int) -> None:
+        self._log.append("set_fan")
+        self.calls.append(("set_fan", {"fan_percent": fan_percent}))
+
     async def mark_beans_added(self) -> None:
         self._log.append("mark_beans_added")
         self.calls.append(("mark_beans_added", {}))
@@ -143,6 +160,65 @@ class FakeMCPClient:
         self._log.append("stop_cooling")
         self.calls.append(("stop_cooling", {}))
 
+    @property
+    def latest_fault_session_id(self) -> str | None:
+        """Return the scripted current-session identity for fault acknowledgement."""
+        return self._latest_fault_session_id
+
+    async def read_session_presence(self) -> SessionPresence:
+        """Refuse no-session clearance unless a test supplies the new proof."""
+        raise RuntimeError("FakeMCPClient has no typed session-presence proof")
+
+    async def read_fault_acknowledgement_state(self, session_id: str) -> FaultAcknowledgementState:
+        """Return the next hardware-free state proof for fault acknowledgement."""
+        self._log.append("fault_acknowledgement_read")
+        if self._latest_fault_session_id != session_id:
+            raise ValueError("fault acknowledgement session does not match latest state")
+        if not self._fault_acknowledgement_states:
+            return FaultAcknowledgementState(
+                session_id=session_id,
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=False,
+            )
+        state = (
+            self._fault_acknowledgement_states.pop(0)
+            if len(self._fault_acknowledgement_states) > 1
+            else self._fault_acknowledgement_states[0]
+        )
+        if isinstance(state, Exception):
+            raise state
+        return state
+
+    async def stop_cooling_for_fault_acknowledgement(
+        self, expected_session_id: str
+    ) -> FaultCoolingStopResult:
+        """Record one scripted acknowledgement cooling stop."""
+        self._log.append("fault_acknowledgement_stop_cooling")
+        self.calls.append(("stop_cooling", {}))
+        if not self._fault_acknowledgement_stop_results:
+            session_id = expected_session_id
+            return FaultCoolingStopResult(
+                session_id=session_id,
+                phase="fault",
+                event_kind="cooling_stopped",
+                recovery_after_fault=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=False,
+            )
+        result = (
+            self._fault_acknowledgement_stop_results.pop(0)
+            if len(self._fault_acknowledgement_stop_results) > 1
+            else self._fault_acknowledgement_stop_results[0]
+        )
+        if isinstance(result, Exception):
+            raise result
+        return result
+
     async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
         self._log.append("emergency_stop")
         self.calls.append(("emergency_stop", {"reason": reason}))
@@ -157,6 +233,25 @@ class FakeMCPClient:
 
     def commands(self) -> list[str]:
         return [name for name, _ in self.calls]
+
+    def log_entries(self) -> list[str]:
+        """Return the recorded fake operation log for test assertions."""
+        return list(self._log)
+
+    @property
+    def fault_acknowledgement_read_count(self) -> int:
+        """Return how often the fault-acknowledgement state was read."""
+        return self._log.count("fault_acknowledgement_read")
+
+    def set_latest_fault_session_id(self, session_id: str | None) -> None:
+        """Set the scripted latest fault identity for an acknowledgement test."""
+        self._latest_fault_session_id = session_id
+
+    def set_fault_acknowledgement_stop_results(self, results: list[object]) -> None:
+        """Install scripted stop results, including malformed adapter-boundary data."""
+        self._fault_acknowledgement_stop_results = [
+            cast("FaultCoolingStopResult | Exception", result) for result in results
+        ]
 
 
 class ScriptedStateReader:
@@ -197,6 +292,11 @@ class RecordingExecutor:
     ) -> None:
         self._log = log if log is not None else []
         self.targets: list[tuple[int, int]] = []
+        # Keep the two physical writes independently observable.  ``targets``
+        # records only a completed split update, so it cannot prove that an
+        # emergency admission prevented the fan half after heat was sent.
+        self.heat_writes: list[int] = []
+        self.fan_writes: list[int] = []
         self.estop_reasons: list[str] = []
         self.commands: list[str] = []
         #: (recording_origin, recording_roast_num) captured per start_session call.
@@ -216,8 +316,25 @@ class RecordingExecutor:
         self.start_session_metadata.append((recording_origin, recording_roast_num))
 
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
-        self._log.append("set_targets")
+        if not getattr(self, "_split_target_write", False):
+            self._log.append("set_targets")
         self.targets.append((heat_percent, fan_percent))
+
+    async def set_heat(self, heat_percent: int) -> None:
+        self._log.append("set_heat")
+        self.heat_writes.append(heat_percent)
+        self._pending_heat = heat_percent
+
+    async def set_fan(self, fan_percent: int) -> None:
+        self._log.append("set_fan")
+        self.fan_writes.append(fan_percent)
+        self._split_target_write = True
+        try:
+            await self.set_targets(
+                heat_percent=getattr(self, "_pending_heat", 0), fan_percent=fan_percent
+            )
+        finally:
+            self._split_target_write = False
 
     async def mark_beans_added(self) -> None:
         self._log.append("mark_beans_added")

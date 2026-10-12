@@ -30,6 +30,8 @@ export interface RecoveryModalProps {
   enabledActions: OperatorAction[] | null;
   /** Dispatch an operator action (wired to `api.operatorAction`). */
   onAction: (action: OperatorAction) => void;
+  /** A failed health refresh leaves only emergency stop available. */
+  healthStale?: boolean;
 }
 
 /** The recovery actions, in display order, with copy + a recommendation note. */
@@ -56,6 +58,7 @@ export function RecoveryModal({
   fanPercent,
   enabledActions,
   onAction,
+  healthStale = false,
 }: RecoveryModalProps): React.JSX.Element | null {
   if (!open) return null;
   // Emergency stop is always available (mirrors evaluate_emergency_stop); the
@@ -104,7 +107,7 @@ export function RecoveryModal({
             Select Recovery Action
           </span>
           {RECOVERY_ACTIONS.map(({ action, label, note }) => {
-            const isEnabled = action === "emergency_stop" || enabled.has(action);
+            const isEnabled = action === "emergency_stop" || (!healthStale && enabled.has(action));
             return (
               <button
                 key={action}
@@ -128,6 +131,12 @@ export function RecoveryModal({
             );
           })}
         </div>
+        {healthStale && (
+          <p data-testid="recovery-health-stale" className="text-xs text-roast-fault">
+            Health status is stale. Recovery actions are disabled until it recovers; emergency
+            stop remains available.
+          </p>
+        )}
       </div>
     </div>
   );

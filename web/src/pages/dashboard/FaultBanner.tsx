@@ -17,15 +17,12 @@
  * served by the OperatorActionBar (START/STOP COOLING + the always-enabled, correctly
  * labelled EMERGENCY STOP, all surfaced from the server's `enabled_actions`).
  *
- * The banner's only affordance is an optional acknowledge action — the real next
- * step once the operator is done. It dispatches the genuine `acknowledge_fault`
- * control action (#117/#206), which finalises the run (outcome `faulted`) server-side
- * and clears `active_run_id`; the page then drops its sticky-faulted pin and re-fetches
- * health → the idle Start form (#124). `acknowledge_fault` issues NO roaster command
- * (heat is already off in `faulted`), so the button label is honest. The page renders
- * the affordance only when the server's `enabled_actions` mirror enables
- * `acknowledge_fault` (the `faulted` phase) — render-from-server, no client-side
- * command matrix (#117, D25); when omitted the banner shows no affordance.
+ * The banner's optional acknowledgement action asks the operator to confirm that
+ * cooling is safe to end, then queues the genuine `acknowledge_fault` control
+ * action. That queue response is not completion: the dashboard keeps this fault
+ * visible until the current SSE stream reports the bounded executed outcome. The
+ * page renders the affordance only when the server's `enabled_actions` mirror
+ * enables `acknowledge_fault` — render-from-server, no client-side command matrix.
  *
  * Driven by the real `fault` + `safety_alert` SafetyEvaluation payloads (the page
  * accumulates the trail). All temperatures Celsius.
@@ -44,10 +41,7 @@ export interface FaultBannerProps {
   fault: SafetyEvaluationData | null;
   /** The accumulated safety event trail (newest entries appended). */
   trail: SafetyTrailEntry[];
-  /** Optional acknowledge affordance. Dispatches the `acknowledge_fault` control
-   *  action (#117/#206) — finalising the operable-faulted run server-side — then
-   *  clears the sticky-faulted pin + re-fetches health → idle form (#124). Issues
-   *  no roaster command (heat is already off in faulted). The page passes it only
+  /** Optional guarded acknowledgement affordance. Its parent supplies it only
    *  when the server's `enabled_actions` mirror enables `acknowledge_fault`;
    *  omit/undefined renders no affordance. */
   acknowledgeAffordance?: ReactNode;

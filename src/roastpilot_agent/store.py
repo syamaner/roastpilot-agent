@@ -7,6 +7,7 @@ migration mechanism. Write paths land in E6-S2, recovery reads in E6-S3.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -35,12 +36,14 @@ from roastpilot_agent.models import (
     BrewMethod,
     CommandTraceSource,
     CommandTraceStatus,
+    FaultLeaseStatus,
     LogManifest,
     PostFcHeatAuthorityState,
     ProcessingMethod,
     ReferenceCurveSample,
     ReferenceLandmarks,
     ReferenceRoast,
+    RestartClearanceState,
     RoastCommand,
     RoastDetail,
     RoastEventKind,
@@ -561,6 +564,93 @@ ALTER TABLE telemetry_snapshots ADD COLUMN post_fc_effective_heat_ceiling_percen
          post_fc_effective_heat_ceiling_percent BETWEEN 0 AND 100);
 """
 
+SCHEMA_V17_FAULT_ACKNOWLEDGEMENT_EVENT = """
+-- #954: persist the bounded execution outcome for the explicit post-fault
+-- cooling-stop acknowledgement. The event is a server-authoritative UI signal;
+-- it contains only a closed outcome/reason code and never hardware identity or
+-- exception text. SQLite requires a rebuild to extend the event-kind CHECK.
+CREATE TABLE roast_events_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES roast_runs(id),
+  kind TEXT NOT NULL CHECK (kind IN (
+    'run_started', 'phase_changed', 'charge_guidance', 't0_detected',
+    'turning_point', 'drying_end', 'first_crack', 'advisory',
+    'command_executed', 'command_failed', 'safety_alert', 'fault',
+    'recovery_required', 'recovery_acknowledged',
+    'fault_acknowledgement_executed', 'logs_exported', 'run_completed')),
+  source TEXT NOT NULL CHECK (source IN (
+    'controller', 'mcp', 'operator', 'advisor', 'safety')),
+  monotonic_seconds REAL,
+  recorded_at_utc TEXT NOT NULL,
+  payload_json TEXT
+);
+INSERT INTO roast_events_new
+  (id, run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json)
+  SELECT id, run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json
+  FROM roast_events;
+DROP TABLE roast_events;
+ALTER TABLE roast_events_new RENAME TO roast_events;
+CREATE INDEX idx_roast_events_run_kind ON roast_events(run_id, kind);
+"""
+
+SCHEMA_V18_FAULT_LEASE_AND_PROCESS_CLEARANCE = """
+-- #954 / D213: process-local clearance is durable audit state, while the
+-- single current fault-control lease retains private Agent/MCP identities.
+CREATE TABLE process_restart_clearance (
+  process_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL CHECK (state IN ('required', 'cleared', 'unknown')),
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL
+);
+CREATE TABLE fault_control_lease (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  run_id TEXT REFERENCES roast_runs(id),
+  mcp_session_id TEXT,
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  status TEXT NOT NULL CHECK (status IN ('closed', 'open', 'unknown')),
+  updated_at_utc TEXT NOT NULL
+);
+"""
+
+SCHEMA_V19_FAULT_CONTROL_EVENTS = """
+-- #954 / D213: server-authoritative lease state changes reach persisted SSE.
+CREATE TABLE roast_events_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES roast_runs(id),
+  kind TEXT NOT NULL CHECK (kind IN (
+    'run_started', 'phase_changed', 'charge_guidance', 't0_detected',
+    'turning_point', 'drying_end', 'first_crack', 'advisory',
+    'command_executed', 'command_failed', 'safety_alert', 'fault',
+    'recovery_required', 'recovery_acknowledged',
+    'fault_acknowledgement_executed', 'fault_controls_changed',
+    'fault_controls_acknowledged', 'logs_exported', 'run_completed')),
+  source TEXT NOT NULL CHECK (source IN (
+    'controller', 'mcp', 'operator', 'advisor', 'safety')),
+  monotonic_seconds REAL,
+  recorded_at_utc TEXT NOT NULL,
+  payload_json TEXT
+);
+INSERT INTO roast_events_new
+  (id, run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json)
+  SELECT id, run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json
+  FROM roast_events;
+DROP TABLE roast_events;
+ALTER TABLE roast_events_new RENAME TO roast_events;
+CREATE INDEX idx_roast_events_run_kind ON roast_events(run_id, kind);
+"""
+
+SCHEMA_V20_PROCESS_EPOCH = """
+-- #954 / D213: distinguish a deliberately clean predecessor from a crash or
+-- an upgrade that has no trustworthy fault-lease record.  The current process
+-- changes this singleton to unclean before it accepts any live clearance.
+CREATE TABLE process_epoch (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  process_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('clean', 'unclean')),
+  updated_at_utc TEXT NOT NULL
+);
+"""
+
 _BEAN_SOURCING_LEASE_DURATION = timedelta(minutes=2)
 _BEAN_SOURCING_LEASE_CONFIRMATION = timedelta(seconds=60)
 
@@ -584,6 +674,10 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V14_BEAN_SOURCING_ATTEMPTS,
     SCHEMA_V15_CATALOGUE_ATTEMPT_COUNTS,
     SCHEMA_V16_D96_VALIDATION_TRACE,
+    SCHEMA_V17_FAULT_ACKNOWLEDGEMENT_EVENT,
+    SCHEMA_V18_FAULT_LEASE_AND_PROCESS_CLEARANCE,
+    SCHEMA_V19_FAULT_CONTROL_EVENTS,
+    SCHEMA_V20_PROCESS_EPOCH,
 )
 
 
@@ -673,6 +767,38 @@ class PersistedRun(BaseModel):
     ambient_captured: bool = False
 
 
+class FaultControlLease(BaseModel):
+    """Private durable lease binding the Agent run to an exact MCP session."""
+
+    model_config = ConfigDict(frozen=True)
+
+    generation: int
+    status: FaultLeaseStatus
+    run_id: str | None
+    mcp_session_id: str | None
+
+
+class FaultControlCloseResult(BaseModel):
+    """The durable outcome of one atomic fault-control close.
+
+    ``historically_committed`` proves the exact close audit and terminal run
+    history, even if a later emergency-stop lease replaced the singleton
+    before the independent read.  ``confirmed`` additionally proves that the
+    exact generation is still the current closed lease and can therefore be
+    acknowledged to an operator.  Keeping these facts separate prevents a
+    historical live runner from surviving a successful close while also
+    preventing a stale HTTP/SSE success acknowledgement.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    historically_committed: bool
+    confirmed: bool
+    run_completed: bool
+    verification_unavailable: bool = False
+    requires_faulted_history: bool = False
+
+
 class RoastStore:
     """aiosqlite-backed persistence and recovery reads.
 
@@ -690,6 +816,11 @@ class RoastStore:
             str, tuple[bool | None, PostFcHeatAuthorityState | None, bool]
         ] = {}
         self._bean_profile_write_lock = asyncio.Lock()
+        # Set only after a successful initial migration.  A pre-v20 database
+        # with no epoch row is not a fresh install: it is ambiguous until a
+        # clean process writes its first completion marker.
+        self._new_database = False
+        self._fault_lease_absence_trusted = False
 
     @property
     def db_path(self) -> Path:
@@ -762,18 +893,19 @@ class RoastStore:
         # PRAGMA reads below keep using ``row[0]``.
         connection.row_factory = aiosqlite.Row
         try:
-            async with connection.execute("PRAGMA journal_mode=WAL") as cursor:
-                mode_row = await cursor.fetchone()
-            if mode_row is None or str(mode_row[0]).lower() != "wal":  # pragma: no cover
-                # Environment-dependent path: WAL activation only fails on
-                # filesystems that cannot support it (e.g. some NFS mounts);
-                # not reproducible on local/CI filesystems.
-                raise RuntimeError(
-                    f"could not activate WAL journal mode (got {mode_row}): "
-                    f"the durability bias requires it"
-                )
-            await connection.execute("PRAGMA synchronous=FULL")
-            await connection.execute("PRAGMA foreign_keys=ON")
+            await self._configure_durable_connection(connection)
+            async with connection.execute("PRAGMA user_version") as cursor:
+                version_row = await cursor.fetchone()
+            assert version_row is not None
+            async with connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%' LIMIT 1"
+            ) as cursor:
+                application_table = await cursor.fetchone()
+            # A version-zero file can still be an interrupted/manual database.
+            # Treat only an empty, version-zero file that migrates successfully
+            # as a fresh-install provenance proof.
+            is_new_database = int(version_row[0]) == 0 and application_table is None
             await self._apply_migrations(connection)
         except BaseException:
             # Never leak the connection (and its worker thread) on a
@@ -782,6 +914,23 @@ class RoastStore:
             await connection.close()
             raise
         self._connection = connection
+        self._new_database = is_new_database
+        self._fault_lease_absence_trusted = is_new_database
+
+    async def _configure_durable_connection(self, connection: aiosqlite.Connection) -> None:
+        """Apply the store's durability settings to one SQLite connection."""
+        async with connection.execute("PRAGMA journal_mode=WAL") as cursor:
+            mode_row = await cursor.fetchone()
+        if mode_row is None or str(mode_row[0]).lower() != "wal":  # pragma: no cover
+            # Environment-dependent path: WAL activation only fails on
+            # filesystems that cannot support it (e.g. some NFS mounts);
+            # not reproducible on local/CI filesystems.
+            raise RuntimeError(
+                f"could not activate WAL journal mode (got {mode_row}): "
+                "the durability bias requires it"
+            )
+        await connection.execute("PRAGMA synchronous=FULL")
+        await connection.execute("PRAGMA foreign_keys=ON")
 
     async def _apply_migrations(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("PRAGMA user_version") as cursor:
@@ -823,6 +972,445 @@ class RoastStore:
         if self._connection is not None:
             await self._connection.close()
             self._connection = None
+
+    async def begin_process_restart_clearance(self, process_id: str) -> RestartClearanceState:
+        """Durably create this fresh process's required restart gate.
+
+        A process identifier is minted in memory and never reused.  Therefore a
+        prior clean marker can never waive this new process's physical-clearance
+        obligation.
+        """
+        now = _utc_now()
+        await self.connection.execute(
+            "INSERT INTO process_restart_clearance "
+            "(process_id, state, created_at_utc, updated_at_utc) VALUES (?, ?, ?, ?)",
+            (process_id, RestartClearanceState.REQUIRED.value, now, now),
+        )
+        await self.connection.commit()
+        return RestartClearanceState.REQUIRED
+
+    async def begin_process_epoch(self, process_id: str) -> bool:
+        """Mark a live process unclean and return trusted absent-lease provenance.
+
+        A missing lease is usable as the zero-generation CLOSED baseline only
+        for an empty database that initialized successfully, or after the
+        immediately preceding process recorded a clean shutdown.  A migration
+        from v19 or an interrupted predecessor has no such proof and remains
+        UNKNOWN until its fault state is resolved.
+        """
+        await self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            async with self.connection.execute(
+                "SELECT status FROM process_epoch WHERE singleton = 1"
+            ) as cursor:
+                previous = await cursor.fetchone()
+            trusted = self._new_database if previous is None else str(previous["status"]) == "clean"
+            await self.connection.execute(
+                "INSERT INTO process_epoch (singleton, process_id, status, updated_at_utc) "
+                "VALUES (1, ?, 'unclean', ?) "
+                "ON CONFLICT(singleton) DO UPDATE SET process_id=excluded.process_id, "
+                "status=excluded.status, updated_at_utc=excluded.updated_at_utc",
+                (process_id, _utc_now()),
+            )
+            await self.connection.execute("COMMIT")
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await self.connection.execute("ROLLBACK")
+            raise
+        self._fault_lease_absence_trusted = trusted
+        return trusted
+
+    async def mark_process_epoch_clean(self, process_id: str) -> bool:
+        """CAS this live process's epoch to clean after verified shutdown."""
+        cursor = await self.connection.execute(
+            "UPDATE process_epoch SET status = 'clean', updated_at_utc = ? "
+            "WHERE singleton = 1 AND process_id = ? AND status = 'unclean'",
+            (_utc_now(), process_id),
+        )
+        await self.connection.commit()
+        return cursor.rowcount == 1
+
+    async def read_process_restart_clearance(self, process_id: str) -> RestartClearanceState:
+        """Read this process's durable restart gate, failing closed if absent."""
+        async with self.connection.execute(
+            "SELECT state FROM process_restart_clearance WHERE process_id = ?", (process_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return RestartClearanceState.UNKNOWN
+        try:
+            return RestartClearanceState(str(row["state"]))
+        except ValueError:
+            return RestartClearanceState.UNKNOWN
+
+    async def confirm_process_restart_clearance(self, process_id: str) -> bool:
+        """CAS the current process gate from required to cleared."""
+        cursor = await self.connection.execute(
+            "UPDATE process_restart_clearance SET state = ?, updated_at_utc = ? "
+            "WHERE process_id = ? AND state = ?",
+            (
+                RestartClearanceState.CLEARED.value,
+                _utc_now(),
+                process_id,
+                RestartClearanceState.REQUIRED.value,
+            ),
+        )
+        await self.connection.commit()
+        return cursor.rowcount == 1
+
+    async def read_fault_control_lease(self) -> FaultControlLease:
+        """Read the current lease, classifying unproven absence as UNKNOWN."""
+        return await self._read_fault_control_lease_from_connection(self.connection)
+
+    async def _read_fault_control_lease_from_connection(
+        self, connection: aiosqlite.Connection
+    ) -> FaultControlLease:
+        """Read a fault lease and its required audit from one connection."""
+        async with connection.execute(
+            "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease "
+            "WHERE singleton = 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return FaultControlLease(
+                generation=0,
+                status=(
+                    FaultLeaseStatus.CLOSED
+                    if self._fault_lease_absence_trusted
+                    else FaultLeaseStatus.UNKNOWN
+                ),
+                run_id=None,
+                mcp_session_id=None,
+            )
+        try:
+            status = FaultLeaseStatus(str(row["status"]))
+        except ValueError:
+            status = FaultLeaseStatus.UNKNOWN
+        run_id = None if row["run_id"] is None else str(row["run_id"])
+        generation = int(row["generation"])
+        # A bare CLOSED row is never an eligible start state.  A crash between
+        # the old independent close/event commits used to make precisely that
+        # state observable on restart.  Keep it UNKNOWN until the exact audit
+        # is durably visible as well.
+        if (
+            status is FaultLeaseStatus.CLOSED
+            and run_id is not None
+            and not await self._has_confirmed_fault_control_close(connection, run_id, generation)
+        ):
+            status = FaultLeaseStatus.UNKNOWN
+        return FaultControlLease(
+            generation=generation,
+            status=status,
+            run_id=run_id,
+            mcp_session_id=(None if row["mcp_session_id"] is None else str(row["mcp_session_id"])),
+        )
+
+    async def _has_confirmed_fault_control_close(
+        self, connection: aiosqlite.Connection, run_id: str, generation: int
+    ) -> bool:
+        """Return whether the exact lease has its committed close audit."""
+        payload = json.dumps(
+            {"generation": generation, "outcome": "confirmed", "status": "closed"},
+            sort_keys=True,
+        )
+        async with connection.execute(
+            "SELECT 1 FROM roast_events WHERE run_id = ? AND kind = ? AND payload_json = ? LIMIT 1",
+            (run_id, RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED.value, payload),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def open_fault_control_lease(
+        self, *, run_id: str | None, mcp_session_id: str | None, generation: int | None = None
+    ) -> FaultControlLease:
+        """Durably open a newer current lease without allowing stale writers."""
+        if generation is None:
+            generation = (await self.read_fault_control_lease()).generation + 1
+        await self.connection.execute(
+            "INSERT INTO fault_control_lease "
+            "(singleton, run_id, mcp_session_id, generation, status, updated_at_utc) "
+            "VALUES (1, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(singleton) DO UPDATE SET run_id=excluded.run_id, "
+            "mcp_session_id=excluded.mcp_session_id, generation=excluded.generation, "
+            "status=excluded.status, updated_at_utc=excluded.updated_at_utc "
+            "WHERE excluded.generation > fault_control_lease.generation",
+            (run_id, mcp_session_id, generation, FaultLeaseStatus.OPEN.value, _utc_now()),
+        )
+        await self.connection.commit()
+        return await self.read_fault_control_lease()
+
+    async def mark_fault_control_lease_unknown(self, generation: int) -> bool:
+        """Fail closed after an unconfirmed lease persistence attempt."""
+        cursor = await self.connection.execute(
+            "UPDATE fault_control_lease SET status = ?, updated_at_utc = ? "
+            "WHERE singleton = 1 AND generation = ?",
+            (FaultLeaseStatus.UNKNOWN.value, _utc_now(), generation),
+        )
+        await self.connection.commit()
+        return cursor.rowcount == 1
+
+    async def replace_fault_control_lease_unknown(
+        self, run_id: str | None, *, generation: int | None = None
+    ) -> FaultControlLease:
+        """Advance the lease into UNKNOWN when no exact session can be bound."""
+        if generation is None:
+            generation = (await self.read_fault_control_lease()).generation + 1
+        await self.connection.execute(
+            "INSERT INTO fault_control_lease "
+            "(singleton, run_id, mcp_session_id, generation, status, updated_at_utc) "
+            "VALUES (1, ?, NULL, ?, ?, ?) "
+            "ON CONFLICT(singleton) DO UPDATE SET run_id=excluded.run_id, "
+            "mcp_session_id=NULL, generation=excluded.generation, "
+            "status=excluded.status, updated_at_utc=excluded.updated_at_utc "
+            "WHERE excluded.generation > fault_control_lease.generation",
+            (run_id, generation, FaultLeaseStatus.UNKNOWN.value, _utc_now()),
+        )
+        await self.connection.commit()
+        return await self.read_fault_control_lease()
+
+    async def close_fault_control_lease(self, generation: int) -> bool:
+        """Close only the current OPEN lease generation through a durable CAS."""
+        cursor = await self.connection.execute(
+            "UPDATE fault_control_lease SET status = ?, updated_at_utc = ? "
+            "WHERE singleton = 1 AND generation = ? AND status = ?",
+            (
+                FaultLeaseStatus.CLOSED.value,
+                _utc_now(),
+                generation,
+                FaultLeaseStatus.OPEN.value,
+            ),
+        )
+        await self.connection.commit()
+        return cursor.rowcount == 1
+
+    async def close_fault_control_lease_atomically(
+        self,
+        *,
+        generation: int,
+        run_id: str,
+        mcp_session_id: str,
+        fault_reason: str | None,
+    ) -> FaultControlCloseResult:
+        """Atomically close one exact OPEN fault lease and retain its evidence.
+
+        A dedicated SQLite connection takes an immediate transaction, so no
+        writer on the normal store connection can commit a lease close without
+        the matching acknowledgement event.  For a live FAULTED row the same
+        commit finalises immutable history with its already-captured fault
+        reason.  Terminal history is intentionally left untouched.
+
+        Args:
+            generation: Current in-memory fault lease generation.
+            run_id: Exact Agent run bound to the safe-zero proof.
+            mcp_session_id: Exact MCP session bound to the safe-zero proof.
+            fault_reason: Captured fault reason, when this closes a live run.
+
+        Returns:
+            A result confirmed only by a fresh post-commit durable read.
+        """
+        connection = await aiosqlite.connect(self._db_path)
+        connection.row_factory = aiosqlite.Row
+        live_run_at_begin = False
+        payload = json.dumps(
+            {"generation": generation, "outcome": "confirmed", "status": "closed"},
+            sort_keys=True,
+        )
+        try:
+            await self._configure_durable_connection(connection)
+            await connection.execute("BEGIN IMMEDIATE")
+            async with connection.execute(
+                "SELECT run_id, mcp_session_id, status FROM fault_control_lease "
+                "WHERE singleton = 1 AND generation = ?",
+                (generation,),
+            ) as cursor:
+                lease = await cursor.fetchone()
+            if (
+                lease is None
+                or str(lease["status"]) != FaultLeaseStatus.OPEN.value
+                or str(lease["run_id"]) != run_id
+                or str(lease["mcp_session_id"]) != mcp_session_id
+            ):
+                await connection.rollback()
+                return FaultControlCloseResult(
+                    historically_committed=False, confirmed=False, run_completed=False
+                )
+            async with connection.execute(
+                "SELECT completed_at_utc FROM roast_runs WHERE id = ?", (run_id,)
+            ) as cursor:
+                run = await cursor.fetchone()
+            if run is None:
+                await connection.rollback()
+                return FaultControlCloseResult(
+                    historically_committed=False, confirmed=False, run_completed=False
+                )
+            live_run_at_begin = run["completed_at_utc"] is None
+            now = _utc_now()
+            cursor = await connection.execute(
+                "UPDATE fault_control_lease SET status = ?, updated_at_utc = ? "
+                "WHERE singleton = 1 AND generation = ? AND run_id = ? "
+                "AND mcp_session_id = ? AND status = ?",
+                (
+                    FaultLeaseStatus.CLOSED.value,
+                    now,
+                    generation,
+                    run_id,
+                    mcp_session_id,
+                    FaultLeaseStatus.OPEN.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                await connection.rollback()
+                return FaultControlCloseResult(
+                    historically_committed=False, confirmed=False, run_completed=False
+                )
+            await connection.execute(
+                "INSERT INTO roast_events "
+                "(run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json) "
+                "VALUES (?, ?, ?, NULL, ?, ?)",
+                (
+                    run_id,
+                    RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED.value,
+                    RoastEventSource.OPERATOR.value,
+                    now,
+                    payload,
+                ),
+            )
+            if live_run_at_begin:
+                completed = await connection.execute(
+                    "UPDATE roast_runs SET completed_at_utc = ?, outcome = 'faulted', "
+                    "agent_phase = ?, fault_reason = COALESCE(?, fault_reason), "
+                    "updated_at_utc = ? WHERE id = ? AND completed_at_utc IS NULL "
+                    "AND agent_phase = ?",
+                    (
+                        now,
+                        RoastPhase.FAULTED.value,
+                        fault_reason,
+                        now,
+                        run_id,
+                        RoastPhase.FAULTED.value,
+                    ),
+                )
+                if completed.rowcount != 1:
+                    await connection.rollback()
+                    return FaultControlCloseResult(
+                        historically_committed=False, confirmed=False, run_completed=False
+                    )
+            await connection.commit()
+        except Exception:  # noqa: BLE001 - commit ambiguity is fail-closed
+            with contextlib.suppress(Exception):
+                await connection.rollback()
+        finally:
+            await connection.close()
+
+        # A successful COMMIT call is still not enough evidence for an actor
+        # whose task was cancelled or whose driver reported ambiguity.  Always
+        # independently inspect the exact audit and terminal history, even if
+        # COMMIT itself raised after SQLite accepted it.  The singleton may
+        # already name a newer e-stop generation; that does not erase proof
+        # that this older live runner must finish.
+        verification_connection: aiosqlite.Connection | None = None
+        try:
+            verification_connection = await aiosqlite.connect(self._db_path)
+            verification_connection.row_factory = aiosqlite.Row
+            await self._configure_durable_connection(verification_connection)
+            lease = await self._read_fault_control_lease_from_connection(verification_connection)
+            audit_present = await self._has_confirmed_fault_control_close(
+                verification_connection, run_id, generation
+            )
+            async with verification_connection.execute(
+                "SELECT completed_at_utc, outcome, agent_phase FROM roast_runs WHERE id = ?",
+                (run_id,),
+            ) as cursor:
+                verified_run = await cursor.fetchone()
+        except Exception:  # noqa: BLE001 - unreadable postcondition is fail-closed
+            return FaultControlCloseResult(
+                historically_committed=False,
+                confirmed=False,
+                run_completed=False,
+                verification_unavailable=True,
+                requires_faulted_history=live_run_at_begin,
+            )
+        finally:
+            if verification_connection is not None:
+                await verification_connection.close()
+        history_confirmed = verified_run is not None and (
+            not live_run_at_begin
+            or (
+                verified_run["completed_at_utc"] is not None
+                and str(verified_run["outcome"]) == "faulted"
+                and str(verified_run["agent_phase"]) == RoastPhase.FAULTED.value
+            )
+        )
+        historically_committed = audit_present and history_confirmed
+        confirmed = (
+            historically_committed
+            and lease.generation == generation
+            and lease.status is FaultLeaseStatus.CLOSED
+            and lease.run_id == run_id
+            and lease.mcp_session_id == mcp_session_id
+        )
+        return FaultControlCloseResult(
+            historically_committed=historically_committed,
+            confirmed=confirmed,
+            run_completed=historically_committed and live_run_at_begin,
+        )
+
+    async def verify_fault_control_lease_close(
+        self,
+        *,
+        generation: int,
+        run_id: str,
+        mcp_session_id: str,
+        requires_faulted_history: bool,
+    ) -> FaultControlCloseResult:
+        """Independently prove one exact close, audit, and terminal history.
+
+        This is used only after the close transaction's first verification
+        connection was unavailable.  It never changes durable state: a caller
+        either receives fresh exact evidence or retains an UNKNOWN fence.
+        """
+        connection: aiosqlite.Connection | None = None
+        try:
+            connection = await aiosqlite.connect(self._db_path)
+            connection.row_factory = aiosqlite.Row
+            await self._configure_durable_connection(connection)
+            lease = await self._read_fault_control_lease_from_connection(connection)
+            audit_present = await self._has_confirmed_fault_control_close(
+                connection, run_id, generation
+            )
+            async with connection.execute(
+                "SELECT completed_at_utc, outcome, agent_phase FROM roast_runs WHERE id = ?",
+                (run_id,),
+            ) as cursor:
+                run = await cursor.fetchone()
+        except Exception:  # noqa: BLE001 - proof failure must retain the fence
+            return FaultControlCloseResult(
+                historically_committed=False,
+                confirmed=False,
+                run_completed=False,
+                verification_unavailable=True,
+            )
+        finally:
+            if connection is not None:
+                await connection.close()
+        history_confirmed = run is not None and run["completed_at_utc"] is not None
+        if requires_faulted_history and run is not None:
+            history_confirmed = history_confirmed and (
+                str(run["outcome"]) == "faulted"
+                and str(run["agent_phase"]) == RoastPhase.FAULTED.value
+            )
+        historically_committed = audit_present and history_confirmed
+        confirmed = (
+            historically_committed
+            and lease.generation == generation
+            and lease.status is FaultLeaseStatus.CLOSED
+            and lease.run_id == run_id
+            and lease.mcp_session_id == mcp_session_id
+        )
+        return FaultControlCloseResult(
+            historically_committed=historically_committed,
+            confirmed=confirmed,
+            run_completed=historically_committed and requires_faulted_history,
+        )
 
     # --- E6-S2: write paths ---
     #
@@ -1266,6 +1854,128 @@ class RoastStore:
             ),
         )
         await self.connection.commit()
+
+    async def begin_fault_acknowledgement_confirmation(self, run_id: str) -> int:
+        """Persist a revocable acknowledgement-confirmation audit candidate.
+
+        A fault acknowledgement crosses several awaited boundaries.  The
+        candidate is deliberately not a confirmation: an admitted emergency
+        stop can still supersede it before the runner emits a success event.
+        Only :meth:`resolve_fault_acknowledgement_confirmation` may turn this
+        row into the closed outcome.
+        """
+        cursor = await self.connection.execute(
+            "INSERT INTO operator_actions (run_id, action, payload_json, result,"
+            " recorded_at_utc) VALUES (?, ?, ?, ?, ?)",
+            (
+                run_id,
+                "acknowledge_fault",
+                json.dumps({"fault_acknowledgement": "pending_confirmation"}, sort_keys=True),
+                "accepted",
+                _utc_now(),
+            ),
+        )
+        await self.connection.commit()
+        action_id = cursor.lastrowid
+        assert action_id is not None  # pragma: no cover - SQLite assigns INTEGER PRIMARY KEY
+        return int(action_id)
+
+    async def resolve_fault_acknowledgement_confirmation(
+        self, action_id: int, *, confirmed: bool
+    ) -> bool:
+        """Resolve one pending acknowledgement candidate to its final outcome.
+
+        The update is narrowly guarded so an unrelated audit row cannot be
+        rewritten.  A superseded candidate stays durable as failed evidence;
+        it never remains a false successful confirmation.
+        """
+        outcome = "confirmed" if confirmed else "superseded_by_emergency_stop"
+        result: Literal["accepted", "rejected", "failed"] = "accepted" if confirmed else "failed"
+        cursor = await self.connection.execute(
+            "UPDATE operator_actions SET payload_json = ?, result = ? "
+            "WHERE id = ? AND action = ? AND payload_json IN (?, ?)",
+            (
+                json.dumps({"fault_acknowledgement": outcome}, sort_keys=True),
+                result,
+                action_id,
+                "acknowledge_fault",
+                json.dumps({"fault_acknowledgement": "pending_confirmation"}, sort_keys=True),
+                json.dumps({"fault_acknowledgement": "confirmed"}, sort_keys=True),
+            ),
+        )
+        await self.connection.commit()
+        return cursor.rowcount == 1
+
+    async def begin_fault_controls_acknowledgement_event(self, run_id: str, generation: int) -> int:
+        """Persist a revocable candidate for one fault-lease close event.
+
+        A closed lease can be superseded by a global e-stop while this durable
+        event write awaits.  The candidate is therefore deliberately not a
+        confirmed close until its caller resolves it through the current
+        in-memory generation fence.
+        """
+        cursor = await self.connection.execute(
+            "INSERT INTO roast_events"
+            " (run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json)"
+            " VALUES (?, ?, ?, NULL, ?, ?)",
+            (
+                run_id,
+                RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED.value,
+                RoastEventSource.OPERATOR.value,
+                _utc_now(),
+                json.dumps(
+                    {
+                        "generation": generation,
+                        "status": "pending_confirmation",
+                        "outcome": "pending",
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        )
+        await self.connection.commit()
+        event_id = cursor.lastrowid
+        assert event_id is not None  # pragma: no cover - SQLite assigns INTEGER PRIMARY KEY
+        return int(event_id)
+
+    async def resolve_fault_controls_acknowledgement_event(
+        self, event_id: int, *, generation: int, confirmed: bool
+    ) -> bool:
+        """Resolve one pending fault-lease close event without stale success."""
+        payload = (
+            {"generation": generation, "status": "closed", "outcome": "confirmed"}
+            if confirmed
+            else {
+                "generation": generation,
+                "status": "superseded_by_emergency_stop",
+                "outcome": "failed",
+            }
+        )
+        pending = json.dumps(
+            {
+                "generation": generation,
+                "status": "pending_confirmation",
+                "outcome": "pending",
+            },
+            sort_keys=True,
+        )
+        confirmed_payload = json.dumps(
+            {"generation": generation, "status": "closed", "outcome": "confirmed"},
+            sort_keys=True,
+        )
+        cursor = await self.connection.execute(
+            "UPDATE roast_events SET payload_json = ? WHERE id = ? AND kind = ? "
+            "AND payload_json IN (?, ?)",
+            (
+                json.dumps(payload, sort_keys=True),
+                event_id,
+                RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED.value,
+                pending,
+                confirmed_payload,
+            ),
+        )
+        await self.connection.commit()
+        return cursor.rowcount == 1
 
     @staticmethod
     def _dump(model: BaseModel) -> dict[str, object]:
