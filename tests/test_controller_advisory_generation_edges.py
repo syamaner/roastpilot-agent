@@ -8,6 +8,7 @@ import pytest
 from roastpilot_agent.advisor import AdvisorFailureMode, FakeAdvisor
 from roastpilot_agent.controller import AdvisoryTrigger, RoastPhase
 from roastpilot_agent.models import AppliedRoasterState, RoastEventKind
+from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 from tests.conftest import RecordingExecutor
 from tests.test_controller import PROFILE, decision, harness_in_development, make_harness, reading
 
@@ -160,6 +161,9 @@ async def test_estop_during_advisor_drop_coherence_audit_cannot_emit_rejection(
         nonlocal evaluations
         evaluations += 1
         if evaluations == 2:
+            assert isinstance(value, SafetyEvaluation)
+            assert value.rule == "advisor_drop_coherence"
+            assert value.verdict is SafetyVerdict.REJECT
             entered.set()
             await release.wait()
         return await original(value)  # type: ignore[arg-type]
