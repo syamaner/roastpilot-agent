@@ -6631,15 +6631,17 @@ def test_batched_unavailable_markers_keep_importer_and_root_boundaries(
     monkeypatch.setattr(sys.modules[__name__], "_memoised_proxy_docs_readers", counting)
     memo = _DocsProxyMemo()
     for filename, root in (
-        ("tests/test_first.py", tmp_path / "first"),
-        ("tests/test_second.py", tmp_path / "second"),
+        ("tests/test_first.py", tmp_path / "shared"),
+        ("tests/test_second.py", tmp_path / "shared"),
+        ("tests/test_shared.py", tmp_path / "first"),
+        ("tests/test_shared.py", tmp_path / "second"),
     ):
         assert _batched_imported_function_readers(source, "safe", names, filename, root, memo) == (
             False,
             False,
         )
-    assert batch_attempts == 2
-    assert len(memo.unavailable) == 2
+    assert batch_attempts == 4
+    assert len(memo.unavailable) == 4
 
 
 @pytest.mark.docs_ci
