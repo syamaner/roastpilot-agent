@@ -534,6 +534,50 @@ async def test_no_session_clearance_rejects_child_replacement_during_proof(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_no_session_clearance_rejects_a_stopped_current_child(tmp_path: Path) -> None:
+    """A stale child object cannot stand in for a live no-session proof."""
+    store = RoastStore(tmp_path / "restart-stopped-child.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, child = await _presence_service(store, "none")
+        child.running = False
+
+        with pytest.raises(RoastRunConflictError, match="current MCP child"):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+
+        assert (await service.health()).restart_clearance.state is RestartClearanceState.REQUIRED
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_rejects_false_durable_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A false clearance CAS result must leave the process gate unknown."""
+    store = RoastStore(tmp_path / "restart-false-confirmation.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, _child = await _presence_service(store, "none")
+
+        async def false_confirmation(process_id: str) -> bool:
+            del process_id
+            return False
+
+        monkeypatch.setattr(store, "confirm_process_restart_clearance", false_confirmation)
+        with pytest.raises(RoastRunConflictError, match="not durably recorded"):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+
+        assert (await service.health()).restart_clearance.state is RestartClearanceState.UNKNOWN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_no_session_clearance_rejects_lease_change_during_proof(tmp_path: Path) -> None:
     """A concurrent fault lease change invalidates a previously clean proof."""
     store = RoastStore(tmp_path / "restart-lease-race.sqlite3")
@@ -703,6 +747,43 @@ async def test_open_fault_clearance_rejects_child_replacement_during_durable_con
         assert health.restart_clearance.state is RestartClearanceState.UNKNOWN
         assert not health.restart_clearance.eligible
         assert health.fault_controls.status is FaultLeaseStatus.OPEN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_phase", "mcp_session_id", "expected_error"),
+    [
+        (RoastPhase.STARTING, "private-session", "requires no active run"),
+        (RoastPhase.FAULTED, None, "exact fault session is unavailable"),
+    ],
+)
+async def test_open_fault_clearance_rejects_non_faulted_or_unbound_active_lease(
+    tmp_path: Path,
+    run_phase: RoastPhase,
+    mcp_session_id: str | None,
+    expected_error: str,
+) -> None:
+    """OPEN-lease clearance needs one active fault and its exact MCP session."""
+    store = RoastStore(tmp_path / "restart-invalid-open-lease.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=run_phase,
+        )
+        await store.open_fault_control_lease(run_id="private-run", mcp_session_id=mcp_session_id)
+
+        with pytest.raises(RoastRunConflictError, match=expected_error):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+
+        assert (await service.health()).restart_clearance.state is RestartClearanceState.REQUIRED
     finally:
         await store.close()
 

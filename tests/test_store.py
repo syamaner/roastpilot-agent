@@ -7394,6 +7394,52 @@ async def test_atomic_fault_close_preserves_already_terminal_history(tmp_store: 
 
 
 @pytest.mark.asyncio
+async def test_independent_fault_close_verification_requires_the_exact_audited_close(
+    tmp_store: RoastStore,
+) -> None:
+    """Recovery can reprove one terminal close without mutating durable state."""
+    run_id = "independently-verified-close"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.FAULTED)
+    await tmp_store.complete_run(
+        run_id=run_id,
+        outcome="faulted",
+        agent_phase=RoastPhase.FAULTED,
+        fault_reason="recorded fault",
+    )
+    await tmp_store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="exact-session", generation=12
+    )
+    assert (
+        await tmp_store.close_fault_control_lease_atomically(
+            generation=12,
+            run_id=run_id,
+            mcp_session_id="exact-session",
+            fault_reason="must not overwrite terminal history",
+        )
+    ).confirmed
+
+    verified = await tmp_store.verify_fault_control_lease_close(
+        generation=12,
+        run_id=run_id,
+        mcp_session_id="exact-session",
+        requires_faulted_history=True,
+    )
+    wrong_generation = await tmp_store.verify_fault_control_lease_close(
+        generation=13,
+        run_id=run_id,
+        mcp_session_id="exact-session",
+        requires_faulted_history=True,
+    )
+
+    assert verified.historically_committed
+    assert verified.confirmed
+    assert verified.run_completed
+    assert not wrong_generation.historically_committed
+    assert not wrong_generation.confirmed
+
+
+@pytest.mark.asyncio
 async def test_unverified_closed_fault_lease_is_unknown_on_restart_read(
     tmp_store: RoastStore,
 ) -> None:
@@ -7410,3 +7456,69 @@ async def test_unverified_closed_fault_lease_is_unknown_on_restart_read(
     lease = await tmp_store.read_fault_control_lease()
 
     assert lease.status.value == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_fault_lease_read_fails_closed_for_corrupt_status_and_legacy_close(
+    tmp_store: RoastStore,
+) -> None:
+    """Corrupt status and a close without its audit never create Start eligibility."""
+    await seeded_store(tmp_store, run_id="corrupt-lease")
+    # The schema rejects bad values in normal operation.  Simulate a damaged
+    # on-disk row to pin the defensive migration/recovery read boundary.
+    await tmp_store.connection.execute("PRAGMA ignore_check_constraints = ON")
+    await tmp_store.connection.execute(
+        "INSERT INTO fault_control_lease "
+        "(singleton, run_id, mcp_session_id, generation, status, updated_at_utc) "
+        "VALUES (1, ?, ?, 1, 'invalid', ?)",
+        ("corrupt-lease", "exact-session", "2026-10-08T00:00:00+00:00"),
+    )
+    await tmp_store.connection.commit()
+    await tmp_store.connection.execute("PRAGMA ignore_check_constraints = OFF")
+
+    assert (await tmp_store.read_fault_control_lease()).status.value == "unknown"
+    await tmp_store.open_fault_control_lease(
+        run_id="corrupt-lease", mcp_session_id="exact-session", generation=2
+    )
+    assert await tmp_store.close_fault_control_lease(2)
+
+    # The legacy primitive changes only the singleton row.  Without D215's
+    # matching immutable audit event, a later read retains the UNKNOWN fence.
+    assert (await tmp_store.read_fault_control_lease()).status.value == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_fault_acknowledgement_audit_can_only_resolve_its_pending_event(
+    tmp_store: RoastStore,
+) -> None:
+    """A revocable acknowledgement audit records either confirmation or an e-stop supersession."""
+    run_id = "revocable-fault-acknowledgement"
+    await seeded_store(tmp_store, run_id=run_id)
+
+    superseded_id = await tmp_store.begin_fault_controls_acknowledgement_event(run_id, 4)
+    assert await tmp_store.resolve_fault_controls_acknowledgement_event(
+        superseded_id, generation=4, confirmed=False
+    )
+    assert not await tmp_store.resolve_fault_controls_acknowledgement_event(
+        superseded_id, generation=5, confirmed=True
+    )
+
+    confirmed_id = await tmp_store.begin_fault_controls_acknowledgement_event(run_id, 5)
+    assert await tmp_store.resolve_fault_controls_acknowledgement_event(
+        confirmed_id, generation=5, confirmed=True
+    )
+
+    timeline = await tmp_store.read_timeline(run_id)
+    acknowledgement_events = [
+        event
+        for event in timeline.events
+        if event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED
+    ]
+    assert [event.payload for event in acknowledgement_events] == [
+        {
+            "generation": 4,
+            "outcome": "failed",
+            "status": "superseded_by_emergency_stop",
+        },
+        {"generation": 5, "outcome": "confirmed", "status": "closed"},
+    ]
