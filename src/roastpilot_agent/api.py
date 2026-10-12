@@ -3186,9 +3186,36 @@ class RoastService:
         """
         previous = self._fault_lease_cache
         was_finalizing = self._fault_acknowledgement_gate.fault_finalization_started
-        # A live run supersedes a CLOSED historical lease.  Its e-stop must go
-        # through the current controller, never an old exact session.
-        run_id = self.active_run_id or previous.run_id
+        # Select an actionable target before admitting a durable lease or
+        # reserving arbiter priority.  ``active_run_id`` intentionally remains
+        # available after completion for history and recovery projections, so
+        # it is not itself proof that a controller can still deliver a stop.
+        # A live controller wins; otherwise only an OPEN/UNKNOWN lease with a
+        # retained exact session may address completed history.
+        live_runner = (
+            self.runner
+            if (
+                self.active_run_id is not None
+                and self.runner is not None
+                # Narrow test runners implement only the priority-dispatch
+                # seam.  Production RoastRunner always exposes ``finalized``.
+                and not getattr(self.runner, "finalized", False)
+                and getattr(self.runner, "run_id", self.active_run_id) == self.active_run_id
+            )
+            else None
+        )
+        terminal_lease_is_actionable = (
+            previous.run_id is not None
+            and previous.mcp_session_id is not None
+            and previous.status in (FaultLeaseStatus.OPEN, FaultLeaseStatus.UNKNOWN)
+        )
+        run_id = (
+            self.active_run_id
+            if live_runner is not None
+            else previous.run_id
+            if terminal_lease_is_actionable
+            else None
+        )
         if expected_run_id is not None and run_id != expected_run_id:
             return FaultControlsActionResult(
                 action=OperatorAction.EMERGENCY_STOP,
@@ -3200,28 +3227,16 @@ class RoastService:
             return FaultControlsActionResult(
                 action=OperatorAction.EMERGENCY_STOP,
                 result="failed",
-                reason="no controller-owned run is available for a software e-stop attempt",
-                fault_controls=FaultControlsProjection(
-                    status=FaultLeaseStatus.UNKNOWN,
-                    generation=None,
-                    enabled_actions=[OperatorAction.EMERGENCY_STOP],
+                reason=(
+                    "no live controller or exact-session fault lease is available for a "
+                    "software e-stop attempt; use the independent physical stop"
                 ),
+                fault_controls=await self._fault_controls_projection_after_action(),
             )
         # No store read, telemetry read, or projection read may precede this
         # generation advance. Retain the prior exact session solely for the
         # immediate controller executor; the lease itself stays UNKNOWN until
         # its asynchronous persistence confirms it.
-        live_runner = (
-            self.runner
-            if (
-                self.active_run_id == run_id
-                and self.runner is not None
-                # Narrow test runners implement only the priority-dispatch
-                # seam.  Production RoastRunner always exposes ``finalized``.
-                and not getattr(self.runner, "finalized", False)
-            )
-            else None
-        )
         prior_session_id = previous.mcp_session_id if previous.run_id == run_id else None
         # A terminal run may retain an exact lease while no runner remains.
         # Without that retained identity, do not fall back to latest telemetry:

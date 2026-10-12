@@ -438,6 +438,85 @@ async def test_fault_controls_route_dispatches_live_emergency_stop_outside_routi
 
 
 @pytest.mark.asyncio
+async def test_global_estop_uses_live_runner_without_a_terminal_fault_lease(
+    store: RoastStore,
+) -> None:
+    """A current controller is an immediate e-stop target without terminal history."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+
+    assert result.result == "accepted"
+    assert service._fault_lease_cache.run_id == run_id  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert mcp.commands().count("emergency_stop") == 1
+
+
+@pytest.mark.asyncio
+async def test_global_estop_uses_open_exact_terminal_lease_despite_historical_active_pointer(
+    store: RoastStore,
+) -> None:
+    """A completed pointer may act only through its retained exact fault lease."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, run_id = await _terminal_fault_control_service(store, mcp)
+    service.active_run_id = run_id
+
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+
+    assert result.result == "confirmed"
+    assert (
+        "fault_control",
+        {"action": "emergency_stop", "expected_session_id": "session-1"},
+    ) in mcp.calls
+
+
+@pytest.mark.asyncio
+async def test_global_estop_rejects_completed_pointer_without_lease_or_start_fence(
+    store: RoastStore,
+) -> None:
+    """A finalised history pointer cannot create an unconfirmable UNKNOWN lease."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False, clock=clock)
+    completed_run_id = "completed-pointer-without-terminal-lease"
+    await store.create_run(
+        run_id=completed_run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id=completed_run_id,
+        outcome="completed",
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    service.active_run_id = completed_run_id
+    generation_before = service._command_arbiter.generation  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+
+    assert result.result == "failed"
+    assert result.reason == (
+        "no live controller or exact-session fault lease is available for a software "
+        "e-stop attempt; use the independent physical stop"
+    )
+    assert service._command_arbiter.generation == generation_before  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+    assert service._fault_lease_cache.status is FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert mcp.commands().count("emergency_stop") == 0
+
+    next_run = await service.start_roast(_profile(name="Fresh after completed pointer"))
+    assert next_run.id != completed_run_id
+
+
+@pytest.mark.asyncio
 async def test_fault_controls_route_queues_confirmed_live_d212_for_current_lease(
     store: RoastStore,
 ) -> None:
