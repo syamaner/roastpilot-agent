@@ -61,13 +61,9 @@ def _fake_proc_tree(tmp_path: Path) -> tuple[Path, str]:
     return proc_root, "100"
 
 
-@pytest.fixture
-def installer_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Path, Path]:
-    """Create one recorded-fake PATH and a root-free appliance destination.
-
-    This is serial because the real script is run in subprocesses and mutates
-    process-visible fake-command state plus a temporary installation root.
-    """
+def _build_installer_harness(base: Path) -> tuple[Path, dict[str, str], Path, Path]:
+    """Build one recorded-fake PATH and root-free destination below ``base``."""
+    tmp_path = base
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     log = tmp_path / "commands.log"
@@ -115,6 +111,31 @@ case "$name" in
       else cat "$FAKE_HOSTNAME"; fi
     else
       [ "$1" = set-hostname ]
+      rendezvous_dir="${FAKE_RENDEZVOUS_DIR-}"
+      rendezvous_self="${FAKE_RENDEZVOUS_SELF-}"
+      rendezvous_peer="${FAKE_RENDEZVOUS_PEER-}"
+      rendezvous_dir_set="${FAKE_RENDEZVOUS_DIR+x}"
+      rendezvous_self_set="${FAKE_RENDEZVOUS_SELF+x}"
+      rendezvous_peer_set="${FAKE_RENDEZVOUS_PEER+x}"
+      if [ -z "$rendezvous_dir_set" ] && [ -z "$rendezvous_self_set" ] && [ -z "$rendezvous_peer_set" ]; then
+        :
+      elif [ "$rendezvous_dir_set" = x ] && [ "$rendezvous_self_set" = x ] && [ "$rendezvous_peer_set" = x ] && [ -n "$rendezvous_dir" ] && [ -n "$rendezvous_self" ] && [ -n "$rendezvous_peer" ]; then
+        /bin/mkdir -p -- "$rendezvous_dir"
+        : > "$rendezvous_dir/$rendezvous_self"
+        rendezvous_timeout="${FAKE_RENDEZVOUS_TIMEOUT_SECONDS:-30}"
+        rendezvous_deadline=$((SECONDS + rendezvous_timeout))
+        while [ ! -e "$rendezvous_dir/$rendezvous_peer" ]; do
+          if [ "$SECONDS" -ge "$rendezvous_deadline" ]; then
+            printf 'FAKE_RENDEZVOUS_TIMEOUT %s\\n' "$rendezvous_self" >> "$FAKE_LOG"
+            exit 64
+          fi
+          /bin/sleep 0.05
+        done
+        printf 'FAKE_RENDEZVOUS_MET %s %s\\n' "$rendezvous_self" "$rendezvous_peer" >> "$FAKE_LOG"
+      else
+        printf 'FAKE_RENDEZVOUS_CONFIG_INVALID\\n' >> "$FAKE_LOG"
+        exit 65
+      fi
       printf '%s\\n' "$2" > "$FAKE_HOSTNAME"
       : > "$FAKE_HOSTNAME_SET_MARKER"
     fi ;;
@@ -657,6 +678,12 @@ esac
         "USER": "operator",
     }
     return fake_bin, environment, log, hostname
+
+
+@pytest.fixture
+def installer_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Path, Path]:
+    """Create one function-scoped isolated fake installer harness."""
+    return _build_installer_harness(tmp_path)
 
 
 @pytest.mark.serial
