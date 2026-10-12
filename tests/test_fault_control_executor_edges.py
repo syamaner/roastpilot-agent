@@ -59,11 +59,13 @@ class FaultPort:
     latest: FaultControlState | None = None
     fail_write: bool = False
     fail_readback: bool = False
+    reads: list[str] = field(default_factory=list[str])
     writes: list[OperatorAction] = field(default_factory=list[OperatorAction])
 
     async def read_fault_control_state(self, session_id: str) -> FaultControlState:
         """Return one typed exact-session state."""
         assert session_id == "fault-session"
+        self.reads.append(session_id)
         if self.fail_readback and self.writes:
             raise RuntimeError("synthetic exact readback failure")
         return self.state
@@ -133,6 +135,7 @@ async def test_rejected_routine_admission_is_traced_without_reading_or_writing()
         )
         is None
     )
+    assert port.reads == []
     assert port.writes == []
     assert await executor.settle_audit_tasks()
     assert len(trace.evaluations) == 1
@@ -360,7 +363,12 @@ async def test_cancelled_queued_estop_releases_its_priority_admission() -> None:
             is_current_generation=lambda: True,
         )
     )
-    await asyncio.sleep(0)
+    for _ in range(50):
+        if arbiter.emergency_stop_active and executor._queue.qsize() == 1:  # pyright: ignore[reportPrivateUsage] - queued-action proof
+            break
+        await asyncio.sleep(0)
+    assert arbiter.emergency_stop_active
+    assert executor._queue.qsize() == 1  # pyright: ignore[reportPrivateUsage] - queued-action proof
     stopped.cancel()
     with pytest.raises(asyncio.CancelledError):
         await stopped
