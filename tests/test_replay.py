@@ -276,6 +276,32 @@ async def test_replay_roaster_control_drop_beans_defaults_to_fallback_before_loa
     assert await control.drop_beans() == _FALLBACK_DROP_APPLIED_STATE
 
 
+@pytest.mark.asyncio
+async def test_replay_control_refuses_live_fault_clearance_proofs_without_writes() -> None:
+    """Replay cannot supply MCP identity or fault-control evidence.
+
+    A replay is a recorded presentation path, so admitting it to a live
+    restart or fault-acknowledgement proof would make a historical trace look
+    like a current hardware read.  Each live-only call must fail before adding
+    a command to the replay record.
+    """
+    from roastpilot_agent.api import RecordingReplayControl
+    from roastpilot_agent.replay import ReplayRoasterControl
+
+    control = ReplayRoasterControl()
+    assert isinstance(control, RecordingReplayControl)
+    assert control.latest_fault_session_id is None
+
+    with pytest.raises(RuntimeError, match="session-presence proof"):
+        await control.read_session_presence()
+    with pytest.raises(RuntimeError, match="fault acknowledgement state"):
+        await control.read_fault_acknowledgement_state("historical-session")
+    with pytest.raises(RuntimeError, match="cannot stop physical cooling"):
+        await control.stop_cooling_for_fault_acknowledgement("historical-session")
+
+    assert control.commands == []
+
+
 def test_session1_manual_t0_export_parses() -> None:
     """session-1 (manual-T0) also parses and reaches a recorded drop."""
     script = load_export(_SESSION_1)

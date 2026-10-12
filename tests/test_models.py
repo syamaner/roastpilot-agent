@@ -22,8 +22,11 @@ from roastpilot_agent.models import (
     BeanProfileInput,
     CatalogueRecommendation,
     CatalogueRecommendationList,
+    FaultControlsProjection,
+    FaultLeaseStatus,
     MicHealth,
     MicStatus,
+    OperatorAction,
     RoastCommand,
     RoastDetail,
     RoastEventKind,
@@ -205,6 +208,17 @@ def test_values_are_unique_snake_case(enum_type: type[Enum]) -> None:
         assert value
         assert value == value.lower()
         assert " " not in value
+
+
+def test_fault_controls_default_to_an_independent_empty_action_projection() -> None:
+    """A closed lease has no exposed controls and instances do not share a list."""
+    first = FaultControlsProjection(status=FaultLeaseStatus.CLOSED)
+    second = FaultControlsProjection(status=FaultLeaseStatus.CLOSED)
+
+    assert first.generation is None
+    assert first.enabled_actions == []
+    first.enabled_actions.append(OperatorAction.DROP_BEANS)
+    assert second.enabled_actions == []
 
 
 def test_event_kinds_match_plan() -> None:
