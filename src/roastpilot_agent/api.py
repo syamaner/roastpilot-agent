@@ -2661,7 +2661,12 @@ class RoastService:
             try:
                 active = await self._store.active_run()
             except Exception:  # noqa: BLE001 - uncertain state exposes e-stop only
-                active = None
+                _log.exception("could not read active run for fault-control projection")
+                return FaultControlsProjection(
+                    status=lease.status,
+                    generation=None if lease.generation == 0 else lease.generation,
+                    enabled_actions=[OperatorAction.EMERGENCY_STOP],
+                )
             if (
                 active is not None
                 and active.run_id == lease.run_id
@@ -4634,6 +4639,9 @@ class RoastService:
             expiry_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await expiry_task
+        executor = self._fault_control_executor
+        if executor is not None and not await executor.settle_audit_tasks():
+            _log.error("fault-control audit tasks did not settle during shutdown")
         await self._store.clear_unclaimed_bean_sourcing_drafts(owner_instance_id=self.instance_id)
 
     async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
