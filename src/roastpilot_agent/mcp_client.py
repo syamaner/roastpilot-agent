@@ -1231,6 +1231,7 @@ class RoasterControlAdapter:
         self._client = client
         self._clock = clock
         self._last_state: RoastSessionState | None = None
+        self._started_session_id: str | None = None
         self._last_elapsed: float | None = None
         self._last_change_monotonic: float | None = None
         self._last_ambient_token: float | None = None
@@ -1245,9 +1246,11 @@ class RoasterControlAdapter:
 
     @property
     def latest_fault_session_id(self) -> str | None:
-        """Return the latest current-run identity, or ``None`` when unknown."""
+        """Return the current telemetry identity or, before telemetry, Start's identity."""
         state = self._last_state
-        return None if state is None else state.session_id
+        if state is not None:
+            return state.session_id
+        return self._started_session_id
 
     def reset_session_identity_for_new_run(self) -> None:
         """Clear cached session identity before a new Agent run is published.
@@ -1257,6 +1260,7 @@ class RoasterControlAdapter:
         attaching a prior run's cached session to the new run.
         """
         self._last_state = None
+        self._started_session_id = None
         self._last_elapsed = None
         self._last_change_monotonic = None
         self._last_ambient_token = None
@@ -1575,7 +1579,8 @@ class RoasterControlAdapter:
                     recording_roast_num,
                     exc_info=True,
                 )
-        await self._client.start_roast_session()
+        result = await self._client.start_roast_session()
+        self._started_session_id = result.session.session_id
 
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
         await self._client.set_heat(heat_percent)
