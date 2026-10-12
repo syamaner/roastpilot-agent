@@ -302,6 +302,96 @@ async def test_fault_controls_action_hides_missing_or_terminal_lease_details(
 
 
 @pytest.mark.asyncio
+async def test_restart_clearance_route_records_no_session_proof_without_roaster_write(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The public clearance route records fresh no-session proof without a write."""
+    roaster = FakeMCPClient()
+    session_presence = mock.AsyncMock(return_value="none")
+    monkeypatch.setattr(roaster, "read_session_presence", session_presence)
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        run_loop=False,
+    )
+    await service.recover_on_start()
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/restart-clearance", json={"physical_confirmation": True}
+        )
+
+    assert response.status_code == 200
+    assert response.json()["outcome"] == "confirmed"
+    assert response.json()["cleared"] is True
+    session_presence.assert_awaited_once()
+    assert roaster.calls == []
+
+
+@pytest.mark.asyncio
+async def test_fault_controls_route_dispatches_live_emergency_stop_outside_routine_queue(
+    store: RoastStore,
+) -> None:
+    """The global route admits a live e-stop without queue-capacity dependence."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    for _ in range(service.OPERATOR_QUEUE_MAX):
+        service.operator_queue.put_nowait(
+            QueuedOperatorAction(run_id=run_id, action=OperatorAction.PAUSE_ADVISORY)
+        )
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/fault-controls/actions", json={"action": "emergency_stop"}
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["action"] == "emergency_stop"
+    assert body["result"] == "accepted"
+    assert body["queued"] is False
+    assert mcp.commands().count("emergency_stop") == 1
+    assert service.operator_queue.qsize() == service.OPERATOR_QUEUE_MAX
+
+
+@pytest.mark.asyncio
+async def test_fault_controls_route_queues_confirmed_live_d212_for_current_lease(
+    store: RoastStore,
+) -> None:
+    """The route passes the server-selected lease generation to live D212 only."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _, clock, run_id = await _faulted_live_service(store, mcp=mcp)
+    lease = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert lease.status is FaultLeaseStatus.OPEN
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/fault-controls/actions",
+            json={
+                "action": "stop_cooling_and_acknowledge",
+                "confirmation": True,
+                "expected_generation": lease.generation,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "accepted"
+    assert response.json()["queued"] is True
+    assert await _tick(service, clock) is True
+    completed = await store.read_run(run_id)
+    assert completed is not None and completed.completed_at_utc is not None
+    assert "stop_cooling" not in mcp.commands()
+
+
+@pytest.mark.asyncio
 async def test_health_advisor_is_null_until_probed(client: AsyncClient) -> None:
     """``advisor`` is null on /api/health until a startup probe records one
     (issue #168) — the E7 contract path has no advisor reachability yet."""
