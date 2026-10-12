@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import grp
 import json
@@ -12,6 +13,7 @@ import re
 import resource
 import selectors
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -923,18 +925,97 @@ def _oracle_run(tmp_path: Path, name: str, *, port: str, api_key: str) -> _Overl
     )
 
 
-def _reap_owned_process(process: subprocess.Popen[str]) -> tuple[str, str]:
-    """Terminate and drain one test-owned child when it has not exited."""
-    if process.poll() is None:
-        process.terminate()
+@dataclass(frozen=True)
+class _OwnedInstallerProcess:
+    """Record a test-created installer parent and its private process group."""
+
+    process: subprocess.Popen[str]
+    group_id: int
+
+
+def _start_owned_installer(
+    argv: list[str], environment: dict[str, str], *, popen: Any = subprocess.Popen
+) -> _OwnedInstallerProcess:
+    """Start one installer in a session owned exclusively by this proof."""
+    process = popen(
+        argv,
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    group_id = os.getpgid(process.pid)
+    if group_id != process.pid:
+        raise AssertionError("installer process did not receive its own process group")
+    return _OwnedInstallerProcess(process, group_id)
+
+
+def _owned_group_live_members(group_id: int) -> tuple[int, ...]:
+    """Return live members of one proof-owned group, tolerating exit races."""
+    listing = subprocess.run(
+        ["ps", "-axo", "pid=,pgid=,stat="], text=True, capture_output=True, check=False
+    )
+    if listing.returncode != 0:
+        return ()
+    members: list[int] = []
+    for line in listing.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
+            continue
+        if int(fields[1]) == group_id and not fields[2].startswith("Z"):
+            members.append(int(fields[0]))
+    return tuple(members)
+
+
+def _assert_owned_group_is_drained(group_id: int) -> None:
+    """Require every member of one recorded, test-owned group to have exited."""
+    deadline = time.monotonic() + 5
+    while _owned_group_live_members(group_id):
+        if time.monotonic() >= deadline:
+            raise AssertionError("owned installer process group still has live members")
+        time.sleep(0.01)
+
+
+def _signal_owned_group(group_id: int, signal_number: int) -> None:
+    """Signal only a recorded private group and tolerate a disappearance race."""
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(group_id, signal_number)
+
+
+def _reap_owned_process(owned: _OwnedInstallerProcess) -> tuple[str, str]:
+    """Stop and drain one private installer group, including surviving descendants."""
+    _signal_owned_group(owned.group_id, signal.SIGTERM)
     try:
-        return process.communicate(timeout=5)
+        return owned.process.communicate(timeout=5)
     except subprocess.TimeoutExpired:
-        process.kill()
-        return process.communicate(timeout=5)
+        _signal_owned_group(owned.group_id, signal.SIGKILL)
+        return owned.process.communicate(timeout=5)
 
 
-def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> None:
+def _drain_owned_processes(
+    processes: list[_OwnedInstallerProcess],
+    outputs: dict[subprocess.Popen[str], tuple[str, str]],
+    *,
+    reaper: Any = _reap_owned_process,
+) -> None:
+    """Attempt every registered cleanup before raising the first cleanup failure."""
+    failure: BaseException | None = None
+    for owned in processes:
+        if owned.process in outputs:
+            continue
+        try:
+            outputs[owned.process] = reaper(owned)
+        except BaseException as error:
+            if failure is None:
+                failure = error
+    if failure is not None:
+        raise failure
+
+
+@pytest.mark.parametrize("case", ("success", "partial-launch", "cleanup-continues"))
+def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path, case: str) -> None:
     """Two fake installer runs overlap at hostname setup without leaking artefacts."""
     parent = tmp_path / "parallel-parent"
     parent.mkdir()
@@ -1038,27 +1119,43 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
         "--port",
         beta["port"],
     )
-    processes: list[subprocess.Popen[str]] = []
+    processes: list[_OwnedInstallerProcess] = []
     outputs: dict[subprocess.Popen[str], tuple[str, str]] = {}
+    cleanup_calls: list[int] = []
+    forced_failure: OSError | None = None
+
+    def reap_with_first_error(owned: _OwnedInstallerProcess) -> tuple[str, str]:
+        """Reap every group while making the first cleanup report an injected error."""
+        cleanup_calls.append(owned.group_id)
+        output = _reap_owned_process(owned)
+        if len(cleanup_calls) == 1:
+            raise RuntimeError("injected first cleanup failure")
+        return output
+
+    def fail_second_launch(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
+        """Fail only after the first actual installer reaches its live barrier child."""
+        assert processes
+        first = processes[0]
+        marker = rendezvous / alpha["self"]
+        deadline = time.monotonic() + 35
+        while not marker.exists() or first.process.poll() is not None:
+            if time.monotonic() >= deadline:
+                raise AssertionError("first installer did not retain a live rendezvous descendant")
+            time.sleep(0.01)
+        raise OSError("forced second installer launch failure")
+
+    reaper: Any = _reap_owned_process
     try:
-        alpha_process = subprocess.Popen(
-            alpha_argv,
-            env=alpha_child_environment,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        processes.append(alpha_process)
-        beta_process = subprocess.Popen(
+        alpha_owned = _start_owned_installer(alpha_argv, alpha_child_environment)
+        processes.append(alpha_owned)
+        beta_owned = _start_owned_installer(
             beta_argv,
-            env=beta_child_environment,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            beta_child_environment,
+            popen=fail_second_launch if case == "partial-launch" else subprocess.Popen,
         )
-        processes.append(beta_process)
+        processes.append(beta_owned)
+        alpha_process = alpha_owned.process
+        beta_process = beta_owned.process
         deadline = time.monotonic() + 35
         markers = (rendezvous / alpha["self"], rendezvous / beta["self"])
         while not all(marker.exists() for marker in markers):
@@ -1074,6 +1171,9 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
         assert {path.name for path in alpha_owner.iterdir()} == {"installer-output"}
         assert {path.name for path in beta_owner.iterdir()} == {"installer-output"}
         assert {path.name for path in rendezvous.iterdir()} == {alpha["self"], beta["self"]}
+        if case == "cleanup-continues":
+            reaper = reap_with_first_error
+            raise RuntimeError("begin cleanup error proof")
         outputs[alpha_process] = alpha_process.communicate(input="input", timeout=35)
         outputs[beta_process] = beta_process.communicate(input="input", timeout=35)
         assert alpha_process.returncode == 0
@@ -1112,10 +1212,28 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
         )
         _assert_no_cross_run_leak(alpha_run, beta_run, tmp_path)
         _assert_no_cross_run_leak(beta_run, alpha_run, tmp_path)
+    except OSError as error:
+        if case != "partial-launch":
+            raise
+        forced_failure = error
+    except RuntimeError as error:
+        if case != "cleanup-continues" or str(error) != "begin cleanup error proof":
+            raise
     finally:
-        for process in processes:
-            if process not in outputs:
-                outputs[process] = _reap_owned_process(process)
+        try:
+            _drain_owned_processes(processes, outputs, reaper=reaper)
+        except RuntimeError as error:
+            if case != "cleanup-continues" or str(error) != "injected first cleanup failure":
+                raise
+    for owned in processes:
+        assert owned.process.poll() is not None
+        _assert_owned_group_is_drained(owned.group_id)
+    if case == "partial-launch":
+        assert forced_failure is not None
+        return
+    if case == "cleanup-continues":
+        assert cleanup_calls == [owned.group_id for owned in processes]
+        return
 
 
 @pytest.mark.parametrize(
