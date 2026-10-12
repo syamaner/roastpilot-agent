@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -820,6 +820,22 @@ def _assert_no_cross_run_leak(own: _OverlapRun, peer: _OverlapRun) -> None:
     environment_mode_is_private = stat.S_IMODE(environment_file.stat().st_mode) == 0o600
     if not environment_mode_is_private:
         raise AssertionError("environment artefact does not have mode 0600")
+    pipx_state = Path(own.environment["FAKE_PIPX_STATE"])
+    pipx_install_count = Path(own.environment["FAKE_PIPX_NORMAL_INSTALL_COUNT"])
+    expected_pipx_state = (
+        '{"venvs":{"roastpilot-agent":{"metadata":{"main_package":'
+        '{"package_version":"default","package_or_url":"roastpilot-agent[pi]"}}}}}\n'
+    )
+    pipx_state_is_own = pipx_state.is_relative_to(own.base)
+    pipx_state_is_fresh = pipx_state.is_file() and pipx_state.read_text() == expected_pipx_state
+    if not (pipx_state_is_own and pipx_state_is_fresh):
+        raise AssertionError("own pipx state artefact is missing or invalid")
+    pipx_install_count_is_own = pipx_install_count.is_relative_to(own.base)
+    pipx_install_count_is_fresh = (
+        pipx_install_count.is_file() and pipx_install_count.read_text() == "1\n"
+    )
+    if not (pipx_install_count_is_own and pipx_install_count_is_fresh):
+        raise AssertionError("own pipx install-count artefact is missing or invalid")
     rendezvous_marker = f"FAKE_RENDEZVOUS_MET {own.rendezvous_self} {own.rendezvous_peer}"
     own_marker_count = own.log.read_text().splitlines().count(rendezvous_marker)
     if own_marker_count != 1:
@@ -874,11 +890,20 @@ def _oracle_run(tmp_path: Path, name: str, *, port: str, api_key: str) -> _Overl
     log.write_text(f"FAKE_RENDEZVOUS_MET marker-{name} peer-{name}\n")
     pipx_log = base / "pipx.log"
     pipx_log.write_text("HOME=<synthetic>\n")
+    pipx_state = base / "pipx-state"
+    pipx_state.write_text(
+        '{"venvs":{"roastpilot-agent":{"metadata":{"main_package":'
+        '{"package_version":"default","package_or_url":"roastpilot-agent[pi]"}}}}}\n'
+    )
+    pipx_install_count = base / "pipx-normal-install-count"
+    pipx_install_count.write_text("1\n")
     return _OverlapRun(
         base=base,
         environment={
             "ROASTPILOT_INSTALL_TEST_ROOT": str(root),
             "FAKE_PIPX_ENV_LOG": str(pipx_log),
+            "FAKE_PIPX_STATE": str(pipx_state),
+            "FAKE_PIPX_NORMAL_INSTALL_COUNT": str(pipx_install_count),
         },
         log=log,
         hostname=hostname,
@@ -1093,6 +1118,12 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
         "wrong-final-hostname",
         "missing-own-port",
         "missing-own-key",
+        "missing-own-pipx-state",
+        "corrupt-own-pipx-state",
+        "own-pipx-state-outside-base",
+        "missing-own-normal-install-count",
+        "corrupt-own-normal-install-count",
+        "own-normal-install-count-outside-base",
         "missing-rendezvous",
     ),
 )
@@ -1105,7 +1136,7 @@ def test_cross_run_leak_oracle_rejects_synthetic_leaks(tmp_path: Path, case: str
     if case == "peer-root-log":
         own.log.write_text(own.log.read_text() + f"record {peer.base}\n")
     elif case == "peer-key-stderr":
-        own = _OverlapRun(**{**own.__dict__, "stderr": f"failure {peer.api_key}"})
+        own = replace(own, stderr=f"failure {peer.api_key}")
     elif case == "peer-prior-hostname-file":
         (own.base / "artefact").write_text(peer.prior_hostname)
     elif case == "peer-prior-hostname-prior-file":
@@ -1134,6 +1165,27 @@ def test_cross_run_leak_oracle_rejects_synthetic_leaks(tmp_path: Path, case: str
             / "etc/roastpilot-agent/roastpilot-agent.env"
         )
         environment_file.write_text(f"PORT={own.port}\n")
+    elif case == "missing-own-pipx-state":
+        Path(own.environment["FAKE_PIPX_STATE"]).unlink()
+    elif case == "corrupt-own-pipx-state":
+        Path(own.environment["FAKE_PIPX_STATE"]).write_text("invalid\n")
+    elif case == "own-pipx-state-outside-base":
+        own = replace(
+            own,
+            environment=own.environment | {"FAKE_PIPX_STATE": peer.environment["FAKE_PIPX_STATE"]},
+        )
+    elif case == "missing-own-normal-install-count":
+        Path(own.environment["FAKE_PIPX_NORMAL_INSTALL_COUNT"]).unlink()
+    elif case == "corrupt-own-normal-install-count":
+        Path(own.environment["FAKE_PIPX_NORMAL_INSTALL_COUNT"]).write_text("2\n")
+    elif case == "own-normal-install-count-outside-base":
+        own = replace(
+            own,
+            environment=own.environment
+            | {
+                "FAKE_PIPX_NORMAL_INSTALL_COUNT": peer.environment["FAKE_PIPX_NORMAL_INSTALL_COUNT"]
+            },
+        )
     else:
         own.log.write_text("")
 
