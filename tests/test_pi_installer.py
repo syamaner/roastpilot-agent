@@ -786,7 +786,7 @@ class _OverlapRun:
     environment: dict[str, str] = field(repr=False)
     log: Path
     hostname: Path
-    hostname_value: str
+    prior_hostname: str
     port: str
     api_key: str = field(repr=False)
     rendezvous_self: str
@@ -803,11 +803,13 @@ def _raise_if_present(present: bool, artifact: str, kind: str) -> None:
 
 def _assert_no_cross_run_leak(own: _OverlapRun, peer: _OverlapRun) -> None:
     """Assert own output is complete and peer identifiers appear nowhere in it."""
-    hostname_matches = own.hostname.read_text().strip() == own.hostname_value
-    if not hostname_matches:
-        raise AssertionError("own hostname is missing from hostname artefact")
+    if own.hostname.read_text() != "roastpilot\n":
+        raise AssertionError("own final hostname is missing from hostname artefact")
 
     root = Path(own.environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    prior_file = root / "var/lib/roastpilot-agent/prior-static-hostname"
+    if prior_file.read_text() != f"{own.prior_hostname}\n":
+        raise AssertionError("own prior hostname is missing from prior-hostname artefact")
     environment_file = root / "etc/roastpilot-agent/roastpilot-agent.env"
     environment_text = environment_file.read_text()
     own_port_present = f"PORT={own.port}" in environment_text
@@ -826,7 +828,7 @@ def _assert_no_cross_run_leak(own: _OverlapRun, peer: _OverlapRun) -> None:
 
     peer_values = (
         (str(peer.base), "base path"),
-        (peer.hostname_value, "hostname"),
+        (peer.prior_hostname, "prior hostname"),
         (peer.api_key, "API key"),
         (f"PORT={peer.port}", "port token"),
     )
@@ -863,9 +865,12 @@ def _oracle_run(tmp_path: Path, name: str, *, port: str, api_key: str) -> _Overl
     environment_file.parent.mkdir(parents=True)
     environment_file.write_text(f"PORT={port}\nOPENROUTER_API_KEY={api_key}\n")
     environment_file.chmod(0o600)
-    hostname_value = f"host-{name}"
+    prior_hostname = f"prior-{name}"
     hostname = base / "hostname"
-    hostname.write_text(f"{hostname_value}\n")
+    hostname.write_text("roastpilot\n")
+    prior_file = root / "var/lib/roastpilot-agent/prior-static-hostname"
+    prior_file.parent.mkdir(parents=True)
+    prior_file.write_text(f"{prior_hostname}\n")
     log = base / "commands.log"
     log.write_text(f"FAKE_RENDEZVOUS_MET marker-{name} peer-{name}\n")
     pipx_log = base / "pipx.log"
@@ -878,7 +883,7 @@ def _oracle_run(tmp_path: Path, name: str, *, port: str, api_key: str) -> _Overl
         },
         log=log,
         hostname=hostname,
-        hostname_value=hostname_value,
+        prior_hostname=prior_hostname,
         port=port,
         api_key=api_key,
         rendezvous_self=f"marker-{name}",
@@ -916,39 +921,64 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
     alpha_fake = alpha_fake_bin / "fake"
     beta_fake = beta_fake_bin / "fake"
     alpha = {
-        "hostname": "host-alpha-z9",
+        "prior_hostname": "alpha-prior-z9",
         "port": "43111",
         "key": "KEY_ALPHA_Q7",
         "self": "barrier-alpha",
         "peer": "barrier-beta",
     }
     beta = {
-        "hostname": "host-beta-k4",
+        "prior_hostname": "beta-prior-k4",
         "port": "43222",
         "key": "KEY_BETA_M3",
         "self": "barrier-beta",
         "peer": "barrier-alpha",
     }
     tokens = {
-        *alpha.values(),
-        *beta.values(),
+        alpha["prior_hostname"],
+        beta["prior_hostname"],
+        alpha["key"],
+        beta["key"],
         str(alpha_base),
         str(beta_base),
         f"PORT={alpha['port']}",
         f"PORT={beta['port']}",
     }
-    assert all(token not in alpha_fake.read_text() for token in tokens)
-    assert all(token not in beta_fake.read_text() for token in tokens)
-    assert alpha["hostname"] != "old-host" and beta["hostname"] != "old-host"
+    alpha_fake_copies = (
+        alpha_fake,
+        alpha_fake_bin / "roastpilot-agent",
+        Path(alpha_environment["FAKE_PIPX_HOME"]) / "venvs/roastpilot-agent/bin/roastpilot-agent",
+    )
+    beta_fake_copies = (
+        beta_fake,
+        beta_fake_bin / "roastpilot-agent",
+        Path(beta_environment["FAKE_PIPX_HOME"]) / "venvs/roastpilot-agent/bin/roastpilot-agent",
+    )
+    assert all(token not in fake.read_text() for token in tokens for fake in alpha_fake_copies)
+    assert all(token not in fake.read_text() for token in tokens for fake in beta_fake_copies)
+    assert alpha["prior_hostname"] not in {"old-host", "roastpilot"}
+    assert beta["prior_hostname"] not in {"old-host", "roastpilot"}
+    assert all(
+        prior not in rendezvous_name
+        for prior in (alpha["prior_hostname"], beta["prior_hostname"])
+        for rendezvous_name in (
+            alpha["self"],
+            alpha["peer"],
+            beta["self"],
+            beta["peer"],
+        )
+    )
     assert all(
         left not in right
         for left, right in (
-            (alpha["hostname"], beta["hostname"]),
-            (beta["hostname"], alpha["hostname"]),
+            (alpha["prior_hostname"], beta["prior_hostname"]),
+            (beta["prior_hostname"], alpha["prior_hostname"]),
             (alpha["key"], beta["key"]),
             (beta["key"], alpha["key"]),
         )
     )
+    alpha_hostname.write_text(f"{alpha['prior_hostname']}\n")
+    beta_hostname.write_text(f"{beta['prior_hostname']}\n")
 
     alpha_argv, alpha_child_environment = _installer_argv_and_environment(
         alpha_environment
@@ -959,7 +989,7 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
             "FAKE_RENDEZVOUS_PEER": alpha["peer"],
         },
         "--set-hostname",
-        alpha["hostname"],
+        "roastpilot",
         "--port",
         alpha["port"],
     )
@@ -972,7 +1002,7 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
             "FAKE_RENDEZVOUS_PEER": beta["peer"],
         },
         "--set-hostname",
-        beta["hostname"],
+        "roastpilot",
         "--port",
         beta["port"],
     )
@@ -1025,7 +1055,7 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
             alpha_environment,
             alpha_log,
             alpha_hostname,
-            alpha["hostname"],
+            alpha["prior_hostname"],
             alpha["port"],
             alpha["key"],
             alpha["self"],
@@ -1037,7 +1067,7 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
             beta_environment,
             beta_log,
             beta_hostname,
-            beta["hostname"],
+            beta["prior_hostname"],
             beta["port"],
             beta["key"],
             beta["self"],
@@ -1057,9 +1087,11 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
     (
         "peer-root-log",
         "peer-key-stderr",
-        "peer-hostname-file",
+        "peer-prior-hostname-file",
+        "peer-prior-hostname-prior-file",
         "peer-root-symlink",
-        "missing-own-hostname",
+        "missing-own-prior-hostname",
+        "wrong-final-hostname",
         "missing-own-port",
         "missing-own-key",
         "missing-rendezvous",
@@ -1073,11 +1105,21 @@ def test_cross_run_leak_oracle_rejects_synthetic_leaks(tmp_path: Path, case: str
         own.log.write_text(own.log.read_text() + f"record {peer.base}\n")
     elif case == "peer-key-stderr":
         own = _OverlapRun(**{**own.__dict__, "stderr": f"failure {peer.api_key}"})
-    elif case == "peer-hostname-file":
-        (own.base / "artefact").write_text(peer.hostname_value)
+    elif case == "peer-prior-hostname-file":
+        (own.base / "artefact").write_text(peer.prior_hostname)
+    elif case == "peer-prior-hostname-prior-file":
+        prior_file = Path(own.environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / (
+            "var/lib/roastpilot-agent/prior-static-hostname"
+        )
+        prior_file.write_text(f"{peer.prior_hostname}\n")
     elif case == "peer-root-symlink":
         (own.base / "peer-link").symlink_to(peer.base)
-    elif case == "missing-own-hostname":
+    elif case == "missing-own-prior-hostname":
+        prior_file = Path(own.environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / (
+            "var/lib/roastpilot-agent/prior-static-hostname"
+        )
+        prior_file.write_text("wrong\n")
+    elif case == "wrong-final-hostname":
         own.hostname.write_text("wrong\n")
     elif case == "missing-own-port":
         environment_file = (
@@ -1104,6 +1146,29 @@ def test_cross_run_leak_oracle_rejects_synthetic_leaks(tmp_path: Path, case: str
     assert peer.api_key not in formatted
 
 
+def _assert_failed_hostname_rendezvous(
+    result: subprocess.CompletedProcess[str],
+    environment: dict[str, str],
+    log: Path,
+    hostname: Path,
+    *,
+    expected_returncode: int,
+    expected_marker: str,
+) -> None:
+    """Assert a hook failure preserves its source-derived rollback state."""
+    assert result.returncode == expected_returncode
+    events = log.read_text().splitlines()
+    assert expected_marker in events
+    assert "rollback incomplete" not in result.stderr
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    prior_file = root / "var/lib/roastpilot-agent/prior-static-hostname"
+    assert f"restore manually from {prior_file}" in result.stderr
+    assert hostname.read_text() == "old-host\n"
+    assert not Path(environment["FAKE_HOSTNAME_SET_MARKER"]).exists()
+    assert prior_file.read_text() == "old-host\n"
+    assert "systemctl <enable>" not in events
+
+
 def test_hostname_rendezvous_timeout_and_inert_timeout_setting(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -1112,15 +1177,18 @@ def test_hostname_rendezvous_timeout_and_inert_timeout_setting(
     inert = _run(
         environment | {"FAKE_RENDEZVOUS_TIMEOUT_SECONDS": "1"},
         "--set-hostname",
-        "inert-host-z9",
+        "roastpilot",
     )
     assert inert.returncode == 0
-    assert hostname.read_text().strip() == "inert-host-z9"
+    assert hostname.read_text() == "roastpilot\n"
     assert not any(line.startswith("FAKE_RENDEZVOUS") for line in log.read_text().splitlines())
-    rendezvous = tmp_path / "timeout-rendezvous"
+    timeout_base = tmp_path / "timeout-run"
+    timeout_base.mkdir()
+    _, timeout_environment, timeout_log, timeout_hostname = _build_installer_harness(timeout_base)
+    rendezvous = timeout_base / "timeout-rendezvous"
     rendezvous.mkdir()
     timed_out = _run(
-        environment
+        timeout_environment
         | {
             "FAKE_RENDEZVOUS_DIR": str(rendezvous),
             "FAKE_RENDEZVOUS_SELF": "timeout-self",
@@ -1128,10 +1196,16 @@ def test_hostname_rendezvous_timeout_and_inert_timeout_setting(
             "FAKE_RENDEZVOUS_TIMEOUT_SECONDS": "1",
         },
         "--set-hostname",
-        "timeout-host-k4",
+        "roastpilot",
     )
-    assert timed_out.returncode == 64
-    assert "FAKE_RENDEZVOUS_TIMEOUT timeout-self" in log.read_text().splitlines()
+    _assert_failed_hostname_rendezvous(
+        timed_out,
+        timeout_environment,
+        timeout_log,
+        timeout_hostname,
+        expected_returncode=64,
+        expected_marker="FAKE_RENDEZVOUS_TIMEOUT timeout-self",
+    )
 
 
 @pytest.mark.parametrize(
@@ -1156,7 +1230,7 @@ def test_hostname_rendezvous_rejects_partial_or_empty_triples(
     peer_name: str | None,
 ) -> None:
     """A partial or explicitly empty rendezvous triple fails closed."""
-    _, environment, log, _ = installer_harness
+    _, environment, log, hostname = installer_harness
     rendezvous = tmp_path / "partial-rendezvous"
     rendezvous.mkdir()
     values = {
@@ -1167,9 +1241,15 @@ def test_hostname_rendezvous_rejects_partial_or_empty_triples(
         "FAKE_RENDEZVOUS_PEER": peer_name,
     }
     override = {key: value for key, value in values.items() if value is not None}
-    rejected = _run(environment | override, "--set-hostname", "partial-host-m3")
-    assert rejected.returncode == 65
-    assert "FAKE_RENDEZVOUS_CONFIG_INVALID" in log.read_text().splitlines()
+    rejected = _run(environment | override, "--set-hostname", "roastpilot")
+    _assert_failed_hostname_rendezvous(
+        rejected,
+        environment,
+        log,
+        hostname,
+        expected_returncode=65,
+        expected_marker="FAKE_RENDEZVOUS_CONFIG_INVALID",
+    )
 
 
 def _delta(log: Path, start: int) -> list[str]:
