@@ -11,7 +11,12 @@ import pytest
 
 from roastpilot_agent.config import ControllerConfig, SafetyLimits
 from roastpilot_agent.controller import RoastController, RoastPhase
-from roastpilot_agent.models import RoastEventKind, RoastProfile, RoastTelemetry
+from roastpilot_agent.models import (
+    AppliedRoasterState,
+    RoastEventKind,
+    RoastProfile,
+    RoastTelemetry,
+)
 from roastpilot_agent.safety import SafetyEvaluation, SafetyPolicy, SafetyVerdict
 from tests.conftest import (
     EventSink,
@@ -98,6 +103,8 @@ async def test_estop_during_snapshot_persistence_stops_the_rest_of_the_tick(
     assert len(snapshots.evaluations) == 1
     assert snapshots.evaluations[0].verdict is SafetyVerdict.EMERGENCY_STOP
     assert executor.targets == []
+    assert executor.heat_writes == []
+    assert executor.fan_writes == []
     assert events.kinds().count(RoastEventKind.FAULT) == 1
 
 
@@ -131,6 +138,8 @@ async def test_estop_during_safety_audit_stops_the_rest_of_the_tick(
     assert len(executor.estop_reasons) == 1
     assert "evaluation race" in executor.estop_reasons[0]
     assert executor.targets == []
+    assert executor.heat_writes == []
+    assert executor.fan_writes == []
 
 
 @pytest.mark.asyncio
@@ -171,6 +180,8 @@ async def test_estop_during_start_session_cannot_commit_preheat_transition() -> 
 
     assert controller.phase is RoastPhase.FAULTED
     assert executor.targets == []
+    assert executor.heat_writes == []
+    assert executor.fan_writes == []
     assert RoastEventKind.RUN_STARTED not in events.kinds()
 
 
@@ -205,6 +216,8 @@ async def test_estop_during_start_target_audit_cannot_apply_initial_targets(
 
     assert controller.phase is RoastPhase.FAULTED
     assert executor.targets == []
+    assert executor.heat_writes == []
+    assert executor.fan_writes == []
     assert len(executor.estop_reasons) == 1
     assert "start target race" in executor.estop_reasons[0]
 
@@ -375,6 +388,7 @@ async def test_estop_during_recovery_failsafe_cannot_commit_recovery_transition(
 
     assert controller.phase is RoastPhase.FAULTED
     assert RoastEventKind.RECOVERY_REQUIRED not in events.kinds()
+    assert executor.fan_writes == []
     assert len(executor.estop_reasons) == 1
     assert "recovery race" in executor.estop_reasons[0]
 
@@ -454,6 +468,136 @@ async def test_estop_during_operator_beans_added_cannot_publish_success() -> Non
     assert controller.phase is RoastPhase.FAULTED
     assert executor.commands == ["mark_beans_added"]
     assert RoastEventKind.COMMAND_EXECUTED not in events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_estop_during_operator_drop_cannot_commit_cooling_transition() -> None:
+    """A completed stale operator drop cannot publish success or start cooling."""
+
+    class BlockingDropExecutor(RecordingExecutor):
+        """Park the operator drop write for an e-stop interleaving."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def drop_beans(self) -> AppliedRoasterState | None:
+            self.entered.set()
+            await self.release.wait()
+            return await super().drop_beans()
+
+    executor = BlockingDropExecutor()
+    controller, _, _, events = _controller(executor=executor)
+    controller.transition_to(RoastPhase.STARTING)
+    controller.transition_to(RoastPhase.PREHEATING)
+    controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    controller.transition_to(RoastPhase.DEVELOPMENT)
+    dropping = asyncio.create_task(controller.operator_drop_beans())
+    await asyncio.wait_for(executor.entered.wait(), timeout=1.0)
+
+    prior_generation = controller.command_generation
+    assert controller.admit_emergency_stop() == prior_generation + 1
+    stop = asyncio.create_task(
+        controller.operator_emergency_stop("drop race", already_admitted=True)
+    )
+    executor.release.set()
+    await asyncio.wait_for(dropping, timeout=1.0)
+    await asyncio.wait_for(stop, timeout=1.0)
+
+    assert controller.phase is RoastPhase.FAULTED
+    assert executor.commands == ["drop_beans"]
+    assert RoastEventKind.COMMAND_EXECUTED not in events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_estop_during_prefc_target_audit_cannot_apply_heat_or_fan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-first-crack target audited before a stop cannot write either lever."""
+    telemetry = RoastTelemetry.model_validate({"bean_temp_c": 180.0, "env_temp_c": 200.0})
+    controller, executor, snapshots, _ = _controller()
+    controller.load_profile(PROFILE)
+    controller.transition_to(RoastPhase.STARTING)
+    controller.transition_to(RoastPhase.PREHEATING)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = snapshots.persist_evaluation
+    writes_recorded = 0
+
+    async def delay_command_evaluation(value: object) -> int | None:
+        nonlocal writes_recorded
+        writes_recorded += 1
+        if writes_recorded == 2:
+            entered.set()
+            await release.wait()
+        return await original(value)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(snapshots, "persist_evaluation", delay_command_evaluation)
+    generation = controller.command_generation
+    applying = asyncio.create_task(
+        controller._apply_deterministic_pre_fc_levers(  # pyright: ignore[reportPrivateUsage]
+            telemetry, generation=generation
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+    assert controller.admit_emergency_stop() == generation + 1
+    stop = asyncio.create_task(
+        controller.operator_emergency_stop("prefc target race", already_admitted=True)
+    )
+    release.set()
+    await asyncio.wait_for(applying, timeout=1.0)
+    await asyncio.wait_for(stop, timeout=1.0)
+
+    assert controller.phase is RoastPhase.FAULTED
+    assert executor.targets == []
+    assert executor.heat_writes == []
+    assert executor.fan_writes == []
+
+
+@pytest.mark.asyncio
+async def test_estop_during_mcp_first_crack_audit_cannot_publish_development(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first-crack source proof that completes after a stop cannot advance phase."""
+    telemetry = RoastTelemetry.model_validate(
+        {"bean_temp_c": 190.0, "env_temp_c": 210.0, "first_crack_detected": True}
+    )
+    controller, executor, snapshots, events = _controller()
+    controller.transition_to(RoastPhase.STARTING)
+    controller.transition_to(RoastPhase.PREHEATING)
+    controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = snapshots.persist_evaluation
+
+    async def delayed_source(value: object) -> int | None:
+        entered.set()
+        await release.wait()
+        return await original(value)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(snapshots, "persist_evaluation", delayed_source)
+    generation = controller.command_generation
+    applying = asyncio.create_task(
+        controller._apply_phase_rules(  # pyright: ignore[reportPrivateUsage]
+            telemetry, generation=generation
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+    assert controller.admit_emergency_stop() == generation + 1
+    stop = asyncio.create_task(
+        controller.operator_emergency_stop("mcp first-crack race", already_admitted=True)
+    )
+    release.set()
+    await asyncio.wait_for(applying, timeout=1.0)
+    await asyncio.wait_for(stop, timeout=1.0)
+
+    assert controller.phase is RoastPhase.FAULTED
+    assert executor.heat_writes == []
+    assert executor.fan_writes == []
+    assert RoastEventKind.FIRST_CRACK not in events.kinds()
 
 
 @pytest.mark.asyncio
