@@ -1213,7 +1213,10 @@ async def test_cancelled_waiting_estop_releases_its_arbiter_reservation() -> Non
     async def later_routine() -> str:
         return "later"
 
-    assert await arbiter.run_routine(generation, later_routine) == (True, "later")
+    assert await asyncio.wait_for(arbiter.run_routine(generation, later_routine), timeout=1.0) == (
+        True,
+        "later",
+    )
 
 
 @pytest.mark.asyncio
