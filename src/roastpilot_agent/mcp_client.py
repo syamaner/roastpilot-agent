@@ -1289,7 +1289,8 @@ class RoasterControlAdapter:
             or state.cooling_on is not device.cooling_on
         ):
             raise ValueError("fault acknowledgement state controls disagree")
-        if state.phase != "fault":
+        # FaultControlReadback accepts only Literal["fault"] at parsing.
+        if state.phase != "fault":  # pragma: no cover
             raise ValueError("fault acknowledgement state is not faulted")
         return FaultAcknowledgementState(
             session_id=state.session_id,

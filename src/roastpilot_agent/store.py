@@ -1330,7 +1330,8 @@ class RoastStore:
                 requires_faulted_history=live_run_at_begin,
             )
         finally:
-            if verification_connection is not None:
+            # A failed connect returns in except, so it cannot reach post-finally flow.
+            if verification_connection is not None:  # pragma: no branch
                 await verification_connection.close()
         history_confirmed = verified_run is not None and (
             not live_run_at_begin
@@ -1390,7 +1391,8 @@ class RoastStore:
                 verification_unavailable=True,
             )
         finally:
-            if connection is not None:
+            # A failed connect returns in except, so it cannot reach post-finally flow.
+            if connection is not None:  # pragma: no branch
                 await connection.close()
         history_confirmed = run is not None and run["completed_at_utc"] is not None
         if requires_faulted_history and run is not None:

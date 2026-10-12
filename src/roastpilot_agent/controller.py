@@ -293,7 +293,8 @@ class CommandArbiter:
                 self._in_flight = True
                 self._emergency_stop_in_flight = True
         except asyncio.CancelledError:
-            if not reservation_released:
+            # Once released, the reservation has no cancellation checkpoint before this handler.
+            if not reservation_released:  # pragma: no branch
                 await self.cancel_emergency_stop_admission()
             raise
         try:
@@ -793,7 +794,8 @@ class FaultControlExecutor:
                 {"admission": "allowed", "dispatch": "completed", "confirmation": "read_back"},
             )
             return state
-        if command is None:
+        # execute() returns before queueing every unmapped routine action.
+        if command is None:  # pragma: no cover
             return None
         if close_reservation is not None and not await self._arbiter.wait_for_close_proof(
             close_reservation
@@ -980,7 +982,8 @@ class FaultControlExecutor:
             return not state.cooling_on
         if action is OperatorAction.DROP_BEANS:
             return state.beans_dropped
-        return False
+        # The closed OperatorAction mapping above handles every reachable action.
+        return False  # pragma: no cover
 
     @staticmethod
     def _unconfirmed_result(dispatch: str) -> dict[str, str]:
@@ -1012,7 +1015,8 @@ class FaultControlExecutor:
         self, run_id: str | None, evaluation: SafetyEvaluation
     ) -> int | None:
         """Persist a post-dispatch e-stop admission without delaying hardware."""
-        if run_id is None or self._trace_sink is None:
+        # _schedule_estop_trace admits only a run with an audit sink.
+        if run_id is None or self._trace_sink is None:  # pragma: no cover
             return None
         try:
             return await self._trace_sink.record_fault_control_evaluation(
@@ -1033,7 +1037,8 @@ class FaultControlExecutor:
         result: object,
     ) -> None:
         """Persist one terminal control outcome without changing command semantics."""
-        if run_id is None or self._trace_sink is None:
+        # _schedule_command_trace admits only a run with an audit sink.
+        if run_id is None or self._trace_sink is None:  # pragma: no cover
             return
         try:
             await self._trace_sink.record_fault_control_command(
@@ -2603,7 +2608,8 @@ class RoastController:
             # (it would otherwise fire in faulted/recovery).
             self._advisory_requested = False
             return
-        if not self._generation_is_current(generation):
+        # The False-return paths in _act_on_safety contain no await, so this cannot change.
+        if not self._generation_is_current(generation):  # pragma: no cover
             return
         await self._apply_phase_rules(telemetry, generation=generation)
         if not self._generation_is_current(generation):
