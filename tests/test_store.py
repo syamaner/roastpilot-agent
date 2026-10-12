@@ -7522,3 +7522,40 @@ async def test_fault_acknowledgement_audit_can_only_resolve_its_pending_event(
         },
         {"generation": 5, "outcome": "confirmed", "status": "closed"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_fault_acknowledgement_confirmation_audit_never_leaves_pending_success(
+    tmp_store: RoastStore,
+) -> None:
+    """D212 records confirmation or e-stop supersession as a final audit outcome.
+
+    A stale resolver cannot turn a superseded acknowledgement into a successful
+    one.  A fresh acknowledgement may confirm, and both terminal outcomes stay
+    readable from the durable operator-action trail.
+    """
+    run_id = "fault-acknowledgement-confirmation"
+    await seeded_store(tmp_store, run_id=run_id)
+
+    superseded_id = await tmp_store.begin_fault_acknowledgement_confirmation(run_id)
+    assert await tmp_store.resolve_fault_acknowledgement_confirmation(
+        superseded_id, confirmed=False
+    )
+    assert not await tmp_store.resolve_fault_acknowledgement_confirmation(
+        superseded_id + 100, confirmed=True
+    )
+
+    confirmed_id = await tmp_store.begin_fault_acknowledgement_confirmation(run_id)
+    assert await tmp_store.resolve_fault_acknowledgement_confirmation(confirmed_id, confirmed=True)
+
+    async with tmp_store.connection.execute(
+        "SELECT payload_json, result FROM operator_actions "
+        "WHERE run_id = ? AND action = ? ORDER BY id ASC",
+        (run_id, "acknowledge_fault"),
+    ) as cursor:
+        rows = await cursor.fetchall()
+
+    assert [(json.loads(str(row["payload_json"])), str(row["result"])) for row in rows] == [
+        ({"fault_acknowledgement": "superseded_by_emergency_stop"}, "failed"),
+        ({"fault_acknowledgement": "confirmed"}, "accepted"),
+    ]

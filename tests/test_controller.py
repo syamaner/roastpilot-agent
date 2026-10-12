@@ -4736,6 +4736,23 @@ async def test_failed_start_session_faults_cleanly() -> None:
     assert harness.executor.targets == []  # no half-started run, no writes
 
 
+@pytest.mark.asyncio
+async def test_start_run_refuses_the_mcp_write_when_restart_clearance_is_not_current() -> None:
+    """D213 never starts a new MCP session after the service withdraws clearance."""
+    harness = make_harness(readings=[reading()])
+    harness.controller._start_write_permitted = lambda: False  # pyright: ignore[reportPrivateUsage]
+
+    await harness.controller.start_run(PROFILE)
+
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert "start_session" not in harness.executor.commands
+    assert harness.executor.targets == []
+    assert (
+        RoastEventKind.COMMAND_FAILED,
+        {"command": "start_roast_session"},
+    ) in harness.events.events
+
+
 def test_recording_origin_slug_joins_identity_and_dedupes_repeats() -> None:
     profile = RoastProfile(
         name="Roast 5",
@@ -13173,3 +13190,58 @@ async def test_suppressed_tick_with_fan_already_correct_issues_no_write() -> Non
     await harness.controller.tick()
 
     assert harness.executor.targets == targets_before
+
+
+@pytest.mark.asyncio
+async def test_fault_acknowledgement_stop_cooling_authorization_is_persisted_and_phase_bound() -> (
+    None
+):
+    """D212 only admits the acknowledgement cooling stop from a faulted run.
+
+    The runner owns the later read/write/read sequence.  This controller seam
+    must therefore record the exact command-phase decision before it returns
+    authorization, and must refuse the same possible write in a non-faulted
+    phase.
+    """
+    faulted = _harness_in_phase(RoastPhase.FAULTED)
+
+    assert await faulted.controller.authorize_fault_acknowledgement_stop_cooling()
+    assert faulted.sink.evaluations[-1].verdict is SafetyVerdict.ALLOW
+
+    preheating = _harness_in_phase(RoastPhase.PREHEATING)
+
+    assert not await preheating.controller.authorize_fault_acknowledgement_stop_cooling()
+    rejected = preheating.sink.evaluations[-1]
+    assert rejected.verdict is SafetyVerdict.REJECT
+    assert rejected.rule == "command_phase_validity"
+
+
+@pytest.mark.asyncio
+async def test_fault_action_does_not_commit_a_stale_transition_after_estop_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A D212 e-stop race owns the terminal transition over a stale fault action."""
+    harness = _harness_in_phase(RoastPhase.DEVELOPMENT)
+    controller = harness.controller
+    generation = controller.command_generation
+    evaluation = SafetyEvaluation(
+        rule="synthetic_fault_race",
+        verdict=SafetyVerdict.FAULT,
+        adjusted_heat=0,
+        adjusted_fan=SafetyLimits().overrun_safe_fan_percent,
+        reason="fault action interrupted by an admitted emergency stop",
+    )
+
+    async def admit_stop_while_confirming_targets(**_: object) -> bool:
+        controller.admit_emergency_stop()
+        return True
+
+    monkeypatch.setattr(controller, "_set_targets", admit_stop_while_confirming_targets)
+
+    assert await controller._act_on_safety(  # pyright: ignore[reportPrivateUsage]
+        evaluation, generation=generation
+    )
+    assert controller.phase is RoastPhase.DEVELOPMENT
+    assert RoastEventKind.FAULT not in harness.events.kinds()
+
+    await controller._arbiter.cancel_emergency_stop_admission()  # pyright: ignore[reportPrivateUsage]
