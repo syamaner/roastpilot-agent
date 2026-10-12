@@ -7542,7 +7542,7 @@ async def test_fault_acknowledgement_confirmation_audit_never_leaves_pending_suc
         superseded_id, confirmed=False
     )
     assert not await tmp_store.resolve_fault_acknowledgement_confirmation(
-        superseded_id + 100, confirmed=True
+        superseded_id, confirmed=True
     )
 
     confirmed_id = await tmp_store.begin_fault_acknowledgement_confirmation(run_id)
