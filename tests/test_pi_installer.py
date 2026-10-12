@@ -803,13 +803,12 @@ def _raise_if_present(present: bool, artifact: str, kind: str) -> None:
 
 def _assert_no_cross_run_leak(own: _OverlapRun, peer: _OverlapRun) -> None:
     """Assert own output is complete and peer identifiers appear nowhere in it."""
-    if own.hostname.read_text() != "roastpilot\n":
-        raise AssertionError("own final hostname is missing from hostname artefact")
-
     root = Path(own.environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     prior_file = root / "var/lib/roastpilot-agent/prior-static-hostname"
     if prior_file.read_text() != f"{own.prior_hostname}\n":
         raise AssertionError("own prior hostname is missing from prior-hostname artefact")
+    if own.hostname.read_text() != "roastpilot\n":
+        raise AssertionError("own final hostname is missing from hostname artefact")
     environment_file = root / "etc/roastpilot-agent/roastpilot-agent.env"
     environment_text = environment_file.read_text()
     own_port_present = f"PORT={own.port}" in environment_text
