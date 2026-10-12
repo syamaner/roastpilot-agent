@@ -3646,6 +3646,119 @@ class _ExactFaultMCP(FakeMCPClient):
         return await self.read_fault_control_state(expected_session_id)
 
 
+async def _terminal_fault_control_service(
+    store: RoastStore, mcp: _ExactFaultMCP
+) -> tuple[RoastService, str]:
+    """Create a completed fault with one durable exact-session lease."""
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "terminal-fault-control-route"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1")
+    await service.health()
+    return service, run_id
+
+
+@pytest.mark.asyncio
+async def test_fault_controls_route_terminal_d212_executor_failure_stays_open(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal D212 executor error returns failed without a substitute write."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, run_id = await _terminal_fault_control_service(store, mcp)
+    executor = service._fault_control_executor  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert executor is not None
+
+    async def fail_execute(*args: Any, **kwargs: Any) -> FaultControlState | None:
+        raise RuntimeError("synthetic terminal executor failure")
+
+    monkeypatch.setattr(executor, "execute", fail_execute)
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/fault-controls/actions",
+            json={
+                "action": "stop_cooling_and_acknowledge",
+                "confirmation": True,
+                "expected_generation": 1,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "failed"
+    assert response.json()["reason"] == "terminal fault action was not confirmed"
+    assert not any(name == "fault_control" for name, _ in mcp.calls)
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.OPEN
+    timeline = await store.read_timeline(run_id)
+    assert not any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_fault_controls_route_keeps_terminal_d212_owned(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling an HTTP waiter cannot cancel its exact-session terminal close."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, run_id = await _terminal_fault_control_service(store, mcp)
+    executor = service._fault_control_executor  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert executor is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_execute = executor.execute
+
+    async def blocked_execute(*args: Any, **kwargs: Any) -> FaultControlState | None:
+        entered.set()
+        await release.wait()
+        return await original_execute(*args, **kwargs)
+
+    monkeypatch.setattr(executor, "execute", blocked_execute)
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        waiter = asyncio.create_task(
+            instance.post(
+                "/api/fault-controls/actions",
+                json={
+                    "action": "stop_cooling_and_acknowledge",
+                    "confirmation": True,
+                    "expected_generation": 1,
+                },
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert not any(name == "fault_control" for name, _ in mcp.calls)
+        release.set()
+
+        async def closed_lease() -> bool:
+            return (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+
+        for _ in range(100):
+            if await closed_lease():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("owned terminal D212 did not close its lease after request cancellation")
+
+    # The original exact readback is already safe-zero, so completion needs no
+    # cooling write; cancellation must not invent one while the owned task runs.
+    assert not any(name == "fault_control" for name, _ in mcp.calls)
+    timeline = await store.read_timeline(run_id)
+    assert any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED for event in timeline.events
+    )
+
+
 @pytest.mark.asyncio
 async def test_recovery_hydrates_open_exact_lease_before_terminal_return(
     store: RoastStore,
