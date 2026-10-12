@@ -66,7 +66,12 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from roastpilot_agent.api import QueuedOperatorAction, RoastService, create_app
+from roastpilot_agent.api import (
+    QueuedOperatorAction,
+    RecordingReplayControl,
+    RoastService,
+    create_app,
+)
 from roastpilot_agent.config import (
     AppConfig,
     JointWindowPlanner,
@@ -77,10 +82,13 @@ from roastpilot_agent.live import mount_spa
 from roastpilot_agent.mcp_client import (
     EventSnapshot,
     MalformedCommandResultError,
+    SessionPresence,
     applied_state_from_event,
 )
 from roastpilot_agent.models import (
     AppliedRoasterState,
+    FaultAcknowledgementState,
+    FaultCoolingStopResult,
     MicStatus,
     OperatorAction,
     RoastEventKind,
@@ -486,7 +494,7 @@ class _SimClock:
         return self.now
 
 
-class ReplayRoasterControl:
+class ReplayRoasterControl(RecordingReplayControl):
     """A ``StateReader`` + ``CommandExecutor`` backed by recorded frames.
 
     ``read_telemetry`` yields the next recorded frame's reading (the last frame
@@ -535,6 +543,15 @@ class ReplayRoasterControl:
         """No raw ``RoastSessionState`` from a flat export (runner tolerates)."""
         return None
 
+    @property
+    def latest_fault_session_id(self) -> None:
+        """Replay has no live MCP session identity for fault acknowledgement."""
+        return None
+
+    async def read_session_presence(self) -> SessionPresence:
+        """Refuse live no-session proof because replay has no MCP child."""
+        raise RuntimeError("replay has no live MCP session-presence proof")
+
     async def read_telemetry(self) -> RoastTelemetry | None:
         if not self._frames:
             return None
@@ -552,6 +569,14 @@ class ReplayRoasterControl:
 
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
         self.commands.append(("set_targets", {"heat": heat_percent, "fan": fan_percent}))
+
+    async def set_heat(self, heat_percent: int) -> None:
+        """Record an arbiter-owned replay heat write."""
+        self.commands.append(("set_heat", {"heat": heat_percent}))
+
+    async def set_fan(self, fan_percent: int) -> None:
+        """Record an arbiter-owned replay fan write."""
+        self.commands.append(("set_fan", {"fan": fan_percent}))
 
     async def mark_beans_added(self) -> None:
         self.commands.append(("mark_beans_added", {}))
@@ -574,6 +599,18 @@ class ReplayRoasterControl:
 
     async def stop_cooling(self) -> None:
         self.commands.append(("stop_cooling", {}))
+
+    async def read_fault_acknowledgement_state(self, session_id: str) -> FaultAcknowledgementState:
+        """Refuse live fault-acknowledgement proof in a no-hardware replay."""
+        del session_id
+        raise RuntimeError("replay has no live fault acknowledgement state")
+
+    async def stop_cooling_for_fault_acknowledgement(
+        self, expected_session_id: str
+    ) -> FaultCoolingStopResult:
+        """Refuse a replay acknowledgement cooling write without recording one."""
+        del expected_session_id
+        raise RuntimeError("replay cannot stop physical cooling")
 
     async def emergency_stop(self, *, reason: str) -> AppliedRoasterState:
         self.commands.append(("emergency_stop", {"reason": reason}))
@@ -1122,6 +1159,7 @@ def build_replay_service(
         config=app_config,
         roaster=control,
         advisor=None,
+        recording_replay_mode=True,
         exporter=None,
         raw_state=control,
         run_loop=False,

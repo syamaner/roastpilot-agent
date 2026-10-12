@@ -45,6 +45,7 @@ from roastpilot_agent.mcp_client import (
     RoastSessionState,
     RuntimeConfigSnapshot,
     ServerInfo,
+    SessionPresenceSnapshot,
     SetRecordingMetadataResult,
     StartRoastSessionResult,
     ambient_reading_is_live,
@@ -60,7 +61,7 @@ from roastpilot_agent.mcp_client import (
     project_session_state,
     resolve_mcp_command,
 )
-from roastpilot_agent.models import AppliedRoasterState, MicHealth
+from roastpilot_agent.models import AppliedRoasterState, MicHealth, OperatorAction
 
 FIXTURES = Path(__file__).parent / "fixtures" / "live-roast-2026-06-07"
 
@@ -271,10 +272,11 @@ CANNED: dict[str, object] = {
 class FakeToolCaller:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.responses: dict[str, object] = dict(CANNED)
 
     async def __call__(self, tool: str, arguments: dict[str, object]) -> object:
         self.calls.append((tool, arguments))
-        return CANNED[tool]
+        return self.responses[tool]
 
 
 @pytest.fixture
@@ -386,6 +388,60 @@ def test_session_state_mirror_round_trips() -> None:
     assert state.ambient_status.temperature_c == 28.49
     assert state.ambient_status.humidity_percent == 38.6
     assert state.ambient_status.pressure_hpa == 1008.56
+
+
+def test_session_presence_snapshot_is_closed_without_changing_frozen_server_info() -> None:
+    """Clearance has a required projection while cold identity stays at v1."""
+    server_info = cast("dict[str, object]", CANNED["get_server_info"])
+    with_presence = {**server_info, "session_presence": "none"}
+
+    assert "session_presence" not in ServerInfo.model_fields
+    assert (
+        ServerInfo.model_validate(with_presence).model_dump()
+        == ServerInfo.model_validate(server_info).model_dump()
+    )
+    assert SessionPresenceSnapshot.model_validate(with_presence).session_presence == "none"
+    with pytest.raises(ValidationError):
+        SessionPresenceSnapshot.model_validate(server_info)
+    with pytest.raises(ValidationError):
+        SessionPresenceSnapshot.model_validate({**server_info, "session_presence": "unknown"})
+
+
+@pytest.mark.asyncio
+async def test_adapter_reads_presence_from_a_fresh_server_info_call() -> None:
+    """Clearance reads one typed server-info snapshot and never cached telemetry."""
+    caller = FakeToolCaller()
+    server_info = cast("dict[str, object]", CANNED["get_server_info"])
+    caller.responses["get_server_info"] = {
+        **server_info,
+        "session_presence": "none",
+    }
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    assert await adapter.read_session_presence() == "none"
+    assert caller.calls == [("get_server_info", {})]
+
+
+@pytest.mark.asyncio
+async def test_public_terminal_commands_forward_the_exact_session_guard() -> None:
+    """Direct MCP command wrappers preserve the caller's exact-session guard."""
+    caller = FakeToolCaller()
+    client = RoasterMCPClient(caller)
+
+    await client.drop_beans(expected_session_id="fault-session")
+    await client.start_cooling(expected_session_id="fault-session")
+    await client.stop_cooling(expected_session_id="fault-session")
+    await client.emergency_stop("operator emergency", expected_session_id="fault-session")
+
+    assert caller.calls == [
+        ("drop_beans", {"expected_session_id": "fault-session"}),
+        ("start_cooling", {"expected_session_id": "fault-session"}),
+        ("stop_cooling", {"expected_session_id": "fault-session"}),
+        (
+            "emergency_stop",
+            {"reason": "operator emergency", "expected_session_id": "fault-session"},
+        ),
+    ]
 
 
 def test_ambient_status_mirror_round_trips_unavailable() -> None:
@@ -732,6 +788,61 @@ async def test_real_child_process_confirms_cold_session_purpose(
         assert started.session.session_purpose == "cold_characterisation"
         marked = EventCommandResult.model_validate(await process.call_tool("mark_beans_added", {}))
         assert marked.session_id == started.session.session_id
+    finally:
+        await process.stop()
+    assert not process.running
+
+
+@pytest.mark.asyncio
+async def test_real_child_process_confirms_session_presence_and_guarded_fault_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mock child proves 0.2.3's presence and exact fault-recovery contract."""
+    monkeypatch.chdir(tmp_path)
+    process = MCPServerProcess()
+    await process.start()
+    try:
+        client = RoasterMCPClient(process.call_tool)
+        adapter = RoasterControlAdapter(client)
+
+        assert await adapter.read_session_presence() == "none"
+        started = await client.start_roast_session()
+        session_id = started.session.session_id
+        assert await adapter.read_session_presence() == "active"
+
+        stopped = await client.emergency_stop(reason="test session-presence transition")
+        assert stopped.session_id == session_id
+        assert stopped.phase == "fault"
+        assert await adapter.read_session_presence() == "stopped"
+
+        await adapter.write_fault_control(
+            OperatorAction.START_COOLING, expected_session_id=session_id
+        )
+        readback = await adapter.read_fault_control_state(session_id)
+        assert readback.session_id == session_id
+        assert readback.mcp_phase == "fault"
+        assert readback.active is False
+        assert readback.device_connected is True
+        assert readback.heat_level_percent == 0
+        assert readback.fan_level_percent == 100
+        assert readback.cooling_on is True
+
+        stopped_cooling = await adapter.stop_cooling_for_fault_acknowledgement(session_id)
+        assert stopped_cooling.session_id == session_id
+        assert stopped_cooling.event_kind == "cooling_stopped"
+        assert stopped_cooling.recovery_after_fault is True
+        assert stopped_cooling.heat_level_percent == 0
+        assert stopped_cooling.fan_level_percent == 0
+        assert stopped_cooling.cooling_on is False
+
+        safe_zero = await adapter.read_fault_control_state(session_id)
+        assert safe_zero.session_id == session_id
+        assert safe_zero.mcp_phase == "fault"
+        assert safe_zero.active is False
+        assert safe_zero.device_connected is True
+        assert safe_zero.heat_level_percent == 0
+        assert safe_zero.fan_level_percent == 0
+        assert safe_zero.cooling_on is False
     finally:
         await process.stop()
     assert not process.running
@@ -2510,6 +2621,11 @@ def _state_payload(elapsed: float, **overrides: object) -> dict[str, object]:
     return payload
 
 
+def _start_result_payload(session_id: str) -> dict[str, object]:
+    """Build a typed start result with a distinct session identity."""
+    return {"session": _state_payload(0.0, session_id=session_id)}
+
+
 class _SequenceCaller:
     """Returns the next payload per call; the last one repeats."""
 
@@ -3020,6 +3136,7 @@ async def test_adapter_emergency_stop_returns_none_on_malformed_payload(
                     "monotonic_seconds": 1228.9,
                     # Malformed: heat_level_percent is a bool, not an int.
                     "payload": {
+                        "driver_safety_method_called": True,
                         "heat_level_percent": True,
                         "fan_level_percent": 100,
                         "cooling_on": True,
@@ -3037,6 +3154,42 @@ async def test_adapter_emergency_stop_returns_none_on_malformed_payload(
         record.levelno == logging.WARNING and "fault" in record.getMessage()
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("driver_called", "driver_error"), [(False, None), (True, "driver rejected")]
+)
+async def test_adapter_emergency_stop_rejects_unconfirmed_driver_result(
+    driver_called: bool, driver_error: str | None
+) -> None:
+    """A safe-looking fallback state cannot confirm a live e-stop."""
+
+    async def caller_fn(tool: str, arguments: dict[str, object]) -> object:
+        assert tool == "emergency_stop"
+        payload: dict[str, object] = {
+            "driver_safety_method_called": driver_called,
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        }
+        if driver_error is not None:
+            payload["driver_error"] = driver_error
+        return {
+            "session_id": "abc",
+            "phase": "fault",
+            "event": {
+                "kind": "fault",
+                "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+                "monotonic_seconds": 1228.9,
+                "payload": payload,
+            },
+            "event_count": 3,
+        }
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller_fn))
+    with pytest.raises(ValueError, match="driver confirmation"):
+        await adapter.emergency_stop(reason="test")
 
 
 def test_applied_state_or_none_returns_parsed_state_on_a_well_formed_payload() -> None:
@@ -3897,6 +4050,467 @@ async def test_adapter_set_targets_writes_heat_then_fan() -> None:
 
 
 @pytest.mark.asyncio
+async def test_adapter_projects_fault_acknowledgement_state_for_exact_session() -> None:
+    """The fault-ack capability reads the caller-bound session and hides MCP types."""
+    session_id = "fault-session"
+    state = {
+        **SESSION_STATE_PAYLOAD,
+        "session_id": session_id,
+        "phase": "fault",
+        "active": False,
+        "heat_level_percent": 0,
+        "fan_level_percent": 0,
+        "cooling_on": True,
+        "device_state": {
+            **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+            "connected": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 0,
+            "cooling_on": True,
+        },
+    }
+    stop_result = {
+        **EVENT_RESULT_PAYLOAD,
+        "session_id": session_id,
+        "phase": "fault",
+        "event": {
+            "kind": "cooling_stopped",
+            "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+            "monotonic_seconds": 1228.9,
+            "payload": {
+                "recovery_after_fault": True,
+                "heat_level_percent": 0,
+                "fan_level_percent": 0,
+                "cooling_on": False,
+            },
+        },
+    }
+    caller = _SequenceCaller([state, state, stop_result])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    await adapter.read_telemetry()
+    assert adapter.latest_fault_session_id == session_id
+    proof = await adapter.read_fault_acknowledgement_state(session_id)
+    stopped = await adapter.stop_cooling_for_fault_acknowledgement(session_id)
+
+    assert proof.session_id == session_id
+    assert proof.mcp_phase == "fault"
+    assert proof.active is False
+    assert proof.device_connected is True
+    assert proof.heat_level_percent == 0
+    assert proof.fan_level_percent == 0
+    assert proof.cooling_on is True
+    assert stopped.session_id == session_id
+    assert stopped.event_kind == "cooling_stopped"
+    assert caller.calls == [
+        ("get_roast_state", {}),
+        ("get_roast_state", {}),
+        ("stop_cooling", {"expected_session_id": session_id}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fault_acknowledgement_rejects_latest_session_change_before_stop() -> None:
+    """An unscoped latest-state read cannot validate a historical fault session."""
+    expected = {
+        **SESSION_STATE_PAYLOAD,
+        "session_id": "fault-a",
+        "phase": "fault",
+        "active": False,
+        "heat_level_percent": 0,
+        "fan_level_percent": 100,
+        "cooling_on": True,
+        "device_state": {
+            **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+            "connected": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+    }
+    latest_other = {**expected, "session_id": "fault-b"}
+    caller = _SequenceCaller([expected, latest_other])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    await adapter.read_telemetry()
+    with pytest.raises(ValueError, match="does not match latest state"):
+        await adapter.read_fault_acknowledgement_state("fault-a")
+
+    assert caller.calls == [("get_roast_state", {}), ("get_roast_state", {})]
+    assert all(tool != "stop_cooling" for tool, _ in caller.calls)
+
+
+@pytest.mark.asyncio
+async def test_fault_acknowledgement_rejects_malformed_or_disagreeing_controls() -> None:
+    """The adapter fails closed before a fault acknowledgement sees bad state."""
+    malformed = {**SESSION_STATE_PAYLOAD, "phase": "fault", "active": "false"}
+    client = RoasterMCPClient(_SequenceCaller([malformed]))
+    # The ordinary mirror remains intentionally tolerant: cold
+    # characterisation projects its own raw strict evidence after this parse.
+    assert (await client.get_roast_state()).active is False
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([malformed])))
+    with pytest.raises(ValueError, match="fault control MCP evidence is malformed"):
+        await adapter.read_fault_acknowledgement_state(
+            cast("str", SESSION_STATE_PAYLOAD["session_id"])
+        )
+
+    disagreeing = {
+        **SESSION_STATE_PAYLOAD,
+        "phase": "fault",
+        "device_state": {
+            **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+            "heat_level_percent": 0,
+        },
+    }
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([disagreeing])))
+    with pytest.raises(ValueError, match="controls disagree"):
+        await adapter.read_fault_acknowledgement_state(
+            cast("str", SESSION_STATE_PAYLOAD["session_id"])
+        )
+
+    no_device = {**_fault_control_state_payload("fault-session"), "device_state": None}
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([no_device])))
+    with pytest.raises(ValueError, match="has no device state"):
+        await adapter.read_fault_acknowledgement_state("fault-session")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("expected_session_id", "case", "error"),
+    [
+        (
+            "expected-session",
+            "different_session",
+            "does not match a fault state",
+        ),
+        (
+            "fault-session",
+            "disconnected",
+            "no connected device",
+        ),
+        (
+            "fault-session",
+            "fan_disagrees",
+            "controls disagree",
+        ),
+    ],
+)
+async def test_fault_control_state_rejects_unusable_terminal_readback(
+    expected_session_id: str,
+    case: str,
+    error: str,
+) -> None:
+    """Terminal fault control rejects mismatched, disconnected, and inconsistent reads."""
+    state = _fault_control_state_payload("fault-session")
+    device = cast("dict[str, object]", state["device_state"])
+    if case == "different_session":
+        state["session_id"] = "different-session"
+    elif case == "disconnected":
+        device["connected"] = False
+    else:
+        assert case == "fan_disagrees"
+        device["fan_level_percent"] = 0
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([state])))
+
+    with pytest.raises(ValueError, match=error):
+        await adapter.read_fault_control_state(expected_session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "error"),
+    [
+        (
+            "no_device",
+            "latest terminal fault control state is unavailable",
+        ),
+        (
+            "disconnected",
+            "latest terminal fault control state is unavailable",
+        ),
+        (
+            "heat_disagrees",
+            "latest terminal fault control controls disagree",
+        ),
+    ],
+)
+async def test_latest_fault_control_state_rejects_unusable_readback(case: str, error: str) -> None:
+    """The unscoped terminal proof also refuses absent, disconnected, or divergent state."""
+    state = _fault_control_state_payload("fault-session")
+    if case == "no_device":
+        state["device_state"] = None
+    else:
+        device = cast("dict[str, object]", state["device_state"])
+        if case == "disconnected":
+            device["connected"] = False
+        else:
+            assert case == "heat_disagrees"
+            device["heat_level_percent"] = 100
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([state])))
+
+    with pytest.raises(ValueError, match=error):
+        await adapter.read_latest_fault_control_state()
+
+
+@pytest.mark.asyncio
+async def test_latest_fault_control_state_projects_a_valid_unscoped_proof() -> None:
+    """A valid latest-state proof keeps the exact state values for the lease owner."""
+    state = _fault_control_state_payload("fault-session")
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([state])))
+
+    proof = await adapter.read_latest_fault_control_state()
+
+    assert proof.session_id == "fault-session"
+    assert proof.mcp_phase == "fault"
+    assert proof.device_connected is True
+    assert proof.heat_level_percent == 0
+    assert proof.fan_level_percent == 100
+    assert proof.cooling_on is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("active",), "false"),
+        (("heat_level_percent",), "0"),
+        (("fan_level_percent",), 0.0),
+        (("cooling_on",), 0),
+        (("device_state", "connected"), "true"),
+        (("device_state", "heat_level_percent"), "0"),
+        (("device_state", "fan_level_percent"), 0.0),
+        (("device_state", "cooling_on"), 0),
+    ],
+)
+async def test_fault_control_readback_rejects_coercible_shared_mirror_values(
+    path: tuple[str, ...], value: object
+) -> None:
+    """The fault boundary proves raw types instead of shared-mirror coercions."""
+    state = _fault_control_state_payload("fault-session")
+    destination: dict[str, object] = state
+    for key in path[:-1]:
+        destination = cast("dict[str, object]", destination[key])
+    destination[path[-1]] = value
+
+    # The regular MCP reader intentionally remains compatible with these raw
+    # MCP values.  Fault-control proof must still decline every one.
+    regular = await RoasterMCPClient(_SequenceCaller([state])).get_roast_state("fault-session")
+    assert regular.session_id == "fault-session"
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(_SequenceCaller([state])))
+    with pytest.raises(ValueError, match="fault control MCP evidence is malformed"):
+        await adapter.read_fault_control_state("fault-session")
+
+
+@pytest.mark.asyncio
+async def test_fault_acknowledgement_rejects_malformed_stop_result() -> None:
+    """The adapter rejects incomplete cooling-stop proof fields before the runner."""
+    malformed_stop = {
+        **EVENT_RESULT_PAYLOAD,
+        "phase": "fault",
+        "event": {
+            "kind": "cooling_stopped",
+            "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+            "monotonic_seconds": 1228.9,
+            "payload": {"recovery_after_fault": True},
+        },
+    }
+    adapter = RoasterControlAdapter(
+        RoasterMCPClient(
+            _SequenceCaller([{**SESSION_STATE_PAYLOAD, "phase": "fault"}, malformed_stop])
+        )
+    )
+    await adapter.read_telemetry()
+
+    with pytest.raises(ValueError, match="cooling stop result is malformed"):
+        await adapter.stop_cooling_for_fault_acknowledgement("fault-session")
+
+
+def _fault_control_state_payload(session_id: str) -> dict[str, object]:
+    """Build one connected, exact-session fault readback payload for adapter tests."""
+    return {
+        **SESSION_STATE_PAYLOAD,
+        "session_id": session_id,
+        "phase": "fault",
+        "active": False,
+        "heat_level_percent": 0,
+        "fan_level_percent": 100,
+        "cooling_on": True,
+        "device_state": {
+            **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+            "connected": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+    }
+
+
+def _fault_control_result_payload(
+    session_id: str, event_kind: str, *, emergency_stop: bool = False
+) -> dict[str, object]:
+    """Build one typed terminal-control result payload with an arbitrary event kind."""
+    payload: dict[str, object] = {}
+    if emergency_stop:
+        payload["driver_safety_method_called"] = True
+    return {
+        **EVENT_RESULT_PAYLOAD,
+        "session_id": session_id,
+        "phase": "fault",
+        "event": {
+            "kind": event_kind,
+            "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+            "monotonic_seconds": 1228.9,
+            "payload": payload,
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "tool", "event_kind"),
+    [
+        (OperatorAction.EMERGENCY_STOP, "emergency_stop", "fault"),
+        (OperatorAction.START_COOLING, "start_cooling", "cooling_started"),
+        (OperatorAction.STOP_COOLING, "stop_cooling", "cooling_stopped"),
+        (OperatorAction.DROP_BEANS, "drop_beans", "beans_dropped"),
+    ],
+)
+async def test_write_fault_control_accepts_the_exact_command_event_kind(
+    action: OperatorAction, tool: str, event_kind: str
+) -> None:
+    """Terminal commands require their matching MCP event before accepting fresh state."""
+    session_id = "fault-session"
+    result = _fault_control_result_payload(
+        session_id, event_kind, emergency_stop=action is OperatorAction.EMERGENCY_STOP
+    )
+    readback = _fault_control_state_payload(session_id)
+    caller = _SequenceCaller([result, readback])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    await adapter.write_fault_control(action, expected_session_id=session_id)
+    state = await adapter.read_fault_control_state(session_id)
+
+    assert state.session_id == session_id
+    assert caller.calls == [
+        (tool, {"reason": "terminal fault control", "expected_session_id": session_id})
+        if action is OperatorAction.EMERGENCY_STOP
+        else (tool, {"expected_session_id": session_id}),
+        ("get_roast_state", {"session_id": session_id}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_write_fault_control_rejects_non_terminal_action_without_a_mcp_write() -> None:
+    """Only the explicitly mapped terminal actions can reach the MCP boundary."""
+    caller = _SequenceCaller([])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    with pytest.raises(ValueError, match="unsupported terminal fault action"):
+        await adapter.write_fault_control(
+            OperatorAction.ACKNOWLEDGE_FAULT, expected_session_id="fault-session"
+        )
+
+    assert caller.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "tool", "expected_event_kind", "wrong_event_kind"),
+    [
+        (OperatorAction.EMERGENCY_STOP, "emergency_stop", "fault", "cooling_started"),
+        (OperatorAction.START_COOLING, "start_cooling", "cooling_started", "fault"),
+        (OperatorAction.STOP_COOLING, "stop_cooling", "cooling_stopped", "beans_dropped"),
+        (OperatorAction.DROP_BEANS, "drop_beans", "beans_dropped", "cooling_stopped"),
+    ],
+)
+async def test_write_fault_control_rejects_wrong_command_event_kind(
+    action: OperatorAction, tool: str, expected_event_kind: str, wrong_event_kind: str
+) -> None:
+    """A valid-shaped result for another terminal command fails closed."""
+    session_id = "fault-session"
+    result = _fault_control_result_payload(
+        session_id, wrong_event_kind, emergency_stop=action is OperatorAction.EMERGENCY_STOP
+    )
+    caller = _SequenceCaller([result])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    with pytest.raises(ValueError, match="is unconfirmed"):
+        await adapter.write_fault_control(action, expected_session_id=session_id)
+
+    assert expected_event_kind != wrong_event_kind
+    assert [call[0] for call in caller.calls] == [tool]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "safety_called,driver_error", [(None, None), (False, None), (True, "driver rejected")]
+)
+async def test_write_fault_control_rejects_unconfirmed_emergency_stop_driver_evidence(
+    safety_called: bool | None, driver_error: str | None
+) -> None:
+    """Safe-looking fallback controls cannot substitute for driver e-stop evidence."""
+    session_id = "fault-session"
+    result = _fault_control_result_payload(session_id, "fault", emergency_stop=True)
+    payload = cast("dict[str, object]", cast("dict[str, object]", result["event"])["payload"])
+    if safety_called is None:
+        del payload["driver_safety_method_called"]
+    else:
+        payload["driver_safety_method_called"] = safety_called
+    if driver_error is not None:
+        payload["driver_error"] = driver_error
+    payload.update(
+        {
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        }
+    )
+    caller = _SequenceCaller([result])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    with pytest.raises(ValueError, match="terminal emergency stop is unconfirmed"):
+        await adapter.write_fault_control(
+            OperatorAction.EMERGENCY_STOP, expected_session_id=session_id
+        )
+
+    assert [call[0] for call in caller.calls] == ["emergency_stop"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("session_id",), 7),
+        (("event_count",), "3"),
+        (("event", "kind"), 7),
+        (("event", "recorded_at_utc"), 7),
+        (("event", "monotonic_seconds"), "1228.9"),
+    ],
+)
+async def test_write_fault_control_rejects_coercible_command_result_values(
+    path: tuple[str, ...], value: object
+) -> None:
+    """Exact fault commands never accept a shared-event mirror coercion."""
+    session_id = "fault-session"
+    result = _fault_control_result_payload(session_id, "cooling_started")
+    destination: dict[str, object] = result
+    for key in path[:-1]:
+        destination = cast("dict[str, object]", destination[key])
+    destination[path[-1]] = value
+    caller = _SequenceCaller([result])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+
+    with pytest.raises(ValueError, match="fault control MCP evidence is malformed"):
+        await adapter.write_fault_control(
+            OperatorAction.START_COOLING, expected_session_id=session_id
+        )
+
+    assert caller.calls == [("start_cooling", {"expected_session_id": session_id})]
+
+
+@pytest.mark.asyncio
 async def test_adapter_read_telemetry_propagates_transport_error() -> None:
     """Transport failures must propagate so the controller's consecutive-failure
     rules see a read fault — never a silent reconnect-and-continue."""
@@ -3953,6 +4567,155 @@ async def test_adapter_start_session_clears_cached_state() -> None:
     assert adapter.last_state is not None
     await adapter.start_session()  # the next session must start from a clean cache
     assert adapter.last_state is None
+
+
+@pytest.mark.asyncio
+async def test_adapter_start_session_retains_result_identity_before_first_telemetry() -> None:
+    """The successful start result closes the post-start telemetry identity gap."""
+
+    async def call_tool(tool: str, arguments: dict[str, object]) -> object:
+        if tool == "start_roast_session":
+            return _start_result_payload("started-session")
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(call_tool))
+
+    await adapter.start_session()
+
+    assert adapter.last_state is None
+    assert adapter.latest_fault_session_id == "started-session"
+
+
+@pytest.mark.asyncio
+async def test_adapter_reset_discards_start_result_identity_before_first_telemetry() -> None:
+    """The synchronous new-run reset clears a Start result even without telemetry."""
+
+    async def call_tool(tool: str, arguments: dict[str, object]) -> object:
+        if tool == "start_roast_session":
+            return _start_result_payload("prior-start-session")
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(call_tool))
+    await adapter.start_session()
+    assert adapter.latest_fault_session_id == "prior-start-session"
+
+    adapter.reset_session_identity_for_new_run()
+
+    assert adapter.latest_fault_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_adapter_start_session_clears_prior_identity_while_start_is_in_flight() -> None:
+    """A new in-flight start never exposes a prior Start-result identity."""
+    start_entered = asyncio.Event()
+    allow_start = asyncio.Event()
+    start_attempts = 0
+
+    async def call_tool(tool: str, arguments: dict[str, object]) -> object:
+        if tool == "start_roast_session":
+            nonlocal start_attempts
+            start_attempts += 1
+            if start_attempts == 1:
+                return _start_result_payload("prior-start-session")
+            start_entered.set()
+            await allow_start.wait()
+            return _start_result_payload("new-session")
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(call_tool))
+    await adapter.start_session()
+    assert adapter.latest_fault_session_id == "prior-start-session"
+
+    starting = asyncio.create_task(adapter.start_session())
+    await start_entered.wait()
+    assert adapter.latest_fault_session_id is None
+
+    allow_start.set()
+    await starting
+    assert adapter.latest_fault_session_id == "new-session"
+
+
+@pytest.mark.asyncio
+async def test_adapter_start_session_identity_updates_for_back_to_back_sessions() -> None:
+    """Each successful start replaces the prior start-result identity."""
+    results = iter(
+        (_start_result_payload("first-session"), _start_result_payload("second-session"))
+    )
+
+    async def call_tool(tool: str, arguments: dict[str, object]) -> object:
+        if tool == "start_roast_session":
+            return next(results)
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(call_tool))
+    await adapter.start_session()
+    assert adapter.latest_fault_session_id == "first-session"
+
+    await adapter.start_session()
+    assert adapter.latest_fault_session_id == "second-session"
+
+
+@pytest.mark.asyncio
+async def test_adapter_start_session_discards_identity_after_failed_or_cancelled_start() -> None:
+    """Failed or cancelled starts cannot retain an earlier Start-result identity."""
+    started = asyncio.Event()
+    failed_attempts = 0
+
+    async def failed_call(tool: str, arguments: dict[str, object]) -> object:
+        if tool == "start_roast_session":
+            nonlocal failed_attempts
+            failed_attempts += 1
+            if failed_attempts == 1:
+                return _start_result_payload("prior-start-session")
+            raise MCPToolError("start rejected")
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    failed = RoasterControlAdapter(RoasterMCPClient(failed_call))
+    await failed.start_session()
+    assert failed.latest_fault_session_id == "prior-start-session"
+    with pytest.raises(MCPToolError, match="start rejected"):
+        await failed.start_session()
+    assert failed.latest_fault_session_id is None
+
+    cancelled_attempts = 0
+
+    async def cancelled_call(tool: str, arguments: dict[str, object]) -> object:
+        if tool == "start_roast_session":
+            nonlocal cancelled_attempts
+            cancelled_attempts += 1
+            if cancelled_attempts == 1:
+                return _start_result_payload("prior-start-session")
+            started.set()
+            await asyncio.Event().wait()
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    cancelled = RoasterControlAdapter(RoasterMCPClient(cancelled_call))
+    await cancelled.start_session()
+    assert cancelled.latest_fault_session_id == "prior-start-session"
+    starting = asyncio.create_task(cancelled.start_session())
+    await started.wait()
+    starting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+    assert cancelled.latest_fault_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_adapter_telemetry_identity_supersedes_start_result_identity() -> None:
+    """Fresh telemetry is authoritative once it arrives after a successful start."""
+
+    async def call_tool(tool: str, arguments: dict[str, object]) -> object:
+        if tool == "start_roast_session":
+            return _start_result_payload("start-result-session")
+        if tool == "get_roast_state":
+            return _state_payload(1.0, session_id="telemetry-session")
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(call_tool))
+    await adapter.start_session()
+    assert adapter.latest_fault_session_id == "start-result-session"
+    await adapter.read_telemetry()
+    assert adapter.latest_fault_session_id == "telemetry-session"
 
 
 @pytest.mark.asyncio

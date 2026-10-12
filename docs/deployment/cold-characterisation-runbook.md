@@ -20,6 +20,23 @@ detector-accuracy claim or a deployment-acoustics claim. #954 stays open, and
 E11-S3 is in progress, not done. The separate live acceptance and release gates
 remain outstanding.
 
+### Faulted-run cooling acknowledgement
+
+For an Agent faulted run, **Stop cooling and acknowledge** is an explicit
+operator decision that ending cooling is appropriate. It is never automatic on
+an emergency stop, and it does not alter normal heat, fan or cooling policy
+before that decision. The Agent reads the latest matching MCP session and
+requires heat 0%, main fan 0%, a connected device and cooling off. If cooling
+is on, it first safety-evaluates one `stop_cooling` command and then requires a
+fresh matching safe-zero readback before ending the Agent run. Queue acceptance
+does not mean completion.
+
+Any unavailable, malformed, timed-out, mismatched or nonzero read leaves the
+run faulted. Cooling and emergency-stop controls remain available and a new
+start stays blocked. The command result and readback are software evidence of
+typed reported controls only; they are not physical safety proof. The
+independent operator emergency stop remains operator-owned throughout.
+
 One cold run has two fixed phases: a 10-minute recording-off phase followed by
 a 10-minute recording-on phase, under the approved music stimulus (recorded in
 `--stimulus-block`). This runbook prescribes no stimulus content, no other
@@ -111,6 +128,15 @@ minutes remain separate gates. #954 stays open and E11-S3 is in progress.
   attest the physical board, the microphone format or the actual loaded model
   and its quantisation. Self-reported identities and software evidence are not
   physical proof.
+
+### 2.0 Fresh Agent process clearance
+
+After every fresh Agent process, before Start, the operator must explicitly
+confirm that the Hottop is stopped and empty and that the independent stop is
+engaged or immediately ready. Clearance also requires a fresh current-child MCP
+`session_presence: none` proof and durable confirmation for that Agent process.
+This is not a hardware safe-zero or readiness proof. An OPEN fault lease remains
+separate and requires its exact-session Stop cooling and acknowledge procedure.
 
 ### 2.1 Select artifacts before installation
 

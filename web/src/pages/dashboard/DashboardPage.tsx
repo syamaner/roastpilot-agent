@@ -27,14 +27,21 @@ import { AppFrame, ConnectionIndicator, LiveCurve } from "@/components/shared";
 import { roastKeys, useHealth, useRoast, useTimeline } from "@/hooks/queries";
 import { useFrameDrain, useRoastStream } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
-import { runConfirmRetry } from "@/lib/confirmRetry";
 import { smoothCurveForDisplay } from "@/lib/rorSmoothing";
-import type { OperatorAction } from "@/lib/types";
+import type {
+  FaultAcknowledgementExecutedEventData,
+  OperatorAction,
+  RoastTimeline,
+} from "@/lib/types";
 import { AdvisoryPanel } from "./AdvisoryPanel";
 import { ChargeBanner } from "./ChargeBanner";
 import { chargeCueState } from "./chargeWindow";
 import { ControlRow } from "./ControlRow";
 import { FaultBanner } from "./FaultBanner";
+import {
+  FaultAcknowledgementControl,
+  type FaultAcknowledgementStatus,
+} from "./FaultAcknowledgementControl";
 import { resolveMicStatus } from "./micStatus";
 import { OperatorActionBar, type OperatorActionResultView } from "./OperatorActionBar";
 import { PostFcRecoveryStatus } from "./PostFcRecoveryStatus";
@@ -43,13 +50,21 @@ import { RoastHeader } from "./RoastHeader";
 import { firstCrackFromTimeline } from "./events";
 import { snapshotFault, useDashboardEvents } from "./useDashboardEvents";
 
-export function DashboardPage(): React.JSX.Element {
+type PersistedFaultAcknowledgement = FaultAcknowledgementExecutedEventData & {
+  /** Position in the append-only server timeline, used only to reject stale reload fallback. */
+  eventIndex: number;
+};
+
+export interface DashboardPageProps {
+  /** A failed health refresh disables ordinary writes while preserving the SSE view. */
+  healthStale?: boolean;
+}
+
+export function DashboardPage({ healthStale = false }: DashboardPageProps): React.JSX.Element {
   const health = useHealth();
 
-  // #513: the fault-acknowledge confirm loop keeps running in this closure
-  // after unmount (React does not cancel in-flight promises) — checked after
-  // every await via `runConfirmRetry`'s `isMounted`, so an orphaned loop
-  // never writes state or the query cache after this component is gone.
+  // The REST queue request can resolve after this page unmounts. Keep that
+  // completion from changing local feedback state after the operator leaves.
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -69,6 +84,20 @@ export function DashboardPage(): React.JSX.Element {
   // DISCARD it on a refetch — we never infer phase locally (invariant intact).
   const [stickyFaultedRunId, setStickyFaultedRunId] = useState<string | null>(null);
   const runId = serverRunId ?? stickyFaultedRunId;
+  // A queue response is deliberately not completion evidence. Only the current
+  // stream's `fault_acknowledgement_executed` event transitions this state from
+  // pending to failed/completed, so a reconnect, reload, or elapsed time cannot
+  // make a stale fault look resolved.
+  const [faultAcknowledgement, setFaultAcknowledgement] =
+    useState<FaultAcknowledgementStatus>({ kind: "ready" });
+  const faultAcknowledgementRef = useRef<FaultAcknowledgementStatus>({ kind: "ready" });
+  // Snapshot the last persisted outcome when this page queues an acknowledgement.
+  // A refetch can repeat that outcome; only a later server event may settle it.
+  const pendingAcknowledgementBaselineRef = useRef<number | null>(null);
+  const setFaultAcknowledgementState = useCallback((next: FaultAcknowledgementStatus) => {
+    faultAcknowledgementRef.current = next;
+    setFaultAcknowledgement(next);
+  }, []);
 
   // Live SSE stream — phase/telemetry/enabledActions are server-derived; the
   // page-local reducer folds the NON-LOSSY frame buffer (frames/frameCount) so a
@@ -120,9 +149,29 @@ export function DashboardPage(): React.JSX.Element {
         .cancelQueries({ queryKey: roastKeys.timeline(runId) })
         .then(() => timeline.refetch());
     }
-    if (frame.event === "run_completed") {
+    if (
+      frame.event === "run_completed" ||
+      frame.event === "fault_controls_changed" ||
+      frame.event === "fault_controls_acknowledged"
+    ) {
       void queryClientForStream.invalidateQueries({ queryKey: roastKeys.health });
+    }
+    if (frame.event === "run_completed") {
       void queryClientForStream.invalidateQueries({ queryKey: roastKeys.history });
+    }
+    if (
+      frame.event === "fault_acknowledgement_executed" &&
+      runId !== null
+    ) {
+      const outcome = faultAcknowledgementOutcome(frame.data);
+      if (outcome?.outcome === "confirmed") {
+        // The exact current stream, not a POST response or timeout, proved
+        // completion. The normal `run_completed` frame revalidates health.
+        setFaultAcknowledgementState({ kind: "completed" });
+        setStickyFaultedRunId(null);
+      } else if (outcome?.outcome === "failed") {
+        setFaultAcknowledgementState({ kind: "failed", reason: outcome.reason });
+      }
     }
   });
 
@@ -135,69 +184,50 @@ export function DashboardPage(): React.JSX.Element {
   const persistedFirstCrack = firstCrackFromTimeline(timeline.data);
   const firstCrack = view.firstCrack ?? persistedFirstCrack;
 
+  // A named SSE stream is scoped to `runId`, but a reconnect/reload can miss its
+  // one-shot acknowledgement outcome. The timeline is the same persisted server
+  // record, and is therefore the only reload fallback we accept. A timeline for a
+  // different run, malformed payload, or non-operator source is ignored.
+  const persistedAcknowledgement = useMemo(
+    () => faultAcknowledgementFromTimeline(timeline.data, runId),
+    [runId, timeline.data],
+  );
+
   // Operator action POST result (the action bar surfaces its typed reason).
   const [lastResult, setLastResult] = useState<OperatorActionResultView | null>(null);
-
-  const queryClient = useQueryClient();
-
-  // #513: acknowledge-confirm state. The operator never loses controls while
-  // this resolves (still on the faulted dashboard, heat already off), but a
-  // silently-stale FaultBanner after a real acknowledge is the same class of
-  // bug as the start-roast hazard this PR fixes elsewhere — this is precisely
-  // the recovery path the operator exercises on the very next restart, so it
-  // gets the same treatment for consistency, not just severity.
-  const [acknowledgeConfirming, setAcknowledgeConfirming] = useState(false);
-  const [acknowledgeConfirmFailed, setAcknowledgeConfirmFailed] = useState(false);
-
-  // #206: the operator acknowledges a fault by POSTing the `acknowledge_fault`
-  // control action. Post-#206 a fault no longer auto-finalises the run — it stays
-  // operable (loop alive, heat off) so the operator can still cool the machine —
-  // so the run is finalised (outcome `faulted`) only by this acknowledgement.
-  // Acknowledging clears `active_run_id` on the server; we then drop the sticky-
-  // faulted pin and confirm the transition directly against `api.health()`
-  // (bypassing `invalidateQueries`/`refetchQueries`, which RESOLVE even when the
-  // underlying fetch failed — see LiveStartView, pages/live/LivePage.tsx). Once
-  // `active_run_id` clears, LivePage (the sole mount point for this page, #523)
-  // swaps this component out for its own idle state (never trapping the
-  // operator on the faulted view, #124). `acknowledge_fault` issues no roaster command
-  // (heat is already off in faulted and stays off) — the operator keeps the
-  // FaultBanner + e-stop the whole time this resolves, but the banner and the
-  // acknowledge control must never go visibly silent on a failed confirm.
   const handleAcknowledgeFault = useCallback(async () => {
+    if (healthStale) return;
     const ackRunId = runId;
-    // Drop the sticky-faulted pin optimistically so the page returns to idle as
-    // soon as health reports no active run — the acknowledgement is the operator's
-    // explicit intent and the server finalisation below makes it authoritative.
-    setStickyFaultedRunId(null);
-    setAcknowledgeConfirming(true);
-    setAcknowledgeConfirmFailed(false);
-    if (ackRunId !== null) {
-      try {
-        await api.operatorAction(ackRunId, { action: "acknowledge_fault" });
-      } catch {
-        // Best-effort: a failed acknowledge (e.g. transient) still confirms
-        // health below; the operator can retry from the live view.
-      }
-      if (!mountedRef.current) return;
+    if (ackRunId === null) {
+      setFaultAcknowledgementState({ kind: "failed", reason: "run_unavailable" });
+      return;
     }
-
-    const result = await runConfirmRetry({
-      attempt: () => api.health(),
-      isSuccess: (health) => health.active_run_id === null,
-      onResult: (health) => queryClient.setQueryData(roastKeys.health, health),
-      isMounted: () => mountedRef.current,
-    });
-    if (result === "unmounted") return;
-    // Whether confirmed or exhausted, re-enable the button (a manual retry on
-    // failure) alongside the visible failure note; never leave it permanently
-    // disabled.
-    setAcknowledgeConfirming(false);
-    if (result === "failed") setAcknowledgeConfirmFailed(true);
-  }, [queryClient, runId]);
+    // Mark pending before the POST. The runner can execute and publish its SSE
+    // outcome before the queue-acceptance response resolves; acceptance remains
+    // non-terminal and is never used as completion evidence.
+    pendingAcknowledgementBaselineRef.current =
+      faultAcknowledgementFromTimeline(timeline.data, ackRunId)?.eventIndex ?? -1;
+    setFaultAcknowledgementState({ kind: "pending" });
+    try {
+      const result = await api.operatorAction(ackRunId, { action: "acknowledge_fault" });
+      if (!mountedRef.current) return;
+      if (result.result === "accepted" && result.queued) {
+        // One persisted-server refresh closes the event/subscription race without
+        // treating elapsed time or queue acceptance as an execution outcome.
+        void timeline.refetch();
+      } else if (faultAcknowledgementRef.current.kind === "pending") {
+        setFaultAcknowledgementState({ kind: "failed", reason: "not_queued" });
+      }
+    } catch {
+      if (mountedRef.current && faultAcknowledgementRef.current.kind === "pending") {
+        setFaultAcknowledgementState({ kind: "failed", reason: "not_queued" });
+      }
+    }
+  }, [healthStale, runId, setFaultAcknowledgementState, timeline]);
 
   const dispatchAction = useCallback(
     async (action: OperatorAction) => {
-      if (runId === null) return;
+      if (runId === null || (healthStale && action !== "emergency_stop")) return;
       try {
         const result = await api.operatorAction(runId, { action });
         setLastResult({ action, result: result.result, reason: result.reason });
@@ -209,7 +239,7 @@ export function DashboardPage(): React.JSX.Element {
         });
       }
     },
-    [runId],
+    [healthStale, runId],
   );
 
   // Development time + DTR (#220, closes the #112 gap): the live telemetry frame
@@ -232,7 +262,28 @@ export function DashboardPage(): React.JSX.Element {
   useEffect(() => {
     setChargeEnteredElapsed(null);
     setLastResult(null);
-  }, [runId]);
+    pendingAcknowledgementBaselineRef.current = null;
+    setFaultAcknowledgementState({ kind: "ready" });
+  }, [runId, setFaultAcknowledgementState]);
+
+  useEffect(() => {
+    if (persistedAcknowledgement === null) return;
+    // Timeline data is a reload fallback, not evidence for an attempt this
+    // mounted page has just started. While an attempt is pending (or has a
+    // current-stream result), an older persisted failure must not replace its
+    // state or re-enable a duplicate acknowledgement control. A later server
+    // timeline event is authoritative for the pending request.
+    const baseline = pendingAcknowledgementBaselineRef.current;
+    const isNewerOutcome = baseline !== null && persistedAcknowledgement.eventIndex > baseline;
+    if (faultAcknowledgementRef.current.kind !== "ready" && !isNewerOutcome) return;
+    pendingAcknowledgementBaselineRef.current = null;
+    if (persistedAcknowledgement.outcome === "confirmed") {
+      setFaultAcknowledgementState({ kind: "completed" });
+      setStickyFaultedRunId(null);
+    } else {
+      setFaultAcknowledgementState({ kind: "failed", reason: persistedAcknowledgement.reason });
+    }
+  }, [persistedAcknowledgement, setFaultAcknowledgementState]);
 
   // #329: the fault that drives the FaultBanner — the LIVE evaluation (`view.fault`,
   // the real SafetyEvaluation off the one-shot `fault` SSE frame) when we witnessed
@@ -251,12 +302,13 @@ export function DashboardPage(): React.JSX.Element {
   // `effectiveFault` so the RELOAD-while-faulted case (no live frame; the fault came
   // from the hydrated snapshot) is pinned too. Pinning the id of the run we are
   // already watching is not phase inference — the fault is server-delivered (live
-  // frame or snapshot phase); cleared by `handleAcknowledgeFault`.
+  // frame or snapshot phase); after a server-confirmed acknowledgement it must
+  // not re-pin a run that health is about to clear.
   useEffect(() => {
-    if (effectiveFault !== null && runId !== null) {
+    if (faultAcknowledgement.kind !== "completed" && effectiveFault !== null && runId !== null) {
       setStickyFaultedRunId(runId);
     }
-  }, [effectiveFault, runId]);
+  }, [effectiveFault, faultAcknowledgement.kind, runId]);
 
   // Advisor targets for the control-row ghost markers (latest decision).
   const targetHeat = view.latestAdvisory?.decision?.target_heat ?? null;
@@ -270,7 +322,7 @@ export function DashboardPage(): React.JSX.Element {
   // iff the server enables `acknowledge_fault` (only in the `faulted` phase). This
   // keeps the banner button render-from-server (no client-side command matrix,
   // D25), consistent with the OperatorActionBar.
-  const canAcknowledgeFault = effectiveEnabled?.includes("acknowledge_fault") ?? false;
+  const canAcknowledgeFault = !healthStale && (effectiveEnabled?.includes("acknowledge_fault") ?? false);
 
   // Persistent charge cue (#211): derive the cue's display state from the SERVER
   // phase (preheating), the live bean temperature, and the profile's charge band
@@ -347,55 +399,22 @@ export function DashboardPage(): React.JSX.Element {
   return (
     <AppFrame headerRight={<ConnectionIndicator status={status} />}>
       <div className="flex flex-col gap-4" data-testid="dashboard">
-        {/* Fault banner sits above the dashboard when faulted (Prompt B §2).
-            Informational + persistent: the fault stays on screen until the
-            operator acknowledges it; cooling/e-stop live in the action bar (the
-            faulted run stays operable, #206). The acknowledge affordance (#117) —
-            shown only when the server's enabled_actions mirror enables
-            acknowledge_fault — dispatches the genuine `acknowledge_fault` action,
-            finalising the operable-faulted run server-side, then clears the
-            sticky-faulted pin (#124) and re-fetches health; once `active_run_id`
-            clears, LivePage swaps this page out for its own idle state (#523).
-            `acknowledge_fault` issues no roaster command (heat is already off). */}
+        {/* A fault stays visible while cooling/e-stop controls remain available.
+            The acknowledgement is a guarded server-authorised action; its POST
+            only queues work, and this page clears the sticky fault only after the
+            current SSE stream confirms completion. */}
         <FaultBanner
           fault={effectiveFault}
           trail={view.safetyTrail}
-          // #117: the acknowledge affordance is driven by the server's
-          // `enabled_actions` mirror (acknowledge_fault is enabled iff the phase
-          // is `faulted`), NOT a client-side fault check — the no-client-matrix
-          // invariant (D25). When the server stops enabling it, the affordance is
-          // omitted. The genuine `acknowledge_fault` control action (#206)
-          // finalises the operable-faulted run server-side (no roaster command —
-          // heat is already off), then the page clears the sticky pin (#124) and
-          // confirms against `api.health()`, handing off to LivePage's idle state
-          // (#523). The label is the operator's real next step. #513: while
-          // confirming the button is
-          // disabled (no double-submit); if every confirm attempt fails the
-          // button stays enabled for a manual retry and a visible note explains
-          // why the banner hasn't cleared — it never goes silently stale.
+          // Render permission still comes solely from the server mirror. The
+          // component adds only the operator's cooling-safe confirmation and
+          // server-event feedback; it never calls MCP or derives a phase.
           acknowledgeAffordance={
             canAcknowledgeFault ? (
-              <div className="flex flex-col items-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => void handleAcknowledgeFault()}
-                  disabled={acknowledgeConfirming}
-                  data-testid="fault-acknowledge"
-                  className="inline-flex items-center rounded-md border border-roast-fault/60 bg-roast-fault/15 px-4 py-2 text-sm font-semibold uppercase tracking-wide text-roast-fault transition-colors hover:bg-roast-fault/25 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {acknowledgeConfirming ? "Acknowledging…" : "Acknowledge Fault & Start New Roast"}
-                </button>
-                {acknowledgeConfirmFailed && (
-                  <p
-                    role="alert"
-                    data-testid="fault-acknowledge-confirm-failed"
-                    className="max-w-xs text-right text-xs text-roast-fault"
-                  >
-                    Acknowledged, but this page could not confirm the run cleared. Heat
-                    stays off. Try again, or reload.
-                  </p>
-                )}
-              </div>
+              <FaultAcknowledgementControl
+                status={faultAcknowledgement}
+                onConfirm={() => void handleAcknowledgeFault()}
+              />
             ) : undefined
           }
         />
@@ -478,6 +497,7 @@ export function DashboardPage(): React.JSX.Element {
           phase={phase}
           onAction={(a) => void dispatchAction(a)}
           lastResult={lastResult}
+          healthStale={healthStale}
         />
       </div>
 
@@ -489,7 +509,54 @@ export function DashboardPage(): React.JSX.Element {
         fanPercent={telemetry?.fan_percent ?? null}
         enabledActions={effectiveEnabled}
         onAction={(a) => void dispatchAction(a)}
+        healthStale={healthStale}
       />
     </AppFrame>
   );
+}
+
+/**
+ * Accept only the closed, bounded acknowledgement outcome grammar from the
+ * server. SSE payloads are external input: malformed data leaves the fault in
+ * its existing state instead of fabricating a completion or failure.
+ */
+function faultAcknowledgementOutcome(
+  value: Record<string, unknown>,
+): FaultAcknowledgementExecutedEventData | null {
+  if (value.outcome === "confirmed") return { outcome: "confirmed" };
+  if (
+    value.outcome === "failed" &&
+    typeof value.reason === "string" &&
+    /^[a-z_]{1,64}$/.test(value.reason)
+  ) {
+    return { outcome: "failed", reason: value.reason };
+  }
+  return null;
+}
+
+/**
+ * Read the latest bounded acknowledgement outcome recorded for this exact run.
+ *
+ * A timeline contains server-persisted events only. It deliberately cannot
+ * represent a still-queued request, so callers leave that state as pending only
+ * while the current page owns the request and never reconstruct it after reload.
+ */
+function faultAcknowledgementFromTimeline(
+  timeline: RoastTimeline | undefined,
+  runId: string | null,
+): PersistedFaultAcknowledgement | null {
+  if (timeline === undefined || runId === null || timeline.run_id !== runId) return null;
+
+  let latest: PersistedFaultAcknowledgement | null = null;
+  for (const [eventIndex, event] of timeline.events.entries()) {
+    if (
+      event.kind === "fault_acknowledgement_executed" &&
+      event.source === "operator" &&
+      event.payload !== null
+    ) {
+      const outcome = faultAcknowledgementOutcome(event.payload);
+      if (outcome !== null) latest = { ...outcome, eventIndex };
+    }
+  }
+  return latest;
 }

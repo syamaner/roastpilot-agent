@@ -22,8 +22,14 @@ from roastpilot_agent.models import (
     BeanProfileInput,
     CatalogueRecommendation,
     CatalogueRecommendationList,
+    FaultControlsProjection,
+    FaultLeaseStatus,
     MicHealth,
     MicStatus,
+    OperatorAction,
+    RestartClearanceProjection,
+    RestartClearanceRequest,
+    RestartClearanceState,
     RoastCommand,
     RoastDetail,
     RoastEventKind,
@@ -207,6 +213,31 @@ def test_values_are_unique_snake_case(enum_type: type[Enum]) -> None:
         assert " " not in value
 
 
+def test_fault_controls_default_to_an_independent_empty_action_projection() -> None:
+    """A closed lease has no exposed controls and instances do not share a list."""
+    first = FaultControlsProjection(status=FaultLeaseStatus.CLOSED)
+    second = FaultControlsProjection(status=FaultLeaseStatus.CLOSED)
+
+    assert first.generation is None
+    assert first.enabled_actions == []
+    first.enabled_actions.append(OperatorAction.DROP_BEANS)
+    assert second.enabled_actions == []
+
+
+def test_restart_clearance_models_require_an_explicit_boolean_confirmation() -> None:
+    """Restart clearance never coerces a wire value into physical confirmation."""
+    projection = RestartClearanceProjection(
+        state=RestartClearanceState.REQUIRED,
+        eligible=False,
+    )
+    assert projection.model_dump(mode="json") == {"state": "required", "eligible": False}
+    assert RestartClearanceRequest(physical_confirmation=True).physical_confirmation is True
+
+    for invalid_confirmation in (False, 1, "true", None):
+        with pytest.raises(pydantic.ValidationError):
+            RestartClearanceRequest.model_validate({"physical_confirmation": invalid_confirmation})
+
+
 def test_event_kinds_match_plan() -> None:
     """The agent event vocabulary from plan §5 (kinds) and §6 (SSE types,
     minus transport-only telemetry/heartbeat)."""
@@ -225,6 +256,9 @@ def test_event_kinds_match_plan() -> None:
         "fault",
         "recovery_required",
         "recovery_acknowledged",
+        "fault_acknowledgement_executed",
+        "fault_controls_changed",
+        "fault_controls_acknowledged",
         "logs_exported",
         "run_completed",
     }

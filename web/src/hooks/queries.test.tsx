@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "@/lib/api";
+import type { HealthResponse } from "@/lib/types";
 import { FIXTURE_DETAIL } from "@/pages/detail/fixture";
 import {
   roastKeys,
@@ -367,5 +368,42 @@ describe("useFreshHealthGate", () => {
         expect.objectContaining({ active_run_id: null }),
       ),
     );
+  });
+
+  it("polls a closed health projection and reflects an independent terminal lease opening", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let response: HealthResponse = {
+      status: "ok",
+      version: "t",
+      instance_id: "server-a",
+      mcp_child: "running",
+      mcp_hardware_clear_required: false,
+      mcp_teardown_incident_id: null,
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: true },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    };
+    const healthSpy = vi
+      .spyOn(api, "health")
+      .mockImplementation(async () => response);
+    const { result } = renderHook(() => useFreshHealthGate(), { wrapper: appDefaultsWrapper().Wrapper });
+
+    await vi.waitFor(() => expect(result.current.data?.fault_controls?.status).toBe("closed"));
+    response = {
+      ...response,
+      fault_controls: {
+        status: "open",
+        generation: 4,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    await vi.advanceTimersByTimeAsync(3_000);
+    await vi.waitFor(() => expect(result.current.data?.fault_controls?.status).toBe("open"));
+    expect(healthSpy).toHaveBeenCalledTimes(2);
+
+    // Polling continues after the state changes: a later e-stop/fault must
+    // not be hidden just because this page first mounted during a clean state.
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(healthSpy).toHaveBeenCalledTimes(4);
   });
 });

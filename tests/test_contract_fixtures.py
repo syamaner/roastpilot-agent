@@ -379,6 +379,26 @@ def _gap_fill_frames() -> list[SseEvent]:
         {"acknowledged": RoastPhase.OPERATOR_RECOVERY_REQUIRED.value},
     )
 
+    # api.py emits this only after the queued fault acknowledgement has an
+    # execution verdict. The frame deliberately contains no hardware identity
+    # or exception text, so the SPA can distinguish completion from queue
+    # acceptance without exposing private diagnostic detail.
+    broadcaster.emit(
+        RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED,
+        {"outcome": "confirmed"},
+    )
+
+    # api.py fault-lease persistence and D212 acknowledgement emit sites. The
+    # lease generation/status/outcome projection contains no run or session ID.
+    broadcaster.emit(
+        RoastEventKind.FAULT_CONTROLS_CHANGED,
+        {"generation": 1, "status": "open", "outcome": "confirmed"},
+    )
+    broadcaster.emit(
+        RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED,
+        {"generation": 1, "status": "closed", "outcome": "confirmed"},
+    )
+
     # controller.py command-failure emit site shape (a rejected e-stop carries a reason).
     broadcaster.emit(
         RoastEventKind.COMMAND_FAILED,

@@ -36,9 +36,10 @@ from roastpilot_agent.config_store import (
     MCPDeviceConfigEdit,
     persist_config_edit,
 )
-from roastpilot_agent.mcp_client import InitializableSession, MCPServerProcess
-from roastpilot_agent.models import RoastProfile
+from roastpilot_agent.mcp_client import InitializableSession, MCPServerProcess, SessionPresence
+from roastpilot_agent.models import RestartClearanceRequest, RoastProfile
 from roastpilot_agent.store import RoastStore
+from tests.conftest import FakeMCPClient
 
 # ---------------------------------------------------------------------------
 # Fake MCP process stub
@@ -60,6 +61,7 @@ class FakeMCPProcess:
     def __init__(self, device_config: MCPDeviceConfig | None = None) -> None:
         self._device_config = device_config
         self._running = False
+        self._child_epoch = 1
         self._stop_unconfirmed = False
         #: Ordered call log: "start" / "stop" / "set_device_config".
         self.calls: list[str] = []
@@ -78,6 +80,11 @@ class FakeMCPProcess:
     def stop_unconfirmed(self) -> bool:
         return self._stop_unconfirmed
 
+    @property
+    def child_epoch(self) -> int:
+        """Return the stable fake current-child generation for D213 proof."""
+        return self._child_epoch
+
     def set_device_config(self, device_config: MCPDeviceConfig) -> None:
         self._device_config = device_config
         self.calls.append("set_device_config")
@@ -95,6 +102,19 @@ class FakeMCPProcess:
         self, name: str, arguments: dict[str, object]
     ) -> object:
         raise NotImplementedError("FakeMCPProcess.call_tool should not be called in these tests")
+
+
+class _NoSessionFakeRoaster(FakeMCPClient):
+    """Fake control surface with the typed D213 no-session proof."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.presence_reads = 0
+
+    async def read_session_presence(self) -> SessionPresence:
+        """Return the current fake child's explicit no-session snapshot."""
+        self.presence_reads += 1
+        return "none"
 
 
 # ---------------------------------------------------------------------------
@@ -383,63 +403,47 @@ async def test_respawn_does_not_auto_resume_heat_fan(
     store: RoastStore,
     config_file: Path,
 ) -> None:
-    """After a respawn the new MCP child does not receive heat/fan commands
-    during the respawn itself.
+    """D213 clearance and Start do not auto-resume heat or fan after a respawn.
 
-    The respawn path (stop → set_device_config → start) must not issue
-    set_targets or any other heat/fan command.  Heat/fan only flow via the
-    controller tick loop AFTER start_session (operator action) — never from
-    the respawn.
-
-    The test wires a real roaster fake (FakeMCPClient) so _begin_live_run
-    runs and the controller is active — meaning the assertion cannot trivially
-    pass because _roaster is None.  Only the respawn window (before
-    _begin_live_run → start_session) is checked for heat/fan calls.
+    The test uses the actual start admission path: the current child supplies
+    the typed 0.2.3 ``none`` proof, an operator submits the explicit physical
+    confirmation, and a saved device change makes that subsequent Start respawn
+    the child. The respawn is restricted to lifecycle calls. Any normal
+    Start-target writes occur only after its new session command, never as an
+    automatic restoration by child replacement.
     """
-    from tests.conftest import FakeMCPClient
-
-    # FakeMCPClient is the roaster/exporter/raw_state: implements RoasterControl.
-    # run_loop=False so the controller's tick loop does not run in the background
-    # (we just need start_session to execute, not the full tick).
-    roaster = FakeMCPClient()
-
     fake_mcp = FakeMCPProcess(device_config=MCPDeviceConfig())
+    roaster = _NoSessionFakeRoaster()
     svc = RoastService(
         store,
         mcp=fake_mcp,  # type: ignore[arg-type]
-        roaster=roaster,  # type: ignore[arg-type]
-        exporter=roaster,  # type: ignore[arg-type]
-        raw_state=roaster,  # type: ignore[arg-type]
+        roaster=roaster,
         live_serve_mode=True,
         run_loop=False,
     )
     svc.set_spawned_mcp_device(MCPDeviceConfig())
+    await fake_mcp.start()
+
+    clearance = await svc.acknowledge_restart_clearance(
+        RestartClearanceRequest(physical_confirmation=True)
+    )
+    assert clearance.cleared
+    assert roaster.presence_reads == 1
+    assert fake_mcp.calls == ["start"]
+    assert roaster.calls == []
 
     persist_config_edit(AppConfigEdit(mcp_device=MCPDeviceConfigEdit(serial_port="/dev/ttyUSB1")))
-
     await svc.start_roast(RoastProfile(**_profile()))
 
-    # The respawn (stop → set_device_config → start) must appear in fake_mcp.calls,
-    # but no heat/fan command may appear there.
-    assert "stop" in fake_mcp.calls
-    assert set(fake_mcp.calls).issubset({"stop", "set_device_config", "start"})
-
-    # The roaster (FakeMCPClient) must not have received set_targets during the
-    # respawn window.  start_session is called by _begin_live_run (normal path)
-    # and is acceptable; only set_targets before start_session would be a violation.
-    roaster_call_names = [name for name, _ in roaster.calls]
-    set_targets_idx = [i for i, n in enumerate(roaster_call_names) if n == "set_targets"]
-    start_session_idx = next(
-        (i for i, n in enumerate(roaster_call_names) if n == "start_session"), None
+    assert fake_mcp.calls == ["start", "stop", "set_device_config", "start"]
+    roaster_commands = [name for name, _ in roaster.calls]
+    start_index = roaster_commands.index("start_session")
+    assert start_index == 0
+    assert all(
+        index > start_index
+        for index, name in enumerate(roaster_commands)
+        if name in {"set_heat", "set_fan", "set_targets"}
     )
-    # No set_targets should precede the first start_session (or appear at all
-    # before the controller tick loop fires, which is not running here).
-    if start_session_idx is not None:
-        assert all(idx > start_session_idx for idx in set_targets_idx), (
-            "set_targets appeared before start_session — heat/fan issued during respawn"
-        )
-    else:
-        assert set_targets_idx == [], "set_targets issued with no start_session — auto-resume"
 
 
 # ---------------------------------------------------------------------------
