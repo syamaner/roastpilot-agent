@@ -4587,23 +4587,44 @@ async def test_adapter_start_session_retains_result_identity_before_first_teleme
 
 
 @pytest.mark.asyncio
-async def test_adapter_start_session_clears_prior_identity_while_start_is_in_flight() -> None:
-    """A new start never exposes a prior session before its result is known."""
-    start_entered = asyncio.Event()
-    allow_start = asyncio.Event()
+async def test_adapter_reset_discards_start_result_identity_before_first_telemetry() -> None:
+    """The synchronous new-run reset clears a Start result even without telemetry."""
 
     async def call_tool(tool: str, arguments: dict[str, object]) -> object:
-        if tool == "get_roast_state":
-            return _state_payload(1.0, session_id="prior-session")
         if tool == "start_roast_session":
+            return _start_result_payload("prior-start-session")
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(call_tool))
+    await adapter.start_session()
+    assert adapter.latest_fault_session_id == "prior-start-session"
+
+    adapter.reset_session_identity_for_new_run()
+
+    assert adapter.latest_fault_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_adapter_start_session_clears_prior_identity_while_start_is_in_flight() -> None:
+    """A new in-flight start never exposes a prior Start-result identity."""
+    start_entered = asyncio.Event()
+    allow_start = asyncio.Event()
+    start_attempts = 0
+
+    async def call_tool(tool: str, arguments: dict[str, object]) -> object:
+        if tool == "start_roast_session":
+            nonlocal start_attempts
+            start_attempts += 1
+            if start_attempts == 1:
+                return _start_result_payload("prior-start-session")
             start_entered.set()
             await allow_start.wait()
             return _start_result_payload("new-session")
         raise AssertionError(f"unexpected tool: {tool}")
 
     adapter = RoasterControlAdapter(RoasterMCPClient(call_tool))
-    await adapter.read_telemetry()
-    assert adapter.latest_fault_session_id == "prior-session"
+    await adapter.start_session()
+    assert adapter.latest_fault_session_id == "prior-start-session"
 
     starting = asyncio.create_task(adapter.start_session())
     await start_entered.wait()
@@ -4636,32 +4657,41 @@ async def test_adapter_start_session_identity_updates_for_back_to_back_sessions(
 
 @pytest.mark.asyncio
 async def test_adapter_start_session_discards_identity_after_failed_or_cancelled_start() -> None:
-    """Failed or cancelled starts cannot retain an earlier run's identity."""
+    """Failed or cancelled starts cannot retain an earlier Start-result identity."""
     started = asyncio.Event()
+    failed_attempts = 0
 
     async def failed_call(tool: str, arguments: dict[str, object]) -> object:
-        if tool == "get_roast_state":
-            return _state_payload(1.0, session_id="prior-session")
         if tool == "start_roast_session":
+            nonlocal failed_attempts
+            failed_attempts += 1
+            if failed_attempts == 1:
+                return _start_result_payload("prior-start-session")
             raise MCPToolError("start rejected")
         raise AssertionError(f"unexpected tool: {tool}")
 
     failed = RoasterControlAdapter(RoasterMCPClient(failed_call))
-    await failed.read_telemetry()
+    await failed.start_session()
+    assert failed.latest_fault_session_id == "prior-start-session"
     with pytest.raises(MCPToolError, match="start rejected"):
         await failed.start_session()
     assert failed.latest_fault_session_id is None
 
+    cancelled_attempts = 0
+
     async def cancelled_call(tool: str, arguments: dict[str, object]) -> object:
-        if tool == "get_roast_state":
-            return _state_payload(1.0, session_id="prior-session")
         if tool == "start_roast_session":
+            nonlocal cancelled_attempts
+            cancelled_attempts += 1
+            if cancelled_attempts == 1:
+                return _start_result_payload("prior-start-session")
             started.set()
             await asyncio.Event().wait()
         raise AssertionError(f"unexpected tool: {tool}")
 
     cancelled = RoasterControlAdapter(RoasterMCPClient(cancelled_call))
-    await cancelled.read_telemetry()
+    await cancelled.start_session()
+    assert cancelled.latest_fault_session_id == "prior-start-session"
     starting = asyncio.create_task(cancelled.start_session())
     await started.wait()
     starting.cancel()
