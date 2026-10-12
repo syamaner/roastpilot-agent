@@ -12,7 +12,13 @@ import pytest
 
 from roastpilot_agent.config import ControllerConfig, SafetyLimits
 from roastpilot_agent.controller import RoastController, RoastPhase
-from roastpilot_agent.models import DropReason, RoastEventKind, RoastProfile, RoastTelemetry
+from roastpilot_agent.models import (
+    AppliedRoasterState,
+    DropReason,
+    RoastEventKind,
+    RoastProfile,
+    RoastTelemetry,
+)
 from roastpilot_agent.safety import SafetyEvaluation, SafetyPolicy, SafetyVerdict
 from tests.conftest import (
     EventSink,
@@ -107,6 +113,10 @@ async def test_estop_during_tick_deterministic_boundary_skips_all_later_control(
     monkeypatch.setattr(controller, later_boundary_name, later_boundary)
     ticking = asyncio.create_task(controller.tick())
     await asyncio.wait_for(entered.wait(), timeout=1.0)
+    # Earlier deterministic stages can have completed a target write before
+    # this selected boundary.  Snapshot them here so the assertion below is
+    # specifically about post-admission stale work rather than that valid
+    # pre-boundary actuation.
     targets_before_stop = list(executor.targets)
     heat_before_stop = list(executor.heat_writes)
     fan_before_stop = list(executor.fan_writes)
@@ -231,7 +241,7 @@ async def test_estop_after_deterministic_drop_write_blocks_cooling_success() -> 
             self.entered = asyncio.Event()
             self.release = asyncio.Event()
 
-        async def drop_beans(self):  # type: ignore[override]
+        async def drop_beans(self) -> AppliedRoasterState | None:
             self.entered.set()
             await self.release.wait()
             return await super().drop_beans()
@@ -272,11 +282,18 @@ async def test_estop_during_failed_failsafe_does_not_restore_ordinary_retry() ->
             super().__init__()
             self.entered = asyncio.Event()
             self.release = asyncio.Event()
+            self.emergency_entered = asyncio.Event()
+            self.emergency_release = asyncio.Event()
 
         async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
             self.entered.set()
             await self.release.wait()
             raise RuntimeError("planned ordinary fail-safe failure")
+
+        async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
+            self.emergency_entered.set()
+            await self.emergency_release.wait()
+            return await super().emergency_stop(reason=reason)
 
     executor = BlockingFailingExecutor()
     controller, _, _, _ = _controller(executor=executor)
@@ -300,9 +317,16 @@ async def test_estop_during_failed_failsafe_does_not_restore_ordinary_retry() ->
     )
     executor.release.set()
     await asyncio.wait_for(applying, timeout=1.0)
-    await asyncio.wait_for(stopping, timeout=1.0)
 
+    # The e-stop is admitted but its hardware call remains parked.  This is
+    # the moment the stale exception returns through guard 4416: if that guard
+    # is removed it re-installs ``evaluation`` as an ordinary retry here.
+    await asyncio.wait_for(executor.emergency_entered.wait(), timeout=1.0)
+    assert controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
+    assert not controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
+
+    executor.emergency_release.set()
+    await asyncio.wait_for(stopping, timeout=1.0)
     assert controller.phase is RoastPhase.FAULTED
-    assert controller._pending_fail_safe is not evaluation  # pyright: ignore[reportPrivateUsage]
     assert controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
     assert not controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
