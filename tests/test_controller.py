@@ -1370,6 +1370,338 @@ async def test_fault_executor_start_cooling_rechecks_safe_preconditions(
     assert port.calls == ["exact_read"]
 
 
+@pytest.mark.asyncio
+async def test_fault_executor_acknowledges_an_already_safe_latest_fault_without_a_write() -> None:
+    """D212 closes only after exact and latest reads agree that cooling is off."""
+
+    class AlreadySafeFaultPort:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        @staticmethod
+        def state() -> FaultControlState:
+            return FaultControlState(
+                session_id="fault-session",
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=False,
+                beans_added=False,
+                beans_dropped=False,
+            )
+
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            assert session_id == "fault-session"
+            self.calls.append("exact_read")
+            return self.state()
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            self.calls.append("latest_read")
+            return self.state()
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            raise AssertionError(f"already-safe closure must not write {action.value}")
+
+    arbiter = CommandArbiter()
+    generation = arbiter.generation
+    assert arbiter.reserve_close(generation)
+    port = AlreadySafeFaultPort()
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), port, arbiter=arbiter)
+
+    state = await executor.execute(
+        OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+        "fault-session",
+        is_current_generation=lambda: True,
+        close_reservation=generation,
+    )
+
+    assert state == port.state()
+    assert port.calls == ["exact_read", "latest_read"]
+    arbiter.release_close(generation)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("active", "device_connected", "heat_level_percent"),
+    [(True, True, 0), (False, False, 0), (False, True, 1)],
+    ids=["active", "disconnected", "heating"],
+)
+async def test_fault_executor_stop_cooling_refuses_an_unsafe_fault_state(
+    active: bool, device_connected: bool, heat_level_percent: int
+) -> None:
+    """A stale UI action cannot stop cooling while the terminal state is unsafe."""
+
+    class UnsafeFaultPort:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            assert session_id == "fault-session"
+            self.calls.append("exact_read")
+            return FaultControlState(
+                session_id=session_id,
+                mcp_phase="fault",
+                active=active,
+                device_connected=device_connected,
+                heat_level_percent=heat_level_percent,
+                fan_level_percent=0,
+                cooling_on=True,
+                beans_added=False,
+                beans_dropped=False,
+            )
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            raise AssertionError("ordinary stop cooling must not read latest state")
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            raise AssertionError(f"unsafe state must not write {action.value}")
+
+    port = UnsafeFaultPort()
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), port)
+
+    assert (
+        await executor.execute(
+            OperatorAction.STOP_COOLING,
+            "fault-session",
+            is_current_generation=lambda: True,
+        )
+        is None
+    )
+    assert port.calls == ["exact_read"]
+
+
+@pytest.mark.asyncio
+async def test_fault_executor_shutdown_timeout_keeps_an_admitted_worker_alive() -> None:
+    """Shutdown reports uncertainty without cancelling a potentially live e-stop."""
+
+    class ShutdownPort:
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            raise AssertionError(f"shutdown must not read {session_id}")
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            raise AssertionError("shutdown must not read latest state")
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            raise AssertionError(f"shutdown must not write {action.value}:{expected_session_id}")
+
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), ShutdownPort())
+    release = asyncio.Event()
+
+    async def admitted_worker() -> None:
+        await release.wait()
+
+    worker = asyncio.create_task(admitted_worker())
+    executor._worker = worker  # pyright: ignore[reportPrivateUsage]
+
+    assert not await executor.settle_for_shutdown(timeout_seconds=0.001)
+    assert not worker.done()
+
+    release.set()
+    await asyncio.wait_for(worker, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_fault_executor_refuses_routine_control_without_a_durable_admission_sink() -> None:
+    """A historical fault run cannot write when its safety admission cannot be audited."""
+
+    class NoWritePort:
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            raise AssertionError(f"untraced control must not read {session_id}")
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            raise AssertionError("untraced control must not read latest state")
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            raise AssertionError(f"untraced control must not write {action.value}")
+
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), NoWritePort())
+
+    assert (
+        await executor.execute(
+            OperatorAction.STOP_COOLING,
+            "fault-session",
+            run_id="persisted-fault",
+            is_current_generation=lambda: True,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_fault_executor_acknowledgement_refuses_when_latest_fault_session_changed() -> None:
+    """D212 does not close an old lease when the MCP's latest fault is different."""
+
+    class ReplacedFaultPort:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        @staticmethod
+        def state(session_id: str) -> FaultControlState:
+            return FaultControlState(
+                session_id=session_id,
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=True,
+                beans_added=False,
+                beans_dropped=False,
+            )
+
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            self.calls.append("exact_read")
+            return self.state(session_id)
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            self.calls.append("latest_read")
+            return self.state("newer-fault-session")
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            raise AssertionError(f"replaced fault must not write {action.value}")
+
+    arbiter = CommandArbiter()
+    generation = arbiter.generation
+    assert arbiter.reserve_close(generation)
+    port = ReplacedFaultPort()
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), port, arbiter=arbiter)
+
+    assert (
+        await executor.execute(
+            OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            "fault-session",
+            is_current_generation=lambda: True,
+            close_reservation=generation,
+        )
+        is None
+    )
+    assert port.calls == ["exact_read", "latest_read"]
+    arbiter.release_close(generation)
+
+
+@pytest.mark.asyncio
+async def test_fault_executor_ignores_actions_without_a_fault_control_command() -> None:
+    """Non-actuating acknowledgement actions cannot enter the terminal writer queue."""
+
+    class NoWritePort:
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            raise AssertionError(f"non-actuating action must not read {session_id}")
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            raise AssertionError("non-actuating action must not read latest state")
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            raise AssertionError(f"non-actuating action must not write {action.value}")
+
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), NoWritePort())
+
+    assert (
+        await executor.execute(
+            OperatorAction.ACKNOWLEDGE_FAULT,
+            "fault-session",
+            is_current_generation=lambda: True,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_fault_executor_estop_write_failure_releases_priority_for_later_work() -> None:
+    """A failed exact-session e-stop reports uncertainty without wedging the arbiter."""
+
+    class FailingEstopPort:
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            raise AssertionError(f"failed e-stop must not read back {session_id}")
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            raise AssertionError("failed e-stop must not read latest state")
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            assert action is OperatorAction.EMERGENCY_STOP
+            assert expected_session_id == "fault-session"
+            raise RuntimeError("synthetic e-stop write failure")
+
+    arbiter = CommandArbiter()
+    executor = FaultControlExecutor(
+        SafetyPolicy(SafetyLimits()), FailingEstopPort(), arbiter=arbiter
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic e-stop write failure"):
+        await executor.execute(
+            OperatorAction.EMERGENCY_STOP,
+            "fault-session",
+            is_current_generation=lambda: True,
+        )
+
+    async def later_routine() -> str:
+        return "later"
+
+    generation = arbiter.generation
+    assert await arbiter.run_routine(generation, later_routine) == (True, "later")
+
+
+@pytest.mark.asyncio
+async def test_fault_executor_estop_requires_a_safe_exact_session_readback() -> None:
+    """A completed e-stop command cannot be accepted when readback still shows heat."""
+
+    class HotReadbackPort:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            self.calls.append("exact_read")
+            return FaultControlState(
+                session_id=session_id,
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=10,
+                fan_level_percent=100,
+                cooling_on=True,
+                beans_added=False,
+                beans_dropped=False,
+            )
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            raise AssertionError("e-stop confirmation uses the exact session read")
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            assert action is OperatorAction.EMERGENCY_STOP
+            assert expected_session_id == "fault-session"
+            self.calls.append("write")
+
+    port = HotReadbackPort()
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), port)
+
+    assert (
+        await executor.execute(
+            OperatorAction.EMERGENCY_STOP,
+            "fault-session",
+            is_current_generation=lambda: True,
+        )
+        is None
+    )
+    assert port.calls == ["write", "exact_read"]
+
+
 def _advisory_harness_in_phase(phase: RoastPhase, *, advisor: RoastAdvisor) -> Harness:
     """A profile-loaded harness manoeuvred into an advisory ``phase``.
 
