@@ -1702,6 +1702,100 @@ async def test_fault_executor_estop_requires_a_safe_exact_session_readback() -> 
     assert port.calls == ["write", "exact_read"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "before_cooling", "before_beans_added", "after_cooling", "after_beans_dropped"),
+    [
+        (OperatorAction.START_COOLING, False, False, True, False),
+        (OperatorAction.STOP_COOLING, True, False, False, False),
+        (OperatorAction.DROP_BEANS, False, True, False, True),
+    ],
+)
+async def test_fault_executor_confirms_each_routine_action_from_its_exact_readback(
+    action: OperatorAction,
+    before_cooling: bool,
+    before_beans_added: bool,
+    after_cooling: bool,
+    after_beans_dropped: bool,
+) -> None:
+    """Each terminal routine action needs its own post-write control proof."""
+
+    class ConfirmingPort:
+        def __init__(self) -> None:
+            self.written = False
+
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            return FaultControlState(
+                session_id=session_id,
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=after_cooling if self.written else before_cooling,
+                beans_added=before_beans_added,
+                beans_dropped=after_beans_dropped if self.written else False,
+            )
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            raise AssertionError("these actions do not require latest-session proof")
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            assert action is expected_action
+            assert expected_session_id == "fault-session"
+            self.written = True
+
+    expected_action = action
+    port = ConfirmingPort()
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), port)
+
+    assert (
+        await executor.execute(action, "fault-session", is_current_generation=lambda: True)
+    ) is not None
+    assert port.written
+
+
+@pytest.mark.asyncio
+async def test_fault_executor_rejects_readback_from_a_different_session() -> None:
+    """A completed exact-session command never confirms against another session."""
+
+    class ReboundPort:
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            return FaultControlState(
+                session_id="rebound-session",
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=True,
+                beans_added=False,
+                beans_dropped=False,
+            )
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            raise AssertionError("e-stop uses exact readback")
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            assert action is OperatorAction.EMERGENCY_STOP
+            assert expected_session_id == "fault-session"
+
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), ReboundPort())
+
+    assert (
+        await executor.execute(
+            OperatorAction.EMERGENCY_STOP,
+            "fault-session",
+            is_current_generation=lambda: True,
+        )
+        is None
+    )
+
+
 def _advisory_harness_in_phase(phase: RoastPhase, *, advisor: RoastAdvisor) -> Harness:
     """A profile-loaded harness manoeuvred into an advisory ``phase``.
 
