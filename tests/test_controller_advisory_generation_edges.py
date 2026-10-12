@@ -5,7 +5,14 @@ from typing import cast
 
 import pytest
 
-from roastpilot_agent.advisor import AdvisorFailureMode, FakeAdvisor
+from roastpilot_agent.advisor import (
+    AdvisorContext,
+    AdvisorFailureMode,
+    AdvisorProviderError,
+    FakeAdvisor,
+    RoastDecision,
+)
+from roastpilot_agent.config import SafetyLimits
 from roastpilot_agent.controller import AdvisoryTrigger, RoastPhase
 from roastpilot_agent.models import AppliedRoasterState, RoastEventKind
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
@@ -349,3 +356,50 @@ async def test_estop_during_failed_advisor_decision_persistence_stops_failure_ev
     assert harness.controller.phase is RoastPhase.FAULTED
     assert len(harness.sink.advisor_decisions) == 1
     assert RoastEventKind.ADVISORY not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_estop_during_provider_failure_skips_failure_accounting() -> None:
+    """A provider failure returning after admission cannot consume the outage budget."""
+
+    class BlockingFailureAdvisor(FakeAdvisor):
+        """Wait until the test admits a stop, then fail at the provider boundary."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
+            del context
+            self.entered.set()
+            await self.release.wait()
+            raise AdvisorProviderError("provider failed after emergency-stop admission")
+
+    advisor = BlockingFailureAdvisor()
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    controller = harness.controller
+    threshold = SafetyLimits().max_consecutive_advisor_failures
+    controller._consecutive_advisor_failures = threshold - 1  # pyright: ignore[reportPrivateUsage]
+    controller.request_advisory()
+    tick = asyncio.create_task(controller.tick())
+    await asyncio.wait_for(advisor.entered.wait(), timeout=1.0)
+
+    generation = controller.command_generation
+    assert controller.admit_emergency_stop() == generation + 1
+    await controller.operator_emergency_stop(
+        "provider failure after admission", already_admitted=True
+    )
+    advisor.release.set()
+    await asyncio.wait_for(tick, timeout=1.0)
+
+    assert controller.phase is RoastPhase.FAULTED
+    assert controller._consecutive_advisor_failures == threshold - 1  # pyright: ignore[reportPrivateUsage]
+    assert not any(
+        evaluation.rule.startswith("advisor_") for evaluation in harness.sink.evaluations
+    )
+    assert harness.sink.advisor_decisions == []
+    assert RoastEventKind.ADVISORY not in harness.events.kinds()
+    assert harness.executor.targets == []
+    assert harness.executor.heat_writes == []
+    assert harness.executor.fan_writes == []
