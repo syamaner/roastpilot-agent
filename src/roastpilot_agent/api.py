@@ -2339,6 +2339,12 @@ class RoastService:
         # Keep that short window explicit so an e-stop can synchronously fence
         # the pending Start write without treating historical pointers as live.
         self._starting_run_id: str | None = None
+        # A global e-stop with no live/exact-session target must still stop a
+        # Start that is preparing or waiting for the start lock.  This is
+        # process-only admission state: it deliberately does not mint or alter
+        # a historical fault lease when no run can receive a software stop.
+        # Each Start captures this generation before its first await.
+        self._start_admission_generation = 0
         #: SSE keepalive interval (plan §6: 15 s). Injectable so tests observe
         #: a heartbeat without waiting the full interval.
         self.sse_heartbeat_seconds = sse_heartbeat_seconds
@@ -3247,13 +3253,19 @@ class RoastService:
                 reason="no current exact-session fault lease matches this run",
                 fault_controls=await self._fault_controls_projection_after_action(),
             )
+        # This process-local fence precedes every await on the admitted global
+        # path. A rejected run-scoped request above must not cancel an
+        # unrelated pending Start. When no target exists the normal no-target
+        # result below leaves historical lease/arbiter state untouched.
+        self._invalidate_pending_start_admissions_for_emergency_stop()
         if run_id is None:
             return FaultControlsActionResult(
                 action=OperatorAction.EMERGENCY_STOP,
                 result="failed",
                 reason=(
                     "no live controller or exact-session fault lease is available for a "
-                    "software e-stop attempt; use the independent physical stop"
+                    "software e-stop attempt; any earlier pending roast start was revoked; "
+                    "use the independent physical stop"
                 ),
                 fault_controls=await self._fault_controls_projection_after_action(),
             )
@@ -3825,6 +3837,28 @@ class RoastService:
         lease = self._fault_lease_cache
         return lease.generation == generation and lease.status is FaultLeaseStatus.CLOSED
 
+    def _invalidate_pending_start_admissions_for_emergency_stop(self) -> None:
+        """Synchronously invalidate every Start admitted before an e-stop attempt."""
+        self._start_admission_generation += 1
+
+    def _require_current_start_admission(self, admission_generation: int) -> None:
+        """Reject a Start superseded by a later global emergency-stop attempt."""
+        if self._start_admission_generation != admission_generation:
+            raise RoastRunConflictError("roast start was superseded by an emergency-stop attempt")
+
+    async def _retire_never_dispatched_start(self, run_id: str) -> None:
+        """Terminally retire a row created after its Start admission was revoked.
+
+        The row has no controller, session, or MCP write.  Existing terminal
+        persistence records that fact as an aborted ``starting`` run instead of
+        publishing a fabricated hardware/session identity.
+        """
+        await self._store.complete_run(
+            run_id=run_id,
+            outcome="aborted",
+            agent_phase=RoastPhase.STARTING,
+        )
+
     async def start_roast(self, profile: RoastProfile) -> RoastDetail:
         """Start a roast: reload saved config, respawn MCP if needed, persist the run.
 
@@ -3863,9 +3897,15 @@ class RoastService:
         that advances it. The active-run check reads persisted state, so the
         guard holds across an agent restart.
         """
+        # Capture before the first await, including the restart-epoch and
+        # start-lock waits.  A global e-stop advances the process-only fence
+        # synchronously even when it has no current target to dispatch to.
+        admission_generation = self._start_admission_generation
         if self._requires_live_restart_clearance:
             await self._ensure_restart_epoch()
+            self._require_current_start_admission(admission_generation)
         async with self._start_lock:
+            self._require_current_start_admission(admission_generation)
             if self._fault_acknowledgement_gate.fault_finalization_started or (
                 self._command_arbiter.close_reservation_is_current(self._command_arbiter.generation)
             ):
@@ -3873,6 +3913,7 @@ class RoastService:
                     "fault finalization is closing the current exact-session lease"
                 )
             lease = await self._read_fault_lease_fail_closed()
+            self._require_current_start_admission(admission_generation)
             if self._fault_acknowledgement_gate.fault_finalization_started or (
                 self._command_arbiter.close_reservation_is_current(self._command_arbiter.generation)
             ):
@@ -3898,6 +3939,7 @@ class RoastService:
                     "the prior roast controller has not finalized; starting a roast remains blocked"
                 )
             active = await self._store.active_run()
+            self._require_current_start_admission(admission_generation)
             if active is not None:
                 raise RoastRunConflictError(
                     f"a roast is already active (run {active.run_id}, phase "
@@ -3910,6 +3952,7 @@ class RoastService:
                     "acknowledgement, then retry"
                 )
             await self._preempt_bean_drafts_for_roast_start()
+            self._require_current_start_admission(admission_generation)
             # Reload effective config from the saved file + env (D76/D78).
             # Only in live-serve mode (``_live_serve_mode=True``, set by
             # ``build_live_service`` in live.py): both the config and the advisor
@@ -3926,6 +3969,7 @@ class RoastService:
                 # injected_keys return value (only needed by build_config_snapshot
                 # for the env-badge UI).
                 fresh_config, _ = await asyncio.to_thread(load_app_config)
+                self._require_current_start_admission(admission_generation)
                 _log.debug(
                     "start_roast: reloaded config (advisor_model_slug=%r)",
                     fresh_config.advisor.model_slug,
@@ -3989,6 +4033,7 @@ class RoastService:
                     or fresh_config.mcp_device != self._spawned_mcp_device
                 ):
                     await self._respawn_mcp_for_device_config(fresh_config.mcp_device)
+                    self._require_current_start_admission(admission_generation)
             else:
                 # No reload here (test doubles, API-only mode, the replay harness):
                 # the caller's explicit config IS the one the roast runs with.
@@ -4004,6 +4049,9 @@ class RoastService:
                 config=self._config,
                 agent_phase=RoastPhase.STARTING,
             )
+            if self._start_admission_generation != admission_generation:
+                await self._retire_never_dispatched_start(run_id)
+                self._require_current_start_admission(admission_generation)
             self.active_run_id = run_id
             self._starting_run_id = run_id
         try:

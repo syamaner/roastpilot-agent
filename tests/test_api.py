@@ -4265,6 +4265,227 @@ async def test_start_write_is_fenced_with_finalized_prior_runner_before_replacem
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("completed_history", [False, True])
+async def test_global_estop_revokes_start_waiting_on_prepublication_store_read(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    completed_history: bool,
+) -> None:
+    """A no-target global e-stop fences preparation without changing the lease."""
+    if completed_history:
+        await store.create_run(
+            run_id="completed-history",
+            profile=_profile(name="Completed history"),
+            config=AppConfig(),
+            agent_phase=RoastPhase.COMPLETE,
+        )
+        await store.complete_run(
+            run_id="completed-history",
+            outcome="completed",
+            agent_phase=RoastPhase.COMPLETE,
+        )
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_active_run = store.active_run
+
+    async def blocked_active_run() -> PersistedRun | None:
+        entered.set()
+        await release.wait()
+        return await original_active_run()
+
+    monkeypatch.setattr(store, "active_run", blocked_active_run)
+    starting = asyncio.create_task(service.start_roast(_profile(name="Revoked start")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+    lease_before = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    arbiter_before = service._command_arbiter.generation  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    stopped = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert stopped.result == "failed"
+    assert service._fault_lease_cache == lease_before  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._command_arbiter.generation == arbiter_before  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    release.set()
+    with pytest.raises(RoastRunConflictError, match="superseded by an emergency-stop"):
+        await asyncio.wait_for(starting, timeout=1.0)
+    assert mcp.commands() == []
+    assert await store.active_run() is None
+
+    # A later explicit request captures the post-e-stop admission generation.
+    detail = await service.start_roast(_profile(name="Fresh explicit start"))
+    assert detail.id
+    assert "start_session" in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_global_estop_revokes_start_during_restart_epoch_initialization(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Start snapshot exists before its earliest restart-epoch await."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        live_serve_mode=True,
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_ensure = service._ensure_restart_epoch  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    async def blocked_restart_epoch() -> None:
+        entered.set()
+        await release.wait()
+        await original_ensure()
+
+    monkeypatch.setattr(service, "_ensure_restart_epoch", blocked_restart_epoch)
+    starting = asyncio.create_task(service.start_roast(_profile(name="Restart epoch start")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    stopped = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert stopped.result == "failed"
+
+    release.set()
+    with pytest.raises(RoastRunConflictError, match="superseded by an emergency-stop"):
+        await asyncio.wait_for(starting, timeout=1.0)
+    assert await store.active_run() is None
+    assert mcp.commands() == []
+
+
+@pytest.mark.asyncio
+async def test_global_estop_revokes_queued_start_before_it_acquires_start_lock(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each queued Start keeps its own admission snapshot through lock waiting."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_active_run = store.active_run
+
+    async def blocked_active_run() -> PersistedRun | None:
+        entered.set()
+        await release.wait()
+        return await original_active_run()
+
+    monkeypatch.setattr(store, "active_run", blocked_active_run)
+    first = asyncio.create_task(service.start_roast(_profile(name="First queued start")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    second = asyncio.create_task(service.start_roast(_profile(name="Second queued start")))
+    await asyncio.sleep(0)
+
+    stopped = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert stopped.result == "failed"
+    release.set()
+    for start in (first, second):
+        with pytest.raises(RoastRunConflictError, match="superseded by an emergency-stop"):
+            await asyncio.wait_for(start, timeout=1.0)
+    assert mcp.commands() == []
+
+
+@pytest.mark.asyncio
+async def test_rejected_scoped_estop_does_not_revoke_an_unrelated_pending_start(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mismatched run-scoped e-stop preserves its rejection-only semantics."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_active_run = store.active_run
+
+    async def blocked_active_run() -> PersistedRun | None:
+        entered.set()
+        await release.wait()
+        return await original_active_run()
+
+    monkeypatch.setattr(store, "active_run", blocked_active_run)
+    starting = asyncio.create_task(service.start_roast(_profile(name="Unrelated pending start")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    rejected = await service._submit_fault_controls_emergency_stop(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        expected_run_id="different-run"
+    )
+    assert rejected.result == "failed"
+    assert "matches this run" in (rejected.reason or "")
+
+    release.set()
+    detail = await asyncio.wait_for(starting, timeout=1.0)
+    assert detail.id
+    assert "start_session" in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_global_estop_retires_a_never_dispatched_run_created_during_admission(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An e-stop during create_run leaves no live row or fabricated session identity."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    created_run_id: str | None = None
+    original_create_run = store.create_run
+
+    async def create_then_block(**kwargs: Any) -> None:
+        nonlocal created_run_id
+        created_run_id = cast(str, kwargs["run_id"])
+        await original_create_run(**kwargs)
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(store, "create_run", create_then_block)
+    starting = asyncio.create_task(service.start_roast(_profile(name="Persisted then revoked")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    stopped = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert stopped.result == "failed"
+    release.set()
+
+    with pytest.raises(RoastRunConflictError, match="superseded by an emergency-stop"):
+        await asyncio.wait_for(starting, timeout=1.0)
+    assert created_run_id is not None
+    retired = await store.read_run(created_run_id)
+    assert retired is not None
+    assert retired.outcome == "aborted"
+    assert retired.agent_phase is RoastPhase.STARTING
+    assert retired.completed_at_utc is not None
+    assert service.active_run_id is None
+    assert mcp.commands() == []
+
+
+@pytest.mark.asyncio
 async def test_per_run_estop_bypasses_saturated_routine_queue(store: RoastStore) -> None:
     """A full routine queue cannot reject a per-run emergency stop."""
     clock = FakeClock()
