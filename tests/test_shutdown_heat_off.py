@@ -982,6 +982,103 @@ async def test_teardown_continues_after_swallowed_unconfirmed_heat_off() -> None
 
 
 @pytest.mark.asyncio
+async def test_teardown_continues_in_order_after_raising_heat_off() -> None:
+    """A failed heat-off attempt cannot skip the remaining ordered cleanup."""
+    order: list[str] = []
+
+    class _RaisingHeatOffService:
+        async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
+            order.append("safe_shutdown_heat_off")
+            raise RuntimeError("synthetic heat-off failure")
+
+        async def shutdown(self) -> None:
+            order.append("service.shutdown")
+
+        async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+            order.append(f"record_child_stop_unconfirmed:{stop_unconfirmed}")
+
+    class _CleanMCP:
+        stop_unconfirmed = False
+
+        async def stop(self) -> None:
+            order.append("mcp.stop")
+
+    class _Store:
+        async def active_run(self) -> None:
+            order.append("store.active_run_before_heat_off")
+            return None
+
+        async def close(self) -> None:
+            order.append("store.close")
+
+    await _teardown_live(
+        cast(RoastService, _RaisingHeatOffService()),
+        cast(MCPServerProcess, _CleanMCP()),
+        cast(RoastStore, _Store()),
+    )
+
+    assert order == [
+        "store.active_run_before_heat_off",
+        "safe_shutdown_heat_off",
+        "service.shutdown",
+        "mcp.stop",
+        "record_child_stop_unconfirmed:False",
+        "store.close",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["service.shutdown", "mcp.stop"])
+async def test_teardown_runs_mcp_stop_and_store_close_after_later_cleanup_failure(
+    failure: str,
+) -> None:
+    """A service or child-stop failure still reaches every subsequent cleanup."""
+    order: list[str] = []
+
+    class _Service:
+        async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
+            order.append("safe_shutdown_heat_off")
+            return ShutdownHeatOffOutcome.DISPATCHED
+
+        async def shutdown(self) -> None:
+            order.append("service.shutdown")
+            if failure == "service.shutdown":
+                raise RuntimeError("synthetic service shutdown failure")
+
+        async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+            order.append(f"record_child_stop_unconfirmed:{stop_unconfirmed}")
+
+    class _MCP:
+        stop_unconfirmed = False
+
+        async def stop(self) -> None:
+            order.append("mcp.stop")
+            if failure == "mcp.stop":
+                raise RuntimeError("synthetic MCP stop failure")
+
+    class _Store:
+        async def active_run(self) -> None:
+            order.append("store.active_run_before_heat_off")
+            return None
+
+        async def close(self) -> None:
+            order.append("store.close")
+
+    await _teardown_live(
+        cast(RoastService, _Service()), cast(MCPServerProcess, _MCP()), cast(RoastStore, _Store())
+    )
+
+    assert order == [
+        "store.active_run_before_heat_off",
+        "safe_shutdown_heat_off",
+        "service.shutdown",
+        "mcp.stop",
+        "record_child_stop_unconfirmed:False",
+        "store.close",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_teardown_rejects_unconfirmed_active_runner_with_empty_store() -> None:
     """An active in-memory runner cannot be certified by an empty store read."""
     marked = False

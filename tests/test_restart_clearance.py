@@ -342,6 +342,145 @@ async def test_idle_ordered_teardown_allows_successor_physical_clearance_and_sta
 
 
 @pytest.mark.asyncio
+async def test_active_graceful_teardown_leaves_successor_epoch_unclean_and_lease_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shutdown e-stop keeps the next process behind its restart gate.
+
+    This exercises the real live service through ``_teardown_live``.  The
+    terminal e-stop is exact-session bound, so the successor must observe its
+    durable OPEN lease as well as the unclean predecessor epoch.
+    """
+    path = tmp_path / "active-ordered-teardown.sqlite3"
+    store = RoastStore(path)
+    await store.initialize()
+    try:
+        predecessor, roaster, _child = await _presence_service(store, "none")
+        assert (
+            await predecessor.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        ).cleared
+
+        async def no_op_respawn(_config: object) -> None:
+            return None
+
+        monkeypatch.setattr(predecessor, "_respawn_mcp_for_device_config", no_op_respawn)
+        detail = await predecessor.start_roast(_profile())
+        roaster.set_latest_fault_session_id("shutdown-session")
+
+        class _CleanStoppingMCP:
+            stop_unconfirmed = False
+
+            async def stop(self) -> None:
+                return None
+
+        await _teardown_live(predecessor, cast(MCPServerProcess, _CleanStoppingMCP()), store)
+    finally:
+        await store.close()
+
+    successor_store = RoastStore(path)
+    await successor_store.initialize()
+    try:
+        assert not await successor_store.begin_process_epoch("successor")
+        lease = await successor_store.read_fault_control_lease()
+        assert lease.status is FaultLeaseStatus.OPEN
+        assert lease.run_id == detail.id
+        assert lease.mcp_session_id == "shutdown-session"
+
+        successor, _roaster, _child = await _presence_service(successor_store, "none")
+        health = await successor.health()
+        assert health.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert health.fault_controls.status is FaultLeaseStatus.OPEN
+    finally:
+        await successor_store.close()
+
+
+@pytest.mark.asyncio
+async def test_clean_epoch_marker_refuses_an_active_run_after_an_eligible_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker's active-run guard remains effective after a proven control."""
+    store = RoastStore(tmp_path / "active-marker-guard.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, _child = await _presence_service(store, "none")
+        await service.health()
+        assert await store.confirm_process_restart_clearance(service.instance_id)
+        service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001 - durable marker harness  # pyright: ignore[reportPrivateUsage]
+
+        marked: list[str] = []
+        original_mark = store.mark_process_epoch_clean
+
+        async def record_mark(process_id: str) -> bool:
+            marked.append(process_id)
+            return await original_mark(process_id)
+
+        monkeypatch.setattr(store, "mark_process_epoch_clean", record_mark)
+        await service.mark_process_epoch_clean_after_ordered_teardown()
+        assert marked == [service.instance_id]
+
+        assert await store.begin_process_epoch(service.instance_id)
+        await store.create_run(
+            run_id="active-run",
+            profile=_profile(),
+            config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+            agent_phase=RoastPhase.PREHEATING,
+        )
+        await service.mark_process_epoch_clean_after_ordered_teardown()
+        assert marked == [service.instance_id]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lease_kind", ["unknown", "open"])
+async def test_clean_epoch_marker_refuses_unknown_or_open_lease_after_eligible_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lease_kind: str
+) -> None:
+    """Only a durably CLOSED fault lease can follow ordered teardown."""
+    store = RoastStore(tmp_path / f"{lease_kind}-marker-guard.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, _child = await _presence_service(store, "none")
+        await service.health()
+        assert await store.confirm_process_restart_clearance(service.instance_id)
+        service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001 - durable marker harness  # pyright: ignore[reportPrivateUsage]
+
+        marked: list[str] = []
+        original_mark = store.mark_process_epoch_clean
+
+        async def record_mark(process_id: str) -> bool:
+            marked.append(process_id)
+            return await original_mark(process_id)
+
+        monkeypatch.setattr(store, "mark_process_epoch_clean", record_mark)
+        await service.mark_process_epoch_clean_after_ordered_teardown()
+        assert marked == [service.instance_id]
+
+        assert await store.begin_process_epoch(service.instance_id)
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await store.complete_run(
+            run_id="private-run", outcome="faulted", agent_phase=RoastPhase.FAULTED
+        )
+        if lease_kind == "unknown":
+            await store.replace_fault_control_lease_unknown("private-run")
+        else:
+            await store.open_fault_control_lease(
+                run_id="private-run", mcp_session_id="private-session"
+            )
+        await service.mark_process_epoch_clean_after_ordered_teardown()
+        assert marked == [service.instance_id]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("durable_gate", ["missing", "required", "read_failure"])
 async def test_clean_epoch_requires_durable_restart_clearance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, durable_gate: str
