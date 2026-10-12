@@ -614,16 +614,27 @@ async def test_stuck_terminal_estop_shutdown_timeout_blocks_clean_epoch(
     await service.shutdown()
 
     assert not service._fault_control_audit_shutdown_clean  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - timeout outcome
-    service._restart_epoch_initialized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - clean-marker guard fixture
-    service._restart_clearance_state = (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - clean-marker guard fixture
+    # Satisfy every other clean-epoch prerequisite so this assertion detects
+    # removal of the audit-timeout guard itself rather than another fence.
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await service._ensure_restart_epoch()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - durable gate fixture
+    assert await store.confirm_process_restart_clearance(service.instance_id)
+    service._restart_clearance_state = (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - durable gate fixture
         RestartClearanceState.CLEARED
     )
+    marker_calls: list[str] = []
 
-    async def mark_clean_must_not_run(process_id: str) -> bool:
-        raise AssertionError(f"unexpected clean epoch marker for {process_id}")
+    async def record_clean_marker(process_id: str) -> bool:
+        marker_calls.append(process_id)
+        return True
 
-    monkeypatch.setattr(store, "mark_process_epoch_clean", mark_clean_must_not_run)
+    monkeypatch.setattr(store, "mark_process_epoch_clean", record_clean_marker)
     await service.mark_process_epoch_clean_after_ordered_teardown()
+    assert marker_calls == []
+
+    service._fault_control_audit_shutdown_clean = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - positive control
+    await service.mark_process_epoch_clean_after_ordered_teardown()
+    assert marker_calls == [service.instance_id]
 
     port.release_write.set()
     assert await asyncio.wait_for(dispatch, timeout=1.0) is not None
