@@ -6603,6 +6603,46 @@ def test_batched_imported_function_propagates_non_assertion_failures_without_mem
 
 
 @pytest.mark.docs_ci
+def test_batched_unavailable_markers_keep_importer_and_root_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unavailable batch never suppresses a separately resolved importer batch."""
+
+    depth = _MAX_DOCS_CALL_GRAPH_DEPTH + 1
+    source = (
+        "def safe():\n    return 'config'\n\n"
+        + "\n\n".join(
+            f"def deep_{index}():\n    return deep_{index + 1}()" for index in range(depth)
+        )
+        + f"\n\ndef deep_{depth}():\n    return 'docs/deep.md'\n"
+    )
+    names = ("safe",) + tuple(f"deep_{index}" for index in range(depth + 1))
+    batch_attempts = 0
+    original = _memoised_proxy_docs_readers
+
+    def counting(
+        proxy: str, filename: str, repository_root: Path, memo: _DocsProxyMemo
+    ) -> frozenset[str]:
+        nonlocal batch_attempts
+        if "def test_import_direct__safe" in proxy:
+            batch_attempts += 1
+        return original(proxy, filename, repository_root, memo)
+
+    monkeypatch.setattr(sys.modules[__name__], "_memoised_proxy_docs_readers", counting)
+    memo = _DocsProxyMemo()
+    for filename, root in (
+        ("tests/test_first.py", tmp_path / "first"),
+        ("tests/test_second.py", tmp_path / "second"),
+    ):
+        assert _batched_imported_function_readers(source, "safe", names, filename, root, memo) == (
+            False,
+            False,
+        )
+    assert batch_attempts == 2
+    assert len(memo.unavailable) == 2
+
+
+@pytest.mark.docs_ci
 def test_batched_imported_function_memo_observes_edits_and_resolution_boundaries(
     tmp_path: Path,
 ) -> None:
