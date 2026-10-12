@@ -8,20 +8,22 @@ from typing import cast
 import pytest
 import pytest_asyncio
 
-from roastpilot_agent.api import RoasterControl, RoastService
+from roastpilot_agent.api import RoasterControl, RoastRunConflictError, RoastService
 from roastpilot_agent.config import AppConfig, SafetyLimits
-from roastpilot_agent.controller import FaultControlExecutor
+from roastpilot_agent.controller import CommandArbiter, FaultControlExecutor
 from roastpilot_agent.models import (
     FaultControlsActionRequest,
     FaultControlState,
+    FaultLeaseStatus,
     OperatorAction,
     OperatorActionRequest,
     RestartClearanceState,
+    RoastEventKind,
     RoastPhase,
     RoastProfile,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyPolicy, SafetyVerdict
-from roastpilot_agent.store import RoastStore
+from roastpilot_agent.store import FaultControlLease, RoastStore
 
 
 @pytest_asyncio.fixture
@@ -88,6 +90,201 @@ class _FaultPort:
             raise RuntimeError("synthetic fault-control write failure")
         if action is OperatorAction.DROP_BEANS:
             self.dropped = True
+
+
+@pytest.mark.asyncio
+async def test_d212_uses_latest_same_session_controls_for_no_write_proof() -> None:
+    """A later unsafe same-session state cannot inherit an earlier safe-zero proof."""
+
+    class ChangingFaultPort(_FaultPort):
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            """Return an earlier same-session safe-zero snapshot."""
+            assert session_id == "fault-session"
+            return self._state()
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            """Return current controls that make terminal cooling unsafe."""
+            return self._state().model_copy(
+                update={
+                    "active": True,
+                    "device_connected": False,
+                    "heat_level_percent": 1,
+                    "fan_level_percent": 1,
+                    "cooling_on": True,
+                }
+            )
+
+    arbiter = CommandArbiter()
+    generation = arbiter.generation
+    assert arbiter.reserve_close(generation)
+    port = ChangingFaultPort()
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), port, arbiter=arbiter)
+
+    assert (
+        await executor.execute(
+            OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            "fault-session",
+            is_current_generation=lambda: True,
+            close_reservation=generation,
+        )
+        is None
+    )
+    assert port.writes == []
+    arbiter.release_close(generation)
+
+
+@pytest.mark.asyncio
+async def test_d212_rejects_latest_cooling_off_when_fan_remains_on(store: RoastStore) -> None:
+    """D212 cannot invent authority to stop a fan after cooling has already stopped."""
+
+    class FanStillOnFaultPort(_FaultPort):
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            """Return current cooling-off evidence that retains a nonzero fan."""
+            return self._state().model_copy(update={"fan_level_percent": 1})
+
+    arbiter = CommandArbiter()
+    generation = arbiter.generation
+    assert arbiter.reserve_close(generation)
+    port = FanStillOnFaultPort()
+    run_id = "d212-fan-still-on"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    executor = FaultControlExecutor(
+        SafetyPolicy(SafetyLimits()), port, arbiter=arbiter, trace_sink=store
+    )
+
+    assert (
+        await executor.execute(
+            OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            "fault-session",
+            run_id=run_id,
+            is_current_generation=lambda: True,
+            close_reservation=generation,
+        )
+        is None
+    )
+    assert port.writes == []
+    assert await executor.settle_audit_tasks()
+    command = (await store.read_timeline(run_id)).commands[0]
+    assert command.status == "failed"
+    assert command.result == {
+        "admission": "allowed",
+        "dispatch": "not_required",
+        "confirmation": "rejected_readback",
+    }
+    arbiter.release_close(generation)
+
+
+@pytest.mark.asyncio
+async def test_fault_controls_projection_uses_latest_same_session_controls(
+    store: RoastStore,
+) -> None:
+    """A stale safe snapshot cannot advertise terminal actions after controls change."""
+
+    class ChangingFaultPort(_FaultPort):
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            """Return an earlier safe-zero snapshot with no pending drop."""
+            assert session_id == "fault-session"
+            return self._state().model_copy(update={"beans_added": False})
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            """Return current same-session controls that admit no routine action."""
+            return self._state().model_copy(
+                update={
+                    "active": True,
+                    "device_connected": False,
+                    "heat_level_percent": 1,
+                    "fan_level_percent": 1,
+                    "cooling_on": True,
+                    "beans_added": False,
+                }
+            )
+
+    run_id = "projection-current-controls"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    service = RoastService(store, roaster=cast(RoasterControl, ChangingFaultPort()), run_loop=False)
+    lease = await store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="fault-session", generation=1
+    )
+
+    projection = await service._fault_controls_projection(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        lease
+    )
+
+    assert projection.enabled_actions == [OperatorAction.EMERGENCY_STOP]
+
+
+@pytest.mark.asyncio
+async def test_same_generation_different_identity_does_not_hydrate_admitted_lease(
+    tmp_path: Path,
+) -> None:
+    """A different connection winning equal generation leaves local admission UNKNOWN."""
+    database = tmp_path / "equal-generation-lease.sqlite3"
+    store = RoastStore(database)
+    competing_store = RoastStore(database)
+    await store.initialize()
+    await competing_store.initialize()
+    try:
+        for run_id in ("losing-run", "winning-run"):
+            await store.create_run(
+                run_id=run_id,
+                profile=_profile(),
+                config=AppConfig(),
+                agent_phase=RoastPhase.FAULTED,
+            )
+            await store.complete_run(
+                run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED
+            )
+        service = RoastService(store, roaster=cast(RoasterControl, _FaultPort()), run_loop=False)
+        admitted = service._admit_fault_control_lease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            "losing-run", session_id="losing-session"
+        )
+        competing_service = RoastService(
+            competing_store, roaster=cast(RoasterControl, _FaultPort()), run_loop=False
+        )
+        winning_admission = competing_service._admit_fault_control_lease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            "winning-run", session_id="winning-session"
+        )
+        assert winning_admission.generation == admitted.generation
+        await competing_service._persist_admitted_fault_control_lease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            "winning-run", "winning-session", winning_admission.generation
+        )
+        winner = await competing_store.read_fault_control_lease()
+
+        await service._persist_admitted_fault_control_lease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            "losing-run", "losing-session", admitted.generation
+        )
+
+        assert winner.status is FaultLeaseStatus.OPEN
+        assert service._fault_lease_cache == FaultControlLease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            generation=admitted.generation,
+            status=FaultLeaseStatus.UNKNOWN,
+            run_id="losing-run",
+            mcp_session_id="losing-session",
+        )
+        assert service._unconfirmed_fault_lease_generation == admitted.generation  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert await store.read_fault_control_lease() == winner
+        timeline = await store.read_timeline("losing-run")
+        assert not any(
+            event.kind is RoastEventKind.FAULT_CONTROLS_CHANGED for event in timeline.events
+        )
+        service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        service._restart_epoch_initialized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+            await service.start_roast(_profile())
+    finally:
+        await competing_store.close()
+        await store.close()
 
 
 @pytest.mark.asyncio

@@ -836,6 +836,11 @@ class FaultControlExecutor:
                     self._unconfirmed_result("not_attempted"),
                 )
                 return None
+            # D212's second read is the current proof for every subsequent
+            # control predicate, including the no-write safe-zero result.
+            # The earlier exact read proves only that this is the same fault
+            # session; it cannot certify controls after the latest read.
+            before = latest
             if not generation_current() or (
                 close_reservation is not None
                 and not self._arbiter.close_reservation_is_current(close_reservation)
@@ -872,6 +877,19 @@ class FaultControlExecutor:
             # D212 may confirm a fresh already-safe-zero read without another
             # stop write. Record that distinct no-dispatch outcome rather than
             # silently returning a state that the API can accept and close.
+            if not self._readback_confirms(action, before, session_id):
+                self._schedule_command_trace(
+                    run_id,
+                    command,
+                    "failed",
+                    evaluation_id,
+                    {
+                        "admission": "allowed",
+                        "dispatch": "not_required",
+                        "confirmation": "rejected_readback",
+                    },
+                )
+                return None
             self._schedule_command_trace(
                 run_id,
                 command,
@@ -978,8 +996,15 @@ class FaultControlExecutor:
             return state.heat_level_percent == 0
         if action is OperatorAction.START_COOLING:
             return state.cooling_on
-        if action in (OperatorAction.STOP_COOLING, OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE):
+        if action is OperatorAction.STOP_COOLING:
             return not state.cooling_on
+        if action is OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE:
+            return (
+                not state.active
+                and state.heat_level_percent == 0
+                and state.fan_level_percent == 0
+                and not state.cooling_on
+            )
         if action is OperatorAction.DROP_BEANS:
             return state.beans_dropped
         # The closed OperatorAction mapping above handles every reachable action.

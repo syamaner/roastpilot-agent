@@ -2715,6 +2715,11 @@ class RoastService:
                         and latest.session_id == lease.mcp_session_id
                         and latest.mcp_phase == "fault"
                     ):
+                        # The latest same-session snapshot is the current
+                        # admission evidence for every advertised routine
+                        # action. The preceding exact read only binds the
+                        # retained historical lease to that current session.
+                        state = latest
                         cooling_stop_safe = (
                             state.cooling_on
                             and not state.active
@@ -3576,6 +3581,12 @@ class RoastService:
         self, run_id: str, session_id: str | None, generation: int
     ) -> None:
         """Persist an e-stop lease; absent exact identity stays fail-closed UNKNOWN."""
+        admitted = FaultControlLease(
+            generation=generation,
+            status=FaultLeaseStatus.UNKNOWN,
+            run_id=run_id,
+            mcp_session_id=session_id,
+        )
         if session_id is None:
             lease = await self._store.replace_fault_control_lease_unknown(
                 run_id, generation=generation
@@ -3584,17 +3595,26 @@ class RoastService:
             lease = await self._store.open_fault_control_lease(
                 run_id=run_id, mcp_session_id=session_id, generation=generation
             )
-        # A newer e-stop won the in-process arbitration.  Its durable write
-        # must be the only one allowed to alter the current projection/event.
-        if self._fault_lease_cache.generation != generation:
+        # A newer e-stop won the in-process arbitration, or the local
+        # admission was otherwise replaced. Its durable write must be the
+        # only one allowed to alter the current projection/event.
+        if (
+            self._fault_lease_cache != admitted
+            or self._unconfirmed_fault_lease_generation != generation
+        ):
             return
-        if lease.generation != generation:
-            # A fresh process can admit generation 1 while SQLite retains a
-            # prior-process generation 9.  The store correctly rejects this
-            # stale write, but that conflict cannot be permission to revive
-            # the old exact session in this process.
+        expected_status = FaultLeaseStatus.UNKNOWN if session_id is None else FaultLeaseStatus.OPEN
+        if (
+            lease.generation != generation
+            or lease.status is not expected_status
+            or lease.run_id != run_id
+            or lease.mcp_session_id != session_id
+        ):
+            # A competing connection can win the same generation with a
+            # different identity. That durable row cannot hydrate this local
+            # admission or clear its Start fence.
             _log.error(
-                "fault-control lease persistence conflicted with durable generation",
+                "fault-control lease persistence conflicted with durable identity",
                 extra={
                     "fault_lease_generation": generation,
                     "durable_fault_lease_generation": lease.generation,
