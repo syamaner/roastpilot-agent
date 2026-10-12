@@ -422,6 +422,28 @@ async def test_adapter_reads_presence_from_a_fresh_server_info_call() -> None:
     assert caller.calls == [("get_server_info", {})]
 
 
+@pytest.mark.asyncio
+async def test_public_terminal_commands_forward_the_exact_session_guard() -> None:
+    """Direct MCP command wrappers preserve the caller's exact-session guard."""
+    caller = FakeToolCaller()
+    client = RoasterMCPClient(caller)
+
+    await client.drop_beans(expected_session_id="fault-session")
+    await client.start_cooling(expected_session_id="fault-session")
+    await client.stop_cooling(expected_session_id="fault-session")
+    await client.emergency_stop("operator emergency", expected_session_id="fault-session")
+
+    assert caller.calls == [
+        ("drop_beans", {"expected_session_id": "fault-session"}),
+        ("start_cooling", {"expected_session_id": "fault-session"}),
+        ("stop_cooling", {"expected_session_id": "fault-session"}),
+        (
+            "emergency_stop",
+            {"reason": "operator emergency", "expected_session_id": "fault-session"},
+        ),
+    ]
+
+
 def test_ambient_status_mirror_round_trips_unavailable() -> None:
     """#342: an unavailable/disabled MCP ambient config round-trips with every
     numeric field null and a human-readable ``reason`` — the fail-soft contract."""

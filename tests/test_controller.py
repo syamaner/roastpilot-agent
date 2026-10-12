@@ -715,6 +715,38 @@ async def test_estop_release_epoch_discards_routine_created_while_stop_is_parked
 
 
 @pytest.mark.asyncio
+async def test_arbiter_rejects_stale_close_and_stale_admitted_work_without_dispatch() -> None:
+    """A stale close proof or stale external admission cannot touch the driver."""
+    arbiter = CommandArbiter()
+    calls: list[str] = []
+
+    async def write() -> str:
+        calls.append("write")
+        return "written"
+
+    assert not arbiter.reserve_close(arbiter.generation + 1)
+    assert arbiter.reserve_close(arbiter.generation)
+    assert not arbiter.reserve_close(arbiter.generation)
+    arbiter.release_close(arbiter.generation + 1)
+    assert arbiter.close_reservation_is_current(arbiter.generation)
+
+    assert await arbiter.run_routine(arbiter.generation, write, admitted=lambda: False) == (
+        False,
+        None,
+    )
+    arbiter.release_close(arbiter.generation)
+
+    generation = arbiter.admit_emergency_stop()
+    assert arbiter.emergency_stop_active
+    with pytest.raises(RuntimeError, match="admission is no longer current"):
+        await arbiter.run_emergency_stop(write, admitted=lambda: False)
+
+    assert not arbiter.emergency_stop_active
+    assert calls == []
+    assert await arbiter.run_routine(generation, write) == (True, "written")
+
+
+@pytest.mark.asyncio
 async def test_fault_transition_before_stop_release_keeps_routine_gate_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
