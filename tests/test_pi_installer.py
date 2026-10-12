@@ -801,8 +801,12 @@ def _raise_if_present(present: bool, artifact: str, kind: str) -> None:
         raise AssertionError(f"peer {kind} leaked to {artifact}")
 
 
-def _assert_no_cross_run_leak(own: _OverlapRun, peer: _OverlapRun) -> None:
+def _assert_no_cross_run_leak(own: _OverlapRun, peer: _OverlapRun, temporary_root: Path) -> None:
     """Assert own output is complete and peer identifiers appear nowhere in it."""
+    if not own.base.is_relative_to(temporary_root):
+        raise AssertionError("own output base is outside the temporary test root")
+    if own.base.parent / "installer-output" != own.base:
+        raise AssertionError("own output base is not the fixture-owned installer output root")
     root = Path(own.environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     prior_file = root / "var/lib/roastpilot-agent/prior-static-hostname"
     if prior_file.read_text() != f"{own.prior_hostname}\n":
@@ -857,7 +861,9 @@ def _assert_no_cross_run_leak(own: _OverlapRun, peer: _OverlapRun) -> None:
         for value, kind in peer_values:
             _raise_if_present(value in text, artifact, kind)
 
-    for directory, directories, files in os.walk(own.base, followlinks=False):
+    for directory, directories, files in os.walk(
+        own.base.parent / "installer-output", followlinks=False
+    ):
         for name in [*directories, *files]:
             path = Path(directory) / name
             mode = os.lstat(path).st_mode
@@ -866,15 +872,15 @@ def _assert_no_cross_run_leak(own: _OverlapRun, peer: _OverlapRun) -> None:
                 for value, kind in peer_values:
                     _raise_if_present(value in target, "symlink target", kind)
             elif stat.S_ISREG(mode):
-                contents = path.read_bytes()
+                contents = Path(directory, name).read_bytes()
                 for value, kind in peer_values:
                     _raise_if_present(value.encode() in contents, "regular file", kind)
 
 
 def _oracle_run(tmp_path: Path, name: str, *, port: str, api_key: str) -> _OverlapRun:
     """Build a no-installer synthetic run artefact for leak-oracle negatives."""
-    base = tmp_path / name
-    base.mkdir()
+    base = tmp_path / name / "installer-output"
+    base.mkdir(parents=True)
     root = base / "root"
     environment_file = root / "etc/roastpilot-agent/roastpilot-agent.env"
     environment_file.parent.mkdir(parents=True)
@@ -932,10 +938,12 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
     """Two fake installer runs overlap at hostname setup without leaking artefacts."""
     parent = tmp_path / "parallel-parent"
     parent.mkdir()
-    alpha_base = parent / "alpha-run"
-    beta_base = parent / "beta-run"
-    alpha_base.mkdir()
-    beta_base.mkdir()
+    alpha_owner = parent / "alpha-run"
+    beta_owner = parent / "beta-run"
+    alpha_base = alpha_owner / "installer-output"
+    beta_base = beta_owner / "installer-output"
+    alpha_base.mkdir(parents=True)
+    beta_base.mkdir(parents=True)
     rendezvous = parent / "rendezvous"
     rendezvous.mkdir()
     alpha_fake_bin, alpha_environment, alpha_log, alpha_hostname = _build_installer_harness(
@@ -1059,20 +1067,24 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
             time.sleep(0.01)
         assert alpha_process.poll() is None and beta_process.poll() is None
         assert {path.name for path in parent.iterdir()} == {
-            alpha_base.name,
-            beta_base.name,
+            alpha_owner.name,
+            beta_owner.name,
             rendezvous.name,
         }
+        assert {path.name for path in alpha_owner.iterdir()} == {"installer-output"}
+        assert {path.name for path in beta_owner.iterdir()} == {"installer-output"}
         assert {path.name for path in rendezvous.iterdir()} == {alpha["self"], beta["self"]}
         outputs[alpha_process] = alpha_process.communicate(input="input", timeout=35)
         outputs[beta_process] = beta_process.communicate(input="input", timeout=35)
         assert alpha_process.returncode == 0
         assert beta_process.returncode == 0
         assert {path.name for path in parent.iterdir()} == {
-            alpha_base.name,
-            beta_base.name,
+            alpha_owner.name,
+            beta_owner.name,
             rendezvous.name,
         }
+        assert {path.name for path in alpha_owner.iterdir()} == {"installer-output"}
+        assert {path.name for path in beta_owner.iterdir()} == {"installer-output"}
         assert {path.name for path in rendezvous.iterdir()} == {alpha["self"], beta["self"]}
         alpha_run = _OverlapRun(
             alpha_base,
@@ -1098,8 +1110,8 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
             beta["peer"],
             *outputs[beta_process],
         )
-        _assert_no_cross_run_leak(alpha_run, beta_run)
-        _assert_no_cross_run_leak(beta_run, alpha_run)
+        _assert_no_cross_run_leak(alpha_run, beta_run, tmp_path)
+        _assert_no_cross_run_leak(beta_run, alpha_run, tmp_path)
     finally:
         for process in processes:
             if process not in outputs:
@@ -1190,7 +1202,7 @@ def test_cross_run_leak_oracle_rejects_synthetic_leaks(tmp_path: Path, case: str
         own.log.write_text("")
 
     with pytest.raises(AssertionError) as raised:
-        _assert_no_cross_run_leak(own, peer)
+        _assert_no_cross_run_leak(own, peer, tmp_path)
     message = str(raised.value)
     formatted = str(raised.getrepr(showlocals=False, funcargs=True))
     assert own.api_key not in message
