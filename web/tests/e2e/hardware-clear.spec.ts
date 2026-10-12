@@ -103,6 +103,9 @@ test("required restart clearance keeps a CLOSED server-advertised software e-sto
 }) => {
   let clearanceRequired = true;
   const emergencyStopRequests: unknown[] = [];
+  // `useFreshHealthGate` polls every three seconds. Freeze page time before
+  // navigation so the test controls the sole post-clearance health read.
+  await page.clock.install();
   await page.route("**/api/**", async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
@@ -142,7 +145,6 @@ test("required restart clearance keeps a CLOSED server-advertised software e-sto
       return;
     }
     if (path === "/api/restart-clearance") {
-      clearanceRequired = false;
       await route.fulfill({
         contentType: "application/json",
         body: JSON.stringify({
@@ -183,6 +185,13 @@ test("required restart clearance keeps a CLOSED server-advertised software e-sto
   await page.getByTestId("restart-clearance-independent-stop").check();
   await page.getByTestId("restart-clearance-submit").click();
   await expect(page.getByTestId("restart-clearance-reported")).toBeVisible();
+  await expect(page.getByTestId("restart-clearance-required")).toBeVisible();
+  await expect(page.getByTestId("start-roast-form")).toHaveCount(0);
+
+  // The POST records only the operator report. The server projection remains
+  // REQUIRED until the test author advances it, so this assertion fails if the
+  // client unlocks Start optimistically from the successful POST response.
+  clearanceRequired = false;
   await page.getByTestId("restart-clearance-refresh-status").click();
   await expect(page.getByTestId("start-roast-form")).toBeVisible();
   await expect(page.getByTestId("restart-clearance-required")).toHaveCount(0);

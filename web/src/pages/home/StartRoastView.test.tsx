@@ -373,14 +373,18 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
   });
 
-  it("fails closed when CLOSED fault controls carry a routine enabled action", () => {
+  it.each([
+    ["a routine action", ["start_cooling"]],
+    ["mixed routine and emergency actions", ["emergency_stop", "start_cooling"]],
+    ["duplicate emergency actions", ["emergency_stop", "emergency_stop"]],
+  ])("fails closed when CLOSED fault controls carry %s", (_description, enabledActions) => {
     healthState.data = {
       active_run_id: null,
       restart_clearance: { state: "cleared", eligible: true },
       fault_controls: {
         status: "closed",
         generation: null,
-        enabled_actions: ["start_cooling"],
+        enabled_actions: enabledActions,
       },
     };
     renderView();
