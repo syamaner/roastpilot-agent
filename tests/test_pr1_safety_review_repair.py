@@ -500,7 +500,7 @@ async def test_shutdown_settles_terminal_estop_audit(store: RoastStore) -> None:
 
 @pytest.mark.asyncio
 async def test_shutdown_waits_for_inflight_terminal_estop_then_drains_audit(
-    store: RoastStore,
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Ordered shutdown sees an audit created by an already-admitted e-stop worker."""
 
@@ -538,6 +538,18 @@ async def test_shutdown_waits_for_inflight_terminal_estop_then_drains_audit(
         )
     )
     await asyncio.wait_for(port.write_entered.wait(), timeout=1.0)
+    audit_recorded = asyncio.Event()
+    original_record_command = store.record_fault_control_command
+
+    async def record_audit_before_shutdown_cleanup(**kwargs: object) -> None:
+        await original_record_command(**kwargs)  # type: ignore[arg-type]
+        audit_recorded.set()
+
+    async def require_audit_before_cleanup(**kwargs: object) -> None:
+        assert audit_recorded.is_set()
+
+    monkeypatch.setattr(store, "record_fault_control_command", record_audit_before_shutdown_cleanup)
+    monkeypatch.setattr(store, "clear_unclaimed_bean_sourcing_drafts", require_audit_before_cleanup)
     shutdown = asyncio.create_task(service.shutdown())
     await asyncio.sleep(0)
     assert not shutdown.done()
@@ -549,6 +561,73 @@ async def test_shutdown_waits_for_inflight_terminal_estop_then_drains_audit(
     timeline = await store.read_timeline(run_id)
     assert timeline.commands[-1].tool.value == "emergency_stop"
     assert timeline.commands[-1].status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_stuck_terminal_estop_shutdown_timeout_blocks_clean_epoch(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bounded shutdown timeout retains uncertainty and never marks the process epoch clean."""
+
+    class StuckEStopPort(_FaultPort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.write_entered = asyncio.Event()
+            self.release_write = asyncio.Event()
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            self.writes.append(action)
+            self.write_entered.set()
+            await self.release_write.wait()
+
+    run_id = "stuck-estop-shutdown"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    port = StuckEStopPort()
+    service = RoastService(
+        store, roaster=cast(RoasterControl, port), live_serve_mode=True, run_loop=False
+    )
+    executor = service._fault_control_executor  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - owned integration seam
+    assert executor is not None
+    original_settle = executor.settle_for_shutdown
+
+    async def short_settle() -> bool:
+        return await original_settle(timeout_seconds=0.01)
+
+    monkeypatch.setattr(executor, "settle_for_shutdown", short_settle)
+    dispatch = asyncio.create_task(
+        executor.execute(
+            OperatorAction.EMERGENCY_STOP,
+            "fault-session",
+            run_id=run_id,
+            is_current_generation=lambda: True,
+        )
+    )
+    await asyncio.wait_for(port.write_entered.wait(), timeout=1.0)
+
+    await service.shutdown()
+
+    assert not service._fault_control_audit_shutdown_clean  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - timeout outcome
+    service._restart_epoch_initialized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - clean-marker guard fixture
+    service._restart_clearance_state = (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - clean-marker guard fixture
+        RestartClearanceState.CLEARED
+    )
+
+    async def mark_clean_must_not_run(process_id: str) -> bool:
+        raise AssertionError(f"unexpected clean epoch marker for {process_id}")
+
+    monkeypatch.setattr(store, "mark_process_epoch_clean", mark_clean_must_not_run)
+    await service.mark_process_epoch_clean_after_ordered_teardown()
+
+    port.release_write.set()
+    assert await asyncio.wait_for(dispatch, timeout=1.0) is not None
+    assert await executor.settle_for_shutdown()
 
 
 @pytest.mark.asyncio
