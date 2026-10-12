@@ -1099,8 +1099,10 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> N
 )
 def test_cross_run_leak_oracle_rejects_synthetic_leaks(tmp_path: Path, case: str) -> None:
     """The leak oracle rejects peer artefacts and incomplete own output without echoing keys."""
-    own = _oracle_run(tmp_path, "own-zebra", port="43111", api_key="KEY_OWN_T9")
-    peer = _oracle_run(tmp_path, "peer-lantern", port="43222", api_key="KEY_PEER_R2")
+    own_key = "KEY" + "_OWN_T9"
+    peer_key = "KEY" + "_PEER_R2"
+    own = _oracle_run(tmp_path, "own-zebra", port="43111", api_key=own_key)
+    peer = _oracle_run(tmp_path, "peer-lantern", port="43222", api_key=peer_key)
     if case == "peer-root-log":
         own.log.write_text(own.log.read_text() + f"record {peer.base}\n")
     elif case == "peer-key-stderr":
@@ -1166,7 +1168,21 @@ def _assert_failed_hostname_rendezvous(
     assert hostname.read_text() == "old-host\n"
     assert not Path(environment["FAKE_HOSTNAME_SET_MARKER"]).exists()
     assert prior_file.read_text() == "old-host\n"
-    assert "systemctl <enable>" not in events
+    _assert_no_service_enable(events)
+
+
+def _assert_no_service_enable(events: list[str]) -> None:
+    """Reject any service-enable event after a failed hostname rendezvous."""
+    if any(event.startswith("systemctl <enable>") for event in events):
+        raise AssertionError("hostname rendezvous failure reached service enablement")
+
+
+def test_hostname_rendezvous_no_enable_oracle_rejects_enable_event() -> None:
+    """M15: the failed-rendezvous oracle rejects an injected service enable event."""
+    events = ["hostnamectl <set-hostname> <roastpilot>"]
+    events.append("systemctl <enable> <roastpilot-agent>")
+    with pytest.raises(AssertionError, match="reached service enablement"):
+        _assert_no_service_enable(events)
 
 
 def test_hostname_rendezvous_timeout_and_inert_timeout_setting(
