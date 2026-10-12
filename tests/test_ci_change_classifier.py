@@ -2521,8 +2521,10 @@ _DocsProxyKey = tuple[str, str, Path]
 class _DocsProxyMemo:
     """Keep successful and unavailable imported-proxy batches within one audit."""
 
-    results: dict[_DocsProxyKey, frozenset[str]] = field(default_factory=dict)
-    unavailable: set[_DocsProxyKey] = field(default_factory=set)
+    results: dict[_DocsProxyKey, frozenset[str]] = field(
+        default_factory=dict[_DocsProxyKey, frozenset[str]]
+    )
+    unavailable: set[_DocsProxyKey] = field(default_factory=set[_DocsProxyKey])
 
 
 def _memoised_proxy_docs_readers(
@@ -3546,7 +3548,7 @@ def _analyse_function(
     control_flow_docs_aliases = {
         target.id
         for assignment in conditional_assignments
-        if isinstance(assignment, (ast.Assign, ast.AnnAssign)) and assignment.value is not None
+        if assignment.value is not None
         for target in (
             assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
         )
@@ -3555,7 +3557,7 @@ def _analyse_function(
     control_flow_subprocess_command_aliases = {
         target.id
         for assignment in conditional_assignments
-        if isinstance(assignment, (ast.Assign, ast.AnnAssign)) and assignment.value is not None
+        if assignment.value is not None
         for target in (
             assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
         )
@@ -3564,8 +3566,7 @@ def _analyse_function(
     control_flow_reader_aliases = {
         target.id
         for assignment in conditional_assignments
-        if isinstance(assignment, (ast.Assign, ast.AnnAssign))
-        and isinstance(assignment.value, ast.Attribute)
+        if isinstance(assignment.value, ast.Attribute)
         and assignment.value.attr in _READ_METHOD_NAMES
         and _expression_is_docs_markdown(assignment.value.value, set())
         for target in (
@@ -3598,8 +3599,7 @@ def _analyse_function(
     control_flow_imported_class_instances = {
         target.id
         for assignment in conditional_assignments
-        if isinstance(assignment, (ast.Assign, ast.AnnAssign))
-        and isinstance(assignment.value, ast.Call)
+        if isinstance(assignment.value, ast.Call)
         and isinstance(assignment.value.func, ast.Name)
         and assignment.value.func.id in (imported_classes or set())
         for target in (
@@ -6461,10 +6461,22 @@ def test_batched_imported_function_probes_match_legacy_per_name_results(tmp_path
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     )
     batched_memo = _DocsProxyMemo()
+    batch_answers = {}
     for name in function_names:
-        assert _batched_imported_function_readers(
+        batch_answers[name] = _batched_imported_function_readers(
             source, name, function_names, filename, tmp_path, batched_memo
-        ) == _per_name_imported_function_readers(source, name, filename, tmp_path, _DocsProxyMemo())
+        )
+        assert batch_answers[name] == _per_name_imported_function_readers(
+            source, name, filename, tmp_path, _DocsProxyMemo()
+        )
+    assert batched_memo.unavailable == set()
+    assert any(
+        "def test_import_direct__docs_direct" in proxy for proxy, _, _ in batched_memo.results
+    )
+    assert batch_answers["chain"] == (True, True)
+    assert batch_answers["decorated"] == (True, True)
+    assert batch_answers["duplicate"] == (True, True)
+    assert batch_answers["non_docs"] == (False, False)
     docs_direct = _batched_imported_function_readers(
         source, "docs_direct", function_names, filename, tmp_path, batched_memo
     )
@@ -6648,7 +6660,7 @@ def test_batched_unavailable_markers_keep_importer_and_root_boundaries(
 def test_batched_imported_function_memo_observes_edits_and_resolution_boundaries(
     tmp_path: Path,
 ) -> None:
-    """Batch keys retain source, importer filename, and repository-root provenance."""
+    """Batch keys retain source, imported-module filename, and repository-root provenance."""
 
     memo = _DocsProxyMemo()
     docs_source = (
