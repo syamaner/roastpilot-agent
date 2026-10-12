@@ -571,6 +571,30 @@ async def test_global_estop_rejects_completed_pointer_without_lease_or_start_fen
 
 
 @pytest.mark.asyncio
+async def test_global_estop_rejects_finalized_runner_despite_stale_start_marker(
+    store: RoastStore,
+) -> None:
+    """A published final runner cannot be mistaken for Start construction."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    assert service.runner is not None
+    service.runner._finalized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    service._starting_run_id = run_id  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    generation_before = service._command_arbiter.generation  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+
+    assert result.result == "failed"
+    assert service._command_arbiter.generation == generation_before  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._fault_lease_cache.status is FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+    assert mcp.commands().count("emergency_stop") == 0
+
+
+@pytest.mark.asyncio
 async def test_fault_controls_route_queues_confirmed_live_d212_for_current_lease(
     store: RoastStore,
 ) -> None:

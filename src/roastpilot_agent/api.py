@@ -3210,7 +3210,9 @@ class RoastService:
             else None
         )
         starting_run_is_current = (
-            self._starting_run_id is not None and self._starting_run_id == self.active_run_id
+            self.runner is None
+            and self._starting_run_id is not None
+            and self._starting_run_id == self.active_run_id
         )
         finalized_runner_has_current_exact_session = (
             runner_is_current
