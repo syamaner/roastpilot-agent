@@ -4064,18 +4064,15 @@ class RoastService:
                     agent_phase=RoastPhase.STARTING,
                 )
             except BaseException:
-                if self._unpublished_start_run_id == run_id:
-                    self._unpublished_start_run_id = None
+                self._unpublished_start_run_id = None
                 raise
             if self._start_admission_generation != admission_generation:
                 try:
                     await self._retire_never_dispatched_start(run_id)
                 finally:
-                    if self._unpublished_start_run_id == run_id:
-                        self._unpublished_start_run_id = None
+                    self._unpublished_start_run_id = None
                 self._require_current_start_admission(admission_generation)
-            if self._unpublished_start_run_id == run_id:
-                self._unpublished_start_run_id = None
+            self._unpublished_start_run_id = None
             self.active_run_id = run_id
             self._starting_run_id = run_id
         try:
