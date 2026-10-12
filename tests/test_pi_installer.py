@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import errno
 import grp
 import json
@@ -964,7 +963,8 @@ def _owned_group_live_members(group_id: int) -> tuple[int, ...]:
         fields = line.split()
         if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
             raise AssertionError("owned process-group inspection was malformed")
-        if int(fields[1]) == group_id and not fields[2].startswith("Z"):
+        zombie_state = re.fullmatch(r"Z[<Nsl+]*", fields[2]) is not None
+        if int(fields[1]) == group_id and not zombie_state:
             members.append(int(fields[0]))
     return tuple(members)
 
@@ -980,16 +980,27 @@ def _assert_owned_group_is_drained(group_id: int) -> None:
 
 def _signal_owned_group(group_id: int, signal_number: int) -> None:
     """Signal only a recorded private group and tolerate a disappearance race."""
-    with contextlib.suppress(ProcessLookupError):
+    try:
         os.killpg(group_id, signal_number)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        if _owned_group_live_members(group_id):
+            raise
 
 
 def _reap_owned_process(owned: _OwnedInstallerProcess) -> tuple[str, str]:
     """Stop and drain one private installer group, including surviving descendants."""
-    _signal_owned_group(owned.group_id, signal.SIGTERM)
+    owned.process.poll()
+    if _owned_group_live_members(owned.group_id):
+        _signal_owned_group(owned.group_id, signal.SIGTERM)
     try:
         return owned.process.communicate(timeout=5)
     except subprocess.TimeoutExpired:
+        if not _owned_group_live_members(owned.group_id):
+            raise AssertionError(
+                "owned installer pipes remained open without a live process"
+            ) from None
         _signal_owned_group(owned.group_id, signal.SIGKILL)
         return owned.process.communicate(timeout=5)
 
@@ -1023,6 +1034,9 @@ def _drain_owned_processes(
         "inspection-command-failure",
         "inspection-empty-output",
         "inspection-malformed-output",
+        "permission-race-no-live-group",
+        "permission-race-live-group",
+        "zombie-only-cleanup",
     ),
 )
 def test_two_installer_runs_overlap_without_cross_run_leaks(
@@ -1047,6 +1061,53 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(
         monkeypatch.setattr(subprocess, "run", inspected_run)
         with pytest.raises(AssertionError, match="owned process-group inspection"):
             _owned_group_live_members(os.getpgrp())
+        return
+    if case.startswith("permission-race"):
+        attempts: list[int] = []
+
+        def vanished_group_signal(group_id: int, signal_number: int) -> None:
+            """Model a permission race after a successful owned-group scan."""
+            attempts.append(group_id)
+            raise PermissionError
+
+        monkeypatch.setattr(os, "killpg", vanished_group_signal)
+        if case == "permission-race-no-live-group":
+            _signal_owned_group(999_999_999, signal.SIGTERM)
+            assert attempts == [999_999_999]
+        else:
+            with pytest.raises(PermissionError):
+                _signal_owned_group(os.getpgrp(), signal.SIGTERM)
+            assert attempts == [os.getpgrp()]
+        return
+    if case == "zombie-only-cleanup":
+        exited_parent = subprocess.Popen(
+            ["/bin/sh", "-c", "exit 0"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        exited_owned = _OwnedInstallerProcess(exited_parent, exited_parent.pid)
+        try:
+            deadline = time.monotonic() + 5
+            while exited_parent.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise AssertionError("owned zombie-only parent did not exit")
+                time.sleep(0.01)
+            signal_attempts: list[int] = []
+
+            def unexpected_group_signal(group_id: int, signal_number: int) -> None:
+                """Reject group signalling after the owned parent has fully exited."""
+                signal_attempts.append(group_id)
+                raise AssertionError("zombie-only group was signalled")
+
+            monkeypatch.setattr(os, "killpg", unexpected_group_signal)
+            assert _reap_owned_process(exited_owned) == ("", "")
+            assert signal_attempts == []
+        finally:
+            monkeypatch.undo()
+            _reap_owned_process(exited_owned)
+            _assert_owned_group_is_drained(exited_owned.group_id)
         return
     alpha_owner = parent / "alpha-run"
     beta_owner = parent / "beta-run"
