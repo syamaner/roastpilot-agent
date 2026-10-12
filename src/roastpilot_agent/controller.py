@@ -726,30 +726,52 @@ class FaultControlExecutor:
                 return None
             # No pre-read may postpone an e-stop attempt.  The guarded command
             # result and its fresh exact-session readback are the proof.
+            write_started = False
+
+            async def dispatch_estop() -> None:
+                """Mark entry to the adapter so admission failures are not called writes."""
+                nonlocal write_started
+                write_started = True
+                await self._port.write_fault_control(action, expected_session_id=session_id)
+
             try:
-                await self._arbiter.run_emergency_stop(
-                    lambda: self._port.write_fault_control(action, expected_session_id=session_id),
-                    admitted=generation_current,
+                await self._arbiter.run_emergency_stop(dispatch_estop, admitted=generation_current)
+            except Exception:
+                self._schedule_estop_trace(
+                    run_id,
+                    evaluation,
+                    "failed",
+                    {
+                        "admission": "allowed",
+                        "dispatch": "write_failed" if write_started else "not_dispatched",
+                        "confirmation": "not_attempted",
+                    },
                 )
-                if not generation_current():
-                    self._schedule_estop_trace(
-                        run_id,
-                        evaluation,
-                        "failed",
-                        {
-                            "admission": "allowed",
-                            "dispatch": "completed",
-                            "confirmation": "superseded",
-                        },
-                    )
-                    return None
+                raise
+            if not generation_current():
+                self._schedule_estop_trace(
+                    run_id,
+                    evaluation,
+                    "failed",
+                    {
+                        "admission": "allowed",
+                        "dispatch": "completed",
+                        "confirmation": "superseded",
+                    },
+                )
+                return None
+            try:
                 state = await self._port.read_fault_control_state(session_id)
             except Exception:
                 self._schedule_estop_trace(
                     run_id,
                     evaluation,
                     "failed",
-                    {"admission": "allowed", "dispatch": "failed", "confirmation": "unconfirmed"},
+                    {
+                        "admission": "allowed",
+                        "dispatch": "completed",
+                        "confirmation": "readback_failed",
+                    },
                 )
                 raise
             if not self._readback_confirms(action, state, session_id):
@@ -1079,6 +1101,28 @@ class FaultControlExecutor:
                 task.cancel()
             return False
         return all(not task.cancelled() and task.exception() is None for task in completed)
+
+    async def settle_for_shutdown(self, *, timeout_seconds: float = 1.0) -> bool:
+        """Boundedly wait for admitted dispatches, then settle their audits.
+
+        The worker is never cancelled here: it can own the one admitted
+        emergency-stop MCP call.  A timeout therefore retains the fail-closed
+        uncertainty for the successor process instead of recasting it as a
+        clean shutdown.
+        """
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        worker = self._worker
+        if worker is not None and not worker.done():
+            _, pending = await asyncio.wait((worker,), timeout=timeout_seconds)
+            if pending:
+                logging.getLogger(__name__).error(
+                    "timed out waiting for fault-control dispatch worker during shutdown"
+                )
+                return False
+        if worker is not None and not worker.cancelled() and worker.exception() is not None:
+            return False
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        return await self.settle_audit_tasks(timeout_seconds=remaining)
 
     @staticmethod
     def _consume_estop_trace_task(task: asyncio.Task[None]) -> None:

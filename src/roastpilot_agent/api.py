@@ -2325,6 +2325,11 @@ class RoastService:
         # ordered live teardown drains these owned tasks before considering its
         # process epoch clean.
         self._fault_lease_persistence_tasks: set[asyncio.Task[None]] = set()
+        # A bounded terminal-control settle timeout is an unclean teardown
+        # outcome. It must prevent a later ordered teardown from claiming this
+        # process epoch clean, even though service.shutdown itself stays
+        # best-effort and returns normally.
+        self._fault_control_audit_shutdown_clean = True
         #: The active run's live loop, attached by :meth:`start_roast` once a
         #: roaster is wired; ``None`` between runs and in API-only mode.
         self.runner: RoastRunner | None = None
@@ -4640,8 +4645,9 @@ class RoastService:
             with contextlib.suppress(asyncio.CancelledError):
                 await expiry_task
         executor = self._fault_control_executor
-        if executor is not None and not await executor.settle_audit_tasks():
-            _log.error("fault-control audit tasks did not settle during shutdown")
+        if executor is not None and not await executor.settle_for_shutdown():
+            self._fault_control_audit_shutdown_clean = False
+            _log.error("fault-control dispatch or audit tasks did not settle during shutdown")
         await self._store.clear_unclaimed_bean_sourcing_drafts(owner_instance_id=self.instance_id)
 
     async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
@@ -4684,6 +4690,8 @@ class RoastService:
         Any uncertainty leaves the durable marker unclean for the successor.
         """
         if not self._requires_live_restart_clearance or not self._restart_epoch_initialized:
+            return
+        if not self._fault_control_audit_shutdown_clean:
             return
         if self._restart_clearance_state is not RestartClearanceState.CLEARED:
             return

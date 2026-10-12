@@ -182,6 +182,7 @@ async def test_terminal_fault_write_persists_linked_admission_and_failure_trace(
             is_current_generation=lambda: True,
         )
 
+    assert await executor.settle_audit_tasks()
     timeline = await store.read_timeline(run_id)
     assert len(timeline.safety_evaluations) == 1
     assert len(timeline.commands) == 1
@@ -193,6 +194,109 @@ async def test_terminal_fault_write_persists_linked_admission_and_failure_trace(
         "confirmation": "unconfirmed",
         "dispatch": "failed",
     }
+
+
+@pytest.mark.asyncio
+async def test_routine_fault_control_refuses_write_when_admission_trace_fails(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A routine exact-session command cannot reach MCP without durable admission."""
+    run_id = "routine-admission-failure"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    port = _FaultPort()
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), port, trace_sink=store)
+
+    async def fail_admission(*, run_id: str, evaluation: SafetyEvaluation) -> int:
+        raise RuntimeError("synthetic admission persistence failure")
+
+    monkeypatch.setattr(store, "record_fault_control_evaluation", fail_admission)
+
+    assert (
+        await executor.execute(
+            OperatorAction.DROP_BEANS,
+            "fault-session",
+            run_id=run_id,
+            is_current_generation=lambda: True,
+        )
+        is None
+    )
+    assert port.writes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("port", "expected"),
+    [
+        (
+            _FaultPort(fail_write=True),
+            {"dispatch": "write_failed", "confirmation": "not_attempted"},
+        ),
+    ],
+)
+async def test_estop_trace_distinguishes_write_failure(
+    store: RoastStore, port: _FaultPort, expected: dict[str, str]
+) -> None:
+    """A failed emergency write is not reported as a failed readback."""
+    run_id = "estop-write-failure"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), port, trace_sink=store)
+
+    with pytest.raises(RuntimeError, match="synthetic fault-control write failure"):
+        await executor.execute(
+            OperatorAction.EMERGENCY_STOP,
+            "fault-session",
+            run_id=run_id,
+            is_current_generation=lambda: True,
+        )
+
+    assert await executor.settle_audit_tasks()
+    command = (await store.read_timeline(run_id)).commands[0]
+    assert command.result is not None
+    assert {key: command.result[key] for key in expected} == expected
+
+
+@pytest.mark.asyncio
+async def test_estop_trace_distinguishes_readback_failure(store: RoastStore) -> None:
+    """A dispatched emergency write records a later exact-state read failure separately."""
+
+    class ReadbackFailurePort(_FaultPort):
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            raise RuntimeError("synthetic e-stop readback failure")
+
+    run_id = "estop-readback-failure"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    executor = FaultControlExecutor(
+        SafetyPolicy(SafetyLimits()), ReadbackFailurePort(), trace_sink=store
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic e-stop readback failure"):
+        await executor.execute(
+            OperatorAction.EMERGENCY_STOP,
+            "fault-session",
+            run_id=run_id,
+            is_current_generation=lambda: True,
+        )
+
+    assert await executor.settle_audit_tasks()
+    command = (await store.read_timeline(run_id)).commands[0]
+    assert command.result is not None
+    assert command.result["dispatch"] == "completed"
+    assert command.result["confirmation"] == "readback_failed"
 
 
 @pytest.mark.asyncio
@@ -389,6 +493,59 @@ async def test_shutdown_settles_terminal_estop_audit(store: RoastStore) -> None:
     await service.shutdown()
 
     assert result.result == "confirmed"
+    timeline = await store.read_timeline(run_id)
+    assert timeline.commands[-1].tool.value == "emergency_stop"
+    assert timeline.commands[-1].status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_inflight_terminal_estop_then_drains_audit(
+    store: RoastStore,
+) -> None:
+    """Ordered shutdown sees an audit created by an already-admitted e-stop worker."""
+
+    class BlockingEStopPort(_FaultPort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.write_entered = asyncio.Event()
+            self.release_write = asyncio.Event()
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            self.writes.append(action)
+            if action is OperatorAction.EMERGENCY_STOP:
+                self.write_entered.set()
+                await self.release_write.wait()
+
+    run_id = "inflight-estop-shutdown"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    port = BlockingEStopPort()
+    service = RoastService(store, roaster=cast(RoasterControl, port), run_loop=False)
+    executor = service._fault_control_executor  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - owned integration seam
+    assert executor is not None
+    dispatch = asyncio.create_task(
+        executor.execute(
+            OperatorAction.EMERGENCY_STOP,
+            "fault-session",
+            run_id=run_id,
+            is_current_generation=lambda: True,
+        )
+    )
+    await asyncio.wait_for(port.write_entered.wait(), timeout=1.0)
+    shutdown = asyncio.create_task(service.shutdown())
+    await asyncio.sleep(0)
+    assert not shutdown.done()
+
+    port.release_write.set()
+    assert await asyncio.wait_for(dispatch, timeout=1.0) is not None
+    await asyncio.wait_for(shutdown, timeout=1.0)
+
     timeline = await store.read_timeline(run_id)
     assert timeline.commands[-1].tool.value == "emergency_stop"
     assert timeline.commands[-1].status == "ok"
