@@ -32,9 +32,10 @@ async def test_close_proof_waiter_fails_when_estop_revokes_its_reservation() -> 
     assert arbiter._condition._waiters  # pyright: ignore[reportPrivateUsage] - race point proof
 
     arbiter.admit_emergency_stop()
-    release_routine.set()
+    await arbiter.cancel_emergency_stop_admission()
 
     assert not await asyncio.wait_for(waiting_for_proof, timeout=1.0)
+    release_routine.set()
     assert await asyncio.wait_for(running, timeout=1.0) == (True, None)
 
 
