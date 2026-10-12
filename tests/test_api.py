@@ -476,6 +476,27 @@ async def test_global_estop_uses_open_exact_terminal_lease_despite_historical_ac
 
 
 @pytest.mark.asyncio
+async def test_global_estop_uses_open_exact_terminal_lease_without_live_markers(
+    store: RoastStore,
+) -> None:
+    """An idle service still routes a retained OPEN lease to its exact session."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _run_id = await _terminal_fault_control_service(store, mcp)
+    assert service.active_run_id is None
+    assert service._starting_run_id is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+
+    assert result.result == "confirmed"
+    assert (
+        "fault_control",
+        {"action": "emergency_stop", "expected_session_id": "session-1"},
+    ) in mcp.calls
+
+
+@pytest.mark.asyncio
 async def test_finalized_runner_does_not_reuse_closed_terminal_session_after_identity_changes(
     store: RoastStore,
 ) -> None:
