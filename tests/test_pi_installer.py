@@ -16,6 +16,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -686,7 +688,6 @@ def installer_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Path, Path]
     return _build_installer_harness(tmp_path)
 
 
-@pytest.mark.serial
 def test_installer_harness_drops_ambient_fake_command_configuration(
     monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> None:
@@ -701,15 +702,14 @@ def test_installer_harness_drops_ambient_fake_command_configuration(
     assert "FAKE_HOSTNAME_QUERY_FAILURE" not in log.read_text().splitlines()
 
 
-def _run(
+def _installer_argv_and_environment(
     environment: dict[str, str],
     *args: str,
     yes: bool = True,
-    stdin: str | None = "input",
     script: Path = INSTALLER,
     xtrace: bool = False,
-    cwd: Path | None = None,
-) -> subprocess.CompletedProcess[str]:
+) -> tuple[list[str], dict[str, str]]:
+    """Return the exact installer argv and filtered child environment used by ``_run``."""
     allowed_installer_inputs = {
         "ROASTPILOT_INSTALL_TEST_MODE",
         "ROASTPILOT_INSTALL_TEST_ROOT",
@@ -738,7 +738,7 @@ def _run(
             or (allow_ambient_secret and key in ambient_secret_names)
         )
     }
-    return subprocess.run(
+    return (
         [
             "bash",
             *(["-x"] if xtrace else []),
@@ -750,13 +750,419 @@ def _run(
             "USB mic",
             *args,
         ],
-        env=environment,
+        environment,
+    )
+
+
+def _run(
+    environment: dict[str, str],
+    *args: str,
+    yes: bool = True,
+    stdin: str | None = "input",
+    script: Path = INSTALLER,
+    xtrace: bool = False,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run the installer with the harness's filtered child environment."""
+    argv, child_environment = _installer_argv_and_environment(
+        environment, *args, yes=yes, script=script, xtrace=xtrace
+    )
+    return subprocess.run(
+        argv,
+        env=child_environment,
         input=stdin,
         text=True,
         capture_output=True,
         check=False,
         cwd=cwd,
     )
+
+
+@dataclass(frozen=True)
+class _OverlapRun:
+    """Capture one completed synthetic installer run for leak checking."""
+
+    base: Path
+    environment: dict[str, str] = field(repr=False)
+    log: Path
+    hostname: Path
+    hostname_value: str
+    port: str
+    api_key: str = field(repr=False)
+    rendezvous_self: str
+    rendezvous_peer: str
+    stdout: str = field(repr=False)
+    stderr: str = field(repr=False)
+
+
+def _raise_if_present(present: bool, artifact: str, kind: str) -> None:
+    """Raise without accepting or interpolating a sensitive matched value."""
+    if present:
+        raise AssertionError(f"peer {kind} leaked to {artifact}")
+
+
+def _assert_no_cross_run_leak(own: _OverlapRun, peer: _OverlapRun) -> None:
+    """Assert own output is complete and peer identifiers appear nowhere in it."""
+    hostname_matches = own.hostname.read_text().strip() == own.hostname_value
+    if not hostname_matches:
+        raise AssertionError("own hostname is missing from hostname artefact")
+
+    root = Path(own.environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    environment_file = root / "etc/roastpilot-agent/roastpilot-agent.env"
+    environment_text = environment_file.read_text()
+    own_port_present = f"PORT={own.port}" in environment_text
+    if not own_port_present:
+        raise AssertionError("own port is missing from environment artefact")
+    own_key_present = f"OPENROUTER_API_KEY={own.api_key}" in environment_text
+    if not own_key_present:
+        raise AssertionError("own API key is missing from environment artefact")
+    environment_mode_is_private = stat.S_IMODE(environment_file.stat().st_mode) == 0o600
+    if not environment_mode_is_private:
+        raise AssertionError("environment artefact does not have mode 0600")
+    rendezvous_marker = f"FAKE_RENDEZVOUS_MET {own.rendezvous_self} {own.rendezvous_peer}"
+    own_marker_count = own.log.read_text().splitlines().count(rendezvous_marker)
+    if own_marker_count != 1:
+        raise AssertionError("own rendezvous marker is missing or repeated")
+
+    peer_values = (
+        (str(peer.base), "base path"),
+        (peer.hostname_value, "hostname"),
+        (peer.api_key, "API key"),
+        (f"PORT={peer.port}", "port token"),
+    )
+    text_artefacts = (
+        ("stdout", own.stdout),
+        ("stderr", own.stderr),
+        ("command log", own.log.read_text()),
+        ("pipx environment log", Path(own.environment["FAKE_PIPX_ENV_LOG"]).read_text()),
+    )
+    for artifact, text in text_artefacts:
+        for value, kind in peer_values:
+            _raise_if_present(value in text, artifact, kind)
+
+    for directory, directories, files in os.walk(own.base, followlinks=False):
+        for name in [*directories, *files]:
+            path = Path(directory) / name
+            mode = os.lstat(path).st_mode
+            if stat.S_ISLNK(mode):
+                target = os.readlink(path)
+                for value, kind in peer_values:
+                    _raise_if_present(value in target, "symlink target", kind)
+            elif stat.S_ISREG(mode):
+                contents = path.read_bytes()
+                for value, kind in peer_values:
+                    _raise_if_present(value.encode() in contents, "regular file", kind)
+
+
+def _oracle_run(tmp_path: Path, name: str, *, port: str, api_key: str) -> _OverlapRun:
+    """Build a no-installer synthetic run artefact for leak-oracle negatives."""
+    base = tmp_path / name
+    base.mkdir()
+    root = base / "root"
+    environment_file = root / "etc/roastpilot-agent/roastpilot-agent.env"
+    environment_file.parent.mkdir(parents=True)
+    environment_file.write_text(f"PORT={port}\nOPENROUTER_API_KEY={api_key}\n")
+    environment_file.chmod(0o600)
+    hostname_value = f"host-{name}"
+    hostname = base / "hostname"
+    hostname.write_text(f"{hostname_value}\n")
+    log = base / "commands.log"
+    log.write_text(f"FAKE_RENDEZVOUS_MET marker-{name} peer-{name}\n")
+    pipx_log = base / "pipx.log"
+    pipx_log.write_text("HOME=<synthetic>\n")
+    return _OverlapRun(
+        base=base,
+        environment={
+            "ROASTPILOT_INSTALL_TEST_ROOT": str(root),
+            "FAKE_PIPX_ENV_LOG": str(pipx_log),
+        },
+        log=log,
+        hostname=hostname,
+        hostname_value=hostname_value,
+        port=port,
+        api_key=api_key,
+        rendezvous_self=f"marker-{name}",
+        rendezvous_peer=f"peer-{name}",
+        stdout="",
+        stderr="",
+    )
+
+
+def _reap_owned_process(process: subprocess.Popen[str]) -> tuple[str, str]:
+    """Terminate and drain one test-owned child when it has not exited."""
+    if process.poll() is None:
+        process.terminate()
+    try:
+        return process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return process.communicate(timeout=5)
+
+
+def test_two_installer_runs_overlap_without_cross_run_leaks(tmp_path: Path) -> None:
+    """Two fake installer runs overlap at hostname setup without leaking artefacts."""
+    parent = tmp_path / "parallel-parent"
+    parent.mkdir()
+    alpha_base = parent / "alpha-run"
+    beta_base = parent / "beta-run"
+    alpha_base.mkdir()
+    beta_base.mkdir()
+    rendezvous = parent / "rendezvous"
+    rendezvous.mkdir()
+    alpha_fake, alpha_environment, alpha_log, alpha_hostname = _build_installer_harness(alpha_base)
+    beta_fake, beta_environment, beta_log, beta_hostname = _build_installer_harness(beta_base)
+    alpha = {
+        "hostname": "host-alpha-z9",
+        "port": "43111",
+        "key": "KEY_ALPHA_Q7",
+        "self": "barrier-alpha",
+        "peer": "barrier-beta",
+    }
+    beta = {
+        "hostname": "host-beta-k4",
+        "port": "43222",
+        "key": "KEY_BETA_M3",
+        "self": "barrier-beta",
+        "peer": "barrier-alpha",
+    }
+    tokens = {
+        *alpha.values(),
+        *beta.values(),
+        str(alpha_base),
+        str(beta_base),
+        f"PORT={alpha['port']}",
+        f"PORT={beta['port']}",
+    }
+    assert all(token not in alpha_fake.read_text() for token in tokens)
+    assert all(token not in beta_fake.read_text() for token in tokens)
+    assert alpha["hostname"] != "old-host" and beta["hostname"] != "old-host"
+    assert all(
+        left not in right
+        for left, right in (
+            (alpha["hostname"], beta["hostname"]),
+            (beta["hostname"], alpha["hostname"]),
+            (alpha["key"], beta["key"]),
+            (beta["key"], alpha["key"]),
+        )
+    )
+
+    alpha_argv, alpha_child_environment = _installer_argv_and_environment(
+        alpha_environment
+        | {
+            "ROASTPILOT_INSTALL_API_KEY": alpha["key"],
+            "FAKE_RENDEZVOUS_DIR": str(rendezvous),
+            "FAKE_RENDEZVOUS_SELF": alpha["self"],
+            "FAKE_RENDEZVOUS_PEER": alpha["peer"],
+        },
+        "--set-hostname",
+        alpha["hostname"],
+        "--port",
+        alpha["port"],
+    )
+    beta_argv, beta_child_environment = _installer_argv_and_environment(
+        beta_environment
+        | {
+            "ROASTPILOT_INSTALL_API_KEY": beta["key"],
+            "FAKE_RENDEZVOUS_DIR": str(rendezvous),
+            "FAKE_RENDEZVOUS_SELF": beta["self"],
+            "FAKE_RENDEZVOUS_PEER": beta["peer"],
+        },
+        "--set-hostname",
+        beta["hostname"],
+        "--port",
+        beta["port"],
+    )
+    processes: list[subprocess.Popen[str]] = []
+    outputs: dict[subprocess.Popen[str], tuple[str, str]] = {}
+    try:
+        alpha_process = subprocess.Popen(
+            alpha_argv,
+            env=alpha_child_environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        processes.append(alpha_process)
+        beta_process = subprocess.Popen(
+            beta_argv,
+            env=beta_child_environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        processes.append(beta_process)
+        deadline = time.monotonic() + 35
+        markers = (rendezvous / alpha["self"], rendezvous / beta["self"])
+        while not all(marker.exists() for marker in markers):
+            if time.monotonic() >= deadline:
+                raise AssertionError("installer runs did not both reach the hostname barrier")
+            time.sleep(0.01)
+        assert alpha_process.poll() is None and beta_process.poll() is None
+        assert {path.name for path in parent.iterdir()} == {
+            alpha_base.name,
+            beta_base.name,
+            rendezvous.name,
+        }
+        assert {path.name for path in rendezvous.iterdir()} == {alpha["self"], beta["self"]}
+        outputs[alpha_process] = alpha_process.communicate(input="input", timeout=35)
+        outputs[beta_process] = beta_process.communicate(input="input", timeout=35)
+        assert alpha_process.returncode == 0
+        assert beta_process.returncode == 0
+        assert {path.name for path in parent.iterdir()} == {
+            alpha_base.name,
+            beta_base.name,
+            rendezvous.name,
+        }
+        assert {path.name for path in rendezvous.iterdir()} == {alpha["self"], beta["self"]}
+        alpha_run = _OverlapRun(
+            alpha_base,
+            alpha_environment,
+            alpha_log,
+            alpha_hostname,
+            alpha["hostname"],
+            alpha["port"],
+            alpha["key"],
+            alpha["self"],
+            alpha["peer"],
+            *outputs[alpha_process],
+        )
+        beta_run = _OverlapRun(
+            beta_base,
+            beta_environment,
+            beta_log,
+            beta_hostname,
+            beta["hostname"],
+            beta["port"],
+            beta["key"],
+            beta["self"],
+            beta["peer"],
+            *outputs[beta_process],
+        )
+        _assert_no_cross_run_leak(alpha_run, beta_run)
+        _assert_no_cross_run_leak(beta_run, alpha_run)
+    finally:
+        for process in processes:
+            if process not in outputs:
+                outputs[process] = _reap_owned_process(process)
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "peer-root-log",
+        "peer-key-stderr",
+        "peer-hostname-file",
+        "peer-root-symlink",
+        "missing-own-hostname",
+        "missing-own-port",
+        "missing-own-key",
+        "missing-rendezvous",
+    ),
+)
+def test_cross_run_leak_oracle_rejects_synthetic_leaks(tmp_path: Path, case: str) -> None:
+    """The leak oracle rejects peer artefacts and incomplete own output without echoing keys."""
+    own = _oracle_run(tmp_path, "own-zebra", port="43111", api_key="KEY_OWN_T9")
+    peer = _oracle_run(tmp_path, "peer-lantern", port="43222", api_key="KEY_PEER_R2")
+    if case == "peer-root-log":
+        own.log.write_text(f"record {peer.base}\n")
+    elif case == "peer-key-stderr":
+        own = _OverlapRun(**{**own.__dict__, "stderr": f"failure {peer.api_key}"})
+    elif case == "peer-hostname-file":
+        (own.base / "artefact").write_text(peer.hostname_value)
+    elif case == "peer-root-symlink":
+        (own.base / "peer-link").symlink_to(peer.base)
+    elif case == "missing-own-hostname":
+        own.hostname.write_text("wrong\n")
+    elif case == "missing-own-port":
+        environment_file = (
+            Path(own.environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+            / "etc/roastpilot-agent/roastpilot-agent.env"
+        )
+        environment_file.write_text(f"OPENROUTER_API_KEY={own.api_key}\n")
+    elif case == "missing-own-key":
+        environment_file = (
+            Path(own.environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+            / "etc/roastpilot-agent/roastpilot-agent.env"
+        )
+        environment_file.write_text(f"PORT={own.port}\n")
+    else:
+        own.log.write_text("")
+
+    with pytest.raises(AssertionError) as raised:
+        _assert_no_cross_run_leak(own, peer)
+    message = str(raised.value)
+    assert own.api_key not in message
+    assert peer.api_key not in message
+
+
+def test_hostname_rendezvous_timeout_and_inert_timeout_setting(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """The hostname hook times out only for a complete active rendezvous triple."""
+    _, environment, log, hostname = installer_harness
+    inert = _run(
+        environment | {"FAKE_RENDEZVOUS_TIMEOUT_SECONDS": "1"},
+        "--set-hostname",
+        "inert-host-z9",
+    )
+    assert inert.returncode == 0
+    assert hostname.read_text().strip() == "inert-host-z9"
+    assert not any(line.startswith("FAKE_RENDEZVOUS") for line in log.read_text().splitlines())
+    rendezvous = tmp_path / "timeout-rendezvous"
+    rendezvous.mkdir()
+    timed_out = _run(
+        environment
+        | {
+            "FAKE_RENDEZVOUS_DIR": str(rendezvous),
+            "FAKE_RENDEZVOUS_SELF": "timeout-self",
+            "FAKE_RENDEZVOUS_PEER": "timeout-peer",
+            "FAKE_RENDEZVOUS_TIMEOUT_SECONDS": "1",
+        },
+        "--set-hostname",
+        "timeout-host-k4",
+    )
+    assert timed_out.returncode == 64
+    assert "FAKE_RENDEZVOUS_TIMEOUT timeout-self" in log.read_text().splitlines()
+
+
+@pytest.mark.parametrize(
+    ("directory", "self_name", "peer_name"),
+    (
+        (None, None, "peer"),
+        ("directory", "self", None),
+        ("", None, None),
+        ("", "", None),
+        ("directory", "", "peer"),
+        ("", "self", "peer"),
+        ("directory", "self", ""),
+        ("", "", ""),
+        ("", "self", ""),
+    ),
+)
+def test_hostname_rendezvous_rejects_partial_or_empty_triples(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    tmp_path: Path,
+    directory: str | None,
+    self_name: str | None,
+    peer_name: str | None,
+) -> None:
+    """A partial or explicitly empty rendezvous triple fails closed."""
+    _, environment, log, _ = installer_harness
+    rendezvous = tmp_path / "partial-rendezvous"
+    rendezvous.mkdir()
+    values = {
+        "FAKE_RENDEZVOUS_DIR": (
+            None if directory is None else (str(rendezvous) if directory else "")
+        ),
+        "FAKE_RENDEZVOUS_SELF": self_name,
+        "FAKE_RENDEZVOUS_PEER": peer_name,
+    }
+    override = {key: value for key, value in values.items() if value is not None}
+    rejected = _run(environment | override, "--set-hostname", "partial-host-m3")
+    assert rejected.returncode == 65
+    assert "FAKE_RENDEZVOUS_CONFIG_INVALID" in log.read_text().splitlines()
 
 
 def _delta(log: Path, start: int) -> list[str]:
@@ -889,7 +1295,7 @@ def _has_fake_install_for_path(events: list[str], expected_path: str) -> bool:
     )
 
 
-@pytest.mark.serial
+@pytest.mark.serial  # C3: fixed two-second framing rendezvous bounds.
 def test_fake_log_framing_is_deterministic_under_two_writers(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -905,7 +1311,7 @@ def test_fake_log_framing_is_deterministic_under_two_writers(
     _assert_closed_fake_log_grammar(repaired, {path.name for path in fake_bin.iterdir()})
 
 
-@pytest.mark.serial
+@pytest.mark.serial  # C3: fixed two-second framing rendezvous bounds.
 def test_framing_writer_closes_all_popen_pipes(
     installer_harness: tuple[Path, dict[str, str], Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -930,7 +1336,7 @@ def test_framing_writer_closes_all_popen_pipes(
     assert process.stderr is not None and process.stderr.closed
 
 
-@pytest.mark.serial
+@pytest.mark.serial  # C3: fixed two-second framing rendezvous bounds.
 def test_fake_log_grammar_fails_closed_for_forced_concurrency(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -965,7 +1371,7 @@ def test_fake_log_grammar_fails_closed_for_forced_concurrency(
             process.wait(timeout=2.0)
 
 
-@pytest.mark.serial
+@pytest.mark.serial  # C1: allocates host file descriptors above the legacy select ceiling.
 def test_framing_writer_wait_supports_a_high_pipe_descriptor() -> None:
     """Keep the framing rendezvous independent of the legacy select descriptor ceiling."""
     legacy_select_fd_limit = 1024
@@ -1097,7 +1503,6 @@ def test_roastpilot_lifecycle_matcher_catches_service_unit_spelling() -> None:
         )
 
 
-@pytest.mark.serial
 def test_absent_pipx_is_installed_by_apt_before_first_application_install(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -1157,7 +1562,6 @@ def _pipx_state(path: Path, version: str, package: str) -> None:
     )
 
 
-@pytest.mark.serial
 def test_real_renderer_outputs_pass_the_installer_closed_contract(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1249,7 +1653,6 @@ def test_installer_model_identity_is_tied_to_the_manifest() -> None:
         assert manifest_file.sha256 in source
 
 
-@pytest.mark.serial  # The subprocess installer shares fake PATH command state.
 def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -1350,7 +1753,6 @@ def test_installer_full_run_is_idempotent_and_keeps_secret_protected(
     assert not any("systemctl <start>" in line for line in second_commands)
 
 
-@pytest.mark.serial  # The subprocess installer shares fake PATH command state.
 def test_preflight_failures_happen_before_privileged_commands(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -1378,7 +1780,6 @@ def test_preflight_failures_happen_before_privileged_commands(
     assert no_tty.returncode != 0
 
 
-@pytest.mark.serial  # The subprocess installer shares fake PATH command state.
 def test_hostname_consent_start_and_failure_abort_before_service_enable(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -1433,7 +1834,6 @@ def test_hostname_consent_start_and_failure_abort_before_service_enable(
     assert not stage.exists()
 
 
-@pytest.mark.serial  # A truncated subprocess must not share fake command state.
 def test_truncated_or_mutated_script_has_no_privileged_effect(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -1460,7 +1860,6 @@ def test_truncated_or_mutated_script_has_no_privileged_effect(
     assert not log.exists()
 
 
-@pytest.mark.serial  # Real subprocesses share one fake-command state and install root.
 def test_rooted_staging_and_hostile_inputs_do_not_escape(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -1489,7 +1888,6 @@ def test_rooted_staging_and_hostile_inputs_do_not_escape(
     )
 
 
-@pytest.mark.serial  # A hostile destination is exercised in its own fake root.
 def test_destination_symlink_aborts_before_final_writes(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -1506,7 +1904,6 @@ def test_destination_symlink_aborts_before_final_writes(
     assert not _has_service_mutation(log.read_text().splitlines())
 
 
-@pytest.mark.serial  # Hostile arguments run only through the isolated fake PATH.
 def test_hostile_values_are_inert_and_rejected_before_writes(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -1526,7 +1923,6 @@ def test_hostile_values_are_inert_and_rejected_before_writes(
     )
 
 
-@pytest.mark.serial
 def test_wheel_with_a_symlinked_parent_is_rejected_before_installer_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -1551,7 +1947,6 @@ def test_wheel_with_a_symlinked_parent_is_rejected_before_installer_effects(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("identity", "value"), [("FAKE_ID_USER", "Operator"), ("FAKE_ID_GROUP", "operators!")]
 )
@@ -1569,7 +1964,6 @@ def test_unsafe_operator_identity_fails_before_installer_effects(
     )
 
 
-@pytest.mark.serial  # This checks one complete subprocess staging lifecycle.
 def test_staging_only_mutates_and_cleans_the_unique_directory(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -1587,7 +1981,6 @@ def test_staging_only_mutates_and_cleans_the_unique_directory(
     assert not stage.exists()
 
 
-@pytest.mark.serial  # Each mutation executes the real harness in a fresh test root.
 @pytest.mark.parametrize(
     ("needle", "replacement", "arguments", "environment_key", "oracle"),
     [
@@ -1699,7 +2092,6 @@ def test_contract_mutation_oracles_detect_removed_guards(
         assert "mutation-secret" in result.stdout
 
 
-@pytest.mark.serial  # The truncated copy must use an isolated fake-command log.
 def test_trailing_main_mutation_is_detected_by_truncation_oracle(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -1729,7 +2121,6 @@ def test_trailing_main_mutation_is_detected_by_truncation_oracle(
     assert log.read_text().splitlines() == ["apt-get <install> <--> <g12-oracle>"]
 
 
-@pytest.mark.serial  # Each parametrized subprocess receives a fresh fake state.
 @pytest.mark.parametrize(
     ("selector", "initial", "expected"),
     [
@@ -1788,7 +2179,6 @@ def test_pipx_selector_deltas_are_isolated(
     )
 
 
-@pytest.mark.serial  # pipx child environments are process-local fake state.
 def test_pipx_children_use_only_the_resolved_invoking_home(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -1836,7 +2226,6 @@ def test_pipx_children_use_only_the_resolved_invoking_home(
     assert [line.split()[1] for line in pipx_events].count("<environment>") == 2
 
 
-@pytest.mark.serial  # Failure behaviour needs an isolated fake command log.
 @pytest.mark.parametrize("state", ["fail", "malformed", "bad-metadata"])
 def test_invalid_pipx_state_fails_before_destructive_or_privileged_work(
     installer_harness: tuple[Path, dict[str, str], Path, Path], state: str
@@ -1858,7 +2247,6 @@ def test_invalid_pipx_state_fails_before_destructive_or_privileged_work(
     assert not _has_service_mutation(events.splitlines())
 
 
-@pytest.mark.serial  # Executable provenance mutates the isolated fake command path.
 def test_full_flow_has_exact_key_order_and_no_real_command_resolution(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -1923,7 +2311,6 @@ def test_full_flow_has_exact_key_order_and_no_real_command_resolution(
         assert Path(resolved.stdout.strip()).parent == fake_bin
 
 
-@pytest.mark.serial  # Help executes the installer parser in a dedicated process.
 def test_help_exits_before_required_arguments_or_preflight(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -1940,7 +2327,6 @@ def test_help_exits_before_required_arguments_or_preflight(
     assert not log.exists()
 
 
-@pytest.mark.serial
 def test_repair_inputs_are_rejected_before_privileged_work(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -1982,7 +2368,6 @@ def test_repair_inputs_are_rejected_before_privileged_work(
     assert f"<--from-dir> <{source}>" in log.read_text()
 
 
-@pytest.mark.serial
 def test_unsupported_equals_form_api_key_never_echoes_its_value(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -1995,7 +2380,6 @@ def test_unsupported_equals_form_api_key_never_echoes_its_value(
     assert sentinel not in output
 
 
-@pytest.mark.serial
 def test_secret_template_and_no_key_summary_fail_closed(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -2030,7 +2414,6 @@ def test_secret_template_and_no_key_summary_fail_closed(
     assert "two" not in bad.stdout + bad.stderr + log.read_text()
 
 
-@pytest.mark.serial
 def test_fake_log_executable_match_ignores_installer_named_temp_paths(tmp_path: Path) -> None:
     """A fake-log command check never treats a path substring as the executable."""
 
@@ -2041,7 +2424,6 @@ def test_fake_log_executable_match_ignores_installer_named_temp_paths(tmp_path: 
     assert not _has_fake_install_for_path([event], logged_path)
 
 
-@pytest.mark.serial
 def test_rendered_unit_and_atomic_env_repairs_fail_before_live_writes(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -2079,7 +2461,6 @@ def test_rendered_unit_and_atomic_env_repairs_fail_before_live_writes(
     assert result.returncode != 0 and env_file.read_bytes() == before
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("field", "mutation"),
     [
@@ -2106,7 +2487,6 @@ def test_unit_and_env_comment_or_continuation_mutations_fail_closed(
     assert not _has_service_mutation(_delta(log, start))
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     "relative",
     [
@@ -2161,7 +2541,6 @@ def test_all_systemd_dropin_locations_refuse_before_unit_write_or_enable(
     )
 
 
-@pytest.mark.serial
 def test_dropin_recheck_blocks_enablement_after_configuration_promotion(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -2179,7 +2558,6 @@ def test_dropin_recheck_blocks_enablement_after_configuration_promotion(
     assert not any(event.startswith("systemctl <enable>") for event in events)
 
 
-@pytest.mark.serial
 def test_managed_etc_recheck_rejects_a_swapped_parent_before_configuration_promotion(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -2213,7 +2591,6 @@ def test_managed_etc_recheck_rejects_a_swapped_parent_before_configuration_promo
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_managed_state_recheck_rejects_a_swapped_parent_before_ownership_change(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -2245,7 +2622,6 @@ def test_managed_state_recheck_rejects_a_swapped_parent_before_ownership_change(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_model_parent_recheck_rejects_a_swapped_parent_before_promotion(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -2275,7 +2651,6 @@ def test_model_parent_recheck_rejects_a_swapped_parent_before_promotion(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_model_staging_parent_recheck_blocks_mktemp_model_render_and_configuration(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -2306,7 +2681,6 @@ def test_model_staging_parent_recheck_blocks_mktemp_model_render_and_configurati
     assert not any(event.startswith(("tee ", "mv ")) and "/etc/" in event for event in events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("boundary", ["etc", "var", "model"])
 def test_directory_recheck_blocks_post_ownership_swap_before_mode_or_promotion(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, boundary: str
@@ -2355,7 +2729,6 @@ def test_directory_recheck_blocks_post_ownership_swap_before_mode_or_promotion(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("phase", "probe_count"), [("before-ownership", "4"), ("after-ownership", "5")]
 )
@@ -2409,7 +2782,6 @@ def test_successful_var_unlock_rechecks_after_each_privileged_boundary(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("boundary", "owner", "mode", "probe_count"),
     [
@@ -2467,7 +2839,6 @@ def test_cleanup_rechecks_after_ownership_before_restoring_mode(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("boundary", "owner", "mode", "probe_count"),
     [
@@ -2516,7 +2887,6 @@ def test_indeterminate_locked_cleanup_symlink_probe_fails_closed_and_continues_r
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("boundary", "owner", "mode", "entry_probe", "entry_failure"),
     [
@@ -2565,7 +2935,6 @@ def test_locked_cleanup_entry_failure_names_the_exact_manual_reconciliation_targ
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("boundary", "owner", "mode", "failure"),
     [
@@ -2606,7 +2975,6 @@ def test_locked_cleanup_chown_and_chmod_failures_keep_specific_manual_diagnostic
     assert not _has_roastpilot_agent_lifecycle_mutation(log.read_text().splitlines())
 
 
-@pytest.mark.serial
 def test_hostname_change_failure_keeps_hostname_and_names_manual_recovery_file(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -2622,7 +2990,6 @@ def test_hostname_change_failure_keeps_hostname_and_names_manual_recovery_file(
     assert "systemctl <enable> <--now> <avahi-daemon>" in log.read_text().splitlines()
 
 
-@pytest.mark.serial
 def test_successful_rollback_preserves_the_original_non_one_failure_status(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -2633,7 +3000,6 @@ def test_successful_rollback_preserves_the_original_non_one_failure_status(
     assert "systemctl <enable> <--now> <avahi-daemon>" in log.read_text().splitlines()
 
 
-@pytest.mark.serial
 def test_model_digests_cover_stage_root_snapshot_and_destination(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -2667,7 +3033,6 @@ def test_model_digests_cover_stage_root_snapshot_and_destination(
         assert sum(temporary in line for line in digests) == 1
 
 
-@pytest.mark.serial
 def test_fake_sha256sum_uses_bound_interpreter_and_distinguishes_non_model_content(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -2712,7 +3077,6 @@ def test_fake_sha256sum_uses_bound_interpreter_and_distinguishes_non_model_conte
     assert not hostile_marker.exists()
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("target", "diagnostic"),
     [
@@ -2753,7 +3117,6 @@ def test_digest_corruption_is_detected_and_cleaned_up(
     assert any(event.startswith("rm <-rf>") and "roastpilot-install" in event for event in events)
 
 
-@pytest.mark.serial
 def test_root_temp_is_cleaned_after_atomic_write_failure(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -2769,7 +3132,6 @@ def test_root_temp_is_cleaned_after_atomic_write_failure(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(("failure", "status"), [("chown", 47), ("chmod", 23)])
 def test_validated_stage_directory_failures_are_cleanup_accounted(
     installer_harness: tuple[Path, dict[str, str], Path, Path], failure: str, status: int
@@ -2795,7 +3157,6 @@ def test_validated_stage_directory_failures_are_cleanup_accounted(
     assert not stage.exists()
 
 
-@pytest.mark.serial
 def test_unvalidated_stage_path_is_reported_without_recursive_cleanup(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -2820,7 +3181,6 @@ def test_unvalidated_stage_path_is_reported_without_recursive_cleanup(
     assert f"rm <-rf> <--> <{unexpected}>" not in events
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("template", "diagnostic"),
     [
@@ -2857,7 +3217,6 @@ def test_untrusted_root_temporary_is_not_registered_for_cleanup(
     assert f"mv <-f> <--> <{unexpected}>" not in events
 
 
-@pytest.mark.serial
 def test_failed_registered_temporary_removal_requires_manual_reconciliation_without_secret_leak(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -2890,7 +3249,6 @@ def test_failed_registered_temporary_removal_requires_manual_reconciliation_with
     assert secret not in result.stdout + result.stderr + log.read_text()
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("retained", ["stage", "restore"])
 def test_retained_cleanup_directory_requires_manual_reconciliation_and_continues(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, retained: str
@@ -2944,7 +3302,6 @@ def test_retained_cleanup_directory_requires_manual_reconciliation_and_continues
     assert secret not in result.stdout + result.stderr + log.read_text()
 
 
-@pytest.mark.serial
 def test_failed_root_lock_restores_operator_access_in_cleanup(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -2975,7 +3332,6 @@ def test_failed_root_lock_restores_operator_access_in_cleanup(
     assert stat.S_IMODE(var_dir.stat().st_mode) == 0o700
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("failure", "status"),
     [("chown", 47), ("chmod", 23)],
@@ -3014,7 +3370,6 @@ def test_cleanup_managed_directory_restore_failure_requires_manual_reconciliatio
     assert "FAKE_HOSTNAME_VERIFY_FAILURE" in events
 
 
-@pytest.mark.serial
 def test_repaired_input_bounds_and_test_mode_are_fail_closed(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3033,7 +3388,6 @@ def test_repaired_input_bounds_and_test_mode_are_fail_closed(
     assert not log.exists()
 
 
-@pytest.mark.serial
 def test_ambiguous_serial_port_double_at_has_an_exact_diagnostic(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3051,7 +3405,6 @@ def test_ambiguous_serial_port_double_at_has_an_exact_diagnostic(
     assert not log.exists()
 
 
-@pytest.mark.serial
 def test_arbitrarily_long_decimal_port_fails_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3063,7 +3416,6 @@ def test_arbitrarily_long_decimal_port_fails_before_effects(
     assert not log.exists()
 
 
-@pytest.mark.serial
 def test_zero_padded_port_fails_before_bash_arithmetic_or_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3076,7 +3428,6 @@ def test_zero_padded_port_fails_before_bash_arithmetic_or_effects(
     assert not log.exists()
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("port", ["1024", "65535"])
 def test_port_range_endpoints_are_inclusive_and_reach_rendered_environment(
     installer_harness: tuple[Path, dict[str, str], Path, Path], port: str
@@ -3092,7 +3443,6 @@ def test_port_range_endpoints_are_inclusive_and_reach_rendered_environment(
     assert f"PORT={port}\n" in env_file.read_text()
 
 
-@pytest.mark.serial
 def test_test_command_directory_rejects_symlink_noncanonical_and_earlier_path_shadow(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -3130,7 +3480,6 @@ def test_test_command_directory_rejects_symlink_noncanonical_and_earlier_path_sh
     assert not rogue_marker.exists()
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     "command",
     (
@@ -3179,7 +3528,6 @@ def test_upfront_test_command_ownership_rejects_rogue_command_without_execution(
     assert not log.exists()
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("missing_command", ["systemctl", "cat", "test"])
 def test_test_mode_requires_one_complete_fake_command_directory_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
@@ -3193,7 +3541,6 @@ def test_test_mode_requires_one_complete_fake_command_directory_before_effects(
     assert not log.exists()
 
 
-@pytest.mark.serial
 def test_missing_python3_in_closed_test_path_fails_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -3214,7 +3561,6 @@ def test_missing_python3_in_closed_test_path_fails_before_effects(
     assert not log.exists()
 
 
-@pytest.mark.serial
 def test_children_observe_c_locale_before_fake_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3229,7 +3575,6 @@ def test_children_observe_c_locale_before_fake_effects(
     assert "FAKE_LC_ALL_C" in log.read_text().splitlines()
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     "relative",
     [
@@ -3267,7 +3612,6 @@ def test_additional_systemd_override_locations_fail_before_effects(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("audio_device", ("AA", "111", "mmm"))
 def test_repeated_character_audio_devices_are_accepted_without_edge_whitespace(
     installer_harness: tuple[Path, dict[str, str], Path, Path], audio_device: str
@@ -3299,7 +3643,6 @@ def test_repeated_character_audio_devices_are_accepted_without_edge_whitespace(
         assert rejected.returncode != 0
 
 
-@pytest.mark.serial
 def test_production_mode_rejects_redirected_test_root_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -3326,7 +3669,6 @@ def test_production_mode_rejects_redirected_test_root_before_effects(
     assert not redirected_root.exists()
 
 
-@pytest.mark.serial  # The fake renderer lifecycle is process-scoped.
 def test_yaml_hash_without_preceding_whitespace_is_not_normalised_away(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3341,7 +3683,6 @@ def test_yaml_hash_without_preceding_whitespace_is_not_normalised_away(
     assert not _has_service_mutation((log.read_text() if log.exists() else "").splitlines())
 
 
-@pytest.mark.serial  # This source-only guard has no production command path.
 def test_production_os_release_override_is_not_a_runtime_input() -> None:
     """Only root-free test mode may select an alternate os-release fixture."""
     source = INSTALLER.read_text()
@@ -3351,7 +3692,6 @@ def test_production_os_release_override_is_not_a_runtime_input() -> None:
     )
 
 
-@pytest.mark.serial
 def test_pipx_null_path_and_malicious_path_are_fail_closed_or_ignored(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3372,7 +3712,6 @@ def test_pipx_null_path_and_malicious_path_are_fail_closed_or_ignored(
     assert "PATH_SHADOW" not in result.stdout + result.stderr + log.read_text()
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("state", ["missing", "outside-venv", "not-executable"])
 def test_appliance_executable_provenance_fails_before_model_or_later_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], state: str
@@ -3398,7 +3737,6 @@ def test_appliance_executable_provenance_fails_before_model_or_later_effects(
     assert not _has_service_mutation(events)
 
 
-@pytest.mark.serial
 def test_hostname_and_identity_repairs_are_observable_through_fake_seam(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3436,7 +3774,6 @@ def test_hostname_and_identity_repairs_are_observable_through_fake_seam(
     )
 
 
-@pytest.mark.serial  # The fake hostname and root-free parent are shared state.
 def test_hostname_write_stays_inside_locked_parent_and_abort_recovers_access(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3475,7 +3812,6 @@ def test_hostname_write_stays_inside_locked_parent_and_abort_recovers_access(
     assert prior.read_text() == "old-host\n" and not prior.is_symlink()
 
 
-@pytest.mark.serial  # Renderer mutation cases share the fake command seam.
 def test_closed_renderer_contract_rejects_yaml_mutations_before_etc_writes(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3539,7 +3875,6 @@ audio:
         )
 
 
-@pytest.mark.serial  # The fake model source is process-scoped fixture state.
 def test_model_snapshot_digest_failure_precedes_live_destinations(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3554,7 +3889,6 @@ def test_model_snapshot_digest_failure_precedes_live_destinations(
     assert not (root / "var/lib/roastpilot-agent/models/onnx/int8/model_quantized.onnx").exists()
 
 
-@pytest.mark.serial
 def test_model_promotion_source_cat_failure_preserves_destination_and_cleans_temp(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3591,7 +3925,6 @@ def test_model_promotion_source_cat_failure_preserves_destination_and_cleans_tem
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("injection", "marker", "diagnostic"),
     [
@@ -3635,7 +3968,6 @@ def test_unsafe_staged_members_fail_before_live_promotion(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_promoted_model_files_are_mode_0644(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3650,7 +3982,6 @@ def test_promoted_model_files_are_mode_0644(
     assert stat.S_IMODE((model_dir / "preprocessor_config.json").stat().st_mode) == 0o644
 
 
-@pytest.mark.serial  # API-key cases exercise the same subprocess harness.
 def test_api_key_allowlist_rejects_environmentfile_metacharacters(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3674,7 +4005,6 @@ def test_api_key_allowlist_rejects_environmentfile_metacharacters(
     assert not any("bad" in line for line in log.read_text().splitlines())
 
 
-@pytest.mark.serial  # Nondefault port uses the isolated renderer fake.
 def test_nondefault_port_is_pinned_across_env_and_service(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3689,7 +4019,6 @@ def test_nondefault_port_is_pinned_across_env_and_service(
     )
 
 
-@pytest.mark.serial  # These failure oracles share the fake pipx and service state.
 def test_pipx_provenance_and_capability_fail_before_appliance_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3711,7 +4040,6 @@ def test_pipx_provenance_and_capability_fail_before_appliance_effects(
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
 
 
-@pytest.mark.serial  # Pipx-home variants alter the isolated executable provenance tree.
 def test_pipx_reports_only_canonical_xdg_or_legacy_operator_homes(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3738,7 +4066,6 @@ def test_pipx_reports_only_canonical_xdg_or_legacy_operator_homes(
         assert "roastpilot-agent <appliance" not in log.read_text()
 
 
-@pytest.mark.serial  # Reuse and retained-key checks require one fake installation lifecycle.
 def test_rerun_reuses_verified_model_and_retains_a_valid_existing_key(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3767,7 +4094,6 @@ def test_rerun_reuses_verified_model_and_retains_a_valid_existing_key(
     )
 
 
-@pytest.mark.serial
 def test_failed_reuse_digest_inspection_falls_back_to_fresh_model_acquisition(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3788,7 +4114,6 @@ def test_failed_reuse_digest_inspection_falls_back_to_fresh_model_acquisition(
     assert any("MODEL_FETCH" in event for event in events)
 
 
-@pytest.mark.serial  # Activation failures are asserted through a dedicated fake systemctl log.
 def test_activation_orders_avahi_and_never_restarts_an_active_agent(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3814,7 +4139,6 @@ def test_activation_orders_avahi_and_never_restarts_an_active_agent(
     assert not any(word in active_events for word in ("restart", "try-restart", "stop", "kill"))
 
 
-@pytest.mark.serial  # A staged replacement must leave the original fake venv untouched on failure.
 def test_failed_staged_replacement_keeps_the_prior_application(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3834,7 +4158,6 @@ def test_failed_staged_replacement_keeps_the_prior_application(
     assert "1.2" in Path(environment["FAKE_PIPX_STATE"]).read_text()
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("failure", "marker", "diagnostic"),
     [
@@ -3871,7 +4194,6 @@ def test_replacement_staging_failures_preserve_the_prior_normal_environment(
     assert "Installed: unit enabled; model verified." not in result.stdout
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("failure", ["FAKE_PIPX_FAIL_FINAL_INSTALL", "FAKE_PIPX_FAIL_FINAL_VERIFY"])
 def test_failed_final_replacement_restores_and_reverifies_the_prior_application(
     installer_harness: tuple[Path, dict[str, str], Path, Path], failure: str
@@ -3905,7 +4227,6 @@ def test_failed_final_replacement_restores_and_reverifies_the_prior_application(
     assert "application/configuration skew may require manual reconciliation" not in result.stderr
 
 
-@pytest.mark.serial
 def test_failed_restoration_cleans_the_stage_and_fails_before_appliance_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3926,7 +4247,6 @@ def test_failed_restoration_cleans_the_stage_and_fails_before_appliance_effects(
     assert "Installed: unit enabled; model verified." not in result.stdout
 
 
-@pytest.mark.serial
 def test_failed_restoration_verification_cleans_the_stage_and_fails_closed(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3952,7 +4272,6 @@ def test_failed_restoration_verification_cleans_the_stage_and_fails_closed(
     assert "Installed: unit enabled; model verified." not in result.stdout
 
 
-@pytest.mark.serial
 def test_staged_cleanup_failure_is_fatal_before_appliance_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -3976,7 +4295,6 @@ def test_staged_cleanup_failure_is_fatal_before_appliance_effects(
     assert "Installed: unit enabled; model verified." not in result.stdout
 
 
-@pytest.mark.serial
 def test_staged_venv_is_cleaned_when_capability_resolution_dies(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -3998,7 +4316,6 @@ def test_staged_venv_is_cleaned_when_capability_resolution_dies(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_fresh_local_wheel_install_includes_pi_extra_and_verifies_mcp(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -4013,7 +4330,6 @@ def test_fresh_local_wheel_install_includes_pi_extra_and_verifies_mcp(
     assert "pipx <runpip> <roastpilot-agent> <show> <coffee-roaster-mcp>" in events
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("content", "diagnostic"),
     [
@@ -4057,7 +4373,6 @@ def test_malformed_existing_environment_fails_before_installer_effects(
     )
 
 
-@pytest.mark.serial
 def test_unsafe_existing_environment_file_fails_before_installer_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -4081,7 +4396,6 @@ def test_unsafe_existing_environment_file_fails_before_installer_effects(
     )
 
 
-@pytest.mark.serial
 def test_xtrace_is_disabled_before_preserving_an_existing_api_key(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4103,7 +4417,6 @@ def test_xtrace_is_disabled_before_preserving_an_existing_api_key(
     assert fixture_value not in result.stdout + result.stderr + log.read_text()
 
 
-@pytest.mark.serial
 def test_xtrace_is_disabled_before_reading_an_inherited_installer_api_key(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4120,7 +4433,6 @@ def test_xtrace_is_disabled_before_reading_an_inherited_installer_api_key(
     assert fixture_value not in result.stdout + result.stderr + log.read_text()
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("mutation", ["bad-digest", "missing-peer", "symlink", "incomplete"])
 def test_only_complete_verified_installed_models_are_reused(
     installer_harness: tuple[Path, dict[str, str], Path, Path], mutation: str
@@ -4153,7 +4465,6 @@ def test_only_complete_verified_installed_models_are_reused(
     assert any(line.startswith("MODEL_FETCH") for line in events)
 
 
-@pytest.mark.serial
 def test_active_agent_without_start_fails_before_appliance_changes(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4166,7 +4477,6 @@ def test_active_agent_without_start_fails_before_appliance_changes(
     assert not any(line.startswith(("apt-get ", "pipx ", "roastpilot-agent ")) for line in events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("state", ["activating", "deactivating", "reloading", "", "garbled"])
 def test_only_inactive_or_failed_service_states_are_admitted(
     installer_harness: tuple[Path, dict[str, str], Path, Path], state: str
@@ -4181,7 +4491,6 @@ def test_only_inactive_or_failed_service_states_are_admitted(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("mode", ["missing", "non-executable", "symlink"])
 def test_missing_or_nonexecutable_mcp_console_fails_before_appliance_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], mode: str
@@ -4204,7 +4513,6 @@ def test_missing_or_nonexecutable_mcp_console_fails_before_appliance_effects(
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text()
 
 
-@pytest.mark.serial
 def test_unavailable_prior_local_wheel_is_not_replaced(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -4219,7 +4527,6 @@ def test_unavailable_prior_local_wheel_is_not_replaced(
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text()
 
 
-@pytest.mark.serial
 def test_indexed_prior_wheelhouse_failure_aborts_before_uninstall(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4239,7 +4546,6 @@ def test_indexed_prior_wheelhouse_failure_aborts_before_uninstall(
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("mcp_version", ("0.1.9", "0.2.0", "0.2.1", "0.2.2"))
 def test_mcp_version_must_match_the_e11_pin_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], mcp_version: str
@@ -4255,7 +4561,6 @@ def test_mcp_version_must_match_the_e11_pin_before_effects(
     assert "roastpilot-agent <appliance" not in log.read_text()
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("injection", "marker"),
     [
@@ -4276,7 +4581,6 @@ def test_mcp_show_requires_exactly_one_version_field(
     assert not any(event.startswith(("apt-get ", "roastpilot-agent ")) for event in events)
 
 
-@pytest.mark.serial
 def test_staged_and_restored_mcp_versions_must_match_the_e11_pin(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4315,7 +4619,6 @@ def test_staged_and_restored_mcp_versions_must_match_the_e11_pin(
     assert "FAKE_RESTORE_MCP_VERSION <0.1.9>" in restored_events
 
 
-@pytest.mark.serial
 def test_upgrade_from_mcp_022_stages_and_finishes_at_the_current_pin(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4349,7 +4652,6 @@ def test_upgrade_from_mcp_022_stages_and_finishes_at_the_current_pin(
     assert events.index("FAKE_FINAL_MCP_VERSION <0.2.3>") < staged_cleanup
 
 
-@pytest.mark.serial
 def test_staged_mcp_022_rejection_preserves_the_prior_application(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4374,7 +4676,6 @@ def test_staged_mcp_022_rejection_preserves_the_prior_application(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_idle_mcp_022_rejection_precedes_package_or_agent_side_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4398,7 +4699,6 @@ def test_idle_mcp_022_rejection_precedes_package_or_agent_side_effects(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_fresh_mcp_022_install_is_removed_before_appliance_work(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4417,7 +4717,6 @@ def test_fresh_mcp_022_install_is_removed_before_appliance_work(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_failed_upgrade_restores_the_captured_prior_mcp_version(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4447,7 +4746,6 @@ def test_failed_upgrade_restores_the_captured_prior_mcp_version(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("shape", ["missing", "duplicate"])
 def test_malformed_prior_mcp_metadata_stops_before_prior_uninstall(
     installer_harness: tuple[Path, dict[str, str], Path, Path], shape: str
@@ -4469,7 +4767,6 @@ def test_malformed_prior_mcp_metadata_stops_before_prior_uninstall(
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
 
 
-@pytest.mark.serial
 def test_malformed_prior_mcp_version_token_stops_before_prior_uninstall(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4490,7 +4787,6 @@ def test_malformed_prior_mcp_version_token_stops_before_prior_uninstall(
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("shape", ["missing", "duplicate"])
 def test_mcp_show_field_shape_is_checked_in_staged_and_restored_venvs(
     installer_harness: tuple[Path, dict[str, str], Path, Path], shape: str
@@ -4547,7 +4843,6 @@ def test_mcp_show_field_shape_is_checked_in_staged_and_restored_venvs(
     assert not _has_roastpilot_agent_lifecycle_mutation(restored_events)
 
 
-@pytest.mark.serial
 def test_build_tagged_prior_wheel_is_preserved_for_rollback(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -4570,7 +4865,6 @@ def test_build_tagged_prior_wheel_is_preserved_for_rollback(
     )
 
 
-@pytest.mark.serial
 def test_malformed_build_tagged_prior_wheel_is_rejected_before_uninstall(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -4584,7 +4878,6 @@ def test_malformed_build_tagged_prior_wheel_is_rejected_before_uninstall(
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text()
 
 
-@pytest.mark.serial
 def test_prior_local_wheel_adjacent_recheck_blocks_a_post_canonicalisation_delete(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -4608,7 +4901,6 @@ def test_prior_local_wheel_adjacent_recheck_blocks_a_post_canonicalisation_delet
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("release", "diagnostic"),
     [
@@ -4638,7 +4930,6 @@ def test_os_release_parser_rejects_each_untrusted_branch_before_effects(
     )
 
 
-@pytest.mark.serial
 def test_dangling_existing_environment_symlink_is_rejected_before_package_work(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4657,7 +4948,6 @@ def test_dangling_existing_environment_symlink_is_rejected_before_package_work(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("version", "package"),
     [
@@ -4678,7 +4968,6 @@ def test_malformed_prior_application_specs_fail_before_replacement(
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text().splitlines()
 
 
-@pytest.mark.serial
 def test_hostname_query_failure_is_not_reported_as_a_hostname_mismatch(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4696,7 +4985,6 @@ def test_hostname_query_failure_is_not_reported_as_a_hostname_mismatch(
     )
 
 
-@pytest.mark.serial
 def test_dash_leading_audio_device_is_bound_as_one_appliance_option_value(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4713,7 +5001,6 @@ def test_dash_leading_audio_device_is_bound_as_one_appliance_option_value(
     assert "<--audio-device> <--device-name>" not in render
 
 
-@pytest.mark.serial
 def test_prior_local_wheel_is_restored_from_the_private_copy_after_source_loss(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -4746,7 +5033,6 @@ def test_prior_local_wheel_is_restored_from_the_private_copy_after_source_loss(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_local_wheel_direct_reference_is_rewritten_to_the_private_copy(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -4780,7 +5066,6 @@ def test_local_wheel_direct_reference_is_rewritten_to_the_private_copy(
     )
 
 
-@pytest.mark.serial
 def test_local_wheelhouse_capture_failure_aborts_before_uninstall(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -4802,7 +5087,6 @@ def test_local_wheelhouse_capture_failure_aborts_before_uninstall(
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("injection", "marker"),
     [
@@ -4834,7 +5118,6 @@ def test_direct_reference_outer_or_inner_grep_error_aborts_before_uninstall(
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
 
 
-@pytest.mark.serial
 def test_prior_local_wheel_artifact_is_retained_before_post_reinstall_capability_failure(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -4874,7 +5157,6 @@ def test_prior_local_wheel_artifact_is_retained_before_post_reinstall_capability
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_final_root_probe_failure_restores_prior_local_wheel_before_exit(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -4917,7 +5199,6 @@ def test_final_root_probe_failure_restores_prior_local_wheel_before_exit(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_non_wheel_prior_local_basename_is_rejected_before_uninstall(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -4932,7 +5213,6 @@ def test_non_wheel_prior_local_basename_is_rejected_before_uninstall(
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in log.read_text()
 
 
-@pytest.mark.serial
 def test_glob_character_in_validated_temporary_suffix_removes_only_that_exact_entry(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -4957,7 +5237,6 @@ def test_glob_character_in_validated_temporary_suffix_removes_only_that_exact_en
     assert f"rm <-f> <--> <{temporary}>" not in events
 
 
-@pytest.mark.serial
 def test_root_temporary_deregistration_is_exact_under_glob_suffix_mutation(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -5005,7 +5284,6 @@ done
     assert f"rm <-f> <--> <{sibling}>" not in log.read_text().splitlines()
 
 
-@pytest.mark.serial
 def test_restrictive_umask_keeps_owned_directories_traversable(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -5027,7 +5305,6 @@ def test_restrictive_umask_keeps_owned_directories_traversable(
     )
 
 
-@pytest.mark.serial
 def test_child_processes_do_not_receive_exported_secret_sentinels(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -5088,7 +5365,6 @@ def test_child_processes_do_not_receive_exported_secret_sentinels(
     assert "installer-sentinel" not in result.stdout + result.stderr + child_env
 
 
-@pytest.mark.serial
 def test_state_sequence_blocks_prior_uninstall(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -5114,7 +5390,6 @@ def test_state_sequence_blocks_prior_uninstall(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("state", ["inactive", "failed"])
 def test_terminal_inactive_states_admit_normal_runs(
     installer_harness: tuple[Path, dict[str, str], Path, Path], state: str
@@ -5127,7 +5402,6 @@ def test_terminal_inactive_states_admit_normal_runs(
     assert log.read_text().splitlines().count(probes) == 2
 
 
-@pytest.mark.serial
 def test_pre_promotion_state_change_aborts_before_live_mutations(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -5164,7 +5438,6 @@ def test_pre_promotion_state_change_aborts_before_live_mutations(
     assert "Installed: unit enabled" not in result.stdout
 
 
-@pytest.mark.serial
 def test_final_start_recheck_never_disturbs_a_deactivating_service(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -5193,7 +5466,6 @@ def test_final_start_recheck_never_disturbs_a_deactivating_service(
     )
 
 
-@pytest.mark.serial
 def test_agent_enable_failure_warns_without_lifecycle_reversal(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -5209,7 +5481,6 @@ def test_agent_enable_failure_warns_without_lifecycle_reversal(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     "environment",
     [
@@ -5247,7 +5518,6 @@ def test_initial_service_probe_failures_are_effect_free(
     )
 
 
-@pytest.mark.serial
 def test_genuinely_absent_unit_admits_first_install(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -5278,7 +5548,6 @@ def test_genuinely_absent_unit_admits_first_install(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("state", ["inactive", "failed"])
 def test_terminal_loaded_unit_states_admit_install_after_show_unavailable(
     installer_harness: tuple[Path, dict[str, str], Path, Path], state: str
@@ -5305,7 +5574,6 @@ def test_terminal_loaded_unit_states_admit_install_after_show_unavailable(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_whitespace_padded_terminal_loaded_unit_row_admits_install(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -5331,7 +5599,6 @@ def test_whitespace_padded_terminal_loaded_unit_row_admits_install(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     "environment",
     [
@@ -5380,7 +5647,6 @@ def test_pending_or_unparseable_job_fails_before_privileged_mutation(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     "environment",
     [
@@ -5485,7 +5751,6 @@ def _live_config_state(root: Path) -> dict[str, tuple[bytes, int] | None]:
     }
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("failure", ["yaml", "unit", "enable"])
 def test_failed_configuration_generation_restores_the_prior_live_set(
     installer_harness: tuple[Path, dict[str, str], Path, Path], failure: str
@@ -5562,7 +5827,6 @@ def test_failed_configuration_generation_restores_the_prior_live_set(
         )
 
 
-@pytest.mark.serial
 def test_failed_configuration_generation_removes_previously_absent_files(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -5575,7 +5839,6 @@ def test_failed_configuration_generation_removes_previously_absent_files(
     assert "systemctl <enable> <--now> <avahi-daemon>" in log.read_text().splitlines()
 
 
-@pytest.mark.serial
 def test_rollback_failure_still_reloads_and_discards_snapshot(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -5624,7 +5887,6 @@ def test_rollback_failure_still_reloads_and_discards_snapshot(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("failed_member", ["env", "yaml", "unit"])
 def test_rollback_cp_failure_continues_to_later_members_and_cleanup(
     installer_harness: tuple[Path, dict[str, str], Path, Path], failed_member: str
@@ -5698,7 +5960,6 @@ def test_rollback_cp_failure_continues_to_later_members_and_cleanup(
     assert rollback_fixture_value not in result.stdout + result.stderr + log.read_text()
 
 
-@pytest.mark.serial
 def test_rollback_recheck_failure_is_not_masked_by_later_members(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -5763,7 +6024,6 @@ def test_rollback_recheck_failure_is_not_masked_by_later_members(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_restore_snapshot_probe_failure_continues_later_rollback_and_cleanup(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -5815,7 +6075,6 @@ def test_restore_snapshot_probe_failure_continues_later_rollback_and_cleanup(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("target_kind", "diagnostic"),
     [
@@ -5859,7 +6118,6 @@ def test_privileged_write_recheck_reports_its_failed_destination(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_snapshot_existing_members_are_decided_through_the_privileged_seam(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -5892,7 +6150,6 @@ def test_snapshot_existing_members_are_decided_through_the_privileged_seam(
         )
 
 
-@pytest.mark.serial
 def test_configuration_snapshot_parent_recheck_blocks_snapshot_members_and_live_writes(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -5935,7 +6192,6 @@ def test_configuration_snapshot_parent_recheck_blocks_snapshot_members_and_live_
     assert any(event.startswith("rm <-rf>") and "roastpilot-install" in event for event in events)
 
 
-@pytest.mark.serial
 def test_snapshot_member_probe_failure_is_not_treated_as_absence(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -5972,7 +6228,6 @@ def test_snapshot_member_probe_failure_is_not_treated_as_absence(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_snapshot_unsafe_existing_yaml_is_not_treated_as_absence(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6009,7 +6264,6 @@ def test_snapshot_unsafe_existing_yaml_is_not_treated_as_absence(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_snapshot_indeterminate_existing_yaml_is_not_treated_as_absence(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6052,7 +6306,6 @@ def test_snapshot_indeterminate_existing_yaml_is_not_treated_as_absence(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_rollback_refuses_member_changed_to_symlink_and_continues(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -6111,7 +6364,6 @@ def test_rollback_refuses_member_changed_to_symlink_and_continues(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_rollback_removal_failure_for_previously_absent_member_continues(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6149,7 +6401,6 @@ def test_rollback_removal_failure_for_previously_absent_member_continues(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_snapshot_discard_failure_reports_the_retained_path_without_secret_contents(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6179,7 +6430,6 @@ def test_snapshot_discard_failure_reports_the_retained_path_without_secret_conte
     assert snapshot.is_dir()
 
 
-@pytest.mark.serial
 def test_success_snapshot_discard_failure_keeps_committed_configuration(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6228,7 +6478,6 @@ def test_success_snapshot_discard_failure_keeps_committed_configuration(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("cleanup_kind", ["stage", "restore"])
 def test_post_commit_cleanup_failure_reports_only_the_retained_target(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, cleanup_kind: str
@@ -6265,7 +6514,6 @@ def test_post_commit_cleanup_failure_reports_only_the_retained_target(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("cleanup_fails", [False, True])
 def test_fresh_incapable_application_is_removed_or_named_for_manual_cleanup(
     installer_harness: tuple[Path, dict[str, str], Path, Path], cleanup_fails: bool
@@ -6292,7 +6540,6 @@ def test_fresh_incapable_application_is_removed_or_named_for_manual_cleanup(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_runtime_pipx_path_substitution_returns_through_cleanup_without_executing_rogue(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -6338,7 +6585,6 @@ def test_runtime_pipx_path_substitution_returns_through_cleanup_without_executin
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("injection", "expected_marker", "manual_cleanup"),
     [
@@ -6370,7 +6616,6 @@ def test_fresh_install_failure_preserves_status_and_cleans_absent_or_partial_env
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_partial_staged_venv_is_registered_before_failed_stage_install(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6390,7 +6635,6 @@ def test_partial_staged_venv_is_registered_before_failed_stage_install(
     assert any("roastpilot-stage-" in event and "<uninstall>" in event for event in events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("root", ["", "relative", "/"])
 def test_test_mode_requires_a_nonempty_nonhost_install_root_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], root: str
@@ -6407,7 +6651,6 @@ def test_test_mode_requires_a_nonempty_nonhost_install_root_before_effects(
     assert not log.exists()
 
 
-@pytest.mark.serial
 def test_second_hostname_query_failure_has_a_distinct_fail_closed_diagnostic(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6422,7 +6665,6 @@ def test_second_hostname_query_failure_has_a_distinct_fail_closed_diagnostic(
     assert "FAKE_HOSTNAME_VERIFY_QUERY_FAILURE" in log.read_text().splitlines()
 
 
-@pytest.mark.serial
 def test_exact_mktemp_prefix_with_empty_suffix_is_not_cleanup_eligible(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6442,7 +6684,6 @@ def test_exact_mktemp_prefix_with_empty_suffix_is_not_cleanup_eligible(
     assert f"rm <-rf> <--> <{prefix}>" not in events
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("site", ["stage", "snapshot", "restore", "model", "env"])
 def test_every_mktemp_site_rejects_an_exact_prefix_without_suffix(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, site: str
@@ -6478,7 +6719,6 @@ def test_every_mktemp_site_rejects_an_exact_prefix_without_suffix(
     )
 
 
-@pytest.mark.serial
 def test_preupdate_hostname_query_failure_stops_before_hostname_or_service_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6496,7 +6736,6 @@ def test_preupdate_hostname_query_failure_stops_before_hostname_or_service_effec
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     "record",
     [
@@ -6532,7 +6771,6 @@ def test_unsafe_getent_identity_and_home_shapes_fail_before_installer_effects(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("unsafe", ["'", '"', "\u200b", "\u2060", "\u2028", "\u2029"])
 def test_unsafe_operator_home_characters_fail_before_canonicalisation(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, unsafe: str
@@ -6554,7 +6792,6 @@ def test_unsafe_operator_home_characters_fail_before_canonicalisation(
     assert not any(event.startswith(("apt-get ", "pipx ")) for event in events)
 
 
-@pytest.mark.serial
 def test_operator_home_symlink_to_canonical_temporary_root_is_rejected(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -6575,7 +6812,6 @@ def test_operator_home_symlink_to_canonical_temporary_root_is_rejected(
     assert not any(event.startswith(("apt-get ", "pipx ")) for event in events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("temporary", ["tmp", "var/tmp"])
 def test_operator_home_symlink_to_each_rooted_temporary_root_is_rejected(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, temporary: str
@@ -6595,7 +6831,6 @@ def test_operator_home_symlink_to_each_rooted_temporary_root_is_rejected(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("temporary", ["tmp", "var/tmp"])
 def test_symlinked_test_temporary_root_is_canonicalised_before_home_comparison(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, temporary: str
@@ -6622,7 +6857,6 @@ def test_symlinked_test_temporary_root_is_canonicalised_before_home_comparison(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("override", "diagnostic"),
     [
@@ -6648,7 +6882,7 @@ def test_renderer_identity_preconditions_fail_before_effects(
     assert not any(event.startswith(("apt-get ", "pipx ", "roastpilot-agent ")) for event in events)
 
 
-@pytest.mark.serial
+@pytest.mark.serial  # C2: creates host-owned temporary homes under /tmp and /var/tmp.
 @pytest.mark.parametrize("temporary_root", ["/tmp", "/var/tmp"])
 def test_operator_home_temporary_root_boundary_differs_by_mode(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path, temporary_root: str
@@ -6698,7 +6932,6 @@ def test_operator_home_temporary_root_boundary_differs_by_mode(
         shutil.rmtree(home)
 
 
-@pytest.mark.serial
 def test_missing_dialout_with_audio_still_issues_the_exact_group_repair(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6709,7 +6942,6 @@ def test_missing_dialout_with_audio_still_issues_the_exact_group_repair(
     assert "usermod <-aG> <dialout,audio> <--> <operator>" in log.read_text().splitlines()
 
 
-@pytest.mark.serial
 def test_failed_usermod_reports_possible_supplementary_group_residue_without_lifecycle_reversal(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6726,7 +6958,6 @@ def test_failed_usermod_reports_possible_supplementary_group_residue_without_lif
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_failed_start_reports_possible_running_service_without_lifecycle_reversal(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6752,7 +6983,6 @@ def test_failed_start_reports_possible_running_service_without_lifecycle_reversa
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("wheel", ["/tmp/wheel\n.whl", "/tmp/wheel\r.whl"])
 def test_wheel_control_characters_fail_before_path_or_installer_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], wheel: str
@@ -6764,7 +6994,6 @@ def test_wheel_control_characters_fail_before_path_or_installer_effects(
     assert not log.exists()
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("option", "value"), [("--wheel", '/tmp/quote".whl'), ("--from-dir", "/tmp/models\u2060")]
 )
@@ -6778,7 +7007,6 @@ def test_local_path_selectors_reject_quotes_or_unicode_before_effects(
     assert not log.exists()
 
 
-@pytest.mark.serial
 def test_python_validation_and_pipx_state_parsing_ignore_hostile_cwd_modules(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -6827,7 +7055,6 @@ def test_python_validation_and_pipx_state_parsing_ignore_hostile_cwd_modules(
     assert any(event.startswith("pipx <runpip> <roastpilot-agent> <wheel>") for event in events)
 
 
-@pytest.mark.serial
 def test_fake_apt_failure_preserves_its_status_before_application_or_lifecycle_work(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6846,7 +7073,6 @@ def test_fake_apt_failure_preserves_its_status_before_application_or_lifecycle_w
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_fake_stage_parent_mkdir_failure_preserves_status_and_blocks_later_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6877,7 +7103,6 @@ def test_fake_stage_parent_mkdir_failure_preserves_status_and_blocks_later_effec
     assert not (stage_parent / "roastpilot-install.fake").exists()
 
 
-@pytest.mark.serial
 def test_fake_model_promotion_mv_failure_cleans_registered_temp_and_blocks_configuration(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6911,7 +7136,6 @@ def test_fake_model_promotion_mv_failure_cleans_registered_temp_and_blocks_confi
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_untrusted_configuration_snapshot_path_is_retained_never_recursively_deleted(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -6938,7 +7162,6 @@ def test_untrusted_configuration_snapshot_path_is_retained_never_recursively_del
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_untrusted_restore_artifact_path_is_retained_never_recursively_deleted(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -6970,7 +7193,6 @@ def test_untrusted_restore_artifact_path_is_retained_never_recursively_deleted(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("failure", "expected_event"),
     [
@@ -7008,7 +7230,6 @@ def test_application_change_warns_of_configuration_skew_for_later_failures(
     assert not _has_roastpilot_agent_lifecycle_mutation(events)
 
 
-@pytest.mark.serial
 def test_success_has_no_application_skew_or_avahi_residue_warning(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -7020,7 +7241,6 @@ def test_success_has_no_application_skew_or_avahi_residue_warning(
     assert "install failed after enabling Avahi; Avahi enablement may remain" not in result.stderr
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     "unit_text",
     [
@@ -7061,7 +7281,6 @@ def test_existing_unit_identity_evidence_fails_before_installer_effects(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     "unit_text",
     [
@@ -7095,7 +7314,6 @@ def test_matching_existing_unit_identity_allows_maintenance(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("line", ["# comment \\", "   \\   \r"])
 def test_rendered_unit_rejects_backslash_before_comment_or_blank_skipping(
     installer_harness: tuple[Path, dict[str, str], Path, Path], line: str
@@ -7111,7 +7329,6 @@ def test_rendered_unit_rejects_backslash_before_comment_or_blank_skipping(
     assert not any(event.startswith("systemctl <enable>") for event in log.read_text().splitlines())
 
 
-@pytest.mark.serial
 def test_symlinked_existing_unit_identity_fails_before_installer_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -7133,7 +7350,6 @@ def test_symlinked_existing_unit_identity_fails_before_installer_effects(
     )
 
 
-@pytest.mark.serial
 def test_existing_managed_unit_identity_uses_privileged_cat_and_accepts_indentation(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -7152,7 +7368,6 @@ def test_existing_managed_unit_identity_uses_privileged_cat_and_accepts_indentat
     assert f"cat <--> <{unit}>" in log.read_text().splitlines()
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("kind", "relative", "content", "diagnostic"),
     [
@@ -7200,7 +7415,6 @@ def test_existing_privileged_reads_fail_closed_before_installer_effects(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("relative", "content", "diagnostic"),
     [
@@ -7246,7 +7460,6 @@ def test_indeterminate_direct_member_symlink_probe_fails_closed(
     )
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("target", "diagnostic", "existing_managed_unit"),
     [
@@ -7299,7 +7512,6 @@ def test_indeterminate_privileged_systemd_presence_fails_before_effects(
     )
 
 
-@pytest.mark.serial
 def test_systemd_dropin_presence_matrix_remains_exact_under_tristate_probes(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -7342,7 +7554,6 @@ def test_systemd_dropin_presence_matrix_remains_exact_under_tristate_probes(
     assert observed_negative == expected
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("has_prior_destination", [False, True])
 def test_atomic_content_staging_rejects_temporary_digest_before_promotion(
     installer_harness: tuple[Path, dict[str, str], Path, Path], has_prior_destination: bool
@@ -7382,7 +7593,6 @@ def test_atomic_content_staging_rejects_temporary_digest_before_promotion(
     assert destination.read_bytes() == prior if has_prior_destination else not destination.exists()
 
 
-@pytest.mark.serial
 def test_prior_application_uninstall_failure_preserves_status_and_reports_skew(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -7475,7 +7685,6 @@ def _run_sourced_process_guard(
     )
 
 
-@pytest.mark.serial
 def test_process_guard_arms_default_sigalrm_before_filesystem_validation(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -7516,7 +7725,6 @@ atexit.register(lambda: open(os.environ["ROASTPILOT_PROBE_TRACE"], "w").write("\
     assert events[:5] == ["signal:SIG_DFL", "alarm:10", "isdir", "islink", "realpath"]
 
 
-@pytest.mark.serial
 def test_process_guard_retries_vanished_scandir_entry_and_kills_the_unavailable_mutant(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -7548,7 +7756,6 @@ def test_process_guard_retries_vanished_scandir_entry_and_kills_the_unavailable_
     assert INSTALLER.read_text() == original
 
 
-@pytest.mark.serial
 def test_process_guard_exhausted_vanished_retries_fail_closed_and_kill_clear_mutant(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -7589,7 +7796,6 @@ atexit.register(lambda: open(os.environ["ROASTPILOT_VANISHED_TRACE"], "w").write
     assert INSTALLER.read_text() == original
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("root_kind", "probe_pid", "diagnostic"),
     [
@@ -7642,7 +7848,6 @@ def test_process_guard_test_seam_rejects_unsafe_proc_roots_before_fake_effects(
     assert log.read_text() == ""
 
 
-@pytest.mark.serial
 def test_process_guard_monotonic_deadline_times_out_and_kills_its_removed_expiry_mutant(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -7666,7 +7871,7 @@ def test_process_guard_monotonic_deadline_times_out_and_kills_its_removed_expiry
     assert INSTALLER.read_text() == original
 
 
-@pytest.mark.serial
+@pytest.mark.serial  # C3: deliberately runs alarm(1) against sleep(2).
 def test_process_guard_default_sigalrm_termination_maps_to_generic_refusal_and_kills_alarm_mutant(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -7724,7 +7929,6 @@ def test_process_guard_probe_forbids_process_control_and_kills_mutant() -> None:
     assert INSTALLER.read_text() == original
 
 
-@pytest.mark.serial
 def test_process_guard_clear_excludes_only_probe_ancestor_chain(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -7741,7 +7945,6 @@ def test_process_guard_clear_excludes_only_probe_ancestor_chain(
     assert {path: path.read_bytes() for path in proc.rglob("*") if path.is_file()} == before
 
 
-@pytest.mark.serial
 def test_process_guard_rejects_noncyclic_ancestor_chain_over_64_hops_and_kills_bound_mutant(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -7770,7 +7973,6 @@ def test_process_guard_rejects_noncyclic_ancestor_chain_over_64_hops_and_kills_b
     assert INSTALLER.read_text() == original
 
 
-@pytest.mark.serial
 def test_process_guard_reports_matching_pid_widths_in_numeric_order_and_kills_lexical_mutant(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -7799,7 +8001,6 @@ def test_process_guard_reports_matching_pid_widths_in_numeric_order_and_kills_le
     assert INSTALLER.read_text() == original
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("cmdline", "comm"),
     [
@@ -7833,7 +8034,6 @@ def test_process_guard_treats_all_family_forms_as_ambiguous_pid_only_matches(
     assert "is running" not in result.stdout
 
 
-@pytest.mark.serial
 def test_process_guard_reports_sorted_capped_pid_set_without_process_bytes(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -7847,7 +8047,6 @@ def test_process_guard_reports_sorted_capped_pid_set_without_process_bytes(
     assert "316" not in result.stdout and "private-argv" not in result.stdout
 
 
-@pytest.mark.serial
 def test_process_guard_reports_descendant_of_probe_and_kills_descendant_exclusion_mutant(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -7873,7 +8072,6 @@ def test_process_guard_reports_descendant_of_probe_and_kills_descendant_exclusio
     assert INSTALLER.read_text() == original
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     "fault",
     [
@@ -7930,7 +8128,6 @@ def test_process_guard_fails_closed_for_unavailable_or_malformed_process_evidenc
     assert "never stops, restarts, or kills" in result.stdout
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("fault", "expected"),
     [
@@ -7988,7 +8185,6 @@ os.open = guarded_open
     assert result.returncode == 2 and result.stdout == expected
 
 
-@pytest.mark.serial
 def test_process_guard_rejects_unreadable_pid_and_kills_skip_evidence_mutant(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
@@ -8024,7 +8220,6 @@ os.open = guarded_open
     assert INSTALLER.read_text() == original
 
 
-@pytest.mark.serial
 def test_process_guard_rejects_excessive_pid_inventory_before_opening_members(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -8039,7 +8234,6 @@ def test_process_guard_rejects_excessive_pid_inventory_before_opening_members(
     )
 
 
-@pytest.mark.serial
 def test_process_guard_b1_and_b2_block_without_protected_mutation_and_clean_stage(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -8086,7 +8280,6 @@ def test_process_guard_b1_and_b2_block_without_protected_mutation_and_clean_stag
     assert not any(event == "pipx <uninstall> <--> <roastpilot-agent>" for event in events)
 
 
-@pytest.mark.serial
 def test_process_guard_b3_and_b4_precede_configuration_snapshot_and_service_start(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -8164,7 +8357,6 @@ def test_process_guard_b3_and_b4_precede_configuration_snapshot_and_service_star
     assert "start roastpilot-agent" not in b4.stdout + b4.stderr
 
 
-@pytest.mark.serial
 def test_process_guard_seams_reject_production_and_malformed_test_inputs_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -8196,7 +8388,6 @@ def test_process_guard_seams_reject_production_and_malformed_test_inputs_before_
     assert bad.returncode != 0 and not log.exists()
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("probe_pid", ["0", "01", "abc", "10000000000"])
 def test_process_guard_test_seam_rejects_malformed_probe_pid_after_valid_proc_root(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
@@ -8219,7 +8410,6 @@ def test_process_guard_test_seam_rejects_malformed_probe_pid_after_valid_proc_ro
     assert log.read_text() == ""
 
 
-@pytest.mark.serial
 def test_process_guard_production_rejects_only_proc_seams_and_kills_new_clause_mutant(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -8265,7 +8455,6 @@ def test_process_guard_production_rejects_only_proc_seams_and_kills_new_clause_m
     assert INSTALLER.read_text() == original
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("parent", ["01", "10000000000"])
 def test_process_guard_rejects_noncanonical_or_overcap_parent_and_kills_parent_mutant(
     installer_harness: tuple[Path, dict[str, str], Path, Path], parent: str
@@ -8288,7 +8477,6 @@ def test_process_guard_rejects_noncanonical_or_overcap_parent_and_kills_parent_m
     assert INSTALLER.read_text() == original
 
 
-@pytest.mark.serial
 def test_process_guard_production_uses_its_own_python_pid_not_shell_pid() -> None:
     """T6: production excludes the Python probe itself, while tests retain a fake PID."""
     source = INSTALLER.read_text()
@@ -8297,7 +8485,6 @@ def test_process_guard_production_uses_its_own_python_pid_not_shell_pid() -> Non
     assert "ROOT, supplied_self = sys.argv[1], sys.argv[2]" in source
 
 
-@pytest.mark.serial
 def test_process_guard_protocol_parser_rejects_noncanonical_or_ambiguous_output(
     installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
 ) -> None:
@@ -8340,7 +8527,6 @@ def test_process_guard_protocol_parser_rejects_noncanonical_or_ambiguous_output(
         assert run_parser(invalid).returncode != 0
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("safe_increment", "bare_increment"),
     [
@@ -8399,7 +8585,6 @@ def test_process_guard_parser_completes_valid_protocol_under_errexit_and_kills_i
     assert INSTALLER.read_text() == original
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize(
     ("probe_status", "probe_output"),
     [
