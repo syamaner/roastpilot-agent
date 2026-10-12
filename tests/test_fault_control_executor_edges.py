@@ -175,6 +175,7 @@ async def test_d212_stale_close_reservation_traces_no_write() -> None:
         )
         is None
     )
+    assert port.reads == []
     assert port.writes == []
     assert await executor.settle_audit_tasks()
     assert trace.commands == [
@@ -538,6 +539,48 @@ async def test_routine_generation_stale_after_exact_read_is_traced_without_write
         )
         is None
     )
+    assert port.writes == []
+    assert await executor.settle_audit_tasks()
+    assert trace.commands[0][2] == {
+        "admission": "allowed",
+        "dispatch": "not_completed",
+        "confirmation": "unconfirmed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_d212_safe_zero_generation_revoked_after_latest_read_cannot_close() -> None:
+    """A safe-zero D212 proof still fails when its lease changes during the latest read."""
+
+    class SupersedingSafeZeroPort(FaultPort):
+        def __init__(self) -> None:
+            super().__init__(_state(cooling_on=False))
+            self.current = True
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            self.current = False
+            return self.state
+
+    arbiter = CommandArbiter()
+    generation = arbiter.generation
+    assert arbiter.reserve_close(generation)
+    trace = RecordingFaultTrace()
+    port = SupersedingSafeZeroPort()
+    executor = FaultControlExecutor(
+        SafetyPolicy(SafetyLimits()), port, arbiter=arbiter, trace_sink=trace
+    )
+
+    assert (
+        await executor.execute(
+            OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            "fault-session",
+            run_id="fault-run",
+            is_current_generation=lambda: port.current,
+            close_reservation=generation,
+        )
+        is None
+    )
+    assert port.reads == ["fault-session"]
     assert port.writes == []
     assert await executor.settle_audit_tasks()
     assert trace.commands[0][2] == {
