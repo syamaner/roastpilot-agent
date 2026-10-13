@@ -79,6 +79,18 @@ _EXHAUSTIVE_ONLY_INVENTORY = frozenset(
         "tests/test_capture_agent_usage.py::test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper"
     }
 )
+#: #1010: the complete installer subset that remains in the serial lane.
+_INSTALLER_RETAINED_SERIAL_INVENTORY = frozenset(
+    {
+        "tests/test_pi_installer.py::test_fake_log_grammar_fails_closed_for_forced_concurrency",
+        "tests/test_pi_installer.py::test_framing_writer_closes_all_popen_pipes",
+        "tests/test_pi_installer.py::test_framing_writer_wait_supports_a_high_pipe_descriptor",
+        "tests/test_pi_installer.py::test_fake_log_framing_is_deterministic_under_two_writers",
+        "tests/test_pi_installer.py::test_operator_home_temporary_root_boundary_differs_by_mode[/tmp]",
+        "tests/test_pi_installer.py::test_operator_home_temporary_root_boundary_differs_by_mode[/var/tmp]",
+        "tests/test_pi_installer.py::test_process_guard_default_sigalrm_termination_maps_to_generic_refusal_and_kills_alarm_mutant",
+    }
+)
 #: #954: the exact serial-lane selection expression; any other value fails closed.
 _SERIAL_SELECTION_EXPRESSION = (
     "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') "
@@ -555,6 +567,16 @@ def test_pytest_markers_are_registered_and_full_gate_is_unfiltered() -> None:
     coverage_run = _mapping(coverage["run"])
     assert coverage_run["relative_files"] is True
     assert coverage_run["branch"] is True
+
+
+def test_installer_serial_inventory_is_frozen() -> None:
+    """Only the seven classified host-resource installer nodes remain serial (#1010)."""
+    returncode, serial, output = _collect_nodeids(["-m", "serial"])
+    assert returncode == 0, output
+    installer_serial = {
+        nodeid for nodeid in serial if nodeid.startswith("tests/test_pi_installer.py::")
+    }
+    assert installer_serial == _INSTALLER_RETAINED_SERIAL_INVENTORY
 
 
 def test_stress_collection_selects_real_parser_boundaries() -> None:

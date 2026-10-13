@@ -693,6 +693,9 @@ async def test_transport_feeds_the_typed_client() -> None:
     assert export.ready is True
 
 
+@pytest.mark.serial(
+    reason="real MCP startup deadline must not contend with installer subprocess load"
+)
 @pytest.mark.skipif(
     not os.path.isfile(resolve_mcp_command(DEFAULT_MCP_COMMAND)),
     reason=(
@@ -717,6 +720,9 @@ async def test_real_child_process_round_trip() -> None:
     assert not process.running
 
 
+@pytest.mark.serial(
+    reason="real MCP startup deadline must not contend with installer subprocess load"
+)
 @pytest.mark.asyncio
 async def test_real_child_process_confirms_cold_session_purpose(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

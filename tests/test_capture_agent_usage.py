@@ -10626,7 +10626,7 @@ def test_git_output_timeout_kills_term_ignoring_process_group(
     def start_after_stub_ready(
         process: subprocess.Popen[bytes], seconds: int, timed_out: threading.Event
     ) -> threading.Timer:
-        for _ in range(50):
+        for _ in range(300):
             if marker.exists():
                 return real_start_deadline(process, seconds, timed_out)
             time.sleep(0.01)
