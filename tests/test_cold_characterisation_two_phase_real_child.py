@@ -1,4 +1,4 @@
-"""T-RC: two-phase child ownership against the real ``coffee-roaster-mcp`` 0.2.3 mock.
+"""T-RC: two-phase child ownership against the real ``coffee-roaster-mcp`` 0.2.4 mock.
 
 Software integration evidence only, never recording-on acceptance.  One
 ``MCPServerProcess`` and one cold client are driven across three asyncio tasks
@@ -12,7 +12,7 @@ are rendered but inert here (first crack is disabled).  Phase admission is not
 attempted: the frozen identity refuses a disabled first-crack mode, which is
 the honest scope of this test.
 
-Published 0.2.3 supplies a typed ``cold_temperature_projection``, so each
+Published 0.2.4 supplies a typed ``cold_temperature_projection``, so each
 cycle verifies one admitted read before calling ``client.finalise_session``
 directly.  This remains direct-client mock evidence only: first crack stays
 disabled, recording-on flags remain inert, and no cold recording or phase
@@ -119,7 +119,7 @@ async def test_t_rc_one_process_and_client_across_tasks_finalise_clean_and_stop(
     record_property: Callable[[str, object], None],
 ) -> None:
     """T-RC: OFF and ON cycles finalise clean and both children stop confirmed."""
-    assert importlib.metadata.version("coffee-roaster-mcp") == "0.2.3"
+    assert importlib.metadata.version("coffee-roaster-mcp") == "0.2.4"
     assert Path(resolve_mcp_command(DEFAULT_MCP_COMMAND)).is_file()
     monkeypatch.chdir(tmp_path)
     for name in list(os.environ):
@@ -211,7 +211,7 @@ async def test_t_rc_one_process_and_client_across_tasks_finalise_clean_and_stop(
     assert off.recording is not None
     assert (off.recording.expected, off.recording.outcome) == (False, "not_configured")
     assert on.recording is not None
-    # Observed with 0.2.3 and first crack disabled: the rendered recording-on flags
+    # Observed with 0.2.3 and 0.2.4 and first crack disabled: the rendered recording-on flags
     # are inert, so this is never recording-on acceptance.
     assert (on.recording.expected, on.recording.outcome) == (False, "not_configured")
     record_property("pids", tuple(pids))

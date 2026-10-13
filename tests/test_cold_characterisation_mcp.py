@@ -2064,7 +2064,7 @@ async def test_real_child_cold_tick_projects_strictly(
     monkeypatch: pytest.MonkeyPatch,
     record_property: Callable[[str, object], None],
 ) -> None:
-    """T9/AC-P6, T-S8/AC-S6, #997 T17: the published 0.2.3 mock MCP cold tick.
+    """T9/AC-P6, T-S8/AC-S6, #997 T17: the published 0.2.4 mock MCP cold tick.
 
     The public read admits the child-provided typed temperature projection and
     retains strict audio, device, roast-fan, and session projectors from that

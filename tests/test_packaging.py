@@ -105,12 +105,44 @@ def test_pi_extra_is_the_exact_torch_free_mcp_pin() -> None:
             "anthropic<1",
             "pydantic-ai-slim[google]>=1.0,<2",
         ],
-        "pi": ["coffee-roaster-mcp==0.2.3"],
+        "pi": ["coffee-roaster-mcp==0.2.4"],
     }
     pi_requirement = cast(list[str], extras["pi"])
     assert len(pi_requirement) == 1
     assert _requirement_name(pi_requirement[0]) == "coffee-roaster-mcp"
-    assert pi_requirement[0] == "coffee-roaster-mcp==0.2.3"
+    assert pi_requirement[0] == "coffee-roaster-mcp==0.2.4"
+
+
+def test_current_mcp_pin_sites_agree() -> None:
+    """The dependency, package checks, and installer share one exact MCP pin."""
+    with (_REPO_ROOT / "pyproject.toml").open("rb") as config_file:
+        project = cast(dict[str, object], tomllib.load(config_file))
+    metadata = cast(dict[str, object], project["project"])
+    extras = cast(dict[str, object], metadata["optional-dependencies"])
+    pi_requirements = cast(list[str], extras["pi"])
+    dependency_groups = cast(dict[str, object], project["dependency-groups"])
+    dev_requirements = cast(list[str], dependency_groups["dev"])
+    dev_mcp_requirements = [
+        requirement
+        for requirement in dev_requirements
+        if _requirement_name(requirement) == "coffee-roaster-mcp"
+    ]
+    assert len(pi_requirements) == 1
+    assert len(dev_mcp_requirements) == 1
+
+    workflow = (_REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    workflow_pins = re.findall(r'version\("coffee-roaster-mcp"\) == "([^"]+)"', workflow)
+    installer = (_REPO_ROOT / "packaging/pi/install.sh").read_text(encoding="utf-8")
+    installer_pins = re.findall(r'expected_mcp_version="(0\.\d+\.\d+)"', installer)
+
+    assert len(workflow_pins) == 2
+    assert len(installer_pins) == 1
+    assert [pi_requirements[0], dev_mcp_requirements[0]] == [
+        "coffee-roaster-mcp==0.2.4",
+        "coffee-roaster-mcp==0.2.4",
+    ]
+    assert workflow_pins == ["0.2.4", "0.2.4"]
+    assert installer_pins == ["0.2.4"]
 
 
 def test_pi_extra_metadata_preserves_a_lean_base_wheel(built_wheel: Path) -> None:
@@ -121,7 +153,7 @@ def test_pi_extra_metadata_preserves_a_lean_base_wheel(built_wheel: Path) -> Non
         for requirement in requirements
         if requirement.partition(";")[2].strip() == "extra == 'pi'"
     ]
-    assert pi_requirements == ["coffee-roaster-mcp==0.2.3; extra == 'pi'"]
+    assert pi_requirements == ["coffee-roaster-mcp==0.2.4; extra == 'pi'"]
     assert {_requirement_name(requirement) for requirement in pi_requirements} == {
         "coffee-roaster-mcp"
     }

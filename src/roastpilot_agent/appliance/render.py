@@ -24,7 +24,7 @@ so this module cannot introduce a second, driftable copy of the pinned model
 identity (AGENTS.md class-sweep discipline).
 
 **Recording stays off.** The MCP YAML template omits the ``recording:``
-section entirely. Published ``coffee-roaster-mcp==0.2.3``'s
+section entirely. Published ``coffee-roaster-mcp==0.2.4``'s
 ``RecordingConfig.enabled`` defaults to ``False``. The reviewed, unreleased
 0.2.2 cold candidate retains that schema, but is a separate historical artifact.
 Neither version nor this source comment attests the installed distribution's bytes.

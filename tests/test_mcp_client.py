@@ -2150,6 +2150,11 @@ def test_every_tool_has_a_captured_fixture() -> None:
     assert captured == set(FIXTURE_MIRRORS)
 
 
+def test_mcp_startup_deadline_default_is_fifteen_seconds() -> None:
+    """The SDK initialisation deadline remains the existing 15-second bound."""
+    assert MCPConfig().startup_timeout_seconds == 15.0
+
+
 def test_captured_server_info_pins_022_bootstrap_inventory() -> None:
     """The fixture records published 0.2.2's 14-tool plus finalisation inventory."""
     payload = json.loads((TOOL_RESULT_FIXTURES / "get_server_info.json").read_text())

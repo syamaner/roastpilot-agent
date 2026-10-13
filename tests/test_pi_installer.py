@@ -166,7 +166,7 @@ case "$name" in
       [ "${FAKE_PIPX_MCP_MISSING:-}" != 1 ] || exit 24
       case "${3:-}" in
         show)
-          mcp_version="${FAKE_PIPX_MCP_VERSION:-0.2.3}"
+          mcp_version="${FAKE_PIPX_MCP_VERSION:-0.2.4}"
           mcp_shape=normal
           if [[ "$venv" == *-roastpilot-stage-* ]]; then
             if [ -n "${FAKE_PIPX_STAGE_MCP_VERSION:-}" ]; then
@@ -207,9 +207,9 @@ case "$name" in
         freeze)
           if [ -n "${FAKE_PIPX_FREEZE_DIRECT_REFERENCE:-}" ]; then
             printf 'FAKE_PIPX_FREEZE_DIRECT_REFERENCE <%s>\\n' "$FAKE_PIPX_FREEZE_DIRECT_REFERENCE" >> "$FAKE_LOG"
-            printf 'roastpilot-agent @ file://%s\\ncoffee-roaster-mcp==%s\\n' "$FAKE_PIPX_FREEZE_DIRECT_REFERENCE" "${FAKE_PIPX_MCP_VERSION:-0.2.3}"
+            printf 'roastpilot-agent @ file://%s\\ncoffee-roaster-mcp==%s\\n' "$FAKE_PIPX_FREEZE_DIRECT_REFERENCE" "${FAKE_PIPX_MCP_VERSION:-0.2.4}"
           else
-            printf 'roastpilot-agent==1.2\\ncoffee-roaster-mcp==%s\\n' "${FAKE_PIPX_MCP_VERSION:-0.2.3}"
+            printf 'roastpilot-agent==1.2\\ncoffee-roaster-mcp==%s\\n' "${FAKE_PIPX_MCP_VERSION:-0.2.4}"
           fi ;;
         wheel)
           [ "${FAKE_PIPX_FAIL_WHEELHOUSE:-}" != 1 ] || { printf 'FAKE_PIPX_WHEELHOUSE_FAILURE\\n' >> "$FAKE_LOG"; exit 54; }
@@ -5113,7 +5113,7 @@ def test_indexed_prior_wheelhouse_failure_aborts_before_uninstall(
     assert "pipx <uninstall> <--> <roastpilot-agent>" not in events
 
 
-@pytest.mark.parametrize("mcp_version", ("0.1.9", "0.2.0", "0.2.1", "0.2.2"))
+@pytest.mark.parametrize("mcp_version", ("0.1.9", "0.2.0", "0.2.1", "0.2.2", "0.2.3"))
 def test_mcp_version_must_match_the_e11_pin_before_effects(
     installer_harness: tuple[Path, dict[str, str], Path, Path], mcp_version: str
 ) -> None:
@@ -5189,7 +5189,7 @@ def test_staged_and_restored_mcp_versions_must_match_the_e11_pin(
 def test_upgrade_from_mcp_022_stages_and_finishes_at_the_current_pin(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
-    """A prior 0.2.2 application upgrades only after final 0.2.3 verification."""
+    """A prior 0.2.2 application upgrades only after final 0.2.4 verification."""
     _, environment, log, _ = installer_harness
     _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
 
@@ -5204,19 +5204,52 @@ def test_upgrade_from_mcp_022_stages_and_finishes_at_the_current_pin(
     assert result.returncode == 0, result.stderr
     events = log.read_text().splitlines()
     assert "FAKE_PRIOR_MCP_VERSION <0.2.2>" in events
-    assert "FAKE_FINAL_MCP_VERSION <0.2.3>" in events
+    assert "FAKE_FINAL_MCP_VERSION <0.2.4>" in events
     assert events.index("FAKE_PRIOR_MCP_VERSION <0.2.2>") < events.index(
         "pipx <uninstall> <--> <roastpilot-agent>"
     )
     assert events.index("pipx <install> <--> <roastpilot-agent[pi]==2.0>") < events.index(
-        "FAKE_FINAL_MCP_VERSION <0.2.3>"
+        "FAKE_FINAL_MCP_VERSION <0.2.4>"
     )
     staged_cleanup = next(
         index
         for index, event in enumerate(events)
         if "roastpilot-stage-" in event and "<uninstall>" in event
     )
-    assert events.index("FAKE_FINAL_MCP_VERSION <0.2.3>") < staged_cleanup
+    assert events.index("FAKE_FINAL_MCP_VERSION <0.2.4>") < staged_cleanup
+
+
+def test_upgrade_from_mcp_023_stages_and_finishes_at_the_current_pin(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """A prior 0.2.3 application upgrades only after final 0.2.4 verification."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+
+    result = _run(
+        environment | {"FAKE_PIPX_PRIOR_MCP_VERSION": "0.2.3"},
+        "--set-hostname",
+        "roastpilot",
+        "--version",
+        "2.0",
+    )
+
+    assert result.returncode == 0, result.stderr
+    events = log.read_text().splitlines()
+    assert "FAKE_PRIOR_MCP_VERSION <0.2.3>" in events
+    assert "FAKE_FINAL_MCP_VERSION <0.2.4>" in events
+    assert events.index("FAKE_PRIOR_MCP_VERSION <0.2.3>") < events.index(
+        "pipx <uninstall> <--> <roastpilot-agent>"
+    )
+    assert events.index("pipx <install> <--> <roastpilot-agent[pi]==2.0>") < events.index(
+        "FAKE_FINAL_MCP_VERSION <0.2.4>"
+    )
+    staged_cleanup = next(
+        index
+        for index, event in enumerate(events)
+        if "roastpilot-stage-" in event and "<uninstall>" in event
+    )
+    assert events.index("FAKE_FINAL_MCP_VERSION <0.2.4>") < staged_cleanup
 
 
 def test_staged_mcp_022_rejection_preserves_the_prior_application(
@@ -5251,6 +5284,29 @@ def test_idle_mcp_022_rejection_precedes_package_or_agent_side_effects(
     _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
 
     result = _run(environment | {"FAKE_PIPX_MCP_VERSION": "0.2.2"}, "--set-hostname", "roastpilot")
+
+    assert (
+        result.returncode != 0
+        and "installed roastpilot-agent lacks required Pi/MCP" in result.stderr
+    )
+    events = log.read_text().splitlines()
+    assert "pipx <runpip> <roastpilot-agent> <show> <coffee-roaster-mcp>" in events
+    assert not any(
+        event.startswith(("apt-get ", "roastpilot-agent ", "systemctl <enable>"))
+        for event in events
+    )
+    assert not any(event.startswith(("pipx <install>", "pipx <uninstall>")) for event in events)
+    assert not _has_roastpilot_agent_lifecycle_mutation(events)
+
+
+def test_idle_mcp_023_rejection_precedes_package_or_agent_side_effects(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """An idle retained 0.2.3 application is refused before package or agent effects."""
+    _, environment, log, _ = installer_harness
+    _pipx_state(Path(environment["FAKE_PIPX_STATE"]), "1.2", "roastpilot-agent[pi]==1.2")
+
+    result = _run(environment | {"FAKE_PIPX_MCP_VERSION": "0.2.3"}, "--set-hostname", "roastpilot")
 
     assert (
         result.returncode != 0
