@@ -1,5 +1,10 @@
 # RoastPilot Agent Project State Registry
 
+**14 Oct 2026 — #1013 MCP 0.2.4 dependency adoption:** this records dependency
+adoption only. The public 0.2.4 release is not a cold candidate; D196 remains
+unchanged. This makes no installation, hardware, Pi or epic-completion claim.
+coffee-roaster-mcp#234 may remain open for nested-suite optimisation.
+
 **5 Oct 2026 — D210/D211 retrospective cold qualification:** the original
 completed supervised 10+10 cold run returned `NOT_CONFORMANT`, exit 6, because
 its original D210 evaluator misclassified the exact MCP prepared-session reason.

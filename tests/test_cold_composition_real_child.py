@@ -1,4 +1,4 @@
-"""T-U1-RC: cold composition refusal against the real 0.2.3 mock child.
+"""T-U1-RC: cold composition refusal against the real 0.2.4 mock child.
 
 Software integration evidence only.  The composition starts one real mock-driver
 child with first-crack and ambient sensing disabled, then refuses the child because
@@ -143,8 +143,8 @@ async def test_t_u1_rc_real_child_closed_environment_and_committed_bytes(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """T-U1-RC: 0.2.3 child is refused by the retained 0.2.2 cold identity."""
-    assert importlib.metadata.version("coffee-roaster-mcp") == "0.2.3"
+    """T-U1-RC: 0.2.4 child is refused by the retained 0.2.2 cold identity."""
+    assert importlib.metadata.version("coffee-roaster-mcp") == "0.2.4"
     assert Path(resolve_mcp_command(DEFAULT_MCP_COMMAND)).is_file()
     monkeypatch.chdir(tmp_path)
     for name in list(os.environ):
@@ -388,10 +388,10 @@ async def test_t_u1_rc_real_child_closed_environment_and_committed_bytes(
     assert len(runtimes) == 1
     assert runtimes[0].first_crack_mode == "disabled"
     assert runtimes[0].roaster_driver == "mock"
-    # The child must report its installed 0.2.3 version; the retained 0.2.2 cold
+    # The child must report its installed 0.2.4 version; the retained 0.2.2 cold
     # identity then refuses it before candidate admission or identity freezing.
     assert len(servers) == 1
-    assert servers[0].version == "0.2.3"
+    assert servers[0].version == "0.2.4"
     assert runtimes[0].config_source == str(active_path)
     assert freeze_calls == []
 

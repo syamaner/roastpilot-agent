@@ -708,11 +708,12 @@ def test_render_mcp_yaml_repo_id_and_revision_come_from_the_manifest_not_inputs(
 
 
 def test_render_mcp_yaml_contains_no_recording_enabling_key() -> None:
-    """T10/G20: selected 0.2.3 schemas default recording off and omit the section."""
+    """T10/G20: selected 0.2.4 schemas default recording off and omit the section."""
     text = render_mcp_yaml(_inputs())
     parsed = yaml.safe_load(text)
     assert "recording" not in parsed
-    assert "Published coffee-roaster-mcp 0.2.3" in text
+    assert "Published coffee-roaster-mcp 0.2.4" in text
+    assert "Published coffee-roaster-mcp 0.2.3" not in text
     assert "reviewed, unreleased 0.2.2" in text
     assert "separate historical artifact" in text
     assert "attest installed bytes" in text

@@ -71,10 +71,12 @@ minutes remain separate gates. #954 stays open and E11-S3 is in progress.
   variable name. Never paste it into the command line.
 - **The MCP package: three different things.** Keep them apart.
   1. *Published distribution metadata.* The `[pi]` extra and the development
-     group pin `coffee-roaster-mcp==0.2.3`; the published 0.2.3 wheel digest is
+     group pin `coffee-roaster-mcp==0.2.4`; the current published 0.2.4 wheel digest is
+     `b11b6764b520bbb7662d4f82841949322222c239a1024d7cc4c74f1875020b70`.
+     The historical published 0.2.3 wheel digest is
      `666fbcee09100939b1cf0e2fd38d6fb5ece528e25f4a0acd715705c208863fa3`.
-     Published 0.2.3 supplies the typed temperature projection in the mock
-     child, but a normal 0.2.3 installation is refused at cold
+     Published 0.2.4 supplies the typed temperature projection in the mock
+     child, but a normal 0.2.4 installation is refused at cold
      identity/admission until a separately approved candidate exists.
   2. *Reviewed candidate bytes*, as recorded by the #997 review: reviewed source
      revision `0fc5e6d2e2a677c392b0706267e154f5780b96b0`; merged MCP main
@@ -83,7 +85,8 @@ minutes remain separate gates. #954 stays open and E11-S3 is in progress.
      of 169948 bytes with SHA-256
      `4f52048efa4c368e785c30acface04356dd943583a251e02a9b635905dec476a`. Its
      self-reported version is also 0.2.2, matching the historical published
-     0.2.2 wheel rather than the current published 0.2.3 wheel. The digest,
+     0.2.2 wheel rather than the published 0.2.3 wheel or the current published
+     0.2.4 wheel. The digest,
      byte length and reviewed revision distinguish it from that historical wheel.
   3. *Installed bytes*, which this software never attests.
 
@@ -120,7 +123,7 @@ outside version-only reasoning:
 1. Record one Agent artifact's kind, source revision, clean-tree assertion where
    applicable, and byte length and SHA-256 where applicable.
 2. Record the reviewed MCP candidate identified above: source revision, merged-tree
-   record, candidate wheel byte length and SHA-256. Published MCP 0.2.3 supplies the
+   record, candidate wheel byte length and SHA-256. Published MCP 0.2.4 supplies the
    D209 temperature projection, but is not cold-admitted; the reviewed, unreleased
    0.2.2 candidate remains the separately recorded typed-projection artifact.
 3. Treat the selected Agent artifact, reviewed MCP candidate, published MCP
