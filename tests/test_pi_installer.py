@@ -942,12 +942,13 @@ def _oracle_run(tmp_path: Path, name: str, *, port: str, api_key: str) -> _Overl
     )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _OwnedInstallerProcess:
     """Record a test-created installer parent and its private process group."""
 
     process: subprocess.Popen[str]
     group_id: int
+    retired: bool = False
 
 
 def _start_owned_installer(
@@ -1009,8 +1010,11 @@ def _signal_owned_group(group_id: int, signal_number: int) -> None:
 
 def _drain_owned_group(owned: _OwnedInstallerProcess) -> None:
     """Stop every remaining member of one recorded private process group."""
+    if owned.retired:
+        return
     owned.process.poll()
     if not _owned_group_live_members(owned.group_id):
+        owned.retired = True
         return
     _signal_owned_group(owned.group_id, signal.SIGTERM)
     deadline = time.monotonic() + 1
@@ -1018,8 +1022,10 @@ def _drain_owned_group(owned: _OwnedInstallerProcess) -> None:
         if time.monotonic() >= deadline:
             _signal_owned_group(owned.group_id, signal.SIGKILL)
             _assert_owned_group_is_drained(owned.group_id)
+            owned.retired = True
             return
         time.sleep(0.01)
+    owned.retired = True
 
 
 def _reap_owned_process(owned: _OwnedInstallerProcess) -> tuple[str, str]:
@@ -1073,6 +1079,7 @@ def _drain_owned_processes(
         "zombie-only-cleanup",
         "captured-output-live-descendant",
         "uncaptured-output-live-descendant",
+        "retired-cleanup-idempotency",
     ),
 )
 def test_two_installer_runs_overlap_without_cross_run_leaks(
@@ -1172,6 +1179,58 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(
             assert not _owned_group_live_members(owned.group_id)
             assert owned.process in outputs
         finally:
+            _drain_owned_processes([owned], outputs)
+            _assert_owned_group_is_drained(owned.group_id)
+        return
+    if case == "retired-cleanup-idempotency":
+        owned = _start_owned_installer(
+            [
+                "/bin/sh",
+                "-c",
+                "(trap '' TERM; exec </dev/null >/dev/null 2>&1; "
+                "while :; do /bin/sleep 1; done) & exit 0",
+            ],
+            dict(os.environ),
+        )
+        outputs: dict[subprocess.Popen[str], tuple[str, str]] = {}
+        try:
+            deadline = time.monotonic() + 5
+            while True:
+                live_members = _owned_group_live_members(owned.group_id)
+                if owned.process.poll() is not None and any(
+                    pid != owned.process.pid for pid in live_members
+                ):
+                    break
+                if time.monotonic() >= deadline:
+                    raise AssertionError("owned descendant did not remain live before cleanup")
+                time.sleep(0.01)
+            outputs[owned.process] = owned.process.communicate(timeout=5)
+            _drain_owned_processes([owned], outputs)
+            assert owned.retired
+            inspections: list[int] = []
+            signals: list[int] = []
+
+            def occupied_group_inspection(
+                *args: Any, **kwargs: Any
+            ) -> subprocess.CompletedProcess[str]:
+                """Model a recycled numeric group that must never be inspected after retirement."""
+                inspections.append(owned.group_id)
+                return subprocess.CompletedProcess(
+                    ["ps"], 0, stdout=f"99999 {owned.group_id} S\n", stderr=""
+                )
+
+            def recycled_group_signal(group_id: int, signal_number: int) -> None:
+                """Reject any signal sent to a retired numeric group."""
+                signals.append(group_id)
+                raise AssertionError("retired process group was signalled")
+
+            monkeypatch.setattr(subprocess, "run", occupied_group_inspection)
+            monkeypatch.setattr(os, "killpg", recycled_group_signal)
+            _drain_owned_processes([owned], outputs)
+            assert inspections == []
+            assert signals == []
+        finally:
+            monkeypatch.undo()
             _drain_owned_processes([owned], outputs)
             _assert_owned_group_is_drained(owned.group_id)
         return
@@ -1412,6 +1471,8 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(
         "relative-shared-parent-symlink",
         "own-base-symlink",
         "temporary-root-ancestor-symlink",
+        "own-relative-symlink",
+        "external-absolute-symlink",
         "missing-own-prior-hostname",
         "wrong-final-hostname",
         "missing-own-port",
@@ -1454,6 +1515,13 @@ def test_cross_run_leak_oracle_rejects_synthetic_leaks(tmp_path: Path, case: str
         (own.base / "self-link").symlink_to(".")
     elif case == "temporary-root-ancestor-symlink":
         (own.base / "root-ancestor-link").symlink_to("../../..")
+    elif case == "own-relative-symlink":
+        (own.base / "safe-target").mkdir()
+        (own.base / "safe-link").symlink_to("safe-target")
+    elif case == "external-absolute-symlink":
+        external_target = tmp_path.parent / "accepted-external-target"
+        external_target.mkdir()
+        (own.base / "external-link").symlink_to(external_target)
     elif case == "missing-own-prior-hostname":
         prior_file = Path(own.environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / (
             "var/lib/roastpilot-agent/prior-static-hostname"
@@ -1497,9 +1565,22 @@ def test_cross_run_leak_oracle_rejects_synthetic_leaks(tmp_path: Path, case: str
     else:
         own.log.write_text("")
 
+    if case in {"own-relative-symlink", "external-absolute-symlink"}:
+        _assert_no_cross_run_leak(own, peer, tmp_path)
+        return
+
     with pytest.raises(AssertionError) as raised:
         _assert_no_cross_run_leak(own, peer, tmp_path)
     message = str(raised.value)
+    expected_messages = {
+        "relative-peer-root-symlink": "symlink target is outside fixture-owned output",
+        "relative-peer-owner-symlink": "symlink target is outside fixture-owned output",
+        "relative-shared-parent-symlink": "symlink target is outside fixture-owned output",
+        "own-base-symlink": "symlink target is outside fixture-owned output",
+        "temporary-root-ancestor-symlink": "symlink target is outside fixture-owned output",
+    }
+    if case in expected_messages:
+        assert message == expected_messages[case]
     formatted = str(raised.getrepr(showlocals=False, funcargs=True))
     assert own.api_key not in message
     assert peer.api_key not in message
