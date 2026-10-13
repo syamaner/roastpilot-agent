@@ -967,6 +967,25 @@ def _start_owned_installer(
     return _OwnedInstallerProcess(process, process.pid)
 
 
+def _start_ready_term_ignoring_descendant(
+    temporary_root: Path,
+) -> tuple[_OwnedInstallerProcess, Path]:
+    """Start a closed-pipe child that marks readiness after ignoring TERM."""
+    ready_marker = temporary_root / "term-ignoring-descendant-ready"
+    owned = _start_owned_installer(
+        [
+            "/bin/sh",
+            "-c",
+            "(trap '' TERM; exec </dev/null >/dev/null 2>&1; "
+            ': > "$1"; while :; do /bin/sleep 1; done) & exit 0',
+            "term-ignoring-descendant",
+            str(ready_marker),
+        ],
+        dict(os.environ),
+    )
+    return owned, ready_marker
+
+
 def _owned_group_live_members(group_id: int) -> tuple[int, ...]:
     """Return live members of one proof-owned group, tolerating exit races."""
     listing = subprocess.run(
@@ -994,6 +1013,19 @@ def _assert_owned_group_is_drained(group_id: int) -> None:
     while _owned_group_live_members(group_id):
         if time.monotonic() >= deadline:
             raise AssertionError("owned installer process group still has live members")
+        time.sleep(0.01)
+
+
+def _wait_for_ready_owned_descendant(owned: _OwnedInstallerProcess, ready_marker: Path) -> None:
+    """Wait for a marked, live descendant after its owner has exited."""
+    deadline = time.monotonic() + 5
+    while True:
+        live_members = _owned_group_live_members(owned.group_id)
+        descendants = [pid for pid in live_members if pid != owned.process.pid]
+        if ready_marker.exists() and owned.process.poll() is not None and descendants:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError("ready closed-pipe descendant did not remain live")
         time.sleep(0.01)
 
 
@@ -1153,60 +1185,53 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(
             _assert_owned_group_is_drained(exited_owned.group_id)
         return
     if case.endswith("output-live-descendant"):
-        owned = _start_owned_installer(
-            [
-                "/bin/sh",
-                "-c",
-                "(trap '' TERM; exec </dev/null >/dev/null 2>&1; "
-                "while :; do /bin/sleep 1; done) & exit 0",
-            ],
-            dict(os.environ),
-        )
+        owned, ready_marker = _start_ready_term_ignoring_descendant(tmp_path)
         outputs: dict[subprocess.Popen[str], tuple[str, str]] = {}
+        signal_calls: list[tuple[int, int]] = []
+        real_killpg = os.killpg
+
+        def record_group_signal(group_id: int, signal_number: int) -> None:
+            """Record and deliver each cleanup signal to its private group."""
+            signal_calls.append((group_id, signal_number))
+            real_killpg(group_id, signal_number)
+
+        monkeypatch.setattr(os, "killpg", record_group_signal)
         try:
-            deadline = time.monotonic() + 5
-            while True:
-                live_members = _owned_group_live_members(owned.group_id)
-                descendants = [pid for pid in live_members if pid != owned.process.pid]
-                if owned.process.poll() is not None and descendants:
-                    break
-                if time.monotonic() >= deadline:
-                    raise AssertionError("closed-pipe descendant did not remain live")
-                time.sleep(0.01)
+            _wait_for_ready_owned_descendant(owned, ready_marker)
             if case == "captured-output-live-descendant":
                 outputs[owned.process] = owned.process.communicate(timeout=5)
             _drain_owned_processes([owned], outputs)
-            assert not _owned_group_live_members(owned.group_id)
             assert owned.process in outputs
+            assert not _owned_group_live_members(owned.group_id)
+            assert signal_calls == [
+                (owned.group_id, signal.SIGTERM),
+                (owned.group_id, signal.SIGKILL),
+            ]
         finally:
             _drain_owned_processes([owned], outputs)
             _assert_owned_group_is_drained(owned.group_id)
         return
     if case == "retired-cleanup-idempotency":
-        owned = _start_owned_installer(
-            [
-                "/bin/sh",
-                "-c",
-                "(trap '' TERM; exec </dev/null >/dev/null 2>&1; "
-                "while :; do /bin/sleep 1; done) & exit 0",
-            ],
-            dict(os.environ),
-        )
+        owned, ready_marker = _start_ready_term_ignoring_descendant(tmp_path)
         outputs: dict[subprocess.Popen[str], tuple[str, str]] = {}
+        signal_calls: list[tuple[int, int]] = []
+        real_killpg = os.killpg
+
+        def record_group_signal(group_id: int, signal_number: int) -> None:
+            """Record and deliver each cleanup signal to its private group."""
+            signal_calls.append((group_id, signal_number))
+            real_killpg(group_id, signal_number)
+
+        monkeypatch.setattr(os, "killpg", record_group_signal)
         try:
-            deadline = time.monotonic() + 5
-            while True:
-                live_members = _owned_group_live_members(owned.group_id)
-                if owned.process.poll() is not None and any(
-                    pid != owned.process.pid for pid in live_members
-                ):
-                    break
-                if time.monotonic() >= deadline:
-                    raise AssertionError("owned descendant did not remain live before cleanup")
-                time.sleep(0.01)
+            _wait_for_ready_owned_descendant(owned, ready_marker)
             outputs[owned.process] = owned.process.communicate(timeout=5)
             _drain_owned_processes([owned], outputs)
             assert owned.retired
+            assert signal_calls == [
+                (owned.group_id, signal.SIGTERM),
+                (owned.group_id, signal.SIGKILL),
+            ]
             inspections: list[int] = []
             signals: list[int] = []
 
@@ -1520,7 +1545,6 @@ def test_cross_run_leak_oracle_rejects_synthetic_leaks(tmp_path: Path, case: str
         (own.base / "safe-link").symlink_to("safe-target")
     elif case == "external-absolute-symlink":
         external_target = tmp_path.parent / "accepted-external-target"
-        external_target.mkdir()
         (own.base / "external-link").symlink_to(external_target)
     elif case == "missing-own-prior-hostname":
         prior_file = Path(own.environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / (
