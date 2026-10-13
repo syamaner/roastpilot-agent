@@ -802,6 +802,11 @@ def _raise_if_present(present: bool, artifact: str, kind: str) -> None:
         raise AssertionError(f"peer {kind} leaked to {artifact}")
 
 
+def _path_is_lexically_within(path: Path, directory: Path) -> bool:
+    """Check lexical containment without resolving or following filesystem links."""
+    return os.path.commonpath((str(path), str(directory))) == str(directory)
+
+
 def _assert_no_cross_run_leak(own: _OverlapRun, peer: _OverlapRun, temporary_root: Path) -> None:
     """Assert own output is complete and peer identifiers appear nowhere in it."""
     if not own.base.is_relative_to(temporary_root):
@@ -872,6 +877,19 @@ def _assert_no_cross_run_leak(own: _OverlapRun, peer: _OverlapRun, temporary_roo
                 target = os.readlink(path)
                 for value, kind in peer_values:
                     _raise_if_present(value in target, "symlink target", kind)
+                target_path = Path(
+                    os.path.abspath(os.path.normpath(os.path.join(path.parent, target)))
+                )
+                normalized_root = Path(os.path.abspath(temporary_root))
+                normalized_base = Path(os.path.abspath(own.base))
+                target_is_peer_or_shared = _path_is_lexically_within(
+                    target_path, normalized_root
+                ) and not _path_is_lexically_within(target_path, normalized_base)
+                target_is_base_or_root_ancestor = _path_is_lexically_within(
+                    normalized_base, target_path
+                ) or _path_is_lexically_within(normalized_root, target_path)
+                if target_is_peer_or_shared or target_is_base_or_root_ancestor:
+                    raise AssertionError("symlink target is outside fixture-owned output")
             elif stat.S_ISREG(mode):
                 contents = Path(directory, name).read_bytes()
                 for value, kind in peer_values:
@@ -989,11 +1007,23 @@ def _signal_owned_group(group_id: int, signal_number: int) -> None:
             raise
 
 
-def _reap_owned_process(owned: _OwnedInstallerProcess) -> tuple[str, str]:
-    """Stop and drain one private installer group, including surviving descendants."""
+def _drain_owned_group(owned: _OwnedInstallerProcess) -> None:
+    """Stop every remaining member of one recorded private process group."""
     owned.process.poll()
-    if _owned_group_live_members(owned.group_id):
-        _signal_owned_group(owned.group_id, signal.SIGTERM)
+    if not _owned_group_live_members(owned.group_id):
+        return
+    _signal_owned_group(owned.group_id, signal.SIGTERM)
+    deadline = time.monotonic() + 1
+    while _owned_group_live_members(owned.group_id):
+        if time.monotonic() >= deadline:
+            _signal_owned_group(owned.group_id, signal.SIGKILL)
+            _assert_owned_group_is_drained(owned.group_id)
+            return
+        time.sleep(0.01)
+
+
+def _reap_owned_process(owned: _OwnedInstallerProcess) -> tuple[str, str]:
+    """Collect one uncaptured installer parent's output after group cleanup."""
     try:
         return owned.process.communicate(timeout=5)
     except subprocess.TimeoutExpired:
@@ -1001,8 +1031,7 @@ def _reap_owned_process(owned: _OwnedInstallerProcess) -> tuple[str, str]:
             raise AssertionError(
                 "owned installer pipes remained open without a live process"
             ) from None
-        _signal_owned_group(owned.group_id, signal.SIGKILL)
-        return owned.process.communicate(timeout=5)
+        raise
 
 
 def _drain_owned_processes(
@@ -1014,10 +1043,15 @@ def _drain_owned_processes(
     """Attempt every registered cleanup before raising the first cleanup failure."""
     failure: BaseException | None = None
     for owned in processes:
-        if owned.process in outputs:
-            continue
         try:
-            outputs[owned.process] = reaper(owned)
+            _drain_owned_group(owned)
+            if owned.process not in outputs:
+                outputs[owned.process] = reaper(owned)
+        except BaseException as error:
+            if failure is None:
+                failure = error
+        try:
+            _drain_owned_group(owned)
         except BaseException as error:
             if failure is None:
                 failure = error
@@ -1037,6 +1071,8 @@ def _drain_owned_processes(
         "permission-race-no-live-group",
         "permission-race-live-group",
         "zombie-only-cleanup",
+        "captured-output-live-descendant",
+        "uncaptured-output-live-descendant",
     ),
 )
 def test_two_installer_runs_overlap_without_cross_run_leaks(
@@ -1108,6 +1144,36 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(
             monkeypatch.undo()
             _reap_owned_process(exited_owned)
             _assert_owned_group_is_drained(exited_owned.group_id)
+        return
+    if case.endswith("output-live-descendant"):
+        owned = _start_owned_installer(
+            [
+                "/bin/sh",
+                "-c",
+                "(trap '' TERM; exec </dev/null >/dev/null 2>&1; "
+                "while :; do /bin/sleep 1; done) & exit 0",
+            ],
+            dict(os.environ),
+        )
+        outputs: dict[subprocess.Popen[str], tuple[str, str]] = {}
+        try:
+            deadline = time.monotonic() + 5
+            while True:
+                live_members = _owned_group_live_members(owned.group_id)
+                descendants = [pid for pid in live_members if pid != owned.process.pid]
+                if owned.process.poll() is not None and descendants:
+                    break
+                if time.monotonic() >= deadline:
+                    raise AssertionError("closed-pipe descendant did not remain live")
+                time.sleep(0.01)
+            if case == "captured-output-live-descendant":
+                outputs[owned.process] = owned.process.communicate(timeout=5)
+            _drain_owned_processes([owned], outputs)
+            assert not _owned_group_live_members(owned.group_id)
+            assert owned.process in outputs
+        finally:
+            _drain_owned_processes([owned], outputs)
+            _assert_owned_group_is_drained(owned.group_id)
         return
     alpha_owner = parent / "alpha-run"
     beta_owner = parent / "beta-run"
@@ -1341,6 +1407,11 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(
         "peer-prior-hostname-file",
         "peer-prior-hostname-prior-file",
         "peer-root-symlink",
+        "relative-peer-root-symlink",
+        "relative-peer-owner-symlink",
+        "relative-shared-parent-symlink",
+        "own-base-symlink",
+        "temporary-root-ancestor-symlink",
         "missing-own-prior-hostname",
         "wrong-final-hostname",
         "missing-own-port",
@@ -1373,6 +1444,16 @@ def test_cross_run_leak_oracle_rejects_synthetic_leaks(tmp_path: Path, case: str
         prior_file.write_text(f"{peer.prior_hostname}\n")
     elif case == "peer-root-symlink":
         (own.base / "peer-link").symlink_to(peer.base)
+    elif case == "relative-peer-root-symlink":
+        (own.base / "peer-link").symlink_to("../../peer-lantern/installer-output")
+    elif case == "relative-peer-owner-symlink":
+        (own.base / "peer-owner-link").symlink_to("../../peer-lantern")
+    elif case == "relative-shared-parent-symlink":
+        (own.base / "shared-parent-link").symlink_to("../..")
+    elif case == "own-base-symlink":
+        (own.base / "self-link").symlink_to(".")
+    elif case == "temporary-root-ancestor-symlink":
+        (own.base / "root-ancestor-link").symlink_to("../../..")
     elif case == "missing-own-prior-hostname":
         prior_file = Path(own.environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / (
             "var/lib/roastpilot-agent/prior-static-hostname"
