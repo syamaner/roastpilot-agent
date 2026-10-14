@@ -417,7 +417,7 @@ UNIT
         exit 41
       fi
     fi
-    if /bin/test "$@"; then
+    if builtin test "$@"; then
       if [ "${1:-}" = -d ] && [ "${!#}" = "${FAKE_MUTATE_AFTER_TEST_D_PATH:-}" ]; then
         [ -n "${FAKE_MUTATE_AFTER_TEST_D_TARGET:-}" ] || exit 46
         count=0; [ ! -e "$FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE" ] || count=$(cat "$FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE")
@@ -9317,3 +9317,559 @@ def test_process_guard_structure_has_closed_protocol_and_four_boundaries() -> No
     assert services.index("require_no_live_agent_process") < services.index(
         "systemctl start roastpilot-agent"
     )
+
+
+# #1017: the fake ``test`` backend evaluates the shell's own check instead of spawning
+# the external checker. These nodes prove that substitution against the reference.
+_REFERENCE_TEST_COMMAND = "/bin/test"
+_PROVEN_TEST_FORMS: tuple[tuple[str, ...], ...] = (
+    ("-e",),
+    ("-L",),
+    ("-f",),
+    ("-d",),
+    ("!", "-e"),
+    ("!", "-L"),
+    ("!", "-d"),
+)
+_FAKE_TEST_COUNTER_VARIABLES = (
+    "FAKE_TEST_FAIL_COUNT_FILE",
+    "FAKE_TEST_FAIL_D_COUNT_FILE",
+    "FAKE_TEST_L_FAIL_COUNT_FILE",
+    "FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE",
+)
+_FAKE_TEST_STATES = (
+    "regular-file",
+    "directory",
+    "directory-slash",
+    "file-link",
+    "directory-link",
+    "directory-link-slash",
+    "dangling-link",
+    "symlink-loop",
+    "missing",
+    "missing-parent-child",
+    "file-parent-child",
+    "spaced-file",
+)
+_FAKE_TEST_TRUE_STATES: dict[tuple[str, ...], frozenset[str]] = {
+    ("-e",): frozenset(
+        {
+            "regular-file",
+            "directory",
+            "directory-slash",
+            "file-link",
+            "directory-link",
+            "directory-link-slash",
+            "spaced-file",
+        }
+    ),
+    ("-L",): frozenset({"file-link", "directory-link", "dangling-link", "symlink-loop"}),
+    ("-f",): frozenset({"regular-file", "file-link", "spaced-file"}),
+    ("-d",): frozenset({"directory", "directory-slash", "directory-link", "directory-link-slash"}),
+    ("!", "-e"): frozenset(
+        {"dangling-link", "symlink-loop", "missing", "missing-parent-child", "file-parent-child"}
+    ),
+    ("!", "-L"): frozenset(
+        {
+            "regular-file",
+            "directory",
+            "directory-slash",
+            "missing",
+            "missing-parent-child",
+            "file-parent-child",
+            "spaced-file",
+        }
+    ),
+    ("!", "-d"): frozenset(
+        {
+            "regular-file",
+            "file-link",
+            "dangling-link",
+            "symlink-loop",
+            "missing",
+            "missing-parent-child",
+            "file-parent-child",
+            "spaced-file",
+        }
+    ),
+}
+# Whether a trailing slash makes ``-L`` follow a directory link is platform-defined, so
+# these two rows are checked against the reference only, never pinned literally.
+_FAKE_TEST_UNPINNED_ROWS = frozenset(
+    {(("-L",), "directory-link-slash"), (("!", "-L"), "directory-link-slash")}
+)
+# One fixed argv per form observed while its path changes: file, directory,
+# link to a directory, then missing.
+_FAKE_TEST_LIVE_STATES = ("regular-file", "directory", "directory-link", "missing")
+_FAKE_TEST_LIVE_TRANSITIONS: dict[tuple[str, ...], tuple[int, int, int, int]] = {
+    ("-d",): (1, 0, 0, 1),
+    ("-e",): (0, 0, 0, 1),
+    ("-L",): (1, 1, 0, 1),
+    ("-f",): (0, 1, 1, 1),
+    ("!", "-e"): (1, 1, 1, 0),
+    ("!", "-L"): (0, 0, 1, 0),
+    ("!", "-d"): (0, 1, 1, 0),
+}
+
+
+@dataclass(frozen=True)
+class _FakeTestInjection:
+    """Describe one configured fault injection of the fake check command."""
+
+    path_variable: str
+    count_file_variable: str
+    on_count_variable: str
+    form: tuple[str, ...]
+    status: int
+    event: str
+    event_has_count: bool
+
+
+_FAKE_TEST_INJECTIONS = (
+    _FakeTestInjection(
+        "FAKE_TEST_L_FAIL_PATH",
+        "FAKE_TEST_L_FAIL_COUNT_FILE",
+        "FAKE_TEST_L_FAIL_ON_COUNT",
+        ("-L",),
+        41,
+        "FAKE_TEST_L_FAILURE",
+        True,
+    ),
+    _FakeTestInjection(
+        "FAKE_TEST_FAIL_D_PATH",
+        "FAKE_TEST_FAIL_D_COUNT_FILE",
+        "FAKE_TEST_FAIL_D_ON_COUNT",
+        ("-d",),
+        48,
+        "FAKE_TEST_D_FAILURE",
+        True,
+    ),
+    _FakeTestInjection(
+        "FAKE_TEST_FAIL_PATH",
+        "FAKE_TEST_FAIL_COUNT_FILE",
+        "FAKE_TEST_FAIL_ON_COUNT",
+        ("-e",),
+        41,
+        "FAKE_TEST_FAILURE",
+        False,
+    ),
+)
+
+
+def _run_check(
+    command: str, arguments: tuple[str, ...], environment: dict[str, str], cwd: Path
+) -> subprocess.CompletedProcess[str]:
+    """Run one filesystem check through ``command`` with an explicit working directory."""
+    return subprocess.run(
+        [command, *arguments],
+        env=environment,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _fake_test_record(arguments: tuple[str, ...]) -> str:
+    """Return the log record the fake writes for one check invocation."""
+    return "test" + "".join(f" <{argument}>" for argument in arguments)
+
+
+def _log_lines(log: Path) -> list[str]:
+    """Return every fake-command log line, or none before the first record."""
+    return log.read_text().splitlines() if log.is_file() else []
+
+
+def _fake_test_counters(environment: dict[str, str]) -> dict[str, bytes | None]:
+    """Return the raw bytes of every fake check counter file, ``None`` when absent."""
+    counters: dict[str, bytes | None] = {}
+    for variable in _FAKE_TEST_COUNTER_VARIABLES:
+        path = Path(environment[variable])
+        counters[variable] = path.read_bytes() if path.is_file() else None
+    return counters
+
+
+def _reset_fake_test_counters(environment: dict[str, str]) -> None:
+    """Delete every fake check counter so one scenario cannot leak into the next."""
+    for variable in _FAKE_TEST_COUNTER_VARIABLES:
+        Path(environment[variable]).unlink(missing_ok=True)
+    assert _fake_test_counters(environment) == dict.fromkeys(_FAKE_TEST_COUNTER_VARIABLES), (
+        "counter files survived the scenario reset"
+    )
+
+
+def _fake_test_states(root: Path) -> dict[str, str]:
+    """Create every filesystem state under proof and return its raw argv spelling.
+
+    Raw strings keep the trailing-slash spellings that ``Path`` would normalise away.
+    """
+    root.mkdir()
+    regular = root / "regular-file"
+    regular.write_text("x\n")
+    directory = root / "directory"
+    directory.mkdir()
+    (root / "file-link").symlink_to(regular)
+    (root / "directory-link").symlink_to(directory, target_is_directory=True)
+    (root / "dangling-link").symlink_to(root / "absent-target")
+    (root / "loop-a").symlink_to(root / "loop-b")
+    (root / "loop-b").symlink_to(root / "loop-a")
+    (root / "path with space").write_text("x\n")
+    return {
+        "regular-file": str(regular),
+        "directory": str(directory),
+        "directory-slash": f"{directory}/",
+        "file-link": str(root / "file-link"),
+        "directory-link": str(root / "directory-link"),
+        "directory-link-slash": f"{root / 'directory-link'}/",
+        "dangling-link": str(root / "dangling-link"),
+        "symlink-loop": str(root / "loop-a"),
+        "missing": str(root / "missing-path"),
+        "missing-parent-child": str(root / "missing-parent" / "child"),
+        "file-parent-child": str(regular / "child"),
+        "spaced-file": str(root / "path with space"),
+    }
+
+
+def _fake_test_tree_snapshot(root: Path) -> dict[str, tuple[int, str | None]]:
+    """Record the lstat type and link target of every entry at or below ``root``."""
+    snapshot: dict[str, tuple[int, str | None]] = {}
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        mode = os.lstat(current).st_mode
+        target = os.readlink(current) if stat.S_ISLNK(mode) else None
+        snapshot[str(current.relative_to(root.parent))] = (stat.S_IFMT(mode), target)
+        if stat.S_ISDIR(mode):
+            pending.extend(sorted(current.iterdir()))
+    return snapshot
+
+
+def _set_live_state(path: Path, state: str, target: Path) -> None:
+    """Replace ``path`` in place with one named live state."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        path.rmdir()
+    if state == "regular-file":
+        path.write_text("x\n")
+    elif state == "directory":
+        path.mkdir()
+    elif state == "directory-link":
+        path.symlink_to(target, target_is_directory=True)
+    else:
+        assert state == "missing", f"unknown live state {state}"
+
+
+@pytest.mark.parametrize(
+    "form", _PROVEN_TEST_FORMS, ids=("e", "L", "f", "d", "not-e", "not-L", "not-d")
+)
+def test_fake_test_backend_matches_reference_for_every_installer_form(
+    form: tuple[str, ...],
+    tmp_path: Path,
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """Prove the fake check agrees with the external reference for one installer form."""
+    fake_bin, environment, log, _ = installer_harness
+    reference = Path(_REFERENCE_TEST_COMMAND)
+    assert reference.is_file() and os.access(reference, os.X_OK), (
+        f"reference checker precondition failed: {reference} is not an executable file"
+    )
+    root = tmp_path / "fake-test-states"
+    states = _fake_test_states(root)
+    assert tuple(states) == _FAKE_TEST_STATES
+    before = _fake_test_tree_snapshot(root)
+    stderr_failures: list[tuple[str, str, str]] = []
+    log_failures: list[tuple[str, list[str]]] = []
+    disagreements: list[tuple[str, int, int]] = []
+    anchor_failures: list[tuple[str, int, int, int]] = []
+    for state, path in states.items():
+        arguments = (*form, path)
+        start = _log_lines(log)
+        fake = _run_check(str(fake_bin / "test"), arguments, environment, tmp_path)
+        after = _log_lines(log)
+        expected_reference = _run_check(_REFERENCE_TEST_COMMAND, arguments, environment, tmp_path)
+        normalised_reference = 0 if expected_reference.returncode == 0 else 1
+        if fake.stderr or expected_reference.stderr:
+            stderr_failures.append((state, fake.stderr, expected_reference.stderr))
+        if after != [*start, _fake_test_record(arguments)]:
+            log_failures.append((state, after[len(start) :]))
+        if fake.returncode != normalised_reference:
+            disagreements.append((state, fake.returncode, expected_reference.returncode))
+        if (form, state) not in _FAKE_TEST_UNPINNED_ROWS:
+            literal = 0 if state in _FAKE_TEST_TRUE_STATES[form] else 1
+            if literal != fake.returncode or literal != normalised_reference:
+                anchor_failures.append((state, fake.returncode, normalised_reference, literal))
+
+    assert not stderr_failures, f"valid-form stderr (state, fake, reference): {stderr_failures}"
+    assert not log_failures, (
+        f"each check must log exactly one record (state, delta): {log_failures}"
+    )
+    assert _fake_test_counters(environment) == dict.fromkeys(_FAKE_TEST_COUNTER_VARIABLES), (
+        f"plain checks must not create counter files: {_fake_test_counters(environment)}"
+    )
+    assert _fake_test_tree_snapshot(root) == before, "plain checks must not mutate fixture state"
+    assert not disagreements, (
+        f"fake must exit 0 iff the reference does, else 1 (state, fake, reference): {disagreements}"
+    )
+    assert not anchor_failures, (
+        f"literal anchor violated (state, fake, normalised reference, literal): {anchor_failures}"
+    )
+
+
+def _assert_live_observations(
+    fake_test: str, environment: dict[str, str], log: Path, root: Path, cwd: Path
+) -> None:
+    """Prove repeated identical argv observes each live change of its path."""
+    target = root / "live-target"
+    target.mkdir()
+    for index, (form, transitions) in enumerate(_FAKE_TEST_LIVE_TRANSITIONS.items()):
+        path = root / f"live-{index}"
+        arguments = (*form, str(path))
+        observed: list[int] = []
+        for state in _FAKE_TEST_LIVE_STATES:
+            _set_live_state(path, state, target)
+            start = _log_lines(log)
+            fake = _run_check(fake_test, arguments, environment, cwd)
+            reference = _run_check(_REFERENCE_TEST_COMMAND, arguments, environment, cwd)
+            assert fake.returncode == (0 if reference.returncode == 0 else 1), (
+                f"stale live observation for fixed argv {arguments} in state {state}: "
+                f"fake {fake.returncode}, reference {reference.returncode}"
+            )
+            assert _log_lines(log) == [*start, _fake_test_record(arguments)], (
+                f"live check {arguments} in state {state} must log exactly one record"
+            )
+            observed.append(fake.returncode)
+        assert tuple(observed) == transitions, (
+            f"literal live transition anchor for fixed argv {form} over {_FAKE_TEST_LIVE_STATES}: "
+            f"observed {observed}, expected {transitions}"
+        )
+
+
+def _assert_injection_scenario(
+    fake_test: str,
+    environment: dict[str, str],
+    log: Path,
+    scenario: Path,
+    injection: _FakeTestInjection,
+    *,
+    existing: bool,
+    on_count: str | None,
+    calls: int,
+    hook_target: Path | None = None,
+) -> None:
+    """Drive one freshly reset injection scenario and check every call's effects."""
+    _reset_fake_test_counters(environment)
+    scenario.mkdir()
+    subject = scenario / "subject"
+    if existing and injection.form == ("-L",):
+        subject.symlink_to(scenario, target_is_directory=True)
+    elif existing:
+        subject.mkdir()
+    overrides = {injection.path_variable: str(subject)}
+    if on_count is not None:
+        overrides[injection.on_count_variable] = on_count
+    if hook_target is not None:
+        overrides["FAKE_MUTATE_AFTER_TEST_D_PATH"] = str(subject)
+        overrides["FAKE_MUTATE_AFTER_TEST_D_TARGET"] = str(hook_target)
+    scenario_environment = environment | overrides
+    arguments = (*injection.form, str(subject))
+    hook_count = 0
+    label = f"{injection.event} existing={existing} on_count={on_count}"
+    for call in range(1, calls + 1):
+        injected = str(call) == on_count or (on_count is None and not injection.event_has_count)
+        start = _log_lines(log)
+        result = _run_check(fake_test, arguments, scenario_environment, scenario)
+        expected_log = [_fake_test_record(arguments)]
+        expected_counters: dict[str, bytes | None] = dict.fromkeys(_FAKE_TEST_COUNTER_VARIABLES)
+        expected_counters[injection.count_file_variable] = f"{call}\n".encode()
+        if injected:
+            expected_status = injection.status
+            suffix = f" <{call}>" if injection.event_has_count else ""
+            expected_log.append(f"{injection.event} <{subject}>{suffix}")
+        else:
+            expected_status = 0 if existing else 1
+            if hook_target is not None and existing:
+                hook_count += 1
+                expected_log.append(
+                    f"FAKE_TEST_D_MUTATION <{subject}> <{hook_target}> <{hook_count}>"
+                )
+        if hook_count:
+            expected_counters["FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE"] = f"{hook_count}\n".encode()
+        assert result.returncode == expected_status, (
+            f"{label} call {call}: status {result.returncode}, expected {expected_status}"
+        )
+        assert _log_lines(log)[len(start) :] == expected_log, (
+            f"{label} call {call}: log delta {_log_lines(log)[len(start) :]}, expected {expected_log}"
+        )
+        assert _fake_test_counters(scenario_environment) == expected_counters, (
+            f"{label} call {call}: counters {_fake_test_counters(scenario_environment)}, "
+            f"expected {expected_counters}"
+        )
+        assert os.path.lexists(subject) == existing, (
+            f"{label} call {call}: subject existence changed"
+        )
+
+
+def _assert_mutation_hook(
+    fake_test: str, environment: dict[str, str], log: Path, root: Path
+) -> None:
+    """Prove the post-success ``-d`` hook fires only after a true backend result."""
+    target = root / "hook-target"
+    target.mkdir()
+    hook_counter = "FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE"
+    cases = (
+        ("existing", ("-d",), True, str(target), None, 0, 1),
+        ("missing", ("-d",), False, str(target), None, 1, 0),
+        ("empty-target", ("-d",), True, "", None, 46, 0),
+        ("other-form", ("-e",), True, str(target), None, 0, 0),
+        ("off-count", ("-d",), True, str(target), "2", 0, 0),
+    )
+    for name, form, existing, hook_target, on_count, status, mutations in cases:
+        _reset_fake_test_counters(environment)
+        subject = root / f"hook-{name}"
+        if existing:
+            subject.mkdir()
+        overrides = {
+            "FAKE_MUTATE_AFTER_TEST_D_PATH": str(subject),
+            "FAKE_MUTATE_AFTER_TEST_D_TARGET": hook_target,
+        }
+        if on_count is not None:
+            overrides["FAKE_MUTATE_AFTER_TEST_D_ON_COUNT"] = on_count
+        arguments = (*form, str(subject))
+        start = _log_lines(log)
+        result = _run_check(fake_test, arguments, environment | overrides, root)
+        expected_log = [_fake_test_record(arguments)]
+        expected_counters: dict[str, bytes | None] = dict.fromkeys(_FAKE_TEST_COUNTER_VARIABLES)
+        if mutations:
+            expected_log.append(f"FAKE_TEST_D_MUTATION <{subject}> <{hook_target}> <1>")
+        if mutations or on_count is not None:
+            expected_counters[hook_counter] = b"1\n"
+        assert result.returncode == status, f"hook {name}: status {result.returncode} != {status}"
+        assert _log_lines(log)[len(start) :] == expected_log, (
+            f"hook {name}: log delta {_log_lines(log)[len(start) :]}, expected {expected_log}"
+        )
+        assert _fake_test_counters(environment) == expected_counters, (
+            f"hook {name}: counters {_fake_test_counters(environment)}, expected {expected_counters}"
+        )
+        assert subject.is_symlink() == bool(mutations), f"hook {name}: symlink state"
+        assert os.path.lexists(subject) == existing, f"hook {name}: existence changed"
+        if mutations:
+            assert os.readlink(subject) == hook_target, f"hook {name}: wrong mutation target"
+        if on_count is not None:
+            start = _log_lines(log)
+            second = _run_check(fake_test, arguments, environment | overrides, root)
+            assert second.returncode == 0, f"hook {name} second call: status {second.returncode}"
+            assert _log_lines(log)[len(start) :] == [
+                _fake_test_record(arguments),
+                f"FAKE_TEST_D_MUTATION <{subject}> <{hook_target}> <{on_count}>",
+            ], f"hook {name} second call: log delta {_log_lines(log)[len(start) :]}"
+            assert Path(environment[hook_counter]).read_bytes() == b"2\n", (
+                f"hook {name} second call: hook counter"
+            )
+            assert os.readlink(subject) == hook_target, f"hook {name}: on-count mutation target"
+
+
+def _assert_malformed_normalisation(fake_test: str, environment: dict[str, str], cwd: Path) -> None:
+    """Prove a non-boolean backend status for a malformed check is normalised to 1."""
+    malformed = ("-d", "a", "b")
+    fake = _run_check(fake_test, malformed, environment, cwd)
+    reference = _run_check(_REFERENCE_TEST_COMMAND, malformed, environment, cwd)
+    assert reference.returncode not in (0, 1), (
+        f"reference must reject malformed {malformed} with a non-boolean status: "
+        f"{reference.returncode}"
+    )
+    assert fake.returncode == 1, (
+        f"malformed {malformed} must normalise to 1 (reference {reference.returncode}): "
+        f"fake {fake.returncode}"
+    )
+
+
+def _assert_injections(fake_test: str, environment: dict[str, str], log: Path, root: Path) -> None:
+    """Prove every fault injection on existing and missing paths, uncounted and counted."""
+    hook_target = root / "injection-hook-target"
+    hook_target.mkdir()
+    for number, injection in enumerate(_FAKE_TEST_INJECTIONS):
+        for existing in (True, False):
+            prefix = f"injection-{number}-{'existing' if existing else 'missing'}"
+            _assert_injection_scenario(
+                fake_test,
+                environment,
+                log,
+                root / f"{prefix}-first",
+                injection,
+                existing=existing,
+                on_count="1" if injection.event_has_count else None,
+                calls=1 if injection.event_has_count else 2,
+            )
+            _assert_injection_scenario(
+                fake_test,
+                environment,
+                log,
+                root / f"{prefix}-counted",
+                injection,
+                existing=existing,
+                on_count="2",
+                calls=3,
+                hook_target=hook_target if injection.form == ("-d",) else None,
+            )
+
+
+def test_fake_test_backend_preserves_live_observation_injections_and_hook(
+    tmp_path: Path, installer_harness: tuple[Path, dict[str, str], Path, Path]
+) -> None:
+    """Prove liveness, status normalisation, fault injections and the mutation hook.
+
+    Each sub-proof runs even when an earlier one fails, so every broken guard is reported.
+    """
+    fake_bin, environment, log, _ = installer_harness
+    fake_test = str(fake_bin / "test")
+    root = tmp_path / "fake-test-proof"
+    root.mkdir()
+    failures: list[str] = []
+    try:
+        _assert_live_observations(fake_test, environment, log, root, tmp_path)
+    except AssertionError as error:
+        failures.append(f"(a) live observation: {error}")
+    try:
+        _assert_malformed_normalisation(fake_test, environment, tmp_path)
+    except AssertionError as error:
+        failures.append(f"(b) malformed normalisation: {error}")
+    try:
+        _assert_injections(fake_test, environment, log, root)
+    except AssertionError as error:
+        failures.append(f"(c) injections: {error}")
+    try:
+        _assert_mutation_hook(fake_test, environment, log, root)
+    except AssertionError as error:
+        failures.append(f"(d) mutation hook: {error}")
+    assert not failures, "fake check sub-proof failures:\n" + "\n".join(failures)
+
+
+def test_fake_test_backend_installer_forms_stay_in_the_proven_domain(
+    tmp_path: Path, installer_harness: tuple[Path, dict[str, str], Path, Path]
+) -> None:
+    """Prove a default run only emits proven check forms on paths below the harness."""
+    _, environment, log, _ = installer_harness
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode == 0, result.stderr
+
+    events = [event for event in log.read_text().splitlines() if event.startswith("test <")]
+    assert events, "the default run must exercise the fake check seam"
+    unproven: list[str] = []
+    outside: list[str] = []
+    for event in events:
+        assert event.endswith(">"), f"malformed check record: {event}"
+        arguments = tuple(event[len("test <") : -1].split("> <"))
+        form, path = arguments[:-1], arguments[-1]
+        if form not in _PROVEN_TEST_FORMS:
+            unproven.append(event)
+        candidate = Path(path)
+        if (
+            path.startswith("/dev/")
+            or not candidate.is_absolute()
+            or ".." in candidate.parts
+            or not _path_is_lexically_within(candidate, tmp_path)
+        ):
+            outside.append(event)
+    assert not unproven, f"default run used check forms outside the proven table: {unproven}"
+    assert not outside, f"default run checked paths outside the harness root: {outside}"
