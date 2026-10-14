@@ -418,9 +418,9 @@ _DECLARATION_OPENER: re.Pattern[str] = re.compile(r"<![A-Z]")
 def _assert_policy_range_is_outside_declarations(text: str, start: int, end: int) -> None:
     """Reject a non-nesting CommonMark Type-4 declaration span at policy boundaries.
 
-    The next opener and next terminator positions are cached and re-searched
-    only once the scan has moved past them, so each marker kind scans the text
-    at most once instead of rescanning every remaining suffix per token.
+    The pending next-opener and next-terminator positions are cached and searched
+    again only after the scan consumes them, so total search work stays linear in
+    the text length instead of rescanning every remaining suffix per token.
     """
     boundaries = iter(sorted((start, end)))
     next_boundary = next(boundaries, None)
