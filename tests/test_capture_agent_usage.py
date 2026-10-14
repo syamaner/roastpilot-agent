@@ -7449,48 +7449,126 @@ _NW_WARNINGS_FOOTER = (
 
 
 @pytest.mark.parametrize(
-    ("stdout", "returncode", "expected"),
+    ("stdout", "returncode", "expected", "error"),
     [
         pytest.param(
             "\n".join(f"tests/test_m.py::test_{index}" for index in range(13611))
             + "\n\n13611/13645 tests collected (34 deselected) in 16.31s\n",
             0,
-            13611,
+            tuple(f"tests/test_m.py::test_{index}" for index in range(13611)),
+            None,
             id="selected-form",
         ),
-        pytest.param(f"{_NW_A}\n\n1 test collected in 0.01s\n", 0, 1, id="singular"),
         pytest.param(
-            f"{_NW_A}\n{_NW_B}\n\n2 tests collected in 767.50s (0:12:47)\n", 0, 2, id="clock"
+            "tests/test_alpha.py::test_one\n\n1 test collected in 0.01s\n",
+            0,
+            ("tests/test_alpha.py::test_one",),
+            None,
+            id="singular",
         ),
         pytest.param(
-            _nw_collection((_NW_A, _NW_B), footer=_NW_WARNINGS_FOOTER), 0, 2, id="warnings"
+            "tests/test_alpha.py::test_one\ntests/test_alpha.py::test_two[x y]\n\n"
+            "2 tests collected in 767.50s (0:12:47)\n",
+            0,
+            ("tests/test_alpha.py::test_one", "tests/test_alpha.py::test_two[x y]"),
+            None,
+            id="clock-parametrised-space",
         ),
-        pytest.param(f"{_NW_A}\n\n1 test collected in 0.01s\n", 2, None, id="nonzero-exit"),
-        pytest.param(f"{_NW_A}\n1 test collected in 0.01s\n", 0, None, id="no-separator"),
-        pytest.param("\n1 test collected in 0.01s\n", 0, None, id="empty-block"),
-        pytest.param(f" {_NW_A}\n\n1 test collected in 0.01s\n", 0, None, id="leading-space"),
-        pytest.param(f"<Module {_NW_A}>\n\n1 test collected in 0.01s\n", 0, None, id="non-node"),
-        pytest.param(f"{_NW_A}\n\nno tests collected in 0.01s\n", 0, None, id="no-tests"),
-        pytest.param(f"{_NW_A}\n\n1 test collected, 1 error in 0.01s\n", 0, None, id="error"),
-        pytest.param(f"{_NW_A}\n{_NW_B}\n\n1 test collected in 0.01s\n", 0, None, id="mismatch"),
         pytest.param(
-            f"{_NW_A}\n\n1/5 tests collected (1 deselected) in 0.01s\n", 0, None, id="sel-des-tot"
+            "tests/test_alpha.py::test_one\ntests/test_alpha.py::test_two[x y]\n\n"
+            + _NW_WARNINGS_FOOTER
+            + "2 tests collected in 0.01s\n",
+            0,
+            ("tests/test_alpha.py::test_one", "tests/test_alpha.py::test_two[x y]"),
+            None,
+            id="warnings-footer",
         ),
-        pytest.param("", 0, None, id="empty-stdout"),
+        pytest.param(
+            f"{_NW_A}\n\n1 test collected in 0.01s\n",
+            2,
+            None,
+            "collection exited nonzero",
+            id="nonzero-exit",
+        ),
+        pytest.param(
+            f"{_NW_A}\n1 test collected in 0.01s\n",
+            0,
+            None,
+            "collection has no blank separator",
+            id="no-separator",
+        ),
+        pytest.param(
+            "\n1 test collected in 0.01s\n",
+            0,
+            None,
+            "collection node block is empty",
+            id="empty-block",
+        ),
+        pytest.param(
+            f" {_NW_A}\n\n1 test collected in 0.01s\n",
+            0,
+            None,
+            "collection line is not a node ID",
+            id="leading-space",
+        ),
+        pytest.param(
+            f"<Module {_NW_A}>\n\n1 test collected in 0.01s\n",
+            0,
+            None,
+            "collection line is not a node ID",
+            id="non-node",
+        ),
+        pytest.param(
+            f"{_NW_A}\n{_NW_A}\n\n2 tests collected in 0.01s\n",
+            0,
+            None,
+            "collection node block contains a duplicate node ID",
+            id="duplicate",
+        ),
+        pytest.param(
+            f"{_NW_A}\n\nno tests collected in 0.01s\n",
+            0,
+            None,
+            "collection trailer is malformed",
+            id="no-tests",
+        ),
+        pytest.param(
+            f"{_NW_A}\n\n1 test collected, 1 error in 0.01s\n",
+            0,
+            None,
+            "collection trailer is malformed",
+            id="error",
+        ),
+        pytest.param(
+            f"{_NW_A}\n{_NW_B}\n\n1 test collected in 0.01s\n",
+            0,
+            None,
+            "collection block has 2 node IDs but the trailer reports 1",
+            id="mismatch",
+        ),
+        pytest.param(
+            f"{_NW_A}\n\n1/5 tests collected (1 deselected) in 0.01s\n",
+            0,
+            None,
+            r"collection trailer selected\+deselected != total",
+            id="sel-des-tot",
+        ),
+        pytest.param("", 0, None, "collection has no blank separator", id="empty-stdout"),
     ],
 )
 def test_nested_witness_collection_parser_grammar(
-    stdout: str, returncode: int, expected: int | None
+    stdout: str, returncode: int, expected: tuple[str, ...] | None, error: str | None
 ) -> None:
-    """T8/G4/G9: only the leading node block counts, under a closed trailer grammar."""
+    """T8/G4/G9: only the leading node block counts, under a closed trailer grammar.
+
+    Each rejection names the guard it must trip, so masking by another guard fails.
+    """
     result = _nw_completed(stdout, returncode)
-    if expected is None:
-        with pytest.raises(_WitnessContractError):
+    if error is not None:
+        with pytest.raises(_WitnessContractError, match=error):
             _parse_collection(result)
     else:
-        nodes = _parse_collection(result)
-        assert len(nodes) == expected
-        assert all(node.startswith("tests/") and "summary" not in node for node in nodes)
+        assert _parse_collection(result) == expected
 
 
 @pytest.mark.parametrize(
@@ -7532,29 +7610,68 @@ def test_nested_witness_execution_parser_accepts_accepted_outcomes(
     assert _require_payload_outcome(_nw_completed(_nw_execution(trailer)), expected) == outcomes
 
 
+_NW_UNKNOWN = "execution trailer has unknown outcome token 'rerun'"
+_NW_REPEATS = "execution trailer repeats outcome PASSED"
+_NW_MALFORMED = "execution trailer is malformed"
+_NW_FAILURES = "payload reported failures or errors"
+
+
 @pytest.mark.parametrize(
-    ("stdout", "returncode", "expected"),
+    ("stdout", "returncode", "expected", "error"),
     [
-        pytest.param(_nw_execution("1 passed, 1 rerun in 0.10s"), 0, 2, id="unknown-token"),
-        pytest.param(_nw_execution("2 rerun in 0.10s"), 0, 2, id="unknown-token-alone"),
-        pytest.param(_nw_execution("1 passed, 1 passed in 0.10s"), 0, 2, id="duplicate-token"),
-        pytest.param(_nw_execution("no tests ran in 0.01s"), 0, 0, id="no-tests-ran"),
-        pytest.param("..s.                       [100%]\n", 0, 3, id="missing-trailer"),
-        pytest.param("", 0, 0, id="empty-stdout"),
-        pytest.param(_nw_execution("3 passed in 0.10s"), 1, 3, id="masked-nonzero"),
-        pytest.param(_nw_execution("2 passed, 1 failed in 0.10s"), 0, 2, id="contradictory"),
-        pytest.param(_nw_execution("2 passed, 1 error in 0.10s"), 0, 2, id="error"),
-        pytest.param(_nw_execution("2 passed, 2 errors in 0.10s"), 0, 2, id="errors"),
-        pytest.param(_nw_execution("2 passed in 0.10s"), 0, 3, id="incomplete"),
-        pytest.param(_nw_execution("4 passed in 0.10s"), 0, 3, id="surplus"),
-        pytest.param(_nw_execution("3 Passed in 0.10s"), 0, 3, id="case"),
+        pytest.param(
+            _nw_execution("1 passed, 1 rerun in 0.10s"), 0, 2, _NW_UNKNOWN, id="unknown-token"
+        ),
+        pytest.param(
+            _nw_execution("2 rerun in 0.10s"), 0, 2, _NW_UNKNOWN, id="unknown-token-alone"
+        ),
+        pytest.param(
+            _nw_execution("1 passed, 1 passed in 0.10s"), 0, 2, _NW_REPEATS, id="duplicate-token"
+        ),
+        pytest.param(
+            _nw_execution("no tests ran in 0.01s"), 0, 0, _NW_MALFORMED, id="no-tests-ran"
+        ),
+        pytest.param(
+            "..s.                       [100%]\n", 0, 3, _NW_MALFORMED, id="missing-trailer"
+        ),
+        pytest.param(_nw_execution("3 Passed in 0.10s"), 0, 3, _NW_MALFORMED, id="case"),
+        pytest.param("", 0, 0, "child produced no final line", id="empty-stdout"),
+        pytest.param(
+            _nw_execution("3 passed in 0.10s"),
+            1,
+            3,
+            "execution exited nonzero",
+            id="masked-nonzero",
+        ),
+        pytest.param(
+            _nw_execution("2 passed, 1 failed in 0.10s"), 0, 2, _NW_FAILURES, id="contradictory"
+        ),
+        pytest.param(_nw_execution("2 passed, 1 error in 0.10s"), 0, 2, _NW_FAILURES, id="error"),
+        pytest.param(_nw_execution("2 passed, 2 errors in 0.10s"), 0, 2, _NW_FAILURES, id="errors"),
+        pytest.param(
+            _nw_execution("2 passed in 0.10s"),
+            0,
+            3,
+            "payload accounted for 2 nodes but 3 were collected",
+            id="incomplete",
+        ),
+        pytest.param(
+            _nw_execution("4 passed in 0.10s"),
+            0,
+            3,
+            "payload accounted for 4 nodes but 3 were collected",
+            id="surplus",
+        ),
     ],
 )
 def test_nested_witness_execution_parser_grammar(
-    stdout: str, returncode: int, expected: int
+    stdout: str, returncode: int, expected: int, error: str
 ) -> None:
-    """T9/G10-G13: unknown, malformed, masked, failing or miscounted payloads fail closed."""
-    with pytest.raises(_WitnessContractError):
+    """T9/G10-G13: unknown, malformed, masked, failing or miscounted payloads fail closed.
+
+    Each rejection names the guard it must trip, so masking by another guard fails.
+    """
+    with pytest.raises(_WitnessContractError, match=error):
         _require_payload_outcome(_nw_completed(stdout, returncode), expected)
 
 
@@ -7575,34 +7692,59 @@ def test_nested_witness_gate_keyword_grammar() -> None:
         == "test_alpha or test_zulu"
     )
     for rejected in (
-        ("tests/gate/test_gate_environment.py::TestGate::test_scrubbed",),
-        (_NW_A,),
-        ("tests/gate/test_gate_environment.py::test_Upper",),
-        ("tests/gate/test_gate_environment.py::test_gate[a b]",),
-        ("tests/gate/test_gate_environment.py::test_gate or test_other",),
-        (),
+        "tests/gate/test_gate_environment.py::TestGate::test_scrubbed",
+        _NW_A,
+        "tests/gate/test_gate_environment.py::test_Upper",
+        "tests/gate/test_gate_environment.py::test_gate[a b]",
+        "tests/gate/test_gate_environment.py::test_gate or test_other",
     ):
-        with pytest.raises(_WitnessContractError):
-            _gate_keyword(rejected)
+        with pytest.raises(
+            _WitnessContractError,
+            match=re.escape(f"gate node ID {rejected!r} is outside the closed grammar"),
+        ):
+            _gate_keyword((_NW_GATE, rejected))
+    with pytest.raises(_WitnessContractError, match="gate collection is empty"):
+        _gate_keyword(())
 
 
 @pytest.mark.parametrize(
-    ("trailer", "expected"),
+    ("trailer", "expected", "error"),
     [
-        pytest.param("1 skipped in 0.10s", 1, id="skipped"),
-        pytest.param("1 xfailed in 0.10s", 1, id="xfailed"),
-        pytest.param("1 xpassed in 0.10s", 1, id="xpassed"),
-        pytest.param("1 failed in 0.10s", 1, id="failed"),
-        pytest.param("1 error in 0.10s", 1, id="error"),
-        pytest.param("2 passed in 0.10s", 1, id="surplus"),
-        pytest.param("1 passed in 0.10s", 2, id="short"),
-        pytest.param("1 passed, 1 skipped in 0.10s", 2, id="pass-plus-skip"),
-        pytest.param("no tests ran in 0.10s", 0, id="none"),
+        pytest.param(
+            "1 skipped in 0.10s", 1, r"\['SKIPPED'\] are not exactly 1 passed", id="skipped"
+        ),
+        pytest.param(
+            "1 xfailed in 0.10s", 1, r"\['XFAILED'\] are not exactly 1 passed", id="xfailed"
+        ),
+        pytest.param(
+            "1 xpassed in 0.10s", 1, r"\['XPASSED'\] are not exactly 1 passed", id="xpassed"
+        ),
+        pytest.param("1 failed in 0.10s", 1, r"\['FAILED'\] are not exactly 1 passed", id="failed"),
+        pytest.param("1 error in 0.10s", 1, r"\['ERROR'\] are not exactly 1 passed", id="error"),
+        pytest.param(
+            "2 passed in 0.10s", 1, r"\['PASSED'\] are not exactly 1 passed", id="surplus"
+        ),
+        pytest.param("1 passed in 0.10s", 2, r"\['PASSED'\] are not exactly 2 passed", id="short"),
+        pytest.param(
+            "1 passed, 1 skipped in 0.10s",
+            2,
+            r"\['PASSED', 'SKIPPED'\] are not exactly 2 passed",
+            id="pass-plus-skip",
+        ),
+        pytest.param(
+            "1 passed in 0.10s", 0, r"\['PASSED'\] are not exactly 0 passed", id="zero-expected"
+        ),
+        pytest.param("no tests ran in 0.10s", 1, "execution trailer is malformed", id="none"),
     ],
 )
-def test_nested_witness_gate_probe_rejects_non_passed_outcomes(trailer: str, expected: int) -> None:
-    """T11/G14: only exactly ``expected`` passed gate nodes prove a gate pass."""
-    with pytest.raises(_WitnessContractError):
+def test_nested_witness_gate_probe_rejects_non_passed_outcomes(
+    trailer: str, expected: int, error: str
+) -> None:
+    """T11/G14: only exactly ``expected`` passed gate nodes prove a gate pass.
+
+    Each rejection names the guard it must trip, so masking by another guard fails.
+    """
+    with pytest.raises(_WitnessContractError, match=error):
         _require_gate_probe_outcome(_nw_completed(_nw_execution(trailer)), expected)
 
 
@@ -7641,6 +7783,18 @@ def test_nested_witness_runs_nothing_when_a_collection_fails(failing_index: int)
     with pytest.raises(_WitnessContractError):
         _run_partitioned_witness(run)
     assert tuple(calls) == _NW_EXPECTED_CALLS[: failing_index + 1]
+
+
+def test_nested_witness_stops_after_broad_collection_without_self() -> None:
+    """T12/G1/G15: a broad collection lacking the witness stops after that one call."""
+    outputs = _nw_default_outputs()
+    outputs[_NW_EXPECTED_CALLS[0]] = _nw_completed(
+        _nw_collection((_NW_GATE, _NW_A, _NW_B, _NW_S, _NW_P))
+    )
+    run, calls = _nw_fake_runner(outputs)
+    with pytest.raises(_WitnessContractError, match="witness node exactly once"):
+        _run_partitioned_witness(run)
+    assert tuple(calls) == _NW_EXPECTED_CALLS[:1]
 
 
 def test_nested_witness_runs_nothing_when_the_partition_fails() -> None:
