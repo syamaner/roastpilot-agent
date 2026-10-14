@@ -1,5 +1,15 @@
 # RoastPilot Agent Project State Registry
 
+**14 Oct 2026, #1015 nested QA-wrapper witness partition (D217):** the single
+`exhaustive_only` witness runs its closed-environment nested suite as three
+sequential, proven-disjoint selections (ordinary under four-worker `worksteal`,
+serial plus stress in one process, packaging in one process) plus one bounded
+broad gate-only worker probe. Ordinary tests no longer have guaranteed
+single-process sequential execution under the closed environment (D217 G2);
+the mandatory outer single-process full gate is unchanged and not equivalent.
+This records test infrastructure only, with no E11 status, hardware, Pi,
+installation or release claim. Timing evidence is recorded in the PR and issue.
+
 **14 Oct 2026 — #1013 MCP 0.2.4 dependency adoption:** this records dependency
 adoption only. The public 0.2.4 release is not a cold candidate; D196 remains
 unchanged. This makes no installation, hardware, Pi or epic-completion claim.

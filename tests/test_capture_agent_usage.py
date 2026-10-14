@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import errno
 import hashlib
 import importlib.util
@@ -22,9 +23,11 @@ import threading
 import time
 import tomllib
 import venv
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum, auto
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -6778,17 +6781,403 @@ def test_gate_target_guard_preserves_broad_discovery_and_gateway_boundary() -> N
     assert "validation gate sentinel is absent" not in gateway.stdout + gateway.stderr
 
 
+_WITNESS_NODEID = (
+    "tests/test_capture_agent_usage.py::"
+    "test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper"
+)
+_GATE_PREFIX = "tests/gate/"
+_PARALLEL_MODE: tuple[str, ...] = ("-n", "4", "--dist", "worksteal")
+
+
+class _WitnessContractError(AssertionError):
+    """A fail-closed nested-witness proof or outcome check did not hold (#1015, D217)."""
+
+
+class _PytestOutcome(Enum):
+    """Closed set of pytest final-line outcome kinds the nested witness understands."""
+
+    PASSED = auto()
+    FAILED = auto()
+    SKIPPED = auto()
+    XFAILED = auto()
+    XPASSED = auto()
+    ERROR = auto()
+    DESELECTED = auto()
+    WARNING = auto()
+
+
+@dataclass(frozen=True)
+class _WitnessSelection:
+    """One nested-witness pytest selection and its pinned execution mode.
+
+    Attributes:
+        name: Stable selection name used to key collected node IDs.
+        selection: Pytest argv shared verbatim by collection and execution.
+        mode: Execution-only argv suffix (scheduling), never used for collection.
+    """
+
+    name: str
+    selection: tuple[str, ...]
+    mode: tuple[str, ...]
+
+
+_WITNESS_SELECTIONS: tuple[_WitnessSelection, ...] = (
+    _WitnessSelection(
+        "ordinary",
+        (
+            "tests",
+            "-m",
+            "not serial and not stress",
+            "--ignore=tests/test_packaging.py",
+            "--deselect",
+            _WITNESS_NODEID,
+        ),
+        _PARALLEL_MODE,
+    ),
+    _WitnessSelection(
+        "serial-stress",
+        (
+            "tests",
+            "-m",
+            "serial or stress",
+            "--ignore=tests/test_packaging.py",
+            "--deselect",
+            _WITNESS_NODEID,
+        ),
+        (),
+    ),
+    _WitnessSelection("packaging", ("tests/test_packaging.py", "--deselect", _WITNESS_NODEID), ()),
+)
+_BROAD_SELECTION: tuple[str, ...] = ("tests",)
+_GATE_SELECTION: tuple[str, ...] = ("tests/gate",)
+
+# Receives the pytest argv that follows the rendered QA wrapper prefix.
+_WitnessRunner = Callable[[tuple[str, ...]], subprocess.CompletedProcess[str]]
+
+_COLLECTED_NODE = re.compile(r"tests/[^\s:]+\.py::\S(?:.*\S)?")
+_COLLECTION_TRAILER = re.compile(
+    r"(?:(?P<all>[1-9]\d*) tests? collected"
+    r"|(?P<sel>[1-9]\d*)/(?P<tot>[1-9]\d*) tests collected \((?P<des>[1-9]\d*) deselected\))"
+    r" in \d+\.\d+s(?: \(\d+:\d{2}:\d{2}\))?"
+)
+_EXECUTION_TRAILER = re.compile(
+    r"(?P<parts>[1-9]\d* [a-z]+(?:, [1-9]\d* [a-z]+)*) in \d+\.\d+s(?: \(\d+:\d{2}:\d{2}\))?"
+)
+_GATE_NODE = re.compile(
+    r"tests/gate/test_[a-z0-9_]+\.py::(?P<function>test_[a-z0-9_]+)(?:\[[^\]\s]+\])?"
+)
+# The single outcome-token lookup table: outcomes are never string-compared elsewhere.
+_OUTCOME_TOKENS: dict[str, _PytestOutcome] = {
+    "passed": _PytestOutcome.PASSED,
+    "failed": _PytestOutcome.FAILED,
+    "skipped": _PytestOutcome.SKIPPED,
+    "xfailed": _PytestOutcome.XFAILED,
+    "xpassed": _PytestOutcome.XPASSED,
+    "error": _PytestOutcome.ERROR,
+    "errors": _PytestOutcome.ERROR,
+    "deselected": _PytestOutcome.DESELECTED,
+    "warning": _PytestOutcome.WARNING,
+    "warnings": _PytestOutcome.WARNING,
+}
+_ACCEPTED_PAYLOAD_OUTCOMES = frozenset(
+    {
+        _PytestOutcome.PASSED,
+        _PytestOutcome.SKIPPED,
+        _PytestOutcome.XFAILED,
+        _PytestOutcome.XPASSED,
+    }
+)
+_NON_NODE_OUTCOMES = frozenset({_PytestOutcome.DESELECTED, _PytestOutcome.WARNING})
+_DIAGNOSTIC_TAIL_LINES = 40
+
+
+def _child_diagnostic(result: subprocess.CompletedProcess[str]) -> str:
+    """Return a bounded stdout/stderr tail for a fail-closed witness message."""
+    stdout_tail = "\n".join(result.stdout.splitlines()[-_DIAGNOSTIC_TAIL_LINES:])
+    stderr_tail = "\n".join(result.stderr.splitlines()[-_DIAGNOSTIC_TAIL_LINES:])
+    return (
+        f"exit={result.returncode}\n--- stdout tail ---\n{stdout_tail}"
+        f"\n--- stderr tail ---\n{stderr_tail}"
+    )
+
+
+def _final_line(result: subprocess.CompletedProcess[str]) -> str:
+    """Return the last non-blank stdout line, failing closed when there is none."""
+    lines = [line for line in result.stdout.splitlines() if line.strip() != ""]
+    if not lines:
+        raise _WitnessContractError(f"child produced no final line\n{_child_diagnostic(result)}")
+    return lines[-1]
+
+
+def _parse_collection(result: subprocess.CompletedProcess[str]) -> tuple[str, ...]:
+    """Parse a ``--collect-only`` child's leading node block under pyproject's ``-q``.
+
+    Args:
+        result: The completed collection child.
+
+    Returns:
+        The collected node IDs in pytest's listing order.
+
+    Raises:
+        _WitnessContractError: On a nonzero exit, a missing blank separator, an
+            empty or non-node block line, a duplicate node, a trailer outside the
+            closed grammar, or a trailer count that disagrees with the block.
+    """
+    if result.returncode != 0:
+        raise _WitnessContractError(f"collection exited nonzero\n{_child_diagnostic(result)}")
+    lines = result.stdout.splitlines()
+    if "" not in lines:
+        raise _WitnessContractError(
+            f"collection has no blank separator\n{_child_diagnostic(result)}"
+        )
+    block = tuple(lines[: lines.index("")])
+    if not block:
+        raise _WitnessContractError(f"collection node block is empty\n{_child_diagnostic(result)}")
+    for line in block:
+        if _COLLECTED_NODE.fullmatch(line) is None:
+            raise _WitnessContractError(f"collection line is not a node ID: {line!r}")
+    if len(set(block)) != len(block):
+        raise _WitnessContractError("collection node block contains a duplicate node ID")
+    trailer = _COLLECTION_TRAILER.fullmatch(_final_line(result))
+    if trailer is None:
+        raise _WitnessContractError(f"collection trailer is malformed\n{_child_diagnostic(result)}")
+    if trailer.group("all") is not None:
+        count = int(trailer.group("all"))
+    else:
+        count = int(trailer.group("sel"))
+        if count + int(trailer.group("des")) != int(trailer.group("tot")):
+            raise _WitnessContractError("collection trailer selected+deselected != total")
+    if len(block) != count:
+        raise _WitnessContractError(
+            f"collection block has {len(block)} node IDs but the trailer reports {count}"
+        )
+    return block
+
+
+def _parse_outcomes(result: subprocess.CompletedProcess[str]) -> dict[_PytestOutcome, int]:
+    """Parse an execution child's single final outcome line through the closed token table.
+
+    Args:
+        result: The completed execution child.
+
+    Returns:
+        The count for each outcome named on the final line.
+
+    Raises:
+        _WitnessContractError: On a nonzero exit (even with a clean-looking
+            trailer), a missing or malformed trailer, an unknown token, or a
+            repeated outcome.
+    """
+    if result.returncode != 0:
+        raise _WitnessContractError(f"execution exited nonzero\n{_child_diagnostic(result)}")
+    trailer = _EXECUTION_TRAILER.fullmatch(_final_line(result))
+    if trailer is None:
+        raise _WitnessContractError(f"execution trailer is malformed\n{_child_diagnostic(result)}")
+    outcomes: dict[_PytestOutcome, int] = {}
+    for part in trailer.group("parts").split(", "):
+        count_text, token = part.split(" ")
+        outcome = _OUTCOME_TOKENS.get(token)
+        if outcome is None:
+            raise _WitnessContractError(f"execution trailer has unknown outcome token {token!r}")
+        if outcome in outcomes:
+            raise _WitnessContractError(f"execution trailer repeats outcome {outcome.name}")
+        outcomes[outcome] = int(count_text)
+    return outcomes
+
+
+def _require_payload_outcome(
+    result: subprocess.CompletedProcess[str], expected: int
+) -> dict[_PytestOutcome, int]:
+    """Require a payload child to account for exactly its collected selection.
+
+    Args:
+        result: The completed payload execution child.
+        expected: The node count collected for the same selection argv.
+
+    Returns:
+        The parsed outcome counts.
+
+    Raises:
+        _WitnessContractError: When parsing fails, any failure or error is
+            reported, or passed+skipped+xfailed+xpassed differs from ``expected``.
+    """
+    outcomes = _parse_outcomes(result)
+    if _PytestOutcome.FAILED in outcomes or _PytestOutcome.ERROR in outcomes:
+        raise _WitnessContractError(
+            f"payload reported failures or errors\n{_child_diagnostic(result)}"
+        )
+    accounted = sum(
+        count for outcome, count in outcomes.items() if outcome in _ACCEPTED_PAYLOAD_OUTCOMES
+    )
+    if accounted != expected:
+        raise _WitnessContractError(
+            f"payload accounted for {accounted} nodes but {expected} were collected"
+        )
+    return outcomes
+
+
+def _require_gate_probe_outcome(result: subprocess.CompletedProcess[str], expected: int) -> None:
+    """Require the gate-only probe to report exactly ``expected`` passed nodes and nothing else.
+
+    Counts that include skips, xfails or xpasses never prove a gate pass.
+
+    Args:
+        result: The completed gate-probe execution child.
+        expected: The non-empty separately collected ``tests/gate`` node count.
+
+    Raises:
+        _WitnessContractError: When parsing fails or the node-bearing outcomes
+            are not exactly ``{PASSED: expected}``.
+    """
+    outcomes = _parse_outcomes(result)
+    node_outcomes = {
+        outcome: count for outcome, count in outcomes.items() if outcome not in _NON_NODE_OUTCOMES
+    }
+    if expected < 1 or node_outcomes != {_PytestOutcome.PASSED: expected}:
+        raise _WitnessContractError(
+            f"gate probe outcomes {sorted(o.name for o in node_outcomes)} are not "
+            f"exactly {expected} passed\n{_child_diagnostic(result)}"
+        )
+
+
+def _require_self_once(broad: tuple[str, ...]) -> None:
+    """Require the witness node to appear exactly once in the broad collection."""
+    if broad.count(_WITNESS_NODEID) != 1:
+        raise _WitnessContractError("broad collection must contain the witness node exactly once")
+
+
+def _require_partition(broad: tuple[str, ...], collected: Mapping[str, tuple[str, ...]]) -> None:
+    """Require the selections to partition the broad collection minus the witness node.
+
+    Args:
+        broad: The wrapped broad collection.
+        collected: The wrapped collection of each ``_WITNESS_SELECTIONS`` entry, by name.
+
+    Raises:
+        _WitnessContractError: When the witness is not exactly once in ``broad``,
+            the selection names differ, any selection is empty, contains a
+            duplicate or the witness, two selections overlap, or the union is not
+            exactly ``broad`` minus the witness.
+    """
+    _require_self_once(broad)
+    if set(collected) != {selection.name for selection in _WITNESS_SELECTIONS}:
+        raise _WitnessContractError(f"selection names {sorted(collected)} are not the pinned set")
+    union: set[str] = set()
+    for name, nodes in collected.items():
+        if not nodes:
+            raise _WitnessContractError(f"selection {name!r} is empty")
+        if len(set(nodes)) != len(nodes):
+            raise _WitnessContractError(f"selection {name!r} contains a duplicate node ID")
+        if _WITNESS_NODEID in nodes:
+            raise _WitnessContractError(f"selection {name!r} contains the witness node")
+        overlap = union & set(nodes)
+        if overlap:
+            raise _WitnessContractError(
+                f"selection {name!r} overlaps another: {sorted(overlap)[:5]}"
+            )
+        union |= set(nodes)
+    expected = set(broad) - {_WITNESS_NODEID}
+    if union != expected:
+        raise _WitnessContractError(
+            f"selections drop {sorted(expected - union)[:5]} and add {sorted(union - expected)[:5]}"
+        )
+
+
+def _gate_keyword(gate_nodeids: tuple[str, ...]) -> str:
+    """Return the closed ``-k`` keyword that selects exactly the gate functions.
+
+    Args:
+        gate_nodeids: The separately collected non-empty ``tests/gate`` node IDs.
+
+    Returns:
+        The sorted, de-duplicated gate function names joined by ``" or "``.
+
+    Raises:
+        _WitnessContractError: When the tuple is empty or any node ID falls
+            outside the closed module-level gate-function grammar.
+    """
+    if not gate_nodeids:
+        raise _WitnessContractError("gate collection is empty")
+    functions: set[str] = set()
+    for nodeid in gate_nodeids:
+        match = _GATE_NODE.fullmatch(nodeid)
+        if match is None:
+            raise _WitnessContractError(f"gate node ID {nodeid!r} is outside the closed grammar")
+        functions.add(match.group("function"))
+    return " or ".join(sorted(functions))
+
+
+def _require_gate_in_ordinary(gate: tuple[str, ...], ordinary: tuple[str, ...]) -> None:
+    """Require a non-empty gate set that the ordinary selection fully contains."""
+    if not gate:
+        raise _WitnessContractError("gate collection is empty")
+    if not all(nodeid.startswith(_GATE_PREFIX) for nodeid in gate):
+        raise _WitnessContractError("gate collection contains a node outside tests/gate/")
+    if not set(gate) <= set(ordinary):
+        raise _WitnessContractError("gate checks are absent from the ordinary selection")
+
+
+def _require_probe_matches_gate(probe: tuple[str, ...], gate: tuple[str, ...]) -> None:
+    """Require the broad gate-only probe to collect exactly the gate set."""
+    if set(probe) != set(gate) or len(probe) != len(gate):
+        raise _WitnessContractError(
+            f"gate probe collects {sorted(set(probe) ^ set(gate))[:5]} beyond the gate set"
+        )
+
+
+def _run_partitioned_witness(run: _WitnessRunner) -> None:
+    """Prove the nested selections and gate probe, then execute them in pinned order.
+
+    Every collection proof completes before any execution starts, and the first
+    failure raises without running any later child (#1015, D217).
+
+    Args:
+        run: Runs one pytest argv under the rendered QA wrapper prefix.
+
+    Raises:
+        _WitnessContractError: On the first failed proof or outcome check.
+    """
+    broad = _parse_collection(run(_BROAD_SELECTION + ("--collect-only",)))
+    _require_self_once(broad)
+    collected: dict[str, tuple[str, ...]] = {}
+    for selection in _WITNESS_SELECTIONS:
+        collected[selection.name] = _parse_collection(
+            run(selection.selection + ("--collect-only",))
+        )
+    _require_partition(broad, collected)
+    gate = _parse_collection(run(_GATE_SELECTION + ("--collect-only",)))
+    _require_gate_in_ordinary(gate, collected["ordinary"])
+    probe_selection = ("tests", "-k", _gate_keyword(gate), "--deselect", _WITNESS_NODEID)
+    probe = _parse_collection(run(probe_selection + ("--collect-only",)))
+    _require_probe_matches_gate(probe, gate)
+    _require_gate_probe_outcome(run(probe_selection + _PARALLEL_MODE), len(gate))
+    for selection in _WITNESS_SELECTIONS:
+        _require_payload_outcome(
+            run(selection.selection + selection.mode), len(collected[selection.name])
+        )
+
+
 @pytest.mark.slow
 @pytest.mark.serial(reason="runs a nested broad pytest suite through a real shell subprocess")
 @pytest.mark.exhaustive_only
 def test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper(tmp_path: Path) -> None:
-    """The actual QA prefix collects the gate checks during broad suite execution."""
+    """The actual QA prefix runs the whole suite as three proven-disjoint selections.
+
+    Under the closed wrapper environment, the witness first proves that the
+    ordinary (four-worker ``worksteal``), serial-plus-stress (one process) and
+    packaging (one process) selections partition the broad collection minus this
+    exact node, and that a broad gate-only probe collects exactly ``tests/gate``.
+    It then runs the probe, requiring every gate node to pass, and runs each
+    selection in order, requiring its outcomes to account for its collection
+    (#1015, D217).
+    """
     root = _executable_gate_root(tmp_path)
     wrapper = render_validation_commands(NativeClaudeRole.QA, str(root))[1]
-    excluded = "not test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper"
-    command = f"{wrapper} tests -k {shlex.quote(excluded)}"
-    result = _run_gate_command(command, _poisoned_gate_environment(), cwd=Path(__file__).parents[1])
-    assert result.returncode == 0, result.stdout + result.stderr
+    environment = _poisoned_gate_environment()
+    repository = Path(__file__).parents[1]
+    _run_partitioned_witness(
+        lambda argv: _run_gate_command(f"{wrapper} {shlex.join(argv)}", environment, cwd=repository)
+    )
 
 
 @pytest.mark.slow
@@ -6833,6 +7222,781 @@ def test_rendered_qa_gate_wrapper_runs_gate_checks_and_broad_collection(tmp_path
     }
     assert expected_gate_nodeids
     assert gate_nodeids == expected_gate_nodeids
+
+
+# --- #1015 nested-witness partition: fast and real-child behavioural tests (D217) ---
+
+_NW_GATE = "tests/gate/test_gate_environment.py::test_gate_environment_is_scrubbed_and_complete"
+_NW_A = "tests/test_alpha.py::test_one"
+_NW_B = "tests/test_alpha.py::test_two[x y]"
+_NW_S = "tests/test_serial_child.py::test_serial"
+_NW_P = "tests/test_packaging.py::test_wheel"
+_NW_WITNESS = (
+    "tests/test_capture_agent_usage.py::"
+    "test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper"
+)
+_NW_BROAD = (_NW_GATE, _NW_A, _NW_B, _NW_S, _NW_WITNESS, _NW_P)
+_NW_PROBE = (
+    "tests",
+    "-k",
+    "test_gate_environment_is_scrubbed_and_complete",
+    "--deselect",
+    _NW_WITNESS,
+)
+_NW_ORDINARY = (
+    "tests",
+    "-m",
+    "not serial and not stress",
+    "--ignore=tests/test_packaging.py",
+    "--deselect",
+    _NW_WITNESS,
+)
+_NW_SERIAL = (
+    "tests",
+    "-m",
+    "serial or stress",
+    "--ignore=tests/test_packaging.py",
+    "--deselect",
+    _NW_WITNESS,
+)
+_NW_PACKAGING = ("tests/test_packaging.py", "--deselect", _NW_WITNESS)
+_NW_COLLECT = ("--collect-only",)
+_NW_WORKERS = ("-n", "4", "--dist", "worksteal")
+# The exact child sequence of a successful run (an independent oracle for the order).
+_NW_EXPECTED_CALLS: tuple[tuple[str, ...], ...] = (
+    ("tests", "--collect-only"),
+    _NW_ORDINARY + _NW_COLLECT,
+    _NW_SERIAL + _NW_COLLECT,
+    _NW_PACKAGING + _NW_COLLECT,
+    ("tests/gate", "--collect-only"),
+    _NW_PROBE + _NW_COLLECT,
+    _NW_PROBE + _NW_WORKERS,
+    _NW_ORDINARY + _NW_WORKERS,
+    _NW_SERIAL,
+    _NW_PACKAGING,
+)
+
+
+def _nw_completed(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess[str]:
+    """Return a canned pytest child result."""
+    return subprocess.CompletedProcess(
+        args=("pytest",), returncode=returncode, stdout=stdout, stderr=""
+    )
+
+
+def _nw_collection(nodes: tuple[str, ...], deselected: int = 0, footer: str = "") -> str:
+    """Render ``--collect-only`` stdout under pyproject's single ``-q``."""
+    if deselected:
+        total = len(nodes) + deselected
+        trailer = f"{len(nodes)}/{total} tests collected ({deselected} deselected) in 0.01s"
+    else:
+        noun = "test" if len(nodes) == 1 else "tests"
+        trailer = f"{len(nodes)} {noun} collected in 0.01s"
+    return "\n".join(nodes) + "\n\n" + footer + trailer + "\n"
+
+
+def _nw_execution(trailer: str) -> str:
+    """Render execution stdout with progress and durations noise before the trailer."""
+    return (
+        "..s.                                                     [100%]\n"
+        "============================= slowest 25 durations ==========\n"
+        "1.20s call     tests/test_alpha.py::test_one\n"
+        "\n"
+        f"{trailer}\n"
+        "\n"
+    )
+
+
+def _nw_default_outputs() -> dict[tuple[str, ...], subprocess.CompletedProcess[str]]:
+    """Return canned outputs for one fully successful partitioned witness run."""
+    return {
+        _NW_EXPECTED_CALLS[0]: _nw_completed(_nw_collection(_NW_BROAD)),
+        _NW_EXPECTED_CALLS[1]: _nw_completed(_nw_collection((_NW_GATE, _NW_A, _NW_B), 2)),
+        _NW_EXPECTED_CALLS[2]: _nw_completed(_nw_collection((_NW_S,), 4)),
+        _NW_EXPECTED_CALLS[3]: _nw_completed(_nw_collection((_NW_P,))),
+        _NW_EXPECTED_CALLS[4]: _nw_completed(_nw_collection((_NW_GATE,))),
+        _NW_EXPECTED_CALLS[5]: _nw_completed(_nw_collection((_NW_GATE,), 5)),
+        _NW_EXPECTED_CALLS[6]: _nw_completed(_nw_execution("1 passed in 0.50s")),
+        _NW_EXPECTED_CALLS[7]: _nw_completed(_nw_execution("2 passed, 1 skipped in 1.00s")),
+        _NW_EXPECTED_CALLS[8]: _nw_completed(_nw_execution("1 passed in 2.00s")),
+        _NW_EXPECTED_CALLS[9]: _nw_completed(_nw_execution("1 skipped in 0.10s")),
+    }
+
+
+def _nw_fake_runner(
+    outputs: Mapping[tuple[str, ...], subprocess.CompletedProcess[str]],
+) -> tuple[_WitnessRunner, list[tuple[str, ...]]]:
+    """Return a recording fake runner serving canned outputs by exact argv."""
+    calls: list[tuple[str, ...]] = []
+
+    def run(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return outputs[argv]
+
+    return run, calls
+
+
+def _nw_partition() -> dict[str, tuple[str, ...]]:
+    """Return a valid partition of ``_NW_BROAD`` minus the witness."""
+    return {
+        "ordinary": (_NW_GATE, _NW_A, _NW_B),
+        "serial-stress": (_NW_S,),
+        "packaging": (_NW_P,),
+    }
+
+
+def test_nested_witness_selections_are_pinned_exactly() -> None:
+    """T1/G2/G16: selections, modes and self-exclusion are pinned to literal argv."""
+    assert _WITNESS_NODEID == _NW_WITNESS
+    assert _WITNESS_NODEID.endswith(
+        "::" + test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper.__name__
+    )
+    assert _PARALLEL_MODE == _NW_WORKERS
+    assert _BROAD_SELECTION == ("tests",)
+    assert _GATE_SELECTION == ("tests/gate",)
+    assert _GATE_PREFIX == "tests/gate/"
+    assert [(item.name, item.selection, item.mode) for item in _WITNESS_SELECTIONS] == [
+        ("ordinary", _NW_ORDINARY, _NW_WORKERS),
+        ("serial-stress", _NW_SERIAL, ()),
+        ("packaging", _NW_PACKAGING, ()),
+    ]
+    for item in _WITNESS_SELECTIONS:
+        assert item.selection.count("--deselect") == 1
+        assert item.selection[item.selection.index("--deselect") + 1] == _WITNESS_NODEID
+        assert "-k" not in item.selection
+        assert not any(arg.startswith("-k") for arg in item.selection)
+
+
+def test_nested_witness_partition_accepts_complete_disjoint_union() -> None:
+    """T2: a complete, disjoint, self-free partition of broad minus self is accepted."""
+    _require_partition(_NW_BROAD, _nw_partition())
+
+
+def test_nested_witness_partition_rejects_dropped_node() -> None:
+    """T3/G6: a broad node that escapes every selection fails closed."""
+    collected = _nw_partition()
+    collected["ordinary"] = (_NW_GATE, _NW_A)
+    with pytest.raises(_WitnessContractError, match="drop"):
+        _require_partition(_NW_BROAD, collected)
+
+
+def test_nested_witness_partition_rejects_extra_node() -> None:
+    """T3/G6: a selection node absent from the broad collection fails closed."""
+    collected = _nw_partition()
+    collected["serial-stress"] = (_NW_S, "tests/test_alpha.py::test_extra")
+    with pytest.raises(_WitnessContractError, match="add"):
+        _require_partition(_NW_BROAD, collected)
+
+
+def test_nested_witness_partition_rejects_overlapping_selections() -> None:
+    """T4/G5: one node counted by two selections fails closed."""
+    collected = _nw_partition()
+    collected["serial-stress"] = (_NW_S, _NW_A)
+    with pytest.raises(_WitnessContractError, match="overlaps"):
+        _require_partition(_NW_BROAD, collected)
+
+
+def test_nested_witness_partition_rejects_duplicate_within_selection() -> None:
+    """T5/G4: a node listed twice in one collection block fails closed."""
+    stdout = f"{_NW_A}\n{_NW_B}\n{_NW_A}\n\n3 tests collected in 0.01s\n"
+    with pytest.raises(_WitnessContractError, match="duplicate"):
+        _parse_collection(_nw_completed(stdout))
+    collected = _nw_partition()
+    collected["packaging"] = (_NW_P, _NW_P)
+    with pytest.raises(_WitnessContractError, match="duplicate"):
+        _require_partition(_NW_BROAD, collected)
+
+
+@pytest.mark.parametrize("name", ["ordinary", "serial-stress", "packaging"])
+def test_nested_witness_partition_rejects_empty_selection(name: str) -> None:
+    """T6/G3: an empty selection fails even when the union still matches broad."""
+    collected = _nw_partition()
+    removed = set(collected[name])
+    collected[name] = ()
+    broad = tuple(node for node in _NW_BROAD if node not in removed)
+    with pytest.raises(_WitnessContractError, match="empty"):
+        _require_partition(broad, collected)
+
+
+def test_nested_witness_partition_rejects_self_in_selection() -> None:
+    """T7/G2: the witness node inside any selection fails closed."""
+    collected = _nw_partition()
+    collected["serial-stress"] = (_NW_S, _NW_WITNESS)
+    with pytest.raises(_WitnessContractError, match="witness"):
+        _require_partition(_NW_BROAD, collected)
+
+
+def test_nested_witness_partition_rejects_self_missing_from_broad() -> None:
+    """T7/G1: a broad collection without the witness node fails closed."""
+    broad = tuple(node for node in _NW_BROAD if node != _NW_WITNESS)
+    with pytest.raises(_WitnessContractError, match="exactly once"):
+        _require_partition(broad, _nw_partition())
+
+
+def test_nested_witness_partition_rejects_self_twice() -> None:
+    """T7/G1: a broad collection listing the witness node twice fails closed."""
+    with pytest.raises(_WitnessContractError, match="exactly once"):
+        _require_partition((*_NW_BROAD, _NW_WITNESS), _nw_partition())
+
+
+_NW_WARNINGS_FOOTER = (
+    "=============================== warnings summary ===============================\n"
+    "tests/test_alpha.py::test_one\n"
+    "  /repo/tests/test_alpha.py:2: UserWarning: collect-time\n"
+    "\n"
+    "-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "expected", "error"),
+    [
+        pytest.param(
+            "\n".join(f"tests/test_m.py::test_{index}" for index in range(13611))
+            + "\n\n13611/13645 tests collected (34 deselected) in 16.31s\n",
+            0,
+            tuple(f"tests/test_m.py::test_{index}" for index in range(13611)),
+            None,
+            id="selected-form",
+        ),
+        pytest.param(
+            "tests/test_alpha.py::test_one\n\n1 test collected in 0.01s\n",
+            0,
+            ("tests/test_alpha.py::test_one",),
+            None,
+            id="singular",
+        ),
+        pytest.param(
+            "tests/test_alpha.py::test_one\ntests/test_alpha.py::test_two[x y]\n\n"
+            "2 tests collected in 767.50s (0:12:47)\n",
+            0,
+            ("tests/test_alpha.py::test_one", "tests/test_alpha.py::test_two[x y]"),
+            None,
+            id="clock-parametrised-space",
+        ),
+        pytest.param(
+            "tests/test_alpha.py::test_one\ntests/test_alpha.py::test_two[x y]\n\n"
+            + _NW_WARNINGS_FOOTER
+            + "2 tests collected in 0.01s\n",
+            0,
+            ("tests/test_alpha.py::test_one", "tests/test_alpha.py::test_two[x y]"),
+            None,
+            id="warnings-footer",
+        ),
+        pytest.param(
+            f"{_NW_A}\n\n1 test collected in 0.01s\n",
+            2,
+            None,
+            "collection exited nonzero",
+            id="nonzero-exit",
+        ),
+        pytest.param(
+            f"{_NW_A}\n1 test collected in 0.01s\n",
+            0,
+            None,
+            "collection has no blank separator",
+            id="no-separator",
+        ),
+        pytest.param(
+            "\n1 test collected in 0.01s\n",
+            0,
+            None,
+            "collection node block is empty",
+            id="empty-block",
+        ),
+        pytest.param(
+            f" {_NW_A}\n\n1 test collected in 0.01s\n",
+            0,
+            None,
+            "collection line is not a node ID",
+            id="leading-space",
+        ),
+        pytest.param(
+            f"<Module {_NW_A}>\n\n1 test collected in 0.01s\n",
+            0,
+            None,
+            "collection line is not a node ID",
+            id="non-node",
+        ),
+        pytest.param(
+            f"{_NW_A}\n{_NW_A}\n\n2 tests collected in 0.01s\n",
+            0,
+            None,
+            "collection node block contains a duplicate node ID",
+            id="duplicate",
+        ),
+        pytest.param(
+            f"{_NW_A}\n\nno tests collected in 0.01s\n",
+            0,
+            None,
+            "collection trailer is malformed",
+            id="no-tests",
+        ),
+        pytest.param(
+            f"{_NW_A}\n\n1 test collected, 1 error in 0.01s\n",
+            0,
+            None,
+            "collection trailer is malformed",
+            id="error",
+        ),
+        pytest.param(
+            f"{_NW_A}\n{_NW_B}\n\n1 test collected in 0.01s\n",
+            0,
+            None,
+            "collection block has 2 node IDs but the trailer reports 1",
+            id="mismatch",
+        ),
+        pytest.param(
+            f"{_NW_A}\n\n1/5 tests collected (1 deselected) in 0.01s\n",
+            0,
+            None,
+            r"collection trailer selected\+deselected != total",
+            id="sel-des-tot",
+        ),
+        pytest.param("", 0, None, "collection has no blank separator", id="empty-stdout"),
+    ],
+)
+def test_nested_witness_collection_parser_grammar(
+    stdout: str, returncode: int, expected: tuple[str, ...] | None, error: str | None
+) -> None:
+    """T8/G4/G9: only the leading node block counts, under a closed trailer grammar.
+
+    Each rejection names the guard it must trip, so masking by another guard fails.
+    """
+    result = _nw_completed(stdout, returncode)
+    if error is not None:
+        with pytest.raises(_WitnessContractError, match=error):
+            _parse_collection(result)
+    else:
+        assert _parse_collection(result) == expected
+
+
+@pytest.mark.parametrize(
+    ("trailer", "expected", "outcomes"),
+    [
+        pytest.param(
+            "13595 passed, 16 skipped in 767.50s",
+            13611,
+            {_PytestOutcome.PASSED: 13595, _PytestOutcome.SKIPPED: 16},
+            id="xdist",
+        ),
+        pytest.param(
+            "33 passed, 13612 deselected, 2 warnings in 102.36s",
+            33,
+            {
+                _PytestOutcome.PASSED: 33,
+                _PytestOutcome.DESELECTED: 13612,
+                _PytestOutcome.WARNING: 2,
+            },
+            id="deselected-warnings",
+        ),
+        pytest.param("15 skipped in 0.80s", 15, {_PytestOutcome.SKIPPED: 15}, id="all-skipped"),
+        pytest.param(
+            "1 passed, 1 xfailed, 1 xpassed in 0.30s (0:00:00)",
+            3,
+            {
+                _PytestOutcome.PASSED: 1,
+                _PytestOutcome.XFAILED: 1,
+                _PytestOutcome.XPASSED: 1,
+            },
+            id="xfail-xpass",
+        ),
+    ],
+)
+def test_nested_witness_execution_parser_accepts_accepted_outcomes(
+    trailer: str, expected: int, outcomes: dict[_PytestOutcome, int]
+) -> None:
+    """T9: accepted non-failing outcomes account for exactly the collected count."""
+    assert _require_payload_outcome(_nw_completed(_nw_execution(trailer)), expected) == outcomes
+
+
+_NW_UNKNOWN = "execution trailer has unknown outcome token 'rerun'"
+_NW_REPEATS = "execution trailer repeats outcome PASSED"
+_NW_MALFORMED = "execution trailer is malformed"
+_NW_FAILURES = "payload reported failures or errors"
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "expected", "error"),
+    [
+        pytest.param(
+            _nw_execution("1 passed, 1 rerun in 0.10s"), 0, 2, _NW_UNKNOWN, id="unknown-token"
+        ),
+        pytest.param(
+            _nw_execution("2 rerun in 0.10s"), 0, 2, _NW_UNKNOWN, id="unknown-token-alone"
+        ),
+        pytest.param(
+            _nw_execution("1 passed, 1 passed in 0.10s"), 0, 2, _NW_REPEATS, id="duplicate-token"
+        ),
+        pytest.param(
+            _nw_execution("no tests ran in 0.01s"), 0, 0, _NW_MALFORMED, id="no-tests-ran"
+        ),
+        pytest.param(
+            "..s.                       [100%]\n", 0, 3, _NW_MALFORMED, id="missing-trailer"
+        ),
+        pytest.param(_nw_execution("3 Passed in 0.10s"), 0, 3, _NW_MALFORMED, id="case"),
+        pytest.param("", 0, 0, "child produced no final line", id="empty-stdout"),
+        pytest.param(
+            _nw_execution("3 passed in 0.10s"),
+            1,
+            3,
+            "execution exited nonzero",
+            id="masked-nonzero",
+        ),
+        pytest.param(
+            _nw_execution("2 passed, 1 failed in 0.10s"), 0, 2, _NW_FAILURES, id="contradictory"
+        ),
+        pytest.param(_nw_execution("2 passed, 1 error in 0.10s"), 0, 2, _NW_FAILURES, id="error"),
+        pytest.param(_nw_execution("2 passed, 2 errors in 0.10s"), 0, 2, _NW_FAILURES, id="errors"),
+        pytest.param(
+            _nw_execution("2 passed in 0.10s"),
+            0,
+            3,
+            "payload accounted for 2 nodes but 3 were collected",
+            id="incomplete",
+        ),
+        pytest.param(
+            _nw_execution("4 passed in 0.10s"),
+            0,
+            3,
+            "payload accounted for 4 nodes but 3 were collected",
+            id="surplus",
+        ),
+    ],
+)
+def test_nested_witness_execution_parser_grammar(
+    stdout: str, returncode: int, expected: int, error: str
+) -> None:
+    """T9/G10-G13: unknown, malformed, masked, failing or miscounted payloads fail closed.
+
+    Each rejection names the guard it must trip, so masking by another guard fails.
+    """
+    with pytest.raises(_WitnessContractError, match=error):
+        _require_payload_outcome(_nw_completed(stdout, returncode), expected)
+
+
+def test_nested_witness_gate_keyword_grammar() -> None:
+    """T10/G8: the keyword is the closed, sorted, de-duplicated gate function set."""
+    assert _gate_keyword((_NW_GATE,)) == "test_gate_environment_is_scrubbed_and_complete"
+    assert (
+        _gate_keyword((f"{_NW_GATE}[a]", f"{_NW_GATE}[b-1]"))
+        == "test_gate_environment_is_scrubbed_and_complete"
+    )
+    assert (
+        _gate_keyword(
+            (
+                "tests/gate/test_gate_environment.py::test_zulu",
+                "tests/gate/test_other.py::test_alpha",
+            )
+        )
+        == "test_alpha or test_zulu"
+    )
+    for rejected in (
+        "tests/gate/test_gate_environment.py::TestGate::test_scrubbed",
+        _NW_A,
+        "tests/gate/test_gate_environment.py::test_Upper",
+        "tests/gate/test_gate_environment.py::test_gate[a b]",
+        "tests/gate/test_gate_environment.py::test_gate or test_other",
+    ):
+        with pytest.raises(
+            _WitnessContractError,
+            match=re.escape(f"gate node ID {rejected!r} is outside the closed grammar"),
+        ):
+            _gate_keyword((_NW_GATE, rejected))
+    with pytest.raises(_WitnessContractError, match="gate collection is empty"):
+        _gate_keyword(())
+
+
+@pytest.mark.parametrize(
+    ("trailer", "expected", "error"),
+    [
+        pytest.param(
+            "1 skipped in 0.10s", 1, r"\['SKIPPED'\] are not exactly 1 passed", id="skipped"
+        ),
+        pytest.param(
+            "1 xfailed in 0.10s", 1, r"\['XFAILED'\] are not exactly 1 passed", id="xfailed"
+        ),
+        pytest.param(
+            "1 xpassed in 0.10s", 1, r"\['XPASSED'\] are not exactly 1 passed", id="xpassed"
+        ),
+        pytest.param("1 failed in 0.10s", 1, r"\['FAILED'\] are not exactly 1 passed", id="failed"),
+        pytest.param("1 error in 0.10s", 1, r"\['ERROR'\] are not exactly 1 passed", id="error"),
+        pytest.param(
+            "2 passed in 0.10s", 1, r"\['PASSED'\] are not exactly 1 passed", id="surplus"
+        ),
+        pytest.param("1 passed in 0.10s", 2, r"\['PASSED'\] are not exactly 2 passed", id="short"),
+        pytest.param(
+            "1 passed, 1 skipped in 0.10s",
+            2,
+            r"\['PASSED', 'SKIPPED'\] are not exactly 2 passed",
+            id="pass-plus-skip",
+        ),
+        pytest.param(
+            "1 passed in 0.10s", 0, r"\['PASSED'\] are not exactly 0 passed", id="zero-expected"
+        ),
+        pytest.param("no tests ran in 0.10s", 1, "execution trailer is malformed", id="none"),
+    ],
+)
+def test_nested_witness_gate_probe_rejects_non_passed_outcomes(
+    trailer: str, expected: int, error: str
+) -> None:
+    """T11/G14: only exactly ``expected`` passed gate nodes prove a gate pass.
+
+    Each rejection names the guard it must trip, so masking by another guard fails.
+    """
+    with pytest.raises(_WitnessContractError, match=error):
+        _require_gate_probe_outcome(_nw_completed(_nw_execution(trailer)), expected)
+
+
+def test_nested_witness_gate_probe_accepts_exact_pass_with_non_node_outcomes() -> None:
+    """T11: deselected and warning counts are non-node and do not block a gate pass."""
+    result = _nw_completed(_nw_execution("1 passed, 13644 deselected, 2 warnings in 3.10s"))
+    _require_gate_probe_outcome(result, 1)
+
+
+def test_nested_witness_orchestration_order_and_argv_reuse() -> None:
+    """T12/G15/G16: every proof precedes execution; execution reuses selection argv."""
+    run, calls = _nw_fake_runner(_nw_default_outputs())
+    _run_partitioned_witness(run)
+    assert tuple(calls) == _NW_EXPECTED_CALLS
+    executions = [call for call in calls if "--collect-only" not in call]
+    collections = [call[:-1] for call in calls if call[-1:] == ("--collect-only",)]
+    assert executions == [
+        _NW_PROBE + _NW_WORKERS,
+        _NW_ORDINARY + _NW_WORKERS,
+        _NW_SERIAL,
+        _NW_PACKAGING,
+    ]
+    for execution in executions:
+        assert any(execution[: len(collected)] == collected for collected in collections)
+
+
+_NW_BAD_COLLECTION = _nw_completed("ERROR collecting\n\n1 error in 0.10s\n", 2)
+
+
+@pytest.mark.parametrize("failing_index", range(6))
+def test_nested_witness_runs_nothing_when_a_collection_fails(failing_index: int) -> None:
+    """T12/G15: a failing collection child stops the run before any execution."""
+    outputs = _nw_default_outputs()
+    outputs[_NW_EXPECTED_CALLS[failing_index]] = _NW_BAD_COLLECTION
+    run, calls = _nw_fake_runner(outputs)
+    with pytest.raises(_WitnessContractError):
+        _run_partitioned_witness(run)
+    assert tuple(calls) == _NW_EXPECTED_CALLS[: failing_index + 1]
+
+
+def test_nested_witness_stops_after_broad_collection_without_self() -> None:
+    """T12/G1/G15: a broad collection lacking the witness stops after that one call."""
+    outputs = _nw_default_outputs()
+    outputs[_NW_EXPECTED_CALLS[0]] = _nw_completed(
+        _nw_collection((_NW_GATE, _NW_A, _NW_B, _NW_S, _NW_P))
+    )
+    run, calls = _nw_fake_runner(outputs)
+    with pytest.raises(_WitnessContractError, match="witness node exactly once"):
+        _run_partitioned_witness(run)
+    assert tuple(calls) == _NW_EXPECTED_CALLS[:1]
+
+
+def test_nested_witness_runs_nothing_when_the_partition_fails() -> None:
+    """T12/G6/G15: a dropped node detected by the partition proof blocks all execution."""
+    outputs = _nw_default_outputs()
+    outputs[_NW_EXPECTED_CALLS[1]] = _nw_completed(_nw_collection((_NW_GATE, _NW_A), 3))
+    run, calls = _nw_fake_runner(outputs)
+    with pytest.raises(_WitnessContractError, match="drop"):
+        _run_partitioned_witness(run)
+    assert tuple(calls) == _NW_EXPECTED_CALLS[:4]
+
+
+@pytest.mark.parametrize("failing_index", [6, 7, 8, 9])
+def test_nested_witness_stops_at_first_failing_child(failing_index: int) -> None:
+    """T13/G10/G15: a failing probe or payload child stops every later child."""
+    outputs = _nw_default_outputs()
+    outputs[_NW_EXPECTED_CALLS[failing_index]] = _nw_completed(
+        _nw_execution("1 failed in 0.10s"), 1
+    )
+    run, calls = _nw_fake_runner(outputs)
+    with pytest.raises(_WitnessContractError):
+        _run_partitioned_witness(run)
+    assert tuple(calls) == _NW_EXPECTED_CALLS[: failing_index + 1]
+
+
+def test_nested_witness_rejects_gate_absent_from_ordinary() -> None:
+    """T14/G7: a gate check routed outside the ordinary selection, or none, fails closed."""
+    outputs = _nw_default_outputs()
+    outputs[_NW_EXPECTED_CALLS[1]] = _nw_completed(_nw_collection((_NW_A, _NW_B), 3))
+    outputs[_NW_EXPECTED_CALLS[2]] = _nw_completed(_nw_collection((_NW_S, _NW_GATE), 3))
+    run, calls = _nw_fake_runner(outputs)
+    with pytest.raises(_WitnessContractError, match="absent from the ordinary"):
+        _run_partitioned_witness(run)
+    assert tuple(calls) == _NW_EXPECTED_CALLS[:5]
+    with pytest.raises(_WitnessContractError, match="empty"):
+        _require_gate_in_ordinary((), (_NW_GATE, _NW_A))
+    with pytest.raises(_WitnessContractError, match="outside"):
+        _require_gate_in_ordinary((_NW_A,), (_NW_GATE, _NW_A))
+
+
+def test_nested_witness_rejects_probe_set_mismatch() -> None:
+    """T14/G8: a probe collecting an extra or a different node fails before execution."""
+    outputs = _nw_default_outputs()
+    extra = "tests/test_alpha.py::test_gate_environment_is_scrubbed_and_complete_twin[p]"
+    outputs[_NW_EXPECTED_CALLS[5]] = _nw_completed(_nw_collection((_NW_GATE, extra), 4))
+    run, calls = _nw_fake_runner(outputs)
+    with pytest.raises(_WitnessContractError, match="beyond the gate set"):
+        _run_partitioned_witness(run)
+    assert tuple(calls) == _NW_EXPECTED_CALLS[:6]
+    with pytest.raises(_WitnessContractError, match="beyond the gate set"):
+        _require_probe_matches_gate((_NW_A,), (_NW_GATE,))
+
+
+def test_nested_witness_body_delegates_to_partitioned_runner() -> None:
+    """T18/G17: the witness delegates once, carries no ``-k not`` omission, keeps markers."""
+    witness = test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper
+    tree = ast.parse(inspect.getsource(witness))
+    function = tree.body[0]
+    assert isinstance(function, ast.FunctionDef)
+    calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_run_partitioned_witness"
+    ]
+    assert len(calls) == 1
+    strings = [
+        node.value
+        for node in ast.walk(function)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+    assert not any("not test_" in value or value == "-k" for value in strings)
+    marker_names: list[str] = []
+    for decorator in function.decorator_list:
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        assert isinstance(target, ast.Attribute)
+        marker_names.append(target.attr)
+    assert marker_names == ["slow", "serial", "exhaustive_only"]
+
+
+def _nw_real_child_runner(tmp_path: Path, source: str) -> _WitnessRunner:
+    """Write a disposable pytest project and return a runner for real child pytest runs.
+
+    The project's ``addopts`` is copied byte-for-byte from this repository's
+    ``pyproject.toml`` so the child's ``-q`` output shape matches the wrapper's.
+    """
+    pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+    addopts = cast(str, pyproject["tool"]["pytest"]["ini_options"]["addopts"])
+    ini = tmp_path / "pytest.ini"
+    ini.write_text(
+        "[pytest]\n"
+        f"addopts = {addopts}\n"
+        "markers =\n"
+        "    serial: real-child fixture marker\n"
+        "    stress: real-child fixture marker\n"
+        "    slow: real-child fixture marker\n"
+    )
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_child.py").write_text(source)
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name != "PYTEST_ADDOPTS" and not name.startswith("PYTEST_XDIST_")
+    }
+
+    def run(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        command = [sys.executable, "-m", "pytest", "-c", str(ini), "-p", "no:cacheprovider"]
+        return subprocess.run(
+            [*command, *argv],
+            capture_output=True,
+            text=True,
+            env=environment,
+            cwd=tmp_path,
+            check=False,
+        )
+
+    return run
+
+
+@pytest.mark.slow
+def test_nested_witness_real_failing_child_fails_closed(tmp_path: Path) -> None:
+    """T15/G10/G12: a real failing child fails closed, even with its exit masked to 0."""
+    run = _nw_real_child_runner(
+        tmp_path, "def test_pass():\n    pass\n\n\ndef test_fail():\n    assert False\n"
+    )
+    expected = len(_parse_collection(run(("tests", "--collect-only"))))
+    assert expected == 2
+    result = run(("tests",))
+    assert result.returncode == 1, result.stdout + result.stderr
+    with pytest.raises(_WitnessContractError, match="nonzero"):
+        _require_payload_outcome(result, expected)
+    masked = subprocess.CompletedProcess(result.args, 0, result.stdout, result.stderr)
+    with pytest.raises(_WitnessContractError, match="failures or errors"):
+        _require_payload_outcome(masked, expected)
+
+
+# Real-child xdist scheduling fixture (two workers keep the disposable children cheap).
+_NW_CHILD_WORKERS = ("-n", "2", "--dist", "worksteal")
+
+_NW_ACCEPTED_SOURCE = """import pytest
+
+
+def test_pass():
+    pass
+
+
+def test_skip():
+    pytest.skip("visibly skipped")
+
+
+@pytest.mark.xfail(reason="expected failure")
+def test_xfail():
+    assert False
+
+
+@pytest.mark.xfail(reason="non-strict xpass")
+def test_xpass():
+    pass
+"""
+
+
+@pytest.mark.slow
+def test_nested_witness_real_accepted_outcomes_and_xdist_trailer(tmp_path: Path) -> None:
+    """T16: real pass/skip/xfail/xpass is accepted single-process and under xdist."""
+    run = _nw_real_child_runner(tmp_path, _NW_ACCEPTED_SOURCE)
+    collected = _parse_collection(run(("tests", "--collect-only")))
+    assert len(collected) == 4
+    expected = {
+        _PytestOutcome.PASSED: 1,
+        _PytestOutcome.SKIPPED: 1,
+        _PytestOutcome.XFAILED: 1,
+        _PytestOutcome.XPASSED: 1,
+    }
+    for mode in ((), _NW_CHILD_WORKERS):
+        outcomes = _require_payload_outcome(run(("tests", *mode)), len(collected))
+        assert {key: value for key, value in outcomes.items() if key not in _NON_NODE_OUTCOMES} == (
+            expected
+        )
+    deselected = run(("tests", "--deselect", "tests/test_child.py::test_pass", "--collect-only"))
+    assert _parse_collection(deselected) == tuple(
+        node for node in collected if node != "tests/test_child.py::test_pass"
+    )
+    assert "3/4 tests collected (1 deselected)" in deselected.stdout
+
+
+@pytest.mark.slow
+def test_nested_witness_real_skipped_or_xfailing_gate_probe_rejected(tmp_path: Path) -> None:
+    """T17/G14: a real skipped or xfailing gate node never proves a gate pass under xdist."""
+    run = _nw_real_child_runner(
+        tmp_path,
+        "import pytest\n\n\ndef test_gate_passes():\n    pass\n\n\n"
+        "def test_gate_skips():\n    pytest.skip('gate skipped')\n\n\n"
+        "@pytest.mark.xfail(reason='gate xfails')\ndef test_gate_xfails():\n    assert False\n",
+    )
+    _require_gate_probe_outcome(run(("tests", "-k", "test_gate_passes", *_NW_CHILD_WORKERS)), 1)
+    for name in ("test_gate_skips", "test_gate_xfails"):
+        result = run(("tests", "-k", name, *_NW_CHILD_WORKERS))
+        assert result.returncode == 0, result.stdout + result.stderr
+        with pytest.raises(_WitnessContractError, match="not exactly 1 passed"):
+            _require_gate_probe_outcome(result, 1)
 
 
 def test_rendered_pyright_gate_runs_cold_under_the_closed_environment(tmp_path: Path) -> None:
