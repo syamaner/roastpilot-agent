@@ -29,9 +29,12 @@ the reviewer assertion.
 from __future__ import annotations
 
 import hashlib
+import itertools
+import operator
+import random
 import re
 from pathlib import Path
-from typing import cast
+from typing import SupportsIndex, cast
 
 import pytest
 import yaml
@@ -409,17 +412,31 @@ def _assert_policy_range_is_outside_processing_instructions(
         next_boundary = next(boundaries, None)
 
 
+_DECLARATION_OPENER: re.Pattern[str] = re.compile(r"<![A-Z]")
+
+
 def _assert_policy_range_is_outside_declarations(text: str, start: int, end: int) -> None:
-    """Reject a non-nesting CommonMark Type-4 declaration span at policy boundaries."""
+    """Reject a non-nesting CommonMark Type-4 declaration span at policy boundaries.
+
+    The next opener and next terminator positions are cached and re-searched
+    only once the scan has moved past them, so each marker kind scans the text
+    at most once instead of rescanning every remaining suffix per token.
+    """
     boundaries = iter(sorted((start, end)))
     next_boundary = next(boundaries, None)
     declaration_open = False
-    declaration_opener = re.compile(r"<![A-Z]")
     scan_start = 0
+    opening_match = _DECLARATION_OPENER.search(text, scan_start)
+    next_opening = opening_match.start() if opening_match else -1
+    next_closing = text.find(">", scan_start)
     while True:
-        opening_match = declaration_opener.search(text, scan_start)
-        opening_start = opening_match.start() if opening_match else -1
-        closing_start = text.find(">", scan_start)
+        if next_opening != -1 and next_opening < scan_start:
+            opening_match = _DECLARATION_OPENER.search(text, scan_start)
+            next_opening = opening_match.start() if opening_match else -1
+        if next_closing != -1 and next_closing < scan_start:
+            next_closing = text.find(">", scan_start)
+        opening_start = next_opening
+        closing_start = next_closing
         if opening_start == closing_start == -1:
             break
         if closing_start == -1 or (opening_start != -1 and opening_start < closing_start):
@@ -3113,3 +3130,308 @@ def test_synthetic_regressions_fail_closed_for_the_other_governance_guards() -> 
             with pytest.raises(AssertionError, match="complete visible dated D-ToS-1 label"):
                 bold_start = document.index("**", label_start, label_end)
                 assertion(document[:bold_start] + document[bold_start + 2 :])
+
+
+# --- #1019: declaration-scan equivalence and bounded-work proofs -------------
+#
+# These nodes are docs-free: they exercise only in-memory strings, so they carry
+# no marker. The frozen oracle below is the pre-#1019 helper body copied
+# verbatim; only its try/except outcome wrapper is new.
+
+
+def _reference_declaration_outcome(text: str, start: int, end: int) -> bool:
+    """Return the frozen pre-#1019 declaration helper's outcome.
+
+    The body is the original quadratic scanner, byte-for-byte apart from one
+    level of indentation, including its local opener pattern so that patching
+    ``_DECLARATION_OPENER`` never reaches it.
+
+    Args:
+        text: Text to scan.
+        start: One policy boundary.
+        end: The other policy boundary.
+
+    Returns:
+        ``True`` when the original helper returns, ``False`` when it raises
+        ``AssertionError``. Any other exception propagates.
+    """
+    try:
+        boundaries = iter(sorted((start, end)))
+        next_boundary = next(boundaries, None)
+        declaration_open = False
+        declaration_opener = re.compile(r"<![A-Z]")
+        scan_start = 0
+        while True:
+            opening_match = declaration_opener.search(text, scan_start)
+            opening_start = opening_match.start() if opening_match else -1
+            closing_start = text.find(">", scan_start)
+            if opening_start == closing_start == -1:
+                break
+            if closing_start == -1 or (opening_start != -1 and opening_start < closing_start):
+                marker_start = opening_start
+                marker_length = len("<!")
+                opening = True
+            else:
+                marker_start = closing_start
+                marker_length = len(">")
+                opening = False
+
+            while next_boundary is not None and next_boundary <= marker_start:
+                assert not declaration_open
+                next_boundary = next(boundaries, None)
+            if opening and not declaration_open:
+                declaration_open = True
+            elif not opening and declaration_open:
+                declaration_open = False
+            scan_start = marker_start + marker_length
+
+        while next_boundary is not None:
+            assert not declaration_open
+            next_boundary = next(boundaries, None)
+    except AssertionError:
+        return False
+    return True
+
+
+def _candidate_declaration_outcome(text: str, start: int, end: int) -> bool:
+    """Return the current declaration helper's outcome.
+
+    Args:
+        text: Text to scan.
+        start: One policy boundary.
+        end: The other policy boundary.
+
+    Returns:
+        ``True`` when the helper returns, ``False`` when it raises
+        ``AssertionError``. Any other exception propagates.
+    """
+    try:
+        _assert_policy_range_is_outside_declarations(text, start, end)
+    except AssertionError:
+        return False
+    return True
+
+
+# Hand-derived from the documented semantics, independent of both
+# implementations: (label, text, start, end, expected_passes).
+_DECLARATION_LITERAL_ANCHORS: tuple[tuple[str, str, int, int, bool], ...] = (
+    ("L1 empty input", "", 0, 0, True),
+    ("L2 boundary at opener", "<!A", 0, 0, True),
+    ("L3 inside unterminated", "<!A", 1, 1, False),
+    ("L4 unterminated at EOF", "<!A", 3, 3, False),
+    ("L5 after EOF", "<!A", 5, 5, False),
+    ("L6 at closing terminator", "<!A>", 3, 3, False),
+    ("L7 just after close", "<!A>", 4, 4, True),
+    ("L8 lowercase not an opener", "<!a>", 2, 2, True),
+    ("L9 non-ASCII uppercase not an opener", "<!É>", 2, 2, True),
+    ("L10 first terminator closes", "<!A<!B>x", 7, 7, True),
+    ("L11 nested opener ignored", "<!A<!B>x", 5, 5, False),
+    ("L12 later terminator is a no-op", "<!A>x>", 5, 5, True),
+    ("L13 stray terminator while closed", ">", 0, 1, True),
+    ("L14 overlapping opener boundary", "<!<!A>", 2, 2, True),
+    ("L15 overlapping opener inside", "<!<!A>", 3, 3, False),
+    ("L16 between adjacent declarations", "<!A><!B>", 4, 4, True),
+    ("L17 inside second declaration", "<!A><!B>", 5, 5, False),
+    ("L18 reversed boundaries", "<!A", 1, 0, False),
+    ("L19 one good one bad boundary", "<!A", 0, 3, False),
+    ("L20 empty declaration not an opener", "<!>", 3, 3, True),
+    ("L21 bare opener prefix at EOF", "<!", 2, 2, True),
+    ("after second declaration closes", "<!A><!B>", 8, 8, True),
+    ("negative boundaries on empty text", "", -1, -1, True),
+    ("negative boundaries before opener", "<!A", -1, -1, True),
+    ("negative and inside boundaries", "<!A", -1, 1, False),
+)
+
+_E1_ALPHABET: tuple[str, ...] = ("<", "!", "A", "a", ">")
+_E2_TOKENS: tuple[str, ...] = ("<!A", "<!a", ">", "x", "<")
+_SEEDED_TOKENS: tuple[str, ...] = ("<!A", "<!z", ">", "x", "<", "!", "Q")
+
+
+def _assert_candidate_matches_reference_for_all_boundaries(text: str) -> int:
+    """Compare candidate and frozen outcomes for every boundary pair in range.
+
+    Args:
+        text: Text to scan.
+
+    Returns:
+        The number of ``(text, start, end)`` triples compared.
+    """
+    compared = 0
+    for start in range(len(text) + 2):
+        for end in range(len(text) + 2):
+            assert _candidate_declaration_outcome(
+                text, start, end
+            ) == _reference_declaration_outcome(text, start, end), (text, start, end)
+            compared += 1
+    return compared
+
+
+class _ScanCountingText(str):
+    """String whose ``find`` records how many characters each call scans."""
+
+    scanned: int
+    find_calls: int
+
+    def __new__(cls, value: str) -> _ScanCountingText:
+        """Create a counting copy of ``value`` with zeroed counters.
+
+        Args:
+            value: The text to wrap.
+
+        Returns:
+            The counting string.
+        """
+        instance = super().__new__(cls, value)
+        instance.scanned = 0
+        instance.find_calls = 0
+        return instance
+
+    def find(
+        self,
+        sub: str,
+        start: SupportsIndex | None = None,
+        end: SupportsIndex | None = None,
+        /,
+    ) -> int:
+        """Delegate to ``str.find`` and count the characters it scanned.
+
+        Args:
+            sub: Substring to find.
+            start: Optional scan start.
+            end: Optional scan end.
+
+        Returns:
+            The ``str.find`` result.
+        """
+        result = super().find(sub, start, end)
+        scan_from = 0 if start is None else operator.index(start)
+        self.find_calls += 1
+        self.scanned += (result + len(sub) if result != -1 else len(self)) - scan_from
+        return result
+
+
+class _ScanCountingOpener:
+    """Proxy for ``_DECLARATION_OPENER`` that counts the characters searched."""
+
+    def __init__(self, pattern: re.Pattern[str]) -> None:
+        """Wrap the real compiled opener pattern.
+
+        Args:
+            pattern: The compiled declaration opener pattern.
+        """
+        self._pattern = pattern
+        self.scanned = 0
+        self.calls = 0
+
+    def search(self, string: str, pos: int = 0) -> re.Match[str] | None:
+        """Delegate to the real pattern and count the characters it searched.
+
+        Args:
+            string: Text to search.
+            pos: Search start.
+
+        Returns:
+            The real pattern's match, or ``None``.
+        """
+        match = self._pattern.search(string, pos)
+        self.calls += 1
+        self.scanned += (match.start() + 3 if match else len(string)) - pos
+        return match
+
+
+def _assert_declaration_scan_work_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, text: str, start: int, end: int, expected: bool
+) -> None:
+    """Run the candidate on counting inputs and assert engagement and a linear bound.
+
+    The frozen oracle runs only after the bound assertions, on a plain ``str``
+    copy, so it can never touch the counters.
+
+    Args:
+        monkeypatch: Fixture used to install the counting opener proxy.
+        text: Text to scan.
+        start: One policy boundary.
+        end: The other policy boundary.
+        expected: Hand-derived outcome for ``(text, start, end)``.
+    """
+    proxy = _ScanCountingOpener(_DECLARATION_OPENER)
+    counting_text = _ScanCountingText(text)
+    monkeypatch.setitem(globals(), "_DECLARATION_OPENER", proxy)
+    outcome = _candidate_declaration_outcome(counting_text, start, end)
+    monkeypatch.undo()
+
+    assert proxy.calls >= 1 and counting_text.find_calls >= 1, (
+        "declaration scan bypassed the counting seam: "
+        f"opener calls={proxy.calls}, find calls={counting_text.find_calls}"
+    )
+    scanned = proxy.scanned + counting_text.scanned
+    bound = 3 * len(text) + 8
+    assert scanned <= bound, (
+        f"declaration scan work bound exceeded: scanned {scanned} > {bound} "
+        f"for {len(text)} characters"
+    )
+    assert outcome is expected
+    assert _reference_declaration_outcome(str(text), start, end) is expected
+
+
+def test_declaration_scan_matches_literal_anchors() -> None:
+    """Hand-derived anchors hold for both the candidate and the frozen oracle."""
+    for label, text, start, end, expected in _DECLARATION_LITERAL_ANCHORS:
+        assert _candidate_declaration_outcome(text, start, end) is expected, label
+        assert _reference_declaration_outcome(text, start, end) is expected, label
+
+
+def test_declaration_scan_matches_frozen_original_exhaustively() -> None:
+    """E1 and E2 finite corpora agree with the frozen oracle at exact counts."""
+    e1_triples = 0
+    for length in range(6):
+        for characters in itertools.product(_E1_ALPHABET, repeat=length):
+            e1_triples += _assert_candidate_matches_reference_for_all_boundaries(
+                "".join(characters)
+            )
+    assert e1_triples == 179_199
+
+    e2_triples = 0
+    for count in range(5):
+        for tokens in itertools.product(_E2_TOKENS, repeat=count):
+            e2_triples += _assert_candidate_matches_reference_for_all_boundaries("".join(tokens))
+    assert e2_triples == 63_418
+
+
+def test_declaration_scan_matches_frozen_original_on_seeded_inputs() -> None:
+    """Seeded long token sequences, including negative boundaries, agree with the oracle."""
+    generator = random.Random(1019)
+    cases = 0
+    for _ in range(200):
+        text = "".join(generator.choice(_SEEDED_TOKENS) for _ in range(generator.randint(0, 400)))
+        for _ in range(50):
+            start = generator.randint(-1, len(text) + 1)
+            end = generator.randint(-1, len(text) + 1)
+            assert _candidate_declaration_outcome(
+                text, start, end
+            ) == _reference_declaration_outcome(text, start, end), (text, start, end)
+            cases += 1
+    assert cases == 10_000
+
+
+def test_declaration_scan_work_is_linear(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Many terminators with no opener ahead (WB-1) and alternation (WB-3) scan linearly."""
+    terminators = "x>" * 4000
+    assert len(terminators) == 8000
+    _assert_declaration_scan_work_is_bounded(
+        monkeypatch, terminators, 0, len(terminators), expected=True
+    )
+    declarations = "<!A>x" * 2000
+    _assert_declaration_scan_work_is_bounded(
+        monkeypatch, declarations, 0, len(declarations), expected=True
+    )
+
+
+def test_declaration_scan_work_is_linear_for_unterminated_openers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Many openers with no terminator (WB-2), judged at EOF, scan linearly."""
+    openers = "<!A" * 4000
+    _assert_declaration_scan_work_is_bounded(
+        monkeypatch, openers, len(openers), len(openers), expected=False
+    )
