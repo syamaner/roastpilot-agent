@@ -1,5 +1,18 @@
 # RoastPilot Agent Project State Registry
 
+**15 Oct 2026, #1019 governance declaration scan:** the declaration-state
+scanner in the review-authority governance test now reuses its pending
+next-opener and next-terminator positions instead of re-searching each
+remaining suffix for every token. The opener grammar (an exclamation-mark
+opener followed by an uppercase letter), non-nesting state, first-close
+behaviour, unterminated declarations and boundary semantics are unchanged.
+Comparisons against a frozen copy of the original scanner, over finite
+exhaustive and seeded corpora, and independent literal anchors preserve the
+tested declaration and boundary outcomes, with deterministic bounded-work
+proofs; this is not an exhaustive proof over all strings. This records test
+infrastructure only, with no E11 status, hardware, Pi, installation or
+release claim. Timing evidence is recorded in the PR and issue.
+
 **14 Oct 2026, #1017 fake filesystem-check backend:** the installer test
 harness's fake `test` command remains the external command at the installer's
 privilege seam, but now evaluates each check with the shell's own `test`
