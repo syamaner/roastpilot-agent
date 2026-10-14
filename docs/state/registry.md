@@ -1,5 +1,17 @@
 # RoastPilot Agent Project State Registry
 
+**14 Oct 2026, #1017 fake filesystem-check backend:** the installer test
+harness's fake `test` command remains the external command at the installer's
+privilege seam, but now evaluates each check with the shell's own `test`
+instead of spawning a second external checker. Recording, locale and
+secret-environment checks, fault injections (41/48/41), the post-success `-d`
+mutation hook and the 0/1 normalisation are unchanged. New
+`test_fake_test_backend_*` nodes prove agreement with the external reference
+for the seven installer check forms, liveness, injections and the hook, and
+that a default run stays inside that proven domain. `packaging/` is unchanged.
+This records test infrastructure only, with no E11 status, hardware, Pi,
+installation or release claim. Timing evidence is recorded in the PR and issue.
+
 **14 Oct 2026, #1015 nested QA-wrapper witness partition (D217):** the single
 `exhaustive_only` witness runs its closed-environment nested suite as three
 sequential, proven-disjoint selections (ordinary under four-worker `worksteal`,
