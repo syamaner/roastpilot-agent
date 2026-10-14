@@ -9331,6 +9331,17 @@ _PROVEN_TEST_FORMS: tuple[tuple[str, ...], ...] = (
     ("!", "-L"),
     ("!", "-d"),
 )
+# T1's proof inventory is deliberately independent of T3's domain allowlist above, so a
+# change to the allowlist can never silently shrink the equivalence proof.
+_EQUIVALENCE_PROOF_FORMS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("e", ("-e",)),
+    ("L", ("-L",)),
+    ("f", ("-f",)),
+    ("d", ("-d",)),
+    ("not-e", ("!", "-e")),
+    ("not-L", ("!", "-L")),
+    ("not-d", ("!", "-d")),
+)
 _FAKE_TEST_COUNTER_VARIABLES = (
     "FAKE_TEST_FAIL_COUNT_FILE",
     "FAKE_TEST_FAIL_D_COUNT_FILE",
@@ -9561,7 +9572,8 @@ def _set_live_state(path: Path, state: str, target: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "form", _PROVEN_TEST_FORMS, ids=("e", "L", "f", "d", "not-e", "not-L", "not-d")
+    "form",
+    [pytest.param(form, id=identifier) for identifier, form in _EQUIVALENCE_PROOF_FORMS],
 )
 def test_fake_test_backend_matches_reference_for_every_installer_form(
     form: tuple[str, ...],
@@ -9569,6 +9581,20 @@ def test_fake_test_backend_matches_reference_for_every_installer_form(
     installer_harness: tuple[Path, dict[str, str], Path, Path],
 ) -> None:
     """Prove the fake check agrees with the external reference for one installer form."""
+    assert _EQUIVALENCE_PROOF_FORMS == (
+        ("e", ("-e",)),
+        ("L", ("-L",)),
+        ("f", ("-f",)),
+        ("d", ("-d",)),
+        ("not-e", ("!", "-e")),
+        ("not-L", ("!", "-L")),
+        ("not-d", ("!", "-d")),
+    ), f"equivalence proof inventory changed: {_EQUIVALENCE_PROOF_FORMS}"
+    proof_forms = {proof_form for _, proof_form in _EQUIVALENCE_PROOF_FORMS}
+    assert set(_FAKE_TEST_TRUE_STATES) == proof_forms, (
+        f"anchor table must cover exactly the proof forms: {sorted(_FAKE_TEST_TRUE_STATES)}"
+    )
+    assert form in proof_forms and form in _FAKE_TEST_TRUE_STATES
     fake_bin, environment, log, _ = installer_harness
     reference = Path(_REFERENCE_TEST_COMMAND)
     assert reference.is_file() and os.access(reference, os.X_OK), (
