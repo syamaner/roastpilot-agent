@@ -9899,3 +9899,13 @@ def test_fake_test_backend_installer_forms_stay_in_the_proven_domain(
             outside.append(event)
     assert not unproven, f"default run used check forms outside the proven table: {unproven}"
     assert not outside, f"default run checked paths outside the harness root: {outside}"
+    # The domain allowlist may admit only forms T1 proves equivalent: T1 pins its own
+    # seven-form inventory literally, so an allowlist-only addition fails here.
+    proven_domain = set(_PROVEN_TEST_FORMS)
+    equivalence_forms = {proof_form for _, proof_form in _EQUIVALENCE_PROOF_FORMS}
+    assert len(proven_domain) == len(_PROVEN_TEST_FORMS) and proven_domain == equivalence_forms, (
+        "proven-domain allowlist must equal the equivalence-proven forms: "
+        f"unproven={sorted(proven_domain - equivalence_forms)} "
+        f"missing={sorted(equivalence_forms - proven_domain)} "
+        f"allowlist={_PROVEN_TEST_FORMS}"
+    )
