@@ -30,6 +30,8 @@ export interface RecoveryModalProps {
   enabledActions: OperatorAction[] | null;
   /** Dispatch an operator action (wired to `api.operatorAction`). */
   onAction: (action: OperatorAction) => void;
+  /** A failed health refresh leaves only emergency stop available. */
+  healthStale?: boolean;
 }
 
 /** The recovery actions, in display order, with copy + a recommendation note. */
@@ -56,6 +58,7 @@ export function RecoveryModal({
   fanPercent,
   enabledActions,
   onAction,
+  healthStale = false,
 }: RecoveryModalProps): React.JSX.Element | null {
   if (!open) return null;
   // Emergency stop is always available (mirrors evaluate_emergency_stop); the
@@ -103,23 +106,20 @@ export function RecoveryModal({
           <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Select Recovery Action
           </span>
-          {RECOVERY_ACTIONS.map(({ action, label, note }) => {
-            const isEnabled = action === "emergency_stop" || enabled.has(action);
+          {RECOVERY_ACTIONS.filter(
+            ({ action }) => action === "emergency_stop" || (!healthStale && enabled.has(action)),
+          ).map(({ action, label, note }) => {
             return (
               <button
                 key={action}
                 type="button"
                 data-testid={`recovery-${action}`}
-                data-enabled={isEnabled ? "true" : "false"}
-                disabled={!isEnabled}
-                aria-disabled={!isEnabled}
+                data-enabled="true"
                 onClick={() => onAction(action)}
                 className={cn(
                   "flex items-center justify-between gap-4 rounded-md border px-4 py-3 text-left transition-colors",
-                  isEnabled
-                    ? "border-border bg-secondary hover:bg-accent"
-                    : "cursor-not-allowed border-border/40 text-muted-foreground/50",
-                  action === "emergency_stop" && isEnabled && "border-roast-fault/60 text-roast-fault",
+                  "border-border bg-secondary hover:bg-accent",
+                  action === "emergency_stop" && "border-roast-fault/60 text-roast-fault",
                 )}
               >
                 <span className="text-sm font-semibold uppercase tracking-wide">{label}</span>
@@ -128,6 +128,12 @@ export function RecoveryModal({
             );
           })}
         </div>
+        {healthStale && (
+          <p data-testid="recovery-health-stale" className="text-xs text-roast-fault">
+            Health status is stale. Recovery actions are disabled until it recovers; emergency
+            stop remains available.
+          </p>
+        )}
       </div>
     </div>
   );

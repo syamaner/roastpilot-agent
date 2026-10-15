@@ -45,6 +45,9 @@ export type SseEventType =
   | "fault"
   | "recovery_required"
   | "recovery_acknowledged"
+  | "fault_acknowledgement_executed"
+  | "fault_controls_changed"
+  | "fault_controls_acknowledged"
   | "logs_exported"
   | "run_completed"
   | "telemetry"
@@ -56,6 +59,11 @@ export interface SseEvent<T = Record<string, unknown>> {
   data: T;
   id?: number | null;
 }
+
+/** Bounded server outcome for a queued fault acknowledgement action. */
+export type FaultAcknowledgementExecutedEventData =
+  | { outcome: "confirmed" }
+  | { outcome: "failed"; reason: string };
 
 // --- Microphone / first-crack capture-alive health (models.MicHealth /
 // models.MicStatus, #197). Pure observability: a read-only projection of the MCP
@@ -189,7 +197,9 @@ export type OperatorAction =
   | "stop_cooling"
   | "emergency_stop"
   | "acknowledge_recovery"
-  | "acknowledge_fault";
+  | "acknowledge_fault"
+  /** D212: one confirmed, server-verified terminal fault action. */
+  | "stop_cooling_and_acknowledge";
 
 export interface OperatorActionRequest {
   action: OperatorAction;
@@ -201,6 +211,81 @@ export interface OperatorActionResult {
   result: "accepted" | "rejected" | "failed";
   reason: string;
   queued: boolean;
+}
+
+/** Result of a current-process restart-clearance confirmation attempt.
+ *
+ * It records the server outcome and current projections only. It never proves
+ * the physical state and never performs a roaster write.
+ */
+export interface RestartClearanceResult {
+  /** Whether the requested clearance was durably recorded. */
+  outcome: "confirmed" | "failed";
+  /** The server's current gate state after this acknowledgement attempt. */
+  cleared: boolean;
+  restart_clearance_required: boolean;
+  /** Current-process gate projection, including fail-closed failures. */
+  restart_clearance: RestartClearance;
+  /** Current server-owned fault-control projection. */
+  fault_controls: FaultControls;
+}
+
+/** Current-process restart-clearance state, rendered directly from `/health`. */
+export type RestartClearanceState = "required" | "cleared" | "unknown";
+
+export interface RestartClearance {
+  state: RestartClearanceState;
+  /** Whether the server permits a new start in this process. */
+  eligible: boolean;
+}
+
+/** Durable fault-control lease status projected without private identifiers. */
+export type FaultControlsStatus = "closed" | "open" | "unknown";
+
+/**
+ * Server-owned terminal fault controls. `generation` is an opaque monotonic
+ * lease generation for display/event correlation, never a run or device id.
+ */
+export interface FaultControls {
+  status: FaultControlsStatus;
+  generation: number | null;
+  enabled_actions: OperatorAction[];
+}
+
+/** Global terminal-fault action request. The server resolves the current lease. */
+export type FaultControlsActionRequest =
+  | {
+      action: Exclude<OperatorAction, "stop_cooling_and_acknowledge">;
+      confirmation?: never;
+      expected_generation?: never;
+    }
+  | {
+      /** D212 must bind its confirmation to one positive server lease generation. */
+      action: "stop_cooling_and_acknowledge";
+      confirmation: true;
+      expected_generation: number;
+    };
+
+/**
+ * Bounded admission result for a global terminal-fault action.
+ *
+ * `accepted` is not completion. The response carries the current projection;
+ * subsequent `/health` snapshots and fault-controls events remain authoritative.
+ */
+export interface FaultControlsActionResult {
+  action: OperatorAction;
+  result: "accepted" | "confirmed" | "rejected" | "failed";
+  reason: string;
+  queued?: boolean;
+  /** Current server-owned lease projection after the action attempt. */
+  fault_controls: FaultControls;
+}
+
+/** Event payload for server-authoritative terminal-fault state changes. */
+export interface FaultControlsEventData {
+  status: FaultControlsStatus;
+  generation: number | null;
+  outcome?: "confirmed" | "failed";
 }
 
 // --- Safety verdicts (safety.SafetyVerdict / D15) — six values, three badges.
@@ -700,6 +785,9 @@ export type RoastEventKind =
   | "fault"
   | "recovery_required"
   | "recovery_acknowledged"
+  | "fault_acknowledgement_executed"
+  | "fault_controls_changed"
+  | "fault_controls_acknowledged"
   | "logs_exported"
   | "run_completed";
 
@@ -899,6 +987,16 @@ export interface HealthResponse {
   mcp_hardware_clear_required: boolean;
   mcp_teardown_incident_id: string | null;
   active_run_id: string | null;
+  /**
+   * D213's fresh-process gate. Optional at this untrusted wire boundary so an
+   * older or malformed response can be rendered as UNKNOWN and fail closed.
+   */
+  restart_clearance?: RestartClearance;
+  /**
+   * D212/D213 terminal fault-control projection. Missing data is rendered as
+   * UNKNOWN; the SPA never manufactures enabled controls from phase/history.
+   */
+  fault_controls?: FaultControls;
 }
 
 // --- Config (config_store.AppConfigSnapshot / GET + PUT /api/config) ---

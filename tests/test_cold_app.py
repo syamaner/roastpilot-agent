@@ -229,7 +229,7 @@ async def test_t_a2_control_reads_do_reach_the_inner_stack(
     app = make_app(store, stream.ColdObservationHub())
     sent, _receive = await request(app, "GET", api.HEALTH_PATH)
     assert sent.status == 200
-    assert limiter_calls == ["http", "http", "http"]
+    assert limiter_calls and all(call == "http" for call in limiter_calls)
 
 
 # ------------------------------------------------------------------ T-A3

@@ -15,13 +15,14 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import AsyncGenerator, AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from unittest import mock
 
+import aiosqlite
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI, HTTPException, Request
@@ -46,6 +47,7 @@ from roastpilot_agent.api import (
     RoastRunConflictError,
     RoastRunGoneError,
     RoastRunner,
+    RoastRunNotFoundError,
     RoastService,
     _before_the_minute,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     _parse_last_event_id,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
@@ -76,16 +78,23 @@ from roastpilot_agent.mcp_client import (
     RoastSessionState,
 )
 from roastpilot_agent.models import (
+    AppliedRoasterState,
     BeanProfileDraft,
     BeanProfileInput,
     ChargeWeightRequest,
     ClearStaleSessionRequest,
+    FaultAcknowledgementState,
+    FaultControlsActionRequest,
+    FaultControlState,
+    FaultCoolingStopResult,
+    FaultLeaseStatus,
     HardwareClearAcknowledgementRequest,
     MicHealth,
     OperatorAction,
     OperatorActionRequest,
     PostFcHeatAuthorityState,
     ReferenceRoast,
+    RestartClearanceState,
     RoastCommand,
     RoastDetail,
     RoastedWeightRequest,
@@ -99,7 +108,7 @@ from roastpilot_agent.models import (
     TelemetryEventData,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
-from roastpilot_agent.store import FrozenRunConfig, PersistedRun, RoastStore
+from roastpilot_agent.store import FaultControlLease, FrozenRunConfig, PersistedRun, RoastStore
 from tests.conftest import FakeClock, FakeMCPClient
 
 
@@ -157,6 +166,467 @@ async def test_health_reports_version_and_no_active_run(client: AsyncClient) -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/restart-clearance", "/api/fault-controls/actions"])
+async def test_fault_control_routes_bound_declared_and_chunked_bodies(
+    store: RoastStore, path: str
+) -> None:
+    """Safety-control routes reject oversized declared and streamed request bodies."""
+    app = create_app(RoastService(store))
+    transport = ASGITransport(app=app)
+
+    async def oversized_chunks() -> AsyncIterator[bytes]:
+        yield b"x" * 1024
+        yield b"x"
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        declared = await instance.post(
+            path,
+            content=b"x" * 1025,
+            headers={"content-type": "application/json"},
+        )
+        chunked = await instance.post(
+            path,
+            content=oversized_chunks(),
+            headers={"content-type": "application/json"},
+        )
+
+    expected = {"detail": "request body exceeds 1024-byte limit"}
+    assert declared.status_code == chunked.status_code == 413
+    assert declared.json() == chunked.json() == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "valid_payload", "invalid_field", "expected_status", "expected_result"),
+    [
+        (
+            "/api/restart-clearance",
+            {"physical_confirmation": True},
+            "physical_confirmation",
+            409,
+            None,
+        ),
+        (
+            "/api/fault-controls/actions",
+            {
+                "action": "stop_cooling_and_acknowledge",
+                "confirmation": True,
+                "expected_generation": 1,
+            },
+            "confirmation",
+            200,
+            "rejected",
+        ),
+    ],
+)
+@pytest.mark.parametrize("invalid_confirmation", [False, 1, 1.0, "true"])
+async def test_fault_control_routes_require_strict_true_confirmation(
+    store: RoastStore,
+    path: str,
+    valid_payload: dict[str, object],
+    invalid_field: str,
+    expected_status: int,
+    expected_result: str | None,
+    invalid_confirmation: object,
+) -> None:
+    """Physical and D212 confirmation fields accept only JSON boolean ``true``."""
+    app = create_app(RoastService(store))
+    transport = ASGITransport(app=app)
+    invalid_payload = {**valid_payload, invalid_field: invalid_confirmation}
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        rejected = await instance.post(path, json=invalid_payload)
+        accepted_shape = await instance.post(path, json=valid_payload)
+
+    assert rejected.status_code == 422
+    assert accepted_shape.status_code == expected_status
+    if expected_result is not None:
+        assert accepted_shape.json()["result"] == expected_result
+
+
+@pytest.mark.asyncio
+async def test_fault_control_routes_map_service_conflicts_to_typed_409(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both control routes expose service conflicts as stable 409 responses."""
+    service = RoastService(store)
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async def fault_conflict(_: FaultControlsActionRequest) -> None:
+        raise RoastRunConflictError("current fault lease changed")
+
+    monkeypatch.setattr(service, "submit_fault_controls_action", fault_conflict)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        restart = await instance.post(
+            "/api/restart-clearance", json={"physical_confirmation": True}
+        )
+        fault = await instance.post(
+            "/api/fault-controls/actions", json={"action": "emergency_stop"}
+        )
+
+    assert restart.status_code == 409
+    assert restart.json() == {"detail": "restart clearance requires a current MCP control surface"}
+    assert fault.status_code == 409
+    assert fault.json() == {"detail": "current fault lease changed"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        RoastRunNotFoundError("private-run-id"),
+        RoastRunGoneError("run private-run-id is faulted; operator actions are no longer accepted"),
+    ],
+)
+async def test_fault_controls_action_hides_missing_or_terminal_lease_details(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """Global fault controls fail closed without leaking stale lease details."""
+    service = RoastService(store)
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async def unavailable(_: FaultControlsActionRequest) -> None:
+        raise error
+
+    monkeypatch.setattr(service, "submit_fault_controls_action", unavailable)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/fault-controls/actions", json={"action": "emergency_stop"}
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "current fault control is unavailable"}
+    assert "private-run-id" not in response.text
+    assert "faulted" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_restart_clearance_route_records_no_session_proof_without_roaster_write(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The public clearance route records fresh no-session proof without a write."""
+    roaster = FakeMCPClient()
+    session_presence = mock.AsyncMock(return_value="none")
+    monkeypatch.setattr(roaster, "read_session_presence", session_presence)
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        run_loop=False,
+    )
+    await service.recover_on_start()
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/restart-clearance", json={"physical_confirmation": True}
+        )
+
+    assert response.status_code == 200
+    assert response.json()["outcome"] == "confirmed"
+    assert response.json()["cleared"] is True
+    session_presence.assert_awaited_once()
+    assert roaster.calls == []
+
+
+@pytest.mark.asyncio
+async def test_restart_clearance_route_refuses_unknown_lease_without_mcp_probe(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An UNKNOWN fault lease keeps the HTTP clearance gate fail-closed."""
+    roaster = FakeMCPClient()
+    session_presence = mock.AsyncMock(return_value="none")
+    monkeypatch.setattr(roaster, "read_session_presence", session_presence)
+    await store.create_run(
+        run_id="unknown-fault-lease",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(
+        run_id="unknown-fault-lease", outcome="faulted", agent_phase=RoastPhase.FAULTED
+    )
+    await store.replace_fault_control_lease_unknown("unknown-fault-lease", generation=1)
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        run_loop=False,
+    )
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/restart-clearance", json={"physical_confirmation": True}
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "fault controls are unknown; physical-clear procedure is required"
+    }
+    session_presence.assert_not_awaited()
+    assert roaster.calls == []
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_restart_clearance_route_refuses_active_nonfaulted_run_without_mcp_probe(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persisted live run cannot be cleared through the restart endpoint."""
+    await store.create_run(
+        run_id="restart-clearance-active-run",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    roaster = FakeMCPClient()
+    session_presence = mock.AsyncMock(return_value="none")
+    monkeypatch.setattr(roaster, "read_session_presence", session_presence)
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        run_loop=False,
+    )
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/restart-clearance", json={"physical_confirmation": True}
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "restart clearance requires no active run"}
+    session_presence.assert_not_awaited()
+    assert roaster.calls == []
+    active = await store.active_run()
+    assert active is not None and active.run_id == "restart-clearance-active-run"
+
+
+@pytest.mark.asyncio
+async def test_fault_controls_route_dispatches_live_emergency_stop_outside_routine_queue(
+    store: RoastStore,
+) -> None:
+    """The global route admits a live e-stop without queue-capacity dependence."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    for _ in range(service.OPERATOR_QUEUE_MAX):
+        service.operator_queue.put_nowait(
+            QueuedOperatorAction(run_id=run_id, action=OperatorAction.PAUSE_ADVISORY)
+        )
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/fault-controls/actions", json={"action": "emergency_stop"}
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["action"] == "emergency_stop"
+    assert body["result"] == "accepted"
+    assert body["queued"] is False
+    assert mcp.commands().count("emergency_stop") == 1
+    assert service.operator_queue.qsize() == service.OPERATOR_QUEUE_MAX
+
+
+@pytest.mark.asyncio
+async def test_global_estop_uses_live_runner_without_a_terminal_fault_lease(
+    store: RoastStore,
+) -> None:
+    """A current controller is an immediate e-stop target without terminal history."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+
+    assert result.result == "accepted"
+    assert service._fault_lease_cache.run_id == run_id  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert mcp.commands().count("emergency_stop") == 1
+
+
+@pytest.mark.asyncio
+async def test_global_estop_uses_open_exact_terminal_lease_despite_historical_active_pointer(
+    store: RoastStore,
+) -> None:
+    """A completed pointer may act only through its retained exact fault lease."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, run_id = await _terminal_fault_control_service(store, mcp)
+    service.active_run_id = run_id
+
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+
+    assert result.result == "confirmed"
+    assert (
+        "fault_control",
+        {"action": "emergency_stop", "expected_session_id": "session-1"},
+    ) in mcp.calls
+
+
+@pytest.mark.asyncio
+async def test_global_estop_uses_open_exact_terminal_lease_without_live_markers(
+    store: RoastStore,
+) -> None:
+    """An idle service still routes a retained OPEN lease to its exact session."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _run_id = await _terminal_fault_control_service(store, mcp)
+    assert service.active_run_id is None
+    assert service._starting_run_id is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+
+    assert result.result == "confirmed"
+    assert (
+        "fault_control",
+        {"action": "emergency_stop", "expected_session_id": "session-1"},
+    ) in mcp.calls
+
+
+@pytest.mark.asyncio
+async def test_finalized_runner_does_not_reuse_closed_terminal_session_after_identity_changes(
+    store: RoastStore,
+) -> None:
+    """A closed lease needs the runner's current exact session for a repeat stop."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _mcp, _clock, run_id = await _faulted_live_service(store, mcp=mcp)
+    assert service.runner is not None
+    lease = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert lease.status is FaultLeaseStatus.OPEN
+    service.runner._finalized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    service._fault_lease_cache = FaultControlLease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        generation=lease.generation,
+        status=FaultLeaseStatus.CLOSED,
+        run_id=run_id,
+        mcp_session_id="session-1",
+    )
+    mcp.set_latest_fault_session_id("new-session")
+    fault_controls_before = [call for call in mcp.calls if call[0] == "fault_control"]
+    assert service._fault_lease_cache.status is FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._fault_lease_cache.mcp_session_id == "session-1"  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service.runner.finalized
+    assert mcp.latest_fault_session_id == "new-session"
+
+    result = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+
+    assert result.result == "failed"
+    assert [call for call in mcp.calls if call[0] == "fault_control"] == fault_controls_before
+
+
+@pytest.mark.asyncio
+async def test_global_estop_rejects_completed_pointer_without_lease_or_start_fence(
+    store: RoastStore,
+) -> None:
+    """A finalised history pointer cannot create an unconfirmable UNKNOWN lease."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False, clock=clock)
+    completed_run_id = "completed-pointer-without-terminal-lease"
+    await store.create_run(
+        run_id=completed_run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id=completed_run_id,
+        outcome="completed",
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    service.active_run_id = completed_run_id
+    generation_before = service._command_arbiter.generation  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+
+    assert result.result == "failed"
+    assert result.reason == (
+        "no live controller or exact-session fault lease is available for a software "
+        "e-stop attempt; any earlier pending roast start was revoked; use the independent "
+        "physical stop"
+    )
+    assert service._command_arbiter.generation == generation_before  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+    assert service._fault_lease_cache.status is FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert mcp.commands().count("emergency_stop") == 0
+
+    next_run = await service.start_roast(_profile(name="Fresh after completed pointer"))
+    assert next_run.id != completed_run_id
+
+
+@pytest.mark.asyncio
+async def test_global_estop_rejects_finalized_runner_despite_stale_start_marker(
+    store: RoastStore,
+) -> None:
+    """A published final runner cannot be mistaken for Start construction."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    assert service.runner is not None
+    service.runner._finalized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    service._starting_run_id = run_id  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    generation_before = service._command_arbiter.generation  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+
+    assert result.result == "failed"
+    assert service._command_arbiter.generation == generation_before  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._fault_lease_cache.status is FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+    assert mcp.commands().count("emergency_stop") == 0
+
+
+@pytest.mark.asyncio
+async def test_fault_controls_route_queues_confirmed_live_d212_for_current_lease(
+    store: RoastStore,
+) -> None:
+    """The route passes the server-selected lease generation to live D212 only."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _, clock, run_id = await _faulted_live_service(store, mcp=mcp)
+    lease = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert lease.status is FaultLeaseStatus.OPEN
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/fault-controls/actions",
+            json={
+                "action": "stop_cooling_and_acknowledge",
+                "confirmation": True,
+                "expected_generation": lease.generation,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "accepted"
+    assert response.json()["queued"] is True
+    assert await _tick(service, clock) is True
+    completed = await store.read_run(run_id)
+    assert completed is not None and completed.completed_at_utc is not None
+    assert "stop_cooling" not in mcp.commands()
+
+
+@pytest.mark.asyncio
 async def test_health_advisor_is_null_until_probed(client: AsyncClient) -> None:
     """``advisor`` is null on /api/health until a startup probe records one
     (issue #168) — the E7 contract path has no advisor reachability yet."""
@@ -198,6 +668,25 @@ async def test_health_reports_active_run(client: AsyncClient, store: RoastStore)
     )
     response = await client.get("/api/health")
     assert response.json()["active_run_id"] == "run-active"
+
+
+@pytest.mark.asyncio
+async def test_health_fails_when_active_run_read_is_unknown(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed active-run read cannot be projected as an idle roaster."""
+    service = RoastService(store)
+    app = create_app(service)
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+
+    async def fail_active_run() -> PersistedRun | None:
+        raise RuntimeError("synthetic active-run read failure")
+
+    monkeypatch.setattr(store, "active_run", fail_active_run)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.get("/api/health")
+
+    assert response.status_code == 500
 
 
 class _FakeSession:
@@ -3213,6 +3702,46 @@ def _live_decision() -> RoastDecision:
     )
 
 
+def _fault_ack_state(
+    *,
+    session_id: str = "session-1",
+    active: bool = False,
+    device_connected: bool = True,
+    heat_level_percent: int = 0,
+    fan_level_percent: int = 0,
+    cooling_on: bool = False,
+) -> FaultAcknowledgementState:
+    """Build one closed post-fault control-state proof for queue tests."""
+    return FaultAcknowledgementState(
+        session_id=session_id,
+        mcp_phase="fault",
+        active=active,
+        device_connected=device_connected,
+        heat_level_percent=heat_level_percent,
+        fan_level_percent=fan_level_percent,
+        cooling_on=cooling_on,
+    )
+
+
+def _fault_stop_result(
+    *,
+    session_id: str = "session-1",
+    heat_level_percent: int = 0,
+    fan_level_percent: int = 0,
+    cooling_on: Literal[False] = False,
+) -> FaultCoolingStopResult:
+    """Build one typed cooling-stop result for fault acknowledgement tests."""
+    return FaultCoolingStopResult(
+        session_id=session_id,
+        phase="fault",
+        event_kind="cooling_stopped",
+        recovery_after_fault=True,
+        heat_level_percent=heat_level_percent,
+        fan_level_percent=fan_level_percent,
+        cooling_on=cooling_on,
+    )
+
+
 async def _live_service(
     store: RoastStore,
     *,
@@ -3245,6 +3774,1051 @@ async def _tick(service: RoastService, clock: FakeClock) -> bool:
     assert service.runner is not None
     clock.advance(3.0)
     return await service.runner.tick_once()
+
+
+async def _faulted_live_service(
+    store: RoastStore,
+    *,
+    mcp: FakeMCPClient | None = None,
+    states: list[FaultAcknowledgementState | Exception] | None = None,
+    stop_results: list[FaultCoolingStopResult | Exception] | None = None,
+) -> tuple[RoastService, FakeMCPClient, FakeClock, str]:
+    """Create one operable fault with a scripted acknowledgement capability."""
+    clock = FakeClock()
+    if mcp is None:
+        mcp = FakeMCPClient(
+            [_reading(178.0, 185.0)],
+            fault_acknowledgement_states=states,
+            fault_acknowledgement_stop_results=stop_results,
+        )
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"})
+    )
+    assert not await _tick(service, clock)
+    faulted = await store.read_run(run_id)
+    assert faulted is not None and faulted.agent_phase is RoastPhase.FAULTED
+    await _await_durable_open_fault_lease(service, store, run_id)
+    return service, mcp, clock, run_id
+
+
+async def _await_durable_open_fault_lease(
+    service: RoastService, store: RoastStore, run_id: str
+) -> FaultControlLease:
+    """Wait for the e-stop admission task to expose durable exact OPEN evidence."""
+
+    async def read_open() -> FaultControlLease:
+        while True:
+            lease = await store.read_fault_control_lease()
+            if lease.status is FaultLeaseStatus.OPEN and lease.run_id == run_id:
+                hydrated = await service._read_fault_lease_fail_closed()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                if hydrated == lease:
+                    return lease
+            await asyncio.sleep(0)
+
+    return await asyncio.wait_for(read_open(), timeout=1.0)
+
+
+def _d212_request(service: RoastService) -> OperatorActionRequest:
+    """Build a confirmed D212 request for the current durable OPEN lease."""
+    lease = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert lease.status is FaultLeaseStatus.OPEN
+    assert lease.generation > 0
+    return OperatorActionRequest(
+        action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+        payload={"confirmation": True, "expected_generation": lease.generation},
+    )
+
+
+class _ExactFaultMCP(FakeMCPClient):
+    """Fake fault port that records the exact-session guard used for a write."""
+
+    def __init__(self, readings: list[RoastTelemetry | Exception | None]) -> None:
+        super().__init__(readings)
+        self.fault_cooling_on = False
+        self.fault_beans_dropped = False
+        self.fault_heat_percent = 0
+
+    async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+        return FaultControlState(
+            session_id=cast("str", self.latest_fault_session_id),
+            mcp_phase="fault",
+            active=False,
+            device_connected=True,
+            heat_level_percent=self.fault_heat_percent,
+            fan_level_percent=0,
+            cooling_on=self.fault_cooling_on,
+            beans_added=True,
+            beans_dropped=self.fault_beans_dropped,
+        )
+
+    async def read_latest_fault_control_state(self) -> FaultControlState:
+        """Return the current latest session for exact terminal proof tests."""
+        return await self.read_fault_control_state(cast("str", self.latest_fault_session_id))
+
+    async def write_fault_control(
+        self, action: OperatorAction, *, expected_session_id: str
+    ) -> None:
+        self.calls.append(
+            ("fault_control", {"action": action.value, "expected_session_id": expected_session_id})
+        )
+        if self.latest_fault_session_id != expected_session_id:
+            raise RuntimeError("stale exact-session guard")
+        if action is OperatorAction.START_COOLING:
+            self.fault_cooling_on = True
+        elif action in (OperatorAction.STOP_COOLING, OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE):
+            self.fault_cooling_on = False
+        elif action is OperatorAction.DROP_BEANS:
+            self.fault_beans_dropped = True
+        elif action is OperatorAction.EMERGENCY_STOP:
+            self.fault_heat_percent = 0
+        return None
+
+    async def execute_fault_control(
+        self, action: OperatorAction, *, expected_session_id: str
+    ) -> FaultControlState:
+        await self.write_fault_control(action, expected_session_id=expected_session_id)
+        return await self.read_fault_control_state(expected_session_id)
+
+
+async def _terminal_fault_control_service(
+    store: RoastStore, mcp: _ExactFaultMCP
+) -> tuple[RoastService, str]:
+    """Create a completed fault with one durable exact-session lease."""
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "terminal-fault-control-route"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1")
+    await service.health()
+    return service, run_id
+
+
+@pytest.mark.asyncio
+async def test_fault_controls_route_terminal_d212_executor_failure_stays_open(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal D212 executor error returns failed without a substitute write."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, run_id = await _terminal_fault_control_service(store, mcp)
+    executor = service._fault_control_executor  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert executor is not None
+
+    async def fail_execute(*args: Any, **kwargs: Any) -> FaultControlState | None:
+        raise RuntimeError("synthetic terminal executor failure")
+
+    monkeypatch.setattr(executor, "execute", fail_execute)
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/fault-controls/actions",
+            json={
+                "action": "stop_cooling_and_acknowledge",
+                "confirmation": True,
+                "expected_generation": 1,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "failed"
+    assert response.json()["reason"] == "terminal fault action was not confirmed"
+    assert not any(name == "fault_control" for name, _ in mcp.calls)
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.OPEN
+    timeline = await store.read_timeline(run_id)
+    assert not any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_fault_controls_route_keeps_terminal_d212_owned(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling an HTTP waiter cannot cancel its exact-session terminal close."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, run_id = await _terminal_fault_control_service(store, mcp)
+    executor = service._fault_control_executor  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert executor is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_execute = executor.execute
+
+    async def blocked_execute(*args: Any, **kwargs: Any) -> FaultControlState | None:
+        entered.set()
+        await release.wait()
+        return await original_execute(*args, **kwargs)
+
+    monkeypatch.setattr(executor, "execute", blocked_execute)
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        waiter = asyncio.create_task(
+            instance.post(
+                "/api/fault-controls/actions",
+                json={
+                    "action": "stop_cooling_and_acknowledge",
+                    "confirmation": True,
+                    "expected_generation": 1,
+                },
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert not any(name == "fault_control" for name, _ in mcp.calls)
+        release.set()
+
+        async def closed_lease() -> bool:
+            return (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+
+        for _ in range(100):
+            if await closed_lease():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("owned terminal D212 did not close its lease after request cancellation")
+
+    # The original exact readback is already safe-zero, so completion needs no
+    # cooling write; cancellation must not invent one while the owned task runs.
+    assert not any(name == "fault_control" for name, _ in mcp.calls)
+    timeline = await store.read_timeline(run_id)
+    assert any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_hydrates_open_exact_lease_before_terminal_return(
+    store: RoastStore,
+) -> None:
+    """Startup makes a persisted exact e-stop target available before health."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    run_id = "startup-hydrated-terminal-estop"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    lease = await store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="session-1", generation=4
+    )
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+
+    await service.recover_on_start()
+
+    assert service._fault_lease_cache == lease  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert result.result == "confirmed"
+    assert (
+        "fault_control",
+        {"action": "emergency_stop", "expected_session_id": "session-1"},
+    ) in mcp.calls
+
+    async def persisted_new_generation() -> FaultControlLease:
+        while True:
+            current = await store.read_fault_control_lease()
+            if current.generation == 5:
+                return current
+            await asyncio.sleep(0)
+
+    assert (await asyncio.wait_for(persisted_new_generation(), timeout=1.0)).status is (
+        FaultLeaseStatus.OPEN
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_ambiguous_lease_read_stays_fenced(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A startup lease-read error cannot leave a fresh process eligible to start."""
+    service = RoastService(
+        store,
+        roaster=FakeMCPClient([]),
+        advisor=FakeAdvisor(),
+        live_serve_mode=True,
+        run_loop=False,
+    )
+
+    async def fail_read() -> FaultControlLease:
+        raise RuntimeError("synthetic startup lease read failure")
+
+    monkeypatch.setattr(store, "read_fault_control_lease", fail_read)
+    await service.recover_on_start()
+
+    assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    service._restart_epoch_initialized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+        await service.start_roast(_profile())
+
+
+@pytest.mark.asyncio
+async def test_fresh_process_estop_generation_conflict_stays_unknown(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale durable lease cannot revive controls after e-stop persistence loses CAS."""
+    await store.create_run(
+        run_id="previous-process-fault",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(
+        run_id="previous-process-fault", outcome="faulted", agent_phase=RoastPhase.FAULTED
+    )
+    await store.open_fault_control_lease(
+        run_id="previous-process-fault", mcp_session_id="session-9", generation=9
+    )
+    service = RoastService(
+        store,
+        roaster=_ExactFaultMCP([_reading(178.0, 185.0)]),
+        advisor=FakeAdvisor(),
+        live_serve_mode=True,
+        run_loop=False,
+    )
+    assert service._fault_lease_cache.generation == 0  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    persistence_finished = asyncio.Event()
+    original_open = store.open_fault_control_lease
+
+    async def record_conflicting_persistence(
+        *, run_id: str | None, mcp_session_id: str | None, generation: int | None = None
+    ) -> FaultControlLease:
+        lease = await original_open(
+            run_id=run_id, mcp_session_id=mcp_session_id, generation=generation
+        )
+        persistence_finished.set()
+        return lease
+
+    monkeypatch.setattr(store, "open_fault_control_lease", record_conflicting_persistence)
+
+    # Admission must not wait to hydrate SQLite. Its generation-1 persistence
+    # loses the durable CAS. That remains an in-process UNKNOWN admission: a
+    # later health/projection read cannot revive the old OPEN exact session.
+    service._schedule_admitted_fault_control_lease_persistence(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        service._admit_fault_control_lease("fresh-process-fault")  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    )
+    await asyncio.wait_for(persistence_finished.wait(), timeout=1.0)
+    cached = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert cached.generation == 1
+    assert cached.status is FaultLeaseStatus.UNKNOWN
+    durable = await store.read_fault_control_lease()
+    assert durable.generation == 9
+    assert durable.status is FaultLeaseStatus.OPEN
+
+    health = await service.health()
+    assert health.fault_controls.status is FaultLeaseStatus.UNKNOWN
+    assert health.fault_controls.generation == 1
+    assert health.fault_controls.enabled_actions == [OperatorAction.EMERGENCY_STOP]
+    assert not health.restart_clearance.eligible
+
+    # Isolate the lease gate from the separately governed fresh-process
+    # confirmation: UNKNOWN must still block a Start after that gate clears.
+    service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+        await service.start_roast(_profile())
+
+    routine = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.START_COOLING)
+    )
+    assert routine.result == "rejected"
+    assert routine.fault_controls.status is FaultLeaseStatus.UNKNOWN
+    assert routine.fault_controls.enabled_actions == [OperatorAction.EMERGENCY_STOP]
+
+
+@pytest.mark.asyncio
+async def test_stale_estop_persistence_task_cannot_replace_newer_generation(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late persistence task leaves a newer e-stop generation intact."""
+    await store.create_run(
+        run_id="fault-run",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    service = RoastService(
+        store,
+        roaster=_ExactFaultMCP([_reading(178.0, 185.0)]),
+        advisor=FakeAdvisor(),
+        run_loop=False,
+    )
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    first_finished = asyncio.Event()
+    second_finished = asyncio.Event()
+    original_open = store.open_fault_control_lease
+
+    async def delay_first_persistence(
+        *, run_id: str | None, mcp_session_id: str | None, generation: int | None = None
+    ) -> FaultControlLease:
+        assert generation is not None
+        if generation == 1:
+            first_entered.set()
+            await release_first.wait()
+        lease = await original_open(
+            run_id=run_id, mcp_session_id=mcp_session_id, generation=generation
+        )
+        (first_finished if generation == 1 else second_finished).set()
+        return lease
+
+    monkeypatch.setattr(store, "open_fault_control_lease", delay_first_persistence)
+    service._schedule_admitted_fault_control_lease_persistence(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        service._admit_fault_control_lease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            "fault-run", session_id="session-1"
+        )
+    )
+    await asyncio.wait_for(first_entered.wait(), timeout=1.0)
+    service._schedule_admitted_fault_control_lease_persistence(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        service._admit_fault_control_lease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            "fault-run", session_id="session-2"
+        )
+    )
+    await asyncio.wait_for(second_finished.wait(), timeout=1.0)
+
+    assert service._fault_lease_cache.generation == 2  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    release_first.set()
+    await asyncio.wait_for(first_finished.wait(), timeout=1.0)
+    assert service._fault_lease_cache.generation == 2  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_start_write_is_fenced_when_estop_arrives_after_run_row_creation(
+    store: RoastStore,
+) -> None:
+    """An admitted e-stop invalidates Start before its first MCP write."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = service._begin_live_run  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    async def blocked_begin(profile: RoastProfile, run_id: str, *, lease_generation: int) -> None:
+        entered.set()
+        await release.wait()
+        await original(profile, run_id, lease_generation=lease_generation)
+
+    service._begin_live_run = blocked_begin  # type: ignore[method-assign]  # noqa: SLF001
+    starting = asyncio.create_task(service.start_roast(_profile()))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    stopped = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert stopped.result == "failed"
+    release.set()
+    await asyncio.wait_for(starting, timeout=1.0)
+    assert "start_session" not in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_start_write_is_fenced_with_finalized_prior_runner_before_replacement(
+    store: RoastStore,
+) -> None:
+    """A prior final runner cannot hide the next Start construction window."""
+    clock = FakeClock()
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, prior_run_id = await _live_service(store, mcp=mcp, clock=clock)
+    assert service.runner is not None
+    service.runner._finalized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await store.complete_run(
+        run_id=prior_run_id,
+        outcome="completed",
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = service._begin_live_run  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    async def blocked_begin(profile: RoastProfile, run_id: str, *, lease_generation: int) -> None:
+        entered.set()
+        await release.wait()
+        await original(profile, run_id, lease_generation=lease_generation)
+
+    service._begin_live_run = blocked_begin  # type: ignore[method-assign]  # noqa: SLF001
+    commands_before = list(mcp.commands())
+    starting = asyncio.create_task(service.start_roast(_profile(name="Second run")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    stopped = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert stopped.result == "failed"
+    release.set()
+    await asyncio.wait_for(starting, timeout=1.0)
+
+    assert mcp.commands() == commands_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completed_history", [False, True])
+async def test_global_estop_revokes_start_waiting_on_prepublication_store_read(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    completed_history: bool,
+) -> None:
+    """A no-target global e-stop fences preparation without changing the lease."""
+    if completed_history:
+        await store.create_run(
+            run_id="completed-history",
+            profile=_profile(name="Completed history"),
+            config=AppConfig(),
+            agent_phase=RoastPhase.COMPLETE,
+        )
+        await store.complete_run(
+            run_id="completed-history",
+            outcome="completed",
+            agent_phase=RoastPhase.COMPLETE,
+        )
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_active_run = store.active_run
+
+    async def blocked_active_run() -> PersistedRun | None:
+        entered.set()
+        await release.wait()
+        return await original_active_run()
+
+    monkeypatch.setattr(store, "active_run", blocked_active_run)
+    starting = asyncio.create_task(service.start_roast(_profile(name="Revoked start")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+    lease_before = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    arbiter_before = service._command_arbiter.generation  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    stopped = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert stopped.result == "failed"
+    assert service._fault_lease_cache == lease_before  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._command_arbiter.generation == arbiter_before  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    release.set()
+    with pytest.raises(RoastRunConflictError, match="superseded by an emergency-stop"):
+        await asyncio.wait_for(starting, timeout=1.0)
+    assert mcp.commands() == []
+    assert await store.active_run() is None
+
+    # A later explicit request captures the post-e-stop admission generation.
+    detail = await service.start_roast(_profile(name="Fresh explicit start"))
+    assert detail.id
+    assert "start_session" in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_global_estop_revokes_start_during_restart_epoch_initialization(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Start snapshot exists before its earliest restart-epoch await."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        live_serve_mode=True,
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_ensure = service._ensure_restart_epoch  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    async def blocked_restart_epoch() -> None:
+        entered.set()
+        await release.wait()
+        await original_ensure()
+
+    monkeypatch.setattr(service, "_ensure_restart_epoch", blocked_restart_epoch)
+    starting = asyncio.create_task(service.start_roast(_profile(name="Restart epoch start")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    stopped = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert stopped.result == "failed"
+
+    release.set()
+    with pytest.raises(RoastRunConflictError, match="superseded by an emergency-stop"):
+        await asyncio.wait_for(starting, timeout=1.0)
+    assert await store.active_run() is None
+    assert mcp.commands() == []
+
+
+@pytest.mark.asyncio
+async def test_global_estop_revokes_queued_start_before_it_acquires_start_lock(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each queued Start keeps its own admission snapshot through lock waiting."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_active_run = store.active_run
+
+    async def blocked_active_run() -> PersistedRun | None:
+        entered.set()
+        await release.wait()
+        return await original_active_run()
+
+    monkeypatch.setattr(store, "active_run", blocked_active_run)
+    first = asyncio.create_task(service.start_roast(_profile(name="First queued start")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    second = asyncio.create_task(service.start_roast(_profile(name="Second queued start")))
+    await asyncio.sleep(0)
+
+    stopped = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert stopped.result == "failed"
+    release.set()
+    for start in (first, second):
+        with pytest.raises(RoastRunConflictError, match="superseded by an emergency-stop"):
+            await asyncio.wait_for(start, timeout=1.0)
+    assert mcp.commands() == []
+
+
+@pytest.mark.asyncio
+async def test_rejected_scoped_estop_does_not_revoke_an_unrelated_pending_start(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mismatched run-scoped e-stop preserves its rejection-only semantics."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_active_run = store.active_run
+
+    async def blocked_active_run() -> PersistedRun | None:
+        entered.set()
+        await release.wait()
+        return await original_active_run()
+
+    monkeypatch.setattr(store, "active_run", blocked_active_run)
+    starting = asyncio.create_task(service.start_roast(_profile(name="Unrelated pending start")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    rejected = await service._submit_fault_controls_emergency_stop(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        expected_run_id="different-run"
+    )
+    assert rejected.result == "failed"
+    assert "matches this run" in (rejected.reason or "")
+
+    release.set()
+    detail = await asyncio.wait_for(starting, timeout=1.0)
+    assert detail.id
+    assert "start_session" in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_global_estop_retires_a_never_dispatched_run_created_during_admission(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An e-stop during create_run leaves no live row or fabricated session identity."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    created_run_id: str | None = None
+    original_create_run = store.create_run
+
+    async def create_then_block(**kwargs: Any) -> None:
+        nonlocal created_run_id
+        created_run_id = cast(str, kwargs["run_id"])
+        await original_create_run(**kwargs)
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(store, "create_run", create_then_block)
+    starting = asyncio.create_task(service.start_roast(_profile(name="Persisted then revoked")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    stopped = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert stopped.result == "failed"
+    release.set()
+
+    with pytest.raises(RoastRunConflictError, match="superseded by an emergency-stop"):
+        await asyncio.wait_for(starting, timeout=1.0)
+    assert created_run_id is not None
+    retired = await store.read_run(created_run_id)
+    assert retired is not None
+    assert retired.outcome == "aborted"
+    assert retired.agent_phase is RoastPhase.STARTING
+    assert retired.completed_at_utc is not None
+    assert service.active_run_id is None
+    assert mcp.commands() == []
+
+
+@pytest.mark.asyncio
+async def test_exact_pending_run_estop_revokes_create_in_flight_without_queueing(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact persisted-but-unpublished run is fenced before Start writes."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    created_run_id: str | None = None
+    original_create_run = store.create_run
+
+    async def create_then_block(**kwargs: Any) -> None:
+        nonlocal created_run_id
+        run_id = cast(str, kwargs["run_id"])
+        await original_create_run(**kwargs)
+        if created_run_id is None:
+            created_run_id = run_id
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr(store, "create_run", create_then_block)
+    starting = asyncio.create_task(service.start_roast(_profile(name="Exact pending stop")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    assert created_run_id is not None
+
+    stopped = await service.submit_operator_action(
+        created_run_id,
+        OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "stop"}),
+    )
+    assert stopped.result == "accepted"
+    assert stopped.queued is False
+    assert service.operator_queue.empty()
+    assert service._fault_lease_cache.status is FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._command_arbiter.generation == 0  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert mcp.commands() == []
+
+    release.set()
+    with pytest.raises(RoastRunConflictError, match="superseded by an emergency-stop"):
+        await asyncio.wait_for(starting, timeout=1.0)
+    retired = await store.read_run(created_run_id)
+    assert retired is not None
+    assert retired.outcome == "aborted"
+    assert retired.agent_phase is RoastPhase.STARTING
+    assert retired.completed_at_utc is not None
+    assert service.active_run_id is None
+    assert service._unpublished_start_run_id is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert mcp.commands() == []
+
+    fresh = await service.start_roast(_profile(name="Fresh after exact pending stop"))
+    assert fresh.id != created_run_id
+    assert "start_session" in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_unrelated_estop_cannot_revoke_create_in_flight_start(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown run ID retains the existing per-run rejection behaviour."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_create_run = store.create_run
+
+    async def create_then_block(**kwargs: Any) -> None:
+        await original_create_run(**kwargs)
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(store, "create_run", create_then_block)
+    starting = asyncio.create_task(service.start_roast(_profile(name="Unrelated stop")))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+    with pytest.raises(RoastRunNotFoundError):
+        await service.submit_operator_action(
+            "unrelated-run",
+            OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "stop"}),
+        )
+    assert service._unpublished_start_run_id is not None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert mcp.commands() == []
+
+    release.set()
+    detail = await asyncio.wait_for(starting, timeout=1.0)
+    assert detail.id
+    assert "start_session" in mcp.commands()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audit_outcome", ["cancelled", "failed"])
+async def test_pending_start_revocation_survives_estop_audit_interruption(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    audit_outcome: Literal["cancelled", "failed"],
+) -> None:
+    """E-stop audit cancellation or failure cannot revive an unpublished Start."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+    )
+    start_entered = asyncio.Event()
+    release_start = asyncio.Event()
+    audit_entered = asyncio.Event()
+    release_audit = asyncio.Event()
+    created_run_id: str | None = None
+    original_create_run = store.create_run
+
+    async def create_then_block(**kwargs: Any) -> None:
+        nonlocal created_run_id
+        created_run_id = cast(str, kwargs["run_id"])
+        await original_create_run(**kwargs)
+        start_entered.set()
+        await release_start.wait()
+
+    async def blocked_audit(**kwargs: Any) -> None:
+        audit_entered.set()
+        await release_audit.wait()
+        if audit_outcome == "failed":
+            raise RuntimeError("synthetic audit failure")
+
+    monkeypatch.setattr(store, "create_run", create_then_block)
+    monkeypatch.setattr(store, "record_operator_action", blocked_audit)
+    starting = asyncio.create_task(service.start_roast(_profile(name="Interrupted e-stop audit")))
+    await asyncio.wait_for(start_entered.wait(), timeout=1.0)
+    assert created_run_id is not None
+    stopping = asyncio.create_task(
+        service.submit_operator_action(
+            created_run_id,
+            OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "stop"}),
+        )
+    )
+    await asyncio.wait_for(audit_entered.wait(), timeout=1.0)
+    if audit_outcome == "cancelled":
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+    else:
+        release_audit.set()
+        with pytest.raises(RuntimeError, match="synthetic audit failure"):
+            await stopping
+
+    release_start.set()
+    with pytest.raises(RoastRunConflictError, match="superseded by an emergency-stop"):
+        await asyncio.wait_for(starting, timeout=1.0)
+    retired = await store.read_run(created_run_id)
+    assert retired is not None and retired.outcome == "aborted"
+    assert service._unpublished_start_run_id is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert mcp.commands() == []
+
+
+@pytest.mark.asyncio
+async def test_per_run_estop_bypasses_saturated_routine_queue(store: RoastStore) -> None:
+    """A full routine queue cannot reject a per-run emergency stop."""
+    clock = FakeClock()
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    for _ in range(service.OPERATOR_QUEUE_MAX):
+        service.operator_queue.put_nowait(
+            QueuedOperatorAction(run_id=run_id, action=OperatorAction.PAUSE_ADVISORY)
+        )
+    result = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"})
+    )
+    assert result.result == "accepted"
+    assert result.queued is False
+    assert mcp.commands().count("emergency_stop") == 1
+
+
+@pytest.mark.asyncio
+async def test_open_lease_rejects_routine_fault_actions_for_active_nonfaulted_run(
+    store: RoastStore,
+) -> None:
+    """An OPEN terminal lease cannot redirect a live non-faulted control write."""
+    clock = FakeClock()
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    lease = await store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="session-1", generation=1
+    )
+    service._fault_lease_cache = lease  # noqa: SLF001 - durable OPEN fixture  # pyright: ignore[reportPrivateUsage]
+    rejected = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
+    )
+    assert rejected.result == "rejected"
+    assert rejected.queued is False
+    assert rejected.reason == (
+        "current active run is not faulted; terminal fault controls are unavailable"
+    )
+    assert not any(name == "fault_control" for name, _ in mcp.calls)
+    assert "drop_beans" not in mcp.commands()
+    assert service.operator_queue.empty()
+
+    mcp.set_latest_fault_session_id("new-session")
+    still_rejected = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.START_COOLING)
+    )
+    assert still_rejected.result == "rejected"
+    assert not any(name == "fault_control" for name, _ in mcp.calls)
+    assert "start_cooling" not in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_open_lease_missing_exact_executor_does_not_fall_back_to_queue(
+    store: RoastStore,
+) -> None:
+    """A live non-faulted run rejects routine controls before executor lookup."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    lease = await store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="session-1", generation=1
+    )
+    service._fault_lease_cache = lease  # noqa: SLF001 - durable OPEN fixture  # pyright: ignore[reportPrivateUsage]
+    result = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.STOP_COOLING)
+    )
+    assert result.result == "rejected"
+    assert result.queued is False
+    assert service.operator_queue.empty()
+    assert not any(name == "fault_control" for name, _ in mcp.calls)
+    assert "stop_cooling" not in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_unknown_current_lease_rejects_routine_controls_without_queueing(
+    store: RoastStore,
+) -> None:
+    """An uncertain per-run lease cannot fall through to an unguarded write."""
+    clock = FakeClock()
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    await store.replace_fault_control_lease_unknown(run_id, generation=1)
+
+    result = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
+    )
+
+    assert result.result == "rejected"
+    assert result.queued is False
+    assert service.operator_queue.empty()
+    assert not any(name == "fault_control" for name, _ in mcp.calls)
+    assert "drop_beans" not in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_open_or_unknown_lease_rejects_generic_acknowledgement_without_write(
+    store: RoastStore,
+) -> None:
+    """Generic acknowledgement never bypasses a current fault lease."""
+    clock = FakeClock()
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1", generation=1)
+
+    open_result = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    await store.replace_fault_control_lease_unknown(run_id, generation=2)
+    unknown_result = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+
+    assert open_result.result == "rejected"
+    assert unknown_result.result == "rejected"
+    assert service.operator_queue.empty()
+    assert "stop_cooling" not in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_d212_requires_positive_current_generation_before_live_queueing(
+    store: RoastStore,
+) -> None:
+    """Live D212 rejects absent, boolean, and stale lease generations."""
+    clock = FakeClock()
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1", generation=2)
+
+    for payload in (
+        {"confirmation": True},
+        {"confirmation": True, "expected_generation": True},
+        {"confirmation": True, "expected_generation": 1},
+    ):
+        result = await service.submit_operator_action(
+            run_id,
+            OperatorActionRequest(
+                action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE, payload=payload
+            ),
+        )
+        assert result.result == "rejected"
+        assert result.queued is False
+
+    assert service.operator_queue.empty()
+    assert "stop_cooling" not in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_queued_routine_action_is_fenced_when_lease_becomes_unknown(
+    store: RoastStore,
+) -> None:
+    """A pre-admitted queue item cannot write after an e-stop fence arrives."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    accepted = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.MARK_BEANS_ADDED)
+    )
+    assert accepted.result == "accepted"
+    service._fault_lease_cache = FaultControlLease(  # noqa: SLF001 - dispatch race harness  # pyright: ignore[reportPrivateUsage]
+        generation=1,
+        status=FaultLeaseStatus.UNKNOWN,
+        run_id=run_id,
+        mcp_session_id=None,
+    )
+
+    await _tick(service, clock)
+
+    assert "mark_beans_added" not in mcp.commands()
 
 
 def _start_session_roast_nums(mcp: FakeMCPClient) -> list[int | None]:
@@ -3649,6 +5223,8 @@ async def test_recover_on_start_auto_finalizes_a_stale_faulted_run(
     (the roast-3 boot-onto-"test 6" bug). It is moved terminal (outcome ``faulted``,
     fault_reason preserved) so it lands in history, the boot is clean (no active
     run), and no heat/fan/MCP write is issued (restart-never-auto-resumes intact).
+    This historical-session finalisation is not an MCP safe-zero or physical-safety
+    proof; the live current-session acknowledgement path supplies that gate.
     Supersedes the prior #206 "re-enter operable-faulted on restart" behaviour: the
     in-SESSION operable-faulted path is unchanged; this is only the cross-restart
     stale-fault case."""
@@ -4074,6 +5650,7 @@ async def test_recover_on_start_restores_frozen_controller_and_safety_generation
         outcome="aborted",
         agent_phase=RoastPhase.COMPLETE,
     )
+    service.runner._finalized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     await service.start_roast(_profile())
     assert service.runner is not None
     assert service.runner._config.controller == process_current.controller  # pyright: ignore[reportPrivateUsage]
@@ -5506,7 +7083,7 @@ async def test_emergency_stop_via_queue_faults_but_stays_operable(store: RoastSt
     — so the operator can still engage/stop cooling on a physically-running machine
     before acknowledging the fault."""
     clock = FakeClock()
-    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)
     await service.submit_operator_action(
         run_id,
@@ -5679,7 +7256,7 @@ async def test_206_estop_in_preheating_then_cool_then_acknowledge(store: RoastSt
     the still-live faulted run (accepted, MCP write issued), then ACKNOWLEDGES the
     fault, which finalises the run (outcome ``faulted``) and stops the loop."""
     clock = FakeClock()
-    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)  # preheating
 
     # 1) E-stop in preheating → fault, but the run stays live (not finalised).
@@ -5692,24 +7269,25 @@ async def test_206_estop_in_preheating_then_cool_then_acknowledge(store: RoastSt
     assert faulted.agent_phase is RoastPhase.FAULTED
     assert faulted.completed_at_utc is None
     assert "emergency_stop" in mcp.commands()
+    await _await_durable_open_fault_lease(service, store, run_id)
 
-    # 2) STOP COOLING is accepted on the faulted run (no power cycle) and the MCP
-    #    write is issued on the next tick — the run stays faulted, not completed.
+    # 2) STOP COOLING is exact-session guarded on the faulted run (no power
+    #    cycle) — the run stays faulted, not completed.
     accepted = await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.STOP_COOLING)
     )
     assert accepted.result == "accepted"
     assert not await _tick(service, clock)
-    assert "stop_cooling" in mcp.commands()
+    assert any(
+        name == "fault_control" and args["action"] == "stop_cooling" for name, args in mcp.calls
+    )
     still_faulted = await store.read_run(run_id)
     assert still_faulted is not None
     assert still_faulted.agent_phase is RoastPhase.FAULTED
     assert still_faulted.completed_at_utc is None
 
     # 3) ACKNOWLEDGE the fault → finalises with outcome faulted and the loop stops.
-    ack = await service.submit_operator_action(
-        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
-    )
+    ack = await service.submit_operator_action(run_id, _d212_request(service))
     assert ack.result == "accepted"
     assert await _tick(service, clock)  # finalises this tick → loop stops
     final = await store.read_run(run_id)
@@ -5743,11 +7321,10 @@ async def test_acknowledge_fault_is_audit_only_issues_no_mcp_write(store: RoastS
     commands_before_ack = list(mcp.commands())
     # The fault was caused by exactly one roaster write: the e-stop.
     assert commands_before_ack.count("emergency_stop") == 1
+    await _await_durable_open_fault_lease(service, store, run_id)
 
     # Acknowledge the fault → finalises, but issues no further MCP write.
-    ack = await service.submit_operator_action(
-        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
-    )
+    ack = await service.submit_operator_action(run_id, _d212_request(service))
     assert ack.result == "accepted"
     assert await _tick(service, clock)  # finalises this tick
     # The command trace is UNCHANGED by the ack — no roaster write, no second e-stop.
@@ -5757,10 +7334,2588 @@ async def test_acknowledge_fault_is_audit_only_issues_no_mcp_write(store: RoastS
 
 
 @pytest.mark.asyncio
+async def test_acknowledge_fault_stops_cooling_then_reads_matching_safe_zero(
+    store: RoastStore,
+) -> None:
+    """A fault ends only after one authorised stop and its fresh safe readback."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store,
+        states=[
+            _fault_ack_state(cooling_on=True, fan_level_percent=100),
+            _fault_ack_state(cooling_on=True, fan_level_percent=100),
+            _fault_ack_state(cooling_on=False),
+        ],
+    )
+    subscriber = service.events.subscribe()
+    await service.submit_operator_action(run_id, _d212_request(service))
+
+    assert await _tick(service, clock)
+    assert mcp.commands().count("stop_cooling") == 1
+    final = await store.read_run(run_id)
+    assert final is not None and final.outcome == "faulted"
+    execution_events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in execution_events
+    )
+    evaluations = await store.read_timeline(run_id)
+    assert any(
+        item.verdict == SafetyVerdict.ALLOW.value and item.rule == "command_phase_validity"
+        for item in evaluations.safety_evaluations
+    )
+    assert any(
+        event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.source is RoastEventSource.OPERATOR
+        and event.payload == {"outcome": "confirmed"}
+        for event in evaluations.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_d212_stop_fails_closed_when_adapter_latest_session_changes(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D212 rejects a stale proof when the adapter's latest session changes."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store,
+        states=[
+            _fault_ack_state(cooling_on=True),
+            _fault_ack_state(cooling_on=True),
+            _fault_ack_state(cooling_on=False),
+        ],
+    )
+    captured: list[str] = []
+    original_stop = mcp.stop_cooling_for_fault_acknowledgement
+
+    async def switch_latest(expected_session_id: str) -> FaultCoolingStopResult:
+        captured.append(expected_session_id)
+        mcp._latest_fault_session_id = "newer-session"  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        return await original_stop(expected_session_id)
+
+    monkeypatch.setattr(mcp, "stop_cooling_for_fault_acknowledgement", switch_latest)
+    await service.submit_operator_action(run_id, _d212_request(service))
+
+    assert not await _tick(service, clock)
+    assert captured == ["session-1"]
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.OPEN
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_failure_emits_bounded_execution_outcome(
+    store: RoastStore,
+) -> None:
+    """A failed proof publishes its execution result, never queue acceptance."""
+    service, _, clock, run_id = await _faulted_live_service(
+        store, states=[_fault_ack_state(heat_level_percent=1)]
+    )
+    subscriber = service.events.subscribe()
+    await service.submit_operator_action(run_id, _d212_request(service))
+
+    assert not await _tick(service, clock)
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "failed", "reason": "unsafe_state"}
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_already_off_reads_twice_without_stop_write(
+    store: RoastStore,
+) -> None:
+    """An already-off fault still needs fresh matching safe-zero reads."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store, states=[_fault_ack_state(), _fault_ack_state()]
+    )
+    await service.submit_operator_action(run_id, _d212_request(service))
+
+    assert await _tick(service, clock)
+    assert "stop_cooling" not in mcp.commands()
+    assert mcp.fault_acknowledgement_read_count == 2
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_policy_refusal_issues_no_stop_write(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused STOP_COOLING evaluation cannot reach the MCP adapter."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store, states=[_fault_ack_state(cooling_on=True)]
+    )
+    assert service.runner is not None
+
+    async def refuse() -> bool:
+        return False
+
+    monkeypatch.setattr(
+        service.runner._controller,  # pyright: ignore[reportPrivateUsage]
+        "authorize_fault_acknowledgement_stop_cooling",
+        refuse,
+    )
+    await service.submit_operator_action(run_id, _d212_request(service))
+
+    assert not await _tick(service, clock)
+    assert "stop_cooling" not in mcp.commands()
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.FAULTED  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_rejects_malformed_stop_result_without_retry(
+    store: RoastStore,
+) -> None:
+    """An untyped stop result cannot acknowledge or trigger a second write."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store, states=[_fault_ack_state(cooling_on=True)]
+    )
+    mcp.set_fault_acknowledgement_stop_results([{"session_id": "session-1"}])
+    await service.submit_operator_action(run_id, _d212_request(service))
+
+    assert not await _tick(service, clock)
+    assert mcp.commands().count("stop_cooling") == 1
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.FAULTED  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_rejects_changed_session_on_immediate_pre_stop_read(
+    store: RoastStore,
+) -> None:
+    """A fresh session mismatch immediately before stop reaches no MCP write."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store,
+        states=[_fault_ack_state(cooling_on=True), _fault_ack_state(session_id="other")],
+    )
+    await service.submit_operator_action(run_id, _d212_request(service))
+
+    assert not await _tick(service, clock)
+    assert "stop_cooling" not in mcp.commands()
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.FAULTED  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("states", "stop_results", "session_missing"),
+    [
+        ([_fault_ack_state(active=True)], None, False),
+        ([_fault_ack_state(device_connected=False)], None, False),
+        ([_fault_ack_state(heat_level_percent=1)], None, False),
+        ([_fault_ack_state(fan_level_percent=1, cooling_on=False)], None, False),
+        ([_fault_ack_state(session_id="other")], None, False),
+        ([RuntimeError("read timeout")], None, False),
+        ([_fault_ack_state(cooling_on=True)], [RuntimeError("write timeout")], False),
+        (
+            [_fault_ack_state(cooling_on=True)],
+            [
+                FaultCoolingStopResult(
+                    session_id="other",
+                    phase="fault",
+                    event_kind="cooling_stopped",
+                    recovery_after_fault=True,
+                    heat_level_percent=0,
+                    fan_level_percent=0,
+                    cooling_on=False,
+                )
+            ],
+            False,
+        ),
+        ([_fault_ack_state(cooling_on=True), _fault_ack_state(session_id="other")], None, False),
+        ([_fault_ack_state(cooling_on=True), RuntimeError("read timeout")], None, False),
+        ([_fault_ack_state(cooling_on=True), _fault_ack_state(cooling_on=True)], None, False),
+        (
+            [_fault_ack_state(cooling_on=True)],
+            [_fault_stop_result(heat_level_percent=1)],
+            False,
+        ),
+        (
+            [_fault_ack_state(cooling_on=True)],
+            [_fault_stop_result(fan_level_percent=1)],
+            False,
+        ),
+        ([_fault_ack_state()], None, True),
+    ],
+)
+async def test_acknowledge_fault_fail_closed_on_unconfirmed_state_or_command(
+    store: RoastStore,
+    states: list[FaultAcknowledgementState | Exception],
+    stop_results: list[FaultCoolingStopResult | Exception] | None,
+    session_missing: bool,
+) -> None:
+    """Every unavailable, mismatched, unsafe, or indeterminate branch keeps faulted."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store, states=states, stop_results=stop_results
+    )
+    if session_missing:
+        mcp.set_latest_fault_session_id(None)
+        await store.replace_fault_control_lease_unknown(run_id, generation=1)
+        service._fault_lease_cache = FaultControlLease(  # noqa: SLF001 - no-session fence fixture  # pyright: ignore[reportPrivateUsage]
+            generation=1,
+            status=FaultLeaseStatus.UNKNOWN,
+            run_id=run_id,
+            mcp_session_id=None,
+        )
+        request = OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        )
+    else:
+        request = _d212_request(service)
+    await service.submit_operator_action(run_id, request)
+
+    assert not await _tick(service, clock)
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.agent_phase is RoastPhase.FAULTED
+    assert detail.completed_at_utc is None
+    assert await store.active_run() is not None
+    assert mcp.commands().count("stop_cooling") <= 1
+    with pytest.raises(RoastRunConflictError):
+        await service.start_roast(_profile())
+    assert not await service.runner.tick_once()  # type: ignore[union-attr]
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.FAULTED  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_duplicate_requests_issue_at_most_one_stop(
+    store: RoastStore,
+) -> None:
+    """Two queued clicks cannot turn a single acknowledgement into two writes."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store,
+        states=[
+            _fault_ack_state(cooling_on=True),
+            _fault_ack_state(cooling_on=True),
+            _fault_ack_state(cooling_on=False),
+        ],
+    )
+    request = _d212_request(service)
+    await service.submit_operator_action(run_id, request)
+    await service.submit_operator_action(run_id, request)
+
+    assert await _tick(service, clock)
+    assert mcp.commands().count("stop_cooling") == 1
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_retry_does_not_repeat_a_confirmed_cooling_stop(
+    store: RoastStore,
+) -> None:
+    """A later explicit retry re-reads and completes without a second stop write."""
+    service, mcp, clock, run_id = await _faulted_live_service(
+        store,
+        states=[
+            _fault_ack_state(cooling_on=True),
+            _fault_ack_state(cooling_on=True),
+            RuntimeError("read timeout after confirmed stop"),
+            _fault_ack_state(cooling_on=True),
+            _fault_ack_state(cooling_on=False),
+        ],
+    )
+    request = _d212_request(service)
+    await service.submit_operator_action(run_id, request)
+    assert not await _tick(service, clock)
+    assert mcp.commands().count("stop_cooling") == 1
+
+    await service.submit_operator_action(run_id, request)
+    assert await _tick(service, clock)
+    assert mcp.commands().count("stop_cooling") == 1
+
+
+@pytest.mark.asyncio
+async def test_queued_emergency_stop_preempts_blocked_fault_acknowledgement_final_read(
+    store: RoastStore,
+) -> None:
+    """An e-stop admitted after drain survives an ACK's blocked final read."""
+    service, mcp, clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_read = mcp.read_fault_acknowledgement_state
+    reads = 0
+
+    async def block_final_read(session_id: str) -> FaultAcknowledgementState:
+        nonlocal reads
+        reads += 1
+        state = await original_read(session_id)
+        if reads == 2:
+            entered.set()
+            await release.wait()
+        return state
+
+    mcp.read_fault_acknowledgement_state = block_final_read
+    await service.submit_operator_action(run_id, _d212_request(service))
+    pending_tick = asyncio.create_task(service.runner.tick_once())
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    e_stop_task = asyncio.create_task(
+        service.submit_operator_action(
+            run_id,
+            OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"}),
+        )
+    )
+    await asyncio.sleep(0)
+    assert not e_stop_task.done()
+
+    release.set()
+    e_stop = await asyncio.wait_for(e_stop_task, timeout=1.0)
+    assert e_stop.result == "accepted" and not e_stop.queued
+    assert not await asyncio.wait_for(pending_tick, timeout=1.0)
+    detail = await store.read_run(run_id)
+    assert detail is not None and detail.completed_at_utc is None
+
+    assert not await _tick(service, clock)
+    assert mcp.commands().count("emergency_stop") == 2
+
+    fresh = await service.submit_operator_action(run_id, _d212_request(service))
+    assert fresh.result == "accepted"
+    assert await _tick(service, clock)
+
+
+@pytest.mark.asyncio
+async def test_emergency_stop_after_ack_proof_cancels_without_confirmed_outcome(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An e-stop admitted after safe proof cancels ACK before any success report."""
+    service, mcp, clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def block_controller_tick() -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(
+        service.runner._controller,  # pyright: ignore[reportPrivateUsage]
+        "tick",
+        block_controller_tick,
+    )
+    subscriber = service.events.subscribe()
+    await service.submit_operator_action(run_id, _d212_request(service))
+    pending_tick = asyncio.create_task(service.runner.tick_once())
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    e_stop_task = asyncio.create_task(
+        service.submit_operator_action(
+            run_id,
+            OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"}),
+        )
+    )
+    await asyncio.sleep(0)
+    assert not e_stop_task.done()
+
+    release.set()
+    e_stop = await asyncio.wait_for(e_stop_task, timeout=1.0)
+    assert e_stop.result == "accepted" and not e_stop.queued
+    assert not await asyncio.wait_for(pending_tick, timeout=1.0)
+    detail = await store.read_run(run_id)
+    assert detail is not None and detail.completed_at_utc is None
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in events
+    )
+    timeline = await store.read_timeline(run_id)
+    assert not any(
+        event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.payload == {"outcome": "confirmed"}
+        for event in timeline.events
+    )
+
+    monkeypatch.undo()
+    assert not await _tick(service, clock)
+    assert mcp.commands().count("emergency_stop") == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_live_estop_request_keeps_controller_dispatch_owned(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling an HTTP waiter cannot cancel its admitted priority stop."""
+    service, _mcp, _clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+
+    async def blocked_dispatch(
+        _item: QueuedOperatorAction, *, already_admitted: bool = False
+    ) -> bool:
+        assert already_admitted
+        entered.set()
+        await release.wait()
+        completed.set()
+        return True
+
+    monkeypatch.setattr(service.runner, "dispatch_priority_emergency_stop", blocked_dispatch)
+    request = OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    waiter = asyncio.create_task(service._submit_live_emergency_stop(run_id, request))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    release.set()
+    await asyncio.wait_for(completed.wait(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("global_route", [False, True])
+async def test_live_estop_admission_fences_queued_heat_before_dispatch_task_runs(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, global_route: bool
+) -> None:
+    """Every e-stop task is created after priority admission fences queued heat."""
+    service, mcp, _clock, run_id = await _faulted_live_service(store)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    heat_before = mcp.commands().count("set_heat")
+
+    async def blocked_write() -> None:
+        entered.set()
+        await release.wait()
+
+    generation = service._command_arbiter.generation  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    blocker = asyncio.create_task(
+        service._command_arbiter.run_routine(generation, blocked_write)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    queued_heat = asyncio.create_task(
+        service._command_arbiter.run_routine(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            generation, lambda: mcp.set_heat(25)
+        )
+    )
+    await asyncio.sleep(0)
+
+    created_pending_counts: list[int] = []
+    original_create_task = asyncio.create_task
+
+    def record_task_creation(
+        coroutine: Coroutine[Any, Any, Any], **kwargs: Any
+    ) -> asyncio.Task[Any]:
+        created_pending_counts.append(
+            service._command_arbiter._pending_emergency_stops  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        )
+        return original_create_task(coroutine, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_task", record_task_creation)
+    if global_route:
+        stop_task = original_create_task(
+            service.submit_fault_controls_action(
+                FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+        )
+    else:
+        stop_task = original_create_task(
+            service._submit_live_emergency_stop(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+        )
+    await asyncio.sleep(0)
+    assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert created_pending_counts and all(count == 1 for count in created_pending_counts)
+    release.set()
+    assert await blocker == (True, None)
+    assert await queued_heat == (False, None)
+    assert (await stop_task).result == "accepted"
+    assert mcp.commands().count("set_heat") == heat_before
+    assert mcp.commands()[-1] == "emergency_stop"
+
+
+@pytest.mark.asyncio
+async def test_live_estop_discards_targets_admitted_while_stop_write_is_in_flight(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live target cannot reheat after stop release before FAULTED commits."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    assert service.runner is not None
+    controller = service.runner._controller  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    stop_released = asyncio.Event()
+    release_transition = asyncio.Event()
+    original_emergency_write = controller._run_emergency_write  # pyright: ignore[reportPrivateUsage]
+    heat_before = mcp.commands().count("set_heat")
+    fan_before = mcp.commands().count("set_fan")
+
+    async def park_after_stop(
+        operation: Callable[[], Awaitable[AppliedRoasterState | None]],
+    ) -> AppliedRoasterState | None:
+        applied = await original_emergency_write(operation)
+        stop_released.set()
+        await release_transition.wait()
+        return applied
+
+    monkeypatch.setattr(controller, "_run_emergency_write", park_after_stop)
+    stopping = asyncio.create_task(
+        service.submit_operator_action(
+            run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+    )
+    await asyncio.wait_for(stop_released.wait(), timeout=1.0)
+    queued_targets = asyncio.create_task(
+        controller._execute_targets(  # pyright: ignore[reportPrivateUsage]
+            SafetyEvaluation(
+                rule="parked_live_stop_target",
+                verdict=SafetyVerdict.ALLOW,
+                adjusted_heat=70,
+                adjusted_fan=40,
+                reason="live service regression proof",
+            ),
+            generation=controller.command_generation,
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert await asyncio.wait_for(queued_targets, timeout=1.0) is False
+    assert mcp.commands().count("set_heat") == heat_before
+    assert mcp.commands().count("set_fan") == fan_before
+    release_transition.set()
+    assert (await asyncio.wait_for(stopping, timeout=1.0)).result == "accepted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("global_route", [False, True])
+async def test_scheduled_live_estop_reselects_terminal_executor_after_runner_finalizes(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, global_route: bool
+) -> None:
+    """A reserved e-stop transfers once to exact-session control after finalisation."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _mcp, _clock, run_id = await _faulted_live_service(store, mcp=mcp)
+    assert service.runner is not None
+    subscriber = service.events.subscribe()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_dispatch = service._dispatch_admitted_live_emergency_stop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    async def delayed_dispatch(**kwargs: Any) -> bool:
+        entered.set()
+        await release.wait()
+        return await original_dispatch(**kwargs)
+
+    monkeypatch.setattr(service, "_dispatch_admitted_live_emergency_stop", delayed_dispatch)
+    if global_route:
+        waiter: asyncio.Task[Any] = asyncio.create_task(
+            service.submit_fault_controls_action(
+                FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+        )
+    else:
+        waiter = asyncio.create_task(
+            service.submit_operator_action(
+                run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+        )
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+    # Model the window after task creation but before its first instruction.
+    # The exact-session lease is already UNKNOWN/OPEN, so a replacement Start
+    # remains fenced while this one-use priority token is transferred.
+    service.runner._finalized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    service.active_run_id = None
+    with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+        await service.start_roast(_profile())
+
+    release.set()
+    result = await asyncio.wait_for(waiter, timeout=1.0)
+    assert result.result == "accepted"
+    assert (
+        "fault_control",
+        {"action": "emergency_stop", "expected_session_id": "session-1"},
+    ) in mcp.calls
+
+    async def routine_after_stop() -> None:
+        return None
+
+    generation = service._command_arbiter.generation  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert await service._command_arbiter.run_routine(generation, routine_after_stop) == (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        True,
+        None,
+    )
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("global_route", [False, True])
+async def test_scheduled_live_estop_releases_undeliverable_priority_after_runner_finalizes(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, global_route: bool
+) -> None:
+    """A finalised runner without exact control cannot strand its e-stop token."""
+    service, _mcp, _clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_dispatch = service._dispatch_admitted_live_emergency_stop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    async def delayed_dispatch(**kwargs: Any) -> bool:
+        entered.set()
+        await release.wait()
+        return await original_dispatch(**kwargs)
+
+    monkeypatch.setattr(service, "_dispatch_admitted_live_emergency_stop", delayed_dispatch)
+    if global_route:
+        waiter: asyncio.Task[Any] = asyncio.create_task(
+            service.submit_fault_controls_action(
+                FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+        )
+    else:
+        waiter = asyncio.create_task(
+            service.submit_operator_action(
+                run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+        )
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    service.runner._finalized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    service.active_run_id = None
+    release.set()
+    assert (await asyncio.wait_for(waiter, timeout=1.0)).result == "failed"
+
+    async def routine_after_release() -> None:
+        return None
+
+    generation = service._command_arbiter.generation  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert await service._command_arbiter.run_routine(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        generation, routine_after_release
+    ) == (True, None)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_global_live_estop_keeps_controller_dispatch_owned_behind_mcp_call(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancelled global waiter cannot withdraw a live admitted e-stop."""
+    service, mcp, _clock, _run_id = await _faulted_live_service(store)
+    assert service.runner is not None and not service.runner.finalized
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+    emergency_waiting = asyncio.Event()
+    emergency_written = asyncio.Event()
+
+    async def block_mcp_call() -> None:
+        in_flight.set()
+        await release.wait()
+
+    original_run_emergency_stop = service._command_arbiter.run_emergency_stop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    async def observe_emergency_wait(
+        operation: Callable[[], Awaitable[Any]], *, admitted: Callable[[], bool] | None = None
+    ) -> Any:
+        emergency_waiting.set()
+        return await original_run_emergency_stop(operation, admitted=admitted)
+
+    original_emergency_stop = mcp.emergency_stop
+
+    async def observe_emergency_write(*, reason: str) -> AppliedRoasterState | None:
+        result = await original_emergency_stop(reason=reason)
+        emergency_written.set()
+        return result
+
+    monkeypatch.setattr(
+        service._command_arbiter,  # pyright: ignore[reportPrivateUsage]
+        "run_emergency_stop",
+        observe_emergency_wait,
+    )
+    monkeypatch.setattr(mcp, "emergency_stop", observe_emergency_write)
+    blocker = asyncio.create_task(
+        service._command_arbiter.run_routine(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            service._command_arbiter.generation,  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            block_mcp_call,
+        )
+    )
+    await asyncio.wait_for(in_flight.wait(), timeout=1.0)
+    waiter = asyncio.create_task(
+        service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+    )
+    await asyncio.wait_for(emergency_waiting.wait(), timeout=1.0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    release.set()
+    assert await blocker == (True, None)
+    await asyncio.wait_for(emergency_written.wait(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_emergency_stop_is_dispatched_once_fault_finalization_has_started(
+    store: RoastStore,
+) -> None:
+    """A global e-stop supersedes legacy ACK during its durable audit write."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _mcp, _clock, run_id = await _faulted_live_service(store, mcp=mcp)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_close = store.close_fault_control_lease_atomically
+
+    async def block_before_atomic_close(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return await original_close(*args, **kwargs)
+
+    await service.submit_operator_action(run_id, _d212_request(service))
+    with mock.patch.object(
+        store, "close_fault_control_lease_atomically", block_before_atomic_close
+    ):
+        pending_tick = asyncio.create_task(service.runner.tick_once())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        e_stop_task = asyncio.create_task(
+            service.submit_fault_controls_action(
+                FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+        )
+        # The retained exact session proves this driver/readback-confirmed stop
+        # without waiting for the blocked SQLite audit.  Admission alone would
+        # be ``accepted``; this fake supplies the stronger terminal proof.
+        e_stop = await asyncio.wait_for(e_stop_task, timeout=1.0)
+        assert e_stop.result == "confirmed"
+        assert e_stop.queued is False
+        assert not pending_tick.done()
+        assert service._fault_lease_cache.status is not FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        release.set()
+        assert not await asyncio.wait_for(pending_tick, timeout=1.0)
+
+    assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    detail = await store.read_run(run_id)
+    assert detail is not None and detail.completed_at_utc is None
+    timeline = await store.read_timeline(run_id)
+    assert not any(
+        event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.payload == {"outcome": "confirmed"}
+        for event in timeline.events
+    )
+    # The superseding OPEN lease retains the live controller route.  This
+    # service-level result is admission, not terminal readback confirmation.
+    cooling = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.START_COOLING)
+    )
+    assert cooling.result == "accepted"
+    async with store.connection.execute(
+        "SELECT payload_json FROM operator_actions WHERE run_id = ? AND action = ?",
+        (run_id, OperatorAction.ACKNOWLEDGE_FAULT.value),
+    ) as cursor:
+        acknowledgement_rows = await cursor.fetchall()
+    assert all(
+        json.loads(str(row[0])) != {"fault_acknowledgement": "confirmed"}
+        for row in acknowledgement_rows
+        if row[0] is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeat_estop_after_finalized_runner_uses_terminal_exact_session(
+    store: RoastStore,
+) -> None:
+    """A second e-stop survives a fault finalisation that already received one."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _mcp, _clock, run_id = await _faulted_live_service(store, mcp=mcp)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_close = store.close_fault_control_lease_atomically
+
+    async def block_atomic_close(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return await original_close(*args, **kwargs)
+
+    await service.submit_operator_action(run_id, _d212_request(service))
+    with mock.patch.object(store, "close_fault_control_lease_atomically", block_atomic_close):
+        finalising = asyncio.create_task(service.runner.tick_once())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        first = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert first.result == "confirmed"
+        assert not service.runner._controller._emergency_stop_transition_pending  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        release.set()
+        assert not await asyncio.wait_for(finalising, timeout=1.0)
+    await _await_durable_open_fault_lease(service, store, run_id)
+    # The interrupted controller drain observes the admitted e-stop once;
+    # only then can a new operator acknowledgement bind the newer generation.
+    assert not await _tick(service, _clock)
+    accepted = await service.submit_operator_action(run_id, _d212_request(service))
+    assert accepted.result == "accepted"
+    finalized = await _tick(service, _clock)
+    timeline = await store.read_timeline(run_id)
+    assert finalized
+    assert any(
+        event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.payload == {"outcome": "confirmed"}
+        for event in timeline.events
+    )
+    assert service.runner.finalized
+
+    second = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+
+    assert second.result == "accepted"
+    assert [
+        args["action"]
+        for name, args in mcp.calls
+        if name == "fault_control" and args["action"] == "emergency_stop"
+    ] == ["emergency_stop", "emergency_stop"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_terminal_estop_waiter_keeps_dispatch_owned_behind_mcp_call(
+    store: RoastStore,
+) -> None:
+    """Cancelling a global waiter cannot cancel its admitted terminal e-stop."""
+
+    class NotifyingMCP(_ExactFaultMCP):
+        def __init__(self) -> None:
+            super().__init__([_reading(178.0, 185.0)])
+            self.estop_written = asyncio.Event()
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            await super().write_fault_control(action, expected_session_id=expected_session_id)
+            if action is OperatorAction.EMERGENCY_STOP:
+                self.estop_written.set()
+
+    mcp = NotifyingMCP()
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "cancelled-terminal-estop"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1")
+    await service.health()
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def in_flight_mcp_call() -> None:
+        entered.set()
+        await release.wait()
+
+    blocker = asyncio.create_task(
+        service._command_arbiter.run_routine(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            service._command_arbiter.generation,  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            in_flight_mcp_call,
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    waiter = asyncio.create_task(
+        service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+    )
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    release.set()
+    assert await blocker == (True, None)
+    await asyncio.wait_for(mcp.estop_written.wait(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_failed_terminal_estop_rearms_live_heat_off_retry(
+    store: RoastStore,
+) -> None:
+    """A cancelled terminal waiter still re-arms the live typed heat-off retry."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class FailedTerminalStopMCP(_ExactFaultMCP):
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            if action is OperatorAction.EMERGENCY_STOP:
+                entered.set()
+                await release.wait()
+                raise RuntimeError("synthetic terminal e-stop failure")
+            await super().write_fault_control(action, expected_session_id=expected_session_id)
+
+    mcp = FailedTerminalStopMCP([_reading(178.0, 185.0)])
+    service, _mcp, clock, _run_id = await _faulted_live_service(store, mcp=mcp)
+    assert service.runner is not None
+    service._fault_acknowledgement_gate.fault_finalization_started = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    waiter = asyncio.create_task(
+        service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    release.set()
+    for _ in range(20):
+        if service.runner._controller._pending_fail_safe is not None:  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            break
+        await asyncio.sleep(0)
+
+    assert service.runner._controller._pending_fail_safe is not None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await _tick(service, clock)
+    assert ("set_heat", {"heat_percent": 0}) in mcp.calls
+
+
+@pytest.mark.asyncio
+async def test_cancelled_terminal_estop_dispatch_rearms_live_heat_off_retry(
+    store: RoastStore,
+) -> None:
+    """Cancelling the owned shielded task itself re-arms the live retry."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingTerminalStopMCP(_ExactFaultMCP):
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            if action is OperatorAction.EMERGENCY_STOP:
+                entered.set()
+                await release.wait()
+            await super().write_fault_control(action, expected_session_id=expected_session_id)
+
+    mcp = BlockingTerminalStopMCP([_reading(178.0, 185.0)])
+    service, _mcp, _clock, run_id = await _faulted_live_service(store, mcp=mcp)
+    assert service.runner is not None
+    executor = service._fault_control_executor  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert executor is not None
+    admitted = service._admit_fault_control_lease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        run_id, session_id="session-1", use_latest_session=False
+    )
+    emergency_generation = service._command_arbiter.admit_emergency_stop()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    service.runner.admit_emergency_stop()
+    dispatch = asyncio.create_task(
+        service._execute_terminal_emergency_stop(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            executor=executor,
+            session_id="session-1",
+            admitted_generation=admitted.generation,
+            emergency_generation=emergency_generation,
+            live_runner=service.runner,
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+    dispatch.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await dispatch
+
+    assert service.runner._controller._pending_fail_safe is not None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_terminal_d212_releases_close_fence_after_owned_dispatch(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancelled terminal D212 waiter releases its reservation only after dispatch."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "cancelled-terminal-d212"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1")
+    await service.health()
+    executor = service._fault_control_executor  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert executor is not None
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    dispatched = asyncio.Event()
+    closed = asyncio.Event()
+    owned_completed = asyncio.Event()
+    subscriber = service.events.subscribe()
+
+    async def blocked_execute(*_args: Any, **_kwargs: Any) -> FaultControlState:
+        entered.set()
+        await release.wait()
+        dispatched.set()
+        return FaultControlState(
+            session_id="session-1",
+            mcp_phase="fault",
+            active=False,
+            device_connected=True,
+            heat_level_percent=0,
+            fan_level_percent=0,
+            cooling_on=False,
+            beans_added=True,
+            beans_dropped=False,
+        )
+
+    monkeypatch.setattr(
+        service._fault_control_executor,  # pyright: ignore[reportPrivateUsage]
+        "execute",
+        blocked_execute,
+    )
+    original_close = store.close_fault_control_lease_atomically
+
+    async def observe_atomic_close(*args: Any, **kwargs: Any) -> Any:
+        result = await original_close(*args, **kwargs)
+        closed.set()
+        return result
+
+    monkeypatch.setattr(store, "close_fault_control_lease_atomically", observe_atomic_close)
+    original_terminal_d212 = service._execute_terminal_d212  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    async def observe_owned_completion(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await original_terminal_d212(*args, **kwargs)
+        finally:
+            owned_completed.set()
+
+    monkeypatch.setattr(service, "_execute_terminal_d212", observe_owned_completion)
+    waiter = asyncio.create_task(
+        service.submit_fault_controls_action(
+            FaultControlsActionRequest(
+                action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+                confirmation=True,
+                expected_generation=1,
+            )
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    release.set()
+    await asyncio.wait_for(dispatched.wait(), timeout=1.0)
+    await asyncio.wait_for(closed.wait(), timeout=1.0)
+    await asyncio.wait_for(owned_completed.wait(), timeout=1.0)
+
+    generation = service._command_arbiter.generation  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._command_arbiter.reserve_close(generation)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    service._command_arbiter.release_close(generation)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert any(
+        event.event is SseEventType.FAULT_CONTROLS_ACKNOWLEDGED
+        for event in [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_terminal_d212_waiter_keeps_atomic_close_owned(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation during the store transaction keeps Start fenced until completion."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "cancelled-terminal-d212-store"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1")
+    await service.health()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    owned_completed = asyncio.Event()
+    original_execute = aiosqlite.Connection._execute  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType, reportUnknownVariableType]
+
+    async def pause_inside_close_transaction(
+        connection: Any, function: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        result = await original_execute(connection, function, *args, **kwargs)
+        if args and args[0] == "BEGIN IMMEDIATE":
+            entered.set()
+            await release.wait()
+        return result
+
+    monkeypatch.setattr(aiosqlite.Connection, "_execute", pause_inside_close_transaction)
+    original_terminal_d212 = service._execute_terminal_d212  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    async def observe_owned_completion(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await original_terminal_d212(*args, **kwargs)
+        finally:
+            owned_completed.set()
+
+    monkeypatch.setattr(service, "_execute_terminal_d212", observe_owned_completion)
+    subscriber = service.events.subscribe()
+    waiter = asyncio.create_task(
+        service.submit_fault_controls_action(
+            FaultControlsActionRequest(
+                action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+                confirmation=True,
+                expected_generation=1,
+            )
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=5.0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.OPEN
+    assert not any(
+        event.event is SseEventType.FAULT_CONTROLS_ACKNOWLEDGED
+        for event in [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    )
+    with pytest.raises(RoastRunConflictError, match="fault finalization is closing"):
+        await service.start_roast(_profile())
+    release.set()
+    await asyncio.wait_for(owned_completed.wait(), timeout=5.0)
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+    generation = service._command_arbiter.generation  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._command_arbiter.reserve_close(generation)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    service._command_arbiter.release_close(generation)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_d212_never_confirms_after_delayed_completion_is_superseded_by_estop(
+    store: RoastStore,
+) -> None:
+    """A later e-stop keeps terminal controls current after D212's history write."""
+    service, _mcp, _clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_close = store.close_fault_control_lease_atomically
+
+    async def block_atomic_close(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return await original_close(*args, **kwargs)
+
+    subscriber = service.events.subscribe()
+    accepted = await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        ),
+    )
+    assert accepted.result == "accepted"
+    with mock.patch.object(store, "close_fault_control_lease_atomically", block_atomic_close):
+        pending = asyncio.create_task(service.runner.tick_once())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        # Model the synchronous admission performed before a controller e-stop
+        # dispatch. The atomic transaction has not committed, so the new
+        # generation must make the close fail without terminalising the run.
+        service._schedule_admitted_fault_control_lease_persistence(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            service._admit_fault_control_lease(run_id)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        )
+        release.set()
+        assert not await asyncio.wait_for(pending, timeout=1.0)
+
+    assert service._fault_lease_cache.status is not FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_d212_atomic_audit_failure_keeps_route_open_with_distinct_reason(
+    store: RoastStore,
+) -> None:
+    """A live D212 transaction failure is retryable and is not an e-stop supersession."""
+    service, _mcp, clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    await store.connection.execute(
+        "CREATE TRIGGER reject_live_d212_audit BEFORE INSERT ON roast_events "
+        "WHEN NEW.kind = 'fault_controls_acknowledged' "
+        "BEGIN SELECT RAISE(ABORT, 'synthetic audit failure'); END"
+    )
+    await store.connection.commit()
+    subscriber = service.events.subscribe()
+    accepted = await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        ),
+    )
+    assert accepted.result == "accepted"
+
+    assert not await _tick(service, clock)
+
+    detail = await store.read_run(run_id)
+    assert detail is not None and detail.completed_at_utc is None
+    assert service.runner is not None and not service.runner.finalized
+    assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "failed", "reason": "persistence_unconfirmed"}
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_open_d212_reaches_runner_safe_zero_and_atomic_close(
+    store: RoastStore,
+) -> None:
+    """A generation-bound live D212 continues to the runner's guarded close."""
+    mcp = FakeMCPClient(
+        [_reading(178.0, 185.0)],
+        fault_acknowledgement_states=[
+            _fault_ack_state(cooling_on=True),
+            _fault_ack_state(cooling_on=True),
+            _fault_ack_state(cooling_on=False),
+        ],
+    )
+    service, _mcp, clock, run_id = await _faulted_live_service(store, mcp=mcp)
+    subscriber = service.events.subscribe()
+
+    accepted = await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        ),
+    )
+
+    assert accepted.result == "accepted"
+    assert accepted.queued is True
+    assert await _tick(service, clock)
+    assert mcp.log_entries().count("fault_acknowledgement_stop_cooling") == 1
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+    timeline = await store.read_timeline(run_id)
+    assert any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED
+        and event.payload == {"generation": 1, "status": "closed", "outcome": "confirmed"}
+        for event in timeline.events
+    )
+    assert any(
+        event.event is SseEventType.FAULT_CONTROLS_ACKNOWLEDGED
+        and event.data == {"generation": 1, "status": "closed", "outcome": "confirmed"}
+        for event in [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_open_d212_rejects_invalid_or_stale_admission_without_write(
+    store: RoastStore,
+) -> None:
+    """Only explicit current-generation D212 can enter a live OPEN lease."""
+    service, mcp, _clock, run_id = await _faulted_live_service(store)
+
+    for request in (
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True},
+        ),
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": True},
+        ),
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 2},
+        ),
+    ):
+        result = await service.submit_operator_action(run_id, request)
+        assert result.result == "rejected"
+        assert result.queued is False
+
+    assert await store.mark_fault_control_lease_unknown(1)
+    service._fault_lease_cache = FaultControlLease(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001 - admission harness
+        generation=1,
+        status=FaultLeaseStatus.UNKNOWN,
+        run_id=run_id,
+        mcp_session_id="session-1",
+    )
+    unknown = await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        ),
+    )
+    assert unknown.result == "rejected"
+    assert unknown.queued is False
+    assert service.operator_queue.empty()
+    assert "fault_acknowledgement_stop_cooling" not in mcp.log_entries()
+
+
+@pytest.mark.asyncio
+async def test_live_open_d212_generation_change_before_drain_fails_closed(
+    store: RoastStore,
+) -> None:
+    """A later e-stop generation fences an accepted D212 before any proof/write."""
+    service, mcp, clock, run_id = await _faulted_live_service(store)
+
+    accepted = await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        ),
+    )
+    assert accepted.result == "accepted"
+    service._admit_fault_control_lease(run_id)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001 - dispatch-race harness
+
+    assert not await _tick(service, clock)
+    assert "fault_acknowledgement_read" not in mcp.log_entries()
+    assert "fault_acknowledgement_stop_cooling" not in mcp.log_entries()
+
+
+@pytest.mark.asyncio
+async def test_live_d212_waits_for_inflight_routine_write_before_first_proof(
+    store: RoastStore,
+) -> None:
+    """D212 reads only after an already-dispatched routine MCP write ends."""
+    service, mcp, _clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    routine_returned = asyncio.Event()
+    original_read = mcp.read_fault_acknowledgement_state
+
+    async def write_heat_then_block() -> None:
+        await mcp.set_heat(12)
+        entered.set()
+        await release.wait()
+        routine_returned.set()
+
+    async def assert_routine_returned_before_proof(session_id: str) -> FaultAcknowledgementState:
+        assert routine_returned.is_set(), "D212 read began before the routine write returned"
+        return await original_read(session_id)
+
+    mcp.read_fault_acknowledgement_state = assert_routine_returned_before_proof  # type: ignore[method-assign]
+
+    generation = service._command_arbiter.generation  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    routine = asyncio.create_task(
+        service._command_arbiter.run_routine(generation, write_heat_then_block)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        ),
+    )
+    acknowledgement = asyncio.create_task(service.runner.tick_once())
+    await asyncio.sleep(0)
+    assert mcp.fault_acknowledgement_read_count == 0
+
+    release.set()
+    assert await routine == (True, None)
+    assert await acknowledgement
+    log = mcp.log_entries()
+    assert log.index("set_heat") < log.index("fault_acknowledgement_read")
+
+
+@pytest.mark.asyncio
+async def test_live_d212_reverifies_after_first_post_commit_probe_failure(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh exact proof retires the runner after the first probe is unavailable."""
+    service, _mcp, clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    subscriber = service.events.subscribe()
+    original_close = store.close_fault_control_lease_atomically
+
+    async def commit_then_report_ambiguous(*args: Any, **kwargs: Any) -> Any:
+        return (await original_close(*args, **kwargs)).model_copy(
+            update={
+                "historically_committed": False,
+                "confirmed": False,
+                "run_completed": False,
+                "verification_unavailable": True,
+            }
+        )
+
+    monkeypatch.setattr(store, "close_fault_control_lease_atomically", commit_then_report_ambiguous)
+    await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        ),
+    )
+
+    assert await _tick(service, clock)
+    assert service.runner.finalized
+    lease = await store.read_fault_control_lease()
+    assert lease.status is FaultLeaseStatus.CLOSED
+    timeline = await store.read_timeline(run_id)
+    assert any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED for event in timeline.events
+    )
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert any(
+        event.event is SseEventType.FAULT_CONTROLS_ACKNOWLEDGED
+        and event.data == {"generation": 1, "status": "closed", "outcome": "confirmed"}
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_d212_closed_history_with_unconfirmed_readback_reports_persistence_uncertainty(
+    store: RoastStore,
+) -> None:
+    """A current-generation readback gap is not evidence of a newer e-stop."""
+    service, _mcp, clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    subscriber = service.events.subscribe()
+    service.runner._closed_fault_lease_generation = lambda: None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        ),
+    )
+
+    assert await _tick(service, clock)
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "failed", "reason": "persistence_unconfirmed"}
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_fault_lease_read_cannot_overwrite_synchronous_estop_admission(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A suspended lease read returns the post-admission cache, never stale durable state."""
+    await store.create_run(
+        run_id="paused-lease-read",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.open_fault_control_lease(
+        run_id="paused-lease-read", mcp_session_id="session-1", generation=1
+    )
+    service = RoastService(store, roaster=FakeMCPClient([]), advisor=FakeAdvisor(), run_loop=False)
+    await service.health()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_read = store.read_fault_control_lease
+
+    async def paused_read() -> FaultControlLease:
+        entered.set()
+        await release.wait()
+        return await original_read()
+
+    monkeypatch.setattr(store, "read_fault_control_lease", paused_read)
+    read = asyncio.create_task(service._read_fault_lease_fail_closed())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    admitted = service._admit_fault_control_lease("paused-lease-read")  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    release.set()
+    assert (await asyncio.wait_for(read, timeout=1.0)) == admitted
+    assert service._fault_lease_cache == admitted  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_failed_lease_read_uses_live_newer_exact_estop_identity(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delayed failed read cannot revive a prior run/session for a repeat stop."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    for run_id in ("read-race-old", "read-race-new"):
+        await store.create_run(
+            run_id=run_id,
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(
+        run_id="read-race-old", mcp_session_id="session-old", generation=1
+    )
+    await service.health()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_failure() -> FaultControlLease:
+        entered.set()
+        await release.wait()
+        raise RuntimeError("synthetic read failure")
+
+    monkeypatch.setattr(store, "read_fault_control_lease", delayed_failure)
+    read = asyncio.create_task(service._read_fault_lease_fail_closed())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    admitted = service._admit_fault_control_lease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        "read-race-new", session_id="session-new", use_latest_session=False
+    )
+    release.set()
+    lease = await asyncio.wait_for(read, timeout=1.0)
+    assert lease.status is FaultLeaseStatus.UNKNOWN
+    assert (lease.run_id, lease.mcp_session_id) == ("read-race-new", "session-new")
+    assert service._fault_lease_cache == lease  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+        await service.start_roast(_profile())
+
+    mcp.set_latest_fault_session_id("session-new")
+    repeat = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert repeat.result == "confirmed"
+    assert (
+        "fault_control",
+        {"action": "emergency_stop", "expected_session_id": "session-new"},
+    ) in mcp.calls
+    assert admitted.generation == 2
+
+
+@pytest.mark.asyncio
+async def test_terminal_d212_rejects_missing_or_stale_lease_generation_without_write(
+    store: RoastStore,
+) -> None:
+    """D212 confirmation cannot act without the exact current lease generation."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "terminal-generation-bound-d212"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1", generation=1)
+    await service.health()
+    subscriber = service.events.subscribe()
+
+    missing = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE, confirmation=True
+        )
+    )
+    assert missing.result == "rejected"
+    assert not mcp.calls
+
+    e_stop = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert e_stop.result == "confirmed"
+    stale = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            confirmation=True,
+            expected_generation=1,
+        )
+    )
+    assert stale.result == "rejected"
+    assert not any(
+        name == "fault_control" and args["action"] == "stop_cooling_and_acknowledge"
+        for name, args in mcp.calls
+    )
+    assert not any(
+        event.event is SseEventType.FAULT_CONTROLS_ACKNOWLEDGED
+        for event in [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_d212_historical_commit_finalizes_after_newer_estop_before_verification(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A newer durable lease suppresses old SSE without reviving its runner."""
+    service, _mcp, _clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    old_runner = service.runner
+    entered_verification = asyncio.Event()
+    release_verification = asyncio.Event()
+    newer_lease_persisted = asyncio.Event()
+    original_read = store._read_fault_control_lease_from_connection  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    original_open = store.open_fault_control_lease
+
+    async def pause_before_independent_read(connection: aiosqlite.Connection) -> FaultControlLease:
+        if connection is not store.connection and not entered_verification.is_set():
+            entered_verification.set()
+            await release_verification.wait()
+        return await original_read(connection)
+
+    async def observe_newer_open(
+        *, run_id: str | None, mcp_session_id: str | None, generation: int | None = None
+    ) -> FaultControlLease:
+        lease = await original_open(
+            run_id=run_id, mcp_session_id=mcp_session_id, generation=generation
+        )
+        if generation == 2:
+            newer_lease_persisted.set()
+        return lease
+
+    monkeypatch.setattr(
+        store, "_read_fault_control_lease_from_connection", pause_before_independent_read
+    )
+    monkeypatch.setattr(store, "open_fault_control_lease", observe_newer_open)
+    subscriber = service.events.subscribe()
+    await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        ),
+    )
+    terminalising = asyncio.create_task(old_runner.tick_once())
+    await asyncio.wait_for(entered_verification.wait(), timeout=1.0)
+    e_stop = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert e_stop.result == "accepted"
+    await asyncio.wait_for(newer_lease_persisted.wait(), timeout=1.0)
+    release_verification.set()
+    assert await asyncio.wait_for(terminalising, timeout=1.0)
+
+    durable = await store.read_fault_control_lease()
+    completed = await store.read_run(run_id)
+    timeline = await store.read_timeline(run_id)
+    assert durable.generation == 2 and durable.status is FaultLeaseStatus.OPEN
+    assert completed is not None and completed.completed_at_utc is not None
+    assert old_runner.finalized
+    assert any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED
+        and event.payload == {"generation": 1, "outcome": "confirmed", "status": "closed"}
+        for event in timeline.events
+    )
+    assert not any(
+        event.event is SseEventType.FAULT_CONTROLS_ACKNOWLEDGED
+        and event.data == {"generation": 1, "outcome": "confirmed", "status": "closed"}
+        for event in [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    )
+    with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+        await service.start_roast(_profile())
+
+
+@pytest.mark.asyncio
+async def test_terminal_d212_historical_commit_is_not_confirmed_after_newer_estop(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Terminal D212 reports supersession if N+1 persists before verification."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "terminal-commit-before-verification"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1", generation=1)
+    await service.health()
+    entered_verification = asyncio.Event()
+    release_verification = asyncio.Event()
+    newer_lease_persisted = asyncio.Event()
+    original_read = store._read_fault_control_lease_from_connection  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    original_open = store.open_fault_control_lease
+
+    async def pause_before_independent_read(connection: aiosqlite.Connection) -> FaultControlLease:
+        if connection is not store.connection and not entered_verification.is_set():
+            entered_verification.set()
+            await release_verification.wait()
+        return await original_read(connection)
+
+    async def observe_newer_open(
+        *, run_id: str | None, mcp_session_id: str | None, generation: int | None = None
+    ) -> FaultControlLease:
+        lease = await original_open(
+            run_id=run_id, mcp_session_id=mcp_session_id, generation=generation
+        )
+        if generation == 2:
+            newer_lease_persisted.set()
+        return lease
+
+    monkeypatch.setattr(
+        store, "_read_fault_control_lease_from_connection", pause_before_independent_read
+    )
+    monkeypatch.setattr(store, "open_fault_control_lease", observe_newer_open)
+    subscriber = service.events.subscribe()
+    acknowledgement = asyncio.create_task(
+        service.submit_fault_controls_action(
+            FaultControlsActionRequest(
+                action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+                confirmation=True,
+                expected_generation=1,
+            )
+        )
+    )
+    await asyncio.wait_for(entered_verification.wait(), timeout=1.0)
+    e_stop = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert e_stop.result == "confirmed"
+    await asyncio.wait_for(newer_lease_persisted.wait(), timeout=1.0)
+    release_verification.set()
+    result = await asyncio.wait_for(acknowledgement, timeout=1.0)
+
+    assert result.result == "failed"
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.OPEN
+    assert not any(
+        event.event is SseEventType.FAULT_CONTROLS_ACKNOWLEDGED
+        and event.data == {"generation": 1, "outcome": "confirmed", "status": "closed"}
+        for event in [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    )
+    with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+        await service.start_roast(_profile())
+
+
+@pytest.mark.asyncio
+async def test_terminal_d212_reverifies_completed_history_after_first_probe_failure(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed immutable row needs close/audit proof, not a faulted rewrite."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "terminal-completed-first-probe-failure"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1", generation=1)
+    await service.health()
+    original_close = store.close_fault_control_lease_atomically
+
+    async def first_probe_unavailable(*args: Any, **kwargs: Any) -> Any:
+        return (await original_close(*args, **kwargs)).model_copy(
+            update={
+                "historically_committed": False,
+                "confirmed": False,
+                "run_completed": False,
+                "verification_unavailable": True,
+                "requires_faulted_history": False,
+            }
+        )
+
+    monkeypatch.setattr(store, "close_fault_control_lease_atomically", first_probe_unavailable)
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            confirmation=True,
+            expected_generation=1,
+        )
+    )
+
+    assert result.result == "confirmed"
+    detail = await store.read_run(run_id)
+    assert detail is not None and detail.outcome == "completed"
+    assert detail.agent_phase is RoastPhase.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_unknown_lease_retains_exact_session_for_repeat_guarded_estop(
+    store: RoastStore,
+) -> None:
+    """A failed close blocks Start but retains only the known exact stop target."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "unknown-repeat-estop"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1", generation=4)
+    await service.health()
+    lease = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await service._mark_unconfirmed_fault_lease_unknown(lease.generation, lease)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    mcp.set_latest_fault_session_id("unrelated-session")
+
+    with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+        await service.start_roast(_profile())
+    first = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    second = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert first.result == second.result == "failed"
+    assert [
+        args
+        for name, args in mcp.calls
+        if name == "fault_control" and args["action"] == "emergency_stop"
+    ] == [
+        {"action": "emergency_stop", "expected_session_id": "session-1"},
+        {"action": "emergency_stop", "expected_session_id": "session-1"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_lease_read_retains_hydrated_exact_terminal_estop_target(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed health read keeps only the hydrated exact target for e-stop."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "unknown-hydrated-terminal-estop"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1", generation=4)
+    await service.health()
+    mcp.set_latest_fault_session_id("unrelated-session")
+
+    async def fail_read() -> FaultControlLease:
+        raise RuntimeError("synthetic lease read failure")
+
+    monkeypatch.setattr(store, "read_fault_control_lease", fail_read)
+    health = await service.health()
+    assert health.fault_controls.status is FaultLeaseStatus.UNKNOWN
+    with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+        await service.start_roast(_profile())
+
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert result.result == "failed"
+    assert (
+        "fault_control",
+        {"action": "emergency_stop", "expected_session_id": "session-1"},
+    ) in mcp.calls
+
+
+@pytest.mark.asyncio
+async def test_global_estop_rewrites_legacy_confirmation_resolved_during_audit_await(
+    store: RoastStore,
+) -> None:
+    """An e-stop after D212's durable close suppresses stale acknowledgement."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _mcp, _clock, run_id = await _faulted_live_service(store, mcp=mcp)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_close = store.close_fault_control_lease_atomically
+
+    async def block_after_atomic_close(*args: Any, **kwargs: Any) -> Any:
+        result = await original_close(*args, **kwargs)
+        entered.set()
+        await release.wait()
+        return result
+
+    subscriber = service.events.subscribe()
+    await service.submit_operator_action(run_id, _d212_request(service))
+    with mock.patch.object(store, "close_fault_control_lease_atomically", block_after_atomic_close):
+        pending = asyncio.create_task(service.runner.tick_once())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        e_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert e_stop.result == "confirmed"
+        release.set()
+        assert await asyncio.wait_for(pending, timeout=1.0)
+
+    assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in events
+    )
+    async with store.connection.execute(
+        "SELECT payload_json, result FROM operator_actions WHERE run_id = ? AND action = ? "
+        "ORDER BY id ASC",
+        (run_id, OperatorAction.ACKNOWLEDGE_FAULT.value),
+    ) as cursor:
+        acknowledgement_rows = await cursor.fetchall()
+    resolved_rows = [
+        (json.loads(str(row[0])), str(row[1])) for row in acknowledgement_rows if row[0] is not None
+    ]
+    assert ({"fault_acknowledgement": "confirmed"}, "accepted") not in resolved_rows
+    assert ({"fault_acknowledgement": "superseded_by_emergency_stop"}, "failed") in resolved_rows
+
+
+@pytest.mark.asyncio
+async def test_d212_confirmation_is_suppressed_when_estop_arrives_after_close_cas(
+    store: RoastStore,
+) -> None:
+    """A global e-stop fences D212 while its confirmation audit awaits."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _mcp, _clock, run_id = await _faulted_live_service(store, mcp=mcp)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_close = store.close_fault_control_lease_atomically
+
+    async def block_atomic_close(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return await original_close(*args, **kwargs)
+
+    subscriber = service.events.subscribe()
+    await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        ),
+    )
+    with mock.patch.object(store, "close_fault_control_lease_atomically", block_atomic_close):
+        pending = asyncio.create_task(service.runner.tick_once())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        e_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert e_stop.result == "confirmed"
+        release.set()
+        assert not await asyncio.wait_for(pending, timeout=1.0)
+
+    assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in events
+    )
+    async with store.connection.execute(
+        "SELECT payload_json FROM operator_actions WHERE run_id = ? AND action = ?",
+        (run_id, OperatorAction.ACKNOWLEDGE_FAULT.value),
+    ) as cursor:
+        acknowledgement_rows = await cursor.fetchall()
+    assert all(
+        json.loads(str(row[0])) != {"fault_acknowledgement": "confirmed"}
+        for row in acknowledgement_rows
+        if row[0] is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_global_estop_fences_d212_close_event_persistence(
+    store: RoastStore,
+) -> None:
+    """A global e-stop prevents a stale D212 closed-lease SSE confirmation."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service, _mcp, _clock, run_id = await _faulted_live_service(store, mcp=mcp)
+    assert service.runner is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_close = store.close_fault_control_lease_atomically
+
+    async def block_atomic_close(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return await original_close(*args, **kwargs)
+
+    subscriber = service.events.subscribe()
+    await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        ),
+    )
+    with mock.patch.object(store, "close_fault_control_lease_atomically", block_atomic_close):
+        pending = asyncio.create_task(service.runner.tick_once())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        e_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert e_stop.result == "confirmed"
+        release.set()
+        assert not await asyncio.wait_for(pending, timeout=1.0)
+
+    assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(event.event is SseEventType.FAULT_CONTROLS_ACKNOWLEDGED for event in events)
+    assert not any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in events
+    )
+    timeline = await store.read_timeline(run_id)
+    assert not any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED
+        and event.payload == {"generation": 1, "status": "closed", "outcome": "confirmed"}
+        for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_d212_commit_before_result_is_superseded_without_releasing_old_runner(
+    store: RoastStore,
+) -> None:
+    """A post-commit e-stop suppresses stale confirmation and fences Start.
+
+    The transaction and its independent verification complete before the
+    service receives the result.  This covers the interleaving that a pause at
+    the close call's entry cannot represent.
+    """
+    service, _mcp, _clock, run_id = await _faulted_live_service(
+        store, mcp=_ExactFaultMCP([_reading(178.0, 185.0)])
+    )
+    assert service.runner is not None
+    old_runner = service.runner
+    committed = asyncio.Event()
+    release_result = asyncio.Event()
+    original_close = store.close_fault_control_lease_atomically
+
+    async def commit_then_pause_result(*args: Any, **kwargs: Any) -> Any:
+        result = await original_close(*args, **kwargs)
+        assert result.confirmed
+        committed.set()
+        await release_result.wait()
+        return result
+
+    subscriber = service.events.subscribe()
+    await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        ),
+    )
+    with mock.patch.object(store, "close_fault_control_lease_atomically", commit_then_pause_result):
+        terminalising = asyncio.create_task(old_runner.tick_once())
+        await asyncio.wait_for(committed.wait(), timeout=1.0)
+        assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+        with pytest.raises(RoastRunConflictError, match="fault finalization is closing"):
+            await service.start_roast(_profile())
+
+        e_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert e_stop.result == "confirmed"
+        for _ in range(100):
+            current = await store.read_fault_control_lease()
+            if current.generation == 2 and current.status is FaultLeaseStatus.OPEN:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("newer e-stop lease did not become durably OPEN")
+        assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        release_result.set()
+        assert await asyncio.wait_for(terminalising, timeout=1.0)
+
+    assert old_runner.finalized
+    assert service.runner is old_runner
+    assert service.active_run_id == run_id
+    assert service.operator_queue.empty()
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(event.event is SseEventType.FAULT_CONTROLS_ACKNOWLEDGED for event in events)
+    assert not any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in events
+    )
+    with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+        await service.start_roast(_profile())
+
+
+@pytest.mark.asyncio
+async def test_start_allows_finalized_runner_after_terminal_row_and_closed_lease(
+    store: RoastStore,
+) -> None:
+    """A terminal prior runner does not become a permanent Start fence."""
+    service, _mcp, clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    old_runner = service.runner
+    await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        ),
+    )
+    assert await _tick(service, clock)
+    assert old_runner.finalized
+    completed = await store.read_run(run_id)
+    assert completed is not None and completed.completed_at_utc is not None
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+
+    next_run = await service.start_roast(_profile(name="Second roast"))
+    assert next_run.id != run_id
+    assert service.runner is not old_runner
+
+
+@pytest.mark.asyncio
+async def test_start_blocks_finalized_runner_while_its_loop_task_is_pending(
+    store: RoastStore,
+) -> None:
+    """A terminal row never bypasses a still-owned prior loop task."""
+    service, _mcp, clock, run_id = await _faulted_live_service(store)
+    assert service.runner is not None
+    await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": 1},
+        ),
+    )
+    assert await _tick(service, clock)
+    assert service.runner.finalized
+
+    async def wait_for_cancellation() -> None:
+        await asyncio.Event().wait()
+
+    pending_loop = asyncio.create_task(wait_for_cancellation())
+    service._loop_task = pending_loop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(RoastRunConflictError, match="controller loop is still active"):
+            await service.start_roast(_profile())
+    finally:
+        pending_loop.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pending_loop
+
+
+@pytest.mark.asyncio
+async def test_terminal_fault_control_requires_action_specific_readback(
+    store: RoastStore,
+) -> None:
+    """A successful terminal write without its expected state stays unconfirmed."""
+
+    class CoolingNoopMCP(_ExactFaultMCP):
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            await super().write_fault_control(action, expected_session_id=expected_session_id)
+            if action is OperatorAction.START_COOLING:
+                self.fault_cooling_on = False
+
+    mcp = CoolingNoopMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "terminal-readback-proof-fault-run"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1")
+    await service.health()
+
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.START_COOLING)
+    )
+    assert result.result == "failed"
+    assert result.reason == "terminal fault action was not confirmed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_d212_unsafe_typed_readback_never_closes_lease_or_acknowledges(
+    store: RoastStore,
+) -> None:
+    """Unsafe terminal state rejects D212 before it can close the lease."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    mcp.fault_heat_percent = 10
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "terminal-unsafe-readback-fault-run"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1")
+    await service.health()
+    subscriber = service.events.subscribe()
+
+    # A non-zero heat readback is not an already-safe-zero terminal state, so
+    # the server must reject D212 before any cooling-off write.
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            confirmation=True,
+            expected_generation=1,
+        )
+    )
+
+    assert result.result == "rejected"
+    assert result.reason == "action is not enabled for the current fault controls"
+    assert not any(
+        name == "fault_control" and args["action"] == "stop_cooling_and_acknowledge"
+        for name, args in mcp.calls
+    )
+    lease = await store.read_fault_control_lease()
+    timeline = await store.read_timeline(run_id)
+    assert lease.status is FaultLeaseStatus.OPEN
+    assert not any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED for event in timeline.events
+    )
+    assert not any(
+        event.event is SseEventType.FAULT_CONTROLS_ACKNOWLEDGED
+        for event in [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    )
+    with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+        await service.start_roast(_profile())
+
+
+@pytest.mark.asyncio
+async def test_terminal_d212_reserves_before_executor_readback_returns(
+    store: RoastStore,
+) -> None:
+    """D212 blocks later terminal controls before its executor result resumes."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "terminal-readback-gap-fault-run"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1")
+    await service.health()
+    executor = service._fault_control_executor  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert executor is not None
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_execute = executor.execute
+
+    async def park_after_readback(*args: Any, **kwargs: Any) -> FaultControlState | None:
+        state = await original_execute(*args, **kwargs)
+        entered.set()
+        await release.wait()
+        return state
+
+    with mock.patch.object(executor, "execute", park_after_readback):
+        acknowledgement = asyncio.create_task(
+            service.submit_fault_controls_action(
+                FaultControlsActionRequest(
+                    action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+                    confirmation=True,
+                    expected_generation=1,
+                )
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        blocked = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.START_COOLING)
+        )
+        assert blocked.result == "failed"
+        release.set()
+        result = await asyncio.wait_for(acknowledgement, timeout=1.0)
+
+    assert result.result == "confirmed"
+    assert not service._fault_acknowledgement_gate.fault_finalization_started  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    next_run_id = "terminal-readback-gap-second-cycle"
+    await store.create_run(
+        run_id=next_run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=next_run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=next_run_id, mcp_session_id="session-1")
+    await service.health()
+    next_cycle = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.START_COOLING)
+    )
+    assert next_cycle.result == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_d212_close_reservation_blocks_controls_until_cas_finishes(
+    store: RoastStore,
+) -> None:
+    """Terminal D212 reserves safe-zero through its durable lease CAS.
+
+    A competing ordinary fault command cannot slip between readback and the
+    close, while a later e-stop advances the generation and supersedes the
+    close before it can report confirmation.
+    """
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "terminal-cas-fault-run"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1")
+    await service.health()
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_close = store.close_fault_control_lease_atomically
+
+    async def block_close(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return await original_close(*args, **kwargs)
+
+    with mock.patch.object(store, "close_fault_control_lease_atomically", block_close):
+        acknowledgement = asyncio.create_task(
+            service.submit_fault_controls_action(
+                FaultControlsActionRequest(
+                    action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+                    confirmation=True,
+                    expected_generation=1,
+                )
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        blocked = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.START_COOLING)
+        )
+        assert blocked.result == "failed"
+        e_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert e_stop.result == "confirmed"
+        release.set()
+        result = await asyncio.wait_for(acknowledgement, timeout=1.0)
+
+    assert result.result == "failed"
+    assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_second_terminal_d212_cannot_release_first_owner_reservation(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected second D212 leaves the first owner's close fence intact."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "terminal-d212-owner"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1")
+    await service.health()
+    executor = service._fault_control_executor  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert executor is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_execute = executor.execute
+
+    async def block_first(*args: Any, **kwargs: Any) -> FaultControlState | None:
+        entered.set()
+        await release.wait()
+        return await original_execute(*args, **kwargs)
+
+    monkeypatch.setattr(executor, "execute", block_first)
+    first = asyncio.create_task(
+        service.submit_fault_controls_action(
+            FaultControlsActionRequest(
+                action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+                confirmation=True,
+                expected_generation=1,
+            )
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    second = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            confirmation=True,
+            expected_generation=1,
+        )
+    )
+    assert second.result == "failed"
+    assert service._fault_acknowledgement_gate.fault_finalization_started  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    release.set()
+    assert (await first).result == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_d212_event_failure_marks_safe_zero_lease_unknown_and_blocks_start(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A safe readback without its durable confirmation audit cannot close a lease."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "terminal-d212-event-failure"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1")
+    await service.health()
+
+    await store.connection.execute(
+        "CREATE TRIGGER reject_terminal_d212_audit BEFORE INSERT ON roast_events "
+        "WHEN NEW.kind = 'fault_controls_acknowledged' "
+        "BEGIN SELECT RAISE(ABORT, 'synthetic audit failure'); END"
+    )
+    await store.connection.commit()
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            confirmation=True,
+            expected_generation=1,
+        )
+    )
+
+    assert result.result == "failed"
+    assert result.reason == "terminal acknowledgement did not close the current lease"
+    assert service._fault_lease_cache.status is FaultLeaseStatus.OPEN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.OPEN
+    with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+        await service.start_roast(_profile())
+
+
+@pytest.mark.asyncio
+async def test_terminal_d212_close_event_is_superseded_by_global_estop(
+    store: RoastStore,
+) -> None:
+    """A terminal D212 action cannot leave a stale confirmed close event."""
+    mcp = _ExactFaultMCP([_reading(178.0, 185.0)])
+    service = RoastService(store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False)
+    run_id = "terminal-fault-run"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await store.open_fault_control_lease(run_id=run_id, mcp_session_id="session-1")
+    await service.health()
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_close = store.close_fault_control_lease_atomically
+
+    async def block_atomic_close(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return await original_close(*args, **kwargs)
+
+    subscriber = service.events.subscribe()
+    with mock.patch.object(store, "close_fault_control_lease_atomically", block_atomic_close):
+        acknowledgement = asyncio.create_task(
+            service.submit_fault_controls_action(
+                FaultControlsActionRequest(
+                    action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+                    confirmation=True,
+                    expected_generation=1,
+                )
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        e_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert e_stop.result == "confirmed"
+        release.set()
+        acknowledgement_result = await asyncio.wait_for(acknowledgement, timeout=1.0)
+
+    assert acknowledgement_result.result == "failed"
+    controls = await service._fault_controls_projection_after_action()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert controls.status is FaultLeaseStatus.OPEN
+    assert OperatorAction.START_COOLING in controls.enabled_actions
+    resumed_cooling = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.START_COOLING)
+    )
+    assert resumed_cooling.result == "confirmed"
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(event.event is SseEventType.FAULT_CONTROLS_ACKNOWLEDGED for event in events)
+    timeline = await store.read_timeline(run_id)
+    assert not any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED
+        and event.payload == {"generation": 1, "status": "closed", "outcome": "confirmed"}
+        for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_controller_emergency_escalation_invalidates_pending_fault_acknowledgement(
+    store: RoastStore,
+) -> None:
+    """A same-tick hard ceiling escalation cannot confirm an earlier safe proof."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([RuntimeError("fault")])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    for _ in range(3):
+        assert not await _tick(service, clock)
+    faulted = await store.read_run(run_id)
+    assert faulted is not None and faulted.agent_phase is RoastPhase.FAULTED
+    mcp.frames = [_reading(235.0, 200.0)]
+    subscriber = service.events.subscribe()
+    acknowledgement = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    assert acknowledgement.result == "accepted"
+
+    assert not await _tick(service, clock)
+    detail = await store.read_run(run_id)
+    assert detail is not None and detail.completed_at_utc is None
+    assert mcp.commands().count("emergency_stop") == 1
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert not any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "confirmed"}
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_is_rejected_before_fault_then_emergency_stop(
+    store: RoastStore,
+) -> None:
+    """A pre-fault acknowledgement cannot wait for a later e-stop fault cycle."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    acknowledgement = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    assert acknowledgement.result == "rejected"
+    assert acknowledgement.queued is False
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"})
+    )
+
+    assert not await _tick(service, clock)
+    assert mcp.commands().count("emergency_stop") == 1
+    assert "fault_acknowledgement_read" not in mcp.log_entries()
+
+
+@pytest.mark.asyncio
+async def test_same_drain_emergency_stop_suppresses_previously_admitted_fault_acknowledgement(
+    store: RoastStore,
+) -> None:
+    """A new e-stop cooling cycle needs a fresh acknowledgement after the drain."""
+    service, mcp, clock, run_id = await _faulted_live_service(store)
+    subscriber = service.events.subscribe()
+    acknowledged = await service.submit_operator_action(run_id, _d212_request(service))
+    assert acknowledged.result == "accepted"
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"})
+    )
+
+    assert not await _tick(service, clock)
+    assert "fault_acknowledgement_stop_cooling" not in mcp.log_entries()
+    events = [subscriber.get_nowait() for _ in range(subscriber.qsize())]
+    assert any(
+        event.event is SseEventType.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        and event.data == {"outcome": "failed", "reason": "superseded_by_emergency_stop"}
+        for event in events
+    )
+
+    fresh = await service.submit_operator_action(run_id, _d212_request(service))
+    assert fresh.result == "accepted"
+    assert await _tick(service, clock)
+
+
+@pytest.mark.asyncio
 async def test_acknowledge_fault_clears_promptly_under_wedged_mcp(store: RoastStore) -> None:
-    """#332: ``acknowledge_fault`` must finalise the run on the SAME tick it is
-    drained, without blocking on a fresh escalation read, even when the MCP child
-    is wedged (slow/failed reads).
+    """A wedged acknowledgement-state read must keep the faulted run operable.
 
     Repro of the roast-3 "slow to clear" report: a FAULT-latched run (not e-stop —
     consecutive MCP read failures, so ``_latched_verdict`` is FAULT) re-reads the
@@ -5772,15 +9927,20 @@ async def test_acknowledge_fault_clears_promptly_under_wedged_mcp(store: RoastSt
     acknowledged — the run is being torn down and heat is already off, so there is
     nothing to escalate into.
 
-    Hardware-free + deterministic: a read-counting fake whose reads RAISE (a
-    dead/failed child). The assertion is on the READ COUNT, not wall-clock — the
-    acknowledge tick must NOT issue a fresh escalation read."""
+    The controller's old #332 escalation probe remains suppressed only after a
+    *confirmed* acknowledgement. A fresh state proof is now mandatory, so a
+    wedged MCP cannot be treated as acknowledgement success.
+    """
     clock = FakeClock()
     log: list[str] = []
     # Every read raises → after max_consecutive_mcp_failures (3) the run FAULTs,
     # latched at the FAULT verdict (the escalation-re-read case, not e-stop). The
     # explicit log records every ``read`` so the assertion is on the read count.
-    mcp = FakeMCPClient([RuntimeError("wedged child")], log=log)
+    mcp = FakeMCPClient(
+        [RuntimeError("wedged child")],
+        log=log,
+        fault_acknowledgement_states=[RuntimeError("wedged child")],
+    )
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)
     # Tick to the fault: 3 consecutive failing reads cross the threshold.
     for _ in range(3):
@@ -5792,19 +9952,16 @@ async def test_acknowledge_fault_clears_promptly_under_wedged_mcp(store: RoastSt
     reads_before = log.count("read")
     await _tick(service, clock)
     assert log.count("read") > reads_before, "latched tick should probe for escalation"
-    # Now acknowledge + tick: the ack tick must FINALISE and must NOT issue another
-    # escalation read (that read is the wedged-child latency the operator hit).
+    # Acknowledge + tick: state proof fails, so the run stays faulted and the
+    # controller still treats the fault as operable rather than finalising it.
     ack = await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
     )
     assert ack.result == "accepted"
-    reads_at_ack = log.count("read")
-    assert await _tick(service, clock)  # finalises on the ack tick
-    assert log.count("read") == reads_at_ack, (
-        "acknowledge tick must not block on a fresh escalation read"
-    )
+    assert not await _tick(service, clock)
     final = await store.read_run(run_id)
-    assert final is not None and final.outcome == "faulted"
+    assert final is not None and final.outcome is None
+    assert final.agent_phase is RoastPhase.FAULTED
 
 
 @pytest.mark.asyncio

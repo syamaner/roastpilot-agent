@@ -5,6 +5,7 @@ import type { RoastPhase, SseEvent } from "@/lib/types";
 import {
   useFrameDrain,
   useRoastStream,
+  SSE_EVENT_TYPES,
   type EventSourceLike,
   type UseRoastStreamResult,
 } from "./useRoastStream";
@@ -100,6 +101,9 @@ describe("useRoastStream", () => {
     const es = FakeEventSource.last!;
     await act(async () => es.open());
     expect(latest!.status).toBe("live");
+    // Every declared SSE event needs a named EventSource listener; otherwise the
+    // browser drops it because `onmessage` only receives unnamed frames.
+    expect([...es.listeners.keys()].sort()).toEqual([...SSE_EVENT_TYPES].sort());
 
     // A telemetry frame claiming a different phase must NOT move state.phase.
     await act(async () =>

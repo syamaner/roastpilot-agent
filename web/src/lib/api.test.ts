@@ -15,7 +15,10 @@ function mockFetch(status: number, body: unknown, headers?: Record<string, strin
 }
 
 beforeEach(() => vi.restoreAllMocks());
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 describe("api client", () => {
   it("GET /api/roasts/{id} returns the typed detail", async () => {
@@ -23,6 +26,24 @@ describe("api client", () => {
     const detail = await api.roast("r1");
     expect(detail.id).toBe("r1");
     expect(fetch).toHaveBeenCalledWith("/api/roasts/r1", expect.any(Object));
+  });
+
+  it("bounds a hung health request so safety gates can enter their unknown state", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+        }),
+      ),
+    );
+
+    const health = api.health();
+    const rejection = expect(health).rejects.toThrow("Health request timed out.");
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    await rejection;
   });
 
   it("POST /operator-actions sends the action body", async () => {
@@ -56,6 +77,114 @@ describe("api client", () => {
       teardown_incident_id: "a".repeat(32),
       reason: "roaster cold and child resources released",
     });
+  });
+
+  it("POST /api/restart-clearance records only the fixed physical confirmation", async () => {
+    mockFetch(200, {
+      outcome: "confirmed",
+      cleared: true,
+      restart_clearance_required: false,
+      restart_clearance: { state: "cleared", eligible: true },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    });
+    const result = await api.acknowledgeRestartClearance();
+    expect(result).toMatchObject({
+      outcome: "confirmed",
+      restart_clearance: { state: "cleared", eligible: true },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/restart-clearance",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+      physical_confirmation: true,
+    });
+  });
+
+  it("preserves a fail-closed restart-clearance response and its projections", async () => {
+    mockFetch(200, {
+      outcome: "failed",
+      cleared: false,
+      restart_clearance_required: true,
+      restart_clearance: { state: "unknown", eligible: false },
+      fault_controls: { status: "unknown", generation: 8, enabled_actions: ["emergency_stop"] },
+    });
+
+    const result = await api.acknowledgeRestartClearance();
+
+    expect(result).toMatchObject({
+      outcome: "failed",
+      cleared: false,
+      restart_clearance_required: true,
+      restart_clearance: { state: "unknown", eligible: false },
+      fault_controls: { status: "unknown", generation: 8 },
+    });
+  });
+
+  it("POST /api/fault-controls/actions sends no run or device identifier", async () => {
+    mockFetch(202, {
+      action: "emergency_stop",
+      result: "accepted",
+      reason: "queued for server confirmation",
+      queued: true,
+      fault_controls: {
+        status: "open",
+        generation: 4,
+        enabled_actions: ["emergency_stop"],
+      },
+    });
+    const result = await api.faultControlsAction({ action: "emergency_stop" });
+    expect(result.fault_controls).toMatchObject({
+      status: "open",
+      generation: 4,
+      enabled_actions: ["emergency_stop"],
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/fault-controls/actions",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+      action: "emergency_stop",
+    });
+  });
+
+  it("binds D212 confirmation to the displayed positive lease generation", async () => {
+    mockFetch(200, {
+      action: "stop_cooling_and_acknowledge",
+      result: "confirmed",
+      reason: "server verified cooling is off",
+      queued: false,
+      fault_controls: { status: "closed", generation: 4, enabled_actions: [] },
+    });
+
+    await api.faultControlsAction({
+      action: "stop_cooling_and_acknowledge",
+      confirmation: true,
+      expected_generation: 4,
+    });
+
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+      action: "stop_cooling_and_acknowledge",
+      confirmation: true,
+      expected_generation: 4,
+    });
+  });
+
+  it("fails closed before the request when D212 has no positive generation", async () => {
+    mockFetch(200, {});
+
+    await expect(
+      api.faultControlsAction({
+        action: "stop_cooling_and_acknowledge",
+        confirmation: true,
+        expected_generation: 0,
+      }),
+    ).rejects.toThrow(/positive.*generation/i);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("draft-correlated profile create preserves JSON and attempt headers", async () => {

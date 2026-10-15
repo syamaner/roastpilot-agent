@@ -104,6 +104,14 @@ export function useFreshHealthGate() {
     queryKey: roastKeys.health,
     queryFn: api.health,
     refetchOnMount: "always",
+    // D212/D213: a terminal lease can open after this surface receives a
+    // closed/cleared snapshot (another browser's e-stop or a controller fault).
+    // Keep the mounted gate on a bounded server-health refresh so Start does
+    // not stay stale and hide that server-enumerated terminal-control path.
+    // This is a read-only projection, never a physical-state proof.
+    refetchInterval: 3_000,
+    refetchOnWindowFocus: true,
+    refetchOnReconnect: true,
   });
   return useFreshGate(query);
 }

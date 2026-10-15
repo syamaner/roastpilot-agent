@@ -63,6 +63,8 @@ export interface OperatorActionBarProps {
   onAction: (action: OperatorAction) => void;
   /** The most recent action outcome — its reason is surfaced inline. */
   lastResult?: OperatorActionResultView | null;
+  /** A failed health refresh leaves only the guarded emergency stop available. */
+  healthStale?: boolean;
 }
 
 export function OperatorActionBar({
@@ -70,6 +72,7 @@ export function OperatorActionBar({
   phase,
   onAction,
   lastResult,
+  healthStale = false,
 }: OperatorActionBarProps): React.JSX.Element {
   // Two-step guard for emergency stop: the first press arms, the second fires.
   const [estopArmed, setEstopArmed] = useState(false);
@@ -112,7 +115,7 @@ export function OperatorActionBar({
       </button>
 
       {visibleButtons.map(({ action, label }) => {
-        const isEnabled = enabled.has(action);
+        const isEnabled = !healthStale && enabled.has(action);
         return (
           <button
             key={action}
@@ -133,6 +136,12 @@ export function OperatorActionBar({
           </button>
         );
       })}
+
+      {healthStale && (
+        <span data-testid="operator-actions-health-stale" className="text-xs text-roast-fault">
+          Health status is stale. Routine actions are disabled until it recovers.
+        </span>
+      )}
 
       {/* Typed result feedback — the server's reason, never a client verdict. */}
       {lastResult && lastResult.result !== "accepted" && (

@@ -17,6 +17,7 @@ import pytest
 import uvicorn
 
 from roastpilot_agent import cli
+from roastpilot_agent.api import ShutdownHeatOffOutcome
 
 
 class _ForcedProcessExit(BaseException):
@@ -828,9 +829,9 @@ def test_serve_live_happy_path(
         service = RoastService(store)
         original_shutdown = service.shutdown
 
-        async def _tracked_heat_off() -> bool:
+        async def _tracked_heat_off() -> ShutdownHeatOffOutcome:
             order.append("heat-off")
-            return True
+            return ShutdownHeatOffOutcome.DISPATCHED
 
         async def _tracked_shutdown() -> None:
             order.append("service.shutdown")
@@ -905,9 +906,9 @@ def test_serve_first_signal_tears_down_then_propagates(
         service = RoastService(store)
         original_shutdown = service.shutdown
 
-        async def _tracked_heat_off() -> bool:
+        async def _tracked_heat_off() -> ShutdownHeatOffOutcome:
             order.append("heat-off")
-            return True
+            return ShutdownHeatOffOutcome.DISPATCHED
 
         async def _tracked_shutdown() -> None:
             order.append("service.shutdown")
@@ -954,9 +955,9 @@ def test_serve_first_signal_cancels_non_returning_server_before_ordered_teardown
     server_started = asyncio.Event()
 
     class _Service:
-        async def safe_shutdown_heat_off(self) -> bool:
+        async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
             order.append("heat-off")
-            return True
+            return ShutdownHeatOffOutcome.DISPATCHED
 
         async def shutdown(self) -> None:
             order.append("service.shutdown")

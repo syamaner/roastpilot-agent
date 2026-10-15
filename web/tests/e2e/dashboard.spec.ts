@@ -150,6 +150,12 @@ test("dashboard-fault — real env-ceiling fault renders the fault banner + trai
   await expect(page.getByTestId("fault-reason")).toContainText(
     /241(\.0)?\s*°C exceeds the hard ceiling 240(\.0)?\s*°C/,
   );
+  // The fault completion control is clear about its actual command semantics.
+  // This first press only opens the cooling-safe confirmation; it cannot queue
+  // an acknowledgement by itself.
+  await expect(page.getByTestId("fault-acknowledge")).toHaveText(
+    "Stop cooling and acknowledge",
+  );
 
   // Gate the canvas shot on an INDEPENDENT minimum point-count before reading the
   // hook, so the barrier blocks on the async render (D26 kit).
@@ -182,6 +188,11 @@ test("dashboard-fault — real env-ceiling fault renders the fault banner + trai
 
   await settle(page);
   await expectScreenshot(page, "dashboard-fault.png", SCREENSHOT_CLASSES.CANVAS_PAGE);
+
+  await page.getByTestId("fault-acknowledge").click();
+  await expect(page.getByTestId("fault-acknowledgement-confirmation")).toContainText(
+    "safe to end cooling",
+  );
 });
 
 test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery modal (canvas un-masked)", async ({

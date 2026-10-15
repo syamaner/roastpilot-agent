@@ -31,6 +31,7 @@ import {
   hydrate,
   initialRoastStreamState,
 } from "@/hooks/roastStreamReducer";
+import { SSE_EVENT_TYPES } from "@/hooks/useRoastStream";
 import {
   dashboardReducer,
   initialDashboardViewModel,
@@ -40,14 +41,17 @@ import type {
   MicHealth,
   MicStatus,
   RoastDetail,
+  RoastEventKind,
   RoastPhase,
   RoastSummary,
   CatalogueRecommendationList,
+  FaultControlsEventData,
   SseEvent,
   SseEventType,
   TelemetryEventData,
   TelemetryPoint,
   TelemetrySeries,
+  TimelineEvent,
 } from "@/lib/types";
 
 // --- Fixture loading -------------------------------------------------------
@@ -169,6 +173,9 @@ describe("SSE contract — every event type has a real frame", () => {
     "fault",
     "recovery_required",
     "recovery_acknowledged",
+    "fault_acknowledgement_executed",
+    "fault_controls_changed",
+    "fault_controls_acknowledged",
     "logs_exported",
     "run_completed",
     "telemetry",
@@ -178,6 +185,59 @@ describe("SSE contract — every event type has a real frame", () => {
   it("the fixture covers exactly the SseEventType set the SPA declares", () => {
     const inFixture = new Set(sse.frames.map((f) => f.event));
     expect([...inFixture].sort()).toEqual([...EXPECTED_EVENT_TYPES].sort());
+  });
+
+  it("registers an EventSource listener for every server fixture event", () => {
+    expect([...SSE_EVENT_TYPES].sort()).toEqual([...EXPECTED_EVENT_TYPES].sort());
+  });
+});
+
+describe("fault-control lease SSE contract", () => {
+  it("carries the server-authoritative generation, status, and outcome projection", () => {
+    const changed = frame("fault_controls_changed").data as unknown as FaultControlsEventData;
+    const acknowledged = frame("fault_controls_acknowledged").data as unknown as FaultControlsEventData;
+
+    for (const data of [changed, acknowledged]) {
+      expectKeys(data as unknown as Record<string, unknown>, [
+        "generation",
+        "status",
+        "outcome",
+      ]);
+      expect(typeof data.generation).toBe("number");
+      expect(["closed", "open", "unknown"]).toContain(data.status);
+      expect(["confirmed", "failed"]).toContain(data.outcome);
+    }
+
+    expect(changed).toMatchObject({ generation: 1, status: "open", outcome: "confirmed" });
+    expect(acknowledged).toMatchObject({
+      generation: 1,
+      status: "closed",
+      outcome: "confirmed",
+    });
+  });
+
+  it("recognises the server's persisted fault-control timeline kinds", () => {
+    const events: readonly TimelineEvent[] = [
+      {
+        kind: "fault_controls_changed" satisfies RoastEventKind,
+        source: "safety",
+        monotonic_seconds: null,
+        recorded_at_utc: "2026-10-08T00:00:00Z",
+        payload: frame("fault_controls_changed").data,
+      },
+      {
+        kind: "fault_controls_acknowledged" satisfies RoastEventKind,
+        source: "safety",
+        monotonic_seconds: null,
+        recorded_at_utc: "2026-10-08T00:00:01Z",
+        payload: frame("fault_controls_acknowledged").data,
+      },
+    ];
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "fault_controls_changed",
+      "fault_controls_acknowledged",
+    ]);
   });
 });
 
