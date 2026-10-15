@@ -1,5 +1,25 @@
 # RoastPilot Agent Project State Registry
 
+**15 Oct 2026, #1022 docs-marker audit imported-source parse reuse:** within
+one bounded docs-reader audit operation, the analyser's four imported-module
+parse sites share the syntax tree of byte-identical imported source text
+through the existing per-operation proxy memo, bounded by entry and
+source-character budgets with least-recently-used eviction and an
+authentic-parse bypass for oversized text. File reads, import resolution,
+reader decisions, ambiguity and error behaviour are unchanged; failed parses
+are never retained and nothing persists beyond the operation. Comparisons with
+the cache-disabled parser over a finite fixture corpus and a one-time
+current-repository check, with literal anchors, preserve the tested outcomes;
+this is not a proof over all sources. Reuse engages only in the admitted
+standard recording warnings context. The captured default action, filters,
+dispatcher and handlers must remain unchanged before lookup and after parsing;
+other contexts parse authentically. Within the same admitted recording
+context, repeated identical parser warnings may be recorded fewer times. This
+diagnostic exception was explicitly approved by the maintainer at contract
+ratification. This records test infrastructure only, with no E11 status,
+hardware, Pi, installation or release claim. Timing and memory evidence is
+recorded in the PR and issue.
+
 **15 Oct 2026, #1019 governance declaration scan:** the declaration-state
 scanner in the review-authority governance test now reuses its pending
 next-opener and next-terminator positions instead of re-searching each
