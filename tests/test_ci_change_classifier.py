@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import abc
 import ast
+import collections.abc
+import gc
 import io
 import re
 import runpy
@@ -11,6 +14,9 @@ import sys
 import threading
 import time
 import tomllib
+import types
+import warnings
+import weakref
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -2517,14 +2523,241 @@ def _repository_module_candidates(module: str, filename: str, repository_root: P
 _DocsProxyKey = tuple[str, str, Path]
 
 
+@dataclass(frozen=True)
+class _ImportedParseBudget:
+    """Per-operation retention budget for reused imported-source parse trees."""
+
+    max_entries: int = 64
+    max_total_chars: int = 2_500_000
+    max_entry_chars: int = 400_000
+
+
+_STDLIB_SHOWWARNMSG: object = getattr(warnings, "_showwarnmsg", None)
+
+
+@dataclass(frozen=True)
+class _ParseWarningContext:
+    """Snapshot of the admitted standard recording warnings context for parse reuse."""
+
+    default_action: str
+    filters: tuple[object, ...]
+    filters_list: object
+    showwarning: object
+    showwarnmsg: object
+    impl: object
+
+
+def _canonical_warning_filter(record: object) -> bool:
+    """Return whether one warning-filter record has the canonical admitted shape.
+
+    The record must be an exact five-field ``tuple`` with an exact ``str`` known
+    action; a ``None`` or compiled string-pattern message selector; a ``None``,
+    exact ``str`` or compiled string-pattern module selector; a ``Warning``
+    category whose metaclass is exactly ``type`` (checked before
+    :func:`issubclass`, so ``ABCMeta`` and any custom ``__subclasscheck__`` are
+    rejected); and an exact non-negative ``int`` line. Exact-type category
+    matching then follows only the fixed inheritance of the builtin categories the
+    parser emits. The check is pure, never raises on malformed input and makes no
+    subclass concession.
+
+    Args:
+        record: One entry of ``warnings.filters``.
+
+    Returns:
+        ``True`` only for a canonical record.
+    """
+
+    if type(record) is not tuple:
+        return False
+    fields = cast("tuple[object, ...]", record)
+    if len(fields) != 5:
+        return False
+    action, message, category, module, lineno = fields
+    if type(action) is not str:
+        return False
+    if action not in ("error", "ignore", "always", "default", "module", "once"):
+        return False
+    if message is not None:
+        if type(message) is not re.Pattern:
+            return False
+        if type(getattr(cast(object, message), "pattern", None)) is not str:
+            return False
+    if module is not None:
+        if type(module) is str:
+            pass
+        elif type(module) is re.Pattern:
+            if type(getattr(cast(object, module), "pattern", None)) is not str:
+                return False
+        else:
+            return False
+    if type(category) is not type:
+        return False
+    if not issubclass(category, Warning):
+        return False
+    if type(lineno) is not int:
+        return False
+    return lineno >= 0
+
+
+def _admitted_parse_warning_context() -> _ParseWarningContext | None:
+    """Return the current warnings context when it is the admitted recording shape.
+
+    Parse reuse is admitted only in the standard recording context that
+    ``warnings.catch_warnings(record=True)`` installs: an exact ``list`` of filters,
+    a known string default action, the original ``showwarning``, the
+    ``_showwarnmsg`` dispatcher captured at module import (``_STDLIB_SHOWWARNMSG``),
+    whose trusted standard-library identity is verified by the fresh-environment
+    preflight rather than by this function, and an implementation that is the
+    bound ``append`` of an exact ``list``. Every filter record in one copied tuple
+    must also pass :func:`_canonical_warning_filter`: a standard five-field tuple
+    with a known action, ``None`` or compiled string-pattern message selectors,
+    ``None``, exact-string or compiled string-pattern module selectors, a
+    ``Warning`` category whose metaclass is exactly ``type``, and a non-negative
+    integer line; that same validated tuple is the snapshot's ``filters``. This is
+    per-record admission for the standard parser's builtin warning categories, not
+    a general immutability claim. Private attributes are read only through
+    :func:`getattr` and no warning global is ever written. Any other layout returns
+    ``None``, which only disables reuse and never fails.
+
+    Returns:
+        The context snapshot, or ``None`` when the current context is not admitted.
+    """
+
+    filters: object = warnings.filters
+    if type(filters) is not list:
+        return None
+    records = tuple(warnings.filters)
+    for record in records:
+        if not _canonical_warning_filter(record):
+            return None
+    default_action: object = getattr(warnings, "defaultaction", None)
+    if type(default_action) is not str or default_action not in (
+        "error",
+        "ignore",
+        "always",
+        "default",
+        "module",
+        "once",
+    ):
+        return None
+    original_showwarning: object = getattr(warnings, "_showwarning_orig", None)
+    showwarning: object = warnings.showwarning
+    if original_showwarning is None or showwarning is not original_showwarning:
+        return None
+    dispatcher: object = getattr(warnings, "_showwarnmsg", None)
+    if _STDLIB_SHOWWARNMSG is None or dispatcher is not _STDLIB_SHOWWARNMSG:
+        return None
+    impl: object = getattr(warnings, "_showwarnmsg_impl", None)
+    if not isinstance(impl, types.BuiltinFunctionType):
+        return None
+    owner: object = getattr(impl, "__self__", None)
+    owner_type: object = type(owner)
+    if owner_type is not list or impl != getattr(owner, "append", None):
+        return None
+    return _ParseWarningContext(
+        default_action,
+        records,
+        warnings.filters,
+        showwarning,
+        _STDLIB_SHOWWARNMSG,
+        impl,
+    )
+
+
+def _same_context(a: _ParseWarningContext, b: _ParseWarningContext) -> bool:
+    """Return whether two admitted warnings-context snapshots are unchanged."""
+
+    return (
+        a.default_action == b.default_action
+        and a.filters == b.filters
+        and a.filters_list is b.filters_list
+        and a.showwarning is b.showwarning
+        and a.showwarnmsg is b.showwarnmsg
+        and a.impl == b.impl
+    )
+
+
 @dataclass
 class _DocsProxyMemo:
-    """Keep successful and unavailable imported-proxy batches within one audit."""
+    """Keep successful and unavailable imported-proxy batches within one audit.
+
+    The same per-operation lifetime holds bounded reuse of imported-source syntax
+    trees through :func:`_parse_imported_source`. ``parse_budget`` is fixed when the
+    memo is constructed, ``parse_context`` snapshots the admitted warnings context
+    (``None`` when not admitted), ``parsed_imported_sources`` maps exact imported
+    source text to its completed default-argument parse tree in least-recently-used
+    order, and ``parsed_imported_source_chars`` is the total retained key length.
+    """
 
     results: dict[_DocsProxyKey, frozenset[str]] = field(
         default_factory=dict[_DocsProxyKey, frozenset[str]]
     )
     unavailable: set[_DocsProxyKey] = field(default_factory=set[_DocsProxyKey])
+    parse_budget: _ImportedParseBudget = field(default_factory=_ImportedParseBudget)
+    parse_context: _ParseWarningContext | None = field(
+        default_factory=_admitted_parse_warning_context
+    )
+    parsed_imported_sources: dict[str, ast.Module] = field(default_factory=dict[str, ast.Module])
+    parsed_imported_source_chars: int = 0
+
+
+def _parse_imported_source(source: str, memo: _DocsProxyMemo) -> ast.Module:
+    """Return ``ast.parse(source)``, reusing byte-identical imported text within one memo.
+
+    Only the four imported-module parse sites call this, each previously
+    ``ast.parse(<str>)`` with default arguments, so the exact text is the whole key.
+    The order is fixed: a disabled budget (any non-positive field) parses
+    authentically before anything else; a context that is unadmitted or differs
+    from the memo snapshot parses authentically without reading or writing the
+    cache; a hit refreshes least-recently-used order; a miss parses, and the result
+    is stored only if the context still matches after the parse, the text fits both
+    the entry and the total budget, and older entries have been evicted to make
+    room. Oversized text is returned unstored without eviction. Exceptions
+    propagate and nothing is stored, so a failed or in-progress parse is never
+    reused.
+
+    A returned tree is borrowed, read-only, for the memo's lifetime: no consumer
+    may mutate it, key state on its node identity, or let a node escape into a
+    stored result. Import resolution, plugins, fixtures and ambiguity stay with each
+    caller's own filename and repository root; a shared tree carries syntax only.
+
+    Args:
+        source: The exact imported module source text.
+        memo: The current bounded operation's memo.
+
+    Returns:
+        The parse tree of ``source``.
+    """
+
+    budget = memo.parse_budget
+    if budget.max_entries <= 0 or budget.max_total_chars <= 0 or budget.max_entry_chars <= 0:
+        return ast.parse(source)
+    snapshot = memo.parse_context
+    now = _admitted_parse_warning_context()
+    if snapshot is None or now is None or not _same_context(now, snapshot):
+        return ast.parse(source)
+    cache = memo.parsed_imported_sources
+    cached = cache.pop(source, None)
+    if cached is not None:
+        cache[source] = cached
+        return cached
+    tree = ast.parse(source)
+    now = _admitted_parse_warning_context()
+    if now is None or not _same_context(now, snapshot):
+        return tree
+    size = len(source)
+    if size > budget.max_entry_chars or size > budget.max_total_chars:
+        return tree
+    while cache and (
+        len(cache) >= budget.max_entries
+        or memo.parsed_imported_source_chars + size > budget.max_total_chars
+    ):
+        oldest = next(iter(cache))
+        del cache[oldest]
+        memo.parsed_imported_source_chars -= len(oldest)
+    cache[source] = tree
+    memo.parsed_imported_source_chars += size
+    return tree
 
 
 def _memoised_proxy_docs_readers(
@@ -2663,7 +2896,7 @@ def _repository_imported_fixture_analyses(
             ambiguous.update(alias.asname or alias.name for alias in statement.names)
             continue
         source_path = next(iter(candidates))
-        imported_tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        imported_tree = _parse_imported_source(source_path.read_text(encoding="utf-8"), memo)
         (
             fixture_aliases,
             ambiguous_fixture_aliases,
@@ -2731,7 +2964,7 @@ def _repository_imported_fixture_analyses(
             continue
         source_path = next(iter(candidates))
         source = source_path.read_text(encoding="utf-8")
-        imported_tree = ast.parse(source)
+        imported_tree = _parse_imported_source(source, memo)
         (
             fixture_aliases,
             ambiguous_fixture_aliases,
@@ -3009,7 +3242,7 @@ def _repository_imported_function_analyses(
     def add_module_members(module_alias: str, source_path: Path, members: set[str]) -> None:
         """Expose local module members through one explicitly imported alias."""
 
-        imported_tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        imported_tree = _parse_imported_source(source_path.read_text(encoding="utf-8"), memo)
         function_nodes = [
             node
             for node in imported_tree.body
@@ -3130,7 +3363,7 @@ def _repository_imported_function_analyses(
                 ambiguous.update(imported.asname or imported.name for imported in statement.names)
             continue
         source_path = candidates.pop()
-        imported_tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        imported_tree = _parse_imported_source(source_path.read_text(encoding="utf-8"), memo)
         function_nodes = [
             node
             for node in imported_tree.body
@@ -6699,6 +6932,1123 @@ def test_batched_imported_function_memo_observes_edits_and_resolution_boundaries
     assert docs_answer[0]
     assert root_docs_answer[0]
     assert root_config_answer == (False, False)
+
+
+_AUTHENTIC_AST_PARSE = ast.parse
+_AnyAstParse = collections.abc.Callable[..., ast.AST]
+_ParseOutcome = tuple[str, frozenset[str]] | tuple[str, str, str]
+_INVALID_SYNTAX_OUTCOME = ("raised", "SyntaxError", "invalid syntax (<unknown>, line 1)")
+_INVALID_ESCAPE_OUTCOME = (
+    "raised",
+    "SyntaxError",
+    "invalid escape sequence '\\d' (<unknown>, line 1)",
+)
+_FIXMOD_SOURCE = (
+    "import pytest\nfrom pathlib import Path\n\n\n"
+    "@pytest.fixture\ndef docs_fixture():\n    return Path('docs/fixture.md').read_text()\n"
+)
+_PLUGMOD_SOURCE = (
+    "import pytest\nfrom pathlib import Path\n\n\n"
+    "@pytest.fixture\ndef plugin_docs():\n    return Path('docs/plugin.md').read_text()\n"
+)
+_MEMBERS_SOURCE = (
+    "from pathlib import Path\n\n\n"
+    "def read_member():\n    return Path('docs/member.md').read_text()\n"
+)
+_SCOPED_SOURCE = (
+    "from pathlib import Path\n\n\n"
+    "def scoped_reader():\n    return Path('docs/scoped.md').read_text()\n"
+)
+_HELPER_SOURCE = "from leaf import leaf\n\ndef helper():\n    return leaf()\n"
+_DOCS_LEAF_SOURCE = (
+    "from pathlib import Path\n\ndef leaf():\n    return Path('docs/x.md').read_text()\n"
+)
+_CONFIG_LEAF_SOURCE = "def leaf():\n    return 'config'\n"
+_BROKEN_SOURCE = "def broken(:\n"
+_BROKEN_IMPORTER = "from broken import broken\n\n\ndef test_broken():\n    assert broken()\n"
+_WARN_SOURCE = "VALUE = '\\d'\n"
+_WARN_IMPORTER = "from warn_mod import VALUE\n\n\ndef test_value():\n    assert VALUE\n"
+_PARSE_A = "a = 1\n"
+_PARSE_B = "b = 22\n"
+_PARSE_C = "c = 333\n"
+_PARSE_D = "d = 4444\n"
+_IMPORTED_PARSE_IMPORTERS: tuple[tuple[str, str, frozenset[str]], ...] = (
+    (
+        "test_fix_a.py",
+        "from fixmod import docs_fixture\n\n\n"
+        "def test_fix(docs_fixture):\n    assert docs_fixture\n",
+        frozenset({"test_fix"}),
+    ),
+    (
+        "test_fix_b.py",
+        "from fixmod import docs_fixture\n\n\ndef test_unused():\n    assert True\n",
+        frozenset(),
+    ),
+    (
+        "test_plug_a.py",
+        "pytest_plugins = ['plugmod']\n\n\ndef test_plug(plugin_docs):\n    assert plugin_docs\n",
+        frozenset({"test_plug"}),
+    ),
+    (
+        "test_plug_b.py",
+        "pytest_plugins = ['plugmod']\n\n\ndef test_plain():\n    assert True\n",
+        frozenset(),
+    ),
+    (
+        "test_member_a.py",
+        "import members\n\n\ndef test_member():\n    assert members.read_member()\n",
+        frozenset({"test_member"}),
+    ),
+    (
+        "test_member_b.py",
+        "import members\n\n\ndef test_plain():\n    assert True\n",
+        frozenset(),
+    ),
+    (
+        "test_scoped_a.py",
+        "def test_scoped():\n    from scoped import scoped_reader\n\n    assert scoped_reader()\n",
+        frozenset({"test_scoped"}),
+    ),
+    (
+        "test_scoped_b.py",
+        "def test_scoped_again():\n    from scoped import scoped_reader\n\n"
+        "    assert scoped_reader()\n",
+        frozenset({"test_scoped_again"}),
+    ),
+    (
+        "test_importer_local.py",
+        "from pkg_a.helper import helper as helper_a\n"
+        "from pkg_b.helper import helper as helper_b\n\n"
+        "def test_a():\n    assert helper_a()\n\n"
+        "def test_b():\n    assert helper_b()\n",
+        frozenset({"test_a"}),
+    ),
+)
+_AUTHENTIC_CORPUS_PARSE_COUNTS = {"fixmod": 4, "plugmod": 2, "members": 2, "scoped": 2, "helper": 4}
+_CACHED_CORPUS_PARSE_COUNTS = {"fixmod": 1, "plugmod": 1, "members": 1, "scoped": 1, "helper": 1}
+
+
+@dataclass
+class _ImportedParseCounter:
+    """Real-parser call counts for tracked imported texts in the #1022 reuse proofs."""
+
+    tracked: frozenset[str]
+    counts: Counter[str] = field(default_factory=Counter[str])
+    non_default_calls: list[str] = field(default_factory=list[str])
+
+
+def _imported_parse_counter(
+    monkeypatch: pytest.MonkeyPatch, tracked: Iterable[str]
+) -> _ImportedParseCounter:
+    """Wrap the real ``ast.parse`` and count calls whose first argument is tracked text."""
+
+    counter = _ImportedParseCounter(frozenset(tracked))
+    forward: _AnyAstParse = _AUTHENTIC_AST_PARSE
+
+    def counting(source: str | bytes, *args: object, **kwargs: object) -> ast.AST:
+        if isinstance(source, str) and source in counter.tracked:
+            counter.counts[source] += 1
+            if args or kwargs:
+                counter.non_default_calls.append(source)
+        return forward(source, *args, **kwargs)
+
+    monkeypatch.setattr(ast, "parse", counting)
+    return counter
+
+
+def _analysis_outcome(
+    source: str, filename: str, root: Path, memo: _DocsProxyMemo
+) -> _ParseOutcome:
+    """Return one memo-threaded analysis outcome as a comparable value."""
+
+    try:
+        readers = _docs_reading_test_modules_with_memo(source, filename, root, memo)
+    except (AssertionError, SyntaxError, ValueError, RuntimeError) as exc:
+        return ("raised", type(exc).__name__, str(exc))
+    return ("ok", frozenset(readers))
+
+
+def _helper_outcome(source: str, memo: _DocsProxyMemo) -> tuple[str, str]:
+    """Return one direct imported-parse helper outcome as a comparable value."""
+
+    try:
+        tree = _parse_imported_source(source, memo)
+    except (SyntaxError, ValueError, RuntimeError) as exc:
+        return (type(exc).__name__, str(exc))
+    return ("ok", ast.dump(tree, include_attributes=True))
+
+
+def _authentic_parse_outcome(source: str) -> tuple[str, str]:
+    """Return the unpatched parser's outcome in the current warnings context."""
+
+    try:
+        tree = _AUTHENTIC_AST_PARSE(source)
+    except (SyntaxError, ValueError, RuntimeError) as exc:
+        return (type(exc).__name__, str(exc))
+    return ("ok", ast.dump(tree, include_attributes=True))
+
+
+def _assert_parse_memo_truthful(memo: _DocsProxyMemo) -> None:
+    """Assert the imported-parse memo invariants I1-I4 for every retained entry."""
+
+    cache = memo.parsed_imported_sources
+    budget = memo.parse_budget
+    assert memo.parsed_imported_source_chars == sum(len(key) for key in cache)
+    if min(budget.max_entries, budget.max_total_chars, budget.max_entry_chars) > 0:
+        assert len(cache) <= budget.max_entries
+        assert memo.parsed_imported_source_chars <= budget.max_total_chars
+    for key, tree in cache.items():
+        assert ast.dump(tree, include_attributes=True) == ast.dump(
+            _AUTHENTIC_AST_PARSE(key), include_attributes=True
+        )
+
+
+def _write_imported_parse_corpus(root: Path) -> dict[str, str]:
+    """Write the finite imported-module corpus and return its tracked texts by name."""
+
+    files = {
+        "fixmod.py": _FIXMOD_SOURCE,
+        "plugmod.py": _PLUGMOD_SOURCE,
+        "members.py": _MEMBERS_SOURCE,
+        "scoped.py": _SCOPED_SOURCE,
+        "pkg_a/helper.py": _HELPER_SOURCE,
+        "pkg_b/helper.py": _HELPER_SOURCE,
+        "pkg_a/leaf.py": _DOCS_LEAF_SOURCE,
+        "pkg_b/leaf.py": _CONFIG_LEAF_SOURCE,
+    }
+    for relative, text in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return {
+        "fixmod": _FIXMOD_SOURCE,
+        "plugmod": _PLUGMOD_SOURCE,
+        "members": _MEMBERS_SOURCE,
+        "scoped": _SCOPED_SOURCE,
+        "helper": _HELPER_SOURCE,
+    }
+
+
+def _direct_parse_memo(
+    max_entries: int, max_total_chars: int, max_entry_chars: int
+) -> _DocsProxyMemo:
+    """Return a memo with one explicit imported-parse budget."""
+
+    return _DocsProxyMemo(
+        parse_budget=_ImportedParseBudget(max_entries, max_total_chars, max_entry_chars)
+    )
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_matches_authentic_parsing_on_fixture_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reused imported parses preserve every corpus outcome with one parse per text."""
+
+    tracked = _write_imported_parse_corpus(tmp_path)
+    counter = _imported_parse_counter(monkeypatch, tracked.values())
+    expected: list[_ParseOutcome] = [("ok", readers) for _, _, readers in _IMPORTED_PARSE_IMPORTERS]
+    with warnings.catch_warnings(record=True):
+        authentic_memo = _DocsProxyMemo(parse_budget=_ImportedParseBudget(max_entries=0))
+        authentic = [
+            _analysis_outcome(source, f"tests/{name}", tmp_path, authentic_memo)
+            for name, source, _ in _IMPORTED_PARSE_IMPORTERS
+        ]
+        authentic_counts = {name: counter.counts[text] for name, text in tracked.items()}
+        counter.counts.clear()
+        cached_memo = _DocsProxyMemo()
+        assert cached_memo.parse_context is not None
+        cached = [
+            _analysis_outcome(source, f"tests/{name}", tmp_path, cached_memo)
+            for name, source, _ in _IMPORTED_PARSE_IMPORTERS
+        ]
+        cached_counts = {name: counter.counts[text] for name, text in tracked.items()}
+    assert authentic == expected
+    assert cached == expected
+    assert authentic_counts == _AUTHENTIC_CORPUS_PARSE_COUNTS
+    assert cached_counts == _CACHED_CORPUS_PARSE_COUNTS
+    assert counter.non_default_calls == []
+    assert authentic_memo.parsed_imported_sources == {}
+    assert set(cached_memo.parsed_imported_sources) == set(tracked.values()) | {
+        _DOCS_LEAF_SOURCE,
+        _CONFIG_LEAF_SOURCE,
+    }
+    importer_sources = {source for _, source, _ in _IMPORTED_PARSE_IMPORTERS}
+    for key in cached_memo.parsed_imported_sources:
+        assert "def test_import_direct" not in key
+        assert key not in importer_sources
+    _assert_parse_memo_truthful(cached_memo)
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_hits_and_lru_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hit returns the same tree and refreshes order; the entry cap evicts the oldest."""
+
+    counter = _imported_parse_counter(monkeypatch, (_PARSE_A, _PARSE_B, _PARSE_C))
+    with warnings.catch_warnings(record=True):
+        memo = _direct_parse_memo(2, 100, 100)
+        first_a = _parse_imported_source(_PARSE_A, memo)
+        _parse_imported_source(_PARSE_B, memo)
+        assert list(memo.parsed_imported_sources) == [_PARSE_A, _PARSE_B]
+        assert memo.parsed_imported_source_chars == 13
+        _assert_parse_memo_truthful(memo)
+        assert _parse_imported_source(_PARSE_A, memo) is first_a
+        assert list(memo.parsed_imported_sources) == [_PARSE_B, _PARSE_A]
+        assert counter.counts[_PARSE_A] == 1
+        _assert_parse_memo_truthful(memo)
+        _parse_imported_source(_PARSE_C, memo)
+        assert list(memo.parsed_imported_sources) == [_PARSE_A, _PARSE_C]
+        assert memo.parsed_imported_source_chars == 14
+        _assert_parse_memo_truthful(memo)
+        _parse_imported_source(_PARSE_B, memo)
+        assert counter.counts[_PARSE_B] == 2
+        assert list(memo.parsed_imported_sources) == [_PARSE_C, _PARSE_B]
+        assert memo.parsed_imported_source_chars == 15
+        _assert_parse_memo_truthful(memo)
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_entry_and_char_eviction_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The total-character budget evicts to an exact fit; the entry budget bypasses."""
+
+    counter = _imported_parse_counter(monkeypatch, (_PARSE_D,))
+    with warnings.catch_warnings(record=True):
+        memo = _direct_parse_memo(64, 15, 15)
+        _parse_imported_source(_PARSE_A, memo)
+        _parse_imported_source(_PARSE_B, memo)
+        assert memo.parsed_imported_source_chars == 13
+        _parse_imported_source(_PARSE_C, memo)
+        assert list(memo.parsed_imported_sources) == [_PARSE_B, _PARSE_C]
+        assert memo.parsed_imported_source_chars == 15
+        _assert_parse_memo_truthful(memo)
+        entry_memo = _direct_parse_memo(64, 100, 8)
+        _parse_imported_source(_PARSE_C, entry_memo)
+        assert list(entry_memo.parsed_imported_sources) == [_PARSE_C]
+        assert entry_memo.parsed_imported_source_chars == 8
+        _parse_imported_source(_PARSE_D, entry_memo)
+        _parse_imported_source(_PARSE_D, entry_memo)
+        assert list(entry_memo.parsed_imported_sources) == [_PARSE_C]
+        assert entry_memo.parsed_imported_source_chars == 8
+        assert counter.counts[_PARSE_D] == 2
+        _assert_parse_memo_truthful(entry_memo)
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_oversize_and_disabled_budgets_parse_authentically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oversized text bypasses without eviction; any non-positive budget field disables."""
+
+    counter = _imported_parse_counter(monkeypatch, (_PARSE_A,))
+    with warnings.catch_warnings(record=True):
+        fresh = _direct_parse_memo(64, 7, 100)
+        _parse_imported_source(_PARSE_C, fresh)
+        assert fresh.parsed_imported_sources == {}
+        assert fresh.parsed_imported_source_chars == 0
+        held = _direct_parse_memo(64, 7, 100)
+        _parse_imported_source(_PARSE_A, held)
+        _parse_imported_source(_PARSE_C, held)
+        assert list(held.parsed_imported_sources) == [_PARSE_A]
+        assert held.parsed_imported_source_chars == 6
+        _assert_parse_memo_truthful(held)
+        _parse_imported_source(_PARSE_B, held)
+        assert list(held.parsed_imported_sources) == [_PARSE_B]
+        assert held.parsed_imported_source_chars == 7
+        _assert_parse_memo_truthful(held)
+        disabled_budgets = [
+            budget
+            for value in (0, -1)
+            for budget in (
+                _ImportedParseBudget(max_entries=value),
+                _ImportedParseBudget(max_total_chars=value),
+                _ImportedParseBudget(max_entry_chars=value),
+            )
+        ]
+        authentic_a = ast.dump(_AUTHENTIC_AST_PARSE(_PARSE_A), include_attributes=True)
+        for budget in disabled_budgets:
+            disabled = _DocsProxyMemo(parse_budget=budget)
+            before = counter.counts[_PARSE_A]
+            _parse_imported_source(_PARSE_A, disabled)
+            _parse_imported_source(_PARSE_A, disabled)
+            assert counter.counts[_PARSE_A] - before == 2
+            assert disabled.parsed_imported_sources == {}
+            assert disabled.parsed_imported_source_chars == 0
+            # Disabled-first: an intentionally invalid seed is neither read nor
+            # rewritten, so I4 truthfulness is deliberately not applied to it.
+            seeded = _DocsProxyMemo(parse_budget=budget)
+            seed_tree = _AUTHENTIC_AST_PARSE("")
+            seeded.parsed_imported_sources[_PARSE_A] = seed_tree
+            seeded.parsed_imported_source_chars = 6
+            before = counter.counts[_PARSE_A]
+            tree = _parse_imported_source(_PARSE_A, seeded)
+            assert ast.dump(tree, include_attributes=True) == authentic_a
+            assert counter.counts[_PARSE_A] - before == 1
+            assert list(seeded.parsed_imported_sources) == [_PARSE_A]
+            assert seeded.parsed_imported_sources[_PARSE_A] is seed_tree
+            assert seeded.parsed_imported_source_chars == 6
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_hands_out_unmutated_trees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every hand-out and every retained tree still matches a pristine authentic parse."""
+
+    tracked = _write_imported_parse_corpus(tmp_path)
+    original_helper = _parse_imported_source
+    pristine: dict[str, str] = {}
+    handouts: Counter[str] = Counter()
+    violations: list[str] = []
+
+    def checking(source: str, memo: _DocsProxyMemo) -> ast.Module:
+        tree = original_helper(source, memo)
+        if source not in pristine:
+            pristine[source] = ast.dump(_AUTHENTIC_AST_PARSE(source), include_attributes=True)
+        handouts[source] += 1
+        if ast.dump(tree, include_attributes=True) != pristine[source]:
+            violations.append(source)
+        return tree
+
+    monkeypatch.setattr(sys.modules[__name__], "_parse_imported_source", checking)
+    with warnings.catch_warnings(record=True):
+        memo = _DocsProxyMemo()
+        for name, source, readers in _IMPORTED_PARSE_IMPORTERS:
+            assert _analysis_outcome(source, f"tests/{name}", tmp_path, memo) == ("ok", readers)
+            assert violations == []
+            for key, tree in memo.parsed_imported_sources.items():
+                assert ast.dump(tree, include_attributes=True) == pristine[key]
+    assert {name: handouts[text] >= 2 for name, text in tracked.items()} == dict.fromkeys(
+        tracked, True
+    )
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_observes_source_edits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-length edit past the first 64 characters is a new key and a fresh parse."""
+
+    tree_original = "# " + "p" * 70 + "\nfrom pathlib import Path\nDOC = Path('docs/e.md')\n"
+    tree_edited = tree_original.replace("docs/", "conf/")
+    assert len(tree_edited) == len(tree_original)
+    assert tree_original.index("docs/") > 64
+    tree_module = tmp_path / "tree_edit_mod.py"
+    tree_first_importer = (
+        "from tree_edit_mod import DOC\n\ndef test_tree_edit():\n    assert DOC.read_text()\n"
+    )
+    tree_second_importer = (
+        "from tree_edit_mod import DOC\n\ndef test_tree_edit_again():\n    assert DOC.read_text()\n"
+    )
+    for tree_budget in (_ImportedParseBudget(max_entries=0), _ImportedParseBudget()):
+        tree_module.write_text(tree_original, encoding="utf-8")
+        with warnings.catch_warnings(record=True):
+            tree_memo = _DocsProxyMemo(parse_budget=tree_budget)
+            assert _analysis_outcome(
+                tree_first_importer, "tests/test_tree_a.py", tmp_path, tree_memo
+            ) == ("ok", frozenset({"test_tree_edit"}))
+            tree_module.write_text(tree_edited, encoding="utf-8")
+            assert _analysis_outcome(
+                tree_second_importer, "tests/test_tree_b.py", tmp_path, tree_memo
+            ) == ("ok", frozenset())
+
+    original = (
+        "# "
+        + "p" * 70
+        + "\nfrom pathlib import Path\n\n\ndef edit_reader():\n"
+        + "    return Path('docs/e.md').read_text()\n"
+    )
+    edited = original.replace("docs/", "conf/")
+    assert len(edited) == len(original)
+    assert original.index("docs/") > 64
+    module = tmp_path / "edit_mod.py"
+    module.write_text(original, encoding="utf-8")
+    first_importer = (
+        "from edit_mod import edit_reader\n\n\ndef test_edit():\n    assert edit_reader()\n"
+    )
+    second_importer = (
+        "from edit_mod import edit_reader\n\n\ndef test_edit_again():\n    assert edit_reader()\n"
+    )
+    counter = _imported_parse_counter(monkeypatch, (original, edited))
+    with warnings.catch_warnings(record=True):
+        memo = _DocsProxyMemo()
+        assert _analysis_outcome(first_importer, "tests/test_edit_a.py", tmp_path, memo) == (
+            "ok",
+            frozenset({"test_edit"}),
+        )
+        assert counter.counts[original] == 1
+        module.write_text(edited, encoding="utf-8")
+        assert _analysis_outcome(second_importer, "tests/test_edit_b.py", tmp_path, memo) == (
+            "ok",
+            frozenset(),
+        )
+        assert counter.counts[edited] == 1
+        assert _docs_reading_test_modules(first_importer, "tests/test_edit_a.py", tmp_path) == set()
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_never_retains_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Syntax and injected parser failures are re-raised and never stored."""
+
+    good = "def good():\n    return 'config'\n"
+    broken_good = "def good(:\n"
+    fixed_good = "def good():\n    return 'fixed'\n"
+    good_importer = "from good import good\n\n\ndef test_good():\n    assert good()\n"
+    (tmp_path / "broken.py").write_text(_BROKEN_SOURCE, encoding="utf-8")
+    good_path = tmp_path / "good.py"
+    good_path.write_text(good, encoding="utf-8")
+    counter = _imported_parse_counter(monkeypatch, (_BROKEN_SOURCE, good, broken_good, fixed_good))
+    with warnings.catch_warnings(record=True):
+        memo = _DocsProxyMemo()
+        outcomes = [
+            _analysis_outcome(_BROKEN_IMPORTER, "tests/test_broken.py", tmp_path, memo)
+            for _ in range(2)
+        ]
+        assert outcomes == [_INVALID_SYNTAX_OUTCOME, _INVALID_SYNTAX_OUTCOME]
+        assert counter.counts[_BROKEN_SOURCE] == 2
+        assert _BROKEN_SOURCE not in memo.parsed_imported_sources
+        assert memo.parsed_imported_source_chars == 0
+        assert _analysis_outcome(good_importer, "tests/test_good.py", tmp_path, memo) == (
+            "ok",
+            frozenset(),
+        )
+        assert good in memo.parsed_imported_sources
+        good_path.write_text(broken_good, encoding="utf-8")
+        assert (
+            _analysis_outcome(good_importer, "tests/test_good.py", tmp_path, memo)
+            == _INVALID_SYNTAX_OUTCOME
+        )
+        assert list(memo.parsed_imported_sources) == [good]
+        _assert_parse_memo_truthful(memo)
+        good_path.write_text(fixed_good, encoding="utf-8")
+        assert _analysis_outcome(good_importer, "tests/test_good.py", tmp_path, memo) == (
+            "ok",
+            frozenset(),
+        )
+        assert counter.counts[fixed_good] == 1
+        assert fixed_good in memo.parsed_imported_sources
+        _assert_parse_memo_truthful(memo)
+
+    injected = "def injected():\n    return 'config'\n"
+    (tmp_path / "injected.py").write_text(injected, encoding="utf-8")
+    injected_importer = (
+        "from injected import injected\n\n\ndef test_injected():\n    assert injected()\n"
+    )
+    forward: _AnyAstParse = _AUTHENTIC_AST_PARSE
+    attempts = 0
+
+    def injecting(source: str | bytes, *args: object, **kwargs: object) -> ast.AST:
+        nonlocal attempts
+        if source == injected:
+            attempts += 1
+            raise RuntimeError("injected")
+        return forward(source, *args, **kwargs)
+
+    monkeypatch.setattr(ast, "parse", injecting)
+    with warnings.catch_warnings(record=True):
+        injected_memo = _DocsProxyMemo()
+        injected_outcomes = [
+            _analysis_outcome(injected_importer, "tests/test_injected.py", tmp_path, injected_memo)
+            for _ in range(2)
+        ]
+    assert injected_outcomes == [("raised", "RuntimeError", "injected")] * 2
+    assert attempts == 2
+    assert injected not in injected_memo.parsed_imported_sources
+    _assert_parse_memo_truthful(injected_memo)
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_releases_state_after_each_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every public operation's memo is released after return or raise."""
+
+    refs: list[weakref.ref[_DocsProxyMemo]] = []
+
+    @dataclass
+    class _RecordingMemo(_DocsProxyMemo):
+        """Memo double that records a weak reference to every instance."""
+
+        def __post_init__(self) -> None:
+            refs.append(weakref.ref(self))
+
+    _write_imported_parse_corpus(tmp_path)
+    (tmp_path / "broken.py").write_text(_BROKEN_SOURCE, encoding="utf-8")
+    counter = _imported_parse_counter(monkeypatch, (_FIXMOD_SOURCE,))
+    monkeypatch.setattr(sys.modules[__name__], "_DocsProxyMemo", _RecordingMemo)
+    _, importer, readers = _IMPORTED_PARSE_IMPORTERS[0]
+    per_call_counts: list[int] = []
+    raised: str | None = None
+    with warnings.catch_warnings(record=True):
+        for _ in range(2):
+            before = counter.counts[_FIXMOD_SOURCE]
+            assert _docs_reading_test_modules(importer, "tests/test_fix_a.py", tmp_path) == readers
+            per_call_counts.append(counter.counts[_FIXMOD_SOURCE] - before)
+        try:
+            _docs_reading_test_modules(_BROKEN_IMPORTER, "tests/test_broken.py", tmp_path)
+        except SyntaxError as exc:
+            raised = str(exc)
+    gc.collect()
+    assert per_call_counts == [1, 1]
+    assert raised == _INVALID_SYNTAX_OUTCOME[2]
+    assert len(refs) == 3
+    assert [ref() is None for ref in refs] == [True, True, True]
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_preserves_parse_warning_failures(tmp_path: Path) -> None:
+    """Warnings-as-errors still fail; only the record count of reused parses shrinks."""
+
+    (tmp_path / "warn_mod.py").write_text(_WARN_SOURCE, encoding="utf-8")
+    budgets = {"authentic": _ImportedParseBudget(max_entries=0), "cached": _ImportedParseBudget()}
+    errors: dict[str, tuple[list[_ParseOutcome], dict[str, ast.Module]]] = {}
+    recorded: dict[str, tuple[_ParseOutcome, int]] = {}
+    for label, budget in budgets.items():
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            memo = _DocsProxyMemo(parse_budget=budget)
+            outcomes = [
+                _analysis_outcome(_WARN_IMPORTER, "tests/test_warn.py", tmp_path, memo)
+                for _ in range(2)
+            ]
+        errors[label] = (outcomes, dict(memo.parsed_imported_sources))
+    for label, budget in budgets.items():
+        with warnings.catch_warnings(record=True) as log:
+            warnings.simplefilter("always")
+            memo = _DocsProxyMemo(parse_budget=budget)
+            outcome = _analysis_outcome(_WARN_IMPORTER, "tests/test_warn.py", tmp_path, memo)
+        recorded[label] = (outcome, len(log))
+    assert errors["cached"] == errors["authentic"]
+    escape_outcome = errors["authentic"][0][0]
+    assert errors["authentic"] == ([escape_outcome] * 2, dict[str, ast.Module]())
+    assert len(escape_outcome) == 3
+    assert escape_outcome[0] == "raised"
+    assert escape_outcome[1] == "SyntaxError"
+    assert escape_outcome[2].endswith(" (<unknown>, line 1)")
+    assert "invalid escape sequence" in escape_outcome[2]
+    assert "\\d" in escape_outcome[2]
+    assert sys.version_info[:2] != (3, 11) or errors == dict.fromkeys(
+        budgets, ([_INVALID_ESCAPE_OUTCOME] * 2, dict[str, ast.Module]())
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(SyntaxError) as escape_info:
+            _AUTHENTIC_AST_PARSE(_WARN_SOURCE)
+    assert type(escape_info.value) is SyntaxError
+    assert (escape_info.value.filename, escape_info.value.lineno, escape_info.value.text) == (
+        "<unknown>",
+        1,
+        _WARN_SOURCE,
+    )
+    assert str(escape_info.value) == escape_outcome[2]
+    assert recorded == {"authentic": (("ok", frozenset()), 2), "cached": (("ok", frozenset()), 1)}
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_rechecks_warning_context_before_hit(tmp_path: Path) -> None:
+    """A same-length filter change to ``error`` reaches the parser before any hit.
+
+    An ``error`` filter whose category is an ``ABCMeta`` ``Warning`` subclass is
+    never admitted, so a later public ``register()`` of the category the parser
+    actually emits, which makes the parser warning match without changing any
+    filter record, still yields the authentic ``SyntaxError`` and nothing is
+    retained under the dynamic category.
+    """
+
+    (tmp_path / "warn_mod.py").write_text(_WARN_SOURCE, encoding="utf-8")
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        memo = _DocsProxyMemo()
+        authentic_memo = _DocsProxyMemo(parse_budget=_ImportedParseBudget(max_entries=0))
+        for warm_memo in (memo, authentic_memo):
+            assert _analysis_outcome(_WARN_IMPORTER, "tests/test_warn.py", tmp_path, warm_memo) == (
+                "ok",
+                frozenset(),
+            )
+        keys_before = list(memo.parsed_imported_sources)
+        chars_before = memo.parsed_imported_source_chars
+        assert _WARN_SOURCE in keys_before
+        saved = warnings.filters[0]
+        length = len(warnings.filters)
+        warnings.simplefilter("error")
+        cast(list[object], warnings.filters).remove(saved)
+        assert len(warnings.filters) == length
+        cached = _analysis_outcome(_WARN_IMPORTER, "tests/test_warn.py", tmp_path, memo)
+        authentic = _analysis_outcome(
+            _WARN_IMPORTER, "tests/test_warn.py", tmp_path, authentic_memo
+        )
+    assert cached == authentic
+    assert len(cached) == 3
+    assert cached[0] == "raised"
+    assert cached[1] == "SyntaxError"
+    assert cached[2].endswith(" (<unknown>, line 1)")
+    assert "invalid escape sequence" in cached[2]
+    assert "\\d" in cached[2]
+    assert sys.version_info[:2] != (3, 11) or cached == _INVALID_ESCAPE_OUTCOME
+    assert list(memo.parsed_imported_sources) == keys_before
+    assert memo.parsed_imported_source_chars == chars_before
+
+    class _DynamicWarning(Warning, metaclass=abc.ABCMeta):
+        """A warning category whose subclass relation changes by public registration."""
+
+    with warnings.catch_warnings(record=True) as category_probe:
+        warnings.simplefilter("always")
+        _AUTHENTIC_AST_PARSE(_WARN_SOURCE)
+    observed = [w.category for w in category_probe]
+    assert len(observed) == 1
+    observed_category = observed[0]
+    assert type(observed_category) is type
+    assert observed_category is DeprecationWarning or observed_category is SyntaxWarning
+    assert sys.version_info[:2] != (3, 11) or observed_category is DeprecationWarning
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        warnings.filterwarnings("error", category=_DynamicWarning)
+        dynamic_memo = _DocsProxyMemo()
+        dynamic_authentic_memo = _DocsProxyMemo(parse_budget=_ImportedParseBudget(max_entries=0))
+        assert _admitted_parse_warning_context() is None
+        assert dynamic_memo.parse_context is None
+        expected_ok = ("ok", ast.dump(_AUTHENTIC_AST_PARSE(_WARN_SOURCE), include_attributes=True))
+        before = [
+            _helper_outcome(_WARN_SOURCE, dynamic_memo),
+            _helper_outcome(_WARN_SOURCE, dynamic_authentic_memo),
+        ]
+        authentic_before = _authentic_parse_outcome(_WARN_SOURCE)
+        warm_state = (
+            dict(dynamic_memo.parsed_imported_sources),
+            dynamic_memo.parsed_imported_source_chars,
+        )
+        _DynamicWarning.register(observed_category)
+        after = [
+            _helper_outcome(_WARN_SOURCE, dynamic_memo),
+            _helper_outcome(_WARN_SOURCE, dynamic_authentic_memo),
+        ]
+        authentic_after = _authentic_parse_outcome(_WARN_SOURCE)
+        assert after[0] == after[1]
+        assert authentic_after[0] == "SyntaxError"
+        assert authentic_after[1].endswith(" (<unknown>, line 1)")
+        assert "invalid escape sequence" in authentic_after[1]
+        assert "\\d" in authentic_after[1]
+        assert sys.version_info[:2] != (3, 11) or after == [
+            _INVALID_ESCAPE_OUTCOME[1:],
+            _INVALID_ESCAPE_OUTCOME[1:],
+        ]
+        with pytest.raises(SyntaxError) as escape_info:
+            _AUTHENTIC_AST_PARSE(_WARN_SOURCE)
+        assert _admitted_parse_warning_context() is None
+    assert type(escape_info.value) is SyntaxError
+    assert (escape_info.value.filename, escape_info.value.lineno, escape_info.value.text) == (
+        "<unknown>",
+        1,
+        _WARN_SOURCE,
+    )
+    assert str(escape_info.value) == authentic_after[1]
+    assert before == [expected_ok, expected_ok]
+    assert before == [authentic_before, authentic_before]
+    assert after == [authentic_after, authentic_after]
+    assert warm_state == ({}, 0)
+    assert dynamic_memo.parsed_imported_sources == {}
+    assert dynamic_memo.parsed_imported_source_chars == 0
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_never_optimises_custom_showwarning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A custom ``showwarning`` sees every authentic parse warning in both modes."""
+
+    (tmp_path / "warn_mod.py").write_text(_WARN_SOURCE, encoding="utf-8")
+    calls = 0
+
+    def handler(
+        message: Warning | str,
+        category: type[Warning],
+        filename: str,
+        lineno: int,
+        file: object = None,
+        line: str | None = None,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("second")
+
+    observed: list[tuple[_ParseOutcome, int, dict[str, ast.Module]]] = []
+    for budget in (_ImportedParseBudget(max_entries=0), _ImportedParseBudget()):
+        calls = 0
+        with warnings.catch_warnings(record=True), monkeypatch.context() as patch:
+            warnings.simplefilter("always")
+            patch.setattr(warnings, "showwarning", handler)
+            memo = _DocsProxyMemo(parse_budget=budget)
+            outcome = _analysis_outcome(_WARN_IMPORTER, "tests/test_warn.py", tmp_path, memo)
+        observed.append((outcome, calls, dict(memo.parsed_imported_sources)))
+    assert observed == [(("raised", "RuntimeError", "second"), 2, {})] * 2
+
+    calls = 0
+    with warnings.catch_warnings(record=True), monkeypatch.context() as patch:
+        warnings.simplefilter("always")
+        warm_memo = _DocsProxyMemo()
+        assert _analysis_outcome(_WARN_IMPORTER, "tests/test_warn.py", tmp_path, warm_memo) == (
+            "ok",
+            frozenset(),
+        )
+        warmed = dict(warm_memo.parsed_imported_sources)
+        warmed_chars = warm_memo.parsed_imported_source_chars
+        assert _WARN_SOURCE in warmed
+        patch.setattr(warnings, "showwarning", handler)
+        switched = _analysis_outcome(_WARN_IMPORTER, "tests/test_warn.py", tmp_path, warm_memo)
+    assert switched == ("raised", "RuntimeError", "second")
+    assert calls == 2
+    assert warm_memo.parsed_imported_sources == warmed
+    assert warm_memo.parsed_imported_source_chars == warmed_chars
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_does_not_store_when_context_changes_during_parse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A warnings change made during the miss parse prevents storage and later hits."""
+
+    source = "changed_during_parse = 1\n"
+    forward: _AnyAstParse = _AUTHENTIC_AST_PARSE
+    real_parses = 0
+
+    def changing(text: str | bytes, *args: object, **kwargs: object) -> ast.AST:
+        nonlocal real_parses
+        tree = forward(text, *args, **kwargs)
+        if text == source:
+            real_parses += 1
+            warnings.simplefilter("ignore")
+        return tree
+
+    monkeypatch.setattr(ast, "parse", changing)
+    with warnings.catch_warnings(record=True):
+        memo = _DocsProxyMemo()
+        assert memo.parse_context is not None
+        tree = _parse_imported_source(source, memo)
+        assert ast.dump(tree, include_attributes=True) == ast.dump(
+            _AUTHENTIC_AST_PARSE(source), include_attributes=True
+        )
+        assert memo.parsed_imported_sources == {}
+        assert memo.parsed_imported_source_chars == 0
+        _parse_imported_source(source, memo)
+    assert real_parses == 2
+    assert memo.parsed_imported_sources == {}
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_unadmitted_layouts_parse_authentically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing, subclassed or replaced warning dispatch layouts never reuse a parse."""
+
+    source = "layout_value = 1\n"
+    expected_dump = ast.dump(_AUTHENTIC_AST_PARSE(source), include_attributes=True)
+    counter = _imported_parse_counter(monkeypatch, (source,))
+
+    class _SubclassedRecord(list[object]):
+        """A recording list subclass that the admission guard must reject."""
+
+    def plain_impl(message: object) -> None:
+        return None
+
+    def replacement_dispatch(message: object) -> None:
+        return None
+
+    observations: dict[str, tuple[bool, int, dict[str, ast.Module], bool]] = {}
+
+    def observe(label: str, memo: _DocsProxyMemo) -> None:
+        before = counter.counts[source]
+        dumps = [
+            ast.dump(_parse_imported_source(source, memo), include_attributes=True)
+            for _ in range(2)
+        ]
+        observations[label] = (
+            memo.parse_context is None,
+            counter.counts[source] - before,
+            dict(memo.parsed_imported_sources),
+            dumps == [expected_dump, expected_dump],
+        )
+
+    default_record = ("default", None, DeprecationWarning, "__main__", 0)
+    exact_str_record = ("ignore", None, UserWarning, "rp_exact_mod", 3)
+    assert _canonical_warning_filter(default_record) is True
+    assert _canonical_warning_filter(exact_str_record) is True
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        warnings.filterwarnings("ignore", message="x", category=UserWarning, module="m", lineno=3)
+        warnings.filterwarnings("error", category=DeprecationWarning)
+        observe("canonical control", _DocsProxyMemo())
+    with warnings.catch_warnings(record=True):
+        for label, record in (("P-default", default_record), ("P-exactstr", exact_str_record)):
+            with monkeypatch.context() as patch:
+                patch.setattr(warnings, "filters", [record])
+                observe(label, _DocsProxyMemo())
+    positives: dict[str, tuple[bool, int, list[str], bool]] = {}
+    for label in ("canonical control", "P-default", "P-exactstr"):
+        unadmitted_flag, parses, stored, dumps_match = observations.pop(label)
+        positives[label] = (unadmitted_flag, parses, list(stored), dumps_match)
+    assert positives == dict.fromkeys(
+        ("canonical control", "P-default", "P-exactstr"), (False, 1, [source], True)
+    )
+
+    with warnings.catch_warnings(record=True), monkeypatch.context() as patch:
+        patch.delattr(warnings, "_showwarnmsg_impl")
+        observe("missing_impl", _DocsProxyMemo())
+    with warnings.catch_warnings(record=True), monkeypatch.context() as patch:
+        patch.setattr(warnings, "_showwarnmsg_impl", _SubclassedRecord().append)
+        observe("list_subclass_impl", _DocsProxyMemo())
+    with warnings.catch_warnings(record=True), monkeypatch.context() as patch:
+        patch.setattr(warnings, "_showwarnmsg_impl", plain_impl)
+        observe("plain_function_impl", _DocsProxyMemo())
+    with warnings.catch_warnings(record=True), monkeypatch.context() as patch:
+        patch.setattr(warnings, "_showwarnmsg", replacement_dispatch)
+        observe("replaced_dispatcher", _DocsProxyMemo())
+    with warnings.catch_warnings(record=True):
+        admitted = _DocsProxyMemo()
+        assert admitted.parse_context is not None
+        with warnings.catch_warnings():
+            observe("nested_without_record", admitted)
+    unadmitted = (True, 2, dict[str, ast.Module](), True)
+    assert observations == {
+        "missing_impl": unadmitted,
+        "list_subclass_impl": unadmitted,
+        "plain_function_impl": unadmitted,
+        "replaced_dispatcher": unadmitted,
+        "nested_without_record": (False, 2, {}, True),
+    }
+
+    class _StrSub(str):
+        """A string subclass that exact-type selector and action guards reject."""
+
+    class _TupleSub(tuple[object, ...]):
+        """A tuple subclass that the exact-tuple record guard rejects."""
+
+    class _CustomMatcher:
+        """A non-pattern object exposing ``match`` that selector guards reject."""
+
+        def match(self, text: str) -> bool:
+            return True
+
+    class _AbcWarning(Warning, metaclass=abc.ABCMeta):
+        """An ``ABCMeta`` warning category the metaclass guard rejects."""
+
+    class _CustomMeta(type):
+        """A custom ``type`` metaclass the metaclass guard rejects."""
+
+    class _MetaWarning(Warning, metaclass=_CustomMeta):
+        """A warning category with a custom metaclass."""
+
+    canonical_records: list[object] = [("always", None, Warning, None, 0)]
+    bytes_pattern = re.compile(b"x")
+    bad_records: list[tuple[str, object]] = [
+        ("G1 list record", ["ignore", None, Warning, None, 0]),
+        ("G1 tuple subclass", _TupleSub(("ignore", None, Warning, None, 0))),
+        ("G1 4-tuple", ("ignore", None, Warning, None)),
+        ("G1 6-tuple", ("ignore", None, Warning, None, 0, 0)),
+        ("G2 int action", (0, None, Warning, None, 0)),
+        ("G2 str-subclass action", (_StrSub("ignore"), None, Warning, None, 0)),
+        ("G2 bogus action", ("bogus", None, Warning, None, 0)),
+        ("G3 plain str message", ("ignore", "x", Warning, None, 0)),
+        ("G3 bytes-pattern message", ("ignore", bytes_pattern, Warning, None, 0)),
+        ("G3 custom matcher message", ("ignore", _CustomMatcher(), Warning, None, 0)),
+        ("G4 str-subclass module", ("ignore", None, Warning, _StrSub("__main__"), 0)),
+        ("G4 bytes-pattern module", ("ignore", None, Warning, bytes_pattern, 0)),
+        ("G4 custom matcher module", ("ignore", None, Warning, _CustomMatcher(), 0)),
+        ("G5 non-class category", ("ignore", None, "Warning", None, 0)),
+        ("G5 non-Warning category", ("ignore", None, int, None, 0)),
+        ("G5 ABCMeta category", ("ignore", None, _AbcWarning, None, 0)),
+        ("G5 custom metaclass category", ("ignore", None, _MetaWarning, None, 0)),
+        ("G6 negative line", ("ignore", None, Warning, None, -1)),
+        ("G6 bool line", ("ignore", None, Warning, None, True)),
+        ("G6 float line", ("ignore", None, Warning, None, 0.0)),
+        ("G6 str line", ("ignore", None, Warning, None, "0")),
+        ("G6 None line", ("ignore", None, Warning, None, None)),
+    ]
+    with warnings.catch_warnings(record=True):
+        for label, bad_record in bad_records:
+            installed: list[object] = [bad_record, *canonical_records]
+            with monkeypatch.context() as patch:
+                patch.setattr(warnings, "filters", installed)
+                observe(label, _DocsProxyMemo())
+    assert {label: observations[label] for label, _ in bad_records} == {
+        label: (True, 2, {}, True) for label, _ in bad_records
+    }
+
+    import _warnings
+
+    assert warnings.warn_explicit is _warnings.warn_explicit
+    with warnings.catch_warnings(record=True) as rec, monkeypatch.context() as patch:
+        patch.setattr(
+            warnings,
+            "filters",
+            [("error", None, UserWarning, "rp_exact_mod", 0), ("ignore", None, Warning, None, 0)],
+        )
+        with pytest.raises(UserWarning):
+            warnings.warn_explicit(
+                "rp", UserWarning, "rp.py", 1, module="rp_exact_mod", registry={}
+            )
+        non_matches = [
+            warnings.warn_explicit("rp", UserWarning, "rp.py", 1, module=name, registry={})
+            for name in ("rp_exact_mod_x", "rp_exact_mo")
+        ]
+    assert non_matches == [None, None]
+    assert rec == []
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_admitted_context_engages_with_declared_residual(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The admitted recording context reuses parses and records fewer repeated warnings."""
+
+    tracked = _write_imported_parse_corpus(tmp_path)
+    (tmp_path / "warn_mod.py").write_text(_WARN_SOURCE, encoding="utf-8")
+    counter = _imported_parse_counter(monkeypatch, (*tracked.values(), _WARN_SOURCE))
+    original_helper = _parse_imported_source
+    handouts: Counter[str] = Counter()
+
+    def counting_helper(source: str, memo: _DocsProxyMemo) -> ast.Module:
+        handouts[source] += 1
+        return original_helper(source, memo)
+
+    monkeypatch.setattr(sys.modules[__name__], "_parse_imported_source", counting_helper)
+    results: dict[str, tuple[bool, list[_ParseOutcome], int, int, int]] = {}
+    corpus: dict[str, tuple[list[_ParseOutcome], dict[str, int]]] = {}
+    for label, budget in (
+        ("authentic", _ImportedParseBudget(max_entries=0)),
+        ("cached", _ImportedParseBudget()),
+    ):
+        counter.counts.clear()
+        handouts.clear()
+        with warnings.catch_warnings(record=True) as log:
+            warnings.simplefilter("always")
+            memo = _DocsProxyMemo(parse_budget=budget)
+            outcomes = [
+                _analysis_outcome(_WARN_IMPORTER, "tests/test_warn.py", tmp_path, memo)
+                for _ in range(2)
+            ]
+            results[label] = (
+                memo.parse_context is not None,
+                outcomes,
+                len(log),
+                counter.counts[_WARN_SOURCE],
+                handouts[_WARN_SOURCE] - counter.counts[_WARN_SOURCE],
+            )
+            corpus_outcomes = [
+                _analysis_outcome(source, f"tests/{name}", tmp_path, memo)
+                for name, source, _ in _IMPORTED_PARSE_IMPORTERS
+            ]
+            corpus[label] = (
+                corpus_outcomes,
+                {name: counter.counts[text] for name, text in tracked.items()},
+            )
+    expected_corpus: list[_ParseOutcome] = [
+        ("ok", readers) for _, _, readers in _IMPORTED_PARSE_IMPORTERS
+    ]
+    ok_twice: list[_ParseOutcome] = [("ok", frozenset()), ("ok", frozenset())]
+    assert results["authentic"] == (True, ok_twice, 4, 4, 0)
+    admitted, cached_outcomes, cached_records, cached_parses, cached_hits = results["cached"]
+    assert (admitted, cached_outcomes, cached_records, cached_parses) == (True, ok_twice, 1, 1)
+    assert cached_hits >= 1
+    assert corpus == {
+        "authentic": (expected_corpus, _AUTHENTIC_CORPUS_PARSE_COUNTS),
+        "cached": (expected_corpus, _CACHED_CORPUS_PARSE_COUNTS),
+    }
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_matches_default_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A default-action change to ``error`` bypasses the hit; unknown actions never admit."""
+
+    counter = _imported_parse_counter(monkeypatch, (_WARN_SOURCE, _PARSE_A))
+    with warnings.catch_warnings(record=True), monkeypatch.context() as patch:
+        warnings.resetwarnings()
+        patch.setattr(warnings, "defaultaction", "always")
+        memo = _DocsProxyMemo()
+        assert memo.parse_context is not None
+        warm = _helper_outcome(_WARN_SOURCE, memo)
+        assert warm == ("ok", ast.dump(_AUTHENTIC_AST_PARSE(_WARN_SOURCE), include_attributes=True))
+        keys_before = list(memo.parsed_imported_sources)
+        chars_before = memo.parsed_imported_source_chars
+        assert keys_before == [_WARN_SOURCE]
+        patch.setattr(warnings, "defaultaction", "error")
+        assert warnings.filters == []
+        cached = _helper_outcome(_WARN_SOURCE, memo)
+        authentic = _authentic_parse_outcome(_WARN_SOURCE)
+        with pytest.raises(SyntaxError) as escape_info:
+            _AUTHENTIC_AST_PARSE(_WARN_SOURCE)
+        assert counter.counts[_WARN_SOURCE] == 2
+        assert list(memo.parsed_imported_sources) == keys_before
+        assert memo.parsed_imported_source_chars == chars_before
+    assert cached == authentic
+    assert authentic[0] == "SyntaxError"
+    assert authentic[1].endswith(" (<unknown>, line 1)")
+    assert "invalid escape sequence" in authentic[1]
+    assert "\\d" in authentic[1]
+    assert sys.version_info[:2] != (3, 11) or cached == _INVALID_ESCAPE_OUTCOME[1:]
+    assert type(escape_info.value) is SyntaxError
+    assert (escape_info.value.filename, escape_info.value.lineno, escape_info.value.text) == (
+        "<unknown>",
+        1,
+        _WARN_SOURCE,
+    )
+    assert str(escape_info.value) == authentic[1]
+
+    unknown_actions: dict[str, tuple[bool, int, dict[str, ast.Module]]] = {}
+    for label, action in (("unknown_string", "bogus"), ("non_string", 7)):
+        with warnings.catch_warnings(record=True), monkeypatch.context() as patch:
+            patch.setattr(warnings, "defaultaction", action)
+            unknown_memo = _DocsProxyMemo()
+            before = counter.counts[_PARSE_A]
+            _parse_imported_source(_PARSE_A, unknown_memo)
+            _parse_imported_source(_PARSE_A, unknown_memo)
+            unknown_actions[label] = (
+                unknown_memo.parse_context is None,
+                counter.counts[_PARSE_A] - before,
+                dict(unknown_memo.parsed_imported_sources),
+            )
+    assert unknown_actions == dict.fromkeys(
+        ("unknown_string", "non_string"), (True, 2, dict[str, ast.Module]())
+    )
+
+
+@pytest.mark.docs_ci
+def test_imported_parse_reuse_requires_exact_filters_list_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-valued replacement filters list or a list subclass never reuses a parse."""
+
+    counter = _imported_parse_counter(monkeypatch, (_PARSE_B,))
+    with warnings.catch_warnings(record=True):
+        memo = _DocsProxyMemo()
+        assert memo.parse_context is not None
+        outer_filters = list(warnings.filters)
+        outer_impl: object = getattr(warnings, "_showwarnmsg_impl", None)
+        _parse_imported_source(_PARSE_A, memo)
+        held = dict(memo.parsed_imported_sources)
+        with warnings.catch_warnings():
+            assert list(warnings.filters) == outer_filters
+            assert getattr(warnings, "_showwarnmsg_impl", None) == outer_impl
+            _parse_imported_source(_PARSE_B, memo)
+            _parse_imported_source(_PARSE_B, memo)
+        assert counter.counts[_PARSE_B] == 2
+        assert memo.parsed_imported_sources == held
+
+        class _SubclassedFilters(list[object]):
+            """A filters list subclass that the admission guard must reject."""
+
+        with monkeypatch.context() as patch:
+            patch.setattr(warnings, "filters", _SubclassedFilters(warnings.filters))
+            subclass_memo = _DocsProxyMemo()
+            _parse_imported_source(_PARSE_B, subclass_memo)
+            _parse_imported_source(_PARSE_B, subclass_memo)
+        assert subclass_memo.parse_context is None
+        assert counter.counts[_PARSE_B] == 4
+        assert subclass_memo.parsed_imported_sources == {}
 
 
 @pytest.mark.docs_ci
