@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import abc
 import ast
 import collections.abc
 import gc
@@ -2546,6 +2547,58 @@ class _ParseWarningContext:
     impl: object
 
 
+def _canonical_warning_filter(record: object) -> bool:
+    """Return whether one warning-filter record has the canonical admitted shape.
+
+    The record must be an exact five-field ``tuple`` with an exact ``str`` known
+    action; a ``None`` or compiled string-pattern message selector; a ``None``,
+    exact ``str`` or compiled string-pattern module selector; a ``Warning``
+    category whose metaclass is exactly ``type`` (checked before
+    :func:`issubclass`, so ``ABCMeta`` and any custom ``__subclasscheck__`` are
+    rejected); and an exact non-negative ``int`` line. Exact-type category
+    matching then follows only the fixed inheritance of the builtin categories the
+    parser emits. The check is pure, never raises on malformed input and makes no
+    subclass concession.
+
+    Args:
+        record: One entry of ``warnings.filters``.
+
+    Returns:
+        ``True`` only for a canonical record.
+    """
+
+    if type(record) is not tuple:
+        return False
+    fields = cast("tuple[object, ...]", record)
+    if len(fields) != 5:
+        return False
+    action, message, category, module, lineno = fields
+    if type(action) is not str:
+        return False
+    if action not in ("error", "ignore", "always", "default", "module", "once"):
+        return False
+    if message is not None:
+        if type(message) is not re.Pattern:
+            return False
+        if type(getattr(cast(object, message), "pattern", None)) is not str:
+            return False
+    if module is not None:
+        if type(module) is str:
+            pass
+        elif type(module) is re.Pattern:
+            if type(getattr(cast(object, module), "pattern", None)) is not str:
+                return False
+        else:
+            return False
+    if type(category) is not type:
+        return False
+    if not issubclass(category, Warning):
+        return False
+    if type(lineno) is not int:
+        return False
+    return lineno >= 0
+
+
 def _admitted_parse_warning_context() -> _ParseWarningContext | None:
     """Return the current warnings context when it is the admitted recording shape.
 
@@ -2553,7 +2606,14 @@ def _admitted_parse_warning_context() -> _ParseWarningContext | None:
     ``warnings.catch_warnings(record=True)`` installs: an exact ``list`` of filters,
     a known string default action, the original ``showwarning``, the original
     standard-library ``_showwarnmsg`` dispatcher, and an implementation that is the
-    bound ``append`` of an exact ``list``. Private attributes are read only through
+    bound ``append`` of an exact ``list``. Every filter record in one copied tuple
+    must also pass :func:`_canonical_warning_filter`: a standard five-field tuple
+    with a known action, ``None`` or compiled string-pattern message selectors,
+    ``None``, exact-string or compiled string-pattern module selectors, a
+    ``Warning`` category whose metaclass is exactly ``type``, and a non-negative
+    integer line; that same validated tuple is the snapshot's ``filters``. This is
+    per-record admission for the standard parser's builtin warning categories, not
+    a general immutability claim. Private attributes are read only through
     :func:`getattr` and no warning global is ever written. Any other layout returns
     ``None``, which only disables reuse and never fails.
 
@@ -2564,6 +2624,10 @@ def _admitted_parse_warning_context() -> _ParseWarningContext | None:
     filters: object = warnings.filters
     if type(filters) is not list:
         return None
+    records = tuple(warnings.filters)
+    for record in records:
+        if not _canonical_warning_filter(record):
+            return None
     default_action: object = getattr(warnings, "defaultaction", None)
     if type(default_action) is not str or default_action not in (
         "error",
@@ -2590,7 +2654,7 @@ def _admitted_parse_warning_context() -> _ParseWarningContext | None:
         return None
     return _ParseWarningContext(
         default_action,
-        tuple(warnings.filters),
+        records,
         warnings.filters,
         showwarning,
         _STDLIB_SHOWWARNMSG,
@@ -7463,7 +7527,13 @@ def test_imported_parse_reuse_preserves_parse_warning_failures(tmp_path: Path) -
 
 @pytest.mark.docs_ci
 def test_imported_parse_reuse_rechecks_warning_context_before_hit(tmp_path: Path) -> None:
-    """A same-length filter change to ``error`` reaches the parser before any hit."""
+    """A same-length filter change to ``error`` reaches the parser before any hit.
+
+    An ``error`` filter whose category is an ``ABCMeta`` ``Warning`` subclass is
+    never admitted, so a later public ``register(DeprecationWarning)`` that makes
+    the parser warning match, without changing any filter record, still yields the
+    authentic ``SyntaxError`` and nothing is retained under the dynamic category.
+    """
 
     (tmp_path / "warn_mod.py").write_text(_WARN_SOURCE, encoding="utf-8")
     with warnings.catch_warnings(record=True):
@@ -7491,6 +7561,41 @@ def test_imported_parse_reuse_rechecks_warning_context_before_hit(tmp_path: Path
     assert cached == _INVALID_ESCAPE_OUTCOME
     assert list(memo.parsed_imported_sources) == keys_before
     assert memo.parsed_imported_source_chars == chars_before
+
+    class _DynamicWarning(Warning, metaclass=abc.ABCMeta):
+        """A warning category whose subclass relation changes by public registration."""
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        warnings.filterwarnings("error", category=_DynamicWarning)
+        dynamic_memo = _DocsProxyMemo()
+        dynamic_authentic_memo = _DocsProxyMemo(parse_budget=_ImportedParseBudget(max_entries=0))
+        assert _admitted_parse_warning_context() is None
+        assert dynamic_memo.parse_context is None
+        expected_ok = ("ok", ast.dump(_AUTHENTIC_AST_PARSE(_WARN_SOURCE), include_attributes=True))
+        before = [
+            _helper_outcome(_WARN_SOURCE, dynamic_memo),
+            _helper_outcome(_WARN_SOURCE, dynamic_authentic_memo),
+        ]
+        authentic_before = _authentic_parse_outcome(_WARN_SOURCE)
+        warm_state = (
+            dict(dynamic_memo.parsed_imported_sources),
+            dynamic_memo.parsed_imported_source_chars,
+        )
+        _DynamicWarning.register(DeprecationWarning)
+        after = [
+            _helper_outcome(_WARN_SOURCE, dynamic_memo),
+            _helper_outcome(_WARN_SOURCE, dynamic_authentic_memo),
+        ]
+        authentic_after = _authentic_parse_outcome(_WARN_SOURCE)
+        assert _admitted_parse_warning_context() is None
+    assert before == [expected_ok, expected_ok]
+    assert before == [authentic_before, authentic_before]
+    assert after == [_INVALID_ESCAPE_OUTCOME[1:], _INVALID_ESCAPE_OUTCOME[1:]]
+    assert after == [authentic_after, authentic_after]
+    assert warm_state == ({}, 0)
+    assert dynamic_memo.parsed_imported_sources == {}
+    assert dynamic_memo.parsed_imported_source_chars == 0
 
 
 @pytest.mark.docs_ci
@@ -7612,6 +7717,28 @@ def test_imported_parse_reuse_unadmitted_layouts_parse_authentically(
             dumps == [expected_dump, expected_dump],
         )
 
+    default_record = ("default", None, DeprecationWarning, "__main__", 0)
+    exact_str_record = ("ignore", None, UserWarning, "rp_exact_mod", 3)
+    assert _canonical_warning_filter(default_record) is True
+    assert _canonical_warning_filter(exact_str_record) is True
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        warnings.filterwarnings("ignore", message="x", category=UserWarning, module="m", lineno=3)
+        warnings.filterwarnings("error", category=DeprecationWarning)
+        observe("canonical control", _DocsProxyMemo())
+    with warnings.catch_warnings(record=True):
+        for label, record in (("P-default", default_record), ("P-exactstr", exact_str_record)):
+            with monkeypatch.context() as patch:
+                patch.setattr(warnings, "filters", [record])
+                observe(label, _DocsProxyMemo())
+    positives: dict[str, tuple[bool, int, list[str], bool]] = {}
+    for label in ("canonical control", "P-default", "P-exactstr"):
+        unadmitted_flag, parses, stored, dumps_match = observations.pop(label)
+        positives[label] = (unadmitted_flag, parses, list(stored), dumps_match)
+    assert positives == dict.fromkeys(
+        ("canonical control", "P-default", "P-exactstr"), (False, 1, [source], True)
+    )
+
     with warnings.catch_warnings(record=True), monkeypatch.context() as patch:
         patch.delattr(warnings, "_showwarnmsg_impl")
         observe("missing_impl", _DocsProxyMemo())
@@ -7637,6 +7764,83 @@ def test_imported_parse_reuse_unadmitted_layouts_parse_authentically(
         "replaced_dispatcher": unadmitted,
         "nested_without_record": (False, 2, {}, True),
     }
+
+    class _StrSub(str):
+        """A string subclass that exact-type selector and action guards reject."""
+
+    class _TupleSub(tuple[object, ...]):
+        """A tuple subclass that the exact-tuple record guard rejects."""
+
+    class _CustomMatcher:
+        """A non-pattern object exposing ``match`` that selector guards reject."""
+
+        def match(self, text: str) -> bool:
+            return True
+
+    class _AbcWarning(Warning, metaclass=abc.ABCMeta):
+        """An ``ABCMeta`` warning category the metaclass guard rejects."""
+
+    class _CustomMeta(type):
+        """A custom ``type`` metaclass the metaclass guard rejects."""
+
+    class _MetaWarning(Warning, metaclass=_CustomMeta):
+        """A warning category with a custom metaclass."""
+
+    canonical_records: list[object] = [("always", None, Warning, None, 0)]
+    bytes_pattern = re.compile(b"x")
+    bad_records: list[tuple[str, object]] = [
+        ("G1 list record", ["ignore", None, Warning, None, 0]),
+        ("G1 tuple subclass", _TupleSub(("ignore", None, Warning, None, 0))),
+        ("G1 4-tuple", ("ignore", None, Warning, None)),
+        ("G1 6-tuple", ("ignore", None, Warning, None, 0, 0)),
+        ("G2 int action", (0, None, Warning, None, 0)),
+        ("G2 str-subclass action", (_StrSub("ignore"), None, Warning, None, 0)),
+        ("G2 bogus action", ("bogus", None, Warning, None, 0)),
+        ("G3 plain str message", ("ignore", "x", Warning, None, 0)),
+        ("G3 bytes-pattern message", ("ignore", bytes_pattern, Warning, None, 0)),
+        ("G3 custom matcher message", ("ignore", _CustomMatcher(), Warning, None, 0)),
+        ("G4 str-subclass module", ("ignore", None, Warning, _StrSub("__main__"), 0)),
+        ("G4 bytes-pattern module", ("ignore", None, Warning, bytes_pattern, 0)),
+        ("G4 custom matcher module", ("ignore", None, Warning, _CustomMatcher(), 0)),
+        ("G5 non-class category", ("ignore", None, "Warning", None, 0)),
+        ("G5 non-Warning category", ("ignore", None, int, None, 0)),
+        ("G5 ABCMeta category", ("ignore", None, _AbcWarning, None, 0)),
+        ("G5 custom metaclass category", ("ignore", None, _MetaWarning, None, 0)),
+        ("G6 negative line", ("ignore", None, Warning, None, -1)),
+        ("G6 bool line", ("ignore", None, Warning, None, True)),
+        ("G6 float line", ("ignore", None, Warning, None, 0.0)),
+        ("G6 str line", ("ignore", None, Warning, None, "0")),
+        ("G6 None line", ("ignore", None, Warning, None, None)),
+    ]
+    with warnings.catch_warnings(record=True):
+        for label, bad_record in bad_records:
+            installed: list[object] = [bad_record, *canonical_records]
+            with monkeypatch.context() as patch:
+                patch.setattr(warnings, "filters", installed)
+                observe(label, _DocsProxyMemo())
+    assert {label: observations[label] for label, _ in bad_records} == {
+        label: (True, 2, {}, True) for label, _ in bad_records
+    }
+
+    import _warnings
+
+    assert warnings.warn_explicit is _warnings.warn_explicit
+    with warnings.catch_warnings(record=True) as rec, monkeypatch.context() as patch:
+        patch.setattr(
+            warnings,
+            "filters",
+            [("error", None, UserWarning, "rp_exact_mod", 0), ("ignore", None, Warning, None, 0)],
+        )
+        with pytest.raises(UserWarning):
+            warnings.warn_explicit(
+                "rp", UserWarning, "rp.py", 1, module="rp_exact_mod", registry={}
+            )
+        non_matches = [
+            warnings.warn_explicit("rp", UserWarning, "rp.py", 1, module=name, registry={})
+            for name in ("rp_exact_mod_x", "rp_exact_mo")
+        ]
+    assert non_matches == [None, None]
+    assert rec == []
 
 
 @pytest.mark.docs_ci

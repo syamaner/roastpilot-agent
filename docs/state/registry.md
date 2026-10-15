@@ -13,7 +13,12 @@ current-repository check, with literal anchors, preserve the tested outcomes;
 this is not a proof over all sources. Reuse engages only in the admitted
 standard recording warnings context. The captured default action, filters,
 dispatcher and handlers must remain unchanged before lookup and after parsing;
-other contexts parse authentically. Within the same admitted recording
+other contexts parse authentically. Admission also requires every filter
+record to be a standard five-field tuple with a known action, `None` or
+compiled string-pattern message selectors, `None`, exact-string or compiled
+string-pattern module selectors, a `Warning` category whose metaclass is
+exactly `type`, and a non-negative integer line; other records parse
+authentically. Within the same admitted recording
 context, repeated identical parser warnings may be recorded fewer times. This
 diagnostic exception was explicitly approved by the maintainer at contract
 ratification. This records test infrastructure only, with no E11 status,
