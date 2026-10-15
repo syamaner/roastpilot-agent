@@ -2604,8 +2604,10 @@ def _admitted_parse_warning_context() -> _ParseWarningContext | None:
 
     Parse reuse is admitted only in the standard recording context that
     ``warnings.catch_warnings(record=True)`` installs: an exact ``list`` of filters,
-    a known string default action, the original ``showwarning``, the original
-    standard-library ``_showwarnmsg`` dispatcher, and an implementation that is the
+    a known string default action, the original ``showwarning``, the
+    ``_showwarnmsg`` dispatcher captured at module import (``_STDLIB_SHOWWARNMSG``),
+    whose trusted standard-library identity is verified by the fresh-environment
+    preflight rather than by this function, and an implementation that is the
     bound ``append`` of an exact ``list``. Every filter record in one copied tuple
     must also pass :func:`_canonical_warning_filter`: a standard five-field tuple
     with a known action, ``None`` or compiled string-pattern message selectors,
@@ -7519,9 +7521,29 @@ def test_imported_parse_reuse_preserves_parse_warning_failures(tmp_path: Path) -
             memo = _DocsProxyMemo(parse_budget=budget)
             outcome = _analysis_outcome(_WARN_IMPORTER, "tests/test_warn.py", tmp_path, memo)
         recorded[label] = (outcome, len(log))
-    assert errors == dict.fromkeys(
+    assert errors["cached"] == errors["authentic"]
+    escape_outcome = errors["authentic"][0][0]
+    assert errors["authentic"] == ([escape_outcome] * 2, dict[str, ast.Module]())
+    assert len(escape_outcome) == 3
+    assert escape_outcome[0] == "raised"
+    assert escape_outcome[1] == "SyntaxError"
+    assert escape_outcome[2].endswith(" (<unknown>, line 1)")
+    assert "invalid escape sequence" in escape_outcome[2]
+    assert "\\d" in escape_outcome[2]
+    assert sys.version_info[:2] != (3, 11) or errors == dict.fromkeys(
         budgets, ([_INVALID_ESCAPE_OUTCOME] * 2, dict[str, ast.Module]())
     )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(SyntaxError) as escape_info:
+            _AUTHENTIC_AST_PARSE(_WARN_SOURCE)
+    assert type(escape_info.value) is SyntaxError
+    assert (escape_info.value.filename, escape_info.value.lineno, escape_info.value.text) == (
+        "<unknown>",
+        1,
+        _WARN_SOURCE,
+    )
+    assert str(escape_info.value) == escape_outcome[2]
     assert recorded == {"authentic": (("ok", frozenset()), 2), "cached": (("ok", frozenset()), 1)}
 
 
@@ -7530,9 +7552,10 @@ def test_imported_parse_reuse_rechecks_warning_context_before_hit(tmp_path: Path
     """A same-length filter change to ``error`` reaches the parser before any hit.
 
     An ``error`` filter whose category is an ``ABCMeta`` ``Warning`` subclass is
-    never admitted, so a later public ``register(DeprecationWarning)`` that makes
-    the parser warning match, without changing any filter record, still yields the
-    authentic ``SyntaxError`` and nothing is retained under the dynamic category.
+    never admitted, so a later public ``register()`` of the category the parser
+    actually emits, which makes the parser warning match without changing any
+    filter record, still yields the authentic ``SyntaxError`` and nothing is
+    retained under the dynamic category.
     """
 
     (tmp_path / "warn_mod.py").write_text(_WARN_SOURCE, encoding="utf-8")
@@ -7558,12 +7581,28 @@ def test_imported_parse_reuse_rechecks_warning_context_before_hit(tmp_path: Path
             _WARN_IMPORTER, "tests/test_warn.py", tmp_path, authentic_memo
         )
     assert cached == authentic
-    assert cached == _INVALID_ESCAPE_OUTCOME
+    assert len(cached) == 3
+    assert cached[0] == "raised"
+    assert cached[1] == "SyntaxError"
+    assert cached[2].endswith(" (<unknown>, line 1)")
+    assert "invalid escape sequence" in cached[2]
+    assert "\\d" in cached[2]
+    assert sys.version_info[:2] != (3, 11) or cached == _INVALID_ESCAPE_OUTCOME
     assert list(memo.parsed_imported_sources) == keys_before
     assert memo.parsed_imported_source_chars == chars_before
 
     class _DynamicWarning(Warning, metaclass=abc.ABCMeta):
         """A warning category whose subclass relation changes by public registration."""
+
+    with warnings.catch_warnings(record=True) as category_probe:
+        warnings.simplefilter("always")
+        _AUTHENTIC_AST_PARSE(_WARN_SOURCE)
+    observed = [w.category for w in category_probe]
+    assert len(observed) == 1
+    observed_category = observed[0]
+    assert type(observed_category) is type
+    assert observed_category is DeprecationWarning or observed_category is SyntaxWarning
+    assert sys.version_info[:2] != (3, 11) or observed_category is DeprecationWarning
 
     with warnings.catch_warnings(record=True):
         warnings.simplefilter("always")
@@ -7582,16 +7621,33 @@ def test_imported_parse_reuse_rechecks_warning_context_before_hit(tmp_path: Path
             dict(dynamic_memo.parsed_imported_sources),
             dynamic_memo.parsed_imported_source_chars,
         )
-        _DynamicWarning.register(DeprecationWarning)
+        _DynamicWarning.register(observed_category)
         after = [
             _helper_outcome(_WARN_SOURCE, dynamic_memo),
             _helper_outcome(_WARN_SOURCE, dynamic_authentic_memo),
         ]
         authentic_after = _authentic_parse_outcome(_WARN_SOURCE)
+        assert after[0] == after[1]
+        assert authentic_after[0] == "SyntaxError"
+        assert authentic_after[1].endswith(" (<unknown>, line 1)")
+        assert "invalid escape sequence" in authentic_after[1]
+        assert "\\d" in authentic_after[1]
+        assert sys.version_info[:2] != (3, 11) or after == [
+            _INVALID_ESCAPE_OUTCOME[1:],
+            _INVALID_ESCAPE_OUTCOME[1:],
+        ]
+        with pytest.raises(SyntaxError) as escape_info:
+            _AUTHENTIC_AST_PARSE(_WARN_SOURCE)
         assert _admitted_parse_warning_context() is None
+    assert type(escape_info.value) is SyntaxError
+    assert (escape_info.value.filename, escape_info.value.lineno, escape_info.value.text) == (
+        "<unknown>",
+        1,
+        _WARN_SOURCE,
+    )
+    assert str(escape_info.value) == authentic_after[1]
     assert before == [expected_ok, expected_ok]
     assert before == [authentic_before, authentic_before]
-    assert after == [_INVALID_ESCAPE_OUTCOME[1:], _INVALID_ESCAPE_OUTCOME[1:]]
     assert after == [authentic_after, authentic_after]
     assert warm_state == ({}, 0)
     assert dynamic_memo.parsed_imported_sources == {}
@@ -7923,11 +7979,24 @@ def test_imported_parse_reuse_matches_default_action(monkeypatch: pytest.MonkeyP
         assert warnings.filters == []
         cached = _helper_outcome(_WARN_SOURCE, memo)
         authentic = _authentic_parse_outcome(_WARN_SOURCE)
+        with pytest.raises(SyntaxError) as escape_info:
+            _AUTHENTIC_AST_PARSE(_WARN_SOURCE)
         assert counter.counts[_WARN_SOURCE] == 2
         assert list(memo.parsed_imported_sources) == keys_before
         assert memo.parsed_imported_source_chars == chars_before
     assert cached == authentic
-    assert cached == _INVALID_ESCAPE_OUTCOME[1:]
+    assert authentic[0] == "SyntaxError"
+    assert authentic[1].endswith(" (<unknown>, line 1)")
+    assert "invalid escape sequence" in authentic[1]
+    assert "\\d" in authentic[1]
+    assert sys.version_info[:2] != (3, 11) or cached == _INVALID_ESCAPE_OUTCOME[1:]
+    assert type(escape_info.value) is SyntaxError
+    assert (escape_info.value.filename, escape_info.value.lineno, escape_info.value.text) == (
+        "<unknown>",
+        1,
+        _WARN_SOURCE,
+    )
+    assert str(escape_info.value) == authentic[1]
 
     unknown_actions: dict[str, tuple[bool, int, dict[str, ast.Module]]] = {}
     for label, action in (("unknown_string", "bogus"), ("non_string", 7)):
