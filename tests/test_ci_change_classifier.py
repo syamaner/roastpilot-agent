@@ -7264,6 +7264,29 @@ def test_imported_parse_reuse_observes_source_edits(
 ) -> None:
     """A same-length edit past the first 64 characters is a new key and a fresh parse."""
 
+    tree_original = "# " + "p" * 70 + "\nfrom pathlib import Path\nDOC = Path('docs/e.md')\n"
+    tree_edited = tree_original.replace("docs/", "conf/")
+    assert len(tree_edited) == len(tree_original)
+    assert tree_original.index("docs/") > 64
+    tree_module = tmp_path / "tree_edit_mod.py"
+    tree_first_importer = (
+        "from tree_edit_mod import DOC\n\ndef test_tree_edit():\n    assert DOC.read_text()\n"
+    )
+    tree_second_importer = (
+        "from tree_edit_mod import DOC\n\ndef test_tree_edit_again():\n    assert DOC.read_text()\n"
+    )
+    for tree_budget in (_ImportedParseBudget(max_entries=0), _ImportedParseBudget()):
+        tree_module.write_text(tree_original, encoding="utf-8")
+        with warnings.catch_warnings(record=True):
+            tree_memo = _DocsProxyMemo(parse_budget=tree_budget)
+            assert _analysis_outcome(
+                tree_first_importer, "tests/test_tree_a.py", tmp_path, tree_memo
+            ) == ("ok", frozenset({"test_tree_edit"}))
+            tree_module.write_text(tree_edited, encoding="utf-8")
+            assert _analysis_outcome(
+                tree_second_importer, "tests/test_tree_b.py", tmp_path, tree_memo
+            ) == ("ok", frozenset())
+
     original = (
         "# "
         + "p" * 70
