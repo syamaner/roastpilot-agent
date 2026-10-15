@@ -7200,6 +7200,7 @@ def test_imported_parse_reuse_oversize_and_disabled_budgets_parse_authentically(
                 _ImportedParseBudget(max_entry_chars=value),
             )
         ]
+        authentic_a = ast.dump(_AUTHENTIC_AST_PARSE(_PARSE_A), include_attributes=True)
         for budget in disabled_budgets:
             disabled = _DocsProxyMemo(parse_budget=budget)
             before = counter.counts[_PARSE_A]
@@ -7208,19 +7209,19 @@ def test_imported_parse_reuse_oversize_and_disabled_budgets_parse_authentically(
             assert counter.counts[_PARSE_A] - before == 2
             assert disabled.parsed_imported_sources == {}
             assert disabled.parsed_imported_source_chars == 0
-        seeded = _direct_parse_memo(0, 100, 100)
-        seed_tree = _AUTHENTIC_AST_PARSE("")
-        seeded.parsed_imported_sources[_PARSE_A] = seed_tree
-        seeded.parsed_imported_source_chars = 6
-        before = counter.counts[_PARSE_A]
-        tree = _parse_imported_source(_PARSE_A, seeded)
-        assert ast.dump(tree, include_attributes=True) == ast.dump(
-            _AUTHENTIC_AST_PARSE(_PARSE_A), include_attributes=True
-        )
-        assert counter.counts[_PARSE_A] - before == 1
-        assert list(seeded.parsed_imported_sources) == [_PARSE_A]
-        assert seeded.parsed_imported_sources[_PARSE_A] is seed_tree
-        assert seeded.parsed_imported_source_chars == 6
+            # Disabled-first: an intentionally invalid seed is neither read nor
+            # rewritten, so I4 truthfulness is deliberately not applied to it.
+            seeded = _DocsProxyMemo(parse_budget=budget)
+            seed_tree = _AUTHENTIC_AST_PARSE("")
+            seeded.parsed_imported_sources[_PARSE_A] = seed_tree
+            seeded.parsed_imported_source_chars = 6
+            before = counter.counts[_PARSE_A]
+            tree = _parse_imported_source(_PARSE_A, seeded)
+            assert ast.dump(tree, include_attributes=True) == authentic_a
+            assert counter.counts[_PARSE_A] - before == 1
+            assert list(seeded.parsed_imported_sources) == [_PARSE_A]
+            assert seeded.parsed_imported_sources[_PARSE_A] is seed_tree
+            assert seeded.parsed_imported_source_chars == 6
 
 
 @pytest.mark.docs_ci
