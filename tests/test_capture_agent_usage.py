@@ -12,6 +12,7 @@ import itertools
 import json
 import os
 import pwd
+import random
 import re
 import shlex
 import shutil
@@ -10731,6 +10732,819 @@ def test_codex_duplicate_json_keys_fail_closed(stream: bytes) -> None:
     """Duplicate discriminators or nested token keys cannot be normalized ambiguously."""
     with pytest.raises(CodexUsageParseError, match="duplicate JSON keys"):
         parse_codex_stream(BytesIO(stream))
+
+
+# --- #1026: frozen original Codex root scanner and string fast-path equivalence ---
+#
+# ``_OriginalJsonRootScanner`` is a verbatim copy of base f3d420d4's
+# ``capture_usage_codex.py`` lines 67-330, with only the class name and three
+# module constants renamed to the literal-valued oracle constants below, so a
+# source-constant mutation cannot move the oracle with it. Equivalence evidence
+# is finite (exhaustive short suffixes, seeded corpora, and literal anchors); it
+# is not a proof over all inputs, and CPython's ``re`` search is assumed correct.
+
+_ORACLE_STRING_CAPTURE_LIMIT = 64
+_ORACLE_JSON_NESTING_DEPTH = 64
+_ORACLE_OPAQUE_ITEM_TYPES = frozenset({"item.started", "item.updated", "item.completed"})
+
+
+class _OriginalJsonRootScanner:
+    """Incrementally validate one JSON root object without retaining its payload."""
+
+    def __init__(self) -> None:
+        """Initialize a root-object scanner with bounded string token capture."""
+        self._stack: list[tuple[str, str, str | None]] = []
+        self._root_started = False
+        self._root_finished = False
+        self._string: list[str] = []
+        self._string_truncated = False
+        self._string_state = "none"
+        self._unicode_digits: list[str] = []
+        self._primitive_kind: str | None = None
+        self._primitive_state = ""
+        self._root_type_count = 0
+        self._root_type_value: str | None = None
+
+    @property
+    def is_opaque_item(self) -> bool:
+        """Return whether this complete root has exactly one allowed item type."""
+        return self._root_type_count == 1 and self._root_type_value in _ORACLE_OPAQUE_ITEM_TYPES
+
+    @property
+    def has_nonopaque_root_type(self) -> bool:
+        """Return whether a root discriminator rules out streamed opaque-item handling."""
+        return self._root_type_count == 1 and not self.is_opaque_item
+
+    @property
+    def has_root_content(self) -> bool:
+        """Return whether the event contains more than JSONL whitespace."""
+        return self._root_started
+
+    def consume(self, text: str) -> None:
+        """Consume decoded JSON characters without preserving opaque payload values."""
+        index = 0
+        while index < len(text):
+            character = text[index]
+            if self._string_state != "none":
+                self._consume_string(character)
+                index += 1
+                continue
+            if self._primitive_kind is not None:
+                if self._is_delimiter(character):
+                    self._finish_primitive()
+                    continue
+                self._consume_primitive(character)
+                index += 1
+                continue
+            if character in " \t\r":
+                index += 1
+                continue
+            if character == '"':
+                self._string_state = "string"
+                self._string = []
+                self._string_truncated = False
+            elif character in "{}[],:":
+                self._consume_punctuation(character)
+            elif character in "-0123456789":
+                self._primitive_kind = "number"
+                self._primitive_state = (
+                    "minus" if character == "-" else ("zero" if character == "0" else "integer")
+                )
+            elif character in "tfn":
+                self._primitive_kind = "literal"
+                self._primitive_state = {"t": "true:1", "f": "false:1", "n": "null:1"}[character]
+            else:
+                self._reject()
+            index += 1
+
+    def finish(self) -> None:
+        """Require a complete, single root object at the JSONL newline boundary."""
+        if self._string_state != "none":
+            self._reject()
+        if self._primitive_kind is not None:
+            self._finish_primitive()
+        if not self._root_started or not self._root_finished or self._stack:
+            self._reject()
+
+    def _reject(self) -> None:
+        """Raise a content-free structural error for every scanner failure class."""
+        raise CodexUsageParseError("malformed Codex JSON event")
+
+    @staticmethod
+    def _is_delimiter(character: str) -> bool:
+        """Return whether a character terminates a JSON scalar token."""
+        return character in " \t\r{}[],:"
+
+    def _append_string_character(self, character: str) -> None:
+        """Keep only the bounded string prefix needed for root discriminator checks."""
+        if len(self._string) < _ORACLE_STRING_CAPTURE_LIMIT:
+            self._string.append(character)
+        else:
+            self._string_truncated = True
+
+    def _consume_string(self, character: str) -> None:
+        """Consume one JSON string character, including strictly validated escapes."""
+        if self._string_state == "string":
+            if character == '"':
+                self._string_state = "none"
+                self._emit("string", "".join(self._string), self._string_truncated)
+            elif character == "\\":
+                self._string_state = "escape"
+            elif ord(character) < 0x20:
+                self._reject()
+            else:
+                self._append_string_character(character)
+            return
+        if self._string_state == "escape":
+            escaped = {
+                '"': '"',
+                "\\": "\\",
+                "/": "/",
+                "b": "\b",
+                "f": "\f",
+                "n": "\n",
+                "r": "\r",
+                "t": "\t",
+            }.get(character)
+            if escaped is not None:
+                self._append_string_character(escaped)
+                self._string_state = "string"
+            elif character == "u":
+                self._unicode_digits = []
+                self._string_state = "unicode"
+            else:
+                self._reject()
+            return
+        if character not in "0123456789abcdefABCDEF":
+            self._reject()
+        self._unicode_digits.append(character)
+        if len(self._unicode_digits) == 4:
+            self._append_string_character(chr(int("".join(self._unicode_digits), 16)))
+            self._string_state = "string"
+
+    def _consume_primitive(self, character: str) -> None:
+        """Validate a JSON literal or number with a bounded deterministic automaton."""
+        if self._primitive_kind == "literal":
+            expected, position = self._primitive_state.split(":")  # pyright: ignore[reportOptionalMemberAccess]
+            offset = int(position)
+            if offset >= len(expected) or character != expected[offset]:
+                self._reject()
+            self._primitive_state = f"{expected}:{offset + 1}"
+            return
+        transitions = {
+            "minus": {"digit": "zero_or_integer"},
+            "zero": {".": "fraction_start", "eE": "exponent_start"},
+            "integer": {"digit": "integer", ".": "fraction_start", "eE": "exponent_start"},
+            "fraction_start": {"digit": "fraction"},
+            "fraction": {"digit": "fraction", "eE": "exponent_start"},
+            "exponent_start": {"+-": "exponent_sign", "digit": "exponent"},
+            "exponent_sign": {"digit": "exponent"},
+            "exponent": {"digit": "exponent"},
+        }
+        state = self._primitive_state
+        if character in "0123456789":
+            category = "digit"
+        elif character == ".":
+            category = character
+        elif character in "+-":
+            category = "+-"
+        elif character in "eE":
+            category = "eE"
+        else:
+            self._reject()
+            return
+        next_state = transitions.get(state, {}).get(category)
+        if next_state == "zero_or_integer":
+            next_state = "zero" if character == "0" else "integer"
+        if next_state is None:
+            self._reject()
+        self._primitive_state = next_state
+
+    def _finish_primitive(self) -> None:
+        """Emit only JSON scalars that ended in an accepting state."""
+        assert self._primitive_kind is not None
+        if self._primitive_kind == "literal":
+            expected, position = self._primitive_state.split(":")  # pyright: ignore[reportOptionalMemberAccess]
+            if int(position) != len(expected):
+                self._reject()
+        elif self._primitive_state not in {"zero", "integer", "fraction", "exponent"}:
+            self._reject()
+        self._primitive_kind = None
+        self._primitive_state = ""
+        self._emit("primitive", None, False)
+
+    def _consume_punctuation(self, character: str) -> None:
+        """Consume structural punctuation through the root-only JSON grammar."""
+        if character in "[{":
+            if not self._expect_value():
+                self._reject()
+            if len(self._stack) >= _ORACLE_JSON_NESTING_DEPTH:
+                self._reject()
+            if character == "{":
+                self._stack.append(("object", "key_or_end", None))
+            else:
+                self._stack.append(("array", "value_or_end", None))
+            self._root_started = True
+            return
+        if character in "]}":
+            self._close_container(character)
+            return
+        if character == ":":
+            if not self._stack or self._stack[-1][0] != "object" or self._stack[-1][1] != "colon":
+                self._reject()
+            kind, _state, key = self._stack.pop()
+            self._stack.append((kind, "value", key))
+            return
+        if character == ",":
+            if not self._stack:
+                self._reject()
+            kind, state, _key = self._stack.pop()
+            if state != "comma_or_end":
+                self._reject()
+            self._stack.append((kind, "key" if kind == "object" else "value", None))
+            return
+        self._reject()
+
+    def _expect_value(self) -> bool:
+        """Return whether the current parser location admits a complete JSON value."""
+        if not self._root_started:
+            return True
+        if not self._stack:
+            return False
+        return self._stack[-1][1] in {"value", "value_or_end"}
+
+    def _emit(self, kind: str, value: str | None, truncated: bool) -> None:
+        """Feed a completed scalar token into the enclosing object or array state."""
+        if not self._root_started or not self._stack:
+            self._reject()
+        container, state, key = self._stack.pop()
+        if container == "object" and state in {"key_or_end", "key"}:
+            if kind != "string":
+                self._reject()
+            self._stack.append((container, "colon", value if not truncated else None))
+            return
+        if state not in {"value", "value_or_end"}:
+            self._reject()
+        if len(self._stack) == 0 and key == "type":
+            self._root_type_count += 1
+            if self._root_type_count != 1:
+                raise CodexUsageParseError("Codex event contains duplicate JSON keys")
+            if kind != "string":
+                self._reject()
+            self._root_type_value = None if truncated else value
+        self._stack.append((container, "comma_or_end", None))
+
+    def _close_container(self, character: str) -> None:
+        """Close an object or array only from legal states and propagate its value."""
+        if not self._stack:
+            self._reject()
+        container, state, _key = self._stack[-1]
+        expected = "}" if container == "object" else "]"
+        if character != expected or state not in {"key_or_end", "value_or_end", "comma_or_end"}:
+            self._reject()
+        self._stack.pop()
+        if not self._stack:
+            self._root_finished = True
+            return
+        parent, parent_state, parent_key = self._stack.pop()
+        if parent_state not in {"value", "value_or_end"}:
+            self._reject()
+        if len(self._stack) == 0 and parent_key == "type":
+            self._reject()
+        self._stack.append((parent, "comma_or_end", None))
+
+
+_ORIGINAL_SCANNER_SOURCE_SHA256 = "6da9c3f2ca686c30f498e8fa7c943799e215a8524637168d57cda9f4a9a8ba57"
+_SCANNER_STATE_FIELDS = (
+    "_stack",
+    "_root_started",
+    "_root_finished",
+    "_string",
+    "_string_truncated",
+    "_string_state",
+    "_unicode_digits",
+    "_primitive_kind",
+    "_primitive_state",
+    "_root_type_count",
+    "_root_type_value",
+)
+_OPAQUE_STRING_PREFIX = '{"type":"item.updated","payload":"'
+
+
+def _candidate_scanner_class() -> type[Any]:
+    """Resolve the production scanner at call time so a source mutant is observed."""
+    return usage_codex._JsonRootScanner  # pyright: ignore[reportPrivateUsage]
+
+
+def _scanner_snapshot(scanner: Any) -> tuple[object, ...]:
+    """Return a detached copy of every scanner field plus its public classifications."""
+    state = cast(dict[str, object], vars(scanner))
+    values: list[object] = []
+    for field in _SCANNER_STATE_FIELDS:
+        value: object = state[field]
+        values.append(tuple(cast(list[object], value)) if isinstance(value, list) else value)
+    values.extend(
+        (scanner.is_opaque_item, scanner.has_nonopaque_root_type, scanner.has_root_content)
+    )
+    return tuple(values)
+
+
+def _exception_observable(error: Exception) -> tuple[object, ...]:
+    """Return the comparable type, text, arguments, and chaining of one raised error."""
+    return (
+        type(error),
+        str(error),
+        error.args,
+        error.__cause__ is None,
+        error.__context__ is None,
+        error.__suppress_context__,
+    )
+
+
+def _observe_scanner(scanner_class: type[Any], pieces: list[str]) -> list[tuple[object, ...]]:
+    """Feed decoded pieces, recording the error-or-state observable after every call."""
+    scanner = scanner_class()
+    observed: list[tuple[object, ...]] = []
+    for piece in pieces:
+        try:
+            scanner.consume(piece)
+        except AssertionError:
+            raise
+        except Exception as error:
+            observed.append(("consume", _exception_observable(error), _scanner_snapshot(scanner)))
+            return observed
+        observed.append(("consume", None, _scanner_snapshot(scanner)))
+    try:
+        scanner.finish()
+    except AssertionError:
+        raise
+    except Exception as error:
+        observed.append(("finish", _exception_observable(error), _scanner_snapshot(scanner)))
+        return observed
+    observed.append(("finish", None, _scanner_snapshot(scanner)))
+    return observed
+
+
+def _assert_scanner_equivalent(pieces: list[str], case: str) -> list[tuple[object, ...]]:
+    """Require the production scanner to match the frozen original after every call."""
+    candidate = _observe_scanner(_candidate_scanner_class(), pieces)
+    original = _observe_scanner(_OriginalJsonRootScanner, pieces)
+    assert candidate == original, f"scanner observable diverged from original: {case}"
+    return original
+
+
+def test_original_scanner_oracle_is_pinned() -> None:
+    """The frozen oracle is the pinned base copy and the production limits keep literals."""
+    source = inspect.getsource(_OriginalJsonRootScanner)
+    assert hashlib.sha256(source.encode()).hexdigest() == _ORIGINAL_SCANNER_SOURCE_SHA256
+    assert _ORACLE_STRING_CAPTURE_LIMIT == 64
+    assert _ORACLE_JSON_NESTING_DEPTH == 64
+    assert (
+        frozenset({"item.started", "item.updated", "item.completed"}) == _ORACLE_OPAQUE_ITEM_TYPES
+    )
+    assert usage_codex._STRING_CAPTURE_LIMIT == 64  # pyright: ignore[reportPrivateUsage]
+    assert usage_codex.MAX_JSON_NESTING_DEPTH == 64
+    assert usage_codex.READ_CHUNK_BYTES == 65_536
+    assert usage_codex.MAX_CODEX_OPAQUE_EVENT_BYTES == 8_388_608
+    assert usage_codex.MAX_CODEX_OPAQUE_TOTAL_BYTES == 67_108_864
+    assert (
+        frozenset({"item.started", "item.updated", "item.completed"})
+        == usage_codex.OPAQUE_ITEM_TYPES
+    )
+    assert (
+        frozenset(
+            {
+                "thread.started",
+                "turn.started",
+                "item.started",
+                "item.updated",
+                "item.completed",
+                "turn.failed",
+                "turn.completed",
+            }
+        )
+        == usage_codex.CODEX_EVENT_TYPES
+    )
+
+
+_EXHAUSTIVE_ALPHABET = (
+    "a",
+    '"',
+    "\\",
+    "u",
+    "0",
+    "F",
+    "q",
+    "n",
+    "\x00",
+    "\x1f",
+    " ",
+    "é",
+    "\U0001d11e",
+    "\x7f",
+)
+_EXHAUSTIVE_TEMPLATES = (
+    ("value", _OPAQUE_STRING_PREFIX, '"}'),
+    ("type", '{"type":"', '"}'),
+    ("key", '{"', '":1}'),
+    ("nested", '{"type":"item.updated","a":[["', '"]]}'),
+)
+_EXHAUSTIVE_RUN_LENGTHS = (62, 63, 64, 65)
+
+
+def test_string_fast_path_matches_original_on_exhaustive_small_corpus() -> None:
+    """33,760 cases: 211 suffixes x 4 run lengths x 4 templates x 10 feeds.
+
+    Every string of length at most 2 over a 14-symbol alphabet (211 suffixes)
+    follows 62-65 ordinary characters, so the 64-character truncation edge falls
+    at each suffix position. Feeds are one call, one character per call, and a
+    two-piece split at each content index in [L-2, L+5]. The exhaustive claim
+    covers only these short suffixes; it is not a proof over all inputs.
+    """
+    suffixes = [
+        "",
+        *_EXHAUSTIVE_ALPHABET,
+        *("".join(pair) for pair in itertools.product(_EXHAUSTIVE_ALPHABET, repeat=2)),
+    ]
+    assert len(suffixes) == 211
+    cases = 0
+    for (name, prefix, closing), length, suffix in itertools.product(
+        _EXHAUSTIVE_TEMPLATES, _EXHAUSTIVE_RUN_LENGTHS, suffixes
+    ):
+        text = prefix + ("x" * length) + suffix + closing
+        feeds = [[text], list(text)]
+        for index in range(length - 2, length + 6):
+            split = len(prefix) + index
+            feeds.append([text[:split], text[split:]])
+        for feed_index, pieces in enumerate(feeds):
+            _assert_scanner_equivalent(
+                pieces, f"exhaustive {name} L={length} suffix={suffix!r} feed={feed_index}"
+            )
+            cases += 1
+    assert cases == 33_760
+
+
+_SEEDED_VALID_ESCAPES = ('\\"', "\\\\", "\\/", "\\b", "\\f", "\\n", "\\r", "\\t")
+_SEEDED_INVALID_ESCAPES = ("\\x", "\\U", "\\u12G4", '\\u1"')
+_SEEDED_MULTIBYTE = ("é", "ß", "€", "中", "\U0001d11e", "\U0001f600")
+_SEEDED_ORDINARY = "abcxyzABC 0189~/'"
+_SEEDED_PUNCTUATION = '{}[],:"'
+
+
+def _seeded_string_body(rng: random.Random) -> str:
+    """Return one 0-300 character JSON string body from a weighted token mix."""
+    target = rng.randint(0, 300)
+    parts: list[str] = []
+    if rng.random() < 0.7:
+        parts.append("x" * rng.randint(55, 75))
+    while sum(len(part) for part in parts) < target:
+        roll = rng.random()
+        if roll < 0.45:
+            parts.append(rng.choice(_SEEDED_ORDINARY) * rng.randint(1, 40))
+        elif roll < 0.55:
+            parts.append(chr(rng.randrange(32)))
+        elif roll < 0.60:
+            parts.append('"')
+        elif roll < 0.64:
+            parts.append("\\")
+        elif roll < 0.75:
+            parts.append(rng.choice(_SEEDED_VALID_ESCAPES))
+        elif roll < 0.83:
+            digits = "".join(rng.choice("0123456789abcdefABCDEF") for _ in range(4))
+            parts.append("\\u" + digits)
+        elif roll < 0.88:
+            parts.append(rng.choice(_SEEDED_INVALID_ESCAPES))
+        else:
+            parts.append(rng.choice(_SEEDED_MULTIBYTE))
+    return "".join(parts)[:target]
+
+
+def _seeded_event(rng: random.Random) -> list[str]:
+    """Return one generated event, optionally structurally mutated, as random pieces."""
+    _name, prefix, closing = rng.choice(_EXHAUSTIVE_TEMPLATES)
+    text = prefix + _seeded_string_body(rng) + closing
+    mutation = rng.random()
+    if mutation < 0.08:
+        text = text[: rng.randint(0, len(text))]
+    elif mutation < 0.16:
+        position = rng.randint(0, len(text))
+        text = text[:position] + rng.choice(_SEEDED_PUNCTUATION) + text[position:]
+    elif mutation < 0.24 and text:
+        position = rng.randrange(len(text))
+        text = text[:position] + text[position + 1 :]
+    cuts = sorted(rng.randint(0, len(text)) for _ in range(rng.randint(0, 4)))
+    bounds = [0, *cuts, len(text)]
+    return [text[start:end] for start, end in itertools.pairwise(bounds)]
+
+
+def test_string_fast_path_matches_original_on_seeded_corpus() -> None:
+    """2,500 seeded events (1,250 each from seeds 1026 and 6201) match the original.
+
+    The weighted generator covers all 32 C0 controls, quotes, lone backslashes,
+    all eight valid escapes, mixed-case ``\\uXXXX``, invalid escapes, 2/3/4-byte
+    characters, lengths 0-300, structural mutations, and random call splits.
+    """
+    accepted = rejected = truncated = 0
+    for seed in (1026, 6201):
+        rng = random.Random(seed)
+        for case in range(1_250):
+            pieces = _seeded_event(rng)
+            original = _assert_scanner_equivalent(pieces, f"seeded {seed}:{case} {pieces!r}")
+            if original[-1][0] == "finish" and original[-1][1] is None:
+                accepted += 1
+            else:
+                rejected += 1
+            truncated += any(cast(tuple[object, ...], step[2])[4] for step in original)
+    assert accepted + rejected == 2_500
+    assert accepted >= 600
+    assert rejected >= 1_500
+    assert truncated >= 1_000
+
+
+class _PlannedChunkReader:
+    """Return byte chunks whose sizes follow a deterministic plan."""
+
+    def __init__(self, content: bytes, sizes: Iterator[int]) -> None:
+        """Initialize the content and the chunk-size plan."""
+        self._content = content
+        self._sizes = sizes
+        self._offset = 0
+
+    def read(self, size: int) -> bytes:
+        """Return at most ``size`` bytes, capped by the next planned chunk size."""
+        assert size <= READ_CHUNK_BYTES
+        count = min(size, next(self._sizes))
+        result = self._content[self._offset : self._offset + count]
+        self._offset += len(result)
+        return result
+
+
+def _random_chunk_sizes(seed: int, largest: int) -> Iterator[int]:
+    """Yield an endless deterministic sequence of chunk sizes in [1, largest]."""
+    rng = random.Random(seed)
+    while True:
+        yield rng.randint(1, largest)
+
+
+_STREAM_CHUNK_PLANS: tuple[tuple[str, Callable[[], Iterator[int]]], ...] = (
+    ("1", lambda: itertools.repeat(1)),
+    ("2", lambda: itertools.repeat(2)),
+    ("3", lambda: itertools.repeat(3)),
+    ("7", lambda: itertools.repeat(7)),
+    ("65536", lambda: itertools.repeat(65_536)),
+    ("random-65536", lambda: _random_chunk_sizes(1026, 65_536)),
+    ("random-97", lambda: _random_chunk_sizes(1027, 97)),
+)
+_STREAM_MULTIBYTE = ("é€\U0001d11e" * 3).encode()
+
+
+def _sized_stream_event(prefix: bytes, size: int) -> bytes:
+    """Return one event of exactly ``size`` bytes with a truncated multibyte payload."""
+    suffix = b'"}\n'
+    fill = size - len(prefix) - len(suffix) - 70 - len(_STREAM_MULTIBYTE)
+    assert fill >= 0
+    event = prefix + (b"x" * 70) + _STREAM_MULTIBYTE + (b"y" * fill) + suffix
+    assert len(event) == size
+    return event
+
+
+def _stream_item(size: int) -> bytes:
+    """Return one opaque item event of exactly ``size`` bytes."""
+    return _sized_stream_event(_OPAQUE_STRING_PREFIX.encode(), size)
+
+
+def _stream_retained(size: int) -> bytes:
+    """Return one retained ``turn.started`` event of exactly ``size`` bytes."""
+    return _sized_stream_event(b'{"type":"turn.started","payload":"', size)
+
+
+def _stream_cases() -> list[tuple[str, bytes, str | None]]:
+    """Return stream inputs with literal expected outcomes under the reduced limits."""
+    terminal = _codex_terminal_event()
+    truncated = _OPAQUE_STRING_PREFIX.encode() + (b"x" * 70)
+    return [
+        ("valid-multibyte", _stream_item(600) + terminal, None),
+        ("utf8-mid-string", truncated + b'\xffx"}\n' + terminal, "invalid UTF-8"),
+        ("utf8-surrogate", truncated + b'\xed\xa0\x80"}\n' + terminal, "invalid UTF-8"),
+        ("utf8-final-flush", terminal + truncated + b"\xe2\x82", "invalid UTF-8"),
+        ("partial-event", terminal + truncated, "partial event"),
+        ("c0-after-truncation", truncated + b'\x01"}\n' + terminal, "malformed Codex JSON"),
+        ("escapes-after-truncation", truncated + b'\\u00e9\\n\\""}\n' + terminal, None),
+        (
+            "type-first-retained-oversize",
+            b'{"type":"turn.started","payload":"' + (b"x" * 400) + b'"}\n' + terminal,
+            "retained event exceeds size limit",
+        ),
+        (
+            "late-discriminator-opaque",
+            b'{"payload":"'
+            + (b"x" * 500)
+            + _STREAM_MULTIBYTE
+            + b'","type":"item.updated"}\n'
+            + terminal,
+            None,
+        ),
+        ("opaque-event-exact", _stream_item(1_024) + terminal, None),
+        ("opaque-event-one-over", _stream_item(1_025) + terminal, "opaque event exceeds"),
+        ("opaque-total-exact", _stream_item(1_000) * 3 + terminal, None),
+        (
+            "opaque-total-one-over",
+            _stream_item(1_000) * 2 + _stream_item(1_001) + terminal,
+            "opaque stream exceeds total byte limit",
+        ),
+        ("event-count-exact", _stream_item(140) * 4 + terminal, None),
+        ("event-count-one-over", _stream_item(140) * 5 + terminal, "event count limit"),
+        ("retained-exact", _stream_retained(256) + terminal, None),
+        ("retained-one-over", _stream_retained(257) + terminal, "retained event exceeds"),
+        ("opaque-item-at-retained-bound", _stream_item(256) + terminal, None),
+        ("opaque-item-over-retained-bound", _stream_item(257) + terminal, None),
+    ]
+
+
+def _observe_stream(content: bytes, sizes: Iterator[int]) -> tuple[object, ...]:
+    """Parse one planned-chunk stream into its usage dump or its error observable."""
+    try:
+        return ("ok", parse_codex_stream(_PlannedChunkReader(content, sizes)).model_dump())
+    except AssertionError:
+        raise
+    except Exception as error:
+        return ("error", _exception_observable(error))
+
+
+def test_string_fast_path_stream_outcomes_match_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """19 stream inputs x 7 byte-chunk plans match the original scanner end to end.
+
+    Reduced limits (256-byte retained event, 1,024-byte opaque event, 3,000-byte
+    opaque total, five events) put every counter edge within a few kilobytes.
+    """
+    monkeypatch.setattr(usage_codex, "MAX_EVENT_BYTES", 256)
+    monkeypatch.setattr(usage_codex, "MAX_CODEX_OPAQUE_EVENT_BYTES", 1_024)
+    monkeypatch.setattr(usage_codex, "MAX_CODEX_OPAQUE_TOTAL_BYTES", 3_000)
+    monkeypatch.setattr(usage_codex, "MAX_EVENT_COUNT", 5)
+    cases = _stream_cases()
+    assert len(cases) == 19
+    for name, content, expected in cases:
+        for plan_name, plan in _STREAM_CHUNK_PLANS:
+            candidate = _observe_stream(content, plan())
+            with monkeypatch.context() as patch:
+                patch.setattr(usage_codex, "_JsonRootScanner", _OriginalJsonRootScanner)
+                original = _observe_stream(content, plan())
+            case = f"stream {name} chunks={plan_name}"
+            assert candidate == original, f"stream observable diverged from original: {case}"
+            if expected is None:
+                assert candidate[0] == "ok", case
+            else:
+                error = cast(tuple[object, ...], candidate[1])
+                assert expected in cast(str, error[1]), case
+
+
+_TRUNCATED_ANCHOR_PREFIX = _OPAQUE_STRING_PREFIX + ("x" * 65)
+_TRUNCATED_ANCHOR_CASES = [
+    *(
+        pytest.param(_TRUNCATED_ANCHOR_PREFIX + chr(code) + '"}', False, id=f"c0-{code:02x}")
+        for code in range(32)
+    ),
+    *(
+        pytest.param(_TRUNCATED_ANCHOR_PREFIX + escape + '"}', True, id=f"escape-{index}")
+        for index, escape in enumerate(_SEEDED_VALID_ESCAPES)
+    ),
+    pytest.param(_TRUNCATED_ANCHOR_PREFIX + '\\u00e9"}', True, id="unicode-00e9"),
+    pytest.param(_TRUNCATED_ANCHOR_PREFIX + '\\uD834"}', True, id="unicode-d834"),
+    pytest.param(_TRUNCATED_ANCHOR_PREFIX + '\\q"}', False, id="invalid-escape-q"),
+    pytest.param(_TRUNCATED_ANCHOR_PREFIX + '\\U"}', False, id="invalid-escape-U"),
+    pytest.param(_TRUNCATED_ANCHOR_PREFIX + '\\u12G4"}', False, id="invalid-unicode-12G4"),
+    pytest.param(_TRUNCATED_ANCHOR_PREFIX + '\\q\\"}', False, id="m2-anchor"),
+    pytest.param(_TRUNCATED_ANCHOR_PREFIX + '\x7f"}', True, id="del-007f"),
+    pytest.param(_TRUNCATED_ANCHOR_PREFIX + 'é"}', True, id="two-byte-00e9"),
+    pytest.param(_TRUNCATED_ANCHOR_PREFIX + '\U0001d11e"}', True, id="four-byte-1d11e"),
+]
+
+
+@pytest.mark.parametrize(("text", "accepted"), _TRUNCATED_ANCHOR_CASES)
+def test_truncated_string_literal_anchors(text: str, accepted: bool) -> None:
+    """Literal, oracle-independent outcomes for special characters after truncation."""
+    for pieces in ([text], list(text)):
+        scanner = _candidate_scanner_class()()
+        if accepted:
+            for piece in pieces:
+                scanner.consume(piece)
+            scanner.finish()
+            assert scanner.is_opaque_item
+            assert vars(scanner)["_string"] == ["x"] * 64
+        else:
+            with pytest.raises(CodexUsageParseError) as error:
+                for piece in pieces:
+                    scanner.consume(piece)
+                scanner.finish()
+            assert error.value.args == ("malformed Codex JSON event",)
+            assert error.value.__cause__ is None
+            assert error.value.__context__ is None
+    line = text.encode() + b"\n"
+    if accepted:
+        assert parse_codex_stream(BytesIO(line + _codex_terminal_event())).input_tokens == 1
+    else:
+        with pytest.raises(CodexUsageParseError, match="^malformed Codex JSON event$"):
+            parse_codex_stream(BytesIO(line))
+    if text.endswith('\\q\\"}'):
+        assert line == b'{"type":"item.updated","payload":"' + b"x" * 65 + b'\\q\\"}\n'
+
+
+def test_prefix_and_discriminator_boundaries() -> None:
+    """Literal discriminator capture at 63, 64, and 65 characters, scanner and stream."""
+    scanner_class = _candidate_scanner_class()
+    terminal = _codex_terminal_event()
+    for length in (63, 64, 65):
+        value = "a" * length
+        expected = value if length <= 64 else None
+        scanner = scanner_class()
+        scanner.consume('{"type":"' + value + '"}')
+        scanner.finish()
+        assert vars(scanner)["_root_type_value"] == expected
+        assert vars(scanner)["_root_type_count"] == 1
+        assert not scanner.is_opaque_item
+        assert scanner.has_nonopaque_root_type
+        with pytest.raises(CodexUsageParseError, match="^unknown Codex event type$"):
+            parse_codex_stream(BytesIO(('{"type":"' + value + '"}\n').encode()))
+
+        key = "k" * length
+        scanner = scanner_class()
+        scanner.consume('{"' + key + '"')
+        assert vars(scanner)["_stack"] == [("object", "colon", key if length <= 64 else None)]
+        scanner.consume(':1,"type":"item.updated"}')
+        scanner.finish()
+        assert scanner.is_opaque_item
+        assert not scanner.has_nonopaque_root_type
+        event = ('{"' + key + '":1,"type":"item.updated"}\n').encode()
+        assert parse_codex_stream(BytesIO(event + terminal)).input_tokens == 1
+
+        payload = "x" * (length + 1)
+        scanner = scanner_class()
+        scanner.consume('{"payload":"' + payload + '","type":"item.updated"}')
+        scanner.finish()
+        assert vars(scanner)["_root_type_value"] == "item.updated"
+        assert scanner.is_opaque_item
+        assert not scanner.has_nonopaque_root_type
+        event = ('{"payload":"' + payload + '","type":"item.updated"}\n').encode()
+        assert parse_codex_stream(BytesIO(event + terminal)).input_tokens == 1
+
+
+def _longest_retained_sequence(value: object) -> int:
+    """Return the longest string, list, or tuple length reachable inside one field."""
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, list | tuple):
+        items = cast(list[object] | tuple[object, ...], value)
+        return max([len(items), *(_longest_retained_sequence(item) for item in items)])
+    return 0
+
+
+def test_scanner_retains_no_opaque_content() -> None:
+    """A 1 MiB unclosed truncated string leaves only the base fields and a 64-char prefix."""
+    scanner = _candidate_scanner_class()()
+    scanner.consume(_OPAQUE_STRING_PREFIX + ("x" * 1_048_576))
+    state = cast(dict[str, object], vars(scanner))
+    assert set(state) == {
+        "_stack",
+        "_root_started",
+        "_root_finished",
+        "_string",
+        "_string_truncated",
+        "_string_state",
+        "_unicode_digits",
+        "_primitive_kind",
+        "_primitive_state",
+        "_root_type_count",
+        "_root_type_value",
+    }
+    assert state["_string_state"] == "string"
+    assert state["_string_truncated"] is True
+    assert _longest_retained_sequence(state["_string"]) == 64
+    assert max(_longest_retained_sequence(value) for value in state.values()) <= 64
+
+
+def test_escape_and_unicode_states_never_skip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Split escapes after truncation reach the authentic per-character path in full."""
+    scanner_class = _candidate_scanner_class()
+    original_consume = scanner_class.__dict__["_consume_string"]
+    seen: list[str] = []
+
+    def recording_consume(self: Any, character: str) -> None:
+        """Record each character before delegating to the authentic string automaton."""
+        seen.append(character)
+        original_consume(self, character)
+
+    monkeypatch.setattr(scanner_class, "_consume_string", recording_consume)
+    prefix = _OPAQUE_STRING_PREFIX + ("x" * 70)
+    for escape in ("\\uABCD", "\\n"):
+        feeds = [[prefix + escape[:k], escape[k:] + 'xyz"}'] for k in range(1, len(escape))]
+        feeds.append([prefix, *escape, 'xyz"}'])
+        for pieces in feeds:
+            seen.clear()
+            original = _assert_scanner_equivalent(pieces, f"escape split {pieces[-2:]!r}")
+            assert original[-1][:2] == ("finish", None)
+            assert escape in "".join(seen), f"escape skipped validation: {pieces[-2:]!r}"
 
 
 @pytest.mark.parametrize("removed_key", ["speed", "input_tokens"])
