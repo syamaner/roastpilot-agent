@@ -11039,6 +11039,10 @@ def _candidate_scanner_class() -> type[Any]:
 def _scanner_snapshot(scanner: Any) -> tuple[object, ...]:
     """Return a detached copy of every scanner field plus its public classifications."""
     state = cast(dict[str, object], vars(scanner))
+    assert len(_SCANNER_STATE_FIELDS) == 11
+    assert set(state) == set(_SCANNER_STATE_FIELDS), (
+        f"scanner instance fields changed: {sorted(set(state) ^ set(_SCANNER_STATE_FIELDS))}"
+    )
     values: list[object] = []
     for field in _SCANNER_STATE_FIELDS:
         value: object = state[field]
@@ -11587,7 +11591,7 @@ def _longest_retained_sequence(value: object) -> int:
 
 
 def test_scanner_retains_no_opaque_content() -> None:
-    """A 1 MiB unclosed truncated string leaves only the base fields and a 64-char prefix."""
+    """1 MiB unclosed and closed truncated strings keep only base fields and a 64-char prefix."""
     error, scanner = _scan_pieces([_OPAQUE_STRING_PREFIX + ("x" * 1_048_576)], finish=False)
     assert error is None
     state = cast(dict[str, object], vars(scanner))
@@ -11608,6 +11612,31 @@ def test_scanner_retains_no_opaque_content() -> None:
     assert state["_string_truncated"] is True
     assert _longest_retained_sequence(state["_string"]) == 64
     assert max(_longest_retained_sequence(value) for value in state.values()) <= 64
+
+    # A closed long string takes the fast path's found-special branch, so skipped
+    # text must not be retained there either (appended or in a new attribute).
+    closed = _OPAQUE_STRING_PREFIX + ("x" * 1_048_576) + '"}'
+    error, scanner = _scan_pieces([closed])
+    assert error is None
+    state = cast(dict[str, object], vars(scanner))
+    assert set(state) == {
+        "_stack",
+        "_root_started",
+        "_root_finished",
+        "_string",
+        "_string_truncated",
+        "_string_state",
+        "_unicode_digits",
+        "_primitive_kind",
+        "_primitive_state",
+        "_root_type_count",
+        "_root_type_value",
+    }, f"closed string left extra fields: {sorted(state)}"
+    assert state["_string_state"] == "none"
+    assert state["_string_truncated"] is True
+    assert state["_string"] == ["x"] * 64, "closed string retained more than its prefix"
+    assert max(_longest_retained_sequence(value) for value in state.values()) <= 64
+    assert scanner.is_opaque_item
 
 
 def _escape_split_feeds() -> list[tuple[str, list[str]]]:
