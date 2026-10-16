@@ -86,6 +86,43 @@ if [ "$name" != cat ] || [ "${FAKE_RECORD_CAT:-}" = 1 ]; then
 fi
 [ -z "${FAKE_SECRET_ENV_LOG:-}" ] || printf '%s OPENROUTER_API_KEY=<%s> OPENROUTER_API_KEY_FILE=<%s> OPENAI_API_KEY=<%s> ANTHROPIC_API_KEY=<%s> ROASTPILOT_API_KEY=<%s> ROASTPILOT_OPENROUTER_API_KEY=<%s> ROASTPILOT_INSTALL_API_KEY=<%s> API_KEY=<%s>\\n' "$name" "${OPENROUTER_API_KEY-UNSET}" "${OPENROUTER_API_KEY_FILE-UNSET}" "${OPENAI_API_KEY-UNSET}" "${ANTHROPIC_API_KEY-UNSET}" "${ROASTPILOT_API_KEY-UNSET}" "${ROASTPILOT_OPENROUTER_API_KEY-UNSET}" "${ROASTPILOT_INSTALL_API_KEY-UNSET}" "${API_KEY-UNSET}" >> "$FAKE_SECRET_ENV_LOG"
 [ "${FAKE_REQUIRE_LC_ALL_C:-}" != 1 ] || { [ "${LC_ALL:-}" = C ] || { printf 'FAKE_LC_ALL_NOT_C <%s>\\n' "${LC_ALL-UNSET}" >> "$FAKE_LOG"; exit 58; }; printf 'FAKE_LC_ALL_C\\n' >> "$FAKE_LOG"; }
+if [ "$name" = test ]; then
+    if [ "${1:-}" = -L ] && [ "${FAKE_TEST_L_FAIL_PATH:-}" = "${!#}" ]; then
+      count=0; [ ! -e "$FAKE_TEST_L_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_TEST_L_FAIL_COUNT_FILE")
+      count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_TEST_L_FAIL_COUNT_FILE"
+      if [ "${FAKE_TEST_L_FAIL_ON_COUNT:-}" = "$count" ]; then
+        printf 'FAKE_TEST_L_FAILURE <%s> <%s>\\n' "${!#}" "$count" >> "$FAKE_LOG"
+        exit 41
+      fi
+    fi
+    if [ "${1:-}" = -d ] && [ "${FAKE_TEST_FAIL_D_PATH:-}" = "${!#}" ]; then
+      count=0; [ ! -e "$FAKE_TEST_FAIL_D_COUNT_FILE" ] || count=$(cat "$FAKE_TEST_FAIL_D_COUNT_FILE")
+      count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_TEST_FAIL_D_COUNT_FILE"
+      [ "${FAKE_TEST_FAIL_D_ON_COUNT:-}" != "$count" ] || { printf 'FAKE_TEST_D_FAILURE <%s> <%s>\\n' "${!#}" "$count" >> "$FAKE_LOG"; exit 48; }
+    fi
+    if [ -n "${FAKE_TEST_FAIL_PATH:-}" ] && [ "${!#}" = "$FAKE_TEST_FAIL_PATH" ]; then
+      count=0; [ ! -e "$FAKE_TEST_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_TEST_FAIL_COUNT_FILE")
+      count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_TEST_FAIL_COUNT_FILE"
+      if [ -z "${FAKE_TEST_FAIL_ON_COUNT:-}" ] || [ "$count" = "$FAKE_TEST_FAIL_ON_COUNT" ]; then
+        printf 'FAKE_TEST_FAILURE <%s>\\n' "${!#}" >> "$FAKE_LOG"
+        exit 41
+      fi
+    fi
+    if builtin test "$@"; then
+      if [ "${1:-}" = -d ] && [ "${!#}" = "${FAKE_MUTATE_AFTER_TEST_D_PATH:-}" ]; then
+        [ -n "${FAKE_MUTATE_AFTER_TEST_D_TARGET:-}" ] || exit 46
+        count=0; [ ! -e "$FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE" ] || count=$(cat "$FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE")
+        count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE"
+        if [ -z "${FAKE_MUTATE_AFTER_TEST_D_ON_COUNT:-}" ] || [ "$count" = "$FAKE_MUTATE_AFTER_TEST_D_ON_COUNT" ]; then
+          /bin/rm -rf -- "$FAKE_MUTATE_AFTER_TEST_D_PATH"
+          /bin/ln -s -- "$FAKE_MUTATE_AFTER_TEST_D_TARGET" "$FAKE_MUTATE_AFTER_TEST_D_PATH"
+          printf 'FAKE_TEST_D_MUTATION <%s> <%s> <%s>\n' "$FAKE_MUTATE_AFTER_TEST_D_PATH" "$FAKE_MUTATE_AFTER_TEST_D_TARGET" "$count" >> "$FAKE_LOG"
+        fi
+      fi
+      exit 0
+    fi
+    exit 1
+fi
 case "$name" in
   sudo) shift; [ "${1:-}" = -- ] && shift; exec "$@" ;;
   id)
@@ -395,42 +432,6 @@ UNIT
   tee) [ "${1:-}" = -- ] && shift; [ "${FAKE_TEE_FAIL:-}" != 1 ] || exit 19; [ "${FAKE_TEE_FAIL_TARGET:-}" != "$1" ] || exit 19; mkdir -p "$(dirname "$1")"; cat > "$1" ;;
   install) mode=0644; [ "${1:-}" = -m ] && { mode="$2"; shift 2; }
     [ "${1:-}" = -- ] && shift; cp "$1" "$2"; chmod "$mode" "$2" ;;
-  test)
-    if [ "${1:-}" = -L ] && [ "${FAKE_TEST_L_FAIL_PATH:-}" = "${!#}" ]; then
-      count=0; [ ! -e "$FAKE_TEST_L_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_TEST_L_FAIL_COUNT_FILE")
-      count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_TEST_L_FAIL_COUNT_FILE"
-      if [ "${FAKE_TEST_L_FAIL_ON_COUNT:-}" = "$count" ]; then
-        printf 'FAKE_TEST_L_FAILURE <%s> <%s>\\n' "${!#}" "$count" >> "$FAKE_LOG"
-        exit 41
-      fi
-    fi
-    if [ "${1:-}" = -d ] && [ "${FAKE_TEST_FAIL_D_PATH:-}" = "${!#}" ]; then
-      count=0; [ ! -e "$FAKE_TEST_FAIL_D_COUNT_FILE" ] || count=$(cat "$FAKE_TEST_FAIL_D_COUNT_FILE")
-      count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_TEST_FAIL_D_COUNT_FILE"
-      [ "${FAKE_TEST_FAIL_D_ON_COUNT:-}" != "$count" ] || { printf 'FAKE_TEST_D_FAILURE <%s> <%s>\\n' "${!#}" "$count" >> "$FAKE_LOG"; exit 48; }
-    fi
-    if [ -n "${FAKE_TEST_FAIL_PATH:-}" ] && [ "${!#}" = "$FAKE_TEST_FAIL_PATH" ]; then
-      count=0; [ ! -e "$FAKE_TEST_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_TEST_FAIL_COUNT_FILE")
-      count=$((count + 1)); printf '%s\\n' "$count" > "$FAKE_TEST_FAIL_COUNT_FILE"
-      if [ -z "${FAKE_TEST_FAIL_ON_COUNT:-}" ] || [ "$count" = "$FAKE_TEST_FAIL_ON_COUNT" ]; then
-        printf 'FAKE_TEST_FAILURE <%s>\\n' "${!#}" >> "$FAKE_LOG"
-        exit 41
-      fi
-    fi
-    if builtin test "$@"; then
-      if [ "${1:-}" = -d ] && [ "${!#}" = "${FAKE_MUTATE_AFTER_TEST_D_PATH:-}" ]; then
-        [ -n "${FAKE_MUTATE_AFTER_TEST_D_TARGET:-}" ] || exit 46
-        count=0; [ ! -e "$FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE" ] || count=$(cat "$FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE")
-        count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_MUTATE_AFTER_TEST_D_COUNT_FILE"
-        if [ -z "${FAKE_MUTATE_AFTER_TEST_D_ON_COUNT:-}" ] || [ "$count" = "$FAKE_MUTATE_AFTER_TEST_D_ON_COUNT" ]; then
-          /bin/rm -rf -- "$FAKE_MUTATE_AFTER_TEST_D_PATH"
-          /bin/ln -s -- "$FAKE_MUTATE_AFTER_TEST_D_TARGET" "$FAKE_MUTATE_AFTER_TEST_D_PATH"
-          printf 'FAKE_TEST_D_MUTATION <%s> <%s> <%s>\n' "$FAKE_MUTATE_AFTER_TEST_D_PATH" "$FAKE_MUTATE_AFTER_TEST_D_TARGET" "$count" >> "$FAKE_LOG"
-        fi
-      fi
-      exit 0
-    fi
-    exit 1 ;;
   mkdir)
     if [ "${FAKE_MKDIR_FAIL_PATH:-}" = "${!#}" ]; then
       count=0; [ ! -e "$FAKE_MKDIR_FAIL_COUNT_FILE" ] || count=$(cat "$FAKE_MKDIR_FAIL_COUNT_FILE")
@@ -9909,3 +9910,171 @@ def test_fake_test_backend_installer_forms_stay_in_the_proven_domain(
         f"missing={sorted(equivalence_forms - proven_domain)} "
         f"allowlist={_PROVEN_TEST_FORMS}"
     )
+
+
+# #1024: the fake ``test`` command dispatches before the shell reads the unrelated
+# multi-command dispatcher. These nodes witness the early exit and the prefix order.
+_EARLY_DISPATCH_MARKER_TAIL = (
+    'printf \'FAKE_DISPATCHER_REACHED <%s>\\n\' "$name" >> "$FAKE_LOG"\nexit 97\n'
+)
+_EARLY_DISPATCH_UNPARSABLE_TAIL = 'case "$name" in\n  unterminated)\n'
+_EARLY_DISPATCH_SECRET_VARIABLES = (
+    "OPENROUTER_API_KEY",
+    "OPENROUTER_API_KEY_FILE",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "ROASTPILOT_API_KEY",
+    "ROASTPILOT_OPENROUTER_API_KEY",
+    "ROASTPILOT_INSTALL_API_KEY",
+    "API_KEY",
+)
+
+
+def _early_dispatch_witness(fake_bin: Path, root: Path, tail: str) -> Path:
+    """Write the generated fake truncated at its dispatcher plus ``tail``; return its bin.
+
+    Args:
+        fake_bin: The harness directory holding the generated ``fake`` script.
+        root: A test-owned directory that receives the witness ``witness-bin``.
+        tail: Shell text that replaces the dispatcher and everything after it.
+
+    Returns:
+        The witness directory, holding ``fake`` with ``test`` and ``uname`` linked to it.
+    """
+    source = (fake_bin / "fake").read_text()
+    assert source.startswith("#!/usr/bin/env bash\n"), "generated fake lost its interpreter"
+    anchor = '\ncase "$name" in\n'
+    assert source.count(anchor) == 1, "generated fake must contain exactly one dispatcher"
+    index = source.index(anchor)
+    witness_bin = root / "witness-bin"
+    witness_bin.mkdir(parents=True)
+    witness = witness_bin / "fake"
+    witness.write_text(source[: index + 1] + tail)
+    witness.chmod(0o755)
+    for name in ("test", "uname"):
+        (witness_bin / name).symlink_to(witness)
+    return witness_bin
+
+
+def _early_dispatch_check_calls(root: Path) -> tuple[tuple[tuple[str, ...], int], ...]:
+    """Create one existing directory and return the true and false ``-d`` checks on it."""
+    existing = root / "existing-directory"
+    existing.mkdir(parents=True)
+    return (("-d", str(existing)), 0), (("-d", str(root / "missing-directory")), 1)
+
+
+def test_fake_test_early_dispatch_exits_before_the_unrelated_dispatcher(
+    tmp_path: Path, installer_harness: tuple[Path, dict[str, str], Path, Path]
+) -> None:
+    """Witness that ``test`` neither reaches nor parses the dispatcher, unlike a control."""
+    fake_bin, environment, log, _ = installer_harness
+    calls = _early_dispatch_check_calls(tmp_path / "early-dispatch-states")
+
+    reach_bin = _early_dispatch_witness(fake_bin, tmp_path / "reach", _EARLY_DISPATCH_MARKER_TAIL)
+    for arguments, status in calls:
+        start = _log_lines(log)
+        result = _run_check(str(reach_bin / "test"), arguments, environment, tmp_path)
+        delta = _log_lines(log)[len(start) :]
+        assert (result.returncode, delta) == (status, [_fake_test_record(arguments)]), (
+            f"test dispatch reached the dispatcher: {arguments} status {result.returncode}, "
+            f"log delta {delta}"
+        )
+    start = _log_lines(log)
+    control = _run_check(str(reach_bin / "uname"), (), environment, tmp_path)
+    delta = _log_lines(log)[len(start) :]
+    assert (control.returncode, delta) == (97, ["uname", "FAKE_DISPATCHER_REACHED <uname>"]), (
+        f"control must reach the dispatcher: status {control.returncode}, log delta {delta}"
+    )
+
+    parse_bin = _early_dispatch_witness(
+        fake_bin, tmp_path / "parse", _EARLY_DISPATCH_UNPARSABLE_TAIL
+    )
+    for arguments, status in calls:
+        start = _log_lines(log)
+        result = _run_check(str(parse_bin / "test"), arguments, environment, tmp_path)
+        delta = _log_lines(log)[len(start) :]
+        assert (result.returncode, result.stderr, delta) == (
+            status,
+            "",
+            [_fake_test_record(arguments)],
+        ), (
+            f"test dispatch must not parse the dispatcher: {arguments} status "
+            f"{result.returncode}, stderr {result.stderr!r}, log delta {delta}"
+        )
+    start = _log_lines(log)
+    control = _run_check(str(parse_bin / "uname"), (), environment, tmp_path)
+    delta = _log_lines(log)[len(start) :]
+    assert control.returncode != 0 and control.stdout == "" and delta == ["uname"], (
+        f"control must parse the dispatcher: status {control.returncode}, "
+        f"stdout {control.stdout!r}, log delta {delta}"
+    )
+
+
+def test_fake_test_early_dispatch_keeps_the_common_prefix_first(
+    tmp_path: Path, installer_harness: tuple[Path, dict[str, str], Path, Path]
+) -> None:
+    """Prove recording, secret-environment and locale prefixes still run before dispatch."""
+    fake_bin, environment, log, _ = installer_harness
+    assert (fake_bin / "fake").read_text().splitlines()[0] == "#!/usr/bin/env bash", (
+        "generated fake must keep dynamic interpreter selection"
+    )
+    assert (fake_bin / "test").is_symlink(), "fake check must stay an external symlink seam"
+    assert (fake_bin / "test").resolve() == (fake_bin / "fake").resolve(), (
+        "fake check seam must resolve to the generated fake"
+    )
+    existing = tmp_path / "early-dispatch-prefix-directory"
+    existing.mkdir()
+    commands: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("test", ("-d", str(existing))),
+        ("uname", ()),
+    )
+    sentinels = {
+        variable: f"sentinel-{number}"
+        for number, variable in enumerate(_EARLY_DISPATCH_SECRET_VARIABLES, start=1)
+    }
+    for name, arguments in commands:
+        command = str(fake_bin / name)
+        record = name + "".join(f" <{argument}>" for argument in arguments)
+
+        secret_log = tmp_path / f"early-dispatch-secret-{name}.log"
+        secret_environment = environment | sentinels | {"FAKE_SECRET_ENV_LOG": str(secret_log)}
+        start = _log_lines(log)
+        result = _run_check(command, arguments, secret_environment, tmp_path)
+        delta = _log_lines(log)[len(start) :]
+        assert delta == [record], f"recording prefix must run before dispatch: {name} {delta}"
+        secret_lines = secret_log.read_text().splitlines() if secret_log.is_file() else []
+        expected_secret = name + "".join(
+            f" {variable}=<{value}>" for variable, value in sentinels.items()
+        )
+        assert (result.returncode, secret_lines) == (0, [expected_secret]), (
+            f"secret prefix must run before dispatch: {name} status {result.returncode}, "
+            f"secret log {secret_lines}"
+        )
+
+        reject_environment = environment | {"LC_ALL": "not-C", "FAKE_REQUIRE_LC_ALL_C": "1"}
+        if name == "test":
+            reject_environment |= {
+                "FAKE_TEST_FAIL_D_PATH": str(existing),
+                "FAKE_TEST_FAIL_D_ON_COUNT": "1",
+            }
+        start = _log_lines(log)
+        result = _run_check(command, arguments, reject_environment, tmp_path)
+        delta = _log_lines(log)[len(start) :]
+        counters = _fake_test_counters(environment)
+        assert (result.returncode, delta, counters) == (
+            58,
+            [record, "FAKE_LC_ALL_NOT_C <not-C>"],
+            dict.fromkeys(_FAKE_TEST_COUNTER_VARIABLES),
+        ), (
+            f"locale prefix must run before dispatch: {name} status {result.returncode}, "
+            f"log delta {delta}, counters {counters}"
+        )
+
+        accept_environment = environment | {"LC_ALL": "C", "FAKE_REQUIRE_LC_ALL_C": "1"}
+        start = _log_lines(log)
+        result = _run_check(command, arguments, accept_environment, tmp_path)
+        delta = _log_lines(log)[len(start) :]
+        assert (result.returncode, delta) == (0, [record, "FAKE_LC_ALL_C"]), (
+            f"record must precede the locale line: {name} status {result.returncode}, "
+            f"log delta {delta}"
+        )

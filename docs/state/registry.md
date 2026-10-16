@@ -1,5 +1,23 @@
 # RoastPilot Agent Project State Registry
 
+**16 Oct 2026, #1024 fake filesystem-check early dispatch:** the installer
+test harness's fake `test` command now runs its unchanged check logic (fault
+injections 41/48/41, post-success `-d` hook/46, `0/1` normalisation,
+shell-builtin backend) before the shell reads the unrelated multi-command
+dispatcher; the shared recording, secret-environment and locale prefix still
+runs first, and the external fake-command seam and `/usr/bin/env bash`
+selection are unchanged. New nodes witness the early exit against a
+non-filesystem control and the prefix order. Over 3 alternating matched pairs
+of three unchanged installer nodes (summed call-phase seconds, baseline B vs
+candidate C): pair 1 (B then C) 52.709 vs 48.989, 7.06% saving; pair 2 (C then
+B) 53.870 vs 49.746, 7.66%; pair 3 (B then C) 53.925 vs 49.590, 8.04%. Median
+saving 7.66% (4.12 s); the two new nodes cost K = 1.10 s (median all-phase),
+for a net 3.03 s; all three ratified bars passed. Unrelated host load was not
+controlled. This is a finite measurement of the selected tests, not a module,
+whole-suite or CI claim. `packaging/` is unchanged. This records test
+infrastructure only, with no E11 status, hardware, Pi, installation or release
+claim.
+
 **15 Oct 2026, #1022 docs-marker audit imported-source parse reuse:** within
 one bounded docs-reader audit operation, the analyser's four imported-module
 parse sites share the syntax tree of byte-identical imported source text
