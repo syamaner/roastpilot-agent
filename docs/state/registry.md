@@ -18,6 +18,7 @@ their bodies, assertions and markers, and there are 58 new cases. Over 3
 alternating matched pairs of the two unchanged real 64 MiB aggregate stress
 nodes (each node in a fresh process; summed call-phase seconds, baseline B
 vs candidate C), the results were:
+
 - pair 1 (B then C): 21.101 vs 0.399, a 98.11% saving;
 - pair 2 (C then B): 20.963 vs 0.501, a 97.61% saving;
 - pair 3 (B then C): 25.204 vs 0.828, a 96.72% saving.
@@ -27,10 +28,10 @@ The median saving was 97.61% (20.70 s). The new cases cost K = 7.71 s
 (about 50.9 MiB) lower. All four ratified bars passed. Unrelated host load
 was not controlled. This is a finite measurement of the selected nodes, not a
 whole-suite or ordinary-CI forecast. Usage capture is not activated, and
-permissions, providers and hardware are unchanged. The full all-markers gate
-and the independent reviews are pending. This records test and tooling
-infrastructure only, with no E11 status, hardware, Pi, installation or release
-claim.
+permissions, providers and hardware are unchanged. These measurements do not
+substitute for the full all-markers gate or independent review. This records
+test and tooling infrastructure only, with no E11 status, hardware, Pi,
+installation or release claim.
 
 **16 Oct 2026, #1024 fake filesystem-check early dispatch:** the installer
 test harness's fake `test` command now runs its unchanged check logic (fault
