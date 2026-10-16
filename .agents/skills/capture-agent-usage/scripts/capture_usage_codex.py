@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codecs
 import json
+import re
 from collections.abc import Mapping
 from typing import Any, Protocol
 
@@ -36,6 +37,7 @@ MAX_CODEX_OPAQUE_TOTAL_BYTES = 67_108_864
 READ_CHUNK_BYTES = 65_536
 """Largest read request and retained-line carry buffer bound."""
 _STRING_CAPTURE_LIMIT = 64
+_STRING_SPECIAL_CHARACTER = re.compile(r'["\\\x00-\x1f]')
 MAX_JSON_NESTING_DEPTH = 64
 """Maximum shallow JSON container depth accepted by the frozen Codex grammar."""
 
@@ -102,6 +104,16 @@ class _JsonRootScanner:
         while index < len(text):
             character = text[index]
             if self._string_state != "none":
+                # Truncation is set only once the 64-character prefix is full, so an
+                # ordinary string character changes no state. Skip to the next quote,
+                # backslash, or C0 control; that special character still goes to the
+                # authentic automaton. Escape and unicode states never skip.
+                if self._string_state == "string" and self._string_truncated:
+                    special = _STRING_SPECIAL_CHARACTER.search(text, index)
+                    if special is None:
+                        break
+                    index = special.start()
+                    character = text[index]
                 self._consume_string(character)
                 index += 1
                 continue

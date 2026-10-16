@@ -11061,11 +11061,63 @@ def _exception_observable(error: Exception) -> tuple[object, ...]:
     )
 
 
-def _observe_scanner(scanner_class: type[Any], pieces: list[str]) -> list[tuple[object, ...]]:
+class _RecordingSpecialSearch:
+    """Delegate to the production special-character pattern while bounding its work.
+
+    ``begin`` sets the budget for one ``consume`` call: within one call the searched
+    spans must be disjoint, so their sum can never exceed the characters supplied.
+    A rescanning search therefore fails this assertion in finite time instead of
+    looping.
+    """
+
+    def __init__(self, pattern: re.Pattern[str]) -> None:
+        """Wrap the real compiled pattern with zeroed work counters."""
+        self._pattern = pattern
+        self.budget = 0
+        self.spent = 0
+        self.total_spent = 0
+        self.calls = 0
+        self.skipped_runs = 0
+
+    def begin(self, characters: int) -> None:
+        """Start the scan budget for one ``consume`` call of ``characters`` length."""
+        self.budget = characters
+        self.spent = 0
+
+    def search(self, string: str, pos: int = 0) -> re.Match[str] | None:
+        """Search like ``re.Pattern.search`` while recording the scanned span."""
+        match = self._pattern.search(string, pos)
+        end = len(string) if match is None else match.end()
+        self.calls += 1
+        self.spent += end - pos
+        self.total_spent += end - pos
+        if match is None or match.start() > pos:
+            self.skipped_runs += 1
+        assert self.spent <= self.budget, (
+            f"special-character search scanned {self.spent} > {self.budget} characters "
+            "within one consume call"
+        )
+        return match
+
+
+def _install_search_guard(monkeypatch: pytest.MonkeyPatch) -> _RecordingSpecialSearch:
+    """Replace the production special-character pattern with a recording proxy."""
+    guard = _RecordingSpecialSearch(
+        usage_codex._STRING_SPECIAL_CHARACTER  # pyright: ignore[reportPrivateUsage]
+    )
+    monkeypatch.setattr(usage_codex, "_STRING_SPECIAL_CHARACTER", guard)
+    return guard
+
+
+def _observe_scanner(
+    scanner_class: type[Any], pieces: list[str], guard: _RecordingSpecialSearch | None = None
+) -> list[tuple[object, ...]]:
     """Feed decoded pieces, recording the error-or-state observable after every call."""
     scanner = scanner_class()
     observed: list[tuple[object, ...]] = []
     for piece in pieces:
+        if guard is not None:
+            guard.begin(len(piece))
         try:
             scanner.consume(piece)
         except AssertionError:
@@ -11085,9 +11137,11 @@ def _observe_scanner(scanner_class: type[Any], pieces: list[str]) -> list[tuple[
     return observed
 
 
-def _assert_scanner_equivalent(pieces: list[str], case: str) -> list[tuple[object, ...]]:
+def _assert_scanner_equivalent(
+    pieces: list[str], case: str, guard: _RecordingSpecialSearch | None = None
+) -> list[tuple[object, ...]]:
     """Require the production scanner to match the frozen original after every call."""
-    candidate = _observe_scanner(_candidate_scanner_class(), pieces)
+    candidate = _observe_scanner(_candidate_scanner_class(), pieces, guard)
     original = _observe_scanner(_OriginalJsonRootScanner, pieces)
     assert candidate == original, f"scanner observable diverged from original: {case}"
     return original
@@ -11152,7 +11206,9 @@ _EXHAUSTIVE_TEMPLATES = (
 _EXHAUSTIVE_RUN_LENGTHS = (62, 63, 64, 65)
 
 
-def test_string_fast_path_matches_original_on_exhaustive_small_corpus() -> None:
+def test_string_fast_path_matches_original_on_exhaustive_small_corpus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """33,760 cases: 211 suffixes x 4 run lengths x 4 templates x 10 feeds.
 
     Every string of length at most 2 over a 14-symbol alphabet (211 suffixes)
@@ -11167,6 +11223,7 @@ def test_string_fast_path_matches_original_on_exhaustive_small_corpus() -> None:
         *("".join(pair) for pair in itertools.product(_EXHAUSTIVE_ALPHABET, repeat=2)),
     ]
     assert len(suffixes) == 211
+    guard = _install_search_guard(monkeypatch)
     cases = 0
     for (name, prefix, closing), length, suffix in itertools.product(
         _EXHAUSTIVE_TEMPLATES, _EXHAUSTIVE_RUN_LENGTHS, suffixes
@@ -11178,7 +11235,7 @@ def test_string_fast_path_matches_original_on_exhaustive_small_corpus() -> None:
             feeds.append([text[:split], text[split:]])
         for feed_index, pieces in enumerate(feeds):
             _assert_scanner_equivalent(
-                pieces, f"exhaustive {name} L={length} suffix={suffix!r} feed={feed_index}"
+                pieces, f"exhaustive {name} L={length} suffix={suffix!r} feed={feed_index}", guard
             )
             cases += 1
     assert cases == 33_760
@@ -11237,19 +11294,22 @@ def _seeded_event(rng: random.Random) -> list[str]:
     return [text[start:end] for start, end in itertools.pairwise(bounds)]
 
 
-def test_string_fast_path_matches_original_on_seeded_corpus() -> None:
+def test_string_fast_path_matches_original_on_seeded_corpus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """2,500 seeded events (1,250 each from seeds 1026 and 6201) match the original.
 
     The weighted generator covers all 32 C0 controls, quotes, lone backslashes,
     all eight valid escapes, mixed-case ``\\uXXXX``, invalid escapes, 2/3/4-byte
     characters, lengths 0-300, structural mutations, and random call splits.
     """
+    guard = _install_search_guard(monkeypatch)
     accepted = rejected = truncated = 0
     for seed in (1026, 6201):
         rng = random.Random(seed)
         for case in range(1_250):
             pieces = _seeded_event(rng)
-            original = _assert_scanner_equivalent(pieces, f"seeded {seed}:{case} {pieces!r}")
+            original = _assert_scanner_equivalent(pieces, f"seeded {seed}:{case} {pieces!r}", guard)
             if original[-1][0] == "finish" and original[-1][1] is None:
                 accepted += 1
             else:
@@ -11524,6 +11584,17 @@ def test_scanner_retains_no_opaque_content() -> None:
     assert max(_longest_retained_sequence(value) for value in state.values()) <= 64
 
 
+def _escape_split_feeds() -> list[tuple[str, list[str]]]:
+    """Return truncated-string escapes split at every internal boundary and per character."""
+    prefix = _OPAQUE_STRING_PREFIX + ("x" * 70)
+    feeds: list[tuple[str, list[str]]] = []
+    for escape in ("\\uABCD", "\\n"):
+        for split in range(1, len(escape)):
+            feeds.append((escape, [prefix + escape[:split], escape[split:] + 'xyz"}']))
+        feeds.append((escape, [prefix, *escape, 'xyz"}']))
+    return feeds
+
+
 def test_escape_and_unicode_states_never_skip(monkeypatch: pytest.MonkeyPatch) -> None:
     """Split escapes after truncation reach the authentic per-character path in full."""
     scanner_class = _candidate_scanner_class()
@@ -11536,15 +11607,156 @@ def test_escape_and_unicode_states_never_skip(monkeypatch: pytest.MonkeyPatch) -
         original_consume(self, character)
 
     monkeypatch.setattr(scanner_class, "_consume_string", recording_consume)
-    prefix = _OPAQUE_STRING_PREFIX + ("x" * 70)
-    for escape in ("\\uABCD", "\\n"):
-        feeds = [[prefix + escape[:k], escape[k:] + 'xyz"}'] for k in range(1, len(escape))]
-        feeds.append([prefix, *escape, 'xyz"}'])
-        for pieces in feeds:
-            seen.clear()
-            original = _assert_scanner_equivalent(pieces, f"escape split {pieces[-2:]!r}")
-            assert original[-1][:2] == ("finish", None)
-            assert escape in "".join(seen), f"escape skipped validation: {pieces[-2:]!r}"
+    guard = _install_search_guard(monkeypatch)
+    for escape, pieces in _escape_split_feeds():
+        seen.clear()
+        original = _assert_scanner_equivalent(pieces, f"escape split {pieces[-2:]!r}", guard)
+        assert original[-1][:2] == ("finish", None)
+        assert escape in "".join(seen), f"escape skipped validation: {pieces[-2:]!r}"
+
+
+def _work_witness_feeds(length: int) -> list[tuple[str, list[str]]]:
+    """Return the whole, 65,536-character, and per-character feeds of one witness event."""
+    text = _OPAQUE_STRING_PREFIX + ("x" * length) + '"}'
+    chunks = [text[start : start + 65_536] for start in range(0, len(text), 65_536)]
+    return [("whole", [text]), ("65536", chunks), ("per-character", list(text))]
+
+
+def _work_witness_final_state(length: int) -> tuple[object, ...]:
+    """Return the literal final scanner observable for one accepted witness event."""
+    return (
+        (),
+        True,
+        True,
+        ("x",) * min(length, 64),
+        length > 64,
+        "none",
+        (),
+        None,
+        "",
+        1,
+        "item.updated",
+        True,
+        False,
+        True,
+    )
+
+
+def _counted_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    scanner_class: type[Any],
+    pieces: list[str],
+    guard: _RecordingSpecialSearch | None = None,
+) -> tuple[int, tuple[object, ...] | None, tuple[object, ...]]:
+    """Count ``_consume_string`` calls for one feed, returning error and final state."""
+    calls = 0
+    original_consume = scanner_class.__dict__["_consume_string"]
+
+    def counting_consume(self: Any, character: str) -> None:
+        """Count one authentic per-character string-automaton step."""
+        nonlocal calls
+        calls += 1
+        original_consume(self, character)
+
+    scanner = scanner_class()
+    error: tuple[object, ...] | None = None
+    with monkeypatch.context() as patch:
+        patch.setattr(scanner_class, "_consume_string", counting_consume)
+        try:
+            for piece in pieces:
+                if guard is not None:
+                    guard.begin(len(piece))
+                scanner.consume(piece)
+            scanner.finish()
+        except AssertionError:
+            raise
+        except Exception as raised:
+            error = _exception_observable(raised)
+    return calls, error, _scanner_snapshot(scanner)
+
+
+def test_string_fast_path_work_witness(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deterministic work: 26 + min(N, 65) + 1 string steps, versus N + 27 originally.
+
+    The ``type`` key (5), ``item.updated`` value (13), and ``payload`` key (8) cost
+    26 steps; the payload costs min(N, 65) characters plus its closing quote. The
+    65th payload character sets truncation, after which ordinary characters skip.
+    """
+    expected_candidate = {64: 91, 65: 92, 66: 92, 1_048_576: 92}
+    expected_original = {64: 91, 65: 92, 66: 93, 1_048_576: 1_048_603}
+    for length, feeds in ((length, _work_witness_feeds(length)) for length in expected_candidate):
+        for feed_name, pieces in feeds:
+            calls, error, state = _counted_scan(monkeypatch, _candidate_scanner_class(), pieces)
+            case = f"N={length} feed={feed_name}"
+            assert (calls, error) == (expected_candidate[length], None), case
+            assert state == _work_witness_final_state(length), case
+        original_calls, original_error, original_state = _counted_scan(
+            monkeypatch, _OriginalJsonRootScanner, feeds[0][1]
+        )
+        assert (original_calls, original_error) == (expected_original[length], None)
+        assert original_state == _work_witness_final_state(length)
+
+
+def test_string_fast_path_search_is_linear(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Searches never rescan and are bounded by consume calls plus truncated specials.
+
+    Covers every work-witness feed and every split-escape feed. Each long ordinary
+    run must be found by at least one search that skipped characters, so a fast
+    path that is never entered fails here as well as in the work witness.
+    """
+    guard = _install_search_guard(monkeypatch)
+    scanner_class = _candidate_scanner_class()
+    original_consume = scanner_class.__dict__["_consume_string"]
+    truncated_specials = 0
+
+    def special_counting_consume(self: Any, character: str) -> None:
+        """Count special characters that reach the automaton inside a truncated string."""
+        nonlocal truncated_specials
+        state = cast(dict[str, object], vars(self))
+        if (
+            state["_string_state"] == "string"
+            and state["_string_truncated"] is True
+            and (character in '"\\' or ord(character) < 0x20)
+        ):
+            truncated_specials += 1
+        original_consume(self, character)
+
+    monkeypatch.setattr(scanner_class, "_consume_string", special_counting_consume)
+    inputs: list[tuple[str, list[str], int]] = []
+    for length in (64, 65, 66, 1_048_576):
+        for feed_name, pieces in _work_witness_feeds(length):
+            inputs.append((f"witness N={length} feed={feed_name}", pieces, length))
+    for escape, pieces in _escape_split_feeds():
+        inputs.append((f"escape {escape!r} split {pieces[-2:]!r}", pieces, -1))
+    for case, pieces, length in inputs:
+        guard.calls = guard.skipped_runs = guard.total_spent = 0
+        truncated_specials = 0
+        if length >= 0:
+            scanner = scanner_class()
+            error: tuple[object, ...] | None = None
+            try:
+                for piece in pieces:
+                    guard.begin(len(piece))
+                    scanner.consume(piece)
+                scanner.finish()
+            except AssertionError:
+                raise
+            except Exception as raised:
+                error = _exception_observable(raised)
+            assert error is None, case
+            assert _scanner_snapshot(scanner) == _work_witness_final_state(length), case
+        else:
+            candidate = _observe_scanner(scanner_class, pieces, guard)
+            assert candidate == _observe_scanner(_OriginalJsonRootScanner, pieces), case
+        assert guard.total_spent <= sum(len(piece) for piece in pieces), case
+        assert guard.calls <= len(pieces) + truncated_specials, case
+        if length > 64 or length < 0:
+            assert guard.calls >= 1, f"fast path never searched: {case}"
+        else:
+            assert guard.calls == 0, f"untruncated string searched: {case}"
+        if length > 65 or length < 0:
+            # Only these inputs hold ordinary characters after truncation is set.
+            assert guard.skipped_runs >= 1, f"fast path never skipped a run: {case}"
 
 
 @pytest.mark.parametrize("removed_key", ["speed", "input_tokens"])
