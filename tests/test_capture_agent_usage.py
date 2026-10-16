@@ -11482,72 +11482,98 @@ _TRUNCATED_ANCHOR_CASES = [
 ]
 
 
+_MALFORMED_SCANNER_ERROR = (
+    CodexUsageParseError,
+    "malformed Codex JSON event",
+    ("malformed Codex JSON event",),
+    True,
+    True,
+    False,
+)
+
+
+def _scan_pieces(pieces: list[str], finish: bool = True) -> tuple[tuple[object, ...] | None, Any]:
+    """Run the production scanner, returning its error observable (or None) and itself."""
+    scanner = _candidate_scanner_class()()
+    try:
+        for piece in pieces:
+            scanner.consume(piece)
+        if finish:
+            scanner.finish()
+    except AssertionError:
+        raise
+    except Exception as raised:
+        return _exception_observable(raised), scanner
+    return None, scanner
+
+
+def _stream_outcome(content: bytes) -> tuple[object, ...]:
+    """Parse one stream in full-size reads into its usage dump or error observable."""
+    return _observe_stream(content, itertools.repeat(READ_CHUNK_BYTES))
+
+
+def _assert_stream_usage(content: bytes, case: str) -> None:
+    """Require one stream to parse to the synthetic terminal usage."""
+    outcome = _stream_outcome(content)
+    assert outcome[0] == "ok", f"stream rejected: {case}: {outcome!r}"
+    assert cast(dict[str, object], outcome[1])["input_tokens"] == 1, case
+
+
 @pytest.mark.parametrize(("text", "accepted"), _TRUNCATED_ANCHOR_CASES)
 def test_truncated_string_literal_anchors(text: str, accepted: bool) -> None:
     """Literal, oracle-independent outcomes for special characters after truncation."""
-    for pieces in ([text], list(text)):
-        scanner = _candidate_scanner_class()()
+    for feed_name, pieces in (("whole", [text]), ("per-character", list(text))):
+        error, scanner = _scan_pieces(pieces)
         if accepted:
-            for piece in pieces:
-                scanner.consume(piece)
-            scanner.finish()
-            assert scanner.is_opaque_item
-            assert vars(scanner)["_string"] == ["x"] * 64
+            assert error is None, f"accepted anchor rejected: feed={feed_name}"
+            assert scanner.is_opaque_item, feed_name
+            assert vars(scanner)["_string"] == ["x"] * 64, feed_name
         else:
-            with pytest.raises(CodexUsageParseError) as error:
-                for piece in pieces:
-                    scanner.consume(piece)
-                scanner.finish()
-            assert error.value.args == ("malformed Codex JSON event",)
-            assert error.value.__cause__ is None
-            assert error.value.__context__ is None
+            assert error == _MALFORMED_SCANNER_ERROR, f"rejected anchor outcome: feed={feed_name}"
     line = text.encode() + b"\n"
     if accepted:
-        assert parse_codex_stream(BytesIO(line + _codex_terminal_event())).input_tokens == 1
+        _assert_stream_usage(line + _codex_terminal_event(), "accepted anchor stream")
     else:
-        with pytest.raises(CodexUsageParseError, match="^malformed Codex JSON event$"):
-            parse_codex_stream(BytesIO(line))
+        assert _stream_outcome(line) == ("error", _MALFORMED_SCANNER_ERROR)
     if text.endswith('\\q\\"}'):
         assert line == b'{"type":"item.updated","payload":"' + b"x" * 65 + b'\\q\\"}\n'
 
 
 def test_prefix_and_discriminator_boundaries() -> None:
     """Literal discriminator capture at 63, 64, and 65 characters, scanner and stream."""
-    scanner_class = _candidate_scanner_class()
     terminal = _codex_terminal_event()
     for length in (63, 64, 65):
         value = "a" * length
         expected = value if length <= 64 else None
-        scanner = scanner_class()
-        scanner.consume('{"type":"' + value + '"}')
-        scanner.finish()
-        assert vars(scanner)["_root_type_value"] == expected
+        error, scanner = _scan_pieces(['{"type":"' + value + '"}'])
+        assert error is None, f"type value {length} rejected"
+        assert vars(scanner)["_root_type_value"] == expected, f"type value {length}"
         assert vars(scanner)["_root_type_count"] == 1
         assert not scanner.is_opaque_item
         assert scanner.has_nonopaque_root_type
-        with pytest.raises(CodexUsageParseError, match="^unknown Codex event type$"):
-            parse_codex_stream(BytesIO(('{"type":"' + value + '"}\n').encode()))
+        outcome = _stream_outcome(('{"type":"' + value + '"}\n').encode())
+        assert outcome[0] == "error", f"type value {length} stream accepted"
+        assert cast(tuple[object, ...], outcome[1])[1] == "unknown Codex event type"
 
         key = "k" * length
-        scanner = scanner_class()
-        scanner.consume('{"' + key + '"')
+        error, scanner = _scan_pieces(['{"' + key + '"'], finish=False)
+        assert error is None, f"key {length} rejected"
         assert vars(scanner)["_stack"] == [("object", "colon", key if length <= 64 else None)]
-        scanner.consume(':1,"type":"item.updated"}')
-        scanner.finish()
+        error, scanner = _scan_pieces(['{"' + key + '"', ':1,"type":"item.updated"}'])
+        assert error is None, f"key {length} event rejected"
         assert scanner.is_opaque_item
         assert not scanner.has_nonopaque_root_type
         event = ('{"' + key + '":1,"type":"item.updated"}\n').encode()
-        assert parse_codex_stream(BytesIO(event + terminal)).input_tokens == 1
+        _assert_stream_usage(event + terminal, f"key {length} stream")
 
         payload = "x" * (length + 1)
-        scanner = scanner_class()
-        scanner.consume('{"payload":"' + payload + '","type":"item.updated"}')
-        scanner.finish()
+        error, scanner = _scan_pieces(['{"payload":"' + payload + '","type":"item.updated"}'])
+        assert error is None, f"late discriminator after {length + 1} rejected"
         assert vars(scanner)["_root_type_value"] == "item.updated"
         assert scanner.is_opaque_item
         assert not scanner.has_nonopaque_root_type
         event = ('{"payload":"' + payload + '","type":"item.updated"}\n').encode()
-        assert parse_codex_stream(BytesIO(event + terminal)).input_tokens == 1
+        _assert_stream_usage(event + terminal, f"late discriminator after {length + 1}")
 
 
 def _longest_retained_sequence(value: object) -> int:
@@ -11562,8 +11588,8 @@ def _longest_retained_sequence(value: object) -> int:
 
 def test_scanner_retains_no_opaque_content() -> None:
     """A 1 MiB unclosed truncated string leaves only the base fields and a 64-char prefix."""
-    scanner = _candidate_scanner_class()()
-    scanner.consume(_OPAQUE_STRING_PREFIX + ("x" * 1_048_576))
+    error, scanner = _scan_pieces([_OPAQUE_STRING_PREFIX + ("x" * 1_048_576)], finish=False)
+    assert error is None
     state = cast(dict[str, object], vars(scanner))
     assert set(state) == {
         "_stack",
