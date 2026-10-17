@@ -15,6 +15,7 @@ so a hostile string cannot inject a GitHub Actions workflow command.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -437,10 +438,23 @@ def _write_new_file(path: Path, data: bytes) -> None:
         descriptor = os.open(path, flags, 0o644)
     except OSError:
         _fail("write: output file could not be created exclusively")
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(descriptor)
+    except OSError:
+        _fail("write: output file could not be written")
+    finally:
+        _close(descriptor, "write")
+
+
+def _close(descriptor: int, what: str) -> None:
+    """Close a descriptor this module opened, mapping failure to a bounded refusal."""
+    try:
+        os.close(descriptor)
+    except OSError:
+        _fail(f"{what}: file could not be closed")
 
 
 def write_receipt(path: Path, receipt: Mapping[str, object]) -> None:
@@ -454,15 +468,16 @@ def write_receipt(path: Path, receipt: Mapping[str, object]) -> None:
         ShardError: The target exists or the receipt cannot be written.
     """
     data = _canonical_json(dict(receipt))
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        pass
-    else:
+    if _lstat_mode(path) is not None:
         _fail("receipt: target already exists")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     _write_new_file(temporary, data)
-    os.replace(temporary, path)
+    try:
+        os.replace(temporary, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        _fail("receipt: could not be published")
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -558,17 +573,25 @@ def read_regular_bounded(path: Path, cap: int, what: str) -> bytes:
         The exact bytes read.
 
     Raises:
-        ShardError: The file is missing, a symlink, not regular, empty, or over cap.
+        ShardError: The file is missing, a symlink, not regular, unreadable, empty,
+            or over cap.
     """
+    # O_NONBLOCK: opening a FIFO (or other special file) must never wait for a
+    # writer; it is rejected below as non-regular. Regular-file reads are unaffected.
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        descriptor = os.open(path, flags)
     except OSError:
         _fail(f"{what}: file is missing or a symlink")
-    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-        os.close(descriptor)
-        _fail(f"{what}: not a regular file")
-    with os.fdopen(descriptor, "rb") as handle:
-        data = handle.read(cap + 1)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            _fail(f"{what}: not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            data = handle.read(cap + 1)
+    except OSError:
+        _fail(f"{what}: file could not be read")
+    finally:
+        _close(descriptor, what)
     if len(data) > cap:
         _fail(f"caps: {what} exceeds its cap")
     if not data:
@@ -601,10 +624,13 @@ def read_head_sha() -> str:
         result = subprocess.run(
             ["git", "rev-parse", "--verify", "HEAD"],
             capture_output=True,
-            text=True,
+            encoding="ascii",
+            errors="strict",
             timeout=_GIT_TIMEOUT_SECONDS,
             check=False,
         )
+    except UnicodeError:
+        _fail("identity: git HEAD is not a 40-hex commit")
     except (OSError, subprocess.TimeoutExpired):
         _fail("identity: git rev-parse could not run")
     head = result.stdout.removesuffix("\n")
@@ -768,11 +794,21 @@ def _lstat_mode(path: Path) -> int | None:
         return os.lstat(path).st_mode
     except FileNotFoundError:
         return None
+    except OSError:
+        _fail("filesystem: a path could not be inspected")
+
+
+def _listdir(path: Path) -> list[str]:
+    """List a directory's entries, mapping failure to a bounded refusal."""
+    try:
+        return os.listdir(path)
+    except OSError:
+        _fail("filesystem: a directory could not be listed")
 
 
 def _check_bundle_files(bundle: Path) -> None:
     """Require exactly ``manifest.json`` and ``coverage.data`` as regular files."""
-    if frozenset(os.listdir(bundle)) != BUNDLE_FILES:
+    if frozenset(_listdir(bundle)) != BUNDLE_FILES:
         _fail("bundle: files are not exactly manifest.json and coverage.data")
     for name in sorted(BUNDLE_FILES):
         mode = _lstat_mode(bundle / name)
@@ -885,7 +921,7 @@ def verify(bundle_root: Path, context: IdentityContext, ordinary_coverage: Path)
     mode = _lstat_mode(bundle_root)
     if mode is None or not stat.S_ISDIR(mode):
         _fail("bundle: the bundle root is not a real directory")
-    if sorted(os.listdir(bundle_root)) != list(SHARD_DIRECTORIES):
+    if sorted(_listdir(bundle_root)) != list(SHARD_DIRECTORIES):
         _fail("bundle: the bundle root does not hold exactly the two shards")
     shards = [
         _verify_shard(bundle_root / name, index, context)

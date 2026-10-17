@@ -24,7 +24,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import NoReturn, cast
 
 import ci_ordinary_shard_plugin as plugin
 import ci_ordinary_shards as shards
@@ -958,7 +958,12 @@ def test_verify_missing_member(tmp_path: Path) -> None:
 
 
 def test_verify_overlap(tmp_path: Path) -> None:
-    """An ID present in both shards is rejected (G21, defence in depth)."""
+    """An ID copied into both shards is rejected by the per-shard membership guard (G20).
+
+    One deterministic index cannot be both 0 and 1, so G20 always fires first; the
+    explicit cross-shard disjointness check (G21) is reasoned defence in depth that
+    this input cannot reach.
+    """
     bundle_root = _make_bundles(tmp_path)
     copied = KEPT[1][0]
 
@@ -967,7 +972,9 @@ def test_verify_overlap(tmp_path: Path) -> None:
         manifest["receipt"] = [*cast(list[object], manifest["receipt"]), *_passed(copied)]
 
     _rewrite(bundle_root, 0, add)
-    with pytest.raises(shards.ShardError, match="partition"):
+    with pytest.raises(
+        shards.ShardError, match=r"^partition: shard 0 kept\[\d+\] belongs to the other shard$"
+    ):
         _verify(bundle_root)
 
 
@@ -1151,18 +1158,280 @@ def test_manifest_schema_exact(tmp_path: Path, case: str) -> None:
 
 
 def test_verify_caps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Manifest and coverage caps are enforced on read (G15/G18)."""
+    """Manifest read cap, manifest size field and coverage read cap fail separately (G15/G18).
+
+    The coverage read cap is proved with a manifest whose size field is valid (at
+    the patched cap), so only the bounded coverage reader can reject the extra
+    byte, before any later size or hash comparison.
+    """
     bundle_root = _make_bundles(tmp_path)
     manifest_size = (bundle_root / "ordinary-shard-0" / "manifest.json").stat().st_size
     with monkeypatch.context() as patch:
         patch.setattr(shards, "MANIFEST_CAP", manifest_size - 1)
-        with pytest.raises(shards.ShardError, match="caps: manifest exceeds its cap"):
+        with pytest.raises(shards.ShardError, match=r"^caps: manifest exceeds its cap$"):
             _verify(bundle_root)
+    original = len(b"coverage-bytes-0")
     with monkeypatch.context() as patch:
-        patch.setattr(shards, "COVERAGE_CAP", len(b"coverage-bytes-0") - 1)
-        with pytest.raises(shards.ShardError, match="manifest coverage size|caps: coverage"):
+        patch.setattr(shards, "COVERAGE_CAP", original - 1)
+        with pytest.raises(
+            shards.ShardError,
+            match=r"^schema: manifest coverage size must be an integer in range$",
+        ):
             _verify(bundle_root)
     _verify(bundle_root)
+    data = bundle_root / "ordinary-shard-0" / "coverage.data"
+    data.write_bytes(data.read_bytes() + b"X")
+    with monkeypatch.context() as patch:
+        patch.setattr(shards, "COVERAGE_CAP", original)
+        assert _manifest(bundle_root, 0)["coverage"] == {
+            "size": original,
+            "sha256": hashlib.sha256(b"coverage-bytes-0").hexdigest(),
+        }
+        with pytest.raises(shards.ShardError, match=r"^caps: coverage exceeds its cap$"):
+            _verify(bundle_root)
+    with pytest.raises(shards.ShardError, match=r"^coverage: shard 0 bytes differ"):
+        _verify(bundle_root)
+
+
+_FIFO_CHILD = """\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+import ci_ordinary_shards as shards
+
+context = shards.IdentityContext("o/r", 1, 1, "0" * 40, "0" * 40, "normal")
+print("PRE-CALL", flush=True)
+try:
+    shards.finalize(
+        index=0,
+        receipt_path=Path(sys.argv[2]),
+        coverage_path=Path(sys.argv[3]),
+        bundle=Path(sys.argv[4]),
+        context=context,
+    )
+except shards.ShardError as error:
+    print("REFUSED", error, flush=True)
+    raise SystemExit(0)
+print("ACCEPTED", flush=True)
+raise SystemExit(3)
+"""
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("position", ["receipt", "coverage"])
+def test_finalize_rejects_fifo_inputs_promptly(tmp_path: Path, position: str) -> None:
+    """A FIFO receipt or coverage input is refused at once, never waiting for a writer.
+
+    The call runs in an owned child behind a watchdog, so a regression that opens
+    the FIFO in blocking mode fails this test instead of hanging pytest.
+    """
+    inputs = {"receipt": _write_receipt(tmp_path, 0), "coverage": tmp_path / "coverage"}
+    inputs["coverage"].write_bytes(b"data")
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    inputs[position] = fifo
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            _FIFO_CHILD,
+            str(SCRIPTS),
+            str(inputs["receipt"]),
+            str(inputs["coverage"]),
+            str(tmp_path / "bundle"),
+        ],
+        cwd=tmp_path,
+        env=_scrubbed_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = child.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.communicate()
+        pytest.fail(f"finalize blocked on a FIFO {position} input")
+    assert child.returncode == 0, stderr
+    assert stdout == f"PRE-CALL\nREFUSED {position}: not a regular file\n"
+    assert not (tmp_path / "bundle").exists()
+
+
+def _injected(*_args: object, **_kwargs: object) -> NoReturn:
+    """Raise an injected OS error whose text must never reach a diagnostic."""
+    raise OSError(5, "injected /secret/path")
+
+
+class _FailingHandle:
+    """A file handle whose read and write fail with an injected OS error."""
+
+    def __enter__(self) -> _FailingHandle:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def read(self, _size: int) -> bytes:
+        _injected()
+
+    def write(self, _data: bytes) -> int:
+        _injected()
+
+
+def _failing_handle(*_args: object, **_kwargs: object) -> _FailingHandle:
+    """Stand in for ``os.fdopen`` with a handle whose I/O fails."""
+    return _FailingHandle()
+
+
+@dataclass
+class _Descriptors:
+    """Tracks descriptors opened and closed through ``os``."""
+
+    opened: list[int] = field(default_factory=list[int])
+    closed: list[int] = field(default_factory=list[int])
+
+    def install(self, patch: pytest.MonkeyPatch) -> None:
+        """Wrap ``os.open`` and ``os.close`` for the duration of ``patch``."""
+        real_open, real_close = os.open, os.close
+
+        def tracking_open(path: str | Path, flags: int, *args: int) -> int:
+            descriptor = real_open(path, flags, *args)
+            self.opened.append(descriptor)
+            return descriptor
+
+        def tracking_close(descriptor: int) -> None:
+            self.closed.append(descriptor)
+            real_close(descriptor)
+
+        patch.setattr(os, "open", tracking_open)
+        patch.setattr(os, "close", tracking_close)
+
+
+@pytest.mark.parametrize(
+    ("name", "replacement"),
+    [
+        ("fstat", _injected),
+        ("fdopen", _injected),
+        ("fdopen", _failing_handle),
+    ],
+    ids=["fstat", "fdopen", "read"],
+)
+def test_read_regular_bounded_maps_os_errors_and_closes_its_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, replacement: object
+) -> None:
+    """fstat, fdopen and read failures become one bounded refusal; the fd is closed."""
+    real = tmp_path / "real"
+    real.write_bytes(b"12345")
+    descriptors = _Descriptors()
+    with monkeypatch.context() as patch:
+        descriptors.install(patch)
+        patch.setattr(os, name, replacement)
+        with pytest.raises(shards.ShardError, match=r"^probe: file could not be read$"):
+            shards.read_regular_bounded(real, 10, "probe")
+    assert len(descriptors.opened) == 1
+    assert descriptors.closed == descriptors.opened
+
+
+@pytest.mark.parametrize(
+    ("name", "replacement"),
+    [
+        ("fdopen", _injected),
+        ("fdopen", _failing_handle),
+        ("fsync", _injected),
+    ],
+    ids=["fdopen", "write", "fsync"],
+)
+def test_write_failures_are_bounded_and_close_the_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, replacement: object
+) -> None:
+    """Writer fdopen/write/fsync failures refuse the receipt and close the fd."""
+    target = tmp_path / "receipt.json"
+    descriptors = _Descriptors()
+    with monkeypatch.context() as patch:
+        descriptors.install(patch)
+        patch.setattr(os, name, replacement)
+        with pytest.raises(shards.ShardError, match=r"^write: output file could not be written$"):
+            shards.write_receipt(target, _build())
+    assert len(descriptors.opened) == 1
+    assert descriptors.closed == descriptors.opened
+    assert not target.exists()
+
+
+def test_write_receipt_maps_inspection_and_publish_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An uninspectable target and a failed publish are bounded; no temporary remains."""
+    plain = tmp_path / "plain"
+    plain.write_bytes(b"x")
+    with pytest.raises(shards.ShardError, match=r"^filesystem: a path could not be inspected$"):
+        shards.write_receipt(plain / "receipt.json", _build())
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", _injected)
+        with pytest.raises(shards.ShardError, match=r"^receipt: could not be published$"):
+            shards.write_receipt(tmp_path / "receipt.json", _build())
+    assert sorted(os.listdir(tmp_path)) == ["plain"]
+
+
+def test_close_failure_is_a_bounded_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing close (after really closing) is refused without OS details."""
+    real = tmp_path / "real"
+    real.write_bytes(b"12345")
+    real_close = os.close
+
+    def close_then_fail(descriptor: int) -> None:
+        real_close(descriptor)
+        _injected()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "close", close_then_fail)
+        with pytest.raises(shards.ShardError, match=r"^probe: file could not be closed$"):
+            shards.read_regular_bounded(real, 10, "probe")
+
+
+def test_verify_maps_listing_and_inspection_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Uninspectable paths and unlistable directories are bounded refusals."""
+    bundle_root = _make_bundles(tmp_path)
+    plain = tmp_path / "plain"
+    plain.write_bytes(b"x")
+    with pytest.raises(shards.ShardError, match=r"^filesystem: a path could not be inspected$"):
+        shards.verify(bundle_root, _context(), plain / ".coverage.ordinary")
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "listdir", _injected)
+        with pytest.raises(
+            shards.ShardError, match=r"^filesystem: a directory could not be listed$"
+        ):
+            _verify(bundle_root)
+    _verify(bundle_root)
+
+
+@pytest.mark.slow
+def test_read_head_sha_refuses_undecodable_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-ASCII git output is a bounded refusal, decoded strictly in the guarded call."""
+    real_run = subprocess.run
+    seen: list[dict[str, object]] = []
+    emit = "import sys; sys.stdout.buffer.write(bytes([255]) * 40 + bytes([10]))"
+
+    def run(_argv: list[str], **kwargs: object) -> object:
+        seen.append(kwargs)
+        return real_run(  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
+            [sys.executable, "-I", "-S", "-c", emit],
+            cwd=tmp_path,
+            **kwargs,  # pyright: ignore[reportArgumentType]
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(shards.ShardError, match=r"^identity: git HEAD is not a 40-hex commit$"):
+        shards.read_head_sha()
+    assert (seen[0]["encoding"], seen[0]["errors"]) == ("ascii", "strict")
 
 
 def test_diagnostics_never_echo_payload_strings(
