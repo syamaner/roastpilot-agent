@@ -37,7 +37,8 @@ Collection-tooling serialisation fixes were tooling, not subject, failures.
 
 Fixed predeclared value test, whole 15-case module, fresh-process BSD `time`
 real seconds (coverage and probes off; identical Python 3.11.14, 114 declared
-versions, Node 22.22.2, npm 10.9.7, plugins, options and bytecode controls):
+versions, Node 22.22.2, npm 10.9.7, plugins, options and bytecode controls).
+Values are B vs C throughout, regardless of execution order:
 pair 1 (B then C) 81.03 vs 49.00, 39.5285697%; pair 2 (C then B) 78.57 vs
 46.18, 41.2243859%; pair 3 (B then C) 77.82 vs 46.48, 40.2724235%. Median
 relative 40.27242354%, median raw 32.03 s, K = 0, net 32.03 s. Peak-RSS deltas
