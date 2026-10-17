@@ -6618,12 +6618,15 @@ def test_report_cost_reuse_proof_builder_propagates_producer_failures(
 ) -> None:
     """A loader failure and an estimator failure each propagate out of the
     builder unchanged -- nothing is swallowed and no fallback rows appear; a
-    loader failure never reaches the estimator."""
+    loader failure never reaches the estimator. Afterwards the same stateless
+    builder succeeds through the recording REAL estimator: one genuine row per
+    default-roster entry, from exactly one estimator call over the full corpus."""
 
     class _Boom(Exception):
         pass
 
     real_load = bo.load_corpus
+    real_estimate = bo.estimate_cost
     estimator_calls: list[int] = []
 
     def failing_load(fixtures_dir: Path) -> list[bo.CorpusPage]:
@@ -6633,7 +6636,7 @@ def test_report_cost_reuse_proof_builder_propagates_producer_failures(
         pages: list[bo.CorpusPage], roster: tuple[bo.RosterModel, ...]
     ) -> list[bo.ModelCostEstimate]:
         estimator_calls.append(len(pages))
-        return []
+        return real_estimate(pages, roster)
 
     monkeypatch.setattr(bo, "load_corpus", failing_load)
     monkeypatch.setattr(bo, "estimate_cost", recording_estimate)
@@ -6650,3 +6653,9 @@ def test_report_cost_reuse_proof_builder_propagates_producer_failures(
     monkeypatch.setattr(bo, "estimate_cost", failing_estimate)
     with pytest.raises(_Boom):
         _build_default_roster_cost_rows()
+
+    monkeypatch.setattr(bo, "estimate_cost", recording_estimate)
+    recovered = _build_default_roster_cost_rows()
+    assert estimator_calls == [len(real_load(bo.DEFAULT_FIXTURES_DIR))]
+    assert all(type(r) is bo.ModelCostEstimate for r in recovered)
+    assert [r.slug for r in recovered] == [m.slug for m in bo.MODEL_ROSTER]
