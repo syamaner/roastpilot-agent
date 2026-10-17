@@ -7,6 +7,8 @@ scripted MCP contract (E4/E5), advisor fixtures (E8), temp SQLite store
 ``log`` list so tests can assert cross-collaborator call order.
 """
 
+import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -353,6 +355,29 @@ def tmp_store(tmp_path: Path) -> RoastStore:
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """Shut down bounded parse workers before pytest enters interpreter exit."""
     del session, exitstatus
+    if "roastpilot_agent.bean_sourcing" not in sys.modules:
+        package = sys.modules.get("roastpilot_agent")
+        if type(package) is types.ModuleType:
+            # Raw namespace only: an exact ModuleType's __dict__ is a type-level
+            # descriptor, so vars() runs no module __getattr__ and no
+            # subclass __getattribute__. Path entries are type-checked, never
+            # coerced, compared or hashed.
+            namespace = vars(package)
+            name = namespace.get("__name__")
+            path = namespace.get("__path__")
+            if (
+                type(name) is str
+                and name == "roastpilot_agent"
+                and type(path) is list
+                and all(type(entry) is str for entry in path)  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
+                and "bean_sourcing" not in namespace
+                and "__getattr__" not in namespace
+            ):
+                # Under ordinary import machinery, the original lookup would
+                # freshly import the parse module with no executor. Every other
+                # state, including present-but-None entries and malformed
+                # metadata, takes the original path.
+                return
     from roastpilot_agent import bean_sourcing
 
     with bean_sourcing._parse_executor_lock:  # pyright: ignore[reportPrivateUsage]
