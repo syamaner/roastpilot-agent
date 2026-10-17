@@ -12,7 +12,7 @@ import sys
 import threading
 import types
 import typing
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,7 +61,7 @@ class _ImportBlocker:
 
 
 def _literal_original_lookup() -> object:
-    from roastpilot_agent import bean_sourcing  # identical to tests/conftest.py:356
+    from roastpilot_agent import bean_sourcing  # identical to the hook's original lookup
 
     return bean_sourcing
 
@@ -268,9 +268,9 @@ def test_a1_real_package_with_neither_cache_entry_skips_the_import(
     assert type(namespace["__name__"]) is str
     assert namespace["__name__"] == _PACKAGE
     assert "__path__" in namespace
-    # Entry types are checked before the list check narrows the raw value.
-    assert all(type(entry) is str for entry in namespace["__path__"])
     assert type(namespace["__path__"]) is list
+    # A fresh raw read keeps the entries un-narrowed for strict typing.
+    assert all(type(entry) is str for entry in vars(roastpilot_agent)["__path__"])
     assert "__getattr__" not in namespace
 
     with monkeypatch.context() as mp:
@@ -422,6 +422,27 @@ def _b14_path_entry_str_subclass(mp: pytest.MonkeyPatch) -> list[str]:
     return log
 
 
+class _RecordingList(list[str]):
+    """A ``list`` subclass logging every iteration of its entries."""
+
+    log: list[str]
+
+    def __iter__(self) -> Iterator[str]:
+        self.log.append("__iter__")
+        return super().__iter__()
+
+
+def _b15_path_list_subclass(mp: pytest.MonkeyPatch) -> list[str]:
+    log: list[str] = []
+    path = _RecordingList(["x"])
+    path.log = log
+    package = _fake_package()
+    vars(package)["__path__"] = path
+    _remove_module(mp, _CHILD)
+    _install_package(mp, package)
+    return log
+
+
 @dataclass(frozen=True)
 class _FallCase:
     """One fall-through state with its pinned literal-original exception type."""
@@ -448,6 +469,7 @@ _FALL_CASES = {
     "B12": _FallCase(_b12_path_missing, ImportError),
     "B13": _FallCase(_b13_path_entry_none, _UnexpectedImport),
     "B14": _FallCase(_b14_path_entry_str_subclass, _UnexpectedImport),
+    "B15": _FallCase(_b15_path_list_subclass, _UnexpectedImport),
 }
 
 
