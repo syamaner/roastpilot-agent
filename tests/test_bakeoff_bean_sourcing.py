@@ -19,6 +19,7 @@ import dataclasses
 import importlib.metadata
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -2887,16 +2888,32 @@ def test_parse_args_accepts_distinct_models() -> None:
 # --- Report + serialization + checkpoint/budget (all network-free) ----------
 
 
+def _build_default_roster_cost_rows() -> list[bo.ModelCostEstimate]:
+    """One REAL estimate: the committed corpus, priced across the full default roster."""
+    return bo.estimate_cost(bo.load_corpus(bo.DEFAULT_FIXTURES_DIR), bo.MODEL_ROSTER)
+
+
+@pytest.fixture(scope="module")
+def default_roster_cost_rows() -> Callable[[], list[bo.ModelCostEstimate]]:
+    """A zero-argument factory: each call returns a FRESH list of the shared frozen rows."""
+    rows = _build_default_roster_cost_rows()
+
+    def fresh() -> list[bo.ModelCostEstimate]:
+        return list(rows)
+
+    return fresh
+
+
 def _full_run(slug: str, outcome: bo.Outcome) -> bo.ModelRun:
     fields = {spec.name: outcome for spec in bo.FIELD_SPECS}
     return _run(slug, {"page-a": dict(fields), "page-b": dict(fields)})
 
 
 def test_render_report_has_headline_pairwise_cost_and_caveat(
-    corpus: list[bo.CorpusPage],
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
 ) -> None:
     runs = [_full_run("model-a", bo.Outcome.COR), _full_run("model-b", bo.Outcome.INC)]
-    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:2]))
+    report = bo.render_report(runs, default_roster_cost_rows()[:2])
     assert "bean-sourcing extraction bake-off" in report
     assert "macro F1" in report
     assert "Pairwise significance" in report
@@ -2908,7 +2925,7 @@ def test_render_report_has_headline_pairwise_cost_and_caveat(
 
 
 def test_render_report_headline_table_shows_schema_counts_for_unpaired_arm(
-    corpus: list[bo.CorpusPage],
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
 ) -> None:
     """schema_failures/recovered_violations must render in the per-model HEADLINE
     table (always present, every arm) -- not just the off-vs-light paired section --
@@ -2922,62 +2939,66 @@ def test_render_report_headline_table_shows_schema_counts_for_unpaired_arm(
         on_page_fields=0,
     )
     run = bo.ModelRun(model_slug="model-a+reasoning-off", pages=[page])
-    report = bo.render_report([run], bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    report = bo.render_report([run], default_roster_cost_rows()[:1])
     assert "schema F/R" in report  # the new headline column
     assert "| 1/0 |" in report  # schema_failures=1, recovered_violations=0
     assert "Reasoning-arm comparison" not in report  # no light sibling -- unpaired
 
 
 def test_render_report_pairwise_reports_every_promised_axis(
-    corpus: list[bo.CorpusPage],
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
 ) -> None:
     """The report's own selection rule leans on P/R/A bootstrap CIs, not
     recall alone -- precision and abstention-correctness gaps must be
     reported too (#600 finding)."""
     runs = [_full_run("model-a", bo.Outcome.COR), _full_run("model-b", bo.Outcome.INC)]
-    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:2]))
+    report = bo.render_report(runs, default_roster_cost_rows()[:2])
     assert "faithfulness (precision) gap" in report
     assert "abstention gap" in report
 
 
 def test_render_report_pairwise_shows_na_not_zero_for_undefined_metric(
-    corpus: list[bo.CorpusPage],
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
 ) -> None:
     """Two models that only ever abstain (ABS_COR) have an undefined
     faithfulness/abstention denominator -- the gap must render ``n/a``, never
     a fabricated ``+0.000`` that reads as a confirmed tie (#602 finding)."""
     runs = [_full_run("model-a", bo.Outcome.ABS_COR), _full_run("model-b", bo.Outcome.ABS_COR)]
-    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:2]))
+    report = bo.render_report(runs, default_roster_cost_rows()[:2])
     assert "faithfulness (precision) gap n/a" in report
 
 
-def test_render_report_emits_wilson_intervals(corpus: list[bo.CorpusPage]) -> None:
+def test_render_report_emits_wilson_intervals(
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
+) -> None:
     """The report promises Wilson intervals (module docstring + CAVEAT_TEXT)
     -- they must actually be rendered, not just computed and dropped (#602
     finding)."""
     runs = [_full_run("model-a", bo.Outcome.COR)]
-    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    report = bo.render_report(runs, default_roster_cost_rows()[:1])
     assert "## Wilson intervals" in report
     assert "`model-a`" in report
     assert "95% Wilson CI" in report
 
 
-def test_render_report_wilson_zero_trials_renders_na(corpus: list[bo.CorpusPage]) -> None:
+def test_render_report_wilson_zero_trials_renders_na(
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
+) -> None:
     """A model with zero present-field decisions (every field ABS_COR) has
     an undefined Wilson proportion -- rendered 'n/a', never a fabricated
     '0.000' (#602 fold round 4, FOLD 5)."""
     runs = [_full_run("model-a", bo.Outcome.ABS_COR)]
-    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    report = bo.render_report(runs, default_roster_cost_rows()[:1])
     assert "| `model-a` | 0/0 | n/a | [0.000, 1.000] |" in report
 
 
 def test_render_report_marks_budget_stopped_runs_partial(
-    corpus: list[bo.CorpusPage],
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
 ) -> None:
     runs = [_full_run("model-a", bo.Outcome.COR)]
     report = bo.render_report(
         runs,
-        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
+        default_roster_cost_rows()[:1],
         stopped_early=True,
         unevaluated_slugs=["model-b", "model-c"],
     )
@@ -2987,7 +3008,7 @@ def test_render_report_marks_budget_stopped_runs_partial(
 
 
 def test_render_report_partial_run_distinguishes_deferred_from_never_run(
-    corpus: list[bo.CorpusPage],
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
 ) -> None:
     """#652 round-5, finding 3: the PARTIAL RUN banner renders "never run"
     and "retry deferred, budget" as DISTINCT lists -- a deferred arm has a
@@ -2996,7 +3017,7 @@ def test_render_report_partial_run_distinguishes_deferred_from_never_run(
     runs = [_full_run("model-a", bo.Outcome.COR)]
     report = bo.render_report(
         runs,
-        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
+        default_roster_cost_rows()[:1],
         stopped_early=True,
         unevaluated_slugs=["model-b"],
         deferred_retry_slugs=["model-c"],
@@ -3006,14 +3027,14 @@ def test_render_report_partial_run_distinguishes_deferred_from_never_run(
 
 
 def test_render_report_partial_run_deferred_only_no_never_run_line(
-    corpus: list[bo.CorpusPage],
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
 ) -> None:
     """Companion: when EVERY stopped arm has a real (deferred) row, the
     "never run" clause never renders at all."""
     runs = [_full_run("model-a", bo.Outcome.COR)]
     report = bo.render_report(
         runs,
-        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
+        default_roster_cost_rows()[:1],
         stopped_early=True,
         deferred_retry_slugs=["model-c"],
     )
@@ -3021,14 +3042,16 @@ def test_render_report_partial_run_deferred_only_no_never_run_line(
     assert "retry deferred, budget (1): `model-c`" in report
 
 
-def test_render_report_marks_failed_models_excluded(corpus: list[bo.CorpusPage]) -> None:
+def test_render_report_marks_failed_models_excluded(
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
+) -> None:
     """A wholly-failed model must appear ONLY in the exclusion banner, never
     in the leaderboard/per-page/pairwise sections below it (#600 round-2
     finding) -- and the banner shows its DISPLAY-ONLY heuristic label."""
     runs = [_full_run("model-a", bo.Outcome.COR)]
     report = bo.render_report(
         runs,
-        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
+        default_roster_cost_rows()[:1],
         failed_slugs=[bo.FailedRun(model_slug="model-failed", heuristic_label="MODEL-SPECIFIC")],
     )
     assert "**EXCLUDED.**" in report
@@ -3036,7 +3059,9 @@ def test_render_report_marks_failed_models_excluded(corpus: list[bo.CorpusPage])
     assert "- models scored: 1" in report  # the failed model is NOT counted
 
 
-def test_render_report_labels_still_retryable_pages(corpus: list[bo.CorpusPage]) -> None:
+def test_render_report_labels_still_retryable_pages(
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
+) -> None:
     """#649: a run with any still-retryable page is labelled in the report, so
     a partial/degraded result is never silently presented as final. #652
     round-5, finding 2: NEUTRAL wording -- never asserts "transient" (a
@@ -3051,14 +3076,14 @@ def test_render_report_labels_still_retryable_pages(corpus: list[bo.CorpusPage])
             bo.PageResult(slug="p2", outcomes=dict(fields), error=None, on_page_fields=1),
         ],
     )
-    report = bo.render_report([run], bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    report = bo.render_report([run], default_roster_cost_rows()[:1])
     assert "eligible for residual retry" in report
     assert "transient" not in report
     assert "`model-a` (1 page(s), attempt 1 of 2)" in report
 
 
 def test_render_report_attempt_range_across_different_retry_counts(
-    corpus: list[bo.CorpusPage],
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
 ) -> None:
     """#652 round-6, finding 6: retryable pages sitting at DIFFERENT retry
     counts render a RANGE across their own attempt numbers, not max()+1
@@ -3086,15 +3111,15 @@ def test_render_report_attempt_range_across_different_retry_counts(
             ),
         ],
     )
-    report = bo.render_report([run], bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    report = bo.render_report([run], default_roster_cost_rows()[:1])
     assert "`model-a` (2 page(s), attempts 1-2 of 2)" in report
 
 
 def test_render_report_no_retryable_banner_when_nothing_retryable(
-    corpus: list[bo.CorpusPage],
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
 ) -> None:
     runs = [_full_run("model-a", bo.Outcome.COR)]
-    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    report = bo.render_report(runs, default_roster_cost_rows()[:1])
     assert "eligible for residual retry" not in report
 
 
@@ -3113,7 +3138,7 @@ def test_render_report_resumed_exclusion_renders_prior_invocation_wording() -> N
 
 
 def test_render_report_pairwise_covers_all_pairs_not_just_first(
-    corpus: list[bo.CorpusPage],
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
 ) -> None:
     """The pairwise section must generate every comparison the selection
     relies on, not just first-model-vs-rest (#600 round-2 finding)."""
@@ -3122,7 +3147,7 @@ def test_render_report_pairwise_covers_all_pairs_not_just_first(
         _full_run("model-b", bo.Outcome.PAR),
         _full_run("model-c", bo.Outcome.INC),
     ]
-    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:3]))
+    report = bo.render_report(runs, default_roster_cost_rows()[:3])
     # C(3,2) = 3 pairs, including model-b vs model-c (neither is "the first model").
     assert "`model-a` vs `model-b`" in report
     assert "`model-a` vs `model-c`" in report
@@ -3174,15 +3199,19 @@ def test_render_report_sums_multiple_arms_retry_prorations(corpus: list[bo.Corpu
     assert "`model-b`'s estimate is PRORATED" in report
 
 
-def test_render_report_no_executed_slugs_is_pure_estimate(corpus: list[bo.CorpusPage]) -> None:
+def test_render_report_no_executed_slugs_is_pure_estimate(
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
+) -> None:
     runs = [_full_run("model-a", bo.Outcome.COR)]
-    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    report = bo.render_report(runs, default_roster_cost_rows()[:1])
     assert "NOT yet spent" in report
     assert "ESTIMATED SPEND INCURRED" not in report
     assert "ACTUALLY SPENT" not in report
 
 
-def test_render_report_shows_actual_vs_estimated_spend(corpus: list[bo.CorpusPage]) -> None:
+def test_render_report_shows_actual_vs_estimated_spend(
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
+) -> None:
     """The cost table's "usage-priced USD (list price)" column (#601 fold round 1,
     slice B) coexists with the unchanged estimate column/label -- "n/a" for an arm
     with no captured usage data, the real figure otherwise."""
@@ -3190,7 +3219,7 @@ def test_render_report_shows_actual_vs_estimated_spend(corpus: list[bo.CorpusPag
     runs = [_full_run(slug_a, bo.Outcome.COR), _full_run(slug_b, bo.Outcome.INC)]
     report = bo.render_report(
         runs,
-        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:2]),
+        default_roster_cost_rows()[:2],
         executed_slugs=[slug_a],
         actual_costs={slug_a: 0.0042},
     )
@@ -3203,7 +3232,7 @@ def test_render_report_shows_actual_vs_estimated_spend(corpus: list[bo.CorpusPag
 
 
 def test_render_report_discloses_reserved_component_of_actuals(
-    corpus: list[bo.CorpusPage],
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
 ) -> None:
     """#601 fold round 13, F3: an arm whose actual includes a reserve
     component (a timeout/provider-error page) must disclose it -- the
@@ -3212,7 +3241,7 @@ def test_render_report_discloses_reserved_component_of_actuals(
     runs = [_full_run(slug_a, bo.Outcome.COR)]
     report = bo.render_report(
         runs,
-        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
+        default_roster_cost_rows()[:1],
         executed_slugs=[slug_a],
         actual_costs={slug_a: 0.0042},
         reserved_costs={slug_a: 0.0010},
@@ -3222,7 +3251,7 @@ def test_render_report_discloses_reserved_component_of_actuals(
 
 
 def test_render_report_pure_captured_shows_zero_reserved(
-    corpus: list[bo.CorpusPage],
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
 ) -> None:
     """An arm with no reserved pages shows an explicit ``$0.0000``, never
     "n/a" (which is reserved for an arm with no actual cost at all)."""
@@ -3230,7 +3259,7 @@ def test_render_report_pure_captured_shows_zero_reserved(
     runs = [_full_run(slug_a, bo.Outcome.COR)]
     report = bo.render_report(
         runs,
-        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
+        default_roster_cost_rows()[:1],
         executed_slugs=[slug_a],
         actual_costs={slug_a: 0.0042},
         reserved_costs={slug_a: 0.0},
@@ -3242,7 +3271,7 @@ def test_render_report_pure_captured_shows_zero_reserved(
 
 
 def test_render_report_renders_ledger_only_prior_lineage_arm(
-    corpus: list[bo.CorpusPage],
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
 ) -> None:
     """#601 fold round 13, F4: an arm present in the current-lineage ledger
     but absent from THIS invocation's ``cost_estimates`` (a prior
@@ -3253,7 +3282,7 @@ def test_render_report_renders_ledger_only_prior_lineage_arm(
     runs = [_full_run(slug_a, bo.Outcome.COR)]
     report = bo.render_report(
         runs,
-        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
+        default_roster_cost_rows()[:1],
         executed_slugs=[slug_a],
         actual_costs={slug_a: 0.0042, "prior-model": 0.0500},
         reserved_costs={slug_a: 0.0, "prior-model": 0.0},
@@ -3312,13 +3341,13 @@ def test_render_report_reasoning_arm_comparison_groups_by_model(
 
 
 def test_render_report_reasoning_arm_comparison_absent_for_default_only_runs(
-    corpus: list[bo.CorpusPage],
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
 ) -> None:
     """The ``--reasoning default`` CLI default (no off/light sibling ever scored) must
     not add the comparison section at all -- report shape stays exactly the pre-#601
     shape."""
     runs = [_full_run("model-a", bo.Outcome.COR), _full_run("model-b", bo.Outcome.INC)]
-    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:2]))
+    report = bo.render_report(runs, default_roster_cost_rows()[:2])
     assert "Reasoning-arm comparison" not in report
 
 
@@ -3514,7 +3543,9 @@ def test_evidence_summary_skips_pages_with_no_draft() -> None:
     assert by_field["altitude_m"].no_evidence == 0
 
 
-def test_render_report_includes_evidence_capture_section(corpus: list[bo.CorpusPage]) -> None:
+def test_render_report_includes_evidence_capture_section(
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
+) -> None:
     fields = {spec.name: bo.Outcome.COR for spec in bo.FIELD_SPECS}
     page = bo.PageResult(
         slug="page-a",
@@ -3527,7 +3558,7 @@ def test_render_report_includes_evidence_capture_section(corpus: list[bo.CorpusP
         },
     )
     run = bo.ModelRun(model_slug="model-a", pages=[page])
-    report = bo.render_report([run], bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    report = bo.render_report([run], default_roster_cost_rows()[:1])
     assert "Evidence-quote capture" in report
     assert "NOT certification" in report
     assert "altitude_m" in report
@@ -6493,3 +6524,129 @@ async def test_main_refuses_a_zero_max_spend_before_any_real_run(
     )
     assert code == 2
     assert not out.exists()  # refused before any artifact is written
+
+
+# --- #1032: proofs for the module-scoped real report cost rows ---------------
+
+
+def test_report_cost_reuse_proof_builder_uses_real_producer_on_full_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared rows come from the REAL loader + estimator, called through
+    ``bo.`` at build time, over the full unreordered committed corpus and the
+    full default roster -- never a reduced, reordered or captured-early input."""
+    real_load = bo.load_corpus
+    real_estimate = bo.estimate_cost
+    load_calls: list[Path] = []
+    page_snapshots: list[list[dict[str, object]]] = []
+    roster_snapshots: list[tuple[bo.RosterModel, ...]] = []
+    returned: list[list[bo.ModelCostEstimate]] = []
+
+    def spy_load(fixtures_dir: Path) -> list[bo.CorpusPage]:
+        load_calls.append(fixtures_dir)
+        return real_load(fixtures_dir)
+
+    def spy_estimate(
+        pages: list[bo.CorpusPage], roster: tuple[bo.RosterModel, ...]
+    ) -> list[bo.ModelCostEstimate]:
+        page_snapshots.append([dataclasses.asdict(p) for p in pages])
+        roster_snapshots.append(tuple(roster))
+        result = real_estimate(pages, roster)
+        returned.append(result)
+        return result
+
+    monkeypatch.setattr(bo, "load_corpus", spy_load)
+    monkeypatch.setattr(bo, "estimate_cost", spy_estimate)
+
+    built = _build_default_roster_cost_rows()
+
+    assert load_calls == [bo.DEFAULT_FIXTURES_DIR]
+    assert len(page_snapshots) == 1
+    assert len(roster_snapshots) == 1
+    assert page_snapshots[0] == [dataclasses.asdict(p) for p in real_load(bo.DEFAULT_FIXTURES_DIR)]
+    assert roster_snapshots[0] == bo.MODEL_ROSTER
+    assert len(returned) == 1
+    assert built is returned[0]
+
+
+def test_report_cost_reuse_proof_prefixes_equal_authentic_original_calls(
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
+) -> None:
+    """Each literal prefix the wired report tests use equals the authentic
+    original expression ``bo.estimate_cost(<fresh corpus>, bo.MODEL_ROSTER[:n])``
+    exactly: same values, same field types, same roster order, no ``approx``."""
+    for n in (1, 2, 3):
+        got = default_roster_cost_rows()[:n]
+        want = bo.estimate_cost(bo.load_corpus(bo.DEFAULT_FIXTURES_DIR), bo.MODEL_ROSTER[:n])
+        assert type(got) is list
+        assert type(want) is list
+        assert [dataclasses.asdict(r) for r in got] == [dataclasses.asdict(r) for r in want]
+        for got_row, want_row in zip(got, want, strict=True):
+            assert type(got_row) is bo.ModelCostEstimate
+            for field in dataclasses.fields(bo.ModelCostEstimate):
+                got_field: object = getattr(got_row, field.name)
+                want_field: object = getattr(want_row, field.name)
+                assert type(got_field) is type(want_field)
+        assert [r.slug for r in got] == [m.slug for m in bo.MODEL_ROSTER[:n]]
+
+
+def test_report_cost_reuse_proof_fresh_containers_share_frozen_rows(
+    default_roster_cost_rows: Callable[[], list[bo.ModelCostEstimate]],
+) -> None:
+    """Every consumer gets its OWN list (mutating it cannot leak to another
+    consumer) holding the SAME frozen rows from the one module-lifetime build;
+    a row itself cannot be mutated."""
+    a = default_roster_cost_rows()
+    b = default_roster_cost_rows()
+    assert a == b
+    assert a is not b
+    assert all(x is y for x, y in zip(a, b, strict=True))
+
+    snapshot = [dataclasses.asdict(r) for r in b]
+    a.clear()
+    assert [dataclasses.asdict(r) for r in b] == snapshot
+    assert [dataclasses.asdict(r) for r in default_roster_cost_rows()] == snapshot
+
+    frozen_field = "usd"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(b[0], frozen_field, 0.0)
+    assert b[0].usd == snapshot[0]["usd"]
+
+
+def test_report_cost_reuse_proof_builder_propagates_producer_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loader failure and an estimator failure each propagate out of the
+    builder unchanged -- nothing is swallowed and no fallback rows appear; a
+    loader failure never reaches the estimator."""
+
+    class _Boom(Exception):
+        pass
+
+    real_load = bo.load_corpus
+    estimator_calls: list[int] = []
+
+    def failing_load(fixtures_dir: Path) -> list[bo.CorpusPage]:
+        raise _Boom(str(fixtures_dir))
+
+    def recording_estimate(
+        pages: list[bo.CorpusPage], roster: tuple[bo.RosterModel, ...]
+    ) -> list[bo.ModelCostEstimate]:
+        estimator_calls.append(len(pages))
+        return []
+
+    monkeypatch.setattr(bo, "load_corpus", failing_load)
+    monkeypatch.setattr(bo, "estimate_cost", recording_estimate)
+    with pytest.raises(_Boom):
+        _build_default_roster_cost_rows()
+    assert estimator_calls == []
+
+    def failing_estimate(
+        pages: list[bo.CorpusPage], roster: tuple[bo.RosterModel, ...]
+    ) -> list[bo.ModelCostEstimate]:
+        raise _Boom(f"{len(pages)}/{len(roster)}")
+
+    monkeypatch.setattr(bo, "load_corpus", real_load)
+    monkeypatch.setattr(bo, "estimate_cost", failing_estimate)
+    with pytest.raises(_Boom):
+        _build_default_roster_cost_rows()
