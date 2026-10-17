@@ -197,8 +197,8 @@ def test_pep503_normaliser_rejects_an_unparseable_name() -> None:
         _normalise_pep503_name("torch audio")
 
 
-@pytest.fixture
-def built_wheel(tmp_path: Path) -> Path:
+@pytest.fixture(scope="module")
+def built_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Build the real wheel into an isolated tmp output dir and return its path.
 
     Uses the repo's own build backend (hatchling + ``hatch_build.py``) via
@@ -209,7 +209,7 @@ def built_wheel(tmp_path: Path) -> Path:
     ``pip install`` inside the test (repo rule: all dev deps declared in
     ``pyproject.toml``).
     """
-    out_dir = tmp_path / "dist"
+    out_dir = tmp_path_factory.mktemp("dist")
     subprocess.run(  # noqa: S603
         [sys.executable, "-m", "build", "--wheel", "--outdir", str(out_dir)],
         cwd=_REPO_ROOT,
