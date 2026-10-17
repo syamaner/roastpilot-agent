@@ -1,0 +1,90 @@
+name: Synthetic artifact transport P0 NONREQUIRED
+on:
+  push:
+    branches: [codex/diag-artifact-v4-6184eca8f3a6]
+permissions:
+  contents: read
+jobs:
+  produce:
+    name: P0 synthetic artifact producer ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [0, 1]
+    steps:
+      - name: Create two public synthetic files
+        env:
+          P0_INDEX: ${{ matrix.shard }}
+        run: |
+          mkdir p0-output
+          python3 - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          index = int(os.environ['P0_INDEX'])
+          attempt = int(os.environ['GITHUB_RUN_ATTEMPT'])
+          root = Path('p0-output')
+          root.joinpath('payload.txt').write_text(f'public-synthetic-index-{index}-attempt-{attempt}\n')
+          root.joinpath('metadata.json').write_text(json.dumps({'index': index, 'attempt': attempt, 'nonce': '6184eca8f3a6'}))
+          PYCODE
+      - name: Upload own fixed-name atomic bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: p0-bundle-${{ matrix.shard }}
+          path: p0-output/
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+      - name: Expected first-attempt failure after upload
+        env:
+          P0_INDEX: ${{ matrix.shard }}
+        run: |
+          if [ "$P0_INDEX" = 0 ] && [ "$GITHUB_RUN_ATTEMPT" = 1 ]; then
+            echo "Expected P0 failure: bundle exists before failed-job retry."
+            exit 1
+          fi
+  observe:
+    name: P0 synthetic artifact observer NONREQUIRED
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    needs: [produce]
+    steps:
+      - name: Download fixed index zero
+        uses: actions/download-artifact@v4
+        with:
+          name: p0-bundle-0
+          path: p0-input-0
+      - name: Download fixed index one
+        uses: actions/download-artifact@v4
+        with:
+          name: p0-bundle-1
+          path: p0-input-1
+      - name: Observe flat bundle and attempt consistency
+        run: |
+          python3 - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          current = int(os.environ['GITHUB_RUN_ATTEMPT'])
+          observed = []
+          for index in (0, 1):
+              root = Path(f'p0-input-{index}')
+              assert {p.name for p in root.iterdir()} == {'payload.txt', 'metadata.json'}
+              row = json.loads(root.joinpath('metadata.json').read_text())
+              assert set(row) == {'index', 'attempt', 'nonce'}
+              assert row['index'] == index and row['nonce'] == '6184eca8f3a6'
+              assert type(row['attempt']) is int and 1 <= row['attempt'] <= current
+              assert root.joinpath('payload.txt').read_text() == f"public-synthetic-index-{index}-attempt-{row['attempt']}\n"
+              observed.append(row)
+          result = {'run_attempt': current, 'run_id': os.environ['GITHUB_RUN_ID'], 'observed': observed, 'flat_two_entry_bundles': True}
+          Path('p0-observation.json').write_text(json.dumps(result, indent=2))
+          print(json.dumps(result))
+          PYCODE
+      - name: Publish synthetic observation only
+        uses: actions/upload-artifact@v4
+        with:
+          name: p0-observation-attempt-${{ github.run_attempt }}
+          path: p0-observation.json
+          if-no-files-found: error
+          retention-days: 1
