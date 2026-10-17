@@ -1236,6 +1236,7 @@ def test_finalize_rejects_fifo_inputs_promptly(tmp_path: Path, position: str) ->
             sys.executable,
             "-I",
             "-S",
+            "-B",
             "-c",
             _FIFO_CHILD,
             str(SCRIPTS),
