@@ -258,6 +258,7 @@ LIFECYCLE_RULES: dict[str, tuple[list[str], list[object], str]] = {
     "setup-not-first": ([_ID], _lifecycle(_C, _S, _T), "leading setup"),
     "duplicate-setup": ([_ID], _lifecycle(_S, _S, _C, _T), "leading setup"),
     "missing-teardown": ([_ID], _lifecycle(_S, _C), "trailing teardown"),
+    "teardown-before-call": ([_ID], _lifecycle(_S, _T, _C), "trailing teardown"),
     "duplicate-teardown": ([_ID], _lifecycle(_S, _C, _T, _T), "trailing teardown"),
     "passed-setup-no-call": ([_ID], _lifecycle(_S, _T), "without exactly one call"),
     "passed-setup-two-calls": ([_ID], _lifecycle(_S, _C, _C, _T), "without exactly one call"),
