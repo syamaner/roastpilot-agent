@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1030,6 +1031,182 @@ def _wait_for_ready_owned_descendant(owned: _OwnedInstallerProcess, ready_marker
         time.sleep(0.01)
 
 
+_OVERLAP_STARTUP_SECONDS = 180.0
+_OVERLAP_COMPLETION_SECONDS = 180.0
+_OVERLAP_BARRIER_TIMEOUT_SECONDS = "180"
+_OVERLAP_POLL_SECONDS = 0.01
+
+
+def _await_overlap_readiness(
+    ready: Callable[[], bool],
+    exited: Callable[[], bool],
+    *,
+    timeout_message: str,
+    exit_message: str,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Wait for overlap readiness, failing early if an owned installer has exited."""
+    deadline = clock() + _OVERLAP_STARTUP_SECONDS
+    while True:
+        if ready():
+            return
+        if exited():
+            raise AssertionError(exit_message)
+        if clock() >= deadline:
+            raise AssertionError(timeout_message)
+        sleep(_OVERLAP_POLL_SECONDS)
+
+
+@dataclass(frozen=True)
+class _ReadinessScenario:
+    """One scripted overlap-readiness run and its exact expected observations."""
+
+    ready_answers: tuple[bool, ...]
+    exited_answers: tuple[bool, ...]
+    clock_readings: tuple[float, ...]
+    outcome: tuple[str, ...]
+    sleeps: tuple[float, ...]
+    clock_reads: tuple[float, ...]
+    ready_calls: int
+    exited_calls: int
+
+
+_READINESS_TIMEOUT_MESSAGE = "scripted overlap readiness timed out"
+_READINESS_EXIT_MESSAGE = "scripted overlap installer exited"
+_OVERLAP_READINESS_SCENARIOS = {
+    "H1-returns-immediately-without-sleep": _ReadinessScenario(
+        ready_answers=(True,),
+        exited_answers=(),
+        clock_readings=(0.0,),
+        outcome=("returned",),
+        sleeps=(),
+        clock_reads=(0.0,),
+        ready_calls=1,
+        exited_calls=0,
+    ),
+    "H2-polls-at-fixed-interval": _ReadinessScenario(
+        ready_answers=(False, False, True),
+        exited_answers=(False, False),
+        clock_readings=(0.0, 1.0, 2.0, 3.0),
+        outcome=("returned",),
+        sleeps=(0.01, 0.01),
+        clock_reads=(0.0, 1.0, 2.0),
+        ready_calls=3,
+        exited_calls=2,
+    ),
+    "H3-fails-early-on-owned-exit": _ReadinessScenario(
+        ready_answers=(False, False),
+        exited_answers=(False, True),
+        clock_readings=(0.0, 1.0, 2.0),
+        outcome=("raised", _READINESS_EXIT_MESSAGE),
+        sleeps=(0.01,),
+        clock_reads=(0.0, 1.0),
+        ready_calls=2,
+        exited_calls=2,
+    ),
+    "H4-prefers-ready-over-exit": _ReadinessScenario(
+        ready_answers=(True,),
+        exited_answers=(True,),
+        clock_readings=(0.0,),
+        outcome=("returned",),
+        sleeps=(),
+        clock_reads=(0.0,),
+        ready_calls=1,
+        exited_calls=0,
+    ),
+    "H5a-expires-exactly-at-bound": _ReadinessScenario(
+        ready_answers=(False, False),
+        exited_answers=(False, False),
+        clock_readings=(0.0, 179.99, 180.0),
+        outcome=("raised", _READINESS_TIMEOUT_MESSAGE),
+        sleeps=(0.01,),
+        clock_reads=(0.0, 179.99, 180.0),
+        ready_calls=2,
+        exited_calls=2,
+    ),
+    "H5b-ready-at-deadline-returns": _ReadinessScenario(
+        ready_answers=(False, True),
+        exited_answers=(False,),
+        clock_readings=(0.0, 179.99, 180.0),
+        outcome=("returned",),
+        sleeps=(0.01,),
+        clock_reads=(0.0, 179.99),
+        ready_calls=2,
+        exited_calls=1,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", tuple(_OVERLAP_READINESS_SCENARIOS))
+def test_overlap_readiness_helper_scenarios(case: str) -> None:
+    """The overlap readiness helper checks ready, then exit, then deadline, then polls.
+
+    Every closure is backed by a finite script; exhausting one raises a distinct
+    assertion that is captured as the outcome, so a non-terminating mutant fails
+    the outcome comparison in finite time instead of looping.
+    """
+    scenario = _OVERLAP_READINESS_SCENARIOS[case]
+    ready_calls: list[bool] = []
+    exited_calls: list[bool] = []
+    clock_reads: list[float] = []
+    sleeps: list[float] = []
+
+    def ready() -> bool:
+        """Return the next scripted readiness answer."""
+        if len(ready_calls) >= len(scenario.ready_answers):
+            raise AssertionError("readiness poll exceeded its scripted bound")
+        ready_calls.append(scenario.ready_answers[len(ready_calls)])
+        return ready_calls[-1]
+
+    def exited() -> bool:
+        """Return the next scripted owned-exit answer."""
+        if len(exited_calls) >= len(scenario.exited_answers):
+            raise AssertionError("exit poll exceeded its scripted bound")
+        exited_calls.append(scenario.exited_answers[len(exited_calls)])
+        return exited_calls[-1]
+
+    def clock() -> float:
+        """Return the next scripted monotonic reading."""
+        if len(clock_reads) >= len(scenario.clock_readings):
+            raise AssertionError("readiness clock exceeded its scripted bound")
+        clock_reads.append(scenario.clock_readings[len(clock_reads)])
+        return clock_reads[-1]
+
+    try:
+        _await_overlap_readiness(
+            ready,
+            exited,
+            timeout_message=_READINESS_TIMEOUT_MESSAGE,
+            exit_message=_READINESS_EXIT_MESSAGE,
+            clock=clock,
+            sleep=sleeps.append,
+        )
+        outcome: tuple[str, ...] = ("returned",)
+    except AssertionError as error:
+        outcome = ("raised", str(error))
+    assert outcome == scenario.outcome
+    assert tuple(sleeps) == scenario.sleeps
+    assert tuple(clock_reads) == scenario.clock_reads
+    assert len(ready_calls) == scenario.ready_calls
+    assert len(exited_calls) == scenario.exited_calls
+    assert all(reading < _OVERLAP_STARTUP_SECONDS for reading in scenario.clock_reads) == (
+        scenario.outcome[0] != "raised" or scenario.outcome[1] != _READINESS_TIMEOUT_MESSAGE
+    )
+
+
+def test_overlap_bounds_are_fixed_literals() -> None:
+    """The overlap allowances are fixed literals and the fake barrier default is unchanged."""
+    assert _OVERLAP_STARTUP_SECONDS == 180.0
+    assert _OVERLAP_COMPLETION_SECONDS == 180.0
+    assert _OVERLAP_BARRIER_TIMEOUT_SECONDS == "180"
+    assert _OVERLAP_POLL_SECONDS == 0.01
+    assert int(_OVERLAP_BARRIER_TIMEOUT_SECONDS) >= _OVERLAP_STARTUP_SECONDS
+    assert 'rendezvous_timeout="${FAKE_RENDEZVOUS_TIMEOUT_SECONDS:-30}"' in (
+        _installer_fake_script_source()
+    )
+
+
 def _signal_owned_group(group_id: int, signal_number: int) -> None:
     """Signal only a recorded private group and tolerate a disappearance race."""
     try:
@@ -1341,11 +1518,15 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(
             "FAKE_RENDEZVOUS_DIR": str(rendezvous),
             "FAKE_RENDEZVOUS_SELF": alpha["self"],
             "FAKE_RENDEZVOUS_PEER": alpha["peer"],
+            "FAKE_RENDEZVOUS_TIMEOUT_SECONDS": _OVERLAP_BARRIER_TIMEOUT_SECONDS,
         },
         "--set-hostname",
         "roastpilot",
         "--port",
         alpha["port"],
+    )
+    assert alpha_child_environment["FAKE_RENDEZVOUS_TIMEOUT_SECONDS"] == (
+        _OVERLAP_BARRIER_TIMEOUT_SECONDS
     )
     beta_argv, beta_child_environment = _installer_argv_and_environment(
         beta_environment
@@ -1354,11 +1535,15 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(
             "FAKE_RENDEZVOUS_DIR": str(rendezvous),
             "FAKE_RENDEZVOUS_SELF": beta["self"],
             "FAKE_RENDEZVOUS_PEER": beta["peer"],
+            "FAKE_RENDEZVOUS_TIMEOUT_SECONDS": _OVERLAP_BARRIER_TIMEOUT_SECONDS,
         },
         "--set-hostname",
         "roastpilot",
         "--port",
         beta["port"],
+    )
+    assert beta_child_environment["FAKE_RENDEZVOUS_TIMEOUT_SECONDS"] == (
+        _OVERLAP_BARRIER_TIMEOUT_SECONDS
     )
     processes: list[_OwnedInstallerProcess] = []
     outputs: dict[subprocess.Popen[str], tuple[str, str]] = {}
@@ -1379,16 +1564,22 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(
         assert processes
         first = processes[0]
         marker = rendezvous / alpha["self"]
-        deadline = time.monotonic() + 35
-        while True:
+
+        def first_ready() -> bool:
+            """Report whether the first installer holds a live barrier descendant."""
             live_members = _owned_group_live_members(first.group_id)
             descendants = [pid for pid in live_members if pid != first.process.pid]
             if marker.exists() and first.process.poll() is None and descendants:
                 observed_descendant_pids.extend(descendants)
-                break
-            if time.monotonic() >= deadline:
-                raise AssertionError("first installer did not retain a live rendezvous descendant")
-            time.sleep(0.01)
+                return True
+            return False
+
+        _await_overlap_readiness(
+            first_ready,
+            lambda: first.process.poll() is not None,
+            timeout_message="first installer did not retain a live rendezvous descendant",
+            exit_message="first installer exited before retaining a live rendezvous descendant",
+        )
         raise OSError("forced second installer launch failure")
 
     reaper: Any = _reap_owned_process
@@ -1403,12 +1594,13 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(
         processes.append(beta_owned)
         alpha_process = alpha_owned.process
         beta_process = beta_owned.process
-        deadline = time.monotonic() + 35
         markers = (rendezvous / alpha["self"], rendezvous / beta["self"])
-        while not all(marker.exists() for marker in markers):
-            if time.monotonic() >= deadline:
-                raise AssertionError("installer runs did not both reach the hostname barrier")
-            time.sleep(0.01)
+        _await_overlap_readiness(
+            lambda: all(marker.exists() for marker in markers),
+            lambda: alpha_process.poll() is not None or beta_process.poll() is not None,
+            timeout_message="installer runs did not both reach the hostname barrier",
+            exit_message="an installer run exited before reaching the hostname barrier",
+        )
         assert alpha_process.poll() is None and beta_process.poll() is None
         assert {path.name for path in parent.iterdir()} == {
             alpha_owner.name,
@@ -1421,8 +1613,12 @@ def test_two_installer_runs_overlap_without_cross_run_leaks(
         if case == "cleanup-continues":
             reaper = reap_with_first_error
             raise RuntimeError("begin cleanup error proof")
-        outputs[alpha_process] = alpha_process.communicate(input="input", timeout=35)
-        outputs[beta_process] = beta_process.communicate(input="input", timeout=35)
+        outputs[alpha_process] = alpha_process.communicate(
+            input="input", timeout=_OVERLAP_COMPLETION_SECONDS
+        )
+        outputs[beta_process] = beta_process.communicate(
+            input="input", timeout=_OVERLAP_COMPLETION_SECONDS
+        )
         assert alpha_process.returncode == 0
         assert beta_process.returncode == 0
         assert {path.name for path in parent.iterdir()} == {
