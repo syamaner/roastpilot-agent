@@ -1,5 +1,77 @@
 # RoastPilot Agent Project State Registry
 
+**17 Oct 2026, #1032 real report cost rows reused in bean-sourcing layout
+tests:** `tests/test_bakeoff_bean_sourcing.py` gains a builder,
+`_build_default_roster_cost_rows`, and a module-scoped
+`default_roster_cost_rows` fixture. The stateless builder makes one real
+`bo.estimate_cost(bo.load_corpus(bo.DEFAULT_FIXTURES_DIR), bo.MODEL_ROSTER)`
+call over the full committed corpus and the full default roster each time it
+is invoked. Fixture setup invokes it once per pytest module instance (so once
+per xdist worker) and holds the rows in memory only; P1 and P4 call the
+builder directly, and P2 and the excluded real-path tests call the producer
+independently. Each
+fixture call returns a fresh list of the shared frozen `ModelCostEstimate`
+rows. The 21 presentation-only `render_report` tests mapped in the contract
+take that fixture instead of `corpus` and keep their literal prefixes `[:1]`,
+`[:2]` and `[:3]`. The function-scoped `corpus`, `small_corpus` and
+`three_page_corpus` fixtures are byte-unchanged for every other consumer, and
+the estimator, pricing, pipeline, budget, retry, custom-roster and statistics
+tests stay on their real paths (genuine statistics, default 10,000 resamples).
+The 282 original cases keep their IDs, order, assertions, parameters and
+markers; four unmarked proof cases are appended (286 in total). They cover
+real-producer use on full inputs through call-time spies, exact equality of
+prefixes 1, 2 and 3 with the authentic original expression, fresh lists over
+shared frozen rows (consumer mutation isolation and `FrozenInstanceError`),
+and propagation of loader and estimator failures followed by a real
+successful rebuild.
+
+Nine named mutation recipes were run on the initial head and again on the
+repaired head: 18 actual executions against the 4 proof cases. Every execution
+failed at its intended named assertion (P4's estimator and loader cases at the
+second and first `DID NOT RAISE` respectively), was restored by exact byte
+copy with a hash check, and was followed by all four proofs passing. There
+were no invalid or surviving attempts.
+
+The first value series, on the initial head, passed every fixed bar: median
+saving 24.9903% (11.6204 s raw), K 4.52073 s, net 7.09969 s, median peak-RSS
+delta −4,767,744 bytes. Its supplementary test-module coverage then found two
+P4 recorder-body lines never executed. The repair changed only P4: its
+recorder now delegates to the captured real estimator, and after both failure
+probes the same stateless builder makes one real successful call, asserting
+one genuine row per default-roster entry from exactly one estimator call over
+the full corpus. All three pairs, all three K runs and both coverage checks
+were then renewed on the repaired head (baseline B vs candidate C, complete
+fresh-process seconds over the original 282-case selection, coverage off):
+
+- pair 1 (B then C): 46.916 vs 35.019, a 25.36% saving;
+- pair 2 (C then B): 46.624 vs 34.972, a 24.99% saving;
+- pair 3 (B then C): 46.847 vs 34.738, a 25.85% saving.
+
+The median saving was 25.3592% (11.89759 s). K, the median complete
+fresh-process wall time of all four proofs including startup, collection and
+cleanup, was 5.08726 s (runs 4.98589, 5.10075 and 5.08726 s), for a net
+6.81033 s. Peak-RSS deltas were −6,651,904, +9,453,568 and +4,603,904 bytes
+(median +4,603,904, within the 33,554,432-byte bar). All four fixed bars pass.
+Both complete series are retained; no favourable rerun, series selection or
+bar change was made. Script coverage over the original 282 cases has exactly
+identical missing statements and branch arcs in B and C, and test-module
+coverage over all 286 cases executes all 110 added or changed executable
+statement lines and every added branch arc, with no pragma and no change to
+coverage configuration, source selection or thresholds.
+
+These are module-only measurements, not a whole-suite or hosted CI claim, and
+unrelated host load was not controlled. Equivalence is proven only for the
+finite prefixes 1, 2 and 3; the 21 consumers no longer each repeat the
+producer, and a builder failure now fans out as setup errors to them. Fixture
+scope, the absence of `autouse` and each wiring literal are audited in the
+diff rather than mutation-killed. Independent local QA review passed with no
+must-fix or should-fix finding. Delivery of this change requires the full
+single-process all-markers coverage, static and CLI gates and the hosted,
+protected delivery checks; this entry does not record their result. Test
+infrastructure only: no production, script, provider, permission, CI,
+dependency, marker or hardware change, and no E11 status claim. Lead-adopted
+under the operator's autonomy exception, not individually human-reviewed.
+
 **17 Oct 2026, #1030 unused bean-parser import skipped at session cleanup:**
 the root `tests/conftest.py` `pytest_sessionfinish` hook now returns before
 importing `roastpilot_agent.bean_sourcing` only when the module is absent from
