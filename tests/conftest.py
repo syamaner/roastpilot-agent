@@ -373,10 +373,10 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
                 and "bean_sourcing" not in namespace
                 and "__getattr__" not in namespace
             ):
-                # Neither import cache holds the parse module, so this session
-                # never loaded it and no executor exists. Every other state,
-                # including present-but-None entries and malformed metadata,
-                # takes the original path.
+                # Under ordinary import machinery, the original lookup would
+                # freshly import the parse module with no executor. Every other
+                # state, including present-but-None entries and malformed
+                # metadata, takes the original path.
                 return
     from roastpilot_agent import bean_sourcing
 
