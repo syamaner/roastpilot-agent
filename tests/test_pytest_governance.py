@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import re
 import shlex
 import subprocess
 import sys
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import cast
 
+import ci_ordinary_shards
 import pytest
 import yaml
 
@@ -117,13 +119,85 @@ _COVERAGE_ARGUMENTS = (
 )
 _COLLECTION_CACHE_MAX_ENTRIES = 32
 _COLLECTION_CACHE: dict[tuple[Path, tuple[str, ...], str], tuple[int, frozenset[str], str]] = {}
+#: #1039: the CI-only shard shim and its two options, stripped before collection probes.
+_ORDINARY_SHARD_PLUGIN = "scripts.ci_ordinary_shard_plugin"
+_ORDINARY_SHARD_OPTIONS = frozenset({"--ordinary-shard-index", "--ordinary-shard-receipt"})
+#: #1039: the closed ordinary two-index matrix (YAML strings, never ints).
+_ORDINARY_SHARD_MATRIX: tuple[dict[str, str], ...] = ({"index": "0"}, {"index": "1"})
 _ORDINARY_RUN = (
-    'python -m pytest -n 4 --dist worksteal -m "not serial and not stress" '
+    f"python -m pytest -n 4 --dist worksteal -p {_ORDINARY_SHARD_PLUGIN} "
+    "--ordinary-shard-index ${{ matrix.index }} "
+    "--ordinary-shard-receipt ordinary-shard-receipt.json "
+    '-m "not serial and not stress" '
     f"--ignore=tests/test_packaging.py {_COVERAGE_ARGUMENTS}"
 )
 _SERIAL_RUN = (
     'python -m pytest -m "$SERIAL_SELECTION" '
     f"--ignore=tests/test_packaging.py {_COVERAGE_ARGUMENTS}"
+)
+#: #1039: every new producer, validation, upload, download and combine step, pinned.
+_ORDINARY_FINALIZE_RUN = (
+    "python scripts/ci_ordinary_shards.py finalize --index ${{ matrix.index }} "
+    "--receipt ordinary-shard-receipt.json "
+    "--coverage .coverage.ordinary-shard-${{ matrix.index }} "
+    "--bundle ordinary-shard-bundle --identity-mode normal"
+)
+_ORDINARY_BUNDLE_UPLOAD: dict[str, object] = {
+    "name": "ordinary-shard-${{ matrix.index }}",
+    "path": "ordinary-shard-bundle",
+    "if-no-files-found": "error",
+    "retention-days": 7,
+    "overwrite": True,
+}
+_ORDINARY_SHARD_STEPS: tuple[dict[str, object], ...] = (
+    {
+        "name": "Run ordinary tests with coverage",
+        "env": {"COVERAGE_FILE": ".coverage.ordinary-shard-${{ matrix.index }}"},
+        "run": _ORDINARY_RUN,
+    },
+    {"name": "Finalize ordinary shard bundle", "run": _ORDINARY_FINALIZE_RUN},
+    {
+        "name": "Upload ordinary shard bundle",
+        "uses": "actions/upload-artifact@v4",
+        "with": _ORDINARY_BUNDLE_UPLOAD,
+    },
+)
+_ORDINARY_SHARD_COMBINE_RUN = (
+    "python -m coverage combine --keep --data-file=.coverage.ordinary "
+    "ordinary-shards/ordinary-shard-0/coverage.data "
+    "ordinary-shards/ordinary-shard-1/coverage.data"
+)
+#: The pre-#1039 final combine, byte-identical.
+_FINAL_COMBINE_RUN = (
+    "python -m coverage combine --keep .coverage.ordinary .coverage.serial "
+    ".coverage.stress-opaque-event-boundary .coverage.stress-opaque-total-accepts-exact "
+    ".coverage.stress-opaque-total-rejects-one-over .coverage.package"
+)
+_COVERAGE_SHARD_STEPS: tuple[dict[str, object], ...] = (
+    {
+        "name": "Download coverage data",
+        "uses": "actions/download-artifact@v4",
+        "with": {"pattern": "coverage-*", "merge-multiple": True, "path": "."},
+    },
+    {
+        "name": "Download ordinary shard 0 bundle",
+        "uses": "actions/download-artifact@v4",
+        "with": {"name": "ordinary-shard-0", "path": "ordinary-shards/ordinary-shard-0"},
+    },
+    {
+        "name": "Download ordinary shard 1 bundle",
+        "uses": "actions/download-artifact@v4",
+        "with": {"name": "ordinary-shard-1", "path": "ordinary-shards/ordinary-shard-1"},
+    },
+    {
+        "name": "Verify ordinary shard bundles",
+        "run": (
+            "python scripts/ci_ordinary_shards.py verify --bundle-root ordinary-shards "
+            "--identity-mode normal"
+        ),
+    },
+    {"name": "Combine ordinary shard coverage", "run": _ORDINARY_SHARD_COMBINE_RUN},
+    {"name": "Combine coverage data", "run": _FINAL_COMBINE_RUN},
 )
 
 
@@ -181,6 +255,10 @@ def _pytest_lanes(workflow: dict[str, object], event: str) -> list[tuple[str, li
             include = matrix["include"]
             assert isinstance(include, list)
             matrix_entries = [_mapping(entry) for entry in cast(list[object], include)]
+        elif job_id == "pytest-ordinary":
+            strategy = _mapping(job["strategy"])
+            assert _mapping(strategy["matrix"]) == {"include": list(_ORDINARY_SHARD_MATRIX)}
+            matrix_entries = [dict(entry) for entry in _ORDINARY_SHARD_MATRIX]
         for step in _steps(job):
             run = step.get("run")
             if not isinstance(run, str) or not run.startswith("python -m pytest"):
@@ -210,12 +288,22 @@ def _pytest_lanes(workflow: dict[str, object], event: str) -> list[tuple[str, li
 
 
 def _collection_arguments(arguments: list[str]) -> list[str]:
-    """Remove execution and coverage options before a lane collection probe."""
+    """Remove execution and coverage options before a lane collection probe.
+
+    The closed #1039 strip list also removes exactly the
+    ``-p scripts.ci_ordinary_shard_plugin`` pair and the two shard options, so
+    both ordinary shards share one cached unsharded collection; the shard filter
+    is then applied by the test-local oracle (:func:`_lane_shard_nodeids`).
+    """
     retained: list[str] = []
     index = 0
     while index < len(arguments):
         argument = arguments[index]
-        if argument in {"-n", "--dist"}:
+        if (
+            argument in {"-n", "--dist"}
+            or argument in _ORDINARY_SHARD_OPTIONS
+            or (argument == "-p" and arguments[index + 1 : index + 2] == [_ORDINARY_SHARD_PLUGIN])
+        ):
             index += 2
         elif argument.startswith("--cov=") or argument.startswith("--cov-report="):
             index += 1
@@ -223,6 +311,24 @@ def _collection_arguments(arguments: list[str]) -> list[str]:
             retained.append(argument)
             index += 1
     return retained
+
+
+def _oracle_shard_index(nodeid: str) -> int:
+    """Return the v1 shard index with a test-local oracle (never the CI helper).
+
+    A big-endian integer is even or odd exactly as its final byte is, so the
+    oracle reads the parity of the digest's last byte.
+    """
+    return hashlib.sha256(nodeid.encode("utf-8", "strict")).digest()[-1] & 1
+
+
+def _lane_shard_nodeids(arguments: list[str], nodeids: set[str]) -> set[str]:
+    """Apply an ordinary lane's shard filter to its unsharded cached collection."""
+    if "--ordinary-shard-index" not in arguments:
+        return nodeids
+    index = arguments[arguments.index("--ordinary-shard-index") + 1]
+    assert index in {"0", "1"}
+    return {nodeid for nodeid in nodeids if _oracle_shard_index(nodeid) == int(index)}
 
 
 def _collection_source_digest(repository_root: Path) -> str:
@@ -627,7 +733,7 @@ def test_ci_lane_selections_partition_the_full_collection(
     for job_id, arguments, _ in _pytest_lanes(workflow, first):
         returncode, nodeids, output = _collect_nodeids(arguments)
         assert returncode == 0, output
-        by_job.setdefault(job_id, set()).update(nodeids)
+        by_job.setdefault(job_id, set()).update(_lane_shard_nodeids(arguments, nodeids))
 
     full_returncode, full, full_output = _collect_nodeids([])
     stress_returncode, stress, stress_output = _collect_nodeids(["-m", "stress"])
@@ -759,6 +865,10 @@ def test_ci_lanes_are_bounded_parallel_and_write_unique_coverage_files() -> None
             ]
             assert len(uploads) == 1
             upload = _mapping(uploads[0]["with"])
+            if job_id == "pytest-ordinary":
+                # #1039: the shard coverage file travels inside the fixed bundle.
+                assert upload == _ORDINARY_BUNDLE_UPLOAD
+                continue
             assert upload["include-hidden-files"] is True
             assert upload["if-no-files-found"] == "error"
             upload_path = cast(str, upload["path"])
@@ -781,7 +891,17 @@ def test_ci_lanes_are_bounded_parallel_and_write_unique_coverage_files() -> None
     combined_files = {
         argument for argument in shlex.split(combine) if argument.startswith(".coverage.")
     }
-    assert combined_files == set(coverage_files)
+    ordinary_shard_files = {
+        coverage_file for job, _, coverage_file in lanes if job == "pytest-ordinary"
+    }
+    assert ordinary_shard_files == {".coverage.ordinary-shard-0", ".coverage.ordinary-shard-1"}
+    shard_combine = next(
+        step["run"]
+        for step in _steps(coverage_job)
+        if step.get("name") == "Combine ordinary shard coverage"
+    )
+    assert shard_combine == _ORDINARY_SHARD_COMBINE_RUN
+    assert combined_files == (set(coverage_files) - ordinary_shard_files) | {".coverage.ordinary"}
 
     with (REPO_ROOT / "pyproject.toml").open("rb") as config_file:
         project = cast(dict[str, object], tomllib.load(config_file))
@@ -794,6 +914,278 @@ def test_ci_lanes_are_bounded_parallel_and_write_unique_coverage_files() -> None
     )
     assert isinstance(install_coverage, str)
     assert '"coverage>=7.6"' in install_coverage
+
+
+def _check_ordinary_shard_wiring(workflow: dict[str, object], workflow_text: str) -> None:
+    """Assert the exact #1039 ordinary-shard producer and coverage-job wiring."""
+    jobs = _mapping(workflow["jobs"])
+    ordinary = _mapping(jobs["pytest-ordinary"])
+    assert set(ordinary) == {"name", "runs-on", "needs", "if", "strategy", "steps"}
+    assert ordinary["runs-on"] == "ubuntu-latest"
+    assert ordinary["needs"] == ["classify"]
+    assert ordinary["if"] == _FULL_ONLY_CONDITION
+    assert ordinary["strategy"] == {
+        "fail-fast": False,
+        "max-parallel": 2,
+        "matrix": {"include": list(_ORDINARY_SHARD_MATRIX)},
+    }
+    ordinary_steps = _steps(ordinary)
+    assert [step.get("name") for step in ordinary_steps[:4]] == [
+        "Check out repository",
+        "Set up Python",
+        "Install system libraries (PortAudio for sounddevice)",
+        "Install dependencies",
+    ]
+    assert ordinary_steps[4:] == list(_ORDINARY_SHARD_STEPS)
+
+    coverage_job = _mapping(jobs["coverage"])
+    assert coverage_job["needs"] == [
+        "classify",
+        "pytest-ordinary",
+        "pytest-serial",
+        "pytest-stress",
+        "package",
+    ]
+    coverage_steps = _steps(coverage_job)
+    assert [step.get("name") for step in coverage_steps[:3]] == [
+        "Check out repository",
+        "Set up Python",
+        "Install coverage",
+    ]
+    assert coverage_steps[3:9] == list(_COVERAGE_SHARD_STEPS)
+    assert [step.get("name") for step in coverage_steps[9:]] == [
+        "Generate combined coverage XML",
+        "Report combined coverage",
+        "Normalize coverage filenames for Codecov",
+        "Upload normalized full coverage artifact",
+    ]
+
+    ordinary_lanes = [
+        (arguments, coverage_file)
+        for job_id, arguments, coverage_file in _pytest_lanes(workflow, "pull_request")
+        if job_id == "pytest-ordinary"
+    ]
+    assert [
+        (arguments[arguments.index("--ordinary-shard-index") + 1], coverage_file)
+        for arguments, coverage_file in ordinary_lanes
+    ] == [("0", ".coverage.ordinary-shard-0"), ("1", ".coverage.ordinary-shard-1")]
+
+    assert "coverage-ordinary" not in workflow_text
+    assert "benchmark" not in workflow_text
+    assert workflow_text.count("--identity-mode") == 2
+    assert workflow_text.count("--identity-mode normal") == 2
+
+
+def test_ordinary_shard_wiring_is_pinned_exactly() -> None:
+    """#1039: two fixed shards, a verified bundle chain, and no local-gate change."""
+    workflow_text = (REPO_ROOT / ".github/workflows/ci.yml").read_text()
+    _check_ordinary_shard_wiring(_workflow(), workflow_text)
+
+    assert not (REPO_ROOT / "conftest.py").exists()
+    addopts = cast(str, _pytest_options()["addopts"])
+    assert "-p" not in addopts.split()
+    pyproject_text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert "ci_ordinary_shard" not in pyproject_text
+    assert "ordinary-shard" not in pyproject_text
+
+
+def _raw_steps(workflow: dict[str, object], job_id: str) -> list[dict[str, object]]:
+    """Return a job's live (uncopied) step list for an in-memory mutant."""
+    jobs = cast(dict[str, object], workflow["jobs"])
+    return cast(list[dict[str, object]], cast(dict[str, object], jobs[job_id])["steps"])
+
+
+def _raw_step(workflow: dict[str, object], job_id: str, name: str) -> dict[str, object]:
+    """Return one named live step for an in-memory mutant."""
+    return next(step for step in _raw_steps(workflow, job_id) if step.get("name") == name)
+
+
+def _raw_with(workflow: dict[str, object], job_id: str, name: str) -> dict[str, object]:
+    """Return one named step's live ``with`` mapping."""
+    return cast(dict[str, object], _raw_step(workflow, job_id, name)["with"])
+
+
+def _raw_strategy(workflow: dict[str, object]) -> dict[str, object]:
+    """Return the ordinary job's live strategy mapping."""
+    jobs = cast(dict[str, object], workflow["jobs"])
+    return cast(dict[str, object], cast(dict[str, object], jobs["pytest-ordinary"])["strategy"])
+
+
+def _raw_include(workflow: dict[str, object]) -> list[dict[str, object]]:
+    """Return the ordinary job's live matrix include list."""
+    matrix = cast(dict[str, object], _raw_strategy(workflow)["matrix"])
+    return cast(list[dict[str, object]], matrix["include"])
+
+
+def _replace_run(workflow: dict[str, object], job_id: str, name: str, old: str, new: str) -> None:
+    """Rewrite part of one named step's run string, asserting the edit applies."""
+    step = _raw_step(workflow, job_id, name)
+    run = cast(str, step["run"])
+    assert old in run
+    step["run"] = run.replace(old, new)
+
+
+def _move_step(workflow: dict[str, object], job_id: str, name: str, offset: int) -> None:
+    """Move one named step by ``offset`` positions."""
+    steps = _raw_steps(workflow, job_id)
+    position = next(index for index, step in enumerate(steps) if step.get("name") == name)
+    steps.insert(position + offset, steps.pop(position))
+
+
+_RUN_STEP = "Run ordinary tests with coverage"
+_UPLOAD_STEP = "Upload ordinary shard bundle"
+_DOWNLOAD_ZERO = "Download ordinary shard 0 bundle"
+_WIRING_MUTANTS: dict[str, Callable[[dict[str, object]], object]] = {
+    # G28: matrix, xdist request, plugin, job scope.
+    "matrix-third-index": lambda w: _raw_include(w).append({"index": "2"}),
+    "matrix-integer-index": lambda w: _raw_include(w)[0].update({"index": 0}),
+    "matrix-fail-fast": lambda w: _raw_strategy(w).update({"fail-fast": True}),
+    "matrix-unbounded-parallel": lambda w: _raw_strategy(w).pop("max-parallel"),
+    "pytest-without-shim": lambda w: _replace_run(
+        w, "pytest-ordinary", _RUN_STEP, f"-p {_ORDINARY_SHARD_PLUGIN} ", ""
+    ),
+    "pytest-three-workers": lambda w: _replace_run(w, "pytest-ordinary", _RUN_STEP, "-n 4", "-n 3"),
+    "job-permissions": lambda w: cast(
+        dict[str, object], cast(dict[str, object], w["jobs"])["pytest-ordinary"]
+    ).update({"permissions": {"contents": "write"}}),
+    "job-runner-changed": lambda w: cast(
+        dict[str, object], cast(dict[str, object], w["jobs"])["pytest-ordinary"]
+    ).update({"runs-on": "ubuntu-24.04"}),
+    # G29: upload mapping.
+    "upload-no-overwrite": lambda w: _raw_with(w, "pytest-ordinary", _UPLOAD_STEP).update(
+        {"overwrite": False}
+    ),
+    "upload-coverage-prefixed-name": lambda w: _raw_with(w, "pytest-ordinary", _UPLOAD_STEP).update(
+        {"name": "coverage-shard-${{ matrix.index }}"}
+    ),
+    "upload-retention": lambda w: _raw_with(w, "pytest-ordinary", _UPLOAD_STEP).update(
+        {"retention-days": 30}
+    ),
+    "upload-hidden-files": lambda w: _raw_with(w, "pytest-ordinary", _UPLOAD_STEP).update(
+        {"include-hidden-files": True}
+    ),
+    # G30: downloads carry no run-id, pattern, merge-multiple or token.
+    "download-run-id": lambda w: _raw_with(w, "coverage", _DOWNLOAD_ZERO).update(
+        {"run-id": "${{ github.run_id }}"}
+    ),
+    "download-pattern": lambda w: _raw_with(w, "coverage", _DOWNLOAD_ZERO).update(
+        {"pattern": "ordinary-shard-*"}
+    ),
+    "download-merge-multiple": lambda w: _raw_with(w, "coverage", _DOWNLOAD_ZERO).update(
+        {"merge-multiple": True}
+    ),
+    "download-github-token": lambda w: _raw_with(w, "coverage", _DOWNLOAD_ZERO).update(
+        {"github-token": "${{ github.token }}"}
+    ),
+    "coverage-download-widened": lambda w: _raw_with(
+        w, "coverage", "Download coverage data"
+    ).update({"pattern": "*"}),
+    # G31: step order and presence.
+    "verify-after-shard-combine": lambda w: _move_step(
+        w, "coverage", "Verify ordinary shard bundles", 1
+    ),
+    "shard-download-before-coverage-download": lambda w: _move_step(
+        w, "coverage", _DOWNLOAD_ZERO, -1
+    ),
+    "verify-removed": lambda w: _raw_steps(w, "coverage").remove(
+        _raw_step(w, "coverage", "Verify ordinary shard bundles")
+    ),
+    "finalize-removed": lambda w: _raw_steps(w, "pytest-ordinary").remove(
+        _raw_step(w, "pytest-ordinary", "Finalize ordinary shard bundle")
+    ),
+    # G32: the final combine stays byte-identical.
+    "final-combine-edited": lambda w: _replace_run(
+        w, "coverage", "Combine coverage data", " .coverage.package", ""
+    ),
+    # G33: identity mode pinned to normal; no benchmark or old upload literal.
+    "finalize-benchmark-mode": lambda w: _replace_run(
+        w,
+        "pytest-ordinary",
+        "Finalize ordinary shard bundle",
+        "--identity-mode normal",
+        "--identity-mode benchmark",
+    ),
+    "text-benchmark-literal": lambda _w: "\n# benchmark\n",
+    "text-coverage-ordinary-literal": lambda _w: "\n# name: coverage-ordinary\n",
+    "text-extra-identity-mode": lambda _w: "\n# --identity-mode normal\n",
+}
+
+
+@pytest.mark.parametrize("mutant", sorted(_WIRING_MUTANTS))
+def test_ordinary_shard_wiring_checker_rejects_each_mutant(mutant: str) -> None:
+    """Each in-memory workflow mutant actually fails the wiring checker (G28-G33)."""
+    workflow = copy.deepcopy(_workflow())
+    workflow_text = (REPO_ROOT / ".github/workflows/ci.yml").read_text()
+    _check_ordinary_shard_wiring(copy.deepcopy(workflow), workflow_text)
+    appended = _WIRING_MUTANTS[mutant](workflow)
+    if isinstance(appended, str):
+        workflow_text += appended
+    with pytest.raises(AssertionError):
+        _check_ordinary_shard_wiring(workflow, workflow_text)
+
+
+def test_collection_arguments_strip_only_the_closed_shard_options() -> None:
+    """Only the exact shim pair and the two shard options are stripped (G34)."""
+    arguments = [
+        "-n",
+        "4",
+        "--dist",
+        "worksteal",
+        "-p",
+        _ORDINARY_SHARD_PLUGIN,
+        "--ordinary-shard-index",
+        "1",
+        "--ordinary-shard-receipt",
+        "receipt.json",
+        "-p",
+        "no:randomly",
+        "-p",
+        "scripts.other_plugin",
+        "--ordinary-shard-count",
+        "2",
+        "-m",
+        "not serial",
+        "--cov=scripts",
+        "--cov-report=",
+    ]
+    assert _collection_arguments(arguments) == [
+        "-p",
+        "no:randomly",
+        "-p",
+        "scripts.other_plugin",
+        "--ordinary-shard-count",
+        "2",
+        "-m",
+        "not serial",
+    ]
+    assert _collection_arguments(["-p"]) == ["-p"]
+
+
+def test_ordinary_shards_partition_the_cached_ordinary_universe() -> None:
+    """The oracle splits the cached ordinary universe into two disjoint, complete shards.
+
+    The CI helper agrees with the test-local oracle on every collected ID, and the
+    universe fits the frozen v1 caps.
+    """
+    ordinary = [
+        arguments
+        for job_id, arguments, _ in _pytest_lanes(_workflow(), "pull_request")
+        if job_id == "pytest-ordinary"
+    ]
+    assert len({tuple(_collection_arguments(arguments)) for arguments in ordinary}) == 1
+    returncode, universe, output = _collect_nodeids(ordinary[0])
+    assert returncode == 0, output
+    zero, one = (_lane_shard_nodeids(arguments, universe) for arguments in ordinary)
+    assert zero and one
+    assert zero.isdisjoint(one)
+    assert zero | one == universe
+    assert all(ci_ordinary_shards.shard_index(nodeid) == 0 for nodeid in zero)
+    assert all(ci_ordinary_shards.shard_index(nodeid) == 1 for nodeid in one)
+    sizes = [len(nodeid.encode("utf-8", "strict")) for nodeid in universe]
+    assert len(universe) <= ci_ordinary_shards.COUNT_CAP
+    assert max(sizes) <= ci_ordinary_shards.NODEID_CAP
+    # kept + three phase records per ID, with generous per-entry JSON overhead.
+    assert 4 * sum(sizes) + 256 * len(universe) < ci_ordinary_shards.MANIFEST_CAP
 
 
 def _argv_declared_classes(run: str) -> dict[str, tuple[str, ...]]:

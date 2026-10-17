@@ -121,11 +121,23 @@ jobs:
           roastpilot-agent --help
           roastpilot-agent --version
 
+  # #1039: two fixed ordinary shards (v1: SHA-256 of the node ID, big-endian,
+  # modulo two), each four xdist workers. The CI-only shim writes a receipt only
+  # after a zero exit and a complete observed lifecycle; finalize then binds it to
+  # the closed coverage bytes as one fixed per-index bundle, verified and combined
+  # into `.coverage.ordinary` by the coverage job.
   pytest-ordinary:
-    name: Python tests (ordinary, xdist)
+    name: Python tests (ordinary, xdist, shard ${{ matrix.index }})
     runs-on: ubuntu-latest
     needs: [classify]
     if: needs.classify.outputs.mode != 'docs-only'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - index: "0"
+          - index: "1"
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -150,17 +162,20 @@ jobs:
 
       - name: Run ordinary tests with coverage
         env:
-          COVERAGE_FILE: .coverage.ordinary
-        run: python -m pytest -n 4 --dist worksteal -m "not serial and not stress" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report=
+          COVERAGE_FILE: .coverage.ordinary-shard-${{ matrix.index }}
+        run: python -m pytest -n 4 --dist worksteal -p scripts.ci_ordinary_shard_plugin --ordinary-shard-index ${{ matrix.index }} --ordinary-shard-receipt ordinary-shard-receipt.json -m "not serial and not stress" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report=
 
-      - name: Upload ordinary coverage data
+      - name: Finalize ordinary shard bundle
+        run: python scripts/ci_ordinary_shards.py finalize --index ${{ matrix.index }} --receipt ordinary-shard-receipt.json --coverage .coverage.ordinary-shard-${{ matrix.index }} --bundle ordinary-shard-bundle --identity-mode normal
+
+      - name: Upload ordinary shard bundle
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-ordinary
-          path: .coverage.ordinary
-          include-hidden-files: true
+          name: ordinary-shard-${{ matrix.index }}
+          path: ordinary-shard-bundle
           if-no-files-found: error
           retention-days: 7
+          overwrite: true
 
   pytest-serial:
     name: Python tests (serial)
@@ -453,6 +468,24 @@ jobs:
           pattern: coverage-*
           merge-multiple: true
           path: .
+
+      - name: Download ordinary shard 0 bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: ordinary-shard-0
+          path: ordinary-shards/ordinary-shard-0
+
+      - name: Download ordinary shard 1 bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: ordinary-shard-1
+          path: ordinary-shards/ordinary-shard-1
+
+      - name: Verify ordinary shard bundles
+        run: python scripts/ci_ordinary_shards.py verify --bundle-root ordinary-shards --identity-mode normal
+
+      - name: Combine ordinary shard coverage
+        run: python -m coverage combine --keep --data-file=.coverage.ordinary ordinary-shards/ordinary-shard-0/coverage.data ordinary-shards/ordinary-shard-1/coverage.data
 
       - name: Combine coverage data
         run: python -m coverage combine --keep .coverage.ordinary .coverage.serial .coverage.stress-opaque-event-boundary .coverage.stress-opaque-total-accepts-exact .coverage.stress-opaque-total-rejects-one-over .coverage.package
