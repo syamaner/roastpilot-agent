@@ -40,7 +40,7 @@ default 30 s barrier and its exits 64 and 65 are unchanged, as are the real
 overlap, the nonce and owned-process-group cleanup. The 180 s figures are
 test allowances, not production requirements, and the production installer is
 unchanged. Adding the installer test module to this slice's file scope is a
-lead-adopted extension under the operator's autonomy exception in AGENTS.md;
+lead-adopted extension under the operator's autonomy authorisation and exception to AGENTS.md;
 it was not individually ratified by a human.
 
 Both measurement series used 3 alternating matched pairs of the two unchanged
