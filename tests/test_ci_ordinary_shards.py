@@ -1740,8 +1740,13 @@ def _witness(path: Path) -> tuple[dict[str, list[str]], list[tuple[str, str, str
 
 
 def _bodies(directory: Path) -> set[str]:
-    """Return the node IDs whose bodies actually ran."""
-    return {path.read_text(encoding="utf-8") for path in directory.iterdir()}
+    """Return the SHA-256 names of the node IDs whose bodies actually ran."""
+    return {entry.name for entry in directory.iterdir()}
+
+
+def _hashed(nodeids: set[str]) -> set[str]:
+    """Return the body-record names the synthetic tests write for ``nodeids``."""
+    return {hashlib.sha256(nodeid.encode()).hexdigest() for nodeid in nodeids}
 
 
 @pytest.mark.slow
@@ -1801,7 +1806,7 @@ def test_real_shards_filter_after_marker_selection_in_original_order(tmp_path: P
         }
         assert observed == {report for report in reports if report[0] in kept}
         setup_passed = {r[0] for r in observed if r[1] == "setup" and r[2] == "passed"}
-        assert _bodies(project.root / f"bodies-{index}") == setup_passed
+        assert setup_passed and _bodies(project.root / f"bodies-{index}") == _hashed(setup_passed)
         kept_by_index[index] = kept
 
     assert kept_by_index[0] and kept_by_index[1]
