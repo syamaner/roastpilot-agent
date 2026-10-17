@@ -22,11 +22,11 @@ be invoked. All existing cases and fixtures are preserved. The original 28
 guard and cleanup mutants plus one list-subclass mutant (29 variants) each
 failed at their intended behavioural check. This is finite assurance under
 ordinary import machinery and cache assumptions, not a universal proof; under
-those assumptions no cleanup of a reachable executor is skipped. Trade-off: a
-`bean_sourcing` that no test imported is no longer import-smoked by unrelated
-cleanup, whether it is broken or its package path cannot resolve it; the
-dedicated bean-sourcing and catalogue test modules still import it at
-collection, and the full gate runs both.
+those assumptions no cleanup that the original hook would perform is skipped.
+Trade-off: a `bean_sourcing` that no test imported is no longer import-smoked
+by unrelated cleanup, whether it is broken or its package path cannot resolve
+it; the dedicated bean-sourcing and catalogue test modules still import it
+at collection, and the full gate runs both.
 
 Three alternating matched pairs of the unchanged real five-scenario
 environment-guard node (fresh single processes, coverage off; baseline B vs
