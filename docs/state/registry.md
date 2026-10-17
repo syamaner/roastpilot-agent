@@ -20,9 +20,9 @@ real-executor cleanup checks. The fifteenth state, added after QA found the
 negative proof missing, is a list-subclass `__path__` whose iterator must not
 be invoked. All existing cases and fixtures are preserved. The original 28
 guard and cleanup mutants plus one list-subclass mutant (29 variants) each
-failed on their intended assertion. This is finite assurance under ordinary
-import machinery and cache assumptions, not a universal proof; under those
-assumptions no cleanup of a reachable executor is skipped. Trade-off: a
+failed at their intended behavioural check. This is finite assurance under
+ordinary import machinery and cache assumptions, not a universal proof; under
+those assumptions no cleanup of a reachable executor is skipped. Trade-off: a
 `bean_sourcing` that no test imported is no longer import-smoked by unrelated
 cleanup, whether it is broken or its package path cannot resolve it; the
 dedicated bean-sourcing and catalogue test modules still import it at
@@ -42,17 +42,18 @@ K (the median complete fresh-process wall time of all new cases, including
 startup, collection and session cleanup) was 0.750 s, for a net 2.461 s.
 These matched pairs are retained unchanged: for the selected node, only a
 conftest comment has changed since, and the executable tokens, the selected
-test and production dependency bytes are the same. After the QA repair, K for all 29 cases was
-remeasured in three fresh full processes (0.730, 0.730 and 0.781 s), a median
-of 0.730 s, for a net 2.481 s. All four fixed bars still pass. The two K
-results are not evidence of a proof speed-up: the corpus differs and host load
-was not controlled. No new pair series, tuning or threshold change was made.
-These are selected-node measurements, not a whole-suite or CI forecast. Test
+test and production dependency bytes are the same. After the QA repair, K
+for all 29 cases was remeasured in three fresh full processes (0.730, 0.730
+and 0.781 s), a median of 0.730 s, for a net 2.481 s. All four fixed bars
+still pass. The two K results are not evidence of a proof speed-up: the
+corpus differs and host load was not controlled. No new pair series, tuning
+or threshold change was made. These are selected-node measurements, not a
+whole-suite or CI forecast. Test
 infrastructure only: no production, CI, marker, sentinel, dependency or
-hardware change, and no E11 status claim. The full all-markers coverage,
-static and CLI gates, final QA, security and product review, and protected
-delivery are still pending. Lead-adopted under the operator's autonomy
-exception, not individually human-reviewed.
+hardware change, and no E11 status claim. These measurements do not replace
+the full all-markers coverage, static and CLI gates, independent QA, security
+and product review, or protected delivery requirements. Lead-adopted under
+the operator's autonomy exception, not individually human-reviewed.
 
 **17 Oct 2026, #1026 Codex scanner opaque string-run skip:** once a JSON
 string's 64-character discriminator prefix is already full and marked
