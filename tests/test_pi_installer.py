@@ -1934,6 +1934,27 @@ def _delta(log: Path, start: int) -> list[str]:
     return log.read_text()[start:].splitlines()
 
 
+def _seed_installed_model(environment: dict[str, str]) -> None:
+    """Create only the two valid installed-model files on a fresh, unused harness."""
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    assert not root.exists(), "seed requires an absent install root"
+    assert not Path(environment["FAKE_LOG"]).exists(), "seed requires an absent fake log"
+    int8 = root / "var/lib/roastpilot-agent/models/onnx/int8"
+    int8.mkdir(parents=True)
+    for name, content in (
+        ("model_quantized.onnx", b"MODEL"),
+        ("preprocessor_config.json", b"CONFIG"),
+    ):
+        with (int8 / name).open("xb") as handle:
+            handle.write(content)
+        (int8 / name).chmod(0o644)
+
+
+def _blocked_installer_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    """Refuse every installer invocation in a setup-routing proof."""
+    raise RuntimeError("installer invocation blocked")
+
+
 def _installer_fake_script_source() -> str:
     """Return the generated fake-command shell script source from this module."""
     source = Path(__file__).read_text()
@@ -4863,10 +4884,10 @@ def test_failed_reuse_digest_inspection_falls_back_to_fresh_model_acquisition(
 ) -> None:
     """An unreadable prior model is not trusted and is reacquired through the renderer seam."""
     _, environment, log, _ = installer_harness
-    assert _run(environment, "--set-hostname", "roastpilot").returncode == 0
+    _seed_installed_model(environment)
     root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
     quantized = root / "var/lib/roastpilot-agent/models/onnx/int8/model_quantized.onnx"
-    start = len(log.read_text())
+    start = 0
     result = _run(
         environment | {"FAKE_SHA256_FAIL_PATH": str(quantized), "FAKE_SHA256_FAIL_ON_COUNT": "1"},
         "--set-hostname",
@@ -5203,7 +5224,11 @@ def test_only_complete_verified_installed_models_are_reused(
 ) -> None:
     """Invalid installed model trees fall back to the normal verified fetch path."""
     _, environment, log, _ = installer_harness
-    assert _run(environment, "--set-hostname", "roastpilot").returncode == 0
+    if mutation == "bad-digest":
+        assert _run(environment, "--set-hostname", "roastpilot").returncode == 0
+    else:
+        assert mutation in ("missing-peer", "symlink", "incomplete"), mutation
+        _seed_installed_model(environment)
     model_dir = (
         Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"]) / "var/lib/roastpilot-agent/models"
     )
@@ -5218,7 +5243,7 @@ def test_only_complete_verified_installed_models_are_reused(
         quantized.symlink_to(preprocessor)
     else:
         quantized.write_text("MODEL-partial")
-    start = len(log.read_text())
+    start = len(log.read_text()) if mutation == "bad-digest" else 0
     result = _run(environment, "--set-hostname", "roastpilot")
     assert result.returncode == (1 if mutation == "symlink" else 0), result.stderr
     events = _delta(log, start)
@@ -10274,3 +10299,106 @@ def test_fake_test_early_dispatch_keeps_the_common_prefix_first(
             f"record must precede the locale line: {name} status {result.returncode}, "
             f"log delta {delta}"
         )
+
+
+def test_installed_model_seed_is_exact_regular_and_fresh_only(
+    installer_harness: tuple[Path, dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    """The model seed writes exactly the two valid regular files and refuses a used harness."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+    _seed_installed_model(environment)
+    after = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+    for name, content in (
+        ("model_quantized.onnx", b"MODEL"),
+        ("preprocessor_config.json", b"CONFIG"),
+    ):
+        path = root / "var/lib/roastpilot-agent/models/onnx/int8" / name
+        assert path.is_file(), name
+        assert not path.is_symlink(), name
+        assert path.read_bytes() == content, name
+        assert stat.S_IMODE(path.lstat().st_mode) == 0o644, name
+    assert before - after == set()
+    assert after - before == {
+        Path("root"),
+        Path("root/var"),
+        Path("root/var/lib"),
+        Path("root/var/lib/roastpilot-agent"),
+        Path("root/var/lib/roastpilot-agent/models"),
+        Path("root/var/lib/roastpilot-agent/models/onnx"),
+        Path("root/var/lib/roastpilot-agent/models/onnx/int8"),
+        Path("root/var/lib/roastpilot-agent/models/onnx/int8/model_quantized.onnx"),
+        Path("root/var/lib/roastpilot-agent/models/onnx/int8/preprocessor_config.json"),
+    }
+    assert not log.exists()
+    with pytest.raises(AssertionError, match="absent install root"):
+        _seed_installed_model(environment)
+    used = tmp_path / "used"
+    used.mkdir()
+    _, used_environment, used_log, _ = _build_installer_harness(used)
+    used_log.write_text("")
+    with pytest.raises(AssertionError, match="absent fake log"):
+        _seed_installed_model(used_environment)
+    assert not Path(used_environment["ROASTPILOT_INSTALL_TEST_ROOT"]).exists()
+
+
+def test_installed_model_seed_is_accepted_by_real_reuse_without_fetch(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+) -> None:
+    """The real installer reuses the seeded model directory without fetching or damaging it."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    _seed_installed_model(environment)
+    result = _run(environment, "--set-hostname", "roastpilot")
+    assert result.returncode == 0, result.stderr
+    events = log.read_text().splitlines()
+    assert not any("MODEL_FETCH" in event for event in events)
+    model_installs = [
+        event for event in events if event.startswith("roastpilot-agent <appliance> <model>")
+    ]
+    assert len(model_installs) == 1
+    assert f"<--from-dir> <{root / 'var/lib/roastpilot-agent/models'}>" in model_installs[0]
+    for name, content in (
+        ("model_quantized.onnx", b"MODEL"),
+        ("preprocessor_config.json", b"CONFIG"),
+    ):
+        path = root / "var/lib/roastpilot-agent/models/onnx/int8" / name
+        assert path.is_file(), name
+        assert not path.is_symlink(), name
+        assert path.read_bytes() == content, name
+        assert stat.S_IMODE(path.lstat().st_mode) == 0o644, name
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected", "match", "seeded"),
+    [
+        pytest.param(
+            "bad-digest", RuntimeError, "installer invocation blocked", False, id="bad-digest"
+        ),
+        pytest.param(
+            "missing-peer", RuntimeError, "installer invocation blocked", True, id="missing-peer"
+        ),
+        pytest.param("symlink", RuntimeError, "installer invocation blocked", True, id="symlink"),
+        pytest.param(
+            "incomplete", RuntimeError, "installer invocation blocked", True, id="incomplete"
+        ),
+        pytest.param("unknown", AssertionError, "^unknown", False, id="unknown"),
+    ],
+)
+def test_installed_model_setup_routing_is_closed(
+    installer_harness: tuple[Path, dict[str, str], Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected: type[Exception],
+    match: str,
+    seeded: bool,
+) -> None:
+    """Only bad-digest installs first, admitted values seed first, and unknown values fail closed."""
+    _, environment, log, _ = installer_harness
+    root = Path(environment["ROASTPILOT_INSTALL_TEST_ROOT"])
+    monkeypatch.setattr(sys.modules[__name__], "_run", _blocked_installer_run)
+    with pytest.raises(expected, match=match):
+        test_only_complete_verified_installed_models_are_reused(installer_harness, mutation)
+    assert root.exists() is seeded
+    assert not log.exists()
