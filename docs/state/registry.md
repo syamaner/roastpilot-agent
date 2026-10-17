@@ -9,18 +9,24 @@ of exact-`str` entries, and no `bean_sourcing` or `__getattr__` entry. The
 check reads only that raw namespace and makes no dynamic attribute lookup.
 Every unknown, malformed, dynamic, subclassed or `None`-valued state falls
 through to the unchanged original typed import, lock, capture and clear, and
-`shutdown(wait=True, cancel_futures=True)` outside the lock. One
+`shutdown(wait=True, cancel_futures=True)` outside the lock. One new
 line-specific comment suppresses the two strict Pyright unknown-type
-diagnostics on the path-entry check; there is no other suppression or cast in
-the hook. A new unmarked module adds 28 proof cases: skip, 14 fall-through
-states compared with a literal copy of the original import under a meta-path
-blocker, a `None` attribute, 5 loaded forms, and lock, order, argument,
-repeat, failure and real-executor cleanup checks. All existing cases and
-fixtures are preserved. This is finite assurance under ordinary import
-machinery and cache assumptions, not a universal proof. Trade-off: a broken
+diagnostics on the path-entry check; the hook gains no other new suppression
+or cast, and its three existing private-usage ignores remain. A new unmarked
+module adds 29 proof cases: skip, 15 fall-through states compared with a
+literal copy of the original import under a meta-path blocker, a `None`
+attribute, 5 loaded forms, and lock, order, argument, repeat, failure and
+real-executor cleanup checks. The fifteenth state, added after QA found the
+negative proof missing, is a list-subclass `__path__` whose iterator must not
+be invoked. All existing cases and fixtures are preserved. The original 28
+guard and cleanup mutants plus one list-subclass mutant (29 variants) each
+failed on their intended assertion. This is finite assurance under ordinary
+import machinery and cache assumptions, not a universal proof; under those
+assumptions no cleanup of a reachable executor is skipped. Trade-off: a
 `bean_sourcing` that no test imported is no longer import-smoked by unrelated
-cleanup; the dedicated bean-sourcing and catalogue test modules still import
-it at collection, and the full gate runs both.
+cleanup, whether it is broken or its package path cannot resolve it; the
+dedicated bean-sourcing and catalogue test modules still import it at
+collection, and the full gate runs both.
 
 Three alternating matched pairs of the unchanged real five-scenario
 environment-guard node (fresh single processes, coverage off; baseline B vs
@@ -30,15 +36,23 @@ candidate C call seconds):
 - pair 2 (C then B): 9.446 vs 6.275, a 33.57% saving;
 - pair 3 (B then C): 9.565 vs 6.354, a 33.57% saving.
 
-The median saving was 33.57% (3.211 s). K, the median complete fresh-process
-wall time of all 28 new cases including startup, collection and session
-cleanup, was 0.750 s, for a net 2.461 s. Peak-RSS deltas were +311,296,
-−32,768 and +294,912 bytes (median +294,912). All four ratified bars passed
-on the first complete series. These are selected-node measurements, not a
-whole-suite or CI forecast; unrelated host load was not controlled. Test
+The median saving was 33.57% (3.211 s). Peak-RSS deltas were +311,296,
+−32,768 and +294,912 bytes (median +294,912). Against the original 28 cases,
+K (the median complete fresh-process wall time of all new cases, including
+startup, collection and session cleanup) was 0.750 s, for a net 2.461 s.
+These matched pairs are retained unchanged: for the selected node, only a
+conftest comment has changed since, and the executable tokens, the selected
+test and production dependency bytes are the same. After the QA repair, K for all 29 cases was
+remeasured in three fresh full processes (0.730, 0.730 and 0.781 s), a median
+of 0.730 s, for a net 2.481 s. All four fixed bars still pass. The two K
+results are not evidence of a proof speed-up: the corpus differs and host load
+was not controlled. No new pair series, tuning or threshold change was made.
+These are selected-node measurements, not a whole-suite or CI forecast. Test
 infrastructure only: no production, CI, marker, sentinel, dependency or
-hardware change, and no E11 status claim. Lead-adopted under the operator's
-autonomy exception, not individually human-reviewed.
+hardware change, and no E11 status claim. The full all-markers coverage,
+static and CLI gates, final QA, security and product review, and protected
+delivery are still pending. Lead-adopted under the operator's autonomy
+exception, not individually human-reviewed.
 
 **17 Oct 2026, #1026 Codex scanner opaque string-run skip:** once a JSON
 string's 64-character discriminator prefix is already full and marked
