@@ -1,5 +1,103 @@
 # RoastPilot Agent Project State Registry
 
+**17 Oct 2026, #1034 installed-model setup trimmed in four installer
+fallback cases:** `tests/test_pi_installer.py` gains a private
+`_seed_installed_model` helper. On a fresh harness it creates only the two
+fixture files, `model_quantized.onnx` (`MODEL`) and
+`preprocessor_config.json` (`CONFIG`), under the genuine rooted
+`var/lib/roastpilot-agent/models/onnx/int8` path as regular non-link 0644
+files, and refuses the tested used-root and used-log states; it reuses the
+existing fixture bytes and computes or invents no digest. Four cases now
+seed instead of running a first successful install: the `missing-peer`,
+`symlink` and `incomplete` parameters of
+`test_only_complete_verified_installed_models_are_reused`, and
+`test_failed_reuse_digest_inspection_falls_back_to_fresh_model_acquisition`.
+Their first successful setup calls and initial log-offset handling are the
+deliberately replaced lines (offset 0 on a fresh log); the real subject
+installer runs, fault inputs, mutation branches, second-run arguments and
+environment, and subject assertions are unchanged. `bad-digest` keeps its
+genuine first full install and real fallback run. The four anchors stay
+byte-identical: idempotence
+(`test_installer_full_run_is_idempotent_and_keeps_secret_protected`), valid
+reuse (`test_rerun_reuses_verified_model_and_retains_a_valid_existing_key`)
+and promotion (`test_model_digests_cover_stage_root_snapshot_and_destination`,
+`test_promoted_model_files_are_mode_0644`).
+
+The trimmed cases now start from a fresh machine with model files present,
+not a re-run after a full install, so pipx state, unit, env file, hostname
+marker, groups and fake counters differ. Genuine positive and negative
+reinstall contexts remain at class level (`bad-digest` and the anchors);
+whole-machine trace equivalence is not claimed. The helper is a private
+trusted fixture helper, not a general snapshot API or hostile
+filesystem-race boundary; there is no shared, cached or `autouse` seam and
+no production change. All 596 original installer cases keep their IDs,
+order, parameters and selection markers, plus seven appended proofs (603);
+the global collection keeps all 13864 old IDs in order plus the 7 (13871).
+P1 checks the exact 9-path tree, bytes, modes, regular non-links, no extra
+state and both fresh-only refusals. P2 runs the actual Bash installer on the
+seed: reuse through the exact `--from-dir` directory, no `MODEL_FETCH`,
+valid files afterwards. P3 covers five explicit routing values with a
+distinct `RuntimeError` blocker (`_blocked_installer_run`, used only by P3;
+the subject `_run` stays real), including an unknown value raising
+`AssertionError` before seed or run. P3's `parametrize` is the only new
+marker; selection policy is unchanged.
+
+Mutation evidence: 21 recipes, 19 killing and 2 expected survivors. The four
+fallback recipes ran in baseline B and candidate C (8 processes, 10 failed
+subject nodes); 9 helper and 6 wiring recipes ran on C (15 processes). Of 25
+mutant processes, 23 failed as intended and the 2 survivors passed; the 41
+mutant node outcomes were 32 failed and 9 passed (non-primary P3 cases and
+the survivors). Each attempt used exact file-copy snapshot and restoration
+with hash checks and a fresh bytecode prefix, then a restored witness (25
+processes, 41 green nodes; no invalid attempt or rescue rerun). Baseline
+mutants temporarily used base test bytes inside the author's own worktree;
+both files were restored to the candidate safety commit before the
+same-node witnesses, so no per-variant baseline-green rerun is claimed. The
+initial baseline profile and three separate matched baseline 7-case
+processes were green (the normal B controls). Survivors S1/S2 (offset forced
+to 0 in `bad-digest`) pass on B and C: pre-existing and disclosed, not an
+introduced regression or production defect. These are finite named
+regressions, not a universal no-regression claim.
+
+Fixed value test, 7-case cohort, complete fresh-process wall seconds
+(startup, collection, setup, cleanup; coverage off; matched Python 3.11.14,
+114 declared versions, plugins and options):
+
+- pair 1 (B then C): B 93.221365333 vs C 65.740600250, a 29.47904162% saving;
+- pair 2 (C then B): B 90.889727417 vs C 65.632834333, a 27.78850130% saving;
+- pair 3 (B then C): B 90.392274500 vs C 65.796962625, a 27.20952870% saving.
+
+Median raw saving 25.25689308398 s, median relative 27.7885012991%. K, the
+complete fresh-process wall of all seven proofs (9.253393500, 9.243783083,
+9.137340125 s), is 9.24378308299 s; net 16.01311000099 s. Peak-RSS deltas
++1,622,016, -458,752 and +2,424,832 bytes (median +1,622,016, within the
+33,554,432-byte bar). All four predeclared bars pass; every trial is
+retained, with no threshold tuning or favourable selection. No other parent
+model, test or build ran during the accepted series; unrelated host load was
+not controlled. The cohort gain is not a full-suite or hosted CI claim. C1
+(the five original fallback cases, proofs excluded): identical statements,
+missing lines and branch arcs in B and C for the 15 measured production
+Python files; every changed executable line in `_seed_installed_model` and in
+the two consumer functions' wiring was hit (`_blocked_installer_run`
+runs only under the P3 proofs, so only in C2). C2 (those five plus
+all seven proofs): all 69 changed executable test lines and every new arc
+executed. Both used a supplementary Coverage API run (`config_file=False`,
+exact file includes, started before pytest import); no repository coverage
+configuration, source policy or threshold changed. No Python coverage of
+Bash is claimed; Bash evidence is the trace assertions and the fallback mutations.
+
+Independent native local QA passed with no blocking or medium finding; the
+low pre-existing offset survivor is consciously retained outside this slice.
+This entry records measured local focused evidence only: the full current-head
+single-process all-markers coverage, static and CLI gates, final product
+audit and hosted protected delivery checks remain mandatory and are not
+recorded here. Test infrastructure only: no production, script, dependency,
+provider, permission, CI, selection-marker or hardware change, and no E11
+status claim. Lead-adopted under the operator's autonomy exception, not
+individually human-reviewed. The parent orchestrated, profiled, validated
+and adjudicated; the same named native leaf authored the committed source
+and this entry.
+
 **17 Oct 2026, #1032 real report cost rows reused in bean-sourcing layout
 tests:** `tests/test_bakeoff_bean_sourcing.py` gains a builder,
 `_build_default_roster_cost_rows`, and a module-scoped
