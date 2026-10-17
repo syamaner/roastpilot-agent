@@ -13,25 +13,64 @@ comments for inherited typing errors, with no whole-file suppression. The
 copy is compared with the candidate over a finite exhaustive short-suffix
 corpus, 2,500 seeded events and literal, chunked-stream, error, work and
 retention anchors. This is finite assurance, not a proof over all inputs,
-and it assumes CPython `re` is correct. All 1,023 existing test cases keep
-their bodies, assertions and markers, and there are 58 new cases. Over 3
-alternating matched pairs of the two unchanged real 64 MiB aggregate stress
-nodes (each node in a fresh process; summed call-phase seconds, baseline B
-vs candidate C), the results were:
+and it assumes CPython `re` is correct. All 1,023 existing cases in the
+capture test module keep their bodies, assertions and markers. The slice adds
+65 cases: 58 parser proof cases in that module and 7 overlap-readiness helper
+cases in the installer test module. The oracle hash pin (T0) keeps its
+unchanged source hash, but now reads the oracle's exact line span from its own
+module file by syntax-tree position instead of `inspect.getsource`.
+
+A first full all-markers attempt failed and is preserved as evidence, not as
+a completion. The outer run had 1 failure, 2,717 passes and 1 skip before the
+parent stopped it gracefully. Its nested ordinary four-worker run had 4
+failures, 13,756 passes and 16 skips in 2,952.99 s. The four failures were:
+
+- the docs-marker exactness guard, which correctly reported the T0
+  `inspect.getsource` result as an ambiguous same-module helper-class receiver;
+- three positive installer overlap cases (`success`, `partial-launch` and
+  `cleanup-continues`), which missed the 35 s startup deadline before reaching
+  the hostname barrier.
+
+No host-load or root-cause claim is made. The repair changes only tests. T0
+uses the syntax-tree span described above, and the docs-marker classifier is
+unchanged. The positive overlap harness now allows 180 s for startup, 180 s
+for completion and a 180 s fake barrier (set for the positive overlap only).
+It fails early when an owned installer exits before readiness. The fake's
+default 30 s barrier and its exits 64 and 65 are unchanged, as are the real
+overlap, the nonce and owned-process-group cleanup. The 180 s figures are
+test allowances, not production requirements, and the production installer is
+unchanged. Adding the installer test module to this slice's file scope is a
+lead-adopted extension under the operator's autonomy exception in AGENTS.md;
+it was not individually ratified by a human.
+
+Both measurement series used 3 alternating matched pairs of the two unchanged
+real 64 MiB aggregate stress nodes (each node in a separate fresh process;
+summed call-phase seconds, baseline B vs candidate C). The initial series
+covered the candidate with the 58 parser proof cases:
 
 - pair 1 (B then C): 21.101 vs 0.399, a 98.11% saving;
 - pair 2 (C then B): 20.963 vs 0.501, a 97.61% saving;
 - pair 3 (B then C): 25.204 vs 0.828, a 96.72% saving.
 
-The median saving was 97.61% (20.70 s). The new cases cost K = 7.71 s
+Its median saving was 97.61% (20.70 s). The new cases cost K = 7.71 s
 (median all-phase), for a net 12.99 s. Median peak RSS was 53,362,688 bytes
-(about 50.9 MiB) lower. All four ratified bars passed. Unrelated host load
-was not controlled. This is a finite measurement of the selected nodes, not a
-whole-suite or ordinary-CI forecast. Usage capture is not activated, and
-permissions, providers and hardware are unchanged. These measurements do not
-substitute for the full all-markers gate or independent review. This records
-test and tooling infrastructure only, with no E11 status, hardware, Pi,
-installation or release claim.
+lower. The final remeasurement covered the repaired head, with K covering all
+65 added cases:
+
+- pair 1 (B then C): 21.995 vs 0.409, a 98.14% saving;
+- pair 2 (C then B): 21.869 vs 0.407, a 98.14% saving;
+- pair 3 (B then C): 21.837 vs 0.404, a 98.15% saving.
+
+Its median saving was 98.14% (21.46 s), with K = 3.76 s, for a net 17.70 s.
+Median peak RSS was 54,673,408 bytes lower. All four unchanged ratified bars
+passed in both series. The series are not evidence of a change between them:
+unrelated host load was not controlled and the proof corpus differs. These are
+finite measurements of the selected nodes, not a whole-suite or ordinary-CI
+forecast. Usage capture is not activated, and permissions, providers and
+hardware are unchanged. These measurements do not substitute for the full
+all-markers gate or independent review. This records test and tooling
+infrastructure only, with no E11 status, hardware, Pi, installation or
+release claim.
 
 **16 Oct 2026, #1024 fake filesystem-check early dispatch:** the installer
 test harness's fake `test` command now runs its unchanged check logic (fault
