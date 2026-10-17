@@ -1,5 +1,80 @@
 # RoastPilot Agent Project State Registry
 
+**17 Oct 2026, #1036 one real packaging wheel reused per test module:**
+`tests/test_packaging.py` changes exactly three lines: `built_wheel` is now
+`scope="module"`, takes a typed `pytest.TempPathFactory` and builds into
+`tmp_path_factory.mktemp("dist")`. The genuine `python -m build --wheel` call,
+`check=True`, one-wheel cardinality guard and return are unchanged, so the four
+consumers share one real read-only wheel per module instance in one pytest
+process. The separate stale-`web/dist` marker, rebuild and cleanup test stays
+unchanged and independent. Clean-venv install, CLI `--version` and
+packaged-SPA-path assertions are unchanged; no live HTTP request is claimed
+(the older, overstated docstring is retained). No production, build-hook, CI,
+dependency, marker, helper or assertion change. All 15 original packaging
+cases keep their IDs, order, parameters and selection markers; all 13871
+global IDs keep their order. No recurring test is added (K = 0); the one-time
+diagnostic, mutation and review cost was real.
+
+Disclosed trade-off: consumers lose independent per-consumer rebuilds, and a
+build failure is one cached fixture error reported as 4 ERROR (still
+fail-closed). Current consumers are read-only; future ones must preserve the
+artifact's immutability, a convention the O2 observations support but nothing
+enforces in general. A diagnostic plugin saw 5 real backend calls in baseline
+(4 ordinary, 1 stale) and 2 (1 ordinary, 1 stale) in each of two separate
+candidate processes, each with the 4 consumers on one artifact, 10 unchanged
+boundary SHA-256 readings and distinct output directories. Their digests
+happened to match; no universal bitwise reproducibility is claimed.
+
+Fault recipes M1-M4, confined to the fixture, each used a safety commit, exact
+snapshot, hash-checked restore and fresh bytecode prefix. M1 (function scope)
+kept all 15 cases passing but O1 counted 4 builds: an observation failure, not
+an original-test kill. M2 (build exit 1), M3 (no-op, zero wheels) and M4
+(duplicate wheel) each gave the intended 4 setup ERROR and 11 PASS. Four mutant
+processes: 48 PASS, 12 ERROR; four restored-candidate (not baseline) witnesses:
+60 PASS. No invalid mutation or rescue. Pip compilation in the tests' own fresh
+smoke venvs may write `.pyc` files; source prefix cold controls held.
+Collection-tooling serialisation fixes were tooling, not subject, failures.
+
+Fixed predeclared value test, whole 15-case module, fresh-process BSD `time`
+real seconds (coverage and probes off; identical Python 3.11.14, 114 declared
+versions, Node 22.22.2, npm 10.9.7, plugins, options and bytecode controls):
+pair 1 (B then C) 81.03 vs 49.00, 39.5285697%; pair 2 (C then B) 78.57 vs
+46.18, 41.2243859%; pair 3 (B then C) 77.82 vs 46.48, 40.2724235%. Median
+relative 40.27242354%, median raw 32.03 s, K = 0, net 32.03 s. Peak-RSS deltas
+-2,719,744, -1,130,496 and -3,211,264 bytes (median -2,719,744). All four bars
+pass; all six trials 15 PASS, 0 skips; no tuning, selection or rescue. No other
+parent model, test or build ran during the series; unrelated host load was not
+controlled. A module gain, not a full-suite or whole-CI claim (the Package job
+is off the ordinary critical path). Supplementary Coverage API runs (config
+off, branch on, exact includes, started before pytest import) passed on B and
+C: 12 measured production files have identical statements, executed, missing
+and branch arcs; changed lines 200, 201 and 212 were all hit, with no missing
+lines or new missing arcs. Coverage config, policy and thresholds unchanged;
+Node/npm and the uninstrumented build and clean-venv children are not covered.
+
+Independent native QA: local PASS, 15 PASS 0 skips, static gates 0, no blocking
+or medium finding; one low informational note (the shared-artifact
+immutability convention) is retained and disclosed above. QA ran a
+byte-identical external mirror at the same commit with the declared bundled
+Node 24.19.0 / npm 11.17.0 (not claimed equivalent to the Node 22 gates); the
+attested source stayed ignored-clean, tracked bytes in both roots unchanged.
+The normal command printer rejects an absolute mirror selector, so the lead
+used the standing AGENTS procedural exception to render the verified absolute
+path with the unchanged committed renderers and the byte-identical five
+permission rules; no helper, role, permission or gate source changed, no denied
+provider call was retried, and all five commands ran exactly and in order. The
+lead's npm alias was corrected before QA launch to the bundle's real CLI. The
+author earlier omitted explicit `cd` prefixes; the parent verified actual cwd,
+own venv, imports and source writes, with no universal-discipline claim.
+
+Focused local evidence only. The final current-head single-process all-markers
+coverage, static and CLI gates, product audit, hosted required checks, CodeQL,
+ready-head Codex review and protected merge remain mandatory and unrecorded;
+no future pass, timing or merge is implied. No E11 status, hardware-ready claim
+or new decision number. The parent orchestrated, profiled, validated and
+adjudicated; the same named native leaf authored source and docs. Lead-adopted
+under the standing autonomy exception; no individual human review is claimed.
+
 **17 Oct 2026, #1034 installed-model setup trimmed in four installer
 fallback cases:** `tests/test_pi_installer.py` gains a private
 `_seed_installed_model` helper. On a fresh harness it creates only the two
