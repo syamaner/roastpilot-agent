@@ -11153,7 +11153,18 @@ def _assert_scanner_equivalent(
 
 def test_original_scanner_oracle_is_pinned() -> None:
     """The frozen oracle is the pinned base copy and the production limits keep literals."""
-    source = inspect.getsource(_OriginalJsonRootScanner)
+    module_source = Path(__file__).read_text(encoding="utf-8")
+    oracle_nodes = [
+        node
+        for node in ast.parse(module_source).body
+        if isinstance(node, ast.ClassDef) and node.name == "_OriginalJsonRootScanner"
+    ]
+    assert len(oracle_nodes) == 1
+    oracle_node = oracle_nodes[0]
+    assert not oracle_node.decorator_list
+    assert oracle_node.end_lineno is not None
+    module_lines = module_source.split("\n")
+    source = "\n".join(module_lines[oracle_node.lineno - 1 : oracle_node.end_lineno]) + "\n"
     assert hashlib.sha256(source.encode()).hexdigest() == _ORIGINAL_SCANNER_SOURCE_SHA256
     assert _ORACLE_STRING_CAPTURE_LIMIT == 64
     assert _ORACLE_JSON_NESTING_DEPTH == 64
