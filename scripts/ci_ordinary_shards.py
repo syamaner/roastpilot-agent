@@ -624,16 +624,16 @@ def read_head_sha() -> str:
         result = subprocess.run(
             ["git", "rev-parse", "--verify", "HEAD"],
             capture_output=True,
-            encoding="ascii",
-            errors="strict",
             timeout=_GIT_TIMEOUT_SECONDS,
             check=False,
         )
+        # Only stdout is identity input: stderr (e.g. a localized warning) is never
+        # decoded, so it can neither widen nor narrow acceptance.
+        head = result.stdout.decode("ascii", "strict").removesuffix("\n")
     except UnicodeError:
         _fail("identity: git HEAD is not a 40-hex commit")
     except (OSError, subprocess.TimeoutExpired):
         _fail("identity: git rev-parse could not run")
-    head = result.stdout.removesuffix("\n")
     if result.returncode != 0 or _SHA1_HEX.fullmatch(head) is None:
         _fail("identity: git HEAD is not a 40-hex commit")
     return head

@@ -595,9 +595,9 @@ def test_identity_grammar_fails_closed(changes: dict[str, str], message: str) ->
         shards.identity_context(_env(), "normal", None, "HEAD")
 
 
-def _completed(returncode: int, stdout: str) -> subprocess.CompletedProcess[str]:
-    """Return a fake completed git process."""
-    return subprocess.CompletedProcess(["git"], returncode, stdout=stdout, stderr="")
+def _completed(returncode: int, stdout: str) -> subprocess.CompletedProcess[bytes]:
+    """Return a fake completed git process carrying raw bytes, as git produces."""
+    return subprocess.CompletedProcess(["git"], returncode, stdout=stdout.encode(), stderr=b"")
 
 
 def test_read_head_sha_requires_one_exact_commit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -605,7 +605,7 @@ def test_read_head_sha_requires_one_exact_commit(monkeypatch: pytest.MonkeyPatch
     calls: list[tuple[list[str], dict[str, object]]] = []
 
     def fake(stdout: str, returncode: int = 0) -> Callable[..., object]:
-        def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
             calls.append((argv, kwargs))
             return _completed(returncode, stdout)
 
@@ -1416,13 +1416,11 @@ def test_verify_maps_listing_and_inspection_errors(
 def test_read_head_sha_refuses_undecodable_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Non-ASCII git output is a bounded refusal, decoded strictly in the guarded call."""
+    """Non-ASCII git stdout from a real child is a bounded typed refusal."""
     real_run = subprocess.run
-    seen: list[dict[str, object]] = []
     emit = "import sys; sys.stdout.buffer.write(bytes([255]) * 40 + bytes([10]))"
 
     def run(_argv: list[str], **kwargs: object) -> object:
-        seen.append(kwargs)
         return real_run(  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
             [sys.executable, "-I", "-S", "-c", emit],
             cwd=tmp_path,
@@ -1432,7 +1430,40 @@ def test_read_head_sha_refuses_undecodable_output(
     monkeypatch.setattr(subprocess, "run", run)
     with pytest.raises(shards.ShardError, match=r"^identity: git HEAD is not a 40-hex commit$"):
         shards.read_head_sha()
-    assert (seen[0]["encoding"], seen[0]["errors"]) == ("ascii", "strict")
+
+
+_GIT_LIKE_CHILD = """\
+import sys
+sys.stdout.buffer.write(sys.argv[1].encode("ascii") + bytes([10]))
+sys.stderr.buffer.write("warning: caf\\u00e9 ".encode("utf-8") + bytes([255, 10]))
+raise SystemExit(int(sys.argv[2]))
+"""
+
+
+@pytest.mark.slow
+def test_read_head_sha_accepts_valid_stdout_with_non_ascii_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Valid 40-hex stdout plus non-ASCII stderr is accepted only on exit 0.
+
+    Real children emit UTF-8 and arbitrary bytes on stderr; only stdout is the
+    identity input, and a non-zero exit still refuses the same stdout.
+    """
+    real_run = subprocess.run
+    exit_code = ["0"]
+
+    def run(_argv: list[str], **kwargs: object) -> object:
+        return real_run(  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
+            [sys.executable, "-I", "-S", "-B", "-c", _GIT_LIKE_CHILD, HEAD, exit_code[0]],
+            cwd=tmp_path,
+            **kwargs,  # pyright: ignore[reportArgumentType]
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert shards.read_head_sha() == HEAD
+    exit_code[0] = "1"
+    with pytest.raises(shards.ShardError, match=r"^identity: git HEAD is not a 40-hex commit$"):
+        shards.read_head_sha()
 
 
 def test_diagnostics_never_echo_payload_strings(
