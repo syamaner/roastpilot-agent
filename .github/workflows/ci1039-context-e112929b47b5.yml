@@ -1,0 +1,106 @@
+name: CI1039 corrected context technical probe
+'on':
+  push:
+    branches:
+    - codex/diag-ci1039-context-e112929b47b5
+permissions:
+  contents: read
+jobs:
+  ordinary:
+    name: BENCH NONREQUIRED ordinary ${{ matrix.index }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        index: ${{ fromJSON('["0","1"]') }}
+    env:
+      TARGET_SHA: ${{ startsWith(github.ref_name, 'codex/ci1039-bench-000000000002-B')
+        && 'ac1108c163865503a384d5601bc1bb123abfa33c' || 'cae541b69a7576804a1bc34bf1a4dae0fd423dbf'
+        }}
+      BENCH_ARM: ${{ startsWith(github.ref_name, 'codex/ci1039-bench-000000000002-C')
+        && 'C' || 'B' }}
+      SHARD_INDEX: ${{ matrix.index }}
+    steps:
+    - name: Export runtime output directory
+      run: 'python3 - <<''PYCODE''
+
+        import os
+
+        from pathlib import Path
+
+        out=Path(os.environ[''RUNNER_TEMP''])/''ci1039-evidence'';out.mkdir()
+
+        with Path(os.environ[''GITHUB_ENV'']).open(''a'',encoding=''utf-8'')as f:f.write(''BENCH_OUTPUT=''+str(out)+''\n'')
+
+        PYCODE
+
+        '
+    - name: Verify next step receives runtime export
+      run: 'python3 - <<''PYCODE''
+
+        import os
+
+        from pathlib import Path
+
+        assert Path(os.environ[''BENCH_OUTPUT''])==Path(os.environ[''RUNNER_TEMP''])/''ci1039-evidence''
+
+        assert Path(os.environ[''BENCH_OUTPUT'']).is_dir()
+
+        assert os.environ[''TARGET_SHA'']==''cae541b69a7576804a1bc34bf1a4dae0fd423dbf''
+
+        assert os.environ[''BENCH_ARM'']==''C''
+
+        print(''Configuration accepted; runtime export verified; no tests or timing'')
+
+        PYCODE
+
+        '
+  combine:
+    name: BENCH NONREQUIRED verifier and combiner
+    needs:
+    - ordinary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TARGET_SHA: ${{ startsWith(github.ref_name, 'codex/ci1039-bench-000000000002-B')
+        && 'ac1108c163865503a384d5601bc1bb123abfa33c' || 'cae541b69a7576804a1bc34bf1a4dae0fd423dbf'
+        }}
+      BENCH_ARM: ${{ startsWith(github.ref_name, 'codex/ci1039-bench-000000000002-C')
+        && 'C' || 'B' }}
+    steps:
+    - name: Export runtime output directory
+      run: 'python3 - <<''PYCODE''
+
+        import os
+
+        from pathlib import Path
+
+        out=Path(os.environ[''RUNNER_TEMP''])/''ci1039-evidence'';out.mkdir()
+
+        with Path(os.environ[''GITHUB_ENV'']).open(''a'',encoding=''utf-8'')as f:f.write(''BENCH_OUTPUT=''+str(out)+''\n'')
+
+        PYCODE
+
+        '
+    - name: Verify next step receives runtime export
+      run: 'python3 - <<''PYCODE''
+
+        import os
+
+        from pathlib import Path
+
+        assert Path(os.environ[''BENCH_OUTPUT''])==Path(os.environ[''RUNNER_TEMP''])/''ci1039-evidence''
+
+        assert Path(os.environ[''BENCH_OUTPUT'']).is_dir()
+
+        assert os.environ[''TARGET_SHA'']==''cae541b69a7576804a1bc34bf1a4dae0fd423dbf''
+
+        assert os.environ[''BENCH_ARM'']==''C''
+
+        print(''Configuration accepted; runtime export verified; no tests or timing'')
+
+        PYCODE
+
+        '
