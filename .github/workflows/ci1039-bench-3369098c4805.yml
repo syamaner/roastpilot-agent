@@ -1,0 +1,201 @@
+name: CI1039 paired ordinary benchmark NONREQUIRED
+'on':
+  push:
+    branches:
+    - codex/ci1039-bench-3369098c4805-B1
+    - codex/ci1039-bench-3369098c4805-C1
+    - codex/ci1039-bench-3369098c4805-C2
+    - codex/ci1039-bench-3369098c4805-B2
+    - codex/ci1039-bench-3369098c4805-B3
+    - codex/ci1039-bench-3369098c4805-C3
+permissions:
+  contents: read
+jobs:
+  ordinary:
+    name: BENCH NONREQUIRED ordinary ${{ matrix.index }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        index: ${{ fromJSON(startsWith(github.ref_name, 'codex/ci1039-bench-3369098c4805-C') && '["0","1"]' || '["0"]') }}
+    env:
+      TARGET_SHA: ${{ startsWith(github.ref_name, 'codex/ci1039-bench-3369098c4805-B') && 'ac1108c163865503a384d5601bc1bb123abfa33c'
+        || 'cae541b69a7576804a1bc34bf1a4dae0fd423dbf' }}
+      BENCH_ARM: ${{ startsWith(github.ref_name, 'codex/ci1039-bench-3369098c4805-C') && 'C' || 'B' }}
+      SHARD_INDEX: ${{ matrix.index }}
+    steps:
+    - name: Check out literal tested source
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        ref: ${{ startsWith(github.ref_name, 'codex/ci1039-bench-3369098c4805-B') && 'ac1108c163865503a384d5601bc1bb123abfa33c'
+          || 'cae541b69a7576804a1bc34bf1a4dae0fd423dbf' }}
+        persist-credentials: false
+    - name: Set up Python
+      uses: actions/setup-python@v6.2.0
+      with:
+        python-version: '3.11'
+        cache: pip
+    - name: Install system libraries
+      run: sudo apt-get update && sudo apt-get install -y libportaudio2
+    - name: Install declared dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -e . --group dev
+    - name: Prepare identical external measurement observer
+      run: |
+        python - <<'PYCODE'
+        import base64,os,subprocess
+        from pathlib import Path
+        assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==os.environ['TARGET_SHA']
+        assert os.environ['GITHUB_WORKFLOW_SHA']==os.environ['GITHUB_SHA']
+        assert os.environ['GITHUB_SHA']!=os.environ['TARGET_SHA']
+        r=Path(os.environ['RUNNER_TEMP'])/'ci1039-observer';r.mkdir()
+        (r/'rp_ci_bench_observer.py').write_bytes(base64.b64decode('IiIiRXh0ZXJuYWwgbWVhc3VyZW1lbnQgb2JzZXJ2ZXI7IG5ldmVyIGluc3RhbGxlZCBpbiBvciBtZXJnZWQgd2l0aCB0aGUgZmVhdHVyZS4iIiIKaW1wb3J0IGpzb24KaW1wb3J0IG9zCmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aAppbXBvcnQgcHl0ZXN0Cl9jb250cm9sbGVyID0gRmFsc2UKX2NvbGxlY3Rpb25zID0ge30KX3JlcG9ydHMgPSBbXQoKZGVmIHB5dGVzdF9jb25maWd1cmUoY29uZmlnKToKICAgIGdsb2JhbCBfY29udHJvbGxlcgogICAgX2NvbnRyb2xsZXIgPSBub3QgaGFzYXR0cihjb25maWcsICJ3b3JrZXJpbnB1dCIpCgpAcHl0ZXN0Lmhvb2tpbXBsKG9wdGlvbmFsaG9vaz1UcnVlKQpkZWYgcHl0ZXN0X3hkaXN0X25vZGVfY29sbGVjdGlvbl9maW5pc2hlZChub2RlLCBpZHMpOgogICAgaWYgX2NvbnRyb2xsZXI6CiAgICAgICAgd29ya2VyID0gbm9kZS5nYXRld2F5LmlkCiAgICAgICAgaWYgd29ya2VyIGluIF9jb2xsZWN0aW9uczoKICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJtZWFzdXJlbWVudCBvYnNlcnZlcjogZHVwbGljYXRlIHdvcmtlciBjb2xsZWN0aW9uIikKICAgICAgICBfY29sbGVjdGlvbnNbd29ya2VyXSA9IGxpc3QoaWRzKQoKZGVmIHB5dGVzdF9ydW50ZXN0X2xvZ3JlcG9ydChyZXBvcnQpOgogICAgaWYgbm90IF9jb250cm9sbGVyOgogICAgICAgIHJldHVybgogICAgcm93ID0geyJub2RlaWQiOiByZXBvcnQubm9kZWlkLCAid2hlbiI6IHJlcG9ydC53aGVuLAogICAgICAgICAgICJvdXRjb21lIjogcmVwb3J0Lm91dGNvbWUsICJkdXJhdGlvbiI6IHJlcG9ydC5kdXJhdGlvbn0KICAgIGlmIGhhc2F0dHIocmVwb3J0LCAid2FzeGZhaWwiKToKICAgICAgICByb3dbIndhc3hmYWlsIl0gPSByZXBvcnQud2FzeGZhaWwKICAgIGlmIHJlcG9ydC5za2lwcGVkIGFuZCBub3QgaGFzYXR0cihyZXBvcnQsICJ3YXN4ZmFpbCIpOgogICAgICAgIHJlcHJlc2VudGF0aW9uID0gcmVwb3J0LmxvbmdyZXByCiAgICAgICAgcm93WyJza2lwX3JlYXNvbiJdID0gKHJlcHJlc2VudGF0aW9uWzJdIGlmIGlzaW5zdGFuY2UocmVwcmVzZW50YXRpb24sIHR1cGxlKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICBhbmQgbGVuKHJlcHJlc2VudGF0aW9uKSA9PSAzIGVsc2Ugc3RyKHJlcHJlc2VudGF0aW9uKSkKICAgIF9yZXBvcnRzLmFwcGVuZChyb3cpCgpkZWYgcHl0ZXN0X3Nlc3Npb25maW5pc2goc2Vzc2lvbiwgZXhpdHN0YXR1cyk6CiAgICBpZiBfY29udHJvbGxlcjoKICAgICAgICByZWNvcmQgPSB7InNjaGVtYSI6ICJleHRlcm5hbC1jaTEwMzktb2JzZXJ2ZXItdjEiLCAiZXhpdHN0YXR1cyI6IGludChleGl0c3RhdHVzKSwKICAgICAgICAgICAgICAgICAgImNvbGxlY3Rpb25zIjogX2NvbGxlY3Rpb25zLCAicmVwb3J0cyI6IF9yZXBvcnRzfQogICAgICAgIHBhdGggPSBQYXRoKG9zLmVudmlyb25bIlJQX0JFTkNIX09CU0VSVkVSX09VVCJdKQogICAgICAgIHdpdGggcGF0aC5vcGVuKCJ4IiwgZW5jb2Rpbmc9InV0Zi04IikgYXMgb3V0cHV0OgogICAgICAgICAgICBqc29uLmR1bXAocmVjb3JkLCBvdXRwdXQsIGVuc3VyZV9hc2NpaT1UcnVlLCBzZXBhcmF0b3JzPSgiLCIsICI6IikpCg=='))
+        out=Path(os.environ['RUNNER_TEMP'])/'ci1039-evidence';out.mkdir()
+        with Path(os.environ['GITHUB_ENV']).open('a',encoding='utf-8')as f:f.write('BENCH_OUTPUT='+str(out)+'\n')
+        PYCODE
+    - name: Record exact runtime and dependency inventory
+      run: |
+        python - <<'PYCODE'
+        import importlib.metadata as m,json,os,platform,subprocess,sys
+        from pathlib import Path
+        import roastpilot_agent
+        assert Path(roastpilot_agent.__file__).resolve().is_relative_to(Path.cwd()/'src')
+        subprocess.run([sys.executable,'-m','pip','check'],check=True)
+        def command(args):
+         try:return subprocess.check_output(args,text=True).strip()
+         except FileNotFoundError:return None
+        packages=sorted([{'name':d.metadata['Name'].lower().replace('_','-'),'version':d.version}for d in m.distributions()],key=lambda d:d['name'])
+        assert len({p['name']for p in packages})==len(packages)
+        plugins=sorted([{'name':e.name,'value':e.value,'distribution':e.dist.metadata['Name'],'version':e.dist.version}for e in m.entry_points(group='pytest11')],key=lambda e:(e['name'],e['value']))
+        parity={'python':sys.version,'packages':packages,'plugins':plugins,'node':command(['node','--version']),'npm':command(['npm','--version']),'runner_os':os.environ['RUNNER_OS'],'runner_arch':os.environ['RUNNER_ARCH'],'machine':platform.machine(),'image_os':os.environ.get('ImageOS'),'image_version':os.environ.get('ImageVersion')}
+        identity={'repository':os.environ['GITHUB_REPOSITORY'],'run_id':os.environ['GITHUB_RUN_ID'],'attempt':os.environ['GITHUB_RUN_ATTEMPT'],'workflow_sha':os.environ['GITHUB_WORKFLOW_SHA'],'target_sha':os.environ['TARGET_SHA'],'arm':os.environ['BENCH_ARM'],'index':os.environ['SHARD_INDEX']}
+        assert identity['attempt']=='1'
+        (Path(os.environ['BENCH_OUTPUT'])/'environment.json').write_text(json.dumps({'identity':identity,'parity':parity},sort_keys=True))
+        PYCODE
+    - name: Run observed ordinary tests with real coverage
+      run: |
+        set -e
+        export PYTHONPATH="$RUNNER_TEMP/ci1039-observer"
+        export RP_BENCH_OBSERVER_OUT="$BENCH_OUTPUT/observer.json"
+        export COVERAGE_FILE=.coverage.ordinary-shard-$SHARD_INDEX
+        unset PYTEST_ADDOPTS PYTEST_PLUGINS PYTEST_DISABLE_PLUGIN_AUTOLOAD COVERAGE_PROCESS_START
+        if [ "$BENCH_ARM" = C ]; then
+          python -m pytest -n 4 --dist worksteal -p rp_ci_bench_observer -p scripts.ci_ordinary_shard_plugin --ordinary-shard-index "$SHARD_INDEX" --ordinary-shard-receipt ordinary-shard-receipt.json -m "not serial and not stress" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report= --junitxml="$BENCH_OUTPUT/results.xml"
+        else
+          python -m pytest -n 4 --dist worksteal -p rp_ci_bench_observer -m "not serial and not stress" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report= --junitxml="$BENCH_OUTPUT/results.xml"
+        fi
+    - name: Finalize successful ordinary coverage
+      run: |
+        set -e
+        if [ "$BENCH_ARM" = C ]; then
+          python scripts/ci_ordinary_shards.py finalize --index "$SHARD_INDEX" --receipt ordinary-shard-receipt.json --coverage .coverage.ordinary-shard-$SHARD_INDEX --bundle "$BENCH_OUTPUT/bundle" --identity-mode benchmark --expected-target-sha "$TARGET_SHA"
+        else
+          mkdir "$BENCH_OUTPUT/bundle"
+          cp .coverage.ordinary-shard-$SHARD_INDEX "$BENCH_OUTPUT/bundle/coverage.data"
+        fi
+    - name: Retain measurement evidence including failed attempts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: bench-input-${{ matrix.index }}
+        path: ${{ runner.temp }}/ci1039-evidence/
+        if-no-files-found: error
+        retention-days: 7
+  combine:
+    name: BENCH NONREQUIRED verifier and combiner
+    needs:
+    - ordinary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TARGET_SHA: ${{ startsWith(github.ref_name, 'codex/ci1039-bench-3369098c4805-B') && 'ac1108c163865503a384d5601bc1bb123abfa33c'
+        || 'cae541b69a7576804a1bc34bf1a4dae0fd423dbf' }}
+      BENCH_ARM: ${{ startsWith(github.ref_name, 'codex/ci1039-bench-3369098c4805-C') && 'C' || 'B' }}
+    steps:
+    - name: Check out literal tested source
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        ref: ${{ startsWith(github.ref_name, 'codex/ci1039-bench-3369098c4805-B') && 'ac1108c163865503a384d5601bc1bb123abfa33c'
+          || 'cae541b69a7576804a1bc34bf1a4dae0fd423dbf' }}
+        persist-credentials: false
+    - name: Set up Python
+      uses: actions/setup-python@v6.2.0
+      with:
+        python-version: '3.11'
+    - name: Download exact index zero evidence
+      uses: actions/download-artifact@v4
+      with:
+        name: bench-input-0
+        path: inputs/0
+    - name: Download exact index one evidence
+      if: ${{ startsWith(github.ref_name, 'codex/ci1039-bench-3369098c4805-C') }}
+      uses: actions/download-artifact@v4
+      with:
+        name: bench-input-1
+        path: inputs/1
+    - name: Verify identities and install matched declared coverage version
+      run: |
+        python - <<'PYCODE'
+        import json,os,re,subprocess,sys
+        from pathlib import Path
+        assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==os.environ['TARGET_SHA']
+        assert os.environ['GITHUB_WORKFLOW_SHA']==os.environ['GITHUB_SHA']!=os.environ['TARGET_SHA']
+        roots=[Path('inputs/0')]+([Path('inputs/1')]if os.environ['BENCH_ARM']=='C'else[])
+        rows=[]
+        for index,r in enumerate(roots):
+         p=r/'environment.json';assert p.is_file()and not p.is_symlink()and p.stat().st_size<=131072
+         x=json.loads(p.read_text());ident=x['identity'];assert ident=={'repository':os.environ['GITHUB_REPOSITORY'],'run_id':os.environ['GITHUB_RUN_ID'],'attempt':'1','workflow_sha':os.environ['GITHUB_WORKFLOW_SHA'],'target_sha':os.environ['TARGET_SHA'],'arm':os.environ['BENCH_ARM'],'index':str(index)}
+         rows.append(x)
+        assert all(r['parity']==rows[0]['parity']for r in rows)
+        versions=[p['version']for p in rows[0]['parity']['packages']if p['name']=='coverage'];assert len(versions)==1 and re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,3}',versions[0])
+        subprocess.run([sys.executable,'-m','pip','install','--upgrade','pip'],check=True)
+        subprocess.run([sys.executable,'-m','pip','install','coverage=='+versions[0]],check=True)
+        Path('bench-results').mkdir()
+        Path('bench-results/environment.json').write_text(json.dumps(rows,sort_keys=True))
+        PYCODE
+    - name: MEASURE END ordinary coverage combine
+      run: |
+        set -e
+        if [ "$BENCH_ARM" = C ]; then
+          mkdir ordinary-shards
+          cp -R inputs/0/bundle ordinary-shards/ordinary-shard-0
+          cp -R inputs/1/bundle ordinary-shards/ordinary-shard-1
+          python scripts/ci_ordinary_shards.py verify --bundle-root ordinary-shards --identity-mode benchmark --expected-target-sha "$TARGET_SHA"
+          python -m coverage combine --keep --data-file=.coverage.ordinary ordinary-shards/ordinary-shard-0/coverage.data ordinary-shards/ordinary-shard-1/coverage.data
+        else
+          test ! -e .coverage.ordinary
+          python -m coverage combine --keep --data-file=.coverage.ordinary inputs/0/bundle/coverage.data
+        fi
+    - name: Export post-metric coverage and outcome evidence
+      run: |
+        python - <<'PYCODE'
+        import importlib.metadata as m,json,os,subprocess,sys
+        from pathlib import Path
+        r=Path('bench-results');env=os.environ.copy();env['COVERAGE_FILE']=str(Path('.coverage.ordinary').resolve())
+        subprocess.run([sys.executable,'-m','coverage','json','-o',str(r/'coverage.json')],env=env,check=True)
+        from coverage import Coverage
+        import hashlib
+        c=Coverage(data_file=env['COVERAGE_FILE']);c.load();data=c.get_data();assert data.has_arcs()
+        root=Path.cwd().resolve();raw={}
+        for name in sorted(data.measured_files()):
+         path=Path(name);relative=path.relative_to(root)if path.is_absolute()else path
+         assert '..'not in relative.parts and relative.parts[0]in{'scripts','src','.agents'}
+         source=root/relative;assert source.is_file()and not source.is_symlink()
+         raw[relative.as_posix()]={'source_sha256':hashlib.sha256(source.read_bytes()).hexdigest(),'lines':sorted(data.lines(name)or[]),'arcs':sorted([list(a)for a in(data.arcs(name)or[])])}
+        (r/'coverage-raw.json').write_text(json.dumps(raw,sort_keys=True))
+        indices=['0','1']if os.environ['BENCH_ARM']=='C'else['0']
+        for i in indices:
+         for name in ['observer.json','results.xml']:
+          (r/(i+'-'+name)).write_bytes((Path('inputs')/i/name).read_bytes())
+        (r/'combiner.json').write_text(json.dumps({'coverage_version':m.version('coverage'),'python':sys.version,'workflow_sha':os.environ['GITHUB_WORKFLOW_SHA'],'target_sha':os.environ['TARGET_SHA'],'arm':os.environ['BENCH_ARM'],'run_id':os.environ['GITHUB_RUN_ID'],'attempt':os.environ['GITHUB_RUN_ATTEMPT']}))
+        PYCODE
+    - name: Publish public measurement evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: bench-results
+        path: bench-results/
+        if-no-files-found: error
+        retention-days: 7
