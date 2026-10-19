@@ -22,6 +22,19 @@ delayed, and no speedup or full-suite/CI gain is claimed. Installer deadlines an
 their separately observed failures are unchanged and not resolved. #954 and
 E11-S3 are unchanged. No new decision number.
 
+Review-repair round (test harness only; real 30 s + 30 s defaults unchanged):
+an ordinary exception from the one bounded post-kill output collection is now
+cleanup trouble, so the phase failure keeps its reason plus cleanup context and
+an incidental primary exception is re-raised as the same object, noted when
+collection is incomplete. Proof-only bounded waits raise a distinct assertion,
+the proof fixture records and rejects any signal to an already-reaped outer
+for every consumer, and two negative proofs use a generous 100 s injected
+import budget instead of artificial 5/9 s startup margins. Known retained
+residual: the outer group is signalled only while its leader is unreaped, so a
+hypothetical descendant left in that group after leader exit would not be
+signalled; current MCP children own separate sessions and parsing uses threads.
+Cleanup wording reports attempted cleanup, not proof that every signal landed.
+
 **17 Oct 2026, #1036 one real packaging wheel reused per test module:**
 `tests/test_packaging.py` changes exactly three lines: `built_wheel` is now
 `scope="module"`, takes a typed `pytest.TempPathFactory` and builds into
