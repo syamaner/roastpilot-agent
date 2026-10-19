@@ -110,6 +110,9 @@ def _run_phased_lifecycle_probe(
             stdout, stderr = child.communicate(timeout=_POST_KILL_COLLECT_SECONDS)
         except subprocess.TimeoutExpired:
             return False
+        except Exception as error:
+            cleanup_errors.append(error)
+            return False
         exited = True
         return True
 
@@ -162,9 +165,11 @@ def _run_phased_lifecycle_probe(
             _fail(not_exited)
     except BaseException as error:
         if not cleaned:
-            _cleanup_once()
+            collected = _cleanup_once()
             for cleanup_error in cleanup_errors:
                 error.add_note(f"lifecycle probe cleanup error: {cleanup_error!r}")
+            if not collected:
+                error.add_note("lifecycle probe output collection incomplete after cleanup")
         raise
     return child, stdout, stderr
 
@@ -575,6 +580,14 @@ _requires_killpg = pytest.mark.skipif(
 )
 
 
+def _proof_wait(handle: subprocess.Popen[str], what: str) -> None:
+    """Bounded proof-only wait whose timeout cannot pass as a helper polling timeout."""
+    try:
+        handle.wait(timeout=5.0)
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError(f"proof wait failed: {what} did not exit within 5 s") from error
+
+
 class _ProofHarness:
     """Owned handles, a Popen spy and a guarded ``killpg`` for phased-probe proofs."""
 
@@ -588,9 +601,11 @@ class _ProofHarness:
         self.signals: list[tuple[int, int]] = []
         self.communicate_calls: list[tuple[float | None, bool]] = []
         self.force_post_kill_timeout = False
+        self.post_kill_error: Exception | None = None
         self.release_file: Path | None = None
         self.sleeper: subprocess.Popen[bytes] | None = None
         self.rescued: list[int] = []
+        self.retired_signal_attempts: list[tuple[int, int]] = []
 
     def arm(self, *, sleeper: bool = True) -> None:
         """Spawn the simulated MCP group (optional), then install the spy and guard."""
@@ -614,10 +629,12 @@ class _ProofHarness:
                 harness.communicate_calls.append((timeout, post_kill))
                 if post_kill and harness.force_post_kill_timeout:
                     raise subprocess.TimeoutExpired(self.args, timeout or 0.0)
+                if post_kill and harness.post_kill_error is not None:
+                    raise harness.post_kill_error
                 release = harness.release_file
                 if release is not None and not release.exists():
                     release.write_text("go", encoding="utf-8")
-                    self.wait(timeout=5.0)
+                    _proof_wait(self, "gated sentinel after release")
                 return super().communicate(input, timeout)
 
         self.monkeypatch.setattr(subprocess, "Popen", _CapturingPopen)
@@ -626,6 +643,7 @@ class _ProofHarness:
     def _guarded_killpg(self, pgid: int, sig: int) -> None:
         self.signals.append((pgid, sig))
         if any(h.pid == pgid and h.returncode is not None for h in self.instances):
+            self.retired_signal_attempts.append((pgid, sig))
             raise AssertionError("signal to retired outer")
         self.real_killpg(pgid, sig)
 
@@ -678,11 +696,14 @@ class _ProofHarness:
 
 @pytest.fixture
 def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_ProofHarness]:
-    """Yield a proof harness whose teardown rescue must never be needed."""
+    """Yield a proof harness: no rescue may be needed and no retired outer signalled."""
     proof = _ProofHarness(tmp_path, monkeypatch)
     yield proof
     proof.rescue()
-    assert not proof.rescued, f"rescue had to kill owned pids {proof.rescued}"
+    assert not proof.rescued and not proof.retired_signal_attempts, (
+        f"rescued owned pids {proof.rescued}; "
+        f"refused signals to retired outer {proof.retired_signal_attempts}"
+    )
 
 
 def _offset_clock(trigger: Path, offset: float) -> Callable[[], float]:
@@ -765,13 +786,62 @@ def test_phased_probe_post_kill_collection_is_single_and_bounded(harness: _Proof
 
 
 @_requires_killpg
+@pytest.mark.parametrize("fault", ["ordinary-error", "timeout"])
+def test_phased_probe_incidental_primary_survives_collection_fault(
+    harness: _ProofHarness, fault: str
+) -> None:
+    """A failed or exhausted post-kill collection is noted on the exact primary error."""
+    harness.arm()
+    collection_error = RuntimeError("injected collection failure")
+    if fault == "timeout":
+        harness.force_post_kill_timeout = True
+    else:
+        harness.post_kill_error = collection_error
+    started = harness.tmp_path / "started"
+    clock_error = RuntimeError("injected clock failure")
+
+    def clock() -> float:
+        if started.exists():
+            raise clock_error
+        return time.monotonic()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        harness.run("silent-owner", clock=clock)
+    assert excinfo.value is clock_error
+    notes = excinfo.value.__notes__
+    assert "lifecycle probe output collection incomplete after cleanup" in notes
+    assert any("injected collection failure" in note for note in notes) == (
+        fault == "ordinary-error"
+    )
+    assert [timeout for timeout, post_kill in harness.communicate_calls if post_kill] == [5.0]
+    assert harness.outer().wait(timeout=5.0) == -signal.SIGKILL
+    harness.assert_sleeper_killed()
+
+
+@_requires_killpg
+def test_phased_probe_phase_failure_survives_collection_error(harness: _ProofHarness) -> None:
+    """An ordinary post-kill collection error keeps the phase reason and cleanup context."""
+    harness.arm()
+    harness.post_kill_error = RuntimeError("injected collection failure")
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        harness.run("silent-owner", clock=_offset_clock(harness.tmp_path / "started", 31.0))
+    message = str(excinfo.value)
+    assert "did not exit after both groups were killed" in message
+    assert "readiness marker not published within" in message
+    assert "injected collection failure" in message
+    assert [timeout for timeout, post_kill in harness.communicate_calls if post_kill] == [5.0]
+    assert harness.outer().wait(timeout=5.0) == -signal.SIGKILL
+    harness.assert_sleeper_killed()
+
+
+@_requires_killpg
 def test_phased_probe_lifecycle_overrun_kills_owned_groups(harness: _ProofHarness) -> None:
     """R2: a ready child that outlives the lifecycle budget kills both groups."""
     harness.arm()
     with pytest.raises(pytest.fail.Exception, match="lifecycle did not exit within"):
         harness.run(
             "ready-owner",
-            import_budget_seconds=40.0,
+            import_budget_seconds=100.0,
             clock=_offset_clock(harness.ready_marker, 35.0),
         )
     assert harness.outer().returncode == -signal.SIGKILL
@@ -813,7 +883,7 @@ def test_phased_probe_collects_reaped_owner_output_once(harness: _ProofHarness) 
     def clock() -> float:
         if harness.ready_marker.exists():
             go.touch()
-            harness.outer().wait(timeout=5.0)
+            _proof_wait(harness.outer(), "invalid-marker owner after release")
         return time.monotonic()
 
     with pytest.raises(pytest.fail.Exception, match="invalid readiness marker") as excinfo:
@@ -879,5 +949,5 @@ def test_phased_probe_rejects_late_completion_observation(harness: _ProofHarness
         return time.monotonic()
 
     with pytest.raises(pytest.fail.Exception, match="lifecycle did not exit within"):
-        harness.run("ready-exit", import_budget_seconds=40.0, clock=clock)
+        harness.run("ready-exit", import_budget_seconds=100.0, clock=clock)
     harness.assert_sleeper_killed()
