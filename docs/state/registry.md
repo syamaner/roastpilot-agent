@@ -1,5 +1,27 @@
 # RoastPilot Agent Project State Registry
 
+**20 Oct 2026, #1044 real MCP lifecycle probe deadline split into two phases:**
+`tests/test_process_exit.py::test_parse_and_real_mcp_subprocess_exits_cleanly`
+no longer has one combined 30 s bound covering interpreter import startup and
+the work under test. The child now has at most 30 s to finish its real
+`roastpilot_agent` imports and atomically publish a fresh, PID-bound private
+ready marker immediately before the existing lifecycle, then at most 30 s for
+the original real mock-driver MCP start, bootstrap-safe server-info assertion,
+bounded parse, MCP stop, child-gone check and interpreter exit. The lifecycle
+bound is anchored at the last reading that saw the marker absent, so total
+observation is at most 60 s plus the existing bounded cleanup (MCP group, then
+the outer group only while unreaped, one 5 s collection). Missing, stale,
+invalid or late readiness, premature exit, either overrun, a failed original
+assertion or a surviving owned process stays a hard failure; there is no retry,
+skip or blanket timeout increase. Test name, markers, decorator, `main()`,
+`PidCapturingProcess` and assertions are unchanged, as are production
+start/call/stop/parser budgets and the other five probes. Focused stdlib-sentinel
+proofs cover both phases and owned-group cleanup. This is a reliability
+correction to the test deadline's meaning: normal execution is not deliberately
+delayed, and no speedup or full-suite/CI gain is claimed. Installer deadlines and
+their separately observed failures are unchanged and not resolved. #954 and
+E11-S3 are unchanged. No new decision number.
+
 **17 Oct 2026, #1036 one real packaging wheel reused per test module:**
 `tests/test_packaging.py` changes exactly three lines: `built_wheel` is now
 `scope="module"`, takes a typed `pytest.TempPathFactory` and builds into
