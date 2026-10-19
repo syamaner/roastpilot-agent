@@ -762,7 +762,8 @@ def test_phased_probe_cleanup_error_preserves_primary_and_kills_outer(
     with pytest.raises(RuntimeError) as excinfo:
         harness.run("silent-owner", clock=clock)
     assert excinfo.value is clock_error
-    assert any("injected cleanup failure" in note for note in excinfo.value.__notes__)
+    notes: list[str] = getattr(excinfo.value, "__notes__", [])
+    assert any("injected cleanup failure" in note for note in notes)
     assert harness.outer().returncode == -signal.SIGKILL
     harness.assert_sleeper_killed()
 
@@ -808,7 +809,7 @@ def test_phased_probe_incidental_primary_survives_collection_fault(
     with pytest.raises(RuntimeError) as excinfo:
         harness.run("silent-owner", clock=clock)
     assert excinfo.value is clock_error
-    notes = excinfo.value.__notes__
+    notes: list[str] = getattr(excinfo.value, "__notes__", [])
     assert "lifecycle probe output collection incomplete after cleanup" in notes
     assert any("injected collection failure" in note for note in notes) == (
         fault == "ordinary-error"
