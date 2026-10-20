@@ -1278,9 +1278,12 @@ def _drain_owned_processes(
 @pytest.mark.parametrize(
     "case",
     (
-        "success",
-        "partial-launch",
-        "cleanup-continues",
+        # C3: real installer overlap/partial-launch scenario with fixed 180 s bounds.
+        pytest.param("success", marks=pytest.mark.serial),
+        # C3: real installer overlap/partial-launch scenario with fixed 180 s bounds.
+        pytest.param("partial-launch", marks=pytest.mark.serial),
+        # C3: real installer overlap/partial-launch scenario with fixed 180 s bounds.
+        pytest.param("cleanup-continues", marks=pytest.mark.serial),
         "inspection-command-failure",
         "inspection-empty-output",
         "inspection-malformed-output",
