@@ -10,6 +10,7 @@ import importlib.util
 import inspect
 import itertools
 import json
+import math
 import os
 import pwd
 import random
@@ -24,8 +25,8 @@ import threading
 import time
 import tomllib
 import venv
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import suppress
+from collections.abc import Callable, Generator, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
@@ -3377,40 +3378,231 @@ def test_native_codex_git_streams_bounded_success_and_error(
     assert captured.out == captured.err == ""
 
 
+_REAL_POPEN = subprocess.Popen
+_REAL_NATIVE_FAIL = usage_native_codex._fail  # pyright: ignore[reportPrivateUsage]
+_REAL_NATIVE_TIME = usage_native_codex.time
+_REAL_MONOTONIC = time.monotonic
+_REAL_SLEEP = time.sleep
+_LIVE_SIGNAL_RETURNCODES = frozenset({-int(signal.SIGTERM), -int(signal.SIGKILL)})
+
+
+@dataclass(frozen=True)
+class _ObservedTime:
+    """Module-binding time proxy: real readings recorded and returned unchanged."""
+
+    monotonic: Callable[[], float]
+    sleep: Callable[[float], None]
+
+
+@dataclass(frozen=True)
+class _NativeGitObservation:
+    """Everything one real ``_git`` call exposed to the live-overflow witness."""
+
+    result: str | None
+    error: usage_native_codex.NativeCodexCaptureError | None
+    readings: tuple[float, ...]
+    fail_times: tuple[float, ...]
+    max_output_bytes: int
+    deadline_seconds: float
+    process: subprocess.Popen[bytes]
+
+
+def _native_git_bindings_are_original() -> bool:
+    return (
+        usage_native_codex.subprocess.Popen is _REAL_POPEN
+        and usage_native_codex._fail is _REAL_NATIVE_FAIL  # pyright: ignore[reportPrivateUsage]
+        and usage_native_codex.time is _REAL_NATIVE_TIME
+    )
+
+
+def _native_git_writer(descriptor: int, size: int, *, linger: bool) -> str:
+    """Child source that fully writes ``size`` bytes, then lingers 20 s or exits 0."""
+    tail = "\ntime.sleep(20)" if linger else ""
+    return (
+        f"import os, time\nv = memoryview(b'x' * {size})\n"
+        f"while v:\n    v = v[os.write({descriptor}, v):]{tail}"
+    )
+
+
+def _observe_native_git(
+    monkeypatch: pytest.MonkeyPatch,
+    script: str,
+    processes: list[subprocess.Popen[bytes]],
+    *,
+    timeout_seconds: float | None = None,
+) -> _NativeGitObservation:
+    """Run real ``_git`` once against a real child, observing without altering it."""
+    if not _native_git_bindings_are_original():
+        pytest.fail("observation binding leaked")
+    readings: list[float] = []
+    fail_times: list[float] = []
+
+    def popen(_command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = cast(
+            "subprocess.Popen[bytes]", _REAL_POPEN([sys.executable, "-c", script], **kwargs)
+        )
+        processes.append(process)
+        return process
+
+    def recording_fail() -> None:
+        fail_times.append(_REAL_MONOTONIC())
+        _REAL_NATIVE_FAIL()
+
+    def monotonic() -> float:
+        reading = _REAL_MONOTONIC()
+        readings.append(reading)
+        return reading
+
+    spawned = len(processes)
+    with monkeypatch.context() as patch:
+        if timeout_seconds is not None:
+            patch.setattr(usage_native_codex, "GIT_TIMEOUT_SECONDS", timeout_seconds)
+        patch.setattr(usage_native_codex.subprocess, "Popen", popen)
+        patch.setattr(usage_native_codex, "_fail", recording_fail)
+        patch.setattr(usage_native_codex, "time", _ObservedTime(monotonic, _REAL_SLEEP))
+        max_output_bytes = usage_native_codex.MAX_GIT_OUTPUT_BYTES
+        deadline_seconds = float(usage_native_codex.GIT_TIMEOUT_SECONDS)
+        result: str | None = None
+        error: usage_native_codex.NativeCodexCaptureError | None = None
+        try:
+            result = usage_native_codex._git(["status", "--porcelain"])  # pyright: ignore[reportPrivateUsage]
+        except usage_native_codex.NativeCodexCaptureError as caught:
+            if type(caught) is not usage_native_codex.NativeCodexCaptureError:
+                raise
+            error = caught
+        assert len(processes) == spawned + 1
+        observation = _NativeGitObservation(
+            result,
+            error,
+            tuple(readings),
+            tuple(fail_times),
+            max_output_bytes,
+            deadline_seconds,
+            processes[-1],
+        )
+    if not _native_git_bindings_are_original():
+        pytest.fail("observation binding leaked")
+    return observation
+
+
+def _live_overflow_violations(
+    observation: _NativeGitObservation, *, expected_timeout_seconds: float = 5
+) -> list[str]:
+    """Closed reasons a call is not a live overflow termination; empty means proven."""
+    violations: list[str] = []
+    if (
+        observation.max_output_bytes != 64 * 1024
+        or observation.deadline_seconds != expected_timeout_seconds
+    ):
+        violations.append("wrong production constants")
+    if observation.error is None:
+        violations.append("did not raise")
+    elif observation.error.__context__ is not None:
+        violations.append("mapped exception path")
+    if len(observation.fail_times) != 1:
+        violations.append("fail count != 1")
+    readings, fail_times = observation.readings, observation.fail_times
+    if (
+        not readings
+        or not all(math.isfinite(reading) for reading in readings)
+        or any(later < earlier for earlier, later in itertools.pairwise(readings))
+        or (fail_times and fail_times[0] < readings[0])
+    ):
+        violations.append("invalid clock observation")
+    if readings and fail_times and not fail_times[0] < readings[0] + observation.deadline_seconds:
+        violations.append("deadline window reached")
+    if observation.process.returncode not in _LIVE_SIGNAL_RETURNCODES:
+        violations.append("not terminated live")
+    return violations
+
+
+def _rescue_owned(processes: list[subprocess.Popen[bytes]]) -> list[str]:
+    """Kill, reap and close only captured still-running handles; return secondary faults."""
+    faults: list[str] = []
+    for process in processes:
+        if process.poll() is None:
+            try:
+                process.kill()
+            except Exception as error:
+                faults.append(f"rescue kill failed: {error!r}")
+            try:
+                process.wait(timeout=5)
+            except Exception as error:
+                faults.append(f"rescue wait failed: {error!r}")
+            if process.returncode is None:
+                faults.append(f"rescue could not reap pid {process.pid}")
+            for stream in (process.stdout, process.stderr):
+                if stream is not None and not stream.closed:
+                    try:
+                        stream.close()
+                    except Exception as error:
+                        faults.append(f"rescue close failed: {error!r}")
+    return faults
+
+
+@contextmanager
+def _owned_native_git_processes() -> Generator[list[subprocess.Popen[bytes]]]:
+    """Yield the captured-handle list; rescue faults never replace a primary failure."""
+    processes: list[subprocess.Popen[bytes]] = []
+    try:
+        yield processes
+    except BaseException as primary:
+        for fault in _rescue_owned(processes):
+            primary.add_note(fault)
+        raise
+    faults = _rescue_owned(processes)
+    if faults:
+        pytest.fail("; ".join(faults))
+
+
 @pytest.mark.parametrize("descriptor", [1, 2])
 def test_native_codex_git_terminates_on_live_output_overflow(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], descriptor: int
 ) -> None:
     """Neither Git stream can be materialized beyond the fixed live-output cap."""
-    real_popen = subprocess.Popen
-    processes: list[subprocess.Popen[bytes]] = []
-    overflow = usage_native_codex.MAX_GIT_OUTPUT_BYTES + 1  # pyright: ignore[reportPrivateUsage]
-
-    def popen(_command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
-        process = cast(
-            "subprocess.Popen[bytes]",
-            real_popen(
-                [
-                    sys.executable,
-                    "-c",
-                    f"import os, time; os.write({descriptor}, b'x' * {overflow}); time.sleep(2)",
-                ],
-                **kwargs,
-            ),
+    assert usage_native_codex.MAX_GIT_OUTPUT_BYTES == 64 * 1024
+    assert usage_native_codex.GIT_TIMEOUT_SECONDS == 5
+    cap = usage_native_codex.MAX_GIT_OUTPUT_BYTES
+    with _owned_native_git_processes() as processes:
+        control = _observe_native_git(
+            monkeypatch, _native_git_writer(descriptor, cap, linger=False), processes
         )
-        processes.append(process)
-        return process
+        if control.error is not None:
+            pytest.fail("at-cap output refused")
+        assert control.result == ("x" * cap if descriptor == 1 else "")
+        assert control.fail_times == ()
+        assert control.process.returncode == 0
+        overflow = _observe_native_git(
+            monkeypatch, _native_git_writer(descriptor, cap + 1, linger=True), processes
+        )
+        assert _live_overflow_violations(overflow) == []
+        assert len(processes) == 2
+        for process in processes:
+            assert process.poll() is not None
+            assert process.stdout is not None and process.stdout.closed
+            assert process.stderr is not None and process.stderr.closed
+        captured = capsys.readouterr()
+        assert captured.out == captured.err == ""
 
-    monkeypatch.setattr(usage_native_codex.subprocess, "Popen", popen)
-    started = time.monotonic()
-    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex._git(["status", "--porcelain"])  # pyright: ignore[reportPrivateUsage]
-    assert time.monotonic() - started < 1
-    assert processes[0].poll() is not None
-    assert processes[0].stdout is not None and processes[0].stdout.closed
-    assert processes[0].stderr is not None and processes[0].stderr.closed
-    captured = capsys.readouterr()
-    assert captured.out == captured.err == ""
+
+def test_native_codex_git_overflow_witness_rejects_deadline_expiry(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """W1: a failure raised at the production deadline never passes as a live overflow."""
+    with _owned_native_git_processes() as processes:
+        observation = _observe_native_git(
+            monkeypatch, "import time; time.sleep(20)", processes, timeout_seconds=0.05
+        )
+        violations = _live_overflow_violations(observation, expected_timeout_seconds=0.05)
+        assert "deadline window reached" in violations
+        assert "invalid clock observation" not in violations
+        assert violations == ["deadline window reached"]
+        assert len(observation.fail_times) == 1
+        assert observation.process.returncode in _LIVE_SIGNAL_RETURNCODES
+        assert observation.process.stdout is not None and observation.process.stdout.closed
+        assert observation.process.stderr is not None and observation.process.stderr.closed
+        captured = capsys.readouterr()
+        assert captured.out == captured.err == ""
 
 
 def test_native_codex_git_terminates_on_timeout(
