@@ -57,6 +57,15 @@ pass is inferred from it and no cause of that latency or of host contention is
 claimed. No speedup is claimed and no decision number is added. #954 and E11-S3
 are unchanged.
 
+A1 repair (test only): the at-cap and overflow writer children now arm a real
+20 s SIGALRM self-deadline before their first potentially blocking write
+(previously their only self-limit was a sleep reached after that write); a
+self-deadline death is never accepted as live termination. The independent
+rescue now closes open pipes of every captured handle, including already-reaped
+ones, while kill and wait still apply only to running handles, and one new
+real-child regression covers that. Production code, the 64 KiB cap and the 5 s
+deadline remain unchanged.
+
 **17 Oct 2026, #1036 one real packaging wheel reused per test module:**
 `tests/test_packaging.py` changes exactly three lines: `built_wheel` is now
 `scope="module"`, takes a typed `pytest.TempPathFactory` and builds into
