@@ -1,5 +1,68 @@
 # RoastPilot Agent Project State Registry
 
+**20 Oct 2026, #1043 gated fake World runs release their own fake gates (rebind):**
+the failure class is a fake gate on a production-shielded cleanup, released only
+in the test body: if an earlier entry wait failed, the shielded cleanup stop
+(`_ChildOwner.shielded_cleanup`, deliberately unchanged) kept waiting on a closed
+fake gate and the run task stayed pending into pytest's function-loop teardown.
+In `tests/test_cold_characterisation_two_phase.py`, `Gates` gains `release_all`,
+and a harness-only `OwnedRun` context manager drains exactly its one owned task
+through `drain_owned`: cancel, release that test's own fake gates, then a bounded
+`asyncio.wait` of `OWNED_DRAIN_SECONDS = 5.0` (never `wait_for`, never any other
+task). It never suppresses: an error in flight wins and carries a note, while an
+undrained task or a cleanup error with nothing in flight fails the test. The four
+in-class consumers (T8 cancellation reaping, C1 repeated cancellation, R2 caller
+cancellation during containment and the Port shielded-cleanup test) only create
+their task inside `async with OwnedRun(...)` and re-indent; every assertion, ID,
+marker, parameter, gate name and expected operation is unchanged and in order,
+and the 5 s entry guards stay. Nine IDs are added:
+`test_1043_converted_consumers_drain_on_an_entry_wait_failure[t8|c1_repeated|r2|port]`,
+`test_1043_drain_owned_is_finite_against_a_cancellation_resistant_task` and
+`test_1043_owned_run_preserves_the_original_and_reports_its_own_failures[original-undrained|none-undrained|original-release_raises|none-release_raises]`.
+The sibling sites (the unshielded Port interrupted stop, T17, TP12, the ungated
+cleanup awaits and the advisor `ignore_cancel` gate) are unchanged; the engine's
+thread gates are a different class, left as a follow-up candidate. Production
+code, timing and resource limits, CI, dependencies, coverage and markers are
+unchanged.
+
+Rebind: this is the same test-only change rebound onto `1c822c2`, which already
+contains #1044. The module is byte-identical to prior head `0625a67`, and the
+module, its observer, `two_phase.py`, `tests/conftest.py`, `pyproject.toml` and
+`web/package-lock.json` are byte-identical from prior base `ac1108c` to
+`1c822c2`. Fresh rebind evidence (interim worker evidence, each exit 0):
+collection gives the 465 base IDs unchanged and in order plus the nine new IDs
+(474); the byte-identity diff against `0625a67` is empty; an AST recompute over
+all 409 top-level statements at the new base (every current statement is
+covered; how the historical 380-node figure was counted is unverified) finds
+every one preserved in order except the
+authorised `Coroutine` import addition, `Gates.release_all` and the four
+consumer wrappers (the Port consumer also adding its local release function);
+the class sweep keeps its 12 members; and one single-process focused run of the
+module and its observer gave 540 passed, 0 failed and 0 skipped in 18.09 s.
+
+Historical (OLD, not re-run in this rebind): at `ac1108c`/`0625a67` (safety
+commits `0700e22` and `3891306`), 12 initial mutation recipes produced 21
+call-phase failures and 7 updated recipes produced 11, all with 0 errors,
+restored by hash check and with no backstop hit. The four initial wrapper-revert
+recipes failed only the helper identity assertion, which is wiring evidence; the
+seven revision 3 replacements include four real captured-waiter behavioural
+failures and supersede those wiring-only claims. These receipts stay applicable
+only because every relevant path above is byte-identical. Prior `qa` and
+`safety-reviewer` PASS verdicts applied to the old head only. The old head's
+full gate FAILED (exit 1: 3 failed, 13863 passed, 14 skipped in 28959.85 s); it
+is neither pending nor passed, and the #1044 fixes are not evidence that it now
+passes. A final new-head full gate is still required.
+
+Limits: a failure before task creation leaves nothing to own; if the test task
+itself is cancelled mid-drain, that cancellation propagates and the owned task
+may stay pending; and asyncio cannot force a task to finish, so a task still
+pending after every owned blocker is released is reported in the call phase but
+may still delay loop teardown (that would indicate a real production
+non-termination). This fixes one proven failure path only: it does not identify
+#1042's wait site or the causes of the old full-gate failures, and it claims no
+speedup, CI ETA or hardware result. No E11 status, plan or decision change;
+#954 and E11-S3 remain open.
+
 **20 Oct 2026, #1044 real MCP lifecycle probe deadline split into two phases:**
 `tests/test_process_exit.py::test_parse_and_real_mcp_subprocess_exits_cleanly`
 no longer has one combined 30 s bound covering interpreter import startup and

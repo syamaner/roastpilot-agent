@@ -22,7 +22,7 @@ import json
 import math
 import types
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -332,6 +332,87 @@ class Gates:
         if gate is not None:
             self.entered[name].set()
             await gate.wait()
+
+    def release_all(self) -> None:
+        """Open every gate this instance armed (and only those)."""
+        for gate in self.gates.values():
+            gate.set()
+
+
+#: Harness-only failure-path bound for draining one owned task (#1043).  It equals
+#: the existing 5 s entry guards and is independent of every product duration.
+OWNED_DRAIN_SECONDS: typing.Final = 5.0
+
+
+async def drain_owned(
+    task: "asyncio.Future[typing.Any]", release: Callable[[], None], *, seconds: float
+) -> bool:
+    """Cancel one owned task, release its fake blockers and observe it for a bounded time.
+
+    The observation uses ``asyncio.wait`` with a timeout, never ``asyncio.wait_for``:
+    the latter waits without bound for a cancellation-resistant (for example
+    production-shielded) task to finish cancelling.  No other task is touched.
+
+    Args:
+        task: The single task this caller owns.
+        release: Opens the fake gates that may block ``task``.
+        seconds: The observation bound.
+
+    Returns:
+        Whether ``task`` is done.
+    """
+    if not task.done():
+        task.cancel()
+    try:
+        release()
+    finally:
+        if not task.done():
+            await asyncio.wait({task}, timeout=seconds)
+    if task.done() and not task.cancelled():
+        task.exception()
+    return task.done()
+
+
+class OwnedRun:
+    """Async context manager that drains its one owned task on every exit (#1043).
+
+    It never suppresses: an exception in flight wins (cleanup problems become notes on
+    it); with none in flight, an undrained task or a cleanup error fails the test.
+    """
+
+    def __init__(
+        self,
+        task: "asyncio.Future[typing.Any]",
+        release: Callable[[], None],
+        *,
+        drain_seconds: float = OWNED_DRAIN_SECONDS,
+    ) -> None:
+        self.task = task
+        self.release = release
+        self.drain_seconds = drain_seconds
+
+    async def __aenter__(self) -> "asyncio.Future[typing.Any]":
+        return self.task
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: types.TracebackType | None,
+    ) -> None:
+        try:
+            drained = await drain_owned(self.task, self.release, seconds=self.drain_seconds)
+        except Exception as error:
+            if exc is None:
+                raise
+            exc.add_note(f"OwnedRun cleanup also failed: {error!r}")
+            return None
+        if not drained:
+            message = f"owned task {self.task!r} still pending after {self.drain_seconds} s"
+            if exc is None:
+                raise AssertionError(message)
+            exc.add_note(message)
+        return None
 
 
 class Mcp:
@@ -3481,16 +3562,21 @@ async def test_4gc_child_shielded_cleanup_absorbs_repeated_cancellation() -> Non
     owner = owner_of(port)
     assert await owner.start()
     port.gate = asyncio.Event()
-    outer = asyncio.ensure_future(owner.shielded_cleanup())
-    await asyncio.wait_for(port.entered.wait(), 5)
-    for _ in range(3):
-        outer.cancel()
-        await asyncio.sleep(0)
-        assert not outer.done()
-    port.gate.set()
-    await outer
-    assert port.calls == ["start", "stop"]
-    assert owner.state is State.STOPPED_CONFIRMED
+
+    def release() -> None:
+        if port.gate is not None:
+            port.gate.set()
+
+    async with OwnedRun(asyncio.ensure_future(owner.shielded_cleanup()), release) as outer:
+        await asyncio.wait_for(port.entered.wait(), 5)
+        for _ in range(3):
+            outer.cancel()
+            await asyncio.sleep(0)
+            assert not outer.done()
+        port.gate.set()
+        await outer
+        assert port.calls == ["start", "stop"]
+        assert owner.state is State.STOPPED_CONFIRMED
 
 
 def test_4gc_child_ownership_maps_every_state() -> None:
@@ -3732,31 +3818,31 @@ async def test_4gc_t8_cancellation_reaps_the_child_and_never_seals(
     stops_before = sum(1 for op in ops if op[0] == "stop") - 1
     cleanup_gate = f"stop:{stops_before}"
     cleanup_entered = world.gates.arm(cleanup_gate) if second else None
-    task = asyncio.ensure_future(world.run())
-    await asyncio.wait_for(entered.wait(), 5)
-    task.cancel()
-    if cleanup_entered is not None:
-        await asyncio.wait_for(cleanup_entered.wait(), 5)
+    async with OwnedRun(asyncio.ensure_future(world.run()), world.gates.release_all) as task:
+        await asyncio.wait_for(entered.wait(), 5)
         task.cancel()
-        for _ in range(3):
-            await asyncio.sleep(0)
-        assert not task.done()
-        world.gates.gates[cleanup_gate].set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert world.child_ops() == ops
-    assert world.child.stops_completed == completed
-    assert not any(event == "run_terminated" for _phase, event in world.events())
-    assert not world.manifest_exists()
-    if gate.startswith("stop:"):
-        assert world.child.unconfirmed_value is True
-    if gate == "start:recording_off":
-        assert CapturingSink.created == []
-    else:
-        (sink,) = CapturingSink.created
-        assert sink.poisoned and not sink.usable
-        with pytest.raises(two_phase.ColdRunSinkRefusedError):
-            sink.append_lifecycle(typing.cast(lifecycle.ColdLifecycleRecord, None))
+        if cleanup_entered is not None:
+            await asyncio.wait_for(cleanup_entered.wait(), 5)
+            task.cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert not task.done()
+            world.gates.gates[cleanup_gate].set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert world.child_ops() == ops
+        assert world.child.stops_completed == completed
+        assert not any(event == "run_terminated" for _phase, event in world.events())
+        assert not world.manifest_exists()
+        if gate.startswith("stop:"):
+            assert world.child.unconfirmed_value is True
+        if gate == "start:recording_off":
+            assert CapturingSink.created == []
+        else:
+            (sink,) = CapturingSink.created
+            assert sink.poisoned and not sink.usable
+            with pytest.raises(two_phase.ColdRunSinkRefusedError):
+                sink.append_lifecycle(typing.cast(lifecycle.ColdLifecycleRecord, None))
 
 
 # ------------------------------------------------- T1 / T2 / T20: success paths
@@ -4775,18 +4861,18 @@ async def test_4gc_a2_c1_repeated_cancellation_still_preserves_the_original(
     entered = world.gates.arm("stop:0")
     halt = Halt()
     run = run_with_child(world, halt)
-    task = asyncio.ensure_future(run.execute())
-    await asyncio.wait_for(entered.wait(), 5)
-    for _ in range(2):
-        task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done()
-    world.gates.gates["stop:0"].set()
-    with pytest.raises(Halt) as caught:
-        await task
-    assert caught.value is halt
-    assert world.child.stops == 1
-    assert run._child.ownership is Own.OWNED_STOP_UNCONFIRMED
+    async with OwnedRun(asyncio.ensure_future(run.execute()), world.gates.release_all) as task:
+        await asyncio.wait_for(entered.wait(), 5)
+        for _ in range(2):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        world.gates.gates["stop:0"].set()
+        with pytest.raises(Halt) as caught:
+            await task
+        assert caught.value is halt
+        assert world.child.stops == 1
+        assert run._child.ownership is Own.OWNED_STOP_UNCONFIRMED
 
 
 # ------------------------------- R2: caller cancellation during containment
@@ -4848,31 +4934,31 @@ async def test_4gc_r2_caller_cancellation_during_containment_propagates(
     counters = Counters(monkeypatch)
     entered = world.gates.arm(gate)
     world.child.stop_modes = ["ok", mode] if scenario == "poisoned_sink" else [mode]
-    task = asyncio.ensure_future(world.run())
-    await asyncio.wait_for(entered.wait(), 5)
-    for _ in range(cancels):
-        task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done()
-    world.gates.gates[gate].set()
-    if cancels:
-        with pytest.raises(asyncio.CancelledError):
-            await task
-    else:
-        result = await task
-        expected = (
-            Outcome.REFUSED_BEFORE_EVIDENCE
-            if scenario == "pre_evidence"
-            else Outcome.EVIDENCE_NOT_SEALED
-        )
-        assert result.outcome is expected and result.manifest_sha256 is None
-        assert result.child_ownership is (
-            Own.OWNED_STOP_CONFIRMED if mode == "ok" else Own.OWNED_STOP_UNCONFIRMED
-        )
-    assert world.child.stops == total_stops
-    assert counters.seals == 0
-    assert not any(event == "run_terminated" for _phase, event in world.events())
-    assert not world.manifest_exists()
+    async with OwnedRun(asyncio.ensure_future(world.run()), world.gates.release_all) as task:
+        await asyncio.wait_for(entered.wait(), 5)
+        for _ in range(cancels):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        world.gates.gates[gate].set()
+        if cancels:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            result = await task
+            expected = (
+                Outcome.REFUSED_BEFORE_EVIDENCE
+                if scenario == "pre_evidence"
+                else Outcome.EVIDENCE_NOT_SEALED
+            )
+            assert result.outcome is expected and result.manifest_sha256 is None
+            assert result.child_ownership is (
+                Own.OWNED_STOP_CONFIRMED if mode == "ok" else Own.OWNED_STOP_UNCONFIRMED
+            )
+        assert world.child.stops == total_stops
+        assert counters.seals == 0
+        assert not any(event == "run_terminated" for _phase, event in world.events())
+        assert not world.manifest_exists()
 
 
 # ------------------------------------------------------------ T11: sessions
@@ -7556,3 +7642,279 @@ def test_997_fx6_one_read_one_publication_one_latest_tick_and_no_construct() -> 
     for name, tree in trees.items():
         assert _calls(tree, "model_construct") == [], name
     assert len(_calls(composition, "model_copy")) == 2
+
+
+# ------------------------------- #1043: owned fake-gate drain on early failure
+
+
+class _FailingEntered(asyncio.Event):
+    """An entry signal whose wait raises one injected error after the real entry."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self.error = error
+
+    async def wait(self) -> typing.Literal[True]:
+        await super().wait()
+        raise self.error
+
+
+class _Seams:
+    """Per-case seam state: the injected error and every object a seam captured."""
+
+    error: typing.ClassVar[BaseException] = RuntimeError("seams not reset")
+    worlds: typing.ClassVar[list["_InjectingWorld"]] = []
+    ports: typing.ClassVar[list["_InjectingPort"]] = []
+    runs: typing.ClassVar[list["_RecordingOwnedRun"]] = []
+
+    @classmethod
+    def reset(cls, error: BaseException) -> None:
+        cls.error = error
+        cls.worlds, cls.ports, cls.runs = [], [], []
+
+    @classmethod
+    def waiters(cls) -> list["asyncio.Future[typing.Any]"]:
+        return [
+            *(task for world in cls.worlds for task in world.injecting.waiters),
+            *(task for port in cls.ports for task in port.waiters),
+        ]
+
+    @classmethod
+    def gates(cls) -> list[asyncio.Event]:
+        return [
+            *(gate for world in cls.worlds for gate in world.injecting.gates.values()),
+            *(port.gate for port in cls.ports if port.gate is not None),
+        ]
+
+
+class _InjectingGates(Gates):
+    """Gates whose first armed entry fails after entry; records each gated waiter."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self.error = error
+        self.waiters: list[asyncio.Future[typing.Any]] = []
+
+    def arm(self, name: str) -> asyncio.Event:
+        entered = super().arm(name)
+        if len(self.gates) == 1:
+            entered = self.entered[name] = _FailingEntered(self.error)
+        return entered
+
+    async def wait(self, name: str) -> None:
+        if name in self.gates:
+            self.waiters.append(typing.cast("asyncio.Task[typing.Any]", asyncio.current_task()))
+        await super().wait(name)
+
+
+class _InjectingWorld(World):
+    """World with injecting gates; every instance is captured."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        super().__init__(tmp_path)
+        self.injecting = _InjectingGates(_Seams.error)
+        self.gates = self.injecting
+        _Seams.worlds.append(self)
+
+
+class _InjectingPort(Port):
+    """Port whose entry signal fails after entry; records each stop task."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = _FailingEntered(_Seams.error)
+        self.waiters: list[asyncio.Future[typing.Any]] = []
+        _Seams.ports.append(self)
+
+    async def stop(self) -> None:
+        self.waiters.append(typing.cast("asyncio.Task[typing.Any]", asyncio.current_task()))
+        await super().stop()
+
+
+class _RecordingOwnedRun(OwnedRun):
+    """OwnedRun that records every entered instance."""
+
+    async def __aenter__(self) -> "asyncio.Future[typing.Any]":
+        _Seams.runs.append(self)
+        return await super().__aenter__()
+
+
+async def _rescue(probe: "asyncio.Future[typing.Any]") -> None:
+    """Independent bounded rescue: set captured gates directly, then reap captured tasks."""
+    for gate in _Seams.gates():
+        gate.set()
+    owned = {probe, *(run.task for run in _Seams.runs), *_Seams.waiters()}
+    await asyncio.wait(owned, timeout=5.0)
+    pending = {task for task in owned if not task.done()}
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.wait(pending, timeout=5.0)
+    for task in owned:
+        if task.done() and not task.cancelled():
+            task.exception()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["t8", "c1_repeated", "r2", "port"])
+async def test_1043_converted_consumers_drain_on_an_entry_wait_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """An entry-wait failure in each real consumer drains its owned task; the original wins."""
+    injected = TimeoutError("injected first entry-wait failure (#1043)")
+    _Seams.reset(injected)
+    monkeypatch.setitem(globals(), "World", _InjectingWorld)
+    monkeypatch.setitem(globals(), "Port", _InjectingPort)
+    monkeypatch.setitem(globals(), "OwnedRun", _RecordingOwnedRun)
+    consumer: Coroutine[typing.Any, typing.Any, None]
+    if case == "t8":
+        ops: list[tuple[str, Phase | None]] = [*BEFORE_ON, ("stop", ON), ("stop", ON)]
+        consumer = test_4gc_t8_cancellation_reaps_the_child_and_never_seals(
+            tmp_path, monkeypatch, "stop:1", ops, 2, True
+        )
+    elif case == "c1_repeated":
+        consumer = test_4gc_a2_c1_repeated_cancellation_still_preserves_the_original(tmp_path)
+    elif case == "r2":
+        consumer = test_4gc_r2_caller_cancellation_during_containment_propagates(
+            tmp_path, monkeypatch, "pre_evidence", "ok", 1
+        )
+    else:
+        consumer = test_4gc_child_shielded_cleanup_absorbs_repeated_cancellation()
+    probe = asyncio.ensure_future(consumer)
+    try:
+        await asyncio.wait({probe}, timeout=15.0)
+        probe_done = probe.done()
+        runs = list(_Seams.runs)
+        owned_done = [run.task.done() for run in runs]
+        waiters = _Seams.waiters()
+        waiters_done = [task.done() for task in waiters]
+        gates_set = [gate.is_set() for gate in _Seams.gates()]
+    finally:
+        await _rescue(probe)
+    assert probe_done, "the consumer did not finish within its bound"
+    assert waiters and all(waiters_done), "a captured gated waiter was left pending"
+    assert gates_set and all(gates_set), "an armed fake gate was left closed"
+    assert len(runs) == 1, "the consumer did not drain through exactly one OwnedRun"
+    assert all(owned_done), "the owned task was left pending"
+    assert probe.exception() is injected
+    owned = runs[0].task
+    if case == "port":
+        (port,) = _Seams.ports
+        assert not owned.cancelled() and port.calls == ["start", "stop"]
+        return
+    (world,) = _Seams.worlds
+    if case == "c1_repeated":
+        assert not owned.cancelled() and isinstance(owned.exception(), Halt)
+        assert world.child.stops == 1 and world.child.stops_completed == 1
+        return
+    assert owned.cancelled()
+    assert not any(event == "run_terminated" for _phase, event in world.events())
+    assert not world.manifest_exists()
+    if case == "r2":
+        assert world.child.stops == 1
+        return
+    assert world.child_ops() == [*BEFORE_ON, ("stop", ON), ("stop", ON)]
+    assert world.child.stops_completed == 2 and world.child.unconfirmed_value is True
+    (sink,) = CapturingSink.created
+    assert sink.poisoned and not sink.usable
+    with pytest.raises(two_phase.ColdRunSinkRefusedError):
+        sink.append_lifecycle(typing.cast(lifecycle.ColdLifecycleRecord, None))
+
+
+async def _resist(free: asyncio.Event) -> str:
+    """Absorb every cancellation until ``free`` is set."""
+    while True:
+        try:
+            await free.wait()
+        except asyncio.CancelledError:
+            continue
+        return "freed"
+
+
+@pytest.mark.asyncio
+async def test_1043_drain_owned_is_finite_against_a_cancellation_resistant_task() -> None:
+    """A resistant owned task bounds the drain, and no other task is touched."""
+    free = asyncio.Event()
+    resistant = asyncio.ensure_future(_resist(free))
+    bystander = asyncio.create_task(asyncio.Event().wait(), name="1043-bystander")
+    await asyncio.sleep(0)
+    probes: list[asyncio.Future[bool]] = []
+    try:
+        first = asyncio.ensure_future(drain_owned(resistant, lambda: None, seconds=0.05))
+        probes.append(first)
+        await asyncio.wait({first}, timeout=5.0)
+        first_done = first.done()
+        resistant_pending = not resistant.done()
+        bystander_untouched = not bystander.done() and not bystander.cancelled()
+        second = asyncio.ensure_future(drain_owned(resistant, free.set, seconds=5.0))
+        probes.append(second)
+        await asyncio.wait({second}, timeout=5.0)
+        second_done = second.done()
+    finally:
+        free.set()
+        for task in (bystander, *probes):
+            if not task.done():
+                task.cancel()
+        await asyncio.wait({resistant, bystander, *probes}, timeout=5.0)
+    assert first_done and first.result() is False
+    assert resistant_pending
+    assert bystander_untouched
+    assert second_done and second.result() is True
+    assert resistant.result() == "freed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("in_flight", "failure"),
+    [
+        ("original", "undrained"),
+        ("none", "undrained"),
+        ("original", "release_raises"),
+        ("none", "release_raises"),
+    ],
+    ids=[
+        "original-undrained",
+        "none-undrained",
+        "original-release_raises",
+        "none-release_raises",
+    ],
+)
+async def test_1043_owned_run_preserves_the_original_and_reports_its_own_failures(
+    in_flight: str, failure: str
+) -> None:
+    """An in-flight error wins with a note; with none, OwnedRun's own failure surfaces."""
+    free = asyncio.Event()
+    resistant = asyncio.ensure_future(_resist(free))
+    await asyncio.sleep(0)
+    injected = TimeoutError("injected original (#1043)")
+    release_error = RuntimeError("injected release failure (#1043)")
+
+    def release() -> None:
+        if failure == "release_raises":
+            raise release_error
+
+    async def scenario() -> None:
+        async with OwnedRun(resistant, release, drain_seconds=0.05):
+            if in_flight == "original":
+                raise injected
+
+    probe = asyncio.ensure_future(scenario())
+    try:
+        await asyncio.wait({probe}, timeout=5.0)
+        probe_done = probe.done()
+    finally:
+        free.set()
+        if not probe.done():
+            probe.cancel()
+        await asyncio.wait({probe, resistant}, timeout=5.0)
+    assert probe_done, "OwnedRun did not finish within its bound"
+    error = probe.exception()
+    notes: list[str] = getattr(error, "__notes__", [])
+    if in_flight == "original":
+        assert error is injected
+        expected = "still pending" if failure == "undrained" else "cleanup also failed"
+        assert any(expected in note for note in notes), notes
+    elif failure == "undrained":
+        assert isinstance(error, AssertionError) and "still pending" in str(error)
+    else:
+        assert error is release_error
