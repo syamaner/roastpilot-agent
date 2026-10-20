@@ -101,6 +101,15 @@ resource limits, `slow` tests use real subprocesses or MCP sessions, and `serial
 tests are never run under `-n`. The full gate (`python -m pytest`, all markers,
 single process) remains mandatory before handback and before opening a PR.
 
+`.venv/bin/python scripts/run_tests.py --profile local --dry-run` prints, and without
+`--dry-run` runs, the lanes above as fixed native pytest argv (profiles `ci`, `local`,
+`nightly`; `--lane`; `--workers`, default 4, ordinary only). With `--lane all`, `ci`
+and `local` omit only the `exhaustive_only` inventory; `nightly` includes it. It is an
+execution and selection interface, coverage-neutral, not a qualified speedup and not
+a reproduction of hosted CI, and it does not replace the full gate above or CI
+coverage. `--profile local` (default lane `ordinary`) is a fast loop, never
+full-suite or PR proof.
+
 ### Lint And Format
 
 ```bash

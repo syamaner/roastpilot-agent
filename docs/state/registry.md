@@ -1,5 +1,45 @@
 # RoastPilot Agent Project State Registry
 
+**21 Oct 2026, #1042 explicit test-run profiles (rebind):** new test-only
+`scripts/run_tests.py` (`--profile ci|local|nightly`, `--lane`, `--workers`,
+`--dry-run`) maps closed choices to fixed native pytest argv over the existing
+lane partition: with `--lane all`, `ci` and `local` omit only the
+`exhaustive_only` inventory and `nightly` includes it; `local` defaults to the
+ordinary lane alone, while `ci` and `nightly` default to `all`; `--workers`
+(default 4) applies to the ordinary lane only, and serial, stress and packaging
+never run under xdist. It runs shell-free from the repository root through the
+launching interpreter, stops at the first failed lane and propagates its code.
+It is a coverage-neutral execution and selection interface: it does not replace
+the single-process all-marker full gate or CI coverage, does not reproduce
+hosted CI and makes no performance claim. `AGENTS.md` gains one 9-line usage
+paragraph after line 102.
+
+Rebind: `scripts/run_tests.py`, `tests/test_run_tests.py` and `AGENTS.md` are
+byte-identical ports of prior head `35a8c36`, checked out by git object onto
+`d33c1b0` (helper SHA-256 `0bcadd09…`; all three blob ids equal the old
+objects; `AGENTS.md` lines 1-102 are unchanged and the paragraph adds 610
+bytes, for a 64936-byte file). `AGENTS.md`, `pyproject.toml`,
+`tests/conftest.py`, `.github/workflows/ci.yml` and `web/package-lock.json` are
+byte-identical from prior base `ac1108c` to `d33c1b0`. Fresh rebind evidence
+(interim worker evidence): one single-process run of `.venv/bin/python -m pytest
+tests/test_run_tests.py --cov=scripts --cov-branch --cov-report=term-missing -p
+no:cacheprovider` exited 0 with 69 passed, 0 failed and 0 skipped (2.44 s), and
+covered all 104 helper statements and 24 branches, with only the `__main__`
+pragma excluded; the shell-execution sweep over both new files is empty, and the
+lane-argv sweep finds only the expected `ci.yml`, `AGENTS.md`, governance, D217
+witness, helper, test and historical registry sites, none edited.
+
+Historical (OLD, not re-run in this rebind): the 26 valid helper-guard mutation
+proofs at the old head stay applicable only because the helper, the test module
+and the context files above are byte-identical; the initial invalid G12 mutant
+(a SyntaxError) is not counted. A completed seven-selection inventory proof at
+`35a8c36` is historical and is not the current-head selection proof; earlier
+interrupted inventory attempts and every old-head full-gate attempt remain
+incomplete, never PASS. The new-head selection proof and full gate are still
+required. CI, `pyproject.toml`, existing tests and markers are unchanged. No E11
+status, hardware, Pi, release, speed, CI ETA or host-cause claim; #954 and
+E11-S3 remain open and unchanged.
+
 **20 Oct 2026, #1043 gated fake World runs release their own fake gates (rebind):**
 the failure class is a fake gate on a production-shielded cleanup, released only
 in the test body: if an earlier entry wait failed, the shielded cleanup stop
