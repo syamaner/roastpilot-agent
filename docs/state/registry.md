@@ -1,5 +1,93 @@
 # RoastPilot Agent Project State Registry
 
+**20 Oct 2026, #1044 real MCP lifecycle probe deadline split into two phases:**
+`tests/test_process_exit.py::test_parse_and_real_mcp_subprocess_exits_cleanly`
+no longer has one combined 30 s bound covering interpreter import startup and
+the work under test. The child now has at most 30 s to finish its real
+`roastpilot_agent` imports and atomically publish a fresh, PID-bound private
+ready marker immediately before the existing lifecycle, then at most 30 s for
+the original real mock-driver MCP start, bootstrap-safe server-info assertion,
+bounded parse, MCP stop, child-gone check and interpreter exit. The lifecycle
+bound is anchored at the last reading that saw the marker absent, so total
+observation is at most 60 s plus the existing bounded cleanup (MCP group, then
+the outer group only while unreaped, one 5 s collection). Missing, stale,
+invalid or late readiness, premature exit, either overrun, a failed original
+assertion or a surviving owned process stays a hard failure; there is no retry,
+skip or blanket timeout increase. Test name, markers, decorator, `main()`,
+`PidCapturingProcess` and assertions are unchanged, as are production
+start/call/stop/parser budgets and the other five probes. Focused stdlib-sentinel
+proofs cover both phases and owned-group cleanup. This is a reliability
+correction to the test deadline's meaning: normal execution is not deliberately
+delayed, and no speedup or full-suite/CI gain is claimed. Installer deadlines and
+their separately observed failures are unchanged and not resolved. #954 and
+E11-S3 are unchanged. No new decision number.
+
+Review-repair round (test harness only; real 30 s + 30 s defaults unchanged):
+an ordinary exception from the one bounded post-kill output collection is now
+cleanup trouble, so the phase failure keeps its reason plus cleanup context and
+an incidental primary exception is re-raised as the same object, noted when
+collection is incomplete. Proof-only bounded waits raise a distinct assertion,
+the proof fixture records and rejects any signal to an already-reaped outer
+for every consumer, and two negative proofs use a generous 100 s injected
+import budget instead of artificial 5/9 s startup margins. Known retained
+residual: the outer group is signalled only while its leader is unreaped, so a
+hypothetical descendant left in that group after leader exit would not be
+signalled; current MCP children own separate sessions and parsing uses threads.
+Cleanup wording reports attempted cleanup, not proof that every signal landed.
+
+Approved amendment A1 (third file, test only): in
+`tests/test_capture_agent_usage.py`, the native Git live-overflow test (IDs
+`[1]`/`[2]`) no longer asserts that the whole call took under 1 s. Each
+parameter first runs a real child writing exactly the 64 KiB cap, which must be
+drained and accepted (exact output, no failure, exit 0), then a real child
+writing cap + 1 bytes that lingers. That call must fail exactly once at the
+overflow site with no mapped exception context, strictly before the deadline
+computed from production's own first monotonic reading plus its unchanged 5 s
+constant, and the still-live child must then be signal-terminated and reaped
+with both pipes closed and quiet diagnostics. Observation uses only an
+argv-only Popen spy, a `_fail` recorder and a module-binding time proxy, all
+delegating to saved originals and restored per call; nothing fakes a clock,
+selector, read, kill or pipe, and no new elapsed threshold is added. A
+synthetic 0.05 s deadline case keeps the witness non-vacuous. Production code,
+the 64 KiB cap and the 5 s deadline are unchanged. The earlier interrupted full
+run is incomplete diagnostic evidence only (exit 2: 2 failed, 2720 passed,
+1 skipped; one genuine whole-call elapsed failure of about 1.64 s on the stderr
+overflow case, and one nested-suite failure induced by the interruption); no
+pass is inferred from it and no cause of that latency or of host contention is
+claimed. No speedup is claimed and no decision number is added. #954 and E11-S3
+are unchanged.
+
+A1 repair (test only): the at-cap and overflow writer children now arm a real
+20 s SIGALRM self-deadline before their first potentially blocking write
+(previously their only self-limit was a sleep reached after that write); a
+self-deadline death is never accepted as live termination. The independent
+rescue now closes open pipes of every captured handle, including already-reaped
+ones, while kill and wait still apply only to running handles, and one new
+real-child regression covers that. Production code, the 64 KiB cap and the 5 s
+deadline remain unchanged.
+
+Approved amendment A2 (test selection only): in `tests/test_pi_installer.py`,
+`test_two_installer_runs_overlap_without_cross_run_leaks` now marks only its
+`[success]`, `[partial-launch]` and `[cleanup-continues]` parameters `serial`
+(C3: real installer overlap/partial-launch scenario with fixed 180 s bounds), so
+no unrelated test runs alongside them. Success and cleanup-continues still start
+two real installers that overlap internally; partial-launch starts one real
+installer, waits for its live barrier descendant and then injects the second
+launch failure. The other nine parameters stay ordinary, all twelve node IDs
+and their order are unchanged, and the bodies, helpers, assertions and 180 s
+bounds are unchanged. The closed installer serial inventory in
+`tests/test_pytest_governance.py` grows from seven to exactly ten. The CI serial
+lane and the exhaustive witness's serial selection now carry these three cases.
+This is a candidate fix only: the earlier r2 full run remains FAIL (exit 1:
+1 failed, 13875 passed, 14 skipped in 16248.97 s; the sole failure was the
+exhaustive witness, whose inner ordinary run had 3 failed, 13806 passed and
+16 skipped in 10334.14 s, while all three cases passed in the outer
+single-process run). Only the last inner traceback (the hostname-barrier
+readiness assertion) was retained, so the earlier individual causes are
+unknown. No host cause, regression cause, speedup, CI ETA or serial-placement
+success is claimed, and no decision number is added. #954 and E11-S3 are
+unchanged.
+
 **17 Oct 2026, #1036 one real packaging wheel reused per test module:**
 `tests/test_packaging.py` changes exactly three lines: `built_wheel` is now
 `scope="module"`, takes a typed `pytest.TempPathFactory` and builds into

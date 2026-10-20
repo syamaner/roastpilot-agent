@@ -79,9 +79,14 @@ _EXHAUSTIVE_ONLY_INVENTORY = frozenset(
         "tests/test_capture_agent_usage.py::test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper"
     }
 )
-#: #1010: the complete installer subset that remains in the serial lane.
+#: #1010 + #1044: the complete installer serial subset, the seven #1010
+#: host-resource and fixed-bound nodes plus the three #1044 real installer
+#: overlap/partial-launch scenario cases with fixed 180 s bounds.
 _INSTALLER_RETAINED_SERIAL_INVENTORY = frozenset(
     {
+        "tests/test_pi_installer.py::test_two_installer_runs_overlap_without_cross_run_leaks[success]",
+        "tests/test_pi_installer.py::test_two_installer_runs_overlap_without_cross_run_leaks[partial-launch]",
+        "tests/test_pi_installer.py::test_two_installer_runs_overlap_without_cross_run_leaks[cleanup-continues]",
         "tests/test_pi_installer.py::test_fake_log_grammar_fails_closed_for_forced_concurrency",
         "tests/test_pi_installer.py::test_framing_writer_closes_all_popen_pipes",
         "tests/test_pi_installer.py::test_framing_writer_wait_supports_a_high_pipe_descriptor",
@@ -570,7 +575,7 @@ def test_pytest_markers_are_registered_and_full_gate_is_unfiltered() -> None:
 
 
 def test_installer_serial_inventory_is_frozen() -> None:
-    """Only the seven classified host-resource installer nodes remain serial (#1010)."""
+    """Exactly the ten classified installer nodes are serial: seven #1010, three #1044."""
     returncode, serial, output = _collect_nodeids(["-m", "serial"])
     assert returncode == 0, output
     installer_serial = {
