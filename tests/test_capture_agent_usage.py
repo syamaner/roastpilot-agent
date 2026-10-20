@@ -3416,10 +3416,15 @@ def _native_git_bindings_are_original() -> bool:
 
 
 def _native_git_writer(descriptor: int, size: int, *, linger: bool) -> str:
-    """Child source that fully writes ``size`` bytes, then lingers 20 s or exits 0."""
+    """Child source: a 20 s SIGALRM self-deadline armed before any write, then a full
+    write of ``size`` bytes, then a linger (still under that deadline) or exit 0.
+
+    A self-deadline death is ``-SIGALRM``, never an accepted live-termination code.
+    """
     tail = "\ntime.sleep(20)" if linger else ""
     return (
-        f"import os, time\nv = memoryview(b'x' * {size})\n"
+        "import os, signal, time\nsignal.alarm(20)\n"
+        f"v = memoryview(b'x' * {size})\n"
         f"while v:\n    v = v[os.write({descriptor}, v):]{tail}"
     )
 
@@ -3517,7 +3522,10 @@ def _live_overflow_violations(
 
 
 def _rescue_owned(processes: list[subprocess.Popen[bytes]]) -> list[str]:
-    """Kill, reap and close only captured still-running handles; return secondary faults."""
+    """Kill and reap still-running captured handles, close every captured open pipe.
+
+    Returns secondary faults; only kill/wait depend on the handle still being alive.
+    """
     faults: list[str] = []
     for process in processes:
         if process.poll() is None:
@@ -3531,12 +3539,12 @@ def _rescue_owned(processes: list[subprocess.Popen[bytes]]) -> list[str]:
                 faults.append(f"rescue wait failed: {error!r}")
             if process.returncode is None:
                 faults.append(f"rescue could not reap pid {process.pid}")
-            for stream in (process.stdout, process.stderr):
-                if stream is not None and not stream.closed:
-                    try:
-                        stream.close()
-                    except Exception as error:
-                        faults.append(f"rescue close failed: {error!r}")
+        for stream in (process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except Exception as error:
+                    faults.append(f"rescue close failed: {error!r}")
     return faults
 
 
@@ -3603,6 +3611,30 @@ def test_native_codex_git_overflow_witness_rejects_deadline_expiry(
         assert observation.process.stderr is not None and observation.process.stderr.closed
         captured = capsys.readouterr()
         assert captured.out == captured.err == ""
+
+
+def test_native_git_rescue_closes_pipes_of_reaped_handle() -> None:
+    """Rescue closes both open pipes of an already-reaped captured handle without signalling."""
+    process = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", "pass"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+        assert process.wait(timeout=60) == 0
+        assert process.stdout is not None and not process.stdout.closed
+        assert process.stderr is not None and not process.stderr.closed
+        assert _rescue_owned([process]) == []
+        assert process.stdout.closed, "rescue left a reaped handle's stdout pipe open"
+        assert process.stderr.closed, "rescue left a reaped handle's stderr pipe open"
+    finally:
+        if process.poll() is None:
+            with suppress(OSError):
+                process.kill()
+            with suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=5)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                with suppress(OSError):
+                    stream.close()
 
 
 def test_native_codex_git_terminates_on_timeout(
