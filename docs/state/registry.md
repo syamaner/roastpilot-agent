@@ -32,8 +32,9 @@ module, its observer, `two_phase.py`, `tests/conftest.py`, `pyproject.toml` and
 `1c822c2`. Fresh rebind evidence (interim worker evidence, each exit 0):
 collection gives the 465 base IDs unchanged and in order plus the nine new IDs
 (474); the byte-identity diff against `0625a67` is empty; an AST recompute over
-all 409 top-level statements at the new base (the historical 380-node figure
-plus the 29 `from` imports) finds every one preserved in order except the
+all 409 top-level statements at the new base (every current statement is
+covered; how the historical 380-node figure was counted is unverified) finds
+every one preserved in order except the
 authorised `Coroutine` import addition, `Gates.release_all` and the four
 consumer wrappers (the Port consumer also adding its local release function);
 the class sweep keeps its 12 members; and one single-process focused run of the
