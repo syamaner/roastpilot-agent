@@ -66,6 +66,28 @@ ones, while kill and wait still apply only to running handles, and one new
 real-child regression covers that. Production code, the 64 KiB cap and the 5 s
 deadline remain unchanged.
 
+Approved amendment A2 (test selection only): in `tests/test_pi_installer.py`,
+`test_two_installer_runs_overlap_without_cross_run_leaks` now marks only its
+`[success]`, `[partial-launch]` and `[cleanup-continues]` parameters `serial`
+(C3: real installer overlap/partial-launch scenario with fixed 180 s bounds), so
+no unrelated test runs alongside them. Success and cleanup-continues still start
+two real installers that overlap internally; partial-launch starts one real
+installer, waits for its live barrier descendant and then injects the second
+launch failure. The other nine parameters stay ordinary, all twelve node IDs
+and their order are unchanged, and the bodies, helpers, assertions and 180 s
+bounds are unchanged. The closed installer serial inventory in
+`tests/test_pytest_governance.py` grows from seven to exactly ten. The CI serial
+lane and the exhaustive witness's serial selection now carry these three cases.
+This is a candidate fix only: the earlier r2 full run remains FAIL (exit 1:
+1 failed, 13875 passed, 14 skipped in 16248.97 s; the sole failure was the
+exhaustive witness, whose inner ordinary run had 3 failed, 13806 passed and
+16 skipped in 10334.14 s, while all three cases passed in the outer
+single-process run). Only the last inner traceback (the hostname-barrier
+readiness assertion) was retained, so the earlier individual causes are
+unknown. No host cause, regression cause, speedup, CI ETA or serial-placement
+success is claimed, and no decision number is added. #954 and E11-S3 are
+unchanged.
+
 **17 Oct 2026, #1036 one real packaging wheel reused per test module:**
 `tests/test_packaging.py` changes exactly three lines: `built_wheel` is now
 `scope="module"`, takes a typed `pytest.TempPathFactory` and builds into
