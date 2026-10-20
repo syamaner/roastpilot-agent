@@ -35,6 +35,28 @@ hypothetical descendant left in that group after leader exit would not be
 signalled; current MCP children own separate sessions and parsing uses threads.
 Cleanup wording reports attempted cleanup, not proof that every signal landed.
 
+Approved amendment A1 (third file, test only): in
+`tests/test_capture_agent_usage.py`, the native Git live-overflow test (IDs
+`[1]`/`[2]`) no longer asserts that the whole call took under 1 s. Each
+parameter first runs a real child writing exactly the 64 KiB cap, which must be
+drained and accepted (exact output, no failure, exit 0), then a real child
+writing cap + 1 bytes that lingers. That call must fail exactly once at the
+overflow site with no mapped exception context, strictly before the deadline
+computed from production's own first monotonic reading plus its unchanged 5 s
+constant, and the still-live child must then be signal-terminated and reaped
+with both pipes closed and quiet diagnostics. Observation uses only an
+argv-only Popen spy, a `_fail` recorder and a module-binding time proxy, all
+delegating to saved originals and restored per call; nothing fakes a clock,
+selector, read, kill or pipe, and no new elapsed threshold is added. A
+synthetic 0.05 s deadline case keeps the witness non-vacuous. Production code,
+the 64 KiB cap and the 5 s deadline are unchanged. The earlier interrupted full
+run is incomplete diagnostic evidence only (exit 2: 2 failed, 2720 passed,
+1 skipped; one genuine whole-call elapsed failure of about 1.64 s on the stderr
+overflow case, and one nested-suite failure induced by the interruption); no
+pass is inferred from it and no cause of that latency or of host contention is
+claimed. No speedup is claimed and no decision number is added. #954 and E11-S3
+are unchanged.
+
 **17 Oct 2026, #1036 one real packaging wheel reused per test module:**
 `tests/test_packaging.py` changes exactly three lines: `built_wheel` is now
 `scope="module"`, takes a typed `pytest.TempPathFactory` and builds into
