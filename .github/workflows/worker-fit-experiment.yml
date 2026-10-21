@@ -1,0 +1,1108 @@
+# Issue #1048: temporary, bounded Actions worker-fit experiment. This workflow
+# exists only on the never-merged branch feature/1048-ci-worker-fit-experiment.
+# It runs exactly six chained trials (workers 4,2,2,4,4,2) of the UNCHANGED
+# ordinary pytest lane against the pinned original source payload H (checked
+# out by sha, so the trials never execute this file or its contract test).
+#
+# Admission is job-level and repeated on every job: exact repository, push
+# event, exact branch ref, the branch-creating push only, and run attempt 1.
+# A second push or any manual re-run therefore skips every trial before a
+# runner is allocated. No job uses a status function in `if`, so GitHub's
+# implicit success() stops the chain at the first failed, cancelled or
+# timed-out trial. The only token is the read-only contents token, nothing is
+# uploaded outside same-run artifacts, and no job is allowed to fail softly.
+name: Worker-fit experiment (#1048)
+
+on:
+  push:
+    branches: ["feature/1048-ci-worker-fit-experiment"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-fit-experiment-1048
+  cancel-in-progress: false
+
+env:
+  # Closed inline producer/checker (stdlib + the declared coverage package).
+  # Invoked as: python -c "$WORKER_FIT_TOOL" MODE [ARGS].
+  WORKER_FIT_TOOL: |
+    """Closed producer/checker for the #1048 worker-fit experiment (stdlib + coverage only).
+
+    Modes: record-before W | record-after | sanitise | seal | check-evidence |
+    check-env PRIOR OUT | check-pair BASE CAND. Unknown mode or arity exits 2; a
+    failed check prints one line and exits 1; any other exception exits 1.
+    """
+
+    import hashlib
+    import json
+    import os
+    import platform
+    import posixpath
+    import stat
+    import subprocess
+    import sys
+    import time
+    import xml.etree.ElementTree as ET
+    from collections import Counter
+    from collections.abc import Callable, Mapping
+    from pathlib import Path
+
+    import coverage
+
+    ABSENT = "absent"
+    JUNIT_RAW_CAP = 32 * 1024 * 1024
+    SEAL_CAP = 64 * 1024 * 1024
+    SUMS = "SHA256SUMS"
+    SEALED = (
+        ".coverage.ordinary",
+        "environment-after.json",
+        "environment-before.json",
+        "junit.xml",
+        "pip-freeze.txt",
+        "pytest-exit.txt",
+    )
+    GATING = (
+        "source_sha",
+        "source_tree",
+        "image_os",
+        "image_version",
+        "python_version",
+        "machine",
+        "cpu_count",
+        "affinity_count",
+        "cgroup_cpu_max",
+        "cgroup_memory_max",
+        "mem_total_gib",
+        "pip_freeze_sha256",
+    )
+    INT_FIELDS = ("cpu_count", "affinity_count", "mem_total_gib")
+    MAY_BE_ABSENT = ("cgroup_cpu_max", "cgroup_memory_max")
+    RECORD_KEYS = frozenset(
+        (
+            "schema",
+            "workers",
+            "source_sha",
+            "source_tree",
+            "image_os",
+            "image_version",
+            "python_version",
+            "machine",
+            "kernel_release",
+            "cpu_count",
+            "affinity_count",
+            "cpu_model",
+            "cgroup_cpu_max",
+            "cgroup_memory_max",
+            "mem_total_gib",
+            "pip_freeze_sha256",
+            "snapshot",
+        )
+    )
+    SNAPSHOT_KEYS = frozenset(
+        (
+            "wall_time",
+            "loadavg",
+            "mem_available_kib",
+            "cpu_usage_usec",
+            "cpu_nr_throttled",
+            "cpu_throttled_usec",
+            "memory_current",
+            "memory_peak",
+        )
+    )
+    CASE_CHILDREN = frozenset(("failure", "error", "skipped", "system-out", "system-err", "properties"))
+    OUTCOME_TAGS = frozenset(("failure", "error", "skipped"))
+    ROOTS = ("src/roastpilot_agent/", "scripts/", ".agents/skills/capture-agent-usage/scripts/")
+    ARITY = {
+        "record-before": 1,
+        "record-after": 0,
+        "sanitise": 0,
+        "seal": 0,
+        "check-evidence": 0,
+        "check-env": 2,
+        "check-pair": 2,
+    }
+
+
+    class CheckFailed(Exception):
+        """A closed check failed; the message is the one-line reason."""
+
+
+    def _read_text(path):
+        """Read a host file as text; FileNotFoundError means ENOENT."""
+        return Path(path).read_text(encoding="utf-8")
+
+
+    def _run(argv):
+        """Run a fixed argv and return its stdout; a nonzero exit raises."""
+        return subprocess.run(argv, check=True, capture_output=True, text=True).stdout
+
+
+    def _affinity():
+        """Return the number of CPUs this process may run on."""
+        return len(os.sched_getaffinity(0))
+
+
+    class Host:
+        """Injectable host access: environment, file reader, command runner, affinity."""
+
+        def __init__(
+            self,
+            environ: Mapping[str, str] | None = None,
+            read: Callable[[str], str] | None = None,
+            run: Callable[[list[str]], str] | None = None,
+            affinity: Callable[[], int] | None = None,
+        ) -> None:
+            """Bind host access, defaulting each seam to the real host.
+
+            Args:
+                environ: Environment mapping; defaults to ``os.environ``.
+                read: Text file reader raising FileNotFoundError on ENOENT.
+                run: Fixed-argv command runner returning stdout.
+                affinity: Callable returning the usable CPU count.
+            """
+            self.environ = os.environ if environ is None else environ
+            self.read = _read_text if read is None else read
+            self.run = _run if run is None else run
+            self.affinity = _affinity if affinity is None else affinity
+
+        def value(self, path: str) -> str:
+            """Return stripped file content, or ABSENT on ENOENT; other OSErrors propagate.
+
+            Args:
+                path: Absolute host file path.
+
+            Returns:
+                The stripped content, or ``"absent"`` when the file does not exist.
+            """
+            try:
+                return self.read(path).strip()
+            except FileNotFoundError:
+                return ABSENT
+
+        def root(self) -> Path:
+            """Return the per-job evidence root under RUNNER_TEMP.
+
+            Returns:
+                ``$RUNNER_TEMP/worker-fit``.
+            """
+            return Path(self.environ["RUNNER_TEMP"]) / "worker-fit"
+
+
+    def _field(text, key):
+        """Return the first value whose line starts with ``key`` (``key:`` allowed)."""
+        if text == ABSENT:
+            return ABSENT
+        for line in text.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[0].rstrip(":") == key:
+                return fields[1]
+        return ABSENT
+
+
+    def _cpu_model(host):
+        """Return the first /proc/cpuinfo model name (observation only)."""
+        text = host.value("/proc/cpuinfo")
+        if text != ABSENT:
+            for line in text.splitlines():
+                key, sep, rest = line.partition(":")
+                if sep and key.strip() == "model name":
+                    return rest.strip() or ABSENT
+        return ABSENT
+
+
+    def _cgroup_dir(host):
+        """Return this process's cgroup v2 directory, or None when there is none."""
+        text = host.value("/proc/self/cgroup")
+        if text == ABSENT:
+            return None
+        for line in text.splitlines():
+            if line.startswith("0::"):
+                relative = line[3:]
+                if not relative.startswith("/") or ".." in relative.split("/"):
+                    raise CheckFailed("unexpected cgroup path grammar")
+                return "/sys/fs/cgroup" + relative.rstrip("/")
+        return None
+
+
+    def _snapshot(host, cgroup):
+        """Return the whitelisted point-in-time resource observations."""
+
+        def cg(name):
+            return ABSENT if cgroup is None else host.value(cgroup + "/" + name)
+
+        meminfo = host.value("/proc/meminfo")
+        loadavg = host.value("/proc/loadavg")
+        cpu_stat = cg("cpu.stat")
+        return {
+            "wall_time": time.time(),
+            "loadavg": ABSENT if loadavg == ABSENT else loadavg.split()[:3],
+            "mem_available_kib": _field(meminfo, "MemAvailable"),
+            "cpu_usage_usec": _field(cpu_stat, "usage_usec"),
+            "cpu_nr_throttled": _field(cpu_stat, "nr_throttled"),
+            "cpu_throttled_usec": _field(cpu_stat, "throttled_usec"),
+            "memory_current": cg("memory.current"),
+            "memory_peak": cg("memory.peak"),
+        }
+
+
+    def _record(host, workers):
+        """Return (environment record, pip freeze text) from the fixed whitelist."""
+        cgroup = _cgroup_dir(host)
+        mem_total = _field(host.value("/proc/meminfo"), "MemTotal")
+        freeze = host.run([sys.executable, "-m", "pip", "freeze", "--all", "--exclude-editable"])
+        record = {
+            "schema": 1,
+            "workers": workers,
+            "source_sha": host.run(["git", "rev-parse", "HEAD"]).strip(),
+            "source_tree": host.run(["git", "rev-parse", "HEAD^{tree}"]).strip(),
+            "image_os": host.environ.get("ImageOS") or ABSENT,
+            "image_version": host.environ.get("ImageVersion") or ABSENT,
+            "python_version": sys.version,
+            "machine": platform.machine(),
+            "kernel_release": platform.release(),
+            "cpu_count": os.cpu_count(),
+            "affinity_count": host.affinity(),
+            "cpu_model": _cpu_model(host),
+            "cgroup_cpu_max": ABSENT if cgroup is None else host.value(cgroup + "/cpu.max"),
+            "cgroup_memory_max": ABSENT if cgroup is None else host.value(cgroup + "/memory.max"),
+            "mem_total_gib": ABSENT if mem_total == ABSENT else int(mem_total) // 1048576,
+            "pip_freeze_sha256": hashlib.sha256(freeze.encode("utf-8")).hexdigest(),
+            "snapshot": _snapshot(host, cgroup),
+        }
+        return record, freeze
+
+
+    def _write_new(path, text):
+        """Write a file that must not already exist."""
+        with open(path, "x", encoding="utf-8") as handle:
+            handle.write(text)
+
+
+    def _record_before(host, workers):
+        """Create the evidence directory and write the before record and pip freeze."""
+        out = host.root() / "out"
+        out.mkdir(parents=True, exist_ok=False)
+        record, freeze = _record(host, workers)
+        _write_new(out / "environment-before.json", json.dumps(record, indent=2, sort_keys=True))
+        _write_new(out / "pip-freeze.txt", freeze)
+
+
+    def _record_after(host):
+        """Write the after record, reusing the before record's worker count."""
+        out = host.root() / "out"
+        before = json.loads((out / "environment-before.json").read_text(encoding="utf-8"))
+        record, _ = _record(host, before["workers"])
+        _write_new(out / "environment-after.json", json.dumps(record, indent=2, sort_keys=True))
+
+
+    def _sanitise(host):
+        """Strip every hostname attribute from the raw JUnit file into out/junit.xml."""
+        root = host.root()
+        raw = root / "junit-raw.xml"
+        if raw.stat().st_size > JUNIT_RAW_CAP:
+            raise CheckFailed("raw JUnit file exceeds the size cap")
+        tree = ET.parse(raw)
+        for element in tree.iter():
+            element.attrib.pop("hostname", None)
+        if any("hostname" in element.attrib for element in tree.iter()):
+            raise CheckFailed("hostname attribute survived sanitising")
+        target = root / "out" / "junit.xml"
+        if os.path.lexists(target):
+            raise CheckFailed("sanitised JUnit file already exists")
+        tree.write(target, encoding="utf-8", xml_declaration=True)
+
+
+    def _sha256(path):
+        """Return the SHA-256 hex digest of a file."""
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+
+    def _closed_listing(directory, expected):
+        """Require ``directory`` to hold exactly ``expected`` regular files within the cap."""
+        names = set(os.listdir(directory))
+        missing = sorted(set(expected) - names)
+        extra = sorted(names - set(expected))
+        if missing:
+            raise CheckFailed("missing evidence file " + missing[0])
+        if extra:
+            raise CheckFailed("unexpected evidence file " + extra[0])
+        total = 0
+        for name in expected:
+            info = os.lstat(directory / name)
+            if not stat.S_ISREG(info.st_mode):
+                raise CheckFailed("evidence entry is not a regular file " + name)
+            if name in SEALED:
+                total += info.st_size
+        if total > SEAL_CAP:
+            raise CheckFailed("evidence exceeds the total size cap")
+
+
+    def _seal(host):
+        """Write SHA256SUMS over the closed evidence file set."""
+        out = host.root() / "out"
+        _closed_listing(out, SEALED)
+        lines = "".join(f"{_sha256(out / name)}  {name}\n" for name in SEALED)
+        _write_new(out / SUMS, lines)
+
+
+    def _validate(record):
+        """Validate one environment record against the closed schema."""
+        if not isinstance(record, dict) or set(record) != RECORD_KEYS:
+            raise CheckFailed("environment record keys differ from the schema")
+        if type(record["schema"]) is not int or record["schema"] != 1:
+            raise CheckFailed("environment record schema is not 1")
+        if type(record["workers"]) is not int or record["workers"] not in (2, 4):
+            raise CheckFailed("environment record workers is not 2 or 4")
+        snapshot = record["snapshot"]
+        if not isinstance(snapshot, dict) or set(snapshot) != SNAPSHOT_KEYS:
+            raise CheckFailed("environment snapshot keys differ from the schema")
+        for name in GATING:
+            value = record[name]
+            if name in INT_FIELDS:
+                valid = type(value) is int and value > 0
+            else:
+                valid = isinstance(value, str) and value != "" and (
+                    value != ABSENT or name in MAY_BE_ABSENT
+                )
+            if not valid:
+                raise CheckFailed("gating field invalid or absent: " + name)
+
+
+    def _compatible(records, label):
+        """Require every record to carry identical gating fields."""
+        for name in GATING:
+            if len({json.dumps(record[name]) for record in records}) != 1:
+                raise CheckFailed(label + ": gating field differs: " + name)
+
+
+    def _verify(directory):
+        """Verify a sealed evidence directory and return its (before, after) records."""
+        directory = Path(directory)
+        _closed_listing(directory, SEALED + (SUMS,))
+        expected = [line.split("  ", 1) for line in (directory / SUMS).read_text().splitlines()]
+        if [entry[-1] for entry in expected] != list(SEALED) or any(len(e) != 2 for e in expected):
+            raise CheckFailed("SHA256SUMS does not list the closed file set")
+        for digest, name in expected:
+            if _sha256(directory / name) != digest:
+                raise CheckFailed("hash mismatch for " + name)
+        if (directory / "pytest-exit.txt").read_text(encoding="utf-8") != "0\n":
+            raise CheckFailed("pytest exit status is not 0")
+        records = []
+        for name in ("environment-before.json", "environment-after.json"):
+            record = json.loads((directory / name).read_text(encoding="utf-8"))
+            _validate(record)
+            records.append(record)
+        _compatible(records, "before/after")
+        return records
+
+
+    def _cases(path):
+        """Parse the closed JUnit grammar into (identity, outcome, skips) tuples."""
+        root = ET.parse(path).getroot()
+        if root.tag != "testsuites":
+            raise CheckFailed("JUnit root is not testsuites")
+        cases = []
+        for suite in root:
+            if suite.tag != "testsuite":
+                raise CheckFailed("unexpected JUnit element " + suite.tag)
+            for case in suite:
+                if case.tag != "testcase":
+                    raise CheckFailed("unexpected JUnit element " + case.tag)
+                if case.get("classname") is None or case.get("name") is None:
+                    raise CheckFailed("testcase lacks classname or name")
+                identity = (case.get("file"), case.get("classname"), case.get("name"))
+                tags = []
+                skips = []
+                for child in case:
+                    if child.tag not in CASE_CHILDREN:
+                        raise CheckFailed("unknown testcase child " + child.tag)
+                    if child.tag in OUTCOME_TAGS:
+                        tags.append(child.tag)
+                    if child.tag == "skipped":
+                        skips.append((identity, child.get("type"), child.get("message")))
+                cases.append((identity, tuple(sorted(tags)), skips))
+        if not cases:
+            raise CheckFailed("JUnit file has no testcase")
+        return cases
+
+
+    def _outcomes(cases):
+        """Map each identity to the sorted list of its per-case outcomes."""
+        mapping = {}
+        for identity, outcome, _ in cases:
+            mapping.setdefault(identity, []).append(outcome)
+        return {identity: sorted(outcomes) for identity, outcomes in mapping.items()}
+
+
+    def _coverage(path):
+        """Read native coverage data that must exist, carry arcs and stay inside the roots."""
+        if not path.is_file():
+            raise CheckFailed("coverage data file missing")
+        data = coverage.CoverageData(basename=str(path))
+        try:
+            data.read()
+        except Exception as exc:
+            raise CheckFailed("coverage data unreadable: " + type(exc).__name__) from exc
+        if not data.has_arcs():
+            raise CheckFailed("coverage data has no arcs")
+        files = data.measured_files()
+        if not files:
+            raise CheckFailed("coverage data measured no files")
+        for name in files:
+            if name.startswith("/") or posixpath.normpath(name) != name or not name.startswith(ROOTS):
+                raise CheckFailed("measured file outside the coverage roots: " + name)
+        return data
+
+
+    def _check_pair(base_dir, cand_dir):
+        """Compare a 4-worker baseline with its 2-worker candidate."""
+        base_dir, cand_dir = Path(base_dir), Path(cand_dir)
+        if _verify(base_dir)[0]["workers"] != 4 or _verify(cand_dir)[0]["workers"] != 2:
+            raise CheckFailed("pair is not a 4-worker baseline and a 2-worker candidate")
+        base_cases = _cases(base_dir / "junit.xml")
+        cand_cases = _cases(cand_dir / "junit.xml")
+        if Counter(c[0] for c in base_cases) != Counter(c[0] for c in cand_cases):
+            raise CheckFailed("case identity multiset differs")
+        if _outcomes(base_cases) != _outcomes(cand_cases):
+            raise CheckFailed("per-case outcome differs")
+        base_skips = Counter(skip for case in base_cases for skip in case[2])
+        if base_skips != Counter(skip for case in cand_cases for skip in case[2]):
+            raise CheckFailed("skip inventory differs")
+        base = _coverage(base_dir / ".coverage.ordinary")
+        cand = _coverage(cand_dir / ".coverage.ordinary")
+        cand_files = set(cand.measured_files())
+        for name in sorted(base.measured_files()):
+            if name not in cand_files:
+                raise CheckFailed("baseline file missing from candidate coverage: " + name)
+            if not set(base.lines(name) or ()) <= set(cand.lines(name) or ()):
+                raise CheckFailed("baseline line missing from candidate coverage: " + name)
+            if not set(base.arcs(name) or ()) <= set(cand.arcs(name) or ()):
+                raise CheckFailed("baseline arc missing from candidate coverage: " + name)
+
+
+    def main(
+        argv: list[str],
+        environ: Mapping[str, str] | None = None,
+        read: Callable[[str], str] | None = None,
+        run: Callable[[list[str]], str] | None = None,
+        affinity: Callable[[], int] | None = None,
+    ) -> int:
+        """Dispatch one closed mode; return the process exit status.
+
+        Args:
+            argv: Mode and its arguments (``sys.argv[1:]``).
+            environ: Optional injected environment (defaults to ``os.environ``).
+            read: Optional injected host file reader.
+            run: Optional injected fixed-argv command runner.
+            affinity: Optional injected usable-CPU counter.
+
+        Returns:
+            0 on success, 1 on a failed check or error, 2 on a grammar error.
+        """
+        if not argv or argv[0] not in ARITY or len(argv) - 1 != ARITY[argv[0]]:
+            print("usage: worker-fit-tool MODE [ARGS]", file=sys.stderr)
+            return 2
+        mode, args = argv[0], argv[1:]
+        if mode == "record-before" and args[0] not in ("2", "4"):
+            print("usage: record-before 2|4", file=sys.stderr)
+            return 2
+        host = Host(environ=environ, read=read, run=run, affinity=affinity)
+        try:
+            if mode == "record-before":
+                _record_before(host, int(args[0]))
+            elif mode == "record-after":
+                _record_after(host)
+            elif mode == "sanitise":
+                _sanitise(host)
+            elif mode == "seal":
+                _seal(host)
+            elif mode == "check-evidence":
+                _verify(host.root() / "out")
+            elif mode == "check-env":
+                prior = _verify(args[0])
+                _compatible(prior + _verify(args[1]), "environment differs from t1")
+            else:
+                _check_pair(args[0], args[1])
+        except CheckFailed as exc:
+            print("worker-fit check failed: " + str(exc), file=sys.stderr)
+            return 1
+        except Exception as exc:
+            detail = (str(exc).splitlines() or [""])[0][:200]
+            print("worker-fit error: " + type(exc).__name__ + ": " + detail, file=sys.stderr)
+            return 1
+        return 0
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main(sys.argv[1:]))
+
+jobs:
+  t1:
+    name: "Trial t1 (4 workers)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.repository == 'syamaner/roastpilot-agent' && github.event_name == 'push' && github.ref == 'refs/heads/feature/1048-ci-worker-fit-experiment' && github.event.created == true && github.run_attempt == '1'
+    steps:
+      - name: Check out original source payload
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: a9cd3997c5b866db3c60d74f126e16ad191d31ec
+          persist-credentials: false
+
+      - name: Verify source payload
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          test "$head_sha" = "a9cd3997c5b866db3c60d74f126e16ad191d31ec"
+          head_tree="$(git rev-parse 'HEAD^{tree}')"
+          test "$head_tree" = "a850a89e5c124a1ee4cda9dfea3d26f25f017db2"
+          worktree_status="$(git status --porcelain --ignored)"
+          test -z "$worktree_status"
+          test ! -e tests/test_worker_fit_experiment_workflow.py
+          test ! -e .github/workflows/worker-fit-experiment.yml
+
+      # Steps 3-5 are byte-for-byte the ci.yml pytest-ordinary setup.
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system libraries (PortAudio for sounddevice)
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
+      - name: Record environment before tests
+        run: python -c "$WORKER_FIT_TOOL" record-before 4
+
+      # Production argv; only -n differs between arms, plus the identical
+      # --junitxml flag on both arms. The real pytest exit status is the step
+      # result.
+      - name: Run ordinary tests with coverage
+        env:
+          COVERAGE_FILE: .coverage.ordinary
+        run: |
+          set +e
+          python -m pytest -n 4 --dist worksteal -m "not serial and not stress" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report= --junitxml="$RUNNER_TEMP/worker-fit/junit-raw.xml"
+          status=$?
+          printf '%s\n' "$status" > "$RUNNER_TEMP/worker-fit/out/pytest-exit.txt"
+          exit "$status"
+
+      # Runs after a test failure (keeps failed-run evidence) but not after a
+      # cancellation or timeout. Every sub-step runs; any failure fails the step.
+      - name: Finalise evidence
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          status=0
+          python -c "$WORKER_FIT_TOOL" record-after || status=1
+          cp .coverage.ordinary "$RUNNER_TEMP/worker-fit/out/.coverage.ordinary" || status=1
+          python -c "$WORKER_FIT_TOOL" sanitise || status=1
+          python -c "$WORKER_FIT_TOOL" seal || status=1
+          exit "$status"
+
+      - name: Upload evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-fit-t1
+          path: ${{ runner.temp }}/worker-fit/out
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Check sealed evidence
+        run: python -c "$WORKER_FIT_TOOL" check-evidence
+
+  t2:
+    name: "Trial t2 (2 workers)"
+    needs: [t1]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.repository == 'syamaner/roastpilot-agent' && github.event_name == 'push' && github.ref == 'refs/heads/feature/1048-ci-worker-fit-experiment' && github.event.created == true && github.run_attempt == '1'
+    steps:
+      - name: Check out original source payload
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: a9cd3997c5b866db3c60d74f126e16ad191d31ec
+          persist-credentials: false
+
+      - name: Verify source payload
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          test "$head_sha" = "a9cd3997c5b866db3c60d74f126e16ad191d31ec"
+          head_tree="$(git rev-parse 'HEAD^{tree}')"
+          test "$head_tree" = "a850a89e5c124a1ee4cda9dfea3d26f25f017db2"
+          worktree_status="$(git status --porcelain --ignored)"
+          test -z "$worktree_status"
+          test ! -e tests/test_worker_fit_experiment_workflow.py
+          test ! -e .github/workflows/worker-fit-experiment.yml
+
+      # Steps 3-5 are byte-for-byte the ci.yml pytest-ordinary setup.
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system libraries (PortAudio for sounddevice)
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
+      - name: Record environment before tests
+        run: python -c "$WORKER_FIT_TOOL" record-before 2
+
+      # Production argv; only -n differs between arms, plus the identical
+      # --junitxml flag on both arms. The real pytest exit status is the step
+      # result.
+      - name: Run ordinary tests with coverage
+        env:
+          COVERAGE_FILE: .coverage.ordinary
+        run: |
+          set +e
+          python -m pytest -n 2 --dist worksteal -m "not serial and not stress" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report= --junitxml="$RUNNER_TEMP/worker-fit/junit-raw.xml"
+          status=$?
+          printf '%s\n' "$status" > "$RUNNER_TEMP/worker-fit/out/pytest-exit.txt"
+          exit "$status"
+
+      # Runs after a test failure (keeps failed-run evidence) but not after a
+      # cancellation or timeout. Every sub-step runs; any failure fails the step.
+      - name: Finalise evidence
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          status=0
+          python -c "$WORKER_FIT_TOOL" record-after || status=1
+          cp .coverage.ordinary "$RUNNER_TEMP/worker-fit/out/.coverage.ordinary" || status=1
+          python -c "$WORKER_FIT_TOOL" sanitise || status=1
+          python -c "$WORKER_FIT_TOOL" seal || status=1
+          exit "$status"
+
+      - name: Upload evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-fit-t2
+          path: ${{ runner.temp }}/worker-fit/out
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Check sealed evidence
+        run: python -c "$WORKER_FIT_TOOL" check-evidence
+
+      - name: Download t1 evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-fit-t1
+          path: ${{ runner.temp }}/worker-fit/prior/t1
+
+      - name: Check environment against t1
+        run: python -c "$WORKER_FIT_TOOL" check-env "$RUNNER_TEMP/worker-fit/prior/t1" "$RUNNER_TEMP/worker-fit/out"
+
+      - name: Download pair partner evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-fit-t1
+          path: ${{ runner.temp }}/worker-fit/prior/pair
+
+      - name: Check pair
+        run: python -c "$WORKER_FIT_TOOL" check-pair "$RUNNER_TEMP/worker-fit/prior/pair" "$RUNNER_TEMP/worker-fit/out"
+
+  t3:
+    name: "Trial t3 (2 workers)"
+    needs: [t2]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.repository == 'syamaner/roastpilot-agent' && github.event_name == 'push' && github.ref == 'refs/heads/feature/1048-ci-worker-fit-experiment' && github.event.created == true && github.run_attempt == '1'
+    steps:
+      - name: Check out original source payload
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: a9cd3997c5b866db3c60d74f126e16ad191d31ec
+          persist-credentials: false
+
+      - name: Verify source payload
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          test "$head_sha" = "a9cd3997c5b866db3c60d74f126e16ad191d31ec"
+          head_tree="$(git rev-parse 'HEAD^{tree}')"
+          test "$head_tree" = "a850a89e5c124a1ee4cda9dfea3d26f25f017db2"
+          worktree_status="$(git status --porcelain --ignored)"
+          test -z "$worktree_status"
+          test ! -e tests/test_worker_fit_experiment_workflow.py
+          test ! -e .github/workflows/worker-fit-experiment.yml
+
+      # Steps 3-5 are byte-for-byte the ci.yml pytest-ordinary setup.
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system libraries (PortAudio for sounddevice)
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
+      - name: Record environment before tests
+        run: python -c "$WORKER_FIT_TOOL" record-before 2
+
+      # Production argv; only -n differs between arms, plus the identical
+      # --junitxml flag on both arms. The real pytest exit status is the step
+      # result.
+      - name: Run ordinary tests with coverage
+        env:
+          COVERAGE_FILE: .coverage.ordinary
+        run: |
+          set +e
+          python -m pytest -n 2 --dist worksteal -m "not serial and not stress" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report= --junitxml="$RUNNER_TEMP/worker-fit/junit-raw.xml"
+          status=$?
+          printf '%s\n' "$status" > "$RUNNER_TEMP/worker-fit/out/pytest-exit.txt"
+          exit "$status"
+
+      # Runs after a test failure (keeps failed-run evidence) but not after a
+      # cancellation or timeout. Every sub-step runs; any failure fails the step.
+      - name: Finalise evidence
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          status=0
+          python -c "$WORKER_FIT_TOOL" record-after || status=1
+          cp .coverage.ordinary "$RUNNER_TEMP/worker-fit/out/.coverage.ordinary" || status=1
+          python -c "$WORKER_FIT_TOOL" sanitise || status=1
+          python -c "$WORKER_FIT_TOOL" seal || status=1
+          exit "$status"
+
+      - name: Upload evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-fit-t3
+          path: ${{ runner.temp }}/worker-fit/out
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Check sealed evidence
+        run: python -c "$WORKER_FIT_TOOL" check-evidence
+
+      - name: Download t1 evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-fit-t1
+          path: ${{ runner.temp }}/worker-fit/prior/t1
+
+      - name: Check environment against t1
+        run: python -c "$WORKER_FIT_TOOL" check-env "$RUNNER_TEMP/worker-fit/prior/t1" "$RUNNER_TEMP/worker-fit/out"
+
+  t4:
+    name: "Trial t4 (4 workers)"
+    needs: [t3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.repository == 'syamaner/roastpilot-agent' && github.event_name == 'push' && github.ref == 'refs/heads/feature/1048-ci-worker-fit-experiment' && github.event.created == true && github.run_attempt == '1'
+    steps:
+      - name: Check out original source payload
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: a9cd3997c5b866db3c60d74f126e16ad191d31ec
+          persist-credentials: false
+
+      - name: Verify source payload
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          test "$head_sha" = "a9cd3997c5b866db3c60d74f126e16ad191d31ec"
+          head_tree="$(git rev-parse 'HEAD^{tree}')"
+          test "$head_tree" = "a850a89e5c124a1ee4cda9dfea3d26f25f017db2"
+          worktree_status="$(git status --porcelain --ignored)"
+          test -z "$worktree_status"
+          test ! -e tests/test_worker_fit_experiment_workflow.py
+          test ! -e .github/workflows/worker-fit-experiment.yml
+
+      # Steps 3-5 are byte-for-byte the ci.yml pytest-ordinary setup.
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system libraries (PortAudio for sounddevice)
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
+      - name: Record environment before tests
+        run: python -c "$WORKER_FIT_TOOL" record-before 4
+
+      # Production argv; only -n differs between arms, plus the identical
+      # --junitxml flag on both arms. The real pytest exit status is the step
+      # result.
+      - name: Run ordinary tests with coverage
+        env:
+          COVERAGE_FILE: .coverage.ordinary
+        run: |
+          set +e
+          python -m pytest -n 4 --dist worksteal -m "not serial and not stress" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report= --junitxml="$RUNNER_TEMP/worker-fit/junit-raw.xml"
+          status=$?
+          printf '%s\n' "$status" > "$RUNNER_TEMP/worker-fit/out/pytest-exit.txt"
+          exit "$status"
+
+      # Runs after a test failure (keeps failed-run evidence) but not after a
+      # cancellation or timeout. Every sub-step runs; any failure fails the step.
+      - name: Finalise evidence
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          status=0
+          python -c "$WORKER_FIT_TOOL" record-after || status=1
+          cp .coverage.ordinary "$RUNNER_TEMP/worker-fit/out/.coverage.ordinary" || status=1
+          python -c "$WORKER_FIT_TOOL" sanitise || status=1
+          python -c "$WORKER_FIT_TOOL" seal || status=1
+          exit "$status"
+
+      - name: Upload evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-fit-t4
+          path: ${{ runner.temp }}/worker-fit/out
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Check sealed evidence
+        run: python -c "$WORKER_FIT_TOOL" check-evidence
+
+      - name: Download t1 evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-fit-t1
+          path: ${{ runner.temp }}/worker-fit/prior/t1
+
+      - name: Check environment against t1
+        run: python -c "$WORKER_FIT_TOOL" check-env "$RUNNER_TEMP/worker-fit/prior/t1" "$RUNNER_TEMP/worker-fit/out"
+
+      - name: Download pair partner evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-fit-t3
+          path: ${{ runner.temp }}/worker-fit/prior/pair
+
+      - name: Check pair
+        run: python -c "$WORKER_FIT_TOOL" check-pair "$RUNNER_TEMP/worker-fit/out" "$RUNNER_TEMP/worker-fit/prior/pair"
+
+  t5:
+    name: "Trial t5 (4 workers)"
+    needs: [t4]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.repository == 'syamaner/roastpilot-agent' && github.event_name == 'push' && github.ref == 'refs/heads/feature/1048-ci-worker-fit-experiment' && github.event.created == true && github.run_attempt == '1'
+    steps:
+      - name: Check out original source payload
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: a9cd3997c5b866db3c60d74f126e16ad191d31ec
+          persist-credentials: false
+
+      - name: Verify source payload
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          test "$head_sha" = "a9cd3997c5b866db3c60d74f126e16ad191d31ec"
+          head_tree="$(git rev-parse 'HEAD^{tree}')"
+          test "$head_tree" = "a850a89e5c124a1ee4cda9dfea3d26f25f017db2"
+          worktree_status="$(git status --porcelain --ignored)"
+          test -z "$worktree_status"
+          test ! -e tests/test_worker_fit_experiment_workflow.py
+          test ! -e .github/workflows/worker-fit-experiment.yml
+
+      # Steps 3-5 are byte-for-byte the ci.yml pytest-ordinary setup.
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system libraries (PortAudio for sounddevice)
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
+      - name: Record environment before tests
+        run: python -c "$WORKER_FIT_TOOL" record-before 4
+
+      # Production argv; only -n differs between arms, plus the identical
+      # --junitxml flag on both arms. The real pytest exit status is the step
+      # result.
+      - name: Run ordinary tests with coverage
+        env:
+          COVERAGE_FILE: .coverage.ordinary
+        run: |
+          set +e
+          python -m pytest -n 4 --dist worksteal -m "not serial and not stress" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report= --junitxml="$RUNNER_TEMP/worker-fit/junit-raw.xml"
+          status=$?
+          printf '%s\n' "$status" > "$RUNNER_TEMP/worker-fit/out/pytest-exit.txt"
+          exit "$status"
+
+      # Runs after a test failure (keeps failed-run evidence) but not after a
+      # cancellation or timeout. Every sub-step runs; any failure fails the step.
+      - name: Finalise evidence
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          status=0
+          python -c "$WORKER_FIT_TOOL" record-after || status=1
+          cp .coverage.ordinary "$RUNNER_TEMP/worker-fit/out/.coverage.ordinary" || status=1
+          python -c "$WORKER_FIT_TOOL" sanitise || status=1
+          python -c "$WORKER_FIT_TOOL" seal || status=1
+          exit "$status"
+
+      - name: Upload evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-fit-t5
+          path: ${{ runner.temp }}/worker-fit/out
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Check sealed evidence
+        run: python -c "$WORKER_FIT_TOOL" check-evidence
+
+      - name: Download t1 evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-fit-t1
+          path: ${{ runner.temp }}/worker-fit/prior/t1
+
+      - name: Check environment against t1
+        run: python -c "$WORKER_FIT_TOOL" check-env "$RUNNER_TEMP/worker-fit/prior/t1" "$RUNNER_TEMP/worker-fit/out"
+
+  t6:
+    name: "Trial t6 (2 workers)"
+    needs: [t5]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.repository == 'syamaner/roastpilot-agent' && github.event_name == 'push' && github.ref == 'refs/heads/feature/1048-ci-worker-fit-experiment' && github.event.created == true && github.run_attempt == '1'
+    steps:
+      - name: Check out original source payload
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: a9cd3997c5b866db3c60d74f126e16ad191d31ec
+          persist-credentials: false
+
+      - name: Verify source payload
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          test "$head_sha" = "a9cd3997c5b866db3c60d74f126e16ad191d31ec"
+          head_tree="$(git rev-parse 'HEAD^{tree}')"
+          test "$head_tree" = "a850a89e5c124a1ee4cda9dfea3d26f25f017db2"
+          worktree_status="$(git status --porcelain --ignored)"
+          test -z "$worktree_status"
+          test ! -e tests/test_worker_fit_experiment_workflow.py
+          test ! -e .github/workflows/worker-fit-experiment.yml
+
+      # Steps 3-5 are byte-for-byte the ci.yml pytest-ordinary setup.
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system libraries (PortAudio for sounddevice)
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
+      - name: Record environment before tests
+        run: python -c "$WORKER_FIT_TOOL" record-before 2
+
+      # Production argv; only -n differs between arms, plus the identical
+      # --junitxml flag on both arms. The real pytest exit status is the step
+      # result.
+      - name: Run ordinary tests with coverage
+        env:
+          COVERAGE_FILE: .coverage.ordinary
+        run: |
+          set +e
+          python -m pytest -n 2 --dist worksteal -m "not serial and not stress" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report= --junitxml="$RUNNER_TEMP/worker-fit/junit-raw.xml"
+          status=$?
+          printf '%s\n' "$status" > "$RUNNER_TEMP/worker-fit/out/pytest-exit.txt"
+          exit "$status"
+
+      # Runs after a test failure (keeps failed-run evidence) but not after a
+      # cancellation or timeout. Every sub-step runs; any failure fails the step.
+      - name: Finalise evidence
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          status=0
+          python -c "$WORKER_FIT_TOOL" record-after || status=1
+          cp .coverage.ordinary "$RUNNER_TEMP/worker-fit/out/.coverage.ordinary" || status=1
+          python -c "$WORKER_FIT_TOOL" sanitise || status=1
+          python -c "$WORKER_FIT_TOOL" seal || status=1
+          exit "$status"
+
+      - name: Upload evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-fit-t6
+          path: ${{ runner.temp }}/worker-fit/out
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Check sealed evidence
+        run: python -c "$WORKER_FIT_TOOL" check-evidence
+
+      - name: Download t1 evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-fit-t1
+          path: ${{ runner.temp }}/worker-fit/prior/t1
+
+      - name: Check environment against t1
+        run: python -c "$WORKER_FIT_TOOL" check-env "$RUNNER_TEMP/worker-fit/prior/t1" "$RUNNER_TEMP/worker-fit/out"
+
+      - name: Download pair partner evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-fit-t5
+          path: ${{ runner.temp }}/worker-fit/prior/pair
+
+      - name: Check pair
+        run: python -c "$WORKER_FIT_TOOL" check-pair "$RUNNER_TEMP/worker-fit/prior/pair" "$RUNNER_TEMP/worker-fit/out"
