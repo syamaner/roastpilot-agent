@@ -2,19 +2,29 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
-from scripts import ci_timing_report as timing
-
 ROOT = Path(__file__).resolve().parents[1]
+
+if TYPE_CHECKING:
+    from scripts import ci_timing_report as timing
+else:
+    _spec = importlib.util.spec_from_file_location(
+        "_ci_timing_report_under_test", ROOT / "scripts/ci_timing_report.py"
+    )
+    assert _spec is not None and _spec.loader is not None
+    timing = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(timing)
 
 
 def report(
@@ -41,6 +51,7 @@ def recorder(tmp_path: Path) -> timing.TimingRecorder:
     """Create isolated controller state with deterministic phase offsets."""
     value = timing.TimingRecorder(tmp_path, Path("out/report.json"))
     value.wall_start = 10.0
+    value.pytest_testnodeready(SimpleNamespace(gateway=SimpleNamespace(id="gw0")))
     return value
 
 
@@ -166,6 +177,14 @@ def test_native_failed_run(tmp_path: Path) -> None:
     assert by_name["test_teardown"]["teardown"]["outcome"] == "failed"
     assert by_name["test_xfail"]["call"]["outcome"] == "skipped"
     assert by_name["test_call_skip"]["call"]["outcome"] == "skipped"
+    captured = result.stdout + result.stderr
+    for sentinel in (
+        "PRIVATE_STDOUT_SENTINEL",
+        "PRIVATE_STDERR_SENTINEL",
+        "PRIVATE_ENV_SENTINEL",
+        "PRIVATE_EXCEPTION_SENTINEL",
+    ):
+        assert sentinel in captured
     raw = path.read_text()
     for forbidden in ("PRIVATE_", str(tmp_path), os.uname().nodename):
         assert forbidden not in raw
@@ -231,6 +250,7 @@ def test_preconditions(tmp_path: Path, extra: list[str]) -> None:
     """T4: collection and inactive distribution fail before running tests."""
     result = child(tmp_path, [*PLUGIN, "--ci-timing-report=out/report.json", *extra])
     assert result.returncode == 4
+    assert "ci-timing requires an active xdist test run" in result.stderr
     assert not (tmp_path / "out").exists()
 
 
@@ -244,6 +264,8 @@ def test_paths(tmp_path: Path, path: str) -> None:
     path = str(tmp_path / "absolute.json") if path == "absolute" else path
     result = child(tmp_path, ["-n", "2", *PLUGIN, f"--ci-timing-report={path}"])
     assert result.returncode == 4
+    assert "invalid or existing ci-timing path" in result.stderr
+    assert not (tmp_path.parent / "out.json").exists()
     assert existing.read_text() == "preserve"
     assert not (tmp_path / "absolute.json").exists()
 
@@ -296,7 +318,7 @@ def test_caps_and_inventory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert len(data["cases"]) == 1
     assert data["counters"]["case_limit"] == 2
     assert data["counters"]["oversize_nodeid"] == 3
-    assert data["workers_up"] == ["gw9999"]
+    assert data["workers_up"] == ["gw0", "gw9999"]
     assert data["counters"]["missing_worker"] == 1
     assert data["counters"]["worker_down_with_error"] == 1
     monkeypatch.setattr(timing, "MAX_REPORT_BYTES", 1)
@@ -358,12 +380,13 @@ def test_write_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     value = timing.TimingRecorder(tmp_path, Path("parent_file/child.json"))
     (tmp_path / "parent_file").write_text("file")
     value.pytest_sessionfinish(session)
-    assert value.status == "not written (exists)"
+    assert value.status == "not written (os_error)"
 
     def encode_error(*args: object, **kwargs: object) -> str:
         raise ValueError("private")
 
-    monkeypatch.setattr(timing.json, "dumps", encode_error)
+    monkeypatch.setattr(timing, "json", SimpleNamespace(dumps=encode_error))
+    assert timing.json is not json
     value.pytest_sessionfinish(session)
     assert value.status == "not written (encode_error)"
     assert session.exitstatus == 1
@@ -372,8 +395,8 @@ def test_write_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 def test_strict_projection_and_clocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """T12: native invalid numbers and aggregate overflow stay strict JSON."""
     value = recorder(tmp_path)
-    monkeypatch.setattr(timing.time, "time", lambda: 10.0)
-    monkeypatch.setattr(timing.time, "monotonic", lambda: 20.0)
+    monkeypatch.setattr(timing, "time", SimpleNamespace(time=lambda: 10.0, monotonic=lambda: 20.0))
+    assert timing.time is not time
     value.pytest_sessionstart()
     for name, duration in (("a", 1e308), ("b", 1e308), ("c", float("inf"))):
         value.pytest_runtest_logreport(report(name, duration=duration))
@@ -498,10 +521,11 @@ def test_explicit_os_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     def fail_open(*args: object, **kwargs: object) -> None:
         raise OSError("private error")
 
-    monkeypatch.setattr(Path, "open", fail_open)
     value = recorder(tmp_path)
     session = cast(pytest.Session, SimpleNamespace(exitstatus=2))
-    value.pytest_sessionfinish(session)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Path, "open", fail_open)
+        value.pytest_sessionfinish(session)
     assert value.status == "not written (os_error)"
     assert session.exitstatus == 2
 
@@ -529,3 +553,63 @@ def test_identity_byte_caps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     other.pytest_runtest_logreport(report("xyz"))
     assert other.expected == {"abc"} and set(other.cases) == {"xyz"}
     assert other.counters["case_limit"] == 0
+
+
+def test_current_private_module_identity() -> None:
+    """Unit coverage executes the current source even when the CI plugin is preloaded."""
+    assert timing.__name__ == "_ci_timing_report_under_test"
+    assert Path(timing.__file__).resolve() == ROOT / "scripts/ci_timing_report.py"
+    loaded = sys.modules.get("scripts.ci_timing_report")
+    assert loaded is not timing
+
+
+@pytest.mark.parametrize("ready,worker", [(False, "gw0"), (True, "gw1")])
+def test_ready_inventory_required(tmp_path: Path, ready: bool, worker: str) -> None:
+    """Grammar-valid attribution must have corresponding native ready evidence."""
+    value = recorder(tmp_path)
+    if not ready:
+        value.workers_up.clear()
+    value.pytest_xdist_node_collection_finished(["a"])
+    for phase in ("setup", "call", "teardown"):
+        value.pytest_runtest_logreport(report("a", phase, worker_id=worker))
+    data = finish(value)
+    assert not data["complete"]
+    assert data["counters"]["missing_worker"] == 1
+    assert "missing_worker" in data["incomplete_reasons"]
+
+
+def test_unencodable_identity(tmp_path: Path) -> None:
+    """A lone surrogate is rejected before either inventory retains or encodes it."""
+    value = recorder(tmp_path)
+    bad = "bad\ud800"
+    value.pytest_xdist_node_collection_finished([bad])
+    value.pytest_runtest_logreport(report(bad))
+    data = finish(value, 1)
+    assert value.expected == set() and value.cases == {}
+    assert data["counters"]["oversize_nodeid"] == 2
+    assert not data["complete"] and data["exit_status"] == 1
+    assert data["missing_case_sample"] == []
+
+
+@pytest.mark.slow
+def test_native_unencodable_reports_preserve_outcome(tmp_path: Path) -> None:
+    """Native controller injection exercises both malformed-ID paths without escaping."""
+    conftest = """import pytest
+@pytest.hookimpl(trylast=True)
+def pytest_sessionstart(session):
+    if not hasattr(session.config, "workerinput"):
+        recorder = session.config.pluginmanager.get_plugin("ci-timing-recorder")
+        recorder.pytest_xdist_node_collection_finished(["bad\\ud800"])
+        report = pytest.TestReport(nodeid="bad\\ud800", location=("test.py", 0, "test"),
+            keywords={}, outcome="passed", longrepr=None, when="call", duration=0.1,
+            start=1.0, stop=1.1, worker_id="gw0")
+        recorder.pytest_runtest_logreport(report=report)
+"""
+    result = child(tmp_path, ACTIVE, "def test_fail(): assert False\n", conftest)
+    assert result.returncode == 1, result.stdout + result.stderr
+    data = json.loads((tmp_path / "out/report.json").read_text())
+    assert data["exit_status"] == 1 and not data["complete"]
+    assert data["counters"]["oversize_nodeid"] == 2
+    assert all("bad" not in case["nodeid"] for case in data["cases"])
+    assert data["missing_case_sample"] == []
+    assert "INTERNALERROR" not in result.stdout + result.stderr

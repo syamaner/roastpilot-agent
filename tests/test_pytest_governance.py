@@ -1371,4 +1371,5 @@ def test_timing_nested_real_collection_isolation(tmp_path: Path) -> None:
         check=False,
     )
     assert control.returncode == 4
+    assert "ci-timing requires an active xdist test run" in control.stderr
     assert not (tmp_path / "ci-timing").exists()

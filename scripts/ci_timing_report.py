@@ -141,6 +141,11 @@ class TimingRecorder:
 
     def _nodeid(self, value: object) -> str | None:
         if isinstance(value, str) and 0 < len(value) <= MAX_NODEID_CHARS:
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                self.counters["oversize_nodeid"] += 1
+                return None
             return value
         self.counters["oversize_nodeid"] += 1
         return None
@@ -285,6 +290,11 @@ class TimingRecorder:
         missing = (self.expected or set()) - self.cases.keys()
         self.counters["missing_cases"] = len(missing)
         self.counters["unexpected_cases"] = len(self.cases.keys() - (self.expected or set()))
+        if not self.workers_up or any(
+            case["worker"] is not None and case["worker"] not in self.workers_up
+            for case in self.cases.values()
+        ):
+            self.counters["missing_worker"] += 1
         reasons = [key for key, count in self.counters.items() if count]
         if self.expected is None:
             reasons.append("collection_unavailable")
@@ -318,15 +328,18 @@ class TimingRecorder:
             if not target.resolve().is_relative_to(self.root):
                 raise OSError("outside root")
             target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("x", encoding="utf-8") as stream:
+            try:
+                stream = target.open("x", encoding="utf-8")
+            except FileExistsError:
+                self.status = "not written (exists)"
+                return
+            with stream:
                 stream.write(encoded)
             reasons = ",".join(cast(list[str], payload["incomplete_reasons"]))
             self.status = (
                 f"{self.path.as_posix()} cases={len(self.cases)} "
                 f"complete={str(payload['complete']).lower()} reasons={reasons or 'none'}"
             )
-        except FileExistsError:
-            self.status = "not written (exists)"
         except OSError:
             self.status = "not written (os_error)"
         except ValueError:
