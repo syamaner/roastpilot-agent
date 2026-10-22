@@ -7377,6 +7377,68 @@ def _child_diagnostic(result: subprocess.CompletedProcess[str]) -> str:
     )
 
 
+_WITNESS_FAILURE_EVIDENCE_DIR = "witness-failure-evidence"
+_WITNESS_FAILURE_STREAM_LIMIT = 16 * 1024 * 1024
+_WITNESS_FAILURE_SCHEMA = "roastpilot-witness-child-failure/1"
+
+
+def _write_failed_child_evidence(
+    directory: Path, index: int, result: subprocess.CompletedProcess[str]
+) -> None:
+    """Retain bounded decoded child streams privately; metadata attests completion."""
+    try:
+        streams: dict[str, dict[str, object]] = {}
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        for name, stream in (("stdout", result.stdout), ("stderr", result.stderr)):
+            encoded = stream.encode("utf-8")
+            retained = len(encoded) <= _WITNESS_FAILURE_STREAM_LIMIT
+            streams[name] = {
+                "retained": retained,
+                "bytes": len(encoded),
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "reason": "ok" if retained else "overflow",
+            }
+            if retained:
+                descriptor = os.open(directory / f"child-{index:02d}.{name}", flags, 0o600)
+                with os.fdopen(descriptor, "wb") as output:
+                    output.write(encoded)
+        metadata = {
+            "schema": _WITNESS_FAILURE_SCHEMA,
+            "sequence": index,
+            "exit": result.returncode,
+            "representation": "utf8-of-decoded-universal-newline-text",
+            "complete": all(stream["retained"] for stream in streams.values()),
+            "streams": streams,
+        }
+        encoded_metadata = json.dumps(metadata, sort_keys=True, allow_nan=False).encode("utf-8")
+        descriptor = os.open(directory / f"child-{index:02d}.json", flags, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(encoded_metadata)
+    except (OSError, ValueError):
+        return
+
+
+def _retain_failed_child_streams(run: _WitnessRunner, evidence: Path) -> _WitnessRunner:
+    """Adapt one caller's runner without changing its calls, results or failures."""
+    sequence = itertools.count()
+    created = False
+
+    def retained(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        nonlocal created
+        index = next(sequence)
+        result = run(argv)
+        if result.returncode != 0 and not created:
+            created = True
+            try:
+                evidence.mkdir(mode=0o700)
+                _write_failed_child_evidence(evidence, index, result)
+            except (OSError, ValueError):
+                pass
+        return result
+
+    return retained
+
+
 def _final_line(result: subprocess.CompletedProcess[str]) -> str:
     """Return the last non-blank stdout line, failing closed when there is none."""
     lines = [line for line in result.stdout.splitlines() if line.strip() != ""]
@@ -7652,7 +7714,12 @@ def test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper(tmp_path: Pat
     environment = _poisoned_gate_environment()
     repository = Path(__file__).parents[1]
     _run_partitioned_witness(
-        lambda argv: _run_gate_command(f"{wrapper} {shlex.join(argv)}", environment, cwd=repository)
+        _retain_failed_child_streams(
+            lambda argv: _run_gate_command(
+                f"{wrapper} {shlex.join(argv)}", environment, cwd=repository
+            ),
+            tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR,
+        )
     )
 
 
@@ -18443,3 +18510,275 @@ def test_no_fable_case_sensitive_literal_anywhere() -> None:
         text = path.read_text()
         assert "Fable" not in text
         assert "claude-fable-5" not in text
+
+
+@pytest.mark.slow
+def test_nested_witness_failure_evidence_native_shell(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """N1: full private streams supplement the unchanged bounded exception tail."""
+    calls: list[tuple[str, ...]] = []
+    results: list[subprocess.CompletedProcess[str]] = []
+
+    def run(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        result = _run_gate_command(
+            'for i in {1..120}; do case "$i" in 1) s=EARLY;; 60) s=MIDDLE;; '
+            '120) s=LATE;; *) s=line;; esac; echo "$i:$s:out"; '
+            'echo "$i:$s:err" >&2; done; exit 1',
+            {},
+            cwd=tmp_path,
+        )
+        results.append(result)
+        return result
+
+    evidence = tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR
+    with pytest.raises(_WitnessContractError, match="collection exited nonzero") as actual:
+        _run_partitioned_witness(_retain_failed_child_streams(run, evidence))
+    result = results[0]
+    assert result.returncode == 1
+    with pytest.raises(_WitnessContractError) as original:
+        _parse_collection(result)
+    assert str(actual.value) == str(original.value)
+    assert calls == [_NW_EXPECTED_CALLS[0]]
+    assert all(value not in str(actual.value) for value in ("EARLY", "MIDDLE", str(tmp_path)))
+    metadata = json.loads((evidence / "child-00.json").read_text())
+    assert set(metadata) == {"schema", "sequence", "exit", "representation", "complete", "streams"}
+    assert metadata["schema"] == _WITNESS_FAILURE_SCHEMA
+    assert metadata["sequence"] == 0 and metadata["exit"] == 1 and metadata["complete"]
+    assert metadata["representation"] == "utf8-of-decoded-universal-newline-text"
+    for name, text in (("stdout", result.stdout), ("stderr", result.stderr)):
+        data = text.encode("utf-8")
+        assert (evidence / f"child-00.{name}").read_bytes() == data
+        assert all(value in data for value in (b"EARLY", b"MIDDLE", b"LATE"))
+        assert metadata["streams"][name] == {
+            "retained": True,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "reason": "ok",
+        }
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.slow
+def test_nested_witness_failure_evidence_native_pytest(tmp_path: Path) -> None:
+    """N2: a real pytest failure retains output preceding the exception's tail."""
+    run = _nw_real_child_runner(
+        tmp_path,
+        "def test_fail():\n    for i in range(120):\n"
+        '        print(f"{i}:" + {0: "EARLY", 59: "MIDDLE", 119: "LATE"}.get(i, "line"))\n'
+        "    assert False\n",
+    )
+    result = _retain_failed_child_streams(run, tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR)(("tests",))
+    assert result.returncode == 1
+    with pytest.raises(_WitnessContractError, match="execution exited nonzero"):
+        _require_payload_outcome(result, 1)
+    data = (tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR / "child-00.stdout").read_bytes()
+    assert all(value in data for value in (b"EARLY", b"MIDDLE", b"LATE"))
+
+
+@pytest.mark.slow
+def test_nested_witness_failure_evidence_success(tmp_path: Path) -> None:
+    """N3: passing native results retain object identity and create nothing."""
+    result = _run_gate_command("printf passed", {}, cwd=tmp_path)
+    assert result.returncode == 0
+    evidence = tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR
+    assert _retain_failed_child_streams(lambda _: result, evidence)(()) is result
+    assert not evidence.exists()
+
+
+@pytest.mark.parametrize("index", range(10))
+def test_nested_witness_failure_evidence_order(tmp_path: Path, index: int) -> None:
+    """N4: every failure position preserves exact calls, identity and parser message."""
+    outputs = _nw_default_outputs()
+    outputs[_NW_EXPECTED_CALLS[index]] = _nw_completed("failure", 1)
+    run, calls = _nw_fake_runner(outputs)
+    wrapped = _retain_failed_child_streams(run, tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR)
+
+    def checked(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        result = wrapped(argv)
+        assert result is outputs[argv]
+        return result
+
+    with pytest.raises(_WitnessContractError) as actual:
+        _run_partitioned_witness(checked)
+    plain, _ = _nw_fake_runner(outputs)
+    with pytest.raises(_WitnessContractError) as original:
+        _run_partitioned_witness(plain)
+    assert str(actual.value) == str(original.value)
+    assert calls == list(_NW_EXPECTED_CALLS[: index + 1])
+    assert {path.name for path in (tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR).iterdir()} == {
+        f"child-{index:02d}.{suffix}" for suffix in ("stdout", "stderr", "json")
+    }
+
+
+@pytest.mark.parametrize("trailer", ["malformed", "1 failed, 2 passed in 0.01s"])
+def test_nested_witness_failure_evidence_zero_exit_rejected(tmp_path: Path, trailer: str) -> None:
+    """N5: malformed and masked-success proofs fail without retaining success output."""
+    outputs = _nw_default_outputs()
+    outputs[_NW_EXPECTED_CALLS[7]] = _nw_completed(_nw_execution(trailer))
+    run, _ = _nw_fake_runner(outputs)
+    evidence = tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR
+    with pytest.raises(_WitnessContractError) as actual:
+        _run_partitioned_witness(_retain_failed_child_streams(run, evidence))
+    plain, _ = _nw_fake_runner(outputs)
+    with pytest.raises(_WitnessContractError) as original:
+        _run_partitioned_witness(plain)
+    assert str(actual.value) == str(original.value)
+    assert not evidence.exists()
+
+
+@pytest.mark.parametrize(
+    "text,limit,retained", [("abc", 3, True), ("abcd", 3, False), ("é", 2, True), ("é", 1, False)]
+)
+def test_nested_witness_failure_evidence_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str, limit: int, retained: bool
+) -> None:
+    """N6/N7: whole UTF-8 streams fit exactly or are honestly marked overflow."""
+    monkeypatch.setitem(globals(), "_WITNESS_FAILURE_STREAM_LIMIT", limit)
+    result = subprocess.CompletedProcess((), 1, text, "")
+    _write_failed_child_evidence(tmp_path, 0, result)
+    metadata = json.loads((tmp_path / "child-00.json").read_text())
+    assert metadata["complete"] is retained
+    assert metadata["streams"]["stdout"] == {
+        "retained": retained,
+        "bytes": len(text.encode("utf-8")),
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "reason": "ok" if retained else "overflow",
+    }
+    assert (tmp_path / "child-00.stdout").exists() is retained
+    if retained:
+        assert (tmp_path / "child-00.stdout").read_bytes() == text.encode("utf-8")
+
+
+def test_nested_witness_failure_evidence_modes(tmp_path: Path) -> None:
+    """N8: the directory and every retained file exclude group and other access."""
+    evidence = tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR
+    _retain_failed_child_streams(lambda _: _nw_completed("failure", 1), evidence)(())
+    assert stat.S_IMODE(evidence.stat().st_mode) == 0o700
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in evidence.iterdir())
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+def test_nested_witness_failure_evidence_existing_path(
+    tmp_path: Path, symlink: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """N9: a pre-existing directory or symlink preserves all original bytes."""
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "preserve").write_text("unchanged")
+    evidence = tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR
+    if symlink:
+        evidence.symlink_to(target, target_is_directory=True)
+    else:
+        evidence.mkdir()
+        (evidence / "preserve").write_text("unchanged")
+    result = _nw_completed("failure", 1)
+    assert _retain_failed_child_streams(lambda _: result, evidence)(()) is result
+    assert {p.name for p in target.iterdir()} == {"preserve"}
+    assert {p.name for p in evidence.iterdir()} == {"preserve"}
+    assert (evidence / "preserve").read_text() == "unchanged"
+    assert evidence.is_symlink() is symlink
+    with pytest.raises(_WitnessContractError) as actual:
+        _parse_collection(result)
+    assert str(actual.value) == "collection exited nonzero\n" + _child_diagnostic(result)
+    assert capsys.readouterr() == ("", "")
+
+
+def test_nested_witness_failure_evidence_no_overwrite(tmp_path: Path) -> None:
+    """N10: repeated writer calls and symlink targets remain byte-identical."""
+    _write_failed_child_evidence(tmp_path, 0, _nw_completed("first", 1))
+    original = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    _write_failed_child_evidence(tmp_path, 0, _nw_completed("second", 2))
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == original
+    target = tmp_path / "target"
+    target.write_text("preserve")
+    (tmp_path / "child-01.stdout").symlink_to(target)
+    _write_failed_child_evidence(tmp_path, 1, _nw_completed("second", 1))
+    assert target.read_text() == "preserve"
+    assert not (tmp_path / "child-01.json").exists()
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("fault", ["stderr", "missing", "file", "unicode"])
+def test_nested_witness_failure_evidence_faults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], fault: str
+) -> None:
+    """N11: partial evidence never masks the original failure or attests completion."""
+    result = _run_gate_command("printf original; printf error >&2; exit 1", {}, cwd=tmp_path)
+    if fault == "unicode":
+        result = subprocess.CompletedProcess(result.args, 1, "bad\ud800", result.stderr)
+    evidence = tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR
+    if fault == "missing":
+        evidence = tmp_path / "missing" / _WITNESS_FAILURE_EVIDENCE_DIR
+    if fault == "file":
+        (tmp_path / "file").write_text("preserve")
+        evidence = tmp_path / "file" / _WITNESS_FAILURE_EVIDENCE_DIR
+    original_open = os.open
+
+    def open_file(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if fault == "stderr" and str(path).endswith(".stderr"):
+            raise OSError(errno.ENOSPC, "full")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "open", open_file)
+        assert _retain_failed_child_streams(lambda _: result, evidence)(()) is result
+        if fault in {"stderr", "unicode"}:
+            direct = tmp_path / "direct-writer"
+            direct.mkdir()
+            _write_failed_child_evidence(direct, 0, result)
+            assert not (direct / "child-00.json").exists()
+    assert not (evidence / "child-00.json").exists()
+    with pytest.raises(_WitnessContractError) as actual:
+        _parse_collection(result)
+    assert str(actual.value) == "collection exited nonzero\n" + _child_diagnostic(result)
+    assert str(evidence) not in str(actual.value)
+    assert capsys.readouterr() == ("", "")
+
+
+def test_nested_witness_failure_evidence_first_attempt_latched(tmp_path: Path) -> None:
+    """The first failure latches retention even when that attempt cannot create files."""
+    evidence = tmp_path / "missing" / _WITNESS_FAILURE_EVIDENCE_DIR
+    result = _nw_completed("failure", 1)
+    calls: list[tuple[str, ...]] = []
+
+    def run(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return result
+
+    wrapped = _retain_failed_child_streams(run, evidence)
+    assert wrapped(("first",)) is result
+    evidence.parent.mkdir()
+    assert wrapped(("second",)) is result
+    assert not evidence.exists()
+    assert calls == [("first",), ("second",)]
+
+
+def test_nested_witness_failure_evidence_caller_wiring() -> None:
+    """N12: only the witness's runner argument gains the private consumer adapter."""
+    tree = ast.parse(
+        inspect.getsource(test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper)
+    )
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_run_partitioned_witness"
+    ]
+    assert len(calls) == 1 and len(calls[0].args) == 1
+    wrapper = calls[0].args[0]
+    assert isinstance(wrapper, ast.Call) and isinstance(wrapper.func, ast.Name)
+    assert wrapper.func.id == "_retain_failed_child_streams" and len(wrapper.args) == 2
+    assert ast.unparse(wrapper.args[0]) == (
+        "lambda argv: _run_gate_command(f'{wrapper} {shlex.join(argv)}', "
+        "environment, cwd=repository)"
+    )
+    assert ast.unparse(wrapper.args[1]) == "tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR"
