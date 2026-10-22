@@ -1,5 +1,16 @@
 # RoastPilot Agent Project State Registry
 
+**22 Oct 2026, #1051 ordinary CI timing attribution (implementation):**
+The ordinary four-worker worksteal lane explicitly loads a bounded controller-only
+pytest report plugin. It records native setup/call/teardown timings and worker IDs,
+with closed incomplete-data counters and timing limitations, and uploads the
+sanitised JSON on success or failure. Nested collection probes strip only the
+exact activation tokens. Selection, coverage roots, budgets and native outcomes
+are unchanged. This tooling slice makes no performance or E11 completion claim.
+Focused native integration and finite guard proofs cover timing, sanitisation,
+exit preservation, bounds and nested isolation. Full-suite and hosted evidence
+remain pending at authoring time; #954 and E11-S3 remain unchanged.
+
 **21 Oct 2026, #1042 explicit test-run profiles (rebind):** new test-only
 `scripts/run_tests.py` (`--profile ci|local|nightly`, `--lane`, `--workers`,
 `--dry-run`) maps closed choices to fixed native pytest argv over the existing
