@@ -18519,6 +18519,7 @@ def test_nested_witness_failure_evidence_native_shell(
     """N1: full private streams supplement the unchanged bounded exception tail."""
     calls: list[tuple[str, ...]] = []
     results: list[subprocess.CompletedProcess[str]] = []
+    snapshots: list[tuple[tuple[str, ...], int, str, str]] = []
 
     def run(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
@@ -18529,6 +18530,7 @@ def test_nested_witness_failure_evidence_native_shell(
             {},
             cwd=tmp_path,
         )
+        snapshots.append((tuple(result.args), result.returncode, result.stdout, result.stderr))
         results.append(result)
         return result
 
@@ -18536,9 +18538,12 @@ def test_nested_witness_failure_evidence_native_shell(
     with pytest.raises(_WitnessContractError, match="collection exited nonzero") as actual:
         _run_partitioned_witness(_retain_failed_child_streams(run, evidence))
     result = results[0]
+    before = snapshots[0]
+    assert (tuple(result.args), result.returncode, result.stdout, result.stderr) == before
+    baseline = subprocess.CompletedProcess(*before)
     assert result.returncode == 1
     with pytest.raises(_WitnessContractError) as original:
-        _parse_collection(result)
+        _parse_collection(baseline)
     assert str(actual.value) == str(original.value)
     assert calls == [_NW_EXPECTED_CALLS[0]]
     assert all(value not in str(actual.value) for value in ("EARLY", "MIDDLE", str(tmp_path)))
@@ -18582,8 +18587,10 @@ def test_nested_witness_failure_evidence_success(tmp_path: Path) -> None:
     """N3: passing native results retain object identity and create nothing."""
     result = _run_gate_command("printf passed", {}, cwd=tmp_path)
     assert result.returncode == 0
+    before = (tuple(result.args), result.returncode, result.stdout, result.stderr)
     evidence = tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR
     assert _retain_failed_child_streams(lambda _: result, evidence)(()) is result
+    assert (tuple(result.args), result.returncode, result.stdout, result.stderr) == before
     assert not evidence.exists()
 
 
@@ -18592,17 +18599,23 @@ def test_nested_witness_failure_evidence_order(tmp_path: Path, index: int) -> No
     """N4: every failure position preserves exact calls, identity and parser message."""
     outputs = _nw_default_outputs()
     outputs[_NW_EXPECTED_CALLS[index]] = _nw_completed("failure", 1)
+    before = {
+        argv: (tuple(value.args), value.returncode, value.stdout, value.stderr)
+        for argv, value in outputs.items()
+    }
+    baselines = {argv: subprocess.CompletedProcess(*snapshot) for argv, snapshot in before.items()}
     run, calls = _nw_fake_runner(outputs)
     wrapped = _retain_failed_child_streams(run, tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR)
 
     def checked(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
         result = wrapped(argv)
         assert result is outputs[argv]
+        assert (tuple(result.args), result.returncode, result.stdout, result.stderr) == before[argv]
         return result
 
     with pytest.raises(_WitnessContractError) as actual:
         _run_partitioned_witness(checked)
-    plain, _ = _nw_fake_runner(outputs)
+    plain, _ = _nw_fake_runner(baselines)
     with pytest.raises(_WitnessContractError) as original:
         _run_partitioned_witness(plain)
     assert str(actual.value) == str(original.value)
@@ -18617,11 +18630,20 @@ def test_nested_witness_failure_evidence_zero_exit_rejected(tmp_path: Path, trai
     """N5: malformed and masked-success proofs fail without retaining success output."""
     outputs = _nw_default_outputs()
     outputs[_NW_EXPECTED_CALLS[7]] = _nw_completed(_nw_execution(trailer))
+    before = {
+        argv: (tuple(value.args), value.returncode, value.stdout, value.stderr)
+        for argv, value in outputs.items()
+    }
+    baselines = {argv: subprocess.CompletedProcess(*snapshot) for argv, snapshot in before.items()}
     run, _ = _nw_fake_runner(outputs)
     evidence = tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR
     with pytest.raises(_WitnessContractError) as actual:
         _run_partitioned_witness(_retain_failed_child_streams(run, evidence))
-    plain, _ = _nw_fake_runner(outputs)
+    assert {
+        argv: (tuple(value.args), value.returncode, value.stdout, value.stderr)
+        for argv, value in outputs.items()
+    } == before
+    plain, _ = _nw_fake_runner(baselines)
     with pytest.raises(_WitnessContractError) as original:
         _run_partitioned_witness(plain)
     assert str(actual.value) == str(original.value)
@@ -18674,14 +18696,19 @@ def test_nested_witness_failure_evidence_existing_path(
         evidence.mkdir()
         (evidence / "preserve").write_text("unchanged")
     result = _nw_completed("failure", 1)
+    before = (tuple(result.args), result.returncode, result.stdout, result.stderr)
+    baseline = subprocess.CompletedProcess(*before)
     assert _retain_failed_child_streams(lambda _: result, evidence)(()) is result
+    assert (tuple(result.args), result.returncode, result.stdout, result.stderr) == before
     assert {p.name for p in target.iterdir()} == {"preserve"}
     assert {p.name for p in evidence.iterdir()} == {"preserve"}
     assert (evidence / "preserve").read_text() == "unchanged"
     assert evidence.is_symlink() is symlink
     with pytest.raises(_WitnessContractError) as actual:
         _parse_collection(result)
-    assert str(actual.value) == "collection exited nonzero\n" + _child_diagnostic(result)
+    with pytest.raises(_WitnessContractError) as original:
+        _parse_collection(baseline)
+    assert str(actual.value) == str(original.value)
     assert capsys.readouterr() == ("", "")
 
 
@@ -18708,6 +18735,8 @@ def test_nested_witness_failure_evidence_faults(
     result = _run_gate_command("printf original; printf error >&2; exit 1", {}, cwd=tmp_path)
     if fault == "unicode":
         result = subprocess.CompletedProcess(result.args, 1, "bad\ud800", result.stderr)
+    before = (tuple(result.args), result.returncode, result.stdout, result.stderr)
+    baseline = subprocess.CompletedProcess(*before)
     evidence = tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR
     if fault == "missing":
         evidence = tmp_path / "missing" / _WITNESS_FAILURE_EVIDENCE_DIR
@@ -18735,10 +18764,13 @@ def test_nested_witness_failure_evidence_faults(
             direct.mkdir()
             _write_failed_child_evidence(direct, 0, result)
             assert not (direct / "child-00.json").exists()
+    assert (tuple(result.args), result.returncode, result.stdout, result.stderr) == before
     assert not (evidence / "child-00.json").exists()
     with pytest.raises(_WitnessContractError) as actual:
         _parse_collection(result)
-    assert str(actual.value) == "collection exited nonzero\n" + _child_diagnostic(result)
+    with pytest.raises(_WitnessContractError) as original:
+        _parse_collection(baseline)
+    assert str(actual.value) == str(original.value)
     assert str(evidence) not in str(actual.value)
     assert capsys.readouterr() == ("", "")
 
