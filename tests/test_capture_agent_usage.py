@@ -6887,11 +6887,260 @@ def test_rendered_ruff_gate_runs_from_the_closed_environment(tmp_path: Path) -> 
     assert "--disable-warnings" not in result.stdout + result.stderr
 
 
+def _verifier_source_imports(relative_path: str, source: str) -> None:
+    """Reject changes to the verifier's finite copied-source import closure."""
+    expected = {
+        "tests/gate/test_gate_environment.py": {"__future__", "os", "capture_usage_models"},
+        "tests/gate/conftest.py": {"__future__", "os", "pathlib", "pytest"},
+        ".agents/skills/capture-agent-usage/scripts/capture_usage_models.py": {
+            "__future__",
+            "os",
+            "re",
+            "shlex",
+            "collections",
+            "dataclasses",
+            "datetime",
+            "enum",
+            "typing",
+            "pydantic",
+        },
+    }
+    roots: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or node.module is None:
+                raise ValueError("Relative verifier imports require a new closure review")
+            roots.add(node.module.split(".", 1)[0])
+    if roots != expected[relative_path]:
+        raise ValueError(f"Verifier import closure changed: {relative_path}")
+
+
+def _verifier_root_conftest_is_inert(source: str) -> bool:
+    """Check a finite root-conftest tripwire, not transitive import side effects."""
+    tree = ast.parse(source)
+    forbidden = {"pytest_plugins", "environ", "environb", "putenv", "unsetenv", "setenv", "delenv"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in forbidden:
+            return False
+        if isinstance(node, ast.Attribute) and node.attr in forbidden:
+            return False
+        if isinstance(node, ast.alias) and (
+            node.name.split(".")[-1] in forbidden or node.asname in forbidden
+        ):
+            return False
+    functions = [
+        node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    hooks = {node.name for node in functions if node.name.startswith("pytest_")}
+    autouse = {
+        node.name
+        for node in functions
+        for decorator in node.decorator_list
+        if isinstance(decorator, ast.Call)
+        and isinstance(decorator.func, ast.Attribute)
+        and isinstance(decorator.func.value, ast.Name)
+        and decorator.func.value.id == "pytest"
+        and decorator.func.attr == "fixture"
+        and any(
+            keyword.arg == "autouse"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in decorator.keywords
+        )
+    }
+    return hooks == {"pytest_sessionfinish"} and autouse == {"reset_non_finite_warning_budget"}
+
+
+def _verifier_checkout(tmp_path: Path) -> Path:
+    """Copy exactly the live verifier sources after finite fidelity checks."""
+    source_root = Path(__file__).resolve().parents[1]
+    if not _verifier_root_conftest_is_inert((source_root / "tests/conftest.py").read_text()):
+        raise ValueError("Root conftest changed; verifier isolation requires review")
+    checkout = tmp_path / "verifier-checkout"
+    checkout.mkdir()
+    for relative_path in (
+        "pyproject.toml",
+        "tests/gate/conftest.py",
+        "tests/gate/test_gate_environment.py",
+        ".agents/skills/capture-agent-usage/scripts/capture_usage_models.py",
+    ):
+        live = source_root / relative_path
+        if live.is_symlink() or not live.is_file():
+            raise ValueError(f"Verifier source must be a regular non-symlink file: {relative_path}")
+        source = live.read_bytes()
+        if live.suffix == ".py":
+            _verifier_source_imports(relative_path, source.decode("utf-8"))
+        copied = checkout / relative_path
+        copied.parent.mkdir(parents=True, exist_ok=True)
+        copied.write_bytes(source)
+        if not (
+            hashlib.sha256(source).digest()
+            == hashlib.sha256(live.read_bytes()).digest()
+            == hashlib.sha256(copied.read_bytes()).digest()
+        ):
+            raise ValueError(f"Verifier source changed during copy: {relative_path}")
+    return checkout
+
+
+def test_verifier_checkout_preserves_current_source_bytes(tmp_path: Path) -> None:
+    """P1: the checkout contains exactly four live files and no root conftest."""
+    checkout = _verifier_checkout(tmp_path)
+    source_root = Path(__file__).resolve().parents[1]
+    expected = {
+        "pyproject.toml",
+        "tests/gate/conftest.py",
+        "tests/gate/test_gate_environment.py",
+        ".agents/skills/capture-agent-usage/scripts/capture_usage_models.py",
+    }
+    assert {
+        path.relative_to(checkout).as_posix() for path in checkout.rglob("*") if path.is_file()
+    } == expected
+    assert not (checkout / "tests/conftest.py").exists()
+    assert not any(path.is_symlink() for path in checkout.rglob("*"))
+    for relative_path in expected:
+        assert (
+            hashlib.sha256((checkout / relative_path).read_bytes()).digest()
+            == hashlib.sha256((source_root / relative_path).read_bytes()).digest()
+        )
+
+
+def test_verifier_checkout_preserves_environment_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2: copied predicate decisions and reinstated key order equal live models."""
+    checkout = _verifier_checkout(tmp_path)
+    path = checkout / ".agents/skills/capture-agent-usage/scripts/capture_usage_models.py"
+    name = "_isolated_verifier_models"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    copied = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, copied)
+    spec.loader.exec_module(copied)
+    assert tuple(key for key, _ in copied.render_gate_environment("")) == tuple(
+        key for key, _ in render_gate_environment("")
+    )
+    for name in (
+        "ROASTPILOT_DB",
+        "roastpilot_advisor__model_slug_by_phase",
+        "RoAsTpIlOt_X",
+        "PYTHONPATH",
+        "OPENROUTER_API_KEY",
+        "PYTEST_ADDOPTS",
+        "TMPDIR",
+        "RP_VALIDATION_GATE",
+        "PATH",
+        "COFFEE_ROAST_LOG_DIR",
+    ):
+        assert copied.is_scrubbed_environment_name(name) is is_scrubbed_environment_name(name)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "tests/gate/conftest.py",
+        "tests/gate/test_gate_environment.py",
+        ".agents/skills/capture-agent-usage/scripts/capture_usage_models.py",
+    ),
+)
+def test_verifier_checkout_import_closure_is_closed(relative_path: str) -> None:
+    """P3: any extra local import requires an explicit closure review."""
+    source = (Path(__file__).resolve().parents[1] / relative_path).read_text()
+    _verifier_source_imports(relative_path, source)
+    with pytest.raises(ValueError, match="import closure changed"):
+        _verifier_source_imports(relative_path, source + "\nimport capture_usage_cli\n")
+
+
+def test_verifier_target_preserves_five_real_command_contexts() -> None:
+    """P4: five direct real calls retain their order and three isolated contexts."""
+    tree = ast.parse(
+        inspect.getsource(
+            test_gate_environment_verifier_fails_closed_for_clean_leaked_missing_and_absent_cases
+        )
+    )
+    function = tree.body[0]
+    assert isinstance(function, ast.FunctionDef)
+    assert all(isinstance(node, (ast.Expr, ast.Assign, ast.Assert)) for node in function.body)
+    calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+    gates = sorted(
+        (
+            node
+            for node in calls
+            if isinstance(node.func, ast.Name) and node.func.id == "_run_gate_command"
+        ),
+        key=lambda node: node.lineno,
+    )
+    assert len(gates) == 5
+    assigned = [
+        node.targets[0].id
+        for node in function.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Name)
+        and node.value in gates
+    ]
+    assert assigned == ["clean", "leaked", "leaked_pytest_addopts", "missing", "absent"]
+    setups = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "_verifier_checkout"
+    ]
+    assert len(setups) == 1
+    assert ast.dump(setups[0]) == ast.dump(
+        ast.parse("_verifier_checkout(tmp_path)", mode="eval").body
+    )
+    setup = next(
+        node for node in function.body if isinstance(node, ast.Assign) and node.value is setups[0]
+    )
+    assert len(setup.targets) == 1 and isinstance(setup.targets[0], ast.Name)
+    for index, gate in enumerate(gates):
+        cwd = [keyword.value for keyword in gate.keywords if keyword.arg == "cwd"]
+        if index in (1, 2, 3):
+            assert len(cwd) == 1 and isinstance(cwd[0], ast.Name)
+            assert cwd[0].id == setup.targets[0].id
+        else:
+            assert cwd == []
+    renders = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "render_validation_commands"
+    ]
+    assert len(renders) == 1
+    assert any(
+        isinstance(node, ast.Subscript)
+        and node.value is renders[0]
+        and isinstance(node.slice, ast.Constant)
+        and node.slice.value == 0
+        for node in ast.walk(function)
+    )
+    forbidden = {"CompletedProcess", "monkeypatch", "skip", "mark", "subprocess"}
+    assert not any(
+        (isinstance(node, ast.Name) and node.id in forbidden)
+        or (isinstance(node, ast.Attribute) and node.attr in forbidden)
+        for node in ast.walk(function)
+    )
+
+
+def test_verifier_root_conftest_tripwire_rejects_environment_mutation() -> None:
+    """P5: finite root-conftest assumptions reject a new environment mutation."""
+    source = (Path(__file__).resolve().parents[1] / "tests/conftest.py").read_text()
+    assert _verifier_root_conftest_is_inert(source)
+    injected = source.replace(
+        "    reset_non_finite_telemetry_warnings()",
+        '    os.environ.pop("ROASTPILOT_DB", None)\n    reset_non_finite_telemetry_warnings()',
+        1,
+    )
+    assert injected != source
+    assert not _verifier_root_conftest_is_inert(injected)
+
+
 def test_gate_environment_verifier_fails_closed_for_clean_leaked_missing_and_absent_cases(
     tmp_path: Path,
 ) -> None:
     """T13-T16: the first gate verifies names only and cannot silently skip collection."""
     root = _executable_gate_root(tmp_path)
+    checkout = _verifier_checkout(tmp_path)
     command = render_validation_commands(NativeClaudeRole.QA, str(root))[0]
     clean = _run_gate_command(command, _poisoned_gate_environment())
     assert clean.returncode == 0, clean.stdout + clean.stderr
@@ -6900,6 +7149,7 @@ def test_gate_environment_verifier_fails_closed_for_clean_leaked_missing_and_abs
     leaked = _run_gate_command(
         command.replace(scrub, scrub.replace(" -i ", f" -i ROASTPILOT_DB={poison_value} ", 1), 1),
         _poisoned_gate_environment(),
+        cwd=checkout,
     )
     assert leaked.returncode != 0
     assert "ROASTPILOT_DB" in leaked.stdout + leaked.stderr
@@ -6910,12 +7160,13 @@ def test_gate_environment_verifier_fails_closed_for_clean_leaked_missing_and_abs
             scrub, scrub.replace(" -i ", f" -i PYTEST_ADDOPTS={pytest_addopts_value} ", 1), 1
         ),
         _poisoned_gate_environment(),
+        cwd=checkout,
     )
     assert leaked_pytest_addopts.returncode != 0
     assert "PYTEST_ADDOPTS" in leaked_pytest_addopts.stdout + leaked_pytest_addopts.stderr
     assert pytest_addopts_value not in leaked_pytest_addopts.stdout + leaked_pytest_addopts.stderr
     missing = _run_gate_command(
-        command.replace(f" TMPDIR={root}/tmp", "", 1), _poisoned_gate_environment()
+        command.replace(f" TMPDIR={root}/tmp", "", 1), _poisoned_gate_environment(), cwd=checkout
     )
     assert missing.returncode != 0
     assert "TMPDIR" in missing.stdout + missing.stderr
