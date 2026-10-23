@@ -18715,9 +18715,16 @@ def test_nested_witness_failure_evidence_existing_path(
 def test_nested_witness_failure_evidence_no_overwrite(tmp_path: Path) -> None:
     """N10: repeated writer calls and symlink targets remain byte-identical."""
     _write_failed_child_evidence(tmp_path, 0, _nw_completed("first", 1))
-    original = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    expected_names = {"child-00.stdout", "child-00.stderr", "child-00.json"}
+    assert {path.name for path in tmp_path.iterdir()} == expected_names
+    stdout_before = (tmp_path / "child-00.stdout").read_bytes()
+    stderr_before = (tmp_path / "child-00.stderr").read_bytes()
+    metadata_before = (tmp_path / "child-00.json").read_bytes()
     _write_failed_child_evidence(tmp_path, 0, _nw_completed("second", 2))
-    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == original
+    assert {path.name for path in tmp_path.iterdir()} == expected_names
+    assert (tmp_path / "child-00.stdout").read_bytes() == stdout_before
+    assert (tmp_path / "child-00.stderr").read_bytes() == stderr_before
+    assert (tmp_path / "child-00.json").read_bytes() == metadata_before
     target = tmp_path / "target"
     target.write_text("preserve")
     (tmp_path / "child-01.stdout").symlink_to(target)
