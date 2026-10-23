@@ -151,7 +151,7 @@ jobs:
       - name: Run ordinary tests with coverage
         env:
           COVERAGE_FILE: .coverage.ordinary
-        run: python -m pytest -n 4 --dist worksteal -m "not serial and not stress" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report=
+        run: python -m pytest -n 4 --dist worksteal -m "not serial and not stress" --ignore=tests/test_packaging.py -p scripts.ci_timing_report --ci-timing-report=ci-timing/ordinary.json --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report=
 
       - name: Upload ordinary coverage data
         uses: actions/upload-artifact@v4
@@ -159,6 +159,15 @@ jobs:
           name: coverage-ordinary
           path: .coverage.ordinary
           include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload ordinary timing report
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-timing-ordinary
+          path: ci-timing/ordinary.json
           if-no-files-found: error
           retention-days: 7
 
@@ -701,7 +710,7 @@ jobs:
   # no libportaudio2 / sounddevice is needed here (unlike the Python `checks` job).
   web-snapshots-worker:
     name: Web worker (Playwright snapshots)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [classify, web-unit-worker]
     if: needs.classify.outputs.mode != 'docs-only'
     # packages: read lets the container pull the GHCR-mirrored Playwright image

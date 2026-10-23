@@ -167,7 +167,18 @@ def _pytest_step(job: dict[str, object]) -> dict[str, object]:
 def _ci_tokens(step: dict[str, object]) -> list[str]:
     tokens = shlex.split(cast(str, step["run"]))
     assert tokens[:3] == ["python", "-m", "pytest"]
-    return [token for token in tokens[3:] if not token.startswith("--cov")]
+    retained: list[str] = []
+    index = 3
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-p" and tokens[index + 1 : index + 2] == ["scripts.ci_timing_report"]:
+            index += 2
+        elif token.startswith(("--cov", "--ci-timing-report=")):
+            index += 1
+        else:
+            retained.append(token)
+            index += 1
+    return retained
 
 
 def test_ordinary_serial_and_packaging_selection_match_ci_workflow() -> None:

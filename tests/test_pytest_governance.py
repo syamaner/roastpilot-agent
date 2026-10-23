@@ -122,9 +122,11 @@ _COVERAGE_ARGUMENTS = (
 )
 _COLLECTION_CACHE_MAX_ENTRIES = 32
 _COLLECTION_CACHE: dict[tuple[Path, tuple[str, ...], str], tuple[int, frozenset[str], str]] = {}
+_CI_TIMING_PLUGIN = "scripts.ci_timing_report"
 _ORDINARY_RUN = (
     'python -m pytest -n 4 --dist worksteal -m "not serial and not stress" '
-    f"--ignore=tests/test_packaging.py {_COVERAGE_ARGUMENTS}"
+    f"--ignore=tests/test_packaging.py -p {_CI_TIMING_PLUGIN} "
+    f"--ci-timing-report=ci-timing/ordinary.json {_COVERAGE_ARGUMENTS}"
 )
 _SERIAL_RUN = (
     'python -m pytest -m "$SERIAL_SELECTION" '
@@ -220,9 +222,17 @@ def _collection_arguments(arguments: list[str]) -> list[str]:
     index = 0
     while index < len(arguments):
         argument = arguments[index]
-        if argument in {"-n", "--dist"}:
+        if (
+            argument in {"-n", "--dist"}
+            or argument == "-p"
+            and arguments[index + 1 : index + 2] == [_CI_TIMING_PLUGIN]
+        ):
             index += 2
-        elif argument.startswith("--cov=") or argument.startswith("--cov-report="):
+        elif (
+            argument.startswith("--ci-timing-report=")
+            or argument.startswith("--cov=")
+            or argument.startswith("--cov-report=")
+        ):
             index += 1
         else:
             retained.append(argument)
@@ -761,6 +771,7 @@ def test_ci_lanes_are_bounded_parallel_and_write_unique_coverage_files() -> None
                 step
                 for step in _steps(_mapping(jobs[job_id]))
                 if step.get("uses") == "actions/upload-artifact@v4"
+                and str(_mapping(step["with"])["name"]).startswith("coverage-")
             ]
             assert len(uploads) == 1
             upload = _mapping(uploads[0]["with"])
@@ -1235,3 +1246,130 @@ def test_docs_fastpath_job_structure_and_dependency_group() -> None:
     markers = cast(list[str], _pytest_options()["markers"])
     registered = {marker.partition(":")[0] for marker in markers}
     assert "docs_ci" in registered
+
+
+@pytest.mark.parametrize(
+    "arguments,expected",
+    [
+        (["-p", _CI_TIMING_PLUGIN, "--ci-timing-report=x.json"], []),
+        (["-p", "other"], ["-p", "other"]),
+        (["-pscripts.ci_timing_report"], ["-pscripts.ci_timing_report"]),
+        (["--ci-timing-report", "x.json", "--bogus"], ["--ci-timing-report", "x.json", "--bogus"]),
+        (["-p"], ["-p"]),
+        (
+            ["-n", "4", "--dist", "worksteal", "--cov=scripts", "--cov-report=", "-m", "ordinary"],
+            ["-m", "ordinary"],
+        ),
+    ],
+)
+def test_timing_collection_strip_is_exact(arguments: list[str], expected: list[str]) -> None:
+    """T13: normalise only the explicit ordinary timing activation forms."""
+    assert _collection_arguments(arguments) == expected
+
+
+def test_timing_ordinary_normalised_tuple() -> None:
+    """T14: every actual ordinary event retains the exact pre-timing cache key."""
+    for event in _SERIAL_SELECTION_BY_EVENT:
+        arguments = next(
+            args for job, args, _ in _pytest_lanes(_workflow(), event) if job == "pytest-ordinary"
+        )
+        assert _collection_arguments(arguments) == [
+            "-m",
+            "not serial and not stress",
+            "--ignore=tests/test_packaging.py",
+        ]
+
+
+def test_timing_workflow_activation_and_upload_pins() -> None:
+    """T16: one ordinary activation/upload, no inherited activation environment."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    assert (REPO_ROOT / ".github/workflows/ci.yml").read_text().count(_CI_TIMING_PLUGIN) == 1
+    for job_id, raw in jobs.items():
+        noncoverage: list[dict[str, object]] = []
+        for step in _steps(_mapping(raw)):
+            env = _mapping(step.get("env", {}))
+            assert not {"PYTEST_ADDOPTS", "PYTEST_PLUGINS"} & env.keys()
+            if step.get("uses") == "actions/upload-artifact@v4":
+                name = str(_mapping(step["with"])["name"])
+                if not name.startswith("coverage-"):
+                    noncoverage.append(step)
+                if job_id != "pytest-ordinary":
+                    assert not name.startswith("ci-timing")
+        if job_id == "pytest-ordinary":
+            assert noncoverage == [
+                {
+                    "name": "Upload ordinary timing report",
+                    "if": "success() || failure()",
+                    "uses": "actions/upload-artifact@v4",
+                    "with": {
+                        "name": "ci-timing-ordinary",
+                        "path": "ci-timing/ordinary.json",
+                        "if-no-files-found": "error",
+                        "retention-days": 7,
+                    },
+                }
+            ]
+
+
+@pytest.mark.slow
+def test_timing_nested_real_collection_isolation(tmp_path: Path) -> None:
+    """T15: the actual normalised ordinary tuple collects; kept activation fails closed."""
+    import os
+
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_nested.py").write_text("def test_nested(): pass\n")
+    (tmp_path / "pytest.ini").write_text("[pytest]\nmarkers =\n    serial\n    stress\n")
+    arguments = next(
+        args
+        for job, args, _ in _pytest_lanes(_workflow(), "pull_request")
+        if job == "pytest-ordinary"
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTEST_ADDOPTS", "PYTEST_PLUGINS"} and not key.startswith("PYTEST_XDIST_")
+    }
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    base = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-c",
+        str(tmp_path / "pytest.ini"),
+        "--rootdir",
+        str(tmp_path),
+        "--collect-only",
+        "-q",
+        "--override-ini",
+        "addopts=",
+        "-p",
+        "no:cacheprovider",
+    ]
+    normalised = _collection_arguments(arguments)
+    result = subprocess.run(
+        [*base, *normalised],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert re.findall(r"^tests/.*::.*$", result.stdout, re.MULTILINE) == [
+        "tests/test_nested.py::test_nested"
+    ]
+    assert not (tmp_path / "ci-timing").exists()
+    control = subprocess.run(
+        [*base, *normalised, "-p", _CI_TIMING_PLUGIN, "--ci-timing-report=ci-timing/ordinary.json"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert control.returncode == 4
+    assert "ci-timing requires an active xdist test run" in control.stderr
+    assert not (tmp_path / "ci-timing").exists()
