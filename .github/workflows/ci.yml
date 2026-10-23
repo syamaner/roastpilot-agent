@@ -710,7 +710,7 @@ jobs:
   # no libportaudio2 / sounddevice is needed here (unlike the Python `checks` job).
   web-snapshots-worker:
     name: Web worker (Playwright snapshots)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [classify, web-unit-worker]
     if: needs.classify.outputs.mode != 'docs-only'
     # packages: read lets the container pull the GHCR-mirrored Playwright image
