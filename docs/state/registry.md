@@ -1,5 +1,37 @@
 # RoastPilot Agent Project State Registry
 
+**24 Oct 2026, completed test optimisation work (state reconciliation):**
+The optimisation work is complete: explicit test-run profiles (#1042, PR #1047),
+the fake-gate reliability repair (#1043, PR #1046), the real MCP lifecycle probe
+repair (#1044, PR #1045), environment-verifier optimisation (#1049, PR #1050),
+and ordinary CI timing instrumentation (#1051, PR #1052) have been delivered.
+The #1049 result is a qualified targeted local measurement: a 36.32% median
+reduction on the environment-verifier path only, with no CI, full-suite or
+aggregate percentage inferred.
+
+The #1048 experiment is complete but inconclusive, and is not a speed
+qualification. Rejected trials #1038–#1041 remain rejected. This reconciliation
+reopens no experiment and changes no method or worker policy; it claims no
+aggregate speedup.
+
+Final historical evidence at the #1051 head records the full gate at 14,046
+passed, 14 skipped and exit 0; current-head hosted CI, Codecov, three CodeQL
+analyses and Codex review were accepted. The normal timing report was complete:
+13,991 unique cases, 13,972 passed, 19 skipped, four workers and zero completeness
+counters. These are the completed #1051 results, not fresh validation of this
+documentation change.
+
+The earlier #1051, #1042 and #1043 entries retain their authoring-time pending
+or still-required statements as historical records; those statements are now
+superseded for the completed optimisation work. Earlier interrupted and FAILED
+runs, including those recorded in the #1044 entry, remain exactly as recorded.
+The later successful #1051 gate supersedes them as current evidence without
+retrospectively changing any failed or interrupted result to PASS.
+
+This closes the optimisation work only. #1028 (hidden-script strict typing),
+#961 (cold capture validation coverage), and #954 / E11-S3 remain open, with
+their acceptance, status and priority unchanged. No Plan decision is amended.
+
 **22 Oct 2026, #1051 ordinary CI timing attribution (implementation):**
 The ordinary four-worker worksteal lane explicitly loads a bounded controller-only
 pytest report plugin. It records native setup/call/teardown timings and worker IDs,
