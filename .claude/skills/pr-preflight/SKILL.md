@@ -30,9 +30,13 @@ Run the gates for every surface the diff touches:
 
 - Python: `.venv/bin/python -m ruff check .`,
   `.venv/bin/python -m ruff format --check .`,
-  `.venv/bin/python -m pyright`, and `.venv/bin/python -m pytest`.
-- Python coverage: `.venv/bin/python -m pytest --cov=roastpilot_agent
-  --cov-branch --cov-report=term-missing`; cover every changed line and branch. Use
+  `.venv/bin/python -m pyright`; run the route selected in the AGENTS.md
+  Validation routes table and record the current-head route assessment.
+- Python coverage for full routes: `.venv/bin/python -m pytest
+  --cov=roastpilot_agent --cov=scripts
+  --cov=.agents/skills/capture-agent-usage/scripts --cov-branch
+  --cov-report=term-missing`; cover every changed line and branch. Never label a
+  focused pass a full gate. Use
   `# pragma: no cover` only for a demonstrably unreachable path and record why.
 - Web: from `web/`, run `npm run lint`, `npm run typecheck`, `npm test`, and
   `npm run build`.

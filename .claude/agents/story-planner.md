@@ -205,7 +205,8 @@ without one is forbidden (fail-closed).
    provisioning command `git worktree add -b <planned-branch> <path>
    <base-sha>` (without `-b` Git creates a detached HEAD and the handback
    commit lands on no branch), the #738 fresh-venv-in-worktree rule,
-   `.venv/bin/python -m ...` invocation, the full gates before handback, the
+   `.venv/bin/python -m ...` invocation, the route-applicable gates before
+   handback (AGENTS.md Validation routes), the
    INVARIANT that the handed-back branch must be attributable to the
    implementation worker acting on its RATIFIED INPUTS alone — this contract and lead-authored
    directives, which are the sanctioned channel; any OTHER model input the
