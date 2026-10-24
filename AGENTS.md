@@ -27,8 +27,9 @@ definition.
 
 - Python 3.11+ with full type hints on all public functions and methods.
 - Google-style docstrings for public modules, classes, functions, and methods.
-- `ruff check`, `ruff format --check`, `pyright` (strict), and `pytest` must
-  pass before marking implementation complete.
+- The route-applicable gates (Validation routes), including applicable `ruff check`,
+  `ruff format --check`, strict `pyright` and pytest checks, must pass before
+  marking implementation complete.
 - All runtime and dev dependencies must be declared in `pyproject.toml`.
   Never install ad-hoc dependencies without adding them to project metadata.
 - Keep roaster hardware control conservative. Heat, fan, drop, cooling, and
@@ -99,16 +100,109 @@ choice, not a standing prerequisite. For a fast local parallel loop, run
 tests exercise real production
 resource limits, `slow` tests use real subprocesses or MCP sessions, and `serial`
 tests are never run under `-n`. The full gate (`python -m pytest`, all markers,
-single process) remains mandatory before handback and before opening a PR.
+single process) retains its meaning. Run the route-applicable gates (Validation
+routes) before handback and before opening a PR.
 
 `.venv/bin/python scripts/run_tests.py --profile local --dry-run` prints, and without
 `--dry-run` runs, the lanes above as fixed native pytest argv (profiles `ci`, `local`,
 `nightly`; `--lane`; `--workers`, default 4, ordinary only). With `--lane all`, `ci`
 and `local` omit only the `exhaustive_only` inventory; `nightly` includes it. It is an
 execution and selection interface, coverage-neutral, not a qualified speedup and not
-a reproduction of hosted CI, and it does not replace the full gate above or CI
-coverage. `--profile local` (default lane `ordinary`) is a fast loop, never
+a reproduction of hosted CI, and it does not replace the route-applicable gates
+(Validation routes) or CI coverage. `--profile local` (default lane `ordinary`) is a fast loop, never
 full-suite or PR proof.
+
+### Validation routes (D218)
+
+D218 replaces only the universal local full-gate requirement after this Agent
+policy slice merges. Until then the existing universal local full-gate rule
+continues to govern every change. This implementation is GATE_MACHINERY and
+requires full native validation with the exhaustive witness passed before
+activation. D180, D196's singleton and D217's witness body and semantics, the
+02:23 UTC schedule and all hosted selections remain unchanged.
+
+The full native gate uses the worktree's own venv:
+
+```bash
+.venv/bin/python -m pytest --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-branch --cov-report=term-missing
+```
+
+It runs all markers in one process, with no `-m`, `-k`, `--deselect` or `-n`.
+All three coverage roots and branch coverage are required. A passed witness
+means the exact exhaustive witness node passed, never skipped or deselected.
+The table's witness column specifies extra explicit witness evidence. A safety
+route still runs the unfiltered all-marker full gate; `not-required` never
+authorises filtering, skipping or deselecting that gate.
+Never label a focused pass a full gate.
+
+The closed tokens below declare obligations for assessment and review; they do
+not classify arbitrary changes or prove that the process was followed.
+
+| Route | Trigger | Local validation | Witness proof | Mandatory added reviewer | Hosted |
+|---|---|---|---|---|---|
+| DOCS_ONLY | `trusted-classifier-docs-only` | `docs-consumers; governance; applicable-statics; focused-not-full` | `not-required` | `risk-routed` | `docs-only` |
+| ROUTINE | `application-behaviour; cross-boundary-contract; ordinary-behavioural-tests` | `focused-behaviour; cross-boundary-contracts; statics; focused-not-full` | `not-required` | `risk-routed` | `ordinary; serial; stress; packaging; web` |
+| SAFETY_CRITICAL | `safety; controller; recovery; hardware-command-path; safety-relevant-runtime-capability` | `full` | `not-required` | `safety-reviewer; risk-routed` | `ordinary; serial; stress; packaging; web` |
+| GATE_MACHINERY | `test-selection; QA-wrapper; execution-environment; gate-machinery` | `full` | `passed` | `risk-routed` | `ordinary; serial; stress; packaging; web` |
+
+DOCS_ONLY requires the existing base-trusted classifier's `docs-only` result.
+ROUTINE requires focused behavioural tests, related cross-boundary contracts
+and static checks. Adding or maintaining ordinary behavioural tests alone does
+not change execution, selection, wrapper, environment or gate machinery.
+Safety-relevant runtime capabilities have potential safety, actuation, control
+or recovery consequences, rather than every ordinary application behaviour.
+Existing independent capability-based security routing remains required.
+External input needs safety review only when its capability can affect roast
+safety or that consequence is uncertain. Uncertain safety requires full plus
+safety review; uncertain gate machinery requires full plus a passed witness.
+Risk-routed reviewers in the table use the existing mandatory trigger rules.
+
+Record the scope assessment at the current head using these fields. Capabilities
+come only from {docs-prose, application-behaviour, cross-boundary-contract,
+safety/controller/recovery/command-path/runtime-capability,
+test-selection/QA-wrapper/execution-environment/gate-machinery}.
+
+**Assessment fields:** `head-sha; merge-base; changed-paths; touched-capabilities; selected-route; focused-tests-run; cross-boundary-tests-run; independent-reviewer; reviewer-disposition`
+
+An independent reviewer must check this assessment and its current-head binding.
+Routine semantic risk is never inferred from filenames. No automatic path-only
+classifier is introduced. Known combined capabilities take the broadest route
+and union their obligations. Docs plus routine or a related contract stays
+ROUTINE when independently adjudicated without any higher-risk capability.
+Safety plus gate machinery requires full, passed witness and safety-reviewer.
+The following closed records make composition and uncertain fallback explicit:
+
+**Breadth:** `DOCS_ONLY=0; ROUTINE=1; SAFETY_CRITICAL=2; GATE_MACHINERY=2`
+
+**Composition rule:** `known=broadest+union`
+
+**Composition:** `DOCS_ONLY+ROUTINE=ROUTINE; ROUTINE+SAFETY_CRITICAL=SAFETY_CRITICAL; ROUTINE+GATE_MACHINERY=GATE_MACHINERY; SAFETY_CRITICAL+GATE_MACHINERY=SAFETY_CRITICAL+GATE_MACHINERY`
+
+**Fallback obligations:** `missing=full; stale=full; unknown=full; unreviewed=full; conflicting=full; ambiguous=full; uncertain-gate-machinery=full+passed-witness; uncertain-safety=full+safety-reviewer`
+
+Missing, stale (assessed head differs from current head), unknown, unreviewed,
+conflicting or ambiguous assessments require full validation. Apply the union
+of all relevant obligations, including safety review for uncertain safety.
+The following records retain the interim rule, prevent self-exemption and bind
+assessment to independent current-head adjudication. These declare process
+requirements; the tests do not verify actual compliance.
+
+**Activation obligations:** `until-agent-merge=universal-full; policy-implementation=GATE_MACHINERY+full+passed-witness`
+
+**Adjudication obligations:** `assessment=current-head+independent-review; semantic-risk=no-filename-inference+no-automatic-classifier`
+
+Every route retains these controls:
+
+**Preserved controls:** `exact-commit-evidence; independent-risk-routed-review; feedback-triage; existing-coverage-gates; protected-checks; automatic-ready-head-Codex-boundary-and-wait; conversation-resolution; normal-protected-merge`
+
+A ROUTINE change no longer guarantees a single-process all-marker run on each
+change. Hosted and nightly ordinary tests remain under xdist, so D217's
+sequential-execution residual widens. Focused evidence is not equivalent to a
+full gate. Independent current-head review and existing hosted regression
+coverage remain required. Existing nightly lanes retain the exhaustive suite
+and wrapper witness. No test deletion, weakening or movement, new benchmark,
+hardware/provider work, dependencies, worker-count, hosted-job, cache-seeding,
+timeout or coverage-threshold changes, or speedup claim is authorised.
 
 ### Lint And Format
 
@@ -362,7 +456,8 @@ checklist before you open.
   create coverable lines. Dependabot #675 also received a normal patch success
   after its public-repository tokenless upload; #677's reported credential-store
   deadlock was therefore a timing misdiagnosis, not an activation prerequisite.
-- **Shift review LEFT — mandatory, not optional.** Before opening: run all gates +
+- **Shift review LEFT — mandatory, not optional.** Before opening: run the
+  route-applicable gates (Validation routes) +
   an adversarial self-critique, AND run one independent, diff-focused review on
   the BRANCH, adding every domain reviewer triggered by the contract or actual
   diff. Resolve its findings before opening. Findings folded

@@ -326,7 +326,8 @@ pyright an explicit source-file path bypasses the resolution behavior at issue.
 
 For delegated sandboxed implementers specifically, lack of network access can
 make a faithful dependency install structurally impossible. Their gate output is
-**unverified evidence — the lead re-runs the full gates lead-side before review**.
+**unverified evidence: the lead re-runs the route-applicable gates
+(AGENTS.md Validation routes) lead-side before review**.
 An implementer that cannot install must say so, never improvise with
 `--system-site-packages`.
 

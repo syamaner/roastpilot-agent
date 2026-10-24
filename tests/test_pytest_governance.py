@@ -731,7 +731,8 @@ def test_agents_md_describes_the_event_selected_serial_lane() -> None:
     assert "manual `workflow_dispatch`" in agents_md
     assert (
         "tests are never run under `-n`. The full gate (`python -m pytest`, all markers,\n"
-        "single process) remains mandatory before handback and before opening a PR.\n"
+        "single process) retains its meaning. Run the route-applicable gates (Validation\n"
+        "routes) before handback and before opening a PR.\n"
     ) in agents_md
 
 

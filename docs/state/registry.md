@@ -1,5 +1,26 @@
 # RoastPilot Agent Project State Registry
 
+**24 Oct 2026, #1055 D218 local validation routes (implementation):**
+Plan D218 is merged. This Agent slice aligns the validation instructions and adds
+finite guards for the declared route mapping, fallback and consumer consistency.
+They do not classify semantic risk or prove process compliance. The previous
+universal local full-gate rule remains in force until this Agent slice merges;
+this GATE_MACHINERY policy change itself requires full native validation with
+the exhaustive witness passed before activation. That evidence is pending.
+
+After activation, trusted docs-only and routine changes use their applicable
+focused local gates. Safety and gate-machinery changes retain full native
+validation. Known combinations take the broadest applicable route and union
+obligations; missing, stale, unknown, unreviewed, conflicting or ambiguous
+assessment requires full. Uncertain safety also requires safety review.
+ROUTINE loses the per-change single-process all-marker guarantee; hosted and
+nightly ordinary tests remain under xdist, widening D217's sequential-execution
+residual. Focused evidence is not a full gate. Current-head assessment,
+independent review, coverage and protected delivery controls remain required.
+Hosted selections, schedule and witness semantics are unchanged. No tests are
+culled or moved and no speedup is claimed. #954 / E11-S3 remain open and
+unchanged; no hardware acceptance is implied. Historical evidence is preserved.
+
 **24 Oct 2026, completed test optimisation work (state reconciliation):**
 The optimisation work is complete: explicit test-run profiles (#1042, PR #1047),
 the fake-gate reliability repair (#1043, PR #1046), the real MCP lifecycle probe
