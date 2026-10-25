@@ -616,6 +616,10 @@ def test_pyright_reports_a_deliberate_error_in_a_hidden_skill_script(tmp_path: P
 
     _assert_witness_detected(returncode, report, witness)
     assert not _file_errors(report, control)
+    # The same real report with a passing exit code must be rejected, so a
+    # witness that accepted exit 0 could not pass this test.
+    with pytest.raises(AssertionError):
+        _assert_witness_detected(0, report, witness)
 
 
 @pytest.mark.slow
