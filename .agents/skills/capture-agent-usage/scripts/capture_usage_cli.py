@@ -1005,11 +1005,9 @@ def _validate_evidence_manifest_schema(
         "generated_at",
         "files",
     }
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or set(cast("dict[str, object]", data)) != expected_keys:
         raise CaptureUsageError("evidence bundle is invalid")
     data = cast("dict[str, object]", data)
-    if set(data) != expected_keys:
-        raise CaptureUsageError("evidence bundle is invalid")
     if data.get("evidence_schema_version") != EVIDENCE_SCHEMA_VERSION:
         raise CaptureUsageError("evidence bundle is invalid")
     if data.get("repository") != "syamaner/roastpilot-agent":
@@ -1057,18 +1055,19 @@ def _validate_evidence_manifest_schema(
         if parsed < now - timedelta(seconds=_EVIDENCE_MAX_AGE_SECONDS):
             raise CaptureUsageError("evidence bundle is invalid")
     files = data.get("files")
-    if not isinstance(files, dict):
+    if not isinstance(files, dict) or set(cast("dict[str, object]", files)) != set(
+        EVIDENCE_PAYLOAD_FILES
+    ):
         raise CaptureUsageError("evidence bundle is invalid")
     files = cast("dict[str, object]", files)
-    if set(files) != set(EVIDENCE_PAYLOAD_FILES):
-        raise CaptureUsageError("evidence bundle is invalid")
     validated_files: dict[str, dict[str, object]] = {}
     for name, entry in files.items():
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or set(cast("dict[str, object]", entry)) != {
+            "sha256",
+            "bytes",
+        }:
             raise CaptureUsageError("evidence bundle is invalid")
         entry = cast("dict[str, object]", entry)
-        if set(entry) != {"sha256", "bytes"}:
-            raise CaptureUsageError("evidence bundle is invalid")
         digest = entry.get("sha256")
         size = entry.get("bytes")
         if not isinstance(digest, str) or _SHA256_HEX_PATTERN.fullmatch(digest) is None:

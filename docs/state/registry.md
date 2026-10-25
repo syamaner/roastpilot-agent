@@ -15,10 +15,10 @@ and strictness are unchanged. Both modes now find 225 files (219 + 6) and exit
 modules, with every restore sha256-verified.
 The 305 exposed strict errors were fixed with type-only changes. Always-raising
 helpers became `NoReturn`, and `_safe_identifier` gained an accurate
-`TypeGuard[str]`. String-form `cast`s follow existing `isinstance` guards, so
-no type expression is evaluated at runtime. Other fixes are a typing-only
-scandir `Protocol`, an explicit `TypeAdapter[Any]`, and a Protocol method body.
-A few composite guards were split into equivalent consecutive raises, and
+`TypeGuard[str]`. String-form `cast`s sit inside or after existing
+`isinstance` guards, whose composite conditions are kept unsplit, so no type
+expression is evaluated at runtime. Other fixes are a typing-only scandir
+`Protocol`, an explicit `TypeAdapter[Any]`, and a Protocol method body.
 `set(...)` became `frozenset(...)` in equality checks. Eleven line-specific
 ignores, each with a stated reason, keep defensive guards that Pyright proves
 redundant, `locals()`-guarded names, the test-only `_candidate_binding` and an

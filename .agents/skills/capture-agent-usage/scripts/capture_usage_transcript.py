@@ -368,11 +368,13 @@ def parse_owned_transcript(
                     row = None
                 if row is None:
                     raise TranscriptError("owned Claude transcript is invalid")
-                if not isinstance(row, dict):
+                if (
+                    not isinstance(row, dict)
+                    or cast("dict[str, Any]", row).get("type") not in _ALLOWED_TYPES
+                    or cast("dict[str, Any]", row).get("sessionId") != session_id
+                ):
                     raise TranscriptError("owned Claude transcript is invalid")
                 row = cast("dict[str, Any]", row)
-                if row.get("type") not in _ALLOWED_TYPES or row.get("sessionId") != session_id:
-                    raise TranscriptError("owned Claude transcript is invalid")
                 if "version" in row and row["version"] != expected_version:
                     raise TranscriptError("owned Claude transcript is invalid")
                 if "permissionMode" in row:

@@ -1268,11 +1268,12 @@ def _registered_role(root: _Root, role: NativeCodexRole) -> tuple[str, str, str,
         config_bytes = _read_relative(root, (".codex", "config.toml"))
         config = tomllib.loads(config_bytes.decode("utf-8"))
         agents = config.get("agents")
-        if not isinstance(agents, dict):
+        if (
+            not isinstance(agents, dict)
+            or cast("dict[str, Any]", agents).get("enabled") is not True
+        ):
             _fail()
         agents = cast("dict[str, Any]", agents)
-        if agents.get("enabled") is not True:
-            _fail()
         expected = {member.value for member in NativeCodexRole}
         if (
             set(config) != {"project_doc_max_bytes", "agents"}
@@ -1284,13 +1285,11 @@ def _registered_role(root: _Root, role: NativeCodexRole) -> tuple[str, str, str,
             _fail()
         relpath, effort = _ROLE_EXPECTATIONS[role]
         registration = agents.get(role.value)
-        if not isinstance(registration, dict):
-            _fail()
-        registration = cast("dict[str, Any]", registration)
         if (
-            set(registration) != {"description", "config_file"}
-            or not isinstance(registration["description"], str)
-            or registration["config_file"] != relpath
+            not isinstance(registration, dict)
+            or set(cast("dict[str, Any]", registration)) != {"description", "config_file"}
+            or not isinstance(cast("dict[str, Any]", registration)["description"], str)
+            or cast("dict[str, Any]", registration)["config_file"] != relpath
         ):
             _fail()
         role_bytes = _read_relative(root, (".codex", *tuple(relpath.split("/"))))
@@ -1401,11 +1400,9 @@ def _totals(value: Any) -> tuple[int, int, int, int, int, int]:
         "reasoning_output_tokens",
         "total_tokens",
     )
-    if not isinstance(value, dict):
+    if not isinstance(value, dict) or set(cast("dict[str, Any]", value)) != set(keys):
         _fail()
     value = cast("dict[str, Any]", value)
-    if set(value) != set(keys):
-        _fail()
     result = tuple(value[key] for key in keys)
     if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in result):
         _fail()
@@ -1533,26 +1530,24 @@ def _parse_rollout(
                 if seen_meta or seen_context:
                     _fail()
                 source, git = payload.get("source"), payload.get("git")
-                if not isinstance(git, dict):
+                if not isinstance(git, dict) or set(cast("dict[str, Any]", git)) != _GIT_KEYS:
                     _fail()
                 git = cast("dict[str, Any]", git)
-                if set(git) != _GIT_KEYS:
-                    _fail()
                 if set(payload) == _ROOT_SESSION_META_KEYS:
                     if source != "cli" or payload["thread_source"] != "user":
                         _fail()
                 elif set(payload) == _SUBAGENT_SESSION_META_KEYS:
-                    if not isinstance(source, dict):
+                    if not isinstance(source, dict) or set(cast("dict[str, Any]", source)) != {
+                        "subagent"
+                    }:
                         _fail()
                     source = cast("dict[str, Any]", source)
-                    if set(source) != {"subagent"}:
-                        _fail()
                     source_subagent = source["subagent"]
-                    if not isinstance(source_subagent, dict):
+                    if not isinstance(source_subagent, dict) or set(
+                        cast("dict[str, Any]", source_subagent)
+                    ) != {"thread_spawn"}:
                         _fail()
                     source_subagent = cast("dict[str, Any]", source_subagent)
-                    if set(source_subagent) != {"thread_spawn"}:
-                        _fail()
                     spawn = source_subagent["thread_spawn"]
                     if not isinstance(spawn, dict):
                         _fail()
@@ -1658,15 +1653,13 @@ def _parse_rollout(
                     if not seen_started or seen_complete:
                         _fail()
                     info = payload["info"]
-                    if not isinstance(info, dict):
-                        _fail()
-                    info = cast("dict[str, Any]", info)
-                    if set(info) != {
+                    if not isinstance(info, dict) or set(cast("dict[str, Any]", info)) != {
                         "last_token_usage",
                         "model_context_window",
                         "total_token_usage",
                     }:
                         _fail()
+                    info = cast("dict[str, Any]", info)
                     current = _totals(info["total_token_usage"])
                     if totals and any(new < old for old, new in zip(totals, current, strict=True)):
                         _fail()
