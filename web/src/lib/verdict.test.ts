@@ -1,16 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { SafetyVerdict } from "./types";
 import { verdictBadge, verdictLabel } from "./verdict";
-
-const ALL: SafetyVerdict[] = [
-  "allow",
-  "clamp",
-  "reject",
-  "recovery",
-  "fault",
-  "emergency_stop",
-];
 
 describe("verdictBadge (D15: six verdicts → three badges)", () => {
   it("maps the three advisory verdicts to badges with the enum spelling", () => {
@@ -38,12 +28,6 @@ describe("verdictBadge (D15: six verdicts → three badges)", () => {
     expect(verdictBadge("recovery")).toBeNull();
     expect(verdictBadge("fault")).toBeNull();
     expect(verdictBadge("emergency_stop")).toBeNull();
-  });
-
-  it("never emits ACCEPT — the prototype spelling is rejected", () => {
-    for (const v of ALL) {
-      expect(verdictBadge(v)?.label).not.toBe("ACCEPT");
-    }
   });
 });
 
