@@ -15,7 +15,6 @@ import {
   MINIMUM_PAGE_AREA_PIXELS,
   SCREENSHOT_CLASSES,
   SCREENSHOT_INVENTORY,
-  expectScreenshot,
   isVisualCalibrationEnabled,
   resolveScreenshotOptions,
   type ScreenshotClass,
@@ -298,7 +297,4 @@ describe("visual screenshot policy", () => {
     ]);
   });
 
-  test("exports the sole screenshot helper surface", () => {
-    expect(expectScreenshot).toBeTypeOf("function");
-  });
 });

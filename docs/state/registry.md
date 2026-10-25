@@ -1,5 +1,15 @@
 # RoastPilot Agent Project State Registry
 
+**25 Oct 2026, #1059 screenshot-helper behavioural contract:**
+Replaced the screenshot helper's existence-only smoke with six behavioural cases
+against the unchanged helper. They exercise page and locator forwarding, pending
+matcher completion, failure propagation and rejection before matcher invocation.
+The existing screenshot-policy assertions and inventory remain intact. Helper
+code, budgets, browser configuration, snapshots and product pixels are unchanged.
+This is ordinary behavioural-test strengthening with an additive state record;
+focused contract evidence is not an all-marker full gate or browser acceptance.
+No speed gain or hardware result is claimed. #954 and E11-S3 remain unchanged.
+
 **24 Oct 2026, #1055 D218 local validation routes (implementation):**
 Plan D218 is merged. This Agent slice aligns the validation instructions and adds
 finite guards for the declared route mapping, fallback and consumer consistency.
