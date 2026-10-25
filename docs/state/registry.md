@@ -1,5 +1,37 @@
 # RoastPilot Agent Project State Registry
 
+**26 Oct 2026, #1028 hidden-script strict typing (single slice):**
+Root cause confirmed at base `4f0a792` with pinned Pyright 1.1.410: with no
+`exclude` key, Pyright applied its default exclusions, and `**/.*` matched the
+`.agents` component. The six capture-agent-usage modules were therefore
+import-resolved through `extraPaths` for `tests/` but never checked as source
+files. Local and `--pythonpath` runs found 219 source files before the fix
+(`Auto-excluding **/.*`; a targeted run reported `No source files found`). The
+W1 witness was an injected `int` error in `capture_usage_codex.py`, which still
+exited 0. `[tool.pyright]` now sets the closed
+`exclude = ["**/node_modules", "**/__pycache__"]`, and `include`, `extraPaths`
+and strictness are unchanged. Both modes now find 225 files (219 + 6) and exit
+0. In W3, the same injection exits 1 and names the file and line in all six
+modules, with every restore sha256-verified.
+The 305 exposed strict errors were fixed with type-only changes. Always-raising
+helpers became `NoReturn`, and `_safe_identifier` gained an accurate
+`TypeGuard[str]`. String-form `cast`s follow existing `isinstance` guards, so
+no type expression is evaluated at runtime. Other fixes are a typing-only
+scandir `Protocol`, an explicit `TypeAdapter[Any]`, and a Protocol method body.
+A few composite guards were split into equivalent consecutive raises, and
+`set(...)` became `frozenset(...)` in equality checks. Eleven line-specific
+ignores, each with a stated reason, keep defensive guards that Pyright proves
+redundant, `locals()`-guarded names, the test-only `_candidate_binding` and an
+intentional global rebinding. There are no file or block suppressions, no
+strictness change and no dependency change.
+`tests/test_tooling_coverage.py` adds T1, which pins `exclude` and hidden-root
+inclusion. It also adds an offline real-Pyright witness with a negative control,
+and that control proves the witness assertion rejects the pre-fix
+configuration. The route is GATE_MACHINERY: the full native three-root gate and
+the exhaustive witness are required at the handback head. No speed gain,
+hardware result, or capture runtime, permission or provider change is claimed.
+No epic row exists and no Plan decision is amended.
+
 **25 Oct 2026, #1061 slice 1 verdict assertion overlap:**
 Removed the redundant six-input "never emits ACCEPT" verdict assertion and its
 unused inventory and type import. The retained exact positive mapping and null
