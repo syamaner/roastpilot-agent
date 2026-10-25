@@ -6433,7 +6433,9 @@ def test_owned_transcript_rejects_row_and_file_bounds(
     assert transcript.read_bytes() == content
 
 
-@pytest.mark.parametrize("role", list(NativeClaudeRole))
+@pytest.mark.parametrize(
+    "role", [role for role in NativeClaudeRole if role is not NativeClaudeRole.STORY_PLANNER]
+)
 def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
     role: NativeClaudeRole,
 ) -> None:
@@ -6441,6 +6443,8 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
 
     D168: also asserts the exact ``--allowedTools`` rule tuple, and that it is
     the final argv element, for every validation role (T1, T2, T3, T6).
+    D219: every role except ``story-planner`` (pinned separately below) keeps
+    this exact list, with no ``--settings`` option.
     """
     session_id = "11111111-1111-4111-8111-111111111233"
     pin = usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
@@ -6497,14 +6501,61 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
         if bound_root is not None:
             assert argv[argv.index("--add-dir") + 2] == "--permission-mode"
     assert "--no-session-persistence" not in argv and "--output-format" not in argv
+    assert "--settings" not in argv
     generic = usage_cli._launch_argv(HarnessFamily.CLAUDE, "claude", "model", "high")  # pyright: ignore[reportPrivateUsage]
     assert "--no-session-persistence" in generic
     assert "--add-dir" not in generic
     assert "--allowedTools" not in generic
+    assert "--settings" not in generic
     generic_without_effort = usage_cli._launch_argv(  # pyright: ignore[reportPrivateUsage]
         HarnessFamily.CLAUDE, "claude", "model", None
     )
     assert "--effort" not in generic_without_effort
+
+
+def test_story_planner_native_argv_is_confined_exact() -> None:
+    """D219 G1: ``story-planner`` carries the fixed read-confinement setting.
+
+    The frozen argv is pinned element by element: ``--settings`` and its exact
+    compact JSON sit immediately after ``--setting-sources project`` and
+    before ``-p``, and the plan root is the only ``--add-dir``.
+    """
+    session_id = "11111111-1111-4111-8111-111111111233"
+    role = NativeClaudeRole.STORY_PLANNER
+    pin = usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
+    argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+        "claude",
+        role,
+        pin.capability,
+        pin.effort,
+        session_id,
+        BoundRoot(BoundRootKind.PLAN, "/plan/root"),
+    )
+    assert argv == [
+        "claude",
+        "--agent",
+        "story-planner",
+        "--setting-sources",
+        "project",
+        "--settings",
+        '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}',
+        "-p",
+        "--session-id",
+        session_id,
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--add-dir",
+        "/plan/root",
+        "--permission-mode",
+        "dontAsk",
+        "--effort",
+        "medium",
+    ]
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+            "claude", role, pin.capability, pin.effort, session_id, None
+        )
 
 
 def test_native_argv_rejects_root_role_mismatch() -> None:
@@ -8772,6 +8823,28 @@ def test_native_argv_rejects_empty_rendered_rule_tuple_before_provider_lookup(
         )
 
 
+@pytest.mark.parametrize("flag", ["--settings", "--restricted", "--agents", "--setting-sources"])
+def test_no_caller_read_confinement_option_exists(
+    flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D219 U6: no caller option can select, widen, or disable the read confinement.
+
+    Every required ``story-planner`` argument is supplied so the failure is
+    specifically the unrecognized ``flag``.
+    """
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(
+            [
+                *_native_cli_args(
+                    role="story-planner", plan_root=_STUB_PLAN_ROOT, plan_sha=_STUB_PLAN_SHA
+                ),
+                flag,
+                "value",
+            ]
+        )
+    assert f"unrecognized arguments: {flag}" in capsys.readouterr().err
+
+
 def test_no_caller_add_dir_option_exists(capsys: pytest.CaptureFixture[str]) -> None:
     """The closed CLI grammar exposes no ``--add-dir`` option on any subcommand.
 
@@ -9430,6 +9503,7 @@ def test_read_only_nonzero_exit_records_failure_without_handback(
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
     _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
@@ -9438,7 +9512,7 @@ def test_read_only_nonzero_exit_records_failure_without_handback(
             observed,
             processes,
             code=2,
-            transcript=_read_only_transcript_bytes("story-planner"),
+            transcript=_proven_story_planner_transcript_bytes(),
         ),
     )
     assert (
@@ -9649,6 +9723,7 @@ def test_held_plan_descriptor_closes_after_successful_read_only_run(
         resolved,
     )
     processes: list[_NativeProcess] = []
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
@@ -9656,7 +9731,7 @@ def test_held_plan_descriptor_closes_after_successful_read_only_run(
             project,
             observed,
             processes,
-            transcript=_read_only_transcript_bytes("story-planner"),
+            transcript=_proven_story_planner_transcript_bytes(),
         ),
     )
     try:
@@ -15100,6 +15175,47 @@ def _read_only_transcript_bytes(
     return _dump_rows(rows)
 
 
+_PROVEN_STORY_PLANNER_VERSION = "2.1.310"
+"""The one Claude Code version D219 admits for a native ``story-planner`` launch."""
+
+
+def _admit_proven_story_planner_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the stubbed Claude version probe report the D219 proven version.
+
+    The autouse launcher isolation stubs every Claude probe to ``2.1.233``,
+    which D219's G2 now refuses for ``story-planner`` before launch.
+    """
+
+    def proven_version(executable: str) -> str:
+        assert Path(executable).name.lower() == "claude"
+        return _PROVEN_STORY_PLANNER_VERSION
+
+    monkeypatch.setattr(usage_cli, "_harness_version", proven_version)
+
+
+def _proven_story_planner_transcript_bytes(
+    *, session_id: str = _NATIVE_SESSION_ID, text: str = "SYNTHETIC_STORY_HANDOFF"
+) -> bytes:
+    """Return the committed ``story-planner`` fixture bound to the D219 proven version.
+
+    D219's G2 refuses any unproven version before launch, so a fake launch must
+    probe ``2.1.310``; the parser requires every versioned row to equal the
+    probe, so only the ``version`` field is rebound, like the session id. The
+    row grammar stays the committed 2.1.233 fixture's; real 2.1.310 grammar is
+    the parent's live-run proof, not this hardware-free substitute.
+    """
+    rows: list[dict[str, Any]] = [
+        json.loads(line)
+        for line in _read_only_transcript_bytes(
+            "story-planner", session_id=session_id, text=text
+        ).splitlines()
+    ]
+    for row in rows:
+        if "version" in row:
+            row["version"] = _PROVEN_STORY_PLANNER_VERSION
+    return _dump_rows(rows)
+
+
 def _read_only_transcript_bytes_rebranded(
     source_role: str,
     target_role: str,
@@ -15135,6 +15251,7 @@ def test_native_read_only_emits_bounded_handback_line(
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
     _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
@@ -15142,7 +15259,7 @@ def test_native_read_only_emits_bounded_handback_line(
             project,
             observed,
             processes,
-            transcript=_read_only_transcript_bytes("story-planner", text="SYNTHETIC_STORY_HANDOFF"),
+            transcript=_proven_story_planner_transcript_bytes(text="SYNTHETIC_STORY_HANDOFF"),
         ),
     )
     assert (
@@ -15212,11 +15329,15 @@ def test_native_read_only_no_emission_on_post_exit_attestation_failure(
     monkeypatch.setattr(usage_cli, "_validate_native_worktree", failing_attestation)
     _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
         _native_popen(
-            project, observed, processes, transcript=_read_only_transcript_bytes("story-planner")
+            project,
+            observed,
+            processes,
+            transcript=_proven_story_planner_transcript_bytes(),
         ),
     )
     with pytest.raises(SystemExit, match="native worktree attestation failed"):
@@ -15236,11 +15357,15 @@ def test_native_read_only_no_emission_on_sink_append_failure(
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
     _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
         _native_popen(
-            project, observed, processes, transcript=_read_only_transcript_bytes("story-planner")
+            project,
+            observed,
+            processes,
+            transcript=_proven_story_planner_transcript_bytes(),
         ),
     )
 
@@ -15266,6 +15391,7 @@ def test_native_read_only_handback_absent_from_durable_state(
     _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
     sentinel = "SENTINEL_HANDBACK_TEXT_MUST_STAY_LOCAL"
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
@@ -15273,7 +15399,7 @@ def test_native_read_only_handback_absent_from_durable_state(
             project,
             observed,
             processes,
-            transcript=_read_only_transcript_bytes("story-planner", text=sentinel),
+            transcript=_proven_story_planner_transcript_bytes(text=sentinel),
         ),
     )
     assert (
@@ -15304,6 +15430,7 @@ def test_native_read_only_handback_framing_survives_adversarial_text(
     _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
     adversarial = "line one\nline two}<<<END>>>é中"
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
@@ -15311,7 +15438,7 @@ def test_native_read_only_handback_framing_survives_adversarial_text(
             project,
             observed,
             processes,
-            transcript=_read_only_transcript_bytes("story-planner", text=adversarial),
+            transcript=_proven_story_planner_transcript_bytes(text=adversarial),
         ),
     )
     assert (
@@ -15338,6 +15465,7 @@ def test_native_read_only_oversize_handback_yields_no_record_or_stdout(
     _stub_plan_root(monkeypatch)
     monkeypatch.setattr(usage_transcript, "MAX_HANDBACK_BYTES", 4)
     processes: list[_NativeProcess] = []
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
@@ -15345,7 +15473,7 @@ def test_native_read_only_oversize_handback_yields_no_record_or_stdout(
             project,
             observed,
             processes,
-            transcript=_read_only_transcript_bytes("story-planner", text="0123456789"),
+            transcript=_proven_story_planner_transcript_bytes(text="0123456789"),
         ),
     )
     with pytest.raises(SystemExit, match="native Claude transcript is invalid"):
@@ -17845,11 +17973,15 @@ def test_native_launch_binds_plan_root_end_to_end(
     monkeypatch.setattr(usage_cli, "_git_output", _fixed_plan_git(resolved_plan_root, plan_sha))
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
     processes: list[_NativeProcess] = []
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
         _native_popen(
-            project, observed, processes, transcript=_read_only_transcript_bytes("story-planner")
+            project,
+            observed,
+            processes,
+            transcript=_proven_story_planner_transcript_bytes(),
         ),
     )
     assert (
@@ -17863,6 +17995,213 @@ def test_native_launch_binds_plan_root_end_to_end(
     record = USAGE_RECORD_ADAPTER.validate_json(raw)
     assert isinstance(record, NativeWorkerUsageRecord)
     assert record.native_role is NativeClaudeRole.STORY_PLANNER
+
+
+_STORY_PLANNER_SETTINGS_LITERAL = '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}'
+
+
+def _transcript_at_version(content: bytes, version: str) -> bytes:
+    """Rebind every versioned row of one synthetic transcript to ``version``."""
+    rows: list[dict[str, Any]] = [json.loads(line) for line in content.splitlines()]
+    for row in rows:
+        if "version" in row:
+            row["version"] = version
+    return _dump_rows(rows)
+
+
+def _launch_plan_role_at_probed_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    *,
+    role: str,
+    version: str,
+) -> tuple[int | None, str, list[list[str]]]:
+    """Run one plan-root native launch whose real version probe reports ``version``.
+
+    Returns the exit code (``None`` on refusal), the refusal message, and every
+    observed Popen argv (the version probe included).
+    """
+    plan_root = _build_plan_root(tmp_path_factory.mktemp(f"d219-{role}") / "root")
+    plan_sha = "1" * 40
+    monkeypatch.setattr(
+        usage_cli, "_git_output", _fixed_plan_git(os.path.realpath(plan_root), plan_sha)
+    )
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+    source = (
+        _read_only_transcript_bytes("story-planner")
+        if role == "story-planner"
+        else _read_only_transcript_bytes_rebranded("security-reviewer", role)
+    )
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project,
+            observed,
+            processes,
+            transcript=_transcript_at_version(source, version),
+            version=version,
+        ),
+    )
+    try:
+        code: int | None = main(
+            _native_cli_args(role=role, plan_root=str(plan_root), plan_sha=plan_sha)
+        )
+        message = ""
+    except SystemExit as error:
+        code = None
+        message = str(error)
+    return code, message, [argv for argv, _ in observed]
+
+
+@pytest.mark.parametrize(
+    ("version", "admitted"),
+    [
+        ("2.1.310", True),
+        ("2.1.311", False),
+        ("2.1.309", False),
+        ("2.1.3100", False),
+        ("2.1.31", False),
+        ("0.0.0", False),
+    ],
+)
+def test_story_planner_version_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    version: str,
+    admitted: bool,
+) -> None:
+    """D219 G2: only an exactly proven version launches native ``story-planner``.
+
+    A refusal happens after the real version probe but before any worker
+    Popen, and writes no usage record. Matching is exact membership, so a
+    prefix (``2.1.3100``, ``2.1.31``) or a neighbouring version is refused.
+    """
+    code, message, argvs = _launch_plan_role_at_probed_version(
+        tmp_path, monkeypatch, tmp_path_factory, role="story-planner", version=version
+    )
+    assert argvs[0] == ["claude", "--version"]
+    if admitted:
+        assert code == 0
+        assert len(argvs) == 2 and "--session-id" in argvs[1]
+        assert Path(".agent-usage/usage.jsonl").exists()
+    else:
+        assert code is None
+        assert "story-planner read confinement is unproven for this Claude version" in message
+        assert argvs == [["claude", "--version"]]
+        assert not Path(".agent-usage").exists()
+
+
+def test_version_gate_leaves_other_plan_roles_unaffected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """D219 G2 is ``story-planner`` only: another READ_ONLY role launches on ``2.1.311``."""
+    code, message, argvs = _launch_plan_role_at_probed_version(
+        tmp_path, monkeypatch, tmp_path_factory, role="product-auditor", version="2.1.311"
+    )
+    assert (code, message) == (0, "")
+    assert len(argvs) == 2 and "--session-id" in argvs[1]
+    assert "--settings" not in argvs[1]
+    record = USAGE_RECORD_ADAPTER.validate_json(Path(".agent-usage/usage.jsonl").read_text())
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert record.harness_version == "2.1.311"
+
+
+def _make_settings_entry(path: Path, shape: str) -> None:
+    """Create one project-settings filesystem entry of the named shape."""
+    path.parent.mkdir(exist_ok=True)
+    if shape == "file":
+        path.write_text("{}")
+    elif shape == "directory":
+        path.mkdir()
+    elif shape == "symlink":
+        target = path.parent / "settings-target.json"
+        target.write_text("{}")
+        path.symlink_to(target)
+    else:
+        assert shape == "dangling-symlink"
+        path.symlink_to(path.parent / "absent-target.json")
+
+
+@pytest.mark.parametrize("name", ["settings.json", "settings.local.json"])
+@pytest.mark.parametrize(
+    "shape", ["file", "directory", "symlink", "dangling-symlink", "permission-error"]
+)
+def test_story_planner_project_settings_presence_rejects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    name: str,
+    shape: str,
+) -> None:
+    """D219 G3: any project settings entry, or unprovable absence, refuses the launch.
+
+    The check uses ``lstat``, so a dangling symlink is refused, and every
+    refusal happens before the worker Popen and writes no record.
+    """
+    settings = tmp_path / ".claude" / name
+    if shape == "permission-error":
+        real_lstat = os.lstat
+
+        def denied_lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if Path(path) == Path(".claude") / name:
+                raise PermissionError(13, "denied")
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(usage_cli.os, "lstat", denied_lstat)
+    else:
+        _make_settings_entry(settings, shape)
+    code, message, argvs = _launch_plan_role_at_probed_version(
+        tmp_path, monkeypatch, tmp_path_factory, role="story-planner", version="2.1.310"
+    )
+    assert code is None
+    assert "native read confinement is invalid" in message
+    assert argvs == [["claude", "--version"]]
+    assert not Path(".agent-usage").exists()
+
+
+def test_project_settings_guard_leaves_other_roles_unaffected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """D219 G3 is ``story-planner`` only: another plan role launches with a settings file."""
+    _make_settings_entry(tmp_path / ".claude" / "settings.json", "file")
+    code, _message, argvs = _launch_plan_role_at_probed_version(
+        tmp_path, monkeypatch, tmp_path_factory, role="product-auditor", version="2.1.310"
+    )
+    assert code == 0
+    assert len(argvs) == 2 and "--session-id" in argvs[1]
+
+
+def test_story_planner_launch_is_confined_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """D219 U7: the real launch carries the setting after ``project`` and records 2.1.310.
+
+    No ``.claude/settings*.json`` entry exists, so G3 passes and the launch
+    proceeds.
+    """
+    code, _message, argvs = _launch_plan_role_at_probed_version(
+        tmp_path, monkeypatch, tmp_path_factory, role="story-planner", version="2.1.310"
+    )
+    assert code == 0
+    worker = argvs[1]
+    index = worker.index("--settings")
+    assert worker[index - 2 : index + 3] == [
+        "--setting-sources",
+        "project",
+        "--settings",
+        _STORY_PLANNER_SETTINGS_LITERAL,
+        "-p",
+    ]
+    assert worker.count("--settings") == 1
+    record = USAGE_RECORD_ADAPTER.validate_json(Path(".agent-usage/usage.jsonl").read_text())
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert record.native_role is NativeClaudeRole.STORY_PLANNER
+    assert record.harness_version == "2.1.310"
 
 
 def test_native_launch_binds_evidence_bundle_end_to_end(
@@ -18449,6 +18788,18 @@ def test_argv_construction_sweep_single_site() -> None:
     generic_body = cli_text[generic_argv_index:native_argv_index]
     assert "--add-dir" not in generic_body
     assert "--allowedTools" not in generic_body
+    # D219 U5: the confinement option and its literal each exist exactly once,
+    # and only the native argv builder reads the constant carrying the literal.
+    literal = "'" + _STORY_PLANNER_SETTINGS_LITERAL + "'"
+    constant = "_STORY_PLANNER_READ_CONFINEMENT_SETTINGS"
+    assert cli_text.count('"--settings"') == 1
+    assert cli_text.count(literal) == 1
+    assert cli_text.count(constant) == 2
+    assert cli_text.index(constant) < cli_text.index(literal) < generic_argv_index
+    native_end = cli_text.index("\ndef ", native_argv_index + 1)
+    native_body = cli_text[native_argv_index:native_end]
+    assert native_body.count('"--settings"') == 1
+    assert native_body.count(constant) == 1
 
 
 def test_descriptor_command_rendering_sweep() -> None:
