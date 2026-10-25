@@ -191,6 +191,18 @@ _STORY_PLANNER_PROVEN_CLAUDE_VERSIONS = frozenset({"2.1.310"})
 Membership is exact string equality; any other version refuses the native
 ``story-planner`` launch before the model starts (narrow D173 exception).
 """
+_STORY_PLANNER_PROVEN_CLAUDE_VERSION_OUTPUTS = frozenset(
+    f"{version} (Claude Code)\n".encode("ascii")
+    for version in _STORY_PLANNER_PROVEN_CLAUDE_VERSIONS
+)
+"""Exact raw ``claude --version`` bytes accepted for native ``story-planner`` (D219).
+
+The generic probe keeps only the first ``x.y.z``, so a prerelease or build
+suffix (``2.1.310-rc.1``, ``2.1.310+local``), extra lines, or undecodable
+bytes would otherwise collapse onto a proven version. ``story-planner``
+therefore also requires the whole bounded probe output to equal the proven
+release spelling.
+"""
 _STORY_PLANNER_PROJECT_SETTINGS_PATHS = (
     Path(".claude/settings.json"),
     Path(".claude/settings.local.json"),
@@ -1516,6 +1528,23 @@ def _emit_handback(
 
 def _harness_version(executable: str) -> str:
     """Return only the first semantic version from fixed executable output."""
+    return _harness_version_probe(executable)[0]
+
+
+def _harness_version_probe(executable: str) -> tuple[str, bytes]:
+    """Run the one bounded ``--version`` probe and return its version and raw output.
+
+    Args:
+        executable: The resolved harness executable.
+
+    Returns:
+        The first semantic version in the output, and the raw bounded output
+        bytes it was extracted from.
+
+    Raises:
+        CaptureUsageError: If the probe cannot run, times out, exceeds its
+            output bound, exits non-zero, or reports no semantic version.
+    """
     process: subprocess.Popen[bytes] | None = None
     deadline: threading.Timer | None = None
     timed_out = threading.Event()
@@ -1552,7 +1581,7 @@ def _harness_version(executable: str) -> str:
     match = _SEMVER.search(output.decode("utf-8", "ignore"))
     if returncode != 0 or match is None:
         raise CaptureUsageError("selected harness version is invalid")
-    return match.group(1)
+    return match.group(1), output
 
 
 def _launch_argv(
@@ -1687,7 +1716,9 @@ def _native_claude_argv(
     return argv
 
 
-def _validate_story_planner_confinement(role: NativeClaudeRole, version: str) -> None:
+def _validate_story_planner_confinement(
+    role: NativeClaudeRole, version: str, version_output: bytes
+) -> None:
     """Refuse an unprovable native ``story-planner`` read boundary (D219).
 
     Runs after the version probe and before any worker launch, so a rejection
@@ -1696,15 +1727,20 @@ def _validate_story_planner_confinement(role: NativeClaudeRole, version: str) ->
     Args:
         role: The registered native role.
         version: The observed Claude Code version.
+        version_output: The raw bytes of the same bounded version probe.
 
     Raises:
         CaptureUsageError: If ``role`` is ``story-planner`` and ``version`` is
-            not exactly a proven version, or a project settings entry of any
+            not exactly a proven version, ``version_output`` is not exactly
+            that version's proven release spelling, or a project settings entry of any
             type exists (or its absence cannot be proven) under ``.claude/``.
     """
     if role is not NativeClaudeRole.STORY_PLANNER:
         return
-    if version not in _STORY_PLANNER_PROVEN_CLAUDE_VERSIONS:
+    if (
+        version not in _STORY_PLANNER_PROVEN_CLAUDE_VERSIONS
+        or version_output not in _STORY_PLANNER_PROVEN_CLAUDE_VERSION_OUTPUTS
+    ):
         raise CaptureUsageError(
             "story-planner read confinement is unproven for this Claude version"
         )
@@ -1858,8 +1894,8 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
             raise CaptureUsageError("native Claude session path is invalid") from None
         prompt = _prompt_bytes(arguments.prompt_file)
         executable = _resolved_executable(HarnessFamily.CLAUDE)
-        version = _harness_version(executable)
-        _validate_story_planner_confinement(role, version)
+        version, version_output = _harness_version_probe(executable)
+        _validate_story_planner_confinement(role, version, version_output)
         _validate_native_worktree(arguments, pin.capability, post_exit=False)
         started_at = _utc_now()
         started_monotonic = time.monotonic()

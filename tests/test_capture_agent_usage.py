@@ -116,6 +116,7 @@ from pydantic import TypeAdapter, ValidationError
 
 _REAL_VALIDATE_WORKTREE_METADATA = usage_cli._validate_worktree_metadata  # pyright: ignore[reportPrivateUsage]
 _REAL_HARNESS_VERSION = usage_cli._harness_version  # pyright: ignore[reportPrivateUsage]
+_REAL_HARNESS_VERSION_PROBE = usage_cli._harness_version_probe  # pyright: ignore[reportPrivateUsage]
 
 
 def _stub_native_codex_git_administration(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3000,6 +3001,7 @@ def test_native_codex_cli_probes_resolved_executable_once_before_supervision(
     monkeypatch.setattr(usage_cli, "_resolved_executable", resolved)
     monkeypatch.setattr(usage_cli.subprocess, "Popen", popen)
     monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", _REAL_HARNESS_VERSION_PROBE)
     monkeypatch.setattr(usage_cli, "supervise_native_codex", supervise)
     monkeypatch.setenv("PATH", "/allowed/codex-bin")
     monkeypatch.setenv("LANG", "en_GB.UTF-8")
@@ -9202,13 +9204,16 @@ def _native_popen(
     prompt_fail: bool = False,
     transcript: bytes | None = None,
     version: str = "2.1.233",
+    version_output: bytes | None = None,
 ) -> Callable[..., _NativeProcess]:
     """Return a fake version/worker launcher that creates only one parent transcript."""
 
     def fake(argv: list[str], **kwargs: object) -> _NativeProcess:
         observed.append((argv, kwargs))
         if argv[-1] == "--version":
-            process = _NativeProcess(f"Claude Code {version}\\n".encode())
+            process = _NativeProcess(
+                f"Claude Code {version}\\n".encode() if version_output is None else version_output
+            )
             processes.append(process)
             return process
         if transcript is not None:
@@ -9364,6 +9369,7 @@ def test_native_command_launches_exact_worker_and_records_immutable_transcript(
         _native_popen(project, observed, processes, transcript=transcript, version="2.1.241"),
     )
     monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", _REAL_HARNESS_VERSION_PROBE)
 
     assert main(_native_cli_args()) == 0
 
@@ -9439,6 +9445,7 @@ def test_generic_claude_probe_uses_closed_environment_once(
     monkeypatch.setattr(usage_cli, "_resolved_executable", resolved)
     monkeypatch.setattr(usage_cli.subprocess, "Popen", popen)
     monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", _REAL_HARNESS_VERSION_PROBE)
 
     assert (
         main(
@@ -10161,6 +10168,11 @@ def isolate_run_metadata_validation(
             return "2.1.233"
         raise AssertionError(executable)
 
+    def harness_version_probe(executable: str) -> tuple[str, bytes]:
+        """Return the stubbed version with Claude Code's observed release spelling."""
+        version = harness_version(executable)
+        return version, f"{version} (Claude Code)\n".encode()
+
     lifecycle_tests = {
         "test_version_probe_timeout_kills_reaps_and_never_reaches_a_run",
         "test_provider_free_executable_integration_captures_only_normalized_usage",
@@ -10178,6 +10190,7 @@ def isolate_run_metadata_validation(
     if original_name not in lifecycle_tests:
         monkeypatch.setattr(usage_cli, "_resolved_executable", resolved_executable)
         monkeypatch.setattr(usage_cli, "_harness_version", harness_version)
+        monkeypatch.setattr(usage_cli, "_harness_version_probe", harness_version_probe)
 
 
 def _stream(*events: str) -> BytesIO:
@@ -12981,6 +12994,7 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
     monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
     monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", _REAL_HARNESS_VERSION_PROBE)
     assert (
         main(
             [
@@ -13840,6 +13854,7 @@ def test_invalid_version_never_spawns_a_run(
 
     monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", _REAL_HARNESS_VERSION_PROBE)
     with pytest.raises(CaptureUsageError, match="version"):
         usage_cli._harness_version("/stub/codex")  # pyright: ignore[reportPrivateUsage]
 
@@ -15177,6 +15192,8 @@ def _read_only_transcript_bytes(
 
 _PROVEN_STORY_PLANNER_VERSION = "2.1.310"
 """The one Claude Code version D219 admits for a native ``story-planner`` launch."""
+_PROVEN_STORY_PLANNER_VERSION_OUTPUT = b"2.1.310 (Claude Code)\n"
+"""The exact raw ``claude --version`` release spelling observed on 2.1.310."""
 
 
 def _admit_proven_story_planner_version(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -15186,11 +15203,11 @@ def _admit_proven_story_planner_version(monkeypatch: pytest.MonkeyPatch) -> None
     which D219's G2 now refuses for ``story-planner`` before launch.
     """
 
-    def proven_version(executable: str) -> str:
+    def proven_version(executable: str) -> tuple[str, bytes]:
         assert Path(executable).name.lower() == "claude"
-        return _PROVEN_STORY_PLANNER_VERSION
+        return _PROVEN_STORY_PLANNER_VERSION, _PROVEN_STORY_PLANNER_VERSION_OUTPUT
 
-    monkeypatch.setattr(usage_cli, "_harness_version", proven_version)
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", proven_version)
 
 
 def _proven_story_planner_transcript_bytes(
@@ -18016,8 +18033,14 @@ def _launch_plan_role_at_probed_version(
     *,
     role: str,
     version: str,
+    version_output: bytes | None = None,
+    transcript: bytes | None = None,
 ) -> tuple[int | None, str, list[list[str]]]:
     """Run one plan-root native launch whose real version probe reports ``version``.
+
+    The probe emits ``version_output`` verbatim, defaulting to Claude Code's
+    observed release spelling of ``version``. ``transcript`` replaces the
+    committed role fixture as the worker's parent transcript.
 
     Returns the exit code (``None`` on refusal), the refusal message, and every
     observed Popen argv (the version probe included).
@@ -18029,8 +18052,11 @@ def _launch_plan_role_at_probed_version(
     )
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
     monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", _REAL_HARNESS_VERSION_PROBE)
     source = (
-        _read_only_transcript_bytes("story-planner")
+        transcript
+        if transcript is not None
+        else _read_only_transcript_bytes("story-planner")
         if role == "story-planner"
         else _read_only_transcript_bytes_rebranded("security-reviewer", role)
     )
@@ -18043,7 +18069,9 @@ def _launch_plan_role_at_probed_version(
             observed,
             processes,
             transcript=_transcript_at_version(source, version),
-            version=version,
+            version_output=(
+                f"{version} (Claude Code)\n".encode() if version_output is None else version_output
+            ),
         ),
     )
     try:
@@ -18094,6 +18122,89 @@ def test_story_planner_version_gate(
         assert "story-planner read confinement is unproven for this Claude version" in message
         assert argvs == [["claude", "--version"]]
         assert not Path(".agent-usage").exists()
+
+
+_UNPROVEN_STORY_PLANNER_VERSION_OUTPUTS = (
+    b"2.1.310-rc.1 (Claude Code)\n",
+    b"2.1.310+local (Claude Code)\n",
+    b"2.1.310 (Claude Code)\nextra\n",
+    b"2.1.310 (Claude Code)\n\n",
+    b"2.1.310 (Claude Code)\xff\n",
+    b"\xff2.1.310 (Claude Code)\n",
+    b"2.1.310 (Claude Code)",
+    b"2.1.310 (Claude Code)\r\n",
+    b" 2.1.310 (Claude Code)\n",
+    b"Claude Code 2.1.310\n",
+    b"2.1.310\n",
+    b"2.1.310 (Claude Code) 9.9.9\n",
+)
+"""Probe outputs whose first ``x.y.z`` is the proven version but whose spelling is not."""
+
+
+@pytest.mark.parametrize("version_output", _UNPROVEN_STORY_PLANNER_VERSION_OUTPUTS)
+def test_story_planner_version_gate_requires_exact_release_spelling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    version_output: bytes,
+) -> None:
+    """D219 G2 checks the raw bounded probe bytes, not only the first ``x.y.z``.
+
+    A prerelease, build suffix, extra line, undecodable byte, or other spelling
+    reduces to ``2.1.310`` under the generic extraction, yet is refused before
+    any worker Popen and writes no usage record.
+    """
+    code, message, argvs = _launch_plan_role_at_probed_version(
+        tmp_path,
+        monkeypatch,
+        tmp_path_factory,
+        role="story-planner",
+        version="2.1.310",
+        version_output=version_output,
+    )
+    assert code is None
+    assert "story-planner read confinement is unproven for this Claude version" in message
+    assert argvs == [["claude", "--version"]]
+    assert not Path(".agent-usage").exists()
+
+
+def test_exact_release_spelling_leaves_other_plan_roles_unaffected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """The raw-spelling check is ``story-planner`` only; others keep D173 extraction."""
+    code, message, argvs = _launch_plan_role_at_probed_version(
+        tmp_path,
+        monkeypatch,
+        tmp_path_factory,
+        role="product-auditor",
+        version="2.1.310",
+        version_output=b"2.1.310-rc.1 (Claude Code)\n",
+    )
+    assert (code, message) == (0, "")
+    assert [argv for argv in argvs if argv[-1] == "--version"] == [["claude", "--version"]]
+    record = USAGE_RECORD_ADAPTER.validate_json(Path(".agent-usage/usage.jsonl").read_text())
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert record.harness_version == "2.1.310"
+
+
+def test_harness_version_probe_returns_the_one_bounded_raw_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The single probe returns its extracted version with the exact raw bytes."""
+    observed: list[list[str]] = []
+
+    def fake_popen(argv: list[str], **_kwargs: object) -> _NativeProcess:
+        observed.append(argv)
+        return _NativeProcess(b"2.1.310-rc.1 (Claude Code)\n")
+
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    assert _REAL_HARNESS_VERSION_PROBE("/stub/claude") == (
+        "2.1.310",
+        b"2.1.310-rc.1 (Claude Code)\n",
+    )
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", _REAL_HARNESS_VERSION_PROBE)
+    assert _REAL_HARNESS_VERSION("/stub/claude") == "2.1.310"
+    assert observed == [["/stub/claude", "--version"]] * 2
 
 
 def test_version_gate_leaves_other_plan_roles_unaffected(
@@ -18202,6 +18313,278 @@ def test_story_planner_launch_is_confined_end_to_end(
     assert isinstance(record, NativeWorkerUsageRecord)
     assert record.native_role is NativeClaudeRole.STORY_PLANNER
     assert record.harness_version == "2.1.310"
+
+
+_ENVELOPE_PAYLOAD_SENTINEL = "SENTINEL_ENVELOPE_PAYLOAD"
+"""Marker planted in nested envelope payloads; it must never reach a result or record."""
+
+
+def _sanitized_envelope_rows(session_id: str) -> list[dict[str, Any]]:
+    """Return the lead-supplied 2.1.310 envelope rows bound to ``session_id``.
+
+    Each nested request payload gains one planted sentinel string so a test
+    can prove the parser never retains payload content.
+    """
+    content = (FIXTURES / "claude-2.1.310-envelope-rows.jsonl").read_bytes()
+    rows: list[dict[str, Any]] = [json.loads(line) for line in content.splitlines()]
+    assert [row["type"] for row in rows] == [
+        "api-request-shape",
+        "api-request-blob",
+        "api-request",
+        "api-request",
+        "cost-state",
+    ]
+    for row in rows:
+        row["sessionId"] = session_id
+    rows[0]["shape"]["system"][0]["text"] = _ENVELOPE_PAYLOAD_SENTINEL
+    rows[1]["message"]["content"][0]["text"] = _ENVELOPE_PAYLOAD_SENTINEL
+    rows[2]["params"]["model"] = _ENVELOPE_PAYLOAD_SENTINEL
+    rows[3]["tail"][0] = _ENVELOPE_PAYLOAD_SENTINEL
+    return rows
+
+
+def _story_planner_transcript_with_envelopes(
+    session_id: str, envelopes: list[dict[str, Any]] | None = None
+) -> bytes:
+    """Interleave envelope rows through a valid proven-version ``story-planner`` transcript.
+
+    The rows are spread before, between, and after the base fixture's rows,
+    as a live 2.1.310 transcript interleaves them with conversation rows.
+    """
+    base: list[dict[str, Any]] = [
+        json.loads(line)
+        for line in _proven_story_planner_transcript_bytes(session_id=session_id).splitlines()
+    ]
+    inserted = _sanitized_envelope_rows(session_id) if envelopes is None else envelopes
+    rows: list[dict[str, Any]] = []
+    for index, row in enumerate(base):
+        if index < len(inserted):
+            rows.append(inserted[index])
+        rows.append(row)
+    rows.extend(inserted[len(base) :])
+    return _dump_rows(rows)
+
+
+def _parse_story_planner_transcript(
+    tmp_path: Path, session_id: str
+) -> usage_transcript.TranscriptUsage:
+    """Parse one installed ``story-planner`` transcript under the D219 proven version."""
+    return usage_transcript.parse_owned_transcript(
+        tmp_path,
+        session_id,
+        NativeClaudeRole.STORY_PLANNER,
+        usage_cli._native_role_pin(NativeClaudeRole.STORY_PLANNER).effort,  # pyright: ignore[reportPrivateUsage]
+        expected_version=_PROVEN_STORY_PLANNER_VERSION,
+        expected_permission_mode="dontAsk",
+        require_handback=True,
+    )
+
+
+def test_observed_2_1_310_envelope_rows_validate_and_are_discarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D219 U9: the sanitized 2.1.310 envelopes parse without changing or retaining anything.
+
+    Usage, model, call count, and handback equal the envelope-free baseline,
+    even when ``cost-state`` reports different per-model token counts, and no
+    nested payload string is retained.
+    """
+    session_id = "73333333-3333-4333-8333-333333333333"
+    transcript, installed = _install_owned_transcript(
+        tmp_path,
+        monkeypatch,
+        _proven_story_planner_transcript_bytes(session_id=session_id),
+        session_id,
+    )
+    baseline = _parse_story_planner_transcript(tmp_path, installed)
+    envelopes = _sanitized_envelope_rows(session_id)
+    envelopes[4]["modelUsage"]["claude-opus-5-5"]["inputTokens"] = 999_999
+    envelopes[4]["totalCostUSD"] = 1.25
+    transcript.write_bytes(_story_planner_transcript_with_envelopes(session_id, envelopes))
+
+    usage = _parse_story_planner_transcript(tmp_path, installed)
+
+    assert usage == baseline
+    assert usage.handback_text == "SYNTHETIC_STORY_HANDOFF"
+    assert _ENVELOPE_PAYLOAD_SENTINEL not in repr(usage)
+    assert "999999" not in repr(usage)
+
+
+def test_envelope_rows_alone_never_complete_a_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Envelope rows contribute no usage: without an assistant row the transcript is incomplete."""
+    session_id = "74444444-4444-4444-8444-444444444444"
+    rows = [
+        json.loads(line)
+        for line in _story_planner_transcript_with_envelopes(session_id).splitlines()
+    ]
+    kept = [row for row in rows if row.get("type") != "assistant"]
+    _install_owned_transcript(tmp_path, monkeypatch, _dump_rows(kept), session_id)
+    with pytest.raises(usage_transcript.TranscriptError, match="incomplete"):
+        _parse_story_planner_transcript(tmp_path, session_id)
+
+
+def _envelope_mutation(
+    index: int, mutate: Callable[[dict[str, Any]], None]
+) -> Callable[[list[dict[str, Any]]], None]:
+    """Return a transform that applies ``mutate`` to one sanitized envelope row."""
+
+    def apply(rows: list[dict[str, Any]]) -> None:
+        mutate(rows[index])
+
+    return apply
+
+
+def _set(key: str, value: object) -> Callable[[dict[str, Any]], None]:
+    def mutate(row: dict[str, Any]) -> None:
+        row[key] = value
+
+    return mutate
+
+
+def _drop(key: str) -> Callable[[dict[str, Any]], None]:
+    def mutate(row: dict[str, Any]) -> None:
+        del row[key]
+
+    return mutate
+
+
+def _set_model_usage(key: str, value: object) -> Callable[[dict[str, Any]], None]:
+    def mutate(row: dict[str, Any]) -> None:
+        row["modelUsage"]["claude-opus-5-5"][key] = value
+
+    return mutate
+
+
+def _drop_model_usage(key: str) -> Callable[[dict[str, Any]], None]:
+    def mutate(row: dict[str, Any]) -> None:
+        del row["modelUsage"]["claude-opus-5-5"][key]
+
+    return mutate
+
+
+_SHAPE, _BLOB, _REQUEST, _REQUEST_BASE, _COST = range(5)
+_MALICIOUS_ENVELOPES: dict[str, Callable[[list[dict[str, Any]]], None]] = {
+    "unknown-type": _envelope_mutation(_BLOB, _set("type", "api-request-extra")),
+    "unknown-prefixed-type": _envelope_mutation(_COST, _set("type", "cost-state-v2")),
+    "shape-extra-key": _envelope_mutation(_SHAPE, _set("agentId", "x")),
+    "blob-extra-base": _envelope_mutation(_BLOB, _set("base", "SYNTHETIC")),
+    "request-extra-usage": _envelope_mutation(_REQUEST, _set("usage", {"input_tokens": 1})),
+    "cost-extra-key": _envelope_mutation(_COST, _set("subagents", [])),
+    "shape-permission-mode": _envelope_mutation(_SHAPE, _set("permissionMode", "dontAsk")),
+    "shape-missing-shape": _envelope_mutation(_SHAPE, _drop("shape")),
+    "shape-missing-version": _envelope_mutation(_SHAPE, _drop("version")),
+    "shape-missing-timestamp": _envelope_mutation(_SHAPE, _drop("timestamp")),
+    "blob-missing-message": _envelope_mutation(_BLOB, _drop("message")),
+    "blob-missing-hash": _envelope_mutation(_BLOB, _drop("hash")),
+    "request-missing-params": _envelope_mutation(_REQUEST, _drop("params")),
+    "request-missing-version": _envelope_mutation(_REQUEST_BASE, _drop("version")),
+    "request-missing-digest": _envelope_mutation(_REQUEST_BASE, _drop("requestDigest")),
+    "cost-missing-model-usage": _envelope_mutation(_COST, _drop("modelUsage")),
+    "cost-missing-flag": _envelope_mutation(_COST, _drop("hasUnknownModelCost")),
+    "missing-session": _envelope_mutation(_BLOB, _drop("sessionId")),
+    "foreign-session": _envelope_mutation(_COST, _set("sessionId", "foreign")),
+    "shape-version-drift": _envelope_mutation(_SHAPE, _set("version", "2.1.311")),
+    "request-version-drift": _envelope_mutation(_REQUEST, _set("version", "2.1.3100")),
+    "shape-version-number": _envelope_mutation(_SHAPE, _set("version", 2)),
+    "shape-bad-timestamp": _envelope_mutation(_SHAPE, _set("timestamp", "not-a-time")),
+    "request-numeric-timestamp": _envelope_mutation(_REQUEST, _set("timestamp", 0)),
+    "shape-list-shape": _envelope_mutation(_SHAPE, _set("shape", [])),
+    "blob-string-message": _envelope_mutation(_BLOB, _set("message", "SYNTHETIC")),
+    "blob-null-hash": _envelope_mutation(_BLOB, _set("hash", None)),
+    "request-list-params": _envelope_mutation(_REQUEST, _set("params", [])),
+    "request-object-tail": _envelope_mutation(_REQUEST, _set("tail", {})),
+    "request-object-cache-control": _envelope_mutation(_REQUEST, _set("cacheControl", {})),
+    "request-numeric-id": _envelope_mutation(_REQUEST, _set("id", 1)),
+    "request-numeric-base": _envelope_mutation(_REQUEST_BASE, _set("base", 0)),
+    "request-bool-keep": _envelope_mutation(_REQUEST, _set("keep", True)),
+    "request-negative-keep": _envelope_mutation(_REQUEST, _set("keep", -1)),
+    "request-fractional-keep": _envelope_mutation(_REQUEST, _set("keep", 1.5)),
+    "cost-string-amount": _envelope_mutation(_COST, _set("totalCostUSD", "0")),
+    "cost-negative-amount": _envelope_mutation(_COST, _set("totalDuration", -1)),
+    "cost-bool-amount": _envelope_mutation(_COST, _set("startTime", True)),
+    "cost-infinite-amount": _envelope_mutation(_COST, _set("totalAPIDuration", math.inf)),
+    "cost-nan-amount": _envelope_mutation(_COST, _set("totalToolDuration", math.nan)),
+    "cost-fractional-count": _envelope_mutation(_COST, _set("totalLinesAdded", 1.5)),
+    "cost-integer-flag": _envelope_mutation(_COST, _set("hasUnknownModelCost", 0)),
+    "cost-list-model-usage": _envelope_mutation(_COST, _set("modelUsage", [])),
+    "cost-model-usage-not-object": _envelope_mutation(
+        _COST, _set("modelUsage", {"claude-opus-5-5": 0})
+    ),
+    "cost-model-usage-extra-key": _envelope_mutation(_COST, _set_model_usage("prompt", "x")),
+    "cost-model-usage-extra-numeric-key": _envelope_mutation(
+        _COST, _set_model_usage("contextWindow", 0)
+    ),
+    "cost-model-usage-missing-key": _envelope_mutation(_COST, _drop_model_usage("costUSD")),
+    "cost-model-usage-negative": _envelope_mutation(_COST, _set_model_usage("inputTokens", -1)),
+    "cost-model-usage-bool": _envelope_mutation(_COST, _set_model_usage("outputTokens", False)),
+    "cost-model-usage-string": _envelope_mutation(_COST, _set_model_usage("costUSD", "0")),
+}
+"""Malicious or malformed variants of the sanitized 2.1.310 envelopes; each must fail closed."""
+
+
+@pytest.mark.parametrize("variant", sorted(_MALICIOUS_ENVELOPES))
+def test_malformed_2_1_310_envelope_rows_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    """D219 U9: unknown types and every malformed envelope reject the whole transcript."""
+    session_id = "75555555-5555-4555-8555-555555555555"
+    envelopes = _sanitized_envelope_rows(session_id)
+    _MALICIOUS_ENVELOPES[variant](envelopes)
+    _install_owned_transcript(
+        tmp_path,
+        monkeypatch,
+        _story_planner_transcript_with_envelopes(session_id, envelopes),
+        session_id,
+    )
+    with pytest.raises(
+        usage_transcript.TranscriptError, match="owned Claude transcript is invalid"
+    ):
+        _parse_story_planner_transcript(tmp_path, session_id)
+
+
+def test_envelope_payload_duplicate_key_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A duplicate key nested inside an unread envelope payload still rejects the row."""
+    session_id = "76666666-6666-4666-8666-666666666666"
+    content = _story_planner_transcript_with_envelopes(session_id)
+    tampered = content.replace(
+        b'"params": {"model": ', b'"params": {"model": "SYNTHETIC", "model": ', 1
+    )
+    assert tampered != content
+    _install_owned_transcript(tmp_path, monkeypatch, tampered, session_id)
+    with pytest.raises(
+        usage_transcript.TranscriptError, match="owned Claude transcript is invalid"
+    ):
+        _parse_story_planner_transcript(tmp_path, session_id)
+
+
+def test_story_planner_launch_records_usage_with_2_1_310_envelope_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """D219 U9: a confined launch whose transcript carries 2.1.310 envelopes appends its record.
+
+    The record carries the role, version, and fixture usage, and no envelope
+    payload string reaches the usage record or the handback stdout line.
+    """
+    code, message, _argvs = _launch_plan_role_at_probed_version(
+        tmp_path,
+        monkeypatch,
+        tmp_path_factory,
+        role="story-planner",
+        version=_PROVEN_STORY_PLANNER_VERSION,
+        transcript=_story_planner_transcript_with_envelopes(_NATIVE_SESSION_ID),
+    )
+    assert (code, message) == (0, "")
+    raw = Path(".agent-usage/usage.jsonl").read_text()
+    record = USAGE_RECORD_ADAPTER.validate_json(raw)
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert record.native_role is NativeClaudeRole.STORY_PLANNER
+    assert record.harness_version == _PROVEN_STORY_PLANNER_VERSION
+    assert record.success and record.usage_complete
+    assert _ENVELOPE_PAYLOAD_SENTINEL not in raw
 
 
 def test_native_launch_binds_evidence_bundle_end_to_end(
