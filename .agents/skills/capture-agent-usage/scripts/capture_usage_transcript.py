@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import stat
 from contextlib import suppress
@@ -33,19 +34,24 @@ _ALLOWED_TYPES = frozenset(
     {
         "agent-setting",
         "ai-title",
+        "api-request",
+        "api-request-blob",
+        "api-request-shape",
         "assistant",
         "attachment",
         "atis-latch",
+        "cost-state",
         "last-prompt",
         "mode",
         "queue-operation",
         "user",
     }
 )
-"""Row types observed across the committed 2.1.233 and 2.1.241 transcript fixtures.
+"""Row types observed across the committed 2.1.233 and 2.1.241 transcript fixtures,
+plus the four envelope types the lead observed on 2.1.310 (D219 U9).
 
 ``mode``, ``ai-title``, and discarded ``atis-latch`` rows are metadata-only rows
-with independently closed shapes.
+with independently closed shapes; so are the 2.1.310 envelope rows below.
 """
 _MODE_ROW_KEYS = frozenset({"type", "mode", "sessionId"})
 """Exact observed keys of the metadata-only ``mode`` row (story-planner.jsonl)."""
@@ -53,6 +59,86 @@ _AI_TITLE_ROW_KEYS = frozenset({"type", "aiTitle", "sessionId"})
 """Exact observed keys of the metadata-only ``ai-title`` row."""
 _ATIS_LATCH_ROW_KEYS = frozenset({"atis", "sessionId", "type"})
 """Exact observed keys of a discarded ``atis-latch`` metadata row."""
+_STRING = "string"
+_OBJECT = "object"
+_ARRAY = "array"
+_TIMESTAMP = "timestamp"
+_COUNT = "count"
+_AMOUNT = "amount"
+_FLAG = "flag"
+_MODEL_USAGE = "model-usage"
+_ENVELOPE_ROW_FIELDS: dict[str, tuple[dict[str, str], frozenset[str]]] = {
+    "api-request-shape": (
+        {
+            "type": _STRING,
+            "sessionId": _STRING,
+            "shapeHash": _STRING,
+            "timestamp": _TIMESTAMP,
+            "version": _STRING,
+            "shape": _OBJECT,
+        },
+        frozenset(),
+    ),
+    "api-request-blob": (
+        {"type": _STRING, "sessionId": _STRING, "hash": _STRING, "message": _OBJECT},
+        frozenset(),
+    ),
+    "api-request": (
+        {
+            "type": _STRING,
+            "sessionId": _STRING,
+            "id": _STRING,
+            "timestamp": _TIMESTAMP,
+            "version": _STRING,
+            "querySource": _STRING,
+            "shapeHash": _STRING,
+            "params": _OBJECT,
+            "base": _STRING,
+            "keep": _COUNT,
+            "tail": _ARRAY,
+            "cacheControl": _ARRAY,
+            "requestDigest": _STRING,
+        },
+        frozenset({"base"}),
+    ),
+    "cost-state": (
+        {
+            "type": _STRING,
+            "sessionId": _STRING,
+            "totalCostUSD": _AMOUNT,
+            "totalAPIDuration": _AMOUNT,
+            "totalAPIDurationWithoutRetries": _AMOUNT,
+            "totalToolDuration": _AMOUNT,
+            "totalLinesAdded": _COUNT,
+            "totalLinesRemoved": _COUNT,
+            "totalDuration": _AMOUNT,
+            "startTime": _AMOUNT,
+            "modelUsage": _MODEL_USAGE,
+            "hasUnknownModelCost": _FLAG,
+        },
+        frozenset(),
+    ),
+}
+"""Closed outer envelopes of the metadata rows observed on 2.1.310 (D219 U9).
+
+Each entry maps every permitted key to its value kind, plus the keys that may be
+absent (only ``api-request``'s ``base``). Nested request/shape/blob payloads may
+carry prompt or tool content, so they are type-checked as containers and never
+read, consumed, or persisted. ``version`` is bound to the probe by the generic
+row check, and these rows never contribute usage, model, role, or chronology.
+"""
+_COST_STATE_MODEL_USAGE_KEYS = frozenset(
+    {
+        "inputTokens",
+        "outputTokens",
+        "thinkingTokens",
+        "cacheReadInputTokens",
+        "cacheCreationInputTokens",
+        "webSearchRequests",
+        "costUSD",
+    }
+)
+"""Exact observed per-model keys of a ``cost-state`` row's ``modelUsage`` (2.1.310)."""
 _USAGE_REQUIRED = frozenset(
     {"input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"}
 )
@@ -67,6 +153,11 @@ _USAGE_OPTIONAL = frozenset(
         "speed",
     }
 )
+_USAGE_NULL_ONLY = frozenset({"fallback_credit"})
+"""Optional assistant usage keys admitted only with a JSON ``null`` value (2.1.310, D219 U9).
+
+They never contribute to token totals; any non-null value fails closed.
+"""
 
 
 class TranscriptError(ValueError):
@@ -101,6 +192,66 @@ def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise TranscriptError("transcript contains duplicate JSON keys")
         result[key] = value
     return result
+
+
+def _amount(value: object) -> bool:
+    """Return whether ``value`` is a finite, non-negative JSON number (not a bool)."""
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int | float)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def _envelope_value_valid(kind: str, value: object) -> bool:
+    """Return whether one envelope value has its closed observed kind."""
+    if kind == _STRING:
+        return isinstance(value, str)
+    if kind == _OBJECT:
+        return isinstance(value, dict)
+    if kind == _ARRAY:
+        return isinstance(value, list)
+    if kind == _TIMESTAMP:
+        try:
+            _timestamp(value)
+        except TranscriptError:
+            return False
+        return True
+    if kind == _COUNT:
+        return not isinstance(value, bool) and isinstance(value, int) and value >= 0
+    if kind == _AMOUNT:
+        return _amount(value)
+    if kind == _FLAG:
+        return isinstance(value, bool)
+    assert kind == _MODEL_USAGE
+    return isinstance(value, dict) and all(
+        isinstance(model, str)
+        and isinstance(usage, dict)
+        and set(usage) == _COST_STATE_MODEL_USAGE_KEYS
+        and all(_amount(amount) for amount in usage.values())
+        for model, usage in value.items()
+    )
+
+
+def _validate_envelope_row(row: dict[str, Any]) -> None:
+    """Validate one closed 2.1.310 metadata envelope row without reading its payload.
+
+    Args:
+        row: A decoded row whose ``type`` is a key of ``_ENVELOPE_ROW_FIELDS``.
+
+    Raises:
+        TranscriptError: If the row's key set or any value kind differs from
+            the closed observed envelope.
+    """
+    fields, optional = _ENVELOPE_ROW_FIELDS[row["type"]]
+    keys = set(row)
+    if (
+        not keys <= set(fields)
+        or not keys >= set(fields) - optional
+        or not all(_envelope_value_valid(fields[key], row[key]) for key in keys)
+    ):
+        raise TranscriptError("owned Claude transcript is invalid")
 
 
 def _integer(value: object) -> int:
@@ -390,6 +541,9 @@ def parse_owned_transcript(
                     ):
                         raise TranscriptError("owned Claude transcript is invalid")
                     continue
+                if row["type"] in _ENVELOPE_ROW_FIELDS:
+                    _validate_envelope_row(row)
+                    continue
                 if row["type"] == "mode":
                     if set(row) != _MODE_ROW_KEYS or row.get("mode") != "normal":
                         raise TranscriptError("owned Claude transcript is invalid")
@@ -449,8 +603,9 @@ def parse_owned_transcript(
                 ):
                     raise TranscriptError("owned Claude transcript is invalid")
                 if (
-                    set(usage) - (_USAGE_REQUIRED | _USAGE_OPTIONAL)
+                    set(usage) - (_USAGE_REQUIRED | _USAGE_OPTIONAL | _USAGE_NULL_ONLY)
                     or not set(usage) >= _USAGE_REQUIRED
+                    or any(usage[key] is not None for key in _USAGE_NULL_ONLY & set(usage))
                 ):
                     raise TranscriptError("owned Claude transcript usage is invalid")
                 values = tuple(

@@ -377,6 +377,43 @@ def test_story_planner_remains_shell_and_write_closed() -> None:
     )
 
 
+_STORY_PLANNER_READ_BOUNDARY_BLOCK = (
+    "Under `run-native-claude`, the launcher mechanically confines this role's "
+    "`Read`/`Grep`/`Glob` to the attested implementation worktree and the bound plan "
+    "root through a fixed per-launch Claude Code setting (D219), and refuses this "
+    "role's native launch on any Claude Code version not proven for that boundary. "
+    "Other launch paths are outside that guarantee and must be assessed separately; "
+    "for them the orchestrator still reviews your tool-use transcript for out-of-tree "
+    "reads before ratifying."
+)
+
+
+def _normalized(text: str) -> str:
+    """Collapse every whitespace run so wrapped Markdown compares as prose."""
+    return " ".join(text.split())
+
+
+def test_story_planner_read_boundary_replaces_prose_caveat() -> None:
+    """D219 U8: the role states the mechanical boundary once, with no prose caveat.
+
+    The skill and the AGENTS.md row point at the D219 boundary without copying
+    the role block, so it keeps one authoritative copy.
+    """
+    role = _normalized(agent_text(AGENTS_DIR / "story-planner.md"))
+    assert "prose, not a mechanism" not in role
+    assert "tracked as follow-up" not in role
+    assert role.count(_STORY_PLANNER_READ_BOUNDARY_BLOCK) == 1
+    assert f"{_STORY_PLANNER_READ_BOUNDARY_BLOCK} The plan repo is the source of truth" in role
+    skill = _normalized(
+        (_REPO / ".agents" / "skills" / "capture-agent-usage" / "SKILL.md").read_text()
+    )
+    agents = _normalized((_REPO / "AGENTS.md").read_text())
+    for document in (skill, agents):
+        assert "D219" in document
+        assert ".claude/agents/story-planner.md" in document
+        assert _STORY_PLANNER_READ_BOUNDARY_BLOCK not in document
+
+
 def _has_runbook_line_citation(text: str) -> bool:
     """Return whether text contains a supported runbook line-citation form."""
     return any(pattern.search(text) is not None for pattern in _RUNBOOK_LINE_CITATIONS)
