@@ -153,6 +153,11 @@ _USAGE_OPTIONAL = frozenset(
         "speed",
     }
 )
+_USAGE_NULL_ONLY = frozenset({"fallback_credit"})
+"""Optional assistant usage keys admitted only with a JSON ``null`` value (2.1.310, D219 U9).
+
+They never contribute to token totals; any non-null value fails closed.
+"""
 
 
 class TranscriptError(ValueError):
@@ -598,8 +603,9 @@ def parse_owned_transcript(
                 ):
                     raise TranscriptError("owned Claude transcript is invalid")
                 if (
-                    set(usage) - (_USAGE_REQUIRED | _USAGE_OPTIONAL)
+                    set(usage) - (_USAGE_REQUIRED | _USAGE_OPTIONAL | _USAGE_NULL_ONLY)
                     or not set(usage) >= _USAGE_REQUIRED
+                    or any(usage[key] is not None for key in _USAGE_NULL_ONLY & set(usage))
                 ):
                     raise TranscriptError("owned Claude transcript usage is invalid")
                 values = tuple(

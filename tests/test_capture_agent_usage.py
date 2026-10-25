@@ -19555,3 +19555,74 @@ def test_nested_witness_failure_evidence_caller_wiring() -> None:
         "environment, cwd=repository)"
     )
     assert ast.unparse(wrapper.args[1]) == "tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR"
+
+
+def _story_planner_transcript_with_usage_extra(session_id: str, key: str, value: object) -> bytes:
+    """Return the envelope-bearing transcript with ``key`` added to every assistant usage."""
+    rows = [
+        json.loads(line)
+        for line in _story_planner_transcript_with_envelopes(session_id).splitlines()
+    ]
+    assistants = [row for row in rows if row.get("type") == "assistant"]
+    assert assistants
+    for row in assistants:
+        row["message"]["usage"][key] = value
+    return _dump_rows(rows)
+
+
+def test_observed_2_1_310_null_fallback_credit_is_admitted_and_not_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D219 U9: a JSON-null ``fallback_credit`` parses and leaves usage and handback unchanged.
+
+    Deleting the null-only admission makes the key unknown, so this parse fails.
+    """
+    assert frozenset({"fallback_credit"}) == usage_transcript._USAGE_NULL_ONLY  # pyright: ignore[reportPrivateUsage]
+    assert "fallback_credit" not in usage_transcript._USAGE_OPTIONAL  # pyright: ignore[reportPrivateUsage]
+    session_id = "75555555-5555-4555-8555-555555555555"
+    transcript, installed = _install_owned_transcript(
+        tmp_path, monkeypatch, _story_planner_transcript_with_envelopes(session_id), session_id
+    )
+    baseline = _parse_story_planner_transcript(tmp_path, installed)
+    transcript.write_bytes(
+        _story_planner_transcript_with_usage_extra(session_id, "fallback_credit", None)
+    )
+
+    usage = _parse_story_planner_transcript(tmp_path, installed)
+
+    assert usage == baseline
+    assert usage.handback_text == "SYNTHETIC_STORY_HANDOFF"
+    assert "fallback_credit" not in repr(usage)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("fallback_credit", 0),
+        ("fallback_credit", 1),
+        ("fallback_credit", 0.5),
+        ("fallback_credit", "0"),
+        ("fallback_credit", ""),
+        ("fallback_credit", False),
+        ("fallback_credit", True),
+        ("fallback_credit", {}),
+        ("fallback_credit", {"amount": None}),
+        ("fallback_credit", []),
+        ("fallback_credit", [None]),
+        ("fallback_credits", None),
+        ("other_credit", None),
+    ],
+)
+def test_non_null_fallback_credit_or_other_null_usage_key_is_rejected(
+    key: str, value: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the exact key ``fallback_credit`` with a JSON-null value is admitted."""
+    session_id = "76666666-6666-4666-8666-666666666666"
+    _install_owned_transcript(
+        tmp_path,
+        monkeypatch,
+        _story_planner_transcript_with_usage_extra(session_id, key, value),
+        session_id,
+    )
+    with pytest.raises(usage_transcript.TranscriptError, match="usage is invalid"):
+        _parse_story_planner_transcript(tmp_path, session_id)
