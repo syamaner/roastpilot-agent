@@ -1,5 +1,14 @@
 # RoastPilot Agent Project State Registry
 
+**25 Oct 2026, #1061 slice 1 verdict assertion overlap:**
+Removed the redundant six-input "never emits ACCEPT" verdict assertion and its
+unused inventory and type import. The retained exact positive mapping and null
+expectations exclude ACCEPT for all six inputs; DOM and AdvisoryPanel tests
+retain their separate rendering and integration coverage. The helper, component,
+snapshots and product pixels are unchanged. Focused evidence is not an all-marker
+full gate. No speed gain or hardware result is claimed. #1061 stays open pending
+the separate capture-pin qualification. #954 and E11-S3 remain unchanged.
+
 **25 Oct 2026, #1059 screenshot-helper behavioural contract:**
 Replaced the screenshot helper's existence-only smoke with six behavioural cases
 against the unchanged helper. They exercise page and locator forwarding, pending
