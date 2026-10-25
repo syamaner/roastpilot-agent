@@ -101,3 +101,16 @@ their version-bearing evidence disagrees with the version bound by the harness
 probe, rather than because their names appear outside an allow-list.
 
 `native-codex-gpt-5.6-terra` contains frozen historical admitted role bytes, bound by the `capture_usage_models.py` hashes, and is never regenerated from live files.
+
+## 2.1.310 envelope rows (D219 U9, 25 October 2026)
+
+`claude-2.1.310-envelope-rows.jsonl` is the lead-supplied, scrubbed five-variant
+envelope evidence for the four metadata row types (`api-request-shape`,
+`api-request-blob`, `api-request` with and without `base`, and `cost-state`)
+that a parent-run native `story-planner` launch on Claude Code 2.1.310 wrote
+into its parent transcript. It preserves the observed outer keys and value
+types; every string value is `SYNTHETIC`, every number is `0`, and the
+`sessionId` is a placeholder rebound by the tests. It contains no path, prompt,
+canary token, or private content, and the raw transcript remains local and
+uncommitted. The parser validates these rows' closed outer envelopes only and
+never reads, consumes, or persists their nested request payloads.
