@@ -330,7 +330,7 @@ def test_parse_frontmatter_rejects_invalid_utf8_with_source_named_reason(tmp_pat
 _CONSUMER_SEMANTIC_SHA256 = {
     "test_agent_model_pins.py": "1d7a12c69792ac533c2f59b420626d3e0e9cb27c4068741557b511f0f3a7d3e1",
     "test_agent_worktree_controls.py": (
-        "f87b4b5ddda26bb9d32c539766115995c9ce23bb1817d3cf8e1f60deba3040bb"
+        "d5c495395d2c786421b7a0374f2766567ff171b54ef109edd67b9b9f3b3c9c12"
     ),
 }
 _NON_RUNTIME_AST_FIELDS = frozenset({"type_params"})
