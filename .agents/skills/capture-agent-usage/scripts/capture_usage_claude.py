@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Iterable, Mapping
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, cast
 
 from capture_usage_models import (
     BoundedStreamError,
@@ -133,6 +133,7 @@ def _event_from_line(line: str, *, expected_version: str | None) -> Mapping[str,
         raise ClaudeUsageParseError("malformed Claude JSONL event") from None
     if not isinstance(event, dict):
         raise ClaudeUsageParseError("malformed Claude event object")
+    event = cast("dict[str, Any]", event)
     event_type = event.get("type")
     if not isinstance(event_type, str):
         raise ClaudeUsageParseError("Claude event is missing a string type discriminator")
@@ -172,11 +173,13 @@ def _model_usage(model_usage: object) -> tuple[ClaudeModelUsage, ...]:
     """Normalize terminal whole-tree per-model usage without message summation."""
     if not isinstance(model_usage, dict) or not model_usage:
         raise ClaudeUsageParseError("Claude terminal result is missing modelUsage")
+    model_usage = cast("dict[object, object]", model_usage)
     parsed: list[ClaudeModelUsage] = []
     for model, usage in model_usage.items():
         if not isinstance(model, str) or not isinstance(usage, dict):
             raise ClaudeUsageParseError("malformed Claude modelUsage entry")
-        if set(usage) != CLAUDE_MODEL_USAGE_KEYS:
+        usage = cast("dict[str, object]", usage)
+        if frozenset(usage) != CLAUDE_MODEL_USAGE_KEYS:
             raise ClaudeUsageParseError("malformed Claude modelUsage schema")
         parsed.append(
             ClaudeModelUsage(
@@ -218,7 +221,8 @@ def _terminal_usage(event: Mapping[str, Any]) -> ParsedUsage:
     usage = event.get("usage")
     if not isinstance(usage, dict):
         raise ClaudeUsageParseError("Claude result event is missing usage")
-    if set(usage) != CLAUDE_RESULT_USAGE_KEYS:
+    usage = cast("dict[str, object]", usage)
+    if frozenset(usage) != CLAUDE_RESULT_USAGE_KEYS:
         raise ClaudeUsageParseError("malformed Claude terminal usage schema")
     for field in (
         "input_tokens",

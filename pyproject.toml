@@ -284,5 +284,11 @@ include = ["src", "tests", "scripts", ".agents/skills/capture-agent-usage/script
 # same way, both by adding ``scripts`` to ``sys.path`` at runtime. Mirror that
 # for the type checker so the harness and its tests are strict-checked.
 extraPaths = ["scripts", ".agents/skills/capture-agent-usage/scripts"]
+# #1028: an explicit ``exclude`` REPLACES Pyright's default exclusions. Those
+# defaults include ``**/.*``, which matched the ``.agents`` component and
+# silently auto-excluded the hidden skill-script root listed in ``include``
+# (import-resolved only, never checked). Keep the other two defaults and never
+# re-add a dot-path pattern; tests/test_tooling_coverage.py pins this list.
+exclude = ["**/node_modules", "**/__pycache__"]
 venvPath = "."
 venv = ".venv"

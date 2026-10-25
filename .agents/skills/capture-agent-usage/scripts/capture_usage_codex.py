@@ -6,7 +6,7 @@ import codecs
 import json
 import re
 from collections.abc import Mapping
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol, cast
 
 from capture_usage_models import (
     MAX_EVENT_BYTES,
@@ -55,6 +55,7 @@ class _ReadableBinaryStream(Protocol):
 
     def read(self, size: int, /) -> bytes:
         """Read at most ``size`` binary bytes from the stream."""
+        ...
 
 
 def _read_chunk(stream: _ReadableBinaryStream) -> bytes:
@@ -154,7 +155,7 @@ class _JsonRootScanner:
         if not self._root_started or not self._root_finished or self._stack:
             self._reject()
 
-    def _reject(self) -> None:
+    def _reject(self) -> NoReturn:
         """Raise a content-free structural error for every scanner failure class."""
         raise CodexUsageParseError("malformed Codex JSON event")
 
@@ -371,6 +372,7 @@ def _event_from_line(line: str) -> Mapping[str, Any]:
         raise CodexUsageParseError("malformed Codex JSONL event") from None
     if not isinstance(event, dict):
         raise CodexUsageParseError("malformed Codex event object")
+    event = cast("dict[str, Any]", event)
     event_type = event.get("type")
     if not isinstance(event_type, str):
         raise CodexUsageParseError("Codex event is missing a string type discriminator")
@@ -412,6 +414,7 @@ def _apply_retained_event(
     }
     if not isinstance(usage, dict):
         raise CodexUsageParseError("Codex turn.completed event is missing usage")
+    usage = cast("dict[str, object]", usage)
     if set(usage) != expected:
         raise CodexUsageParseError("malformed Codex terminal usage schema")
     return True, ParsedUsage(
