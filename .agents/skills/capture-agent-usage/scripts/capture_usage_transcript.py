@@ -10,9 +10,12 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from capture_usage_models import ClaudeModelUsage, NativeClaudeRole, bounded_jsonl_lines
+
+if TYPE_CHECKING:
+    from collections.abc import Set as AbstractSet
 
 MAX_TRANSCRIPT_ROW_BYTES = 4 * 1024 * 1024
 MAX_TRANSCRIPT_ROWS = 500_000
@@ -228,9 +231,10 @@ def _envelope_value_valid(kind: str, value: object) -> bool:
     return isinstance(value, dict) and all(
         isinstance(model, str)
         and isinstance(usage, dict)
-        and set(usage) == _COST_STATE_MODEL_USAGE_KEYS
-        and all(_amount(amount) for amount in usage.values())
-        for model, usage in value.items()
+        and cast("AbstractSet[object]", set(cast("dict[object, object]", usage)))
+        == _COST_STATE_MODEL_USAGE_KEYS
+        and all(_amount(amount) for amount in cast("dict[object, object]", usage).values())
+        for model, usage in cast("dict[object, object]", value).items()
     )
 
 
@@ -437,16 +441,18 @@ def _extract_handback(message: dict[str, Any]) -> str:
     content = message.get("content")
     if not isinstance(content, list):
         raise TranscriptError("owned Claude transcript terminal turn is invalid")
+    content = cast("list[object]", content)
     texts: list[str] = []
     for block in content:
         if not isinstance(block, dict):
             raise TranscriptError("owned Claude transcript terminal turn is invalid")
+        block = cast("dict[str, Any]", block)
         block_type = block.get("type")
         if not isinstance(block_type, str) or block_type not in _HANDBACK_BLOCK_TYPES:
             raise TranscriptError("owned Claude transcript terminal turn is invalid")
         if block_type == "thinking":
             continue
-        if set(block) != _HANDBACK_TEXT_BLOCK_KEYS or not isinstance(block.get("text"), str):
+        if frozenset(block) != _HANDBACK_TEXT_BLOCK_KEYS or not isinstance(block.get("text"), str):
             raise TranscriptError("owned Claude transcript terminal turn is invalid")
         texts.append(block["text"])
     handback = "".join(texts)
@@ -519,10 +525,11 @@ def parse_owned_transcript(
                     raise TranscriptError("owned Claude transcript is invalid")
                 if (
                     not isinstance(row, dict)
-                    or row.get("type") not in _ALLOWED_TYPES
-                    or row.get("sessionId") != session_id
+                    or cast("dict[str, Any]", row).get("type") not in _ALLOWED_TYPES
+                    or cast("dict[str, Any]", row).get("sessionId") != session_id
                 ):
                     raise TranscriptError("owned Claude transcript is invalid")
+                row = cast("dict[str, Any]", row)
                 if "version" in row and row["version"] != expected_version:
                     raise TranscriptError("owned Claude transcript is invalid")
                 if "permissionMode" in row:
@@ -535,7 +542,7 @@ def parse_owned_transcript(
                     permission_mode_seen = True
                 if row["type"] == "atis-latch":
                     if (
-                        set(row) != _ATIS_LATCH_ROW_KEYS
+                        frozenset(row) != _ATIS_LATCH_ROW_KEYS
                         or not isinstance(row.get("atis"), str)
                         or not isinstance(row.get("sessionId"), str)
                     ):
@@ -545,7 +552,7 @@ def parse_owned_transcript(
                     _validate_envelope_row(row)
                     continue
                 if row["type"] == "mode":
-                    if set(row) != _MODE_ROW_KEYS or row.get("mode") != "normal":
+                    if frozenset(row) != _MODE_ROW_KEYS or row.get("mode") != "normal":
                         raise TranscriptError("owned Claude transcript is invalid")
                     continue
                 if row["type"] == "assistant":
@@ -572,7 +579,7 @@ def parse_owned_transcript(
                     continue
                 if row["type"] == "ai-title":
                     if (
-                        set(row) != _AI_TITLE_ROW_KEYS
+                        frozenset(row) != _AI_TITLE_ROW_KEYS
                         or not isinstance(row.get("aiTitle"), str)
                         or not isinstance(row.get("sessionId"), str)
                     ):
@@ -589,6 +596,7 @@ def parse_owned_transcript(
                     or row.get("effort") != effort
                 ):
                     raise TranscriptError("owned Claude transcript is invalid")
+                message = cast("dict[str, Any]", message)
                 if require_handback:
                     last_assistant_message = message
                 message_id, row_model, usage = (
@@ -602,20 +610,24 @@ def parse_owned_transcript(
                     or not isinstance(usage, dict)
                 ):
                     raise TranscriptError("owned Claude transcript is invalid")
+                usage = cast("dict[str, object]", usage)
                 if (
                     set(usage) - (_USAGE_REQUIRED | _USAGE_OPTIONAL | _USAGE_NULL_ONLY)
                     or not set(usage) >= _USAGE_REQUIRED
                     or any(usage[key] is not None for key in _USAGE_NULL_ONLY & set(usage))
                 ):
                     raise TranscriptError("owned Claude transcript usage is invalid")
-                values = tuple(
-                    _integer(usage[key])
-                    for key in (
-                        "input_tokens",
-                        "cache_read_input_tokens",
-                        "cache_creation_input_tokens",
-                        "output_tokens",
-                    )
+                values = cast(
+                    "tuple[int, int, int, int]",
+                    tuple(
+                        _integer(usage[key])
+                        for key in (
+                            "input_tokens",
+                            "cache_read_input_tokens",
+                            "cache_creation_input_tokens",
+                            "output_tokens",
+                        )
+                    ),
                 )
                 parent = row.get("parentUuid")
                 if parent is not None and not isinstance(parent, str):

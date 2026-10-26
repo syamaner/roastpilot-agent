@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, NoReturn, TypeVar
+from typing import BinaryIO, NoReturn, TypeVar, cast
 
 if __name__ == "__main__":
     sys.dont_write_bytecode = True
@@ -362,7 +362,9 @@ def append_record(path: Path, record: UsageRecord, *, root_descriptor: int | Non
     except OSError as exc:
         raise CaptureUsageError("could not append usage record") from exc
     finally:
-        if descriptor is not None:
+        # Defensive: the earlier open either bound an int or raised, so Pyright
+        # proves this always true; keep the fail-closed guard unchanged (#1028).
+        if descriptor is not None:  # pyright: ignore[reportUnnecessaryComparison]
             os.close(descriptor)
 
 
@@ -1035,8 +1037,9 @@ def _validate_evidence_manifest_schema(
         "generated_at",
         "files",
     }
-    if not isinstance(data, dict) or set(data) != expected_keys:
+    if not isinstance(data, dict) or set(cast("dict[str, object]", data)) != expected_keys:
         raise CaptureUsageError("evidence bundle is invalid")
+    data = cast("dict[str, object]", data)
     if data.get("evidence_schema_version") != EVIDENCE_SCHEMA_VERSION:
         raise CaptureUsageError("evidence bundle is invalid")
     if data.get("repository") != "syamaner/roastpilot-agent":
@@ -1084,12 +1087,19 @@ def _validate_evidence_manifest_schema(
         if parsed < now - timedelta(seconds=_EVIDENCE_MAX_AGE_SECONDS):
             raise CaptureUsageError("evidence bundle is invalid")
     files = data.get("files")
-    if not isinstance(files, dict) or set(files) != set(EVIDENCE_PAYLOAD_FILES):
+    if not isinstance(files, dict) or set(cast("dict[str, object]", files)) != set(
+        EVIDENCE_PAYLOAD_FILES
+    ):
         raise CaptureUsageError("evidence bundle is invalid")
+    files = cast("dict[str, object]", files)
     validated_files: dict[str, dict[str, object]] = {}
     for name, entry in files.items():
-        if not isinstance(entry, dict) or set(entry) != {"sha256", "bytes"}:
+        if not isinstance(entry, dict) or set(cast("dict[str, object]", entry)) != {
+            "sha256",
+            "bytes",
+        }:
             raise CaptureUsageError("evidence bundle is invalid")
+        entry = cast("dict[str, object]", entry)
         digest = entry.get("sha256")
         size = entry.get("bytes")
         if not isinstance(digest, str) or _SHA256_HEX_PATTERN.fullmatch(digest) is None:
@@ -1110,6 +1120,7 @@ def _validate_evidence_pr_identity(
         raise CaptureUsageError("evidence bundle is invalid") from None
     if not isinstance(data, dict):
         raise CaptureUsageError("evidence bundle is invalid")
+    data = cast("dict[str, object]", data)
     number = data.get("number")
     if (
         isinstance(number, bool)
@@ -2079,7 +2090,7 @@ def run_command(arguments: argparse.Namespace) -> int:
                 usage = parse_codex_stream(process.stdout)
             else:
                 usage = parse_claude_stream(
-                    process.stdout,
+                    cast("BinaryIO", process.stdout),
                     expected_version=version,
                     require_launch_authority=True,
                 )
@@ -2153,16 +2164,18 @@ def run_command(arguments: argparse.Namespace) -> int:
         )
         return 0
     except OSError as exc:
+        # The ``locals()`` membership guard binds ``writer`` and the earlier
+        # ``writer_result``; Pyright cannot narrow on it (#1028).
         if "writer" in locals():
-            writer.join(timeout=TERMINATE_GRACE_SECONDS)
-            if not writer_result[0]:
+            writer.join(timeout=TERMINATE_GRACE_SECONDS)  # pyright: ignore[reportPossiblyUnboundVariable]
+            if not writer_result[0]:  # pyright: ignore[reportPossiblyUnboundVariable]
                 raise CaptureUsageError("prompt delivery failed") from None
         raise CaptureUsageError("harness run failed") from exc
     except subprocess.TimeoutExpired as exc:
         raise CaptureUsageError("harness run timed out") from exc
     finally:
         if "writer" in locals():
-            writer.join(timeout=TERMINATE_GRACE_SECONDS)
+            writer.join(timeout=TERMINATE_GRACE_SECONDS)  # pyright: ignore[reportPossiblyUnboundVariable]
         _cancel_deadline(deadline)
         if process is not None:
             with suppress(OSError, ValueError):

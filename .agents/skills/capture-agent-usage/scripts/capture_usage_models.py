@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Annotated, BinaryIO, Literal, TypeAlias
+from typing import Annotated, Any, BinaryIO, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
@@ -1046,5 +1046,9 @@ UsageRecord: TypeAlias = (
 )
 """The closed append-only record union."""
 
-USAGE_RECORD_ADAPTER = TypeAdapter(Annotated[UsageRecord, Field(discriminator="record_type")])
+# Explicit ``Any``: Pyright infers ``TypeAdapter[Unknown]`` for the annotated
+# discriminated union; callers narrow the validated record themselves (#1028).
+USAGE_RECORD_ADAPTER: TypeAdapter[Any] = TypeAdapter(
+    Annotated[UsageRecord, Field(discriminator="record_type")]
+)
 """Validator for records received at the sink boundary."""

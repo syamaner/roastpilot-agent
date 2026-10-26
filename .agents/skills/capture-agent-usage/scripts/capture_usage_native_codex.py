@@ -25,7 +25,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any, NoReturn, Protocol, TypeGuard, cast
 from uuid import uuid4
 
 from capture_usage_models import (
@@ -92,6 +92,20 @@ _RESPONSE_TYPES = {
     "custom_tool_call",
     "custom_tool_call_output",
 }
+
+
+if TYPE_CHECKING:
+
+    class _ScandirIteratorView(Protocol):
+        """Typing-only view of the iterator ``os.scandir`` returns (#1028)."""
+
+        def __iter__(self) -> Iterator[os.DirEntry[str]]:
+            """Iterate the directory entries."""
+            ...
+
+        def close(self) -> None:
+            """Release the underlying directory handle."""
+            ...
 
 
 def _python_venv_link_name(name: str) -> bool:
@@ -308,7 +322,7 @@ class _Inventory:
         """Retain compatibility with inventory-owning test-double callers."""
 
 
-def _fail() -> None:
+def _fail() -> NoReturn:
     raise NativeCodexCaptureError("native Codex capture is invalid")
 
 
@@ -322,7 +336,7 @@ def _fchdir(descriptor: int) -> None:
     os.fchdir(descriptor)
 
 
-def _safe_identifier(value: object) -> bool:
+def _safe_identifier(value: object) -> TypeGuard[str]:
     return (
         isinstance(value, str)
         and bool(value)
@@ -450,7 +464,7 @@ def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
             _fail()
         _provider_directory(directory)
         scandir_descriptor = -1
-        iterator: os.ScandirIterator[str] | None = None
+        iterator: _ScandirIteratorView | None = None
         try:
             # Keep ownership of the duplicated descriptor explicit.  CPython currently
             # closes descriptor arguments from ScandirIterator.close(), but that is not
@@ -569,13 +583,16 @@ def _git(args: list[str], *, worktree: _Root | None = None) -> str:
             environment = {**_GIT_ENV, "GIT_WORK_TREE": "."}
             popen_kwargs["pass_fds"] = (bound_worktree.descriptor,)
             popen_kwargs["preexec_fn"] = partial(_fchdir, bound_worktree.descriptor)
-        process = subprocess.Popen(
-            [*command, "-c", "core.fsmonitor=false", *args],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=environment,
-            **popen_kwargs,
+        process = cast(
+            "subprocess.Popen[bytes]",
+            subprocess.Popen(
+                [*command, "-c", "core.fsmonitor=false", *args],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                **popen_kwargs,
+            ),
         )
         if process.stdout is None or process.stderr is None:
             _fail()
@@ -847,7 +864,7 @@ def _assert_git_administration_tree(root: _Root) -> None:
             _fail()
         _git_administration_directory(directory)
         scandir_descriptor = os.dup(directory)
-        iterator: os.ScandirIterator[str] | None = None
+        iterator: _ScandirIteratorView | None = None
         try:
             iterator = os.scandir(scandir_descriptor)
             for entry in iterator:
@@ -1119,7 +1136,7 @@ def _assert_checkout_directories(root: _Root) -> None:
             _fail()
         _checkout_directory(directory)
         scandir_descriptor = os.dup(directory)
-        iterator: os.ScandirIterator[str] | None = None
+        iterator: _ScandirIteratorView | None = None
         try:
             iterator = os.scandir(scandir_descriptor)
             for entry in iterator:
@@ -1251,8 +1268,12 @@ def _registered_role(root: _Root, role: NativeCodexRole) -> tuple[str, str, str,
         config_bytes = _read_relative(root, (".codex", "config.toml"))
         config = tomllib.loads(config_bytes.decode("utf-8"))
         agents = config.get("agents")
-        if not isinstance(agents, dict) or agents.get("enabled") is not True:
+        if (
+            not isinstance(agents, dict)
+            or cast("dict[str, Any]", agents).get("enabled") is not True
+        ):
             _fail()
+        agents = cast("dict[str, Any]", agents)
         expected = {member.value for member in NativeCodexRole}
         if (
             set(config) != {"project_doc_max_bytes", "agents"}
@@ -1266,9 +1287,9 @@ def _registered_role(root: _Root, role: NativeCodexRole) -> tuple[str, str, str,
         registration = agents.get(role.value)
         if (
             not isinstance(registration, dict)
-            or set(registration) != {"description", "config_file"}
-            or not isinstance(registration["description"], str)
-            or registration["config_file"] != relpath
+            or set(cast("dict[str, Any]", registration)) != {"description", "config_file"}
+            or not isinstance(cast("dict[str, Any]", registration)["description"], str)
+            or cast("dict[str, Any]", registration)["config_file"] != relpath
         ):
             _fail()
         role_bytes = _read_relative(root, (".codex", *tuple(relpath.split("/"))))
@@ -1334,7 +1355,7 @@ def _json(raw: bytes) -> dict[str, Any]:
         value = json.loads(raw, object_pairs_hook=unique)
         if not isinstance(value, dict):
             _fail()
-        return value
+        return cast("dict[str, Any]", value)
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         _fail()
 
@@ -1379,8 +1400,9 @@ def _totals(value: Any) -> tuple[int, int, int, int, int, int]:
         "reasoning_output_tokens",
         "total_tokens",
     )
-    if not isinstance(value, dict) or set(value) != set(keys):
+    if not isinstance(value, dict) or set(cast("dict[str, Any]", value)) != set(keys):
         _fail()
+    value = cast("dict[str, Any]", value)
     result = tuple(value[key] for key in keys)
     if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in result):
         _fail()
@@ -1503,27 +1525,33 @@ def _parse_rollout(
                 _fail()
             expected_ordinal += 1
             _opaque_text(event["timestamp"])
-            kind, payload = event["type"], event["payload"]
+            kind, payload = event["type"], cast("dict[str, Any]", event["payload"])
             if kind == "session_meta":
                 if seen_meta or seen_context:
                     _fail()
                 source, git = payload.get("source"), payload.get("git")
-                if not isinstance(git, dict) or set(git) != _GIT_KEYS:
+                if not isinstance(git, dict) or set(cast("dict[str, Any]", git)) != _GIT_KEYS:
                     _fail()
+                git = cast("dict[str, Any]", git)
                 if set(payload) == _ROOT_SESSION_META_KEYS:
                     if source != "cli" or payload["thread_source"] != "user":
                         _fail()
                 elif set(payload) == _SUBAGENT_SESSION_META_KEYS:
-                    if not isinstance(source, dict) or set(source) != {"subagent"}:
-                        _fail()
-                    source_subagent = source["subagent"]
-                    if not isinstance(source_subagent, dict) or set(source_subagent) != {
-                        "thread_spawn"
+                    if not isinstance(source, dict) or set(cast("dict[str, Any]", source)) != {
+                        "subagent"
                     }:
                         _fail()
+                    source = cast("dict[str, Any]", source)
+                    source_subagent = source["subagent"]
+                    if not isinstance(source_subagent, dict) or set(
+                        cast("dict[str, Any]", source_subagent)
+                    ) != {"thread_spawn"}:
+                        _fail()
+                    source_subagent = cast("dict[str, Any]", source_subagent)
                     spawn = source_subagent["thread_spawn"]
                     if not isinstance(spawn, dict):
                         _fail()
+                    spawn = cast("dict[str, Any]", spawn)
                     if set(spawn) != {
                         "parent_thread_id",
                         "depth",
@@ -1625,12 +1653,13 @@ def _parse_rollout(
                     if not seen_started or seen_complete:
                         _fail()
                     info = payload["info"]
-                    if not isinstance(info, dict) or set(info) != {
+                    if not isinstance(info, dict) or set(cast("dict[str, Any]", info)) != {
                         "last_token_usage",
                         "model_context_window",
                         "total_token_usage",
                     }:
                         _fail()
+                    info = cast("dict[str, Any]", info)
                     current = _totals(info["total_token_usage"])
                     if totals and any(new < old for old, new in zip(totals, current, strict=True)):
                         _fail()
@@ -1681,7 +1710,10 @@ def _parse_rollout(
     return session, totals or (0, 0, 0, 0, 0, 0), parent_thread, matches, read_bytes
 
 
-def _candidate_binding(fd: int, binding: dict[str, str]) -> bool | None:
+# Unreferenced in this module but exercised directly by the capture tests (#1028).
+def _candidate_binding(  # pyright: ignore[reportUnusedFunction]
+    fd: int, binding: dict[str, str]
+) -> bool | None:
     """Classify a first metadata row without rejecting an active unrelated rollout."""
     raw = b""
     try:
@@ -1701,6 +1733,7 @@ def _candidate_binding(fd: int, binding: dict[str, str]) -> bool | None:
         source = payload.get("source")
         if not isinstance(source, dict):
             return None
+        source = cast("dict[str, Any]", source)
         spawn = (
             source.get("subagent", {}).get("thread_spawn")
             if isinstance(source.get("subagent"), dict)
@@ -1708,6 +1741,7 @@ def _candidate_binding(fd: int, binding: dict[str, str]) -> bool | None:
         )
         if not isinstance(spawn, dict):
             return None
+        spawn = cast("dict[str, Any]", spawn)
         matches_identity = (
             spawn.get("parent_thread_id") == binding["parent_thread_id"]
             and spawn.get("agent_path") == binding["agent_path"]
@@ -1759,12 +1793,15 @@ def _candidate_metadata(fd: int, binding: dict[str, str]) -> _CandidateMetadata:
         source = payload.get("source")
         if not isinstance(source, dict):
             return _CandidateMetadata(None, retained_parent, len(raw))
+        source = cast("dict[str, Any]", source)
         subagent = source.get("subagent")
         if not isinstance(subagent, dict):
             return _CandidateMetadata(None, retained_parent, len(raw))
+        subagent = cast("dict[str, Any]", subagent)
         spawn = subagent.get("thread_spawn")
         if not isinstance(spawn, dict):
             return _CandidateMetadata(None, retained_parent, len(raw))
+        spawn = cast("dict[str, Any]", spawn)
         parent = spawn.get("parent_thread_id")
         if retained_parent is not None and _safe_identifier(parent) and retained_parent != parent:
             return _CandidateMetadata(None, None, len(raw))
@@ -1839,7 +1876,8 @@ def _reconcile_rollouts(
     final_inventory: _Inventory | set[tuple[int, int, int]] | None = None
     try:
         final_inventory = _inventory(root)
-        if not isinstance(final_inventory, _Inventory):
+        # Defensive fail-closed guard retained unchanged; Pyright proves it (#1028).
+        if not isinstance(final_inventory, _Inventory):  # pyright: ignore[reportUnnecessaryIsInstance]
             _fail()
         for entry in final_inventory.entries.values():
             observed[entry.name] = entry
@@ -2082,22 +2120,25 @@ def _descendant(base: str, head: str, *, worktree: _Root | None = None) -> bool:
             run_kwargs["pass_fds"] = (bound_worktree.descriptor,)
             run_kwargs["preexec_fn"] = partial(_fchdir, bound_worktree.descriptor)
         return (
-            subprocess.run(
-                [
-                    *command,
-                    "-c",
-                    "core.fsmonitor=false",
-                    "merge-base",
-                    "--is-ancestor",
-                    base,
-                    head,
-                ],
-                check=False,
-                timeout=5,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=environment,
-                **run_kwargs,
+            cast(
+                "subprocess.CompletedProcess[bytes]",
+                subprocess.run(
+                    [
+                        *command,
+                        "-c",
+                        "core.fsmonitor=false",
+                        "merge-base",
+                        "--is-ancestor",
+                        base,
+                        head,
+                    ],
+                    check=False,
+                    timeout=5,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=environment,
+                    **run_kwargs,
+                ),
             ).returncode
             == 0
         )
@@ -2125,7 +2166,8 @@ def _provider_home() -> str:
         account_home = pwd.getpwuid(os.geteuid()).pw_dir
     except (KeyError, OSError):
         _fail()
-    if not isinstance(account_home, str) or not os.path.isabs(account_home):
+    # Defensive fail-closed guard retained unchanged; Pyright proves it (#1028).
+    if not isinstance(account_home, str) or not os.path.isabs(account_home):  # pyright: ignore[reportUnnecessaryIsInstance]
         _fail()
     default = os.path.abspath(os.path.join(account_home, ".codex"))
     supplied = os.environ.get("CODEX_HOME")
@@ -2163,7 +2205,8 @@ def supervise_native_codex(arguments: Any, *, harness_version: str) -> int:
         usage = _open_root(arguments.usage_root, private=True)
         provider = _open_root(os.path.join(codex_home, "sessions"), private=False)
         worktree = _open_root(os.getcwd(), private=False)
-        _ACTIVE_GIT_WORKTREE = worktree
+        # Intentional process-global rebinding, restored in ``finally`` (#1028).
+        _ACTIVE_GIT_WORKTREE = worktree  # pyright: ignore[reportConstantRedefinition]
         _reject_root_overlap(usage, provider, worktree)
         _assert_worktree_root(worktree)
         git_administration = _open_git_administration(worktree)
@@ -2296,7 +2339,8 @@ def supervise_native_codex(arguments: Any, *, harness_version: str) -> int:
             expected_inventory = _inventory_generations(before) | {
                 _generation(status) for _fd, status, _metadata in classified
             }
-            if isinstance(before, _Inventory):
+            # Test doubles substitute generation sets; Pyright cannot see that (#1028).
+            if isinstance(before, _Inventory):  # pyright: ignore[reportUnnecessaryIsInstance]
                 # Bracket persistence with identity-aware complete scans. A
                 # pre-READY parent may grow, but cannot disappear, rename, or
                 # rebind; every post-READY candidate is generation-exact.
@@ -2373,7 +2417,8 @@ def supervise_native_codex(arguments: Any, *, harness_version: str) -> int:
         )
         from capture_usage_cli import append_record  # local avoids import cycle
 
-        if selected_fd is None or selected_generation is None:
+        # Defensive fail-closed guard retained unchanged; Pyright proves it (#1028).
+        if selected_fd is None or selected_generation is None:  # pyright: ignore[reportUnnecessaryComparison]
             _fail()
         _assert_selected_rollout(
             provider,
@@ -2398,7 +2443,7 @@ def supervise_native_codex(arguments: Any, *, harness_version: str) -> int:
         sys.stdout.flush()
         return 0
     finally:
-        _ACTIVE_GIT_WORKTREE = prior_git_worktree
+        _ACTIVE_GIT_WORKTREE = prior_git_worktree  # pyright: ignore[reportConstantRedefinition]
         if before is not None:
             _close_inventory(before)
         if selected_fd is not None:

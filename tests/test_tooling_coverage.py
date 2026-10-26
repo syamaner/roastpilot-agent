@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import runpy
 import shlex
 import stat
+import subprocess
 import sys
 import tomllib
 import xml.etree.ElementTree as ElementTree
@@ -494,6 +497,147 @@ def test_each_discovered_skill_root_is_registered_in_flattened_settings() -> Non
         "Pyright extraPaths": _strings(pyright["extraPaths"]),
     }
     tooling_coverage.require_registered_roots(discovered, configured)
+
+
+PYRIGHT_EXPECTED_EXCLUDE = ("**/node_modules", "**/__pycache__")
+"""Pyright's default exclusions minus ``**/.*``, which hid ``.agents`` (#1028)."""
+PYRIGHT_WITNESS_KEYS = ("include", "exclude", "extraPaths", "typeCheckingMode", "pythonVersion")
+PYRIGHT_WITNESS_ROOT = ".agents/skills/capture-agent-usage/scripts"
+PYRIGHT_WITNESS_TIMEOUT_SECONDS = 300
+
+
+def _pyright_table() -> dict[str, object]:
+    """Return the repository's ``[tool.pyright]`` table."""
+    return _mapping(_mapping(_pyproject()["tool"])["pyright"])
+
+
+def test_pyright_exclude_does_not_auto_exclude_hidden_skill_roots() -> None:
+    """An explicit closed ``exclude`` keeps every hidden skill root checked (#1028).
+
+    Pyright replaces its defaults (which include ``**/.*``) only when ``exclude``
+    is set, so a missing key or any dot-path pattern silently drops ``.agents``.
+    """
+    pyright = _pyright_table()
+
+    assert "exclude" in pyright
+    assert _strings(pyright["exclude"]) == PYRIGHT_EXPECTED_EXCLUDE
+    include = _strings(pyright["include"])
+    for root in tooling_coverage.skill_script_roots(REPO_ROOT):
+        assert root in include
+
+
+def _run_pyright_witness_project(
+    tmp_path: Path, *, keep_exclude: bool, control_error: bool
+) -> tuple[int, dict[str, object], Path, Path]:
+    """Run real Pyright over a scratch project mirroring the repository table.
+
+    The scratch project copies the real ``include``/``exclude``/``extraPaths``/
+    strictness/version keys (dropping the venv keys), creates every include root,
+    seeds one control file under ``src`` and one deliberate type error in the
+    hidden root.
+
+    Args:
+        tmp_path: The per-test scratch project root.
+        keep_exclude: ``False`` deletes ``exclude`` to model the pre-#1028 config.
+        control_error: Whether the non-hidden control file carries a type error.
+
+    Returns:
+        The Pyright exit code, its parsed JSON report, and the resolved witness
+        and control paths.
+    """
+    pyright = _pyright_table()
+    table = {key: pyright[key] for key in PYRIGHT_WITNESS_KEYS}
+    if not keep_exclude:
+        del table["exclude"]
+    lines = ["[tool.pyright]", *(f"{key} = {json.dumps(value)}" for key, value in table.items())]
+    (tmp_path / "pyproject.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    for root in _strings(table["include"]):
+        (tmp_path / root).mkdir(parents=True, exist_ok=True)
+    control = tmp_path / "src" / "control_1028.py"
+    control.write_text(
+        'value: int = "not-an-int"\n' if control_error else "value: int = 1\n", encoding="utf-8"
+    )
+    witness = tmp_path / PYRIGHT_WITNESS_ROOT / "witness_1028.py"
+    witness.write_text('value: int = "not-an-int"\n', encoding="utf-8")
+    # Drop wrapper overrides so the venv's bundled, pinned Pyright runs offline.
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("PYRIGHT_PYTHON_")
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pyright",
+            "--outputjson",
+            "--pythonpath",
+            sys.executable,
+            "-p",
+            str(tmp_path),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=PYRIGHT_WITNESS_TIMEOUT_SECONDS,
+        check=False,
+    )
+    report = _mapping(json.loads(result.stdout))
+    return result.returncode, report, witness.resolve(), control.resolve()
+
+
+def _file_errors(report: dict[str, object], path: Path) -> list[dict[str, object]]:
+    """Return the error diagnostics Pyright reported inside ``path``."""
+    diagnostics = cast(list[object], report["generalDiagnostics"])
+    errors: list[dict[str, object]] = []
+    for item in diagnostics:
+        diagnostic = _mapping(item)
+        if (
+            diagnostic["severity"] == "error"
+            and Path(cast(str, diagnostic["file"])).resolve() == path
+        ):
+            errors.append(diagnostic)
+    return errors
+
+
+def _assert_witness_detected(returncode: int, report: dict[str, object], witness: Path) -> None:
+    """Assert Pyright failed the run with an error located in the hidden witness."""
+    summary = _mapping(report["summary"])
+    assert returncode == 1
+    assert cast(int, summary["filesAnalyzed"]) >= 1
+    assert _file_errors(report, witness)
+
+
+@pytest.mark.slow
+def test_pyright_reports_a_deliberate_error_in_a_hidden_skill_script(tmp_path: Path) -> None:
+    """The real config makes strict Pyright check the hidden skill root (#1028)."""
+    returncode, report, witness, control = _run_pyright_witness_project(
+        tmp_path, keep_exclude=True, control_error=False
+    )
+
+    _assert_witness_detected(returncode, report, witness)
+    assert not _file_errors(report, control)
+    # The same real report with a passing exit code must be rejected, so a
+    # witness that accepted exit 0 could not pass this test.
+    with pytest.raises(AssertionError):
+        _assert_witness_detected(0, report, witness)
+
+
+@pytest.mark.slow
+def test_pyright_witness_discriminates_the_default_exclude(tmp_path: Path) -> None:
+    """Negative control: without ``exclude`` the hidden witness is silently skipped.
+
+    A deliberate error in a non-hidden root proves strict checking still ran, so
+    the shared witness assertion must reject this broken configuration.
+    """
+    returncode, report, witness, control = _run_pyright_witness_project(
+        tmp_path, keep_exclude=False, control_error=True
+    )
+
+    assert returncode == 1
+    assert _file_errors(report, control)
+    assert not _file_errors(report, witness)
+    with pytest.raises(AssertionError):
+        _assert_witness_detected(returncode, report, witness)
 
 
 def test_missing_synthetic_skill_root_fails_registration_guard() -> None:

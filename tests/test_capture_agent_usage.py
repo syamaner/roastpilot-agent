@@ -19626,3 +19626,547 @@ def test_non_null_fallback_credit_or_other_null_usage_key_is_rejected(
     )
     with pytest.raises(usage_transcript.TranscriptError, match="usage is invalid"):
         _parse_story_planner_transcript(tmp_path, session_id)
+
+
+# --- #1028: focused coverage for changed lines newly checked by strict Pyright ---
+
+
+def test_append_record_never_closes_an_unbound_sink_descriptor_1028(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unbound sink descriptor is never closed and the open failure propagates.
+
+    Covers the False direction of the ``descriptor is not None`` close guard in
+    ``append_record``'s final ``finally``: the sink open yields no descriptor, the
+    fail-closed ``assert`` fires, and no ``os.close(None)`` masks it.
+    """
+    monkeypatch.chdir(tmp_path)
+    sink = Path(".agent-usage/usage.jsonl")
+    real_open = usage_cli.os.open
+    real_close = usage_cli.os.close
+    real_open_sink_parent = usage_cli._open_sink_parent  # pyright: ignore[reportPrivateUsage]
+    closed: list[object] = []
+
+    def withhold_sink_descriptor(
+        path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int | None:
+        if path == "usage.jsonl" and dir_fd is not None:
+            return None
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    def open_parent_then_withhold_sink(
+        path: Path, *, root_descriptor: int | None = None
+    ) -> tuple[int, str]:
+        opened = real_open_sink_parent(path, root_descriptor=root_descriptor)
+        monkeypatch.setattr(usage_cli.os, "open", withhold_sink_descriptor)
+        return opened
+
+    def recording_close(descriptor: Any) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(usage_cli, "_open_sink_parent", open_parent_then_withhold_sink)
+    monkeypatch.setattr(usage_cli.os, "close", recording_close)
+    with pytest.raises(AssertionError):
+        append_record(sink, _task_record())
+    monkeypatch.setattr(usage_cli.os, "open", real_open)
+    monkeypatch.setattr(usage_cli.os, "close", real_close)
+    assert None not in closed
+    assert closed and all(isinstance(descriptor, int) for descriptor in closed)
+    assert not (tmp_path / sink).exists()
+
+
+@pytest.mark.parametrize(
+    ("delivered", "message"),
+    [(False, "prompt delivery failed"), (True, "harness run failed")],
+)
+def test_run_os_error_after_prompt_writer_starts_reports_writer_outcome_1028(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delivered: bool, message: str
+) -> None:
+    """An ``OSError`` after the prompt writer starts joins it and reports its outcome.
+
+    Covers ``run_command``'s ``OSError`` handler with ``writer`` bound: the writer
+    join and both directions of its delivery check (undelivered prompt versus a
+    delivered prompt whose run then failed). No usage record is appended.
+    """
+    monkeypatch.chdir(tmp_path)
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_bytes(b"prompt")
+    release = threading.Event()
+    stdin = BytesIO()
+    writer_joins: list[float | None] = []
+
+    class RecordingThread(threading.Thread):
+        """Record both joins independently of the writer's scheduling."""
+
+        def join(self, timeout: float | None = None) -> None:
+            writer_joins.append(timeout)
+            super().join(timeout)
+
+    class FakeProcess:
+        """Pid-less child double whose stream read fails after the writer starts."""
+
+        def __init__(self) -> None:
+            self.stdout = BytesIO(b"")
+            self.stdin = stdin
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+        def poll(self) -> int:
+            return 0
+
+        def terminate(self) -> None:
+            raise AssertionError("exited process must not terminate")
+
+        def kill(self) -> None:
+            raise AssertionError("exited process must not be killed")
+
+    def write_prompt(_process: object, _prompt: bytes) -> bool:
+        assert release.wait(timeout=30)
+        return delivered
+
+    def failing_stream(_stream: object) -> NoReturn:
+        release.set()
+        raise OSError("simulated harness stream failure")
+
+    monkeypatch.setattr(usage_cli, "_resolved_executable", lambda _harness: "/stub/codex")  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_cli, "_harness_version", lambda _executable: "0.148.0")  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_cli, "_write_prompt", write_prompt)
+    monkeypatch.setattr(usage_cli, "parse_codex_stream", failing_stream)
+    monkeypatch.setattr(
+        usage_cli,
+        "threading",
+        SimpleNamespace(Thread=RecordingThread, Event=threading.Event, Timer=threading.Timer),
+    )
+    arguments = usage_cli.build_parser().parse_args(
+        [
+            "run",
+            "--harness",
+            "codex",
+            "--prompt-file",
+            str(prompt),
+            "--task-id",
+            "1028",
+            "--slice-id",
+            "typing",
+            "--role",
+            "validation",
+            "--model",
+            "gpt-5.6-terra",
+            "--effort",
+            "high",
+            "--repository",
+            "syamaner/roastpilot-agent",
+            "--branch",
+            "feature/1028",
+            "--base-sha",
+            "2bed7013",
+            "--head-sha",
+            "4a3cca6",
+        ]
+    )
+    with pytest.raises(CaptureUsageError) as raised:
+        usage_cli.run_command(arguments)
+    assert str(raised.value) == message
+    assert writer_joins == [usage_cli.TERMINATE_GRACE_SECONDS] * 2
+    assert stdin.closed
+    assert not (tmp_path / ".agent-usage").exists()
+
+
+def _native_codex_subagent_rollout_1028(
+    tmp_path: Path, mutate: Callable[[list[dict[str, Any]]], None] | None = None
+) -> Path:
+    """Write one closed 0.147 subagent rollout, optionally mutated before encoding."""
+    spawn = {
+        "parent_thread_id": "parent-1028",
+        "depth": 1,
+        "agent_path": "/root/typing-1028",
+        "agent_nickname": "worker-1028",
+        "agent_role": "engineer-be",
+    }
+    usage = {
+        "input_tokens": 9,
+        "cached_input_tokens": 2,
+        "cache_write_input_tokens": 3,
+        "output_tokens": 4,
+        "reasoning_output_tokens": 4,
+        "total_tokens": 13,
+    }
+    events: list[dict[str, Any]] = [
+        {
+            "type": "session_meta",
+            "payload": {
+                "id": "leaf-1028",
+                "agent_nickname": "worker-1028",
+                "agent_path": "/root/typing-1028",
+                "agent_role": "engineer-be",
+                "base_instructions": "discarded",
+                "originator": "codex-tui",
+                "cli_version": "0.147.0",
+                "context_window": 1,
+                "cwd": "discarded",
+                "history_mode": "discarded",
+                "model_provider": "openai",
+                "multi_agent_version": "v2",
+                "parent_thread_id": "parent-1028",
+                "session_id": "leaf-1028",
+                "thread_source": "subagent",
+                "timestamp": "discarded",
+                "source": {"subagent": {"thread_spawn": spawn}},
+                "git": {"commit_hash": "a" * 40, "branch": "main", "repository_url": "discarded"},
+            },
+        },
+        {
+            "type": "turn_context",
+            "payload": {
+                "model": "gpt-5.6-terra",
+                "effort": "high",
+                "approval_policy": "discarded",
+                "approvals_reviewer": "discarded",
+                "collaboration_mode": "discarded",
+                "comp_hash": "discarded",
+                "current_date": "discarded",
+                "cwd": "discarded",
+                "file_system_sandbox_policy": "discarded",
+                "multi_agent_version": "v2",
+                "permission_profile": "discarded",
+                "personality": "discarded",
+                "realtime_active": False,
+                "sandbox_policy": "discarded",
+                "summary": "discarded",
+                "timezone": "discarded",
+                "turn_id": "discarded",
+                "workspace_roots": [],
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "task_started",
+                "collaboration_mode_kind": "discarded",
+                "model_context_window": 1,
+                "started_at": "discarded",
+                "turn_id": "discarded",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {},
+                "info": {
+                    "last_token_usage": dict.fromkeys(usage, 0),
+                    "model_context_window": 1,
+                    "total_token_usage": usage,
+                },
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "completed_at": "discarded",
+                "duration_ms": 1,
+                "last_agent_message": "discarded",
+                "started_at": "discarded",
+                "time_to_first_token_ms": 1,
+                "turn_id": "discarded",
+            },
+        },
+    ]
+    if mutate is not None:
+        mutate(events)
+    rollout = tmp_path / "leaf-1028.jsonl"
+    rollout.write_text(
+        "".join(
+            json.dumps({"ordinal": ordinal, "timestamp": "discarded", **event}) + "\n"
+            for ordinal, event in enumerate(events)
+        )
+    )
+    return rollout
+
+
+_NATIVE_CODEX_BINDING_1028 = {
+    "parent_thread_id": "parent-1028",
+    "role": "engineer-be",
+    "agent_path": "/root/typing-1028",
+    "effort": "high",
+}
+
+
+def _add_extra_source_key_1028(events: list[dict[str, Any]]) -> None:
+    events[0]["payload"]["source"]["extra"] = {}
+
+
+def _add_extra_subagent_key_1028(events: list[dict[str, Any]]) -> None:
+    events[0]["payload"]["source"]["subagent"]["extra"] = {}
+
+
+def _add_extra_info_key_1028(events: list[dict[str, Any]]) -> None:
+    events[3]["payload"]["info"]["extra"] = 0
+
+
+def test_native_codex_closed_subagent_rollout_control_parses_1028(tmp_path: Path) -> None:
+    """The unmutated #1028 rollout parses, so each mutated sibling isolates one guard."""
+    rollout = _native_codex_subagent_rollout_1028(tmp_path)
+    with rollout.open("rb") as stream:
+        session, totals, parent, matches, consumed = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
+            stream.fileno(), _NATIVE_CODEX_BINDING_1028, "0.147.0"
+        )
+    assert (session, parent, matches) == ("leaf-1028", "parent-1028", True)
+    assert totals == (9, 2, 3, 4, 4, 13)
+    assert consumed == rollout.stat().st_size
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [_add_extra_source_key_1028, _add_extra_subagent_key_1028, _add_extra_info_key_1028],
+    ids=["source", "source-subagent", "token-count-info"],
+)
+def test_native_codex_rollout_rejects_open_nested_objects_1028(
+    tmp_path: Path, mutate: Callable[[list[dict[str, Any]]], None]
+) -> None:
+    """A subagent rollout with one extra nested key fails closed.
+
+    Covers the True (``_fail``) direction of the closed key-set guards for the
+    subagent ``source``, ``source.subagent`` and ``token_count`` ``info``
+    objects. Without each guard the otherwise valid rollout would parse.
+    """
+    rollout = _native_codex_subagent_rollout_1028(tmp_path, mutate)
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), _NATIVE_CODEX_BINDING_1028, "0.147.0")  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("value", ["not-an-object", "extra-key", "missing-key"])
+def test_native_codex_totals_rejects_non_closed_usage_objects_1028(value: str) -> None:
+    """Token totals that are not exactly the closed usage object fail closed.
+
+    Covers the True (``_fail``) direction of ``_totals``'s object/key-set guard.
+    The extra-key case is otherwise valid, so it would be accepted without it.
+    """
+    usage: dict[str, object] = {
+        "input_tokens": 9,
+        "cached_input_tokens": 2,
+        "cache_write_input_tokens": 3,
+        "output_tokens": 4,
+        "reasoning_output_tokens": 4,
+        "total_tokens": 13,
+    }
+    assert usage_native_codex._totals(usage) == (9, 2, 3, 4, 4, 13)  # pyright: ignore[reportPrivateUsage]
+    candidate: object = "9"
+    if value == "extra-key":
+        candidate = {**usage, "extra": 0}
+    elif value == "missing-key":
+        candidate = {key: item for key, item in usage.items() if key != "total_tokens"}
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._totals(candidate)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [(None, True), ("agent_role", False), ("depth", None)],
+    ids=["bound-leaf", "unrelated-identity", "unbound-depth"],
+)
+def test_native_codex_candidate_binding_classifies_spawn_identity_1028(
+    tmp_path: Path, change: str | None, expected: bool | None
+) -> None:
+    """A dictionary spawn source is classified by identity and depth, then rewound.
+
+    Covers the dictionary ``source`` and ``thread_spawn`` paths of
+    ``_candidate_binding``: a matching depth-1 identity is bound (``True``), a
+    different role is unrelated (``False``), and a matching deeper spawn stays
+    indeterminate (``None``).
+    """
+
+    def mutate(events: list[dict[str, Any]]) -> None:
+        spawn = events[0]["payload"]["source"]["subagent"]["thread_spawn"]
+        if change == "agent_role":
+            spawn["agent_role"] = "repair"
+        elif change == "depth":
+            spawn["depth"] = 2
+
+    rollout = _native_codex_subagent_rollout_1028(tmp_path, mutate)
+    with rollout.open("rb") as stream:
+        assert (
+            usage_native_codex._candidate_binding(stream.fileno(), _NATIVE_CODEX_BINDING_1028)  # pyright: ignore[reportPrivateUsage]
+            is expected
+        )
+        assert os.lseek(stream.fileno(), 0, os.SEEK_CUR) == 0
+
+
+def test_native_codex_reconciliation_rejects_non_inventory_final_scan_1028(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A final provider scan that is not a descriptor inventory fails closed.
+
+    Covers the True (``_fail``) direction of ``_reconcile_rollouts``'s defensive
+    ``_Inventory`` guard on the final scan.
+    """
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    before = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: set[tuple[int, int, int]]())  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reconcile_rollouts(root, before, [])  # pyright: ignore[reportPrivateUsage]
+    finally:
+        before.close()
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize("account_home", [None, "relative/home"])
+def test_native_codex_provider_home_rejects_non_absolute_account_home_1028(
+    monkeypatch: pytest.MonkeyPatch, account_home: str | None
+) -> None:
+    """A missing or relative account home cannot anchor provider evidence.
+
+    Covers the True (``_fail``) direction of ``_provider_home``'s account-home
+    guard, both for a non-string and for a relative ``pw_dir``.
+    """
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(
+        usage_native_codex.pwd,
+        "getpwuid",
+        lambda _uid: SimpleNamespace(pw_dir=account_home),  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    )
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._provider_home()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_supervisor_rejects_unbound_selected_generation_1028(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A selected leaf without a bound generation appends nothing and fails closed.
+
+    Covers the True (``_fail``) direction of the supervisor's defensive guard
+    before the selected-rollout assertion. Only the selected leaf's first
+    generation read is withheld; every other step mirrors a recordable run.
+    """
+    import capture_usage_cli as native_cli
+
+    roots: list[usage_native_codex._Root] = []  # pyright: ignore[reportPrivateUsage]
+    for name in ("usage", "provider", "worktree"):
+        directory = tmp_path / name
+        directory.mkdir()
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        state = os.fstat(descriptor)
+        roots.append(usage_native_codex._Root(descriptor, state.st_dev, state.st_ino))  # pyright: ignore[reportPrivateUsage]
+    leaf_status = os.stat_result((0,) * 10)
+    real_generation = usage_native_codex._generation  # pyright: ignore[reportPrivateUsage]
+    candidate_generation = real_generation(leaf_status)
+    inventory_calls = 0
+    withheld = False
+    captured: list[NativeCodexUsageRecord] = []
+
+    def open_root(_raw: str, *, private: bool) -> usage_native_codex._Root:  # pyright: ignore[reportPrivateUsage]
+        del private
+        return roots.pop(0)
+
+    def inventory(_root: object) -> set[tuple[int, int, int]]:
+        nonlocal inventory_calls
+        inventory_calls += 1
+        return set() if inventory_calls == 1 else {candidate_generation}
+
+    def generation(status: os.stat_result) -> tuple[int, int, int] | None:
+        nonlocal withheld
+        if status is leaf_status and not withheld:
+            withheld = True
+            return None
+        return real_generation(status)
+
+    def registered_role(_root: object, member: NativeCodexRole) -> tuple[str, str, str, str]:
+        return (
+            NATIVE_CODEX_CONFIG_SHA256,
+            NATIVE_CODEX_ROLE_SHA256[member],
+            "high",
+            member.value,
+        )
+
+    def git_identity(_repository: str, _branch: str, _base: str, *, final: bool) -> str:
+        return "b" * 40 if final else "a" * 40
+
+    def append(_output: object, record: NativeCodexUsageRecord, **_kwargs: object) -> None:
+        captured.append(record)
+
+    class Frames:
+        """Record the supervisor protocol without relying on process-global capture."""
+
+        def __init__(self) -> None:
+            self.values: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.values.append(value)
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    frames = Frames()
+    for helper in (
+        "_assert_root",
+        "_reattest_usage_root",
+        "_reattest_worktree_root",
+        "_reattest_provider_root",
+        "_assert_selected_rollout",
+        "_close",
+        "_assert_checkout",
+    ):
+        monkeypatch.setattr(usage_native_codex, helper, lambda *_args: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_open_root", open_root)
+    monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", lambda *_roots: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
+    monkeypatch.setattr(usage_native_codex, "_generation", generation)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_new_rollouts",
+        lambda _root, _before: [("leaf.jsonl", 99, leaf_status)],  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    )
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_candidate_metadata",
+        lambda _fd, _binding: usage_native_codex._CandidateMetadata(True, None),  # pyright: ignore[reportPrivateUsage,reportUnknownArgumentType,reportUnknownLambdaType]
+    )
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_parse_rollout",
+        lambda _fd, _binding, _version: ("leaf-1028", (2, 2, 3, 5, 5, 7), "", True, 0),  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    )
+    monkeypatch.setattr(usage_native_codex, "_registered_role", registered_role)
+    monkeypatch.setattr(usage_native_codex, "_git_identity", git_identity)
+    _stub_native_codex_git_administration(monkeypatch)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_attested_origin",
+        lambda: "https://github.com/syamaner/roastpilot-agent.git",
+    )
+    monkeypatch.setattr(usage_native_codex, "_descendant", lambda _base, _head: True)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding-1028")
+    monkeypatch.setattr(usage_native_codex.sys, "stdout", frames)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_terminal_line",
+        lambda: b'{"type":"TERMINAL","binding_id":"binding-1028","task_status":"SUCCESS"}\n',
+    )
+    monkeypatch.setattr(native_cli, "append_record", append)
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent-1028")
+    arguments = SimpleNamespace(
+        task_id="task-1028",
+        slice_id="slice-1028",
+        parent_task_id="parent-task-1028",
+        task_name="native-codex-capture",
+        role=NativeCodexRole.ENGINEER_BE.value,
+        usage_root=str(tmp_path / "usage"),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/1028-hidden-script-strict-typing",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    with pytest.raises(
+        usage_native_codex.NativeCodexCaptureError, match="native Codex capture is invalid"
+    ):
+        usage_native_codex.supervise_native_codex(arguments, harness_version="0.147.0")
+    assert withheld
+    assert captured == []
+    assert [json.loads(frame)["type"] for frame in frames.values] == ["READY"]
