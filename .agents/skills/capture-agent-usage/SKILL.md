@@ -122,6 +122,37 @@ non-empty `--cov=<source>`, exact `--cov-branch`, and exact
 output, so the parent cannot authorize a bare or coverage-incomplete pytest
 invocation by accident.
 
+Under D219 (#766), native `story-planner` launches carry a mechanical read
+boundary whose role-facing statement lives in `.claude/agents/story-planner.md`.
+The launcher applies three fixed guards to that role only: G1 inserts one
+`--settings '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}'`
+pair immediately after `--setting-sources project` and before `-p`, so
+Claude Code confines `Read`/`Grep`/`Glob` to the attested worktree (cwd) and
+the bound `--plan-root`; G2 refuses the launch, before any worker starts or
+record is written, unless the probed version is exactly a member of the proven
+set `{"2.1.310"}` (exact string membership, no prefix, range, or semver
+ordering; a narrow D173 exception for this role only) and the raw bounded
+output of that same single `claude --version` probe is exactly the proven
+release spelling (`2.1.310 (Claude Code)` plus one newline), so a prerelease
+or build suffix, an extra line, or an undecodable byte that the generic
+first-`x.y.z` extraction would reduce to `2.1.310` is refused; and G3 refuses it if
+`.claude/settings.json` or `.claude/settings.local.json` exists as any
+filesystem object (checked with `lstat`, so a dangling symlink counts) or its
+absence cannot be proven. Evidence for the proven set: the parent's S0 direct
+runs on Claude Code 2.1.310, recorded in the D219 row with its UNPROVEN cases.
+The transcript parser admits the four metadata envelope row types observed on
+2.1.310 (`api-request-shape`, `api-request-blob`, `api-request`,
+`cost-state`) only with their exact closed outer keys and value kinds; their
+nested request payloads are never read, and they contribute no usage, model,
+role, or chronology (U9, lead-supplied sanitized fixture).
+No caller option selects or disables the confinement, and every other role's
+argv and version policy are unchanged. To admit another version, the parent
+first runs the synthetic §3.3 boundary proof (including the R15 sensitivity
+calibration) on that version, then lands a reviewed change to the
+proven-version literal together with this evidence line and the D219 row.
+Until then native `story-planner` is refused on that version; never fall back
+to an unconfined native run.
+
 Build a PR evidence bundle immediately before native `pr-triage`. Its
 `generated_at` may be at most ten minutes old at launch (future skew remains
 rejected), and every paginated REST/GraphQL collection must be flattened into

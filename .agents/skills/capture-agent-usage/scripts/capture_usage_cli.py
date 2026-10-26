@@ -176,6 +176,38 @@ _NATIVE_BASH_FORBIDDEN_ROLES = frozenset(
     }
 )
 """Native roles whose committed contract is evidence-only and shell-free."""
+_STORY_PLANNER_READ_CONFINEMENT_SETTINGS = (
+    '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}'
+)
+"""Fixed per-launch setting confining ``story-planner`` reads (D219, #766).
+
+Claude Code then denies ``Read``/``Grep``/``Glob`` outside the working
+directory (the attested worktree) and the ``--add-dir`` plan root. It is
+never caller-selectable.
+"""
+_STORY_PLANNER_PROVEN_CLAUDE_VERSIONS = frozenset({"2.1.310"})
+"""Claude Code versions on which the D219 read boundary was proven.
+
+Membership is exact string equality; any other version refuses the native
+``story-planner`` launch before the model starts (narrow D173 exception).
+"""
+_STORY_PLANNER_PROVEN_CLAUDE_VERSION_OUTPUTS = frozenset(
+    f"{version} (Claude Code)\n".encode("ascii")
+    for version in _STORY_PLANNER_PROVEN_CLAUDE_VERSIONS
+)
+"""Exact raw ``claude --version`` bytes accepted for native ``story-planner`` (D219).
+
+The generic probe keeps only the first ``x.y.z``, so a prerelease or build
+suffix (``2.1.310-rc.1``, ``2.1.310+local``), extra lines, or undecodable
+bytes would otherwise collapse onto a proven version. ``story-planner``
+therefore also requires the whole bounded probe output to equal the proven
+release spelling.
+"""
+_STORY_PLANNER_PROJECT_SETTINGS_PATHS = (
+    Path(".claude/settings.json"),
+    Path(".claude/settings.local.json"),
+)
+"""Project settings entries that could merge extra readable directories."""
 _VALIDATION_DIRECTORY_MODE = 0o700
 _FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 """Closed 40-lowercase-hex full commit sha grammar (D169, §2.3, §2.4)."""
@@ -1507,6 +1539,23 @@ def _emit_handback(
 
 def _harness_version(executable: str) -> str:
     """Return only the first semantic version from fixed executable output."""
+    return _harness_version_probe(executable)[0]
+
+
+def _harness_version_probe(executable: str) -> tuple[str, bytes]:
+    """Run the one bounded ``--version`` probe and return its version and raw output.
+
+    Args:
+        executable: The resolved harness executable.
+
+    Returns:
+        The first semantic version in the output, and the raw bounded output
+        bytes it was extracted from.
+
+    Raises:
+        CaptureUsageError: If the probe cannot run, times out, exceeds its
+            output bound, exits non-zero, or reports no semantic version.
+    """
     process: subprocess.Popen[bytes] | None = None
     deadline: threading.Timer | None = None
     timed_out = threading.Event()
@@ -1543,7 +1592,7 @@ def _harness_version(executable: str) -> str:
     match = _SEMVER.search(output.decode("utf-8", "ignore"))
     if returncode != 0 or match is None:
         raise CaptureUsageError("selected harness version is invalid")
-    return match.group(1)
+    return match.group(1), output
 
 
 def _launch_argv(
@@ -1646,13 +1695,19 @@ def _native_claude_argv(
         role.value,
         "--setting-sources",
         "project",
-        "-p",
-        "--session-id",
-        session_id,
-        "--strict-mcp-config",
-        "--mcp-config",
-        '{"mcpServers":{}}',
     ]
+    if role is NativeClaudeRole.STORY_PLANNER:
+        argv.extend(["--settings", _STORY_PLANNER_READ_CONFINEMENT_SETTINGS])
+    argv.extend(
+        [
+            "-p",
+            "--session-id",
+            session_id,
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
+        ]
+    )
     if bound_root is not None:
         argv.extend(["--add-dir", bound_root.path])
     argv.extend(
@@ -1670,6 +1725,44 @@ def _native_claude_argv(
         argv.append("--allowedTools")
         argv.extend(rules)
     return argv
+
+
+def _validate_story_planner_confinement(
+    role: NativeClaudeRole, version: str, version_output: bytes
+) -> None:
+    """Refuse an unprovable native ``story-planner`` read boundary (D219).
+
+    Runs after the version probe and before any worker launch, so a rejection
+    starts no model and writes no record. Other roles are unaffected.
+
+    Args:
+        role: The registered native role.
+        version: The observed Claude Code version.
+        version_output: The raw bytes of the same bounded version probe.
+
+    Raises:
+        CaptureUsageError: If ``role`` is ``story-planner`` and ``version`` is
+            not exactly a proven version, ``version_output`` is not exactly
+            that version's proven release spelling, or a project settings entry of any
+            type exists (or its absence cannot be proven) under ``.claude/``.
+    """
+    if role is not NativeClaudeRole.STORY_PLANNER:
+        return
+    if (
+        version not in _STORY_PLANNER_PROVEN_CLAUDE_VERSIONS
+        or version_output not in _STORY_PLANNER_PROVEN_CLAUDE_VERSION_OUTPUTS
+    ):
+        raise CaptureUsageError(
+            "story-planner read confinement is unproven for this Claude version"
+        )
+    for path in _STORY_PLANNER_PROJECT_SETTINGS_PATHS:
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise CaptureUsageError("native read confinement is invalid") from None
+        raise CaptureUsageError("native read confinement is invalid")
 
 
 def _validate_native_metadata(
@@ -1812,7 +1905,8 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
             raise CaptureUsageError("native Claude session path is invalid") from None
         prompt = _prompt_bytes(arguments.prompt_file)
         executable = _resolved_executable(HarnessFamily.CLAUDE)
-        version = _harness_version(executable)
+        version, version_output = _harness_version_probe(executable)
+        _validate_story_planner_confinement(role, version, version_output)
         _validate_native_worktree(arguments, pin.capability, post_exit=False)
         started_at = _utc_now()
         started_monotonic = time.monotonic()

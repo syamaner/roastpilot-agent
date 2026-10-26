@@ -116,6 +116,7 @@ from pydantic import TypeAdapter, ValidationError
 
 _REAL_VALIDATE_WORKTREE_METADATA = usage_cli._validate_worktree_metadata  # pyright: ignore[reportPrivateUsage]
 _REAL_HARNESS_VERSION = usage_cli._harness_version  # pyright: ignore[reportPrivateUsage]
+_REAL_HARNESS_VERSION_PROBE = usage_cli._harness_version_probe  # pyright: ignore[reportPrivateUsage]
 
 
 def _stub_native_codex_git_administration(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3000,6 +3001,7 @@ def test_native_codex_cli_probes_resolved_executable_once_before_supervision(
     monkeypatch.setattr(usage_cli, "_resolved_executable", resolved)
     monkeypatch.setattr(usage_cli.subprocess, "Popen", popen)
     monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", _REAL_HARNESS_VERSION_PROBE)
     monkeypatch.setattr(usage_cli, "supervise_native_codex", supervise)
     monkeypatch.setenv("PATH", "/allowed/codex-bin")
     monkeypatch.setenv("LANG", "en_GB.UTF-8")
@@ -6433,7 +6435,9 @@ def test_owned_transcript_rejects_row_and_file_bounds(
     assert transcript.read_bytes() == content
 
 
-@pytest.mark.parametrize("role", list(NativeClaudeRole))
+@pytest.mark.parametrize(
+    "role", [role for role in NativeClaudeRole if role is not NativeClaudeRole.STORY_PLANNER]
+)
 def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
     role: NativeClaudeRole,
 ) -> None:
@@ -6441,6 +6445,8 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
 
     D168: also asserts the exact ``--allowedTools`` rule tuple, and that it is
     the final argv element, for every validation role (T1, T2, T3, T6).
+    D219: every role except ``story-planner`` (pinned separately below) keeps
+    this exact list, with no ``--settings`` option.
     """
     session_id = "11111111-1111-4111-8111-111111111233"
     pin = usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
@@ -6497,14 +6503,61 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
         if bound_root is not None:
             assert argv[argv.index("--add-dir") + 2] == "--permission-mode"
     assert "--no-session-persistence" not in argv and "--output-format" not in argv
+    assert "--settings" not in argv
     generic = usage_cli._launch_argv(HarnessFamily.CLAUDE, "claude", "model", "high")  # pyright: ignore[reportPrivateUsage]
     assert "--no-session-persistence" in generic
     assert "--add-dir" not in generic
     assert "--allowedTools" not in generic
+    assert "--settings" not in generic
     generic_without_effort = usage_cli._launch_argv(  # pyright: ignore[reportPrivateUsage]
         HarnessFamily.CLAUDE, "claude", "model", None
     )
     assert "--effort" not in generic_without_effort
+
+
+def test_story_planner_native_argv_is_confined_exact() -> None:
+    """D219 G1: ``story-planner`` carries the fixed read-confinement setting.
+
+    The frozen argv is pinned element by element: ``--settings`` and its exact
+    compact JSON sit immediately after ``--setting-sources project`` and
+    before ``-p``, and the plan root is the only ``--add-dir``.
+    """
+    session_id = "11111111-1111-4111-8111-111111111233"
+    role = NativeClaudeRole.STORY_PLANNER
+    pin = usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
+    argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+        "claude",
+        role,
+        pin.capability,
+        pin.effort,
+        session_id,
+        BoundRoot(BoundRootKind.PLAN, "/plan/root"),
+    )
+    assert argv == [
+        "claude",
+        "--agent",
+        "story-planner",
+        "--setting-sources",
+        "project",
+        "--settings",
+        '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}',
+        "-p",
+        "--session-id",
+        session_id,
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--add-dir",
+        "/plan/root",
+        "--permission-mode",
+        "dontAsk",
+        "--effort",
+        "medium",
+    ]
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+            "claude", role, pin.capability, pin.effort, session_id, None
+        )
 
 
 def test_native_argv_rejects_root_role_mismatch() -> None:
@@ -8772,6 +8825,28 @@ def test_native_argv_rejects_empty_rendered_rule_tuple_before_provider_lookup(
         )
 
 
+@pytest.mark.parametrize("flag", ["--settings", "--restricted", "--agents", "--setting-sources"])
+def test_no_caller_read_confinement_option_exists(
+    flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D219 U6: no caller option can select, widen, or disable the read confinement.
+
+    Every required ``story-planner`` argument is supplied so the failure is
+    specifically the unrecognized ``flag``.
+    """
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(
+            [
+                *_native_cli_args(
+                    role="story-planner", plan_root=_STUB_PLAN_ROOT, plan_sha=_STUB_PLAN_SHA
+                ),
+                flag,
+                "value",
+            ]
+        )
+    assert f"unrecognized arguments: {flag}" in capsys.readouterr().err
+
+
 def test_no_caller_add_dir_option_exists(capsys: pytest.CaptureFixture[str]) -> None:
     """The closed CLI grammar exposes no ``--add-dir`` option on any subcommand.
 
@@ -9129,13 +9204,16 @@ def _native_popen(
     prompt_fail: bool = False,
     transcript: bytes | None = None,
     version: str = "2.1.233",
+    version_output: bytes | None = None,
 ) -> Callable[..., _NativeProcess]:
     """Return a fake version/worker launcher that creates only one parent transcript."""
 
     def fake(argv: list[str], **kwargs: object) -> _NativeProcess:
         observed.append((argv, kwargs))
         if argv[-1] == "--version":
-            process = _NativeProcess(f"Claude Code {version}\\n".encode())
+            process = _NativeProcess(
+                f"Claude Code {version}\\n".encode() if version_output is None else version_output
+            )
             processes.append(process)
             return process
         if transcript is not None:
@@ -9291,6 +9369,7 @@ def test_native_command_launches_exact_worker_and_records_immutable_transcript(
         _native_popen(project, observed, processes, transcript=transcript, version="2.1.241"),
     )
     monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", _REAL_HARNESS_VERSION_PROBE)
 
     assert main(_native_cli_args()) == 0
 
@@ -9366,6 +9445,7 @@ def test_generic_claude_probe_uses_closed_environment_once(
     monkeypatch.setattr(usage_cli, "_resolved_executable", resolved)
     monkeypatch.setattr(usage_cli.subprocess, "Popen", popen)
     monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", _REAL_HARNESS_VERSION_PROBE)
 
     assert (
         main(
@@ -9430,6 +9510,7 @@ def test_read_only_nonzero_exit_records_failure_without_handback(
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
     _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
@@ -9438,7 +9519,7 @@ def test_read_only_nonzero_exit_records_failure_without_handback(
             observed,
             processes,
             code=2,
-            transcript=_read_only_transcript_bytes("story-planner"),
+            transcript=_proven_story_planner_transcript_bytes(),
         ),
     )
     assert (
@@ -9649,6 +9730,7 @@ def test_held_plan_descriptor_closes_after_successful_read_only_run(
         resolved,
     )
     processes: list[_NativeProcess] = []
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
@@ -9656,7 +9738,7 @@ def test_held_plan_descriptor_closes_after_successful_read_only_run(
             project,
             observed,
             processes,
-            transcript=_read_only_transcript_bytes("story-planner"),
+            transcript=_proven_story_planner_transcript_bytes(),
         ),
     )
     try:
@@ -10086,6 +10168,11 @@ def isolate_run_metadata_validation(
             return "2.1.233"
         raise AssertionError(executable)
 
+    def harness_version_probe(executable: str) -> tuple[str, bytes]:
+        """Return the stubbed version with Claude Code's observed release spelling."""
+        version = harness_version(executable)
+        return version, f"{version} (Claude Code)\n".encode()
+
     lifecycle_tests = {
         "test_version_probe_timeout_kills_reaps_and_never_reaches_a_run",
         "test_provider_free_executable_integration_captures_only_normalized_usage",
@@ -10103,6 +10190,7 @@ def isolate_run_metadata_validation(
     if original_name not in lifecycle_tests:
         monkeypatch.setattr(usage_cli, "_resolved_executable", resolved_executable)
         monkeypatch.setattr(usage_cli, "_harness_version", harness_version)
+        monkeypatch.setattr(usage_cli, "_harness_version_probe", harness_version_probe)
 
 
 def _stream(*events: str) -> BytesIO:
@@ -12906,6 +12994,7 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
     monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
     monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", _REAL_HARNESS_VERSION_PROBE)
     assert (
         main(
             [
@@ -13765,6 +13854,7 @@ def test_invalid_version_never_spawns_a_run(
 
     monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", _REAL_HARNESS_VERSION_PROBE)
     with pytest.raises(CaptureUsageError, match="version"):
         usage_cli._harness_version("/stub/codex")  # pyright: ignore[reportPrivateUsage]
 
@@ -15100,6 +15190,49 @@ def _read_only_transcript_bytes(
     return _dump_rows(rows)
 
 
+_PROVEN_STORY_PLANNER_VERSION = "2.1.310"
+"""The one Claude Code version D219 admits for a native ``story-planner`` launch."""
+_PROVEN_STORY_PLANNER_VERSION_OUTPUT = b"2.1.310 (Claude Code)\n"
+"""The exact raw ``claude --version`` release spelling observed on 2.1.310."""
+
+
+def _admit_proven_story_planner_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the stubbed Claude version probe report the D219 proven version.
+
+    The autouse launcher isolation stubs every Claude probe to ``2.1.233``,
+    which D219's G2 now refuses for ``story-planner`` before launch.
+    """
+
+    def proven_version(executable: str) -> tuple[str, bytes]:
+        assert Path(executable).name.lower() == "claude"
+        return _PROVEN_STORY_PLANNER_VERSION, _PROVEN_STORY_PLANNER_VERSION_OUTPUT
+
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", proven_version)
+
+
+def _proven_story_planner_transcript_bytes(
+    *, session_id: str = _NATIVE_SESSION_ID, text: str = "SYNTHETIC_STORY_HANDOFF"
+) -> bytes:
+    """Return the committed ``story-planner`` fixture bound to the D219 proven version.
+
+    D219's G2 refuses any unproven version before launch, so a fake launch must
+    probe ``2.1.310``; the parser requires every versioned row to equal the
+    probe, so only the ``version`` field is rebound, like the session id. The
+    row grammar stays the committed 2.1.233 fixture's; real 2.1.310 grammar is
+    the parent's live-run proof, not this hardware-free substitute.
+    """
+    rows: list[dict[str, Any]] = [
+        json.loads(line)
+        for line in _read_only_transcript_bytes(
+            "story-planner", session_id=session_id, text=text
+        ).splitlines()
+    ]
+    for row in rows:
+        if "version" in row:
+            row["version"] = _PROVEN_STORY_PLANNER_VERSION
+    return _dump_rows(rows)
+
+
 def _read_only_transcript_bytes_rebranded(
     source_role: str,
     target_role: str,
@@ -15135,6 +15268,7 @@ def test_native_read_only_emits_bounded_handback_line(
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
     _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
@@ -15142,7 +15276,7 @@ def test_native_read_only_emits_bounded_handback_line(
             project,
             observed,
             processes,
-            transcript=_read_only_transcript_bytes("story-planner", text="SYNTHETIC_STORY_HANDOFF"),
+            transcript=_proven_story_planner_transcript_bytes(text="SYNTHETIC_STORY_HANDOFF"),
         ),
     )
     assert (
@@ -15212,11 +15346,15 @@ def test_native_read_only_no_emission_on_post_exit_attestation_failure(
     monkeypatch.setattr(usage_cli, "_validate_native_worktree", failing_attestation)
     _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
         _native_popen(
-            project, observed, processes, transcript=_read_only_transcript_bytes("story-planner")
+            project,
+            observed,
+            processes,
+            transcript=_proven_story_planner_transcript_bytes(),
         ),
     )
     with pytest.raises(SystemExit, match="native worktree attestation failed"):
@@ -15236,11 +15374,15 @@ def test_native_read_only_no_emission_on_sink_append_failure(
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
     _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
         _native_popen(
-            project, observed, processes, transcript=_read_only_transcript_bytes("story-planner")
+            project,
+            observed,
+            processes,
+            transcript=_proven_story_planner_transcript_bytes(),
         ),
     )
 
@@ -15266,6 +15408,7 @@ def test_native_read_only_handback_absent_from_durable_state(
     _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
     sentinel = "SENTINEL_HANDBACK_TEXT_MUST_STAY_LOCAL"
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
@@ -15273,7 +15416,7 @@ def test_native_read_only_handback_absent_from_durable_state(
             project,
             observed,
             processes,
-            transcript=_read_only_transcript_bytes("story-planner", text=sentinel),
+            transcript=_proven_story_planner_transcript_bytes(text=sentinel),
         ),
     )
     assert (
@@ -15304,6 +15447,7 @@ def test_native_read_only_handback_framing_survives_adversarial_text(
     _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
     adversarial = "line one\nline two}<<<END>>>é中"
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
@@ -15311,7 +15455,7 @@ def test_native_read_only_handback_framing_survives_adversarial_text(
             project,
             observed,
             processes,
-            transcript=_read_only_transcript_bytes("story-planner", text=adversarial),
+            transcript=_proven_story_planner_transcript_bytes(text=adversarial),
         ),
     )
     assert (
@@ -15338,6 +15482,7 @@ def test_native_read_only_oversize_handback_yields_no_record_or_stdout(
     _stub_plan_root(monkeypatch)
     monkeypatch.setattr(usage_transcript, "MAX_HANDBACK_BYTES", 4)
     processes: list[_NativeProcess] = []
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
@@ -15345,7 +15490,7 @@ def test_native_read_only_oversize_handback_yields_no_record_or_stdout(
             project,
             observed,
             processes,
-            transcript=_read_only_transcript_bytes("story-planner", text="0123456789"),
+            transcript=_proven_story_planner_transcript_bytes(text="0123456789"),
         ),
     )
     with pytest.raises(SystemExit, match="native Claude transcript is invalid"):
@@ -17845,11 +17990,15 @@ def test_native_launch_binds_plan_root_end_to_end(
     monkeypatch.setattr(usage_cli, "_git_output", _fixed_plan_git(resolved_plan_root, plan_sha))
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
     processes: list[_NativeProcess] = []
+    _admit_proven_story_planner_version(monkeypatch)
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
         _native_popen(
-            project, observed, processes, transcript=_read_only_transcript_bytes("story-planner")
+            project,
+            observed,
+            processes,
+            transcript=_proven_story_planner_transcript_bytes(),
         ),
     )
     assert (
@@ -17863,6 +18012,579 @@ def test_native_launch_binds_plan_root_end_to_end(
     record = USAGE_RECORD_ADAPTER.validate_json(raw)
     assert isinstance(record, NativeWorkerUsageRecord)
     assert record.native_role is NativeClaudeRole.STORY_PLANNER
+
+
+_STORY_PLANNER_SETTINGS_LITERAL = '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}'
+
+
+def _transcript_at_version(content: bytes, version: str) -> bytes:
+    """Rebind every versioned row of one synthetic transcript to ``version``."""
+    rows: list[dict[str, Any]] = [json.loads(line) for line in content.splitlines()]
+    for row in rows:
+        if "version" in row:
+            row["version"] = version
+    return _dump_rows(rows)
+
+
+def _launch_plan_role_at_probed_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    *,
+    role: str,
+    version: str,
+    version_output: bytes | None = None,
+    transcript: bytes | None = None,
+) -> tuple[int | None, str, list[list[str]]]:
+    """Run one plan-root native launch whose real version probe reports ``version``.
+
+    The probe emits ``version_output`` verbatim, defaulting to Claude Code's
+    observed release spelling of ``version``. ``transcript`` replaces the
+    committed role fixture as the worker's parent transcript.
+
+    Returns the exit code (``None`` on refusal), the refusal message, and every
+    observed Popen argv (the version probe included).
+    """
+    plan_root = _build_plan_root(tmp_path_factory.mktemp(f"d219-{role}") / "root")
+    plan_sha = "1" * 40
+    monkeypatch.setattr(
+        usage_cli, "_git_output", _fixed_plan_git(os.path.realpath(plan_root), plan_sha)
+    )
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", _REAL_HARNESS_VERSION_PROBE)
+    source = (
+        transcript
+        if transcript is not None
+        else _read_only_transcript_bytes("story-planner")
+        if role == "story-planner"
+        else _read_only_transcript_bytes_rebranded("security-reviewer", role)
+    )
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project,
+            observed,
+            processes,
+            transcript=_transcript_at_version(source, version),
+            version_output=(
+                f"{version} (Claude Code)\n".encode() if version_output is None else version_output
+            ),
+        ),
+    )
+    try:
+        code: int | None = main(
+            _native_cli_args(role=role, plan_root=str(plan_root), plan_sha=plan_sha)
+        )
+        message = ""
+    except SystemExit as error:
+        code = None
+        message = str(error)
+    return code, message, [argv for argv, _ in observed]
+
+
+@pytest.mark.parametrize(
+    ("version", "admitted"),
+    [
+        ("2.1.310", True),
+        ("2.1.311", False),
+        ("2.1.309", False),
+        ("2.1.3100", False),
+        ("2.1.31", False),
+        ("0.0.0", False),
+    ],
+)
+def test_story_planner_version_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    version: str,
+    admitted: bool,
+) -> None:
+    """D219 G2: only an exactly proven version launches native ``story-planner``.
+
+    A refusal happens after the real version probe but before any worker
+    Popen, and writes no usage record. Matching is exact membership, so a
+    prefix (``2.1.3100``, ``2.1.31``) or a neighbouring version is refused.
+    """
+    code, message, argvs = _launch_plan_role_at_probed_version(
+        tmp_path, monkeypatch, tmp_path_factory, role="story-planner", version=version
+    )
+    assert argvs[0] == ["claude", "--version"]
+    if admitted:
+        assert code == 0
+        assert len(argvs) == 2 and "--session-id" in argvs[1]
+        assert Path(".agent-usage/usage.jsonl").exists()
+    else:
+        assert code is None
+        assert "story-planner read confinement is unproven for this Claude version" in message
+        assert argvs == [["claude", "--version"]]
+        assert not Path(".agent-usage").exists()
+
+
+_UNPROVEN_STORY_PLANNER_VERSION_OUTPUTS = (
+    b"2.1.310-rc.1 (Claude Code)\n",
+    b"2.1.310+local (Claude Code)\n",
+    b"2.1.310 (Claude Code)\nextra\n",
+    b"2.1.310 (Claude Code)\n\n",
+    b"2.1.310 (Claude Code)\xff\n",
+    b"\xff2.1.310 (Claude Code)\n",
+    b"2.1.310 (Claude Code)",
+    b"2.1.310 (Claude Code)\r\n",
+    b" 2.1.310 (Claude Code)\n",
+    b"Claude Code 2.1.310\n",
+    b"2.1.310\n",
+    b"2.1.310 (Claude Code) 9.9.9\n",
+)
+"""Probe outputs whose first ``x.y.z`` is the proven version but whose spelling is not."""
+
+
+@pytest.mark.parametrize("version_output", _UNPROVEN_STORY_PLANNER_VERSION_OUTPUTS)
+def test_story_planner_version_gate_requires_exact_release_spelling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    version_output: bytes,
+) -> None:
+    """D219 G2 checks the raw bounded probe bytes, not only the first ``x.y.z``.
+
+    A prerelease, build suffix, extra line, undecodable byte, or other spelling
+    reduces to ``2.1.310`` under the generic extraction, yet is refused before
+    any worker Popen and writes no usage record.
+    """
+    code, message, argvs = _launch_plan_role_at_probed_version(
+        tmp_path,
+        monkeypatch,
+        tmp_path_factory,
+        role="story-planner",
+        version="2.1.310",
+        version_output=version_output,
+    )
+    assert code is None
+    assert "story-planner read confinement is unproven for this Claude version" in message
+    assert argvs == [["claude", "--version"]]
+    assert not Path(".agent-usage").exists()
+
+
+def test_exact_release_spelling_leaves_other_plan_roles_unaffected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """The raw-spelling check is ``story-planner`` only; others keep D173 extraction."""
+    code, message, argvs = _launch_plan_role_at_probed_version(
+        tmp_path,
+        monkeypatch,
+        tmp_path_factory,
+        role="product-auditor",
+        version="2.1.310",
+        version_output=b"2.1.310-rc.1 (Claude Code)\n",
+    )
+    assert (code, message) == (0, "")
+    assert [argv for argv in argvs if argv[-1] == "--version"] == [["claude", "--version"]]
+    record = USAGE_RECORD_ADAPTER.validate_json(Path(".agent-usage/usage.jsonl").read_text())
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert record.harness_version == "2.1.310"
+
+
+def test_harness_version_probe_returns_the_one_bounded_raw_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The single probe returns its extracted version with the exact raw bytes."""
+    observed: list[list[str]] = []
+
+    def fake_popen(argv: list[str], **_kwargs: object) -> _NativeProcess:
+        observed.append(argv)
+        return _NativeProcess(b"2.1.310-rc.1 (Claude Code)\n")
+
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    assert _REAL_HARNESS_VERSION_PROBE("/stub/claude") == (
+        "2.1.310",
+        b"2.1.310-rc.1 (Claude Code)\n",
+    )
+    monkeypatch.setattr(usage_cli, "_harness_version_probe", _REAL_HARNESS_VERSION_PROBE)
+    assert _REAL_HARNESS_VERSION("/stub/claude") == "2.1.310"
+    assert observed == [["/stub/claude", "--version"]] * 2
+
+
+def test_version_gate_leaves_other_plan_roles_unaffected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """D219 G2 is ``story-planner`` only: another READ_ONLY role launches on ``2.1.311``."""
+    code, message, argvs = _launch_plan_role_at_probed_version(
+        tmp_path, monkeypatch, tmp_path_factory, role="product-auditor", version="2.1.311"
+    )
+    assert (code, message) == (0, "")
+    assert len(argvs) == 2 and "--session-id" in argvs[1]
+    assert "--settings" not in argvs[1]
+    record = USAGE_RECORD_ADAPTER.validate_json(Path(".agent-usage/usage.jsonl").read_text())
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert record.harness_version == "2.1.311"
+
+
+def _make_settings_entry(path: Path, shape: str) -> None:
+    """Create one project-settings filesystem entry of the named shape."""
+    path.parent.mkdir(exist_ok=True)
+    if shape == "file":
+        path.write_text("{}")
+    elif shape == "directory":
+        path.mkdir()
+    elif shape == "symlink":
+        target = path.parent / "settings-target.json"
+        target.write_text("{}")
+        path.symlink_to(target)
+    else:
+        assert shape == "dangling-symlink"
+        path.symlink_to(path.parent / "absent-target.json")
+
+
+@pytest.mark.parametrize("name", ["settings.json", "settings.local.json"])
+@pytest.mark.parametrize(
+    "shape", ["file", "directory", "symlink", "dangling-symlink", "permission-error"]
+)
+def test_story_planner_project_settings_presence_rejects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    name: str,
+    shape: str,
+) -> None:
+    """D219 G3: any project settings entry, or unprovable absence, refuses the launch.
+
+    The check uses ``lstat``, so a dangling symlink is refused, and every
+    refusal happens before the worker Popen and writes no record.
+    """
+    settings = tmp_path / ".claude" / name
+    if shape == "permission-error":
+        real_lstat = os.lstat
+
+        def denied_lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if Path(path) == Path(".claude") / name:
+                raise PermissionError(13, "denied")
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(usage_cli.os, "lstat", denied_lstat)
+    else:
+        _make_settings_entry(settings, shape)
+    code, message, argvs = _launch_plan_role_at_probed_version(
+        tmp_path, monkeypatch, tmp_path_factory, role="story-planner", version="2.1.310"
+    )
+    assert code is None
+    assert "native read confinement is invalid" in message
+    assert argvs == [["claude", "--version"]]
+    assert not Path(".agent-usage").exists()
+
+
+def test_project_settings_guard_leaves_other_roles_unaffected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """D219 G3 is ``story-planner`` only: another plan role launches with a settings file."""
+    _make_settings_entry(tmp_path / ".claude" / "settings.json", "file")
+    code, _message, argvs = _launch_plan_role_at_probed_version(
+        tmp_path, monkeypatch, tmp_path_factory, role="product-auditor", version="2.1.310"
+    )
+    assert code == 0
+    assert len(argvs) == 2 and "--session-id" in argvs[1]
+
+
+def test_story_planner_launch_is_confined_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """D219 U7: the real launch carries the setting after ``project`` and records 2.1.310.
+
+    No ``.claude/settings*.json`` entry exists, so G3 passes and the launch
+    proceeds.
+    """
+    code, _message, argvs = _launch_plan_role_at_probed_version(
+        tmp_path, monkeypatch, tmp_path_factory, role="story-planner", version="2.1.310"
+    )
+    assert code == 0
+    worker = argvs[1]
+    index = worker.index("--settings")
+    assert worker[index - 2 : index + 3] == [
+        "--setting-sources",
+        "project",
+        "--settings",
+        _STORY_PLANNER_SETTINGS_LITERAL,
+        "-p",
+    ]
+    assert worker.count("--settings") == 1
+    record = USAGE_RECORD_ADAPTER.validate_json(Path(".agent-usage/usage.jsonl").read_text())
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert record.native_role is NativeClaudeRole.STORY_PLANNER
+    assert record.harness_version == "2.1.310"
+
+
+_ENVELOPE_PAYLOAD_SENTINEL = "SENTINEL_ENVELOPE_PAYLOAD"
+"""Marker planted in nested envelope payloads; it must never reach a result or record."""
+
+
+def _sanitized_envelope_rows(session_id: str) -> list[dict[str, Any]]:
+    """Return the lead-supplied 2.1.310 envelope rows bound to ``session_id``.
+
+    Each nested request payload gains one planted sentinel string so a test
+    can prove the parser never retains payload content.
+    """
+    content = (FIXTURES / "claude-2.1.310-envelope-rows.jsonl").read_bytes()
+    rows: list[dict[str, Any]] = [json.loads(line) for line in content.splitlines()]
+    assert [row["type"] for row in rows] == [
+        "api-request-shape",
+        "api-request-blob",
+        "api-request",
+        "api-request",
+        "cost-state",
+    ]
+    for row in rows:
+        row["sessionId"] = session_id
+    rows[0]["shape"]["system"][0]["text"] = _ENVELOPE_PAYLOAD_SENTINEL
+    rows[1]["message"]["content"][0]["text"] = _ENVELOPE_PAYLOAD_SENTINEL
+    rows[2]["params"]["model"] = _ENVELOPE_PAYLOAD_SENTINEL
+    rows[3]["tail"][0] = _ENVELOPE_PAYLOAD_SENTINEL
+    return rows
+
+
+def _story_planner_transcript_with_envelopes(
+    session_id: str, envelopes: list[dict[str, Any]] | None = None
+) -> bytes:
+    """Interleave envelope rows through a valid proven-version ``story-planner`` transcript.
+
+    The rows are spread before, between, and after the base fixture's rows,
+    as a live 2.1.310 transcript interleaves them with conversation rows.
+    """
+    base: list[dict[str, Any]] = [
+        json.loads(line)
+        for line in _proven_story_planner_transcript_bytes(session_id=session_id).splitlines()
+    ]
+    inserted = _sanitized_envelope_rows(session_id) if envelopes is None else envelopes
+    rows: list[dict[str, Any]] = []
+    for index, row in enumerate(base):
+        if index < len(inserted):
+            rows.append(inserted[index])
+        rows.append(row)
+    rows.extend(inserted[len(base) :])
+    return _dump_rows(rows)
+
+
+def _parse_story_planner_transcript(
+    tmp_path: Path, session_id: str
+) -> usage_transcript.TranscriptUsage:
+    """Parse one installed ``story-planner`` transcript under the D219 proven version."""
+    return usage_transcript.parse_owned_transcript(
+        tmp_path,
+        session_id,
+        NativeClaudeRole.STORY_PLANNER,
+        usage_cli._native_role_pin(NativeClaudeRole.STORY_PLANNER).effort,  # pyright: ignore[reportPrivateUsage]
+        expected_version=_PROVEN_STORY_PLANNER_VERSION,
+        expected_permission_mode="dontAsk",
+        require_handback=True,
+    )
+
+
+def test_observed_2_1_310_envelope_rows_validate_and_are_discarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D219 U9: the sanitized 2.1.310 envelopes parse without changing or retaining anything.
+
+    Usage, model, call count, and handback equal the envelope-free baseline,
+    even when ``cost-state`` reports different per-model token counts, and no
+    nested payload string is retained.
+    """
+    session_id = "73333333-3333-4333-8333-333333333333"
+    transcript, installed = _install_owned_transcript(
+        tmp_path,
+        monkeypatch,
+        _proven_story_planner_transcript_bytes(session_id=session_id),
+        session_id,
+    )
+    baseline = _parse_story_planner_transcript(tmp_path, installed)
+    envelopes = _sanitized_envelope_rows(session_id)
+    envelopes[4]["modelUsage"]["claude-opus-5-5"]["inputTokens"] = 999_999
+    envelopes[4]["totalCostUSD"] = 1.25
+    transcript.write_bytes(_story_planner_transcript_with_envelopes(session_id, envelopes))
+
+    usage = _parse_story_planner_transcript(tmp_path, installed)
+
+    assert usage == baseline
+    assert usage.handback_text == "SYNTHETIC_STORY_HANDOFF"
+    assert _ENVELOPE_PAYLOAD_SENTINEL not in repr(usage)
+    assert "999999" not in repr(usage)
+
+
+def test_envelope_rows_alone_never_complete_a_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Envelope rows contribute no usage: without an assistant row the transcript is incomplete."""
+    session_id = "74444444-4444-4444-8444-444444444444"
+    rows = [
+        json.loads(line)
+        for line in _story_planner_transcript_with_envelopes(session_id).splitlines()
+    ]
+    kept = [row for row in rows if row.get("type") != "assistant"]
+    _install_owned_transcript(tmp_path, monkeypatch, _dump_rows(kept), session_id)
+    with pytest.raises(usage_transcript.TranscriptError, match="incomplete"):
+        _parse_story_planner_transcript(tmp_path, session_id)
+
+
+def _envelope_mutation(
+    index: int, mutate: Callable[[dict[str, Any]], None]
+) -> Callable[[list[dict[str, Any]]], None]:
+    """Return a transform that applies ``mutate`` to one sanitized envelope row."""
+
+    def apply(rows: list[dict[str, Any]]) -> None:
+        mutate(rows[index])
+
+    return apply
+
+
+def _set(key: str, value: object) -> Callable[[dict[str, Any]], None]:
+    def mutate(row: dict[str, Any]) -> None:
+        row[key] = value
+
+    return mutate
+
+
+def _drop(key: str) -> Callable[[dict[str, Any]], None]:
+    def mutate(row: dict[str, Any]) -> None:
+        del row[key]
+
+    return mutate
+
+
+def _set_model_usage(key: str, value: object) -> Callable[[dict[str, Any]], None]:
+    def mutate(row: dict[str, Any]) -> None:
+        row["modelUsage"]["claude-opus-5-5"][key] = value
+
+    return mutate
+
+
+def _drop_model_usage(key: str) -> Callable[[dict[str, Any]], None]:
+    def mutate(row: dict[str, Any]) -> None:
+        del row["modelUsage"]["claude-opus-5-5"][key]
+
+    return mutate
+
+
+_SHAPE, _BLOB, _REQUEST, _REQUEST_BASE, _COST = range(5)
+_MALICIOUS_ENVELOPES: dict[str, Callable[[list[dict[str, Any]]], None]] = {
+    "unknown-type": _envelope_mutation(_BLOB, _set("type", "api-request-extra")),
+    "unknown-prefixed-type": _envelope_mutation(_COST, _set("type", "cost-state-v2")),
+    "shape-extra-key": _envelope_mutation(_SHAPE, _set("agentId", "x")),
+    "blob-extra-base": _envelope_mutation(_BLOB, _set("base", "SYNTHETIC")),
+    "request-extra-usage": _envelope_mutation(_REQUEST, _set("usage", {"input_tokens": 1})),
+    "cost-extra-key": _envelope_mutation(_COST, _set("subagents", [])),
+    "shape-permission-mode": _envelope_mutation(_SHAPE, _set("permissionMode", "dontAsk")),
+    "shape-missing-shape": _envelope_mutation(_SHAPE, _drop("shape")),
+    "shape-missing-version": _envelope_mutation(_SHAPE, _drop("version")),
+    "shape-missing-timestamp": _envelope_mutation(_SHAPE, _drop("timestamp")),
+    "blob-missing-message": _envelope_mutation(_BLOB, _drop("message")),
+    "blob-missing-hash": _envelope_mutation(_BLOB, _drop("hash")),
+    "request-missing-params": _envelope_mutation(_REQUEST, _drop("params")),
+    "request-missing-version": _envelope_mutation(_REQUEST_BASE, _drop("version")),
+    "request-missing-digest": _envelope_mutation(_REQUEST_BASE, _drop("requestDigest")),
+    "cost-missing-model-usage": _envelope_mutation(_COST, _drop("modelUsage")),
+    "cost-missing-flag": _envelope_mutation(_COST, _drop("hasUnknownModelCost")),
+    "missing-session": _envelope_mutation(_BLOB, _drop("sessionId")),
+    "foreign-session": _envelope_mutation(_COST, _set("sessionId", "foreign")),
+    "shape-version-drift": _envelope_mutation(_SHAPE, _set("version", "2.1.311")),
+    "request-version-drift": _envelope_mutation(_REQUEST, _set("version", "2.1.3100")),
+    "shape-version-number": _envelope_mutation(_SHAPE, _set("version", 2)),
+    "shape-bad-timestamp": _envelope_mutation(_SHAPE, _set("timestamp", "not-a-time")),
+    "request-numeric-timestamp": _envelope_mutation(_REQUEST, _set("timestamp", 0)),
+    "shape-list-shape": _envelope_mutation(_SHAPE, _set("shape", [])),
+    "blob-string-message": _envelope_mutation(_BLOB, _set("message", "SYNTHETIC")),
+    "blob-null-hash": _envelope_mutation(_BLOB, _set("hash", None)),
+    "request-list-params": _envelope_mutation(_REQUEST, _set("params", [])),
+    "request-object-tail": _envelope_mutation(_REQUEST, _set("tail", {})),
+    "request-object-cache-control": _envelope_mutation(_REQUEST, _set("cacheControl", {})),
+    "request-numeric-id": _envelope_mutation(_REQUEST, _set("id", 1)),
+    "request-numeric-base": _envelope_mutation(_REQUEST_BASE, _set("base", 0)),
+    "request-bool-keep": _envelope_mutation(_REQUEST, _set("keep", True)),
+    "request-negative-keep": _envelope_mutation(_REQUEST, _set("keep", -1)),
+    "request-fractional-keep": _envelope_mutation(_REQUEST, _set("keep", 1.5)),
+    "cost-string-amount": _envelope_mutation(_COST, _set("totalCostUSD", "0")),
+    "cost-negative-amount": _envelope_mutation(_COST, _set("totalDuration", -1)),
+    "cost-bool-amount": _envelope_mutation(_COST, _set("startTime", True)),
+    "cost-infinite-amount": _envelope_mutation(_COST, _set("totalAPIDuration", math.inf)),
+    "cost-nan-amount": _envelope_mutation(_COST, _set("totalToolDuration", math.nan)),
+    "cost-fractional-count": _envelope_mutation(_COST, _set("totalLinesAdded", 1.5)),
+    "cost-integer-flag": _envelope_mutation(_COST, _set("hasUnknownModelCost", 0)),
+    "cost-list-model-usage": _envelope_mutation(_COST, _set("modelUsage", [])),
+    "cost-model-usage-not-object": _envelope_mutation(
+        _COST, _set("modelUsage", {"claude-opus-5-5": 0})
+    ),
+    "cost-model-usage-extra-key": _envelope_mutation(_COST, _set_model_usage("prompt", "x")),
+    "cost-model-usage-extra-numeric-key": _envelope_mutation(
+        _COST, _set_model_usage("contextWindow", 0)
+    ),
+    "cost-model-usage-missing-key": _envelope_mutation(_COST, _drop_model_usage("costUSD")),
+    "cost-model-usage-negative": _envelope_mutation(_COST, _set_model_usage("inputTokens", -1)),
+    "cost-model-usage-bool": _envelope_mutation(_COST, _set_model_usage("outputTokens", False)),
+    "cost-model-usage-string": _envelope_mutation(_COST, _set_model_usage("costUSD", "0")),
+}
+"""Malicious or malformed variants of the sanitized 2.1.310 envelopes; each must fail closed."""
+
+
+@pytest.mark.parametrize("variant", sorted(_MALICIOUS_ENVELOPES))
+def test_malformed_2_1_310_envelope_rows_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    """D219 U9: unknown types and every malformed envelope reject the whole transcript."""
+    session_id = "75555555-5555-4555-8555-555555555555"
+    envelopes = _sanitized_envelope_rows(session_id)
+    _MALICIOUS_ENVELOPES[variant](envelopes)
+    _install_owned_transcript(
+        tmp_path,
+        monkeypatch,
+        _story_planner_transcript_with_envelopes(session_id, envelopes),
+        session_id,
+    )
+    with pytest.raises(
+        usage_transcript.TranscriptError, match="owned Claude transcript is invalid"
+    ):
+        _parse_story_planner_transcript(tmp_path, session_id)
+
+
+def test_envelope_payload_duplicate_key_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A duplicate key nested inside an unread envelope payload still rejects the row."""
+    session_id = "76666666-6666-4666-8666-666666666666"
+    content = _story_planner_transcript_with_envelopes(session_id)
+    tampered = content.replace(
+        b'"params": {"model": ', b'"params": {"model": "SYNTHETIC", "model": ', 1
+    )
+    assert tampered != content
+    _install_owned_transcript(tmp_path, monkeypatch, tampered, session_id)
+    with pytest.raises(
+        usage_transcript.TranscriptError, match="owned Claude transcript is invalid"
+    ):
+        _parse_story_planner_transcript(tmp_path, session_id)
+
+
+def test_story_planner_launch_records_usage_with_2_1_310_envelope_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """D219 U9: a confined launch whose transcript carries 2.1.310 envelopes appends its record.
+
+    The record carries the role, version, and fixture usage, and no envelope
+    payload string reaches the usage record or the handback stdout line.
+    """
+    code, message, _argvs = _launch_plan_role_at_probed_version(
+        tmp_path,
+        monkeypatch,
+        tmp_path_factory,
+        role="story-planner",
+        version=_PROVEN_STORY_PLANNER_VERSION,
+        transcript=_story_planner_transcript_with_envelopes(_NATIVE_SESSION_ID),
+    )
+    assert (code, message) == (0, "")
+    raw = Path(".agent-usage/usage.jsonl").read_text()
+    record = USAGE_RECORD_ADAPTER.validate_json(raw)
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert record.native_role is NativeClaudeRole.STORY_PLANNER
+    assert record.harness_version == _PROVEN_STORY_PLANNER_VERSION
+    assert record.success and record.usage_complete
+    assert _ENVELOPE_PAYLOAD_SENTINEL not in raw
 
 
 def test_native_launch_binds_evidence_bundle_end_to_end(
@@ -18449,6 +19171,18 @@ def test_argv_construction_sweep_single_site() -> None:
     generic_body = cli_text[generic_argv_index:native_argv_index]
     assert "--add-dir" not in generic_body
     assert "--allowedTools" not in generic_body
+    # D219 U5: the confinement option and its literal each exist exactly once,
+    # and only the native argv builder reads the constant carrying the literal.
+    literal = "'" + _STORY_PLANNER_SETTINGS_LITERAL + "'"
+    constant = "_STORY_PLANNER_READ_CONFINEMENT_SETTINGS"
+    assert cli_text.count('"--settings"') == 1
+    assert cli_text.count(literal) == 1
+    assert cli_text.count(constant) == 2
+    assert cli_text.index(constant) < cli_text.index(literal) < generic_argv_index
+    native_end = cli_text.index("\ndef ", native_argv_index + 1)
+    native_body = cli_text[native_argv_index:native_end]
+    assert native_body.count('"--settings"') == 1
+    assert native_body.count(constant) == 1
 
 
 def test_descriptor_command_rendering_sweep() -> None:
@@ -18821,3 +19555,74 @@ def test_nested_witness_failure_evidence_caller_wiring() -> None:
         "environment, cwd=repository)"
     )
     assert ast.unparse(wrapper.args[1]) == "tmp_path / _WITNESS_FAILURE_EVIDENCE_DIR"
+
+
+def _story_planner_transcript_with_usage_extra(session_id: str, key: str, value: object) -> bytes:
+    """Return the envelope-bearing transcript with ``key`` added to every assistant usage."""
+    rows = [
+        json.loads(line)
+        for line in _story_planner_transcript_with_envelopes(session_id).splitlines()
+    ]
+    assistants = [row for row in rows if row.get("type") == "assistant"]
+    assert assistants
+    for row in assistants:
+        row["message"]["usage"][key] = value
+    return _dump_rows(rows)
+
+
+def test_observed_2_1_310_null_fallback_credit_is_admitted_and_not_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D219 U9: a JSON-null ``fallback_credit`` parses and leaves usage and handback unchanged.
+
+    Deleting the null-only admission makes the key unknown, so this parse fails.
+    """
+    assert frozenset({"fallback_credit"}) == usage_transcript._USAGE_NULL_ONLY  # pyright: ignore[reportPrivateUsage]
+    assert "fallback_credit" not in usage_transcript._USAGE_OPTIONAL  # pyright: ignore[reportPrivateUsage]
+    session_id = "75555555-5555-4555-8555-555555555555"
+    transcript, installed = _install_owned_transcript(
+        tmp_path, monkeypatch, _story_planner_transcript_with_envelopes(session_id), session_id
+    )
+    baseline = _parse_story_planner_transcript(tmp_path, installed)
+    transcript.write_bytes(
+        _story_planner_transcript_with_usage_extra(session_id, "fallback_credit", None)
+    )
+
+    usage = _parse_story_planner_transcript(tmp_path, installed)
+
+    assert usage == baseline
+    assert usage.handback_text == "SYNTHETIC_STORY_HANDOFF"
+    assert "fallback_credit" not in repr(usage)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("fallback_credit", 0),
+        ("fallback_credit", 1),
+        ("fallback_credit", 0.5),
+        ("fallback_credit", "0"),
+        ("fallback_credit", ""),
+        ("fallback_credit", False),
+        ("fallback_credit", True),
+        ("fallback_credit", {}),
+        ("fallback_credit", {"amount": None}),
+        ("fallback_credit", []),
+        ("fallback_credit", [None]),
+        ("fallback_credits", None),
+        ("other_credit", None),
+    ],
+)
+def test_non_null_fallback_credit_or_other_null_usage_key_is_rejected(
+    key: str, value: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the exact key ``fallback_credit`` with a JSON-null value is admitted."""
+    session_id = "76666666-6666-4666-8666-666666666666"
+    _install_owned_transcript(
+        tmp_path,
+        monkeypatch,
+        _story_planner_transcript_with_usage_extra(session_id, key, value),
+        session_id,
+    )
+    with pytest.raises(usage_transcript.TranscriptError, match="usage is invalid"):
+        _parse_story_planner_transcript(tmp_path, session_id)
