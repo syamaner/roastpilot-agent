@@ -1,7 +1,8 @@
 # RoastPilot Agent Project State Registry
 
 **26 Oct 2026, #1028 hidden-script strict typing (single slice):**
-Root cause confirmed at base `4f0a792` with pinned Pyright 1.1.410: with no
+Historical evidence, reviewed head `b157074` on old base `4f0a792` (not
+final-head proof): root cause confirmed with pinned Pyright 1.1.410: with no
 `exclude` key, Pyright applied its default exclusions, and `**/.*` matched the
 `.agents` component. The six capture-agent-usage modules were therefore
 import-resolved through `extraPaths` for `tests/` but never checked as source
@@ -31,6 +32,23 @@ configuration. The route is GATE_MACHINERY: the full native three-root gate and
 the exhaustive witness are required at the handback head. No speed gain,
 hardware result, or capture runtime, permission or provider change is claimed.
 No epic row exists and no Plan decision is amended.
+Integrated-head evidence (addendum A1): `main` at `3d3cc53` was merged without
+conflict, and every reviewed production hunk is unchanged (the transcript diff
+differs only in context next to D219 code). The newly checked D219 code raised
+six strict errors in one `modelUsage` envelope expression in
+`capture_usage_transcript.py`. They were cleared with identity-only string
+`cast`s and a `TYPE_CHECKING`-only `collections.abc.Set` import, keeping the
+evaluation order, short-circuiting and results. At the integrated head, E_base
+is still 219, and local and `--pythonpath` runs both find 225 files and exit 0.
+W3 again exits 1 naming the file and line in all six modules, and T1/T2 and
+their ratified mutations were re-run with sha256-verified restores. Re-deriving
+coverage against `3d3cc53` gave four uncovered changed lines and eight partial
+branch sites, matching the approved historical list. Focused tests appended to
+`tests/test_capture_agent_usage.py` now cover all of them, and each guard was
+proven by a restored-by-copy mutation (12 of 12 killed). These are the sink
+close guard and the `run_command` writer outcome in `capture_usage_cli.py`, and
+the totals, nested-object, candidate-binding, final-scan, account-home and
+selected-generation guards in `capture_usage_native_codex.py`.
 
 **25 Oct 2026, #1061 slice 1 verdict assertion overlap:**
 Removed the redundant six-input "never emits ACCEPT" verdict assertion and its
