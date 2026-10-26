@@ -10,9 +10,12 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from capture_usage_models import ClaudeModelUsage, NativeClaudeRole, bounded_jsonl_lines
+
+if TYPE_CHECKING:
+    from collections.abc import Set as AbstractSet
 
 MAX_TRANSCRIPT_ROW_BYTES = 4 * 1024 * 1024
 MAX_TRANSCRIPT_ROWS = 500_000
@@ -228,9 +231,10 @@ def _envelope_value_valid(kind: str, value: object) -> bool:
     return isinstance(value, dict) and all(
         isinstance(model, str)
         and isinstance(usage, dict)
-        and set(usage) == _COST_STATE_MODEL_USAGE_KEYS
-        and all(_amount(amount) for amount in usage.values())
-        for model, usage in value.items()
+        and cast("AbstractSet[object]", set(cast("dict[object, object]", usage)))
+        == _COST_STATE_MODEL_USAGE_KEYS
+        and all(_amount(amount) for amount in cast("dict[object, object]", usage).values())
+        for model, usage in cast("dict[object, object]", value).items()
     )
 
 
