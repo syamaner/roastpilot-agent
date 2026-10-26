@@ -19647,11 +19647,18 @@ def test_append_record_never_closes_an_unbound_sink_descriptor_1028(
     real_open_sink_parent = usage_cli._open_sink_parent  # pyright: ignore[reportPrivateUsage]
     closed: list[object] = []
 
+    def withhold_sink_descriptor(
+        path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int | None:
+        if path == "usage.jsonl" and dir_fd is not None:
+            return None
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
     def open_parent_then_withhold_sink(
         path: Path, *, root_descriptor: int | None = None
     ) -> tuple[int, str]:
         opened = real_open_sink_parent(path, root_descriptor=root_descriptor)
-        monkeypatch.setattr(usage_cli.os, "open", lambda *_args, **_kwargs: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+        monkeypatch.setattr(usage_cli.os, "open", withhold_sink_descriptor)
         return opened
 
     def recording_close(descriptor: Any) -> None:
@@ -19687,6 +19694,14 @@ def test_run_os_error_after_prompt_writer_starts_reports_writer_outcome_1028(
     prompt.write_bytes(b"prompt")
     release = threading.Event()
     stdin = BytesIO()
+    writer_joins: list[float | None] = []
+
+    class RecordingThread(threading.Thread):
+        """Record both joins independently of the writer's scheduling."""
+
+        def join(self, timeout: float | None = None) -> None:
+            writer_joins.append(timeout)
+            super().join(timeout)
 
     class FakeProcess:
         """Pid-less child double whose stream read fails after the writer starts."""
@@ -19721,6 +19736,11 @@ def test_run_os_error_after_prompt_writer_starts_reports_writer_outcome_1028(
     monkeypatch.setattr(usage_cli.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_cli, "_write_prompt", write_prompt)
     monkeypatch.setattr(usage_cli, "parse_codex_stream", failing_stream)
+    monkeypatch.setattr(
+        usage_cli,
+        "threading",
+        SimpleNamespace(Thread=RecordingThread, Event=threading.Event, Timer=threading.Timer),
+    )
     arguments = usage_cli.build_parser().parse_args(
         [
             "run",
@@ -19751,6 +19771,7 @@ def test_run_os_error_after_prompt_writer_starts_reports_writer_outcome_1028(
     with pytest.raises(CaptureUsageError) as raised:
         usage_cli.run_command(arguments)
     assert str(raised.value) == message
+    assert writer_joins == [usage_cli.TERMINATE_GRACE_SECONDS] * 2
     assert stdin.closed
     assert not (tmp_path / ".agent-usage").exists()
 
