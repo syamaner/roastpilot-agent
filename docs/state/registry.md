@@ -1,5 +1,17 @@
 # RoastPilot Agent Project State Registry
 
+**27 Oct 2026, #955 A0 E15 cloud-sync epic and state (docs only):**
+D220 allocates E15 (Agent) and C9 (Cloud); E13/E14 keep their D91 meanings.
+The new `docs/epics/E15-cloud-sync.md` records the Agent units and dependency
+contracts under governing Plan pin
+`3e33bb140fe600740ea00b85046f2e4aef4ccc9c`.
+P0 is merged in Plan; A0 is this documentation/state PR.
+Units E1m and E1–E8 are not started; each needs a fresh ratified contract.
+G1–G6 are operator-only and not performed; client features stay off.
+No runtime, activation, live cloud, upload, credential, deployment or hardware
+completion is claimed. #955 stays open.
+The active epic pointer, epic order, E11, #954 and E11-S3 are unchanged.
+
 **26 Oct 2026, #1028 hidden-script strict typing (single slice):**
 Historical evidence, reviewed head `b157074` on old base `4f0a792` (not
 final-head proof): root cause confirmed with pinned Pyright 1.1.410: with no
