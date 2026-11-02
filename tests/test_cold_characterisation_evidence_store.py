@@ -2060,17 +2060,37 @@ def test_fully_copied_tree_shares_no_inode_and_verifies(tmp_path: Path) -> None:
 def test_lineage_identity_failure_closes_the_opened_directory_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """If recording a component's identity fails, its descriptor is closed exactly once."""
+    """Scope identity failure to tracked open descriptors so foreign fstat calls stay real."""
     root = make_root(tmp_path)
-    ledger = _DescriptorLedger(monkeypatch)
+    real_fstat = os.fstat
+    foreign_descriptor = os.open(tmp_path, os.O_RDONLY)
+    try:
+        with monkeypatch.context() as monkeypatch:
+            ledger = _DescriptorLedger(monkeypatch)
+            injected: list[int] = []
 
-    def failing_fstat(_descriptor: int) -> os.stat_result:
-        raise OSError("fstat failed")
+            def failing_fstat(descriptor: int) -> os.stat_result:
+                if ledger.state.get(descriptor) == "open":
+                    injected.append(descriptor)
+                    raise OSError("fstat failed")
+                return real_fstat(descriptor)
 
-    monkeypatch.setattr(os, "fstat", failing_fstat)
-    expect(Failure.ROOT_UNUSABLE, lambda: store.admit_evidence_root(root))
-    assert ledger.double_closes == []
-    assert ledger.leaked == []
+            monkeypatch.setattr(os, "fstat", failing_fstat)
+            try:
+                foreign_status = os.fstat(foreign_descriptor)
+            except OSError:
+                pytest.fail("foreign-descriptor delegation failed")
+            assert isinstance(foreign_status, os.stat_result)
+            assert foreign_status == real_fstat(foreign_descriptor)
+            expect(Failure.ROOT_UNUSABLE, lambda: store.admit_evidence_root(root))
+            assert ledger.double_closes == []
+            assert ledger.leaked == []
+            assert len(injected) == 1
+            first_descriptor = next(iter(ledger.state))
+            assert injected == [first_descriptor]
+            assert ledger.state[injected[0]] == "closed"
+    finally:
+        os.close(foreign_descriptor)
 
 
 def test_resolved_path_containment_holds_without_the_identity_layer(
