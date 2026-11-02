@@ -1,5 +1,28 @@
 # RoastPilot Agent Project State Registry
 
+**2 Nov 2026, #1066 scheduled CI maintenance (single slice):**
+The filesystem failure reproduced locally: the process-global `os.fstat`
+injection reached pytest's `FDCapture.snap`, after the store's lineage descriptor
+had failed through the closed `ROOT_UNUSABLE` mapping and been closed. Both
+calls were on the test thread; no leaked-thread cause was observed. Branch A
+scopes the injected failure to ledger-tracked open descriptors, delegates a
+separately opened foreign descriptor to the real OS, and bounds the patch to
+the test body. The original closed-failure, chain-free, double-close and no-leak
+assertions remain, with explicit fault-fired-once and closed-descriptor checks.
+The bake-off test now narrows both optional scores before subtraction;
+undefined production scores still remain `None`.
+The verified local environment is Python 3.11.14, pytest 9.2.0 and pinned
+Pyright 1.1.410; it differs from inspected CI's Python 3.11.17 / pytest 9.1.1.
+Exact-head local controls and gate receipts are retained in private evidence;
+hosted checks, independent QA and ready-head Codex review remain pending.
+The bounded sibling audit found four capture-usage `os.fstat` patches that
+synthesize ownership for all descriptors after real OS lookup; these are
+follow-up candidates, unchanged here. Other sibling patches delegate foreign
+descriptors. The writer-only `_require_owned` raw `fstat` is outside admission
+and remains unchanged, with caller error mapping audited separately.
+This is CI maintenance only: no E11, #954, E11-S3 or hardware status changes.
+Cloud sync and its automation remain paused; no epic status table changes.
+
 **27 Oct 2026, #955 A0 E15 cloud-sync epic and state (docs only):**
 D220 allocates E15 (Agent) and C9 (Cloud); E13/E14 keep their D91 meanings.
 The new `docs/epics/E15-cloud-sync.md` records the Agent units and dependency
