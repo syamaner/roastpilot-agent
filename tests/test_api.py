@@ -1509,6 +1509,114 @@ async def test_shutdown_continues_after_inflight_closure_only_end_fails(
 
 
 @pytest.mark.asyncio
+async def test_shutdown_continues_when_an_inflight_closure_end_task_is_cancelled(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child End cancellation cannot abort an otherwise live shutdown task."""
+    run_id = "closure-only-shutdown-child-cancelled"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    roaster = FakeMCPClient()
+    monkeypatch.setattr(roaster, "read_session_presence", mock.AsyncMock(return_value="none"))
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        live_serve_mode=True,
+        run_loop=False,
+    )
+    await service.recover_on_start()
+    await service.acknowledge_closure_only_clearance(
+        RestartClearanceRequest(physical_confirmation=True)
+    )
+    entered = asyncio.Event()
+
+    async def waiting_end(**_: object) -> bool:
+        entered.set()
+        await asyncio.Future[None]()
+        return False
+
+    monkeypatch.setattr(store, "end_closure_only_recovered_run", waiting_end)
+    ending = asyncio.create_task(service.end_recovered_run(run_id))
+    await entered.wait()
+    owned = service._closure_end_task  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert owned is not None
+    stopping = asyncio.create_task(service.shutdown())
+    await asyncio.sleep(0)
+    assert not stopping.done()
+    owned[1].cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await ending
+    await stopping
+
+    assert service._closure_end_task is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._restart_clearance_state is RestartClearanceState.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert roaster.calls == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancellation_propagates_while_waiting_for_inflight_closure_end(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling shutdown itself propagates while its shielded D216 End remains owned."""
+    run_id = "closure-only-shutdown-cancelled"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    roaster = FakeMCPClient()
+    monkeypatch.setattr(roaster, "read_session_presence", mock.AsyncMock(return_value="none"))
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        live_serve_mode=True,
+        run_loop=False,
+    )
+    await service.recover_on_start()
+    await service.acknowledge_closure_only_clearance(
+        RestartClearanceRequest(physical_confirmation=True)
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_end = store.end_closure_only_recovered_run
+
+    async def delayed_end(
+        *, process_id: str, run_id: str, expected_lease: FaultControlLease
+    ) -> bool:
+        entered.set()
+        await release.wait()
+        return await original_end(
+            process_id=process_id, run_id=run_id, expected_lease=expected_lease
+        )
+
+    monkeypatch.setattr(store, "end_closure_only_recovered_run", delayed_end)
+    ending = asyncio.create_task(service.end_recovered_run(run_id))
+    await entered.wait()
+    stopping = asyncio.create_task(service.shutdown())
+    await asyncio.sleep(0)
+    assert not stopping.done()
+    stopping.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+    assert not ending.done()
+
+    release.set()
+    ended = await ending
+    assert ended.outcome == "aborted"
+    await service.shutdown()
+    assert roaster.calls == []
+
+
+@pytest.mark.asyncio
 async def test_restart_clearance_route_refuses_unknown_lease_without_mcp_probe(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

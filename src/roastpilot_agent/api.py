@@ -5580,7 +5580,9 @@ class RoastService:
             try:
                 await asyncio.shield(closure_end[1])
             except asyncio.CancelledError:
-                raise
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    raise
             except Exception:  # noqa: BLE001 - teardown continues with safety fences retained
                 _log.exception("closure-only recovered-run end failed during shutdown")
         task = self._loop_task
