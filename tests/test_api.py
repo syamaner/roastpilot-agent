@@ -438,6 +438,32 @@ async def test_fault_controls_route_dispatches_live_emergency_stop_outside_routi
 
 
 @pytest.mark.asyncio
+async def test_generic_fault_controls_route_rejects_recovered_run_end_without_dispatch_or_audit(
+    store: RoastStore,
+) -> None:
+    """D216 End cannot use the global fault-control executor or routine audit path."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    commands_before = mcp.commands()
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/fault-controls/actions", json={"action": "end_recovered_run"}
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "end_recovered_run is available only through the recovered-run end path"
+    }
+    assert mcp.commands() == commands_before
+    assert service.operator_queue.empty()
+    assert await _operator_action_rows(store, run_id) == []
+
+
+@pytest.mark.asyncio
 async def test_global_estop_uses_live_runner_without_a_terminal_fault_lease(
     store: RoastStore,
 ) -> None:
@@ -3132,6 +3158,26 @@ async def test_operator_action_rejected_in_wrong_phase(
     assert service.operator_queue.qsize() == 0
     rows = await _operator_action_rows(store, "run-pre")
     assert rows == [("drop_beans", "rejected", None)]
+
+
+@pytest.mark.asyncio
+async def test_generic_operator_route_rejects_recovered_run_end_without_audit_or_dispatch(
+    client: AsyncClient, service: RoastService, store: RoastStore
+) -> None:
+    """D216 End never enters the routine queue or its accepted-action audit path."""
+    run_id = "run-end-recovered-generic"
+    await _make_run(store, run_id, RoastPhase.DEVELOPMENT)
+
+    response = await client.post(
+        f"/api/roasts/{run_id}/operator-actions", json={"action": "end_recovered_run"}
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "end_recovered_run is available only through the recovered-run end path"
+    }
+    assert service.operator_queue.empty()
+    assert await _operator_action_rows(store, run_id) == []
 
 
 @pytest.mark.asyncio
