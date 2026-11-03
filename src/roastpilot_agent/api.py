@@ -919,6 +919,12 @@ class RoastRunner:
         self._event_flush_lock = asyncio.Lock()
         self._sleep = sleep
         self._finalized = False
+        # D221: a pre-retirement e-stop can synchronously revoke D216 closure
+        # authority after its durable End CAS has committed.  The runner then
+        # remains alive solely to retry its already-admitted heat-off posture;
+        # its historical run row is immutable and must receive no ordinary
+        # tick persistence or terminal completion.
+        self._post_durable_end_emergency_retry_only = False
         # Whether the operator has acknowledged a fault (#206). A fault no longer
         # auto-finalises: the run stays live (loop ticking, heat at 0) until
         # acknowledge_fault flips this and _handle_completion finalises it.
@@ -1239,9 +1245,25 @@ class RoastRunner:
         event flush (last, so terminal events like ``run_completed`` /
         ``logs_exported`` are never emitted-but-unpersisted) → telemetry."""
         self._counter.value += 1
+        if self._post_durable_end_emergency_retry_only:
+            # The durable D216 End transaction already wrote immutable aborted
+            # history. Retain only the controller's terminal fail-safe retry;
+            # do not drain ordinary actions, finalise, or persist any new
+            # event/telemetry/phase evidence against that completed row.
+            self._emitter.drain()
+            if self._controller.phase is RoastPhase.FAULTED:
+                await self._controller.tick()
+            self._emitter.drain()
+            return False
         await self._drain_queue()
         events_before_controller_tick = len(self._emitter.peek())
         await self._controller.tick()
+        if self._post_durable_end_emergency_retry_only:
+            # The mode can be entered while this ordinary tick is awaiting a
+            # failed heat-off write. Recheck before any completion, event, or
+            # telemetry persistence touches the now-terminal run row.
+            self._emitter.drain()
+            return False
         if self._controller_tick_emergency_stop_emitted(events_before_controller_tick):
             self._fault_acknowledgement_gate.invalidate_fault_acknowledgement()
             self._confirmed_fault_cooling_stop_sessions.clear()
@@ -1401,6 +1423,16 @@ class RoastRunner:
     def rearm_emergency_stop_fail_safe(self) -> None:
         """Keep the controller's typed heat-off retry armed after a failed stop."""
         self._controller.rearm_emergency_stop_fail_safe()
+
+    def retain_emergency_stop_retry_after_durable_end(self) -> None:
+        """Retain only fail-safe heat-off retries after immutable D216 End.
+
+        The service invokes this only after the exact D216 terminal
+        postcondition is proven and an e-stop has synchronously won the
+        closure binding. The runner remains dispatchable for safety retries,
+        but all normal lifecycle and historical persistence is suppressed.
+        """
+        self._post_durable_end_emergency_retry_only = True
 
     def confirm_external_emergency_stop(self) -> None:
         """Release the live controller gate after terminal proof confirms a stop."""
@@ -3132,6 +3164,18 @@ class RoastService:
             # e-stop) means it cannot retire a live runner or overwrite that
             # runner's priority retry path.
             self._invalidate_closure_only_clearance()
+        elif (
+            self._closure_only_emergency_stop_admission_epoch
+            != context.emergency_stop_admission_epoch
+            and self.runner is not None
+            and self.active_run_id == context.run_id
+            and self.runner.run_id == context.run_id
+        ):
+            # The End transaction is already durably proven above, but an
+            # admitted e-stop won before the no-await retirement handoff.
+            # Retain that exact live runner for heat-off retries only; it must
+            # not mutate or normally complete the now-immutable aborted row.
+            self.runner.retain_emergency_stop_retry_after_durable_end()
         lease = await self._read_fault_lease_fail_closed()
         return EndRecoveredRunResult(
             run_id=context.run_id,
@@ -5192,7 +5236,9 @@ class RoastService:
                 try:
                     await detached.task
                 except asyncio.CancelledError:
-                    pass
+                    current_task = asyncio.current_task()
+                    if current_task is not None and current_task.cancelling():
+                        raise
                 except Exception:  # noqa: BLE001 - safe shutdown continues after loop failure
                     _log.exception("detached recovered-run loop failed during shutdown")
             self._finish_detached_recovery_loop(detached)

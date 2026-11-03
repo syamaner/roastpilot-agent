@@ -723,24 +723,81 @@ async def test_closure_end_detached_loop_blocks_start_without_retaining_stale_ru
 
 
 @pytest.mark.asyncio
-async def test_pre_retirement_estop_failure_keeps_real_runner_for_heat_off_retry(
+async def test_shutdown_cancellation_propagates_while_detached_recovery_loop_settles(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An e-stop admitted before atomic retirement retains its real retry owner."""
-    run_id = "closure-only-real-runner-estop-retry"
+    """Shutdown must not swallow cancellation while awaiting a detached loop."""
+    run_id = "closure-only-detached-shutdown-cancel"
     await store.create_run(
         run_id=run_id,
         profile=_profile(),
         config=AppConfig(),
         agent_phase=RoastPhase.PREHEATING,
     )
+    roaster = FakeMCPClient()
+    monkeypatch.setattr(roaster, "read_session_presence", mock.AsyncMock(return_value="none"))
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        run_loop=False,
+    )
+    await service.recover_on_start()
+    await service.acknowledge_closure_only_clearance(
+        RestartClearanceRequest(physical_confirmation=True)
+    )
+    loop_cancelled = asyncio.Event()
+    settle_loop = asyncio.Event()
 
-    class FailFirstEmergencyStopMCP(FakeMCPClient):
-        """Fail the direct stop write once so the controller must retry heat-off."""
+    async def delayed_loop_cancellation() -> None:
+        try:
+            await asyncio.Future[None]()
+        except asyncio.CancelledError:
+            loop_cancelled.set()
+            await settle_loop.wait()
+            raise
+
+    loop = asyncio.create_task(delayed_loop_cancellation())
+    service._loop_task = loop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await service.end_recovered_run(run_id)
+    await loop_cancelled.wait()
+
+    stopping = asyncio.create_task(service.shutdown())
+    await asyncio.sleep(0)
+    assert not stopping.done()
+    stopping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+
+    settle_loop.set()
+    with contextlib.suppress(asyncio.CancelledError):
+        await loop
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pre_retirement_estop_keeps_real_runner_for_two_post_end_heat_off_retries(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retained D216 runner retries heat-off without mutating aborted history."""
+    run_id = "closure-only-real-runner-estop-retry"
+    recovery_config = AppConfig(controller=ControllerConfig(tick_interval_seconds=0.001))
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=recovery_config,
+        agent_phase=RoastPhase.PREHEATING,
+    )
+
+    retry_permitted = asyncio.Event()
+
+    class FailEmergencyStopAndFirstHeatOffMCP(FakeMCPClient):
+        """Fail the stop and first post-End heat-off write, then allow retry two."""
 
         def __init__(self) -> None:
             super().__init__([_reading(178.0, 185.0)])
             self.emergency_stop_attempts = 0
+            self.heat_off_attempts = 0
 
         async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
             self.emergency_stop_attempts += 1
@@ -748,11 +805,22 @@ async def test_pre_retirement_estop_failure_keeps_real_runner_for_heat_off_retry
             self.calls.append(("emergency_stop", {"reason": reason}))
             raise RuntimeError("synthetic pre-retirement e-stop write failure")
 
-    roaster = FailFirstEmergencyStopMCP()
+        async def set_heat(self, heat_percent: int) -> None:
+            if heat_percent != 0:
+                await super().set_heat(heat_percent)
+                return
+            await retry_permitted.wait()
+            self.heat_off_attempts += 1
+            self._log.append("set_heat")  # noqa: SLF001 - test double trace
+            self.calls.append(("set_heat", {"heat_percent": heat_percent}))
+            if self.heat_off_attempts == 1:
+                raise RuntimeError("synthetic first heat-off retry failure")
+
+    roaster = FailEmergencyStopAndFirstHeatOffMCP()
     monkeypatch.setattr(roaster, "read_session_presence", mock.AsyncMock(return_value="none"))
     service = RoastService(
         store,
-        config=AppConfig(controller=ControllerConfig(tick_interval_seconds=0.001)),
+        config=recovery_config,
         mcp=MCPServerProcess(session=_FakeSession()),
         roaster=roaster,
         advisor=FakeAdvisor([], default_decision=_live_decision()),
@@ -764,6 +832,7 @@ async def test_pre_retirement_estop_failure_keeps_real_runner_for_heat_off_retry
     await service.acknowledge_closure_only_clearance(
         RestartClearanceRequest(physical_confirmation=True)
     )
+    assert ("set_heat", {"heat_percent": 0}) not in roaster.calls
     original_end = store.end_closure_only_recovered_run
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -799,11 +868,27 @@ async def test_pre_retirement_estop_failure_keeps_real_runner_for_heat_off_retry
     assert service.runner is not None
     assert service.active_run_id == run_id
     assert roaster.emergency_stop_attempts == 1
+    persisted = await store.read_run(run_id)
+    assert persisted is not None
+    assert persisted.outcome == "aborted"
+    assert persisted.agent_phase is RoastPhase.COMPLETE
+    completed_at_utc = persisted.completed_at_utc
+    assert completed_at_utc is not None
+
+    retry_permitted.set()
     for _ in range(200):
-        if ("set_heat", {"heat_percent": 0}) in roaster.calls:
+        if roaster.heat_off_attempts == 2:
             break
         await asyncio.sleep(0.005)
-    assert ("set_heat", {"heat_percent": 0}) in roaster.calls
+    assert service._loop_task is not None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert not service._loop_task.done()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert roaster.heat_off_attempts == 2
+    assert service.runner._finalized is False  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    persisted_after_retries = await store.read_run(run_id)
+    assert persisted_after_retries is not None
+    assert persisted_after_retries.outcome == "aborted"
+    assert persisted_after_retries.agent_phase is RoastPhase.COMPLETE
+    assert persisted_after_retries.completed_at_utc == completed_at_utc
     await service.shutdown()
 
 
