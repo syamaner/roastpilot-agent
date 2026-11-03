@@ -80,6 +80,8 @@ const healthState: {
         restart_clearance?: {
           state: "required" | "cleared" | "unknown";
           eligible: boolean;
+          enabled_actions: string[];
+          closure_only_available: boolean;
         };
         fault_controls?: {
           status: "closed" | "open" | "unknown";
@@ -121,7 +123,7 @@ vi.mock("@/hooks/queries", async () => {
           : {
               mcp_hardware_clear_required: false,
               mcp_teardown_incident_id: null,
-              restart_clearance: { state: "cleared", eligible: true },
+              restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
               fault_controls: { status: "closed", generation: null, enabled_actions: [] },
               ...healthState.data,
             },
@@ -340,7 +342,7 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
   it("keeps a coherent cleared-but-ineligible process gate blocked", () => {
     healthState.data = {
       active_run_id: null,
-      restart_clearance: { state: "cleared", eligible: false },
+      restart_clearance: { state: "cleared", eligible: false, enabled_actions: [], closure_only_available: false },
       fault_controls: { status: "closed", generation: null, enabled_actions: [] },
     };
     renderView();
@@ -352,7 +354,7 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
   it("fails closed when a required restart clearance claims eligibility", () => {
     healthState.data = {
       active_run_id: null,
-      restart_clearance: { state: "required", eligible: true },
+      restart_clearance: { state: "required", eligible: true } as never,
       fault_controls: { status: "closed", generation: null, enabled_actions: [] },
     };
     renderView();
@@ -364,7 +366,7 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
   it("fails closed when the fresh health projection omits fault controls", () => {
     healthState.data = {
       active_run_id: null,
-      restart_clearance: { state: "cleared", eligible: true },
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
       fault_controls: undefined,
     };
     renderView();
@@ -380,7 +382,7 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
   ])("fails closed when CLOSED fault controls carry %s", (_description, enabledActions) => {
     healthState.data = {
       active_run_id: null,
-      restart_clearance: { state: "cleared", eligible: true },
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
       fault_controls: {
         status: "closed",
         generation: null,
@@ -396,7 +398,7 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
   it("fails closed when an OPEN fault lease omits its generation", () => {
     healthState.data = {
       active_run_id: null,
-      restart_clearance: { state: "cleared", eligible: true },
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
       fault_controls: {
         status: "open",
         generation: null,
@@ -412,7 +414,7 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
   it("retains only a two-press server-resolved e-stop for incoherent fault controls", async () => {
     healthState.data = {
       active_run_id: null,
-      restart_clearance: { state: "cleared", eligible: true },
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
       fault_controls: {
         status: "open",
         generation: null,
@@ -435,7 +437,7 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
   it("renders a CLOSED server e-stop alongside required physical clearance, then admits the refreshed cleared projection", async () => {
     healthState.data = {
       active_run_id: null,
-      restart_clearance: { state: "required", eligible: false },
+      restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
       fault_controls: {
         status: "closed",
         generation: null,
@@ -459,7 +461,7 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
 
     healthState.data = {
       active_run_id: null,
-      restart_clearance: { state: "cleared", eligible: true },
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
       fault_controls: { status: "closed", generation: null, enabled_actions: [] },
     };
     rerender();
@@ -472,7 +474,7 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
   it("shows restart clearance beside an OPEN terminal lease and keeps routine controls disarmed", () => {
     healthState.data = {
       active_run_id: "run-awaiting-clearance",
-      restart_clearance: { state: "required", eligible: false },
+      restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
       fault_controls: {
         status: "open",
         generation: 7,
@@ -492,7 +494,7 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
   it("keeps Start blocked while a cleared-but-ineligible gate leaves server-enumerated OPEN controls available", () => {
     healthState.data = {
       active_run_id: null,
-      restart_clearance: { state: "cleared", eligible: false },
+      restart_clearance: { state: "cleared", eligible: false, enabled_actions: [], closure_only_available: false },
       fault_controls: {
         status: "open",
         generation: 7,
@@ -523,7 +525,7 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
   it("routes terminal actions globally and does not send a run identity", async () => {
     healthState.data = {
       active_run_id: null,
-      restart_clearance: { state: "cleared", eligible: true },
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
       fault_controls: {
         status: "open",
         generation: 7,

@@ -84,13 +84,13 @@ describe("api client", () => {
       outcome: "confirmed",
       cleared: true,
       restart_clearance_required: false,
-      restart_clearance: { state: "cleared", eligible: true },
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
       fault_controls: { status: "closed", generation: null, enabled_actions: [] },
     });
     const result = await api.acknowledgeRestartClearance();
     expect(result).toMatchObject({
       outcome: "confirmed",
-      restart_clearance: { state: "cleared", eligible: true },
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
       fault_controls: { status: "closed", generation: null, enabled_actions: [] },
     });
     expect(fetch).toHaveBeenCalledWith(
@@ -108,7 +108,7 @@ describe("api client", () => {
       outcome: "failed",
       cleared: false,
       restart_clearance_required: true,
-      restart_clearance: { state: "unknown", eligible: false },
+      restart_clearance: { state: "unknown", eligible: false, enabled_actions: [], closure_only_available: false },
       fault_controls: { status: "unknown", generation: 8, enabled_actions: ["emergency_stop"] },
     });
 
@@ -118,7 +118,7 @@ describe("api client", () => {
       outcome: "failed",
       cleared: false,
       restart_clearance_required: true,
-      restart_clearance: { state: "unknown", eligible: false },
+      restart_clearance: { state: "unknown", eligible: false, enabled_actions: [], closure_only_available: false },
       fault_controls: { status: "unknown", generation: 8 },
     });
   });

@@ -35,7 +35,12 @@ const healthState: {
         active_run_id: string | null;
         mcp_hardware_clear_required: boolean;
         mcp_teardown_incident_id: string | null;
-        restart_clearance: { state: "cleared"; eligible: true };
+        restart_clearance: {
+          state: "cleared";
+          eligible: true;
+          enabled_actions: [];
+          closure_only_available: false;
+        };
         fault_controls: { status: "closed"; generation: null; enabled_actions: [] };
       }
     | undefined;
@@ -122,7 +127,7 @@ describe("RootLayout — nav renders on every route and state (#523)", () => {
       active_run_id: null,
       mcp_hardware_clear_required: false,
       mcp_teardown_incident_id: null,
-      restart_clearance: { state: "cleared", eligible: true },
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
       fault_controls: { status: "closed", generation: null, enabled_actions: [] },
     };
     renderLayout();
@@ -141,7 +146,7 @@ describe("RootLayout — nav renders on every route and state (#523)", () => {
       active_run_id: "run-42",
       mcp_hardware_clear_required: false,
       mcp_teardown_incident_id: null,
-      restart_clearance: { state: "cleared", eligible: true },
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
       fault_controls: { status: "closed", generation: null, enabled_actions: [] },
     };
     renderLayout();

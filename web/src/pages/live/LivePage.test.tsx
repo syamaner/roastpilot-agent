@@ -70,7 +70,12 @@ const healthState: {
         active_run_id: string | null;
         instance_id?: string;
         fault_controls?: FaultControls;
-        restart_clearance?: { state: "required" | "cleared" | "unknown"; eligible: boolean };
+        restart_clearance?: {
+          state: "required" | "cleared" | "unknown";
+          eligible: boolean;
+          enabled_actions: string[];
+          closure_only_available: boolean;
+        };
       }
     | undefined;
   isSuccess: boolean;
@@ -114,7 +119,7 @@ vi.mock("@/hooks/queries", async () => {
                 generation: null,
                 enabled_actions: [],
               },
-              restart_clearance: { state: "cleared", eligible: true },
+              restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
               ...healthState.data,
             },
     }),
@@ -473,7 +478,7 @@ describe("LivePage — terminal fault lease", () => {
     healthState.isSuccess = true;
     healthState.data = {
       active_run_id: "run-awaiting-clearance",
-      restart_clearance: { state: "required", eligible: false },
+      restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
       fault_controls: {
         status: "open",
         generation: 6,
@@ -493,7 +498,7 @@ describe("LivePage — terminal fault lease", () => {
     healthState.isSuccess = true;
     healthState.data = {
       active_run_id: null,
-      restart_clearance: { state: "cleared", eligible: false },
+      restart_clearance: { state: "cleared", eligible: false, enabled_actions: [], closure_only_available: false },
       fault_controls: {
         status: "open",
         generation: 6,
@@ -552,7 +557,7 @@ describe("LivePage — terminal fault lease", () => {
     healthState.isSuccess = true;
     healthState.data = {
       active_run_id: null,
-      restart_clearance: { state: "unknown", eligible: false },
+      restart_clearance: { state: "unknown", eligible: false, enabled_actions: [], closure_only_available: false },
       fault_controls: {
         status: "open",
         generation: 6,
