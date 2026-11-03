@@ -593,6 +593,77 @@ async def test_closure_end_keeps_live_runner_and_unknown_estop_fence_after_cas_r
 
 
 @pytest.mark.asyncio
+async def test_closure_end_keeps_runner_and_loop_when_estop_arrives_during_loop_settling(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E-stop admission during cancelled-loop settling retains its live owner."""
+    run_id = "closure-only-loop-settling-estop"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    roaster = FakeMCPClient()
+    monkeypatch.setattr(roaster, "read_session_presence", mock.AsyncMock(return_value="none"))
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        live_serve_mode=True,
+        run_loop=False,
+    )
+    await service.recover_on_start()
+    await service.acknowledge_closure_only_clearance(
+        RestartClearanceRequest(physical_confirmation=True)
+    )
+    runner = mock.Mock()
+    runner.run_id = run_id
+    runner.finalized = False
+    runner.dispatch_priority_emergency_stop = mock.AsyncMock(return_value=True)
+    service.runner = runner
+
+    def leave_estop_persistence_pending(_lease: FaultControlLease) -> None:
+        """Hold the synchronous UNKNOWN admission through loop retirement."""
+
+    monkeypatch.setattr(
+        service,
+        "_schedule_admitted_fault_control_lease_persistence",
+        leave_estop_persistence_pending,
+    )
+    loop_cancelled = asyncio.Event()
+    settle_loop = asyncio.Event()
+
+    async def delayed_loop_cancellation() -> None:
+        try:
+            await asyncio.Future[None]()
+        except asyncio.CancelledError:
+            loop_cancelled.set()
+            await settle_loop.wait()
+            raise
+
+    loop = asyncio.create_task(delayed_loop_cancellation())
+    service._loop_task = loop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    ending = asyncio.create_task(service.end_recovered_run(run_id))
+    await loop_cancelled.wait()
+    estop = await service._submit_live_emergency_stop(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    settle_loop.set()
+    ended = await ending
+
+    assert estop.result == "accepted"
+    runner.dispatch_priority_emergency_stop.assert_awaited_once()
+    assert ended.outcome == "aborted"
+    assert service.runner is runner
+    assert service.active_run_id == run_id
+    assert service._loop_task is loop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._restart_clearance_state is RestartClearanceState.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_waits_for_inflight_closure_only_end_without_roaster_write(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -654,6 +725,8 @@ async def test_shutdown_waits_for_inflight_closure_only_end_without_roaster_writ
     await stopping
     assert calls == 1
     assert service._closure_end_task is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    persisted = await store.read_run(run_id)
+    assert persisted is not None and persisted.outcome == "aborted"
     assert roaster.calls == []
 
 

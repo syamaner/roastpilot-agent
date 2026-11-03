@@ -3053,16 +3053,28 @@ class RoastService:
                 self._invalidate_closure_only_clearance()
                 raise RoastRunConflictError("recovered-run end was not durably recorded")
         if self._closure_only_binding_is_current(context):
-            self._restart_clearance_state = RestartClearanceState.REQUIRED
-            self._closure_only_context = None
             loop = self._loop_task
             if loop is not None and not loop.done():
                 loop.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
+                try:
                     await loop
-            self._loop_task = None
-            self.runner = None
-            self.active_run_id = None
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:  # noqa: BLE001 - a failed retirement must remain fenced
+                    self._invalidate_closure_only_clearance()
+                    raise RoastRunConflictError("recovered-run retirement is unconfirmed") from exc
+            # E-stop admission can interleave while the cancelled live loop is
+            # settling. It synchronously revokes this binding and reserves the
+            # runner's priority dispatch; never discard either reference after
+            # that await.
+            if self._closure_only_binding_is_current(context):
+                self._restart_clearance_state = RestartClearanceState.REQUIRED
+                self._closure_only_context = None
+                self._loop_task = None
+                self.runner = None
+                self.active_run_id = None
+            elif self._restart_clearance_state is RestartClearanceState.CLOSURE_ONLY:
+                self._invalidate_closure_only_clearance()
         elif self._restart_clearance_state is RestartClearanceState.CLOSURE_ONLY:
             # The durable terminal state is independently proven above, but a
             # child/epoch/cache change means it cannot retire a live runner or
