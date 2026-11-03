@@ -43,6 +43,18 @@ const acknowledgeHardwareClearMock = vi.hoisted(() =>
 const acknowledgeRestartClearanceMock = vi.hoisted(() =>
   vi.fn(async () => ({ cleared: true, restart_clearance_required: false })),
 );
+const initializeSafetyRecordMock = vi.hoisted(() =>
+  vi.fn(async () => ({
+    outcome: "confirmed" as const,
+    restart_clearance: {
+      state: "required" as const,
+      eligible: false,
+      enabled_actions: [],
+      closure_only_available: false,
+    },
+    fault_controls: { status: "closed" as const, generation: 1, enabled_actions: [] },
+  })),
+);
 const faultControlsActionMock = vi.hoisted(() =>
   vi.fn(async (request: { action: string }) => ({
     action: request.action,
@@ -61,6 +73,7 @@ vi.mock("@/lib/api", async () => {
       clearStaleSession: clearStaleSessionMock,
       acknowledgeHardwareClear: acknowledgeHardwareClearMock,
       acknowledgeRestartClearance: acknowledgeRestartClearanceMock,
+      initializeSafetyRecord: initializeSafetyRecordMock,
       faultControlsAction: faultControlsActionMock,
     },
   };
@@ -175,6 +188,7 @@ beforeEach(() => {
   clearStaleSessionMock.mockClear();
   acknowledgeHardwareClearMock.mockClear();
   acknowledgeRestartClearanceMock.mockClear();
+  initializeSafetyRecordMock.mockClear();
   faultControlsActionMock.mockClear();
   clearStaleSessionMock.mockResolvedValue({
     run_id: "run-stranded",
@@ -318,6 +332,123 @@ describe("StartRoastView (#324)", () => {
 });
 
 describe("StartRoastView — restart clearance and terminal lease (#954)", () => {
+  it("renders only the server-projected D220 action beside the independent e-stop", async () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: ["initialize_safety_record"],
+        closure_only_available: false,
+      },
+      fault_controls: {
+        status: "unknown",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderView();
+
+    expect(screen.getByTestId("initialize-safety-record")).toBeInTheDocument();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeEnabled();
+
+    fireEvent.click(screen.getByTestId("initialize-safety-record-open"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-stopped"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-empty"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-independent-stop"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-submit"));
+    await waitFor(() => expect(initializeSafetyRecordMock).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("initialize-safety-record-reported")).toHaveTextContent(
+      /new ordinary restart clearance/i,
+    );
+  });
+
+  it("replaces D220 with fresh ordinary clearance after the server records its CLOSED baseline", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: ["initialize_safety_record"],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "unknown", generation: null, enabled_actions: ["emergency_stop"] },
+    };
+    const page = renderView();
+    fireEvent.click(screen.getByTestId("initialize-safety-record-open"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-stopped"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-empty"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-independent-stop"));
+
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: [],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "closed", generation: 1, enabled_actions: [] },
+    };
+    page.rerender();
+
+    expect(screen.queryByTestId("initialize-safety-record")).toBeNull();
+    expect(screen.getByTestId("restart-clearance-required")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    fireEvent.click(screen.getByTestId("restart-clearance-open"));
+    expect(screen.getByTestId("restart-clearance-stopped")).not.toBeChecked();
+    expect(screen.getByTestId("restart-clearance-empty")).not.toBeChecked();
+    expect(screen.getByTestId("restart-clearance-independent-stop")).not.toBeChecked();
+  });
+
+  it("withdraws checked D220 confirmation on parent projection change and returns fresh", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: ["initialize_safety_record"],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "unknown", generation: null, enabled_actions: ["emergency_stop"] },
+    };
+    const page = renderView();
+    fireEvent.click(screen.getByTestId("initialize-safety-record-open"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-stopped"));
+    expect(screen.getByTestId("initialize-safety-record-stopped")).toBeChecked();
+
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: [],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "unknown", generation: null, enabled_actions: ["emergency_stop"] },
+    };
+    page.rerender();
+    expect(screen.queryByTestId("initialize-safety-record")).toBeNull();
+    expect(screen.getByTestId("restart-clearance-required")).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeEnabled();
+
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: ["initialize_safety_record"],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "unknown", generation: null, enabled_actions: ["emergency_stop"] },
+    };
+    page.rerender();
+    fireEvent.click(screen.getByTestId("initialize-safety-record-open"));
+    expect(screen.getByTestId("initialize-safety-record-stopped")).not.toBeChecked();
+  });
+
   it("fails closed when the fresh health projection omits restart clearance", () => {
     healthState.data = { active_run_id: null, restart_clearance: undefined };
     renderView();

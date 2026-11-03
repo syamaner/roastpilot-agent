@@ -10,6 +10,11 @@ const TERMINAL_FAULT_ACTIONS = new Set<string>([
   "stop_cooling_and_acknowledge",
 ]);
 
+const RESTART_CLEARANCE_ACTIONS = new Set<string>([
+  "end_recovered_run",
+  "initialize_safety_record",
+]);
+
 /**
  * Validate untrusted health JSON before it decides a Start or terminal-control
  * view. This validates the projection only; it never establishes hardware state.
@@ -58,16 +63,28 @@ export function isCoherentRestartClearance(value: unknown): value is RestartClea
     typeof candidate.eligible !== "boolean" ||
     typeof candidate.closure_only_available !== "boolean" ||
     !Array.isArray(candidate.enabled_actions) ||
-    candidate.enabled_actions.some((action) => action !== "end_recovered_run") ||
+    candidate.enabled_actions.some((action) => !RESTART_CLEARANCE_ACTIONS.has(action)) ||
     new Set(candidate.enabled_actions).size !== candidate.enabled_actions.length
   ) {
     return false;
   }
   switch (candidate.state) {
     case "required":
-      return candidate.eligible === false && candidate.enabled_actions.length === 0;
+      return (
+        candidate.eligible === false &&
+        (candidate.enabled_actions.length === 0 ||
+          (candidate.enabled_actions.length === 1 &&
+            candidate.enabled_actions[0] === "initialize_safety_record" &&
+            candidate.closure_only_available === false))
+      );
     case "closure_only":
-      return candidate.eligible === false && candidate.closure_only_available === false;
+      return (
+        candidate.eligible === false &&
+        candidate.closure_only_available === false &&
+        (candidate.enabled_actions.length === 0 ||
+          (candidate.enabled_actions.length === 1 &&
+            candidate.enabled_actions[0] === "end_recovered_run"))
+      );
     case "unknown":
       return (
         candidate.eligible === false &&

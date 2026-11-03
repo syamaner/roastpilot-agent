@@ -103,6 +103,7 @@ import type {
 import type { LiveNavigationState } from "@/pages/live/LivePage";
 
 import { StartRoastForm } from "@/pages/dashboard/StartRoastForm";
+import { InitializeSafetyRecordCard } from "./InitializeSafetyRecordCard";
 import { RestartClearanceCard } from "./RestartClearanceCard";
 import { TerminalFaultControls } from "./TerminalFaultControls";
 import { UnknownStatusEmergencyStop } from "./UnknownStatusEmergencyStop";
@@ -600,6 +601,8 @@ export function StartRoastView(): React.JSX.Element {
     ? restartClearance
     : null;
   const restartClearanceRequired = coherentRestartClearance?.state === "required";
+  const initializeSafetyRecordAvailable =
+    coherentRestartClearance?.enabled_actions.includes("initialize_safety_record") === true;
   const routineControlsDisabled =
     coherentRestartClearance?.state !== "cleared";
   // The server may retain only its global software e-stop after it closes the
@@ -608,6 +611,35 @@ export function StartRoastView(): React.JSX.Element {
   const closedLeaseEmergencyStopAdvertised =
     coherentFaultControls?.status === "closed" &&
     coherentFaultControls.enabled_actions.includes("emergency_stop");
+
+  // The server alone exposes D220. Its dedicated confirmation cannot fall
+  // through to D213 or Start; after a confirmed result a fresh health snapshot
+  // replaces this card with the ordinary D213 clearance card.
+  const restartGate = initializeSafetyRecordAvailable ? (
+    <InitializeSafetyRecordCard
+      available
+      onInitialize={async () => {
+        try {
+          return await api.initializeSafetyRecord();
+        } finally {
+          void queryClient.invalidateQueries({ queryKey: roastKeys.health });
+        }
+      }}
+      onRefreshStatus={() => queryClient.invalidateQueries({ queryKey: roastKeys.health })}
+    />
+  ) : (
+    <RestartClearanceCard
+      onAcknowledge={async () => {
+        try {
+          return await api.acknowledgeRestartClearance();
+        } catch (error) {
+          await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+          throw error;
+        }
+      }}
+      onRefreshStatus={() => queryClient.invalidateQueries({ queryKey: roastKeys.health })}
+    />
+  );
 
   if (health.isSuccess && coherentFaultControls === null) {
     return <FaultControlsStatusIncomplete />;
@@ -641,19 +673,7 @@ export function StartRoastView(): React.JSX.Element {
             }
           }}
         />
-        {restartClearanceRequired && (
-          <RestartClearanceCard
-            onAcknowledge={async () => {
-              try {
-                return await api.acknowledgeRestartClearance();
-              } catch (error) {
-                await queryClient.invalidateQueries({ queryKey: roastKeys.health });
-                throw error;
-              }
-            }}
-            onRefreshStatus={() => queryClient.invalidateQueries({ queryKey: roastKeys.health })}
-          />
-        )}
+        {restartClearanceRequired && restartGate}
       </AppFrame>
     );
   }
@@ -712,17 +732,7 @@ export function StartRoastView(): React.JSX.Element {
           </span>
         }
       >
-        <RestartClearanceCard
-          onAcknowledge={async () => {
-            try {
-              return await api.acknowledgeRestartClearance();
-            } catch (error) {
-              await queryClient.invalidateQueries({ queryKey: roastKeys.health });
-              throw error;
-            }
-          }}
-          onRefreshStatus={() => queryClient.invalidateQueries({ queryKey: roastKeys.health })}
-        />
+        {restartGate}
         {closedLeaseEmergencyStopAdvertised && (
           <UnknownStatusEmergencyStop testIdPrefix="start-restart-clearance-emergency-stop" />
         )}

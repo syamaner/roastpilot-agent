@@ -251,6 +251,13 @@ export interface EndRecoveredRunResult {
   fault_controls: FaultControls;
 }
 
+/** Outcome of the server-owned D220 missing-safety-record admission. */
+export interface InitializeSafetyRecordResult {
+  outcome: "confirmed" | "rejected" | "unconfirmed";
+  restart_clearance: RestartClearance;
+  fault_controls: FaultControls;
+}
+
 /** Current-process restart-clearance state, rendered directly from `/health`. */
 export type RestartClearanceState = "required" | "closure_only" | "cleared" | "unknown";
 
