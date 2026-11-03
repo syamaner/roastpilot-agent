@@ -163,6 +163,14 @@ describe("restart-clearance contract", () => {
       isCoherentRestartClearance({
         state: "required",
         eligible: false,
+        enabled_actions: [],
+        closure_only_available: true,
+      }),
+    ).toBe(true);
+    expect(
+      isCoherentRestartClearance({
+        state: "required",
+        eligible: false,
         enabled_actions: ["end_recovered_run"],
         closure_only_available: true,
       }),

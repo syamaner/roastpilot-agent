@@ -167,7 +167,14 @@ async def test_health_reports_version_and_no_active_run(client: AsyncClient) -> 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["/api/restart-clearance", "/api/fault-controls/actions"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/restart-clearance",
+        "/api/restart-clearance/closure-only",
+        "/api/fault-controls/actions",
+    ],
+)
 async def test_fault_control_routes_bound_declared_and_chunked_bodies(
     store: RoastStore, path: str
 ) -> None:
@@ -359,19 +366,33 @@ async def test_closure_only_routes_end_recovered_run_without_a_roaster_write(
     transport = ASGITransport(app=app)
 
     async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        available = await instance.get("/api/health")
         admitted = await instance.post(
             "/api/restart-clearance/closure-only", json={"physical_confirmation": True}
         )
+        wrong_run = await instance.post("/api/roasts/a-different-run/end-recovered-run")
         ended = await instance.post(f"/api/roasts/{run_id}/end-recovered-run")
+        repeated = await instance.post(f"/api/roasts/{run_id}/end-recovered-run")
 
     assert admitted.status_code == 200
+    assert available.json()["restart_clearance"] == {
+        "state": "required",
+        "eligible": False,
+        "enabled_actions": [],
+        "closure_only_available": True,
+    }
     assert admitted.json()["restart_clearance"]["state"] == "closure_only"
+    assert wrong_run.status_code == 409
     assert ended.status_code == 200
     assert ended.json()["outcome"] == "aborted"
+    assert repeated.status_code == 409
     assert session_presence.await_count == 2
     assert roaster.calls == []
     persisted = await store.read_run(run_id)
     assert persisted is not None and persisted.outcome == "aborted"
+    assert (
+        await store.read_process_restart_clearance(service.instance_id)
+    ) is RestartClearanceState.REQUIRED
 
 
 @pytest.mark.asyncio
@@ -417,6 +438,52 @@ async def test_closure_only_end_fences_when_its_durable_commit_is_not_proved(
 
 
 @pytest.mark.asyncio
+async def test_closure_only_admission_does_not_publish_after_cache_epoch_moves(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cache/epoch change during the clearance CAS cannot publish End authority."""
+    run_id = "closure-only-admission-race"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    roaster = FakeMCPClient()
+    monkeypatch.setattr(roaster, "read_session_presence", mock.AsyncMock(return_value="none"))
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        live_serve_mode=True,
+        run_loop=False,
+    )
+    await service.recover_on_start()
+    original_confirm = store.confirm_process_closure_only_clearance
+
+    async def move_cache_after_confirm(process_id: str) -> bool:
+        confirmed = await original_confirm(process_id)
+        service._admit_fault_control_lease(run_id)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        return confirmed
+
+    monkeypatch.setattr(store, "confirm_process_closure_only_clearance", move_cache_after_confirm)
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/restart-clearance/closure-only", json={"physical_confirmation": True}
+        )
+
+    assert response.status_code == 409
+    await asyncio.sleep(0)
+    assert service._closure_only_context is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._restart_clearance_state is RestartClearanceState.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert (
+        await store.read_process_restart_clearance(service.instance_id)
+    ) is RestartClearanceState.UNKNOWN
+
+
+@pytest.mark.asyncio
 async def test_emergency_stop_admission_revokes_closure_only_end_before_it_can_run(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -452,6 +519,77 @@ async def test_emergency_stop_admission_revokes_closure_only_end_before_it_can_r
     assert admitted.status_code == 200
     assert ended.status_code == 409
     assert roaster.calls == []
+
+
+@pytest.mark.asyncio
+async def test_closure_end_keeps_live_runner_and_unknown_estop_fence_after_cas_race(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A synchronous e-stop wins over End retirement even when its CAS commits."""
+    run_id = "closure-only-cas-estop-race"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    roaster = FakeMCPClient()
+    monkeypatch.setattr(roaster, "read_session_presence", mock.AsyncMock(return_value="none"))
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        live_serve_mode=True,
+        run_loop=False,
+    )
+    await service.recover_on_start()
+    await service.acknowledge_closure_only_clearance(
+        RestartClearanceRequest(physical_confirmation=True)
+    )
+    runner = mock.Mock()
+    runner.run_id = run_id
+    runner.finalized = False
+    runner.dispatch_priority_emergency_stop = mock.AsyncMock(return_value=True)
+    service.runner = runner
+    original_end = store.end_closure_only_recovered_run
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_end(
+        *, process_id: str, run_id: str, expected_lease: FaultControlLease
+    ) -> bool:
+        entered.set()
+        await release.wait()
+        return await original_end(
+            process_id=process_id, run_id=run_id, expected_lease=expected_lease
+        )
+
+    def leave_estop_persistence_pending(_lease: FaultControlLease) -> None:
+        """Keep the admitted UNKNOWN cache ahead of the delayed end CAS."""
+
+    monkeypatch.setattr(store, "end_closure_only_recovered_run", delayed_end)
+    monkeypatch.setattr(
+        service,
+        "_schedule_admitted_fault_control_lease_persistence",
+        leave_estop_persistence_pending,
+    )
+    ending = asyncio.create_task(service.end_recovered_run(run_id))
+    await entered.wait()
+    estop = await service._submit_live_emergency_stop(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    release.set()
+    ended = await ending
+
+    assert estop.result == "accepted"
+    runner.dispatch_priority_emergency_stop.assert_awaited_once()
+    assert ended.outcome == "aborted"
+    assert service.runner is runner
+    assert service.active_run_id == run_id
+    assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._restart_clearance_state is RestartClearanceState.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(RoastRunConflictError):
+        await service.start_roast(_profile(name="must-remain-fenced"))
 
 
 @pytest.mark.asyncio
@@ -507,12 +645,64 @@ async def test_shutdown_waits_for_inflight_closure_only_end_without_roaster_writ
     assert not stopping.done()
     release.set()
 
-    result = await ending
-    joined_result = await joining
+    ending.cancel()
+    joining.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await ending
+    with pytest.raises(asyncio.CancelledError):
+        await joining
     await stopping
-    assert result.outcome == "aborted"
-    assert joined_result.outcome == "aborted"
     assert calls == 1
+    assert service._closure_end_task is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert roaster.calls == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_continues_after_inflight_closure_only_end_fails(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed owned End leaves shutdown able to complete behind its fence."""
+    run_id = "closure-only-shutdown-failure"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    roaster = FakeMCPClient()
+    monkeypatch.setattr(roaster, "read_session_presence", mock.AsyncMock(return_value="none"))
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        live_serve_mode=True,
+        run_loop=False,
+    )
+    await service.recover_on_start()
+    await service.acknowledge_closure_only_clearance(
+        RestartClearanceRequest(physical_confirmation=True)
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def failed_end(**_: object) -> bool:
+        entered.set()
+        await release.wait()
+        raise RuntimeError("synthetic closure-only end failure")
+
+    monkeypatch.setattr(store, "end_closure_only_recovered_run", failed_end)
+    ending = asyncio.create_task(service.end_recovered_run(run_id))
+    await entered.wait()
+    stopping = asyncio.create_task(service.shutdown())
+    await asyncio.sleep(0)
+    assert not stopping.done()
+    release.set()
+
+    with pytest.raises(RoastRunConflictError, match="unconfirmed"):
+        await ending
+    await stopping
+    assert service._closure_end_task is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._restart_clearance_state is RestartClearanceState.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     assert roaster.calls == []
 
 

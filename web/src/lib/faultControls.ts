@@ -65,11 +65,7 @@ export function isCoherentRestartClearance(value: unknown): value is RestartClea
   }
   switch (candidate.state) {
     case "required":
-      return (
-        candidate.eligible === false &&
-        candidate.closure_only_available === false &&
-        candidate.enabled_actions.length === 0
-      );
+      return candidate.eligible === false && candidate.enabled_actions.length === 0;
     case "closure_only":
       return candidate.eligible === false && candidate.closure_only_available === false;
     case "unknown":
