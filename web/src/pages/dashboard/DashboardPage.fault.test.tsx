@@ -78,14 +78,25 @@ vi.mock("@/lib/api", async () => {
 
 // --- Mocks for the read-only foundation hooks the page consumes. ---
 const healthState = {
-  data: undefined as { active_run_id: string | null; mcp_child?: string } | undefined,
+  data: undefined as
+    | {
+        active_run_id: string | null;
+        mcp_child?: string;
+        restart_clearance?: {
+          state: "required" | "closure_only" | "cleared" | "unknown";
+          eligible: boolean;
+          enabled_actions: string[];
+          closure_only_available: boolean;
+        };
+      }
+    | undefined,
   isSuccess: false,
 };
 
 // The run snapshot (`useRoast`) — mutable so the #329 hydrate-onto-faulted case can
 // supply a faulted `agent_phase` + `fault_reason` + `enabled_actions` (the restore /
 // reload path that has NO live `fault` SSE frame).
-const roastState: { data: unknown } = { data: undefined };
+const roastState: { data: unknown; isSuccess: boolean } = { data: undefined, isSuccess: false };
 const timelineRefetchMock = vi.hoisted(() => vi.fn(async () => undefined));
 const timelineState: {
   data: RoastTimeline | undefined;
@@ -196,6 +207,7 @@ beforeEach(() => {
   healthState.data = undefined;
   healthState.isSuccess = false;
   roastState.data = undefined;
+  roastState.isSuccess = false;
   viewState.fault = null;
   viewState.points = [];
   streamState.enabledActions = null;
@@ -833,6 +845,53 @@ describe("DashboardPage restored/reloaded fault (#329)", () => {
 });
 
 describe("DashboardPage stale-health controls", () => {
+  it("shows D216 End after a health transition without requiring an SSE action update", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: "run-recovered",
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: [],
+        closure_only_available: false,
+      },
+    };
+    streamState.phase = "operator_recovery_required";
+    // D216 admission is not a phase change, so this connected SSE mirror does
+    // not receive End. The dedicated fresh run-detail projection owns it.
+    streamState.enabledActions = ["emergency_stop"];
+    roastState.isSuccess = true;
+    roastState.data = {
+      id: "run-recovered",
+      agent_phase: "operator_recovery_required",
+      fault_reason: null,
+      enabled_actions: ["emergency_stop", "end_recovered_run"],
+      profile: SNAPSHOT_PROFILE,
+    };
+
+    const page = renderPage();
+    expect(screen.queryByTestId("end-recovered-run")).toBeNull();
+
+    healthState.data = {
+      active_run_id: "run-recovered",
+      restart_clearance: {
+        state: "closure_only",
+        eligible: false,
+        enabled_actions: ["end_recovered_run"],
+        closure_only_available: false,
+      },
+    };
+    page.rerender(
+      <QueryClientProvider client={page.client}>
+        <MemoryRouter>
+          <DashboardPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByTestId("end-recovered-run-submit")).toBeEnabled();
+  });
+
   it("blocks routine and fault-acknowledgement dispatch while preserving the guarded emergency stop", async () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };

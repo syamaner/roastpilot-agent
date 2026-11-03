@@ -357,9 +357,15 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
   // recovered-run closure path, even if another view retained cached data.
   const healthProjectionStale = healthStale || !health.isSuccess;
   const closureOnlyAvailable = restartClearance?.closure_only_available === true;
+  // D216 End is a separate route rather than a phase change, so its action is
+  // not published through the SSE phase-action mirror. Its second projection is
+  // the current successfully fetched run snapshot; ordinary controls remain on
+  // `effectiveEnabled` above.
+  const currentRunDetailActions =
+    detail.isSuccess && detail.data?.id === runId ? detail.data.enabled_actions ?? null : null;
   const endRecoveredRunAvailable = isRecoveredRunEndProjected(
     restartClearance,
-    effectiveEnabled,
+    currentRunDetailActions,
     healthProjectionStale,
   );
 

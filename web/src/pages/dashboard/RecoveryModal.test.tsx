@@ -136,7 +136,7 @@ describe("RecoveryModal", () => {
     expect(screen.getByTestId("closure-only-independent-stop")).not.toBeChecked();
   });
 
-  it("shows recovered-run End only when the server projects it", () => {
+  it("shows recovered-run End only when the server projects it and latches success", async () => {
     const onEndRecoveredRun = vi.fn(async () => ({
       run_id: "run-recovered",
       outcome: "aborted" as const,
@@ -171,6 +171,8 @@ describe("RecoveryModal", () => {
     );
     fireEvent.click(screen.getByTestId("end-recovered-run-submit"));
     expect(onEndRecoveredRun).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(screen.getByTestId("end-recovered-run-submit")).toBeDisabled());
+    expect(screen.getByTestId("end-recovered-run-submit")).toHaveTextContent("End requested");
   });
 
   it("resets physical checks across a stale-to-fresh health transition while retaining e-stop", async () => {
@@ -273,7 +275,8 @@ describe("RecoveryModal", () => {
     expect(onAction).toHaveBeenCalledWith("emergency_stop");
 
     resolveEnd?.();
-    await waitFor(() => expect(screen.getByTestId("end-recovered-run-submit")).toBeEnabled());
+    await waitFor(() => expect(screen.getByTestId("end-recovered-run-submit")).toBeDisabled());
+    expect(screen.getByTestId("end-recovered-run-submit")).toHaveTextContent("End requested");
   });
 
   it("clears an End error when its server authority disappears", async () => {
@@ -315,5 +318,31 @@ describe("RecoveryModal", () => {
       />,
     );
     expect(screen.queryByTestId("end-recovered-run-error")).toBeNull();
+  });
+
+  it("clears an old closure error when a new checklist is opened", async () => {
+    const onRequestClosureOnly = vi.fn(async () => {
+      throw new Error("authority changed");
+    });
+    render(
+      <RecoveryModal
+        open
+        {...READOUT}
+        enabledActions={[]}
+        onAction={() => {}}
+        closureOnlyAvailable
+        onRequestClosureOnly={onRequestClosureOnly}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("closure-only-open"));
+    fireEvent.click(screen.getByTestId("closure-only-stopped"));
+    fireEvent.click(screen.getByTestId("closure-only-empty"));
+    fireEvent.click(screen.getByTestId("closure-only-independent-stop"));
+    fireEvent.click(screen.getByTestId("closure-only-submit"));
+    await waitFor(() => expect(screen.getByTestId("closure-only-error")).toHaveTextContent("authority changed"));
+
+    fireEvent.click(screen.getByTestId("closure-only-cancel"));
+    fireEvent.click(screen.getByTestId("closure-only-open"));
+    expect(screen.queryByTestId("closure-only-error")).toBeNull();
   });
 });
