@@ -697,6 +697,7 @@ export function StartRoastView(): React.JSX.Element {
     health.isSuccess &&
     (coherentRestartClearance === null ||
       coherentRestartClearance.state === "unknown" ||
+      coherentRestartClearance.state === "closure_only" ||
       (coherentRestartClearance.state === "cleared" && !coherentRestartClearance.eligible))
   ) {
     return <RestartClearanceStatusIncomplete />;

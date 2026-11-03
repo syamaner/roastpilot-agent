@@ -232,6 +232,23 @@ export interface RestartClearanceResult {
   fault_controls: FaultControls;
 }
 
+/** Outcome of the server-owned D216 closure-only admission. */
+export interface ClosureOnlyClearanceResult {
+  outcome: "confirmed" | "failed";
+  /** True only when the server recorded the narrow recovered-run End authority. */
+  closure_only: boolean;
+  restart_clearance: RestartClearance;
+  fault_controls: FaultControls;
+}
+
+/** Durable terminal result from the separate D216 recovered-run End route. */
+export interface EndRecoveredRunResult {
+  run_id: string;
+  outcome: "aborted";
+  restart_clearance: RestartClearance;
+  fault_controls: FaultControls;
+}
+
 /** Current-process restart-clearance state, rendered directly from `/health`. */
 export type RestartClearanceState = "required" | "closure_only" | "cleared" | "unknown";
 

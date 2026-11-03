@@ -123,6 +123,54 @@ describe("api client", () => {
     });
   });
 
+  it("POST /api/restart-clearance/closure-only sends only the fixed physical confirmation", async () => {
+    mockFetch(200, {
+      outcome: "confirmed",
+      closure_only: true,
+      restart_clearance: {
+        state: "closure_only",
+        eligible: false,
+        enabled_actions: ["end_recovered_run"],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    });
+
+    await api.requestClosureOnlyClearance();
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/restart-clearance/closure-only",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+      physical_confirmation: true,
+    });
+  });
+
+  it("POST /api/roasts/{id}/end-recovered-run has no operator-action body", async () => {
+    mockFetch(200, {
+      run_id: "run-recovered",
+      outcome: "aborted",
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: [],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    });
+
+    await api.endRecoveredRun("run-recovered");
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/roasts/run-recovered/end-recovered-run",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init).not.toHaveProperty("body");
+  });
+
   it("POST /api/fault-controls/actions sends no run or device identifier", async () => {
     mockFetch(202, {
       action: "emergency_stop",
