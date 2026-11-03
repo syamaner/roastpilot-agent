@@ -593,10 +593,10 @@ async def test_closure_end_keeps_live_runner_and_unknown_estop_fence_after_cas_r
 
 
 @pytest.mark.asyncio
-async def test_closure_end_keeps_runner_and_loop_when_estop_arrives_during_loop_settling(
+async def test_closure_end_detaches_runner_before_loop_settles_and_never_routes_late_estop(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """E-stop admission during cancelled-loop settling retains its live owner."""
+    """A post-handoff e-stop cannot dispatch through the detached old runner."""
     run_id = "closure-only-loop-settling-estop"
     await store.create_run(
         run_id=run_id,
@@ -649,25 +649,169 @@ async def test_closure_end_keeps_runner_and_loop_when_estop_arrives_during_loop_
     estop = await service._submit_live_emergency_stop(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
     )
-    settle_loop.set()
     ended = await ending
 
-    assert estop.result == "accepted"
-    runner.dispatch_priority_emergency_stop.assert_awaited_once()
+    assert estop.result == "failed"
+    runner.dispatch_priority_emergency_stop.assert_not_awaited()
     assert ended.outcome == "aborted"
-    assert service.runner is runner
-    assert service.active_run_id == run_id
-    assert service._loop_task is loop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service.runner is None
+    assert service.active_run_id is None
+    assert service._loop_task is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._detached_recovery_loop is not None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._detached_recovery_loop.task is loop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    settle_loop.set()
     assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-    assert service._restart_clearance_state is RestartClearanceState.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._restart_clearance_state is RestartClearanceState.REQUIRED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     await service.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_cancelling_owned_closure_end_keeps_unknown_runner_and_loop_fences(
+async def test_closure_end_detached_loop_blocks_start_without_retaining_stale_runner(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Cancelling End itself is not mistaken for normal loop cancellation."""
+    """The detached recovery loop is an independent Start fence until it settles."""
+    run_id = "closure-only-detached-start-fence"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    roaster = FakeMCPClient()
+    monkeypatch.setattr(roaster, "read_session_presence", mock.AsyncMock(return_value="none"))
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        run_loop=False,
+    )
+    await service.recover_on_start()
+    await service.acknowledge_closure_only_clearance(
+        RestartClearanceRequest(physical_confirmation=True)
+    )
+    loop_cancelled = asyncio.Event()
+    settle_loop = asyncio.Event()
+
+    async def delayed_loop_cancellation() -> None:
+        try:
+            await asyncio.Future[None]()
+        except asyncio.CancelledError:
+            loop_cancelled.set()
+            await settle_loop.wait()
+            raise
+
+    loop = asyncio.create_task(delayed_loop_cancellation())
+    service._loop_task = loop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    ended = await service.end_recovered_run(run_id)
+    await loop_cancelled.wait()
+
+    assert ended.outcome == "aborted"
+    assert service.runner is None
+    assert service.active_run_id is None
+    assert service._loop_task is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(RoastRunConflictError, match="retired recovered-run controller loop"):
+        await service.start_roast(_profile(name="must-wait-for-detached-loop"))
+
+    settle_loop.set()
+    with pytest.raises(asyncio.CancelledError):
+        await loop
+    await asyncio.sleep(0)
+    assert service._detached_recovery_loop is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    started = await service.start_roast(_profile(name="after-detached-loop"))
+    assert started.id != run_id
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pre_retirement_estop_failure_keeps_real_runner_for_heat_off_retry(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An e-stop admitted before atomic retirement retains its real retry owner."""
+    run_id = "closure-only-real-runner-estop-retry"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+
+    class FailFirstEmergencyStopMCP(FakeMCPClient):
+        """Fail the direct stop write once so the controller must retry heat-off."""
+
+        def __init__(self) -> None:
+            super().__init__([_reading(178.0, 185.0)])
+            self.emergency_stop_attempts = 0
+
+        async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
+            self.emergency_stop_attempts += 1
+            self._log.append("emergency_stop")  # noqa: SLF001 - test double trace
+            self.calls.append(("emergency_stop", {"reason": reason}))
+            raise RuntimeError("synthetic pre-retirement e-stop write failure")
+
+    roaster = FailFirstEmergencyStopMCP()
+    monkeypatch.setattr(roaster, "read_session_presence", mock.AsyncMock(return_value="none"))
+    service = RoastService(
+        store,
+        config=AppConfig(controller=ControllerConfig(tick_interval_seconds=0.001)),
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        live_serve_mode=True,
+        run_loop=True,
+    )
+    await service.recover_on_start()
+    assert isinstance(service.runner, RoastRunner)
+    await service.acknowledge_closure_only_clearance(
+        RestartClearanceRequest(physical_confirmation=True)
+    )
+    original_end = store.end_closure_only_recovered_run
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_end(
+        *, process_id: str, run_id: str, expected_lease: FaultControlLease
+    ) -> bool:
+        entered.set()
+        await release.wait()
+        return await original_end(
+            process_id=process_id, run_id=run_id, expected_lease=expected_lease
+        )
+
+    def leave_estop_persistence_pending(_lease: FaultControlLease) -> None:
+        """Keep the admitted cache ahead of the delayed durable End CAS."""
+
+    monkeypatch.setattr(store, "end_closure_only_recovered_run", delayed_end)
+    monkeypatch.setattr(
+        service,
+        "_schedule_admitted_fault_control_lease_persistence",
+        leave_estop_persistence_pending,
+    )
+    ending = asyncio.create_task(service.end_recovered_run(run_id))
+    await entered.wait()
+    stopped = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    release.set()
+    ended = await ending
+
+    assert stopped.result == "accepted"
+    assert ended.outcome == "aborted"
+    assert service.runner is not None
+    assert service.active_run_id == run_id
+    assert roaster.emergency_stop_attempts == 1
+    for _ in range(200):
+        if ("set_heat", {"heat_percent": 0}) in roaster.calls:
+            break
+        await asyncio.sleep(0.005)
+    assert ("set_heat", {"heat_percent": 0}) in roaster.calls
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_owned_closure_end_keeps_unknown_detached_loop_fence(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling End after handoff retains the detached loop Start fence."""
     run_id = "closure-only-end-task-cancelled"
     await store.create_run(
         run_id=run_id,
@@ -715,16 +859,21 @@ async def test_cancelling_owned_closure_end_keeps_unknown_runner_and_loop_fences
     await asyncio.sleep(0)
 
     assert service._restart_clearance_state is RestartClearanceState.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-    assert service.runner is runner
-    assert service.active_run_id == run_id
-    assert service._loop_task is loop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service.runner is None
+    assert service.active_run_id is None
+    assert service._loop_task is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._detached_recovery_loop is not None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._detached_recovery_loop.task is loop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    settle_loop.set()
+    with pytest.raises(asyncio.CancelledError):
+        await loop
 
 
 @pytest.mark.asyncio
-async def test_closure_end_loop_settling_error_keeps_unknown_runner_and_loop_fences(
+async def test_closure_end_loop_settling_error_keeps_unknown_without_stale_live_runner(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A loop error during cancellation settlement cannot complete retirement."""
+    """A detached loop failure keeps the process gate UNKNOWN, not dispatchable."""
     run_id = "closure-only-loop-settling-error"
     await store.create_run(
         run_id=run_id,
@@ -765,13 +914,14 @@ async def test_closure_end_loop_settling_error_keeps_unknown_runner_and_loop_fen
     ending = asyncio.create_task(service.end_recovered_run(run_id))
     await loop_cancelled.wait()
     release_loop_error.set()
-    with pytest.raises(RoastRunConflictError, match="retirement is unconfirmed"):
-        await ending
+    ended = await ending
 
+    assert ended.outcome == "aborted"
     assert service._restart_clearance_state is RestartClearanceState.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-    assert service.runner is runner
-    assert service.active_run_id == run_id
-    assert service._loop_task is loop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service.runner is None
+    assert service.active_run_id is None
+    assert service._loop_task is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._detached_recovery_loop is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio

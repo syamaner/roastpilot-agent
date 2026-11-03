@@ -626,6 +626,14 @@ class _ClosureOnlyContext:
     emergency_stop_admission_epoch: int
 
 
+@dataclass(frozen=True)
+class _DetachedRecoveryLoop:
+    """One retired recovered-run loop kept solely as a Start admission fence."""
+
+    run_id: str
+    task: asyncio.Task[None]
+
+
 #: Fallback agent-event → source mapping for persisted ``roast_events`` rows.
 #: A ``source`` carried in the event payload (e.g. an operator/MCP first-crack,
 #: an advisor/operator command) wins over this map; it is the default for events
@@ -2357,6 +2365,11 @@ class RoastService:
         #: roaster is wired; ``None`` between runs and in API-only mode.
         self.runner: RoastRunner | None = None
         self._loop_task: asyncio.Task[None] | None = None
+        # A successful closure-only End atomically removes the old runner from
+        # live e-stop dispatch before cancelling its loop.  The task remains
+        # here, rather than in ``_loop_task``, solely to fence a later Start
+        # until that exact detached loop has settled.
+        self._detached_recovery_loop: _DetachedRecoveryLoop | None = None
         self.active_run_id: str | None = None
         # A new run is published before its controller has been constructed.
         # Keep that short window explicit so an e-stop can synchronously fence
@@ -2794,6 +2807,63 @@ class RoastService:
                 exc_info=(type(error), error, error.__traceback__),
             )
 
+    def _finish_detached_recovery_loop(self, detached: _DetachedRecoveryLoop) -> None:
+        """Release one retired-loop Start fence after observing its exact task.
+
+        The runner has already been removed from every live-dispatch pointer.
+        This callback owns only the independent Start fence and turns an
+        unexpected loop failure into a durable UNKNOWN process gate.
+        """
+        if self._detached_recovery_loop != detached:
+            return
+        self._detached_recovery_loop = None
+        try:
+            error = detached.task.exception()
+        except asyncio.CancelledError:
+            # This is the expected result of the retirement cancellation.
+            return
+        if error is not None:
+            _log.error(
+                "detached recovered-run loop failed during retirement",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            self._invalidate_closure_only_clearance()
+
+    def _retire_current_recovered_runner(self, context: _ClosureOnlyContext) -> bool:
+        """Atomically detach a recovered runner after a durably ended run.
+
+        No await may be inserted between the final binding check and loop
+        cancellation.  An admitted e-stop advances the closure admission
+        epoch synchronously, so any such admission that wins before this
+        handoff leaves the live runner and its priority retry path intact.
+        """
+        if not self._closure_only_binding_is_current(context):
+            return False
+        loop = self._loop_task
+        if loop is not None and loop.done():
+            try:
+                error = loop.exception()
+            except asyncio.CancelledError:
+                error = None
+            if error is not None:
+                self._invalidate_closure_only_clearance()
+                raise RoastRunConflictError("recovered-run retirement is unconfirmed") from error
+
+        # This is the all-or-nothing retirement handoff.  Clearing these live
+        # pointers first prevents a later e-stop from targeting a detached
+        # runner; the exact loop task below is deliberately not dispatchable.
+        self._restart_clearance_state = RestartClearanceState.REQUIRED
+        self._closure_only_context = None
+        self._loop_task = None
+        self.runner = None
+        self.active_run_id = None
+        if loop is not None and not loop.done():
+            detached = _DetachedRecoveryLoop(run_id=context.run_id, task=loop)
+            self._detached_recovery_loop = detached
+            loop.add_done_callback(lambda completed: self._finish_detached_recovery_loop(detached))
+            loop.cancel()
+        return True
+
     async def _fault_controls_projection(self, lease: FaultControlLease) -> FaultControlsProjection:
         """Return a conservative server-owned control projection for one lease."""
         actions: list[OperatorAction] = []
@@ -3053,39 +3123,14 @@ class RoastService:
             if not committed:
                 self._invalidate_closure_only_clearance()
                 raise RoastRunConflictError("recovered-run end was not durably recorded")
-        if self._closure_only_binding_is_current(context):
-            loop = self._loop_task
-            if loop is not None and not loop.done():
-                loop.cancel()
-                try:
-                    await loop
-                except asyncio.CancelledError:
-                    # Cancelling the End task itself also cancels its awaited
-                    # loop.  Only the loop's own expected cancellation may
-                    # continue to retirement; an End cancellation propagates
-                    # and its done callback retains the UNKNOWN fence.
-                    current_task = asyncio.current_task()
-                    if current_task is not None and current_task.cancelling():
-                        raise
-                except Exception as exc:  # noqa: BLE001 - a failed retirement must remain fenced
-                    self._invalidate_closure_only_clearance()
-                    raise RoastRunConflictError("recovered-run retirement is unconfirmed") from exc
-            # E-stop admission can interleave while the cancelled live loop is
-            # settling. It synchronously revokes this binding and reserves the
-            # runner's priority dispatch; never discard either reference after
-            # that await.
-            if self._closure_only_binding_is_current(context):
-                self._restart_clearance_state = RestartClearanceState.REQUIRED
-                self._closure_only_context = None
-                self._loop_task = None
-                self.runner = None
-                self.active_run_id = None
-            elif self._restart_clearance_state is RestartClearanceState.CLOSURE_ONLY:
-                self._invalidate_closure_only_clearance()
-        elif self._restart_clearance_state is RestartClearanceState.CLOSURE_ONLY:
+        if (
+            not self._retire_current_recovered_runner(context)
+            and self._restart_clearance_state is RestartClearanceState.CLOSURE_ONLY
+        ):
             # The durable terminal state is independently proven above, but a
-            # child/epoch/cache change means it cannot retire a live runner or
-            # overwrite a later safety admission.
+            # child/epoch/cache change (including a synchronously admitted
+            # e-stop) means it cannot retire a live runner or overwrite that
+            # runner's priority retry path.
             self._invalidate_closure_only_clearance()
         lease = await self._read_fault_lease_fail_closed()
         return EndRecoveredRunResult(
@@ -4312,6 +4357,20 @@ class RoastService:
                     "the prior roast controller loop is still active; "
                     "starting a roast remains blocked"
                 )
+            detached = self._detached_recovery_loop
+            if detached is not None:
+                if detached.task.done():
+                    self._finish_detached_recovery_loop(detached)
+                    if self._restart_clearance_state is RestartClearanceState.UNKNOWN:
+                        raise RoastRunConflictError(
+                            "the retired recovered-run controller loop settled with an error; "
+                            "starting a roast remains blocked"
+                        )
+                else:
+                    raise RoastRunConflictError(
+                        "the retired recovered-run controller loop is still settling; "
+                        "starting a roast remains blocked"
+                    )
             if self.runner is not None and not self.runner.finalized:
                 raise RoastRunConflictError(
                     "the prior roast controller has not finalized; starting a roast remains blocked"
@@ -5126,6 +5185,17 @@ class RoastService:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        detached = self._detached_recovery_loop
+        if detached is not None:
+            if not detached.task.done():
+                detached.task.cancel()
+                try:
+                    await detached.task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001 - safe shutdown continues after loop failure
+                    _log.exception("detached recovered-run loop failed during shutdown")
+            self._finish_detached_recovery_loop(detached)
         expiry_task = self._bean_draft_expiry_task
         self._bean_draft_expiry_task = None
         if expiry_task is not None and not expiry_task.done():
