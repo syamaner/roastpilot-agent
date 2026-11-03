@@ -86,6 +86,7 @@ export function RecoveryModal({
   const [closureError, setClosureError] = useState<string | null>(null);
   const [closureReported, setClosureReported] = useState(false);
   const [endSubmitting, setEndSubmitting] = useState(false);
+  const [endSubmitted, setEndSubmitted] = useState(false);
   const [endError, setEndError] = useState<string | null>(null);
   const firstClosureCheckRef = useRef<HTMLInputElement>(null);
   const closureSubmissionInFlight = useRef(false);
@@ -115,7 +116,10 @@ export function RecoveryModal({
   }, [healthStale]);
 
   useEffect(() => {
-    if (!endRecoveredRunAvailable) setEndError(null);
+    if (!endRecoveredRunAvailable) {
+      setEndError(null);
+      setEndSubmitted(false);
+    }
   }, [endRecoveredRunAvailable]);
 
   useEffect(() => {
@@ -127,6 +131,7 @@ export function RecoveryModal({
     setClosureError(null);
     setClosureReported(false);
     setEndError(null);
+    setEndSubmitted(false);
   }, [open]);
 
   if (!open) return null;
@@ -182,7 +187,8 @@ export function RecoveryModal({
     setEndSubmitting(true);
     setEndError(null);
     try {
-      await onEndRecoveredRun();
+      const result = await onEndRecoveredRun();
+      setEndSubmitted(result.outcome === "aborted");
     } catch (cause) {
       setEndError(
         cause instanceof Error
@@ -276,7 +282,10 @@ export function RecoveryModal({
               <button
                 type="button"
                 data-testid="closure-only-open"
-                onClick={() => setClosureConfirmationOpen(true)}
+                onClick={() => {
+                  setClosureError(null);
+                  setClosureConfirmationOpen(true);
+                }}
                 className="self-start rounded-md border border-roast-caution/50 px-4 py-2 text-sm font-semibold text-roast-caution transition-colors hover:bg-roast-caution/10"
               >
                 Review physical safety checks
@@ -365,11 +374,11 @@ export function RecoveryModal({
             <button
               type="button"
               data-testid="end-recovered-run-submit"
-              disabled={endSubmitting}
+              disabled={endSubmitting || endSubmitted}
               onClick={() => void submitRecoveredRunEnd()}
               className="self-start rounded-md bg-roast-fault px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {endSubmitting ? "Ending…" : "End recovered run"}
+              {endSubmitting ? "Ending…" : endSubmitted ? "End requested" : "End recovered run"}
             </button>
             {endError !== null && (
               <p role="alert" data-testid="end-recovered-run-error" className="text-xs text-roast-fault">
