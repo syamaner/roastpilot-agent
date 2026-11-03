@@ -38,6 +38,7 @@ from roastpilot_agent.models import (
     CommandTraceStatus,
     FaultLeaseStatus,
     LogManifest,
+    OperatorAction,
     PostFcHeatAuthorityState,
     ProcessingMethod,
     ReferenceCurveSample,
@@ -651,6 +652,24 @@ CREATE TABLE process_epoch (
 );
 """
 
+SCHEMA_V21_CLOSURE_ONLY_RESTART_CLEARANCE = """
+-- #954 / D216: a recovered run can receive only separate closure authority.
+-- SQLite cannot widen a CHECK constraint in place, so preserve every prior
+-- process record while rebuilding this small process-local table.
+CREATE TABLE process_restart_clearance_new (
+  process_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL CHECK (state IN ('required', 'closure_only', 'cleared', 'unknown')),
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL
+);
+INSERT INTO process_restart_clearance_new
+  (process_id, state, created_at_utc, updated_at_utc)
+  SELECT process_id, state, created_at_utc, updated_at_utc
+  FROM process_restart_clearance;
+DROP TABLE process_restart_clearance;
+ALTER TABLE process_restart_clearance_new RENAME TO process_restart_clearance;
+"""
+
 _BEAN_SOURCING_LEASE_DURATION = timedelta(minutes=2)
 _BEAN_SOURCING_LEASE_CONFIRMATION = timedelta(seconds=60)
 
@@ -678,6 +697,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V18_FAULT_LEASE_AND_PROCESS_CLEARANCE,
     SCHEMA_V19_FAULT_CONTROL_EVENTS,
     SCHEMA_V20_PROCESS_EPOCH,
+    SCHEMA_V21_CLOSURE_ONLY_RESTART_CLEARANCE,
 )
 
 
@@ -1057,6 +1077,160 @@ class RoastStore:
         )
         await self.connection.commit()
         return cursor.rowcount == 1
+
+    async def confirm_process_closure_only_clearance(self, process_id: str) -> bool:
+        """CAS this fresh process gate from required to D216 closure-only."""
+        cursor = await self.connection.execute(
+            "UPDATE process_restart_clearance SET state = ?, updated_at_utc = ? "
+            "WHERE process_id = ? AND state = ?",
+            (
+                RestartClearanceState.CLOSURE_ONLY.value,
+                _utc_now(),
+                process_id,
+                RestartClearanceState.REQUIRED.value,
+            ),
+        )
+        await self.connection.commit()
+        return cursor.rowcount == 1
+
+    async def mark_process_restart_clearance_unknown(self, process_id: str) -> None:
+        """Fence an uncertain process-clearance transition durably."""
+        await self.connection.execute(
+            "UPDATE process_restart_clearance SET state = ?, updated_at_utc = ? "
+            "WHERE process_id = ?",
+            (RestartClearanceState.UNKNOWN.value, _utc_now(), process_id),
+        )
+        await self.connection.commit()
+
+    async def end_closure_only_recovered_run(
+        self,
+        *,
+        process_id: str,
+        run_id: str,
+        expected_lease: FaultControlLease,
+    ) -> bool:
+        """Atomically end one D216 recovered run under its exact closed lease.
+
+        The dedicated transaction changes the recovered history, immutable
+        operator audit, and process gate together. It does not issue MCP
+        commands or export roast logs.
+        """
+        connection = await aiosqlite.connect(self._db_path)
+        connection.row_factory = aiosqlite.Row
+        try:
+            await self._configure_durable_connection(connection)
+            await connection.execute("BEGIN IMMEDIATE")
+            async with connection.execute(
+                "SELECT state FROM process_restart_clearance WHERE process_id = ?",
+                (process_id,),
+            ) as cursor:
+                clearance = await cursor.fetchone()
+            lease = await self._read_fault_control_lease_from_connection(connection)
+            if (
+                clearance is None
+                or str(clearance["state"]) != RestartClearanceState.CLOSURE_ONLY.value
+                or lease != expected_lease
+                or lease.status is not FaultLeaseStatus.CLOSED
+            ):
+                await connection.rollback()
+                return False
+            now = _utc_now()
+            updated_run = await connection.execute(
+                "UPDATE roast_runs SET completed_at_utc = ?, outcome = 'aborted', "
+                "agent_phase = ?, updated_at_utc = ? WHERE id = ? "
+                "AND completed_at_utc IS NULL AND agent_phase = ?",
+                (
+                    now,
+                    RoastPhase.COMPLETE.value,
+                    now,
+                    run_id,
+                    RoastPhase.OPERATOR_RECOVERY_REQUIRED.value,
+                ),
+            )
+            if updated_run.rowcount != 1:
+                await connection.rollback()
+                return False
+            payload = json.dumps(
+                {"closure_only": "confirmed", "lease_generation": lease.generation},
+                sort_keys=True,
+            )
+            audit = await connection.execute(
+                "INSERT INTO operator_actions (run_id, action, payload_json, result, "
+                "recorded_at_utc) VALUES (?, ?, ?, ?, ?)",
+                (run_id, OperatorAction.END_RECOVERED_RUN.value, payload, "accepted", now),
+            )
+            if audit.rowcount != 1:
+                await connection.rollback()
+                return False
+            reset_gate = await connection.execute(
+                "UPDATE process_restart_clearance SET state = ?, updated_at_utc = ? "
+                "WHERE process_id = ? AND state = ?",
+                (
+                    RestartClearanceState.REQUIRED.value,
+                    now,
+                    process_id,
+                    RestartClearanceState.CLOSURE_ONLY.value,
+                ),
+            )
+            if reset_gate.rowcount != 1:
+                await connection.rollback()
+                return False
+            await connection.commit()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await connection.rollback()
+            raise
+        finally:
+            await connection.close()
+        return await self.closure_only_end_postcondition(
+            process_id=process_id,
+            run_id=run_id,
+            lease_generation=expected_lease.generation,
+        )
+
+    async def closure_only_end_postcondition(
+        self, *, process_id: str, run_id: str, lease_generation: int
+    ) -> bool:
+        """Prove the exact durable D216 terminal state after an uncertain commit."""
+        connection: aiosqlite.Connection | None = None
+        try:
+            connection = await aiosqlite.connect(self._db_path)
+            connection.row_factory = aiosqlite.Row
+            await self._configure_durable_connection(connection)
+            async with connection.execute(
+                "SELECT outcome, agent_phase, completed_at_utc FROM roast_runs WHERE id = ?",
+                (run_id,),
+            ) as cursor:
+                run = await cursor.fetchone()
+            async with connection.execute(
+                "SELECT state FROM process_restart_clearance WHERE process_id = ?",
+                (process_id,),
+            ) as cursor:
+                clearance = await cursor.fetchone()
+            payload = json.dumps(
+                {"closure_only": "confirmed", "lease_generation": lease_generation},
+                sort_keys=True,
+            )
+            async with connection.execute(
+                "SELECT 1 FROM operator_actions WHERE run_id = ? AND action = ? "
+                "AND result = ? AND payload_json = ? LIMIT 1",
+                (run_id, OperatorAction.END_RECOVERED_RUN.value, "accepted", payload),
+            ) as cursor:
+                audit = await cursor.fetchone()
+            return (
+                run is not None
+                and str(run["outcome"]) == "aborted"
+                and str(run["agent_phase"]) == RoastPhase.COMPLETE.value
+                and run["completed_at_utc"] is not None
+                and clearance is not None
+                and str(clearance["state"]) == RestartClearanceState.REQUIRED.value
+                and audit is not None
+            )
+        except Exception:  # noqa: BLE001 - unreadable state is not proof
+            return False
+        finally:
+            if connection is not None:
+                await connection.close()
 
     async def read_fault_control_lease(self) -> FaultControlLease:
         """Read the current lease, classifying unproven absence as UNKNOWN."""

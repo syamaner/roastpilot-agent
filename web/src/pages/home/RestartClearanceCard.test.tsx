@@ -10,7 +10,12 @@ describe("RestartClearanceCard", () => {
       outcome: "confirmed",
       cleared: true,
       restart_clearance_required: false,
-      restart_clearance: { state: "cleared", eligible: true },
+      restart_clearance: {
+        state: "cleared",
+        eligible: true,
+        enabled_actions: [],
+        closure_only_available: false,
+      },
       fault_controls: { status: "closed", generation: null, enabled_actions: [] },
     }));
     render(<RestartClearanceCard onAcknowledge={acknowledge} />);
@@ -45,7 +50,12 @@ describe("RestartClearanceCard", () => {
           outcome: "confirmed",
           cleared: true,
           restart_clearance_required: false,
-          restart_clearance: { state: "cleared", eligible: true },
+          restart_clearance: {
+            state: "cleared",
+            eligible: true,
+            enabled_actions: [],
+            closure_only_available: false,
+          },
           fault_controls: { status: "closed", generation: null, enabled_actions: [] },
         })}
         onRefreshStatus={refresh}
@@ -90,7 +100,12 @@ describe("RestartClearanceCard", () => {
       outcome: "failed",
       cleared: false,
       restart_clearance_required: true,
-      restart_clearance: { state: "required", eligible: false },
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: [],
+        closure_only_available: false,
+      },
       fault_controls: { status: "open", generation: 4, enabled_actions: ["emergency_stop"] },
     }));
     render(<RestartClearanceCard onAcknowledge={acknowledge} />);

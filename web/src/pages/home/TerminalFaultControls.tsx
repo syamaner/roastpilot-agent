@@ -21,6 +21,8 @@ const TERMINAL_ACTIONS = [
   "stop_cooling_and_acknowledge",
 ] as const satisfies readonly OperatorAction[];
 
+type TerminalFaultAction = (typeof TERMINAL_ACTIONS)[number];
+
 const ACTION_LABELS: Record<(typeof TERMINAL_ACTIONS)[number], string> = {
   emergency_stop: "Emergency stop",
   start_cooling: "Start cooling",
@@ -36,7 +38,7 @@ export interface TerminalFaultControlsProps {
   routineControlsDisabled?: boolean;
   /** Calls the server-resolved global terminal-fault action endpoint. */
   onAction: (
-    action: OperatorAction,
+    action: TerminalFaultAction,
     confirmation?: true,
     expectedGeneration?: number,
   ) => Promise<FaultControlsActionResult>;
@@ -52,7 +54,7 @@ export function TerminalFaultControls({
   const [confirmationLeaseKey, setConfirmationLeaseKey] = useState<string | null>(null);
   const [emergencyStopArmed, setEmergencyStopArmed] = useState(false);
   const [pendingOrdinaryAction, setPendingOrdinaryAction] = useState<{
-    action: OperatorAction;
+    action: TerminalFaultAction;
     leaseKey: string;
     requestId: number;
   } | null>(null);
@@ -90,7 +92,7 @@ export function TerminalFaultControls({
   );
 
   const submit = async (
-    action: OperatorAction,
+    action: TerminalFaultAction,
     confirmation?: true,
     expectedGeneration?: number,
   ) => {

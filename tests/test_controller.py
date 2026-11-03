@@ -8592,12 +8592,15 @@ def _controller_accepts(action: OperatorAction, phase: RoastPhase) -> bool:
       (``RoastRunner._dispatch_acknowledge_fault``) acts iff the controller is in
       ``faulted`` (it flips the runner's finalise flag); the
       controller-observable acceptance condition is exactly "phase is FAULTED".
-    * ``stop_cooling_and_acknowledge`` (D212): deliberately false here.  It is
-      an API-owned, fault-lease operation with an exact-session readback and a
-      durable compare-and-swap; it is not a direct controller action and must
-      never be exposed through this controller permission mirror.
+    * ``stop_cooling_and_acknowledge`` (D212) and ``end_recovered_run``
+      (D216): deliberately false here. They are API-owned, lease-bound durable
+      operations, not direct controller actions, and must never be exposed
+      through this controller permission mirror.
     """
-    if action is OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE:
+    if action in (
+        OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+        OperatorAction.END_RECOVERED_RUN,
+    ):
         return False
     command = OPERATOR_ACTION_COMMAND.get(action)
     if command is not None:
@@ -8639,9 +8642,9 @@ def test_enabled_actions_mirror_controller_acceptance(
     the server's ``enabled_actions`` projection includes the action IFF the real
     controller would accept it. Zero carve-outs — a controller change that
     diverges (phase-gating pause/resume, widening acknowledge, a matrix edit)
-    fails here, keeping ``enabled_actions`` an honest permission mirror.  D212's
-    lease-owned composite action is intentionally excluded from that mirror and
-    therefore remains false for every controller phase."""
+    fails here, keeping ``enabled_actions`` an honest permission mirror. D212's
+    and D216's lease-owned API actions are intentionally excluded from that
+    mirror and therefore remain false for every controller phase."""
     in_enabled = action in enabled_operator_actions(phase)
     assert in_enabled is _controller_accepts(action, phase), (
         f"{action.value} in {phase.value}: enabled={in_enabled} but "

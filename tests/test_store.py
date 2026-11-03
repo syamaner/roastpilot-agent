@@ -20,6 +20,7 @@ from roastpilot_agent import store as store_module
 from roastpilot_agent.ambient_evidence import AmbientEvidenceVerdict, NotProvenReason
 from roastpilot_agent.store import (
     MIGRATIONS,
+    FaultControlLease,
     PhysicallyImpossibleWeightError,
     RoastStore,
     RunActivelyDrivenError,
@@ -206,6 +207,60 @@ async def test_process_epoch_unclean_or_upgraded_database_keeps_absent_lease_unk
     try:
         assert not await upgraded.begin_process_epoch("upgraded")
         assert (await upgraded.read_fault_control_lease()).status.value == "unknown"
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_v21_migration_preserves_clearance_rows_and_process_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V21 widens only the clearance CHECK and retains all V20 durable state."""
+    db_path = tmp_path / "v21-clearance-upgrade.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:20])
+    old = RoastStore(db_path)
+    await old.initialize()
+    try:
+        assert (
+            await old.begin_process_restart_clearance("required-process")
+            is RestartClearanceState.REQUIRED
+        )
+        assert (
+            await old.begin_process_restart_clearance("cleared-process")
+            is RestartClearanceState.REQUIRED
+        )
+        assert await old.confirm_process_restart_clearance("cleared-process")
+        assert await old.begin_process_epoch("v20-process")
+    finally:
+        await old.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == 21 == len(MIGRATIONS)
+        assert (
+            await upgraded.read_process_restart_clearance("required-process")
+            is RestartClearanceState.REQUIRED
+        )
+        assert (
+            await upgraded.read_process_restart_clearance("cleared-process")
+            is RestartClearanceState.CLEARED
+        )
+        assert await fetch_one(
+            upgraded, "SELECT process_id, status FROM process_epoch WHERE singleton = 1"
+        ) == ("v20-process", "unclean")
+        assert await upgraded.confirm_process_closure_only_clearance("required-process")
+        assert (
+            await upgraded.read_process_restart_clearance("required-process")
+            is RestartClearanceState.CLOSURE_ONLY
+        )
+        await upgraded.mark_process_restart_clearance_unknown("required-process")
+        assert (
+            await upgraded.read_process_restart_clearance("required-process")
+            is RestartClearanceState.UNKNOWN
+        )
+        assert not await upgraded.confirm_process_closure_only_clearance("required-process")
     finally:
         await upgraded.close()
 
@@ -476,7 +531,7 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
     upgraded = RoastStore(db_path=db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 20 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 21 == len(MIGRATIONS)
         row = await fetch_one(upgraded, "SELECT excluded FROM roast_runs WHERE id = 'run-1'")
         assert row == (0,)
         detail = await upgraded.read_run("run-1")
@@ -492,11 +547,11 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
 
 
 @pytest.mark.asyncio
-async def test_fresh_store_is_v20(tmp_store: RoastStore) -> None:
-    """A brand-new store lands on the current (v20) schema version."""
+async def test_fresh_store_is_v21(tmp_store: RoastStore) -> None:
+    """A brand-new store lands on the current (v21) schema version."""
     await tmp_store.initialize()
     try:
-        assert await tmp_store.schema_version() == 20 == len(MIGRATIONS)
+        assert await tmp_store.schema_version() == 21 == len(MIGRATIONS)
     finally:
         await tmp_store.close()
 
@@ -520,7 +575,7 @@ async def test_v14_migration_upgrades_real_v13_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 20
+        assert await upgraded.schema_version() == 21
         assert await upgraded.read_run("run-1") is not None
         assert "bean_sourcing_attempts" in await fetch_names(upgraded, "table")
         assert "idx_bean_sourcing_attempt_expiry" in await fetch_names(upgraded, "index")
@@ -549,7 +604,7 @@ async def test_v15_migration_adds_catalogue_counts_to_real_v14_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 20 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 21 == len(MIGRATIONS)
         row = await fetch_one(
             upgraded,
             "SELECT catalogue_discovered_count, catalogue_extracted_count"
@@ -606,7 +661,7 @@ async def test_v16_migration_adds_nullable_d96_trace_to_real_v15_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 20 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 21 == len(MIGRATIONS)
         [point] = await upgraded.read_telemetry_points("run-1")
         assert point.post_fc_recovery_enabled is None
         assert point.post_fc_heat_authority_state is None
@@ -643,7 +698,7 @@ async def test_v17_migration_preserves_historical_event_ids_and_index(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 20 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 21 == len(MIGRATIONS)
         assert (
             await fetch_one(upgraded, "SELECT id FROM roast_events WHERE run_id = 'run-1'")
             == historical
@@ -909,9 +964,12 @@ from roastpilot_agent.advisor import AdvisorContext, RoastDecision  # noqa: E402
 from roastpilot_agent.config import AppConfig  # noqa: E402
 from roastpilot_agent.models import (  # noqa: E402
     DropReason,
+    FaultLeaseStatus,
+    OperatorAction,
     PostFcHeatAuthorityState,
     ReferenceLandmarks,
     ReferenceRoast,
+    RestartClearanceState,
     RoastCommand,
     RoastEventKind,
     RoastEventSource,
@@ -7635,6 +7693,158 @@ async def test_fault_lease_read_fails_closed_for_corrupt_status_and_legacy_close
     # The legacy primitive changes only the singleton row.  Without D215's
     # matching immutable audit event, a later read retains the UNKNOWN fence.
     assert (await tmp_store.read_fault_control_lease()).status.value == "unknown"
+
+
+async def _closed_recovered_lease(
+    store: RoastStore, *, run_id: str, generation: int
+) -> FaultControlLease:
+    """Persist the exact closed-lease audit a D216 closure transaction requires."""
+    await store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="recovery-session", generation=generation
+    )
+    assert await store.close_fault_control_lease(generation)
+    await store.record_event(
+        run_id=run_id,
+        kind=RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED,
+        source=RoastEventSource.SAFETY,
+        payload={"generation": generation, "outcome": "confirmed", "status": "closed"},
+    )
+    lease = await store.read_fault_control_lease()
+    assert lease.status is FaultLeaseStatus.CLOSED
+    return lease
+
+
+@pytest.mark.asyncio
+async def test_closure_only_end_cas_requires_the_exact_closed_lease_and_run(
+    tmp_store: RoastStore,
+) -> None:
+    """D216 leaves recovered history and its gate untouched on a stale lease."""
+    run_id = "closure-only-cas"
+    process_id = "closure-only-process"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    await tmp_store.begin_process_restart_clearance(process_id)
+    assert await tmp_store.confirm_process_closure_only_clearance(process_id)
+    lease = await _closed_recovered_lease(tmp_store, run_id=run_id, generation=32)
+
+    assert not await tmp_store.end_closure_only_recovered_run(
+        process_id=process_id,
+        run_id=run_id,
+        expected_lease=FaultControlLease(
+            generation=lease.generation + 1,
+            status=FaultLeaseStatus.CLOSED,
+            run_id=lease.run_id,
+            mcp_session_id=lease.mcp_session_id,
+        ),
+    )
+
+    detail = await tmp_store.read_run(run_id)
+    assert detail is not None
+    assert detail.completed_at_utc is None
+    assert detail.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert (
+        await tmp_store.read_process_restart_clearance(process_id)
+        is RestartClearanceState.CLOSURE_ONLY
+    )
+    assert await fetch_one(
+        tmp_store, "SELECT COUNT(*) FROM operator_actions WHERE run_id = ?", (run_id,)
+    ) == (0,)
+
+    assert await tmp_store.end_closure_only_recovered_run(
+        process_id=process_id, run_id=run_id, expected_lease=lease
+    )
+    assert await tmp_store.closure_only_end_postcondition(
+        process_id=process_id, run_id=run_id, lease_generation=lease.generation
+    )
+    assert await fetch_one(
+        tmp_store,
+        "SELECT action, payload_json, result FROM operator_actions WHERE run_id = ?",
+        (run_id,),
+    ) == (
+        OperatorAction.END_RECOVERED_RUN.value,
+        '{"closure_only": "confirmed", "lease_generation": 32}',
+        "accepted",
+    )
+
+
+@pytest.mark.asyncio
+async def test_closure_only_end_rejects_an_untrusted_absent_lease(tmp_store: RoastStore) -> None:
+    """D216 does not mistake a V20-upgrade-shaped missing lease for CLOSED."""
+    run_id = "untrusted-absence"
+    process_id = "untrusted-process"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    await tmp_store.begin_process_restart_clearance(process_id)
+    assert await tmp_store.confirm_process_closure_only_clearance(process_id)
+
+    tmp_store._fault_lease_absence_trusted = False  # noqa: SLF001 - upgrade-state harness  # pyright: ignore[reportPrivateUsage]
+    assert (await tmp_store.read_fault_control_lease()).status is FaultLeaseStatus.UNKNOWN
+    assert not await tmp_store.end_closure_only_recovered_run(
+        process_id=process_id,
+        run_id=run_id,
+        expected_lease=FaultControlLease(
+            generation=0,
+            status=FaultLeaseStatus.CLOSED,
+            run_id=None,
+            mcp_session_id=None,
+        ),
+    )
+    assert (
+        await tmp_store.read_process_restart_clearance(process_id)
+        is RestartClearanceState.CLOSURE_ONLY
+    )
+
+
+@pytest.mark.asyncio
+async def test_closure_only_end_rolls_back_when_the_audit_insert_errors(
+    tmp_store: RoastStore,
+) -> None:
+    """An audit-write failure cannot finalise recovered history or reopen Start."""
+    run_id = "closure-only-audit-rollback"
+    process_id = "closure-only-audit-process"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    await tmp_store.begin_process_restart_clearance(process_id)
+    assert await tmp_store.confirm_process_closure_only_clearance(process_id)
+    lease = await _closed_recovered_lease(tmp_store, run_id=run_id, generation=33)
+    await tmp_store.connection.execute(
+        "CREATE TRIGGER reject_end_recovered_run_audit BEFORE INSERT ON operator_actions "
+        "WHEN NEW.action = 'end_recovered_run' "
+        "BEGIN SELECT RAISE(ABORT, 'synthetic audit error'); END"
+    )
+    await tmp_store.connection.commit()
+
+    with pytest.raises(aiosqlite_module.IntegrityError, match="synthetic audit error"):
+        await tmp_store.end_closure_only_recovered_run(
+            process_id=process_id, run_id=run_id, expected_lease=lease
+        )
+
+    detail = await tmp_store.read_run(run_id)
+    assert detail is not None
+    assert detail.completed_at_utc is None
+    assert detail.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert (
+        await tmp_store.read_process_restart_clearance(process_id)
+        is RestartClearanceState.CLOSURE_ONLY
+    )
+
+
+@pytest.mark.asyncio
+async def test_closure_only_end_postcondition_fails_closed_when_unreadable(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lost commit response cannot be treated as completion without fresh proof."""
+    await tmp_store.initialize()
+
+    async def unreadable_connection(*_args: Any, **_kwargs: Any) -> NoReturn:
+        raise OSError("synthetic independent verification failure")
+
+    store_aiosqlite = cast("Any", store_module.aiosqlite)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(store_aiosqlite, "connect", unreadable_connection)
+
+    assert not await tmp_store.closure_only_end_postcondition(
+        process_id="unreadable-process", run_id="unreadable-run", lease_generation=44
+    )
 
 
 @pytest.mark.asyncio

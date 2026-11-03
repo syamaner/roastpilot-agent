@@ -199,7 +199,9 @@ export type OperatorAction =
   | "acknowledge_recovery"
   | "acknowledge_fault"
   /** D212: one confirmed, server-verified terminal fault action. */
-  | "stop_cooling_and_acknowledge";
+  | "stop_cooling_and_acknowledge"
+  /** D216: the separately admitted, server-owned recovered-run closure path. */
+  | "end_recovered_run";
 
 export interface OperatorActionRequest {
   action: OperatorAction;
@@ -231,12 +233,16 @@ export interface RestartClearanceResult {
 }
 
 /** Current-process restart-clearance state, rendered directly from `/health`. */
-export type RestartClearanceState = "required" | "cleared" | "unknown";
+export type RestartClearanceState = "required" | "closure_only" | "cleared" | "unknown";
 
 export interface RestartClearance {
   state: RestartClearanceState;
   /** Whether the server permits a new start in this process. */
   eligible: boolean;
+  /** Server-projected closure-only actions; never client-derived. */
+  enabled_actions: OperatorAction[];
+  /** Server-projected availability of the separate closure-only admission. */
+  closure_only_available: boolean;
 }
 
 /** Durable fault-control lease status projected without private identifiers. */
@@ -255,7 +261,7 @@ export interface FaultControls {
 /** Global terminal-fault action request. The server resolves the current lease. */
 export type FaultControlsActionRequest =
   | {
-      action: Exclude<OperatorAction, "stop_cooling_and_acknowledge">;
+      action: Exclude<OperatorAction, "stop_cooling_and_acknowledge" | "end_recovered_run">;
       confirmation?: never;
       expected_generation?: never;
     }

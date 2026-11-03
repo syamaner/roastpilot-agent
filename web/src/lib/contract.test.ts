@@ -52,6 +52,7 @@ import type {
   TelemetryPoint,
   TelemetrySeries,
   TimelineEvent,
+  RestartClearance,
 } from "@/lib/types";
 
 // --- Fixture loading -------------------------------------------------------
@@ -127,6 +128,19 @@ const FC_STATUSES: readonly FcStatus[] = [
   "faulted",
   "unavailable",
 ];
+
+describe("restart-clearance contract", () => {
+  it("accepts the server's typed D216 closure-only projection", () => {
+    const projection = {
+      state: "closure_only",
+      eligible: false,
+      enabled_actions: ["end_recovered_run"],
+      closure_only_available: false,
+    } satisfies RestartClearance;
+
+    expect(projection.enabled_actions).toEqual(["end_recovered_run"]);
+  });
+});
 
 describe("catalogue recommendation REST contract", () => {
   it("accepts the real server-dumped response and pins every reason code", () => {
