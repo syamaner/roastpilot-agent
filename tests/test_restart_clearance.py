@@ -216,6 +216,138 @@ async def test_no_session_clearance_confirms_current_child_none_and_persists(
 
 
 @pytest.mark.asyncio
+async def test_d220_initialises_only_an_unclean_absent_safety_record(tmp_path: Path) -> None:
+    """D220 records one baseline but leaves this process's Start gate REQUIRED."""
+    path = tmp_path / "d220-unclean-absence.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        result = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+
+        assert result.outcome == "confirmed"
+        assert result.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert not result.restart_clearance.eligible
+        assert roaster.presence_reads == 1
+        assert roaster.commands() == []
+        lease = await store.read_fault_control_lease()
+        assert lease.generation == 1
+        assert lease.status is FaultLeaseStatus.CLOSED
+        assert lease.run_id is None
+        assert (
+            await store.read_process_restart_clearance(service.instance_id)
+            is RestartClearanceState.REQUIRED
+        )
+        with pytest.raises(RoastRunConflictError, match="restart clearance"):
+            await service.start_roast(_profile())
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_estop_admission_invalidates_a_parked_presence_proof(tmp_path: Path) -> None:
+    """A synchronous global e-stop wins before D220 can write its baseline."""
+    path = tmp_path / "d220-estop-race.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def parked_presence() -> SessionPresence:
+            entered.set()
+            await release.wait()
+            return "none"
+
+        roaster.on_read = parked_presence
+        initialization = asyncio.create_task(
+            service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        emergency = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert emergency.result == "failed"
+        release.set()
+        result = await asyncio.wait_for(initialization, timeout=1.0)
+
+        assert result.outcome == "rejected"
+        assert (await store.read_fault_control_lease()).generation == 0
+        assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_reconciles_only_its_exact_operation_after_ambiguous_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ambiguous store return is confirmed only by the server-minted audit id."""
+    path = tmp_path / "d220-reconcile.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        original = store.initialize_missing_fault_control_safety_record
+
+        async def commit_then_raise(*, process_id: str, generation: int, operation_id: str) -> bool:
+            assert await original(
+                process_id=process_id, generation=generation, operation_id=operation_id
+            )
+            raise OSError("commit acknowledgement was lost")
+
+        monkeypatch.setattr(
+            store, "initialize_missing_fault_control_safety_record", commit_then_raise
+        )
+        result = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+
+        assert result.outcome == "confirmed"
+        assert service._fault_lease_cache.status is FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_fresh_no_session_clearance_allows_a_live_start_after_confirmation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

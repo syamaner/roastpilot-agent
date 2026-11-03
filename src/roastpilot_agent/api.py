@@ -122,6 +122,7 @@ from roastpilot_agent.models import (
     HardwareClearAcknowledgementRequest,
     HardwareClearAcknowledgementResult,
     HealthResponse,
+    InitializeSafetyRecordResult,
     LogManifest,
     MCPChildStatus,
     MicStatus,
@@ -167,6 +168,7 @@ from roastpilot_agent.store import (
     BeanProfileNotFoundError,
     FaultControlCloseResult,
     FaultControlLease,
+    FaultControlLeaseAbsence,
     FrozenRunConfig,
     PersistedRun,
     PhysicallyImpossibleWeightError,
@@ -543,6 +545,7 @@ _HARDWARE_CLEAR_MAX_BODY_BYTES = 2048
 _HARDWARE_CLEAR_MIN_INTERVAL_SECONDS = 1.0
 _RESTART_CLEARANCE_PATH = "/api/restart-clearance"
 _CLOSURE_ONLY_CLEARANCE_PATH = "/api/restart-clearance/closure-only"
+_INITIALIZE_SAFETY_RECORD_PATH = "/api/restart-clearance/initialize-safety-record"
 _FAULT_CONTROLS_ACTIONS_PATH = "/api/fault-controls/actions"
 _FAULT_CONTROLS_MAX_BODY_BYTES = 1024
 
@@ -624,6 +627,18 @@ class _ClosureOnlyContext:
     child_epoch: int
     lease: FaultControlLease
     emergency_stop_admission_epoch: int
+
+
+@dataclass(frozen=True)
+class _SafetyRecordInitializationContext:
+    """One D220 proof bound to the current process, child, and absence fence."""
+
+    child: MCPServerProcess
+    child_epoch: int
+    expected_lease: FaultControlLease
+    emergency_stop_admission_epoch: int
+    generation: int
+    operation_id: str
 
 
 @dataclass(frozen=True)
@@ -2382,7 +2397,18 @@ class RoastService:
         self._restart_epoch_lock = asyncio.Lock()
         self._restart_clearance_lock = asyncio.Lock()
         self._closure_only_context: _ClosureOnlyContext | None = None
-        self._closure_only_emergency_stop_admission_epoch = 0
+        # Every synchronous emergency admission increments this epoch before
+        # it schedules persistence or dispatch. Both D216 and D220 bind their
+        # durable proof to it, so an e-stop never waits for their reservations.
+        self._emergency_stop_admission_epoch = 0
+        # A D220 baseline reserves its generation before any awaited presence
+        # read. A later e-stop must allocate strictly above that floor even if
+        # the baseline transaction has not committed yet.
+        self._fault_control_generation_floor = 0
+        self._safety_record_initialization: (
+            tuple[_SafetyRecordInitializationContext, asyncio.Task[InitializeSafetyRecordResult]]
+            | None
+        ) = None
         self._closure_end_task: tuple[str, asyncio.Task[EndRecoveredRunResult]] | None = None
         self._closure_end_lock = asyncio.Lock()
         # Serializes only recovered-run history mutations with D216's durable
@@ -2787,13 +2813,12 @@ class RoastService:
             and child.running
             and child.child_epoch == context.child_epoch
             and self._fault_lease_cache == context.lease
-            and self._closure_only_emergency_stop_admission_epoch
-            == context.emergency_stop_admission_epoch
+            and self._emergency_stop_admission_epoch == context.emergency_stop_admission_epoch
         )
 
-    def _note_emergency_stop_for_closure_only(self) -> None:
-        """Synchronously revoke closure-only evidence before e-stop admission."""
-        self._closure_only_emergency_stop_admission_epoch += 1
+    def _note_emergency_stop_admission(self) -> None:
+        """Synchronously invalidate recovery proofs before e-stop admission."""
+        self._emergency_stop_admission_epoch += 1
         if self._restart_clearance_state is RestartClearanceState.CLOSURE_ONLY:
             self._closure_only_context = None
             self._restart_clearance_state = RestartClearanceState.UNKNOWN
@@ -2813,7 +2838,7 @@ class RoastService:
             and child.running
             and child.child_epoch == child_epoch
             and self._fault_lease_cache == lease
-            and self._closure_only_emergency_stop_admission_epoch == emergency_stop_admission_epoch
+            and self._emergency_stop_admission_epoch == emergency_stop_admission_epoch
         )
 
     def _invalidate_closure_only_clearance(self) -> None:
@@ -3031,7 +3056,7 @@ class RoastService:
             ):
                 raise RoastRunConflictError("closure-only clearance is not currently eligible")
             expected_epoch = child.child_epoch
-            expected_estop_epoch = self._closure_only_emergency_stop_admission_epoch
+            expected_estop_epoch = self._emergency_stop_admission_epoch
             try:
                 presence = await self._roaster.read_session_presence()
             except Exception as exc:  # noqa: BLE001 - a current proof is mandatory
@@ -3302,6 +3327,179 @@ class RoastService:
                 restart_clearance_required=not self._restart_clearance_projection(lease).eligible,
                 restart_clearance=self._restart_clearance_projection(lease),
                 fault_controls=await self._fault_controls_projection(lease),
+            )
+
+    async def initialize_missing_fault_control_safety_record(
+        self, request: RestartClearanceRequest
+    ) -> InitializeSafetyRecordResult:
+        """Create one D220 baseline only from a current stopped-roaster proof.
+
+        This deliberately does not clear restart clearance or grant Start. The
+        task is retained after HTTP cancellation so its exact operation-id can
+        reconcile only its own ambiguous durable commit.
+        """
+        del request  # strict literal validation is the operator confirmation
+        async with self._restart_clearance_lock:
+            existing = self._safety_record_initialization
+            if existing is not None:
+                if existing[1].done():
+                    self._finish_safety_record_initialization(existing[0], existing[1])
+                else:
+                    return await self._safety_record_initialization_result("rejected")
+            await self._ensure_restart_epoch()
+            lease = await self._read_fault_lease_fail_closed()
+            active = await self._store.active_run()
+            child = self._mcp
+            if (
+                self._shutdown_started
+                or not self._restart_epoch_initialized
+                or self._restart_clearance_state is not RestartClearanceState.REQUIRED
+                or lease.generation != 0
+                or lease.status is not FaultLeaseStatus.UNKNOWN
+                or self._fault_lease_cache != lease
+                or active is not None
+                or self.active_run_id is not None
+                or self.runner is not None
+                or self._starting_run_id is not None
+                or self._unpublished_start_run_id is not None
+                or self._loop_task is not None
+                or self._detached_recovery_loop is not None
+                or child is None
+                or not child.running
+                or self._roaster is None
+            ):
+                return await self._safety_record_initialization_result("rejected")
+            try:
+                absence = await self._store.probe_fault_control_lease_absence()
+            except Exception:  # noqa: BLE001 - durable absence is mandatory
+                return await self._safety_record_initialization_result("rejected")
+            if absence is not FaultControlLeaseAbsence.ABSENT_UNTRUSTED:
+                return await self._safety_record_initialization_result("rejected")
+            generation = max(
+                1,
+                lease.generation + 1,
+                self._fault_control_generation_floor + 1,
+            )
+            self._fault_control_generation_floor = generation
+            context = _SafetyRecordInitializationContext(
+                child=child,
+                child_epoch=child.child_epoch,
+                expected_lease=lease,
+                emergency_stop_admission_epoch=self._emergency_stop_admission_epoch,
+                generation=generation,
+                operation_id=uuid.uuid4().hex,
+            )
+            task = asyncio.create_task(
+                self._initialize_missing_fault_control_safety_record_task(context)
+            )
+            self._safety_record_initialization = (context, task)
+            task.add_done_callback(
+                lambda completed: self._finish_safety_record_initialization(context, completed)
+            )
+        return await asyncio.shield(task)
+
+    def _safety_record_initialization_is_current(
+        self, context: _SafetyRecordInitializationContext
+    ) -> bool:
+        """Return whether a D220 proof still has its no-await local fences."""
+        return (
+            not self._shutdown_started
+            and self._restart_epoch_initialized
+            and self._restart_clearance_state is RestartClearanceState.REQUIRED
+            and self._safety_record_initialization is not None
+            and self._safety_record_initialization[0] == context
+            and self._mcp is context.child
+            and context.child.running
+            and context.child.child_epoch == context.child_epoch
+            and self._fault_lease_cache == context.expected_lease
+            and self._emergency_stop_admission_epoch == context.emergency_stop_admission_epoch
+            and self.active_run_id is None
+            and self.runner is None
+            and self._starting_run_id is None
+            and self._unpublished_start_run_id is None
+            and self._loop_task is None
+            and self._detached_recovery_loop is None
+        )
+
+    async def _initialize_missing_fault_control_safety_record_task(
+        self, context: _SafetyRecordInitializationContext
+    ) -> InitializeSafetyRecordResult:
+        """Own one current-presence proof, baseline transaction, and reconciliation."""
+        if not self._safety_record_initialization_is_current(context):
+            return await self._safety_record_initialization_result("rejected")
+        roaster = self._roaster
+        if roaster is None:
+            return await self._safety_record_initialization_result("rejected")
+        try:
+            presence = await roaster.read_session_presence()
+        except Exception:  # noqa: BLE001 - uncertain presence must reject
+            return await self._safety_record_initialization_result("rejected")
+        if presence != "none" or not self._safety_record_initialization_is_current(context):
+            return await self._safety_record_initialization_result("rejected")
+        committed = False
+        try:
+            committed = await self._store.initialize_missing_fault_control_safety_record(
+                process_id=self.instance_id,
+                generation=context.generation,
+                operation_id=context.operation_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - only exact reconciliation can prove a commit
+            _log.exception("D220 safety-record baseline transaction failed")
+        if not committed and self._safety_record_initialization_is_current(context):
+            try:
+                committed = await self._store.verify_missing_fault_control_safety_record(
+                    process_id=self.instance_id,
+                    generation=context.generation,
+                    operation_id=context.operation_id,
+                )
+            except Exception:  # noqa: BLE001 - no exact proof means unconfirmed
+                committed = False
+        if not committed:
+            return await self._safety_record_initialization_result("unconfirmed")
+        # No await may occur between this exact local fence and hydration.
+        if not self._safety_record_initialization_is_current(context):
+            return await self._safety_record_initialization_result("unconfirmed")
+        self._fault_lease_cache = FaultControlLease(
+            generation=context.generation,
+            status=FaultLeaseStatus.CLOSED,
+            run_id=None,
+            mcp_session_id=None,
+        )
+        return await self._safety_record_initialization_result("confirmed")
+
+    async def _safety_record_initialization_result(
+        self, outcome: Literal["confirmed", "rejected", "unconfirmed"]
+    ) -> InitializeSafetyRecordResult:
+        """Project a D220 outcome without exposing its process-local identity."""
+        # Do not rehydrate from SQLite here. A stale context may have committed
+        # the baseline but lost its child/e-stop binding; publication must keep
+        # the in-memory UNKNOWN fence until an exact in-process reconciliation.
+        lease = self._fault_lease_cache
+        return InitializeSafetyRecordResult(
+            outcome=outcome,
+            restart_clearance=self._restart_clearance_projection(lease),
+            fault_controls=await self._fault_controls_projection(lease),
+        )
+
+    def _finish_safety_record_initialization(
+        self,
+        context: _SafetyRecordInitializationContext,
+        task: asyncio.Task[InitializeSafetyRecordResult],
+    ) -> None:
+        """Release exactly one owned D220 reservation and consume detached errors."""
+        if self._safety_record_initialization == (context, task):
+            self._safety_record_initialization = None
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            _log.warning("D220 safety-record initialization task was cancelled")
+            return
+        if error is not None:
+            _log.error(
+                "D220 safety-record initialization task failed",
+                exc_info=(type(error), error, error.__traceback__),
             )
 
     def _restart_clearance_admission_is_current(
@@ -3926,9 +4124,9 @@ class RoastService:
         admission.  Until persistence succeeds, Start remains blocked by this
         UNKNOWN lease.
         """
-        self._note_emergency_stop_for_closure_only()
+        self._note_emergency_stop_admission()
         cached = self._fault_lease_cache
-        generation = max(1, cached.generation + 1)
+        generation = max(1, cached.generation + 1, self._fault_control_generation_floor + 1)
         if session_id is None and use_latest_session:
             session_id = None if self._roaster is None else self._roaster.latest_fault_session_id
         self._fault_lease_cache = FaultControlLease(
@@ -4322,7 +4520,7 @@ class RoastService:
 
     def _invalidate_pending_start_admissions_for_emergency_stop(self) -> None:
         """Synchronously invalidate every Start admitted before an e-stop attempt."""
-        self._note_emergency_stop_for_closure_only()
+        self._note_emergency_stop_admission()
         self._start_admission_generation += 1
 
     def _require_current_start_admission(self, admission_generation: int) -> None:
@@ -5242,6 +5440,11 @@ class RoastService:
         """Stop the live loop and release the background task (clean teardown /
         agent restart). Idempotent; safe in API-only mode."""
         self._shutdown_started = True
+        initialization = self._safety_record_initialization
+        if initialization is not None and not initialization[1].done():
+            initialization[1].cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await initialization[1]
         closure_end = self._closure_end_task
         if closure_end is not None and not closure_end[1].done():
             try:
@@ -7221,6 +7424,13 @@ async def acknowledge_closure_only_clearance(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+async def initialize_safety_record(
+    request: RestartClearanceRequest, service: ServiceDep
+) -> InitializeSafetyRecordResult:
+    """``POST /api/restart-clearance/initialize-safety-record`` — D220 only."""
+    return await service.initialize_missing_fault_control_safety_record(request)
+
+
 async def end_recovered_run(run_id: str, service: ServiceDep) -> EndRecoveredRunResult:
     """``POST /api/roasts/{run_id}/end-recovered-run`` — close one recovered run."""
     try:
@@ -8087,6 +8297,11 @@ def create_app(
     )
     app.add_middleware(
         _RouteBodyLimitMiddleware,
+        path=_INITIALIZE_SAFETY_RECORD_PATH,
+        max_body_bytes=_FAULT_CONTROLS_MAX_BODY_BYTES,
+    )
+    app.add_middleware(
+        _RouteBodyLimitMiddleware,
         path=_FAULT_CONTROLS_ACTIONS_PATH,
         max_body_bytes=_FAULT_CONTROLS_MAX_BODY_BYTES,
     )
@@ -8098,6 +8313,7 @@ def create_app(
     app.get(DEVICES_PATH)(get_devices)
     app.post(_RESTART_CLEARANCE_PATH)(acknowledge_restart_clearance)
     app.post(_CLOSURE_ONLY_CLEARANCE_PATH)(acknowledge_closure_only_clearance)
+    app.post(_INITIALIZE_SAFETY_RECORD_PATH)(initialize_safety_record)
     app.post(_FAULT_CONTROLS_ACTIONS_PATH)(submit_fault_controls_action)
     app.post("/api/roasts", status_code=201)(start_roast)
     app.get("/api/roasts")(list_roasts)

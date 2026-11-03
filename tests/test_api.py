@@ -172,6 +172,7 @@ async def test_health_reports_version_and_no_active_run(client: AsyncClient) -> 
     [
         "/api/restart-clearance",
         "/api/restart-clearance/closure-only",
+        "/api/restart-clearance/initialize-safety-record",
         "/api/fault-controls/actions",
     ],
 )
@@ -215,6 +216,13 @@ async def test_fault_control_routes_bound_declared_and_chunked_bodies(
             None,
         ),
         (
+            "/api/restart-clearance/initialize-safety-record",
+            {"physical_confirmation": True},
+            "physical_confirmation",
+            200,
+            None,
+        ),
+        (
             "/api/fault-controls/actions",
             {
                 "action": "stop_cooling_and_acknowledge",
@@ -249,6 +257,28 @@ async def test_fault_control_routes_require_strict_true_confirmation(
     assert accepted_shape.status_code == expected_status
     if expected_result is not None:
         assert accepted_shape.json()["result"] == expected_result
+
+
+@pytest.mark.asyncio
+async def test_safety_record_initialization_body_forbids_unrecognised_fields(
+    store: RoastStore,
+) -> None:
+    """D220's literal physical confirmation does not silently accept extras."""
+    app = create_app(RoastService(store))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        valid = await instance.post(
+            "/api/restart-clearance/initialize-safety-record",
+            json={"physical_confirmation": True},
+        )
+        response = await instance.post(
+            "/api/restart-clearance/initialize-safety-record",
+            json={"physical_confirmation": True, "operation_id": "client-supplied"},
+        )
+
+    assert valid.status_code == 200
+    assert valid.json()["outcome"] == "rejected"
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio

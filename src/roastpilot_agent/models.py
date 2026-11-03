@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     PrivateAttr,
     StrictBool,
@@ -1368,6 +1369,8 @@ class FaultControlsProjection(BaseModel):
 class RestartClearanceRequest(BaseModel):
     """Explicit physical confirmation needed to clear a fresh process gate."""
 
+    model_config = ConfigDict(extra="forbid")
+
     physical_confirmation: StrictBool
 
     @field_validator("physical_confirmation")
@@ -1377,6 +1380,14 @@ class RestartClearanceRequest(BaseModel):
         if value is not True:
             raise ValueError("must be true")
         return value
+
+
+class InitializeSafetyRecordResult(BaseModel):
+    """Closed outcome of the D220 missing-safety-record admission."""
+
+    outcome: Literal["confirmed", "rejected", "unconfirmed"]
+    restart_clearance: RestartClearanceProjection
+    fault_controls: FaultControlsProjection
 
 
 class RestartClearanceResult(BaseModel):
