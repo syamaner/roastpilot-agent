@@ -776,6 +776,64 @@ async def test_shutdown_cancellation_propagates_while_detached_recovery_loop_set
 
 
 @pytest.mark.asyncio
+async def test_stale_child_after_durable_end_fences_inflight_recovered_tick_history(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale child cannot let an in-flight recovered tick rewrite D216 history."""
+    run_id = "closure-only-stale-child-history-fence"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    roaster = FakeMCPClient([_reading(178.0, 185.0)])
+    monkeypatch.setattr(roaster, "read_session_presence", mock.AsyncMock(return_value="none"))
+    mcp = MCPServerProcess(session=_FakeSession())
+    service = RoastService(store, mcp=mcp, roaster=roaster, run_loop=False)
+    await service.recover_on_start()
+    assert service.runner is not None
+    await service.acknowledge_closure_only_clearance(
+        RestartClearanceRequest(physical_confirmation=True)
+    )
+    original_end = store.end_closure_only_recovered_run
+    committed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_after_durable_end(
+        *, process_id: str, run_id: str, expected_lease: FaultControlLease
+    ) -> bool:
+        result = await original_end(
+            process_id=process_id, run_id=run_id, expected_lease=expected_lease
+        )
+        assert result
+        committed.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(store, "end_closure_only_recovered_run", hold_after_durable_end)
+    ending = asyncio.create_task(service.end_recovered_run(run_id))
+    await committed.wait()
+    mcp._replace_session(_FakeSession())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    ticking = asyncio.create_task(service.runner.tick_once())
+    await asyncio.sleep(0)
+    assert not ticking.done()
+
+    release.set()
+    await ending
+    assert await ticking is False
+
+    persisted = await store.read_run(run_id)
+    assert persisted is not None
+    assert persisted.outcome == "aborted"
+    assert persisted.agent_phase is RoastPhase.COMPLETE
+    assert await store.read_telemetry_points(run_id) == []
+    assert service.runner is not None
+    assert service.active_run_id == run_id
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_pre_retirement_estop_keeps_real_runner_for_two_post_end_heat_off_retries(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -818,10 +876,11 @@ async def test_pre_retirement_estop_keeps_real_runner_for_two_post_end_heat_off_
 
     roaster = FailEmergencyStopAndFirstHeatOffMCP()
     monkeypatch.setattr(roaster, "read_session_presence", mock.AsyncMock(return_value="none"))
+    mcp = MCPServerProcess(session=_FakeSession())
     service = RoastService(
         store,
         config=recovery_config,
-        mcp=MCPServerProcess(session=_FakeSession()),
+        mcp=mcp,
         roaster=roaster,
         advisor=FakeAdvisor([], default_decision=_live_decision()),
         live_serve_mode=True,
@@ -857,6 +916,7 @@ async def test_pre_retirement_estop_keeps_real_runner_for_two_post_end_heat_off_
     )
     ending = asyncio.create_task(service.end_recovered_run(run_id))
     await entered.wait()
+    mcp._replace_session(_FakeSession())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     stopped = await service.submit_fault_controls_action(
         FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
     )

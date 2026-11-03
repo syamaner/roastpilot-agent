@@ -892,6 +892,7 @@ class RoastRunner:
         routine_fault_lease_is_closed: Callable[[], bool] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         configured_doctrine_enabled: bool | None = None,
+        recovered_history_mutation_lock: asyncio.Lock | None = None,
     ) -> None:
         self._controller = controller
         self._store = store
@@ -968,6 +969,7 @@ class RoastRunner:
             if configured_doctrine_enabled is None
             else configured_doctrine_enabled
         )
+        self._recovered_history_mutation_lock = recovered_history_mutation_lock
 
     async def start(self, profile: RoastProfile, *, recording_roast_num: int | None = None) -> None:
         """Begin the run: drive the controller's idle→preheating start, then
@@ -1258,6 +1260,19 @@ class RoastRunner:
         await self._drain_queue()
         events_before_controller_tick = len(self._emitter.peek())
         await self._controller.tick()
+        lock = self._recovered_history_mutation_lock
+        if lock is not None:
+            async with lock:
+                return await self._persist_tick_history(events_before_controller_tick)
+        return await self._persist_tick_history(events_before_controller_tick)
+
+    async def _persist_tick_history(self, events_before_controller_tick: int) -> bool:
+        """Persist one completed controller tick unless durable D216 End won.
+
+        The optional lock is owned by the service's recovered-run closure
+        transaction and is deliberately acquired only after controller/MCP
+        work has finished. It serializes history writes, not roaster control.
+        """
         if self._post_durable_end_emergency_retry_only:
             # The mode can be entered while this ordinary tick is awaiting a
             # failed heat-off write. Recheck before any completion, event, or
@@ -2370,6 +2385,10 @@ class RoastService:
         self._closure_only_emergency_stop_admission_epoch = 0
         self._closure_end_task: tuple[str, asyncio.Task[EndRecoveredRunResult]] | None = None
         self._closure_end_lock = asyncio.Lock()
+        # Serializes only recovered-run history mutations with D216's durable
+        # End CAS. Controller/MCP work stays outside this lock so a slow write
+        # can never delay a synchronous e-stop admission.
+        self._recovered_history_mutation_lock = asyncio.Lock()
         self._closure_invalidation_tasks: set[asyncio.Task[None]] = set()
         self._shutdown_started = False
         self._fault_lease_cache = FaultControlLease(
@@ -3130,52 +3149,53 @@ class RoastService:
         if self._shutdown_started or not self._closure_only_binding_is_current(context):
             self._invalidate_closure_only_clearance()
             raise RoastRunConflictError("closure-only evidence became stale")
-        try:
-            committed = await self._store.end_closure_only_recovered_run(
-                process_id=context.process_id, run_id=context.run_id, expected_lease=context.lease
-            )
-        except Exception as exc:  # noqa: BLE001 - only the exact postcondition can recover ambiguity
-            committed = await self._store.closure_only_end_postcondition(
-                process_id=context.process_id,
-                run_id=context.run_id,
-                lease_generation=context.lease.generation,
-            )
-            if not committed:
+        async with self._recovered_history_mutation_lock:
+            # A normal recovered tick may have been completing its store-only
+            # history tail while End waited for this lock. Revalidate before
+            # the CAS; the lock never covers controller or MCP work.
+            if self._shutdown_started or not self._closure_only_binding_is_current(context):
                 self._invalidate_closure_only_clearance()
-                raise RoastRunConflictError("recovered-run end is unconfirmed") from exc
-        if not committed:
-            # A false CAS result is not proof that no concurrent owner reached
-            # the exact terminal postcondition.  Accept only that durable
-            # postcondition; every other result remains an admission fence.
-            committed = await self._store.closure_only_end_postcondition(
-                process_id=context.process_id,
-                run_id=context.run_id,
-                lease_generation=context.lease.generation,
-            )
+                raise RoastRunConflictError("closure-only evidence became stale")
+            try:
+                committed = await self._store.end_closure_only_recovered_run(
+                    process_id=context.process_id,
+                    run_id=context.run_id,
+                    expected_lease=context.lease,
+                )
+            except Exception as exc:  # noqa: BLE001 - only the exact postcondition can recover ambiguity
+                committed = await self._store.closure_only_end_postcondition(
+                    process_id=context.process_id,
+                    run_id=context.run_id,
+                    lease_generation=context.lease.generation,
+                )
+                if not committed:
+                    self._invalidate_closure_only_clearance()
+                    raise RoastRunConflictError("recovered-run end is unconfirmed") from exc
             if not committed:
-                self._invalidate_closure_only_clearance()
-                raise RoastRunConflictError("recovered-run end was not durably recorded")
-        if (
-            not self._retire_current_recovered_runner(context)
-            and self._restart_clearance_state is RestartClearanceState.CLOSURE_ONLY
-        ):
-            # The durable terminal state is independently proven above, but a
-            # child/epoch/cache change (including a synchronously admitted
-            # e-stop) means it cannot retire a live runner or overwrite that
-            # runner's priority retry path.
-            self._invalidate_closure_only_clearance()
-        elif (
-            self._closure_only_emergency_stop_admission_epoch
-            != context.emergency_stop_admission_epoch
-            and self.runner is not None
-            and self.active_run_id == context.run_id
-            and self.runner.run_id == context.run_id
-        ):
-            # The End transaction is already durably proven above, but an
-            # admitted e-stop won before the no-await retirement handoff.
-            # Retain that exact live runner for heat-off retries only; it must
-            # not mutate or normally complete the now-immutable aborted row.
-            self.runner.retain_emergency_stop_retry_after_durable_end()
+                # A false CAS result is not proof that no concurrent owner
+                # reached the exact terminal postcondition. Accept only that
+                # durable postcondition; every other result remains fenced.
+                committed = await self._store.closure_only_end_postcondition(
+                    process_id=context.process_id,
+                    run_id=context.run_id,
+                    lease_generation=context.lease.generation,
+                )
+                if not committed:
+                    self._invalidate_closure_only_clearance()
+                    raise RoastRunConflictError("recovered-run end was not durably recorded")
+            if not self._retire_current_recovered_runner(context):
+                # The End transaction is already proven, but *any* stale
+                # binding can retain this exact runner. It may continue only
+                # its existing fail-safe retry, never ordinary history writes.
+                runner = self.runner
+                if (
+                    runner is not None
+                    and self.active_run_id == context.run_id
+                    and runner.run_id == context.run_id
+                ):
+                    runner.retain_emergency_stop_retry_after_durable_end()
+                if self._restart_clearance_state is RestartClearanceState.CLOSURE_ONLY:
+                    self._invalidate_closure_only_clearance()
         lease = await self._read_fault_lease_fail_closed()
         return EndRecoveredRunResult(
             run_id=context.run_id,
@@ -4771,6 +4791,7 @@ class RoastService:
         safety: SafetyPolicy | None = None,
         configured_doctrine_enabled: bool | None = None,
         start_write_permitted: Callable[[], bool] | None = None,
+        recovered_history_mutation_lock: asyncio.Lock | None = None,
     ) -> "RoastRunner | None":
         """Construct a controller + runner bound to ``run_id`` (shared by the
         fresh-start and restart-recovery paths). ``None`` in API-only mode.
@@ -4842,6 +4863,7 @@ class RoastService:
                 self._fault_lease_cache.status is FaultLeaseStatus.CLOSED
             ),
             configured_doctrine_enabled=configured_doctrine_enabled,
+            recovered_history_mutation_lock=recovered_history_mutation_lock,
         )
         self.runner = runner
         return runner
@@ -5068,6 +5090,7 @@ class RoastService:
             configured_doctrine_enabled=(
                 persisted.frozen_config.controller.ambient_fan_doctrine.enabled
             ),
+            recovered_history_mutation_lock=self._recovered_history_mutation_lock,
         )
         if runner is None:  # pragma: no cover — guarded above
             return
