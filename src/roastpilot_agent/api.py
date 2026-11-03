@@ -2701,6 +2701,14 @@ class RoastService:
             await self._ensure_restart_epoch()
         active = await self._store.active_run()
         lease = await self._read_fault_lease_fail_closed()
+        safety_record_initialization_available = (
+            await self._safety_record_initialization_may_be_admitted(lease, active)
+        )
+        restart_clearance = self._restart_clearance_projection(
+            lease,
+            active=active,
+            safety_record_initialization_available=safety_record_initialization_available,
+        )
         return HealthResponse(
             version=__version__,
             instance_id=self.instance_id,
@@ -2711,10 +2719,8 @@ class RoastService:
             ),
             active_run_id=None if active is None else active.run_id,
             advisor=self._advisor_health,
-            restart_clearance=self._restart_clearance_projection(lease, active=active),
-            restart_clearance_required=not self._restart_clearance_projection(
-                lease, active=active
-            ).eligible,
+            restart_clearance=restart_clearance,
+            restart_clearance_required=not restart_clearance.eligible,
             fault_controls=await self._fault_controls_projection(lease),
         )
 
@@ -2768,8 +2774,45 @@ class RoastService:
         self._fault_lease_cache = lease
         return lease
 
+    async def _safety_record_initialization_may_be_admitted(
+        self, lease: FaultControlLease, active: PersistedRun | None
+    ) -> bool:
+        """Return the fail-closed D220 snapshot eligibility projection."""
+        child = self._mcp
+        if (
+            self._shutdown_started
+            or not self._restart_epoch_initialized
+            or self._restart_clearance_state is not RestartClearanceState.REQUIRED
+            or lease.generation != 0
+            or lease.status is not FaultLeaseStatus.UNKNOWN
+            or self._fault_lease_cache != lease
+            or active is not None
+            or self.active_run_id is not None
+            or self.runner is not None
+            or self._starting_run_id is not None
+            or self._unpublished_start_run_id is not None
+            or self._loop_task is not None
+            or self._detached_recovery_loop is not None
+            or self._safety_record_initialization is not None
+            or child is None
+            or not child.running
+            or self._roaster is None
+        ):
+            return False
+        try:
+            return (
+                await self._store.probe_fault_control_lease_absence()
+                is FaultControlLeaseAbsence.ABSENT_UNTRUSTED
+            )
+        except Exception:  # noqa: BLE001 - an unreadable absence is never advertised
+            return False
+
     def _restart_clearance_projection(
-        self, lease: FaultControlLease, *, active: PersistedRun | None = None
+        self,
+        lease: FaultControlLease,
+        *,
+        active: PersistedRun | None = None,
+        safety_record_initialization_available: bool = False,
     ) -> RestartClearanceProjection:
         """Project the process gate; OPEN/UNKNOWN leases keep Start ineligible."""
         context = self._closure_only_context
@@ -2797,7 +2840,13 @@ class RoastService:
                 self._restart_clearance_state is RestartClearanceState.CLEARED
                 and lease.status is FaultLeaseStatus.CLOSED
             ),
-            enabled_actions=([OperatorAction.END_RECOVERED_RUN] if closure_binding_current else []),
+            enabled_actions=(
+                [OperatorAction.END_RECOVERED_RUN]
+                if closure_binding_current
+                else [OperatorAction.INITIALIZE_SAFETY_RECORD]
+                if safety_record_initialization_available
+                else []
+            ),
             closure_only_available=closure_available,
         )
 

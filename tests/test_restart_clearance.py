@@ -231,6 +231,8 @@ async def test_d220_initialises_only_an_unclean_absent_safety_record(tmp_path: P
     service: RoastService | None = None
     try:
         service, roaster, _child = await _presence_service(store, "none")
+        before = await service.health()
+        assert before.restart_clearance.enabled_actions == [OperatorAction.INITIALIZE_SAFETY_RECORD]
         result = await service.initialize_missing_fault_control_safety_record(
             RestartClearanceRequest(physical_confirmation=True)
         )
@@ -238,6 +240,7 @@ async def test_d220_initialises_only_an_unclean_absent_safety_record(tmp_path: P
         assert result.outcome == "confirmed"
         assert result.restart_clearance.state is RestartClearanceState.REQUIRED
         assert not result.restart_clearance.eligible
+        assert (await service.health()).restart_clearance.enabled_actions == []
         assert roaster.presence_reads == 1
         assert roaster.commands() == []
         lease = await store.read_fault_control_lease()
