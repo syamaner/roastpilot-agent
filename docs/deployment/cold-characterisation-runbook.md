@@ -141,6 +141,20 @@ engaged or immediately ready. Clearance also requires a fresh current-child MCP
 This is not a hardware safe-zero or readiness proof. An OPEN fault lease remains
 separate and requires its exact-session Stop cooling and acknowledge procedure.
 
+For a persisted non-faulted recovered run, a fresh Agent child cannot supply
+matching-session evidence for that old run. Under D216, an explicit physical
+confirmation and typed current-child `session_presence: none` proof can admit
+only the separate closure-only **End recovered run** action. End makes no MCP
+write. Resume, drop, cooling, marking, Start and every other routine control
+remain blocked. An emergency-stop admission invalidates this closure-only path
+and returns control to the separately governed D213 fault or hardware-clear
+procedure; the independent physical stop remains available throughout. After
+End, the earlier confirmation and proof cannot be reused: a new ordinary D213
+confirmation and current-child no-session proof are required before Start.
+This closure path is separate from the faulted exact-session Stop cooling and
+acknowledge path above, and neither path authorises Pi access, a live roast or
+a hardware-readiness claim.
+
 ### 2.1 Select artifacts before installation
 
 Preparation starts by selecting two exact artifacts and recording their identities

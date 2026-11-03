@@ -86,6 +86,28 @@ def test_runbook_states_the_safety_boundaries() -> None:
         assert phrase.replace("**", "") in text.replace("**", ""), phrase
 
 
+@pytest.mark.docs
+def test_runbook_states_the_d216_recovered_run_boundary() -> None:
+    """D216 closure-only recovery is distinct from cold or fault authority."""
+    raw = RUNBOOK.read_text(encoding="utf-8")
+    section = _flat(raw[raw.index("### 2.0") : raw.index("### 2.1")])
+    for phrase in (
+        "persisted non-faulted recovered run",
+        "fresh Agent child cannot supply matching-session evidence",
+        "explicit physical confirmation",
+        "current-child `session_presence: none` proof",
+        "closure-only End recovered run action",
+        "End makes no MCP write.",
+        "Resume, drop, cooling, marking, Start and every other routine control remain blocked.",
+        "emergency-stop admission invalidates this closure-only path",
+        "new ordinary D213 confirmation and current-child no-session proof are required "
+        "before Start.",
+        "separate from the faulted exact-session Stop cooling and acknowledge path",
+        "neither path authorises Pi access, a live roast or a hardware-readiness claim.",
+    ):
+        assert phrase.replace("**", "") in section.replace("**", ""), phrase
+
+
 def _marked_fence(marker: str, language: str) -> str:
     """Extract the one fenced block immediately following a story marker."""
     raw = RUNBOOK.read_text(encoding="utf-8")
