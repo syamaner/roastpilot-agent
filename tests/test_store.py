@@ -7718,6 +7718,17 @@ async def test_d220_missing_safety_record_transaction_commits_one_audited_baseli
             '{"baseline": "initialised", "generation": 1, "operation_id": "d220-operation"}',
             "accepted",
         )
+        await store.record_operator_action(
+            action=OperatorAction.INITIALIZE_SAFETY_RECORD.value,
+            result="accepted",
+            payload={"baseline": "initialised", "generation": 1, "operation_id": "foreign"},
+        )
+        # Exact reconciliation must inherit the read guard's one-audit rule:
+        # a different server operation at the same generation is not proof.
+        assert not await store.verify_missing_fault_control_safety_record(
+            process_id="d220-process", generation=1, operation_id="d220-operation"
+        )
+        assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.UNKNOWN
     finally:
         await store.close()
 
@@ -7758,6 +7769,83 @@ async def test_d220_baseline_refuses_trusted_absence_or_an_active_run(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", list(FaultLeaseStatus))
+async def test_d220_baseline_never_overwrites_an_existing_lease(
+    tmp_path: Path, status: FaultLeaseStatus
+) -> None:
+    """Every extant CLOSED, OPEN, or UNKNOWN row rejects D220's plain insert."""
+    path = tmp_path / f"d220-existing-{status.value}.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    try:
+        assert not await store.begin_process_epoch("d220-process")
+        assert (
+            await store.begin_process_restart_clearance("d220-process")
+            is RestartClearanceState.REQUIRED
+        )
+        await store.connection.execute(
+            "INSERT INTO fault_control_lease "
+            "(singleton, run_id, mcp_session_id, generation, status, updated_at_utc) "
+            "VALUES (1, ?, ?, 7, ?, ?)",
+            (None, None, status.value, "2026-11-03T00:00:00+00:00"),
+        )
+        await store.connection.commit()
+
+        assert not await store.initialize_missing_fault_control_safety_record(
+            process_id="d220-process", generation=7, operation_id="equal-generation"
+        )
+        assert await fetch_one(
+            store,
+            "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease",
+        ) == (None, None, 7, status.value)
+        assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_baseline_requires_its_exact_unclean_epoch_and_required_gate(
+    tmp_path: Path,
+) -> None:
+    """A missing, untrusted row is still insufficient without exact process markers."""
+    path = tmp_path / "d220-process-markers.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    try:
+        assert not await store.initialize_missing_fault_control_safety_record(
+            process_id="missing-epoch", generation=1, operation_id="missing-epoch"
+        )
+        assert not await store.begin_process_epoch("d220-process")
+        assert not await store.initialize_missing_fault_control_safety_record(
+            process_id="d220-process", generation=1, operation_id="missing-gate"
+        )
+        assert (
+            await store.begin_process_restart_clearance("d220-process")
+            is RestartClearanceState.REQUIRED
+        )
+        assert not await store.initialize_missing_fault_control_safety_record(
+            process_id="different-process", generation=1, operation_id="wrong-process"
+        )
+        assert await fetch_one(store, "SELECT COUNT(*) FROM fault_control_lease") == (0,)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_d220_absence_probe_is_closed_and_unreadable_fails_closed(
     tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7794,8 +7882,15 @@ async def test_d220_null_run_closed_lease_requires_one_exact_baseline_audit(
     await tmp_store.connection.execute(
         "INSERT INTO fault_control_lease "
         "(singleton, run_id, mcp_session_id, generation, status, updated_at_utc) "
-        "VALUES (1, NULL, NULL, 7, 'closed', ?)",
+        "VALUES (1, NULL, 'unexpected-session', 7, 'closed', ?)",
         ("2026-11-03T00:00:00+00:00",),
+    )
+    await tmp_store.connection.commit()
+    # A D220 baseline has no session binding; any non-null value is corrupt
+    # even if a matching audit exists later.
+    assert (await tmp_store.read_fault_control_lease()).status is FaultLeaseStatus.UNKNOWN
+    await tmp_store.connection.execute(
+        "UPDATE fault_control_lease SET mcp_session_id = NULL WHERE singleton = 1"
     )
     await tmp_store.connection.commit()
     assert (await tmp_store.read_fault_control_lease()).status is FaultLeaseStatus.UNKNOWN

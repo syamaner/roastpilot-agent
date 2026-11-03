@@ -1262,6 +1262,15 @@ class RoastStore:
         except Exception:  # noqa: BLE001 - unreadable evidence never grants admission
             return FaultControlLeaseAbsence.UNREADABLE
 
+    def trust_confirmed_fault_control_lease(self) -> None:
+        """Record current-process trust after an exact durable lease proof.
+
+        The singleton is present after D220, so this does not itself make an
+        absence eligible. It only preserves the process-local provenance fact
+        used by the legacy absence projection if that row is later unavailable.
+        """
+        self._fault_lease_absence_trusted = True
+
     async def _probe_fault_control_lease_absence_from_connection(
         self,
         connection: aiosqlite.Connection,
@@ -1367,6 +1376,7 @@ class RoastStore:
             connection = await aiosqlite.connect(self._db_path)
             connection.row_factory = aiosqlite.Row
             await self._configure_durable_connection(connection)
+            await connection.execute("BEGIN")
             async with connection.execute(
                 "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease "
                 "WHERE singleton = 1"
@@ -1399,11 +1409,16 @@ class RoastStore:
                 and await self._has_confirmed_missing_fault_control_safety_record(
                     connection, generation, operation_id
                 )
+                and await self._has_any_confirmed_missing_fault_control_safety_record(
+                    connection, generation
+                )
             )
         except Exception:  # noqa: BLE001 - unreadable postcondition is not proof
             return False
         finally:
             if connection is not None:
+                with contextlib.suppress(Exception):
+                    await connection.rollback()
                 await connection.close()
 
     @staticmethod
@@ -1497,8 +1512,11 @@ class RoastStore:
         # is durably visible as well.
         if status is FaultLeaseStatus.CLOSED:
             if run_id is None:
-                if not await self._has_any_confirmed_missing_fault_control_safety_record(
-                    connection, generation
+                if (
+                    row["mcp_session_id"] is not None
+                    or not await self._has_any_confirmed_missing_fault_control_safety_record(
+                        connection, generation
+                    )
                 ):
                     status = FaultLeaseStatus.UNKNOWN
             elif not await self._has_confirmed_fault_control_close(connection, run_id, generation):

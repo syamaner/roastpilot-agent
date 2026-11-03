@@ -3348,7 +3348,10 @@ class RoastService:
                     return await self._safety_record_initialization_result("rejected")
             await self._ensure_restart_epoch()
             lease = await self._read_fault_lease_fail_closed()
-            active = await self._store.active_run()
+            try:
+                active = await self._store.active_run()
+            except Exception:  # noqa: BLE001 - unreadable durable history blocks D220
+                return await self._safety_record_initialization_result("rejected")
             child = self._mcp
             if (
                 self._shutdown_started
@@ -3369,12 +3372,9 @@ class RoastService:
                 or self._roaster is None
             ):
                 return await self._safety_record_initialization_result("rejected")
-            try:
-                absence = await self._store.probe_fault_control_lease_absence()
-            except Exception:  # noqa: BLE001 - durable absence is mandatory
-                return await self._safety_record_initialization_result("rejected")
-            if absence is not FaultControlLeaseAbsence.ABSENT_UNTRUSTED:
-                return await self._safety_record_initialization_result("rejected")
+            # Reserve a generation before the task reaches any new await.
+            # An e-stop racing the durable probe or current presence read must
+            # allocate strictly above this baseline even if it persists first.
             generation = max(
                 1,
                 lease.generation + 1,
@@ -3431,6 +3431,15 @@ class RoastService:
         if roaster is None:
             return await self._safety_record_initialization_result("rejected")
         try:
+            absence = await self._store.probe_fault_control_lease_absence()
+        except Exception:  # noqa: BLE001 - durable absence is mandatory
+            return await self._safety_record_initialization_result("rejected")
+        if (
+            absence is not FaultControlLeaseAbsence.ABSENT_UNTRUSTED
+            or not self._safety_record_initialization_is_current(context)
+        ):
+            return await self._safety_record_initialization_result("rejected")
+        try:
             presence = await roaster.read_session_presence()
         except Exception:  # noqa: BLE001 - uncertain presence must reject
             return await self._safety_record_initialization_result("rejected")
@@ -3467,6 +3476,7 @@ class RoastService:
             run_id=None,
             mcp_session_id=None,
         )
+        self._store.trust_confirmed_fault_control_lease()
         return await self._safety_record_initialization_result("confirmed")
 
     async def _safety_record_initialization_result(

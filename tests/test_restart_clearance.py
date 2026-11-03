@@ -271,6 +271,15 @@ async def test_d220_estop_admission_invalidates_a_parked_presence_proof(tmp_path
     await store.initialize()
     service: RoastService | None = None
     try:
+        await store.create_run(
+            run_id="pending-estop",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.COMPLETE,
+        )
+        await store.complete_run(
+            run_id="pending-estop", outcome="aborted", agent_phase=RoastPhase.COMPLETE
+        )
         service, roaster, _child = await _presence_service(store, "none")
         entered = asyncio.Event()
         release = asyncio.Event()
@@ -288,16 +297,24 @@ async def test_d220_estop_admission_invalidates_a_parked_presence_proof(tmp_path
         )
         await asyncio.wait_for(entered.wait(), timeout=1.0)
 
-        emergency = await service.submit_fault_controls_action(
-            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        admitted = service._admit_fault_control_lease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            "pending-estop"
         )
-        assert emergency.result == "failed"
+        service._schedule_admitted_fault_control_lease_persistence(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            admitted
+        )
+        # The baseline floor was raised before the parked presence await, so
+        # this real durable e-stop lease can never share generation one.
+        assert admitted.generation == 2
         release.set()
         result = await asyncio.wait_for(initialization, timeout=1.0)
+        assert await service.settle_fault_lease_persistence_for_teardown()
 
         assert result.outcome == "rejected"
-        assert (await store.read_fault_control_lease()).generation == 0
-        assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        durable = await store.read_fault_control_lease()
+        assert durable.generation == 2
+        assert durable.status is FaultLeaseStatus.OPEN
+        assert service._fault_lease_cache.generation == 2  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         assert roaster.commands() == []
     finally:
         if service is not None:
