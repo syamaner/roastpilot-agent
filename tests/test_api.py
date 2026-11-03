@@ -425,6 +425,243 @@ async def test_closure_only_routes_end_recovered_run_without_a_roaster_write(
     ) is RestartClearanceState.REQUIRED
 
 
+async def _recovered_d216_service(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, *, run_id: str
+) -> tuple[RoastService, FakeMCPClient, mock.AsyncMock]:
+    """Create one recovered D216 service with a current no-session proof."""
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    roaster = FakeMCPClient()
+    presence = mock.AsyncMock(return_value="none")
+    monkeypatch.setattr(roaster, "read_session_presence", presence)
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        live_serve_mode=True,
+        run_loop=False,
+    )
+    await service.recover_on_start()
+    return service, roaster, presence
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("race", ["restart_epoch", "lease_read"])
+async def test_closure_only_clearance_rejects_estop_admission_before_presence_proof(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, race: str
+) -> None:
+    """Every pre-presence D216 e-stop epoch check rejects stale clearance evidence."""
+    service, roaster, presence = await _recovered_d216_service(
+        store, monkeypatch, run_id=f"closure-entry-{race}"
+    )
+    if race == "restart_epoch":
+        original_ensure = service._ensure_restart_epoch  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        async def stale_after_restart_epoch() -> None:
+            await original_ensure()
+            service._note_emergency_stop_admission()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        monkeypatch.setattr(service, "_ensure_restart_epoch", stale_after_restart_epoch)
+    else:
+        original_read = service._read_fault_lease_fail_closed  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        async def stale_after_lease_read() -> FaultControlLease:
+            lease = await original_read()
+            service._note_emergency_stop_admission()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            return lease
+
+        monkeypatch.setattr(service, "_read_fault_lease_fail_closed", stale_after_lease_read)
+
+    with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+        await service.acknowledge_closure_only_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+
+    presence.assert_not_awaited()
+    assert roaster.calls == []
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rejection", ["ineligible", "presence", "child", "lease"])
+async def test_closure_only_clearance_rejects_ineligible_or_noncurrent_admission_evidence(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, rejection: str
+) -> None:
+    """D216 requires a live child, no-session proof, and unchanged closed lease."""
+    service, roaster, presence = await _recovered_d216_service(
+        store, monkeypatch, run_id=f"closure-reject-{rejection}"
+    )
+    if rejection == "ineligible":
+        service._roaster = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    elif rejection == "presence":
+        presence.return_value = "active"
+    elif rejection == "child":
+        child = service._mcp  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert child is not None
+
+        async def replace_child_during_presence_read() -> str:
+            child._replace_session(_FakeSession())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            return "none"
+
+        monkeypatch.setattr(roaster, "read_session_presence", replace_child_during_presence_read)
+    else:
+        cached = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        async def replace_lease_during_presence_read() -> str:
+            service._fault_lease_cache = FaultControlLease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                generation=cached.generation + 1,
+                status=FaultLeaseStatus.UNKNOWN,
+                run_id=None,
+                mcp_session_id=None,
+            )
+            return "none"
+
+        monkeypatch.setattr(roaster, "read_session_presence", replace_lease_during_presence_read)
+
+    with pytest.raises(RoastRunConflictError):
+        await service.acknowledge_closure_only_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+
+    assert roaster.calls == []
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_closure_only_clearance_fails_closed_when_presence_or_gate_commit_is_unconfirmed(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D216 cannot publish End authority after an unreadable proof or gate write."""
+    service, roaster, presence = await _recovered_d216_service(
+        store, monkeypatch, run_id="closure-unconfirmed-admission"
+    )
+    presence.side_effect = OSError("synthetic presence failure")
+    with pytest.raises(RoastRunConflictError, match="presence could not be confirmed"):
+        await service.acknowledge_closure_only_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+
+    presence.side_effect = None
+
+    async def fail_gate_write(_process_id: str) -> bool:
+        raise OSError("synthetic closure gate failure")
+
+    monkeypatch.setattr(store, "confirm_process_closure_only_clearance", fail_gate_write)
+    with pytest.raises(RoastRunConflictError, match="persistence is unconfirmed"):
+        await service.acknowledge_closure_only_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+
+    assert service._closure_only_context is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._restart_clearance_state is RestartClearanceState.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert roaster.calls == []
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rejection", ["shutdown", "binding", "inactive", "roaster", "presence", "lease"]
+)
+async def test_end_recovered_run_rejects_each_lost_closure_only_precondition(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, rejection: str
+) -> None:
+    """D216 End cannot use shutdown, stale, unavailable, or changed evidence."""
+    run_id = f"closure-end-reject-{rejection}"
+    service, roaster, _presence = await _recovered_d216_service(store, monkeypatch, run_id=run_id)
+    if rejection == "shutdown":
+        await service.shutdown()
+    else:
+        await service.acknowledge_closure_only_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        if rejection == "binding":
+            child = service._mcp  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            assert child is not None
+            child._replace_session(_FakeSession())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif rejection == "inactive":
+            await store.complete_run(
+                run_id=run_id, outcome="aborted", agent_phase=RoastPhase.COMPLETE
+            )
+        elif rejection == "roaster":
+            service._roaster = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif rejection == "presence":
+
+            async def unreadable_presence() -> str:
+                raise OSError("synthetic end-presence failure")
+
+            monkeypatch.setattr(roaster, "read_session_presence", unreadable_presence)
+        else:
+            lease = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            await store.replace_fault_control_lease_unknown(run_id, generation=lease.generation + 1)
+
+    with pytest.raises(RoastRunConflictError):
+        await service.end_recovered_run(run_id)
+
+    assert roaster.calls == []
+    if rejection != "shutdown":
+        assert service._closure_only_context is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_recovered_end_task_rechecks_its_binding_before_the_history_lock(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D216's task rejects a binding that goes stale before its durable CAS."""
+    run_id = "closure-task-rechecks-binding"
+    service, _roaster, _presence = await _recovered_d216_service(store, monkeypatch, run_id=run_id)
+    await service.acknowledge_closure_only_clearance(
+        RestartClearanceRequest(physical_confirmation=True)
+    )
+    first_context = service._closure_only_context  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert first_context is not None
+    child = service._mcp  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert child is not None
+    child._replace_session(_FakeSession())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+        await service._end_recovered_run_task(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            first_context
+        )
+
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_recovered_end_task_rechecks_binding_after_waiting_for_history_lock(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child replacement while End waits for history mutation keeps D216 fenced."""
+    run_id = "closure-task-lock-recheck"
+    service, _roaster, _presence = await _recovered_d216_service(store, monkeypatch, run_id=run_id)
+    await service.acknowledge_closure_only_clearance(
+        RestartClearanceRequest(physical_confirmation=True)
+    )
+    context = service._closure_only_context  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert context is not None
+    history_lock = service._recovered_history_mutation_lock  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await history_lock.acquire()
+    try:
+        ending = asyncio.create_task(
+            service._end_recovered_run_task(context)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        )
+        await asyncio.sleep(0)
+        child = service._mcp  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert child is not None
+        child._replace_session(_FakeSession())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    finally:
+        history_lock.release()
+
+    with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+        await ending
+
+    await service.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_closure_only_clearance_rejects_estop_during_history_read(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
