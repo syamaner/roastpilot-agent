@@ -54,13 +54,32 @@ export function isCoherentFaultControls(value: unknown): value is FaultControls 
 export function isCoherentRestartClearance(value: unknown): value is RestartClearance {
   if (value === null || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
-  if (typeof candidate.eligible !== "boolean") return false;
+  if (
+    typeof candidate.eligible !== "boolean" ||
+    typeof candidate.closure_only_available !== "boolean" ||
+    !Array.isArray(candidate.enabled_actions) ||
+    candidate.enabled_actions.some((action) => action !== "end_recovered_run") ||
+    new Set(candidate.enabled_actions).size !== candidate.enabled_actions.length
+  ) {
+    return false;
+  }
   switch (candidate.state) {
     case "required":
+      return (
+        candidate.eligible === false &&
+        candidate.closure_only_available === false &&
+        candidate.enabled_actions.length === 0
+      );
+    case "closure_only":
+      return candidate.eligible === false && candidate.closure_only_available === false;
     case "unknown":
-      return candidate.eligible === false;
+      return (
+        candidate.eligible === false &&
+        candidate.closure_only_available === false &&
+        candidate.enabled_actions.length === 0
+      );
     case "cleared":
-      return true;
+      return candidate.closure_only_available === false && candidate.enabled_actions.length === 0;
     default:
       return false;
   }

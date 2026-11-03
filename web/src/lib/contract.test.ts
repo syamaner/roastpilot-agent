@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
+import { isCoherentRestartClearance } from "@/lib/faultControls";
 import { parseCatalogueRecommendationList } from "@/lib/types";
 import {
   applyEvent,
@@ -139,6 +140,33 @@ describe("restart-clearance contract", () => {
     } satisfies RestartClearance;
 
     expect(projection.enabled_actions).toEqual(["end_recovered_run"]);
+  });
+
+  it("fails closed for incoherent server closure-only projections", () => {
+    expect(
+      isCoherentRestartClearance({
+        state: "closure_only",
+        eligible: false,
+        enabled_actions: ["end_recovered_run"],
+        closure_only_available: false,
+      }),
+    ).toBe(true);
+    expect(
+      isCoherentRestartClearance({
+        state: "closure_only",
+        eligible: true,
+        enabled_actions: ["end_recovered_run"],
+        closure_only_available: false,
+      }),
+    ).toBe(false);
+    expect(
+      isCoherentRestartClearance({
+        state: "required",
+        eligible: false,
+        enabled_actions: ["end_recovered_run"],
+        closure_only_available: true,
+      }),
+    ).toBe(false);
   });
 });
 

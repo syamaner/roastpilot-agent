@@ -110,6 +110,8 @@ from roastpilot_agent.models import (
     ChargeWeightRequest,
     ClearStaleSessionRequest,
     ClearStaleSessionResult,
+    ClosureOnlyClearanceResult,
+    EndRecoveredRunResult,
     FaultAcknowledgementState,
     FaultControlsActionRequest,
     FaultControlsActionResult,
@@ -166,6 +168,7 @@ from roastpilot_agent.store import (
     FaultControlCloseResult,
     FaultControlLease,
     FrozenRunConfig,
+    PersistedRun,
     PhysicallyImpossibleWeightError,
     RoastStore,
     RunActivelyDrivenError,
@@ -539,6 +542,7 @@ _HARDWARE_CLEAR_PATH = "/api/mcp/acknowledge-hardware-clear"
 _HARDWARE_CLEAR_MAX_BODY_BYTES = 2048
 _HARDWARE_CLEAR_MIN_INTERVAL_SECONDS = 1.0
 _RESTART_CLEARANCE_PATH = "/api/restart-clearance"
+_CLOSURE_ONLY_CLEARANCE_PATH = "/api/restart-clearance/closure-only"
 _FAULT_CONTROLS_ACTIONS_PATH = "/api/fault-controls/actions"
 _FAULT_CONTROLS_MAX_BODY_BYTES = 1024
 
@@ -604,9 +608,22 @@ def _before_the_minute(tasted_at_utc: str, completed_at_utc: str) -> bool:
         ``True`` iff ``tasted_at_utc`` falls in a minute strictly before
         ``completed_at_utc``'s minute.
     """
+
     tasted_minute = datetime.fromisoformat(tasted_at_utc).replace(second=0, microsecond=0)
     completed_minute = datetime.fromisoformat(completed_at_utc).replace(second=0, microsecond=0)
     return tasted_minute < completed_minute
+
+
+@dataclass(frozen=True)
+class _ClosureOnlyContext:
+    """Process-local evidence authorising only one recovered-run closure."""
+
+    process_id: str
+    run_id: str
+    child: MCPServerProcess
+    child_epoch: int
+    lease: FaultControlLease
+    emergency_stop_admission_epoch: int
 
 
 #: Fallback agent-event → source mapping for persisted ``roast_events`` rows.
@@ -2309,6 +2326,11 @@ class RoastService:
         self._restart_epoch_initialized = False
         self._restart_epoch_lock = asyncio.Lock()
         self._restart_clearance_lock = asyncio.Lock()
+        self._closure_only_context: _ClosureOnlyContext | None = None
+        self._closure_only_emergency_stop_admission_epoch = 0
+        self._closure_end_task: tuple[str, asyncio.Task[EndRecoveredRunResult]] | None = None
+        self._closure_end_lock = asyncio.Lock()
+        self._shutdown_started = False
         self._fault_lease_cache = FaultControlLease(
             generation=0,
             status=FaultLeaseStatus.CLOSED,
@@ -2598,8 +2620,10 @@ class RoastService:
             ),
             active_run_id=None if active is None else active.run_id,
             advisor=self._advisor_health,
-            restart_clearance=self._restart_clearance_projection(lease),
-            restart_clearance_required=not self._restart_clearance_projection(lease).eligible,
+            restart_clearance=self._restart_clearance_projection(lease, active=active),
+            restart_clearance_required=not self._restart_clearance_projection(
+                lease, active=active
+            ).eligible,
             fault_controls=await self._fault_controls_projection(lease),
         )
 
@@ -2653,14 +2677,69 @@ class RoastService:
         self._fault_lease_cache = lease
         return lease
 
-    def _restart_clearance_projection(self, lease: FaultControlLease) -> RestartClearanceProjection:
+    def _restart_clearance_projection(
+        self, lease: FaultControlLease, *, active: PersistedRun | None = None
+    ) -> RestartClearanceProjection:
         """Project the process gate; OPEN/UNKNOWN leases keep Start ineligible."""
+        context = self._closure_only_context
+        closure_binding_current = (
+            context is not None
+            and self._closure_only_binding_is_current(context)
+            and lease == context.lease
+            and lease.status is FaultLeaseStatus.CLOSED
+        )
+        closure_available = (
+            self._restart_clearance_state is RestartClearanceState.REQUIRED
+            and lease.status is FaultLeaseStatus.CLOSED
+            and active is not None
+            and active.completed_at_utc is None
+            and active.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+            and active.run_id == self.active_run_id
+            and self._mcp is not None
+            and self._mcp.running
+        )
         return RestartClearanceProjection(
             state=self._restart_clearance_state,
             eligible=(
                 self._restart_clearance_state is RestartClearanceState.CLEARED
                 and lease.status is FaultLeaseStatus.CLOSED
             ),
+            enabled_actions=([OperatorAction.END_RECOVERED_RUN] if closure_binding_current else []),
+            closure_only_available=closure_available,
+        )
+
+    def _closure_only_binding_is_current(self, context: _ClosureOnlyContext) -> bool:
+        """Return whether process-local closure evidence has not gone stale."""
+        child = self._mcp
+        return (
+            not self._shutdown_started
+            and self._restart_clearance_state is RestartClearanceState.CLOSURE_ONLY
+            and self._closure_only_context == context
+            and child is not None
+            and child is context.child
+            and child.running
+            and child.child_epoch == context.child_epoch
+            and self._fault_lease_cache == context.lease
+            and self._closure_only_emergency_stop_admission_epoch
+            == context.emergency_stop_admission_epoch
+        )
+
+    def _note_emergency_stop_for_closure_only(self) -> None:
+        """Synchronously revoke closure-only evidence before e-stop admission."""
+        self._closure_only_emergency_stop_admission_epoch += 1
+        if self._restart_clearance_state is RestartClearanceState.CLOSURE_ONLY:
+            self._closure_only_context = None
+            self._restart_clearance_state = RestartClearanceState.UNKNOWN
+
+    def _invalidate_closure_only_clearance(self) -> None:
+        """Fail closed after stale or indeterminate closure-only evidence."""
+        self._closure_only_context = None
+        self._restart_clearance_state = RestartClearanceState.UNKNOWN
+        task = asyncio.create_task(
+            self._store.mark_process_restart_clearance_unknown(self.instance_id)
+        )
+        task.add_done_callback(
+            lambda completed: completed.exception() if not completed.cancelled() else None
         )
 
     async def _fault_controls_projection(self, lease: FaultControlLease) -> FaultControlsProjection:
@@ -2754,6 +2833,78 @@ class RoastService:
             generation=None if lease.generation == 0 else lease.generation,
             enabled_actions=actions,
         )
+
+    async def acknowledge_closure_only_clearance(
+        self, request: RestartClearanceRequest
+    ) -> ClosureOnlyClearanceResult:
+        """Admit process-local authority to end, but never resume, one recovered run."""
+        del request
+        async with self._restart_clearance_lock:
+            await self._ensure_restart_epoch()
+            lease = await self._read_fault_lease_fail_closed()
+            active = await self._store.active_run()
+            child = self._mcp
+            if (
+                self._shutdown_started
+                or self._restart_clearance_state is not RestartClearanceState.REQUIRED
+                or lease.status is not FaultLeaseStatus.CLOSED
+                or active is None
+                or active.completed_at_utc is not None
+                or active.agent_phase is not RoastPhase.OPERATOR_RECOVERY_REQUIRED
+                or active.run_id != self.active_run_id
+                or child is None
+                or not child.running
+                or self._roaster is None
+            ):
+                raise RoastRunConflictError("closure-only clearance is not currently eligible")
+            expected_epoch = child.child_epoch
+            try:
+                presence = await self._roaster.read_session_presence()
+            except Exception as exc:  # noqa: BLE001 - a current proof is mandatory
+                raise RoastRunConflictError(
+                    "current MCP session presence could not be confirmed"
+                ) from exc
+            if (
+                presence != "none"
+                or self._mcp is not child
+                or not child.running
+                or child.child_epoch != expected_epoch
+            ):
+                raise RoastRunConflictError("current MCP child has no typed no-session proof")
+            context = _ClosureOnlyContext(
+                process_id=self.instance_id,
+                run_id=active.run_id,
+                child=child,
+                child_epoch=expected_epoch,
+                lease=lease,
+                emergency_stop_admission_epoch=self._closure_only_emergency_stop_admission_epoch,
+            )
+            try:
+                confirmed = await self._store.confirm_process_closure_only_clearance(
+                    self.instance_id
+                )
+            except Exception as exc:  # noqa: BLE001 - uncertainty cannot grant authority
+                self._invalidate_closure_only_clearance()
+                raise RoastRunConflictError(
+                    "closure-only clearance persistence is unconfirmed"
+                ) from exc
+            if (
+                not confirmed
+                or self._shutdown_started
+                or self._mcp is not child
+                or not child.running
+            ):
+                self._invalidate_closure_only_clearance()
+                raise RoastRunConflictError("closure-only clearance evidence became stale")
+            self._restart_clearance_state = RestartClearanceState.CLOSURE_ONLY
+            self._closure_only_context = context
+            projection = self._restart_clearance_projection(lease, active=active)
+            return ClosureOnlyClearanceResult(
+                outcome="confirmed",
+                closure_only=True,
+                restart_clearance=projection,
+                fault_controls=await self._fault_controls_projection(lease),
+            )
 
     async def acknowledge_restart_clearance(
         self, request: RestartClearanceRequest
@@ -3473,6 +3624,7 @@ class RoastService:
         admission.  Until persistence succeeds, Start remains blocked by this
         UNKNOWN lease.
         """
+        self._note_emergency_stop_for_closure_only()
         cached = self._fault_lease_cache
         generation = max(1, cached.generation + 1)
         if session_id is None and use_latest_session:
@@ -3868,6 +4020,7 @@ class RoastService:
 
     def _invalidate_pending_start_admissions_for_emergency_stop(self) -> None:
         """Synchronously invalidate every Start admitted before an e-stop attempt."""
+        self._note_emergency_stop_for_closure_only()
         self._start_admission_generation += 1
 
     def _require_current_start_admission(self, admission_generation: int) -> None:
@@ -4879,6 +5032,22 @@ class RoastService:
                     # fresh clearance exists.
                     detail = detail.model_copy(
                         update={"enabled_actions": [OperatorAction.EMERGENCY_STOP]}
+                    )
+                context = self._closure_only_context
+                if (
+                    context is not None
+                    and context.run_id == run_id
+                    and self._closure_only_binding_is_current(context)
+                    and lease == context.lease
+                    and lease.status is FaultLeaseStatus.CLOSED
+                ):
+                    detail = detail.model_copy(
+                        update={
+                            "enabled_actions": [
+                                OperatorAction.END_RECOVERED_RUN,
+                                OperatorAction.EMERGENCY_STOP,
+                            ]
+                        }
                     )
         if lease.run_id == run_id:
             if lease.status in (FaultLeaseStatus.OPEN, FaultLeaseStatus.UNKNOWN):
@@ -6694,6 +6863,16 @@ async def acknowledge_restart_clearance(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+async def acknowledge_closure_only_clearance(
+    request: RestartClearanceRequest, service: ServiceDep
+) -> ClosureOnlyClearanceResult:
+    """``POST /api/restart-clearance/closure-only`` — admit recovered-run End only."""
+    try:
+        return await service.acknowledge_closure_only_clearance(request)
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 async def submit_fault_controls_action(
     request: FaultControlsActionRequest, service: ServiceDep
 ) -> FaultControlsActionResult:
@@ -7557,6 +7736,7 @@ def create_app(
     app.put(CONFIG_PATH)(put_config)
     app.get(DEVICES_PATH)(get_devices)
     app.post(_RESTART_CLEARANCE_PATH)(acknowledge_restart_clearance)
+    app.post(_CLOSURE_ONLY_CLEARANCE_PATH)(acknowledge_closure_only_clearance)
     app.post(_FAULT_CONTROLS_ACTIONS_PATH)(submit_fault_controls_action)
     app.post("/api/roasts", status_code=201)(start_roast)
     app.get("/api/roasts")(list_roasts)
