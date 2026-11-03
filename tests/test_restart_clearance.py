@@ -6,12 +6,15 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 
+import roastpilot_agent.store as store_module
 from roastpilot_agent.api import (
     QueuedOperatorAction,
     RoastRunConflictError,
     RoastService,
     ShutdownHeatOffOutcome,
+    create_app,
 )
 from roastpilot_agent.cli import _teardown_live  # pyright: ignore[reportPrivateUsage]
 from roastpilot_agent.config import AppConfig, ControllerConfig
@@ -28,6 +31,7 @@ from roastpilot_agent.models import (
     RoastProfile,
 )
 from roastpilot_agent.store import (
+    MIGRATIONS,
     FaultControlLease,
     FaultControlLeaseAbsence,
     PersistedRun,
@@ -335,6 +339,153 @@ async def test_d220_initialises_only_an_unclean_absent_safety_record(tmp_path: P
         )
         assert ordinary.cleared
         assert roaster.presence_reads == 2
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_upgrades_v19_terminal_history_without_granting_restart_clearance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A V19 terminal row survives D220, but every process still re-proves clearance."""
+    path = tmp_path / "d220-v19-terminal-history.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:19])
+    legacy = RoastStore(path)
+    await legacy.initialize()
+    try:
+        await legacy.create_run(
+            run_id="v19-terminal",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.COMPLETE,
+        )
+        await legacy.complete_run(
+            run_id="v19-terminal", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        terminal_before = await legacy.read_run("v19-terminal")
+        assert terminal_before is not None
+    finally:
+        await legacy.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert not await crashed.begin_process_epoch("v19-crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        eligible = await service.health()
+        assert eligible.restart_clearance.enabled_actions == [
+            OperatorAction.INITIALIZE_SAFETY_RECORD
+        ]
+
+        confirmed = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert confirmed.outcome == "confirmed"
+        assert confirmed.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert await store.read_run("v19-terminal") == terminal_before
+        async with store.connection.execute(
+            "SELECT COUNT(*) FROM operator_actions WHERE run_id IS NULL AND action = ? "
+            "AND result = 'accepted'",
+            (OperatorAction.INITIALIZE_SAFETY_RECORD.value,),
+        ) as cursor:
+            audit = await cursor.fetchone()
+        assert audit is not None and audit[0] == 1
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+    reopened_store = RoastStore(path)
+    await reopened_store.initialize()
+    reopened_service: RoastService | None = None
+    try:
+        reopened_service, reopened_roaster, _child = await _presence_service(reopened_store, "none")
+        reopened = await reopened_service.health()
+        assert reopened.fault_controls.status is FaultLeaseStatus.CLOSED
+        assert reopened.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert not reopened.restart_clearance.eligible
+        assert reopened.restart_clearance.enabled_actions == []
+        with pytest.raises(RoastRunConflictError, match="restart clearance"):
+            await reopened_service.start_roast(_profile())
+
+        ordinary = await reopened_service.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert ordinary.cleared
+        assert reopened_roaster.presence_reads == 1
+    finally:
+        if reopened_service is not None:
+            await reopened_service.shutdown()
+        await reopened_store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_http_cancellation_keeps_its_owned_baseline_task(tmp_path: Path) -> None:
+    """Cancelling an ASGI waiter cannot cancel its one owned D220 baseline task."""
+    path = tmp_path / "d220-cancelled-http-waiter.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def parked_presence() -> SessionPresence:
+            entered.set()
+            await release.wait()
+            return "none"
+
+        roaster.on_read = parked_presence
+        transport = ASGITransport(app=create_app(service))
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            waiter = asyncio.create_task(
+                client.post(
+                    "/api/restart-clearance/initialize-safety-record",
+                    json={"physical_confirmation": True},
+                )
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            owned = service._safety_record_initialization  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            assert owned is not None
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            assert not owned[1].done()
+            release.set()
+            result = await asyncio.wait_for(owned[1], timeout=1.0)
+
+        assert result.outcome == "confirmed"
+        lease = await store.read_fault_control_lease()
+        assert lease.generation == 1
+        assert lease.status is FaultLeaseStatus.CLOSED
+        async with store.connection.execute(
+            "SELECT COUNT(*) FROM operator_actions WHERE run_id IS NULL AND action = ? "
+            "AND result = 'accepted'",
+            (OperatorAction.INITIALIZE_SAFETY_RECORD.value,),
+        ) as cursor:
+            audit = await cursor.fetchone()
+        assert audit is not None and audit[0] == 1
+        assert roaster.presence_reads == 1
+        assert roaster.commands() == []
     finally:
         if service is not None:
             await service.shutdown()
