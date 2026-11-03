@@ -7839,7 +7839,7 @@ async def test_closure_only_end_postcondition_fails_closed_when_unreadable(
     async def unreadable_connection(*_args: Any, **_kwargs: Any) -> NoReturn:
         raise OSError("synthetic independent verification failure")
 
-    store_aiosqlite = cast("Any", store_module.aiosqlite)  # pyright: ignore[reportPrivateUsage]
+    store_aiosqlite = cast("Any", aiosqlite_module)
     monkeypatch.setattr(store_aiosqlite, "connect", unreadable_connection)
 
     assert not await tmp_store.closure_only_end_postcondition(
