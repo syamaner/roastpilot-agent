@@ -7667,6 +7667,43 @@ async def test_unverified_closed_fault_lease_is_unknown_on_restart_read(
     assert lease.status.value == "unknown"
 
 
+async def _d220_store_with_unclean_epoch(tmp_path: Path, name: str) -> RoastStore:
+    """Return a reopened store with D220's exact durable admission markers."""
+    path = tmp_path / f"{name}.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    assert not await store.begin_process_epoch("d220-process")
+    assert (
+        await store.begin_process_restart_clearance("d220-process")
+        is RestartClearanceState.REQUIRED
+    )
+    return store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("generation", [0, -1])
+async def test_d220_baseline_rejects_nonpositive_generation_before_opening_a_transaction(
+    tmp_store: RoastStore, generation: int
+) -> None:
+    """D220 never gives a nonpositive value a durable safety-record identity."""
+    await tmp_store.initialize()
+
+    with pytest.raises(ValueError, match="generation must be positive"):
+        await tmp_store.initialize_missing_fault_control_safety_record(
+            process_id="unused", generation=generation, operation_id="unused"
+        )
+
+    assert await fetch_one(tmp_store, "SELECT COUNT(*) FROM fault_control_lease") == (0,)
+    assert await fetch_one(tmp_store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+
+
 @pytest.mark.asyncio
 async def test_d220_missing_safety_record_transaction_commits_one_audited_baseline(
     tmp_path: Path,
@@ -7731,6 +7768,142 @@ async def test_d220_missing_safety_record_transaction_commits_one_audited_baseli
         assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.UNKNOWN
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_baseline_cancellation_after_begin_rolls_back_every_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation after D220 begins cannot leave a lease or baseline audit behind."""
+    store = await _d220_store_with_unclean_epoch(tmp_path, "d220-cancel-after-begin")
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_execute: Any = connection_type._execute
+
+    async def cancel_first_d220_read(
+        connection: aiosqlite_module.Connection, function: Any, *args: Any, **kwargs: Any
+    ) -> object:
+        sql = args[0] if args else None
+        if (
+            connection is not store.connection
+            and isinstance(sql, str)
+            and sql.startswith("SELECT 1 FROM fault_control_lease")
+        ):
+            raise asyncio.CancelledError("synthetic D220 cancellation after BEGIN")
+        return await original_execute(connection, function, *args, **kwargs)
+
+    monkeypatch.setattr(connection_type, "_execute", cancel_first_d220_read)
+    try:
+        with pytest.raises(asyncio.CancelledError, match="synthetic D220 cancellation"):
+            await store.initialize_missing_fault_control_safety_record(
+                process_id="d220-process", generation=1, operation_id="cancelled"
+            )
+    finally:
+        monkeypatch.undo()
+        try:
+            assert await fetch_one(store, "SELECT COUNT(*) FROM fault_control_lease") == (0,)
+            assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+        finally:
+            await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_verification_fails_closed_when_its_independent_read_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D220's committed baseline is not reported as proven when verification cannot open."""
+    store = await _d220_store_with_unclean_epoch(tmp_path, "d220-unreadable-verification")
+    try:
+        assert await store.initialize_missing_fault_control_safety_record(
+            process_id="d220-process", generation=1, operation_id="committed"
+        )
+
+        async def unreadable_connection(*_args: Any, **_kwargs: Any) -> NoReturn:
+            raise OSError("synthetic D220 verification failure")
+
+        store_aiosqlite = cast("Any", store_module.aiosqlite)  # pyright: ignore[reportPrivateImportUsage]
+        monkeypatch.setattr(store_aiosqlite, "connect", unreadable_connection)
+        assert not await store.verify_missing_fault_control_safety_record(
+            process_id="d220-process", generation=1, operation_id="committed"
+        )
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_audit_count_ignores_noncanonical_json_payloads(tmp_path: Path) -> None:
+    """D220 accepts only canonical JSON-object audits for its generation proof."""
+    store = await _d220_store_with_unclean_epoch(tmp_path, "d220-noncanonical-audits")
+    try:
+        assert await store.initialize_missing_fault_control_safety_record(
+            process_id="d220-process", generation=1, operation_id="canonical"
+        )
+        for payload in ("not-json", "[]", "42"):
+            await store.connection.execute(
+                "INSERT INTO operator_actions "
+                "(run_id, action, payload_json, result, recorded_at_utc) "
+                "VALUES (NULL, ?, ?, 'accepted', ?)",
+                (
+                    OperatorAction.INITIALIZE_SAFETY_RECORD.value,
+                    payload,
+                    "2026-11-03T00:00:00+00:00",
+                ),
+            )
+        await store.connection.commit()
+
+        assert await store.verify_missing_fault_control_safety_record(
+            process_id="d220-process", generation=1, operation_id="canonical"
+        )
+        assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_audit_count_discards_a_nonstring_driver_value(tmp_store: RoastStore) -> None:
+    """D220 treats a driver value outside SQLite's text contract as non-evidence."""
+
+    class SyntheticAuditCursor:
+        """Provide the narrow async-cursor contract used by the audit reader."""
+
+        async def __aenter__(self) -> "SyntheticAuditCursor":
+            """Enter the synthetic cursor context."""
+            return self
+
+        async def __aexit__(
+            self,
+            _type: type[BaseException] | None,
+            _value: BaseException | None,
+            _traceback: object | None,
+        ) -> Literal[False]:
+            """Leave the synthetic cursor context without suppressing failures."""
+            return False
+
+        async def fetchall(self) -> list[dict[str, object]]:
+            """Return one malformed driver value and one canonical payload."""
+            return [
+                {"payload_json": 7},
+                {
+                    "payload_json": tmp_store._fault_control_safety_record_payload(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                        1, "canonical"
+                    )
+                },
+            ]
+
+    class SyntheticAuditConnection:
+        """Provide the narrow execute contract used by the audit reader."""
+
+        def execute(self, _query: str, _parameters: tuple[str, ...]) -> SyntheticAuditCursor:
+            """Return a cursor with controlled raw driver values."""
+            return SyntheticAuditCursor()
+
+    connection = cast(aiosqlite_module.Connection, SyntheticAuditConnection())
+    assert (
+        await tmp_store._missing_fault_control_safety_record_audit_count(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            connection, 1
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -8055,6 +8228,59 @@ async def test_closure_only_end_cas_requires_the_exact_closed_lease_and_run(
         '{"closure_only": "confirmed", "lease_generation": 32}',
         "accepted",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("trigger_name", "trigger_sql"),
+    [
+        (
+            "ignore_d216_run_update",
+            "BEFORE UPDATE ON roast_runs WHEN NEW.id = 'd216-rowcount' "
+            "BEGIN SELECT RAISE(IGNORE); END",
+        ),
+        (
+            "ignore_d216_audit_insert",
+            "BEFORE INSERT ON operator_actions WHEN NEW.action = 'end_recovered_run' "
+            "BEGIN SELECT RAISE(IGNORE); END",
+        ),
+        (
+            "ignore_d216_gate_reset",
+            "BEFORE UPDATE ON process_restart_clearance "
+            "WHEN NEW.process_id = 'd216-rowcount-process' AND NEW.state = 'required' "
+            "BEGIN SELECT RAISE(IGNORE); END",
+        ),
+    ],
+)
+async def test_closure_only_end_rolls_back_when_any_required_write_loses_its_rowcount(
+    tmp_store: RoastStore, trigger_name: str, trigger_sql: str
+) -> None:
+    """D216 retains its recovered-run fence when any transactional write loses its CAS."""
+    run_id = "d216-rowcount"
+    process_id = "d216-rowcount-process"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    await tmp_store.begin_process_restart_clearance(process_id)
+    assert await tmp_store.confirm_process_closure_only_clearance(process_id)
+    lease = await _closed_recovered_lease(tmp_store, run_id=run_id, generation=34)
+    await tmp_store.connection.execute(f"CREATE TRIGGER {trigger_name} {trigger_sql}")
+    await tmp_store.connection.commit()
+
+    assert not await tmp_store.end_closure_only_recovered_run(
+        process_id=process_id, run_id=run_id, expected_lease=lease
+    )
+
+    detail = await tmp_store.read_run(run_id)
+    assert detail is not None
+    assert detail.completed_at_utc is None
+    assert detail.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert (
+        await tmp_store.read_process_restart_clearance(process_id)
+        is RestartClearanceState.CLOSURE_ONLY
+    )
+    assert await fetch_one(
+        tmp_store, "SELECT COUNT(*) FROM operator_actions WHERE run_id = ?", (run_id,)
+    ) == (0,)
 
 
 @pytest.mark.asyncio
