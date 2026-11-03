@@ -821,6 +821,7 @@ async def test_stale_child_after_durable_end_fences_inflight_recovered_tick_hist
 
     release.set()
     await ending
+    assert service.runner._post_durable_end_emergency_retry_only is True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     assert await ticking is False
 
     persisted = await store.read_run(run_id)
