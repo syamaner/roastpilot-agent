@@ -4,11 +4,12 @@ Write paths (E6-S2) and recovery reads / immutability (E6-S3) extend
 this suite.
 """
 
+import asyncio
 import json
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, NoReturn, cast
 from unittest import mock
 
 import aiosqlite as aiosqlite_module
@@ -40,6 +41,9 @@ EXPECTED_TABLES = {
     "bean_profiles",
     "bean_sourcing_attempts",
     "roast_tastings",
+    "process_restart_clearance",
+    "fault_control_lease",
+    "process_epoch",
 }
 
 EXPECTED_INDEXES = {
@@ -148,6 +152,78 @@ async def test_reinitialization_is_idempotent(tmp_path: Path) -> None:
         assert await fetch_names(reopened, "table") == EXPECTED_TABLES
     finally:
         await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_process_epoch_clean_predecessor_proves_absent_lease_baseline(tmp_path: Path) -> None:
+    """Only a completed clean epoch permits a successor's missing lease to close."""
+    path = tmp_path / "clean-process-epoch.sqlite3"
+    first = RoastStore(path)
+    await first.initialize()
+    try:
+        assert await first.begin_process_epoch("first")
+        assert await first.mark_process_epoch_clean("first")
+    finally:
+        await first.close()
+
+    successor = RoastStore(path)
+    await successor.initialize()
+    try:
+        assert await successor.begin_process_epoch("second")
+        assert (await successor.read_fault_control_lease()).status.value == "closed"
+    finally:
+        await successor.close()
+
+
+@pytest.mark.asyncio
+async def test_process_epoch_unclean_or_upgraded_database_keeps_absent_lease_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash and a v19-to-v20 migration cannot invent a CLOSED lease."""
+    crash_path = tmp_path / "unclean-process-epoch.sqlite3"
+    crashed = RoastStore(crash_path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed")
+    finally:
+        await crashed.close()
+    successor = RoastStore(crash_path)
+    await successor.initialize()
+    try:
+        assert not await successor.begin_process_epoch("successor")
+        assert (await successor.read_fault_control_lease()).status.value == "unknown"
+    finally:
+        await successor.close()
+
+    upgrade_path = tmp_path / "upgraded-process-epoch.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:-1])
+    old = RoastStore(upgrade_path)
+    await old.initialize()
+    await old.close()
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(upgrade_path)
+    await upgraded.initialize()
+    try:
+        assert not await upgraded.begin_process_epoch("upgraded")
+        assert (await upgraded.read_fault_control_lease()).status.value == "unknown"
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_corrupt_restart_clearance_row_fails_closed(tmp_store: RoastStore) -> None:
+    """A damaged persisted clearance value must never waive the fresh-process gate."""
+    await tmp_store.initialize()
+    await tmp_store.begin_process_restart_clearance("current-process")
+    await tmp_store.connection.execute("PRAGMA ignore_check_constraints = ON")
+    await tmp_store.connection.execute(
+        "UPDATE process_restart_clearance SET state = 'corrupt' WHERE process_id = ?",
+        ("current-process",),
+    )
+    await tmp_store.connection.commit()
+    await tmp_store.connection.execute("PRAGMA ignore_check_constraints = OFF")
+
+    assert (await tmp_store.read_process_restart_clearance("current-process")).value == "unknown"
 
 
 @pytest.mark.asyncio
@@ -400,7 +476,7 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
     upgraded = RoastStore(db_path=db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 16 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 20 == len(MIGRATIONS)
         row = await fetch_one(upgraded, "SELECT excluded FROM roast_runs WHERE id = 'run-1'")
         assert row == (0,)
         detail = await upgraded.read_run("run-1")
@@ -416,11 +492,11 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
 
 
 @pytest.mark.asyncio
-async def test_fresh_store_is_v16(tmp_store: RoastStore) -> None:
-    """A brand-new store lands on the current (v16) schema version."""
+async def test_fresh_store_is_v20(tmp_store: RoastStore) -> None:
+    """A brand-new store lands on the current (v20) schema version."""
     await tmp_store.initialize()
     try:
-        assert await tmp_store.schema_version() == 16 == len(MIGRATIONS)
+        assert await tmp_store.schema_version() == 20 == len(MIGRATIONS)
     finally:
         await tmp_store.close()
 
@@ -444,7 +520,7 @@ async def test_v14_migration_upgrades_real_v13_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 16
+        assert await upgraded.schema_version() == 20
         assert await upgraded.read_run("run-1") is not None
         assert "bean_sourcing_attempts" in await fetch_names(upgraded, "table")
         assert "idx_bean_sourcing_attempt_expiry" in await fetch_names(upgraded, "index")
@@ -473,7 +549,7 @@ async def test_v15_migration_adds_catalogue_counts_to_real_v14_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 16 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 20 == len(MIGRATIONS)
         row = await fetch_one(
             upgraded,
             "SELECT catalogue_discovered_count, catalogue_extracted_count"
@@ -530,13 +606,60 @@ async def test_v16_migration_adds_nullable_d96_trace_to_real_v15_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 16 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 20 == len(MIGRATIONS)
         [point] = await upgraded.read_telemetry_points("run-1")
         assert point.post_fc_recovery_enabled is None
         assert point.post_fc_heat_authority_state is None
         assert point.post_fc_ror_setpoint_c_per_min is None
         assert point.post_fc_smoothed_ror_c_per_min is None
         assert point.post_fc_effective_heat_ceiling_percent is None
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_v17_migration_preserves_historical_event_ids_and_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The v17 event-table rebuild retains old IDs, index coverage, and writes."""
+    db_path = tmp_path / "v17upgrade.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:16])
+    old = RoastStore(db_path)
+    await old.initialize()
+    try:
+        assert await old.schema_version() == 16
+        await seeded_store(old)
+        await old.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FAULT,
+            source=RoastEventSource.CONTROLLER,
+            payload={"reason": "historical"},
+        )
+        historical = await fetch_one(old, "SELECT id FROM roast_events WHERE run_id = 'run-1'")
+    finally:
+        await old.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == 20 == len(MIGRATIONS)
+        assert (
+            await fetch_one(upgraded, "SELECT id FROM roast_events WHERE run_id = 'run-1'")
+            == historical
+        )
+        assert "idx_roast_events_run_kind" in await fetch_names(upgraded, "index")
+        await upgraded.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED,
+            source=RoastEventSource.OPERATOR,
+            payload={"outcome": "confirmed"},
+        )
+        assert await fetch_one(
+            upgraded,
+            "SELECT kind, source FROM roast_events WHERE kind = ?",
+            (RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED.value,),
+        ) == ("fault_acknowledgement_executed", "operator")
     finally:
         await upgraded.close()
 
@@ -6850,3 +6973,739 @@ async def test_read_termination_writes_nothing(tmp_store: RoastStore) -> None:
         assert await read_back() == before
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_atomic_fault_close_commits_lease_audit_and_live_history_together(
+    tmp_store: RoastStore,
+) -> None:
+    """D215 closes a live fault only with its exact audit and terminal row."""
+    await seeded_store(tmp_store, run_id="atomic-fault-close")
+    await tmp_store.update_run_phase("atomic-fault-close", RoastPhase.FAULTED)
+    await tmp_store.open_fault_control_lease(
+        run_id="atomic-fault-close", mcp_session_id="exact-session", generation=4
+    )
+
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=4,
+        run_id="atomic-fault-close",
+        mcp_session_id="exact-session",
+        fault_reason="typed fault reason",
+    )
+
+    assert result.confirmed
+    assert result.run_completed
+    lease = await tmp_store.read_fault_control_lease()
+    assert lease.status.value == "closed"
+    detail = await tmp_store.read_run("atomic-fault-close")
+    assert detail is not None
+    assert detail.completed_at_utc is not None
+    assert detail.outcome == "faulted"
+    assert detail.fault_reason == "typed fault reason"
+    timeline = await tmp_store.read_timeline("atomic-fault-close")
+    assert any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED
+        and event.payload == {"generation": 4, "outcome": "confirmed", "status": "closed"}
+        for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_atomic_fault_close_refuses_a_lease_for_a_missing_run(tmp_store: RoastStore) -> None:
+    """A valid OPEN lease alone cannot close when its persisted run vanished."""
+    await seeded_store(tmp_store, run_id="missing-run")
+    await tmp_store.open_fault_control_lease(
+        run_id="missing-run", mcp_session_id="exact-session", generation=40
+    )
+    await tmp_store.connection.execute("PRAGMA foreign_keys = OFF")
+    await tmp_store.connection.execute("DELETE FROM roast_runs WHERE id = ?", ("missing-run",))
+    await tmp_store.connection.commit()
+    await tmp_store.connection.execute("PRAGMA foreign_keys = ON")
+
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=40,
+        run_id="missing-run",
+        mcp_session_id="exact-session",
+        fault_reason="missing run must retain the fence",
+    )
+
+    assert not result.historically_committed
+    assert not result.confirmed
+    assert not result.run_completed
+    assert (await tmp_store.read_fault_control_lease()).status.value == "open"
+
+
+@pytest.mark.asyncio
+async def test_atomic_fault_close_retains_open_lease_when_its_compare_and_swap_loses(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zero-row lease CAS is an unconfirmed close and must retain the fence."""
+    run_id = "atomic-close-lost-cas"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.FAULTED)
+    await tmp_store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="exact-session", generation=43
+    )
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_execute: Any = connection_type._execute
+    cas_attempted = False
+
+    async def lose_the_lease_compare_and_swap(
+        connection: aiosqlite_module.Connection, function: Any, *args: Any, **kwargs: Any
+    ) -> object:
+        nonlocal cas_attempted
+        sql = args[0] if args else None
+        if (
+            connection is not tmp_store.connection
+            and isinstance(sql, str)
+            and sql.startswith("UPDATE fault_control_lease SET status")
+        ):
+            cas_attempted = True
+            return mock.Mock(rowcount=0)
+        return await original_execute(connection, function, *args, **kwargs)
+
+    monkeypatch.setattr(connection_type, "_execute", lose_the_lease_compare_and_swap)
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=43,
+        run_id=run_id,
+        mcp_session_id="exact-session",
+        fault_reason="lost lease compare and swap",
+    )
+
+    assert cas_attempted
+    assert not result.historically_committed
+    assert not result.confirmed
+    assert not result.run_completed
+    assert (await tmp_store.read_fault_control_lease()).status.value == "open"
+
+
+@pytest.mark.asyncio
+async def test_atomic_fault_close_verifies_from_independent_connection(
+    tmp_store: RoastStore,
+) -> None:
+    """An old shared-connection snapshot cannot negate a committed close."""
+    await seeded_store(tmp_store, run_id="atomic-independent-read")
+    await tmp_store.update_run_phase("atomic-independent-read", RoastPhase.FAULTED)
+    await tmp_store.open_fault_control_lease(
+        run_id="atomic-independent-read", mcp_session_id="exact-session", generation=5
+    )
+    await tmp_store.connection.execute("BEGIN")
+    async with tmp_store.connection.execute(
+        "SELECT status FROM fault_control_lease WHERE singleton = 1"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert row["status"] == "open"
+    try:
+        result = await tmp_store.close_fault_control_lease_atomically(
+            generation=5,
+            run_id="atomic-independent-read",
+            mcp_session_id="exact-session",
+            fault_reason="typed fault reason",
+        )
+    finally:
+        await tmp_store.connection.rollback()
+
+    assert result.confirmed
+    assert result.run_completed
+
+
+@pytest.mark.asyncio
+async def test_atomic_fault_close_commit_then_raise_leaves_auditable_durable_close(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A driver ambiguity after COMMIT never fabricates a half-close."""
+    await seeded_store(tmp_store, run_id="atomic-commit-raise")
+    await tmp_store.update_run_phase("atomic-commit-raise", RoastPhase.FAULTED)
+    await tmp_store.open_fault_control_lease(
+        run_id="atomic-commit-raise", mcp_session_id="exact-session", generation=6
+    )
+    original_commit = aiosqlite_module.Connection.commit
+
+    async def commit_then_raise(connection: aiosqlite_module.Connection) -> None:
+        await original_commit(connection)
+        raise RuntimeError("synthetic commit acknowledgement loss")
+
+    monkeypatch.setattr(aiosqlite_module.Connection, "commit", commit_then_raise)
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=6,
+        run_id="atomic-commit-raise",
+        mcp_session_id="exact-session",
+        fault_reason="typed fault reason",
+    )
+
+    assert result.historically_committed
+    assert result.confirmed
+    assert result.run_completed
+    monkeypatch.undo()
+    lease = await tmp_store.read_fault_control_lease()
+    assert lease.status.value == "closed"
+    detail = await tmp_store.read_run("atomic-commit-raise")
+    assert detail is not None and detail.completed_at_utc is not None
+    timeline = await tmp_store.read_timeline("atomic-commit-raise")
+    assert any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_atomic_fault_close_keeps_result_unconfirmed_when_postcommit_proof_is_unreadable(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed close remains unavailable to the caller if independent proof cannot open."""
+    run_id = "atomic-verification-unavailable"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.FAULTED)
+    await tmp_store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="exact-session", generation=41
+    )
+    store_aiosqlite = cast("Any", store_module.aiosqlite)  # pyright: ignore[reportPrivateImportUsage]
+    original_connect = store_aiosqlite.connect
+    connect_calls = 0
+
+    async def fail_only_the_postcommit_connection(
+        *args: Any, **kwargs: Any
+    ) -> aiosqlite_module.Connection:
+        nonlocal connect_calls
+        connect_calls += 1
+        if connect_calls == 2:
+            raise OSError("synthetic postcommit verification failure")
+        return await original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(store_aiosqlite, "connect", fail_only_the_postcommit_connection)
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=41,
+        run_id=run_id,
+        mcp_session_id="exact-session",
+        fault_reason="proof must be readable",
+    )
+
+    assert connect_calls == 2
+    assert not result.historically_committed
+    assert not result.confirmed
+    assert result.verification_unavailable
+    assert result.requires_faulted_history
+    assert (await tmp_store.read_fault_control_lease()).status.value == "closed"
+
+
+@pytest.mark.asyncio
+async def test_atomic_terminal_close_commit_ambiguity_preserves_durable_evidence(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-COMMIT exception before verification reports ambiguity, not success."""
+    run_id = "atomic-terminal-commit-raise"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.FAULTED)
+    await tmp_store.complete_run(
+        run_id=run_id,
+        outcome="faulted",
+        agent_phase=RoastPhase.FAULTED,
+        fault_reason="original terminal fault",
+    )
+    before = await tmp_store.read_run(run_id)
+    assert before is not None
+    await tmp_store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="exact-session", generation=12
+    )
+    original_commit = aiosqlite_module.Connection.commit
+
+    async def commit_then_raise(connection: aiosqlite_module.Connection) -> None:
+        await original_commit(connection)
+        raise RuntimeError("synthetic commit acknowledgement loss")
+
+    monkeypatch.setattr(aiosqlite_module.Connection, "commit", commit_then_raise)
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=12,
+        run_id=run_id,
+        mcp_session_id="exact-session",
+        fault_reason="must not rewrite terminal history",
+    )
+
+    monkeypatch.undo()
+    lease = await tmp_store.read_fault_control_lease()
+    after = await tmp_store.read_run(run_id)
+    timeline = await tmp_store.read_timeline(run_id)
+    assert result.historically_committed
+    assert result.confirmed
+    assert not result.run_completed
+    assert lease.status.value == "closed"
+    assert after == before
+    assert any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED
+        and event.payload == {"generation": 12, "outcome": "confirmed", "status": "closed"}
+        for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_atomic_fault_close_rolls_back_when_audit_write_fails(
+    tmp_store: RoastStore,
+) -> None:
+    """An audit failure leaves the live fault and exact OPEN lease operable."""
+    await seeded_store(tmp_store, run_id="atomic-close-rollback")
+    await tmp_store.update_run_phase("atomic-close-rollback", RoastPhase.FAULTED)
+    await tmp_store.open_fault_control_lease(
+        run_id="atomic-close-rollback", mcp_session_id="exact-session", generation=2
+    )
+    await tmp_store.connection.execute(
+        "CREATE TRIGGER reject_atomic_fault_audit BEFORE INSERT ON roast_events "
+        "WHEN NEW.kind = 'fault_controls_acknowledged' "
+        "BEGIN SELECT RAISE(ABORT, 'synthetic audit failure'); END"
+    )
+    await tmp_store.connection.commit()
+
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=2,
+        run_id="atomic-close-rollback",
+        mcp_session_id="exact-session",
+        fault_reason="must not persist",
+    )
+
+    assert not result.confirmed
+    lease = await tmp_store.read_fault_control_lease()
+    assert lease.status.value == "open"
+    detail = await tmp_store.read_run("atomic-close-rollback")
+    assert detail is not None and detail.completed_at_utc is None
+    timeline = await tmp_store.read_timeline("atomic-close-rollback")
+    assert not any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_atomic_fault_close_exception_after_lease_update_rolls_back_before_audit(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, terminal: bool
+) -> None:
+    """The dedicated transaction cannot expose a closed lease before its audit."""
+    run_id = f"atomic-close-before-audit-{terminal}"
+    generation = 13 if terminal else 14
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.FAULTED)
+    if terminal:
+        await tmp_store.complete_run(
+            run_id=run_id,
+            outcome="faulted",
+            agent_phase=RoastPhase.FAULTED,
+            fault_reason="original terminal fault",
+        )
+    before = await tmp_store.read_run(run_id)
+    assert before is not None
+    await tmp_store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="exact-session", generation=generation
+    )
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_execute: Any = connection_type._execute
+    audit_insert_attempted = False
+
+    async def fail_before_audit_insert(
+        connection: aiosqlite_module.Connection, function: Any, *args: Any, **kwargs: Any
+    ) -> object:
+        nonlocal audit_insert_attempted
+        sql = args[0] if args else None
+        if (
+            connection is not tmp_store.connection
+            and isinstance(sql, str)
+            and sql.startswith("INSERT INTO roast_events")
+        ):
+            audit_insert_attempted = True
+            raise RuntimeError("synthetic failure between lease update and audit insert")
+        return await original_execute(connection, function, *args, **kwargs)
+
+    monkeypatch.setattr(connection_type, "_execute", fail_before_audit_insert)
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=generation,
+        run_id=run_id,
+        mcp_session_id="exact-session",
+        fault_reason="must roll back",
+    )
+
+    monkeypatch.undo()
+    lease = await tmp_store.read_fault_control_lease()
+    after = await tmp_store.read_run(run_id)
+    timeline = await tmp_store.read_timeline(run_id)
+    assert audit_insert_attempted
+    assert not result.confirmed
+    assert not result.run_completed
+    assert lease.status.value == "open"
+    assert after == before
+    assert not any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_atomic_fault_close_cancellation_after_begin_rolls_back_every_row(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation after ``BEGIN IMMEDIATE`` leaves the lease and history OPEN."""
+    run_id = "atomic-close-cancel-after-begin"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.FAULTED)
+    await tmp_store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="exact-session", generation=7
+    )
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_execute: Any = connection_type._execute
+
+    async def cancel_first_transaction_read(
+        connection: aiosqlite_module.Connection, function: Any, *args: Any, **kwargs: Any
+    ) -> object:
+        sql = args[0] if args else None
+        if (
+            connection is not tmp_store.connection
+            and isinstance(sql, str)
+            and sql.startswith("SELECT run_id, mcp_session_id, status FROM fault_control_lease")
+        ):
+            raise asyncio.CancelledError("synthetic cancellation after BEGIN")
+        return await original_execute(connection, function, *args, **kwargs)
+
+    monkeypatch.setattr(connection_type, "_execute", cancel_first_transaction_read)
+    with pytest.raises(asyncio.CancelledError):
+        await tmp_store.close_fault_control_lease_atomically(
+            generation=7,
+            run_id=run_id,
+            mcp_session_id="exact-session",
+            fault_reason="must roll back",
+        )
+
+    monkeypatch.undo()
+    lease = await tmp_store.read_fault_control_lease()
+    detail = await tmp_store.read_run(run_id)
+    timeline = await tmp_store.read_timeline(run_id)
+    assert lease.status.value == "open"
+    assert detail is not None and detail.completed_at_utc is None
+    assert not any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_atomic_fault_close_rolls_back_after_audit_before_live_history_update(
+    tmp_store: RoastStore,
+) -> None:
+    """A failure after the acknowledgement INSERT cannot strand a closed lease."""
+    run_id = "atomic-close-after-audit"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.FAULTED)
+    await tmp_store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="exact-session", generation=8
+    )
+    await tmp_store.connection.execute(
+        "CREATE TRIGGER reject_atomic_fault_history BEFORE UPDATE ON roast_runs "
+        "WHEN NEW.completed_at_utc IS NOT NULL "
+        "BEGIN SELECT RAISE(ABORT, 'synthetic history failure'); END"
+    )
+    await tmp_store.connection.commit()
+
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=8,
+        run_id=run_id,
+        mcp_session_id="exact-session",
+        fault_reason="must roll back",
+    )
+
+    lease = await tmp_store.read_fault_control_lease()
+    detail = await tmp_store.read_run(run_id)
+    timeline = await tmp_store.read_timeline(run_id)
+    assert not result.confirmed
+    assert lease.status.value == "open"
+    assert detail is not None and detail.completed_at_utc is None
+    assert not any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_atomic_fault_close_cas_refuses_wrong_identity_and_nonfaulted_live_history(
+    tmp_store: RoastStore,
+) -> None:
+    """D215 closes only the exact OPEN FAULTED lease and leaves failed CAS rows intact."""
+    run_id = "atomic-close-cas"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.FAULTED)
+    await tmp_store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="exact-session", generation=9
+    )
+
+    for generation, candidate_run_id, session_id in (
+        (8, run_id, "exact-session"),
+        (9, "wrong-run", "exact-session"),
+        (9, run_id, "wrong-session"),
+    ):
+        result = await tmp_store.close_fault_control_lease_atomically(
+            generation=generation,
+            run_id=candidate_run_id,
+            mcp_session_id=session_id,
+            fault_reason="must not close",
+        )
+        assert not result.confirmed
+
+    await tmp_store.mark_fault_control_lease_unknown(9)
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=9,
+        run_id=run_id,
+        mcp_session_id="exact-session",
+        fault_reason="must not close unknown lease",
+    )
+    assert not result.confirmed
+    lease = await tmp_store.read_fault_control_lease()
+    detail = await tmp_store.read_run(run_id)
+    timeline = await tmp_store.read_timeline(run_id)
+    assert lease.status.value == "unknown"
+    assert detail is not None and detail.completed_at_utc is None
+    assert not any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED for event in timeline.events
+    )
+
+    nonfaulted_run_id = "atomic-close-nonfaulted"
+    await seeded_store(tmp_store, run_id=nonfaulted_run_id)
+    await tmp_store.open_fault_control_lease(
+        run_id=nonfaulted_run_id, mcp_session_id="exact-session", generation=10
+    )
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=10,
+        run_id=nonfaulted_run_id,
+        mcp_session_id="exact-session",
+        fault_reason="must not terminalise a live non-fault",
+    )
+    lease = await tmp_store.read_fault_control_lease()
+    detail = await tmp_store.read_run(nonfaulted_run_id)
+    timeline = await tmp_store.read_timeline(nonfaulted_run_id)
+    assert not result.confirmed
+    assert lease.status.value == "open"
+    assert detail is not None and detail.agent_phase is RoastPhase.STARTING
+    assert detail.completed_at_utc is None
+    assert not any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_atomic_fault_close_preserves_already_terminal_history(tmp_store: RoastStore) -> None:
+    """A terminal fault lease gains its audit without rewriting immutable run history."""
+    run_id = "atomic-close-terminal"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.FAULTED)
+    await tmp_store.complete_run(
+        run_id=run_id,
+        outcome="faulted",
+        agent_phase=RoastPhase.FAULTED,
+        fault_reason="original fault",
+    )
+    before = await tmp_store.read_run(run_id)
+    assert before is not None and before.completed_at_utc is not None
+    await tmp_store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="exact-session", generation=11
+    )
+
+    result = await tmp_store.close_fault_control_lease_atomically(
+        generation=11,
+        run_id=run_id,
+        mcp_session_id="exact-session",
+        fault_reason="must not overwrite immutable history",
+    )
+
+    after = await tmp_store.read_run(run_id)
+    timeline = await tmp_store.read_timeline(run_id)
+    assert result.confirmed
+    assert not result.run_completed
+    assert after == before
+    assert any(
+        event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED
+        and event.payload == {"generation": 11, "outcome": "confirmed", "status": "closed"}
+        for event in timeline.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_independent_fault_close_verification_requires_the_exact_audited_close(
+    tmp_store: RoastStore,
+) -> None:
+    """Recovery can reprove one terminal close without mutating durable state."""
+    run_id = "independently-verified-close"
+    await seeded_store(tmp_store, run_id=run_id)
+    await tmp_store.update_run_phase(run_id, RoastPhase.FAULTED)
+    await tmp_store.complete_run(
+        run_id=run_id,
+        outcome="faulted",
+        agent_phase=RoastPhase.FAULTED,
+        fault_reason="recorded fault",
+    )
+    await tmp_store.open_fault_control_lease(
+        run_id=run_id, mcp_session_id="exact-session", generation=12
+    )
+    assert (
+        await tmp_store.close_fault_control_lease_atomically(
+            generation=12,
+            run_id=run_id,
+            mcp_session_id="exact-session",
+            fault_reason="must not overwrite terminal history",
+        )
+    ).confirmed
+
+    verified = await tmp_store.verify_fault_control_lease_close(
+        generation=12,
+        run_id=run_id,
+        mcp_session_id="exact-session",
+        requires_faulted_history=True,
+    )
+    wrong_generation = await tmp_store.verify_fault_control_lease_close(
+        generation=13,
+        run_id=run_id,
+        mcp_session_id="exact-session",
+        requires_faulted_history=True,
+    )
+
+    assert verified.historically_committed
+    assert verified.confirmed
+    assert verified.run_completed
+    assert not wrong_generation.historically_committed
+    assert not wrong_generation.confirmed
+
+
+@pytest.mark.asyncio
+async def test_independent_fault_close_verification_fails_closed_when_the_database_is_unreadable(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recovery retry retains the fence when it cannot obtain a fresh database proof."""
+    await tmp_store.initialize()
+
+    async def unreadable_connection(*_args: Any, **_kwargs: Any) -> NoReturn:
+        raise OSError("synthetic independent verification failure")
+
+    store_aiosqlite = cast("Any", store_module.aiosqlite)  # pyright: ignore[reportPrivateImportUsage]
+    monkeypatch.setattr(store_aiosqlite, "connect", unreadable_connection)
+    result = await tmp_store.verify_fault_control_lease_close(
+        generation=42,
+        run_id="missing-run",
+        mcp_session_id="exact-session",
+        requires_faulted_history=True,
+    )
+
+    assert not result.historically_committed
+    assert not result.confirmed
+    assert not result.run_completed
+    assert result.verification_unavailable
+
+
+@pytest.mark.asyncio
+async def test_unverified_closed_fault_lease_is_unknown_on_restart_read(
+    tmp_store: RoastStore,
+) -> None:
+    """A crash-shaped CLOSED row without its audit cannot clear Start fencing."""
+    await seeded_store(tmp_store, run_id="unverified-close")
+    await tmp_store.connection.execute(
+        "INSERT INTO fault_control_lease "
+        "(singleton, run_id, mcp_session_id, generation, status, updated_at_utc) "
+        "VALUES (1, ?, ?, 1, 'closed', ?)",
+        ("unverified-close", "exact-session", "2026-10-08T00:00:00+00:00"),
+    )
+    await tmp_store.connection.commit()
+
+    lease = await tmp_store.read_fault_control_lease()
+
+    assert lease.status.value == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_fault_lease_read_fails_closed_for_corrupt_status_and_legacy_close(
+    tmp_store: RoastStore,
+) -> None:
+    """Corrupt status and a close without its audit never create Start eligibility."""
+    await seeded_store(tmp_store, run_id="corrupt-lease")
+    # The schema rejects bad values in normal operation.  Simulate a damaged
+    # on-disk row to pin the defensive migration/recovery read boundary.
+    await tmp_store.connection.execute("PRAGMA ignore_check_constraints = ON")
+    await tmp_store.connection.execute(
+        "INSERT INTO fault_control_lease "
+        "(singleton, run_id, mcp_session_id, generation, status, updated_at_utc) "
+        "VALUES (1, ?, ?, 1, 'invalid', ?)",
+        ("corrupt-lease", "exact-session", "2026-10-08T00:00:00+00:00"),
+    )
+    await tmp_store.connection.commit()
+    await tmp_store.connection.execute("PRAGMA ignore_check_constraints = OFF")
+
+    assert (await tmp_store.read_fault_control_lease()).status.value == "unknown"
+    await tmp_store.open_fault_control_lease(
+        run_id="corrupt-lease", mcp_session_id="exact-session", generation=2
+    )
+    assert await tmp_store.close_fault_control_lease(2)
+
+    # The legacy primitive changes only the singleton row.  Without D215's
+    # matching immutable audit event, a later read retains the UNKNOWN fence.
+    assert (await tmp_store.read_fault_control_lease()).status.value == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_fault_acknowledgement_audit_can_only_resolve_its_pending_event(
+    tmp_store: RoastStore,
+) -> None:
+    """A revocable acknowledgement audit records either confirmation or an e-stop supersession."""
+    run_id = "revocable-fault-acknowledgement"
+    await seeded_store(tmp_store, run_id=run_id)
+
+    superseded_id = await tmp_store.begin_fault_controls_acknowledgement_event(run_id, 4)
+    assert await tmp_store.resolve_fault_controls_acknowledgement_event(
+        superseded_id, generation=4, confirmed=False
+    )
+    assert not await tmp_store.resolve_fault_controls_acknowledgement_event(
+        superseded_id, generation=5, confirmed=True
+    )
+
+    confirmed_id = await tmp_store.begin_fault_controls_acknowledgement_event(run_id, 5)
+    assert await tmp_store.resolve_fault_controls_acknowledgement_event(
+        confirmed_id, generation=5, confirmed=True
+    )
+
+    timeline = await tmp_store.read_timeline(run_id)
+    acknowledgement_events = [
+        event
+        for event in timeline.events
+        if event.kind is RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED
+    ]
+    assert [event.payload for event in acknowledgement_events] == [
+        {
+            "generation": 4,
+            "outcome": "failed",
+            "status": "superseded_by_emergency_stop",
+        },
+        {"generation": 5, "outcome": "confirmed", "status": "closed"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fault_acknowledgement_confirmation_audit_never_leaves_pending_success(
+    tmp_store: RoastStore,
+) -> None:
+    """D212 records confirmation or e-stop supersession as a final audit outcome.
+
+    A stale resolver cannot turn a superseded acknowledgement into a successful
+    one.  A fresh acknowledgement may confirm, and both terminal outcomes stay
+    readable from the durable operator-action trail.
+    """
+    run_id = "fault-acknowledgement-confirmation"
+    await seeded_store(tmp_store, run_id=run_id)
+
+    superseded_id = await tmp_store.begin_fault_acknowledgement_confirmation(run_id)
+    assert await tmp_store.resolve_fault_acknowledgement_confirmation(
+        superseded_id, confirmed=False
+    )
+    assert not await tmp_store.resolve_fault_acknowledgement_confirmation(
+        superseded_id, confirmed=True
+    )
+
+    confirmed_id = await tmp_store.begin_fault_acknowledgement_confirmation(run_id)
+    assert await tmp_store.resolve_fault_acknowledgement_confirmation(confirmed_id, confirmed=True)
+
+    async with tmp_store.connection.execute(
+        "SELECT payload_json, result FROM operator_actions "
+        "WHERE run_id = ? AND action = ? ORDER BY id ASC",
+        (run_id, "acknowledge_fault"),
+    ) as cursor:
+        rows = await cursor.fetchall()
+
+    assert [(json.loads(str(row["payload_json"])), str(row["result"])) for row in rows] == [
+        ({"fault_acknowledgement": "superseded_by_emergency_stop"}, "failed"),
+        ({"fault_acknowledgement": "confirmed"}, "accepted"),
+    ]

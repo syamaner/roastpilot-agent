@@ -45,14 +45,22 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Annotated, Any, Literal, Protocol, TypeVar, cast
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceConfig
-from roastpilot_agent.models import AppliedRoasterState, MicStatus, RoastTelemetry
+from roastpilot_agent.models import (
+    AppliedRoasterState,
+    FaultAcknowledgementState,
+    FaultControlState,
+    FaultCoolingStopResult,
+    MicStatus,
+    OperatorAction,
+    RoastTelemetry,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -87,6 +95,7 @@ MCPPhase = Literal[
     "complete",
     "fault",
 ]
+SessionPresence = Literal["none", "starting", "active", "stopped"]
 
 FirstCrackMode = Literal["disabled", "audio", "manual"]
 FirstCrackRuntimeStatus = Literal[
@@ -251,7 +260,7 @@ class RoastSessionState(MCPMirror):
 
 
 class ServerInfo(MCPMirror):
-    """Mirror of mcp_server.ServerInfo."""
+    """Frozen mirror of mcp_server.ServerInfo for identity and health reads."""
 
     product_name: str
     package_name: str
@@ -266,6 +275,18 @@ class ServerInfo(MCPMirror):
     bootstrap_safe: bool
     available_bootstrap_tools: tuple[str, ...]
     started_at_utc: str
+
+
+class SessionPresenceSnapshot(MCPMirror):
+    """Typed session-presence projection from a fresh ``get_server_info`` read.
+
+    This is intentionally separate from :class:`ServerInfo`: the latter is a
+    frozen cold-characterisation identity component.  The current MCP adds
+    this field to the same wire response, while a published older MCP omits it
+    and is therefore rejected by this required projection.
+    """
+
+    session_presence: SessionPresence
 
 
 class RuntimeConfigSnapshot(MCPMirror):
@@ -320,6 +341,80 @@ class EventCommandResult(MCPMirror):
     event_count: int
 
 
+class FaultControlDeviceReadback(BaseModel):
+    """Strict control fields read from one fault-session device snapshot."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore", strict=True)
+
+    connected: StrictBool
+    heat_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    fan_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    cooling_on: StrictBool
+
+
+class FaultControlReadback(BaseModel):
+    """Strict minimal projection used only by the fault-control boundary.
+
+    Ordinary roast and cold-characterisation reads intentionally keep using
+    :class:`RoastSessionState`, whose tolerant mirror supports compatible MCP
+    additions and feeds the cold boundary's independent strict projector.  A
+    fault acknowledgement or terminal fault command, however, must not base a
+    safe-zero proof on values that Pydantic coerced at the shared mirror.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore", strict=True)
+
+    session_id: StrictStr
+    active: StrictBool
+    phase: Literal["fault"]
+    heat_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    fan_level_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    cooling_on: StrictBool
+    beans_added_at_utc: StrictStr | None
+    beans_dropped_at_utc: StrictStr | None
+    device_state: FaultControlDeviceReadback | None
+
+
+class FaultControlEvent(BaseModel):
+    """Strict event fields from one fault-control command result."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore", strict=True)
+
+    kind: StrictStr
+    recorded_at_utc: StrictStr
+    monotonic_seconds: float
+    payload: dict[str, object]
+
+
+class FaultControlCommandResult(BaseModel):
+    """Strict result projection used only by exact fault-control writes."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore", strict=True)
+
+    session_id: StrictStr
+    phase: Literal["fault"]
+    event: FaultControlEvent
+    event_count: StrictInt
+
+
+_FaultControlModelT = TypeVar("_FaultControlModelT", bound=BaseModel)
+
+
+def _validate_fault_control_payload(
+    model: type[_FaultControlModelT], payload: object
+) -> _FaultControlModelT:
+    """Validate a safety-critical fault payload without exposing raw values.
+
+    The fixed exception deliberately contains no MCP response fragments.  The
+    controller can therefore preserve a fail-closed fault lease without
+    propagating private device data into diagnostics.
+    """
+    try:
+        return model.model_validate(payload)
+    except ValidationError:
+        raise ValueError("fault control MCP evidence is malformed") from None
+
+
 class ExportRoastLogResult(MCPMirror):
     """Mirror of mcp_server.ExportRoastLogResult."""
 
@@ -353,6 +448,16 @@ class RoasterMCPClient:
     async def get_server_info(self) -> ServerInfo:
         return ServerInfo.model_validate(await self._call("get_server_info", {}))
 
+    async def _get_session_presence(self) -> SessionPresence:
+        """Return required typed presence from one fresh server-info response.
+
+        The method intentionally has no generic tool or field-selection input:
+        restart clearance can only read the MCP's fixed ``get_server_info``
+        response and an omitted field from an older MCP is invalid evidence.
+        """
+        result = await self._call("get_server_info", {})
+        return SessionPresenceSnapshot.model_validate(result).session_presence
+
     async def get_runtime_config(self) -> RuntimeConfigSnapshot:
         return RuntimeConfigSnapshot.model_validate(await self._call("get_runtime_config", {}))
 
@@ -381,22 +486,63 @@ class RoasterMCPClient:
     async def mark_first_crack(self) -> EventCommandResult:
         return EventCommandResult.model_validate(await self._call("mark_first_crack", {}))
 
-    async def drop_beans(self) -> EventCommandResult:
-        return EventCommandResult.model_validate(await self._call("drop_beans", {}))
+    async def drop_beans(self, *, expected_session_id: str | None = None) -> EventCommandResult:
+        """Drop beans, optionally bound to the current exact MCP session."""
+        args: dict[str, object] = {}
+        if expected_session_id is not None:
+            args["expected_session_id"] = expected_session_id
+        return EventCommandResult.model_validate(await self._call("drop_beans", args))
 
-    async def start_cooling(self) -> EventCommandResult:
-        return EventCommandResult.model_validate(await self._call("start_cooling", {}))
+    async def start_cooling(self, *, expected_session_id: str | None = None) -> EventCommandResult:
+        """Start cooling, optionally bound to the current exact MCP session."""
+        args: dict[str, object] = {}
+        if expected_session_id is not None:
+            args["expected_session_id"] = expected_session_id
+        return EventCommandResult.model_validate(await self._call("start_cooling", args))
 
-    async def stop_cooling(self) -> EventCommandResult:
-        return EventCommandResult.model_validate(await self._call("stop_cooling", {}))
+    async def stop_cooling(self, *, expected_session_id: str | None = None) -> EventCommandResult:
+        """Stop cooling, optionally bound to the current exact MCP session."""
+        args: dict[str, object] = {}
+        if expected_session_id is not None:
+            args["expected_session_id"] = expected_session_id
+        return EventCommandResult.model_validate(await self._call("stop_cooling", args))
 
     async def export_roast_log(self, session_id: str | None = None) -> ExportRoastLogResult:
         args: dict[str, object] = {} if session_id is None else {"session_id": session_id}
         return ExportRoastLogResult.model_validate(await self._call("export_roast_log", args))
 
-    async def emergency_stop(self, reason: str = "manual emergency stop") -> EventCommandResult:
-        return EventCommandResult.model_validate(
-            await self._call("emergency_stop", {"reason": reason})
+    async def emergency_stop(
+        self, reason: str = "manual emergency stop", *, expected_session_id: str | None = None
+    ) -> EventCommandResult:
+        """Emergency-stop, optionally bound to the current exact MCP session."""
+        args: dict[str, object] = {"reason": reason}
+        if expected_session_id is not None:
+            args["expected_session_id"] = expected_session_id
+        return EventCommandResult.model_validate(await self._call("emergency_stop", args))
+
+    async def _get_fault_control_readback(
+        self, session_id: str | None = None
+    ) -> FaultControlReadback:
+        """Return one exact-typed fault-state readback for a guarded action.
+
+        This deliberately bypasses the tolerant session mirror.  It is the
+        narrow safety boundary used to prove fault controls, while the regular
+        session client remains compatible with raw MCP telemetry used by the
+        cold-characterisation projector.
+        """
+        args: dict[str, object] = {} if session_id is None else {"session_id": session_id}
+        return _validate_fault_control_payload(
+            FaultControlReadback, await self._call("get_roast_state", args)
+        )
+
+    async def _execute_fault_control(
+        self,
+        tool: Literal["emergency_stop", "start_cooling", "stop_cooling", "drop_beans"],
+        arguments: dict[str, object],
+    ) -> FaultControlCommandResult:
+        """Execute one guarded fault action and require an exact typed result."""
+        return _validate_fault_control_payload(
+            FaultControlCommandResult, await self._call(tool, arguments)
         )
 
     async def set_recording_metadata(
@@ -1085,6 +1231,7 @@ class RoasterControlAdapter:
         self._client = client
         self._clock = clock
         self._last_state: RoastSessionState | None = None
+        self._started_session_id: str | None = None
         self._last_elapsed: float | None = None
         self._last_change_monotonic: float | None = None
         self._last_ambient_token: float | None = None
@@ -1096,6 +1243,202 @@ class RoasterControlAdapter:
         first read). Source of the persisted ``raw_state_json`` / dev% / MCP
         phase fields the projected telemetry drops."""
         return self._last_state
+
+    @property
+    def latest_fault_session_id(self) -> str | None:
+        """Return the current telemetry identity or, before telemetry, Start's identity."""
+        state = self._last_state
+        if state is not None:
+            return state.session_id
+        return self._started_session_id
+
+    def reset_session_identity_for_new_run(self) -> None:
+        """Clear cached session identity before a new Agent run is published.
+
+        A runner may become visible before its ``start_session`` write runs.
+        Clearing synchronously prevents an e-stop in that interval from
+        attaching a prior run's cached session to the new run.
+        """
+        self._last_state = None
+        self._started_session_id = None
+        self._last_elapsed = None
+        self._last_change_monotonic = None
+        self._last_ambient_token = None
+        self._ambient_token_change_monotonic = None
+
+    async def read_session_presence(self) -> SessionPresence:
+        """Read the current child's typed MCP session-presence snapshot.
+
+        This deliberately calls ``get_server_info`` for every clearance proof;
+        the adapter never derives no-session state from cached telemetry or a
+        failed ``get_roast_state`` call.  Older MCP responses omit the field
+        and therefore fail closed.
+        """
+        return await self._client._get_session_presence()  # pyright: ignore[reportPrivateUsage]
+
+    async def read_fault_acknowledgement_state(self, session_id: str) -> FaultAcknowledgementState:
+        """Read and bind the MCP's current session for a fault acknowledgement proof."""
+        # ``stop_cooling`` now binds its recovery write to ``expected_session_id``.
+        # Read the current authoritative state first; the runner serializes this
+        # proof and its possible exact-session write.
+        state = await self._client._get_fault_control_readback()  # pyright: ignore[reportPrivateUsage]
+        if state.session_id != session_id:
+            raise ValueError("fault acknowledgement session does not match latest state")
+        device = state.device_state
+        if device is None:
+            raise ValueError("fault acknowledgement state has no device state")
+        if (
+            state.heat_level_percent != device.heat_level_percent
+            or state.fan_level_percent != device.fan_level_percent
+            or state.cooling_on is not device.cooling_on
+        ):
+            raise ValueError("fault acknowledgement state controls disagree")
+        # FaultControlReadback accepts only Literal["fault"] at parsing.
+        if state.phase != "fault":  # pragma: no cover
+            raise ValueError("fault acknowledgement state is not faulted")
+        return FaultAcknowledgementState(
+            session_id=state.session_id,
+            mcp_phase=state.phase,
+            active=state.active,
+            device_connected=device.connected,
+            heat_level_percent=device.heat_level_percent,
+            fan_level_percent=device.fan_level_percent,
+            cooling_on=device.cooling_on,
+        )
+
+    async def stop_cooling_for_fault_acknowledgement(
+        self, expected_session_id: str
+    ) -> FaultCoolingStopResult:
+        """Issue one cooling-stop command and project its typed proof."""
+        result = await self._client._execute_fault_control(  # pyright: ignore[reportPrivateUsage]
+            "stop_cooling", {"expected_session_id": expected_session_id}
+        )
+        payload = result.event.payload
+        recovery_after_fault = payload.get("recovery_after_fault")
+        heat_level_percent = payload.get("heat_level_percent")
+        fan_level_percent = payload.get("fan_level_percent")
+        cooling_on = payload.get("cooling_on")
+        if (
+            result.phase != "fault"
+            or result.event.kind != "cooling_stopped"
+            or recovery_after_fault is not True
+            or type(heat_level_percent) is not int
+            or type(fan_level_percent) is not int
+            or cooling_on is not False
+        ):
+            raise ValueError("fault acknowledgement cooling stop result is malformed")
+        return FaultCoolingStopResult(
+            session_id=result.session_id,
+            phase=result.phase,
+            event_kind=result.event.kind,
+            recovery_after_fault=recovery_after_fault,
+            heat_level_percent=heat_level_percent,
+            fan_level_percent=fan_level_percent,
+            cooling_on=cooling_on,
+        )
+
+    async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+        """Read one exact MCP fault session for a terminal lease action."""
+        state = await self._client._get_fault_control_readback(  # pyright: ignore[reportPrivateUsage]
+            session_id
+        )
+        if state.session_id != session_id:
+            raise ValueError("terminal fault control session does not match a fault state")
+        device = state.device_state
+        if device is None or not device.connected:
+            raise ValueError("terminal fault control state has no connected device")
+        if (
+            state.heat_level_percent != device.heat_level_percent
+            or state.fan_level_percent != device.fan_level_percent
+            or state.cooling_on is not device.cooling_on
+        ):
+            raise ValueError("terminal fault control state controls disagree")
+        return FaultControlState(
+            session_id=state.session_id,
+            mcp_phase=state.phase,
+            active=state.active,
+            device_connected=device.connected,
+            heat_level_percent=device.heat_level_percent,
+            fan_level_percent=device.fan_level_percent,
+            cooling_on=device.cooling_on,
+            beans_added=state.beans_added_at_utc is not None,
+            beans_dropped=state.beans_dropped_at_utc is not None,
+        )
+
+    async def read_latest_fault_control_state(self) -> FaultControlState:
+        """Read the MCP's latest fault session for terminal identity proof."""
+        state = await self._client._get_fault_control_readback()  # pyright: ignore[reportPrivateUsage]
+        device = state.device_state
+        if state.phase != "fault" or device is None or not device.connected:
+            raise ValueError("latest terminal fault control state is unavailable")
+        if (
+            state.heat_level_percent != device.heat_level_percent
+            or state.fan_level_percent != device.fan_level_percent
+            or state.cooling_on is not device.cooling_on
+        ):
+            raise ValueError("latest terminal fault control controls disagree")
+        return FaultControlState(
+            session_id=state.session_id,
+            mcp_phase=state.phase,
+            active=state.active,
+            device_connected=device.connected,
+            heat_level_percent=device.heat_level_percent,
+            fan_level_percent=device.fan_level_percent,
+            cooling_on=device.cooling_on,
+            beans_added=state.beans_added_at_utc is not None,
+            beans_dropped=state.beans_dropped_at_utc is not None,
+        )
+
+    async def write_fault_control(
+        self, action: OperatorAction, *, expected_session_id: str
+    ) -> None:
+        """Issue one exact-session terminal fault write without holding an arbiter for readback."""
+        if action is OperatorAction.EMERGENCY_STOP:
+            result = await self._client._execute_fault_control(  # pyright: ignore[reportPrivateUsage]
+                "emergency_stop",
+                {"reason": "terminal fault control", "expected_session_id": expected_session_id},
+            )
+            if (
+                result.session_id != expected_session_id
+                or result.phase != "fault"
+                or result.event.kind != "fault"
+                or result.event.payload.get("driver_safety_method_called") is not True
+                or result.event.payload.get("driver_error") is not None
+            ):
+                raise ValueError("terminal emergency stop is unconfirmed")
+        elif action is OperatorAction.START_COOLING:
+            result = await self._client._execute_fault_control(  # pyright: ignore[reportPrivateUsage]
+                "start_cooling", {"expected_session_id": expected_session_id}
+            )
+            if (
+                result.session_id != expected_session_id
+                or result.phase != "fault"
+                or result.event.kind != "cooling_started"
+            ):
+                raise ValueError("terminal start cooling is unconfirmed")
+        elif action in (OperatorAction.STOP_COOLING, OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE):
+            result = await self._client._execute_fault_control(  # pyright: ignore[reportPrivateUsage]
+                "stop_cooling", {"expected_session_id": expected_session_id}
+            )
+            if (
+                result.session_id != expected_session_id
+                or result.phase != "fault"
+                or result.event.kind != "cooling_stopped"
+            ):
+                raise ValueError("terminal stop cooling is unconfirmed")
+        elif action is OperatorAction.DROP_BEANS:
+            result = await self._client._execute_fault_control(  # pyright: ignore[reportPrivateUsage]
+                "drop_beans", {"expected_session_id": expected_session_id}
+            )
+            if (
+                result.session_id != expected_session_id
+                or result.phase != "fault"
+                or result.event.kind != "beans_dropped"
+            ):
+                raise ValueError("terminal drop is unconfirmed")
+        else:
+            raise ValueError("unsupported terminal fault action")
+        return None
 
     async def read_telemetry(self) -> RoastTelemetry | None:
         state = await self._client.get_roast_state()
@@ -1213,9 +1556,7 @@ class RoasterControlAdapter:
         # would otherwise expose the prior session's state — e.g. a stale mic
         # icon on a back-to-back roast (#200/Codex), or a stale raw_state_json /
         # dev% / mcp_phase persisted for the new run's first tick. Reset on start.
-        self._last_state = None
-        self._last_elapsed = None
-        self._last_change_monotonic = None
+        self.reset_session_identity_for_new_run()
         # #732: the ambient tracker is age-tracking state exactly like the two
         # above and must reset with them. The MCP's stop path deliberately
         # PRESERVES the last ambient reading and its stamp, and a stop/start
@@ -1225,8 +1566,6 @@ class RoasterControlAdapter:
         # new run's first reading from the old run's clock (passing a stale
         # reading as fresh) or declines it immediately and burns the new run's
         # one-shot decline warning on a phantom.
-        self._last_ambient_token = None
-        self._ambient_token_change_monotonic = None
         if recording_origin is not None and recording_roast_num is not None:
             try:
                 await self._client.set_recording_metadata(recording_origin, recording_roast_num)
@@ -1240,10 +1579,19 @@ class RoasterControlAdapter:
                     recording_roast_num,
                     exc_info=True,
                 )
-        await self._client.start_roast_session()
+        result = await self._client.start_roast_session()
+        self._started_session_id = result.session.session_id
 
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
         await self._client.set_heat(heat_percent)
+        await self._client.set_fan(fan_percent)
+
+    async def set_heat(self, heat_percent: int) -> None:
+        """Set heat as one arbiter-visible MCP command."""
+        await self._client.set_heat(heat_percent)
+
+    async def set_fan(self, fan_percent: int) -> None:
+        """Set fan as one arbiter-visible MCP command."""
         await self._client.set_fan(fan_percent)
 
     async def mark_beans_added(self) -> None:
@@ -1295,6 +1643,11 @@ class RoasterControlAdapter:
         treat as "the stop itself failed", queuing a needless heat-off retry
         on a machine that is already safely stopped)."""
         result = await self._client.emergency_stop(reason)
+        if (
+            result.event.payload.get("driver_safety_method_called") is not True
+            or result.event.payload.get("driver_error") is not None
+        ):
+            raise ValueError("emergency stop driver confirmation is missing or failed")
         return self._applied_state_or_none(result.event)
 
     @staticmethod
@@ -1600,6 +1953,10 @@ class MCPServerProcess:
         self._config = config or MCPConfig()
         self._device_config: MCPDeviceConfig | None = device_config
         self._session: ToolSession | None = session  # injectable test seam
+        #: Monotonic in-process identity of the attached child/session.  API
+        #: clearance records this before a fresh read and rejects a proof when
+        #: a stop or replacement changes it before durable confirmation.
+        self._child_epoch = 1 if session is not None else 0
         self._session_factory: SessionFactory = (
             session_factory if session_factory is not None else self._default_session_factory
         )
@@ -1806,6 +2163,23 @@ class MCPServerProcess:
         return self._session is not None
 
     @property
+    def child_epoch(self) -> int:
+        """Return the identity epoch of the currently attached MCP child.
+
+        The value changes whenever this transport attaches or detaches a
+        session.  It is an in-process freshness fence, never a hardware-state
+        assertion or a persistent child identifier.
+        """
+        return self._child_epoch
+
+    def _replace_session(self, session: ToolSession | None) -> None:
+        """Set the attached session and advance its in-process identity."""
+        if self._session is session:
+            return
+        self._session = session
+        self._child_epoch += 1
+
+    @property
     def stop_unconfirmed(self) -> bool:
         """Whether the most recent child lifecycle lacked confirmed clean teardown.
 
@@ -1914,11 +2288,11 @@ class MCPServerProcess:
                         await asyncio.wait_for(
                             session.initialize(), timeout=self._config.startup_timeout_seconds
                         )
-                        self._session = session
+                        self._replace_session(session)
                         # Health check through the public surface before we report ready.
                         await self.call_tool("get_server_info", {})
                     except Exception as exc:  # startup failure: unwind + report to start()
-                        self._session = None
+                        self._replace_session(None)
                         # First (and only) resolution on this path — ready is still
                         # pending here (nothing else resolves it), so set directly; a
                         # hypothetical double-set would raise InvalidStateError, which
@@ -1962,7 +2336,7 @@ class MCPServerProcess:
                 )
             raise
         finally:
-            self._session = None
+            self._replace_session(None)
             # Absolute backstop: if some path left ``ready`` unresolved (should be
             # impossible after the guards above), fail it closed rather than hang.
             if not ready.done():  # pragma: no cover - defensive: unreachable
@@ -2234,7 +2608,7 @@ class MCPServerProcess:
                 if owner.done():
                     self._owner_task = None
                     self._stop_requested = None
-                self._session = None
+                self._replace_session(None)
                 # Clean up the rendered yaml temp dir (D78-4, #420); best-effort —
                 # a leftover temp dir is harmless, never blocks shutdown.
                 if self._rendered_yaml_dir is not None:
@@ -2275,11 +2649,12 @@ class MCPServerProcess:
 
     async def call_tool(self, name: str, arguments: dict[str, object]) -> object:
         """ToolCaller implementation: timeout-bounded, typed failures only."""
-        if self._session is None:
+        session = self._session
+        if session is None:
             raise MCPConnectionError("MCP server process is not running")
         try:
             result = await asyncio.wait_for(
-                self._session.call_tool(name, dict(arguments)),
+                session.call_tool(name, dict(arguments)),
                 timeout=self._config.call_timeout_seconds,
             )
             # Parsed inside the try: a malformed text block (JSONDecodeError)

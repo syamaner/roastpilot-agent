@@ -52,6 +52,11 @@ test("route refreshes a rejected stale incident and resets confirmation for the 
           mcp_child: "stopped",
           mcp_hardware_clear_required: true,
           mcp_teardown_incident_id: incidentId,
+          // This route test isolates the incident-bound acknowledgement. The
+          // D213 process gate is already cleared, and the lease is closed, so
+          // neither independent gate masks the hardware-clear card.
+          restart_clearance: { state: "cleared", eligible: true },
+          fault_controls: { status: "closed", generation: null, enabled_actions: [] },
           active_run_id: null,
         }),
       });
@@ -91,4 +96,140 @@ test("route refreshes a rejected stale incident and resets confirmation for the 
   await expect(page.getByTestId("hardware-clear-open")).toBeVisible();
   await expect(page.getByTestId("hardware-clear-confirm")).toHaveCount(0);
   expect(submittedIncidents).toEqual(["a".repeat(32)]);
+});
+
+test("required restart clearance keeps a CLOSED server-advertised software e-stop visible", async ({
+  page,
+}) => {
+  let clearanceRequired = true;
+  const emergencyStopRequests: unknown[] = [];
+  // `useFreshHealthGate` polls every three seconds. Let page loading run from
+  // a fixed time, then pause before the assertions and controlled refresh.
+  await page.clock.install({ time: new Date("2026-10-13T04:00:00.000Z") });
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === "/api/health") {
+      // Keep the response in flight long enough to prove that advancing the
+      // frozen browser clock cannot stand in for a completed health read.
+      await new Promise<void>((resolve) => setTimeout(resolve, 30));
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "ok",
+          version: "e2e",
+          instance_id: "e2e-instance",
+          mcp_child: "stopped",
+          mcp_hardware_clear_required: false,
+          mcp_teardown_incident_id: null,
+          active_run_id: null,
+          restart_clearance: clearanceRequired
+            ? { state: "required", eligible: false }
+            : { state: "cleared", eligible: true },
+          fault_controls: clearanceRequired
+            ? { status: "closed", generation: null, enabled_actions: ["emergency_stop"] }
+            : { status: "closed", generation: null, enabled_actions: [] },
+        }),
+      });
+      return;
+    }
+    if (path === "/api/fault-controls/actions") {
+      emergencyStopRequests.push(request.postDataJSON());
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          action: "emergency_stop",
+          result: "accepted",
+          reason: "request accepted",
+          queued: true,
+          fault_controls: { status: "closed", generation: null, enabled_actions: ["emergency_stop"] },
+        }),
+      });
+      return;
+    }
+    if (path === "/api/restart-clearance") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          outcome: "confirmed",
+          cleared: true,
+          restart_clearance_required: false,
+          restart_clearance: { state: "cleared", eligible: true },
+          fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+        }),
+      });
+      return;
+    }
+    if (path === "/api/roasts") {
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify({ runs: [] }) });
+      return;
+    }
+    if (path === "/api/bean-profiles") {
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify({ profiles: [] }) });
+      return;
+    }
+    await route.abort();
+  });
+
+  await page.goto("/start");
+  await page.waitForLoadState("networkidle");
+  await page.clock.pauseAt(new Date("2026-10-13T05:00:00.000Z"));
+  await expect(page.getByTestId("restart-clearance-required")).toBeVisible();
+  await expect(page.getByTestId("start-roast-form")).toHaveCount(0);
+  await expect(page.getByTestId("start-restart-clearance-emergency-stop")).toBeVisible();
+  await expect(page.getByText(/software request cannot confirm physical state here/i)).toBeVisible();
+
+  const emergencyStop = page.getByTestId("start-restart-clearance-emergency-stop-submit");
+  await emergencyStop.click();
+  await emergencyStop.click();
+  await expect.poll(() => emergencyStopRequests).toEqual([{ action: "emergency_stop" }]);
+
+  await page.getByTestId("restart-clearance-open").click();
+  await page.getByTestId("restart-clearance-stopped").check();
+  await page.getByTestId("restart-clearance-empty").check();
+  await page.getByTestId("restart-clearance-independent-stop").check();
+  const clearanceReportResponse = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/restart-clearance" &&
+      response.request().method() === "POST",
+  );
+  await page.getByTestId("restart-clearance-submit").click();
+  const clearanceReport = await clearanceReportResponse;
+  expect(await clearanceReport.json()).toMatchObject({
+    outcome: "confirmed",
+    restart_clearance_required: false,
+  });
+  await expect(page.getByTestId("restart-clearance-reported")).toBeVisible();
+  // TanStack Query schedules observer notifications with setTimeout(0). Flush
+  // that queue before the negative assertion, so an optimistic cache write
+  // would expose Start here instead of being hidden behind a frozen clock.
+  await page.clock.runFor(1);
+  await expect(page.getByTestId("restart-clearance-required")).toBeVisible();
+  await expect(page.getByTestId("start-roast-form")).toHaveCount(0);
+
+  // The POST records only the operator report. The server projection remains
+  // REQUIRED until the test author advances it, so this assertion fails if the
+  // client unlocks Start optimistically from the successful POST response.
+  clearanceRequired = false;
+  const refreshedHealthResponse = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/health" &&
+      response.request().method() === "GET",
+  );
+  await page.getByTestId("restart-clearance-refresh-status").click();
+  const refreshedHealth = await refreshedHealthResponse;
+  expect(await refreshedHealth.json()).toMatchObject({
+    restart_clearance: { state: "cleared", eligible: true },
+  });
+
+  // The delayed response has completed, but its TanStack notification still
+  // uses the paused browser clock. Poll visibility while advancing at most one
+  // second in total: this is below the three-second health polling interval,
+  // so a missing refresh cannot be masked by the next poll.
+  const startRoastForm = page.getByTestId("start-roast-form");
+  for (let tick = 0; tick < 10 && !(await startRoastForm.isVisible()); tick += 1) {
+    await page.clock.runFor(100);
+  }
+  await expect(startRoastForm).toBeVisible();
+  await expect(page.getByTestId("restart-clearance-required")).toHaveCount(0);
 });

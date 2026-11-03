@@ -16,7 +16,12 @@
  *    that first frame, since `useEffect` runs post-paint).
  * 2. Active run — the full live dashboard (DashboardPage). A reload on this
  *    URL re-hydrates from the server snapshot + SSE — the reload-safe guarantee.
- * 3. No active run — the last completed run's summary (`LiveFinishedView`),
+ * 3. An open or unknown terminal-fault lease — the server-projected global
+ *    terminal controls. This takes precedence even while `active_run_id`
+ *    remains non-null during an admitted terminal action. The controls use
+ *    the global lease endpoint and never a historical run id.
+ * 4. No active run with a closed terminal-fault lease — the last completed
+ *    run's summary (`LiveFinishedView`),
  *    PERSISTENT across reload: sourced from the history API
  *    (`GET /api/roasts`, newest-first), not session state. The just-finished
  *    run from THIS session (`stickyCompletedRunId`) is preferred while set —
@@ -39,10 +44,11 @@
  * `/start` (StartRoastView.tsx) is the ONLY start-form surface under the
  * #523 IA; `/live` never renders one.
  *
- * INVARIANTS: active-run presence comes from the SERVER's `/health` snapshot
- * (`active_run_id`) — never inferred client-side (D8). Phase is not read here;
- * DashboardPage owns phase via SSE + snapshot. Operator actions and MCP access
- * live entirely in DashboardPage.
+ * INVARIANTS: active-run presence and terminal-fault controls come from the
+ * SERVER's `/health` snapshot — never inferred client-side (D8). Phase is not
+ * read here; DashboardPage owns phase via SSE + snapshot. The SPA never calls
+ * MCP. Run-scoped operator actions remain in DashboardPage only while a run is
+ * active; terminal actions use the server-resolved global lease endpoint.
  *
  * IMPOSTOR-PROCESS DEFENCE (#516, follow-up to the #513 port-impostor
  * incident — docs/recent-fixes.md, 12 Jul): a second process wildcard-bound
@@ -119,7 +125,12 @@ import {
   useTelemetry,
 } from "@/hooks/queries";
 import { api } from "@/lib/api";
+import { isCoherentFaultControls, isCoherentRestartClearance } from "@/lib/faultControls";
+import type { FaultControls } from "@/lib/types";
 import { DashboardPage } from "@/pages/dashboard/DashboardPage";
+import { RestartClearanceCard } from "@/pages/home/RestartClearanceCard";
+import { TerminalFaultControls } from "@/pages/home/TerminalFaultControls";
+import { UnknownStatusEmergencyStop } from "@/pages/home/UnknownStatusEmergencyStop";
 import { headlineStats, toCurveMarkers, toCurvePoints } from "@/pages/detail/traceModel";
 
 /**
@@ -242,7 +253,10 @@ export function LivePage(): React.JSX.Element {
   // predates this feature) — never a benign "field not implemented yet" case
   // to shrug past.
   const instanceMismatch =
-    armed && health.isFresh && health.data?.instance_id !== expectedInstanceId;
+    armed &&
+    health.isFresh &&
+    health.isSuccess &&
+    health.data?.instance_id !== expectedInstanceId;
 
   // #556 LATCH-THEN-STRIP: `mismatchLatched` keeps the warning visible for
   // the rest of THIS component's lifetime once a mismatch is first observed,
@@ -261,7 +275,7 @@ export function LivePage(): React.JSX.Element {
   // covers that ordering for the RENDER path, but this effect must apply the
   // same guard itself since effects run independently of the render gates.
   useEffect(() => {
-    if (!armed || !health.isFresh || health.data === undefined) return;
+    if (!armed || !health.isFresh || !health.isSuccess || health.data === undefined) return;
     if (health.data.instance_id === expectedInstanceId) {
       setVerified(true);
       // Strip expectedInstanceId out of router state via a REPLACE
@@ -290,7 +304,7 @@ export function LivePage(): React.JSX.Element {
     // a dependency object (it's a new reference every fetch) — instance_id
     // and isFresh are the only fields this effect's decision depends on.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [armed, health.isFresh, health.data?.instance_id, expectedInstanceId, navigate, location.pathname]);
+  }, [armed, health.isFresh, health.isSuccess, health.data?.instance_id, expectedInstanceId, navigate, location.pathname]);
 
   // Persistent idle fallback (#523): the roast history, newest-first
   // (`GET /api/roasts` — store.py orders `started_at_utc DESC`). #523 Codex
@@ -500,16 +514,6 @@ export function LivePage(): React.JSX.Element {
     };
   }, [stickyCompletedRunId, lastCompletedRunId, freshHistoryRunId, terminalFetchPending, queryClient]);
 
-  // Health error (#513 medium): active-run status is UNKNOWN — never fall
-  // through to a state that implies "no run" (a run could genuinely be active
-  // and the operator would have no path to the dashboard/e-stop, the exact
-  // hazard this PR fixes elsewhere). `useHealth`'s default `retry: 1` already
-  // rides out a single blip before `isError` is true, so this is a persistent
-  // failure, not noise. Show a neutral "can't confirm" state instead.
-  if (health.isError) {
-    return <LiveStatusUnknownView />;
-  }
-
   // Hold until health has produced a GENUINELY FRESH read (same pattern as
   // the old HomeGate hold, extended #513 Codex follow-up). `health.isFresh`
   // (`useFreshHealthGate`) is false both while genuinely pending AND while
@@ -525,6 +529,25 @@ export function LivePage(): React.JSX.Element {
         <div data-testid="live-page-loading" />
       </AppFrame>
     );
+  }
+
+  // A query error without a retained snapshot leaves active-run status unknown.
+  // A background refetch can retain the last successful health data while
+  // setting isError; the coherent active-run path below keeps that dashboard
+  // mounted so its stream, emergency stop and request result state are not
+  // discarded by a transient poll failure.
+  if (health.isError && health.data === undefined) {
+    return <LiveStatusUnknownView />;
+  }
+
+  // An armed start-process comparison has no safe verdict when its first
+  // forced health read fails. TanStack Query may retain an earlier active
+  // snapshot on that error, but that cached process identity cannot verify
+  // the process which accepted the start. Keep the ordinary, already-verified
+  // dashboard retention below; only this one-shot identity boundary fails
+  // closed.
+  if (armed && health.isError) {
+    return <LiveStatusUnknownView />;
   }
 
   // #516 impostor-process defence: while ARMED (an expectedInstanceId is
@@ -555,9 +578,41 @@ export function LivePage(): React.JSX.Element {
     return <LiveStatusUnknownView variant="instance-mismatch" />;
   }
 
-  // Active run: the full live dashboard.
+  // A D212/D213 lease is the sole authority for terminal controls while it is
+  // open or unknown, even if an admitted terminal action has not yet cleared
+  // `active_run_id`. Do not keep a dashboard mounted in that overlap: its
+  // run-scoped endpoint could address a run the server has placed under the
+  // terminal lease. A reload takes this same health-projected path.
+  const faultControls = health.data?.fault_controls;
+  if (!isCoherentFaultControls(faultControls)) {
+    return <LiveFaultControlsStatusUnknownView />;
+  }
+  const restartClearance = health.data?.restart_clearance;
+  if (!isCoherentRestartClearance(restartClearance)) {
+    return <LiveRestartClearanceStatusUnknownView />;
+  }
+  if (faultControls.status !== "closed") {
+    return (
+      <LiveTerminalFaultControls
+        controls={faultControls}
+        restartClearanceRequired={
+          restartClearance.state === "required"
+        }
+        routineControlsDisabled={health.isError || restartClearance.state !== "cleared"}
+      />
+    );
+  }
+
+  // Active run with a coherently CLOSED terminal lease: the full live dashboard.
   if (activeRunId !== null) {
-    return <DashboardPage />;
+    return <LiveDashboard healthStale={health.isError} />;
+  }
+
+  // Cached idle data cannot prove that starting or an ordinary action is safe
+  // after its refresh fails. Only the coherent active-run path above remains
+  // visible, preserving its already-live dashboard while the poll recovers.
+  if (health.isError) {
+    return <LiveStatusUnknownView />;
   }
 
   // No active run: never a form (#523). Hold while a terminal-outcome fetch
@@ -667,6 +722,146 @@ export function LivePage(): React.JSX.Element {
   // No active run, and no completed run exists (ever) — a neutral, still-not-
   // a-form state pointing to /start, the only start-form surface (#523).
   return <LiveNoRoastsView />;
+}
+
+/** Server-projected global terminal controls for `/live` after active-run closure. */
+function LiveTerminalFaultControls({
+  controls,
+  restartClearanceRequired,
+  routineControlsDisabled,
+}: {
+  controls: FaultControls;
+  restartClearanceRequired: boolean;
+  routineControlsDisabled: boolean;
+}): React.JSX.Element {
+  const queryClient = useQueryClient();
+  return (
+    <AppFrame
+      headerRight={
+        <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+          Fault controls
+        </span>
+      }
+    >
+      <TerminalFaultControls
+        controls={controls}
+        routineControlsDisabled={routineControlsDisabled}
+        onAction={async (action, _confirmation, expectedGeneration) => {
+          try {
+            const result =
+              action === "stop_cooling_and_acknowledge"
+                ? await submitD212FaultAction(expectedGeneration)
+                : await api.faultControlsAction({ action });
+            await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+            return result;
+          } catch (error) {
+            await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+            throw error;
+          }
+        }}
+      />
+      {restartClearanceRequired && (
+        <RestartClearanceCard
+          onAcknowledge={async () => {
+            try {
+              return await api.acknowledgeRestartClearance();
+            } catch (error) {
+              await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+              throw error;
+            }
+          }}
+          onRefreshStatus={() => queryClient.invalidateQueries({ queryKey: roastKeys.health })}
+        />
+      )}
+    </AppFrame>
+  );
+}
+
+/** Keep the same dashboard instance mounted while its health poll recovers. */
+function LiveDashboard({ healthStale }: { healthStale: boolean }): React.JSX.Element {
+  return (
+    <>
+      {healthStale && (
+        <p
+          role="alert"
+          data-testid="live-dashboard-health-stale"
+          className="bg-roast-fault/10 px-6 py-2 text-center text-xs text-roast-fault"
+        >
+          Health refresh failed. The live dashboard remains visible from its last confirmed server
+          snapshot while status recovers. Routine actions are disabled; use the independent
+          physical emergency stop if the Hottop may be active.
+        </p>
+      )}
+      <DashboardPage healthStale={healthStale} />
+    </>
+  );
+}
+
+/** Bind D212's physical acknowledgement to the exact displayed server lease. */
+async function submitD212FaultAction(expectedGeneration: number | undefined) {
+  if (
+    expectedGeneration === undefined ||
+    !Number.isSafeInteger(expectedGeneration) ||
+    expectedGeneration <= 0
+  ) {
+    throw new Error("D212 requires a positive server fault-control lease generation.");
+  }
+  return api.faultControlsAction({
+    action: "stop_cooling_and_acknowledge",
+    confirmation: true,
+    expected_generation: expectedGeneration,
+  });
+}
+
+/** Missing or malformed fault-controls data cannot be treated as a closed lease. */
+function LiveFaultControlsStatusUnknownView(): React.JSX.Element {
+  return (
+    <AppFrame
+      headerRight={
+        <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+          Fault controls unknown
+        </span>
+      }
+    >
+      <div
+        className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-fault/50 bg-roast-fault/10 p-8 text-center"
+        data-testid="live-fault-controls-status-unknown"
+      >
+        <h2 className="text-lg font-bold uppercase tracking-wide">Fault control status unknown</h2>
+        <p className="text-sm text-muted-foreground">
+          RoastPilot cannot confirm the current fault-control lease. If the Hottop may be active,
+          use the independent physical emergency stop and reload to obtain current status.
+        </p>
+        <UnknownStatusEmergencyStop testIdPrefix="live-fault-controls-emergency-stop" />
+      </div>
+    </AppFrame>
+  );
+}
+
+/** Fail closed when the D213 projection is absent or malformed on `/live`. */
+function LiveRestartClearanceStatusUnknownView(): React.JSX.Element {
+  return (
+    <AppFrame
+      headerRight={
+        <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+          Start blocked
+        </span>
+      }
+    >
+      <div
+        className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-fault/50 bg-roast-fault/10 p-8 text-center"
+        data-testid="restart-clearance-status-unknown"
+      >
+        <h2 className="text-lg font-bold uppercase tracking-wide">Restart clearance status unknown</h2>
+        <p className="text-sm text-muted-foreground">
+          RoastPilot cannot confirm this Agent process has a valid restart clearance. Starting
+          remains blocked. If the Hottop may be active, use the independent physical emergency
+          stop and reload to obtain current status.
+        </p>
+        <UnknownStatusEmergencyStop testIdPrefix="live-restart-clearance-emergency-stop" />
+      </div>
+    </AppFrame>
+  );
 }
 
 // --- LiveStatusUnknownView: shown at /live when /health persistently errors. ---
@@ -880,11 +1075,14 @@ function LiveStatusUnknownView({
             </p>
           </>
         ) : (
-          <p className="text-sm text-muted-foreground" data-testid="live-status-unknown-message">
-            This page could not reach the agent to check whether a roast is active. If
-            one is running, it is still live and heating — reload to reconnect before
-            assuming it is safe to start a new one.
-          </p>
+          <>
+            <p className="text-sm text-muted-foreground" data-testid="live-status-unknown-message">
+              This page could not reach the agent to check whether a roast is active. If
+              one is running, it is still live and heating — reload to reconnect before
+              assuming it is safe to start a new one.
+            </p>
+            <UnknownStatusEmergencyStop testIdPrefix="live-health-error-emergency-stop" />
+          </>
         )}
         <a
           href="/live"

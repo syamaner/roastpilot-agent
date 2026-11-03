@@ -178,7 +178,20 @@ async def test_twelve_step_vertical_slice_against_fake_mcp(
     assert any(e.kind is RoastEventKind.ADVISORY for e in timeline.events)
     assert any(e.kind is RoastEventKind.COMMAND_EXECUTED for e in timeline.events)
     assert timeline.safety_evaluations, "safety verdicts persisted"
-    assert "set_targets" in mcp.commands()
+    # The controller's safe split-write path produces a heat/fan pair.  The
+    # command trace and MCP writes must agree on the evaluated advisory target;
+    # earlier preheat targets are deliberately outside this assertion.
+    assert any(
+        event.kind is RoastEventKind.COMMAND_EXECUTED
+        and event.payload == {"heat_percent": 55, "fan_percent": 45}
+        for event in timeline.events
+    )
+    assert [(name, payload) for name, payload in mcp.calls if name in {"set_heat", "set_fan"}][
+        -2:
+    ] == [
+        ("set_heat", {"heat_percent": 55}),
+        ("set_fan", {"fan_percent": 45}),
+    ]
 
     # Step 9: drop the beans — an operator action through the queue and full
     # safety policy on drain.

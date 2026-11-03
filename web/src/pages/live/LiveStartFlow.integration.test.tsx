@@ -64,6 +64,8 @@ function fakeFetch(opts: {
           mcp_child: "running",
           mcp_hardware_clear_required: false,
           mcp_teardown_incident_id: null,
+          restart_clearance: { state: "cleared", eligible: true },
+          fault_controls: { status: "closed", generation: null, enabled_actions: [] },
           active_run_id: opts.activeRunId(),
         }),
         { status: 200 },
@@ -118,6 +120,68 @@ function fillMinimum() {
   });
   fireEvent.change(screen.getByTestId("start-roast-bean_weight_grams"), { target: { value: "250" } });
 }
+
+describe("#954 real-integration — terminal emergency-stop result", () => {
+  it("keeps a failed e-stop result visible after its health invalidation advances the lease", async () => {
+    let generation = 9;
+    let healthCalls = 0;
+    global.fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      const path = String(url);
+      if (path === "/api/health") {
+        healthCalls += 1;
+        return new Response(
+          JSON.stringify({
+            status: "ok",
+            version: "test",
+            instance_id: "server-a",
+            mcp_child: "running",
+            mcp_hardware_clear_required: false,
+            mcp_teardown_incident_id: null,
+            restart_clearance: { state: "cleared", eligible: true },
+            fault_controls: {
+              status: "open",
+              generation,
+              enabled_actions: ["emergency_stop"],
+            },
+            active_run_id: null,
+          }),
+          { status: 200 },
+        );
+      }
+      if (path === "/api/roasts") {
+        return new Response(JSON.stringify({ runs: [] }), { status: 200 });
+      }
+      if (path === "/api/fault-controls/actions" && init?.method === "POST") {
+        generation = 10;
+        return new Response(
+          JSON.stringify({ detail: "software emergency stop was not confirmed" }),
+          { status: 409 },
+        );
+      }
+      throw new Error(`unexpected fetch ${path} ${init?.method ?? "GET"}`);
+    }) as unknown as typeof fetch;
+
+    renderLive();
+    await waitFor(() => expect(screen.getByTestId("terminal-fault-controls")).toBeInTheDocument());
+    const emergencyStop = screen.getByTestId("terminal-fault-action-emergency_stop");
+    fireEvent.click(emergencyStop);
+    fireEvent.click(emergencyStop);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("terminal-fault-controls-result")).toHaveTextContent(
+        /software emergency stop was not confirmed/i,
+      ),
+    );
+    await waitFor(() => expect(healthCalls).toBeGreaterThanOrEqual(2));
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-lease-generation",
+      "10",
+    );
+    expect(screen.getByTestId("terminal-fault-controls-result")).toHaveTextContent(
+      /historical and request-scoped.*independent physical emergency stop/i,
+    );
+  });
+});
 
 describe("#523 real-integration — /start start flow, real handoff to /live", () => {
   it("a clean 201 navigates to /live, which reaches the real live dashboard", async () => {
@@ -213,6 +277,8 @@ describe("#523 real-integration — /start start flow, real handoff to /live", (
       mcp_child: "running",
       mcp_hardware_clear_required: false,
       mcp_teardown_incident_id: null,
+      restart_clearance: { state: "cleared", eligible: true },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
       active_run_id: null,
     });
 
@@ -238,6 +304,8 @@ describe("#523 real-integration — /start start flow, real handoff to /live", (
             mcp_child: "running",
             mcp_hardware_clear_required: false,
             mcp_teardown_incident_id: null,
+            restart_clearance: { state: "cleared", eligible: true },
+            fault_controls: { status: "closed", generation: null, enabled_actions: [] },
             active_run_id: null,
           }),
           { status: 200 },
@@ -318,6 +386,8 @@ describe("#513 real-integration — /start active-run guard", () => {
       mcp_child: "running",
       mcp_hardware_clear_required: false,
       mcp_teardown_incident_id: null,
+      restart_clearance: { state: "cleared", eligible: true },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
       active_run_id: null,
     });
 
@@ -337,6 +407,8 @@ describe("#513 real-integration — /start active-run guard", () => {
             mcp_child: "running",
             mcp_hardware_clear_required: false,
             mcp_teardown_incident_id: null,
+            restart_clearance: { state: "cleared", eligible: true },
+            fault_controls: { status: "closed", generation: null, enabled_actions: [] },
             active_run_id: "run-from-another-tab",
           }),
           { status: 200 },
@@ -467,6 +539,8 @@ describe("#523 real-integration — /live idle state reads REAL history for the 
             mcp_child: "running",
             mcp_hardware_clear_required: false,
             mcp_teardown_incident_id: null,
+            restart_clearance: { state: "cleared", eligible: true },
+            fault_controls: { status: "closed", generation: null, enabled_actions: [] },
             active_run_id: null,
           }),
           { status: 200 },
@@ -631,6 +705,8 @@ describe("#523 real-integration — /live idle state reads REAL history for the 
             mcp_child: "running",
             mcp_hardware_clear_required: false,
             mcp_teardown_incident_id: null,
+            restart_clearance: { state: "cleared", eligible: true },
+            fault_controls: { status: "closed", generation: null, enabled_actions: [] },
             active_run_id: null,
           }),
           { status: 200 },
@@ -767,6 +843,8 @@ describe("#523 real-integration — /live idle state reads REAL history for the 
             mcp_child: "running",
             mcp_hardware_clear_required: false,
             mcp_teardown_incident_id: null,
+            restart_clearance: { state: "cleared", eligible: true },
+            fault_controls: { status: "closed", generation: null, enabled_actions: [] },
             active_run_id: null,
           }),
           { status: 200 },
@@ -873,6 +951,8 @@ describe("#523 real-integration — /live idle state reads REAL history for the 
             mcp_child: "running",
             mcp_hardware_clear_required: false,
             mcp_teardown_incident_id: null,
+            restart_clearance: { state: "cleared", eligible: true },
+            fault_controls: { status: "closed", generation: null, enabled_actions: [] },
             active_run_id: null,
           }),
           { status: 200 },

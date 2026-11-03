@@ -22,10 +22,10 @@ Assertions per the #484 acceptance:
 - the NEW child is healthy and answers a typed call;
 - a SECOND respawn also works (recycled-pid hygiene, cross-refs #431).
 
-The api-layer repro (``test_start_roast_respawn_real_child_no_500_cascade``)
-reproduces the exact operator sequence — a mid-session device-config change then
-``start_roast`` — against the real child, and asserts a clean respawn instead of
-the 500 → store-teardown → process-exit cascade the crash produced.
+The API service test drives the same between-roast respawn primitive in the
+request-handler task.  D213 blocks a fresh process from ``start_roast`` until
+it has durable operator clearance and typed no-session proof, so this test
+cannot use start as its respawn trigger.
 """
 
 from __future__ import annotations
@@ -35,7 +35,6 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -53,7 +52,7 @@ from roastpilot_agent.mcp_client import (
     RoasterMCPClient,
     resolve_mcp_command,
 )
-from roastpilot_agent.models import RoastPhase, RoastProfile
+from roastpilot_agent.models import RestartClearanceRequest, RoastPhase, RoastProfile
 from roastpilot_agent.store import RoastStore
 
 # The spawn resolves the default command to the in-venv console script
@@ -137,6 +136,38 @@ class _PidCapturingMCP(MCPServerProcess):
     def _register_force_terminate(self, pid: int) -> None:
         self.spawned_pids.append(pid)
         super()._register_force_terminate(pid)
+
+
+class _RecordingRoasterControlAdapter(RoasterControlAdapter):
+    """Adapter that records the order of session and control writes."""
+
+    def __init__(self, client: RoasterMCPClient) -> None:
+        super().__init__(client)
+        self.command_order: list[str] = []
+
+    async def start_session(
+        self, *, recording_origin: str | None = None, recording_roast_num: int | None = None
+    ) -> None:
+        """Record the session boundary before forwarding the typed MCP command."""
+        self.command_order.append("start_session")
+        await super().start_session(
+            recording_origin=recording_origin, recording_roast_num=recording_roast_num
+        )
+
+    async def set_heat(self, heat_percent: int) -> None:
+        """Record one heat write before forwarding it."""
+        self.command_order.append("set_heat")
+        await super().set_heat(heat_percent)
+
+    async def set_fan(self, fan_percent: int) -> None:
+        """Record one fan write before forwarding it."""
+        self.command_order.append("set_fan")
+        await super().set_fan(fan_percent)
+
+    async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
+        """Record combined target writes so they cannot hide auto-resume."""
+        self.command_order.append("set_targets")
+        await super().set_targets(heat_percent=heat_percent, fan_percent=fan_percent)
 
 
 @pytest_asyncio.fixture
@@ -234,20 +265,19 @@ async def test_cross_task_respawn_no_scope_crash_and_no_orphan(
 
 
 @pytest.mark.asyncio
-async def test_start_roast_respawn_real_child_no_500_cascade(
+async def test_service_respawn_real_child_start_does_not_auto_resume_heat_fan(
     store: RoastStore,
     config_file: Path,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The exact operator repro: mid-session device-config change → start_roast.
+    """D213 clearance plus Start respawns a real child without heat/fan resume.
 
-    Reproduces the #484 sequence against the REAL child: a live service spawns
-    the MCP child (serve task), the operator saves an ambient device-config
-    change (drift), and ``start_roast`` detects the drift and respawns the child.
-    Pre-fix, the respawn's cross-task stop crashed and cascaded into a 500 +
-    store teardown + process exit; post-fix the roast starts cleanly and the
-    service stays usable.
+    The initial mock child supplies its typed 0.2.3 no-session snapshot before
+    the operator's explicit physical confirmation. A saved device change then
+    makes the actual Start path stop and replace that child. Normal Start
+    targets may only follow the new-session command: respawn never restores
+    heat or fan from an earlier process.
     """
     caplog.set_level(logging.ERROR, logger="roastpilot_agent.mcp_client")
     yaml_path = _write_mock_yaml(tmp_path, "mock.yaml")
@@ -260,7 +290,7 @@ async def test_start_roast_respawn_real_child_no_500_cascade(
     await asyncio.create_task(process.start())
     try:
         first_pid = process.spawned_pids[0]
-        adapter = RoasterControlAdapter(RoasterMCPClient(process.call_tool))
+        adapter = _RecordingRoasterControlAdapter(RoasterMCPClient(process.call_tool))
         service = RoastService(
             store,
             mcp=process,
@@ -272,22 +302,35 @@ async def test_start_roast_respawn_real_child_no_500_cascade(
         )
         service.set_spawned_mcp_device(initial_device)
 
-        # Operator changes ambient device config mid-session (the /config save).
+        assert await adapter.read_session_presence() == "none"
+        clearance = await service.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert clearance.cleared
+        assert adapter.command_order == []
+
         persist_config_edit(
             AppConfigEdit(
                 mcp_device=MCPDeviceConfigEdit(
-                    ambient_mode="yoctopuce",
-                    ambient_device="METEOMK2-1",
+                    ambient_mode="yoctopuce", ambient_device="METEOMK2-1"
+                )
+            )
+        )
+        detail = await asyncio.create_task(
+            service.start_roast(
+                RoastProfile(
+                    name="Mock respawn roast",
+                    bean_origin="Test origin",
+                    bean_weight_grams=250,
+                    initial_heat_percent=70,
+                    initial_fan_percent=40,
+                    target_drop_temp_c=195,
+                    target_development_percent=14,
                 )
             )
         )
 
-        # start_roast runs in a SEPARATE task, exactly as a request handler does,
-        # so the respawn's stop() runs in a different task from the spawn.
-        detail = await asyncio.create_task(service.start_roast(RoastProfile(**_profile())))
-
-        # Clean start — no 500 cascade. The roast is persisted and the child live.
-        assert detail.agent_phase is RoastPhase.PREHEATING
+        # Clean respawn and admitted Start — no 500 cascade.
         assert service.mcp_child_status().value == "running"
         assert process.stop_unconfirmed is False
 
@@ -297,28 +340,26 @@ async def test_start_roast_respawn_real_child_no_500_cascade(
         new_pid = process.spawned_pids[1]
         assert _pid_alive(new_pid)
 
-        # The store is still usable (pre-fix it was cancelled mid-create_run):
-        # the run is readable and active.
+        # A respawn emitted no heat/fan write before the new session boundary.
+        # Any normal preheat target belongs to this explicit Start, never to an
+        # automatic restoration by child replacement.
+        start_index = adapter.command_order.index("start_session")
+        assert start_index == 0
+        assert all(
+            index > start_index
+            for index, name in enumerate(adapter.command_order)
+            if name in {"set_heat", "set_fan", "set_targets"}
+        )
+
+        # The Start response and persisted run agree on the explicit new session.
         active = await store.active_run()
         assert active is not None
         assert active.run_id == detail.id
+        assert detail.agent_phase is RoastPhase.PREHEATING
+        assert adapter.command_order == ["start_session", "set_heat", "set_fan"]
     finally:
         await asyncio.create_task(process.stop())
         for pid in process.spawned_pids:
             assert await _wait_pid_gone(pid), f"MCP child pid {pid} leaked"
     # The respawn's cross-task stop must not have logged the scope crash (#484).
     _assert_no_cross_task_scope_error(caplog)
-
-
-def _profile(**kwargs: Any) -> dict[str, Any]:
-    base: dict[str, Any] = {
-        "name": "Respawn Repro",
-        "bean_origin": "Kenya",
-        "bean_weight_grams": 250.0,
-        "initial_heat_percent": 0,  # never command heat during this repro
-        "initial_fan_percent": 40,
-        "target_drop_temp_c": 205.0,
-        "target_development_percent": 20.0,
-    }
-    base.update(kwargs)
-    return base
