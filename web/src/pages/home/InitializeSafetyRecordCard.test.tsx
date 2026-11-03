@@ -86,4 +86,23 @@ describe("InitializeSafetyRecordCard", () => {
     resolveRequest?.();
     await waitFor(() => expect(screen.getByTestId("initialize-safety-record-reported")).toBeVisible());
   });
+
+  it("tells the operator to refresh status before another unconfirmed attempt", async () => {
+    render(
+      <InitializeSafetyRecordCard
+        available
+        onInitialize={async () => ({ ...CONFIRMED_RESULT, outcome: "unconfirmed" as const })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("initialize-safety-record-open"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-stopped"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-empty"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-independent-stop"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-submit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("initialize-safety-record-error")).toHaveTextContent(
+        /check refreshed status before any further attempt/i,
+      ),
+    );
+  });
 });

@@ -55,8 +55,12 @@ export function InitializeSafetyRecordCard({
       const result = await onInitialize();
       if (result.outcome === "confirmed") {
         setReported(true);
+      } else if (result.outcome === "unconfirmed") {
+        setError(
+          "Safety record is unconfirmed. Check refreshed status before any further attempt.",
+        );
       } else {
-        setError("Safety record was not confirmed. Check current status and retry.");
+        setError("Safety record was rejected. Check current status before another attempt.");
       }
     } catch (cause) {
       setError(
