@@ -330,6 +330,11 @@ async def test_d220_initialises_only_an_unclean_absent_safety_record(tmp_path: P
         )
         with pytest.raises(RoastRunConflictError, match="restart clearance"):
             await service.start_roast(_profile())
+        ordinary = await service.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert ordinary.cleared
+        assert roaster.presence_reads == 2
     finally:
         if service is not None:
             await service.shutdown()
