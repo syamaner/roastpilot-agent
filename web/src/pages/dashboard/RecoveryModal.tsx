@@ -89,6 +89,7 @@ export function RecoveryModal({
   const [endError, setEndError] = useState<string | null>(null);
   const firstClosureCheckRef = useRef<HTMLInputElement>(null);
   const closureSubmissionInFlight = useRef(false);
+  const endSubmissionInFlight = useRef(false);
 
   useEffect(() => {
     if (closureConfirmationOpen) firstClosureCheckRef.current?.focus();
@@ -100,9 +101,22 @@ export function RecoveryModal({
     setStopped(false);
     setEmpty(false);
     setIndependentStopReady(false);
-    setClosureError(null);
     setClosureReported(false);
   }, [closureOnlyAvailable]);
+
+  // A stale-to-fresh transition is a new server observation, never a reason
+  // to reuse physical confirmations collected before the stale interval.
+  useEffect(() => {
+    setClosureConfirmationOpen(false);
+    setStopped(false);
+    setEmpty(false);
+    setIndependentStopReady(false);
+    setClosureReported(false);
+  }, [healthStale]);
+
+  useEffect(() => {
+    if (!endRecoveredRunAvailable) setEndError(null);
+  }, [endRecoveredRunAvailable]);
 
   useEffect(() => {
     if (open) return;
@@ -119,6 +133,12 @@ export function RecoveryModal({
   // Emergency stop is always available (mirrors evaluate_emergency_stop); the
   // rest are gated by the server mirror.
   const enabled = new Set(enabledActions ?? []);
+  const routineRecoveryActions = RECOVERY_ACTIONS.filter(
+    ({ action }) => action !== "emergency_stop",
+  );
+  const emergencyStopAction = RECOVERY_ACTIONS.find(
+    ({ action }) => action === "emergency_stop",
+  );
   const closureConfirmed = stopped && empty && independentStopReady;
   const showClosureOnlyConfirmation =
     !healthStale && closureOnlyAvailable && onRequestClosureOnly !== undefined;
@@ -157,7 +177,8 @@ export function RecoveryModal({
   };
 
   const submitRecoveredRunEnd = async () => {
-    if (onEndRecoveredRun === undefined || endSubmitting) return;
+    if (onEndRecoveredRun === undefined || endSubmissionInFlight.current) return;
+    endSubmissionInFlight.current = true;
     setEndSubmitting(true);
     setEndError(null);
     try {
@@ -169,6 +190,7 @@ export function RecoveryModal({
           : "Could not end the recovered run. Check current status and retry.",
       );
     } finally {
+      endSubmissionInFlight.current = false;
       setEndSubmitting(false);
     }
   };
@@ -209,6 +231,29 @@ export function RecoveryModal({
           <Readout label="Heat (locked)" value={formatPercent(heatPercent)} />
           <Readout label="Fan (locked)" value={formatPercent(fanPercent)} />
         </dl>
+
+        {emergencyStopAction !== undefined && (
+          <aside
+            data-testid="recovery-emergency-stop-container"
+            className="sticky top-0 z-10 flex flex-col gap-2 rounded-md border border-roast-fault/60 bg-card p-3 shadow-sm"
+          >
+            <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+              Emergency stop remains available
+            </span>
+            <button
+              type="button"
+              data-testid={`recovery-${emergencyStopAction.action}`}
+              data-enabled="true"
+              onClick={() => onAction(emergencyStopAction.action)}
+              className="flex items-center justify-between gap-4 rounded-md border border-roast-fault/60 px-4 py-3 text-left text-roast-fault transition-colors hover:bg-roast-fault/10"
+            >
+              <span className="text-sm font-semibold uppercase tracking-wide">
+                {emergencyStopAction.label}
+              </span>
+              <span className="text-xs text-muted-foreground">{emergencyStopAction.note}</span>
+            </button>
+          </aside>
+        )}
 
         {showClosureOnlyConfirmation && (
           <section
@@ -338,27 +383,26 @@ export function RecoveryModal({
           <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Select Recovery Action
           </span>
-          {RECOVERY_ACTIONS.filter(
-            ({ action }) => action === "emergency_stop" || (!healthStale && enabled.has(action)),
-          ).map(({ action, label, note }) => {
-            return (
-              <button
-                key={action}
-                type="button"
-                data-testid={`recovery-${action}`}
-                data-enabled="true"
-                onClick={() => onAction(action)}
-                className={cn(
-                  "flex items-center justify-between gap-4 rounded-md border px-4 py-3 text-left transition-colors",
-                  "border-border bg-secondary hover:bg-accent",
-                  action === "emergency_stop" && "border-roast-fault/60 text-roast-fault",
-                )}
-              >
-                <span className="text-sm font-semibold uppercase tracking-wide">{label}</span>
-                <span className="text-xs text-muted-foreground">{note}</span>
-              </button>
-            );
-          })}
+          {routineRecoveryActions
+            .filter(({ action }) => !healthStale && enabled.has(action))
+            .map(({ action, label, note }) => {
+              return (
+                <button
+                  key={action}
+                  type="button"
+                  data-testid={`recovery-${action}`}
+                  data-enabled="true"
+                  onClick={() => onAction(action)}
+                  className={cn(
+                    "flex items-center justify-between gap-4 rounded-md border px-4 py-3 text-left transition-colors",
+                    "border-border bg-secondary hover:bg-accent",
+                  )}
+                >
+                  <span className="text-sm font-semibold uppercase tracking-wide">{label}</span>
+                  <span className="text-xs text-muted-foreground">{note}</span>
+                </button>
+              );
+            })}
         </div>
         {healthStale && (
           <p data-testid="recovery-health-stale" className="text-xs text-roast-fault">

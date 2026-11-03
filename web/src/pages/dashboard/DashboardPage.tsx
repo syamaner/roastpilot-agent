@@ -28,6 +28,7 @@ import { roastKeys, useHealth, useRoast, useTimeline } from "@/hooks/queries";
 import { useFrameDrain, useRoastStream } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
 import { isCoherentRestartClearance } from "@/lib/faultControls";
+import { isRecoveredRunEndProjected } from "@/lib/recoveredRunClosure";
 import { smoothCurveForDisplay } from "@/lib/rorSmoothing";
 import type {
   FaultAcknowledgementExecutedEventData,
@@ -244,23 +245,31 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
   );
 
   const requestClosureOnlyClearance = useCallback(async () => {
-    const result = await api.requestClosureOnlyClearance();
-    await queryClientForStream.invalidateQueries({ queryKey: roastKeys.health });
-    if (runId !== null) {
-      await queryClientForStream.invalidateQueries({ queryKey: roastKeys.detail(runId) });
+    try {
+      return await api.requestClosureOnlyClearance();
+    } finally {
+      // A rejection may be caused by a changed authority. Refresh, but do not
+      // await it here: the modal must retain and display the original error.
+      void queryClientForStream.invalidateQueries({ queryKey: roastKeys.health });
+      if (runId !== null) {
+        void queryClientForStream.invalidateQueries({ queryKey: roastKeys.detail(runId) });
+      }
     }
-    return result;
   }, [queryClientForStream, runId]);
 
   const endRecoveredRun = useCallback(async () => {
     if (runId === null) throw new Error("Recovered run is unavailable.");
-    const result = await api.endRecoveredRun(runId);
-    await Promise.all([
-      queryClientForStream.invalidateQueries({ queryKey: roastKeys.health }),
-      queryClientForStream.invalidateQueries({ queryKey: roastKeys.detail(runId) }),
-      queryClientForStream.invalidateQueries({ queryKey: roastKeys.history }),
-    ]);
-    return result;
+    try {
+      return await api.endRecoveredRun(runId);
+    } finally {
+      // As above, retain a rejected End's original error while making the
+      // changed server projection available to the next render.
+      void Promise.all([
+        queryClientForStream.invalidateQueries({ queryKey: roastKeys.health }),
+        queryClientForStream.invalidateQueries({ queryKey: roastKeys.detail(runId) }),
+        queryClientForStream.invalidateQueries({ queryKey: roastKeys.history }),
+      ]);
+    }
   }, [queryClientForStream, runId]);
 
   // Development time + DTR (#220, closes the #112 gap): the live telemetry frame
@@ -344,10 +353,15 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
   const restartClearance = isCoherentRestartClearance(health.data?.restart_clearance)
     ? health.data.restart_clearance
     : null;
+  // A response still loading or in error cannot be current authority for the
+  // recovered-run closure path, even if another view retained cached data.
+  const healthProjectionStale = healthStale || !health.isSuccess;
   const closureOnlyAvailable = restartClearance?.closure_only_available === true;
-  const endRecoveredRunAvailable =
-    restartClearance?.enabled_actions.includes("end_recovered_run") === true ||
-    detail.data?.enabled_actions?.includes("end_recovered_run") === true;
+  const endRecoveredRunAvailable = isRecoveredRunEndProjected(
+    restartClearance,
+    effectiveEnabled,
+    healthProjectionStale,
+  );
 
   // #117: the FaultBanner's acknowledge affordance mirrors server truth — shown
   // iff the server enables `acknowledge_fault` (only in the `faulted` phase). This
@@ -540,7 +554,7 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
         fanPercent={telemetry?.fan_percent ?? null}
         enabledActions={effectiveEnabled}
         onAction={(a) => void dispatchAction(a)}
-        healthStale={healthStale}
+        healthStale={healthProjectionStale}
         closureOnlyAvailable={closureOnlyAvailable}
         endRecoveredRunAvailable={endRecoveredRunAvailable}
         onRequestClosureOnly={requestClosureOnlyClearance}

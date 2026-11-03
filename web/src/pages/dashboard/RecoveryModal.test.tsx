@@ -172,4 +172,148 @@ describe("RecoveryModal", () => {
     fireEvent.click(screen.getByTestId("end-recovered-run-submit"));
     expect(onEndRecoveredRun).toHaveBeenCalledTimes(1);
   });
+
+  it("resets physical checks across a stale-to-fresh health transition while retaining e-stop", async () => {
+    const { rerender } = render(
+      <RecoveryModal
+        open
+        {...READOUT}
+        enabledActions={[]}
+        onAction={() => {}}
+        closureOnlyAvailable
+        onRequestClosureOnly={async () => {
+          throw new Error("not reached");
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("closure-only-open"));
+    fireEvent.click(screen.getByTestId("closure-only-stopped"));
+    expect(screen.getByTestId("closure-only-stopped")).toBeChecked();
+
+    rerender(
+      <RecoveryModal
+        open
+        {...READOUT}
+        enabledActions={[]}
+        onAction={() => {}}
+        closureOnlyAvailable
+        healthStale
+        onRequestClosureOnly={async () => {
+          throw new Error("not reached");
+        }}
+      />,
+    );
+    expect(screen.queryByTestId("closure-only-clearance")).toBeNull();
+    expect(screen.getByTestId("recovery-emergency_stop")).toBeEnabled();
+
+    rerender(
+      <RecoveryModal
+        open
+        {...READOUT}
+        enabledActions={[]}
+        onAction={() => {}}
+        closureOnlyAvailable
+        onRequestClosureOnly={async () => {
+          throw new Error("not reached");
+        }}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId("closure-only-open")).toBeVisible());
+    fireEvent.click(screen.getByTestId("closure-only-open"));
+    expect(screen.getByTestId("closure-only-stopped")).not.toBeChecked();
+  });
+
+  it("keeps emergency stop available and submits End only once while End is in flight", async () => {
+    let resolveEnd: (() => void) | undefined;
+    const onEndRecoveredRun = vi.fn(
+      () =>
+        new Promise<{
+          run_id: string;
+          outcome: "aborted";
+          restart_clearance: {
+            state: "required";
+            eligible: boolean;
+            enabled_actions: [];
+            closure_only_available: boolean;
+          };
+          fault_controls: { status: "closed"; generation: null; enabled_actions: [] };
+        }>((resolve) => {
+          resolveEnd = () =>
+            resolve({
+              run_id: "run-recovered",
+              outcome: "aborted",
+              restart_clearance: {
+                state: "required",
+                eligible: false,
+                enabled_actions: [],
+                closure_only_available: false,
+              },
+              fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+            });
+        }),
+    );
+    const onAction = vi.fn();
+    render(
+      <RecoveryModal
+        open
+        {...READOUT}
+        enabledActions={[]}
+        onAction={onAction}
+        endRecoveredRunAvailable
+        onEndRecoveredRun={onEndRecoveredRun}
+      />,
+    );
+
+    const end = screen.getByTestId("end-recovered-run-submit");
+    fireEvent.click(end);
+    fireEvent.click(end);
+    expect(onEndRecoveredRun).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("recovery-emergency_stop")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("recovery-emergency_stop"));
+    expect(onAction).toHaveBeenCalledWith("emergency_stop");
+
+    resolveEnd?.();
+    await waitFor(() => expect(screen.getByTestId("end-recovered-run-submit")).toBeEnabled());
+  });
+
+  it("clears an End error when its server authority disappears", async () => {
+    const onEndRecoveredRun = vi.fn(async () => {
+      throw new Error("authority changed");
+    });
+    const { rerender } = render(
+      <RecoveryModal
+        open
+        {...READOUT}
+        enabledActions={[]}
+        onAction={() => {}}
+        endRecoveredRunAvailable
+        onEndRecoveredRun={onEndRecoveredRun}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("end-recovered-run-submit"));
+    await waitFor(() => expect(screen.getByTestId("end-recovered-run-error")).toHaveTextContent("authority changed"));
+
+    rerender(
+      <RecoveryModal
+        open
+        {...READOUT}
+        enabledActions={[]}
+        onAction={() => {}}
+        onEndRecoveredRun={onEndRecoveredRun}
+      />,
+    );
+    expect(screen.queryByTestId("end-recovered-run")).toBeNull();
+
+    rerender(
+      <RecoveryModal
+        open
+        {...READOUT}
+        enabledActions={[]}
+        onAction={() => {}}
+        endRecoveredRunAvailable
+        onEndRecoveredRun={onEndRecoveredRun}
+      />,
+    );
+    expect(screen.queryByTestId("end-recovered-run-error")).toBeNull();
+  });
 });
