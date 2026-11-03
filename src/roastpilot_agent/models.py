@@ -1284,6 +1284,7 @@ class RestartClearanceState(Enum):
     """Durable clearance state for the current Agent process (#954/D213)."""
 
     REQUIRED = "required"
+    CLOSURE_ONLY = "closure_only"
     CLEARED = "cleared"
     UNKNOWN = "unknown"
 
@@ -1294,13 +1295,6 @@ class FaultLeaseStatus(Enum):
     CLOSED = "closed"
     OPEN = "open"
     UNKNOWN = "unknown"
-
-
-class RestartClearanceProjection(BaseModel):
-    """Public current-process restart gate without physical identifiers."""
-
-    state: RestartClearanceState
-    eligible: StrictBool
 
 
 class OperatorAction(Enum):
@@ -1337,6 +1331,21 @@ class OperatorAction(Enum):
     ACKNOWLEDGE_RECOVERY = "acknowledge_recovery"
     ACKNOWLEDGE_FAULT = "acknowledge_fault"
     STOP_COOLING_AND_ACKNOWLEDGE = "stop_cooling_and_acknowledge"
+    END_RECOVERED_RUN = "end_recovered_run"
+
+
+def _empty_restart_clearance_actions() -> list[OperatorAction]:
+    """Return the typed default action projection for restart clearance."""
+    return []
+
+
+class RestartClearanceProjection(BaseModel):
+    """Public current-process restart gate without physical identifiers."""
+
+    state: RestartClearanceState
+    eligible: StrictBool
+    enabled_actions: list[OperatorAction] = Field(default_factory=_empty_restart_clearance_actions)
+    closure_only_available: StrictBool = False
 
 
 def _empty_fault_control_actions() -> list[OperatorAction]:
@@ -1375,6 +1384,24 @@ class RestartClearanceResult(BaseModel):
     outcome: Literal["confirmed", "failed"]
     cleared: bool
     restart_clearance_required: bool
+    restart_clearance: RestartClearanceProjection
+    fault_controls: FaultControlsProjection
+
+
+class ClosureOnlyClearanceResult(BaseModel):
+    """Outcome of admitting the narrow D216 recovered-run closure gate."""
+
+    outcome: Literal["confirmed", "failed"]
+    closure_only: bool
+    restart_clearance: RestartClearanceProjection
+    fault_controls: FaultControlsProjection
+
+
+class EndRecoveredRunResult(BaseModel):
+    """Durable result of ending a D216 closure-only recovered run."""
+
+    run_id: str
+    outcome: Literal["aborted"]
     restart_clearance: RestartClearanceProjection
     fault_controls: FaultControlsProjection
 

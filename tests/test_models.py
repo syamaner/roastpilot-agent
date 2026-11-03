@@ -22,6 +22,8 @@ from roastpilot_agent.models import (
     BeanProfileInput,
     CatalogueRecommendation,
     CatalogueRecommendationList,
+    ClosureOnlyClearanceResult,
+    EndRecoveredRunResult,
     FaultControlsProjection,
     FaultLeaseStatus,
     MicHealth,
@@ -230,12 +232,43 @@ def test_restart_clearance_models_require_an_explicit_boolean_confirmation() -> 
         state=RestartClearanceState.REQUIRED,
         eligible=False,
     )
-    assert projection.model_dump(mode="json") == {"state": "required", "eligible": False}
+    assert projection.model_dump(mode="json") == {
+        "state": "required",
+        "eligible": False,
+        "enabled_actions": [],
+        "closure_only_available": False,
+    }
     assert RestartClearanceRequest(physical_confirmation=True).physical_confirmation is True
 
     for invalid_confirmation in (False, 1, "true", None):
         with pytest.raises(pydantic.ValidationError):
             RestartClearanceRequest.model_validate({"physical_confirmation": invalid_confirmation})
+
+
+def test_closure_only_restart_clearance_models_are_typed_and_closed_by_default() -> None:
+    """D216 exposes only the server-projected recovered-run end action."""
+    clearance = RestartClearanceProjection(
+        state=RestartClearanceState.CLOSURE_ONLY,
+        eligible=False,
+        enabled_actions=[OperatorAction.END_RECOVERED_RUN],
+    )
+    controls = FaultControlsProjection(status=FaultLeaseStatus.CLOSED)
+
+    admission = ClosureOnlyClearanceResult(
+        outcome="confirmed",
+        closure_only=True,
+        restart_clearance=clearance,
+        fault_controls=controls,
+    )
+    ended = EndRecoveredRunResult(
+        run_id="recovered-run",
+        outcome="aborted",
+        restart_clearance=clearance,
+        fault_controls=controls,
+    )
+
+    assert admission.restart_clearance.enabled_actions == [OperatorAction.END_RECOVERED_RUN]
+    assert ended.model_dump(mode="json")["outcome"] == "aborted"
 
 
 def test_event_kinds_match_plan() -> None:

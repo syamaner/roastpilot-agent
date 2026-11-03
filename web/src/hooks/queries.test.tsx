@@ -380,7 +380,12 @@ describe("useFreshHealthGate", () => {
       mcp_hardware_clear_required: false,
       mcp_teardown_incident_id: null,
       active_run_id: null,
-      restart_clearance: { state: "cleared", eligible: true },
+      restart_clearance: {
+        state: "cleared",
+        eligible: true,
+        enabled_actions: [],
+        closure_only_available: false,
+      },
       fault_controls: { status: "closed", generation: null, enabled_actions: [] },
     };
     const healthSpy = vi
