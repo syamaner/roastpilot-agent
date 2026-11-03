@@ -579,6 +579,70 @@ async def test_d220_reconciles_only_its_exact_operation_after_ambiguous_commit(
 
 
 @pytest.mark.asyncio
+async def test_d220_stale_ambiguous_commit_skips_service_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale context cannot run an additional service-side exact verify."""
+    path = tmp_path / "d220-stale-ambiguous.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, _roaster, child = await _presence_service(store, "none")
+        committed = asyncio.Event()
+        release = asyncio.Event()
+        original_initialize = store.initialize_missing_fault_control_safety_record
+        original_verify = store.verify_missing_fault_control_safety_record
+        verify_calls = 0
+
+        async def counted_verify(*, process_id: str, generation: int, operation_id: str) -> bool:
+            nonlocal verify_calls
+            verify_calls += 1
+            return await original_verify(
+                process_id=process_id, generation=generation, operation_id=operation_id
+            )
+
+        async def commit_then_raise(*, process_id: str, generation: int, operation_id: str) -> bool:
+            nonlocal verify_calls
+            assert await original_initialize(
+                process_id=process_id, generation=generation, operation_id=operation_id
+            )
+            # The transaction's own exact postcondition has already run.
+            assert verify_calls == 1
+            verify_calls = 0
+            committed.set()
+            await release.wait()
+            raise OSError("ambiguous commit")
+
+        monkeypatch.setattr(store, "verify_missing_fault_control_safety_record", counted_verify)
+        monkeypatch.setattr(
+            store, "initialize_missing_fault_control_safety_record", commit_then_raise
+        )
+        initialization = asyncio.create_task(
+            service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(committed.wait(), timeout=1.0)
+        child.child_epoch += 1
+        release.set()
+        result = await asyncio.wait_for(initialization, timeout=1.0)
+
+        assert result.outcome == "unconfirmed"
+        assert verify_calls == 0
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_d220_keeps_unknown_projection_after_commit_until_its_proof_is_current(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
