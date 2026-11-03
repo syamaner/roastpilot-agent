@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import cast
 
+import aiosqlite
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -485,6 +486,145 @@ async def test_d220_http_cancellation_keeps_its_owned_baseline_task(tmp_path: Pa
             audit = await cursor.fetchone()
         assert audit is not None and audit[0] == 1
         assert roaster.presence_reads == 1
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_sqlite_transaction_cannot_delay_global_no_target_estop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-target e-stop revokes D220 before its held SQLite write can commit."""
+    path = tmp_path / "d220-transaction-estop.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_probe = store._probe_fault_control_lease_absence_from_connection  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        async def parked_transaction_probe(
+            connection: aiosqlite.Connection, *, absence_trusted: bool
+        ) -> FaultControlLeaseAbsence:
+            absence = await original_probe(connection, absence_trusted=absence_trusted)
+            if connection is not store.connection:
+                entered.set()
+                await release.wait()
+            return absence
+
+        monkeypatch.setattr(
+            store,
+            "_probe_fault_control_lease_absence_from_connection",
+            parked_transaction_probe,
+        )
+        initialization = asyncio.create_task(
+            service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        transport = ASGITransport(app=create_app(service))
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            emergency_stop = await asyncio.wait_for(
+                client.post(
+                    "/api/fault-controls/actions",
+                    json={"action": OperatorAction.EMERGENCY_STOP.value},
+                ),
+                timeout=1.0,
+            )
+        assert emergency_stop.status_code == 200
+        assert emergency_stop.json()["result"] == "failed"
+        assert not initialization.done()
+
+        release.set()
+        result = await asyncio.wait_for(initialization, timeout=1.0)
+        assert result.outcome == "unconfirmed"
+        health = await service.health()
+        assert health.fault_controls.status is FaultLeaseStatus.UNKNOWN
+        assert not health.restart_clearance.eligible
+        with pytest.raises(RoastRunConflictError, match="restart clearance"):
+            await service.start_roast(_profile())
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidation", ["replacement", "stopped", "shutdown", "gate"])
+async def test_d220_parked_presence_rejects_invalidated_current_context(
+    tmp_path: Path, invalidation: str
+) -> None:
+    """D220 writes no baseline when its child or restart context changes mid-proof."""
+    path = tmp_path / f"d220-parked-presence-{invalidation}.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, child = await _presence_service(store, "none")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def parked_presence() -> SessionPresence:
+            entered.set()
+            await release.wait()
+            return "none"
+
+        roaster.on_read = parked_presence
+        initialization = asyncio.create_task(
+            service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        if invalidation == "replacement":
+            service._mcp = cast("MCPServerProcess", _CurrentChild())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif invalidation == "stopped":
+            child.running = False
+        elif invalidation == "shutdown":
+            await service.shutdown()
+        else:
+            service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        release.set()
+
+        if invalidation == "shutdown":
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(initialization, timeout=1.0)
+        else:
+            result = await asyncio.wait_for(initialization, timeout=1.0)
+            assert result.outcome == "rejected"
+        assert (
+            await store.probe_fault_control_lease_absence()
+            is FaultControlLeaseAbsence.ABSENT_UNTRUSTED
+        )
+        async with store.connection.execute(
+            "SELECT COUNT(*) FROM operator_actions WHERE run_id IS NULL AND action = ? "
+            "AND result = 'accepted'",
+            (OperatorAction.INITIALIZE_SAFETY_RECORD.value,),
+        ) as cursor:
+            audit = await cursor.fetchone()
+        assert audit is not None and audit[0] == 0
         assert roaster.commands() == []
     finally:
         if service is not None:
