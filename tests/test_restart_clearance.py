@@ -221,24 +221,54 @@ async def test_no_session_clearance_confirms_current_child_none_and_persists(
 
 
 @pytest.mark.asyncio
-async def test_no_session_clearance_rejects_no_target_estop_during_epoch_setup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("parked_read", ["epoch_setup", "lease", "history"])
+async def test_no_session_clearance_rejects_no_target_estop_during_entry_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parked_read: str
 ) -> None:
-    """A no-target e-stop before epoch setup returns blocks clearance proof."""
-    store = RoastStore(tmp_path / "restart-entry-estop-epoch.sqlite3")
+    """A no-target e-stop before any ordinary-clearance proof blocks it."""
+    store = RoastStore(tmp_path / f"restart-entry-estop-{parked_read}.sqlite3")
     await store.initialize()
     try:
         service, roaster, _child = await _presence_service(store, "none")
         entered = asyncio.Event()
         release = asyncio.Event()
-        original_begin_epoch = store.begin_process_epoch
+        if parked_read == "epoch_setup":
+            original_begin_epoch = store.begin_process_epoch
 
-        async def parked_begin_epoch(process_id: str) -> bool:
-            entered.set()
-            await release.wait()
-            return await original_begin_epoch(process_id)
+            async def parked_begin_epoch(process_id: str) -> bool:
+                entered.set()
+                await release.wait()
+                return await original_begin_epoch(process_id)
 
-        monkeypatch.setattr(store, "begin_process_epoch", parked_begin_epoch)
+            monkeypatch.setattr(store, "begin_process_epoch", parked_begin_epoch)
+        elif parked_read == "lease":
+            await service.health()
+            original_read_lease = service._read_fault_lease_fail_closed  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            reads = 0
+
+            async def parked_read_lease() -> FaultControlLease:
+                nonlocal reads
+                reads += 1
+                if reads == 1:
+                    entered.set()
+                    await release.wait()
+                return await original_read_lease()
+
+            monkeypatch.setattr(
+                service,
+                "_read_fault_lease_fail_closed",
+                parked_read_lease,
+            )
+        else:
+            await service.health()
+            original_active_run = store.active_run
+
+            async def parked_active_run() -> PersistedRun | None:
+                entered.set()
+                await release.wait()
+                return await original_active_run()
+
+            monkeypatch.setattr(store, "active_run", parked_active_run)
         clearance = asyncio.create_task(
             service.acknowledge_restart_clearance(
                 RestartClearanceRequest(physical_confirmation=True)
@@ -350,11 +380,12 @@ async def test_d220_retries_above_a_prior_audited_generation(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_d220_rejects_no_target_estop_admitted_during_active_history_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("parked_read", ["epoch_setup", "lease", "history"])
+async def test_d220_rejects_no_target_estop_admitted_during_entry_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parked_read: str
 ) -> None:
     """A no-target e-stop before D220 reservation prevents any baseline write."""
-    path = tmp_path / "d220-entry-estop-active-read.sqlite3"
+    path = tmp_path / f"d220-entry-estop-{parked_read}.sqlite3"
     crashed = RoastStore(path)
     await crashed.initialize()
     try:
@@ -367,19 +398,47 @@ async def test_d220_rejects_no_target_estop_admitted_during_active_history_read(
     service: RoastService | None = None
     try:
         service, roaster, _child = await _presence_service(store, "none")
-        # Establish the process epoch before parking the specific durable
-        # history read performed by this D220 request.
-        await service.health()
         entered = asyncio.Event()
         release = asyncio.Event()
-        original_active_run = store.active_run
+        if parked_read == "epoch_setup":
+            original_begin_epoch = store.begin_process_epoch
 
-        async def parked_active_run() -> PersistedRun | None:
-            entered.set()
-            await release.wait()
-            return await original_active_run()
+            async def parked_begin_epoch(process_id: str) -> bool:
+                entered.set()
+                await release.wait()
+                return await original_begin_epoch(process_id)
 
-        monkeypatch.setattr(store, "active_run", parked_active_run)
+            monkeypatch.setattr(store, "begin_process_epoch", parked_begin_epoch)
+        elif parked_read == "lease":
+            await service.health()
+            original_read_lease = service._read_fault_lease_fail_closed  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            reads = 0
+
+            async def parked_read_lease() -> FaultControlLease:
+                nonlocal reads
+                reads += 1
+                if reads == 1:
+                    entered.set()
+                    await release.wait()
+                return await original_read_lease()
+
+            monkeypatch.setattr(
+                service,
+                "_read_fault_lease_fail_closed",
+                parked_read_lease,
+            )
+        else:
+            # Establish the process epoch before parking the specific durable
+            # history read performed by this D220 request.
+            await service.health()
+            original_active_run = store.active_run
+
+            async def parked_active_run() -> PersistedRun | None:
+                entered.set()
+                await release.wait()
+                return await original_active_run()
+
+            monkeypatch.setattr(store, "active_run", parked_active_run)
         initialization = asyncio.create_task(
             service.initialize_missing_fault_control_safety_record(
                 RestartClearanceRequest(physical_confirmation=True)

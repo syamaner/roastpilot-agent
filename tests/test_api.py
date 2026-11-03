@@ -426,6 +426,61 @@ async def test_closure_only_routes_end_recovered_run_without_a_roaster_write(
 
 
 @pytest.mark.asyncio
+async def test_closure_only_clearance_rejects_estop_during_history_read(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real e-stop stales D216 before presence proof or End authority."""
+    run_id = "closure-only-entry-estop"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    roaster = FakeMCPClient()
+    session_presence = mock.AsyncMock(return_value="none")
+    monkeypatch.setattr(roaster, "read_session_presence", session_presence)
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        live_serve_mode=True,
+        run_loop=False,
+    )
+    await service.recover_on_start()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_active_run = store.active_run
+
+    async def parked_active_run() -> PersistedRun | None:
+        entered.set()
+        await release.wait()
+        return await original_active_run()
+
+    monkeypatch.setattr(store, "active_run", parked_active_run)
+    clearance = asyncio.create_task(
+        service.acknowledge_closure_only_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    emergency_stop = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert emergency_stop.result == "accepted"
+    release.set()
+
+    with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+        await asyncio.wait_for(clearance, timeout=1.0)
+    session_presence.assert_not_awaited()
+    assert service._closure_only_context is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service._restart_clearance_state is RestartClearanceState.REQUIRED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert (
+        await store.read_process_restart_clearance(service.instance_id)
+    ) is RestartClearanceState.REQUIRED
+
+
+@pytest.mark.asyncio
 async def test_closure_only_end_fences_when_its_durable_commit_is_not_proved(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

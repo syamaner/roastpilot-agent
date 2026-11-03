@@ -3101,10 +3101,20 @@ class RoastService:
     ) -> ClosureOnlyClearanceResult:
         """Admit process-local authority to end, but never resume, one recovered run."""
         del request
+        # Bind this request to the e-stop epoch before waiting for the
+        # clearance lock or any durable recovery read. A global no-target
+        # e-stop still revokes this process-local End authority.
+        expected_estop_epoch = self._emergency_stop_admission_epoch
         async with self._restart_clearance_lock:
             await self._ensure_restart_epoch()
+            if self._emergency_stop_admission_epoch != expected_estop_epoch:
+                raise RoastRunConflictError("closure-only clearance evidence became stale")
             lease = await self._read_fault_lease_fail_closed()
+            if self._emergency_stop_admission_epoch != expected_estop_epoch:
+                raise RoastRunConflictError("closure-only clearance evidence became stale")
             active = await self._store.active_run()
+            if self._emergency_stop_admission_epoch != expected_estop_epoch:
+                raise RoastRunConflictError("closure-only clearance evidence became stale")
             child = self._mcp
             if (
                 self._shutdown_started
@@ -3120,7 +3130,6 @@ class RoastService:
             ):
                 raise RoastRunConflictError("closure-only clearance is not currently eligible")
             expected_epoch = child.child_epoch
-            expected_estop_epoch = self._emergency_stop_admission_epoch
             try:
                 presence = await self._roaster.read_session_presence()
             except Exception as exc:  # noqa: BLE001 - a current proof is mandatory
