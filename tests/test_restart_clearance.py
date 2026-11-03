@@ -368,6 +368,77 @@ async def test_d220_reconciles_only_its_exact_operation_after_ambiguous_commit(
 
 
 @pytest.mark.asyncio
+async def test_d220_keeps_unknown_projection_after_commit_until_its_proof_is_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed baseline stays UNKNOWN through a later no-target e-stop."""
+    path = tmp_path / "d220-committed-proof-fence.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        committed = asyncio.Event()
+        release = asyncio.Event()
+        original = store.initialize_missing_fault_control_safety_record
+
+        async def commit_then_park(*, process_id: str, generation: int, operation_id: str) -> bool:
+            assert await original(
+                process_id=process_id, generation=generation, operation_id=operation_id
+            )
+            committed.set()
+            await release.wait()
+            return True
+
+        monkeypatch.setattr(
+            store, "initialize_missing_fault_control_safety_record", commit_then_park
+        )
+        initialization = asyncio.create_task(
+            service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(committed.wait(), timeout=1.0)
+
+        pending = await service.health()
+        assert pending.fault_controls.status is FaultLeaseStatus.UNKNOWN
+        assert pending.fault_controls.generation == 1
+        assert not pending.restart_clearance.eligible
+
+        # This is a real global e-stop admission with no target. It still
+        # revokes every concurrent proof synchronously before its projection
+        # awaits, so it cannot leave a committed CLOSED baseline published.
+        emergency_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert emergency_stop.result == "failed"
+        assert emergency_stop.fault_controls.status is FaultLeaseStatus.UNKNOWN
+
+        release.set()
+        result = await asyncio.wait_for(initialization, timeout=1.0)
+        assert result.outcome == "unconfirmed"
+        assert result.fault_controls.status is FaultLeaseStatus.UNKNOWN
+        assert result.fault_controls.generation == 1
+        after = await service.health()
+        assert after.fault_controls.status is FaultLeaseStatus.UNKNOWN
+        assert after.fault_controls.generation == 1
+        assert not after.restart_clearance.eligible
+        assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_fresh_no_session_clearance_allows_a_live_start_after_confirmation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -952,10 +1023,10 @@ async def test_no_session_clearance_rejects_child_replacement_during_durable_con
 
 
 @pytest.mark.asyncio
-async def test_no_session_clearance_keeps_confirmation_after_rejected_no_target_estop(
+async def test_no_session_clearance_rejects_confirmation_after_no_target_estop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A rejected no-target e-stop cannot stale durable no-session confirmation."""
+    """A no-target e-stop revokes a clearance proof before its CAS returns."""
     store = RoastStore(tmp_path / "restart-confirm-estop-race.sqlite3")
     await store.initialize()
     try:
@@ -970,7 +1041,6 @@ async def test_no_session_clearance_keeps_confirmation_after_rejected_no_target_
             return await original_confirm(process_id)
 
         monkeypatch.setattr(store, "confirm_process_restart_clearance", delayed_confirmation)
-        lease_before = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         clearance = asyncio.create_task(
             service.acknowledge_restart_clearance(
                 RestartClearanceRequest(physical_confirmation=True)
@@ -984,14 +1054,13 @@ async def test_no_session_clearance_keeps_confirmation_after_rejected_no_target_
         assert emergency_stop.result == "failed"
         release_confirmation.set()
 
-        result = await clearance
-        assert result.cleared
+        with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+            await clearance
         await asyncio.sleep(0)
         health = await service.health()
-        assert health.restart_clearance.state is RestartClearanceState.CLEARED
-        assert health.restart_clearance.eligible
+        assert health.restart_clearance.state is RestartClearanceState.UNKNOWN
+        assert not health.restart_clearance.eligible
         assert health.fault_controls.status is FaultLeaseStatus.CLOSED
-        assert service._fault_lease_cache.generation == lease_before.generation  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     finally:
         await store.close()
 

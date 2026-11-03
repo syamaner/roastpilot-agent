@@ -2409,6 +2409,10 @@ class RoastService:
             tuple[_SafetyRecordInitializationContext, asyncio.Task[InitializeSafetyRecordResult]]
             | None
         ) = None
+        # A D220 transaction can commit before its process/child/e-stop context
+        # is rechecked. Until that exact operation proves current, never let a
+        # health read turn its durable CLOSED row into local Start authority.
+        self._unconfirmed_safety_record_generation: int | None = None
         self._closure_end_task: tuple[str, asyncio.Task[EndRecoveredRunResult]] | None = None
         self._closure_end_lock = asyncio.Lock()
         # Serializes only recovered-run history mutations with D216's durable
@@ -2771,6 +2775,17 @@ class RoastService:
             live.generation > lease.generation and live.run_id is not None
         ):
             return live
+        pending_safety_record = self._unconfirmed_safety_record_generation
+        if pending_safety_record is not None:
+            if live.generation > pending_safety_record:
+                return live
+            if lease.generation == pending_safety_record:
+                return FaultControlLease(
+                    generation=pending_safety_record,
+                    status=FaultLeaseStatus.UNKNOWN,
+                    run_id=None,
+                    mcp_session_id=None,
+                )
         self._fault_lease_cache = lease
         return lease
 
@@ -3293,6 +3308,11 @@ class RoastService:
             active = await self._store.active_run()
             expected_cached_lease = self._fault_lease_cache
             expected_active_run_id = None if active is None else active.run_id
+            # Emergency-stop admission is synchronous, including a global
+            # no-target stop.  Capture its epoch before either physical proof
+            # so a stop admitted while SQLite is confirming cannot publish
+            # this process as cleared.
+            expected_emergency_stop_admission_epoch = self._emergency_stop_admission_epoch
             # An OPEN lease follows its separate exact-session proof, but it
             # can still be backed by this child.  Capture its identity before
             # either proof so a replacement during durable confirmation cannot
@@ -3348,7 +3368,11 @@ class RoastService:
                 raise
             except Exception as exc:  # noqa: BLE001 - current MCP proof is mandatory
                 raise RoastRunConflictError("current MCP state could not be confirmed") from exc
-            if not await self._restart_clearance_context_is_current(lease, expected_active_run_id):
+            if not await self._restart_clearance_context_is_current(
+                lease,
+                expected_active_run_id,
+                expected_emergency_stop_admission_epoch,
+            ):
                 raise RoastRunConflictError("restart clearance evidence became stale")
             try:
                 confirmed = await self._store.confirm_process_restart_clearance(self.instance_id)
@@ -3366,6 +3390,7 @@ class RoastService:
                 expected_cached_lease,
                 expected_child,
                 expected_child_epoch,
+                expected_emergency_stop_admission_epoch,
             ):
                 self._restart_clearance_state = RestartClearanceState.UNKNOWN
                 raise RoastRunConflictError("restart clearance evidence became stale")
@@ -3430,6 +3455,7 @@ class RoastService:
                 self._fault_control_generation_floor + 1,
             )
             self._fault_control_generation_floor = generation
+            self._unconfirmed_safety_record_generation = generation
             context = _SafetyRecordInitializationContext(
                 child=child,
                 child_epoch=child.child_epoch,
@@ -3525,7 +3551,7 @@ class RoastService:
             run_id=None,
             mcp_session_id=None,
         )
-        self._store.trust_confirmed_fault_control_lease()
+        self._unconfirmed_safety_record_generation = None
         return await self._safety_record_initialization_result("confirmed")
 
     async def _safety_record_initialization_result(
@@ -3536,6 +3562,14 @@ class RoastService:
         # the baseline but lost its child/e-stop binding; publication must keep
         # the in-memory UNKNOWN fence until an exact in-process reconciliation.
         lease = self._fault_lease_cache
+        pending_safety_record = self._unconfirmed_safety_record_generation
+        if pending_safety_record is not None and lease.generation <= pending_safety_record:
+            lease = FaultControlLease(
+                generation=pending_safety_record,
+                status=FaultLeaseStatus.UNKNOWN,
+                run_id=None,
+                mcp_session_id=None,
+            )
         return InitializeSafetyRecordResult(
             outcome=outcome,
             restart_clearance=self._restart_clearance_projection(lease),
@@ -3566,6 +3600,7 @@ class RoastService:
         expected_cached_lease: FaultControlLease,
         expected_child: MCPServerProcess | None,
         expected_child_epoch: int | None,
+        expected_emergency_stop_admission_epoch: int,
     ) -> bool:
         """Return whether the no-await clearance publication fence still holds.
 
@@ -3579,6 +3614,7 @@ class RoastService:
             not self._restart_epoch_initialized
             or self._restart_clearance_state is not RestartClearanceState.REQUIRED
             or self._fault_lease_cache != expected_cached_lease
+            or self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch
         ):
             return False
         if expected_child is None:
@@ -3591,12 +3627,16 @@ class RoastService:
         )
 
     async def _restart_clearance_context_is_current(
-        self, expected_lease: FaultControlLease, expected_active_run_id: str | None
+        self,
+        expected_lease: FaultControlLease,
+        expected_active_run_id: str | None,
+        expected_emergency_stop_admission_epoch: int,
     ) -> bool:
         """Recheck clearance admission context immediately before durable confirmation."""
         if (
             not self._restart_epoch_initialized
             or self._restart_clearance_state is not RestartClearanceState.REQUIRED
+            or self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch
         ):
             return False
         try:
@@ -3604,7 +3644,10 @@ class RoastService:
         except Exception:  # noqa: BLE001 - a failed durable recheck must block
             _log.exception("could not recheck restart gate for clearance")
             return False
-        if persisted_state is not RestartClearanceState.REQUIRED:
+        if (
+            persisted_state is not RestartClearanceState.REQUIRED
+            or self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch
+        ):
             return False
         lease = await self._read_fault_lease_fail_closed()
         if (
@@ -3612,6 +3655,7 @@ class RoastService:
             or lease.status is not expected_lease.status
             or lease.run_id != expected_lease.run_id
             or lease.mcp_session_id != expected_lease.mcp_session_id
+            or self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch
         ):
             return False
         try:
@@ -3620,11 +3664,15 @@ class RoastService:
             _log.exception("could not recheck active run for restart clearance")
             return False
         if expected_active_run_id is None:
-            return active is None
+            return (
+                active is None
+                and self._emergency_stop_admission_epoch == expected_emergency_stop_admission_epoch
+            )
         return (
             active is not None
             and active.run_id == expected_active_run_id
             and active.agent_phase is RoastPhase.FAULTED
+            and self._emergency_stop_admission_epoch == expected_emergency_stop_admission_epoch
         )
 
     async def submit_fault_controls_action(

@@ -1262,15 +1262,6 @@ class RoastStore:
         except Exception:  # noqa: BLE001 - unreadable evidence never grants admission
             return FaultControlLeaseAbsence.UNREADABLE
 
-    def trust_confirmed_fault_control_lease(self) -> None:
-        """Record current-process trust after an exact durable lease proof.
-
-        The singleton is present after D220, so this does not itself make an
-        absence eligible. It only preserves the process-local provenance fact
-        used by the legacy absence projection if that row is later unavailable.
-        """
-        self._fault_lease_absence_trusted = True
-
     async def _probe_fault_control_lease_absence_from_connection(
         self,
         connection: aiosqlite.Connection,
@@ -1334,6 +1325,16 @@ class RoastStore:
             ) as cursor:
                 active = await cursor.fetchone()
             if epoch is None or clearance is None or active is not None:
+                await connection.rollback()
+                return False
+            # A generation is a durable server operation identity, not merely
+            # a value available while this singleton happens to be absent.
+            # Refuse reuse inside the same write transaction so a stale
+            # process can never attach a second baseline to an old audit.
+            if (
+                await self._missing_fault_control_safety_record_audit_count(connection, generation)
+                != 0
+            ):
                 await connection.rollback()
                 return False
             now = _utc_now()
@@ -1449,6 +1450,14 @@ class RoastStore:
         self, connection: aiosqlite.Connection, generation: int
     ) -> bool:
         """Return whether exactly one well-formed D220 audit proves this generation."""
+        return (
+            await self._missing_fault_control_safety_record_audit_count(connection, generation) == 1
+        )
+
+    async def _missing_fault_control_safety_record_audit_count(
+        self, connection: aiosqlite.Connection, generation: int
+    ) -> int:
+        """Count canonical null-run D220 audits for one durable generation."""
         async with connection.execute(
             "SELECT payload_json FROM operator_actions WHERE run_id IS NULL AND action = ? "
             "AND result = 'accepted'",
@@ -1478,7 +1487,7 @@ class RoastStore:
                 and payload == self._fault_control_safety_record_payload(generation, operation_id)
             ):
                 matching += 1
-        return matching == 1
+        return matching
 
     async def _read_fault_control_lease_from_connection(
         self, connection: aiosqlite.Connection

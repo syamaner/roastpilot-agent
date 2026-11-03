@@ -7734,6 +7734,42 @@ async def test_d220_missing_safety_record_transaction_commits_one_audited_baseli
 
 
 @pytest.mark.asyncio
+async def test_d220_baseline_rejects_a_generation_with_a_prior_server_audit(
+    tmp_path: Path,
+) -> None:
+    """A reused generation cannot attach a new D220 baseline to an old audit."""
+    path = tmp_path / "d220-prior-audit.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    try:
+        assert not await store.begin_process_epoch("d220-process")
+        assert (
+            await store.begin_process_restart_clearance("d220-process")
+            is RestartClearanceState.REQUIRED
+        )
+        await store.record_operator_action(
+            action=OperatorAction.INITIALIZE_SAFETY_RECORD.value,
+            result="accepted",
+            payload={"baseline": "initialised", "generation": 1, "operation_id": "old"},
+        )
+
+        assert not await store.initialize_missing_fault_control_safety_record(
+            process_id="d220-process", generation=1, operation_id="new"
+        )
+        assert await fetch_one(store, "SELECT COUNT(*) FROM fault_control_lease") == (0,)
+        assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == (1,)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_d220_baseline_refuses_trusted_absence_or_an_active_run(
     tmp_store: RoastStore,
 ) -> None:
