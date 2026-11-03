@@ -2930,6 +2930,10 @@ class RoastService:
         command can be admitted for the controller queue, but that admission is
         never represented as a completed physical action.
         """
+        if request.action is OperatorAction.END_RECOVERED_RUN:
+            raise RoastRunConflictError(
+                "end_recovered_run is available only through the recovered-run end path"
+            )
         if request.action is OperatorAction.EMERGENCY_STOP:
             return await self._submit_fault_controls_emergency_stop()
         if self._fault_acknowledgement_gate.fault_finalization_started:
@@ -5432,6 +5436,10 @@ class RoastService:
         ``emergency_stop`` / ``acknowledge_fault`` so a fault never strands a
         physically-running machine.
         """
+        if request.action is OperatorAction.END_RECOVERED_RUN:
+            raise RoastRunConflictError(
+                "end_recovered_run is available only through the recovered-run end path"
+            )
         if request.action is OperatorAction.EMERGENCY_STOP:
             if self._revoke_unpublished_start_for_emergency_stop(run_id):
                 # The exact row is already visible, but this process has not
@@ -6823,6 +6831,8 @@ async def submit_operator_action(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except RoastRunGoneError as exc:
         raise HTTPException(status_code=410, detail=str(exc)) from exc
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 async def list_bean_profiles(service: ServiceDep) -> BeanProfileList:
