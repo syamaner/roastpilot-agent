@@ -148,6 +148,30 @@ describe("api client", () => {
     });
   });
 
+  it("POST /api/restart-clearance/initialize-safety-record sends only the fixed confirmation", async () => {
+    mockFetch(200, {
+      outcome: "confirmed",
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: [],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "closed", generation: 1, enabled_actions: [] },
+    });
+
+    await api.initializeSafetyRecord();
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/restart-clearance/initialize-safety-record",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+      physical_confirmation: true,
+    });
+  });
+
   it("POST /api/roasts/{id}/end-recovered-run has no operator-action body", async () => {
     mockFetch(200, {
       run_id: "run-recovered",

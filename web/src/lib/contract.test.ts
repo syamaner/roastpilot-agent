@@ -142,6 +142,33 @@ describe("restart-clearance contract", () => {
     expect(projection.enabled_actions).toEqual(["end_recovered_run"]);
   });
 
+  it("accepts D220 only as a required-gate server action", () => {
+    expect(
+      isCoherentRestartClearance({
+        state: "required",
+        eligible: false,
+        enabled_actions: ["initialize_safety_record"],
+        closure_only_available: false,
+      }),
+    ).toBe(true);
+    expect(
+      isCoherentRestartClearance({
+        state: "closure_only",
+        eligible: false,
+        enabled_actions: ["initialize_safety_record"],
+        closure_only_available: false,
+      }),
+    ).toBe(false);
+    expect(
+      isCoherentRestartClearance({
+        state: "required",
+        eligible: false,
+        enabled_actions: ["initialize_safety_record"],
+        closure_only_available: true,
+      }),
+    ).toBe(false);
+  });
+
   it("fails closed for incoherent server closure-only projections", () => {
     expect(
       isCoherentRestartClearance({

@@ -26,6 +26,7 @@ import type {
   HealthResponse,
   HardwareClearAcknowledgementRequest,
   HardwareClearAcknowledgementResult,
+  InitializeSafetyRecordResult,
   OperatorActionRequest,
   OperatorActionResult,
   OperatorRatingRequest,
@@ -211,6 +212,17 @@ export const api = {
   endRecoveredRun: (runId: string) =>
     request<EndRecoveredRunResult>(`/api/roasts/${runId}/end-recovered-run`, {
       method: "POST",
+    }),
+
+  /**
+   * `POST /api/restart-clearance/initialize-safety-record` — records one
+   * D220 physical confirmation for the server-projected missing-record path.
+   * It neither actuates hardware nor grants Start authority.
+   */
+  initializeSafetyRecord: () =>
+    request<InitializeSafetyRecordResult>("/api/restart-clearance/initialize-safety-record", {
+      method: "POST",
+      body: JSON.stringify({ physical_confirmation: true }),
     }),
 
   /** `GET /api/roasts/{id}/tastings` — the run's tasting entries (#522, D91). */
