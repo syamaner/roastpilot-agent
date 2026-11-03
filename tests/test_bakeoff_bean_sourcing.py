@@ -1817,7 +1817,10 @@ def test_paired_bootstrap_combined_flattens_cell_weighted_not_page_averaged() ->
     # equal combined_score(all A cells) - combined_score(all B cells)).
     all_a = [o for page in run_a.pages for o in page.outcomes.values()]
     all_b = [o for page in run_b.pages for o in page.outcomes.values()]
-    expected = bo.combined_score(all_a) - bo.combined_score(all_b)  # type: ignore[operator]
+    score_a = bo.combined_score(all_a)
+    score_b = bo.combined_score(all_b)
+    assert score_a is not None and score_b is not None  # Both runs have scored cells here.
+    expected = score_a - score_b
     assert ci.estimate == pytest.approx(expected)
 
 
