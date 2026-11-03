@@ -2906,6 +2906,114 @@ class RoastService:
                 fault_controls=await self._fault_controls_projection(lease),
             )
 
+    async def end_recovered_run(self, run_id: str) -> EndRecoveredRunResult:
+        """End one closure-only recovered run without a controller or MCP write."""
+        async with self._closure_end_lock:
+            if self._shutdown_started:
+                raise RoastRunConflictError("shutdown has started")
+            existing = self._closure_end_task
+            if existing is not None:
+                if existing[0] != run_id:
+                    raise RoastRunConflictError("a different recovered run is ending")
+                task = existing[1]
+            else:
+                context = self._closure_only_context
+                if (
+                    context is None
+                    or context.run_id != run_id
+                    or not self._closure_only_binding_is_current(context)
+                ):
+                    self._invalidate_closure_only_clearance()
+                    raise RoastRunConflictError("closure-only clearance evidence is unavailable")
+                active = await self._store.active_run()
+                if (
+                    active is None
+                    or active.run_id != run_id
+                    or active.agent_phase is not RoastPhase.OPERATOR_RECOVERY_REQUIRED
+                    or active.completed_at_utc is not None
+                ):
+                    self._invalidate_closure_only_clearance()
+                    raise RoastRunConflictError("recovered run is no longer active")
+                try:
+                    presence = await cast(RoasterControl, self._roaster).read_session_presence()
+                except Exception as exc:  # noqa: BLE001 - no presence proof means no end
+                    self._invalidate_closure_only_clearance()
+                    raise RoastRunConflictError(
+                        "current MCP session presence could not be confirmed"
+                    ) from exc
+                durable_lease = await self._read_fault_lease_fail_closed()
+                if (
+                    presence != "none"
+                    or durable_lease != context.lease
+                    or not self._closure_only_binding_is_current(context)
+                ):
+                    self._invalidate_closure_only_clearance()
+                    raise RoastRunConflictError("closure-only evidence became stale")
+                task = asyncio.create_task(self._end_recovered_run_task(context))
+                self._closure_end_task = (run_id, task)
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done() and self._closure_end_task == (run_id, task):
+                self._closure_end_task = None
+
+    async def _end_recovered_run_task(self, context: _ClosureOnlyContext) -> EndRecoveredRunResult:
+        """Own the durable end CAS and retain the live-loop Start fence until settled."""
+        if self._shutdown_started or not self._closure_only_binding_is_current(context):
+            self._invalidate_closure_only_clearance()
+            raise RoastRunConflictError("closure-only evidence became stale")
+        try:
+            committed = await self._store.end_closure_only_recovered_run(
+                process_id=context.process_id, run_id=context.run_id, expected_lease=context.lease
+            )
+        except Exception as exc:  # noqa: BLE001 - only the exact postcondition can recover ambiguity
+            committed = await self._store.closure_only_end_postcondition(
+                process_id=context.process_id,
+                run_id=context.run_id,
+                lease_generation=context.lease.generation,
+            )
+            if not committed:
+                self._invalidate_closure_only_clearance()
+                raise RoastRunConflictError("recovered-run end is unconfirmed") from exc
+        if not committed:
+            # A false CAS result is not proof that no concurrent owner reached
+            # the exact terminal postcondition.  Accept only that durable
+            # postcondition; every other result remains an admission fence.
+            committed = await self._store.closure_only_end_postcondition(
+                process_id=context.process_id,
+                run_id=context.run_id,
+                lease_generation=context.lease.generation,
+            )
+            if not committed:
+                self._invalidate_closure_only_clearance()
+                raise RoastRunConflictError("recovered-run end was not durably recorded")
+        if not self._closure_only_binding_is_current(
+            context
+        ) and not await self._store.closure_only_end_postcondition(
+            process_id=context.process_id,
+            run_id=context.run_id,
+            lease_generation=context.lease.generation,
+        ):
+            self._invalidate_closure_only_clearance()
+            raise RoastRunConflictError("recovered-run end is unconfirmed")
+        self._restart_clearance_state = RestartClearanceState.REQUIRED
+        self._closure_only_context = None
+        loop = self._loop_task
+        if loop is not None and not loop.done():
+            loop.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop
+        self._loop_task = None
+        self.runner = None
+        self.active_run_id = None
+        lease = await self._read_fault_lease_fail_closed()
+        return EndRecoveredRunResult(
+            run_id=context.run_id,
+            outcome="aborted",
+            restart_clearance=self._restart_clearance_projection(lease),
+            fault_controls=await self._fault_controls_projection(lease),
+        )
+
     async def acknowledge_restart_clearance(
         self, request: RestartClearanceRequest
     ) -> RestartClearanceResult:
@@ -4922,6 +5030,10 @@ class RoastService:
     async def shutdown(self) -> None:
         """Stop the live loop and release the background task (clean teardown /
         agent restart). Idempotent; safe in API-only mode."""
+        self._shutdown_started = True
+        closure_end = self._closure_end_task
+        if closure_end is not None and not closure_end[1].done():
+            await asyncio.shield(closure_end[1])
         task = self._loop_task
         self._loop_task = None
         if task is not None and not task.done():
@@ -6873,6 +6985,14 @@ async def acknowledge_closure_only_clearance(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+async def end_recovered_run(run_id: str, service: ServiceDep) -> EndRecoveredRunResult:
+    """``POST /api/roasts/{run_id}/end-recovered-run`` — close one recovered run."""
+    try:
+        return await service.end_recovered_run(run_id)
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 async def submit_fault_controls_action(
     request: FaultControlsActionRequest, service: ServiceDep
 ) -> FaultControlsActionResult:
@@ -7755,6 +7875,7 @@ def create_app(
     app.post("/api/roasts/{run_id}/tastings", status_code=201)(add_tasting)
     app.get("/api/roasts/{run_id}/tastings")(list_tastings)
     app.post("/api/roasts/{run_id}/operator-actions")(submit_operator_action)
+    app.post("/api/roasts/{run_id}/end-recovered-run")(end_recovered_run)
     app.get("/api/bean-profiles")(list_bean_profiles)
     app.post("/api/bean-profiles", status_code=201)(create_bean_profile)
     app.put("/api/bean-profiles/{profile_id}")(update_bean_profile)
