@@ -8592,14 +8592,16 @@ def _controller_accepts(action: OperatorAction, phase: RoastPhase) -> bool:
       (``RoastRunner._dispatch_acknowledge_fault``) acts iff the controller is in
       ``faulted`` (it flips the runner's finalise flag); the
       controller-observable acceptance condition is exactly "phase is FAULTED".
-    * ``stop_cooling_and_acknowledge`` (D212) and ``end_recovered_run``
-      (D216): deliberately false here. They are API-owned, lease-bound durable
-      operations, not direct controller actions, and must never be exposed
-      through this controller permission mirror.
+    * ``stop_cooling_and_acknowledge`` (D212), ``end_recovered_run`` (D216),
+      and ``initialize_safety_record`` (D220): deliberately false here. They
+      are API-owned, lease-bound durable operations, not direct controller
+      actions, and must never be exposed through this controller permission
+      mirror.
     """
     if action in (
         OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
         OperatorAction.END_RECOVERED_RUN,
+        OperatorAction.INITIALIZE_SAFETY_RECORD,
     ):
         return False
     command = OPERATOR_ACTION_COMMAND.get(action)

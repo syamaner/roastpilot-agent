@@ -15,6 +15,7 @@ import math
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -798,6 +799,15 @@ class FaultControlLease(BaseModel):
     mcp_session_id: str | None
 
 
+class FaultControlLeaseAbsence(Enum):
+    """Durable fault-lease absence classification for D220 admission."""
+
+    ABSENT_UNTRUSTED = "absent_untrusted"
+    ABSENT_TRUSTED = "absent_trusted"
+    PRESENT = "present"
+    UNREADABLE = "unreadable"
+
+
 class FaultControlCloseResult(BaseModel):
     """The durable outcome of one atomic fault-control close.
 
@@ -1236,6 +1246,225 @@ class RoastStore:
         """Read the current lease, classifying unproven absence as UNKNOWN."""
         return await self._read_fault_control_lease_from_connection(self.connection)
 
+    async def probe_fault_control_lease_absence(self) -> FaultControlLeaseAbsence:
+        """Classify whether the singleton lease row is durably absent.
+
+        This deliberately does not project a :class:`FaultControlLease`:
+        generation-zero ``UNKNOWN`` is ambiguous between an absent row and a
+        failed read, while D220 may admit only an actually readable, absent,
+        untrusted row.
+        """
+        try:
+            return await self._probe_fault_control_lease_absence_from_connection(
+                self.connection,
+                absence_trusted=self._fault_lease_absence_trusted,
+            )
+        except Exception:  # noqa: BLE001 - unreadable evidence never grants admission
+            return FaultControlLeaseAbsence.UNREADABLE
+
+    async def _probe_fault_control_lease_absence_from_connection(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        absence_trusted: bool,
+    ) -> FaultControlLeaseAbsence:
+        """Probe the singleton row on one connection without projecting it."""
+        async with connection.execute(
+            "SELECT 1 FROM fault_control_lease WHERE singleton = 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is not None:
+            return FaultControlLeaseAbsence.PRESENT
+        return (
+            FaultControlLeaseAbsence.ABSENT_TRUSTED
+            if absence_trusted
+            else FaultControlLeaseAbsence.ABSENT_UNTRUSTED
+        )
+
+    async def initialize_missing_fault_control_safety_record(
+        self,
+        *,
+        process_id: str,
+        generation: int,
+        operation_id: str,
+    ) -> bool:
+        """Atomically insert D220's first audited CLOSED safety record.
+
+        The service owns all process/child/e-stop admission fences. SQLite
+        proves only durable premises: this exact unclean process epoch, its
+        required restart gate, no active run, and an actually absent untrusted
+        singleton. The insert is intentionally never an upsert.
+        """
+        if generation < 1:
+            raise ValueError("D220 baseline generation must be positive")
+        connection = await aiosqlite.connect(self._db_path)
+        connection.row_factory = aiosqlite.Row
+        try:
+            await self._configure_durable_connection(connection)
+            await connection.execute("BEGIN IMMEDIATE")
+            absence = await self._probe_fault_control_lease_absence_from_connection(
+                connection,
+                absence_trusted=self._fault_lease_absence_trusted,
+            )
+            if absence is not FaultControlLeaseAbsence.ABSENT_UNTRUSTED:
+                await connection.rollback()
+                return False
+            async with connection.execute(
+                "SELECT 1 FROM process_epoch WHERE singleton = 1 "
+                "AND process_id = ? AND status = 'unclean'",
+                (process_id,),
+            ) as cursor:
+                epoch = await cursor.fetchone()
+            async with connection.execute(
+                "SELECT 1 FROM process_restart_clearance WHERE process_id = ? AND state = ?",
+                (process_id, RestartClearanceState.REQUIRED.value),
+            ) as cursor:
+                clearance = await cursor.fetchone()
+            async with connection.execute(
+                "SELECT 1 FROM roast_runs WHERE completed_at_utc IS NULL LIMIT 1"
+            ) as cursor:
+                active = await cursor.fetchone()
+            if epoch is None or clearance is None or active is not None:
+                await connection.rollback()
+                return False
+            now = _utc_now()
+            await connection.execute(
+                "INSERT INTO fault_control_lease "
+                "(singleton, run_id, mcp_session_id, generation, status, updated_at_utc) "
+                "VALUES (1, NULL, NULL, ?, ?, ?)",
+                (generation, FaultLeaseStatus.CLOSED.value, now),
+            )
+            payload = self._fault_control_safety_record_payload(generation, operation_id)
+            await connection.execute(
+                "INSERT INTO operator_actions "
+                "(run_id, action, payload_json, result, recorded_at_utc) "
+                "VALUES (NULL, ?, ?, 'accepted', ?)",
+                (OperatorAction.INITIALIZE_SAFETY_RECORD.value, payload, now),
+            )
+            await connection.commit()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await connection.rollback()
+            raise
+        finally:
+            await connection.close()
+        return await self.verify_missing_fault_control_safety_record(
+            process_id=process_id,
+            generation=generation,
+            operation_id=operation_id,
+        )
+
+    async def verify_missing_fault_control_safety_record(
+        self,
+        *,
+        process_id: str,
+        generation: int,
+        operation_id: str,
+    ) -> bool:
+        """Prove the exact D220 baseline and its unique matching audit."""
+        connection: aiosqlite.Connection | None = None
+        try:
+            connection = await aiosqlite.connect(self._db_path)
+            connection.row_factory = aiosqlite.Row
+            await self._configure_durable_connection(connection)
+            async with connection.execute(
+                "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease "
+                "WHERE singleton = 1"
+            ) as cursor:
+                lease = await cursor.fetchone()
+            async with connection.execute(
+                "SELECT 1 FROM process_epoch WHERE singleton = 1 "
+                "AND process_id = ? AND status = 'unclean'",
+                (process_id,),
+            ) as cursor:
+                epoch = await cursor.fetchone()
+            async with connection.execute(
+                "SELECT 1 FROM process_restart_clearance WHERE process_id = ? AND state = ?",
+                (process_id, RestartClearanceState.REQUIRED.value),
+            ) as cursor:
+                clearance = await cursor.fetchone()
+            async with connection.execute(
+                "SELECT 1 FROM roast_runs WHERE completed_at_utc IS NULL LIMIT 1"
+            ) as cursor:
+                active = await cursor.fetchone()
+            return (
+                lease is not None
+                and lease["run_id"] is None
+                and lease["mcp_session_id"] is None
+                and int(lease["generation"]) == generation
+                and str(lease["status"]) == FaultLeaseStatus.CLOSED.value
+                and epoch is not None
+                and clearance is not None
+                and active is None
+                and await self._has_confirmed_missing_fault_control_safety_record(
+                    connection, generation, operation_id
+                )
+            )
+        except Exception:  # noqa: BLE001 - unreadable postcondition is not proof
+            return False
+        finally:
+            if connection is not None:
+                await connection.close()
+
+    @staticmethod
+    def _fault_control_safety_record_payload(generation: int, operation_id: str) -> str:
+        """Render the canonical D220 baseline-audit payload."""
+        return json.dumps(
+            {"baseline": "initialised", "generation": generation, "operation_id": operation_id},
+            sort_keys=True,
+        )
+
+    async def _has_confirmed_missing_fault_control_safety_record(
+        self,
+        connection: aiosqlite.Connection,
+        generation: int,
+        operation_id: str,
+    ) -> bool:
+        """Return whether exactly one matching null-run D220 audit exists."""
+        payload = self._fault_control_safety_record_payload(generation, operation_id)
+        async with connection.execute(
+            "SELECT COUNT(*) FROM operator_actions WHERE run_id IS NULL AND action = ? "
+            "AND result = 'accepted' AND payload_json = ?",
+            (OperatorAction.INITIALIZE_SAFETY_RECORD.value, payload),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row is not None and int(row[0]) == 1
+
+    async def _has_any_confirmed_missing_fault_control_safety_record(
+        self, connection: aiosqlite.Connection, generation: int
+    ) -> bool:
+        """Return whether exactly one well-formed D220 audit proves this generation."""
+        async with connection.execute(
+            "SELECT payload_json FROM operator_actions WHERE run_id IS NULL AND action = ? "
+            "AND result = 'accepted'",
+            (OperatorAction.INITIALIZE_SAFETY_RECORD.value,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        matching = 0
+        for row in rows:
+            payload = row["payload_json"]
+            if not isinstance(payload, str):
+                continue
+            try:
+                decoded_value = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(decoded_value, dict):
+                continue
+            decoded = cast("dict[str, object]", decoded_value)
+            audit_generation = decoded.get("generation")
+            operation_id = decoded.get("operation_id")
+            if (
+                set(decoded) == {"baseline", "generation", "operation_id"}
+                and decoded.get("baseline") == "initialised"
+                and type(audit_generation) is int
+                and audit_generation == generation
+                and isinstance(operation_id, str)
+                and payload == self._fault_control_safety_record_payload(generation, operation_id)
+            ):
+                matching += 1
+        return matching == 1
+
     async def _read_fault_control_lease_from_connection(
         self, connection: aiosqlite.Connection
     ) -> FaultControlLease:
@@ -1266,12 +1495,14 @@ class RoastStore:
         # the old independent close/event commits used to make precisely that
         # state observable on restart.  Keep it UNKNOWN until the exact audit
         # is durably visible as well.
-        if (
-            status is FaultLeaseStatus.CLOSED
-            and run_id is not None
-            and not await self._has_confirmed_fault_control_close(connection, run_id, generation)
-        ):
-            status = FaultLeaseStatus.UNKNOWN
+        if status is FaultLeaseStatus.CLOSED:
+            if run_id is None:
+                if not await self._has_any_confirmed_missing_fault_control_safety_record(
+                    connection, generation
+                ):
+                    status = FaultLeaseStatus.UNKNOWN
+            elif not await self._has_confirmed_fault_control_close(connection, run_id, generation):
+                status = FaultLeaseStatus.UNKNOWN
         return FaultControlLease(
             generation=generation,
             status=status,

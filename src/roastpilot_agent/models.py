@@ -1332,6 +1332,7 @@ class OperatorAction(Enum):
     ACKNOWLEDGE_FAULT = "acknowledge_fault"
     STOP_COOLING_AND_ACKNOWLEDGE = "stop_cooling_and_acknowledge"
     END_RECOVERED_RUN = "end_recovered_run"
+    INITIALIZE_SAFETY_RECORD = "initialize_safety_record"
 
 
 def _empty_restart_clearance_actions() -> list[OperatorAction]:

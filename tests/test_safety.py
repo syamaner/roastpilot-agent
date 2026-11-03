@@ -754,19 +754,22 @@ def test_enabled_actions_in_faulted_allow_cooling_drop_and_acknowledge() -> None
 def test_every_operator_action_is_reachable_in_some_phase() -> None:
     """Every direct controller action is enabled in at least one phase.
 
-    D212's composite action and D216's recovered-run End are deliberately
-    absent: both require API-owned, lease-bound durable proof rather than a
-    controller phase. Keeping them out of this matrix prevents a future
-    controller-only route from bypassing that proof.
+    D212's composite action, D216's recovered-run End, and D220's missing
+    safety-record initialisation are deliberately absent: all require API-owned,
+    lease-bound durable proof rather than a controller phase. Keeping them out
+    of this matrix prevents a future controller-only route from bypassing that
+    proof.
     """
     reachable = {a for phase in RoastPhase for a in enabled_operator_actions(phase)}
     direct_actions = set(OperatorAction) - {
         OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
         OperatorAction.END_RECOVERED_RUN,
+        OperatorAction.INITIALIZE_SAFETY_RECORD,
     }
     assert reachable == direct_actions
     assert OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE not in reachable
     assert OperatorAction.END_RECOVERED_RUN not in reachable
+    assert OperatorAction.INITIALIZE_SAFETY_RECORD not in reachable
 
 
 def test_emergency_stop_matrix_row_is_every_phase() -> None:

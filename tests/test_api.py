@@ -1319,6 +1319,33 @@ async def test_generic_fault_controls_route_rejects_recovered_run_end_without_di
 
 
 @pytest.mark.asyncio
+async def test_generic_fault_controls_route_rejects_safety_record_initialisation_without_mutation(
+    store: RoastStore,
+) -> None:
+    """D220 initialisation cannot enter the global executor, queue, or audit path."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, _run_id = await _live_service(store, mcp=mcp, clock=clock)
+    commands_before = mcp.commands()
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/fault-controls/actions", json={"action": "initialize_safety_record"}
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "initialize_safety_record is available only through the safety-record path"
+    }
+    assert mcp.commands() == commands_before
+    assert service.operator_queue.empty()
+    assert await _operator_action_rows(store, _run_id) == []
+    assert await _operator_action_rows(store, None) == []
+
+
+@pytest.mark.asyncio
 async def test_global_estop_uses_live_runner_without_a_terminal_fault_lease(
     store: RoastStore,
 ) -> None:
@@ -3961,10 +3988,10 @@ async def _make_run(store: RoastStore, run_id: str, phase: RoastPhase) -> None:
 
 
 async def _operator_action_rows(
-    store: RoastStore, run_id: str
+    store: RoastStore, run_id: str | None
 ) -> list[tuple[str, str, str | None]]:
     async with store.connection.execute(
-        "SELECT action, result, payload_json FROM operator_actions WHERE run_id = ?"
+        "SELECT action, result, payload_json FROM operator_actions WHERE run_id IS ?"
         " ORDER BY id ASC",
         (run_id,),
     ) as cursor:
@@ -4033,6 +4060,27 @@ async def test_generic_operator_route_rejects_recovered_run_end_without_audit_or
     }
     assert service.operator_queue.empty()
     assert await _operator_action_rows(store, run_id) == []
+
+
+@pytest.mark.asyncio
+async def test_generic_operator_route_rejects_safety_record_initialisation_without_mutation(
+    client: AsyncClient, service: RoastService, store: RoastStore
+) -> None:
+    """D220 initialisation cannot use a run-bound queue or accepted audit path."""
+    run_id = "run-d220-generic"
+    await _make_run(store, run_id, RoastPhase.DEVELOPMENT)
+
+    response = await client.post(
+        f"/api/roasts/{run_id}/operator-actions", json={"action": "initialize_safety_record"}
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "initialize_safety_record is available only through the safety-record path"
+    }
+    assert service.operator_queue.empty()
+    assert await _operator_action_rows(store, run_id) == []
+    assert await _operator_action_rows(store, None) == []
 
 
 @pytest.mark.asyncio

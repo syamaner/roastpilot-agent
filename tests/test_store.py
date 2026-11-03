@@ -21,6 +21,7 @@ from roastpilot_agent.ambient_evidence import AmbientEvidenceVerdict, NotProvenR
 from roastpilot_agent.store import (
     MIGRATIONS,
     FaultControlLease,
+    FaultControlLeaseAbsence,
     PhysicallyImpossibleWeightError,
     RoastStore,
     RunActivelyDrivenError,
@@ -7664,6 +7665,164 @@ async def test_unverified_closed_fault_lease_is_unknown_on_restart_read(
     lease = await tmp_store.read_fault_control_lease()
 
     assert lease.status.value == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_d220_missing_safety_record_transaction_commits_one_audited_baseline(
+    tmp_path: Path,
+) -> None:
+    """D220 inserts only an untrusted absent lease with its exact one-off audit."""
+    path = tmp_path / "d220-unclean-absence.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    try:
+        assert not await store.begin_process_epoch("d220-process")
+        assert (
+            await store.begin_process_restart_clearance("d220-process")
+            is RestartClearanceState.REQUIRED
+        )
+        assert (
+            await store.probe_fault_control_lease_absence()
+            is FaultControlLeaseAbsence.ABSENT_UNTRUSTED
+        )
+
+        assert await store.initialize_missing_fault_control_safety_record(
+            process_id="d220-process", generation=1, operation_id="d220-operation"
+        )
+        assert await store.verify_missing_fault_control_safety_record(
+            process_id="d220-process", generation=1, operation_id="d220-operation"
+        )
+        assert not await store.verify_missing_fault_control_safety_record(
+            process_id="d220-process", generation=1, operation_id="foreign-operation"
+        )
+        lease = await store.read_fault_control_lease()
+        assert lease == FaultControlLease(
+            generation=1,
+            status=FaultLeaseStatus.CLOSED,
+            run_id=None,
+            mcp_session_id=None,
+        )
+        assert await fetch_one(
+            store,
+            "SELECT run_id, action, payload_json, result FROM operator_actions",
+        ) == (
+            None,
+            OperatorAction.INITIALIZE_SAFETY_RECORD.value,
+            '{"baseline": "initialised", "generation": 1, "operation_id": "d220-operation"}',
+            "accepted",
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_baseline_refuses_trusted_absence_or_an_active_run(
+    tmp_store: RoastStore,
+) -> None:
+    """D220 never turns a trusted absence or active history into a baseline."""
+    await tmp_store.initialize()
+    assert await tmp_store.begin_process_epoch("fresh-process")
+    assert (
+        await tmp_store.begin_process_restart_clearance("fresh-process")
+        is RestartClearanceState.REQUIRED
+    )
+    assert (
+        await tmp_store.probe_fault_control_lease_absence()
+        is FaultControlLeaseAbsence.ABSENT_TRUSTED
+    )
+    assert not await tmp_store.initialize_missing_fault_control_safety_record(
+        process_id="fresh-process", generation=1, operation_id="trusted-absence"
+    )
+
+    await tmp_store.create_run(
+        run_id="active-d220-run",
+        profile=_reference_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+    )
+    # Simulate the otherwise eligible durable absence directly; the active-row
+    # check remains in the same transaction as the plain lease insert.
+    tmp_store._fault_lease_absence_trusted = False  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert not await tmp_store.initialize_missing_fault_control_safety_record(
+        process_id="fresh-process", generation=1, operation_id="active-run"
+    )
+    assert await fetch_one(tmp_store, "SELECT COUNT(*) FROM fault_control_lease") == (0,)
+    assert await fetch_one(tmp_store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+
+
+@pytest.mark.asyncio
+async def test_d220_absence_probe_is_closed_and_unreadable_fails_closed(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store distinguishes a readable row from unreadable durable evidence."""
+    await tmp_store.initialize()
+    assert (
+        await tmp_store.probe_fault_control_lease_absence()
+        is FaultControlLeaseAbsence.ABSENT_TRUSTED
+    )
+    await tmp_store.connection.execute(
+        "INSERT INTO fault_control_lease "
+        "(singleton, run_id, mcp_session_id, generation, status, updated_at_utc) "
+        "VALUES (1, NULL, NULL, 1, 'unknown', ?)",
+        ("2026-11-03T00:00:00+00:00",),
+    )
+    await tmp_store.connection.commit()
+    assert await tmp_store.probe_fault_control_lease_absence() is FaultControlLeaseAbsence.PRESENT
+
+    async def unreadable(*_args: object, **_kwargs: object) -> FaultControlLeaseAbsence:
+        raise OSError("synthetic unreadable lease table")
+
+    monkeypatch.setattr(tmp_store, "_probe_fault_control_lease_absence_from_connection", unreadable)
+    assert (
+        await tmp_store.probe_fault_control_lease_absence() is FaultControlLeaseAbsence.UNREADABLE
+    )
+
+
+@pytest.mark.asyncio
+async def test_d220_null_run_closed_lease_requires_one_exact_baseline_audit(
+    tmp_store: RoastStore,
+) -> None:
+    """A null-run CLOSED lease is UNKNOWN without exactly one canonical D220 audit."""
+    await tmp_store.initialize()
+    await tmp_store.connection.execute(
+        "INSERT INTO fault_control_lease "
+        "(singleton, run_id, mcp_session_id, generation, status, updated_at_utc) "
+        "VALUES (1, NULL, NULL, 7, 'closed', ?)",
+        ("2026-11-03T00:00:00+00:00",),
+    )
+    await tmp_store.connection.commit()
+    assert (await tmp_store.read_fault_control_lease()).status is FaultLeaseStatus.UNKNOWN
+
+    await tmp_store.connection.execute(
+        "INSERT INTO operator_actions (run_id, action, payload_json, result, recorded_at_utc) "
+        "VALUES (NULL, ?, ?, 'accepted', ?)",
+        (
+            OperatorAction.INITIALIZE_SAFETY_RECORD.value,
+            '{"baseline": "initialised", "generation": 7, "operation_id": "one"}',
+            "2026-11-03T00:00:00+00:00",
+        ),
+    )
+    await tmp_store.connection.commit()
+    assert (await tmp_store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+
+    await tmp_store.connection.execute(
+        "INSERT INTO operator_actions (run_id, action, payload_json, result, recorded_at_utc) "
+        "VALUES (NULL, ?, ?, 'accepted', ?)",
+        (
+            OperatorAction.INITIALIZE_SAFETY_RECORD.value,
+            '{"baseline": "initialised", "generation": 7, "operation_id": "two"}',
+            "2026-11-03T00:00:01+00:00",
+        ),
+    )
+    await tmp_store.connection.commit()
+    assert (await tmp_store.read_fault_control_lease()).status is FaultLeaseStatus.UNKNOWN
 
 
 @pytest.mark.asyncio

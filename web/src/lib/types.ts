@@ -201,7 +201,9 @@ export type OperatorAction =
   /** D212: one confirmed, server-verified terminal fault action. */
   | "stop_cooling_and_acknowledge"
   /** D216: the separately admitted, server-owned recovered-run closure path. */
-  | "end_recovered_run";
+  | "end_recovered_run"
+  /** D220: the separately admitted, server-owned missing-record baseline path. */
+  | "initialize_safety_record";
 
 export interface OperatorActionRequest {
   action: OperatorAction;
@@ -278,7 +280,10 @@ export interface FaultControls {
 /** Global terminal-fault action request. The server resolves the current lease. */
 export type FaultControlsActionRequest =
   | {
-      action: Exclude<OperatorAction, "stop_cooling_and_acknowledge" | "end_recovered_run">;
+      action: Exclude<
+        OperatorAction,
+        "stop_cooling_and_acknowledge" | "end_recovered_run" | "initialize_safety_record"
+      >;
       confirmation?: never;
       expected_generation?: never;
     }
