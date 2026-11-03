@@ -27,6 +27,7 @@ import { AppFrame, ConnectionIndicator, LiveCurve } from "@/components/shared";
 import { roastKeys, useHealth, useRoast, useTimeline } from "@/hooks/queries";
 import { useFrameDrain, useRoastStream } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
+import { isCoherentRestartClearance } from "@/lib/faultControls";
 import { smoothCurveForDisplay } from "@/lib/rorSmoothing";
 import type {
   FaultAcknowledgementExecutedEventData,
@@ -242,6 +243,26 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
     [healthStale, runId],
   );
 
+  const requestClosureOnlyClearance = useCallback(async () => {
+    const result = await api.requestClosureOnlyClearance();
+    await queryClientForStream.invalidateQueries({ queryKey: roastKeys.health });
+    if (runId !== null) {
+      await queryClientForStream.invalidateQueries({ queryKey: roastKeys.detail(runId) });
+    }
+    return result;
+  }, [queryClientForStream, runId]);
+
+  const endRecoveredRun = useCallback(async () => {
+    if (runId === null) throw new Error("Recovered run is unavailable.");
+    const result = await api.endRecoveredRun(runId);
+    await Promise.all([
+      queryClientForStream.invalidateQueries({ queryKey: roastKeys.health }),
+      queryClientForStream.invalidateQueries({ queryKey: roastKeys.detail(runId) }),
+      queryClientForStream.invalidateQueries({ queryKey: roastKeys.history }),
+    ]);
+    return result;
+  }, [queryClientForStream, runId]);
+
   // Development time + DTR (#220, closes the #112 gap): the live telemetry frame
   // now carries BOTH server-authoritative values — `development_elapsed_seconds`
   // (time since first crack) and `development_percent` (DTR — that time as a share
@@ -317,6 +338,16 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
   // Effective enabled actions: the live SSE mirror once a phase_changed has
   // arrived, else the snapshot's set (so the bar is correct on first paint).
   const effectiveEnabled = enabledActions ?? detail.data?.enabled_actions ?? null;
+  // D216 authority is a server projection. An untrusted health payload never
+  // exposes its confirmation or End controls, and no local recovery-state
+  // derivation is used to fill in either affordance.
+  const restartClearance = isCoherentRestartClearance(health.data?.restart_clearance)
+    ? health.data.restart_clearance
+    : null;
+  const closureOnlyAvailable = restartClearance?.closure_only_available === true;
+  const endRecoveredRunAvailable =
+    restartClearance?.enabled_actions.includes("end_recovered_run") === true ||
+    detail.data?.enabled_actions?.includes("end_recovered_run") === true;
 
   // #117: the FaultBanner's acknowledge affordance mirrors server truth — shown
   // iff the server enables `acknowledge_fault` (only in the `faulted` phase). This
@@ -510,6 +541,10 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
         enabledActions={effectiveEnabled}
         onAction={(a) => void dispatchAction(a)}
         healthStale={healthStale}
+        closureOnlyAvailable={closureOnlyAvailable}
+        endRecoveredRunAvailable={endRecoveredRunAvailable}
+        onRequestClosureOnly={requestClosureOnlyClearance}
+        onEndRecoveredRun={endRecoveredRun}
       />
     </AppFrame>
   );

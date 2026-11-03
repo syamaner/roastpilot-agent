@@ -78,7 +78,7 @@ const healthState: {
         mcp_hardware_clear_required?: boolean;
         mcp_teardown_incident_id?: string | null;
         restart_clearance?: {
-          state: "required" | "cleared" | "unknown";
+          state: "required" | "closure_only" | "cleared" | "unknown";
           eligible: boolean;
           enabled_actions: string[];
           closure_only_available: boolean;
@@ -348,6 +348,24 @@ describe("StartRoastView — restart clearance and terminal lease (#954)", () =>
     renderView();
 
     expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("treats closure-only clearance as non-startable without showing ordinary clearance", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: {
+        state: "closure_only",
+        eligible: false,
+        enabled_actions: ["end_recovered_run"],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    };
+    renderView();
+
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
   });
 

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { RecoveryModal } from "./RecoveryModal";
@@ -85,5 +85,91 @@ describe("RecoveryModal", () => {
     render(<RecoveryModal open {...READOUT} enabledActions={[]} onAction={onAction} />);
     expect(screen.queryByTestId("recovery-drop_beans")).toBeNull();
     expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it("renders closure-only confirmation only from the server projection and resets its checks", async () => {
+    const onRequestClosureOnly = vi.fn(async () => ({
+      outcome: "failed" as const,
+      closure_only: false,
+      restart_clearance: {
+        state: "required" as const,
+        eligible: false,
+        enabled_actions: [],
+        closure_only_available: true,
+      },
+      fault_controls: { status: "closed" as const, generation: null, enabled_actions: [] },
+    }));
+    const { rerender } = render(
+      <RecoveryModal
+        open
+        {...READOUT}
+        enabledActions={[]}
+        onAction={() => {}}
+        onRequestClosureOnly={onRequestClosureOnly}
+      />,
+    );
+    expect(screen.queryByTestId("closure-only-clearance")).toBeNull();
+
+    rerender(
+      <RecoveryModal
+        open
+        {...READOUT}
+        enabledActions={[]}
+        onAction={() => {}}
+        closureOnlyAvailable
+        onRequestClosureOnly={onRequestClosureOnly}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("closure-only-open"));
+    const submit = screen.getByTestId("closure-only-submit");
+    expect(submit).toBeDisabled();
+    fireEvent.click(screen.getByTestId("closure-only-stopped"));
+    fireEvent.click(screen.getByTestId("closure-only-empty"));
+    fireEvent.click(screen.getByTestId("closure-only-independent-stop"));
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(onRequestClosureOnly).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByTestId("closure-only-error")).toBeVisible());
+    expect(screen.getByTestId("closure-only-stopped")).not.toBeChecked();
+    expect(screen.getByTestId("closure-only-empty")).not.toBeChecked();
+    expect(screen.getByTestId("closure-only-independent-stop")).not.toBeChecked();
+  });
+
+  it("shows recovered-run End only when the server projects it", () => {
+    const onEndRecoveredRun = vi.fn(async () => ({
+      run_id: "run-recovered",
+      outcome: "aborted" as const,
+      restart_clearance: {
+        state: "required" as const,
+        eligible: false,
+        enabled_actions: [],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "closed" as const, generation: null, enabled_actions: [] },
+    }));
+    const { rerender } = render(
+      <RecoveryModal
+        open
+        {...READOUT}
+        enabledActions={[]}
+        onAction={() => {}}
+        onEndRecoveredRun={onEndRecoveredRun}
+      />,
+    );
+    expect(screen.queryByTestId("end-recovered-run")).toBeNull();
+
+    rerender(
+      <RecoveryModal
+        open
+        {...READOUT}
+        enabledActions={[]}
+        onAction={() => {}}
+        endRecoveredRunAvailable
+        onEndRecoveredRun={onEndRecoveredRun}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("end-recovered-run-submit"));
+    expect(onEndRecoveredRun).toHaveBeenCalledTimes(1);
   });
 });

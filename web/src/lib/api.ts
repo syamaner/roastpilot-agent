@@ -18,7 +18,9 @@ import type {
   ChargeWeightRequest,
   ClearStaleSessionRequest,
   ClearStaleSessionResult,
+  ClosureOnlyClearanceResult,
   DevicesSnapshot,
+  EndRecoveredRunResult,
   FaultControlsActionRequest,
   FaultControlsActionResult,
   HealthResponse,
@@ -189,6 +191,26 @@ export const api = {
     request<RestartClearanceResult>("/api/restart-clearance", {
       method: "POST",
       body: JSON.stringify({ physical_confirmation: true }),
+    }),
+
+  /**
+   * `POST /api/restart-clearance/closure-only` — records an explicit physical
+   * confirmation for the server's separately projected D216 End authority.
+   * It never actuates hardware or grants Start authority.
+   */
+  requestClosureOnlyClearance: () =>
+    request<ClosureOnlyClearanceResult>("/api/restart-clearance/closure-only", {
+      method: "POST",
+      body: JSON.stringify({ physical_confirmation: true }),
+    }),
+
+  /**
+   * `POST /api/roasts/{id}/end-recovered-run` — invokes only the dedicated,
+   * server-authorised D216 recovered-run closure path.
+   */
+  endRecoveredRun: (runId: string) =>
+    request<EndRecoveredRunResult>(`/api/roasts/${runId}/end-recovered-run`, {
+      method: "POST",
     }),
 
   /** `GET /api/roasts/{id}/tastings` — the run's tasting entries (#522, D91). */

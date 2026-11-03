@@ -71,7 +71,7 @@ const healthState: {
         instance_id?: string;
         fault_controls?: FaultControls;
         restart_clearance?: {
-          state: "required" | "cleared" | "unknown";
+          state: "required" | "closure_only" | "cleared" | "unknown";
           eligible: boolean;
           enabled_actions: string[];
           closure_only_available: boolean;
