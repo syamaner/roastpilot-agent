@@ -2785,6 +2785,7 @@ class RoastService:
         try:
             error = task.exception()
         except asyncio.CancelledError:
+            self._invalidate_closure_only_clearance()
             _log.warning("closure-only recovered-run end task was cancelled")
             return
         if error is not None:
@@ -3059,7 +3060,13 @@ class RoastService:
                 try:
                     await loop
                 except asyncio.CancelledError:
-                    pass
+                    # Cancelling the End task itself also cancels its awaited
+                    # loop.  Only the loop's own expected cancellation may
+                    # continue to retirement; an End cancellation propagates
+                    # and its done callback retains the UNKNOWN fence.
+                    current_task = asyncio.current_task()
+                    if current_task is not None and current_task.cancelling():
+                        raise
                 except Exception as exc:  # noqa: BLE001 - a failed retirement must remain fenced
                     self._invalidate_closure_only_clearance()
                     raise RoastRunConflictError("recovered-run retirement is unconfirmed") from exc

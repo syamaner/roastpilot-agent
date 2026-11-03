@@ -664,6 +664,117 @@ async def test_closure_end_keeps_runner_and_loop_when_estop_arrives_during_loop_
 
 
 @pytest.mark.asyncio
+async def test_cancelling_owned_closure_end_keeps_unknown_runner_and_loop_fences(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling End itself is not mistaken for normal loop cancellation."""
+    run_id = "closure-only-end-task-cancelled"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    roaster = FakeMCPClient()
+    monkeypatch.setattr(roaster, "read_session_presence", mock.AsyncMock(return_value="none"))
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        live_serve_mode=True,
+        run_loop=False,
+    )
+    await service.recover_on_start()
+    await service.acknowledge_closure_only_clearance(
+        RestartClearanceRequest(physical_confirmation=True)
+    )
+    runner = mock.Mock()
+    runner.run_id = run_id
+    runner.finalized = False
+    service.runner = runner
+    loop_cancelled = asyncio.Event()
+    settle_loop = asyncio.Event()
+
+    async def delayed_loop_cancellation() -> None:
+        try:
+            await asyncio.Future[None]()
+        except asyncio.CancelledError:
+            loop_cancelled.set()
+            await settle_loop.wait()
+            raise
+
+    loop = asyncio.create_task(delayed_loop_cancellation())
+    service._loop_task = loop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    ending = asyncio.create_task(service.end_recovered_run(run_id))
+    await loop_cancelled.wait()
+    owned = service._closure_end_task  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert owned is not None
+    owned[1].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await ending
+    await asyncio.sleep(0)
+
+    assert service._restart_clearance_state is RestartClearanceState.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service.runner is runner
+    assert service.active_run_id == run_id
+    assert service._loop_task is loop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_closure_end_loop_settling_error_keeps_unknown_runner_and_loop_fences(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A loop error during cancellation settlement cannot complete retirement."""
+    run_id = "closure-only-loop-settling-error"
+    await store.create_run(
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    roaster = FakeMCPClient()
+    monkeypatch.setattr(roaster, "read_session_presence", mock.AsyncMock(return_value="none"))
+    service = RoastService(
+        store,
+        mcp=MCPServerProcess(session=_FakeSession()),
+        roaster=roaster,
+        live_serve_mode=True,
+        run_loop=False,
+    )
+    await service.recover_on_start()
+    await service.acknowledge_closure_only_clearance(
+        RestartClearanceRequest(physical_confirmation=True)
+    )
+    runner = mock.Mock()
+    runner.run_id = run_id
+    runner.finalized = False
+    service.runner = runner
+    loop_cancelled = asyncio.Event()
+    release_loop_error = asyncio.Event()
+
+    async def failing_loop_cancellation() -> None:
+        try:
+            await asyncio.Future[None]()
+        except asyncio.CancelledError:
+            loop_cancelled.set()
+            await release_loop_error.wait()
+            raise RuntimeError("synthetic recovery loop settlement failure") from None
+
+    loop = asyncio.create_task(failing_loop_cancellation())
+    service._loop_task = loop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    ending = asyncio.create_task(service.end_recovered_run(run_id))
+    await loop_cancelled.wait()
+    release_loop_error.set()
+    with pytest.raises(RoastRunConflictError, match="retirement is unconfirmed"):
+        await ending
+
+    assert service._restart_clearance_state is RestartClearanceState.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert service.runner is runner
+    assert service.active_run_id == run_id
+    assert service._loop_task is loop  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
 async def test_shutdown_waits_for_inflight_closure_only_end_without_roaster_write(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
