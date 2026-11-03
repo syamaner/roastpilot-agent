@@ -27,7 +27,12 @@ from roastpilot_agent.models import (
     RoastPhase,
     RoastProfile,
 )
-from roastpilot_agent.store import FaultControlLease, RoastStore
+from roastpilot_agent.store import (
+    FaultControlLease,
+    FaultControlLeaseAbsence,
+    PersistedRun,
+    RoastStore,
+)
 from tests.conftest import FakeClock, FakeMCPClient
 
 
@@ -216,6 +221,48 @@ async def test_no_session_clearance_confirms_current_child_none_and_persists(
 
 
 @pytest.mark.asyncio
+async def test_no_session_clearance_rejects_no_target_estop_during_epoch_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-target e-stop before epoch setup returns blocks clearance proof."""
+    store = RoastStore(tmp_path / "restart-entry-estop-epoch.sqlite3")
+    await store.initialize()
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_begin_epoch = store.begin_process_epoch
+
+        async def parked_begin_epoch(process_id: str) -> bool:
+            entered.set()
+            await release.wait()
+            return await original_begin_epoch(process_id)
+
+        monkeypatch.setattr(store, "begin_process_epoch", parked_begin_epoch)
+        clearance = asyncio.create_task(
+            service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        emergency_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert emergency_stop.result == "failed"
+        release.set()
+
+        with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+            await asyncio.wait_for(clearance, timeout=1.0)
+        assert roaster.presence_reads == 0
+        assert (
+            await store.read_process_restart_clearance(service.instance_id)
+            is RestartClearanceState.REQUIRED
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_d220_initialises_only_an_unclean_absent_safety_record(tmp_path: Path) -> None:
     """D220 records one baseline but leaves this process's Start gate REQUIRED."""
     path = tmp_path / "d220-unclean-absence.sqlite3"
@@ -253,6 +300,106 @@ async def test_d220_initialises_only_an_unclean_absent_safety_record(tmp_path: P
         )
         with pytest.raises(RoastRunConflictError, match="restart clearance"):
             await service.start_roast(_profile())
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_retries_above_a_prior_audited_generation(tmp_path: Path) -> None:
+    """A rejected reused generation retains the synchronous floor for retry."""
+    path = tmp_path / "d220-prior-audit-retry.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        await store.record_operator_action(
+            action=OperatorAction.INITIALIZE_SAFETY_RECORD.value,
+            result="accepted",
+            payload={"baseline": "initialised", "generation": 1, "operation_id": "old"},
+        )
+        service, roaster, _child = await _presence_service(store, "none")
+
+        first = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert first.outcome == "unconfirmed"
+        assert (
+            await store.probe_fault_control_lease_absence()
+            is FaultControlLeaseAbsence.ABSENT_UNTRUSTED
+        )
+
+        second = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert second.outcome == "confirmed"
+        assert (await store.read_fault_control_lease()).generation == 2
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_rejects_no_target_estop_admitted_during_active_history_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-target e-stop before D220 reservation prevents any baseline write."""
+    path = tmp_path / "d220-entry-estop-active-read.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        # Establish the process epoch before parking the specific durable
+        # history read performed by this D220 request.
+        await service.health()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_active_run = store.active_run
+
+        async def parked_active_run() -> PersistedRun | None:
+            entered.set()
+            await release.wait()
+            return await original_active_run()
+
+        monkeypatch.setattr(store, "active_run", parked_active_run)
+        initialization = asyncio.create_task(
+            service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        emergency_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert emergency_stop.result == "failed"
+        release.set()
+
+        result = await asyncio.wait_for(initialization, timeout=1.0)
+        assert result.outcome == "rejected"
+        assert roaster.presence_reads == 0
+        assert (
+            await store.probe_fault_control_lease_absence()
+            is FaultControlLeaseAbsence.ABSENT_UNTRUSTED
+        )
+        assert roaster.commands() == []
     finally:
         if service is not None:
             await service.shutdown()

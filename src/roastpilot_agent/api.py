@@ -3302,17 +3302,22 @@ class RoastService:
         make Start eligible after a fault.  No MCP write occurs here.
         """
         del request  # literal validation is the explicit operator confirmation
+        # Capture before acquiring a lock or awaiting epoch setup. A global
+        # no-target e-stop is still a synchronous safety admission and must
+        # stale this confirmation even while it waits to begin.
+        expected_emergency_stop_admission_epoch = self._emergency_stop_admission_epoch
         async with self._restart_clearance_lock:
             await self._ensure_restart_epoch()
+            if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
+                raise RoastRunConflictError("restart clearance evidence became stale")
             lease = await self._read_fault_lease_fail_closed()
+            if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
+                raise RoastRunConflictError("restart clearance evidence became stale")
             active = await self._store.active_run()
+            if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
+                raise RoastRunConflictError("restart clearance evidence became stale")
             expected_cached_lease = self._fault_lease_cache
             expected_active_run_id = None if active is None else active.run_id
-            # Emergency-stop admission is synchronous, including a global
-            # no-target stop.  Capture its epoch before either physical proof
-            # so a stop admitted while SQLite is confirming cannot publish
-            # this process as cleared.
-            expected_emergency_stop_admission_epoch = self._emergency_stop_admission_epoch
             # An OPEN lease follows its separate exact-session proof, but it
             # can still be backed by this child.  Capture its identity before
             # either proof so a replacement during durable confirmation cannot
@@ -3413,6 +3418,10 @@ class RoastService:
         reconcile only its own ambiguous durable commit.
         """
         del request  # strict literal validation is the operator confirmation
+        # D220's generation reservation must never begin for a request that
+        # predates a global e-stop admission, including while this handler is
+        # waiting for its process epoch or active-history read.
+        expected_emergency_stop_admission_epoch = self._emergency_stop_admission_epoch
         async with self._restart_clearance_lock:
             existing = self._safety_record_initialization
             if existing is not None:
@@ -3421,7 +3430,11 @@ class RoastService:
                 else:
                     return await self._safety_record_initialization_result("rejected")
             await self._ensure_restart_epoch()
+            if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
+                return await self._safety_record_initialization_result("rejected")
             lease = await self._read_fault_lease_fail_closed()
+            if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
+                return await self._safety_record_initialization_result("rejected")
             try:
                 active = await self._store.active_run()
             except Exception:  # noqa: BLE001 - unreadable durable history blocks D220
@@ -3431,6 +3444,7 @@ class RoastService:
                 self._shutdown_started
                 or not self._restart_epoch_initialized
                 or self._restart_clearance_state is not RestartClearanceState.REQUIRED
+                or self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch
                 or lease.generation != 0
                 or lease.status is not FaultLeaseStatus.UNKNOWN
                 or self._fault_lease_cache != lease
@@ -3460,7 +3474,7 @@ class RoastService:
                 child=child,
                 child_epoch=child.child_epoch,
                 expected_lease=lease,
-                emergency_stop_admission_epoch=self._emergency_stop_admission_epoch,
+                emergency_stop_admission_epoch=expected_emergency_stop_admission_epoch,
                 generation=generation,
                 operation_id=uuid.uuid4().hex,
             )
