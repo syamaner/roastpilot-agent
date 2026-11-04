@@ -39,13 +39,19 @@
  * the roast history list (both from the server).
  */
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { RoastDetail, RoastHistory, TelemetrySeries } from "@/lib/types";
+import type {
+  FaultControls,
+  OperatorAction,
+  RoastDetail,
+  RoastHistory,
+  TelemetrySeries,
+} from "@/lib/types";
 import { LivePage } from "./LivePage";
 import {
   FIXTURE_FINISHED_DETAIL,
@@ -59,11 +65,24 @@ import {
 // only from a stale cache entry with the genuinely fresh refetch still in
 // flight — see StartRoastView.test.tsx's matching stub for the fuller doc. ---
 const healthState: {
-  data: { active_run_id: string | null; instance_id?: string } | undefined;
+  data:
+    | {
+        active_run_id: string | null;
+        instance_id?: string;
+        fault_controls?: FaultControls;
+        restart_clearance?: {
+          state: "required" | "closure_only" | "cleared" | "unknown";
+          eligible: boolean;
+          enabled_actions: string[];
+          closure_only_available: boolean;
+        };
+      }
+    | undefined;
   isSuccess: boolean;
   isError: boolean;
+  isFetching: boolean;
   isFresh: boolean;
-} = { data: undefined, isSuccess: false, isError: false, isFresh: false };
+} = { data: undefined, isSuccess: false, isError: false, isFetching: false, isFresh: false };
 
 // Mutable history stub (#523, updated #532 Codex follow-up): LivePage's
 // persistent idle fallback. `isFresh` models `useFreshHistoryGate` — the same
@@ -87,7 +106,24 @@ vi.mock("@/hooks/queries", async () => {
   const actual = await vi.importActual<typeof import("@/hooks/queries")>("@/hooks/queries");
   return {
     ...actual,
-    useFreshHealthGate: () => healthState,
+    useFreshHealthGate: () => ({
+      ...healthState,
+      // The pre-D212 fixtures in this file model ordinary idle/active state.
+      // Their omitted terminal projection represents the valid closed lease
+      // only in this test seam; production JSON still fails closed in LivePage.
+      data:
+        healthState.data === undefined
+          ? undefined
+          : {
+              fault_controls: {
+                status: "closed",
+                generation: null,
+                enabled_actions: [],
+              },
+              restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
+              ...healthState.data,
+            },
+    }),
     useFreshHistoryGate: () => historyState,
     useRoast: () => roastState,
     // Return full-res stub for downsample=1 (stats), curve stub for downsample=5.
@@ -96,10 +132,25 @@ vi.mock("@/hooks/queries", async () => {
   };
 });
 
-// Stub the destination bodies so the test asserts the gate branch, not their internals.
-vi.mock("@/pages/dashboard/DashboardPage", () => ({
-  DashboardPage: () => <div data-testid="dashboard-stub" />,
-}));
+const dashboardState = vi.hoisted(() => ({ mounts: 0 }));
+
+// The stub retains a value that represents dashboard/SSE-local state. The
+// health-transition test below proves this exact instance survives a poll error.
+vi.mock("@/pages/dashboard/DashboardPage", async () => {
+  const React = await vi.importActual<typeof import("react")>("react");
+  return {
+    DashboardPage: ({ healthStale = false }: { healthStale?: boolean }) => {
+      const [localSseState] = React.useState(() => ++dashboardState.mounts);
+      return (
+        <div
+          data-testid="dashboard-stub"
+          data-health-stale={healthStale ? "true" : "false"}
+          data-sse-local-state={localSseState}
+        />
+      );
+    },
+  };
+});
 
 // traceModel is stubbed for gate-only tests; the content tests override with real values.
 // vi.hoisted ensures the refs are available when the hoisted vi.mock factory runs.
@@ -139,11 +190,24 @@ const roastApiMock = vi.hoisted(() =>
     outcome: "completed",
   })),
 );
+const faultControlsActionMock = vi.hoisted(() =>
+  vi.fn(async (request: { action: OperatorAction }) => ({
+    action: request.action,
+    result: "accepted" as const,
+    reason: "accepted for processing",
+  })),
+);
+const operatorActionMock = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
     ...actual,
-    api: { ...actual.api, roast: roastApiMock },
+    api: {
+      ...actual.api,
+      roast: roastApiMock,
+      faultControlsAction: faultControlsActionMock,
+      operatorAction: operatorActionMock,
+    },
   };
 });
 
@@ -152,6 +216,7 @@ beforeEach(() => {
   healthState.data = undefined;
   healthState.isSuccess = false;
   healthState.isError = false;
+  healthState.isFetching = false;
   // Default to a SETTLED read (matches the overwhelming majority of this
   // file's tests, which set isSuccess/isError explicitly right after this
   // runs); the loading-hold-specific tests below override isFresh to false.
@@ -162,10 +227,13 @@ beforeEach(() => {
   // the loading-hold-specific tests below override it to false.
   historyState.isFresh = true;
   roastApiMock.mockClear();
+  faultControlsActionMock.mockClear();
+  operatorActionMock.mockClear();
   // Reset stubs to defaults (null data, no-op traceModel).
   roastState.data = null;
   telemetryFullState.data = undefined;
   telemetryCurveState.data = undefined;
+  dashboardState.mounts = 0;
   traceModelMock.headlineStats.mockReturnValue({
     dropTempC: null,
     developmentPercent: null,
@@ -363,6 +431,358 @@ describe("LivePage — active run", () => {
   });
 });
 
+describe("LivePage — terminal fault lease", () => {
+  it("keeps an explicitly server-enabled CLOSED e-stop available on an idle projection", async () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: null,
+      fault_controls: {
+        status: "closed",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-status",
+      "closed",
+    );
+    expect(
+      screen.getByText(
+        "The terminal-fault lease is closed. The server still authorises this emergency stop; no other software fault controls are available here.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+
+    const emergencyStop = screen.getByTestId("terminal-fault-action-emergency_stop");
+    fireEvent.click(emergencyStop);
+    fireEvent.click(emergencyStop);
+    await waitFor(() =>
+      expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }),
+    );
+    expect(operatorActionMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the active dashboard ahead of a CLOSED e-stop projection", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: "run-live",
+      fault_controls: {
+        status: "closed",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-fault-controls")).toBeNull();
+  });
+
+  it("does not render a cached CLOSED e-stop after a health error", () => {
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    healthState.data = {
+      active_run_id: null,
+      fault_controls: {
+        status: "closed",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("live-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-fault-controls")).toBeNull();
+  });
+
+  it("uses global controls instead of the dashboard while an active run has an open terminal lease", async () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: "run-awaiting-terminal-action",
+      fault_controls: {
+        status: "open",
+        generation: 6,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-status",
+      "open",
+    );
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+
+    const emergencyStop = screen.getByTestId("terminal-fault-action-emergency_stop");
+    fireEvent.click(emergencyStop);
+    fireEvent.click(emergencyStop);
+    await waitFor(() =>
+      expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }),
+    );
+    expect(operatorActionMock).not.toHaveBeenCalled();
+  });
+
+  it("disables routine terminal controls after a health error while retaining emergency stop", () => {
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    healthState.data = {
+      active_run_id: null,
+      fault_controls: {
+        status: "open",
+        generation: 6,
+        enabled_actions: ["emergency_stop", "start_cooling"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeEnabled();
+    expect(screen.getByTestId("terminal-fault-action-start_cooling")).toBeDisabled();
+  });
+
+  it("uses an honest refresh notice instead of a restart-clearance notice during a health refetch", () => {
+    healthState.isSuccess = true;
+    healthState.isError = false;
+    healthState.isFetching = true;
+    healthState.isFresh = true;
+    healthState.data = {
+      active_run_id: null,
+      fault_controls: {
+        status: "open",
+        generation: 6,
+        enabled_actions: ["emergency_stop", "start_cooling"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeEnabled();
+    expect(screen.getByTestId("terminal-fault-action-start_cooling")).toBeDisabled();
+    expect(screen.getByTestId("terminal-fault-controls-refresh-pending")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-fault-controls-restart-clearance-required")).toBeNull();
+  });
+
+  it("shows restart clearance with an open terminal lease and leaves only e-stop enabled", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: "run-awaiting-clearance",
+      restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
+      fault_controls: {
+        status: "open",
+        generation: 6,
+        enabled_actions: ["emergency_stop", "start_cooling"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute("data-status", "open");
+    expect(screen.getByTestId("restart-clearance-required")).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeEnabled();
+    expect(screen.getByTestId("terminal-fault-action-start_cooling")).toBeDisabled();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+  });
+
+  it("leaves server-enumerated OPEN controls available after clearance while Start remains ineligible", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: false, enabled_actions: [], closure_only_available: false },
+      fault_controls: {
+        status: "open",
+        generation: 6,
+        enabled_actions: [
+          "emergency_stop",
+          "start_cooling",
+          "stop_cooling",
+          "drop_beans",
+          "stop_cooling_and_acknowledge",
+        ],
+      },
+    };
+    renderPage();
+
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeEnabled();
+    expect(screen.getByTestId("terminal-fault-action-start_cooling")).toBeEnabled();
+    expect(screen.getByTestId("terminal-fault-action-stop_cooling")).toBeEnabled();
+    expect(screen.getByTestId("terminal-fault-action-drop_beans")).toBeEnabled();
+    expect(
+      screen.getByTestId("terminal-fault-action-stop_cooling_and_acknowledge"),
+    ).toBeEnabled();
+  });
+
+  it("fails closed when an OPEN terminal lease lacks a coherent restart-clearance projection", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "required", eligible: true } as never,
+      fault_controls: {
+        status: "open",
+        generation: 6,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-fault-controls")).toBeNull();
+  });
+
+  it("fails closed when a CLOSED lease has malformed restart clearance", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: "run-with-malformed-clearance",
+      restart_clearance: { state: "required", eligible: true } as never,
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+  });
+
+  it("keeps routine controls disabled when the coherent restart-clearance state is unknown", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "unknown", eligible: false, enabled_actions: [], closure_only_available: false },
+      fault_controls: {
+        status: "open",
+        generation: 6,
+        enabled_actions: ["emergency_stop", "start_cooling"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeEnabled();
+    expect(screen.getByTestId("terminal-fault-action-start_cooling")).toBeDisabled();
+    expect(screen.getByTestId("terminal-fault-controls-restart-clearance-required")).toBeInTheDocument();
+  });
+
+  it("retains only a server-listed emergency stop when an active run has an unknown lease", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: "run-awaiting-terminal-action",
+      fault_controls: {
+        status: "unknown",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-status",
+      "unknown",
+    );
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-fault-action-start_cooling")).toBeNull();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+  });
+
+  it("keeps only a server-resolved e-stop when an active run has malformed terminal controls", async () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: "run-awaiting-terminal-action",
+      fault_controls: {
+        status: "open",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      } as unknown as FaultControls,
+    };
+    renderPage();
+
+    expect(screen.getByTestId("live-fault-controls-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+    expect(screen.queryByTestId("terminal-fault-controls")).toBeNull();
+    const emergencyStop = screen.getByTestId("live-fault-controls-emergency-stop-submit");
+    fireEvent.click(emergencyStop);
+    fireEvent.click(emergencyStop);
+    await waitFor(() =>
+      expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }),
+    );
+  });
+
+  it("replaces a sticky active dashboard with global controls when an open lease follows active-run closure", async () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-live" };
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+
+    healthState.data = {
+      active_run_id: null,
+      fault_controls: {
+        status: "open",
+        generation: 7,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    rerender();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-status",
+      "open",
+    );
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+
+    const emergencyStop = screen.getByTestId("terminal-fault-action-emergency_stop");
+    fireEvent.click(emergencyStop);
+    fireEvent.click(emergencyStop);
+    await waitFor(() =>
+      expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }),
+    );
+    expect(operatorActionMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps global open-lease controls after a reload/remount", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: null,
+      fault_controls: {
+        status: "open",
+        generation: 8,
+        enabled_actions: ["emergency_stop", "stop_cooling"],
+      },
+    };
+    const { remount } = renderPage();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-status",
+      "open",
+    );
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+
+    remount();
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-status",
+      "open",
+    );
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+  });
+
+  it("retains only a server-listed emergency stop for an unknown terminal lease", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: null,
+      fault_controls: {
+        status: "unknown",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-status",
+      "unknown",
+    );
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-fault-action-start_cooling")).toBeNull();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+  });
+});
+
 describe("LivePage — no active run, no completed run ever (#523)", () => {
   it("shows the neutral no-roasts view, never a form, linking to /start", () => {
     healthState.isSuccess = true;
@@ -392,6 +812,108 @@ describe("LivePage — no active run, no completed run ever (#523)", () => {
     expect(screen.queryByTestId("live-page-loading")).toBeNull();
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
   });
+
+  it("does not treat retained idle health data as proof that Start is safe after a health error", () => {
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    // TanStack Query retains the last successful snapshot when a refresh fails.
+    healthState.data = { active_run_id: null };
+    renderPage();
+
+    expect(screen.getByTestId("live-status-unknown")).toHaveAttribute(
+      "data-variant",
+      "health-error",
+    );
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+  });
+
+  it("preserves dashboard/SSE-local state through a health refetch error and recovery", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-before-health-error" };
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("dashboard-stub")).toHaveAttribute("data-sse-local-state", "1");
+
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    // TanStack Query retains the previous successful payload on a refetch error.
+    rerender();
+
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("dashboard-stub")).toHaveAttribute("data-sse-local-state", "1");
+    expect(screen.getByTestId("dashboard-stub")).toHaveAttribute("data-health-stale", "true");
+    expect(screen.getByTestId("live-dashboard-health-stale")).toHaveTextContent(
+      /health refresh failed.*last confirmed server snapshot/i,
+    );
+    expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+    healthState.isSuccess = true;
+    healthState.isError = false;
+    rerender();
+
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("dashboard-stub")).toHaveAttribute("data-sse-local-state", "1");
+    expect(screen.getByTestId("dashboard-stub")).toHaveAttribute("data-health-stale", "false");
+    expect(screen.queryByTestId("live-dashboard-health-stale")).toBeNull();
+  });
+
+  it("reports a failed unknown-health software e-stop request without claiming a hardware outcome", async () => {
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    faultControlsActionMock.mockRejectedValueOnce(new Error("request unavailable"));
+    renderPage();
+
+    const emergencyStop = screen.getByTestId("live-health-error-emergency-stop-submit");
+    fireEvent.click(emergencyStop);
+    expect(screen.getByTestId("live-health-error-emergency-stop-confirmation")).toHaveTextContent(
+      /press Confirm emergency stop/i,
+    );
+    fireEvent.click(emergencyStop);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("live-health-error-emergency-stop-result")).toHaveTextContent(
+        /request unavailable.*independent physical emergency stop/i,
+      ),
+    );
+    expect(screen.getByTestId("live-health-error-emergency-stop-result")).not.toHaveTextContent(
+      /confirmed.*Hottop stopped/i,
+    );
+  });
+
+  it("keeps the unknown-health e-stop pending without waiting for a health refetch", async () => {
+    type EmergencyStopResult = {
+      action: OperatorAction;
+      result: "accepted";
+      reason: string;
+    };
+    let resolveRequest!: (value: EmergencyStopResult) => void;
+    faultControlsActionMock.mockReturnValueOnce(
+      new Promise<EmergencyStopResult>((resolve) => {
+        resolveRequest = resolve;
+      }),
+    );
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    renderPage();
+
+    const emergencyStop = screen.getByTestId("live-health-error-emergency-stop-submit");
+    fireEvent.click(emergencyStop);
+    fireEvent.click(emergencyStop);
+    await waitFor(() => expect(emergencyStop).toBeDisabled());
+    expect(screen.getByTestId("live-health-error-emergency-stop-pending")).toHaveTextContent(
+      /pending.*independent physical emergency stop/i,
+    );
+
+    resolveRequest({
+      action: "emergency_stop",
+      result: "accepted",
+      reason: "queued",
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("live-health-error-emergency-stop-result")).toHaveTextContent(
+        /accepted.*does not prove the Hottop stopped/i,
+      ),
+    );
+  });
 });
 
 describe("LivePage — impostor-process defence (#516)", () => {
@@ -404,6 +926,7 @@ describe("LivePage — impostor-process defence (#516)", () => {
     expect(screen.getByTestId("live-status-unknown-message")).toHaveTextContent(
       /different server process/i,
     );
+    expect(screen.queryByTestId("live-health-error-emergency-stop")).toBeNull();
     // Takes PRECEDENCE over the active-run branch — a wrong process's
     // active_run_id cannot be trusted either, so the dashboard must NOT render.
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
@@ -620,6 +1143,22 @@ describe("LivePage — impostor-process defence (#516)", () => {
     expect(screen.getByTestId("live-status-unknown-message")).toHaveTextContent(
       /could not reach the agent/i,
     );
+  });
+
+  it("fails closed on an armed cached-active health error without verifying or latching a process mismatch", () => {
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    // This is retained cache data from before the failed first forced refetch;
+    // it cannot establish that the process which accepted the start is alive.
+    healthState.data = { active_run_id: "run-cached", instance_id: "server-a" };
+    renderPage("/live", { expectedInstanceId: "server-a" });
+
+    expect(screen.getByTestId("live-status-unknown")).toHaveAttribute(
+      "data-variant",
+      "health-error",
+    );
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+    expect(screen.queryByTestId("live-status-unknown-field-protocol")).toBeNull();
   });
 
   it("holds the loading state (does not gate on instance_id) until health is genuinely fresh", () => {

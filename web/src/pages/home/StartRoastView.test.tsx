@@ -40,6 +40,29 @@ const acknowledgeHardwareClearMock = vi.hoisted(() =>
     fresh_spawn_permitted: true,
   })),
 );
+const acknowledgeRestartClearanceMock = vi.hoisted(() =>
+  vi.fn(async () => ({ cleared: true, restart_clearance_required: false })),
+);
+const initializeSafetyRecordMock = vi.hoisted(() =>
+  vi.fn(async () => ({
+    outcome: "confirmed" as const,
+    restart_clearance: {
+      state: "required" as const,
+      eligible: false,
+      enabled_actions: [],
+      closure_only_available: false,
+    },
+    fault_controls: { status: "closed" as const, generation: 1, enabled_actions: [] },
+  })),
+);
+const faultControlsActionMock = vi.hoisted(() =>
+  vi.fn(async (request: { action: string }) => ({
+    action: request.action,
+    result: "accepted",
+    reason: "queued for server confirmation",
+    queued: true,
+  })),
+);
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
@@ -49,6 +72,9 @@ vi.mock("@/lib/api", async () => {
       startRoast: startRoastMock,
       clearStaleSession: clearStaleSessionMock,
       acknowledgeHardwareClear: acknowledgeHardwareClearMock,
+      acknowledgeRestartClearance: acknowledgeRestartClearanceMock,
+      initializeSafetyRecord: initializeSafetyRecordMock,
+      faultControlsAction: faultControlsActionMock,
     },
   };
 });
@@ -64,6 +90,17 @@ const healthState: {
         active_run_id: string | null;
         mcp_hardware_clear_required?: boolean;
         mcp_teardown_incident_id?: string | null;
+        restart_clearance?: {
+          state: "required" | "closure_only" | "cleared" | "unknown";
+          eligible: boolean;
+          enabled_actions: string[];
+          closure_only_available: boolean;
+        };
+        fault_controls?: {
+          status: "closed" | "open" | "unknown";
+          generation: number | null;
+          enabled_actions: string[];
+        };
       }
     | undefined;
   isSuccess: boolean;
@@ -99,6 +136,8 @@ vi.mock("@/hooks/queries", async () => {
           : {
               mcp_hardware_clear_required: false,
               mcp_teardown_incident_id: null,
+              restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
+              fault_controls: { status: "closed", generation: null, enabled_actions: [] },
               ...healthState.data,
             },
     }),
@@ -148,6 +187,9 @@ beforeEach(() => {
   startRoastMock.mockClear();
   clearStaleSessionMock.mockClear();
   acknowledgeHardwareClearMock.mockClear();
+  acknowledgeRestartClearanceMock.mockClear();
+  initializeSafetyRecordMock.mockClear();
+  faultControlsActionMock.mockClear();
   clearStaleSessionMock.mockResolvedValue({
     run_id: "run-stranded",
     outcome: "aborted",
@@ -286,6 +328,366 @@ describe("StartRoastView (#324)", () => {
     expect(screen.getByTestId("start-roast-status-unknown")).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
     expect(screen.queryByTestId("start-roast-active-run-banner")).toBeNull();
+  });
+});
+
+describe("StartRoastView — restart clearance and terminal lease (#954)", () => {
+  it("renders only the server-projected D220 action beside the independent e-stop", async () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: ["initialize_safety_record"],
+        closure_only_available: false,
+      },
+      fault_controls: {
+        status: "unknown",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderView();
+
+    expect(screen.getByTestId("initialize-safety-record")).toBeInTheDocument();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeEnabled();
+
+    fireEvent.click(screen.getByTestId("initialize-safety-record-open"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-stopped"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-empty"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-independent-stop"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-submit"));
+    await waitFor(() => expect(initializeSafetyRecordMock).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("initialize-safety-record-reported")).toHaveTextContent(
+      /new ordinary restart clearance/i,
+    );
+  });
+
+  it("replaces D220 with fresh ordinary clearance after the server records its CLOSED baseline", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: ["initialize_safety_record"],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "unknown", generation: null, enabled_actions: ["emergency_stop"] },
+    };
+    const page = renderView();
+    fireEvent.click(screen.getByTestId("initialize-safety-record-open"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-stopped"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-empty"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-independent-stop"));
+
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: [],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "closed", generation: 1, enabled_actions: [] },
+    };
+    page.rerender();
+
+    expect(screen.queryByTestId("initialize-safety-record")).toBeNull();
+    expect(screen.getByTestId("restart-clearance-required")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    fireEvent.click(screen.getByTestId("restart-clearance-open"));
+    expect(screen.getByTestId("restart-clearance-stopped")).not.toBeChecked();
+    expect(screen.getByTestId("restart-clearance-empty")).not.toBeChecked();
+    expect(screen.getByTestId("restart-clearance-independent-stop")).not.toBeChecked();
+  });
+
+  it("withdraws checked D220 confirmation on parent projection change and returns fresh", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: ["initialize_safety_record"],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "unknown", generation: null, enabled_actions: ["emergency_stop"] },
+    };
+    const page = renderView();
+    fireEvent.click(screen.getByTestId("initialize-safety-record-open"));
+    fireEvent.click(screen.getByTestId("initialize-safety-record-stopped"));
+    expect(screen.getByTestId("initialize-safety-record-stopped")).toBeChecked();
+
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: [],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "unknown", generation: null, enabled_actions: ["emergency_stop"] },
+    };
+    page.rerender();
+    expect(screen.queryByTestId("initialize-safety-record")).toBeNull();
+    expect(screen.getByTestId("restart-clearance-required")).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeEnabled();
+
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: {
+        state: "required",
+        eligible: false,
+        enabled_actions: ["initialize_safety_record"],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "unknown", generation: null, enabled_actions: ["emergency_stop"] },
+    };
+    page.rerender();
+    fireEvent.click(screen.getByTestId("initialize-safety-record-open"));
+    expect(screen.getByTestId("initialize-safety-record-stopped")).not.toBeChecked();
+  });
+
+  it("fails closed when the fresh health projection omits restart clearance", () => {
+    healthState.data = { active_run_id: null, restart_clearance: undefined };
+    renderView();
+
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(screen.getByTestId("start-restart-clearance-emergency-stop")).toBeInTheDocument();
+  });
+
+  it("fails closed when restart clearance has an unrecognised state or nonboolean eligibility", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "invented", eligible: "yes" } as never,
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    };
+    renderView();
+
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("keeps a coherent cleared-but-ineligible process gate blocked", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: false, enabled_actions: [], closure_only_available: false },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    };
+    renderView();
+
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("treats closure-only clearance as non-startable without showing ordinary clearance", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: {
+        state: "closure_only",
+        eligible: false,
+        enabled_actions: ["end_recovered_run"],
+        closure_only_available: false,
+      },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    };
+    renderView();
+
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("fails closed when a required restart clearance claims eligibility", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "required", eligible: true } as never,
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    };
+    renderView();
+
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+  });
+
+  it("fails closed when the fresh health projection omits fault controls", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
+      fault_controls: undefined,
+    };
+    renderView();
+
+    expect(screen.getByTestId("fault-controls-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it.each([
+    ["a routine action", ["start_cooling"]],
+    ["mixed routine and emergency actions", ["emergency_stop", "start_cooling"]],
+    ["duplicate emergency actions", ["emergency_stop", "emergency_stop"]],
+  ])("fails closed when CLOSED fault controls carry %s", (_description, enabledActions) => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
+      fault_controls: {
+        status: "closed",
+        generation: null,
+        enabled_actions: enabledActions,
+      },
+    };
+    renderView();
+
+    expect(screen.getByTestId("fault-controls-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("fails closed when an OPEN fault lease omits its generation", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
+      fault_controls: {
+        status: "open",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderView();
+
+    expect(screen.getByTestId("fault-controls-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-fault-controls")).toBeNull();
+  });
+
+  it("retains only a two-press server-resolved e-stop for incoherent fault controls", async () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
+      fault_controls: {
+        status: "open",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderView();
+
+    expect(screen.getByTestId("fault-controls-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-fault-controls")).toBeNull();
+    const emergencyStop = screen.getByTestId("start-fault-controls-emergency-stop-submit");
+    fireEvent.click(emergencyStop);
+    expect(faultControlsActionMock).not.toHaveBeenCalled();
+    fireEvent.click(emergencyStop);
+    await waitFor(() =>
+      expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }),
+    );
+  });
+
+  it("renders a CLOSED server e-stop alongside required physical clearance, then admits the refreshed cleared projection", async () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
+      fault_controls: {
+        status: "closed",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    const { rerender } = renderView();
+
+    expect(screen.getByTestId("restart-clearance-required")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    const emergencyStop = screen.getByTestId("start-restart-clearance-emergency-stop-submit");
+    expect(emergencyStop).toBeEnabled();
+    expect(screen.getByText(/software request cannot confirm physical state here/i)).toBeInTheDocument();
+
+    fireEvent.click(emergencyStop);
+    expect(faultControlsActionMock).not.toHaveBeenCalled();
+    fireEvent.click(emergencyStop);
+    await waitFor(() =>
+      expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }),
+    );
+
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
+      fault_controls: { status: "closed", generation: null, enabled_actions: [] },
+    };
+    rerender();
+
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.queryByTestId("start-restart-clearance-emergency-stop")).toBeNull();
+    expect(screen.getByTestId("start-roast-form")).toBeInTheDocument();
+  });
+
+  it("shows restart clearance beside an OPEN terminal lease and keeps routine controls disarmed", () => {
+    healthState.data = {
+      active_run_id: "run-awaiting-clearance",
+      restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
+      fault_controls: {
+        status: "open",
+        generation: 7,
+        enabled_actions: ["emergency_stop", "start_cooling"],
+      },
+    };
+    renderView();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute("data-status", "open");
+    expect(screen.getByTestId("restart-clearance-required")).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeEnabled();
+    expect(screen.getByTestId("terminal-fault-action-start_cooling")).toBeDisabled();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(screen.queryByTestId("start-roast-active-run-banner")).toBeNull();
+  });
+
+  it("keeps Start blocked while a cleared-but-ineligible gate leaves server-enumerated OPEN controls available", () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: false, enabled_actions: [], closure_only_available: false },
+      fault_controls: {
+        status: "open",
+        generation: 7,
+        enabled_actions: [
+          "emergency_stop",
+          "start_cooling",
+          "stop_cooling",
+          "drop_beans",
+          "stop_cooling_and_acknowledge",
+        ],
+      },
+    };
+    renderView();
+
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeEnabled();
+    expect(screen.getByTestId("terminal-fault-action-start_cooling")).toBeEnabled();
+    expect(screen.getByTestId("terminal-fault-action-stop_cooling")).toBeEnabled();
+    expect(screen.getByTestId("terminal-fault-action-drop_beans")).toBeEnabled();
+    expect(
+      screen.getByTestId("terminal-fault-action-stop_cooling_and_acknowledge"),
+    ).toBeEnabled();
+    expect(
+      screen.queryByTestId("terminal-fault-controls-restart-clearance-required"),
+    ).toBeNull();
+  });
+
+  it("routes terminal actions globally and does not send a run identity", async () => {
+    healthState.data = {
+      active_run_id: null,
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
+      fault_controls: {
+        status: "open",
+        generation: 7,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderView();
+    const emergencyStop = screen.getByTestId("terminal-fault-action-emergency_stop");
+    fireEvent.click(emergencyStop);
+    fireEvent.click(emergencyStop);
+    await waitFor(() =>
+      expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }),
+    );
   });
 });
 
@@ -648,7 +1050,7 @@ describe("StartRoastView — #557: staleRun must never be derived from UNRESOLVE
     expect(screen.getByTestId("start-roast-stale-session")).toBeInTheDocument();
   });
 
-  it("the health-error leg renders its own explicit state, never the stale card, when health persistently errors", () => {
+  it("the health-error leg keeps a two-press global e-stop without rendering stale state", async () => {
     healthState.data = undefined;
     healthState.isSuccess = false;
     healthState.isError = true;
@@ -659,6 +1061,18 @@ describe("StartRoastView — #557: staleRun must never be derived from UNRESOLVE
     expect(screen.getByTestId("start-roast-status-unknown")).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-stale-session")).toBeNull();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    const emergencyStop = screen.getByTestId("start-health-error-emergency-stop-submit");
+    expect(emergencyStop).toHaveAttribute("data-armed", "false");
+    fireEvent.click(emergencyStop);
+    expect(emergencyStop).toHaveAttribute("data-armed", "true");
+    fireEvent.blur(emergencyStop);
+    expect(emergencyStop).toHaveAttribute("data-armed", "false");
+    expect(faultControlsActionMock).not.toHaveBeenCalled();
+    fireEvent.click(emergencyStop);
+    fireEvent.click(emergencyStop);
+    await waitFor(() =>
+      expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }),
+    );
   });
 
   it("staleRun's own derivation is closed against a resolved-but-NOT-fresh health read too (defense-in-depth, second incident hypothesis) — NO stale card when health.isFresh is false", () => {

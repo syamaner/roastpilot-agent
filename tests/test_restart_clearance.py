@@ -1,0 +1,2948 @@
+"""D213 process-clearance and fault-control lease tests (hardware-free)."""
+
+import asyncio
+import contextlib
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import cast
+
+import aiosqlite
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+import roastpilot_agent.store as store_module
+from roastpilot_agent.api import (
+    QueuedOperatorAction,
+    RoastRunConflictError,
+    RoastService,
+    ShutdownHeatOffOutcome,
+    _SafetyRecordInitializationContext,  # pyright: ignore[reportPrivateUsage]
+    create_app,
+)
+from roastpilot_agent.cli import _teardown_live  # pyright: ignore[reportPrivateUsage]
+from roastpilot_agent.config import AppConfig, ControllerConfig
+from roastpilot_agent.mcp_client import MCPServerProcess, SessionPresence
+from roastpilot_agent.models import (
+    FaultControlsActionRequest,
+    FaultControlState,
+    FaultLeaseStatus,
+    InitializeSafetyRecordResult,
+    OperatorAction,
+    OperatorActionRequest,
+    RestartClearanceRequest,
+    RestartClearanceState,
+    RoastPhase,
+    RoastProfile,
+)
+from roastpilot_agent.store import (
+    MIGRATIONS,
+    FaultControlLease,
+    FaultControlLeaseAbsence,
+    PersistedRun,
+    RoastStore,
+)
+from tests.conftest import FakeClock, FakeMCPClient
+
+
+def _profile() -> RoastProfile:
+    """Return a minimal saved-profile equivalent for controller construction."""
+    return RoastProfile(
+        name="Test bean",
+        bean_origin="Test origin",
+        bean_weight_grams=250,
+        initial_heat_percent=70,
+        initial_fan_percent=40,
+        target_drop_temp_c=195,
+        target_development_percent=14,
+    )
+
+
+async def _service(store: RoastStore) -> RoastService:
+    """Build a live-mode service whose fake MCP reports no current session."""
+    return RoastService(
+        store,
+        config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+        roaster=FakeMCPClient(),
+        live_serve_mode=True,
+        run_loop=False,
+        clock=FakeClock(),
+    )
+
+
+class _CurrentChild:
+    """Minimal current-child identity seam for no-session clearance tests."""
+
+    def __init__(self) -> None:
+        self.running = True
+        self.child_epoch = 1
+        self.stop_unconfirmed = False
+        self.teardown_incident_id: str | None = None
+
+
+class _PresenceMCP(FakeMCPClient):
+    """Fake control surface with an explicit, current typed presence snapshot."""
+
+    def __init__(self, presence: object) -> None:
+        super().__init__()
+        self.presence = presence
+        self.presence_reads = 0
+        self.on_read: Callable[[], Awaitable[SessionPresence]] | None = None
+
+    async def read_session_presence(self) -> SessionPresence:
+        """Return one scripted typed-presence result or its failure."""
+        self.presence_reads += 1
+        if self.on_read is not None:
+            return await self.on_read()
+        if isinstance(self.presence, Exception):
+            raise self.presence
+        return cast("SessionPresence", self.presence)
+
+
+async def _presence_service(
+    store: RoastStore, presence: object
+) -> tuple[RoastService, _PresenceMCP, _CurrentChild]:
+    """Build a live service with a current child and scripted presence proof."""
+    child = _CurrentChild()
+    roaster = _PresenceMCP(presence)
+    service = RoastService(
+        store,
+        config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+        mcp=cast("MCPServerProcess", child),
+        roaster=roaster,
+        live_serve_mode=True,
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    return service, roaster, child
+
+
+class _TerminalFaultPort(FakeMCPClient):
+    """Hardware-free exact-session port for terminal lease tests."""
+
+    def __init__(self, state: FaultControlState) -> None:
+        super().__init__()
+        self.state = state
+        self.stop_started: asyncio.Event | None = None
+        self.release_stop: asyncio.Event | None = None
+
+    async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+        assert session_id == self.state.session_id
+        return self.state
+
+    async def read_latest_fault_control_state(self) -> FaultControlState:
+        """Return the same state as the latest-session proof for this fake."""
+        return self.state
+
+    async def write_fault_control(
+        self, action: OperatorAction, *, expected_session_id: str
+    ) -> None:
+        assert expected_session_id == self.state.session_id
+        self.calls.append((action.value, {"expected_session_id": expected_session_id}))
+        if action in (OperatorAction.STOP_COOLING, OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE):
+            if self.stop_started is not None and self.release_stop is not None:
+                self.stop_started.set()
+                await self.release_stop.wait()
+            self.state = self.state.model_copy(
+                update={"cooling_on": False, "heat_level_percent": 0, "fan_level_percent": 0}
+            )
+        return None
+
+    async def execute_fault_control(
+        self, action: OperatorAction, *, expected_session_id: str
+    ) -> FaultControlState:
+        await self.write_fault_control(action, expected_session_id=expected_session_id)
+        return await self.read_fault_control_state(expected_session_id)
+
+
+class _HistoricalTerminalFaultPort(_TerminalFaultPort):
+    """Port exposing a stale exact snapshot and a distinct latest session."""
+
+    def __init__(self, state: FaultControlState, latest_state: FaultControlState) -> None:
+        super().__init__(state)
+        self.latest_state = latest_state
+
+    async def read_latest_fault_control_state(self) -> FaultControlState:
+        """Return the current latest session rather than the historical lease."""
+        return self.latest_state
+
+
+async def _terminal_service(store: RoastStore, port: _TerminalFaultPort) -> RoastService:
+    """Build a live service with a terminal exact-session fault port."""
+    return RoastService(
+        store,
+        config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+        roaster=port,
+        live_serve_mode=True,
+        run_loop=False,
+        clock=FakeClock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_fails_closed_without_a_current_child(tmp_path: Path) -> None:
+    """Physical confirmation cannot convert an MCP exception into no-session proof."""
+    store = RoastStore(tmp_path / "restart.sqlite3")
+    await store.initialize()
+    try:
+        first = await _service(store)
+        initial = await first.health()
+        assert initial.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert not initial.restart_clearance.eligible
+        with pytest.raises(RoastRunConflictError, match="restart clearance"):
+            await first.start_roast(_profile())
+
+        with pytest.raises(RoastRunConflictError, match="current MCP child"):
+            await first.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        after = await first.health()
+        assert after.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert not after.restart_clearance.eligible
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_confirms_current_child_none_and_persists(
+    tmp_path: Path,
+) -> None:
+    """A fresh ``none`` proof plus physical confirmation clears only this process."""
+    store = RoastStore(tmp_path / "restart-none.sqlite3")
+    await store.initialize()
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+
+        result = await service.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+
+        assert result.outcome == "confirmed"
+        assert result.cleared
+        assert result.restart_clearance.eligible
+        assert roaster.presence_reads == 1
+        assert (
+            await store.read_process_restart_clearance(service.instance_id)
+            is RestartClearanceState.CLEARED
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parked_read", ["epoch_setup", "lease", "history"])
+async def test_no_session_clearance_rejects_no_target_estop_during_entry_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parked_read: str
+) -> None:
+    """A no-target e-stop before any ordinary-clearance proof blocks it."""
+    store = RoastStore(tmp_path / f"restart-entry-estop-{parked_read}.sqlite3")
+    await store.initialize()
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        if parked_read == "epoch_setup":
+            original_begin_epoch = store.begin_process_epoch
+
+            async def parked_begin_epoch(process_id: str) -> bool:
+                entered.set()
+                await release.wait()
+                return await original_begin_epoch(process_id)
+
+            monkeypatch.setattr(store, "begin_process_epoch", parked_begin_epoch)
+        elif parked_read == "lease":
+            await service.health()
+            original_read_lease = service._read_fault_lease_fail_closed  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            reads = 0
+
+            async def parked_read_lease() -> FaultControlLease:
+                nonlocal reads
+                reads += 1
+                if reads == 1:
+                    entered.set()
+                    await release.wait()
+                return await original_read_lease()
+
+            monkeypatch.setattr(
+                service,
+                "_read_fault_lease_fail_closed",
+                parked_read_lease,
+            )
+        else:
+            await service.health()
+            original_active_run = store.active_run
+
+            async def parked_active_run() -> PersistedRun | None:
+                entered.set()
+                await release.wait()
+                return await original_active_run()
+
+            monkeypatch.setattr(store, "active_run", parked_active_run)
+        clearance = asyncio.create_task(
+            service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        emergency_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert emergency_stop.result == "failed"
+        release.set()
+
+        with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+            await asyncio.wait_for(clearance, timeout=1.0)
+        assert roaster.presence_reads == 0
+        assert (
+            await store.read_process_restart_clearance(service.instance_id)
+            is RestartClearanceState.REQUIRED
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_initialises_only_an_unclean_absent_safety_record(tmp_path: Path) -> None:
+    """D220 records one baseline but leaves this process's Start gate REQUIRED."""
+    path = tmp_path / "d220-unclean-absence.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        before = await service.health()
+        assert before.restart_clearance.enabled_actions == [OperatorAction.INITIALIZE_SAFETY_RECORD]
+        result = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+
+        assert result.outcome == "confirmed"
+        assert result.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert not result.restart_clearance.eligible
+        assert (await service.health()).restart_clearance.enabled_actions == []
+        assert roaster.presence_reads == 1
+        assert roaster.commands() == []
+        lease = await store.read_fault_control_lease()
+        assert lease.generation == 1
+        assert lease.status is FaultLeaseStatus.CLOSED
+        assert lease.run_id is None
+        assert (
+            await store.read_process_restart_clearance(service.instance_id)
+            is RestartClearanceState.REQUIRED
+        )
+        with pytest.raises(RoastRunConflictError, match="restart clearance"):
+            await service.start_roast(_profile())
+        ordinary = await service.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert ordinary.cleared
+        assert roaster.presence_reads == 2
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_upgrades_v19_terminal_history_without_granting_restart_clearance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A V19 terminal row survives D220, but every process still re-proves clearance."""
+    path = tmp_path / "d220-v19-terminal-history.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:19])
+    legacy = RoastStore(path)
+    await legacy.initialize()
+    try:
+        await legacy.create_run(
+            run_id="v19-terminal",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.COMPLETE,
+        )
+        await legacy.complete_run(
+            run_id="v19-terminal", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        terminal_before = await legacy.read_run("v19-terminal")
+        assert terminal_before is not None
+    finally:
+        await legacy.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert not await crashed.begin_process_epoch("v19-crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        eligible = await service.health()
+        assert eligible.restart_clearance.enabled_actions == [
+            OperatorAction.INITIALIZE_SAFETY_RECORD
+        ]
+
+        confirmed = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert confirmed.outcome == "confirmed"
+        assert confirmed.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert await store.read_run("v19-terminal") == terminal_before
+        async with store.connection.execute(
+            "SELECT COUNT(*) FROM operator_actions WHERE run_id IS NULL AND action = ? "
+            "AND result = 'accepted'",
+            (OperatorAction.INITIALIZE_SAFETY_RECORD.value,),
+        ) as cursor:
+            audit = await cursor.fetchone()
+        assert audit is not None and audit[0] == 1
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+    reopened_store = RoastStore(path)
+    await reopened_store.initialize()
+    reopened_service: RoastService | None = None
+    try:
+        reopened_service, reopened_roaster, _child = await _presence_service(reopened_store, "none")
+        reopened = await reopened_service.health()
+        assert reopened.fault_controls.status is FaultLeaseStatus.CLOSED
+        assert reopened.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert not reopened.restart_clearance.eligible
+        assert reopened.restart_clearance.enabled_actions == []
+        with pytest.raises(RoastRunConflictError, match="restart clearance"):
+            await reopened_service.start_roast(_profile())
+
+        ordinary = await reopened_service.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert ordinary.cleared
+        assert reopened_roaster.presence_reads == 1
+    finally:
+        if reopened_service is not None:
+            await reopened_service.shutdown()
+        await reopened_store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_http_cancellation_keeps_its_owned_baseline_task(tmp_path: Path) -> None:
+    """Cancelling an ASGI waiter cannot cancel its one owned D220 baseline task."""
+    path = tmp_path / "d220-cancelled-http-waiter.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def parked_presence() -> SessionPresence:
+            entered.set()
+            await release.wait()
+            return "none"
+
+        roaster.on_read = parked_presence
+        transport = ASGITransport(app=create_app(service))
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            waiter = asyncio.create_task(
+                client.post(
+                    "/api/restart-clearance/initialize-safety-record",
+                    json={"physical_confirmation": True},
+                )
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            owned = service._safety_record_initialization  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            assert owned is not None
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            assert not owned[1].done()
+            release.set()
+            result = await asyncio.wait_for(owned[1], timeout=1.0)
+
+        assert result.outcome == "confirmed"
+        lease = await store.read_fault_control_lease()
+        assert lease.generation == 1
+        assert lease.status is FaultLeaseStatus.CLOSED
+        async with store.connection.execute(
+            "SELECT COUNT(*) FROM operator_actions WHERE run_id IS NULL AND action = ? "
+            "AND result = 'accepted'",
+            (OperatorAction.INITIALIZE_SAFETY_RECORD.value,),
+        ) as cursor:
+            audit = await cursor.fetchone()
+        assert audit is not None and audit[0] == 1
+        assert roaster.presence_reads == 1
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_sqlite_transaction_cannot_delay_global_no_target_estop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-target e-stop revokes D220 before its held SQLite write can commit."""
+    path = tmp_path / "d220-transaction-estop.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_probe = store._probe_fault_control_lease_absence_from_connection  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        async def parked_transaction_probe(
+            connection: aiosqlite.Connection, *, absence_trusted: bool
+        ) -> FaultControlLeaseAbsence:
+            absence = await original_probe(connection, absence_trusted=absence_trusted)
+            if connection is not store.connection:
+                entered.set()
+                await release.wait()
+            return absence
+
+        monkeypatch.setattr(
+            store,
+            "_probe_fault_control_lease_absence_from_connection",
+            parked_transaction_probe,
+        )
+        initialization = asyncio.create_task(
+            service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        transport = ASGITransport(app=create_app(service))
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            emergency_stop = await asyncio.wait_for(
+                client.post(
+                    "/api/fault-controls/actions",
+                    json={"action": OperatorAction.EMERGENCY_STOP.value},
+                ),
+                timeout=1.0,
+            )
+        assert emergency_stop.status_code == 200
+        assert emergency_stop.json()["result"] == "failed"
+        assert not initialization.done()
+
+        release.set()
+        result = await asyncio.wait_for(initialization, timeout=1.0)
+        assert result.outcome == "unconfirmed"
+        health = await service.health()
+        assert health.fault_controls.status is FaultLeaseStatus.UNKNOWN
+        assert not health.restart_clearance.eligible
+        with pytest.raises(RoastRunConflictError, match="restart clearance"):
+            await service.start_roast(_profile())
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidation", ["replacement", "stopped", "shutdown", "gate"])
+async def test_d220_parked_presence_rejects_invalidated_current_context(
+    tmp_path: Path, invalidation: str
+) -> None:
+    """D220 writes no baseline when its child or restart context changes mid-proof."""
+    path = tmp_path / f"d220-parked-presence-{invalidation}.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, child = await _presence_service(store, "none")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def parked_presence() -> SessionPresence:
+            entered.set()
+            await release.wait()
+            return "none"
+
+        roaster.on_read = parked_presence
+        initialization = asyncio.create_task(
+            service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        if invalidation == "replacement":
+            service._mcp = cast("MCPServerProcess", _CurrentChild())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif invalidation == "stopped":
+            child.running = False
+        elif invalidation == "shutdown":
+            await service.shutdown()
+        else:
+            service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        release.set()
+
+        if invalidation == "shutdown":
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(initialization, timeout=1.0)
+        else:
+            result = await asyncio.wait_for(initialization, timeout=1.0)
+            assert result.outcome == "rejected"
+        assert (
+            await store.probe_fault_control_lease_absence()
+            is FaultControlLeaseAbsence.ABSENT_UNTRUSTED
+        )
+        async with store.connection.execute(
+            "SELECT COUNT(*) FROM operator_actions WHERE run_id IS NULL AND action = ? "
+            "AND result = 'accepted'",
+            (OperatorAction.INITIALIZE_SAFETY_RECORD.value,),
+        ) as cursor:
+            audit = await cursor.fetchone()
+        assert audit is not None and audit[0] == 0
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_health_hides_baseline_action_when_absence_probe_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unreadable durable absence is never advertised as a D220 option."""
+    path = tmp_path / "d220-unreadable-absence.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, _roaster, _child = await _presence_service(store, "none")
+
+        async def unreadable_absence() -> FaultControlLeaseAbsence:
+            raise OSError("database unavailable")
+
+        monkeypatch.setattr(store, "probe_fault_control_lease_absence", unreadable_absence)
+        health = await service.health()
+        assert health.restart_clearance.enabled_actions == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_keeps_newer_live_fault_generation_over_pending_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A newer live fault generation is never overwritten by pending D220 state."""
+    store = RoastStore(tmp_path / "d220-newer-live-generation.sqlite3")
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service = await _service(store)
+        newer_live = FaultControlLease(
+            generation=2,
+            status=FaultLeaseStatus.UNKNOWN,
+            run_id=None,
+            mcp_session_id=None,
+        )
+        service._fault_lease_cache = newer_live  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        service._unconfirmed_safety_record_generation = 1  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        async def older_durable_lease() -> FaultControlLease:
+            return FaultControlLease(
+                generation=0,
+                status=FaultLeaseStatus.UNKNOWN,
+                run_id=None,
+                mcp_session_id=None,
+            )
+
+        monkeypatch.setattr(store, "read_fault_control_lease", older_durable_lease)
+        assert await service._read_fault_lease_fail_closed() == newer_live  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["probe", "present", "presence"])
+async def test_d220_rejects_unproven_absence_or_presence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Every failed durable or current-presence proof rejects without a baseline."""
+    path = tmp_path / f"d220-unproven-{failure}.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(
+            store, OSError("presence unavailable") if failure == "presence" else "none"
+        )
+        if failure == "probe":
+
+            async def unreadable_absence() -> FaultControlLeaseAbsence:
+                raise OSError("absence unavailable")
+
+            monkeypatch.setattr(store, "probe_fault_control_lease_absence", unreadable_absence)
+        elif failure == "present":
+
+            async def durable_lease_present() -> FaultControlLeaseAbsence:
+                return FaultControlLeaseAbsence.PRESENT
+
+            monkeypatch.setattr(store, "probe_fault_control_lease_absence", durable_lease_present)
+
+        result = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert result.outcome == "rejected"
+        assert await store.read_fault_control_lease() == FaultControlLease(
+            generation=0,
+            status=FaultLeaseStatus.UNKNOWN,
+            run_id=None,
+            mcp_session_id=None,
+        )
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_stale_or_missing_roaster_task_fails_closed(tmp_path: Path) -> None:
+    """A detached task, or one that loses its roaster, cannot write D220 state."""
+    store = RoastStore(tmp_path / "d220-stale-task.sqlite3")
+    await store.initialize()
+    service: RoastService | None = None
+    owned: asyncio.Task[InitializeSafetyRecordResult] | None = None
+    try:
+        service, _roaster, child = await _presence_service(store, "none")
+        expected_lease = FaultControlLease(
+            generation=0,
+            status=FaultLeaseStatus.UNKNOWN,
+            run_id=None,
+            mcp_session_id=None,
+        )
+        context = _SafetyRecordInitializationContext(
+            child=cast("MCPServerProcess", child),
+            child_epoch=child.child_epoch,
+            expected_lease=expected_lease,
+            emergency_stop_admission_epoch=0,
+            generation=1,
+            operation_id="stale-task",
+        )
+        stale = await service._initialize_missing_fault_control_safety_record_task(context)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert stale.outcome == "rejected"
+
+        service._restart_epoch_initialized = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        service._restart_clearance_state = RestartClearanceState.REQUIRED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        service._fault_lease_cache = expected_lease  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        waiting = asyncio.Event()
+
+        async def owned_placeholder() -> InitializeSafetyRecordResult:
+            await waiting.wait()
+            return await service._safety_record_initialization_result("rejected")  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        owned = asyncio.create_task(owned_placeholder())
+        service._safety_record_initialization = (context, owned)  # type: ignore[assignment]  # noqa: SLF001
+        service._roaster = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        run_d220_task = service._initialize_missing_fault_control_safety_record_task  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        missing_roaster = await run_d220_task(context)
+        assert missing_roaster.outcome == "rejected"
+        assert (
+            await store.probe_fault_control_lease_absence()
+            is FaultControlLeaseAbsence.ABSENT_TRUSTED
+        )
+    finally:
+        if owned is not None:
+            owned.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await owned
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["epoch", "lease", "history"])
+async def test_d220_rejects_unreadable_entry_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """D220 fails closed when its process, lease, or history evidence is unreadable."""
+    path = tmp_path / f"d220-unreadable-entry-{failure}.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        if failure == "epoch":
+            original_epoch = service._ensure_restart_epoch  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+            async def epoch_then_estop_epoch_drift() -> None:
+                await original_epoch()
+                service._emergency_stop_admission_epoch += 1  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+            monkeypatch.setattr(service, "_ensure_restart_epoch", epoch_then_estop_epoch_drift)
+        elif failure == "lease":
+            original_lease = service._read_fault_lease_fail_closed  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+            async def lease_then_estop_epoch_drift() -> FaultControlLease:
+                lease = await original_lease()
+                service._emergency_stop_admission_epoch += 1  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                return lease
+
+            monkeypatch.setattr(
+                service, "_read_fault_lease_fail_closed", lease_then_estop_epoch_drift
+            )
+        else:
+
+            async def unreadable_history() -> PersistedRun | None:
+                raise OSError("history unavailable")
+
+            monkeypatch.setattr(store, "active_run", unreadable_history)
+
+        result = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert result.outcome == "rejected"
+        assert roaster.presence_reads == 0
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_concurrent_and_stale_owned_reservations_are_rejected_or_reaped(
+    tmp_path: Path,
+) -> None:
+    """One live request owns D220; a completed reservation is reaped before retry."""
+    path = tmp_path / "d220-owned-reservations.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def parked_presence() -> SessionPresence:
+            entered.set()
+            await release.wait()
+            return "none"
+
+        roaster.on_read = parked_presence
+        first = asyncio.create_task(
+            service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        duplicate = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert duplicate.outcome == "rejected"
+        release.set()
+        assert (await asyncio.wait_for(first, timeout=1.0)).outcome == "confirmed"
+
+        # A completed retained task can exist briefly before its callback runs.
+        # Reusing the real context proves the next request explicitly reaps it.
+        completed_context = _SafetyRecordInitializationContext(
+            child=service._mcp,  # type: ignore[arg-type]  # noqa: SLF001
+            child_epoch=1,
+            expected_lease=service._fault_lease_cache,  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            emergency_stop_admission_epoch=0,
+            generation=1,
+            operation_id="completed-reservation",
+        )
+
+        async def completed_result() -> object:
+            return await service._safety_record_initialization_result("rejected")  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        completed = asyncio.create_task(completed_result())
+        await completed
+        service._safety_record_initialization = (  # type: ignore[assignment]  # noqa: SLF001
+            completed_context,
+            completed,
+        )
+        rejected = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert rejected.outcome == "rejected"
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_cancelled_commit_and_failed_reconciliation_leave_no_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancelled write or failed exact reconciliation never confirms D220."""
+    path = tmp_path / "d220-cancelled-commit.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def parked_write(*, process_id: str, generation: int, operation_id: str) -> bool:
+            del process_id, generation, operation_id
+            entered.set()
+            await release.wait()
+            return False
+
+        monkeypatch.setattr(store, "initialize_missing_fault_control_safety_record", parked_write)
+        initialization = asyncio.create_task(
+            service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        owned = service._safety_record_initialization  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert owned is not None
+        owned[1].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await initialization
+        release.set()
+
+        replacement, _replacement_roaster, _replacement_child = await _presence_service(
+            store, "none"
+        )
+
+        async def failed_write(*, process_id: str, generation: int, operation_id: str) -> bool:
+            del process_id, generation, operation_id
+            raise OSError("write acknowledgement lost")
+
+        async def failed_exact_proof(
+            *, process_id: str, generation: int, operation_id: str
+        ) -> bool:
+            del process_id, generation, operation_id
+            raise OSError("proof unavailable")
+
+        monkeypatch.setattr(store, "initialize_missing_fault_control_safety_record", failed_write)
+        monkeypatch.setattr(store, "verify_missing_fault_control_safety_record", failed_exact_proof)
+        result = await replacement.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert result.outcome == "unconfirmed"
+        assert roaster.commands() == []
+        await replacement.shutdown()
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_owned_task_exception_is_consumed_and_releases_reservation(
+    tmp_path: Path,
+) -> None:
+    """An unexpected owned-task failure is logged and cannot retain D220 ownership."""
+    store = RoastStore(tmp_path / "d220-owned-task-error.sqlite3")
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, _roaster, child = await _presence_service(store, "none")
+        context = _SafetyRecordInitializationContext(
+            child=cast("MCPServerProcess", child),
+            child_epoch=child.child_epoch,
+            expected_lease=FaultControlLease(
+                generation=0,
+                status=FaultLeaseStatus.UNKNOWN,
+                run_id=None,
+                mcp_session_id=None,
+            ),
+            emergency_stop_admission_epoch=0,
+            generation=1,
+            operation_id="owned-task-error",
+        )
+
+        async def explode() -> InitializeSafetyRecordResult:
+            raise RuntimeError("unexpected D220 task failure")
+
+        failed = asyncio.create_task(explode())
+        with pytest.raises(RuntimeError, match="unexpected D220"):
+            await failed
+        service._safety_record_initialization = (context, failed)  # type: ignore[assignment]  # noqa: SLF001
+        service._finish_safety_record_initialization(context, failed)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert service._safety_record_initialization is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_retries_above_a_prior_audited_generation(tmp_path: Path) -> None:
+    """A rejected reused generation retains the synchronous floor for retry."""
+    path = tmp_path / "d220-prior-audit-retry.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        await store.record_operator_action(
+            action=OperatorAction.INITIALIZE_SAFETY_RECORD.value,
+            result="accepted",
+            payload={"baseline": "initialised", "generation": 1, "operation_id": "old"},
+        )
+        service, roaster, _child = await _presence_service(store, "none")
+
+        first = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert first.outcome == "unconfirmed"
+        assert (
+            await store.probe_fault_control_lease_absence()
+            is FaultControlLeaseAbsence.ABSENT_UNTRUSTED
+        )
+
+        second = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert second.outcome == "confirmed"
+        assert (await store.read_fault_control_lease()).generation == 2
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parked_read", ["epoch_setup", "lease", "history"])
+async def test_d220_rejects_no_target_estop_admitted_during_entry_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parked_read: str
+) -> None:
+    """A no-target e-stop before D220 reservation prevents any baseline write."""
+    path = tmp_path / f"d220-entry-estop-{parked_read}.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        if parked_read == "epoch_setup":
+            original_begin_epoch = store.begin_process_epoch
+
+            async def parked_begin_epoch(process_id: str) -> bool:
+                entered.set()
+                await release.wait()
+                return await original_begin_epoch(process_id)
+
+            monkeypatch.setattr(store, "begin_process_epoch", parked_begin_epoch)
+        elif parked_read == "lease":
+            await service.health()
+            original_read_lease = service._read_fault_lease_fail_closed  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            reads = 0
+
+            async def parked_read_lease() -> FaultControlLease:
+                nonlocal reads
+                reads += 1
+                if reads == 1:
+                    entered.set()
+                    await release.wait()
+                return await original_read_lease()
+
+            monkeypatch.setattr(
+                service,
+                "_read_fault_lease_fail_closed",
+                parked_read_lease,
+            )
+        else:
+            # Establish the process epoch before parking the specific durable
+            # history read performed by this D220 request.
+            await service.health()
+            original_active_run = store.active_run
+
+            async def parked_active_run() -> PersistedRun | None:
+                entered.set()
+                await release.wait()
+                return await original_active_run()
+
+            monkeypatch.setattr(store, "active_run", parked_active_run)
+        initialization = asyncio.create_task(
+            service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        emergency_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert emergency_stop.result == "failed"
+        release.set()
+
+        result = await asyncio.wait_for(initialization, timeout=1.0)
+        assert result.outcome == "rejected"
+        assert roaster.presence_reads == 0
+        assert (
+            await store.probe_fault_control_lease_absence()
+            is FaultControlLeaseAbsence.ABSENT_UNTRUSTED
+        )
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_estop_admission_invalidates_a_parked_presence_proof(tmp_path: Path) -> None:
+    """A synchronous global e-stop wins before D220 can write its baseline."""
+    path = tmp_path / "d220-estop-race.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        await store.create_run(
+            run_id="pending-estop",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.COMPLETE,
+        )
+        await store.complete_run(
+            run_id="pending-estop", outcome="aborted", agent_phase=RoastPhase.COMPLETE
+        )
+        service, roaster, _child = await _presence_service(store, "none")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def parked_presence() -> SessionPresence:
+            entered.set()
+            await release.wait()
+            return "none"
+
+        roaster.on_read = parked_presence
+        initialization = asyncio.create_task(
+            service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        admitted = service._admit_fault_control_lease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            "pending-estop"
+        )
+        service._schedule_admitted_fault_control_lease_persistence(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            admitted
+        )
+        # The baseline floor was raised before the parked presence await, so
+        # this real durable e-stop lease can never share generation one.
+        assert admitted.generation == 2
+        release.set()
+        result = await asyncio.wait_for(initialization, timeout=1.0)
+        assert await service.settle_fault_lease_persistence_for_teardown()
+
+        assert result.outcome == "rejected"
+        durable = await store.read_fault_control_lease()
+        assert durable.generation == 2
+        assert durable.status is FaultLeaseStatus.OPEN
+        assert service._fault_lease_cache.generation == 2  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_reconciles_only_its_exact_operation_after_ambiguous_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ambiguous store return is confirmed only by the server-minted audit id."""
+    path = tmp_path / "d220-reconcile.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        original = store.initialize_missing_fault_control_safety_record
+
+        async def commit_then_raise(*, process_id: str, generation: int, operation_id: str) -> bool:
+            assert await original(
+                process_id=process_id, generation=generation, operation_id=operation_id
+            )
+            raise OSError("commit acknowledgement was lost")
+
+        monkeypatch.setattr(
+            store, "initialize_missing_fault_control_safety_record", commit_then_raise
+        )
+        result = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+
+        assert result.outcome == "confirmed"
+        assert service._fault_lease_cache.status is FaultLeaseStatus.CLOSED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_stale_ambiguous_commit_skips_service_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale context cannot run an additional service-side exact verify."""
+    path = tmp_path / "d220-stale-ambiguous.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, _roaster, child = await _presence_service(store, "none")
+        committed = asyncio.Event()
+        release = asyncio.Event()
+        original_initialize = store.initialize_missing_fault_control_safety_record
+        original_verify = store.verify_missing_fault_control_safety_record
+        verify_calls = 0
+
+        async def counted_verify(*, process_id: str, generation: int, operation_id: str) -> bool:
+            nonlocal verify_calls
+            verify_calls += 1
+            return await original_verify(
+                process_id=process_id, generation=generation, operation_id=operation_id
+            )
+
+        async def commit_then_raise(*, process_id: str, generation: int, operation_id: str) -> bool:
+            nonlocal verify_calls
+            assert await original_initialize(
+                process_id=process_id, generation=generation, operation_id=operation_id
+            )
+            # The transaction's own exact postcondition has already run.
+            assert verify_calls == 1
+            verify_calls = 0
+            committed.set()
+            await release.wait()
+            raise OSError("ambiguous commit")
+
+        monkeypatch.setattr(store, "verify_missing_fault_control_safety_record", counted_verify)
+        monkeypatch.setattr(
+            store, "initialize_missing_fault_control_safety_record", commit_then_raise
+        )
+        initialization = asyncio.create_task(
+            service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(committed.wait(), timeout=1.0)
+        child.child_epoch += 1
+        release.set()
+        result = await asyncio.wait_for(initialization, timeout=1.0)
+
+        assert result.outcome == "unconfirmed"
+        assert verify_calls == 0
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d220_keeps_unknown_projection_after_commit_until_its_proof_is_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed baseline stays UNKNOWN through a later no-target e-stop."""
+    path = tmp_path / "d220-committed-proof-fence.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        committed = asyncio.Event()
+        release = asyncio.Event()
+        original = store.initialize_missing_fault_control_safety_record
+
+        async def commit_then_park(*, process_id: str, generation: int, operation_id: str) -> bool:
+            assert await original(
+                process_id=process_id, generation=generation, operation_id=operation_id
+            )
+            committed.set()
+            await release.wait()
+            return True
+
+        monkeypatch.setattr(
+            store, "initialize_missing_fault_control_safety_record", commit_then_park
+        )
+        initialization = asyncio.create_task(
+            service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await asyncio.wait_for(committed.wait(), timeout=1.0)
+
+        pending = await service.health()
+        assert pending.fault_controls.status is FaultLeaseStatus.UNKNOWN
+        assert pending.fault_controls.generation == 1
+        assert not pending.restart_clearance.eligible
+
+        # This is a real global e-stop admission with no target. It still
+        # revokes every concurrent proof synchronously before its projection
+        # awaits, so it cannot leave a committed CLOSED baseline published.
+        emergency_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert emergency_stop.result == "failed"
+        assert emergency_stop.fault_controls.status is FaultLeaseStatus.UNKNOWN
+
+        release.set()
+        result = await asyncio.wait_for(initialization, timeout=1.0)
+        assert result.outcome == "unconfirmed"
+        assert result.fault_controls.status is FaultLeaseStatus.UNKNOWN
+        assert result.fault_controls.generation == 1
+        after = await service.health()
+        assert after.fault_controls.status is FaultLeaseStatus.UNKNOWN
+        assert after.fault_controls.generation == 1
+        assert not after.restart_clearance.eligible
+        assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+        assert roaster.commands() == []
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_no_session_clearance_allows_a_live_start_after_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fresh D213 clearance permits Start only after current-child proof."""
+    store = RoastStore(tmp_path / "restart-none-start.sqlite3")
+    await store.initialize()
+    service: RoastService | None = None
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+        with pytest.raises(RoastRunConflictError, match="restart clearance"):
+            await service.start_roast(_profile())
+
+        cleared = await service.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert cleared.cleared
+
+        async def no_op_respawn(_config: object) -> None:
+            return None
+
+        monkeypatch.setattr(service, "_respawn_mcp_for_device_config", no_op_respawn)
+        await service.start_roast(_profile())
+        assert roaster.presence_reads == 1
+    finally:
+        if service is not None:
+            await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_clean_predecessor_clearance_cannot_clear_a_fresh_process(
+    tmp_path: Path,
+) -> None:
+    """A clean predecessor leaves the next Agent process gated until reproved."""
+    store = RoastStore(tmp_path / "restart-fresh-process.sqlite3")
+    await store.initialize()
+    try:
+        predecessor, predecessor_roaster, _predecessor_child = await _presence_service(
+            store, "none"
+        )
+        predecessor_result = await predecessor.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert predecessor_result.cleared
+        assert predecessor_roaster.presence_reads == 1
+        assert await store.active_run() is None
+        await predecessor.mark_process_epoch_clean_after_ordered_teardown()
+
+        successor, successor_roaster, _successor_child = await _presence_service(store, "none")
+        successor_health = await successor.health()
+        assert successor_health.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert not successor_health.restart_clearance.eligible
+        assert successor_roaster.presence_reads == 0
+        with pytest.raises(RoastRunConflictError, match="restart clearance"):
+            await successor.start_roast(_profile())
+
+        successor_result = await successor.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert successor_result.cleared
+        assert successor_roaster.presence_reads == 1
+        assert (
+            await store.read_process_restart_clearance(successor.instance_id)
+            is RestartClearanceState.CLEARED
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_ordered_teardown_allows_successor_physical_clearance_and_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An idle ordered teardown creates a trusted baseline, never a clearance waiver."""
+    path = tmp_path / "idle-ordered-teardown.sqlite3"
+    store = RoastStore(path)
+    await store.initialize()
+    try:
+        predecessor, predecessor_roaster, _predecessor_child = await _presence_service(
+            store, "none"
+        )
+        predecessor_clearance = await predecessor.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert predecessor_clearance.cleared
+        assert predecessor_roaster.presence_reads == 1
+
+        class _CleanStoppingMCP:
+            stop_unconfirmed = False
+
+            async def stop(self) -> None:
+                return None
+
+        await _teardown_live(predecessor, cast(MCPServerProcess, _CleanStoppingMCP()), store)
+    finally:
+        await store.close()
+
+    successor_store = RoastStore(path)
+    await successor_store.initialize()
+    try:
+        successor, successor_roaster, _successor_child = await _presence_service(
+            successor_store, "none"
+        )
+        successor_health = await successor.health()
+        assert successor_health.restart_clearance.state is RestartClearanceState.REQUIRED
+        with pytest.raises(RoastRunConflictError, match="restart clearance"):
+            await successor.start_roast(_profile())
+
+        successor_clearance = await successor.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert successor_clearance.cleared
+        assert successor_roaster.presence_reads == 1
+
+        async def no_op_respawn(_config: object) -> None:
+            return None
+
+        monkeypatch.setattr(successor, "_respawn_mcp_for_device_config", no_op_respawn)
+        detail = await successor.start_roast(_profile())
+        assert detail.id
+        assert detail.agent_phase is RoastPhase.PREHEATING
+    finally:
+        await successor_store.close()
+
+
+@pytest.mark.asyncio
+async def test_active_graceful_teardown_leaves_successor_epoch_unclean_and_lease_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shutdown e-stop keeps the next process behind its restart gate.
+
+    This exercises the real live service through ``_teardown_live``.  The
+    terminal e-stop is exact-session bound, so the successor must observe its
+    durable OPEN lease as well as the unclean predecessor epoch.
+    """
+    path = tmp_path / "active-ordered-teardown.sqlite3"
+    store = RoastStore(path)
+    await store.initialize()
+    try:
+        predecessor, roaster, _child = await _presence_service(store, "none")
+        assert (
+            await predecessor.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        ).cleared
+
+        async def no_op_respawn(_config: object) -> None:
+            return None
+
+        monkeypatch.setattr(predecessor, "_respawn_mcp_for_device_config", no_op_respawn)
+        detail = await predecessor.start_roast(_profile())
+        roaster.set_latest_fault_session_id("shutdown-session")
+
+        class _CleanStoppingMCP:
+            stop_unconfirmed = False
+
+            async def stop(self) -> None:
+                return None
+
+        await _teardown_live(predecessor, cast(MCPServerProcess, _CleanStoppingMCP()), store)
+    finally:
+        await store.close()
+
+    successor_store = RoastStore(path)
+    await successor_store.initialize()
+    try:
+        assert not await successor_store.begin_process_epoch("successor")
+        lease = await successor_store.read_fault_control_lease()
+        assert lease.status is FaultLeaseStatus.OPEN
+        assert lease.run_id == detail.id
+        assert lease.mcp_session_id == "shutdown-session"
+
+        successor, _roaster, _child = await _presence_service(successor_store, "none")
+        health = await successor.health()
+        assert health.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert health.fault_controls.status is FaultLeaseStatus.OPEN
+    finally:
+        await successor_store.close()
+
+
+@pytest.mark.asyncio
+async def test_clean_epoch_marker_refuses_an_active_run_after_an_eligible_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker's active-run guard remains effective after a proven control."""
+    store = RoastStore(tmp_path / "active-marker-guard.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, _child = await _presence_service(store, "none")
+        await service.health()
+        assert await store.confirm_process_restart_clearance(service.instance_id)
+        service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001 - durable marker harness  # pyright: ignore[reportPrivateUsage]
+
+        marked: list[str] = []
+        original_mark = store.mark_process_epoch_clean
+
+        async def record_mark(process_id: str) -> bool:
+            marked.append(process_id)
+            return await original_mark(process_id)
+
+        monkeypatch.setattr(store, "mark_process_epoch_clean", record_mark)
+        await service.mark_process_epoch_clean_after_ordered_teardown()
+        assert marked == [service.instance_id]
+
+        assert await store.begin_process_epoch(service.instance_id)
+        await store.create_run(
+            run_id="active-run",
+            profile=_profile(),
+            config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+            agent_phase=RoastPhase.PREHEATING,
+        )
+        await service.mark_process_epoch_clean_after_ordered_teardown()
+        assert marked == [service.instance_id]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lease_kind", ["unknown", "open"])
+async def test_clean_epoch_marker_refuses_unknown_or_open_lease_after_eligible_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lease_kind: str
+) -> None:
+    """Only a durably CLOSED fault lease can follow ordered teardown."""
+    store = RoastStore(tmp_path / f"{lease_kind}-marker-guard.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, _child = await _presence_service(store, "none")
+        await service.health()
+        assert await store.confirm_process_restart_clearance(service.instance_id)
+        service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001 - durable marker harness  # pyright: ignore[reportPrivateUsage]
+
+        marked: list[str] = []
+        original_mark = store.mark_process_epoch_clean
+
+        async def record_mark(process_id: str) -> bool:
+            marked.append(process_id)
+            return await original_mark(process_id)
+
+        monkeypatch.setattr(store, "mark_process_epoch_clean", record_mark)
+        await service.mark_process_epoch_clean_after_ordered_teardown()
+        assert marked == [service.instance_id]
+
+        assert await store.begin_process_epoch(service.instance_id)
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await store.complete_run(
+            run_id="private-run", outcome="faulted", agent_phase=RoastPhase.FAULTED
+        )
+        if lease_kind == "unknown":
+            await store.replace_fault_control_lease_unknown("private-run")
+        else:
+            await store.open_fault_control_lease(
+                run_id="private-run", mcp_session_id="private-session"
+            )
+        await service.mark_process_epoch_clean_after_ordered_teardown()
+        assert marked == [service.instance_id]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable_gate", ["missing", "required", "read_failure"])
+async def test_clean_epoch_requires_durable_restart_clearance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, durable_gate: str
+) -> None:
+    """An in-memory CLEARED projection cannot certify an uncertain D213 gate."""
+    path = tmp_path / f"uncertain-clean-epoch-{durable_gate}.sqlite3"
+    store = RoastStore(path)
+    await store.initialize()
+    try:
+        service, _roaster, _child = await _presence_service(store, "none")
+        await service.health()
+        service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001 - durable gate fence harness  # pyright: ignore[reportPrivateUsage]
+        if durable_gate == "missing":
+            await store.connection.execute(
+                "DELETE FROM process_restart_clearance WHERE process_id = ?",
+                (service.instance_id,),
+            )
+            await store.connection.commit()
+        elif durable_gate == "read_failure":
+
+            async def fail_gate_read(_process_id: str) -> RestartClearanceState:
+                raise RuntimeError("synthetic restart gate read failure")
+
+            monkeypatch.setattr(store, "read_process_restart_clearance", fail_gate_read)
+
+        await service.mark_process_epoch_clean_after_ordered_teardown()
+    finally:
+        await store.close()
+
+    successor_store = RoastStore(path)
+    await successor_store.initialize()
+    try:
+        # The attempted clean marker did not commit, so an absent lease remains
+        # UNKNOWN for the successor rather than becoming a fresh baseline.
+        assert not await successor_store.begin_process_epoch("successor")
+        assert (await successor_store.read_fault_control_lease()).status is FaultLeaseStatus.UNKNOWN
+    finally:
+        await successor_store.close()
+
+
+@pytest.mark.asyncio
+async def test_graceful_teardown_after_failed_open_lease_persistence_blocks_successor_clearance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A graceful teardown cannot clean an epoch after OPEN persistence fails."""
+    path = tmp_path / "crashed-estop.sqlite3"
+    store = RoastStore(path)
+    await store.initialize()
+    try:
+        first, _first_roaster, _first_child = await _presence_service(store, "none")
+        cleared = await first.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert cleared.cleared
+        first.active_run_id = "private-run"
+        runner = _PriorityEmergencyRunner()
+        first.runner = runner  # type: ignore[assignment]  # noqa: SLF001 - controlled admission seam
+        failed = asyncio.Event()
+
+        async def fail_open_write(
+            *, run_id: str, mcp_session_id: str, generation: int | None = None
+        ) -> FaultControlLease:
+            assert run_id == "private-run"
+            assert mcp_session_id
+            assert generation == 1
+            failed.set()
+            raise RuntimeError("synthetic lease write failure")
+
+        monkeypatch.setattr(store, "open_fault_control_lease", fail_open_write)
+
+        marker_reached = asyncio.Event()
+        original_marker = first.mark_process_epoch_clean_after_ordered_teardown
+
+        async def record_marker_reached() -> None:
+            assert runner.calls == [OperatorAction.EMERGENCY_STOP]
+            marker_reached.set()
+            await original_marker()
+
+        monkeypatch.setattr(
+            first, "mark_process_epoch_clean_after_ordered_teardown", record_marker_reached
+        )
+
+        class _CleanStoppingMCP:
+            stop_unconfirmed = False
+
+            async def stop(self) -> None:
+                return None
+
+        await _teardown_live(first, cast(MCPServerProcess, _CleanStoppingMCP()), store)
+        await asyncio.wait_for(failed.wait(), timeout=1.0)
+        assert runner.calls == [OperatorAction.EMERGENCY_STOP]
+        assert runner.shutdown_admissions == 1
+        assert not marker_reached.is_set()
+    finally:
+        await store.close()
+
+    successor_store = RoastStore(path)
+    await successor_store.initialize()
+    try:
+        successor, _roaster, _child = await _presence_service(successor_store, "none")
+        await successor.recover_on_start()
+        health = await successor.health()
+        assert health.fault_controls.status is FaultLeaseStatus.UNKNOWN
+        assert health.fault_controls.enabled_actions == [OperatorAction.EMERGENCY_STOP]
+        with pytest.raises(RoastRunConflictError, match="fault controls are unknown"):
+            await successor.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        with pytest.raises(RoastRunConflictError):
+            await successor.start_roast(_profile())
+    finally:
+        await successor_store.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_lease_read_failure_can_recover_a_fresh_closed_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient startup read failure does not permanently invent generation one."""
+    store = RoastStore(tmp_path / "transient-startup-lease-read.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        original = store.read_fault_control_lease
+        reads = 0
+
+        async def fail_once() -> FaultControlLease:
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                raise RuntimeError("synthetic startup read failure")
+            return await original()
+
+        monkeypatch.setattr(store, "read_fault_control_lease", fail_once)
+        await service.recover_on_start()
+        assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001 - startup fence assertion  # pyright: ignore[reportPrivateUsage]
+        recovered = await service._read_fault_lease_fail_closed()  # noqa: SLF001 - recovery seam  # pyright: ignore[reportPrivateUsage]
+        assert recovered.generation == 0
+        assert recovered.status is FaultLeaseStatus.CLOSED
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "presence",
+    [None, "starting", "active", "stopped", "unknown", RuntimeError("MCP timeout")],
+)
+async def test_no_session_clearance_rejects_absent_malformed_or_non_none_presence(
+    tmp_path: Path, presence: object
+) -> None:
+    """Only the exact typed ``none`` value is affirmative no-session evidence."""
+    store = RoastStore(tmp_path / "restart-invalid-presence.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, _child = await _presence_service(store, presence)
+
+        with pytest.raises(RoastRunConflictError):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+
+        health = await service.health()
+        assert health.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert not health.restart_clearance.eligible
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_rejects_child_replacement_during_proof(tmp_path: Path) -> None:
+    """A response from a replaced child cannot clear the process gate."""
+    store = RoastStore(tmp_path / "restart-child-race.sqlite3")
+    await store.initialize()
+    try:
+        service, roaster, child = await _presence_service(store, "none")
+
+        async def replace_child() -> SessionPresence:
+            child.child_epoch += 1
+            return "none"
+
+        roaster.on_read = replace_child
+        with pytest.raises(RoastRunConflictError, match="child changed"):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        assert (await service.health()).restart_clearance.state is RestartClearanceState.REQUIRED
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_rejects_a_stopped_current_child(tmp_path: Path) -> None:
+    """A stale child object cannot stand in for a live no-session proof."""
+    store = RoastStore(tmp_path / "restart-stopped-child.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, child = await _presence_service(store, "none")
+        child.running = False
+
+        with pytest.raises(RoastRunConflictError, match="current MCP child"):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+
+        assert (await service.health()).restart_clearance.state is RestartClearanceState.REQUIRED
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_rejects_false_durable_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A false clearance CAS result must leave the process gate unknown."""
+    store = RoastStore(tmp_path / "restart-false-confirmation.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, _child = await _presence_service(store, "none")
+
+        async def false_confirmation(process_id: str) -> bool:
+            del process_id
+            return False
+
+        monkeypatch.setattr(store, "confirm_process_restart_clearance", false_confirmation)
+        with pytest.raises(RoastRunConflictError, match="not durably recorded"):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+
+        assert (await service.health()).restart_clearance.state is RestartClearanceState.UNKNOWN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_rejects_lease_change_during_proof(tmp_path: Path) -> None:
+    """A concurrent fault lease change invalidates a previously clean proof."""
+    store = RoastStore(tmp_path / "restart-lease-race.sqlite3")
+    await store.initialize()
+    try:
+        service, roaster, _child = await _presence_service(store, "none")
+
+        async def change_lease() -> SessionPresence:
+            await store.replace_fault_control_lease_unknown(None)
+            return "none"
+
+        roaster.on_read = change_lease
+        with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        assert (await service.health()).fault_controls.status is FaultLeaseStatus.UNKNOWN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_fails_closed_when_persistence_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful current-child proof cannot survive unconfirmed persistence."""
+    store = RoastStore(tmp_path / "restart-persistence.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, _child = await _presence_service(store, "none")
+
+        async def fail_confirmation(process_id: str) -> bool:
+            del process_id
+            raise RuntimeError("synthetic SQLite failure")
+
+        monkeypatch.setattr(store, "confirm_process_restart_clearance", fail_confirmation)
+        with pytest.raises(RoastRunConflictError, match="persistence is unconfirmed"):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        assert (await service.health()).restart_clearance.state is RestartClearanceState.UNKNOWN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_rejects_child_replacement_during_durable_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child replacement while the durable confirmation awaits cannot clear memory."""
+    store = RoastStore(tmp_path / "restart-confirm-child-race.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, child = await _presence_service(store, "none")
+        confirmation_started = asyncio.Event()
+        release_confirmation = asyncio.Event()
+        original_confirm = store.confirm_process_restart_clearance
+
+        async def delayed_confirmation(process_id: str) -> bool:
+            confirmation_started.set()
+            await release_confirmation.wait()
+            return await original_confirm(process_id)
+
+        monkeypatch.setattr(store, "confirm_process_restart_clearance", delayed_confirmation)
+        clearance = asyncio.create_task(
+            service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await confirmation_started.wait()
+        child.child_epoch += 1
+        release_confirmation.set()
+
+        with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+            await clearance
+        health = await service.health()
+        assert health.restart_clearance.state is RestartClearanceState.UNKNOWN
+        assert not health.restart_clearance.eligible
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_session_clearance_rejects_confirmation_after_no_target_estop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-target e-stop revokes a clearance proof before its CAS returns."""
+    store = RoastStore(tmp_path / "restart-confirm-estop-race.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, _child = await _presence_service(store, "none")
+        confirmation_started = asyncio.Event()
+        release_confirmation = asyncio.Event()
+        original_confirm = store.confirm_process_restart_clearance
+
+        async def delayed_confirmation(process_id: str) -> bool:
+            confirmation_started.set()
+            await release_confirmation.wait()
+            return await original_confirm(process_id)
+
+        monkeypatch.setattr(store, "confirm_process_restart_clearance", delayed_confirmation)
+        clearance = asyncio.create_task(
+            service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await confirmation_started.wait()
+        service.active_run_id = "private-run"
+        emergency_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert emergency_stop.result == "failed"
+        release_confirmation.set()
+
+        with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+            await clearance
+        await asyncio.sleep(0)
+        health = await service.health()
+        assert health.restart_clearance.state is RestartClearanceState.UNKNOWN
+        assert not health.restart_clearance.eligible
+        assert health.fault_controls.status is FaultLeaseStatus.CLOSED
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_open_fault_clearance_rejects_exact_terminal_estop_during_durable_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real exact-session e-stop admission stales OPEN-lease confirmation."""
+    store = RoastStore(tmp_path / "restart-confirm-terminal-estop-race.sqlite3")
+    await store.initialize()
+    try:
+        child = _CurrentChild()
+        port = _TerminalFaultPort(
+            FaultControlState(
+                session_id="private-session",
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=False,
+                beans_added=False,
+                beans_dropped=False,
+            )
+        )
+
+        service = RoastService(
+            store,
+            config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+            mcp=cast("MCPServerProcess", child),
+            roaster=port,
+            live_serve_mode=True,
+            run_loop=False,
+            clock=FakeClock(),
+        )
+        confirmation_started = asyncio.Event()
+        release_confirmation = asyncio.Event()
+        original_confirm = store.confirm_process_restart_clearance
+
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        lease = await store.open_fault_control_lease(
+            run_id="private-run", mcp_session_id="private-session"
+        )
+        port.set_latest_fault_session_id("private-session")
+        await service.health()
+        assert service._fault_lease_cache == lease  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        async def delayed_confirmation(process_id: str) -> bool:
+            confirmation_started.set()
+            await release_confirmation.wait()
+            return await original_confirm(process_id)
+
+        monkeypatch.setattr(store, "confirm_process_restart_clearance", delayed_confirmation)
+        clearance = asyncio.create_task(
+            service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await confirmation_started.wait()
+
+        emergency_stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert emergency_stop.result == "confirmed"
+        release_confirmation.set()
+
+        with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+            await clearance
+        health = await service.health()
+        assert health.restart_clearance.state is RestartClearanceState.UNKNOWN
+        assert not health.restart_clearance.eligible
+        assert health.fault_controls.generation is not None
+        assert health.fault_controls.generation > lease.generation
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_open_fault_clearance_rejects_child_replacement_during_durable_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exact-session proof cannot survive replacement of its current MCP child."""
+    store = RoastStore(tmp_path / "restart-confirm-open-child-race.sqlite3")
+    await store.initialize()
+    try:
+        service, _roaster, child = await _presence_service(store, "none")
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await store.open_fault_control_lease(run_id="private-run", mcp_session_id="private-session")
+        roaster = service._roaster  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(roaster, FakeMCPClient)
+        roaster.set_latest_fault_session_id("private-session")
+        confirmation_started = asyncio.Event()
+        release_confirmation = asyncio.Event()
+        original_confirm = store.confirm_process_restart_clearance
+
+        async def delayed_confirmation(process_id: str) -> bool:
+            confirmation_started.set()
+            await release_confirmation.wait()
+            return await original_confirm(process_id)
+
+        monkeypatch.setattr(store, "confirm_process_restart_clearance", delayed_confirmation)
+        clearance = asyncio.create_task(
+            service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        )
+        await confirmation_started.wait()
+        child.child_epoch += 1
+        release_confirmation.set()
+
+        with pytest.raises(RoastRunConflictError, match="evidence became stale"):
+            await clearance
+        health = await service.health()
+        assert health.restart_clearance.state is RestartClearanceState.UNKNOWN
+        assert not health.restart_clearance.eligible
+        assert health.fault_controls.status is FaultLeaseStatus.OPEN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_phase", "mcp_session_id", "expected_error"),
+    [
+        (RoastPhase.STARTING, "private-session", "requires no active run"),
+        (RoastPhase.FAULTED, None, "exact fault session is unavailable"),
+    ],
+)
+async def test_open_fault_clearance_rejects_non_faulted_or_unbound_active_lease(
+    tmp_path: Path,
+    run_phase: RoastPhase,
+    mcp_session_id: str | None,
+    expected_error: str,
+) -> None:
+    """OPEN-lease clearance needs one active fault and its exact MCP session."""
+    store = RoastStore(tmp_path / "restart-invalid-open-lease.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=run_phase,
+        )
+        await store.open_fault_control_lease(run_id="private-run", mcp_session_id=mcp_session_id)
+
+        with pytest.raises(RoastRunConflictError, match=expected_error):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+
+        assert (await service.health()).restart_clearance.state is RestartClearanceState.REQUIRED
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_open_fault_clearance_keeps_existing_exact_session_path(tmp_path: Path) -> None:
+    """No-session evidence is not required for the separate OPEN-lease proof."""
+    store = RoastStore(tmp_path / "restart-open-fault.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await store.open_fault_control_lease(run_id="private-run", mcp_session_id="private-session")
+        roaster = service._roaster  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(roaster, FakeMCPClient)
+        roaster.set_latest_fault_session_id("private-session")
+
+        result = await service.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+
+        assert result.outcome == "confirmed"
+        assert result.restart_clearance.state is RestartClearanceState.CLEARED
+        assert not result.restart_clearance.eligible
+        assert result.fault_controls.status is FaultLeaseStatus.OPEN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_lease_exposes_only_software_estop(tmp_path: Path) -> None:
+    """An unbound e-stop lease fails closed and never exposes routine controls."""
+    store = RoastStore(tmp_path / "lease.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await store.replace_fault_control_lease_unknown("private-run")
+        health = await service.health()
+        assert health.fault_controls.status is FaultLeaseStatus.UNKNOWN
+        assert health.fault_controls.enabled_actions == [OperatorAction.EMERGENCY_STOP]
+        assert not health.restart_clearance.eligible
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_global_d212_requires_explicit_confirmation(tmp_path: Path) -> None:
+    """The global fault endpoint cannot queue D212 without its confirmation."""
+    store = RoastStore(tmp_path / "global-action.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await store.open_fault_control_lease(run_id="private-run", mcp_session_id="private-session")
+        result = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE)
+        )
+        assert result.result == "rejected"
+        assert result.fault_controls.status is FaultLeaseStatus.OPEN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_open_lease_uses_exact_controller_executor_and_d212_closes(
+    tmp_path: Path,
+) -> None:
+    """A terminal fault remains controllable only through the guarded executor."""
+    store = RoastStore(tmp_path / "terminal-open.sqlite3")
+    await store.initialize()
+    try:
+        port = _TerminalFaultPort(
+            FaultControlState(
+                session_id="private-session",
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=True,
+                beans_added=False,
+                beans_dropped=False,
+            )
+        )
+        service = await _terminal_service(store, port)
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await store.complete_run(
+            run_id="private-run", outcome="faulted", agent_phase=RoastPhase.FAULTED
+        )
+        await store.open_fault_control_lease(run_id="private-run", mcp_session_id="private-session")
+
+        health = await service.health()
+        assert health.fault_controls.enabled_actions == [OperatorAction.EMERGENCY_STOP]
+        rejected = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.STOP_COOLING)
+        )
+        assert rejected.result == "rejected"
+        assert port.calls == []
+
+        port.set_latest_fault_session_id("private-session")
+        clearance = await service.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert clearance.cleared
+        health = await service.health()
+        assert OperatorAction.DROP_BEANS not in health.fault_controls.enabled_actions
+        assert OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE in health.fault_controls.enabled_actions
+
+        acknowledged = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(
+                action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+                confirmation=True,
+                expected_generation=1,
+            )
+        )
+        assert acknowledged.result == "confirmed"
+        assert acknowledged.fault_controls.status is FaultLeaseStatus.CLOSED
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_newer_in_memory_estop_generation_cannot_regress_to_old_durable_lease(
+    tmp_path: Path,
+) -> None:
+    """A stale store read cannot restore Start eligibility after e-stop admission."""
+    store = RoastStore(tmp_path / "lease-generation.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        service._fault_lease_cache = FaultControlLease(  # noqa: SLF001 - race harness  # pyright: ignore[reportPrivateUsage]
+            generation=2,
+            status=FaultLeaseStatus.UNKNOWN,
+            run_id="private-run",
+            mcp_session_id=None,
+        )
+        durable = await service._read_fault_lease_fail_closed()  # noqa: SLF001 - race harness  # pyright: ignore[reportPrivateUsage]
+        assert durable.generation == 2
+        assert durable.status is FaultLeaseStatus.UNKNOWN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_persistence_failure_preserves_newer_exact_session_lease(
+    tmp_path: Path,
+) -> None:
+    """An old persistence failure cannot erase newer e-stop controls."""
+    store = RoastStore(tmp_path / "lease-persistence-order.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        service._fault_lease_cache = FaultControlLease(  # noqa: SLF001 - race harness  # pyright: ignore[reportPrivateUsage]
+            generation=2,
+            status=FaultLeaseStatus.OPEN,
+            run_id="private-newer-run",
+            mcp_session_id="private-newer-session",
+        )
+
+        async def fail() -> None:
+            raise RuntimeError("synthetic persistence failure")
+
+        task = asyncio.create_task(fail())
+        with pytest.raises(RuntimeError, match="synthetic persistence failure"):
+            await task
+        service._log_fault_lease_persistence_failure(task, 1)  # noqa: SLF001 - race harness  # pyright: ignore[reportPrivateUsage]
+
+        lease = service._fault_lease_cache  # noqa: SLF001 - race harness  # pyright: ignore[reportPrivateUsage]
+        assert lease.generation == 2
+        assert lease.status is FaultLeaseStatus.OPEN
+        assert lease.mcp_session_id == "private-newer-session"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_estop_admission_supersedes_concurrent_d212_close(
+    tmp_path: Path,
+) -> None:
+    """A terminal e-stop generation wins before a delayed D212 may close."""
+    store = RoastStore(tmp_path / "terminal-estop-race.sqlite3")
+    await store.initialize()
+    try:
+        port = _TerminalFaultPort(
+            FaultControlState(
+                session_id="private-session",
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=True,
+                beans_added=False,
+                beans_dropped=False,
+            )
+        )
+        port.stop_started = asyncio.Event()
+        port.release_stop = asyncio.Event()
+        service = await _terminal_service(store, port)
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await store.complete_run(
+            run_id="private-run", outcome="faulted", agent_phase=RoastPhase.FAULTED
+        )
+        await store.open_fault_control_lease(run_id="private-run", mcp_session_id="private-session")
+        port.set_latest_fault_session_id("private-session")
+        clearance = await service.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert clearance.cleared
+        await service.health()  # Hydrate the server-owned terminal lease cache.
+
+        acknowledgement = asyncio.create_task(
+            service.submit_fault_controls_action(
+                FaultControlsActionRequest(
+                    action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+                    confirmation=True,
+                    expected_generation=1,
+                )
+            )
+        )
+        await asyncio.wait_for(port.stop_started.wait(), timeout=1.0)
+        emergency_stop = asyncio.create_task(
+            service.submit_fault_controls_action(
+                FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+        )
+        port.release_stop.set()
+        acknowledgement_result = await asyncio.wait_for(acknowledgement, timeout=1.0)
+        emergency_result = await asyncio.wait_for(emergency_stop, timeout=1.0)
+
+        assert acknowledgement_result.result == "failed"
+        assert emergency_result.result == "confirmed"
+        controls = await service._fault_controls_projection_after_action()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert controls.status in (FaultLeaseStatus.OPEN, FaultLeaseStatus.UNKNOWN)
+        assert controls.generation is not None and controls.generation > 1
+        assert OperatorAction.EMERGENCY_STOP in controls.enabled_actions
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_fault_controls_wait_for_fresh_process_clearance(
+    tmp_path: Path,
+) -> None:
+    """A terminal lease exposes only e-stop until this process is cleared."""
+    store = RoastStore(tmp_path / "terminal-restart-clearance.sqlite3")
+    await store.initialize()
+    try:
+        port = _TerminalFaultPort(
+            FaultControlState(
+                session_id="private-session",
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=True,
+                beans_added=False,
+                beans_dropped=False,
+            )
+        )
+        service = await _terminal_service(store, port)
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await store.complete_run(
+            run_id="private-run", outcome="faulted", agent_phase=RoastPhase.FAULTED
+        )
+        await store.open_fault_control_lease(run_id="private-run", mcp_session_id="private-session")
+
+        health = await service.health()
+        assert health.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert health.fault_controls.enabled_actions == [OperatorAction.EMERGENCY_STOP]
+        result = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.STOP_COOLING)
+        )
+
+        assert result.result == "rejected"
+        assert port.calls == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("active", "connected", "heat"),
+    [(False, True, 1), (True, True, 0), (False, False, 0)],
+)
+async def test_terminal_projection_hides_cooling_stop_when_state_is_unsafe(
+    tmp_path: Path, active: bool, connected: bool, heat: int
+) -> None:
+    """Unsafe exact-state evidence never advertises a terminal cooling stop."""
+    store = RoastStore(tmp_path / f"unsafe-{active}-{connected}-{heat}.sqlite3")
+    await store.initialize()
+    try:
+        port = _TerminalFaultPort(
+            FaultControlState(
+                session_id="private-session",
+                mcp_phase="fault",
+                active=active,
+                device_connected=connected,
+                heat_level_percent=heat,
+                fan_level_percent=0,
+                cooling_on=True,
+                beans_added=False,
+                beans_dropped=False,
+            )
+        )
+        service = await _terminal_service(store, port)
+        service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001 - projection harness  # pyright: ignore[reportPrivateUsage]
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await store.complete_run(
+            run_id="private-run", outcome="faulted", agent_phase=RoastPhase.FAULTED
+        )
+        await store.open_fault_control_lease(run_id="private-run", mcp_session_id="private-session")
+
+        health = await service.health()
+
+        assert OperatorAction.STOP_COOLING not in health.fault_controls.enabled_actions
+        assert (
+            OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE not in health.fault_controls.enabled_actions
+        )
+        result = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.STOP_COOLING)
+        )
+        assert result.result == "rejected"
+        assert port.calls == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_d212_rejects_historical_session_with_different_latest_session(
+    tmp_path: Path,
+) -> None:
+    """A stale exact snapshot cannot close when MCP latest identity changed."""
+    store = RoastStore(tmp_path / "historical-terminal-d212.sqlite3")
+    await store.initialize()
+    try:
+        stale = FaultControlState(
+            session_id="private-session",
+            mcp_phase="fault",
+            active=False,
+            device_connected=True,
+            heat_level_percent=0,
+            fan_level_percent=0,
+            cooling_on=False,
+            beans_added=False,
+            beans_dropped=False,
+        )
+        latest = stale.model_copy(update={"session_id": "different-session"})
+        port = _HistoricalTerminalFaultPort(stale, latest)
+        service = await _terminal_service(store, port)
+        service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001 - exact-session harness  # pyright: ignore[reportPrivateUsage]
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await store.complete_run(
+            run_id="private-run", outcome="faulted", agent_phase=RoastPhase.FAULTED
+        )
+        await store.open_fault_control_lease(run_id="private-run", mcp_session_id="private-session")
+        await service.health()
+
+        result = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(
+                action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+                confirmation=True,
+                expected_generation=1,
+            )
+        )
+
+        assert result.result == "rejected"
+        assert port.calls == []
+        assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.OPEN
+    finally:
+        await store.close()
+
+
+class _PriorityEmergencyRunner:
+    """Hardware-free runner seam proving global e-stop bypasses a full routine queue."""
+
+    def __init__(self, run_id: str = "private-run") -> None:
+        self.run_id = run_id
+        self.calls: list[OperatorAction] = []
+        self.fault_acknowledgement_invalidations = 0
+        self.shutdown_admissions = 0
+
+    def invalidate_fault_acknowledgement_for_emergency_stop(self) -> None:
+        """Model the live runner's synchronous acknowledgement fence."""
+        self.fault_acknowledgement_invalidations += 1
+
+    def admit_emergency_stop(self) -> None:
+        """Model the synchronous controller-arbiter priority admission."""
+        self.shutdown_admissions += 1
+
+    def controller_snapshot(self) -> object:
+        """Expose an active phase for the graceful-shutdown admission seam."""
+        return type("Snapshot", (), {"phase": RoastPhase.PREHEATING})()
+
+    async def dispatch_priority_emergency_stop(
+        self, item: QueuedOperatorAction, *, already_admitted: bool = False
+    ) -> bool:
+        """Record the controller-owned priority dispatch."""
+        assert item.action is OperatorAction.EMERGENCY_STOP
+        assert already_admitted
+        self.calls.append(item.action)
+        return True
+
+    async def shutdown_heat_off(self, *, already_admitted: bool = False) -> ShutdownHeatOffOutcome:
+        """Dispatch a graceful heat-off through the admitted priority seam."""
+        await self.dispatch_priority_emergency_stop(
+            QueuedOperatorAction(run_id=self.run_id, action=OperatorAction.EMERGENCY_STOP),
+            already_admitted=already_admitted,
+        )
+        return ShutdownHeatOffOutcome.DISPATCHED
+
+    async def retry_shutdown_heat_off(
+        self, *, already_admitted: bool = False
+    ) -> ShutdownHeatOffOutcome:
+        """Dispatch a retry through the same admitted priority seam."""
+        return await self.shutdown_heat_off(already_admitted=already_admitted)
+
+    async def record_shutdown_unconfirmed(self, *, command: str, reason: str) -> None:
+        """Provide the service's runner persistence seam for teardown tests."""
+        raise AssertionError(f"unexpected unconfirmed shutdown: {command} / {reason}")
+
+
+@pytest.mark.asyncio
+async def test_global_estop_dispatches_before_delayed_open_lease_persists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E-stop dispatch and Start blocking do not wait for the real OPEN lease write."""
+    store = RoastStore(tmp_path / "delayed-open-lease.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001 - admission harness  # pyright: ignore[reportPrivateUsage]
+        service._restart_epoch_initialized = True  # noqa: SLF001 - admission harness  # pyright: ignore[reportPrivateUsage]
+        await store.create_run(
+            run_id="private-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        runner = _PriorityEmergencyRunner()
+        service.runner = runner  # type: ignore[assignment]  # noqa: SLF001 - narrow runner seam
+        service.active_run_id = "private-run"
+        service._fault_lease_cache = FaultControlLease(  # noqa: SLF001 - admission harness  # pyright: ignore[reportPrivateUsage]
+            generation=1,
+            status=FaultLeaseStatus.OPEN,
+            run_id="private-run",
+            mcp_session_id="private-session",
+        )
+        write_started = asyncio.Event()
+        release_write = asyncio.Event()
+        write_finished = asyncio.Event()
+        original_open = store.open_fault_control_lease
+
+        async def delayed_open(
+            run_id: str, mcp_session_id: str, *, generation: int | None = None
+        ) -> FaultControlLease:
+            write_started.set()
+            await release_write.wait()
+            lease = await original_open(
+                run_id=run_id, mcp_session_id=mcp_session_id, generation=generation
+            )
+            write_finished.set()
+            return lease
+
+        monkeypatch.setattr(store, "open_fault_control_lease", delayed_open)
+        emergency = asyncio.create_task(
+            service.submit_fault_controls_action(
+                FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+        )
+        await asyncio.wait_for(write_started.wait(), timeout=1.0)
+
+        assert runner.calls == [OperatorAction.EMERGENCY_STOP]
+        assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001 - admission assertion  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+            await service.start_roast(_profile())
+
+        release_write.set()
+        result = await emergency
+        await asyncio.wait_for(write_finished.wait(), timeout=1.0)
+        persisted = await store.read_fault_control_lease()
+        assert result.result == "accepted"
+        assert persisted.generation == 2
+        assert persisted.status is FaultLeaseStatus.OPEN
+        assert persisted.mcp_session_id == "private-session"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_global_estop_failed_open_lease_write_remains_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real failed OPEN write never turns an admitted e-stop into durable success."""
+    store = RoastStore(tmp_path / "failed-open-lease.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001 - admission harness  # pyright: ignore[reportPrivateUsage]
+        service._restart_epoch_initialized = True  # noqa: SLF001 - admission harness  # pyright: ignore[reportPrivateUsage]
+        runner = _PriorityEmergencyRunner()
+        service.runner = runner  # type: ignore[assignment]  # noqa: SLF001 - narrow runner seam
+        service.active_run_id = "private-run"
+        service._fault_lease_cache = FaultControlLease(  # noqa: SLF001 - admission harness  # pyright: ignore[reportPrivateUsage]
+            generation=1,
+            status=FaultLeaseStatus.OPEN,
+            run_id="private-run",
+            mcp_session_id="private-session",
+        )
+        persistence_failed = asyncio.Event()
+        callback_ran = asyncio.Event()
+        original_callback = service._log_fault_lease_persistence_failure  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        async def fail_open(
+            run_id: str, mcp_session_id: str, *, generation: int | None = None
+        ) -> FaultControlLease:
+            assert run_id == "private-run"
+            assert mcp_session_id == "private-session"
+            assert generation == 2
+            persistence_failed.set()
+            raise RuntimeError("synthetic OPEN persistence failure")
+
+        def observe_failure(task: asyncio.Task[None], generation: int) -> None:
+            original_callback(task, generation)
+            callback_ran.set()
+
+        monkeypatch.setattr(store, "open_fault_control_lease", fail_open)
+        monkeypatch.setattr(service, "_log_fault_lease_persistence_failure", observe_failure)
+        result = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        await asyncio.wait_for(persistence_failed.wait(), timeout=1.0)
+        await asyncio.wait_for(callback_ran.wait(), timeout=1.0)
+
+        assert result.result == "accepted"
+        assert runner.calls == [OperatorAction.EMERGENCY_STOP]
+        assert service._fault_lease_cache.status is FaultLeaseStatus.UNKNOWN  # noqa: SLF001 - failure assertion  # pyright: ignore[reportPrivateUsage]
+        persisted = await store.read_fault_control_lease()
+        assert persisted.generation == 0
+        assert persisted.status is FaultLeaseStatus.CLOSED
+        with pytest.raises(RoastRunConflictError, match="fault controls are not closed"):
+            await service.start_roast(_profile())
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_global_estop_bypasses_full_routine_queue_for_live_runner(tmp_path: Path) -> None:
+    """A full routine queue cannot prevent a controller-owned e-stop attempt."""
+    store = RoastStore(tmp_path / "full-queue-estop.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        runner = _PriorityEmergencyRunner()
+        service.runner = runner  # type: ignore[assignment]  # noqa: SLF001 - narrow runner seam
+        service.active_run_id = "private-run"
+        service._fault_lease_cache = FaultControlLease(  # noqa: SLF001 - race harness  # pyright: ignore[reportPrivateUsage]
+            generation=1,
+            status=FaultLeaseStatus.OPEN,
+            run_id="private-run",
+            mcp_session_id=None,
+        )
+        for _ in range(service.OPERATOR_QUEUE_MAX):
+            service.operator_queue.put_nowait(
+                QueuedOperatorAction(run_id="private-run", action=OperatorAction.START_COOLING)
+            )
+
+        result = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+
+        assert result.result == "accepted"
+        assert not result.queued
+        assert runner.calls == [OperatorAction.EMERGENCY_STOP]
+        assert runner.fault_acknowledgement_invalidations == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_global_estop_targets_current_live_run_not_closed_lease(tmp_path: Path) -> None:
+    """A closed historical lease cannot redirect a later live-run e-stop."""
+    store = RoastStore(tmp_path / "two-run-global-estop.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        runner = _PriorityEmergencyRunner(run_id="current-run")
+        service.runner = runner  # type: ignore[assignment]  # noqa: SLF001
+        service.active_run_id = "current-run"
+        # The real adapter exposes its most recently observed MCP state.  A
+        # current live runner has therefore established this session identity;
+        # it must replace the unrelated historical lease identity below.
+        roaster = service._roaster  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(roaster, FakeMCPClient)
+        roaster.set_latest_fault_session_id("current-session")
+        service._fault_lease_cache = FaultControlLease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            generation=3,
+            status=FaultLeaseStatus.CLOSED,
+            run_id="old-run",
+            mcp_session_id="old-session",
+        )
+
+        result = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+
+        assert result.result == "accepted"
+        assert runner.calls == [OperatorAction.EMERGENCY_STOP]
+        assert service._fault_lease_cache.run_id == "current-run"  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert service._fault_lease_cache.mcp_session_id == "current-session"  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_recovered_run_blocks_routine_actions_until_clearance_but_admits_estop(
+    tmp_path: Path,
+) -> None:
+    """D213 blocks recovery writes while retaining the independent e-stop route."""
+    store = RoastStore(tmp_path / "recovered-routine-gate.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        await store.create_run(
+            run_id="recovered-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+        )
+        runner = _PriorityEmergencyRunner(run_id="recovered-run")
+        service.runner = runner  # type: ignore[assignment]  # noqa: SLF001
+        service.active_run_id = "recovered-run"
+
+        with pytest.raises(RoastRunConflictError, match="restart clearance"):
+            await service.submit_operator_action(
+                "recovered-run", OperatorActionRequest(action=OperatorAction.RESUME_ADVISORY)
+            )
+        emergency = await service.submit_operator_action(
+            "recovered-run", OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert emergency.result == "accepted"
+        assert runner.calls == [OperatorAction.EMERGENCY_STOP]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_per_run_estop_dispatches_before_store_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live per-run e-stop never waits for ordinary action-store admission."""
+    store = RoastStore(tmp_path / "per-run-estop-no-read.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        await store.create_run(
+            run_id="live-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.PREHEATING,
+        )
+        runner = _PriorityEmergencyRunner(run_id="live-run")
+        service.runner = runner  # type: ignore[assignment]  # noqa: SLF001
+        service.active_run_id = "live-run"
+
+        async def unexpected_read(_run_id: str) -> object:
+            raise AssertionError("per-run e-stop must not read the run before dispatch")
+
+        monkeypatch.setattr(store, "read_run", unexpected_read)
+        result = await service.submit_operator_action(
+            "live-run", OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+
+        assert result.result == "accepted"
+        assert runner.calls == [OperatorAction.EMERGENCY_STOP]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_estop_without_live_controller_does_not_claim_admission(
+    tmp_path: Path,
+) -> None:
+    """A terminal row with no controller loop cannot report a queued e-stop."""
+    store = RoastStore(tmp_path / "terminal-no-runner-estop.sqlite3")
+    await store.initialize()
+    try:
+        service = await _service(store)
+        service._fault_lease_cache = FaultControlLease(  # noqa: SLF001 - race harness  # pyright: ignore[reportPrivateUsage]
+            generation=1,
+            status=FaultLeaseStatus.OPEN,
+            run_id="private-terminal-run",
+            mcp_session_id=None,
+        )
+
+        result = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+
+        assert result.result == "failed"
+        assert "independent physical stop" in result.reason
+    finally:
+        await store.close()

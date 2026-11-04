@@ -14,8 +14,14 @@
  * modal. All temperatures Celsius.
  */
 
+import { useEffect, useRef, useState } from "react";
+
 import { cn } from "@/lib/cn";
-import type { OperatorAction } from "@/lib/types";
+import type {
+  ClosureOnlyClearanceResult,
+  EndRecoveredRunResult,
+  OperatorAction,
+} from "@/lib/types";
 import { formatPercent, formatTempC } from "./format";
 
 export interface RecoveryModalProps {
@@ -30,6 +36,18 @@ export interface RecoveryModalProps {
   enabledActions: OperatorAction[] | null;
   /** Dispatch an operator action (wired to `api.operatorAction`). */
   onAction: (action: OperatorAction) => void;
+  /** A failed health refresh leaves only emergency stop available. */
+  healthStale?: boolean;
+  /** A routine health poll temporarily blocks writes without resetting confirmations. */
+  routineDispatchBlocked?: boolean;
+  /** Server projection for the separate D216 physical-confirmation path. */
+  closureOnlyAvailable?: boolean;
+  /** Server projection for the dedicated D216 End path. */
+  endRecoveredRunAvailable?: boolean;
+  /** Submit only the server-owned closure-only confirmation. */
+  onRequestClosureOnly?: () => Promise<ClosureOnlyClearanceResult>;
+  /** Submit only the server-owned recovered-run End route. */
+  onEndRecoveredRun?: () => Promise<EndRecoveredRunResult>;
 }
 
 /** The recovery actions, in display order, with copy + a recommendation note. */
@@ -56,11 +74,140 @@ export function RecoveryModal({
   fanPercent,
   enabledActions,
   onAction,
+  healthStale = false,
+  routineDispatchBlocked = false,
+  closureOnlyAvailable = false,
+  endRecoveredRunAvailable = false,
+  onRequestClosureOnly,
+  onEndRecoveredRun,
 }: RecoveryModalProps): React.JSX.Element | null {
+  const [closureConfirmationOpen, setClosureConfirmationOpen] = useState(false);
+  const [stopped, setStopped] = useState(false);
+  const [empty, setEmpty] = useState(false);
+  const [independentStopReady, setIndependentStopReady] = useState(false);
+  const [closureSubmitting, setClosureSubmitting] = useState(false);
+  const [closureError, setClosureError] = useState<string | null>(null);
+  const [closureReported, setClosureReported] = useState(false);
+  const [endSubmitting, setEndSubmitting] = useState(false);
+  const [endSubmitted, setEndSubmitted] = useState(false);
+  const [endError, setEndError] = useState<string | null>(null);
+  const firstClosureCheckRef = useRef<HTMLInputElement>(null);
+  const closureSubmissionInFlight = useRef(false);
+  const endSubmissionInFlight = useRef(false);
+
+  useEffect(() => {
+    if (closureConfirmationOpen) firstClosureCheckRef.current?.focus();
+  }, [closureConfirmationOpen]);
+
+  useEffect(() => {
+    if (closureOnlyAvailable) return;
+    setClosureConfirmationOpen(false);
+    setStopped(false);
+    setEmpty(false);
+    setIndependentStopReady(false);
+    setClosureReported(false);
+  }, [closureOnlyAvailable]);
+
+  // A stale-to-fresh transition is a new server observation, never a reason
+  // to reuse physical confirmations collected before the stale interval.
+  useEffect(() => {
+    setClosureConfirmationOpen(false);
+    setStopped(false);
+    setEmpty(false);
+    setIndependentStopReady(false);
+    setClosureReported(false);
+  }, [healthStale]);
+
+  useEffect(() => {
+    if (!endRecoveredRunAvailable) {
+      setEndError(null);
+      setEndSubmitted(false);
+    }
+  }, [endRecoveredRunAvailable]);
+
+  useEffect(() => {
+    if (open) return;
+    setClosureConfirmationOpen(false);
+    setStopped(false);
+    setEmpty(false);
+    setIndependentStopReady(false);
+    setClosureError(null);
+    setClosureReported(false);
+    setEndError(null);
+    setEndSubmitted(false);
+  }, [open]);
+
   if (!open) return null;
   // Emergency stop is always available (mirrors evaluate_emergency_stop); the
   // rest are gated by the server mirror.
   const enabled = new Set(enabledActions ?? []);
+  const routineRecoveryActions = RECOVERY_ACTIONS.filter(
+    ({ action }) => action !== "emergency_stop",
+  );
+  const emergencyStopAction = RECOVERY_ACTIONS.find(
+    ({ action }) => action === "emergency_stop",
+  );
+  const closureConfirmed = stopped && empty && independentStopReady;
+  const showClosureOnlyConfirmation =
+    !healthStale && closureOnlyAvailable && onRequestClosureOnly !== undefined;
+  const showRecoveredRunEnd =
+    !healthStale && endRecoveredRunAvailable && onEndRecoveredRun !== undefined;
+
+  const submitClosureOnly = async () => {
+    if (
+      !closureConfirmed ||
+      routineDispatchBlocked ||
+      closureSubmissionInFlight.current ||
+      onRequestClosureOnly === undefined
+    ) {
+      return;
+    }
+    closureSubmissionInFlight.current = true;
+    setClosureSubmitting(true);
+    setClosureError(null);
+    try {
+      const result = await onRequestClosureOnly();
+      if (result.outcome === "confirmed") {
+        setClosureReported(true);
+      } else {
+        setClosureError("Closure-only clearance was not confirmed. Check current status and retry.");
+      }
+    } catch (cause) {
+      setClosureError(
+        cause instanceof Error
+          ? cause.message
+          : "Could not record closure-only clearance. Check current status and retry.",
+      );
+    } finally {
+      // This is an explicit physical confirmation for one server admission.
+      // Never retain checks for a retry or a later server projection.
+      setStopped(false);
+      setEmpty(false);
+      setIndependentStopReady(false);
+      closureSubmissionInFlight.current = false;
+      setClosureSubmitting(false);
+    }
+  };
+
+  const submitRecoveredRunEnd = async () => {
+    if (routineDispatchBlocked || onEndRecoveredRun === undefined || endSubmissionInFlight.current) return;
+    endSubmissionInFlight.current = true;
+    setEndSubmitting(true);
+    setEndError(null);
+    try {
+      const result = await onEndRecoveredRun();
+      setEndSubmitted(result.outcome === "aborted");
+    } catch (cause) {
+      setEndError(
+        cause instanceof Error
+          ? cause.message
+          : "Could not end the recovered run. Check current status and retry.",
+      );
+    } finally {
+      endSubmissionInFlight.current = false;
+      setEndSubmitting(false);
+    }
+  };
 
   return (
     <div
@@ -99,35 +246,200 @@ export function RecoveryModal({
           <Readout label="Fan (locked)" value={formatPercent(fanPercent)} />
         </dl>
 
+        {emergencyStopAction !== undefined && (
+          <aside
+            data-testid="recovery-emergency-stop-container"
+            className="sticky top-0 z-10 flex flex-col gap-2 rounded-md border border-roast-fault/60 bg-card p-3 shadow-sm"
+          >
+            <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+              Emergency stop remains available
+            </span>
+            <button
+              type="button"
+              data-testid={`recovery-${emergencyStopAction.action}`}
+              data-enabled="true"
+              onClick={() => onAction(emergencyStopAction.action)}
+              className="flex items-center justify-between gap-4 rounded-md border border-roast-fault/60 px-4 py-3 text-left text-roast-fault transition-colors hover:bg-roast-fault/10"
+            >
+              <span className="text-sm font-semibold uppercase tracking-wide">
+                {emergencyStopAction.label}
+              </span>
+              <span className="text-xs text-muted-foreground">{emergencyStopAction.note}</span>
+            </button>
+          </aside>
+        )}
+
+        {showClosureOnlyConfirmation && (
+          <section
+            data-testid="closure-only-clearance"
+            className="flex flex-col gap-3 rounded-md border border-roast-caution/50 bg-roast-caution/10 p-4"
+          >
+            <h3 className="text-sm font-semibold uppercase tracking-wide text-roast-caution">
+              End recovered run only
+            </h3>
+            <p className="text-sm text-muted-foreground">
+              This can only ask the server to close the recovered run. It cannot resume,
+              start, drop, cool, or control the roaster.
+            </p>
+            {closureReported ? (
+              <p role="status" data-testid="closure-only-reported" className="text-sm text-roast-nominal">
+                Closure-only clearance was recorded. Wait for the current server status before ending
+                the recovered run.
+              </p>
+            ) : !closureConfirmationOpen ? (
+              <button
+                type="button"
+                data-testid="closure-only-open"
+                onClick={() => {
+                  setClosureError(null);
+                  setClosureConfirmationOpen(true);
+                }}
+                className="self-start rounded-md border border-roast-caution/50 px-4 py-2 text-sm font-semibold text-roast-caution transition-colors hover:bg-roast-caution/10"
+              >
+                Review physical safety checks
+              </button>
+            ) : (
+              <div className="flex flex-col gap-3 text-left" data-testid="closure-only-confirm">
+                <label className="flex items-start gap-3 text-sm text-foreground">
+                  <input
+                    ref={firstClosureCheckRef}
+                    type="checkbox"
+                    data-testid="closure-only-stopped"
+                    checked={stopped}
+                    onChange={(event) => setStopped(event.target.checked)}
+                    className="mt-0.5 h-4 w-4"
+                  />
+                  <span>I physically checked that the Hottop is stopped.</span>
+                </label>
+                <label className="flex items-start gap-3 text-sm text-foreground">
+                  <input
+                    type="checkbox"
+                    data-testid="closure-only-empty"
+                    checked={empty}
+                    onChange={(event) => setEmpty(event.target.checked)}
+                    className="mt-0.5 h-4 w-4"
+                  />
+                  <span>I physically checked that the Hottop is empty.</span>
+                </label>
+                <label className="flex items-start gap-3 text-sm text-foreground">
+                  <input
+                    type="checkbox"
+                    data-testid="closure-only-independent-stop"
+                    checked={independentStopReady}
+                    onChange={(event) => setIndependentStopReady(event.target.checked)}
+                    className="mt-0.5 h-4 w-4"
+                  />
+                  <span>The independent emergency stop is engaged or immediately ready.</span>
+                </label>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    data-testid="closure-only-submit"
+                    disabled={!closureConfirmed || closureSubmitting || routineDispatchBlocked}
+                    onClick={() => void submitClosureOnly()}
+                    className="rounded-md bg-roast-caution px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {closureSubmitting ? "Recording…" : "Record closure-only clearance"}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="closure-only-cancel"
+                    disabled={closureSubmitting}
+                    onClick={() => {
+                      setClosureConfirmationOpen(false);
+                      setStopped(false);
+                      setEmpty(false);
+                      setIndependentStopReady(false);
+                      setClosureError(null);
+                    }}
+                    className="rounded-md border border-border px-4 py-2 text-sm font-medium text-foreground"
+                  >
+                    Cancel
+                  </button>
+                </div>
+                {closureError !== null && (
+                  <p role="alert" data-testid="closure-only-error" className="text-xs text-roast-fault">
+                    {closureError}
+                  </p>
+                )}
+              </div>
+            )}
+          </section>
+        )}
+
+        {showRecoveredRunEnd && (
+          <section
+            data-testid="end-recovered-run"
+            className="flex flex-col gap-3 rounded-md border border-roast-fault/50 bg-roast-fault/10 p-4"
+          >
+            <h3 className="text-sm font-semibold uppercase tracking-wide text-roast-fault">
+              Server-authorised recovered-run closure
+            </h3>
+            <p className="text-sm text-muted-foreground">
+              End closes this recovered run only. It does not prove a physical safe state or permit a
+              new roast.
+            </p>
+            <button
+              type="button"
+              data-testid="end-recovered-run-submit"
+              disabled={endSubmitting || endSubmitted || routineDispatchBlocked}
+              onClick={() => void submitRecoveredRunEnd()}
+              className="self-start rounded-md bg-roast-fault px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {endSubmitting ? "Ending…" : endSubmitted ? "End requested" : "End recovered run"}
+            </button>
+            {endError !== null && (
+              <p role="alert" data-testid="end-recovered-run-error" className="text-xs text-roast-fault">
+                {endError}
+              </p>
+            )}
+          </section>
+        )}
+
         <div className="flex flex-col gap-2">
           <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Select Recovery Action
           </span>
-          {RECOVERY_ACTIONS.map(({ action, label, note }) => {
-            const isEnabled = action === "emergency_stop" || enabled.has(action);
-            return (
-              <button
-                key={action}
-                type="button"
-                data-testid={`recovery-${action}`}
-                data-enabled={isEnabled ? "true" : "false"}
-                disabled={!isEnabled}
-                aria-disabled={!isEnabled}
-                onClick={() => onAction(action)}
-                className={cn(
-                  "flex items-center justify-between gap-4 rounded-md border px-4 py-3 text-left transition-colors",
-                  isEnabled
-                    ? "border-border bg-secondary hover:bg-accent"
-                    : "cursor-not-allowed border-border/40 text-muted-foreground/50",
-                  action === "emergency_stop" && isEnabled && "border-roast-fault/60 text-roast-fault",
-                )}
-              >
-                <span className="text-sm font-semibold uppercase tracking-wide">{label}</span>
-                <span className="text-xs text-muted-foreground">{note}</span>
-              </button>
-            );
-          })}
+          {routineRecoveryActions
+            .filter(({ action }) => !healthStale && enabled.has(action))
+            .map(({ action, label, note }) => {
+              return (
+                <button
+                  key={action}
+                  type="button"
+                  data-testid={`recovery-${action}`}
+                    data-enabled={routineDispatchBlocked ? "false" : "true"}
+                    disabled={routineDispatchBlocked}
+                    aria-disabled={routineDispatchBlocked}
+                    onClick={() => {
+                      if (routineDispatchBlocked) return;
+                      onAction(action);
+                    }}
+                  className={cn(
+                    "flex items-center justify-between gap-4 rounded-md border px-4 py-3 text-left transition-colors",
+                    routineDispatchBlocked
+                      ? "cursor-not-allowed border-border/40 bg-transparent text-muted-foreground/50"
+                      : "border-border bg-secondary hover:bg-accent",
+                  )}
+                >
+                  <span className="text-sm font-semibold uppercase tracking-wide">{label}</span>
+                  <span className="text-xs text-muted-foreground">{note}</span>
+                </button>
+              );
+            })}
         </div>
+        {healthStale && (
+          <p data-testid="recovery-health-stale" className="text-xs text-roast-fault">
+            Health status is stale. Recovery actions are disabled until it recovers; emergency
+            stop remains available.
+          </p>
+        )}
+        {!healthStale && routineDispatchBlocked && (
+          <p data-testid="recovery-refresh-pending" role="status" className="text-xs text-muted-foreground">
+            Refreshing server authority. Recovery actions are temporarily unavailable; physical
+            confirmations remain recorded. Emergency stop remains available.
+          </p>
+        )}
       </div>
     </div>
   );

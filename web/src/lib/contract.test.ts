@@ -25,12 +25,14 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
+import { isCoherentRestartClearance } from "@/lib/faultControls";
 import { parseCatalogueRecommendationList } from "@/lib/types";
 import {
   applyEvent,
   hydrate,
   initialRoastStreamState,
 } from "@/hooks/roastStreamReducer";
+import { SSE_EVENT_TYPES } from "@/hooks/useRoastStream";
 import {
   dashboardReducer,
   initialDashboardViewModel,
@@ -40,14 +42,18 @@ import type {
   MicHealth,
   MicStatus,
   RoastDetail,
+  RoastEventKind,
   RoastPhase,
   RoastSummary,
   CatalogueRecommendationList,
+  FaultControlsEventData,
   SseEvent,
   SseEventType,
   TelemetryEventData,
   TelemetryPoint,
   TelemetrySeries,
+  TimelineEvent,
+  RestartClearance,
 } from "@/lib/types";
 
 // --- Fixture loading -------------------------------------------------------
@@ -124,6 +130,81 @@ const FC_STATUSES: readonly FcStatus[] = [
   "unavailable",
 ];
 
+describe("restart-clearance contract", () => {
+  it("accepts the server's typed D216 closure-only projection", () => {
+    const projection = {
+      state: "closure_only",
+      eligible: false,
+      enabled_actions: ["end_recovered_run"],
+      closure_only_available: false,
+    } satisfies RestartClearance;
+
+    expect(projection.enabled_actions).toEqual(["end_recovered_run"]);
+  });
+
+  it("accepts D220 only as a required-gate server action", () => {
+    expect(
+      isCoherentRestartClearance({
+        state: "required",
+        eligible: false,
+        enabled_actions: ["initialize_safety_record"],
+        closure_only_available: false,
+      }),
+    ).toBe(true);
+    expect(
+      isCoherentRestartClearance({
+        state: "closure_only",
+        eligible: false,
+        enabled_actions: ["initialize_safety_record"],
+        closure_only_available: false,
+      }),
+    ).toBe(false);
+    expect(
+      isCoherentRestartClearance({
+        state: "required",
+        eligible: false,
+        enabled_actions: ["initialize_safety_record"],
+        closure_only_available: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("fails closed for incoherent server closure-only projections", () => {
+    expect(
+      isCoherentRestartClearance({
+        state: "closure_only",
+        eligible: false,
+        enabled_actions: ["end_recovered_run"],
+        closure_only_available: false,
+      }),
+    ).toBe(true);
+    expect(
+      isCoherentRestartClearance({
+        state: "closure_only",
+        eligible: true,
+        enabled_actions: ["end_recovered_run"],
+        closure_only_available: false,
+      }),
+    ).toBe(false);
+    expect(
+      isCoherentRestartClearance({
+        state: "required",
+        eligible: false,
+        enabled_actions: [],
+        closure_only_available: true,
+      }),
+    ).toBe(true);
+    expect(
+      isCoherentRestartClearance({
+        state: "required",
+        eligible: false,
+        enabled_actions: ["end_recovered_run"],
+        closure_only_available: true,
+      }),
+    ).toBe(false);
+  });
+});
+
 describe("catalogue recommendation REST contract", () => {
   it("accepts the real server-dumped response and pins every reason code", () => {
     const parsed = parseCatalogueRecommendationList(rest.catalogue_recommendations);
@@ -169,6 +250,9 @@ describe("SSE contract — every event type has a real frame", () => {
     "fault",
     "recovery_required",
     "recovery_acknowledged",
+    "fault_acknowledgement_executed",
+    "fault_controls_changed",
+    "fault_controls_acknowledged",
     "logs_exported",
     "run_completed",
     "telemetry",
@@ -178,6 +262,59 @@ describe("SSE contract — every event type has a real frame", () => {
   it("the fixture covers exactly the SseEventType set the SPA declares", () => {
     const inFixture = new Set(sse.frames.map((f) => f.event));
     expect([...inFixture].sort()).toEqual([...EXPECTED_EVENT_TYPES].sort());
+  });
+
+  it("registers an EventSource listener for every server fixture event", () => {
+    expect([...SSE_EVENT_TYPES].sort()).toEqual([...EXPECTED_EVENT_TYPES].sort());
+  });
+});
+
+describe("fault-control lease SSE contract", () => {
+  it("carries the server-authoritative generation, status, and outcome projection", () => {
+    const changed = frame("fault_controls_changed").data as unknown as FaultControlsEventData;
+    const acknowledged = frame("fault_controls_acknowledged").data as unknown as FaultControlsEventData;
+
+    for (const data of [changed, acknowledged]) {
+      expectKeys(data as unknown as Record<string, unknown>, [
+        "generation",
+        "status",
+        "outcome",
+      ]);
+      expect(typeof data.generation).toBe("number");
+      expect(["closed", "open", "unknown"]).toContain(data.status);
+      expect(["confirmed", "failed"]).toContain(data.outcome);
+    }
+
+    expect(changed).toMatchObject({ generation: 1, status: "open", outcome: "confirmed" });
+    expect(acknowledged).toMatchObject({
+      generation: 1,
+      status: "closed",
+      outcome: "confirmed",
+    });
+  });
+
+  it("recognises the server's persisted fault-control timeline kinds", () => {
+    const events: readonly TimelineEvent[] = [
+      {
+        kind: "fault_controls_changed" satisfies RoastEventKind,
+        source: "safety",
+        monotonic_seconds: null,
+        recorded_at_utc: "2026-10-08T00:00:00Z",
+        payload: frame("fault_controls_changed").data,
+      },
+      {
+        kind: "fault_controls_acknowledged" satisfies RoastEventKind,
+        source: "safety",
+        monotonic_seconds: null,
+        recorded_at_utc: "2026-10-08T00:00:01Z",
+        payload: frame("fault_controls_acknowledged").data,
+      },
+    ];
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "fault_controls_changed",
+      "fault_controls_acknowledged",
+    ]);
   });
 });
 

@@ -63,6 +63,10 @@ export interface OperatorActionBarProps {
   onAction: (action: OperatorAction) => void;
   /** The most recent action outcome — its reason is surfaced inline. */
   lastResult?: OperatorActionResultView | null;
+  /** A failed health refresh leaves only the guarded emergency stop available. */
+  healthStale?: boolean;
+  /** A recovery-only health refresh temporarily disables routine actions. */
+  routineActionsRefreshPending?: boolean;
 }
 
 export function OperatorActionBar({
@@ -70,10 +74,13 @@ export function OperatorActionBar({
   phase,
   onAction,
   lastResult,
+  healthStale = false,
+  routineActionsRefreshPending = false,
 }: OperatorActionBarProps): React.JSX.Element {
   // Two-step guard for emergency stop: the first press arms, the second fires.
   const [estopArmed, setEstopArmed] = useState(false);
   const enabled = new Set(enabledActions ?? []);
+  const routineActionsBlocked = healthStale || routineActionsRefreshPending;
   const isTerminal = phase !== null && TERMINAL_PHASES.has(phase);
 
   const visibleButtons = ACTION_BUTTONS.filter(
@@ -112,7 +119,7 @@ export function OperatorActionBar({
       </button>
 
       {visibleButtons.map(({ action, label }) => {
-        const isEnabled = enabled.has(action);
+        const isEnabled = !routineActionsBlocked && enabled.has(action);
         return (
           <button
             key={action}
@@ -133,6 +140,17 @@ export function OperatorActionBar({
           </button>
         );
       })}
+
+      {healthStale && (
+        <span data-testid="operator-actions-health-stale" className="text-xs text-roast-fault">
+          Health status is stale. Routine actions are disabled until it recovers.
+        </span>
+      )}
+      {!healthStale && routineActionsRefreshPending && (
+        <span data-testid="operator-actions-refresh-pending" className="text-xs text-muted-foreground">
+          Refreshing server authority. Routine recovery actions are temporarily unavailable.
+        </span>
+      )}
 
       {/* Typed result feedback — the server's reason, never a client verdict. */}
       {lastResult && lastResult.result !== "accepted" && (
