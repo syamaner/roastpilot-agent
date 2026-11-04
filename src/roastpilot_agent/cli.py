@@ -33,7 +33,6 @@ from typing import TYPE_CHECKING, cast
 import uvicorn
 
 from roastpilot_agent import __version__
-from roastpilot_agent.api import ShutdownHeatOffOutcome
 
 if TYPE_CHECKING:
     from roastpilot_agent.api import RoastService
@@ -1069,6 +1068,11 @@ async def _teardown_live(
         mcp: The MCP child process to stop after heat-off has landed.
         store: The decision-trace store to close last.
     """
+    # Import only on the live teardown path. Normal CLI operations (notably
+    # ``--help`` and replay) must not initialise the API stack merely to name a
+    # teardown-only outcome enum.
+    from roastpilot_agent.api import ShutdownHeatOffOutcome
+
     # Only explicit no-op outcomes may pair with durable idle evidence. An
     # unconfirmed active e-stop remains fail-closed even if the store read is
     # unexpectedly empty. The epoch marker rechecks its durable state after

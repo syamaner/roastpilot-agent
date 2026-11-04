@@ -17,7 +17,7 @@ export type FaultAcknowledgementStatus =
 
 export interface FaultAcknowledgementControlProps {
   /** Dispatches the server-authorised acknowledge action after confirmation. */
-  onConfirm: () => void;
+  onConfirm: () => boolean | void;
   /** Server-event-derived acknowledgement state. */
   status: FaultAcknowledgementStatus;
 }
@@ -75,8 +75,9 @@ export function FaultAcknowledgementControl({
         onClick={() => {
           if (submitting) return;
           if (confirming) {
-            setSubmitting(true);
-            onConfirm();
+            if (onConfirm() !== false) {
+              setSubmitting(true);
+            }
             return;
           }
           setConfirming(true);

@@ -36,6 +36,8 @@ export interface TerminalFaultControlsProps {
   controls: FaultControls;
   /** A current server restart-clearance gate keeps all routine controls disabled. */
   routineControlsDisabled?: boolean;
+  /** A health refresh temporarily blocks routine controls without implying clearance state. */
+  routineControlsRefreshPending?: boolean;
   /** Calls the server-resolved global terminal-fault action endpoint. */
   onAction: (
     action: TerminalFaultAction,
@@ -48,6 +50,7 @@ export interface TerminalFaultControlsProps {
 export function TerminalFaultControls({
   controls,
   routineControlsDisabled = false,
+  routineControlsRefreshPending = false,
   onAction,
 }: TerminalFaultControlsProps): React.JSX.Element {
   const leaseKey = `${controls.status}:${controls.generation ?? "none"}`;
@@ -90,6 +93,8 @@ export function TerminalFaultControls({
     (action) =>
       controls.enabled_actions.includes(action) && (!isUnknown || action === "emergency_stop"),
   );
+  const closedLeaseEmergencyStop =
+    controls.status === "closed" && enabledActions.includes("emergency_stop");
 
   const submit = async (
     action: TerminalFaultAction,
@@ -167,6 +172,7 @@ export function TerminalFaultControls({
         ? result.value
         : null;
   const hasPendingEmergencyStop = pendingEmergencyRequestIds.length > 0;
+  const routineControlsBlocked = routineControlsDisabled || routineControlsRefreshPending;
   const acknowledgementGeneration =
     typeof controls.generation === "number" &&
     Number.isSafeInteger(controls.generation) &&
@@ -183,12 +189,18 @@ export function TerminalFaultControls({
     >
       <div className="flex flex-col gap-2">
         <h2 className="text-lg font-bold uppercase tracking-wide text-roast-fault">
-          {isUnknown ? "Fault control status unknown" : "Fault controls remain available"}
+          {isUnknown
+            ? "Fault control status unknown"
+            : closedLeaseEmergencyStop
+              ? "Emergency stop remains available"
+              : "Fault controls remain available"}
         </h2>
         <p className="text-sm text-muted-foreground">
           {isUnknown
             ? "The Agent cannot confirm the durable fault-control state. If heat or fan may be active, use the independent physical emergency stop. Only controls explicitly listed by the server can be attempted here."
-            : "The historical roast record may be terminal, but the current fault-control lease remains open. Use only the controls listed by the server."}
+            : closedLeaseEmergencyStop
+              ? "The terminal-fault lease is closed. The server still authorises this emergency stop; no other software fault controls are available here."
+              : "The historical roast record may be terminal, but the current fault-control lease remains open. Use only the controls listed by the server."}
         </p>
         <p className="text-xs text-muted-foreground">
           This page does not confirm that any physical command completed. Check the server status after an action.
@@ -291,13 +303,13 @@ export function TerminalFaultControls({
                     disabled={
                       pendingOrdinaryAction !== null ||
                       hasPendingEmergencyStop ||
-                      routineControlsDisabled ||
+                      routineControlsBlocked ||
                       acknowledgementGeneration === null
                     }
                     onClick={() => {
                       if (
                         hasPendingEmergencyStop ||
-                        routineControlsDisabled ||
+                        routineControlsBlocked ||
                         acknowledgementGeneration === null
                       ) {
                         return;
@@ -353,10 +365,10 @@ export function TerminalFaultControls({
                 disabled={
                   pendingOrdinaryAction !== null ||
                   hasPendingEmergencyStop ||
-                  routineControlsDisabled
+                  routineControlsBlocked
                 }
                 onClick={() => {
-                  if (hasPendingEmergencyStop || routineControlsDisabled) return;
+                  if (hasPendingEmergencyStop || routineControlsBlocked) return;
                   void submit(action);
                 }}
                 className="rounded-md border border-border bg-secondary px-4 py-2 text-sm font-semibold text-secondary-foreground transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
@@ -376,6 +388,17 @@ export function TerminalFaultControls({
         >
           Restart clearance remains required. Routine controls stay disabled until the server
           confirms clearance; emergency stop remains available.
+        </p>
+      )}
+
+      {!routineControlsDisabled && routineControlsRefreshPending && (
+        <p
+          role="status"
+          data-testid="terminal-fault-controls-refresh-pending"
+          className="text-xs text-muted-foreground"
+        >
+          Refreshing server authority. Routine controls are temporarily unavailable; emergency stop
+          remains available.
         </p>
       )}
 

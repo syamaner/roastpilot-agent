@@ -49,6 +49,7 @@ from roastpilot_agent.api import (
     RoastRunner,
     RoastRunNotFoundError,
     RoastService,
+    ShutdownHeatOffOutcome,
     _before_the_minute,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     _parse_last_event_id,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     create_app,
@@ -5147,6 +5148,92 @@ async def _live_service(
     )
     detail = await service.start_roast(profile or _profile())
     return service, detail.id
+
+
+class _ShutdownEmergencyStopMCP(FakeMCPClient):
+    """Fake live MCP with deterministic shutdown e-stop outcomes."""
+
+    def __init__(self, outcomes: list[Exception | None]) -> None:
+        """Set the ordered outcomes returned by emergency-stop calls."""
+        super().__init__([_reading(178.0, 185.0)])
+        self._outcomes = outcomes
+
+    async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
+        """Record and then raise or confirm the next scripted e-stop."""
+        outcome = self._outcomes.pop(0)
+        if outcome is not None:
+            self.calls.append(("emergency_stop", {"reason": reason}))
+            raise outcome
+        return await super().emergency_stop(reason=reason)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_heat_off_retries_a_caught_mcp_error_until_confirmed(
+    store: RoastStore,
+) -> None:
+    """A faulted first e-stop remains unconfirmed until the retry reaches MCP."""
+    mcp = _ShutdownEmergencyStopMCP([RuntimeError("first e-stop failed"), None])
+    service, run_id = await _live_service(store, mcp=mcp, clock=FakeClock())
+
+    try:
+        outcome = await service.safe_shutdown_heat_off(timeout_seconds=0.1)
+
+        assert outcome is ShutdownHeatOffOutcome.DISPATCHED
+        reasons = [
+            str(args["reason"]) for command, args in mcp.calls if command == "emergency_stop"
+        ]
+        assert len(reasons) == 2
+        assert "graceful shutdown" in reasons[0]
+        assert "graceful shutdown retry" in reasons[1]
+        run = await store.read_run(run_id)
+        assert run is not None and run.agent_phase is RoastPhase.FAULTED
+        timeline = await store.read_timeline(run_id)
+        assert not any(
+            event.kind is RoastEventKind.COMMAND_FAILED
+            and isinstance(event.payload, dict)
+            and event.payload.get("context") == "shutdown"
+            for event in timeline.events
+        )
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_heat_off_marks_persistent_mcp_errors_unconfirmed(
+    store: RoastStore,
+) -> None:
+    """Two caught MCP errors retain the fault and record the shutdown marker."""
+    mcp = _ShutdownEmergencyStopMCP(
+        [RuntimeError("first e-stop failed"), RuntimeError("retry failed")]
+    )
+    service, run_id = await _live_service(store, mcp=mcp, clock=FakeClock())
+
+    try:
+        outcome = await service.safe_shutdown_heat_off(timeout_seconds=0.1)
+
+        assert outcome is ShutdownHeatOffOutcome.UNCONFIRMED
+        reasons = [
+            str(args["reason"]) for command, args in mcp.calls if command == "emergency_stop"
+        ]
+        assert len(reasons) == 2
+        assert "graceful shutdown" in reasons[0]
+        assert "graceful shutdown retry" in reasons[1]
+        run = await store.read_run(run_id)
+        assert run is not None and run.agent_phase is RoastPhase.FAULTED
+        timeline = await store.read_timeline(run_id)
+        assert any(
+            event.kind is RoastEventKind.COMMAND_FAILED
+            and event.payload
+            == {
+                "command": "shutdown_heat_off",
+                "context": "shutdown",
+                "unconfirmed": True,
+                "reason": "unconfirmed",
+            }
+            for event in timeline.events
+        )
+    finally:
+        await service.shutdown()
 
 
 async def _tick(service: RoastService, clock: FakeClock) -> bool:

@@ -80,8 +80,9 @@ const healthState: {
     | undefined;
   isSuccess: boolean;
   isError: boolean;
+  isFetching: boolean;
   isFresh: boolean;
-} = { data: undefined, isSuccess: false, isError: false, isFresh: false };
+} = { data: undefined, isSuccess: false, isError: false, isFetching: false, isFresh: false };
 
 // Mutable history stub (#523, updated #532 Codex follow-up): LivePage's
 // persistent idle fallback. `isFresh` models `useFreshHistoryGate` — the same
@@ -215,6 +216,7 @@ beforeEach(() => {
   healthState.data = undefined;
   healthState.isSuccess = false;
   healthState.isError = false;
+  healthState.isFetching = false;
   // Default to a SETTLED read (matches the overwhelming majority of this
   // file's tests, which set isSuccess/isError explicitly right after this
   // runs); the loading-hold-specific tests below override isFresh to false.
@@ -430,6 +432,72 @@ describe("LivePage — active run", () => {
 });
 
 describe("LivePage — terminal fault lease", () => {
+  it("keeps an explicitly server-enabled CLOSED e-stop available on an idle projection", async () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: null,
+      fault_controls: {
+        status: "closed",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("terminal-fault-controls")).toHaveAttribute(
+      "data-status",
+      "closed",
+    );
+    expect(
+      screen.getByText(
+        "The terminal-fault lease is closed. The server still authorises this emergency stop; no other software fault controls are available here.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+
+    const emergencyStop = screen.getByTestId("terminal-fault-action-emergency_stop");
+    fireEvent.click(emergencyStop);
+    fireEvent.click(emergencyStop);
+    await waitFor(() =>
+      expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }),
+    );
+    expect(operatorActionMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the active dashboard ahead of a CLOSED e-stop projection", () => {
+    healthState.isSuccess = true;
+    healthState.data = {
+      active_run_id: "run-live",
+      fault_controls: {
+        status: "closed",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-fault-controls")).toBeNull();
+  });
+
+  it("does not render a cached CLOSED e-stop after a health error", () => {
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    healthState.data = {
+      active_run_id: null,
+      fault_controls: {
+        status: "closed",
+        generation: null,
+        enabled_actions: ["emergency_stop"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("live-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-fault-controls")).toBeNull();
+  });
+
   it("uses global controls instead of the dashboard while an active run has an open terminal lease", async () => {
     healthState.isSuccess = true;
     healthState.data = {
@@ -472,6 +540,27 @@ describe("LivePage — terminal fault lease", () => {
 
     expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeEnabled();
     expect(screen.getByTestId("terminal-fault-action-start_cooling")).toBeDisabled();
+  });
+
+  it("uses an honest refresh notice instead of a restart-clearance notice during a health refetch", () => {
+    healthState.isSuccess = true;
+    healthState.isError = false;
+    healthState.isFetching = true;
+    healthState.isFresh = true;
+    healthState.data = {
+      active_run_id: null,
+      fault_controls: {
+        status: "open",
+        generation: 6,
+        enabled_actions: ["emergency_stop", "start_cooling"],
+      },
+    };
+    renderPage();
+
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeEnabled();
+    expect(screen.getByTestId("terminal-fault-action-start_cooling")).toBeDisabled();
+    expect(screen.getByTestId("terminal-fault-controls-refresh-pending")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-fault-controls-restart-clearance-required")).toBeNull();
   });
 
   it("shows restart clearance with an open terminal lease and leaves only e-stop enabled", () => {

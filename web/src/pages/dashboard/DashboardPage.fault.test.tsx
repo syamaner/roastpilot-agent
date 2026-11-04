@@ -61,6 +61,19 @@ const operatorActionMock = vi.hoisted(() =>
     queued: true,
   })),
 );
+const requestClosureOnlyClearanceMock = vi.hoisted(() =>
+  vi.fn(async () => ({
+    outcome: "confirmed" as const,
+    closure_only: true,
+    restart_clearance: {
+      state: "closure_only" as const,
+      eligible: false,
+      enabled_actions: ["end_recovered_run"],
+      closure_only_available: false,
+    },
+    fault_controls: { status: "closed" as const, generation: null, enabled_actions: [] },
+  })),
+);
 const timelineApiMock = vi.hoisted(() =>
   vi.fn<(runId: string) => Promise<RoastTimeline>>(),
 );
@@ -71,6 +84,7 @@ vi.mock("@/lib/api", async () => {
     api: {
       ...actual.api,
       operatorAction: operatorActionMock,
+      requestClosureOnlyClearance: requestClosureOnlyClearanceMock,
       timeline: timelineApiMock,
     },
   };
@@ -91,6 +105,7 @@ const healthState = {
       }
     | undefined,
   isSuccess: false,
+  isFetching: false,
 };
 
 // The run snapshot (`useRoast`) — mutable so the #329 hydrate-onto-faulted case can
@@ -206,6 +221,8 @@ afterEach(cleanup);
 beforeEach(() => {
   healthState.data = undefined;
   healthState.isSuccess = false;
+  healthState.isFetching = false;
+  requestClosureOnlyClearanceMock.mockClear();
   roastState.data = undefined;
   roastState.isSuccess = false;
   viewState.fault = null;
@@ -859,7 +876,7 @@ describe("DashboardPage stale-health controls", () => {
     streamState.phase = "operator_recovery_required";
     // D216 admission is not a phase change, so this connected SSE mirror does
     // not receive End. The dedicated fresh run-detail projection owns it.
-    streamState.enabledActions = ["emergency_stop"];
+    streamState.enabledActions = ["start_cooling", "emergency_stop"];
     roastState.isSuccess = true;
     roastState.data = {
       id: "run-recovered",
@@ -922,6 +939,141 @@ describe("DashboardPage stale-health controls", () => {
       }),
     );
     expect(operatorActionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves ordinary active-roast actions during a retained successful health refetch", async () => {
+    healthState.isSuccess = true;
+    healthState.isFetching = true;
+    healthState.data = { active_run_id: "run-live", mcp_child: "stopped" };
+    streamState.phase = "development";
+    streamState.enabledActions = ["drop_beans", "mark_first_crack", "emergency_stop"];
+    roastState.data = {
+      id: "run-live",
+      agent_phase: "development",
+      fault_reason: null,
+      enabled_actions: ["drop_beans", "mark_first_crack", "emergency_stop"],
+      profile: SNAPSHOT_PROFILE,
+    };
+
+    renderPage();
+
+    expect(screen.getByTestId("action-drop_beans")).toBeEnabled();
+    expect(screen.getByTestId("action-mark_first_crack")).toBeEnabled();
+    expect(screen.queryByTestId("operator-actions-health-stale")).toBeNull();
+    expect(screen.queryByTestId("operator-actions-refresh-pending")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("action-drop_beans"));
+    fireEvent.click(screen.getByTestId("action-mark_first_crack"));
+    await waitFor(() =>
+      expect(operatorActionMock).toHaveBeenNthCalledWith(1, "run-live", { action: "drop_beans" }),
+    );
+    expect(operatorActionMock).toHaveBeenNthCalledWith(2, "run-live", {
+      action: "mark_first_crack",
+    });
+  });
+
+  it("preserves D216 physical checks through a routine health poll", async () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-recovery", mcp_child: "stopped" };
+    healthState.data.restart_clearance = {
+      state: "required",
+      eligible: false,
+      enabled_actions: [],
+      closure_only_available: true,
+    };
+    streamState.phase = "operator_recovery_required";
+    streamState.enabledActions = ["start_cooling", "emergency_stop"];
+    roastState.data = {
+      id: "run-recovery",
+      agent_phase: "operator_recovery_required",
+      fault_reason: null,
+      enabled_actions: ["start_cooling", "emergency_stop"],
+      profile: SNAPSHOT_PROFILE,
+    };
+
+    const page = renderPage();
+    fireEvent.click(screen.getByTestId("closure-only-open"));
+    fireEvent.click(screen.getByTestId("closure-only-stopped"));
+    fireEvent.click(screen.getByTestId("closure-only-empty"));
+    fireEvent.click(screen.getByTestId("closure-only-independent-stop"));
+
+    healthState.isFetching = true;
+    page.rerender(
+      <QueryClientProvider client={page.client}>
+        <MemoryRouter>
+          <DashboardPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByTestId("recovery-modal")).toBeInTheDocument();
+    expect(screen.getByTestId("closure-only-stopped")).toBeChecked();
+    expect(screen.getByTestId("closure-only-empty")).toBeChecked();
+    expect(screen.getByTestId("closure-only-independent-stop")).toBeChecked();
+    expect(screen.getByTestId("recovery-emergency_stop")).toBeEnabled();
+    expect(screen.getByTestId("recovery-start_cooling")).toBeDisabled();
+    expect(screen.getByTestId("action-start_cooling")).toBeDisabled();
+    expect(screen.queryByTestId("recovery-health-stale")).toBeNull();
+    expect(screen.getByTestId("recovery-refresh-pending")).toBeInTheDocument();
+    expect(screen.getByTestId("operator-actions-refresh-pending")).toBeInTheDocument();
+    expect(screen.getByTestId("closure-only-submit")).toBeDisabled();
+    expect(requestClosureOnlyClearanceMock).not.toHaveBeenCalled();
+
+    healthState.isFetching = false;
+    page.rerender(
+      <QueryClientProvider client={page.client}>
+        <MemoryRouter>
+          <DashboardPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByTestId("closure-only-stopped")).toBeChecked();
+    expect(screen.getByTestId("closure-only-empty")).toBeChecked();
+    expect(screen.getByTestId("closure-only-independent-stop")).toBeChecked();
+    expect(screen.queryByTestId("recovery-refresh-pending")).toBeNull();
+    expect(screen.getByTestId("closure-only-submit")).toBeEnabled();
+    expect(screen.getByTestId("recovery-start_cooling")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("closure-only-submit"));
+    await waitFor(() => expect(requestClosureOnlyClearanceMock).toHaveBeenCalledOnce());
+  });
+
+  it("preserves the fault acknowledgement confirmation through a routine health poll", async () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
+    streamState.phase = "faulted";
+    streamState.enabledActions = ["acknowledge_fault", "emergency_stop"];
+    roastState.data = {
+      id: "run-fault",
+      agent_phase: "faulted",
+      fault_reason: "env ceiling exceeded",
+      enabled_actions: ["acknowledge_fault", "emergency_stop"],
+      profile: SNAPSHOT_PROFILE,
+    };
+
+    const page = renderPage();
+    fireEvent.click(screen.getByTestId("fault-acknowledge"));
+    expect(screen.getByTestId("fault-acknowledgement-confirmation")).toBeInTheDocument();
+
+    healthState.isFetching = true;
+    page.rerender(
+      <QueryClientProvider client={page.client}>
+        <MemoryRouter>
+          <DashboardPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByTestId("fault-acknowledgement-confirmation")).toBeInTheDocument();
+    expect(screen.getByTestId("action-emergency_stop")).toBeEnabled();
+
+    fireEvent.click(screen.getByTestId("fault-acknowledge"));
+    await waitFor(() =>
+      expect(operatorActionMock).toHaveBeenCalledWith("run-fault", {
+        action: "acknowledge_fault",
+      }),
+    );
+    expect(screen.getByTestId("fault-acknowledgement-pending")).toBeInTheDocument();
   });
 });
 

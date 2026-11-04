@@ -38,6 +38,8 @@ export interface RecoveryModalProps {
   onAction: (action: OperatorAction) => void;
   /** A failed health refresh leaves only emergency stop available. */
   healthStale?: boolean;
+  /** A routine health poll temporarily blocks writes without resetting confirmations. */
+  routineDispatchBlocked?: boolean;
   /** Server projection for the separate D216 physical-confirmation path. */
   closureOnlyAvailable?: boolean;
   /** Server projection for the dedicated D216 End path. */
@@ -73,6 +75,7 @@ export function RecoveryModal({
   enabledActions,
   onAction,
   healthStale = false,
+  routineDispatchBlocked = false,
   closureOnlyAvailable = false,
   endRecoveredRunAvailable = false,
   onRequestClosureOnly,
@@ -151,7 +154,12 @@ export function RecoveryModal({
     !healthStale && endRecoveredRunAvailable && onEndRecoveredRun !== undefined;
 
   const submitClosureOnly = async () => {
-    if (!closureConfirmed || closureSubmissionInFlight.current || onRequestClosureOnly === undefined) {
+    if (
+      !closureConfirmed ||
+      routineDispatchBlocked ||
+      closureSubmissionInFlight.current ||
+      onRequestClosureOnly === undefined
+    ) {
       return;
     }
     closureSubmissionInFlight.current = true;
@@ -182,7 +190,7 @@ export function RecoveryModal({
   };
 
   const submitRecoveredRunEnd = async () => {
-    if (onEndRecoveredRun === undefined || endSubmissionInFlight.current) return;
+    if (routineDispatchBlocked || onEndRecoveredRun === undefined || endSubmissionInFlight.current) return;
     endSubmissionInFlight.current = true;
     setEndSubmitting(true);
     setEndError(null);
@@ -327,7 +335,7 @@ export function RecoveryModal({
                   <button
                     type="button"
                     data-testid="closure-only-submit"
-                    disabled={!closureConfirmed || closureSubmitting}
+                    disabled={!closureConfirmed || closureSubmitting || routineDispatchBlocked}
                     onClick={() => void submitClosureOnly()}
                     className="rounded-md bg-roast-caution px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
                   >
@@ -374,7 +382,7 @@ export function RecoveryModal({
             <button
               type="button"
               data-testid="end-recovered-run-submit"
-              disabled={endSubmitting || endSubmitted}
+              disabled={endSubmitting || endSubmitted || routineDispatchBlocked}
               onClick={() => void submitRecoveredRunEnd()}
               className="self-start rounded-md bg-roast-fault px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
             >
@@ -400,11 +408,18 @@ export function RecoveryModal({
                   key={action}
                   type="button"
                   data-testid={`recovery-${action}`}
-                  data-enabled="true"
-                  onClick={() => onAction(action)}
+                    data-enabled={routineDispatchBlocked ? "false" : "true"}
+                    disabled={routineDispatchBlocked}
+                    aria-disabled={routineDispatchBlocked}
+                    onClick={() => {
+                      if (routineDispatchBlocked) return;
+                      onAction(action);
+                    }}
                   className={cn(
                     "flex items-center justify-between gap-4 rounded-md border px-4 py-3 text-left transition-colors",
-                    "border-border bg-secondary hover:bg-accent",
+                    routineDispatchBlocked
+                      ? "cursor-not-allowed border-border/40 bg-transparent text-muted-foreground/50"
+                      : "border-border bg-secondary hover:bg-accent",
                   )}
                 >
                   <span className="text-sm font-semibold uppercase tracking-wide">{label}</span>
@@ -417,6 +432,12 @@ export function RecoveryModal({
           <p data-testid="recovery-health-stale" className="text-xs text-roast-fault">
             Health status is stale. Recovery actions are disabled until it recovers; emergency
             stop remains available.
+          </p>
+        )}
+        {!healthStale && routineDispatchBlocked && (
+          <p data-testid="recovery-refresh-pending" role="status" className="text-xs text-muted-foreground">
+            Refreshing server authority. Recovery actions are temporarily unavailable; physical
+            confirmations remain recorded. Emergency stop remains available.
           </p>
         )}
       </div>

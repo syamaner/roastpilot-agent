@@ -1447,6 +1447,47 @@ async def test_live_teardown_resists_repeated_cancellation() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_live_teardown_never_marks_epoch_clean_after_unconfirmed_heat_off() -> None:
+    """A failed shutdown e-stop remains an unclean process epoch after teardown."""
+    order: list[str] = []
+
+    class _Service:
+        async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
+            order.append("heat-off")
+            return ShutdownHeatOffOutcome.UNCONFIRMED
+
+        async def shutdown(self) -> None:
+            order.append("service-stop")
+
+        async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+            order.append(f"child-stop:{stop_unconfirmed}")
+
+        async def mark_process_epoch_clean_after_ordered_teardown(self) -> None:
+            order.append("epoch-clean")
+
+    class _MCP:
+        stop_unconfirmed = False
+
+        async def stop(self) -> None:
+            order.append("mcp-stop")
+
+    class _Store:
+        async def active_run(self) -> object:
+            return object()
+
+        async def close(self) -> None:
+            order.append("store-close")
+
+    await cli._teardown_live(  # pyright: ignore[reportPrivateUsage]
+        _Service(),  # type: ignore[arg-type]
+        _MCP(),  # type: ignore[arg-type]
+        _Store(),  # type: ignore[arg-type]
+    )
+
+    assert order == ["heat-off", "service-stop", "mcp-stop", "child-stop:False", "store-close"]
+
+
 # --- startup runtime readout (#134) ---------------------------------------------
 
 

@@ -1110,12 +1110,13 @@ class RoastRunner:
         change persisted so the decision trace records the shutdown stop.
 
         Returns:
-            ``DISPATCHED`` if a heat-off e-stop was issued this call, otherwise
-            ``NOT_ACTIVE`` when the runner is already hardware-off.
+            ``DISPATCHED`` only when this call's heat-off e-stop completed at
+            MCP; otherwise ``UNCONFIRMED``. ``NOT_ACTIVE`` means the runner is
+            already hardware-off.
         """
         if self._controller.phase not in ACTIVE_ROAST_PHASES:
             return ShutdownHeatOffOutcome.NOT_ACTIVE
-        await self.dispatch_priority_emergency_stop(
+        confirmed = await self.dispatch_shutdown_emergency_stop(
             QueuedOperatorAction(
                 run_id=self._run_id,
                 action=OperatorAction.EMERGENCY_STOP,
@@ -1124,7 +1125,9 @@ class RoastRunner:
             already_admitted=already_admitted,
         )
         await self._persist_phase_if_changed()
-        return ShutdownHeatOffOutcome.DISPATCHED
+        return (
+            ShutdownHeatOffOutcome.DISPATCHED if confirmed else ShutdownHeatOffOutcome.UNCONFIRMED
+        )
 
     async def retry_shutdown_heat_off(
         self, *, already_admitted: bool = False
@@ -1137,7 +1140,7 @@ class RoastRunner:
         issues only the controller-owned emergency-stop command; it never
         resumes a routine command or changes the terminal phase.
         """
-        await self.dispatch_priority_emergency_stop(
+        confirmed = await self.dispatch_shutdown_emergency_stop(
             QueuedOperatorAction(
                 run_id=self._run_id,
                 action=OperatorAction.EMERGENCY_STOP,
@@ -1146,7 +1149,9 @@ class RoastRunner:
             already_admitted=already_admitted,
         )
         await self._persist_phase_if_changed()
-        return ShutdownHeatOffOutcome.DISPATCHED
+        return (
+            ShutdownHeatOffOutcome.DISPATCHED if confirmed else ShutdownHeatOffOutcome.UNCONFIRMED
+        )
 
     async def record_shutdown_unconfirmed(self, *, command: str, reason: str) -> None:
         """Persist a 'shutdown step did NOT confirm' marker to the trace (#177).
@@ -1341,9 +1346,15 @@ class RoastRunner:
                 fault_acknowledgement_seen = True
             await self._dispatch(item)
 
-    async def _dispatch(self, item: QueuedOperatorAction) -> None:
+    async def _dispatch(self, item: QueuedOperatorAction) -> bool:
         """Route one operator action to its controller handler and record the
-        executed MCP command (when one was issued) in the decision trace."""
+        executed MCP command (when one was issued) in the decision trace.
+
+        Returns:
+            Positive MCP completion for an emergency-stop item. Routine callers
+            deliberately ignore this value; it exists only for the bounded
+            graceful-shutdown confirmation path.
+        """
         controller = self._controller
         payload = item.payload or {}
         # A routine action may have entered the queue while the lease was
@@ -1365,15 +1376,16 @@ class RoastRunner:
                 run_id=self._run_id,
                 payload=item.payload,
             )
-            return
+            return False
         tool: RoastCommand | None = None
+        emergency_stop_confirmed = False
         before = len(self._emitter.peek())
         if item.action is OperatorAction.EMERGENCY_STOP:
             reason = payload.get("reason")
             already_admitted = self._admitted_emergency_stops > 0
             if already_admitted:
                 self._admitted_emergency_stops -= 1
-            await controller.operator_emergency_stop(
+            emergency_stop_confirmed = await controller.operator_emergency_stop(
                 reason if isinstance(reason, str) else None, already_admitted=already_admitted
             )
             # An e-stop starts a new cooling cycle even if the MCP retains the
@@ -1416,11 +1428,12 @@ class RoastRunner:
                 ):
                     self._d212_acknowledgement_requested = False
                     await self._record_fault_acknowledgement_failure("lease_unavailable")
-                    return
+                    return False
                 self._d212_acknowledgement_requested = True
             await self._dispatch_acknowledge_fault(payload)
         if tool is not None:
             await self._record_dispatch_command(tool, item, since=before)
+        return emergency_stop_confirmed
 
     async def dispatch_priority_emergency_stop(
         self, item: QueuedOperatorAction, *, already_admitted: bool = False
@@ -1444,6 +1457,26 @@ class RoastRunner:
         # direct emergency dispatch cannot leave a buffered event behind.
         await self._flush_events()
         return True
+
+    async def dispatch_shutdown_emergency_stop(
+        self, item: QueuedOperatorAction, *, already_admitted: bool = False
+    ) -> bool:
+        """Dispatch a shutdown e-stop and retain only positive MCP evidence.
+
+        Unlike the ordinary operator route, graceful teardown must not treat a
+        controller fault transition after a caught MCP exception as confirmation
+        that heat-off landed. The safety policy and priority admission remain
+        identical; only the result classification is stricter.
+        """
+        if self._finalized:
+            return False
+        if not already_admitted:
+            self._fault_acknowledgement_gate.invalidate_fault_acknowledgement()
+            self._emergency_stop_since_last_drain = True
+            self.admit_emergency_stop()
+        confirmed = await self._dispatch(item)
+        await self._flush_events()
+        return confirmed
 
     def admit_emergency_stop(self) -> None:
         """Synchronously fence routine controller work before queue dispatch."""
@@ -5468,12 +5501,10 @@ class RoastService:
                 attempt and the single retry, so worst-case bound is ~2×.
 
         Returns:
-            ``DISPATCHED`` if the heat-off safety path ran and the controller faulted
-            (the e-stop was dispatched through ``operator_emergency_stop``).
-            Note this is *not* a hardware acknowledgement: if the MCP
-            ``emergency_stop`` write itself fails, ``operator_emergency_stop``
-            still emits ``COMMAND_FAILED``, faults the run, and reports success
-            here — fail-safe is the controller's job, not the caller's.
+            ``DISPATCHED`` only if the heat-off e-stop completed at MCP. If the
+            MCP ``emergency_stop`` write fails, ``operator_emergency_stop``
+            still emits ``COMMAND_FAILED`` and faults the run, but the first
+            attempt remains unconfirmed and the bounded retry is required.
             ``NO_RUNNER`` when no live runner exists, ``NOT_ACTIVE`` for a
             runner already in a hardware-off phase, or ``UNCONFIRMED`` when an
             active-attempt timeout/error could not be confirmed after the retry.
@@ -5489,8 +5520,14 @@ class RoastService:
         # evaluated in every phase instead of being suppressed as inactive.
         try:
             self._admit_shutdown_emergency_stop(runner)
-            return await asyncio.wait_for(
+            first_outcome = await asyncio.wait_for(
                 runner.shutdown_heat_off(already_admitted=True), timeout=timeout_seconds
+            )
+            if first_outcome is ShutdownHeatOffOutcome.DISPATCHED:
+                return first_outcome
+            _log.error(
+                "SHUTDOWN heat-off did not confirm — retrying once before giving up; "
+                "the roaster may still be commanded hot"
             )
         except TimeoutError:
             _log.error(
@@ -5506,9 +5543,12 @@ class RoastService:
             )
         try:
             self._admit_shutdown_emergency_stop(runner)
-            return await asyncio.wait_for(
+            retry_outcome = await asyncio.wait_for(
                 runner.retry_shutdown_heat_off(already_admitted=True), timeout=timeout_seconds
             )
+            if retry_outcome is ShutdownHeatOffOutcome.DISPATCHED:
+                return retry_outcome
+            return await self._record_shutdown_heat_off_unconfirmed(runner, reason="unconfirmed")
         except TimeoutError:
             _log.error(
                 "SHUTDOWN heat-off did not confirm within %.1fs on retry — the roaster may "

@@ -20,8 +20,9 @@
  *    terminal controls. This takes precedence even while `active_run_id`
  *    remains non-null during an admitted terminal action. The controls use
  *    the global lease endpoint and never a historical run id.
- * 4. No active run with a closed terminal-fault lease — the last completed
- *    run's summary (`LiveFinishedView`),
+ * 4. No active run with a closed terminal-fault lease — a server-advertised
+ *    emergency stop remains available; otherwise the last completed run's
+ *    summary (`LiveFinishedView`),
  *    PERSISTENT across reload: sourced from the history API
  *    (`GET /api/roasts`, newest-first), not session state. The just-finished
  *    run from THIS session (`stickyCompletedRunId`) is preferred while set —
@@ -217,6 +218,10 @@ export function LivePage(): React.JSX.Element {
   // (header/nav) keep using plain `useHealth` unchanged.
   const health = useFreshHealthGate();
   const activeRunId = health.data?.active_run_id ?? null;
+  // A retained data object is not current authority after an error or failed
+  // health result. A routine poll is represented separately so it never makes
+  // a false claim about restart clearance.
+  const healthProjectionStale = health.isError || !health.isSuccess;
   const queryClient = useQueryClient();
 
   // #516: the instance_id StartRoastView observed on the 201 response, if
@@ -598,7 +603,8 @@ export function LivePage(): React.JSX.Element {
         restartClearanceRequired={
           restartClearance.state === "required"
         }
-        routineControlsDisabled={health.isError || restartClearance.state !== "cleared"}
+        routineControlsDisabled={healthProjectionStale || restartClearance.state !== "cleared"}
+        routineControlsRefreshPending={health.isFetching}
       />
     );
   }
@@ -613,6 +619,22 @@ export function LivePage(): React.JSX.Element {
   // visible, preserving its already-live dashboard while the poll recovers.
   if (health.isError) {
     return <LiveStatusUnknownView />;
+  }
+
+  // A CLOSED lease ordinarily means no terminal controls, but the server may
+  // retain its independently resolved software e-stop. Keep that explicit
+  // authority visible after a run closes rather than falling through to an
+  // idle summary. The active-run and stale-health branches above deliberately
+  // retain their precedence.
+  if (faultControls.enabled_actions.includes("emergency_stop")) {
+    return (
+      <LiveTerminalFaultControls
+        controls={faultControls}
+        restartClearanceRequired={restartClearance.state === "required"}
+        routineControlsDisabled={false}
+        routineControlsRefreshPending={health.isFetching}
+      />
+    );
   }
 
   // No active run: never a form (#523). Hold while a terminal-outcome fetch
@@ -729,10 +751,12 @@ function LiveTerminalFaultControls({
   controls,
   restartClearanceRequired,
   routineControlsDisabled,
+  routineControlsRefreshPending,
 }: {
   controls: FaultControls;
   restartClearanceRequired: boolean;
   routineControlsDisabled: boolean;
+  routineControlsRefreshPending: boolean;
 }): React.JSX.Element {
   const queryClient = useQueryClient();
   return (
@@ -746,6 +770,7 @@ function LiveTerminalFaultControls({
       <TerminalFaultControls
         controls={controls}
         routineControlsDisabled={routineControlsDisabled}
+        routineControlsRefreshPending={routineControlsRefreshPending}
         onAction={async (action, _confirmation, expectedGeneration) => {
           try {
             const result =

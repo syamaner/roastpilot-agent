@@ -1428,6 +1428,123 @@ async def test_fault_executor_acknowledges_an_already_safe_latest_fault_without_
 
 
 @pytest.mark.asyncio
+async def test_fault_executor_fences_a_generation_that_stales_between_readback_and_dispatch() -> (
+    None
+):
+    """A routine fault action cannot write after its final pre-dispatch generation check."""
+
+    class SafeFaultPort:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            self.calls.append("exact_read")
+            return FaultControlState(
+                session_id=session_id,
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=False,
+                beans_added=False,
+                beans_dropped=False,
+            )
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            raise AssertionError("start cooling does not read latest fault state")
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            raise AssertionError(
+                f"stale generation must not write {action.value}:{expected_session_id}"
+            )
+
+    checks = 0
+
+    def generation_current() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks == 1
+
+    port = SafeFaultPort()
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), port)
+
+    assert (
+        await executor.execute(
+            OperatorAction.START_COOLING,
+            "fault-session",
+            is_current_generation=generation_current,
+        )
+        is None
+    )
+    assert checks == 2
+    assert port.calls == ["exact_read"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write_fails", [False, True], ids=["result", "exception"])
+async def test_fault_executor_finishes_cancelled_waiter_without_recompleting_its_future(
+    write_fails: bool,
+) -> None:
+    """A cancelled caller cannot make the serial fault worker fail after its write settles."""
+
+    class BlockingFaultPort:
+        def __init__(self) -> None:
+            self.write_entered = asyncio.Event()
+            self.release_write = asyncio.Event()
+            self.written = False
+
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            return FaultControlState(
+                session_id=session_id,
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=self.written,
+                beans_added=False,
+                beans_dropped=False,
+            )
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            raise AssertionError("start cooling does not read latest fault state")
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            assert action is OperatorAction.START_COOLING
+            assert expected_session_id == "fault-session"
+            self.write_entered.set()
+            await self.release_write.wait()
+            if write_fails:
+                raise RuntimeError("synthetic fault write failure")
+            self.written = True
+
+    port = BlockingFaultPort()
+    executor = FaultControlExecutor(SafetyPolicy(SafetyLimits()), port)
+    waiting = asyncio.create_task(
+        executor.execute(
+            OperatorAction.START_COOLING,
+            "fault-session",
+            is_current_generation=lambda: True,
+        )
+    )
+    await asyncio.wait_for(port.write_entered.wait(), timeout=1.0)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+    port.release_write.set()
+    worker = executor._worker  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert worker is not None
+    await asyncio.wait_for(worker, timeout=1.0)
+    assert port.written is not write_fails
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("active", "device_connected", "heat_level_percent"),
     [(True, True, 0), (False, False, 0), (False, True, 1)],

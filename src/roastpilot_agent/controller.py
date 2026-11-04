@@ -4324,65 +4324,9 @@ class RoastController:
         if verdict is SafetyVerdict.ALLOW:
             return False
         if verdict is SafetyVerdict.EMERGENCY_STOP:
-            if not emergency_already_admitted:
-                self.admit_emergency_stop()
-            try:
-                applied = await self._run_emergency_write(
-                    lambda: self._executor.emergency_stop(reason=evaluation.reason)
-                )
-            except asyncio.CancelledError:
-                # Cancellation cannot leave the controller reporting an
-                # ordinary, writable phase after an admitted stop.  The
-                # arbiter has released or retained the physical boundary as
-                # appropriate; record the unresolved hardware outcome as a
-                # fault and retain the heat-off retry posture.
-                self._events.emit(
-                    RoastEventKind.COMMAND_FAILED,
-                    {"command": "emergency_stop", "reason": evaluation.reason},
-                )
-                self._pending_fail_safe = self._heat_off_evaluation(
-                    source_rule=_EMERGENCY_STOP_RETRY_RULE
-                )
-                self._pending_fail_safe_is_emergency_stop_retry = True
-                if self._phase is not RoastPhase.FAULTED:
-                    self.transition_to(RoastPhase.FAULTED)
-                    self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
-                self._latched_verdict = SafetyVerdict.EMERGENCY_STOP
-                self._release_emergency_stop_transition_gate_if_safe()
-                raise
-            except Exception:
-                # A raising e-stop must not crash the tick loop or leave
-                # the phase pre-fault: fault anyway and surface the failed
-                # command. Timeout-bounding the call itself is E5's
-                # criterion; retry/fallback hardening is E4-S4's.
-                self._events.emit(
-                    RoastEventKind.COMMAND_FAILED,
-                    {"command": "emergency_stop", "reason": evaluation.reason},
-                )
-                # The e-stop did not confirm; latch a heat-off retry so the
-                # terminal-phase tick keeps driving toward safety rather than
-                # leaving the roaster potentially hot (#206 / PR review blocker).
-                self._pending_fail_safe = self._heat_off_evaluation(
-                    source_rule=_EMERGENCY_STOP_RETRY_RULE
-                )
-                self._pending_fail_safe_is_emergency_stop_retry = True
-            else:
-                # Confirmed on hardware (#507): adopt the applied heat/fan so the
-                # mirrors — and everything downstream reading them — reflect the
-                # e-stop immediately, the same tick, instead of the last pre-stop
-                # set_targets values.
-                self._adopt_applied_state(applied)
-                self._pending_fail_safe = None
-                self._pending_fail_safe_is_emergency_stop_retry = False
-            # Emit ONCE, only on entry into FAULTED — never while already
-            # latched there (the tick loop short-circuits before reaching here
-            # in a terminal phase, but the guard keeps the emit transition-bound
-            # regardless of caller; #206 infinite-loop fix).
-            if self._phase is not RoastPhase.FAULTED:
-                self.transition_to(RoastPhase.FAULTED)
-                self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
-            self._latched_verdict = SafetyVerdict.EMERGENCY_STOP
-            self._release_emergency_stop_transition_gate_if_safe()
+            await self._execute_emergency_stop(
+                evaluation, emergency_already_admitted=emergency_already_admitted
+            )
             return True
         if verdict is SafetyVerdict.FAULT:
             await self._apply_fail_safe(evaluation, generation=generation)
@@ -4408,6 +4352,76 @@ class RoastController:
             return True
         # CLAMP/REJECT never arise from telemetry-stage rules.
         return False
+
+    async def _execute_emergency_stop(
+        self, evaluation: SafetyEvaluation, *, emergency_already_admitted: bool
+    ) -> bool:
+        """Execute one policy-approved e-stop and report positive MCP completion.
+
+        The ordinary operator API intentionally remains fail-closed on a write
+        exception: it records the fault and leaves the controller in its retry
+        posture instead of propagating the error. Graceful shutdown also needs
+        to know whether that particular MCP write completed, so this narrow
+        result distinguishes a confirmed call from the same faulted state after
+        a caught exception.
+        """
+        if not emergency_already_admitted:
+            self.admit_emergency_stop()
+        confirmed = False
+        try:
+            applied = await self._run_emergency_write(
+                lambda: self._executor.emergency_stop(reason=evaluation.reason)
+            )
+        except asyncio.CancelledError:
+            # Cancellation cannot leave the controller reporting an ordinary,
+            # writable phase after an admitted stop. The arbiter has released
+            # or retained the physical boundary as appropriate; record the
+            # unresolved hardware outcome as a fault and retain retry posture.
+            self._events.emit(
+                RoastEventKind.COMMAND_FAILED,
+                {"command": "emergency_stop", "reason": evaluation.reason},
+            )
+            self._pending_fail_safe = self._heat_off_evaluation(
+                source_rule=_EMERGENCY_STOP_RETRY_RULE
+            )
+            self._pending_fail_safe_is_emergency_stop_retry = True
+            if self._phase is not RoastPhase.FAULTED:
+                self.transition_to(RoastPhase.FAULTED)
+                self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
+            self._latched_verdict = SafetyVerdict.EMERGENCY_STOP
+            self._release_emergency_stop_transition_gate_if_safe()
+            raise
+        except Exception:
+            # A raising e-stop must not crash the tick loop or leave the phase
+            # pre-fault: fault anyway and surface the failed command. The
+            # terminal-phase tick retains the heat-off retry posture.
+            self._events.emit(
+                RoastEventKind.COMMAND_FAILED,
+                {"command": "emergency_stop", "reason": evaluation.reason},
+            )
+            self._pending_fail_safe = self._heat_off_evaluation(
+                source_rule=_EMERGENCY_STOP_RETRY_RULE
+            )
+            self._pending_fail_safe_is_emergency_stop_retry = True
+        else:
+            # Confirmed on hardware (#507): adopt the applied heat/fan so the
+            # mirrors — and everything downstream reading them — reflect the
+            # e-stop immediately, the same tick, instead of the last pre-stop
+            # set_targets values.
+            self._adopt_applied_state(applied)
+            self._pending_fail_safe = None
+            self._pending_fail_safe_is_emergency_stop_retry = False
+            confirmed = True
+        # Emit ONCE, only on entry into FAULTED — never while already latched
+        # there (the tick loop short-circuits before reaching here in a terminal
+        # phase, but the guard keeps the emit transition-bound regardless of
+        # caller; #206 infinite-loop fix).
+        if self._phase is not RoastPhase.FAULTED:
+            self.transition_to(RoastPhase.FAULTED)
+            self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
+        self._latched_verdict = SafetyVerdict.EMERGENCY_STOP
+        self._release_emergency_stop_transition_gate_if_safe()
+        return confirmed
 
     async def _apply_fail_safe(self, evaluation: SafetyEvaluation, *, generation: int) -> None:
         """Hardware-off on faulted/recovery entry (E3-S2/E4 carry-forward).
@@ -5715,19 +5729,23 @@ class RoastController:
 
     async def operator_emergency_stop(
         self, reason: str | None = None, *, already_admitted: bool = False
-    ) -> None:
-        """Operator e-stop: always available, from every phase (E3-S4)."""
+    ) -> bool:
+        """Operator e-stop: always available, from every phase (E3-S4).
+
+        Returns:
+            ``True`` only when this invocation's MCP emergency-stop call
+            completed. A failed call still faults and latches retry as the
+            ordinary operator safety contract requires.
+        """
         evaluation = self._safety.evaluate_emergency_stop(phase=self._phase, operator_reason=reason)
-        generation = (
-            self.admit_emergency_stop() if not already_admitted else self._arbiter.generation
-        )
-        await self._act_on_safety(
-            evaluation, generation=generation, emergency_already_admitted=True
-        )
+        if not already_admitted:
+            self.admit_emergency_stop()
+        confirmed = await self._execute_emergency_stop(evaluation, emergency_already_admitted=True)
         try:
             await self._snapshots.persist_evaluation(evaluation)
         except Exception:  # noqa: BLE001 - e-stop must never wait on trace persistence
             _log.exception("could not persist emergency-stop safety evaluation")
+        return confirmed
 
     async def operator_mark_beans_added(self) -> None:
         """Operator manual beans-added — the manual-T0 fallback (D19, E9).

@@ -64,6 +64,10 @@ export interface DashboardPageProps {
 
 export function DashboardPage({ healthStale = false }: DashboardPageProps): React.JSX.Element {
   const health = useHealth();
+  // An invalidated health projection is not current authority for D216/D220
+  // controls. A routine poll only temporarily blocks recovery dispatch; it
+  // must not reset physical confirmations or mounted two-step controls.
+  const healthProjectionStale = healthStale || !health.isSuccess;
 
   // The REST queue request can resolve after this page unmounts. Keep that
   // completion from changing local feedback state after the operator leaves.
@@ -105,6 +109,9 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
   // page-local reducer folds the NON-LOSSY frame buffer (frames/frameCount) so a
   // burst never drops a fault/recovery/advisory/marker frame (#122).
   const { status, phase, telemetry, enabledActions, frames, frameCount } = useRoastStream(runId);
+  const routineActionsRefreshPending =
+    health.isFetching && phase === "operator_recovery_required";
+  const recoveryDispatchBlocked = healthProjectionStale || routineActionsRefreshPending;
   // The view-model seeds the curve from the `/telemetry` snapshot on every
   // (re)connect — keyed on `status` — so a late-joining or reconnecting device shows
   // the full roast curve, not just the frames it personally witnessed (#153).
@@ -197,12 +204,12 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
 
   // Operator action POST result (the action bar surfaces its typed reason).
   const [lastResult, setLastResult] = useState<OperatorActionResultView | null>(null);
-  const handleAcknowledgeFault = useCallback(async () => {
-    if (healthStale) return;
+  const handleAcknowledgeFault = useCallback((): boolean => {
+    if (healthProjectionStale) return false;
     const ackRunId = runId;
     if (ackRunId === null) {
       setFaultAcknowledgementState({ kind: "failed", reason: "run_unavailable" });
-      return;
+      return false;
     }
     // Mark pending before the POST. The runner can execute and publish its SSE
     // outcome before the queue-acceptance response resolves; acceptance remains
@@ -210,26 +217,29 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
     pendingAcknowledgementBaselineRef.current =
       faultAcknowledgementFromTimeline(timeline.data, ackRunId)?.eventIndex ?? -1;
     setFaultAcknowledgementState({ kind: "pending" });
-    try {
-      const result = await api.operatorAction(ackRunId, { action: "acknowledge_fault" });
-      if (!mountedRef.current) return;
-      if (result.result === "accepted" && result.queued) {
-        // One persisted-server refresh closes the event/subscription race without
-        // treating elapsed time or queue acceptance as an execution outcome.
-        void timeline.refetch();
-      } else if (faultAcknowledgementRef.current.kind === "pending") {
-        setFaultAcknowledgementState({ kind: "failed", reason: "not_queued" });
+    void (async () => {
+      try {
+        const result = await api.operatorAction(ackRunId, { action: "acknowledge_fault" });
+        if (!mountedRef.current) return;
+        if (result.result === "accepted" && result.queued) {
+          // One persisted-server refresh closes the event/subscription race without
+          // treating elapsed time or queue acceptance as an execution outcome.
+          void timeline.refetch();
+        } else if (faultAcknowledgementRef.current.kind === "pending") {
+          setFaultAcknowledgementState({ kind: "failed", reason: "not_queued" });
+        }
+      } catch {
+        if (mountedRef.current && faultAcknowledgementRef.current.kind === "pending") {
+          setFaultAcknowledgementState({ kind: "failed", reason: "not_queued" });
+        }
       }
-    } catch {
-      if (mountedRef.current && faultAcknowledgementRef.current.kind === "pending") {
-        setFaultAcknowledgementState({ kind: "failed", reason: "not_queued" });
-      }
-    }
-  }, [healthStale, runId, setFaultAcknowledgementState, timeline]);
+    })();
+    return true;
+  }, [healthProjectionStale, runId, setFaultAcknowledgementState, timeline]);
 
   const dispatchAction = useCallback(
     async (action: OperatorAction) => {
-      if (runId === null || (healthStale && action !== "emergency_stop")) return;
+      if (runId === null || (recoveryDispatchBlocked && action !== "emergency_stop")) return;
       try {
         const result = await api.operatorAction(runId, { action });
         setLastResult({ action, result: result.result, reason: result.reason });
@@ -241,7 +251,7 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
         });
       }
     },
-    [healthStale, runId],
+    [recoveryDispatchBlocked, runId],
   );
 
   const requestClosureOnlyClearance = useCallback(async () => {
@@ -355,7 +365,6 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
     : null;
   // A response still loading or in error cannot be current authority for the
   // recovered-run closure path, even if another view retained cached data.
-  const healthProjectionStale = healthStale || !health.isSuccess;
   const closureOnlyAvailable = restartClearance?.closure_only_available === true;
   // D216 End is a separate route rather than a phase change, so its action is
   // not published through the SSE phase-action mirror. Its second projection is
@@ -373,7 +382,8 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
   // iff the server enables `acknowledge_fault` (only in the `faulted` phase). This
   // keeps the banner button render-from-server (no client-side command matrix,
   // D25), consistent with the OperatorActionBar.
-  const canAcknowledgeFault = !healthStale && (effectiveEnabled?.includes("acknowledge_fault") ?? false);
+  const canAcknowledgeFault =
+    !healthProjectionStale && (effectiveEnabled?.includes("acknowledge_fault") ?? false);
 
   // Persistent charge cue (#211): derive the cue's display state from the SERVER
   // phase (preheating), the live bean temperature, and the profile's charge band
@@ -464,7 +474,7 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
             canAcknowledgeFault ? (
               <FaultAcknowledgementControl
                 status={faultAcknowledgement}
-                onConfirm={() => void handleAcknowledgeFault()}
+                onConfirm={handleAcknowledgeFault}
               />
             ) : undefined
           }
@@ -548,7 +558,8 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
           phase={phase}
           onAction={(a) => void dispatchAction(a)}
           lastResult={lastResult}
-          healthStale={healthStale}
+          healthStale={healthProjectionStale}
+          routineActionsRefreshPending={routineActionsRefreshPending}
         />
       </div>
 
@@ -561,6 +572,7 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
         enabledActions={effectiveEnabled}
         onAction={(a) => void dispatchAction(a)}
         healthStale={healthProjectionStale}
+        routineDispatchBlocked={recoveryDispatchBlocked}
         closureOnlyAvailable={closureOnlyAvailable}
         endRecoveredRunAvailable={endRecoveredRunAvailable}
         onRequestClosureOnly={requestClosureOnlyClearance}
