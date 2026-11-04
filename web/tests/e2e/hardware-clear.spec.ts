@@ -55,7 +55,12 @@ test("route refreshes a rejected stale incident and resets confirmation for the 
           // This route test isolates the incident-bound acknowledgement. The
           // D213 process gate is already cleared, and the lease is closed, so
           // neither independent gate masks the hardware-clear card.
-          restart_clearance: { state: "cleared", eligible: true },
+          restart_clearance: {
+            state: "cleared",
+            eligible: true,
+            enabled_actions: [],
+            closure_only_available: false,
+          },
           fault_controls: { status: "closed", generation: null, enabled_actions: [] },
           active_run_id: null,
         }),
@@ -124,8 +129,18 @@ test("required restart clearance keeps a CLOSED server-advertised software e-sto
           mcp_teardown_incident_id: null,
           active_run_id: null,
           restart_clearance: clearanceRequired
-            ? { state: "required", eligible: false }
-            : { state: "cleared", eligible: true },
+            ? {
+                state: "required",
+                eligible: false,
+                enabled_actions: [],
+                closure_only_available: false,
+              }
+            : {
+                state: "cleared",
+                eligible: true,
+                enabled_actions: [],
+                closure_only_available: false,
+              },
           fault_controls: clearanceRequired
             ? { status: "closed", generation: null, enabled_actions: ["emergency_stop"] }
             : { status: "closed", generation: null, enabled_actions: [] },
@@ -154,7 +169,12 @@ test("required restart clearance keeps a CLOSED server-advertised software e-sto
           outcome: "confirmed",
           cleared: true,
           restart_clearance_required: false,
-          restart_clearance: { state: "cleared", eligible: true },
+          restart_clearance: {
+            state: "cleared",
+            eligible: true,
+            enabled_actions: [],
+            closure_only_available: false,
+          },
           fault_controls: { status: "closed", generation: null, enabled_actions: [] },
         }),
       });
