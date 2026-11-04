@@ -354,9 +354,11 @@ def test_live_exit_watchdog_bounds_cancellation_resistant_owner(tmp_path: Path) 
                     pass
 
         guard = _LiveExitGuard(grace_seconds=0.25)
+        owner: asyncio.Task[None] | None = None
 
         async def main() -> None:
-            asyncio.create_task(cancellation_resistant_owner(), name="retained-mcp-owner")
+            global owner
+            owner = asyncio.create_task(cancellation_resistant_owner(), name="retained-mcp-owner")
             await _finish_live_teardown(Service(), MCP(), Store(), guard)
 
         asyncio.run(main())
@@ -405,6 +407,7 @@ def test_live_exit_watchdog_bounds_startup_failure_owner(tmp_path: Path) -> None
         from roastpilot_agent.mcp_client import MCPConnectionError
 
         evidence = Path(sys.argv[1])
+        owner: asyncio.Task[None] | None = None
 
         async def cancellation_resistant_owner() -> None:
             while True:
@@ -414,7 +417,8 @@ def test_live_exit_watchdog_bounds_startup_failure_owner(tmp_path: Path) -> None
                     pass
 
         async def fail_after_cleanup(_config: object, *, store_path: object) -> object:
-            asyncio.create_task(
+            global owner
+            owner = asyncio.create_task(
                 cancellation_resistant_owner(),
                 name="retained-startup-mcp-owner",
             )
