@@ -107,6 +107,12 @@ export interface MicStatus {
   overflow_count_last_minute: number;
   estimated_lost_audio_ms_last_minute: number;
   total_overflow_count: number;
+  // Inference diagnostics (MCP 0.2.4): null is an explicitly unproven or
+  // unavailable diagnostic, never a fabricated passing zero.
+  max_consecutive_overflow_count: number | null;
+  inference_overrun_count: number | null;
+  last_inference_duration_ms: number | null;
+  max_inference_duration_ms: number | null;
 }
 
 // --- Per-tick telemetry payload (models.TelemetryEventData). The live reading

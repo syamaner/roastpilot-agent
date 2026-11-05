@@ -1,5 +1,12 @@
 # RoastPilot Agent Project State Registry
 
+**5 Nov 2026, #1069 software-only first-crack diagnostic retention:**
+The normal MCP mirror and existing raw-state, detail, SSE and SPA type paths
+retain four MCP-computed inference diagnostics as values or explicit null.
+No evaluator, threshold, control, capture, hardware, acceptance or
+qualification behaviour changed. E11-S3 remains in progress and #954 remains
+open.
+
 **2 Nov 2026, #1066 scheduled CI maintenance (single slice):**
 The filesystem failure reproduced locally: the process-global `os.fstat`
 injection reached pytest's `FDCapture.snap`, after the store's lineage descriptor

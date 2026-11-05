@@ -1,5 +1,11 @@
 # E11 — Packaging
 
+**5 Nov 2026 — #1069 software-only diagnostic retention:** the normal MCP
+mirror, existing raw-state persistence, existing detail/SSE projection and SPA
+type contract retain four first-crack inference diagnostics as values or
+explicit null. This is software delivery only: it makes no hardware,
+qualification, acceptance or E11-S3 status claim.
+
 **5 Oct 2026 — D210/D211 retrospective cold qualification:** the original
 completed supervised 10+10 cold run returned `NOT_CONFORMANT`, exit 6, because
 its original D210 evaluator misclassified the exact MCP prepared-session reason.

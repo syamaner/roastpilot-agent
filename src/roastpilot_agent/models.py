@@ -374,6 +374,12 @@ class MicStatus(BaseModel):
     overflow_count_last_minute: int = 0
     estimated_lost_audio_ms_last_minute: float = 0.0
     total_overflow_count: int = 0
+    # Inference diagnostics (MCP 0.2.4): absent or unavailable values are
+    # explicitly unproven, never fabricated as zero.
+    max_consecutive_overflow_count: int | None = None
+    inference_overrun_count: int | None = None
+    last_inference_duration_ms: float | None = None
+    max_inference_duration_ms: float | None = None
 
     @classmethod
     def from_first_crack_status(
@@ -389,6 +395,10 @@ class MicStatus(BaseModel):
         overflow_count_last_minute: int = 0,
         estimated_lost_audio_ms_last_minute: float = 0.0,
         total_overflow_count: int = 0,
+        max_consecutive_overflow_count: int | None = None,
+        inference_overrun_count: int | None = None,
+        last_inference_duration_ms: float | None = None,
+        max_inference_duration_ms: float | None = None,
     ) -> "MicStatus":
         """Project the MCP first-crack status fields into a :class:`MicStatus`.
 
@@ -412,6 +422,14 @@ class MicStatus(BaseModel):
                 trailing minute, in milliseconds (MCP 0.1.13, #539).
             total_overflow_count: Cumulative overflow events for the whole
                 capture session (MCP 0.1.13, #539).
+            max_consecutive_overflow_count: Largest consecutive capture-buffer
+                overflow count observed by the MCP, if available.
+            inference_overrun_count: Inference-hop overruns observed by the MCP,
+                if available.
+            last_inference_duration_ms: Most recent MCP inference duration in
+                milliseconds, if available.
+            max_inference_duration_ms: Maximum MCP inference duration in
+                milliseconds, if available.
 
         Returns:
             The projected capture-alive status with its derived health.
@@ -434,6 +452,10 @@ class MicStatus(BaseModel):
             overflow_count_last_minute=overflow_count_last_minute,
             estimated_lost_audio_ms_last_minute=estimated_lost_audio_ms_last_minute,
             total_overflow_count=total_overflow_count,
+            max_consecutive_overflow_count=max_consecutive_overflow_count,
+            inference_overrun_count=inference_overrun_count,
+            last_inference_duration_ms=last_inference_duration_ms,
+            max_inference_duration_ms=max_inference_duration_ms,
         )
 
 

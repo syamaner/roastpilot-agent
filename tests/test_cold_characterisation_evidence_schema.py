@@ -1071,7 +1071,7 @@ def test_tolerant_mirror_can_launder_missing_counter_but_projection_refuses() ->
     del payload["max_consecutive_overflow_count"]
     tolerant = FirstCrackStatus.model_validate(payload)
     assert tolerant.status == "pending"
-    assert "max_consecutive_overflow_count" not in FirstCrackStatus.model_fields
+    assert tolerant.max_consecutive_overflow_count is None
     with pytest.raises(evidence.ColdEvidenceError):
         evidence.project_tick_audio(payload)
 
@@ -1650,7 +1650,13 @@ def test_consumer_owned_contracts_match_delivered_models_without_importing_them(
         typing.get_args(SessionFinalisationResult.model_fields["status"].annotation)
     )
     assert FirstCrackStatus.model_fields["queued_window_count"].default == 0
-    assert "max_consecutive_overflow_count" not in FirstCrackStatus.model_fields
+    for name in (
+        "max_consecutive_overflow_count",
+        "inference_overrun_count",
+        "last_inference_duration_ms",
+        "max_inference_duration_ms",
+    ):
+        assert FirstCrackStatus.model_fields[name].default is None
 
 
 def test_delivered_model_signatures_are_explicitly_pinned_to_the_bound_base() -> None:
@@ -1691,6 +1697,10 @@ def test_delivered_model_signatures_are_explicitly_pinned_to_the_bound_base() ->
             ("overflow_count_last_minute", 0),
             ("estimated_lost_audio_ms_last_minute", 0.0),
             ("total_overflow_count", 0),
+            ("max_consecutive_overflow_count", None),
+            ("inference_overrun_count", None),
+            ("last_inference_duration_ms", None),
+            ("max_inference_duration_ms", None),
         ),
         HostBoundSample: tuple(
             (name, required)

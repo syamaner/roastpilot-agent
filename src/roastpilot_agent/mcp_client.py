@@ -49,7 +49,16 @@ from typing import Annotated, Any, Literal, Protocol, TypeVar, cast
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+)
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceConfig
 from roastpilot_agent.models import (
@@ -116,6 +125,38 @@ class MCPMirror(BaseModel):
     model_config = ConfigDict(frozen=True, extra="ignore")
 
 
+def _admit_inference_count(value: object) -> int | None:
+    """Admit a finite, JavaScript-safe nonnegative inference count or ``None``.
+
+    Args:
+        value: Untrusted value from the MCP first-crack status payload.
+
+    Returns:
+        The admitted count, or ``None`` when the diagnostic is absent or unproven.
+    """
+    if type(value) is int and 0 <= value <= 2**53 - 1:
+        return value
+    return None
+
+
+def _admit_inference_duration_ms(value: object) -> float | None:
+    """Admit a finite nonnegative inference duration in milliseconds or ``None``.
+
+    Args:
+        value: Untrusted value from the MCP first-crack status payload.
+
+    Returns:
+        The admitted duration, or ``None`` when the diagnostic is absent or unproven.
+    """
+    if type(value) is int:
+        if value < 0 or value > 2**53:
+            return None
+        return float(value)
+    if type(value) is float and math.isfinite(value) and value >= 0.0:
+        return value
+    return None
+
+
 class EventSnapshot(MCPMirror):
     """Mirror of mcp_server.EventSnapshot.
 
@@ -180,6 +221,20 @@ class FirstCrackStatus(MCPMirror):
     overflow_count_last_minute: int = 0
     estimated_lost_audio_ms_last_minute: float = 0.0
     total_overflow_count: int = 0
+    # Inference diagnostics (MCP 0.2.4): unknown or malformed values remain
+    # unproven rather than being coerced or fabricated as zero.
+    max_consecutive_overflow_count: Annotated[
+        int | None, BeforeValidator(_admit_inference_count)
+    ] = Field(default=None)
+    inference_overrun_count: Annotated[int | None, BeforeValidator(_admit_inference_count)] = Field(
+        default=None
+    )
+    last_inference_duration_ms: Annotated[
+        float | None, BeforeValidator(_admit_inference_duration_ms)
+    ] = Field(default=None)
+    max_inference_duration_ms: Annotated[
+        float | None, BeforeValidator(_admit_inference_duration_ms)
+    ] = Field(default=None)
 
 
 class T0Status(MCPMirror):
@@ -599,6 +654,10 @@ def project_mic_status(status: FirstCrackStatus) -> MicStatus:
         overflow_count_last_minute=status.overflow_count_last_minute,
         estimated_lost_audio_ms_last_minute=status.estimated_lost_audio_ms_last_minute,
         total_overflow_count=status.total_overflow_count,
+        max_consecutive_overflow_count=status.max_consecutive_overflow_count,
+        inference_overrun_count=status.inference_overrun_count,
+        last_inference_duration_ms=status.last_inference_duration_ms,
+        max_inference_duration_ms=status.max_inference_duration_ms,
     )
 
 
