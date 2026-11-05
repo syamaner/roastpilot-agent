@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import cast
+from typing import Any, Literal, cast
 
 import aiosqlite
 import pytest
@@ -77,6 +77,62 @@ class _CurrentChild:
         self.child_epoch = 1
         self.stop_unconfirmed = False
         self.teardown_incident_id: str | None = None
+
+
+class _PausedExecution:
+    """Retain aiosqlite execute's await/context-manager protocol for a pause."""
+
+    def __init__(
+        self,
+        execution: object,
+        sql: str,
+        entered: asyncio.Event,
+        release: asyncio.Event,
+    ) -> None:
+        self._execution = cast("Any", execution)
+        self._sql = sql
+        self._entered = entered
+        self._release = release
+        self._cursor: aiosqlite.Cursor | None = None
+        self._paused = False
+
+    async def _result(self) -> aiosqlite.Cursor:
+        if self._cursor is None:
+            self._cursor = await self._execution
+        if not self._paused and " ".join(self._sql.split()).upper().startswith(
+            "INSERT INTO PROCESS_EPOCH"
+        ):
+            self._paused = True
+            self._entered.set()
+            await self._release.wait()
+        assert self._cursor is not None
+        return self._cursor
+
+    def __await__(self) -> Any:
+        """Await the original execution, pausing after the selected statement."""
+        return self._result().__await__()
+
+    async def __aenter__(self) -> aiosqlite.Cursor:
+        """Return the cursor for ``async with connection.execute`` callers."""
+        return await self
+
+    async def __aexit__(self, *args: object) -> None:
+        """Close the cursor when leaving an execute context."""
+        if self._cursor is not None:
+            await self._cursor.close()
+
+
+class _ObservedWakeEvent(asyncio.Event):
+    """Record when the service-owned expiry loop is waiting for a wakeup."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waiting = asyncio.Event()
+
+    async def wait(self) -> Literal[True]:
+        """Record the wait boundary before delegating to the event."""
+        self.waiting.set()
+        return await super().wait()
 
 
 class _PresenceMCP(FakeMCPClient):
@@ -199,6 +255,129 @@ async def test_no_session_clearance_fails_closed_without_a_current_child(tmp_pat
         assert after.restart_clearance.state is RestartClearanceState.REQUIRED
         assert not after.restart_clearance.eligible
     finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_order_reaches_required_gate_when_expiry_interleaves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The startup expiry task cannot split the epoch transaction into UNKNOWN."""
+    store = RoastStore(tmp_path / "epoch-lifespan-order.sqlite3")
+    await store.initialize()
+    service, roaster, _child = await _presence_service(store, "none")
+    observed_wakeup = _ObservedWakeEvent()
+    service._bean_draft_expiry_wakeup = observed_wakeup  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    epoch_entered = asyncio.Event()
+    release_epoch = asyncio.Event()
+    maintenance_started = asyncio.Event()
+    maintenance_finished = asyncio.Event()
+    armed = False
+    recovering: asyncio.Task[None] | None = None
+    original_execute = aiosqlite.Connection.execute
+
+    def paused_execute(
+        connection: aiosqlite.Connection, sql: str, *args: object, **kwargs: object
+    ) -> object:
+        return _PausedExecution(
+            original_execute(connection, sql, *args, **kwargs), sql, epoch_entered, release_epoch
+        )
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", paused_execute)
+    try:
+        await service.seed_bean_profiles()
+        await asyncio.wait_for(observed_wakeup.waiting.wait(), timeout=1.0)
+        await store.connection.execute(
+            "INSERT INTO bean_sourcing_attempts "
+            "(id, provider, model_slug, prompt_version, owner_instance_id, "
+            "started_at_utc, lease_expires_at_utc, completed_at_utc, outcome, "
+            "draft_snapshot_json, claim_expires_at_utc) "
+            "VALUES (?, 'test', 'test', 'test', 'test', ?, ?, ?, 'success', ?, ?)",
+            (
+                "b" * 32,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:05:00+00:00",
+                "2026-01-01T00:01:00+00:00",
+                "{}",
+                "2099-01-01T00:00:00+00:00",
+            ),
+        )
+        await store.connection.commit()
+        await store.connection.execute(
+            "UPDATE bean_sourcing_attempts SET claim_expires_at_utc = ? WHERE id = ?",
+            ("2026-01-01T01:00:00+00:00", "b" * 32),
+        )
+        await store.connection.commit()
+        original_reconcile = store.reconcile_interrupted_bean_sourcing_attempts
+
+        async def observed_reconcile(
+            *, completed_at_utc: str | None = None, lease_deadline_utc: str | None = None
+        ) -> int:
+            if armed:
+                maintenance_started.set()
+            result = await original_reconcile(
+                completed_at_utc=completed_at_utc, lease_deadline_utc=lease_deadline_utc
+            )
+            if armed:
+                maintenance_finished.set()
+            return result
+
+        monkeypatch.setattr(
+            store, "reconcile_interrupted_bean_sourcing_attempts", observed_reconcile
+        )
+        armed = True
+        recovering = asyncio.create_task(service.recover_on_start())
+        await asyncio.wait_for(epoch_entered.wait(), timeout=1.0)
+        expiry_task = service._bean_draft_expiry_task  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert expiry_task is not None and not expiry_task.done()
+        service._bean_draft_expiry_wakeup.set()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await asyncio.wait_for(maintenance_started.wait(), timeout=1.0)
+        maintenance_completion = asyncio.create_task(maintenance_finished.wait())
+        done, _pending = await asyncio.wait_for(
+            asyncio.wait({maintenance_completion}, timeout=0.1), timeout=0.2
+        )
+        assert done == set()
+        release_epoch.set()
+        await asyncio.wait_for(recovering, timeout=2.0)
+        assert await asyncio.wait_for(maintenance_completion, timeout=2.0)
+        assert (
+            await store.read_process_restart_clearance(service.instance_id)
+            is RestartClearanceState.REQUIRED
+        )
+        assert service._restart_clearance_state is RestartClearanceState.REQUIRED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert roaster.commands() == []
+    finally:
+        release_epoch.set()
+        if recovering is not None and not recovering.done():
+            await asyncio.wait_for(recovering, timeout=2.0)
+        await service.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_epoch_failure_maps_restart_clearance_to_unknown_and_refuses_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Epoch persistence ambiguity keeps restart admission closed."""
+    store = RoastStore(tmp_path / "epoch-failure-maps-unknown.sqlite3")
+    await store.initialize()
+    service = await _service(store)
+
+    async def failed_epoch(_process_id: str) -> bool:
+        raise OSError("epoch persistence failed")
+
+    monkeypatch.setattr(store, "begin_process_epoch", failed_epoch)
+    try:
+        await service._ensure_restart_epoch()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert service._restart_clearance_state is RestartClearanceState.UNKNOWN  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert (
+            await store.read_process_restart_clearance(service.instance_id)
+            is RestartClearanceState.UNKNOWN
+        )
+        with pytest.raises(RoastRunConflictError, match="restart clearance"):
+            await service.start_roast(_profile())
+    finally:
+        await service.shutdown()
         await store.close()
 
 

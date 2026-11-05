@@ -1027,26 +1027,37 @@ class RoastStore:
         immediately preceding process recorded a clean shutdown.  A migration
         from v19 or an interrupted predecessor has no such proof and remains
         UNKNOWN until its fault state is resolved.
+
+        A dedicated connection owns this transaction because the main store
+        connection also serves periodic background writes.
         """
-        await self.connection.execute("BEGIN IMMEDIATE")
+        # Preserve the initialized-store guard before connecting: an
+        # uninitialized store must not create a database or mint provenance.
+        _ = self.connection
+        connection = await aiosqlite.connect(self._db_path)
+        connection.row_factory = aiosqlite.Row
         try:
-            async with self.connection.execute(
+            await self._configure_durable_connection(connection)
+            await connection.execute("BEGIN IMMEDIATE")
+            async with connection.execute(
                 "SELECT status FROM process_epoch WHERE singleton = 1"
             ) as cursor:
                 previous = await cursor.fetchone()
             trusted = self._new_database if previous is None else str(previous["status"]) == "clean"
-            await self.connection.execute(
+            await connection.execute(
                 "INSERT INTO process_epoch (singleton, process_id, status, updated_at_utc) "
                 "VALUES (1, ?, 'unclean', ?) "
                 "ON CONFLICT(singleton) DO UPDATE SET process_id=excluded.process_id, "
                 "status=excluded.status, updated_at_utc=excluded.updated_at_utc",
                 (process_id, _utc_now()),
             )
-            await self.connection.execute("COMMIT")
+            await connection.commit()
         except BaseException:
             with contextlib.suppress(Exception):
-                await self.connection.execute("ROLLBACK")
+                await connection.rollback()
             raise
+        finally:
+            await connection.close()
         self._fault_lease_absence_trusted = trusted
         return trusted
 
