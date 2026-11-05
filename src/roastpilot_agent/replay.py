@@ -244,7 +244,8 @@ def _synthesized_mic_status(*, first_crack: bool) -> MicStatus:
     ``detected``. Window counts are left at zero (the export records none); the
     derived :class:`~roastpilot_agent.models.MicHealth` is OK either way. This
     is what lets the committed contract fixture pin the real ``MicStatus`` shape
-    on the telemetry frame rather than ``null``."""
+    on the telemetry frame rather than ``null``. The four MCP inference
+    diagnostics remain ``None`` because flat exports record none."""
     return MicStatus.from_first_crack_status(
         status="detected" if first_crack else "pending",
         audio_running=True,
