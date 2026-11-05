@@ -103,9 +103,7 @@ def test_inference_diagnostics_do_not_change_mic_health() -> None:
     )
     observed = project_mic_status(
         FirstCrackStatus.model_validate(
-            _first_crack_payload(
-                status="pending", audio_running=True, **_DIAGNOSTIC_VALUES
-            )
+            _first_crack_payload(status="pending", audio_running=True, **_DIAGNOSTIC_VALUES)
         )
     )
     assert observed.mic_health is baseline.mic_health
