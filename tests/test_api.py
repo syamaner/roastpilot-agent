@@ -27,6 +27,7 @@ from collections.abc import (
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, cast
 from unittest import mock
 
@@ -84,7 +85,9 @@ from roastpilot_agent.mcp_client import (
     FirstCrackStatus,
     MCPConnectionError,
     MCPServerProcess,
+    RoasterControlAdapter,
     RoasterDeviceState,
+    RoasterMCPClient,
     RoastSessionState,
     project_mic_status,
     project_session_state,
@@ -6665,6 +6668,116 @@ async def test_runner_retains_inference_diagnostics_in_raw_state_sse_and_detail(
         finally:
             service.events.unsubscribe(queue)
             await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_text_only_malformed_diagnostics_stay_null_without_faulting_runner(
+    store: RoastStore,
+) -> None:
+    """T8/T15: text transport degrades all bad diagnostics without a new fault path."""
+    base = _session_state(fc_status="pending", audio_running=True).model_copy(
+        update={
+            "device_state": RoasterDeviceState(
+                driver="mock",
+                connected=True,
+                bean_temp_c=180.0,
+                env_temp_c=205.0,
+                heat_level_percent=70,
+                fan_level_percent=40,
+                cooling_on=False,
+                raw_vendor_data={},
+            )
+        }
+    )
+    payload = cast("dict[str, object]", base.model_dump(mode="json"))
+    first_crack = cast("dict[str, object]", payload["first_crack_status"])
+    first_crack.update(
+        {
+            "max_consecutive_overflow_count": True,
+            "inference_overrun_count": -1,
+            "last_inference_duration_ms": float("nan"),
+            "max_inference_duration_ms": float("inf"),
+        }
+    )
+
+    class TextOnlySession:
+        """Return the malformed state only through a CallToolResult text block."""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object] | None]] = []
+
+        async def call_tool(self, name: str, arguments: dict[str, object] | None = None) -> object:
+            self.calls.append((name, arguments))
+            assert name == "get_roast_state"
+            return SimpleNamespace(
+                structuredContent=None,
+                content=[SimpleNamespace(text=json.dumps(payload))],
+                isError=False,
+            )
+
+    text_session = TextOnlySession()
+    clock = FakeClock()
+    process = MCPServerProcess(session=text_session)
+    adapter = RoasterControlAdapter(RoasterMCPClient(process.call_tool), clock=clock)
+    telemetry = await adapter.read_telemetry()
+    raw_state = adapter.last_state
+
+    assert text_session.calls == [("get_roast_state", {})]
+    assert raw_state is not None
+    assert telemetry is not None
+    assert telemetry.bean_temp_c == 180.0
+    assert telemetry.env_temp_c == 205.0
+    assert telemetry.mic_status is not None
+    for field in _INFERENCE_DIAGNOSTIC_NAMES:
+        assert getattr(raw_state.first_crack_status, field) is None
+        assert getattr(telemetry.mic_status, field) is None
+
+    mcp = FakeMCPClient([telemetry])
+    service, run_id = await _live_service(
+        store,
+        mcp=mcp,
+        clock=clock,
+        raw_state=_FakeRawState(raw_state),
+        profile=_profile(name="malformed-inference-diagnostics"),
+    )
+    queue = service.events.subscribe()
+    try:
+        await _tick(service, clock)
+        detail = await service.detail(run_id)
+        assert detail.agent_phase not in {
+            RoastPhase.FAULTED,
+            RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+        }
+        timeline = await store.read_timeline(run_id)
+        assert not any(event.kind is RoastEventKind.FAULT for event in timeline.events)
+
+        async with store.connection.execute(
+            "SELECT raw_state_json FROM telemetry_snapshots WHERE run_id = ?", (run_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        persisted = json.loads(cast("str", row[0]))
+        assert {
+            field: persisted["first_crack_status"][field] for field in _INFERENCE_DIAGNOSTIC_NAMES
+        } == {field: None for field in _INFERENCE_DIAGNOSTIC_NAMES}
+
+        events: list[SseEvent] = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        rendered = next(event.render() for event in events if "event: telemetry" in event.render())
+        data_line = next(line for line in rendered.splitlines() if line.startswith("data: "))
+
+        def reject_non_finite(token: str) -> object:
+            raise ValueError(f"non-finite JSON token: {token}")
+
+        data = json.loads(data_line.removeprefix("data: "), parse_constant=reject_non_finite)
+        assert isinstance(data, dict)
+        assert {field: data["mic_status"][field] for field in _INFERENCE_DIAGNOSTIC_NAMES} == {
+            field: None for field in _INFERENCE_DIAGNOSTIC_NAMES
+        }
+    finally:
+        service.events.unsubscribe(queue)
+        await service.shutdown()
 
 
 _INFERENCE_DIAGNOSTIC_NAMES = (

@@ -15,6 +15,8 @@ from roastpilot_agent.mcp_client import (
     project_mic_status,
     project_session_state,
 )
+from roastpilot_agent.models import SseEvent, SseEventType
+from roastpilot_agent.replay import ReplayMarker, create_replay_app
 
 _DIAGNOSTIC_VALUES: dict[str, int | float] = {
     "max_consecutive_overflow_count": 2,
@@ -94,6 +96,59 @@ def test_legacy_absence_defaults_only_the_new_diagnostics_to_none() -> None:
     assert legacy.overflow_count_last_minute == 0
     assert legacy.estimated_lost_audio_ms_last_minute == 0.0
     assert legacy.total_overflow_count == 0
+
+
+def test_legacy_absence_changes_only_the_new_diagnostics_across_state_and_telemetry() -> None:
+    """T5: legacy absence preserves every pre-existing state and telemetry value."""
+    normal = RoastSessionState.model_validate(_session_payload(**_DIAGNOSTIC_VALUES))
+    legacy_payload = _session_payload()
+    legacy_first_crack = cast("dict[str, object]", legacy_payload["first_crack_status"])
+    for name in _DIAGNOSTIC_VALUES:
+        del legacy_first_crack[name]
+    legacy = RoastSessionState.model_validate(legacy_payload)
+
+    normal_state = normal.model_dump(mode="json")
+    legacy_state = legacy.model_dump(mode="json")
+    normal_diagnostics = normal_state["first_crack_status"]
+    legacy_diagnostics = legacy_state["first_crack_status"]
+    assert isinstance(normal_diagnostics, dict)
+    assert isinstance(legacy_diagnostics, dict)
+    for name in _DIAGNOSTIC_VALUES:
+        assert legacy_diagnostics[name] is None
+        assert normal_diagnostics[name] == _DIAGNOSTIC_VALUES[name]
+        del normal_diagnostics[name]
+        del legacy_diagnostics[name]
+    assert legacy_state == normal_state
+
+    normal_telemetry = project_session_state(normal, age_seconds=0.0)
+    legacy_telemetry = project_session_state(legacy, age_seconds=0.0)
+    assert normal_telemetry is not None
+    assert legacy_telemetry is not None
+    assert legacy_telemetry.bean_temp_c == normal_telemetry.bean_temp_c
+    assert legacy_telemetry.env_temp_c == normal_telemetry.env_temp_c
+    assert legacy_telemetry.bean_ror_c_per_min == normal_telemetry.bean_ror_c_per_min
+    assert legacy_telemetry.env_ror_c_per_min == normal_telemetry.env_ror_c_per_min
+    assert legacy_telemetry.first_crack_detected is normal_telemetry.first_crack_detected
+    assert legacy_telemetry.mic_status is not None
+    assert normal_telemetry.mic_status is not None
+    for name in (
+        "overflow_count_last_minute",
+        "estimated_lost_audio_ms_last_minute",
+        "total_overflow_count",
+    ):
+        assert getattr(legacy_telemetry.mic_status, name) == getattr(
+            normal_telemetry.mic_status, name
+        )
+    normal_dump = normal_telemetry.model_dump(mode="json")
+    legacy_dump = legacy_telemetry.model_dump(mode="json")
+    assert isinstance(normal_dump["mic_status"], dict)
+    assert isinstance(legacy_dump["mic_status"], dict)
+    for name in _DIAGNOSTIC_VALUES:
+        assert legacy_dump["mic_status"][name] is None
+        assert normal_dump["mic_status"][name] == _DIAGNOSTIC_VALUES[name]
+        del normal_dump["mic_status"][name]
+        del legacy_dump["mic_status"][name]
+    assert legacy_dump == normal_dump
 
 
 def test_inference_diagnostics_do_not_change_mic_health() -> None:
@@ -186,6 +241,14 @@ def test_diagnostic_admission_boundaries_are_exact() -> None:
     assert count.max_consecutive_overflow_count == 2**53 - 1
     assert count.inference_overrun_count == 0
 
+    zero_duration = FirstCrackStatus.model_validate(
+        _first_crack_payload(last_inference_duration_ms=0, max_inference_duration_ms=0)
+    )
+    assert type(zero_duration.last_inference_duration_ms) is float
+    assert zero_duration.last_inference_duration_ms == 0.0
+    assert type(zero_duration.max_inference_duration_ms) is float
+    assert zero_duration.max_inference_duration_ms == 0.0
+
     duration = FirstCrackStatus.model_validate(
         _first_crack_payload(
             last_inference_duration_ms=2**53,
@@ -223,3 +286,29 @@ def test_text_path_nonfinite_diagnostics_are_typed_nulls() -> None:
     assert telemetry.mic_status.max_consecutive_overflow_count is None
     assert telemetry.mic_status.last_inference_duration_ms is None
     assert telemetry.mic_status.max_inference_duration_ms is None
+
+
+@pytest.mark.asyncio
+async def test_replay_telemetry_keeps_inference_diagnostic_defaults_as_null(tmp_path: Path) -> None:
+    """T14: the real replay pipeline emits all four synthesized null diagnostics."""
+    fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
+    _app, service, source = await create_replay_app(
+        fixture, tmp_path / "replay.sqlite3", step_mode=True, speed=60
+    )
+    subscriber = service.events.subscribe()
+    try:
+        await source.advance_to(ReplayMarker.FIRST_CRACK)
+        frames: list[SseEvent] = []
+        while not subscriber.empty():
+            frames.append(subscriber.get_nowait())
+        telemetry_frames = [frame for frame in frames if frame.event is SseEventType.TELEMETRY]
+        assert telemetry_frames
+        for frame in telemetry_frames:
+            mic_status = frame.data["mic_status"]
+            assert isinstance(mic_status, dict)
+            assert {name: mic_status[name] for name in _DIAGNOSTIC_VALUES} == {
+                name: None for name in _DIAGNOSTIC_VALUES
+            }
+    finally:
+        service.events.unsubscribe(subscriber)
+        await source.aclose()
