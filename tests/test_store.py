@@ -4,9 +4,11 @@ Write paths (E6-S2) and recovery reads / immutability (E6-S3) extend
 this suite.
 """
 
+import ast
 import asyncio
 import json
-from collections.abc import Iterable
+import sqlite3
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, NoReturn, cast
@@ -59,6 +61,49 @@ EXPECTED_INDEXES = {
     "idx_bean_sourcing_attempt_expiry",
     "idx_roast_tastings_run",
 }
+
+
+class _PausedExecution:
+    """Preserve aiosqlite's awaitable/context-manager execute contract while paused."""
+
+    def __init__(
+        self,
+        execution: object,
+        sql: str,
+        should_pause: Callable[[str], bool],
+        entered: asyncio.Event,
+        release: asyncio.Event,
+    ) -> None:
+        self._execution = cast("Any", execution)
+        self._sql = sql
+        self._should_pause = should_pause
+        self._entered = entered
+        self._release = release
+        self._cursor: aiosqlite_module.Cursor | None = None
+        self._paused = False
+
+    async def _result(self) -> aiosqlite_module.Cursor:
+        if self._cursor is None:
+            self._cursor = await self._execution
+        if not self._paused and self._should_pause(self._sql):
+            self._paused = True
+            self._entered.set()
+            await self._release.wait()
+        assert self._cursor is not None
+        return self._cursor
+
+    def __await__(self) -> Any:
+        """Await the original execute result after the requested pause."""
+        return self._result().__await__()
+
+    async def __aenter__(self) -> aiosqlite_module.Cursor:
+        """Enter as the original cursor-returning execute context manager."""
+        return await self
+
+    async def __aexit__(self, *args: object) -> None:
+        """Close the cursor as aiosqlite's execute context manager does."""
+        if self._cursor is not None:
+            await self._cursor.close()
 
 
 async def fetch_names(store: RoastStore, kind: str) -> set[str]:
@@ -210,6 +255,308 @@ async def test_process_epoch_unclean_or_upgraded_database_keeps_absent_lease_unk
         assert (await upgraded.read_fault_control_lease()).status.value == "unknown"
     finally:
         await upgraded.close()
+
+
+async def _seed_expired_bean_draft(store: RoastStore) -> str:
+    """Insert one expired draft retained by the shared expiry writer."""
+    attempt_id = "a" * 32
+    await store.connection.execute(
+        "INSERT INTO bean_sourcing_attempts "
+        "(id, provider, model_slug, prompt_version, owner_instance_id, "
+        "started_at_utc, lease_expires_at_utc, completed_at_utc, outcome, "
+        "draft_snapshot_json, claim_expires_at_utc) "
+        "VALUES (?, 'test', 'test', 'test', 'test', ?, ?, ?, 'success', ?, ?)",
+        (
+            attempt_id,
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:05:00+00:00",
+            "2026-01-01T00:01:00+00:00",
+            "{}",
+            "2026-01-01T01:00:00+00:00",
+        ),
+    )
+    await store.connection.commit()
+    return attempt_id
+
+
+@pytest.mark.asyncio
+async def test_epoch_commit_survives_interleaved_draft_expiry_after_insert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The expiry writer cannot commit another connection's epoch transaction."""
+    store = RoastStore(tmp_path / "epoch-expiry.sqlite3")
+    await store.initialize()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_execute = aiosqlite_module.Connection.execute
+
+    def paused_execute(
+        connection: aiosqlite_module.Connection, sql: str, *args: object, **kwargs: object
+    ) -> object:
+        return _PausedExecution(
+            original_execute(connection, sql, *args, **kwargs),
+            sql,
+            lambda statement: (
+                " ".join(statement.split()).upper().startswith("INSERT INTO PROCESS_EPOCH")
+            ),
+            entered,
+            release,
+        )
+
+    monkeypatch.setattr(aiosqlite_module.Connection, "execute", paused_execute)
+    try:
+        attempt_id = await _seed_expired_bean_draft(store)
+        epoch = asyncio.create_task(store.begin_process_epoch("epoch-process"))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        expiry = asyncio.create_task(
+            store.expire_bean_sourcing_drafts(now_utc="2026-01-02T00:00:00+00:00")
+        )
+        done, _pending = await asyncio.wait_for(asyncio.wait({expiry}, timeout=0.1), timeout=0.2)
+        assert done == set()
+        release.set()
+        assert await asyncio.wait_for(epoch, timeout=2.0)
+        assert await asyncio.wait_for(expiry, timeout=2.0) == 1
+        async with aiosqlite_module.connect(store.db_path) as fresh:
+            fresh.row_factory = aiosqlite_module.Row
+            async with fresh.execute(
+                "SELECT process_id, status FROM process_epoch WHERE singleton = 1"
+            ) as cursor:
+                epoch_row = await cursor.fetchone()
+            async with fresh.execute(
+                "SELECT draft_snapshot_json FROM bean_sourcing_attempts WHERE id = ?", (attempt_id,)
+            ) as cursor:
+                draft_row = await cursor.fetchone()
+        assert epoch_row is not None
+        assert tuple(epoch_row) == ("epoch-process", "unclean")
+        assert draft_row is not None and draft_row["draft_snapshot_json"] is None
+        assert not store.connection.in_transaction
+    finally:
+        release.set()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_epoch_waits_for_pending_shared_write_instead_of_failing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dedicated epoch transaction waits for a shared writer to finish."""
+    store = RoastStore(tmp_path / "epoch-pending-write.sqlite3")
+    await store.initialize()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_execute = aiosqlite_module.Connection.execute
+
+    def paused_execute(
+        connection: aiosqlite_module.Connection, sql: str, *args: object, **kwargs: object
+    ) -> object:
+        return _PausedExecution(
+            original_execute(connection, sql, *args, **kwargs),
+            sql,
+            lambda statement: (
+                " ".join(statement.split())
+                .upper()
+                .startswith("UPDATE BEAN_SOURCING_ATTEMPTS SET DRAFT")
+            ),
+            entered,
+            release,
+        )
+
+    monkeypatch.setattr(aiosqlite_module.Connection, "execute", paused_execute)
+    try:
+        attempt_id = await _seed_expired_bean_draft(store)
+        expiry = asyncio.create_task(
+            store.expire_bean_sourcing_drafts(now_utc="2026-01-02T00:00:00+00:00")
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        epoch = asyncio.create_task(store.begin_process_epoch("waiting-process"))
+        done, _pending = await asyncio.wait_for(asyncio.wait({epoch}, timeout=0.1), timeout=0.2)
+        assert done == set()
+        release.set()
+        assert await asyncio.wait_for(expiry, timeout=2.0) == 1
+        assert await asyncio.wait_for(epoch, timeout=2.0)
+        async with aiosqlite_module.connect(store.db_path) as fresh:
+            async with fresh.execute(
+                "SELECT status FROM process_epoch WHERE singleton = 1"
+            ) as cursor:
+                epoch_row = await cursor.fetchone()
+            async with fresh.execute(
+                "SELECT draft_snapshot_json FROM bean_sourcing_attempts WHERE id = ?", (attempt_id,)
+            ) as cursor:
+                draft_row = await cursor.fetchone()
+        assert epoch_row is not None and epoch_row[0] == "unclean"
+        assert draft_row is not None and draft_row[0] is None
+    finally:
+        release.set()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_epoch_commit_failure_fails_closed_and_closes_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An uncertain epoch commit preserves trust and rolls back before closing."""
+    store = RoastStore(tmp_path / "epoch-commit-failure.sqlite3")
+    await store.initialize()
+    await store.connection.execute(
+        "INSERT INTO process_epoch (singleton, process_id, status, updated_at_utc) "
+        "VALUES (1, 'predecessor', 'unclean', '2026-01-01T00:00:00+00:00')"
+    )
+    await store.connection.commit()
+    initial_trust = store._fault_lease_absence_trusted  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    calls: list[str] = []
+    original_connect = aiosqlite_module.connect
+
+    async def failing_connect(
+        database: str | Path, *args: Any, **kwargs: Any
+    ) -> aiosqlite_module.Connection:
+        connection = await original_connect(database, *args, **kwargs)
+        original_rollback = connection.rollback
+        original_close = connection.close
+
+        async def failing_commit() -> None:
+            raise sqlite3.OperationalError("commit failed")
+
+        async def recording_rollback() -> None:
+            calls.append("rollback")
+            await original_rollback()
+
+        async def recording_close() -> None:
+            calls.append("close")
+            await original_close()
+
+        monkeypatch.setattr(connection, "commit", failing_commit)
+        monkeypatch.setattr(connection, "rollback", recording_rollback)
+        monkeypatch.setattr(connection, "close", recording_close)
+        return connection
+
+    monkeypatch.setattr(aiosqlite_module, "connect", failing_connect)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="commit failed"):
+            await store.begin_process_epoch("failed-process")
+        assert store._fault_lease_absence_trusted is initial_trust  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert calls == ["rollback", "close"]
+        async with (
+            original_connect(store.db_path) as fresh,
+            fresh.execute("SELECT process_id, status FROM process_epoch") as cursor,
+        ):
+            assert await cursor.fetchone() == ("predecessor", "unclean")
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_epoch_cancellation_rolls_back_and_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation rolls the dedicated epoch transaction back and releases it."""
+    store = RoastStore(tmp_path / "epoch-cancel.sqlite3")
+    await store.initialize()
+    initial_trust = store._fault_lease_absence_trusted  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    closed = asyncio.Event()
+    original_execute = aiosqlite_module.Connection.execute
+    original_connect = aiosqlite_module.connect
+
+    def paused_execute(
+        connection: aiosqlite_module.Connection, sql: str, *args: object, **kwargs: object
+    ) -> object:
+        return _PausedExecution(
+            original_execute(connection, sql, *args, **kwargs),
+            sql,
+            lambda statement: (
+                " ".join(statement.split()).upper().startswith("INSERT INTO PROCESS_EPOCH")
+            ),
+            entered,
+            release,
+        )
+
+    async def recording_connect(
+        database: str | Path, *args: Any, **kwargs: Any
+    ) -> aiosqlite_module.Connection:
+        connection = await original_connect(database, *args, **kwargs)
+        original_close = connection.close
+
+        async def recording_close() -> None:
+            closed.set()
+            await original_close()
+
+        monkeypatch.setattr(connection, "close", recording_close)
+        return connection
+
+    monkeypatch.setattr(aiosqlite_module.Connection, "execute", paused_execute)
+    monkeypatch.setattr(aiosqlite_module, "connect", recording_connect)
+    try:
+        epoch = asyncio.create_task(store.begin_process_epoch("cancelled-process"))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        epoch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(epoch, timeout=1.0)
+        assert await asyncio.wait_for(closed.wait(), timeout=1.0)
+        assert store._fault_lease_absence_trusted is initial_trust  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert not store.connection.in_transaction
+        assert await store.expire_bean_sourcing_drafts(now_utc="2026-01-02T00:00:00+00:00") == 0
+        async with (
+            original_connect(store.db_path) as fresh,
+            fresh.execute("SELECT process_id FROM process_epoch") as cursor,
+        ):
+            assert await cursor.fetchone() is None
+    finally:
+        release.set()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_epoch_on_uninitialized_store_raises_without_connecting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An uninitialized store cannot create a database through epoch admission."""
+    path = tmp_path / "uninitialized-epoch.sqlite3"
+    store = RoastStore(path)
+    connected = False
+
+    async def unexpected_connect(*args: object, **kwargs: object) -> aiosqlite_module.Connection:
+        nonlocal connected
+        connected = True
+        raise AssertionError("epoch must check initialization before connecting")
+
+    monkeypatch.setattr(aiosqlite_module, "connect", unexpected_connect)
+    with pytest.raises(RuntimeError, match="^store is not initialized$"):
+        await store.begin_process_epoch("uninitialized-process")
+    assert not connected
+    assert not path.exists()
+
+
+def test_no_explicit_transaction_sql_on_shared_store_connection() -> None:
+    """The shared connection never owns an explicit transaction or rollback."""
+    tree = ast.parse((Path(__file__).parents[1] / "src/roastpilot_agent/store.py").read_text())
+    forbidden: list[tuple[int, str]] = []
+    prefixes = ("BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE")
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        receiver = node.func.value
+        shared = (
+            isinstance(receiver, ast.Attribute)
+            and isinstance(receiver.value, ast.Name)
+            and receiver.value.id == "self"
+            and receiver.attr in {"connection", "_connection"}
+        )
+        if not shared:
+            continue
+        if node.func.attr == "rollback":
+            forbidden.append((node.lineno, "rollback"))
+            continue
+        if node.func.attr not in {"execute", "executescript"} or not node.args:
+            continue
+        argument = node.args[0]
+        if (
+            isinstance(argument, ast.Constant)
+            and isinstance(argument.value, str)
+            and argument.value.lstrip().upper().startswith(prefixes)
+        ):
+            forbidden.append((node.lineno, argument.value))
+    assert forbidden == []
 
 
 @pytest.mark.asyncio
