@@ -289,6 +289,10 @@ describe("RoastHeader", () => {
           overflow_count_last_minute: 0,
           estimated_lost_audio_ms_last_minute: 0,
           total_overflow_count: 0,
+          max_consecutive_overflow_count: null,
+          inference_overrun_count: null,
+          last_inference_duration_ms: null,
+          max_inference_duration_ms: null,
         }}
       />,
     );
@@ -325,6 +329,10 @@ describe("RoastHeader", () => {
           overflow_count_last_minute: 2,
           estimated_lost_audio_ms_last_minute: 64.7,
           total_overflow_count: 5,
+          max_consecutive_overflow_count: null,
+          inference_overrun_count: null,
+          last_inference_duration_ms: null,
+          max_inference_duration_ms: null,
         }}
       />,
     );
