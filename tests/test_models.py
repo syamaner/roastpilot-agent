@@ -784,6 +784,32 @@ def test_mic_status_overflow_diagnostics_forwarded_and_default_to_zero() -> None
     assert defaulted.total_overflow_count == 0
 
 
+def test_mic_status_inference_diagnostics_default_to_none() -> None:
+    """#1069: direct and factory defaults retain unavailable diagnostics as null."""
+    direct = MicStatus(
+        mic_health=MicHealth.OK,
+        audio_running=True,
+        fc_status="detected",
+        queued_window_count=1,
+        emitted_window_count=1,
+        dropped_window_count=0,
+        processed_window_count=1,
+    )
+    factory = MicStatus.from_first_crack_status(
+        status="detected",
+        audio_running=True,
+        queued_window_count=1,
+        emitted_window_count=1,
+        dropped_window_count=0,
+        processed_window_count=1,
+    )
+    for status in (direct, factory):
+        assert status.max_consecutive_overflow_count is None
+        assert status.inference_overrun_count is None
+        assert status.last_inference_duration_ms is None
+        assert status.max_inference_duration_ms is None
+
+
 def test_mic_status_json_round_trip() -> None:
     """MicStatus serializes by enum value and reconstructs (the SSE/REST wire)."""
     mic = MicStatus.from_first_crack_status(

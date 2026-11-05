@@ -3298,6 +3298,21 @@ def test_project_mic_status_forwards_the_overflow_diagnostics_trio() -> None:
     assert mic.total_overflow_count == 17
 
 
+def test_project_mic_status_forwards_inference_diagnostics() -> None:
+    """#1069: retained MCP inference diagnostics are a pure read-only projection."""
+    state = _state_with_fc(
+        max_consecutive_overflow_count=2,
+        inference_overrun_count=3,
+        last_inference_duration_ms=12.5,
+        max_inference_duration_ms=640.0,
+    )
+    mic = project_mic_status(state.first_crack_status)
+    assert mic.max_consecutive_overflow_count == 2
+    assert mic.inference_overrun_count == 3
+    assert mic.last_inference_duration_ms == 12.5
+    assert mic.max_inference_duration_ms == 640.0
+
+
 def test_project_mic_status_overflow_diagnostics_default_to_zero_pre_0_1_13() -> None:
     """#539: a pre-0.1.13 MCP payload (all-zero overflow fields, the mirror's
     own defaults — see test_first_crack_status_overflow_fields_default_for_

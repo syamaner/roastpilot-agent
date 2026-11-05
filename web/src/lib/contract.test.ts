@@ -394,6 +394,10 @@ describe("telemetry — every field the SPA renders is present", () => {
       "dropped_window_count",
       "processed_window_count",
       "reason",
+      "max_consecutive_overflow_count",
+      "inference_overrun_count",
+      "last_inference_duration_ms",
+      "max_inference_duration_ms",
     ]);
     // mic_health is one of the three the icon tints by (the union the SPA renders).
     expect(MIC_HEALTHS).toContain((mic as MicStatus).mic_health);
@@ -401,6 +405,15 @@ describe("telemetry — every field the SPA renders is present", () => {
     expect(FC_STATUSES).toContain((mic as MicStatus).fc_status);
     expect(typeof (mic as MicStatus).audio_running).toBe("boolean");
     expect(typeof (mic as MicStatus).queued_window_count).toBe("number");
+    for (const name of [
+      "max_consecutive_overflow_count",
+      "inference_overrun_count",
+      "last_inference_duration_ms",
+      "max_inference_duration_ms",
+    ] as const) {
+      const value = (mic as MicStatus)[name];
+      expect(value === null || (typeof value === "number" && Number.isFinite(value))).toBe(true);
+    }
   });
 });
 
@@ -610,8 +623,21 @@ describe("REST snapshot contract", () => {
       "dropped_window_count",
       "processed_window_count",
       "reason",
+      "max_consecutive_overflow_count",
+      "inference_overrun_count",
+      "last_inference_duration_ms",
+      "max_inference_duration_ms",
     ]);
     expect(MIC_HEALTHS).toContain((rest.roast_detail.mic_status as MicStatus).mic_health);
+    for (const name of [
+      "max_consecutive_overflow_count",
+      "inference_overrun_count",
+      "last_inference_duration_ms",
+      "max_inference_duration_ms",
+    ] as const) {
+      const value = (rest.roast_detail.mic_status as MicStatus)[name];
+      expect(value === null || (typeof value === "number" && Number.isFinite(value))).toBe(true);
+    }
     // The nested profile the detail/header render from.
     expectKeys(rest.roast_detail.profile as unknown as Record<string, unknown>, [
       "name",

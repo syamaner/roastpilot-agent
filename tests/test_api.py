@@ -6504,6 +6504,38 @@ async def test_detail_enriches_active_run_with_live_mic_status(store: RoastStore
 
 
 @pytest.mark.asyncio
+async def test_detail_preserves_live_inference_diagnostics(store: RoastStore) -> None:
+    """#1069: detail exposes retained diagnostic values without changing mic health."""
+    await store.create_run(
+        run_id="run-live-inference-diagnostics",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    )
+    state = _session_state(fc_status="detected", audio_running=True)
+    status = state.first_crack_status.model_copy(
+        update={
+            "max_consecutive_overflow_count": 2,
+            "inference_overrun_count": 3,
+            "last_inference_duration_ms": 12.5,
+            "max_inference_duration_ms": 640.0,
+        }
+    )
+    service = RoastService(
+        store,
+        raw_state=_FakeRawState(state.model_copy(update={"first_crack_status": status})),
+    )
+    service.active_run_id = "run-live-inference-diagnostics"
+    detail = await service.detail("run-live-inference-diagnostics")
+    assert detail.mic_status is not None
+    assert detail.mic_status.mic_health is MicHealth.OK
+    assert detail.mic_status.max_consecutive_overflow_count == 2
+    assert detail.mic_status.inference_overrun_count == 3
+    assert detail.mic_status.last_inference_duration_ms == 12.5
+    assert detail.mic_status.max_inference_duration_ms == 640.0
+
+
+@pytest.mark.asyncio
 async def test_detail_mic_status_none_for_completed_run_with_stale_active_pointer(
     store: RoastStore,
 ) -> None:
