@@ -84,8 +84,10 @@ from roastpilot_agent.mcp_client import (
     FirstCrackStatus,
     MCPConnectionError,
     MCPServerProcess,
+    RoasterDeviceState,
     RoastSessionState,
     project_mic_status,
+    project_session_state,
 )
 from roastpilot_agent.models import (
     AppliedRoasterState,
@@ -6594,12 +6596,23 @@ async def test_runner_retains_inference_diagnostics_in_raw_state_sse_and_detail(
             first_crack_payload.pop(field)
         first_crack_payload.update(updates)
         parsed_status = FirstCrackStatus.model_validate(first_crack_payload)
-        raw_state = base.model_copy(update={"first_crack_status": parsed_status})
-        telemetry = RoastTelemetry(
-            bean_temp_c=180.0,
-            env_temp_c=205.0,
-            mic_status=project_mic_status(parsed_status),
+        raw_state = base.model_copy(
+            update={
+                "first_crack_status": parsed_status,
+                "device_state": RoasterDeviceState(
+                    driver="mock",
+                    connected=True,
+                    bean_temp_c=180.0,
+                    env_temp_c=205.0,
+                    heat_level_percent=70,
+                    fan_level_percent=40,
+                    cooling_on=False,
+                    raw_vendor_data={},
+                ),
+            }
         )
+        telemetry = project_session_state(raw_state, age_seconds=0.0)
+        assert telemetry is not None
         mcp = FakeMCPClient([telemetry])
         clock = FakeClock()
         service, run_id = await _live_service(
