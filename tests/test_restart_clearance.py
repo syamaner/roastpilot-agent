@@ -279,7 +279,6 @@ async def test_lifespan_order_reaches_required_gate_when_expiry_interleaves(
     def paused_execute(
         connection: aiosqlite.Connection, sql: str, *args: object, **kwargs: object
     ) -> object:
-        nonlocal armed
         return _PausedExecution(
             original_execute(connection, sql, *args, **kwargs), sql, epoch_entered, release_epoch
         )
@@ -329,8 +328,9 @@ async def test_lifespan_order_reaches_required_gate_when_expiry_interleaves(
         armed = True
         recovering = asyncio.create_task(service.recover_on_start())
         await asyncio.wait_for(epoch_entered.wait(), timeout=1.0)
+        expiry_task = service._bean_draft_expiry_task  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert expiry_task is not None and not expiry_task.done()
         service._bean_draft_expiry_wakeup.set()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        service._ensure_bean_draft_expiry_task()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         await asyncio.wait_for(maintenance_started.wait(), timeout=1.0)
         maintenance_completion = asyncio.create_task(maintenance_finished.wait())
         done, _pending = await asyncio.wait_for(
