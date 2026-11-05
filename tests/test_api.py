@@ -15,7 +15,15 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Iterator
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterator,
+    Mapping,
+)
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -77,6 +85,7 @@ from roastpilot_agent.mcp_client import (
     MCPConnectionError,
     MCPServerProcess,
     RoastSessionState,
+    project_mic_status,
 )
 from roastpilot_agent.models import (
     AppliedRoasterState,
@@ -6533,6 +6542,230 @@ async def test_detail_preserves_live_inference_diagnostics(store: RoastStore) ->
     assert detail.mic_status.inference_overrun_count == 3
     assert detail.mic_status.last_inference_duration_ms == 12.5
     assert detail.mic_status.max_inference_duration_ms == 640.0
+
+
+@pytest.mark.asyncio
+async def test_runner_retains_inference_diagnostics_in_raw_state_sse_and_detail(
+    store: RoastStore,
+) -> None:
+    """#1069: one normal runner tick retains values, nulls and legacy absence.
+
+    Each case starts from a parsed MCP first-crack payload, drives a real
+    ``RoastRunner`` tick through the fake roaster, then reads the actual SQLite
+    raw state, rendered telemetry frame and live detail projection.
+    """
+    cases: tuple[tuple[str, dict[str, object], dict[str, object]], ...] = (
+        (
+            "values",
+            {
+                "max_consecutive_overflow_count": 2,
+                "inference_overrun_count": 3,
+                "last_inference_duration_ms": 12.5,
+                "max_inference_duration_ms": 640.0,
+            },
+            {
+                "max_consecutive_overflow_count": 2,
+                "inference_overrun_count": 3,
+                "last_inference_duration_ms": 12.5,
+                "max_inference_duration_ms": 640.0,
+            },
+        ),
+        (
+            "nulls",
+            {
+                "max_consecutive_overflow_count": None,
+                "inference_overrun_count": None,
+                "last_inference_duration_ms": None,
+                "max_inference_duration_ms": None,
+            },
+            {
+                "max_consecutive_overflow_count": None,
+                "inference_overrun_count": None,
+                "last_inference_duration_ms": None,
+                "max_inference_duration_ms": None,
+            },
+        ),
+        ("legacy", {}, {name: None for name in _INFERENCE_DIAGNOSTIC_NAMES}),
+    )
+    for name, updates, expected in cases:
+        base = _session_state(fc_status="detected", audio_running=True)
+        first_crack_payload = base.first_crack_status.model_dump()
+        for field in _INFERENCE_DIAGNOSTIC_NAMES:
+            first_crack_payload.pop(field)
+        first_crack_payload.update(updates)
+        parsed_status = FirstCrackStatus.model_validate(first_crack_payload)
+        raw_state = base.model_copy(update={"first_crack_status": parsed_status})
+        telemetry = RoastTelemetry(
+            bean_temp_c=180.0,
+            env_temp_c=205.0,
+            mic_status=project_mic_status(parsed_status),
+        )
+        mcp = FakeMCPClient([telemetry])
+        clock = FakeClock()
+        service, run_id = await _live_service(
+            store,
+            mcp=mcp,
+            clock=clock,
+            raw_state=_FakeRawState(raw_state),
+            profile=_profile(name=f"inference-{name}"),
+        )
+        queue = service.events.subscribe()
+        try:
+            await _tick(service, clock)
+            async with store.connection.execute(
+                "SELECT raw_state_json FROM telemetry_snapshots WHERE run_id = ?", (run_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+            persisted = json.loads(cast("str", row[0]))
+            assert {
+                field: persisted["first_crack_status"][field]
+                for field in _INFERENCE_DIAGNOSTIC_NAMES
+            } == expected
+
+            events: list[SseEvent] = []
+            while not queue.empty():
+                events.append(queue.get_nowait())
+            rendered = [event.render() for event in events]
+            telemetry_frame = next(frame for frame in rendered if "event: telemetry" in frame)
+            data_line = next(
+                line for line in telemetry_frame.splitlines() if line.startswith("data: ")
+            )
+
+            def reject_non_finite(token: str) -> object:
+                raise ValueError(f"non-finite JSON token: {token}")
+
+            data = json.loads(data_line.removeprefix("data: "), parse_constant=reject_non_finite)
+            assert isinstance(data, dict)
+            assert {
+                field: data["mic_status"][field] for field in _INFERENCE_DIAGNOSTIC_NAMES
+            } == expected
+
+            detail = await service.detail(run_id)
+            assert detail.mic_status is not None
+            assert {
+                field: getattr(detail.mic_status, field) for field in _INFERENCE_DIAGNOSTIC_NAMES
+            } == expected
+            await store.complete_run(
+                run_id=run_id, outcome="aborted", agent_phase=RoastPhase.COMPLETE
+            )
+        finally:
+            service.events.unsubscribe(queue)
+            await service.shutdown()
+
+
+_INFERENCE_DIAGNOSTIC_NAMES = (
+    "max_consecutive_overflow_count",
+    "inference_overrun_count",
+    "last_inference_duration_ms",
+    "max_inference_duration_ms",
+)
+
+
+async def _drive_inference_diagnostic_advisory_run(
+    store: RoastStore, diagnostics: Mapping[str, object]
+) -> tuple[FakeAdvisor, tuple[Any, ...], list[tuple[str, dict[str, object]]], MicHealth]:
+    """Drive one actual advisory/safety/write path with diagnostic values."""
+    base_mic = project_mic_status(
+        FirstCrackStatus.model_validate(
+            {
+                **_session_state(
+                    fc_status="pending", audio_running=True
+                ).first_crack_status.model_dump(),
+                **diagnostics,
+            }
+        )
+    )
+    mcp = FakeMCPClient([_reading(178.0, 185.0, mic_status=base_mic)])
+    advisor = FakeAdvisor(
+        [],
+        default_decision=RoastDecision(
+            target_heat=10,
+            target_fan=100,
+            should_drop=False,
+            confidence=0.9,
+            rationale="diagnostic-invariant",
+        ),
+    )
+    clock = FakeClock()
+    config = AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0))
+    service, run_id = await _live_service(
+        store,
+        mcp=mcp,
+        clock=clock,
+        advisor=advisor,
+        profile=_profile(name="diagnostic-invariant"),
+        config=config,
+    )
+    try:
+        await _tick(service, clock)
+        mcp.frames = [_reading(95.0, 150.0, t0_detected=True, mic_status=base_mic)]
+        for _ in range(3):
+            await _tick(service, clock)
+        mcp.frames = [
+            _reading(
+                180.0,
+                205.0,
+                t0_detected=True,
+                first_crack_detected=True,
+                mic_status=base_mic,
+            )
+        ]
+        await _tick(service, clock)
+        mcp.frames = [
+            _reading(
+                185.0,
+                208.0,
+                t0_detected=True,
+                first_crack_detected=True,
+                mic_status=base_mic,
+            )
+        ]
+        await _tick(service, clock)
+        for _ in range(3):
+            await asyncio.sleep(0)
+            await _tick(service, clock)
+        timeline = await store.read_timeline(run_id)
+        assert advisor.contexts
+        assert {context.phase for context in advisor.contexts} == {RoastPhase.DEVELOPMENT}
+        assert timeline.safety_evaluations
+        writes = [call for call in mcp.calls if call[0] in {"set_heat", "set_fan", "set_targets"}]
+        assert writes
+        await store.complete_run(run_id=run_id, outcome="aborted", agent_phase=RoastPhase.COMPLETE)
+        return advisor, tuple(timeline.safety_evaluations), writes, base_mic.mic_health
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runner_diagnostics_do_not_reach_advisor_safety_or_commands(
+    store: RoastStore,
+) -> None:
+    """#1069: changed diagnostics leave actual advisor/safety/write traces equal."""
+    no_diagnostics = {name: None for name in _INFERENCE_DIAGNOSTIC_NAMES}
+    observed_diagnostics = {
+        "max_consecutive_overflow_count": 2**53 - 1,
+        "inference_overrun_count": 2**53 - 1,
+        "last_inference_duration_ms": 1e300,
+        "max_inference_duration_ms": 1e300,
+    }
+    baseline = await _drive_inference_diagnostic_advisory_run(store, no_diagnostics)
+    observed = await _drive_inference_diagnostic_advisory_run(store, observed_diagnostics)
+
+    baseline_advisor, baseline_evaluations, baseline_writes, baseline_health = baseline
+    observed_advisor, observed_evaluations, observed_writes, observed_health = observed
+    assert [context.model_dump(mode="json") for context in baseline_advisor.contexts] == [
+        context.model_dump(mode="json") for context in observed_advisor.contexts
+    ]
+    assert [
+        evaluation.model_dump(mode="json", exclude={"id", "recorded_at_utc"})
+        for evaluation in baseline_evaluations
+    ] == [
+        evaluation.model_dump(mode="json", exclude={"id", "recorded_at_utc"})
+        for evaluation in observed_evaluations
+    ]
+    assert baseline_writes == observed_writes
+    assert baseline_health is observed_health
 
 
 @pytest.mark.asyncio
