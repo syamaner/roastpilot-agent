@@ -1,8 +1,9 @@
 """D225 stranded-fault retirement service behaviour (hardware-free)."""
 
 import asyncio
-from typing import cast
+from typing import Any, cast
 
+import aiosqlite
 import pytest
 
 import roastpilot_agent.api as api_module
@@ -271,7 +272,7 @@ async def test_foreign_child_binding_cannot_reconcile_an_owned_fence(
                 return lease
 
             monkeypatch.setattr(service, "_read_fault_lease_fail_closed", stop_after_lease_read)
-            expected_outcome = "rejected"
+            expected_outcome = "unconfirmed"
 
         assert (await service.retire_stranded_fault(request)).outcome == expected_outcome
         assert len(verifier_calls) == 1
@@ -546,6 +547,64 @@ async def _settled_task() -> asyncio.Task[None]:
     task = asyncio.create_task(asyncio.sleep(0))
     await task
     return task
+
+
+@pytest.mark.asyncio
+async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g_plus_one_settles(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TB6/TB7: priority e-stop dispatch runs before G's transaction releases."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        transaction_entered = asyncio.Event()
+        release_transaction = asyncio.Event()
+        dispatch_reached = asyncio.Event()
+        original_execute = cast("Any", aiosqlite.Connection._execute)  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]
+        held_once = False
+
+        async def hold_first_begin_immediate(
+            connection: Any, function: Any, *args: Any, **kwargs: Any
+        ) -> Any:
+            nonlocal held_once
+            result = await original_execute(connection, function, *args, **kwargs)
+            if not held_once and args and args[0] == "BEGIN IMMEDIATE":
+                held_once = True
+                transaction_entered.set()
+                await release_transaction.wait()
+            return result
+
+        async def observe_terminal_dispatch(**_kwargs: object) -> bool:
+            dispatch_reached.set()
+            return False
+
+        monkeypatch.setattr(aiosqlite.Connection, "_execute", hold_first_begin_immediate)
+        monkeypatch.setattr(service, "_execute_terminal_emergency_stop", observe_terminal_dispatch)
+        service._fault_control_executor = cast("Any", object())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        retirement = asyncio.create_task(service.retire_stranded_fault(_retirement_request()))
+        await asyncio.wait_for(transaction_entered.wait(), timeout=2.0)
+        estop = asyncio.create_task(service._submit_fault_controls_emergency_stop())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await asyncio.wait_for(dispatch_reached.wait(), timeout=2.0)
+
+        assert service._fault_lease_cache.generation == 2  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        release_transaction.set()
+        retirement_result = await retirement
+        estop_result = await estop
+
+        assert retirement_result.outcome == "unconfirmed"
+        assert estop_result.action is OperatorAction.EMERGENCY_STOP
+        assert (await tmp_store.read_fault_control_lease()).generation == 2
+        async with tmp_store.connection.execute(
+            "SELECT COUNT(*) FROM operator_actions WHERE action = ?",
+            (OperatorAction.RETIRE_STRANDED_FAULT.value,),
+        ) as cursor:
+            retirement_audit = await cursor.fetchone()
+        assert retirement_audit is not None
+        assert retirement_audit[0] == 1
+        service._fault_control_executor = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
 
 
 @pytest.mark.asyncio
