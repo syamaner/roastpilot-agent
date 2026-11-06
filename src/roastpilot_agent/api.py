@@ -680,8 +680,27 @@ class _StrandedFaultRetirementSnapshot:
     available: bool
     physical_stop_operative: bool
     fresh: bool
+    read_failed: bool
     expected_cache: FaultControlLease
     emergency_stop_admission_epoch: int
+
+
+@dataclass(frozen=True)
+class _FaultControlsProjectionBinding:
+    """No-await binding for preserving an established D212 controls projection."""
+
+    process_id: str
+    child: MCPServerProcess | None
+    child_epoch: int | None
+    child_running: bool | None
+    child_stop_unconfirmed: bool | None
+    roaster: object | None
+    executor: object | None
+    cache_lease: FaultControlLease
+    emergency_stop_admission_epoch: int
+    requires_live_restart_clearance: bool
+    restart_clearance_state: RestartClearanceState
+    transients: "_RetirementSnapshotTransients"
 
 
 @dataclass(frozen=True)
@@ -2815,9 +2834,7 @@ class RoastService:
         if self._requires_live_restart_clearance:
             await self._ensure_restart_epoch()
         pre_snapshot_lease = await self._read_fault_lease_fail_closed()
-        pre_snapshot_identity = self._capture_retirement_identity()
-        pre_snapshot_cache = self._fault_lease_cache
-        pre_snapshot_transients = self._retirement_snapshot_transient_marker()
+        pre_snapshot_controls_binding = self._capture_fault_controls_projection_binding()
         pre_snapshot_active = await self._store.active_run()
         safety_record_initialization_available = (
             await self._safety_record_initialization_may_be_admitted(
@@ -2846,11 +2863,9 @@ class RoastService:
                 }
             )
             if (
-                snapshot.fresh
+                not snapshot.read_failed
                 and pre_snapshot_lease == snapshot.lease
-                and self._retirement_snapshot_binding_holds(
-                    pre_snapshot_identity, pre_snapshot_cache, pre_snapshot_transients
-                )
+                and self._fault_controls_projection_binding_holds(pre_snapshot_controls_binding)
             )
             else self._fault_controls_snapshot_projection(snapshot)
         )
@@ -3867,6 +3882,26 @@ class RoastService:
             and reservation[1] is asyncio.current_task()
         )
 
+    def _owned_retirement_fence_for(
+        self, identity: _RetirementIdentity
+    ) -> _StrandedFaultRetirementContext | None:
+        """Return the exact captured fence that may only reconcile read-only.
+
+        A caller that captured a valid identity can lose a local binding while
+        waiting for the lock or a later admission read. If it already names its
+        own retained uncertainty fence, that is an honest unconfirmed result,
+        never a fresh admission rejection. Foreign and newer fences remain
+        ordinary rejections.
+        """
+        fence = self._unconfirmed_stranded_fault_retirement
+        if (
+            fence is not None
+            and fence.identity == identity
+            and fence.expected_lease == identity.cache_lease
+        ):
+            return fence
+        return None
+
     async def _stranded_fault_retirement_snapshot(self) -> _StrandedFaultRetirementSnapshot:
         """Read one current D225 projection without asking the MCP child.
 
@@ -3948,8 +3983,53 @@ class RoastService:
             available=available,
             physical_stop_operative=physical_stop_operative,
             fresh=binding_current,
+            read_failed=read_failed,
             expected_cache=expected_cache,
             emergency_stop_admission_epoch=expected_emergency_stop_admission_epoch,
+        )
+
+    def _capture_fault_controls_projection_binding(self) -> _FaultControlsProjectionBinding:
+        """Capture the local state that makes an established D212 projection current.
+
+        D212 can be valid for a legacy terminal lease without a process child.
+        That is distinct from D225, whose retirement admission requires a live,
+        typed child. The optional child is held by reference so the historical
+        controls never survive a process-local replacement or status change.
+        """
+        child = self._mcp
+        return _FaultControlsProjectionBinding(
+            process_id=self.instance_id,
+            child=child,
+            child_epoch=None if child is None else child.child_epoch,
+            child_running=None if child is None else child.running,
+            child_stop_unconfirmed=None if child is None else child.stop_unconfirmed,
+            roaster=self._roaster,
+            executor=self._fault_control_executor,
+            cache_lease=self._fault_lease_cache,
+            emergency_stop_admission_epoch=self._emergency_stop_admission_epoch,
+            requires_live_restart_clearance=self._requires_live_restart_clearance,
+            restart_clearance_state=self._restart_clearance_state,
+            transients=self._retirement_snapshot_transient_marker(),
+        )
+
+    def _fault_controls_projection_binding_holds(
+        self, expected: _FaultControlsProjectionBinding
+    ) -> bool:
+        """Return whether an established D212 projection remains current."""
+        child = self._mcp
+        return (
+            self.instance_id == expected.process_id
+            and child is expected.child
+            and (child is None or child.child_epoch == expected.child_epoch)
+            and (child is None or child.running == expected.child_running)
+            and (child is None or child.stop_unconfirmed == expected.child_stop_unconfirmed)
+            and self._roaster is expected.roaster
+            and self._fault_control_executor is expected.executor
+            and self._fault_lease_cache == expected.cache_lease
+            and self._emergency_stop_admission_epoch == expected.emergency_stop_admission_epoch
+            and self._requires_live_restart_clearance == expected.requires_live_restart_clearance
+            and self._restart_clearance_state is expected.restart_clearance_state
+            and self._retirement_snapshot_transients_hold(expected.transients)
         )
 
     def _retirement_snapshot_binding_holds(
@@ -4147,18 +4227,33 @@ class RoastService:
                 else:
                     return await self._stranded_fault_retirement_result("rejected", None)
             if not self._retirement_identity_holds(identity):
+                fence = self._owned_retirement_fence_for(identity)
+                if fence is not None:
+                    return await self._stranded_fault_retirement_result(
+                        "unconfirmed", fence.expected_lease.generation
+                    )
                 return await self._stranded_fault_retirement_result("rejected", None)
             await self._ensure_restart_epoch()
             if (
                 not self._retirement_identity_holds(identity)
                 or not self._retirement_conditions_hold()
             ):
+                fence = self._owned_retirement_fence_for(identity)
+                if fence is not None:
+                    return await self._stranded_fault_retirement_result(
+                        "unconfirmed", fence.expected_lease.generation
+                    )
                 return await self._stranded_fault_retirement_result("rejected", None)
             lease = await self._read_fault_lease_fail_closed()
             if (
                 not self._retirement_identity_holds(identity)
                 or not self._retirement_conditions_hold()
             ):
+                fence = self._owned_retirement_fence_for(identity)
+                if fence is not None:
+                    return await self._stranded_fault_retirement_result(
+                        "unconfirmed", fence.expected_lease.generation
+                    )
                 return await self._stranded_fault_retirement_result("rejected", None)
             fence = self._unconfirmed_stranded_fault_retirement
             if (
