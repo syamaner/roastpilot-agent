@@ -8867,6 +8867,7 @@ async def test_d225_retirement_commits_one_exact_audit_without_mutating_run_or_e
     operation_id = "b" * 32
     original_configure = store._configure_durable_connection  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     history_dml_attempts: list[tuple[int, str | None]] = []
+    lease_update_attempts: list[tuple[int, str | None]] = []
 
     def deny_history_dml(
         action: int,
@@ -8880,6 +8881,8 @@ async def test_d225_retirement_commits_one_exact_audit_without_mutating_run_or_e
         ):
             history_dml_attempts.append((action, argument1))
             return sqlite3.SQLITE_DENY
+        if action == sqlite3.SQLITE_UPDATE and argument1 == "fault_control_lease":
+            lease_update_attempts.append((action, argument1))
         return sqlite3.SQLITE_OK
 
     async def configure_with_history_dml_oracle(
@@ -8931,6 +8934,8 @@ async def test_d225_retirement_commits_one_exact_audit_without_mutating_run_or_e
         assert await _d225_run_snapshot(store) == runs_before
         assert await fetch_one(store, "SELECT COUNT(*) FROM roast_events") == events_before
         assert history_dml_attempts == []
+        assert lease_update_attempts
+        assert set(lease_update_attempts) == {(sqlite3.SQLITE_UPDATE, "fault_control_lease")}
     finally:
         monkeypatch.undo()
         await store.close()
@@ -8947,7 +8952,12 @@ async def test_d225_retirement_commits_one_exact_audit_without_mutating_run_or_e
         ("a" * 32, 7, "", "d225-session", "b" * 32),
         ("a" * 32, 7, "d225-run", "", "b" * 32),
         ("a" * 32, 7, "d225-run", "d225-session", "not-an-operation-id"),
+        ("a" * 32, 7, "d225-run", "d225-session", "B" * 32),
+        ("a" * 32, 7, "d225-run", "d225-session", "b" * 31),
         ("not-a-process-id", 7, "d225-run", "d225-session", "b" * 32),
+        ("A" * 32, 7, "d225-run", "d225-session", "b" * 32),
+        ("a" * 31, 7, "d225-run", "d225-session", "b" * 32),
+        ("a" * 32, 7, 7, "d225-session", "b" * 32),
     ],
 )
 async def test_d225_retirement_rejects_malformed_arguments_before_connecting(
@@ -8955,7 +8965,7 @@ async def test_d225_retirement_rejects_malformed_arguments_before_connecting(
     monkeypatch: pytest.MonkeyPatch,
     process_id: str,
     generation: object,
-    run_id: str,
+    run_id: object,
     mcp_session_id: str,
     operation_id: str,
 ) -> None:
@@ -8974,7 +8984,7 @@ async def test_d225_retirement_rejects_malformed_arguments_before_connecting(
         await tmp_store.retire_stranded_fault_lease(
             process_id=process_id,
             generation=cast(int, generation),
-            run_id=run_id,
+            run_id=cast(str, run_id),
             mcp_session_id=mcp_session_id,
             operation_id=operation_id,
         )
@@ -9425,6 +9435,7 @@ async def test_d225_precondition_rejection_with_transaction_close_failure_is_ind
     store = await _d225_store_with_terminal_fault(tmp_path, "d225-precondition-close")
     connection_type = cast("Any", aiosqlite_module.Connection)
     original_close: Any = connection_type.close
+    verifier_called = False
     try:
         before_lease = await fetch_one(
             store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
@@ -9436,7 +9447,9 @@ async def test_d225_precondition_rejection_with_transaction_close_failure_is_ind
                 raise RuntimeError("synthetic D225 transaction close failure")
 
         async def verifier_must_not_run(**_kwargs: object) -> bool:
-            raise AssertionError("verification must not run for a rejected premise")
+            nonlocal verifier_called
+            verifier_called = True
+            return False
 
         monkeypatch.setattr(connection_type, "close", close_then_raise)
         monkeypatch.setattr(store, "verify_stranded_fault_retirement", verifier_must_not_run)
@@ -9450,6 +9463,7 @@ async def test_d225_precondition_rejection_with_transaction_close_failure_is_ind
             )
             is StrandedFaultRetirementCommit.INDETERMINATE
         )
+        assert not verifier_called
         assert (
             await fetch_one(
                 store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"

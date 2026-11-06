@@ -1867,7 +1867,8 @@ class RoastStore:
         except Exception:  # noqa: BLE001 - unreadable evidence is not proof
             return False
         finally:
-            if connection is not None:
+            # A failed connect returns in except, so it cannot reach post-finally flow.
+            if connection is not None:  # pragma: no branch
                 try:
                     await connection.rollback()
                 except Exception:
