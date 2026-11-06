@@ -118,6 +118,7 @@ from roastpilot_agent.models import (
     FaultControlsProjection,
     FaultControlState,
     FaultCoolingStopResult,
+    FaultLeaseClosureProvenance,
     FaultLeaseStatus,
     HardwareClearAcknowledgementRequest,
     HardwareClearAcknowledgementResult,
@@ -665,6 +666,19 @@ class _StrandedFaultRetirementContext:
     identity: _RetirementIdentity
     expected_lease: FaultControlLease
     operation_id: str
+
+
+@dataclass(frozen=True)
+class _StrandedFaultRetirementSnapshot:
+    """One coherent, fail-closed public view of D225 retirement state."""
+
+    lease: FaultControlLease
+    active: PersistedRun | None
+    latest: PersistedRun | None
+    gate: RestartClearanceState | None
+    provenance: FaultLeaseClosureProvenance | None
+    available: bool
+    physical_stop_operative: bool
 
 
 @dataclass(frozen=True)
@@ -2771,33 +2785,25 @@ class RoastService:
         """
         if self._requires_live_restart_clearance:
             await self._ensure_restart_epoch()
-        active = await self._store.active_run()
-        lease = await self._read_fault_lease_fail_closed()
+        pre_snapshot_lease = await self._read_fault_lease_fail_closed()
+        pre_snapshot_active = await self._store.active_run()
         safety_record_initialization_available = (
-            await self._safety_record_initialization_may_be_admitted(lease, active)
+            await self._safety_record_initialization_may_be_admitted(
+                pre_snapshot_lease, pre_snapshot_active
+            )
         )
+        # This is deliberately the final await sequence for the D225-facing
+        # fields: all returned retirement state comes from this one snapshot.
+        snapshot = await self._stranded_fault_retirement_snapshot(raise_on_read_failure=True)
+        active = snapshot.active
+        lease = snapshot.lease
         restart_clearance = self._restart_clearance_projection(
             lease,
             active=active,
             safety_record_initialization_available=safety_record_initialization_available,
-            retirement_available=await self._stranded_fault_retirement_may_be_admitted(
-                lease, active
-            ),
+            retirement_available=snapshot.available,
         )
-        fault_controls = await self._fault_controls_projection(lease)
-        try:
-            provenance = await self._store.read_fault_control_lease_closure_provenance(lease)
-        except Exception:  # noqa: BLE001 - unavailable durable evidence stays absent
-            provenance = None
-        fault_controls = fault_controls.model_copy(
-            update={
-                "closure_provenance": provenance,
-                "physical_stop_operative": (
-                    lease.status in (FaultLeaseStatus.OPEN, FaultLeaseStatus.UNKNOWN)
-                    and self.runner is None
-                ),
-            }
-        )
+        fault_controls = self._fault_controls_snapshot_projection(snapshot)
         return HealthResponse(
             version=__version__,
             instance_id=self.instance_id,
@@ -3795,6 +3801,7 @@ class RoastService:
             and self._unconfirmed_fault_lease_generation is None
             and not self._fault_lease_persistence_tasks
             and self._safety_record_initialization is None
+            and self._unconfirmed_safety_record_generation is None
             and self._closure_end_task is None
             and self._closure_only_context is None
             and self._starting_run_id is None
@@ -3823,32 +3830,151 @@ class RoastService:
             )
         )
 
+    def _retirement_context_is_owned(self, context: _StrandedFaultRetirementContext) -> bool:
+        """Return whether both D225 reservations still belong to ``context``."""
+        reservation = self._stranded_fault_retirement
+        return (
+            self._unconfirmed_stranded_fault_retirement is context
+            and reservation is not None
+            and reservation[0] is context
+            and reservation[1] is asyncio.current_task()
+        )
+
+    async def _stranded_fault_retirement_snapshot(
+        self,
+        *,
+        raise_on_read_failure: bool = False,
+    ) -> _StrandedFaultRetirementSnapshot:
+        """Read one current D225 projection without asking the MCP child.
+
+        The entry identity is deliberately captured before the first store
+        await.  The ordinary reader may itself hydrate the cache, so its
+        post-read cache becomes the expected snapshot cache only when every
+        other captured binding still holds.  A later mismatch refreshes solely
+        through that ordinary reader; it never fabricates a newer UNKNOWN.
+        """
+        entry_identity = self._capture_retirement_identity()
+        lease = await self._read_fault_lease_fail_closed()
+        expected_cache = self._fault_lease_cache
+        try:
+            active = await self._store.active_run()
+            latest = await self._store.read_latest_run()
+            gate = await self._store.read_process_restart_clearance(self.instance_id)
+        except Exception:  # noqa: BLE001 - projection never grants on a read error
+            if raise_on_read_failure:
+                raise
+            active = None
+            latest = None
+            gate = None
+        provenance: FaultLeaseClosureProvenance | None = None
+        if lease.status is FaultLeaseStatus.CLOSED:
+            try:
+                candidate = await self._store.read_fault_control_lease_closure_provenance(lease)
+            except Exception:  # noqa: BLE001 - provenance is never inferred
+                candidate = None
+            if self._fault_lease_cache == expected_cache:
+                provenance = candidate
+        binding_current = self._retirement_snapshot_binding_holds(entry_identity, expected_cache)
+        if not binding_current:
+            # The ordinary reader has the closed precedence order for e-stop,
+            # newer live leases and both fences.  It is the only honest refresh.
+            lease = await self._read_fault_lease_fail_closed()
+            provenance = None
+        available = (
+            binding_current
+            and entry_identity is not None
+            and self._retirement_conditions_hold()
+            and active is None
+            and gate is RestartClearanceState.REQUIRED
+            and latest is not None
+            and latest.run_id == lease.run_id
+            and latest.completed_at_utc is not None
+            and latest.outcome == "faulted"
+            and latest.agent_phase is RoastPhase.FAULTED
+            and self._retirement_open_admission(lease, entry_identity)
+            and self._stranded_fault_retirement is None
+        )
+        # This describes only whether the separately-operated physical stop is
+        # the conservative control in a stranded or uncertain lease state.
+        physical_stop_operative = (
+            lease.status in (FaultLeaseStatus.OPEN, FaultLeaseStatus.UNKNOWN)
+            and self.runner is None
+            and (
+                available
+                or self._stranded_fault_retirement is not None
+                or self._unconfirmed_stranded_fault_retirement is not None
+                or not binding_current
+            )
+        )
+        if not binding_current:
+            provenance = None
+        return _StrandedFaultRetirementSnapshot(
+            lease=lease,
+            active=active,
+            latest=latest,
+            gate=gate,
+            provenance=provenance,
+            available=available,
+            physical_stop_operative=physical_stop_operative,
+        )
+
+    def _retirement_snapshot_binding_holds(
+        self,
+        identity: _RetirementIdentity | None,
+        expected_cache: FaultControlLease,
+    ) -> bool:
+        """Return whether a projection read retained its non-eligibility binding."""
+        if identity is None:
+            return False
+        child = identity.child
+        return (
+            not self._shutdown_started
+            and not self._recording_replay_mode
+            and self.instance_id == identity.process_id
+            and self._mcp is child
+            and child.running
+            and not child.stop_unconfirmed
+            and child.child_epoch == identity.child_epoch
+            and self._roaster is not None
+            and self._fault_lease_cache == expected_cache
+            and self._emergency_stop_admission_epoch == identity.emergency_stop_admission_epoch
+        )
+
+    def _fault_controls_snapshot_projection(
+        self, snapshot: _StrandedFaultRetirementSnapshot
+    ) -> FaultControlsProjection:
+        """Project D225 fields without adding an MCP read to a snapshot."""
+        lease = snapshot.lease
+        actions = (
+            [OperatorAction.EMERGENCY_STOP]
+            if lease.status in (FaultLeaseStatus.OPEN, FaultLeaseStatus.UNKNOWN)
+            else []
+        )
+        return FaultControlsProjection(
+            status=lease.status,
+            generation=None if lease.generation == 0 else lease.generation,
+            enabled_actions=actions,
+            closure_provenance=snapshot.provenance,
+            physical_stop_operative=snapshot.physical_stop_operative,
+        )
+
     async def _stranded_fault_retirement_result(
         self,
         outcome: Literal["confirmed", "rejected", "unconfirmed"],
         attempted_generation: int | None,
+        snapshot: _StrandedFaultRetirementSnapshot | None = None,
     ) -> StrandedFaultRetirementResult:
         """Build a current public D225 result without exposing operation identities."""
-        lease = await self._read_fault_lease_fail_closed()
-        try:
-            provenance = await self._store.read_fault_control_lease_closure_provenance(lease)
-        except Exception:  # noqa: BLE001 - public projection remains unavailable
-            provenance = None
-        controls = await self._fault_controls_projection(lease)
-        physical_stop_operative = (
-            lease.status in (FaultLeaseStatus.OPEN, FaultLeaseStatus.UNKNOWN)
-            and self.runner is None
-        )
-        controls = controls.model_copy(
-            update={
-                "closure_provenance": provenance,
-                "physical_stop_operative": physical_stop_operative,
-            }
-        )
+        current = snapshot or await self._stranded_fault_retirement_snapshot()
+        controls = self._fault_controls_snapshot_projection(current)
         return StrandedFaultRetirementResult(
             outcome=outcome,
             attempted_generation=attempted_generation,
-            restart_clearance=self._restart_clearance_projection(lease),
+            restart_clearance=self._restart_clearance_projection(
+                current.lease,
+                active=current.active,
+                retirement_available=current.available,
+            ),
             fault_controls=controls,
         )
 
@@ -3857,6 +3983,7 @@ class RoastService:
         result: StrandedFaultRetirementResult,
         attempted_generation: int,
         context: _StrandedFaultRetirementContext,
+        snapshot: _StrandedFaultRetirementSnapshot | None = None,
     ) -> None:
         """Broadcast one bounded current D225 outcome without durable history writes."""
         ledger = self._retirement_event_ledger
@@ -3867,8 +3994,9 @@ class RoastService:
         )
         if result.outcome in emitted:
             return
-        # The result has just performed all awaits. Do not reinterpret a later
-        # e-stop as an invented retirement frame.
+        current = snapshot or await self._stranded_fault_retirement_snapshot()
+        # The result and the event use the same snapshot; do not reinterpret a
+        # later e-stop as an invented retirement frame.
         child = context.identity.child
         if (
             self._shutdown_started
@@ -3879,18 +4007,18 @@ class RoastService:
             or child.child_epoch != context.identity.child_epoch
             or self._emergency_stop_admission_epoch
             != context.identity.emergency_stop_admission_epoch
-            or self._fault_lease_cache.generation != result.fault_controls.generation
+            or self._fault_lease_cache != current.lease
         ):
             return
         payload = StrandedFaultRetirementEventData(
-            generation=result.fault_controls.generation,
-            status=result.fault_controls.status,
-            closure_provenance=result.fault_controls.closure_provenance,
-            physical_stop_operative=result.fault_controls.physical_stop_operative,
+            generation=None if current.lease.generation == 0 else current.lease.generation,
+            status=current.lease.status,
+            closure_provenance=current.provenance,
+            physical_stop_operative=current.physical_stop_operative,
             retirement=StrandedFaultRetirementEventOutcome(
                 attempted_generation=attempted_generation,
                 outcome=result.outcome,
-                available=False,
+                available=current.available,
             ),
         ).model_dump(mode="json")
         self.events.emit(RoastEventKind.FAULT_CONTROLS_CHANGED, payload)
@@ -3971,15 +4099,15 @@ class RoastService:
                         mcp_session_id=fence.expected_lease.mcp_session_id,
                     )
                     self._unconfirmed_stranded_fault_retirement = None
-                    result = await self._stranded_fault_retirement_result(
-                        "confirmed", fence.expected_lease.generation
-                    )
+                    retirement_outcome: Literal["confirmed", "unconfirmed"] = "confirmed"
                 else:
-                    result = await self._stranded_fault_retirement_result(
-                        "unconfirmed", fence.expected_lease.generation
-                    )
+                    retirement_outcome = "unconfirmed"
+                snapshot = await self._stranded_fault_retirement_snapshot()
+                result = await self._stranded_fault_retirement_result(
+                    retirement_outcome, fence.expected_lease.generation, snapshot
+                )
                 await self._emit_stranded_fault_retirement(
-                    result, fence.expected_lease.generation, fence
+                    result, fence.expected_lease.generation, fence, snapshot
                 )
                 return result
             if not self._retirement_open_admission(lease, identity):
@@ -4029,7 +4157,8 @@ class RoastService:
         """Own the one presence proof and D225 store operation."""
         generation = context.expected_lease.generation
         if (
-            not self._retirement_identity_holds(context.identity)
+            not self._retirement_context_is_owned(context)
+            or not self._retirement_identity_holds(context.identity)
             or not self._retirement_conditions_hold()
         ):
             return await self._reject_stranded_fault_retirement(context)
@@ -4041,11 +4170,18 @@ class RoastService:
             return await self._reject_stranded_fault_retirement(context)
         if (
             presence != "none"
+            or not self._retirement_context_is_owned(context)
             or not self._retirement_identity_holds(context.identity)
             or not self._retirement_conditions_hold()
         ):
             return await self._reject_stranded_fault_retirement(context)
         try:
+            if (
+                not self._retirement_context_is_owned(context)
+                or not self._retirement_identity_holds(context.identity)
+                or not self._retirement_conditions_hold()
+            ):
+                return await self._reject_stranded_fault_retirement(context)
             outcome = await self._store.retire_stranded_fault_lease(
                 process_id=context.identity.process_id,
                 generation=generation,
@@ -4060,8 +4196,9 @@ class RoastService:
         if outcome is StrandedFaultRetirementCommit.PRECONDITION_REJECTED:
             if self._unconfirmed_stranded_fault_retirement is context:
                 self._unconfirmed_stranded_fault_retirement = None
-            result = await self._stranded_fault_retirement_result("rejected", generation)
-            await self._emit_stranded_fault_retirement(result, generation, context)
+            snapshot = await self._stranded_fault_retirement_snapshot()
+            result = await self._stranded_fault_retirement_result("rejected", generation, snapshot)
+            await self._emit_stranded_fault_retirement(result, generation, context, snapshot)
             return result
         confirmed = outcome is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
         if (
@@ -4082,9 +4219,7 @@ class RoastService:
                 confirmed = False
         if (
             confirmed
-            and self._unconfirmed_stranded_fault_retirement is context
-            and self._stranded_fault_retirement is not None
-            and self._stranded_fault_retirement[0] is context
+            and self._retirement_context_is_owned(context)
             and self._retirement_identity_holds(context.identity)
             and self._retirement_conditions_hold()
         ):
@@ -4096,10 +4231,14 @@ class RoastService:
             )
             if self._unconfirmed_stranded_fault_retirement is context:
                 self._unconfirmed_stranded_fault_retirement = None
-            result = await self._stranded_fault_retirement_result("confirmed", generation)
+            retirement_outcome = "confirmed"
         else:
-            result = await self._stranded_fault_retirement_result("unconfirmed", generation)
-        await self._emit_stranded_fault_retirement(result, generation, context)
+            retirement_outcome = "unconfirmed"
+        snapshot = await self._stranded_fault_retirement_snapshot()
+        result = await self._stranded_fault_retirement_result(
+            retirement_outcome, generation, snapshot
+        )
+        await self._emit_stranded_fault_retirement(result, generation, context, snapshot)
         return result
 
     async def _reject_stranded_fault_retirement(
@@ -4108,11 +4247,12 @@ class RoastService:
         """Release one pre-write fence and report its bounded rejected outcome."""
         if self._unconfirmed_stranded_fault_retirement is context:
             self._unconfirmed_stranded_fault_retirement = None
+        snapshot = await self._stranded_fault_retirement_snapshot()
         result = await self._stranded_fault_retirement_result(
-            "rejected", context.expected_lease.generation
+            "rejected", context.expected_lease.generation, snapshot
         )
         await self._emit_stranded_fault_retirement(
-            result, context.expected_lease.generation, context
+            result, context.expected_lease.generation, context, snapshot
         )
         return result
 
