@@ -44,6 +44,7 @@ from roastpilot_agent.models import (
     RoastSummary,
     SseEvent,
     SseEventType,
+    StrandedFaultRetirementRequest,
     TastingEntryRequest,
     TelemetryEventData,
     TelemetryPoint,
@@ -256,6 +257,26 @@ def test_restart_clearance_models_require_an_explicit_boolean_confirmation() -> 
     for invalid_confirmation in (False, 1, "true", None):
         with pytest.raises(pydantic.ValidationError):
             RestartClearanceRequest.model_validate({"physical_confirmation": invalid_confirmation})
+
+
+def test_stranded_fault_retirement_confirmation_is_one_strict_literal() -> None:
+    """D225 accepts only its distinct, non-reusable physical attestation."""
+    literal = "roaster_stopped_empty_heat_fan_cooling_off_physical_stop_ready"
+    assert (
+        StrandedFaultRetirementRequest(
+            stranded_fault_confirmation=literal
+        ).stranded_fault_confirmation
+        == literal
+    )
+    for payload in (
+        {},
+        {"stranded_fault_confirmation": literal.upper()},
+        {"stranded_fault_confirmation": f"{literal} "},
+        {"stranded_fault_confirmation": True},
+        {"stranded_fault_confirmation": literal, "extra": True},
+    ):
+        with pytest.raises(pydantic.ValidationError):
+            StrandedFaultRetirementRequest.model_validate(payload)
 
 
 def test_closure_only_restart_clearance_models_are_typed_and_closed_by_default() -> None:

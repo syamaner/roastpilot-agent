@@ -47,6 +47,7 @@ import type {
   RoastSummary,
   CatalogueRecommendationList,
   FaultControlsEventData,
+  StrandedFaultRetirementEventData,
   SseEvent,
   SseEventType,
   TelemetryEventData,
@@ -71,6 +72,7 @@ interface SseFixture {
   frames: SseEvent[];
   advisory_variants: SseEvent[];
   command_variants: SseEvent[];
+  fault_controls_variants: SseEvent[];
 }
 interface RestFixture {
   roast_detail: RoastDetail;
@@ -315,6 +317,30 @@ describe("fault-control lease SSE contract", () => {
       "fault_controls_changed",
       "fault_controls_acknowledged",
     ]);
+  });
+});
+
+describe("stranded-fault retirement SSE contract", () => {
+  it("keeps the retirement payload separate from the legacy changed shape", () => {
+    const frame = sse.fault_controls_variants[0];
+    const data = frame.data as unknown as StrandedFaultRetirementEventData;
+    expectKeys(data as unknown as Record<string, unknown>, [
+      "generation",
+      "status",
+      "closure_provenance",
+      "physical_stop_operative",
+      "retirement",
+    ]);
+    expect(data).not.toHaveProperty("outcome");
+    expectKeys(data.retirement as unknown as Record<string, unknown>, [
+      "attempted_generation",
+      "outcome",
+      "available",
+    ]);
+    expect(["confirmed", "rejected", "unconfirmed"]).toContain(data.retirement.outcome);
+    expect(["exact_session_safe_zero", "operator_attested_retirement", "baseline"]).toContain(
+      data.closure_provenance,
+    );
   });
 });
 
