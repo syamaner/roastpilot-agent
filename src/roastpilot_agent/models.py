@@ -1395,6 +1395,8 @@ class FaultControlsProjection(BaseModel):
     status: FaultLeaseStatus
     generation: Annotated[StrictInt, Field(ge=0)] | None = None
     enabled_actions: list[OperatorAction] = Field(default_factory=_empty_fault_control_actions)
+    closure_provenance: FaultLeaseClosureProvenance | None = None
+    physical_stop_operative: StrictBool = False
 
 
 class RestartClearanceRequest(BaseModel):
@@ -1411,6 +1413,47 @@ class RestartClearanceRequest(BaseModel):
         if value is not True:
             raise ValueError("must be true")
         return value
+
+
+class StrandedFaultRetirementRequest(BaseModel):
+    """Explicit attestation required to retire one stranded fault lease."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stranded_fault_confirmation: Literal[
+        "roaster_stopped_empty_heat_fan_cooling_off_physical_stop_ready"
+    ]
+
+
+class StrandedFaultRetirementEventOutcome(BaseModel):
+    """One bounded retirement outcome carried by a fault-controls event."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempted_generation: Annotated[StrictInt, Field(ge=1)]
+    outcome: Literal["confirmed", "rejected", "unconfirmed"]
+    available: StrictBool
+
+
+class StrandedFaultRetirementEventData(BaseModel):
+    """Public non-persisted projection for a stranded-fault retirement."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    generation: Annotated[StrictInt, Field(ge=0)] | None
+    status: FaultLeaseStatus
+    closure_provenance: FaultLeaseClosureProvenance | None
+    physical_stop_operative: StrictBool
+    retirement: StrandedFaultRetirementEventOutcome
+
+
+class StrandedFaultRetirementResult(BaseModel):
+    """Public result of an attempted stranded-fault lease retirement."""
+
+    outcome: Literal["confirmed", "rejected", "unconfirmed"]
+    attempted_generation: Annotated[StrictInt, Field(ge=1)] | None
+    restart_clearance: RestartClearanceProjection
+    fault_controls: FaultControlsProjection
 
 
 class InitializeSafetyRecordResult(BaseModel):

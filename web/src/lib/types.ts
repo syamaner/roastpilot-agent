@@ -281,6 +281,10 @@ export interface RestartClearance {
 
 /** Durable fault-control lease status projected without private identifiers. */
 export type FaultControlsStatus = "closed" | "open" | "unknown";
+export type FaultLeaseClosureProvenance =
+  | "exact_session_safe_zero"
+  | "operator_attested_retirement"
+  | "baseline";
 
 /**
  * Server-owned terminal fault controls. `generation` is an opaque monotonic
@@ -290,6 +294,29 @@ export interface FaultControls {
   status: FaultControlsStatus;
   generation: number | null;
   enabled_actions: OperatorAction[];
+  closure_provenance?: FaultLeaseClosureProvenance | null;
+  physical_stop_operative?: boolean;
+}
+
+export interface StrandedFaultRetirementResult {
+  outcome: "confirmed" | "rejected" | "unconfirmed";
+  attempted_generation: number | null;
+  restart_clearance: RestartClearance;
+  fault_controls: FaultControls;
+}
+
+export interface StrandedFaultRetirementEventOutcome {
+  attempted_generation: number;
+  outcome: "confirmed" | "rejected" | "unconfirmed";
+  available: boolean;
+}
+
+export interface StrandedFaultRetirementEventData {
+  generation: number | null;
+  status: FaultControlsStatus;
+  closure_provenance: FaultLeaseClosureProvenance | null;
+  physical_stop_operative: boolean;
+  retirement: StrandedFaultRetirementEventOutcome;
 }
 
 /** Global terminal-fault action request. The server resolves the current lease. */
