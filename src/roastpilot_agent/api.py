@@ -2787,6 +2787,9 @@ class RoastService:
         if self._requires_live_restart_clearance:
             await self._ensure_restart_epoch()
         pre_snapshot_lease = await self._read_fault_lease_fail_closed()
+        pre_snapshot_identity = self._capture_retirement_identity()
+        pre_snapshot_cache = self._fault_lease_cache
+        pre_snapshot_transients = self._retirement_snapshot_transient_marker()
         pre_snapshot_active = await self._store.active_run()
         safety_record_initialization_available = (
             await self._safety_record_initialization_may_be_admitted(
@@ -2814,7 +2817,13 @@ class RoastService:
                     "physical_stop_operative": snapshot.physical_stop_operative,
                 }
             )
-            if snapshot.fresh and pre_snapshot_lease == snapshot.lease
+            if (
+                snapshot.fresh
+                and pre_snapshot_lease == snapshot.lease
+                and self._retirement_snapshot_binding_holds(
+                    pre_snapshot_identity, pre_snapshot_cache, pre_snapshot_transients
+                )
+            )
             else self._fault_controls_snapshot_projection(snapshot)
         )
         return HealthResponse(
