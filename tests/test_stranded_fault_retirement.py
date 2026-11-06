@@ -253,15 +253,27 @@ async def test_foreign_child_binding_cannot_reconcile_an_owned_fence(
         assert (await service.retire_stranded_fault(request)).outcome == "unconfirmed"
         assert commit_outcomes == [StrandedFaultRetirementCommit.COMMITTED_VERIFIED]
         assert len(verifier_calls) == 1
+        expected_outcome = "unconfirmed"
         if stale_binding == "child_epoch":
             child = cast("_CurrentChild", service._mcp)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
             child.child_epoch += 1
         elif stale_binding == "process":
             service.instance_id = "a" * 32
         else:
-            cast("_CurrentChild", service._mcp).stop_unconfirmed = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            # T-F1b's stop-unconfirmed case must enter with a valid captured
+            # child, then become stale at an await.  T-F5 separately pins the
+            # pre-capture stop-unconfirmed rejection.
+            original_reader = service._read_fault_lease_fail_closed  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
 
-        assert (await service.retire_stranded_fault(request)).outcome == "unconfirmed"
+            async def stop_after_lease_read() -> object:
+                lease = await original_reader()
+                cast("_CurrentChild", service._mcp).stop_unconfirmed = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                return lease
+
+            monkeypatch.setattr(service, "_read_fault_lease_fail_closed", stop_after_lease_read)
+            expected_outcome = "rejected"
+
+        assert (await service.retire_stranded_fault(request)).outcome == expected_outcome
         assert len(verifier_calls) == 1
         assert (await tmp_store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
         await service.shutdown()
@@ -1231,6 +1243,53 @@ async def test_tb12_cancelling_owned_task_retains_its_uncertainty_fence_without_
             return "none"
 
         roaster.read_session_presence = parked_presence  # type: ignore[method-assign]
+        frames = service.events.subscribe()
+        waiter = asyncio.create_task(service.retire_stranded_fault(_retirement_request()))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        owned = service._stranded_fault_retirement  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert owned is not None
+        owned[1].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        assert service._unconfirmed_stranded_fault_retirement is owned[0]  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert frames.empty()
+        release.set()
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["transaction", "verifier"])
+async def test_tb12_c2_c3_cancellation_after_reservation_retains_fence_and_emits_nothing(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    """TB12 C2/C3: cancellation after proof reservation cannot clear uncertainty."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def parked_transaction(**_kwargs: object) -> StrandedFaultRetirementCommit:
+            entered.set()
+            await release.wait()
+            return StrandedFaultRetirementCommit.INDETERMINATE
+
+        async def indeterminate_transaction(**_kwargs: object) -> StrandedFaultRetirementCommit:
+            return StrandedFaultRetirementCommit.INDETERMINATE
+
+        async def parked_verifier(**_kwargs: object) -> bool:
+            entered.set()
+            await release.wait()
+            return False
+
+        if stage == "transaction":
+            monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", parked_transaction)
+        else:
+            monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", indeterminate_transaction)
+            monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", parked_verifier)
         frames = service.events.subscribe()
         waiter = asyncio.create_task(service.retire_stranded_fault(_retirement_request()))
         await asyncio.wait_for(entered.wait(), timeout=1.0)
