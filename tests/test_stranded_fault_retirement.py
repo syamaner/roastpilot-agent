@@ -2676,12 +2676,12 @@ async def test_each_final_durable_admission_term_rejects_before_presence_or_tran
                 latest = await original_latest()
                 assert latest is not None
                 if variant == "wrong_run":
-                    return replace(latest, run_id="other-run")
+                    return latest.model_copy(update={"run_id": "other-run"})
                 if variant == "not_completed":
-                    return replace(latest, completed_at_utc=None)
+                    return latest.model_copy(update={"completed_at_utc": None})
                 if variant == "not_faulted":
-                    return replace(latest, outcome="completed")
-                return replace(latest, agent_phase=RoastPhase.COMPLETE)
+                    return latest.model_copy(update={"outcome": "completed"})
+                return latest.model_copy(update={"agent_phase": RoastPhase.COMPLETE})
 
             monkeypatch.setattr(tmp_store, "read_latest_run", altered_latest)
         else:
@@ -3251,6 +3251,91 @@ async def test_every_context_ownership_pointer_term_is_isolated_and_total(
             pytest.fail(f"ownership term {term} raised {type(error).__name__}")
         assert owned is False
         service._stranded_fault_retirement = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["child_epoch", "hardware_clear"])
+async def test_final_gate_read_race_rejects_before_reservation_presence_or_write(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """The final durable gate await cannot admit a stale D225 reservation."""
+    await tmp_store.initialize()
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        presence = 0
+        writes = 0
+        original_gate = tmp_store.read_process_restart_clearance
+
+        async def counted_presence() -> str:
+            nonlocal presence
+            presence += 1
+            return "none"
+
+        async def counted_write(**_kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal writes
+            writes += 1
+            return StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+
+        async def stale_gate(process_id: str) -> RestartClearanceState:
+            value = await original_gate(process_id)
+            if change == "child_epoch":
+                cast("_CurrentChild", service._mcp).child_epoch += 1  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            else:
+                service._hardware_clear_request_in_flight = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            return value
+
+        roaster.read_session_presence = counted_presence  # type: ignore[method-assign]
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", counted_write)
+        monkeypatch.setattr(tmp_store, "read_process_restart_clearance", stale_gate)
+        result = await service.retire_stranded_fault(_retirement_request())
+
+        assert result.outcome == "rejected"
+        assert result.attempted_generation is None
+        assert presence == 0
+        assert writes == 0
+        assert service._stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert service._unconfirmed_stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_latest_none_route_is_a_typed_pre_reservation_rejection_not_a_500(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing latest durable row is explicitly an HTTP rejection before any proof/write."""
+    await tmp_store.initialize()
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        presence = 0
+
+        async def counted_presence() -> str:
+            nonlocal presence
+            presence += 1
+            return "none"
+
+        async def no_latest() -> None:
+            return None
+
+        roaster.read_session_presence = counted_presence  # type: ignore[method-assign]
+        monkeypatch.setattr(tmp_store, "read_latest_run", no_latest)
+        app = create_app(service)
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/restart-clearance/retire-stranded-fault",
+                json={"stranded_fault_confirmation": "roaster_stopped_empty_heat_fan_cooling_off_physical_stop_ready"},
+            )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["outcome"] == "rejected"
+        assert body["attempted_generation"] is None
+        assert presence == 0
+        assert service._stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         await service.shutdown()
     finally:
         await tmp_store.close()
