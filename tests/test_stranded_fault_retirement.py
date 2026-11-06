@@ -5,6 +5,7 @@ from typing import cast
 
 import pytest
 
+import roastpilot_agent.api as api_module
 from roastpilot_agent.api import (
     RoastRunConflictError,
     RoastService,
@@ -160,22 +161,26 @@ async def test_owned_fence_reconciles_exactly_once_without_a_second_transaction(
         original_retire = tmp_store.retire_stranded_fault_lease
         original_verify = tmp_store.verify_stranded_fault_retirement
         retire_calls = 0
-        verify_calls = 0
+        verifier_calls: list[dict[str, object]] = []
+        commit_outcomes: list[StrandedFaultRetirementCommit] = []
 
         async def indeterminate_after_commit(**kwargs: object) -> StrandedFaultRetirementCommit:
             nonlocal retire_calls
             retire_calls += 1
+            # Keep the store's internal post-commit verification real.  The
+            # service's recovery verifier is installed only after it returns.
+            monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", original_verify)
             committed = await original_retire(**kwargs)  # type: ignore[arg-type]
-            assert committed is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+            commit_outcomes.append(committed)
+            monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", service_verifier)
             return StrandedFaultRetirementCommit.INDETERMINATE
 
-        async def verify_on_second_attempt(**kwargs: object) -> bool:
-            nonlocal verify_calls
-            verify_calls += 1
-            return verify_calls > 2 and await original_verify(**kwargs)  # type: ignore[arg-type]
+        async def service_verifier(**kwargs: object) -> bool:
+            verifier_calls.append(dict(kwargs))
+            return len(verifier_calls) == 2 and await original_verify(**kwargs)  # type: ignore[arg-type]
 
         monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", indeterminate_after_commit)
-        monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", verify_on_second_attempt)
+        monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", service_verifier)
         request = StrandedFaultRetirementRequest(
             stranded_fault_confirmation=(
                 "roaster_stopped_empty_heat_fan_cooling_off_physical_stop_ready"
@@ -183,12 +188,29 @@ async def test_owned_fence_reconciles_exactly_once_without_a_second_transaction(
         )
 
         first = await service.retire_stranded_fault(request)
+        closed_after_commit = await tmp_store.read_fault_control_lease()
         second = await service.retire_stranded_fault(request)
 
         assert first.outcome == "unconfirmed"
         assert second.outcome == "confirmed"
         assert retire_calls == 1
-        assert verify_calls == 3
+        assert commit_outcomes == [StrandedFaultRetirementCommit.COMMITTED_VERIFIED]
+        assert closed_after_commit.status is FaultLeaseStatus.CLOSED
+        assert len(verifier_calls) == 2
+        assert verifier_calls[0] == verifier_calls[1]
+        assert verifier_calls[0]["process_id"] == service.instance_id
+        assert verifier_calls[0]["generation"] == 1
+        assert verifier_calls[0]["run_id"] == "terminal-faulted-run"
+        assert verifier_calls[0]["mcp_session_id"] == "fault-session"
+        assert isinstance(verifier_calls[0]["operation_id"], str)
+        async with tmp_store.connection.execute(
+            "SELECT COUNT(*) FROM operator_actions WHERE action = ?",
+            (OperatorAction.RETIRE_STRANDED_FAULT.value,),
+        ) as cursor:
+            audit_row = await cursor.fetchone()
+        assert audit_row is not None
+        audit_count = int(audit_row[0])
+        assert audit_count == 1
         assert (await tmp_store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
         await service.shutdown()
     finally:
@@ -196,47 +218,91 @@ async def test_owned_fence_reconciles_exactly_once_without_a_second_transaction(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stale_binding", ["child_epoch", "process", "stop_unconfirmed"])
 async def test_foreign_child_binding_cannot_reconcile_an_owned_fence(
-    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, stale_binding: str
 ) -> None:
-    """A child epoch change leaves uncertainty fenced and skips the verifier."""
+    """T-F1b: a stale own fence never authorises a second exact verifier read."""
     await tmp_store.initialize()
     try:
         service, _roaster = await _eligible_service(tmp_store)
         original_retire = tmp_store.retire_stranded_fault_lease
         original_verify = tmp_store.verify_stranded_fault_retirement
-        verify_calls = 0
+        verifier_calls: list[dict[str, object]] = []
+        commit_outcomes: list[StrandedFaultRetirementCommit] = []
 
         async def indeterminate_after_commit(**kwargs: object) -> StrandedFaultRetirementCommit:
-            assert (
-                await original_retire(**kwargs)  # type: ignore[arg-type]
-                is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+            monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", original_verify)
+            commit_outcomes.append(await original_retire(**kwargs))  # type: ignore[arg-type]
+            monkeypatch.setattr(
+                tmp_store, "verify_stranded_fault_retirement", counted_false_verifier
             )
             return StrandedFaultRetirementCommit.INDETERMINATE
 
-        async def unexpected_verify(**_kwargs: object) -> bool:
-            raise AssertionError("stale child must not run exact reconciliation")
+        async def counted_false_verifier(**kwargs: object) -> bool:
+            verifier_calls.append(dict(kwargs))
+            return False
 
         monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", indeterminate_after_commit)
-
-        async def fail_first_verification(**kwargs: object) -> bool:
-            nonlocal verify_calls
-            verify_calls += 1
-            return verify_calls > 2 and await original_verify(**kwargs)  # type: ignore[arg-type]
-
-        monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", fail_first_verification)
-        monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", unexpected_verify)
+        monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", counted_false_verifier)
         request = StrandedFaultRetirementRequest(
             stranded_fault_confirmation=(
                 "roaster_stopped_empty_heat_fan_cooling_off_physical_stop_ready"
             )
         )
         assert (await service.retire_stranded_fault(request)).outcome == "unconfirmed"
-        child = cast("_CurrentChild", service._mcp)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        child.child_epoch += 1
+        assert commit_outcomes == [StrandedFaultRetirementCommit.COMMITTED_VERIFIED]
+        assert len(verifier_calls) == 1
+        if stale_binding == "child_epoch":
+            child = cast("_CurrentChild", service._mcp)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            child.child_epoch += 1
+        elif stale_binding == "process":
+            service.instance_id = "a" * 32
+        else:
+            cast("_CurrentChild", service._mcp).stop_unconfirmed = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
 
         assert (await service.retire_stranded_fault(request)).outcome == "unconfirmed"
+        assert len(verifier_calls) == 1
         assert (await tmp_store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_tb9_second_concurrent_request_rejects_while_one_transaction_is_owned(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TB9: one in-flight proof owns the reservation and reaches one transaction."""
+    await tmp_store.initialize()
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        transaction_calls = 0
+        original_transaction = tmp_store.retire_stranded_fault_lease
+
+        async def parked_presence() -> str:
+            entered.set()
+            await release.wait()
+            return "none"
+
+        async def counted_transaction(**kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal transaction_calls
+            transaction_calls += 1
+            return await original_transaction(**kwargs)  # type: ignore[arg-type]
+
+        roaster.read_session_presence = parked_presence  # type: ignore[method-assign]
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", counted_transaction)
+        first = asyncio.create_task(service.retire_stranded_fault(_retirement_request()))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        second = await service.retire_stranded_fault(_retirement_request())
+        release.set()
+
+        assert second.outcome == "rejected"
+        assert second.attempted_generation is None
+        assert (await first).outcome == "confirmed"
+        assert transaction_calls == 1
         await service.shutdown()
     finally:
         await tmp_store.close()
@@ -471,6 +537,169 @@ async def _settled_task() -> asyncio.Task[None]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("child_state", ["current", "absent", "not_running", "stop_unconfirmed"])
+async def test_t3_required_closed_keeps_emergency_stop_visible_in_result_and_health(
+    tmp_store: RoastStore, child_state: str
+) -> None:
+    """T3: restart gating never removes the independent e-stop from CLOSED D225 state."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        result = await service.retire_stranded_fault(_retirement_request())
+
+        assert result.outcome == "confirmed"
+        assert result.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert result.fault_controls.enabled_actions == [OperatorAction.EMERGENCY_STOP]
+        if child_state == "absent":
+            service._mcp = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif child_state == "not_running":
+            cast("_CurrentChild", service._mcp).running = False  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif child_state == "stop_unconfirmed":
+            cast("_CurrentChild", service._mcp).stop_unconfirmed = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        health = await service.health()
+
+        assert health.restart_clearance.state is RestartClearanceState.REQUIRED
+        assert health.fault_controls.status is FaultLeaseStatus.CLOSED
+        assert health.fault_controls.enabled_actions == [OperatorAction.EMERGENCY_STOP]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_t4_fenced_false_reconciliations_emit_one_unconfirmed_frame_without_retrying(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T4: public UNKNOWN fencing does not suppress the one honest recovery event."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        original_retire = tmp_store.retire_stranded_fault_lease
+        original_verify = tmp_store.verify_stranded_fault_retirement
+        transaction_calls = 0
+        verifier_calls = 0
+        commit_outcomes: list[StrandedFaultRetirementCommit] = []
+
+        async def false_verifier(**_kwargs: object) -> bool:
+            nonlocal verifier_calls
+            verifier_calls += 1
+            return False
+
+        async def indeterminate_after_real_commit(
+            **kwargs: object,
+        ) -> StrandedFaultRetirementCommit:
+            nonlocal transaction_calls
+            transaction_calls += 1
+            monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", original_verify)
+            commit_outcomes.append(await original_retire(**kwargs))  # type: ignore[arg-type]
+            monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", false_verifier)
+            return StrandedFaultRetirementCommit.INDETERMINATE
+
+        monkeypatch.setattr(
+            tmp_store, "retire_stranded_fault_lease", indeterminate_after_real_commit
+        )
+        monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", false_verifier)
+        frames = service.events.subscribe()
+        results = [await service.retire_stranded_fault(_retirement_request()) for _ in range(50)]
+
+        assert [result.outcome for result in results] == ["unconfirmed"] * 50
+        assert transaction_calls == 1
+        assert commit_outcomes == [StrandedFaultRetirementCommit.COMMITTED_VERIFIED]
+        assert verifier_calls == 50
+        emitted = frames.get_nowait()
+        assert frames.empty()
+        data = StrandedFaultRetirementEventData.model_validate(emitted.data)
+        assert data.status is FaultLeaseStatus.UNKNOWN
+        assert data.retirement.outcome == "unconfirmed"
+        assert service._retirement_event_ledger == (1, frozenset(("unconfirmed",)))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_read", ["latest", "gate", "provenance"])
+async def test_t5_new_snapshot_read_failures_remain_typed_fail_closed_health(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, failed_read: str
+) -> None:
+    """T5: each D225 snapshot read fails closed without turning health into a 500."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        if failed_read == "latest":
+
+            async def fail_latest() -> object:
+                raise RuntimeError("latest read unavailable")
+
+            monkeypatch.setattr(tmp_store, "read_latest_run", fail_latest)
+        elif failed_read == "gate":
+
+            async def fail_gate(_process_id: str) -> RestartClearanceState:
+                raise RuntimeError("gate read unavailable")
+
+            monkeypatch.setattr(tmp_store, "read_process_restart_clearance", fail_gate)
+        else:
+            assert (
+                await service.retire_stranded_fault(_retirement_request())
+            ).outcome == "confirmed"
+
+            async def fail_provenance(**_kwargs: object) -> FaultLeaseClosureProvenance | None:
+                raise RuntimeError("provenance read unavailable")
+
+            monkeypatch.setattr(
+                tmp_store, "read_fault_control_lease_closure_provenance", fail_provenance
+            )
+
+        health = await service.health()
+
+        assert OperatorAction.RETIRE_STRANDED_FAULT not in health.restart_clearance.enabled_actions
+        assert health.fault_controls.closure_provenance is None
+        assert health.fault_controls.enabled_actions == [OperatorAction.EMERGENCY_STOP]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_t6_snapshot_object_replacement_clears_closed_provenance_even_under_id_collision(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T6: snapshot freshness tracks identity, not collidable integer object IDs."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        assert (await service.retire_stranded_fault(_retirement_request())).outcome == "confirmed"
+        original_provenance = tmp_store.read_fault_control_lease_closure_provenance
+        original_id = id
+        replacement_runner = object()
+
+        def colliding_local_id(value: object) -> int:
+            if value is None or value is replacement_runner:
+                return 7
+            return original_id(value)
+
+        async def replace_runner_during_provenance(*args: object, **kwargs: object) -> object:
+            service.runner = cast("object", replacement_runner)  # type: ignore[assignment]
+            return await original_provenance(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(api_module, "id", colliding_local_id, raising=False)
+        monkeypatch.setattr(
+            tmp_store,
+            "read_fault_control_lease_closure_provenance",
+            replace_runner_during_provenance,
+        )
+        health = await service.health()
+
+        assert health.fault_controls.status is FaultLeaseStatus.CLOSED
+        assert health.fault_controls.closure_provenance is None
+        assert health.restart_clearance.enabled_actions == []
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_tb1_retirement_preserves_run_and_event_history_and_broadcasts_only(
     tmp_store: RoastStore,
 ) -> None:
@@ -544,6 +773,46 @@ async def test_tb2_d213_requires_a_separate_fresh_presence_read_after_retirement
             )
         assert calls == 2
         assert service._restart_clearance_state is RestartClearanceState.REQUIRED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_tb3_ordered_teardown_stays_unclean_until_separate_d213_then_can_mark_clean(
+    tmp_store: RoastStore,
+) -> None:
+    """TB3: D225 never turns an unclean epoch into an ordered clean shutdown."""
+    await tmp_store.initialize()
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        assert (await service.retire_stranded_fault(_retirement_request())).outcome == "confirmed"
+
+        await service.mark_process_epoch_clean_after_ordered_teardown()
+        async with tmp_store.connection.execute(
+            "SELECT status FROM process_epoch WHERE singleton = 1"
+        ) as cursor:
+            before_clear = await cursor.fetchone()
+        assert before_clear is not None
+        assert before_clear[0] == "unclean"
+
+        async def new_d213_presence() -> str:
+            return "none"
+
+        roaster.read_session_presence = new_d213_presence  # type: ignore[method-assign]
+        acknowledgement = await service.acknowledge_restart_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert acknowledgement.cleared is True
+        assert service._restart_clearance_state is RestartClearanceState.CLEARED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        await service.mark_process_epoch_clean_after_ordered_teardown()
+        async with tmp_store.connection.execute(
+            "SELECT status FROM process_epoch WHERE singleton = 1"
+        ) as cursor:
+            after_clear = await cursor.fetchone()
+        assert after_clear is not None
+        assert after_clear[0] == "clean"
         await service.shutdown()
     finally:
         await tmp_store.close()
@@ -706,6 +975,18 @@ async def test_tb10_indeterminate_transaction_keeps_unknown_fence_and_blocks_res
         assert health.fault_controls.status is FaultLeaseStatus.UNKNOWN
         assert health.restart_clearance.state is RestartClearanceState.REQUIRED
         with pytest.raises(RoastRunConflictError):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        with pytest.raises(RoastRunConflictError):
+            await service.acknowledge_closure_only_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        d220 = await service.initialize_missing_fault_control_safety_record(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert d220.outcome == "rejected"
+        with pytest.raises(RoastRunConflictError):
             await service.start_roast(_profile())
         await service.shutdown()
     finally:
@@ -759,6 +1040,43 @@ async def test_tb_evt_pre_reservation_rejections_emit_no_frame(
 
         assert [result.outcome for result in results] == ["rejected"] * 50
         assert frames.empty()
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_tb_evt_is_broadcast_only_and_never_exposes_private_retirement_identity(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TB-EVT/MB19-21: D225 has one public changed frame and no history write/leak."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        record_event_calls = 0
+
+        async def forbidden_record_event(*_args: object, **_kwargs: object) -> None:
+            nonlocal record_event_calls
+            record_event_calls += 1
+
+        monkeypatch.setattr(tmp_store, "record_event", forbidden_record_event)
+        frames = service.events.subscribe()
+        result = await service.retire_stranded_fault(_retirement_request())
+        emitted = frames.get_nowait()
+        rendered = f"{result.model_dump(mode='json')}|{emitted.data}"
+
+        assert result.outcome == "confirmed"
+        assert record_event_calls == 0
+        assert frames.empty()
+        assert emitted.event.value == RoastEventKind.FAULT_CONTROLS_CHANGED.value
+        assert "outcome" not in emitted.data
+        for private_value in (
+            "terminal-faulted-run",
+            "fault-session",
+            service.instance_id,
+            str(tmp_store._db_path),  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        ):
+            assert private_value not in rendered
         await service.shutdown()
     finally:
         await tmp_store.close()
