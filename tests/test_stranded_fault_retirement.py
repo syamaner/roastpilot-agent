@@ -1150,7 +1150,11 @@ async def test_tf5_invalid_identity_capture_is_typed_pre_reservation_rejection(
         else:
             service._recording_replay_mode = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
 
-        assert service._capture_retirement_identity() is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        try:
+            captured = service._capture_retirement_identity()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        except Exception as error:  # noqa: BLE001 - this is the total-function mutation oracle
+            pytest.fail(f"invalid capture raised {type(error).__name__}")
+        assert captured is None
         result = await service.retire_stranded_fault(_retirement_request())
 
         assert result.outcome == "rejected"
@@ -1309,12 +1313,24 @@ async def test_tb_evt_is_broadcast_only_and_never_exposes_private_retirement_ide
     try:
         service, _roaster = await _eligible_service(tmp_store)
         record_event_calls = 0
+        operation_ids: list[str] = []
+        original_retire = tmp_store.retire_stranded_fault_lease
 
         async def forbidden_record_event(*_args: object, **_kwargs: object) -> None:
             nonlocal record_event_calls
             record_event_calls += 1
 
         monkeypatch.setattr(tmp_store, "record_event", forbidden_record_event)
+
+        async def capture_retirement_operation(
+            **kwargs: object,
+        ) -> StrandedFaultRetirementCommit:
+            operation_id = kwargs.get("operation_id")
+            if isinstance(operation_id, str):
+                operation_ids.append(operation_id)
+            return await original_retire(**cast("Any", kwargs))
+
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", capture_retirement_operation)
         frames = service.events.subscribe()
         result = await service.retire_stranded_fault(_retirement_request())
         emitted = frames.get_nowait()
@@ -1327,6 +1343,7 @@ async def test_tb_evt_is_broadcast_only_and_never_exposes_private_retirement_ide
 
         assert result.outcome == "confirmed"
         assert record_event_calls == 0
+        assert len(operation_ids) == 1
         assert frames.empty()
         assert emitted.event.value == RoastEventKind.FAULT_CONTROLS_CHANGED.value
         assert "outcome" not in emitted.data
@@ -1334,6 +1351,7 @@ async def test_tb_evt_is_broadcast_only_and_never_exposes_private_retirement_ide
             "terminal-faulted-run",
             "fault-session",
             service.instance_id,
+            operation_ids[0],
             str(tmp_store._db_path),  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         ):
             assert private_value not in rendered
@@ -2343,3 +2361,504 @@ async def test_tb4_real_store_provenance_distinguishes_d212_d220_retirement_and_
         await tmp_store.close()
         await baseline_store.close()
         await retirement_store.close()
+
+
+def _test_retirement_context(service: RoastService, lease: FaultControlLease) -> Any:
+    """Build one private context from a real current D225 identity for a narrow test seam."""
+    identity = service._capture_retirement_identity()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert identity is not None
+    context_type = api_module._StrandedFaultRetirementContext  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    return context_type(identity=identity, expected_lease=lease, operation_id="d" * 32)
+
+
+@pytest.mark.asyncio
+async def test_tb_evt_higher_generation_resets_ledger_but_an_older_attempt_cannot_consume_it(
+    tmp_store: RoastStore,
+) -> None:
+    """TB-EVT/MB26: event deduplication is a one-generation, monotonic ledger."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        frames = service.events.subscribe()
+        lease_one = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        context_one = _test_retirement_context(service, lease_one)
+        result_one = await service._stranded_fault_retirement_result("rejected", 1)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service._emit_stranded_fault_retirement(result_one, 1, context_one)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        await tmp_store.open_fault_control_lease(
+            run_id="terminal-faulted-run", mcp_session_id="fault-session-two", generation=2
+        )
+        await service.health()
+        lease_two = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert lease_two.generation == 2
+        context_two = _test_retirement_context(service, lease_two)
+        result_two = await service._stranded_fault_retirement_result("unconfirmed", 2)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service._emit_stranded_fault_retirement(result_two, 2, context_two)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert service._retirement_event_ledger == (2, frozenset(("unconfirmed",)))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        await service._emit_stranded_fault_retirement(result_one, 1, context_one)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert service._retirement_event_ledger == (2, frozenset(("unconfirmed",)))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        rejected_two = await service._stranded_fault_retirement_result("rejected", 2)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service._emit_stranded_fault_retirement(rejected_two, 2, context_two)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        payloads = [
+            StrandedFaultRetirementEventData.model_validate(frames.get_nowait().data)
+            for _ in range(3)
+        ]
+        assert frames.empty()
+        assert [payload.retirement.attempted_generation for payload in payloads] == [1, 2, 2]
+        assert [payload.retirement.outcome for payload in payloads] == [
+            "rejected",
+            "unconfirmed",
+            "rejected",
+        ]
+        assert service._retirement_event_ledger == (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            2,
+            frozenset(("unconfirmed", "rejected")),
+        )
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_tf6_stale_done_callback_preserves_the_newer_reservation_tuple_and_fence(
+    tmp_store: RoastStore,
+) -> None:
+    """T-F6/MB28: an old callback cannot discard a newer context-task reservation."""
+    await tmp_store.initialize()
+    old_task: Any = None
+    newer_task: Any = None
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        lease = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        old_context = _test_retirement_context(service, lease)
+        newer_context = _test_retirement_context(service, lease)
+        release = asyncio.Event()
+
+        async def wait_for_release() -> None:
+            await release.wait()
+
+        old_task = asyncio.create_task(wait_for_release())
+        newer_task = asyncio.create_task(wait_for_release())
+        service._unconfirmed_stranded_fault_retirement = newer_context  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        service._stranded_fault_retirement = (newer_context, newer_task)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        service._finish_stranded_fault_retirement(old_context, old_task)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        assert service._unconfirmed_stranded_fault_retirement is newer_context  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert service._stranded_fault_retirement == (newer_context, newer_task)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        release.set()
+        await asyncio.gather(old_task, newer_task)
+        service._stranded_fault_retirement = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        for task in (old_task, newer_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_owned_reservation_is_cleaned_before_a_new_d225_admission(
+    tmp_store: RoastStore,
+) -> None:
+    """The completed-reservation re-entry branch removes only its own tuple before retrying."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        lease = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        completed = await _settled_task()
+        service._stranded_fault_retirement = cast(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            "Any", (_test_retirement_context(service, lease), completed)
+        )
+
+        result = await service.retire_stranded_fault(_retirement_request())
+
+        assert result.outcome == "confirmed"
+        assert service._stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert (await tmp_store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("guard_id", "mutation"),
+    [
+        ("MB1:_retirement_conditions_hold:0", "epoch"),
+        ("MB1:_retirement_conditions_hold:3", "pending_dispatch"),
+        ("MB1:_retirement_conditions_hold:4", "arbiter_estop"),
+        ("MB1:_retirement_conditions_hold:5", "fault_finalization"),
+        ("MB1:_retirement_conditions_hold:6", "d212_close"),
+        ("MB1:_retirement_conditions_hold:9", "d220_context"),
+        ("MB1:_retirement_conditions_hold:12", "d216_context"),
+    ],
+)
+async def test_each_residual_transient_guard_rejects_before_presence_or_transaction(
+    tmp_store: RoastStore, guard_id: str, mutation: str
+) -> None:
+    """MB1 mapping: each previously-uncovered transient has a direct closed predicate test."""
+    await tmp_store.initialize()
+    pending: Any = None
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        presence_calls = 0
+        transactions = 0
+
+        async def counted_presence() -> str:
+            nonlocal presence_calls
+            presence_calls += 1
+            return "none"
+
+        async def counted_transaction(**_kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal transactions
+            transactions += 1
+            return StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+
+        roaster.read_session_presence = counted_presence  # type: ignore[method-assign]
+        service._store.retire_stranded_fault_lease = counted_transaction  # type: ignore[method-assign]
+        assert service._retirement_conditions_hold()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        if mutation == "epoch":
+            service._restart_epoch_initialized = False  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif mutation == "pending_dispatch":
+            pending = asyncio.create_task(asyncio.Event().wait())
+            service._emergency_stop_dispatch_tasks.add(pending)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif mutation == "arbiter_estop":
+            service._command_arbiter.admit_emergency_stop()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif mutation == "fault_finalization":
+            service._fault_acknowledgement_gate.fault_finalization_started = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif mutation == "d212_close":
+            assert service._command_arbiter.reserve_close(service._command_arbiter.generation)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif mutation == "d220_context":
+            service._safety_record_initialization = cast("Any", (object(), await _settled_task()))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        else:
+            service._closure_only_context = cast("Any", object())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        assert guard_id.startswith("MB1:")
+        try:
+            conditions_hold = service._retirement_conditions_hold()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        except Exception as error:  # noqa: BLE001 - this is the total-function mutation oracle
+            pytest.fail(f"transient predicate raised {type(error).__name__}")
+        assert conditions_hold is False
+        result = await service.retire_stranded_fault(_retirement_request())
+
+        assert result.outcome == "rejected"
+        assert result.attempted_generation is None
+        assert presence_calls == 0
+        assert transactions == 0
+        assert service._unconfirmed_stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("guard_id", "mutation"),
+    [
+        ("MB1:_retirement_identity_holds:0", "not_live"),
+        ("MB1:_retirement_identity_holds:1", "shutdown"),
+        ("MB1:_retirement_identity_holds:2", "replay"),
+        ("MB1:_retirement_identity_holds:3", "process"),
+        ("MB1:_retirement_identity_holds:4", "child_object"),
+        ("MB1:_retirement_identity_holds:5", "child_stopped"),
+        ("MB1:_retirement_identity_holds:6", "stop_unconfirmed"),
+        ("MB1:_retirement_identity_holds:7", "child_epoch"),
+        ("MB1:_retirement_identity_holds:8", "roaster"),
+        ("MB1:_retirement_identity_holds:9", "cache"),
+        ("MB1:_retirement_identity_holds:10", "estop_epoch"),
+        ("MB1:_retirement_identity_holds:11", "restart_state"),
+    ],
+)
+async def test_every_identity_hold_term_has_an_independent_negative_and_positive_control(
+    tmp_store: RoastStore, guard_id: str, mutation: str
+) -> None:
+    """MB1 mapping: each identity field independently closes the captured authority."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        identity = service._capture_retirement_identity()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert identity is not None
+        assert service._retirement_identity_holds(identity)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        child = cast("_CurrentChild", service._mcp)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        if mutation == "not_live":
+            service._requires_live_restart_clearance = False  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif mutation == "shutdown":
+            service._shutdown_started = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif mutation == "replay":
+            service._recording_replay_mode = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif mutation == "process":
+            service.instance_id = "1" * 32
+        elif mutation == "child_object":
+            service._mcp = cast("MCPServerProcess", _CurrentChild())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif mutation == "child_stopped":
+            child.running = False
+        elif mutation == "stop_unconfirmed":
+            child.stop_unconfirmed = True
+        elif mutation == "child_epoch":
+            child.child_epoch += 1
+        elif mutation == "roaster":
+            service._roaster = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif mutation == "cache":
+            service._fault_lease_cache = FaultControlLease(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                generation=1,
+                status=FaultLeaseStatus.UNKNOWN,
+                run_id="terminal-faulted-run",
+                mcp_session_id="fault-session",
+            )
+        elif mutation == "estop_epoch":
+            service._note_emergency_stop_admission()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        else:
+            service._restart_clearance_state = RestartClearanceState.CLEARED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        assert guard_id.startswith("MB1:_retirement_identity_holds:")
+        try:
+            identity_holds = service._retirement_identity_holds(identity)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        except Exception as error:  # noqa: BLE001 - this is the total-function mutation oracle
+            pytest.fail(f"identity predicate raised {type(error).__name__}")
+        assert identity_holds is False
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "variant",
+    ["active", "latest_absent", "wrong_run", "not_completed", "not_faulted", "wrong_phase", "gate"],
+)
+async def test_each_final_durable_admission_term_rejects_before_presence_or_transaction(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    """The final durable admission is independently closed after its ordinary awaits."""
+    await tmp_store.initialize()
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        presence_calls = 0
+        transaction_calls = 0
+
+        async def counted_presence() -> str:
+            nonlocal presence_calls
+            presence_calls += 1
+            return "none"
+
+        async def counted_transaction(**_kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal transaction_calls
+            transaction_calls += 1
+            return StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+
+        roaster.read_session_presence = counted_presence  # type: ignore[method-assign]
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", counted_transaction)
+        if variant == "active":
+            original_active = tmp_store.active_run
+
+            async def active() -> object:
+                return await tmp_store.read_latest_run() or await original_active()
+
+            monkeypatch.setattr(tmp_store, "active_run", active)
+        elif variant == "latest_absent":
+
+            async def absent() -> None:
+                return None
+
+            monkeypatch.setattr(tmp_store, "read_latest_run", absent)
+        elif variant in {"wrong_run", "not_completed", "not_faulted", "wrong_phase"}:
+            original_latest = tmp_store.read_latest_run
+
+            async def altered_latest() -> object:
+                latest = await original_latest()
+                assert latest is not None
+                if variant == "wrong_run":
+                    return replace(latest, run_id="other-run")
+                if variant == "not_completed":
+                    return replace(latest, completed_at_utc=None)
+                if variant == "not_faulted":
+                    return replace(latest, outcome="completed")
+                return replace(latest, agent_phase=RoastPhase.COMPLETE)
+
+            monkeypatch.setattr(tmp_store, "read_latest_run", altered_latest)
+        else:
+
+            async def cleared(_process_id: str) -> RestartClearanceState:
+                return RestartClearanceState.CLEARED
+
+            monkeypatch.setattr(tmp_store, "read_process_restart_clearance", cleared)
+
+        result = await service.retire_stranded_fault(_retirement_request())
+
+        assert result.outcome == "rejected"
+        assert result.attempted_generation is None
+        assert presence_calls == 0
+        assert transaction_calls == 0
+        assert (await tmp_store.read_fault_control_lease()).status is FaultLeaseStatus.OPEN
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_open_reader_cache_mismatch_rejects_before_presence_or_write(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-F1c/MB1: normal admission requires reader and captured cache equality."""
+    await tmp_store.initialize()
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        presence_calls = 0
+
+        async def counted_presence() -> str:
+            nonlocal presence_calls
+            presence_calls += 1
+            return "none"
+
+        async def mismatched_reader() -> FaultControlLease:
+            return FaultControlLease(
+                generation=1,
+                status=FaultLeaseStatus.OPEN,
+                run_id="other-run",
+                mcp_session_id="fault-session",
+            )
+
+        roaster.read_session_presence = counted_presence  # type: ignore[method-assign]
+        monkeypatch.setattr(service, "_read_fault_lease_fail_closed", mismatched_reader)
+        result = await service.retire_stranded_fault(_retirement_request())
+
+        assert result.outcome == "rejected"
+        assert result.attempted_generation is None
+        assert presence_calls == 0
+        assert service._unconfirmed_stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verification", ["true", "false", "stale"])
+async def test_transaction_exception_uses_at_most_one_current_exact_verifier(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, verification: str
+) -> None:
+    """An exception after durable work has one proof opportunity and never retries the write."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        original_retire = tmp_store.retire_stranded_fault_lease
+        original_verify = tmp_store.verify_stranded_fault_retirement
+        transaction_calls = 0
+        verify_calls = 0
+
+        async def raises_after_commit(**kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal transaction_calls
+            transaction_calls += 1
+            monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", original_verify)
+            committed = await original_retire(**cast("Any", kwargs))
+            assert committed is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+            monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", verifier)
+            if verification == "stale":
+                cast("_CurrentChild", service._mcp).child_epoch += 1  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            raise OSError("synthetic uncertain transaction transport")
+
+        async def verifier(**kwargs: object) -> bool:
+            nonlocal verify_calls
+            verify_calls += 1
+            if verification == "true":
+                return await original_verify(**kwargs)  # type: ignore[arg-type]
+            if verification == "false":
+                return False
+            raise AssertionError("stale binding must not reach verifier")
+
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", raises_after_commit)
+        monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", verifier)
+        result = await service.retire_stranded_fault(_retirement_request())
+
+        assert transaction_calls == 1
+        assert verify_calls == (0 if verification == "stale" else 1)
+        assert result.outcome == ("confirmed" if verification == "true" else "unconfirmed")
+        if verification == "true":
+            assert service._unconfirmed_stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        else:
+            assert service._unconfirmed_stranded_fault_retirement is not None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_verifier_exception_retains_fence_without_a_second_transaction(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-only reconciliation failure is unconfirmed and cannot manufacture a second write."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        original_retire = tmp_store.retire_stranded_fault_lease
+        writes = 0
+
+        async def indeterminate_after_commit(**kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal writes
+            writes += 1
+            committed = await original_retire(**cast("Any", kwargs))
+            assert committed is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+            return StrandedFaultRetirementCommit.INDETERMINATE
+
+        async def raises(**_kwargs: object) -> bool:
+            raise OSError("synthetic reconciliation read failure")
+
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", indeterminate_after_commit)
+        monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", raises)
+        assert (await service.retire_stranded_fault(_retirement_request())).outcome == "unconfirmed"
+        result = await service.retire_stranded_fault(_retirement_request())
+
+        assert result.outcome == "unconfirmed"
+        assert writes == 1
+        assert service._unconfirmed_stranded_fault_retirement is not None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_and_awaits_the_owned_retirement_task_without_clearing_its_fence(
+    tmp_store: RoastStore,
+) -> None:
+    """TB12: shutdown cancels its D225 task while preserving uncertainty."""
+    await tmp_store.initialize()
+    request_task: asyncio.Task[object] | None = None
+    release: asyncio.Event | None = None
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_presence() -> str:
+            entered.set()
+            assert release is not None
+            await release.wait()
+            return "none"
+
+        roaster.read_session_presence = blocked_presence  # type: ignore[method-assign]
+        request_task = asyncio.create_task(service.retire_stranded_fault(_retirement_request()))
+        await entered.wait()
+        owned = service._stranded_fault_retirement  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert owned is not None
+
+        await service.shutdown()
+
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+        assert owned[1].cancelled()
+        assert service._unconfirmed_stranded_fault_retirement is owned[0]  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    finally:
+        if release is not None:
+            release.set()
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+        await tmp_store.close()
