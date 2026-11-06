@@ -8719,6 +8719,7 @@ def _controller_accepts(action: OperatorAction, phase: RoastPhase) -> bool:
         OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
         OperatorAction.END_RECOVERED_RUN,
         OperatorAction.INITIALIZE_SAFETY_RECORD,
+        OperatorAction.RETIRE_STRANDED_FAULT,
     ):
         return False
     command = OPERATOR_ACTION_COMMAND.get(action)
