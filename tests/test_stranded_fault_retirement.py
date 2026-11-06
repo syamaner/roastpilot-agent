@@ -399,3 +399,39 @@ async def test_health_fails_closed_when_child_changes_during_snapshot_read(
         await service.shutdown()
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_health_hides_retirement_while_its_owned_reservation_is_in_flight(
+    tmp_store: RoastStore,
+) -> None:
+    """An in-flight D225 task is a projection fence even before durable state moves."""
+    await tmp_store.initialize()
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def parked_presence() -> str:
+            entered.set()
+            await release.wait()
+            return "none"
+
+        roaster.read_session_presence = parked_presence  # type: ignore[method-assign]
+        request = StrandedFaultRetirementRequest(
+            stranded_fault_confirmation=(
+                "roaster_stopped_empty_heat_fan_cooling_off_physical_stop_ready"
+            )
+        )
+        attempt = asyncio.create_task(service.retire_stranded_fault(request))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        health = await service.health()
+
+        assert OperatorAction.RETIRE_STRANDED_FAULT not in health.restart_clearance.enabled_actions
+        assert health.fault_controls.physical_stop_operative is True
+        release.set()
+        assert (await attempt).outcome == "confirmed"
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
