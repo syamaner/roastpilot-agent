@@ -3778,7 +3778,8 @@ class RoastService:
         """Capture the current child and lease before a D225 await."""
         child = self._mcp
         if (
-            self._shutdown_started
+            not self._requires_live_restart_clearance
+            or self._shutdown_started
             or self._recording_replay_mode
             or child is None
             or not child.running
@@ -3798,7 +3799,8 @@ class RoastService:
         """Return whether an awaited D225 proof still names this child and lease."""
         child = identity.child
         return (
-            not self._shutdown_started
+            self._requires_live_restart_clearance
+            and not self._shutdown_started
             and not self._recording_replay_mode
             and self.instance_id == identity.process_id
             and self._mcp is child
@@ -3958,7 +3960,8 @@ class RoastService:
             return False
         child = identity.child
         return (
-            not self._shutdown_started
+            self._requires_live_restart_clearance
+            and not self._shutdown_started
             and not self._recording_replay_mode
             and self.instance_id == identity.process_id
             and self._mcp is child
