@@ -679,6 +679,7 @@ class _StrandedFaultRetirementSnapshot:
     provenance: FaultLeaseClosureProvenance | None
     available: bool
     physical_stop_operative: bool
+    fresh: bool
 
 
 @dataclass(frozen=True)
@@ -2792,6 +2793,9 @@ class RoastService:
                 pre_snapshot_lease, pre_snapshot_active
             )
         )
+        # Preserve the established D212 projection while the final D225
+        # snapshot proves the inputs have not changed underneath it.
+        pre_snapshot_controls = await self._fault_controls_projection(pre_snapshot_lease)
         # This is deliberately the final await sequence for the D225-facing
         # fields: all returned retirement state comes from this one snapshot.
         snapshot = await self._stranded_fault_retirement_snapshot(raise_on_read_failure=True)
@@ -2803,7 +2807,16 @@ class RoastService:
             safety_record_initialization_available=safety_record_initialization_available,
             retirement_available=snapshot.available,
         )
-        fault_controls = self._fault_controls_snapshot_projection(snapshot)
+        fault_controls = (
+            pre_snapshot_controls.model_copy(
+                update={
+                    "closure_provenance": snapshot.provenance,
+                    "physical_stop_operative": snapshot.physical_stop_operative,
+                }
+            )
+            if snapshot.fresh and pre_snapshot_lease == snapshot.lease
+            else self._fault_controls_snapshot_projection(snapshot)
+        )
         return HealthResponse(
             version=__version__,
             instance_id=self.instance_id,
@@ -3854,6 +3867,7 @@ class RoastService:
         through that ordinary reader; it never fabricates a newer UNKNOWN.
         """
         entry_identity = self._capture_retirement_identity()
+        entry_transients = self._retirement_snapshot_transient_marker()
         lease = await self._read_fault_lease_fail_closed()
         expected_cache = self._fault_lease_cache
         try:
@@ -3874,7 +3888,9 @@ class RoastService:
                 candidate = None
             if self._fault_lease_cache == expected_cache:
                 provenance = candidate
-        binding_current = self._retirement_snapshot_binding_holds(entry_identity, expected_cache)
+        binding_current = self._retirement_snapshot_binding_holds(
+            entry_identity, expected_cache, entry_transients
+        )
         if not binding_current:
             # The ordinary reader has the closed precedence order for e-stop,
             # newer live leases and both fences.  It is the only honest refresh.
@@ -3916,12 +3932,14 @@ class RoastService:
             provenance=provenance,
             available=available,
             physical_stop_operative=physical_stop_operative,
+            fresh=binding_current,
         )
 
     def _retirement_snapshot_binding_holds(
         self,
         identity: _RetirementIdentity | None,
         expected_cache: FaultControlLease,
+        expected_transients: tuple[object, ...],
     ) -> bool:
         """Return whether a projection read retained its non-eligibility binding."""
         if identity is None:
@@ -3938,6 +3956,33 @@ class RoastService:
             and self._roaster is not None
             and self._fault_lease_cache == expected_cache
             and self._emergency_stop_admission_epoch == identity.emergency_stop_admission_epoch
+            and self._retirement_snapshot_transient_marker() == expected_transients
+        )
+
+    def _retirement_snapshot_transient_marker(self) -> tuple[object, ...]:
+        """Capture local state that can stale a D225 projection without a lease move."""
+        reservation = self._stranded_fault_retirement
+        initialization = self._safety_record_initialization
+        return (
+            self._hardware_clear_request_in_flight,
+            self._starting_run_id,
+            self._unpublished_start_run_id,
+            self.active_run_id,
+            id(self.runner),
+            id(self._loop_task),
+            id(self._detached_recovery_loop),
+            self._fault_acknowledgement_gate.fault_finalization_started,
+            self._command_arbiter.emergency_stop_active,
+            id(self._unconfirmed_stranded_fault_retirement),
+            id(reservation),
+            False if reservation is None else reservation[1].done(),
+            id(initialization),
+            False if initialization is None else initialization[1].done(),
+            self._unconfirmed_safety_record_generation,
+            self._unconfirmed_fault_lease_generation,
+            len(self._fault_lease_persistence_tasks),
+            any(not task.done() for task in self._emergency_stop_dispatch_tasks),
+            id(self._closure_end_task),
         )
 
     def _fault_controls_snapshot_projection(
