@@ -34,6 +34,7 @@ from roastpilot_agent.models import (
 )
 from roastpilot_agent.store import (
     FaultControlLease,
+    PersistedRun,
     RoastStore,
     StrandedFaultRetirementCommit,
 )
@@ -2672,7 +2673,7 @@ async def test_each_final_durable_admission_term_rejects_before_presence_or_tran
         elif variant in {"wrong_run", "not_completed", "not_faulted", "wrong_phase"}:
             original_latest = tmp_store.read_latest_run
 
-            async def altered_latest() -> object:
+            async def altered_latest() -> PersistedRun:
                 latest = await original_latest()
                 assert latest is not None
                 if variant == "wrong_run":
@@ -3025,6 +3026,7 @@ async def test_owned_fence_stale_while_waiting_for_restart_lock_returns_unconfir
 ) -> None:
     """The own-fence lock checkpoint reports uncertainty without reopening proof or write work."""
     await tmp_store.initialize()
+    service: RoastService | None = None
     try:
         service, _roaster = await _eligible_service(tmp_store)
         writes = 0
@@ -3064,7 +3066,7 @@ async def test_owned_fence_stale_while_waiting_for_restart_lock_returns_unconfir
         assert service._unconfirmed_stranded_fault_retirement is fence  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         await service.shutdown()
     finally:
-        if service._restart_clearance_lock.locked():  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        if service is not None and service._restart_clearance_lock.locked():  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
             service._restart_clearance_lock.release()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         await tmp_store.close()
 
