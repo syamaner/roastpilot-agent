@@ -9957,6 +9957,45 @@ async def test_d225_verifier_cleanup_exception_cannot_certify_true(
 
 
 @pytest.mark.asyncio
+async def test_d225_verifier_preserves_cleanup_cancellation_after_closing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifier cleanup cancellation is never converted into a false return."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-verifier-cancellation")
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_close: Any = connection_type.close
+    close_attempted = False
+    try:
+        assert await _retire_d225(store) is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+
+        async def cancel_rollback(_connection: aiosqlite_module.Connection) -> None:
+            raise asyncio.CancelledError("synthetic verifier rollback cancellation")
+
+        async def close_spy(connection: aiosqlite_module.Connection) -> None:
+            nonlocal close_attempted
+            if connection is not store.connection:
+                close_attempted = True
+            await original_close(connection)
+
+        monkeypatch.setattr(connection_type, "rollback", cancel_rollback)
+        monkeypatch.setattr(connection_type, "close", close_spy)
+        with pytest.raises(
+            asyncio.CancelledError, match="synthetic verifier rollback cancellation"
+        ):
+            await store.verify_stranded_fault_retirement(
+                process_id="a" * 32,
+                generation=7,
+                run_id="d225-run",
+                mcp_session_id="d225-session",
+                operation_id="b" * 32,
+            )
+        assert close_attempted
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_d225_commit_acknowledgement_failure_after_commit_is_indeterminate_but_durable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1876,6 +1876,10 @@ class RoastStore:
                     await connection.rollback()
                 except Exception:
                     verified = False
+                except BaseException:
+                    with contextlib.suppress(Exception):
+                        await connection.close()
+                    raise
                 try:
                     await connection.close()
                 except Exception:
