@@ -9271,10 +9271,12 @@ async def test_d225_close_failure_is_indeterminate_inside_a_callers_handled_exce
 )
 async def test_d225_retirement_rejects_each_durable_precondition(tmp_path: Path, case: str) -> None:
     """Every D225 precondition rejects without changing its lease or audit count."""
-    outcome = "completed" if case == "latest-completed" else "aborted"
+    outcome = "faulted"
+    if case == "latest-completed":
+        outcome = "completed"
+    elif case == "latest-aborted":
+        outcome = "aborted"
     phase = RoastPhase.COMPLETE if case == "latest-phase" else RoastPhase.FAULTED
-    if case == "latest-phase":
-        outcome = "faulted"
     store = await _d225_store_with_terminal_fault(
         tmp_path,
         f"d225-premise-{case}",
@@ -9283,6 +9285,16 @@ async def test_d225_retirement_rejects_each_durable_precondition(tmp_path: Path,
         terminal=case != "latest-uncompleted",
     )
     try:
+        if not case.startswith("latest-"):
+            assert await fetch_one(
+                store,
+                "SELECT id, agent_phase, outcome, completed_at_utc IS NOT NULL "
+                "FROM roast_runs ORDER BY started_at_utc DESC, rowid DESC LIMIT 1",
+            ) == ("d225-run", RoastPhase.FAULTED.value, "faulted", 1)
+            assert await fetch_one(
+                store,
+                "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease",
+            ) == ("d225-run", "d225-session", 7, FaultLeaseStatus.OPEN.value)
         if case in {"closed", "unknown"}:
             await store.connection.execute("UPDATE fault_control_lease SET status = ?", (case,))
         elif case == "run":
