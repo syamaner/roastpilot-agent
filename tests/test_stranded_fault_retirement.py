@@ -3752,3 +3752,134 @@ async def test_admission_binding_races_stop_before_the_next_protocol_stage(
             with pytest.raises(asyncio.CancelledError):
                 await request_task
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_read", ["active", "latest", "gate"])
+async def test_unreadable_normal_admission_evidence_returns_typed_pre_reservation_rejection(
+    tmp_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_read: str,
+) -> None:
+    """Unreadable active/latest/gate evidence rejects before MCP proof or a retirement write."""
+    await tmp_store.initialize()
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        original_active = tmp_store.active_run
+        original_latest = tmp_store.read_latest_run
+        original_gate = tmp_store.read_process_restart_clearance
+        original_presence = roaster.read_session_presence
+        original_transaction = tmp_store.retire_stranded_fault_lease
+        failure_facts: list[str] = []
+        read_calls = {"active": 0, "latest": 0, "gate": 0}
+        presence_calls = 0
+        transaction_calls = 0
+        frames = service.events.subscribe()
+        before_runs = await _table_rows(tmp_store, "roast_runs")
+        before_events = await _table_rows(tmp_store, "roast_events")
+
+        async def active() -> PersistedRun | None:
+            read_calls["active"] += 1
+            if failing_read == "active" and not failure_facts:
+                failure_facts.append("active")
+                raise OSError("synthetic unreadable active run")
+            return await original_active()
+
+        async def latest() -> PersistedRun | None:
+            read_calls["latest"] += 1
+            if failing_read == "latest" and not failure_facts:
+                failure_facts.append("latest")
+                raise OSError("synthetic unreadable latest run")
+            return await original_latest()
+
+        async def gate(process_id: str) -> RestartClearanceState:
+            read_calls["gate"] += 1
+            if failing_read == "gate" and not failure_facts:
+                failure_facts.append("gate")
+                raise OSError("synthetic unreadable restart clearance")
+            return await original_gate(process_id)
+
+        async def presence() -> str:
+            nonlocal presence_calls
+            presence_calls += 1
+            return await original_presence()
+
+        async def transaction(**kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal transaction_calls
+            transaction_calls += 1
+            return await original_transaction(**cast("Any", kwargs))
+
+        monkeypatch.setattr(tmp_store, "active_run", active)
+        monkeypatch.setattr(tmp_store, "read_latest_run", latest)
+        monkeypatch.setattr(tmp_store, "read_process_restart_clearance", gate)
+        monkeypatch.setattr(roaster, "read_session_presence", presence)
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", transaction)
+        app = create_app(service)
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/restart-clearance/retire-stranded-fault",
+                json=_retirement_request().model_dump(mode="json"),
+            )
+
+        assert failure_facts == [failing_read]
+        assert response.status_code == 200
+        body = response.json()
+        assert body["outcome"] == "rejected"
+        assert body["attempted_generation"] is None
+        assert presence_calls == 0
+        assert transaction_calls == 0
+        assert read_calls[failing_read] == 2
+        assert frames.empty()
+        assert service._stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert service._unconfirmed_stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert service._restart_clearance_state is RestartClearanceState.REQUIRED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert (await tmp_store.read_fault_control_lease()).status is FaultLeaseStatus.OPEN
+        assert await _table_rows(tmp_store, "roast_runs") == before_runs
+        assert await _table_rows(tmp_store, "roast_events") == before_events
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_admission_durable_reads_positive_control_reaches_presence_and_transaction(
+    tmp_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real unperturbed durable reads leave the eligible positive path intact."""
+    await tmp_store.initialize()
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        original_presence = roaster.read_session_presence
+        original_transaction = tmp_store.retire_stranded_fault_lease
+        presence_calls = 0
+        transaction_calls = 0
+
+        async def presence() -> str:
+            nonlocal presence_calls
+            presence_calls += 1
+            return await original_presence()
+
+        async def transaction(**kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal transaction_calls
+            transaction_calls += 1
+            return await original_transaction(**cast("Any", kwargs))
+
+        monkeypatch.setattr(roaster, "read_session_presence", presence)
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", transaction)
+        app = create_app(service)
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/restart-clearance/retire-stranded-fault",
+                json=_retirement_request().model_dump(mode="json"),
+            )
+
+        assert response.status_code == 200
+        assert response.json()["outcome"] == "confirmed"
+        assert presence_calls == 1
+        assert transaction_calls == 1
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
