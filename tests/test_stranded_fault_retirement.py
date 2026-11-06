@@ -2081,3 +2081,88 @@ async def test_tb13_malformed_older_audit_cannot_reconcile_or_retry_the_transact
         await service.shutdown()
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_tb4_real_store_provenance_distinguishes_d212_d220_retirement_and_unproven_states(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TB4: provenance is exact durable evidence, never inferred from lease status."""
+    await tmp_store.initialize()
+    baseline_path = tmp_store._db_path.with_name("tb4-baseline.sqlite3")  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    baseline_store = RoastStore(baseline_path)
+    retirement_store = RoastStore(tmp_store._db_path.with_name("tb4-retirement.sqlite3"))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await baseline_store.initialize()
+    await retirement_store.initialize()
+    # D220's absent record is intentionally trusted only after reopening an
+    # existing database: a fresh install is a distinct safe-zero provenance.
+    await baseline_store.close()
+    baseline_store = RoastStore(baseline_path)
+    await baseline_store.initialize()
+    try:
+        await tmp_store.create_run(
+            run_id="tb4-d212-run",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        await tmp_store.complete_run(
+            run_id="tb4-d212-run", outcome="faulted", agent_phase=RoastPhase.FAULTED
+        )
+        await tmp_store.open_fault_control_lease(
+            run_id="tb4-d212-run", mcp_session_id="tb4-d212-session", generation=1
+        )
+        closed = await tmp_store.close_fault_control_lease_atomically(
+            generation=1,
+            run_id="tb4-d212-run",
+            mcp_session_id="tb4-d212-session",
+            fault_reason=None,
+        )
+        d212_lease = await tmp_store.read_fault_control_lease()
+        assert closed.confirmed is True
+        assert (
+            await tmp_store.read_fault_control_lease_closure_provenance(d212_lease)
+            is FaultLeaseClosureProvenance.EXACT_SESSION_SAFE_ZERO
+        )
+
+        process_id = "f" * 32
+        assert not await baseline_store.begin_process_epoch(process_id)
+        assert await baseline_store.begin_process_restart_clearance(process_id)
+        assert await baseline_store.initialize_missing_fault_control_safety_record(
+            process_id=process_id, generation=1, operation_id="a" * 32
+        )
+        baseline_lease = await baseline_store.read_fault_control_lease()
+        assert (
+            await baseline_store.read_fault_control_lease_closure_provenance(baseline_lease)
+            is FaultLeaseClosureProvenance.BASELINE
+        )
+
+        retirement_service, _roaster = await _eligible_service(retirement_store)
+        assert (
+            await retirement_service.retire_stranded_fault(_retirement_request())
+        ).outcome == "confirmed"
+        retirement_lease = await retirement_store.read_fault_control_lease()
+        assert (
+            await retirement_store.read_fault_control_lease_closure_provenance(retirement_lease)
+            is FaultLeaseClosureProvenance.OPERATOR_ATTESTED_RETIREMENT
+        )
+        await retirement_service.shutdown()
+
+        await tmp_store.open_fault_control_lease(
+            run_id="tb4-d212-run", mcp_session_id="tb4-open-session", generation=2
+        )
+        open_lease = await tmp_store.read_fault_control_lease()
+        assert await tmp_store.read_fault_control_lease_closure_provenance(open_lease) is None
+        assert await tmp_store.mark_fault_control_lease_unknown(2)
+        unknown_lease = await tmp_store.read_fault_control_lease()
+        assert await tmp_store.read_fault_control_lease_closure_provenance(unknown_lease) is None
+
+        async def unreadable(*_args: object, **_kwargs: object) -> FaultControlLease:
+            raise OSError("synthetic provenance read failure")
+
+        monkeypatch.setattr(tmp_store, "_read_fault_control_lease_from_connection", unreadable)
+        assert await tmp_store.read_fault_control_lease_closure_provenance(unknown_lease) is None
+    finally:
+        await tmp_store.close()
+        await baseline_store.close()
+        await retirement_store.close()
