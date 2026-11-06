@@ -37,6 +37,7 @@ from roastpilot_agent.models import (
     BrewMethod,
     CommandTraceSource,
     CommandTraceStatus,
+    FaultLeaseClosureProvenance,
     FaultLeaseStatus,
     LogManifest,
     OperatorAction,
@@ -808,6 +809,14 @@ class FaultControlLeaseAbsence(Enum):
     UNREADABLE = "unreadable"
 
 
+class StrandedFaultRetirementCommit(Enum):
+    """Durable outcome of one stranded-fault lease retirement (#1071/D225)."""
+
+    COMMITTED_VERIFIED = "committed_verified"
+    PRECONDITION_REJECTED = "precondition_rejected"
+    INDETERMINATE = "indeterminate"
+
+
 class FaultControlCloseResult(BaseModel):
     """The durable outcome of one atomic fault-control close.
 
@@ -1500,6 +1509,389 @@ class RoastStore:
                 matching += 1
         return matching
 
+    @staticmethod
+    def _stranded_fault_retirement_payload(
+        generation: int, mcp_session_id: str, operation_id: str, process_id: str
+    ) -> str:
+        """Render the canonical D225 stranded-fault retirement audit payload."""
+        return json.dumps(
+            {
+                "generation": generation,
+                "mcp_session_id": mcp_session_id,
+                "operation_id": operation_id,
+                "process_id": process_id,
+                "retirement": "operator_attested",
+            },
+            sort_keys=True,
+        )
+
+    @classmethod
+    def _parse_stranded_fault_retirement_payload(cls, payload: object) -> dict[str, object] | None:
+        """Return one canonical D225 audit payload, or ``None`` if malformed."""
+        if not isinstance(payload, str):
+            return None
+        try:
+            decoded_value = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(decoded_value, dict):
+            return None
+        decoded = cast("dict[str, object]", decoded_value)
+        generation = decoded.get("generation")
+        session_id = decoded.get("mcp_session_id")
+        operation_id = decoded.get("operation_id")
+        process_id = decoded.get("process_id")
+        if (
+            set(decoded)
+            != {"generation", "mcp_session_id", "operation_id", "process_id", "retirement"}
+            or decoded.get("retirement") != "operator_attested"
+            or type(generation) is not int
+            or generation < 1
+            or not isinstance(session_id, str)
+            or not session_id
+            or not isinstance(operation_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None
+            or not isinstance(process_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", process_id) is None
+        ):
+            return None
+        canonical = cls._stranded_fault_retirement_payload(
+            generation, session_id, operation_id, process_id
+        )
+        return decoded if payload == canonical else None
+
+    async def _accepted_stranded_fault_retirement_payloads(
+        self, connection: aiosqlite.Connection, run_id: str
+    ) -> list[object]:
+        """Read accepted D225 audit payloads for one run without classifying them."""
+        async with connection.execute(
+            "SELECT payload_json FROM operator_actions WHERE action = ? AND run_id = ? "
+            "AND result = 'accepted'",
+            (OperatorAction.RETIRE_STRANDED_FAULT.value, run_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [row["payload_json"] for row in rows]
+
+    async def _classify_run_bound_closed_lease(
+        self,
+        connection: aiosqlite.Connection,
+        run_id: str,
+        generation: int,
+        session_id: str | None,
+    ) -> FaultLeaseClosureProvenance | None:
+        """Classify the closed run-bound lease proof grammar from D212 and D225."""
+        legacy = await self._has_confirmed_fault_control_close(connection, run_id, generation)
+        malformed_count = 0
+        same_generation: list[dict[str, object]] = []
+        for payload in await self._accepted_stranded_fault_retirement_payloads(connection, run_id):
+            decoded = self._parse_stranded_fault_retirement_payload(payload)
+            if decoded is None:
+                malformed_count += 1
+                continue
+            if decoded["generation"] == generation:
+                same_generation.append(decoded)
+        matches = (
+            []
+            if session_id is None
+            else [entry for entry in same_generation if entry["mcp_session_id"] == session_id]
+        )
+        match_count = len(matches)
+        mismatch_count = len(same_generation) - match_count
+        if malformed_count > 0 or mismatch_count > 0:
+            return None
+        if legacy and match_count >= 1:
+            return None
+        if legacy:
+            return FaultLeaseClosureProvenance.EXACT_SESSION_SAFE_ZERO
+        if match_count == 1:
+            return FaultLeaseClosureProvenance.OPERATOR_ATTESTED_RETIREMENT
+        return None
+
+    async def _has_accepted_stranded_fault_retirement_generation(
+        self, connection: aiosqlite.Connection, run_id: str, generation: int
+    ) -> bool:
+        """Return whether any accepted D225 row decodes to this generation."""
+        for payload in await self._accepted_stranded_fault_retirement_payloads(connection, run_id):
+            if not isinstance(payload, str):
+                continue
+            try:
+                decoded_value = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(decoded_value, dict):
+                continue
+            decoded = cast("dict[str, object]", decoded_value)
+            if decoded.get("generation") == generation:
+                return True
+        return False
+
+    @staticmethod
+    def _validate_stranded_fault_retirement_arguments(
+        *, process_id: str, generation: int, run_id: str, mcp_session_id: str, operation_id: str
+    ) -> None:
+        """Reject malformed D225 operation identities before opening a connection."""
+        if (
+            type(generation) is not int
+            or generation < 1
+            or not all(
+                type(value) is str and value
+                for value in (process_id, run_id, mcp_session_id, operation_id)
+            )
+            or re.fullmatch(r"[0-9a-f]{32}", process_id) is None
+            or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None
+        ):
+            raise ValueError("invalid stranded-fault retirement identity")
+
+    async def retire_stranded_fault_lease(
+        self,
+        *,
+        process_id: str,
+        generation: int,
+        run_id: str,
+        mcp_session_id: str,
+        operation_id: str,
+    ) -> StrandedFaultRetirementCommit:
+        """Atomically retire one exact terminal-faulted OPEN lease under D225.
+
+        Args:
+            process_id: The current unclean process's opaque operation identity.
+            generation: The exact positive fault-control lease generation.
+            run_id: The terminal faulted run bound to the lease.
+            mcp_session_id: The exact MCP session bound to the lease.
+            operation_id: The unique opaque identity for this retirement attempt.
+
+        Returns:
+            A closed enum that distinguishes verified commit, rejected premises,
+            and any indeterminate persistence or verification outcome.
+        """
+        self._validate_stranded_fault_retirement_arguments(
+            process_id=process_id,
+            generation=generation,
+            run_id=run_id,
+            mcp_session_id=mcp_session_id,
+            operation_id=operation_id,
+        )
+        connection: aiosqlite.Connection | None = None
+        propagating_base_exception = False
+        try:
+            connection = await aiosqlite.connect(self._db_path)
+            connection.row_factory = aiosqlite.Row
+            await self._configure_durable_connection(connection)
+            await connection.execute("BEGIN IMMEDIATE")
+            async with connection.execute(
+                "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease "
+                "WHERE singleton = 1"
+            ) as cursor:
+                lease = await cursor.fetchone()
+            if (
+                lease is None
+                or lease["run_id"] != run_id
+                or lease["mcp_session_id"] != mcp_session_id
+                or int(lease["generation"]) != generation
+                or str(lease["status"]) != FaultLeaseStatus.OPEN.value
+            ):
+                await connection.rollback()
+                return StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+            async with connection.execute(
+                "SELECT 1 FROM process_epoch WHERE singleton = 1 AND process_id = ? "
+                "AND status = 'unclean'",
+                (process_id,),
+            ) as cursor:
+                epoch = await cursor.fetchone()
+            async with connection.execute(
+                "SELECT 1 FROM process_restart_clearance WHERE process_id = ? AND state = ?",
+                (process_id, RestartClearanceState.REQUIRED.value),
+            ) as cursor:
+                clearance = await cursor.fetchone()
+            async with connection.execute(
+                "SELECT 1 FROM roast_runs WHERE completed_at_utc IS NULL LIMIT 1"
+            ) as cursor:
+                active = await cursor.fetchone()
+            async with connection.execute(
+                "SELECT id, completed_at_utc, outcome, agent_phase FROM roast_runs "
+                "ORDER BY started_at_utc DESC, rowid DESC LIMIT 1"
+            ) as cursor:
+                latest_run = await cursor.fetchone()
+            if (
+                epoch is None
+                or clearance is None
+                or active is not None
+                or latest_run is None
+                or latest_run["id"] != run_id
+                or latest_run["completed_at_utc"] is None
+                or str(latest_run["outcome"]) != "faulted"
+                or str(latest_run["agent_phase"]) != RoastPhase.FAULTED.value
+                or await self._has_confirmed_fault_control_close(connection, run_id, generation)
+                or await self._has_accepted_stranded_fault_retirement_generation(
+                    connection, run_id, generation
+                )
+            ):
+                await connection.rollback()
+                return StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+            now = _utc_now()
+            updated = await connection.execute(
+                "UPDATE fault_control_lease SET status = ?, updated_at_utc = ? "
+                "WHERE singleton = 1 AND generation = ? AND run_id = ? "
+                "AND mcp_session_id = ? AND status = ?",
+                (
+                    FaultLeaseStatus.CLOSED.value,
+                    now,
+                    generation,
+                    run_id,
+                    mcp_session_id,
+                    FaultLeaseStatus.OPEN.value,
+                ),
+            )
+            if updated.rowcount != 1:
+                await connection.rollback()
+                return StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+            await connection.execute(
+                "INSERT INTO operator_actions "
+                "(run_id, action, payload_json, result, recorded_at_utc) "
+                "VALUES (?, ?, ?, 'accepted', ?)",
+                (
+                    run_id,
+                    OperatorAction.RETIRE_STRANDED_FAULT.value,
+                    self._stranded_fault_retirement_payload(
+                        generation, mcp_session_id, operation_id, process_id
+                    ),
+                    now,
+                ),
+            )
+            await connection.commit()
+        except Exception:  # noqa: BLE001 - every persistence ambiguity fails closed
+            if connection is not None:
+                with contextlib.suppress(Exception):
+                    await connection.rollback()
+            return StrandedFaultRetirementCommit.INDETERMINATE
+        except BaseException:
+            propagating_base_exception = True
+            if connection is not None:
+                with contextlib.suppress(Exception):
+                    await connection.rollback()
+            raise
+        finally:
+            if connection is not None:
+                try:
+                    await connection.close()
+                except Exception:  # noqa: BLE001 - cleanup ambiguity cannot report success
+                    if not propagating_base_exception:
+                        return StrandedFaultRetirementCommit.INDETERMINATE
+        try:
+            verified = await self.verify_stranded_fault_retirement(
+                process_id=process_id,
+                generation=generation,
+                run_id=run_id,
+                mcp_session_id=mcp_session_id,
+                operation_id=operation_id,
+            )
+        except Exception:  # noqa: BLE001 - a missing postcondition is indeterminate
+            return StrandedFaultRetirementCommit.INDETERMINATE
+        return (
+            StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+            if verified
+            else StrandedFaultRetirementCommit.INDETERMINATE
+        )
+
+    async def verify_stranded_fault_retirement(
+        self,
+        *,
+        process_id: str,
+        generation: int,
+        run_id: str,
+        mcp_session_id: str,
+        operation_id: str,
+    ) -> bool:
+        """Read-only proof for one exact committed D225 retirement operation."""
+        connection: aiosqlite.Connection | None = None
+        try:
+            connection = await aiosqlite.connect(self._db_path)
+            connection.row_factory = aiosqlite.Row
+            await self._configure_durable_connection(connection)
+            await connection.execute("BEGIN")
+            lease = await self._read_fault_control_lease_from_connection(connection)
+            if lease != FaultControlLease(
+                generation=generation,
+                status=FaultLeaseStatus.CLOSED,
+                run_id=run_id,
+                mcp_session_id=mcp_session_id,
+            ):
+                return False
+            if (
+                await self._classify_run_bound_closed_lease(
+                    connection, run_id, generation, mcp_session_id
+                )
+                is not FaultLeaseClosureProvenance.OPERATOR_ATTESTED_RETIREMENT
+            ):
+                return False
+            matches = [
+                decoded
+                for payload in await self._accepted_stranded_fault_retirement_payloads(
+                    connection, run_id
+                )
+                if (decoded := self._parse_stranded_fault_retirement_payload(payload)) is not None
+                and decoded["generation"] == generation
+                and decoded["mcp_session_id"] == mcp_session_id
+            ]
+            if (
+                len(matches) != 1
+                or matches[0]["operation_id"] != operation_id
+                or matches[0]["process_id"] != process_id
+            ):
+                return False
+            async with connection.execute(
+                "SELECT 1 FROM process_epoch WHERE singleton = 1 AND process_id = ? "
+                "AND status = 'unclean'",
+                (process_id,),
+            ) as cursor:
+                epoch = await cursor.fetchone()
+            async with connection.execute(
+                "SELECT 1 FROM process_restart_clearance WHERE process_id = ? AND state = ?",
+                (process_id, RestartClearanceState.REQUIRED.value),
+            ) as cursor:
+                clearance = await cursor.fetchone()
+            return epoch is not None and clearance is not None
+        except Exception:  # noqa: BLE001 - unreadable evidence is not proof
+            return False
+        finally:
+            if connection is not None:
+                with contextlib.suppress(Exception):
+                    await connection.rollback()
+                with contextlib.suppress(Exception):
+                    await connection.close()
+
+    async def read_fault_control_lease_closure_provenance(
+        self, lease: FaultControlLease
+    ) -> FaultLeaseClosureProvenance | None:
+        """Read the closed lease's durable proof kind without changing state."""
+        try:
+            if lease.generation == 0:
+                absence = await self._probe_fault_control_lease_absence_from_connection(
+                    self.connection,
+                    absence_trusted=self._fault_lease_absence_trusted,
+                )
+                return (
+                    FaultLeaseClosureProvenance.BASELINE
+                    if (
+                        lease.status is FaultLeaseStatus.CLOSED
+                        and absence is FaultControlLeaseAbsence.ABSENT_TRUSTED
+                    )
+                    else None
+                )
+            durable = await self._read_fault_control_lease_from_connection(self.connection)
+            if durable != lease or durable.status is not FaultLeaseStatus.CLOSED:
+                return None
+            if durable.run_id is None:
+                return FaultLeaseClosureProvenance.BASELINE
+            return await self._classify_run_bound_closed_lease(
+                self.connection,
+                durable.run_id,
+                durable.generation,
+                durable.mcp_session_id,
+            )
+        except Exception:  # noqa: BLE001 - unreadable closure evidence is not proof
+            return None
+
     async def _read_fault_control_lease_from_connection(
         self, connection: aiosqlite.Connection
     ) -> FaultControlLease:
@@ -1539,7 +1931,15 @@ class RoastStore:
                     )
                 ):
                     status = FaultLeaseStatus.UNKNOWN
-            elif not await self._has_confirmed_fault_control_close(connection, run_id, generation):
+            elif (
+                await self._classify_run_bound_closed_lease(
+                    connection,
+                    run_id,
+                    generation,
+                    None if row["mcp_session_id"] is None else str(row["mcp_session_id"]),
+                )
+                is None
+            ):
                 status = FaultLeaseStatus.UNKNOWN
         return FaultControlLease(
             generation=generation,

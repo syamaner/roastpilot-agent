@@ -3748,6 +3748,10 @@ class RoastService:
             raise RoastRunConflictError(
                 "initialize_safety_record is available only through the safety-record path"
             )
+        if request.action is OperatorAction.RETIRE_STRANDED_FAULT:
+            raise RoastRunConflictError(
+                "retire_stranded_fault is available only through the stranded-fault retirement path"
+            )
         if request.action is OperatorAction.EMERGENCY_STOP:
             return await self._submit_fault_controls_emergency_stop()
         if self._fault_acknowledgement_gate.fault_finalization_started:
@@ -6331,6 +6335,10 @@ class RoastService:
         if request.action is OperatorAction.INITIALIZE_SAFETY_RECORD:
             raise RoastRunConflictError(
                 "initialize_safety_record is available only through the safety-record path"
+            )
+        if request.action is OperatorAction.RETIRE_STRANDED_FAULT:
+            raise RoastRunConflictError(
+                "retire_stranded_fault is available only through the stranded-fault retirement path"
             )
         if request.action is OperatorAction.EMERGENCY_STOP:
             if self._revoke_unpublished_start_for_emergency_stop(run_id):
