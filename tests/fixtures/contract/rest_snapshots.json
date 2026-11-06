@@ -50,8 +50,10 @@
     "excluded": false,
     "export_manifest": null,
     "fault_controls": {
+      "closure_provenance": null,
       "enabled_actions": [],
       "generation": null,
+      "physical_stop_operative": false,
       "status": "closed"
     },
     "fault_reason": null,
