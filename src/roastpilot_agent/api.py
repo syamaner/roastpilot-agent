@@ -4430,8 +4430,7 @@ class RoastService:
                 run_id=context.expected_lease.run_id,
                 mcp_session_id=context.expected_lease.mcp_session_id,
             )
-            if self._unconfirmed_stranded_fault_retirement is context:
-                self._unconfirmed_stranded_fault_retirement = None
+            self._unconfirmed_stranded_fault_retirement = None
             retirement_outcome = "confirmed"
         else:
             retirement_outcome = "unconfirmed"
