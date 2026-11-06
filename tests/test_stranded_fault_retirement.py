@@ -3016,3 +3016,134 @@ async def test_tb_proj_actual_persisted_g_plus_one_is_honestly_projected_at_ever
         await service.shutdown()
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale", ["child", "process", "stop"])
+async def test_owned_fence_stale_while_waiting_for_restart_lock_returns_unconfirmed_without_retry(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, stale: str
+) -> None:
+    """The own-fence lock checkpoint reports uncertainty without reopening proof or write work."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        writes = 0
+        verifies = 0
+
+        async def indeterminate(**_kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal writes
+            writes += 1
+            return StrandedFaultRetirementCommit.INDETERMINATE
+
+        async def false_verify(**_kwargs: object) -> bool:
+            nonlocal verifies
+            verifies += 1
+            return False
+
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", indeterminate)
+        monkeypatch.setattr(tmp_store, "verify_stranded_fault_retirement", false_verify)
+        assert (await service.retire_stranded_fault(_retirement_request())).outcome == "unconfirmed"
+        fence = service._unconfirmed_stranded_fault_retirement  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert fence is not None
+        await service._restart_clearance_lock.acquire()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        request = asyncio.create_task(service.retire_stranded_fault(_retirement_request()))
+        await asyncio.sleep(0)
+        if stale == "child":
+            cast("_CurrentChild", service._mcp).child_epoch += 1  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif stale == "process":
+            service.instance_id = "b" * 32
+        else:
+            cast("_CurrentChild", service._mcp).stop_unconfirmed = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        service._restart_clearance_lock.release()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        result = await request
+
+        assert result.outcome == "unconfirmed"
+        assert result.attempted_generation == 1
+        assert writes == 1
+        assert verifies == 1
+        assert service._unconfirmed_stranded_fault_retirement is fence  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        if service._restart_clearance_lock.locked():  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            service._restart_clearance_lock.release()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_task_stale_before_first_presence_rejects_without_presence_or_transaction(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owned task's first checkpoint releases its own reservation before MCP proof."""
+    await tmp_store.initialize()
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        original_task = service._retire_stranded_fault_task  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        presence = 0
+        writes = 0
+
+        async def counted_presence() -> str:
+            nonlocal presence
+            presence += 1
+            return "none"
+
+        async def counted_write(**_kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal writes
+            writes += 1
+            return StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+
+        async def stale_entry(context: Any) -> Any:
+            service._hardware_clear_request_in_flight = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            return await original_task(context)
+
+        roaster.read_session_presence = counted_presence  # type: ignore[method-assign]
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", counted_write)
+        monkeypatch.setattr(service, "_retire_stranded_fault_task", stale_entry)
+        result = await service.retire_stranded_fault(_retirement_request())
+
+        assert result.outcome == "rejected"
+        assert result.attempted_generation == 1
+        assert presence == 0
+        assert writes == 0
+        assert service._unconfirmed_stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_precondition_rejected_releases_only_its_owned_fence_without_history_or_retry(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, replacement: bool
+) -> None:
+    """PRECONDITION_REJECTED clears its own fence but cannot erase a successor fence."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        writes = 0
+
+        async def rejected(**_kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal writes
+            writes += 1
+            if replacement:
+                current = service._unconfirmed_stranded_fault_retirement  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                assert current is not None
+                service._unconfirmed_stranded_fault_retirement = replace(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                    current, operation_id="e" * 32
+                )
+            return StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", rejected)
+        before_runs = await _table_rows(tmp_store, "roast_runs")
+        before_events = await _table_rows(tmp_store, "roast_events")
+        result = await service.retire_stranded_fault(_retirement_request())
+
+        assert result.outcome == "rejected"
+        assert result.attempted_generation == 1
+        assert writes == 1
+        assert await _table_rows(tmp_store, "roast_runs") == before_runs
+        assert await _table_rows(tmp_store, "roast_events") == before_events
+        fence = service._unconfirmed_stranded_fault_retirement  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert (fence is not None) is replacement
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
