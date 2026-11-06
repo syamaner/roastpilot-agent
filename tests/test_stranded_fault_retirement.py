@@ -3076,8 +3076,9 @@ async def test_owned_fence_stale_while_waiting_for_restart_lock_returns_unconfir
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stale_binding", ["child_epoch", "hardware_clear"])
 async def test_owned_task_stale_before_first_presence_rejects_without_presence_or_transaction(
-    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, stale_binding: str
 ) -> None:
     """The owned task's first checkpoint releases its own reservation before MCP proof."""
     await tmp_store.initialize()
@@ -3098,7 +3099,10 @@ async def test_owned_task_stale_before_first_presence_rejects_without_presence_o
             return StrandedFaultRetirementCommit.PRECONDITION_REJECTED
 
         async def stale_entry(context: Any) -> Any:
-            service._hardware_clear_request_in_flight = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            if stale_binding == "child_epoch":
+                cast("_CurrentChild", service._mcp).child_epoch += 1  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            else:
+                service._hardware_clear_request_in_flight = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
             return await original_task(context)
 
         roaster.read_session_presence = counted_presence  # type: ignore[method-assign]
@@ -3255,9 +3259,11 @@ async def test_every_context_ownership_pointer_term_is_isolated_and_total(
                 context,
                 cast("Any", await _settled_task()),
             )
-        owned = service._retirement_context_is_owned(context)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        assert isinstance(owned, bool)
-        assert owned is False
+        try:
+            observed: object = service._retirement_context_is_owned(context)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        except Exception as error:  # noqa: BLE001 - assert the total-function result below
+            observed = error
+        assert observed is False
         service._stranded_fault_retirement = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         await service.shutdown()
     finally:
@@ -3583,4 +3589,166 @@ async def test_stably_invalid_snapshot_is_fresh_but_not_available_without_mcp_io
         assert roaster.calls == []
         await service.shutdown()
     finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale_after", ["lock", "epoch-init", "lease", "active", "latest"])
+@pytest.mark.parametrize("binding_change", ["unperturbed", "child_epoch", "hardware_clear"])
+async def test_admission_binding_races_stop_before_the_next_protocol_stage(
+    tmp_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    stale_after: str,
+    binding_change: str,
+) -> None:
+    """MB4: stale admission bindings stop the real protocol at their next checkpoint."""
+    await tmp_store.initialize()
+    request_task: asyncio.Task[Any] | None = None
+    lock_held = False
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        original_epoch = service._ensure_restart_epoch  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        original_lease = service._read_fault_lease_fail_closed  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        original_active = tmp_store.active_run
+        original_latest = tmp_store.read_latest_run
+        original_gate = tmp_store.read_process_restart_clearance
+        original_presence = roaster.read_session_presence
+        original_transaction = tmp_store.retire_stranded_fault_lease
+        original_result = service._stranded_fault_retirement_result  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        trace: list[str] = []
+        first_result_trace: list[str] | None = None
+        presence_calls = 0
+        transaction_calls = 0
+        trace_admission = True
+        identity_captured = asyncio.Event()
+        original_capture = service._capture_retirement_identity  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        def make_stale() -> None:
+            if binding_change == "child_epoch":
+                cast("_CurrentChild", service._mcp).child_epoch += 1  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            elif binding_change == "hardware_clear":
+                service._hardware_clear_request_in_flight = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        def capture_identity() -> Any:
+            identity = original_capture()
+            identity_captured.set()
+            return identity
+
+        async def epoch_init() -> None:
+            if trace_admission:
+                trace.append("epoch-init")
+            await original_epoch()
+            if stale_after == "epoch-init":
+                make_stale()
+
+        async def lease() -> FaultControlLease:
+            if trace_admission:
+                trace.append("lease")
+            value = await original_lease()
+            if stale_after == "lease":
+                make_stale()
+            return value
+
+        async def active() -> PersistedRun | None:
+            if trace_admission:
+                trace.append("active")
+            value = await original_active()
+            if stale_after == "active":
+                make_stale()
+            return value
+
+        async def latest() -> PersistedRun | None:
+            if trace_admission:
+                trace.append("latest")
+            value = await original_latest()
+            if stale_after == "latest":
+                make_stale()
+            return value
+
+        async def gate(process_id: str) -> RestartClearanceState:
+            if trace_admission:
+                trace.append("gate")
+            return await original_gate(process_id)
+
+        async def presence() -> str:
+            nonlocal presence_calls
+            if trace_admission:
+                trace.append("presence")
+            presence_calls += 1
+            return await original_presence()
+
+        async def transaction(**kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal trace_admission, transaction_calls
+            if trace_admission:
+                trace.append("transaction")
+            transaction_calls += 1
+            value = await original_transaction(**cast("Any", kwargs))
+            trace_admission = False
+            return value
+
+        async def capture_first_result(*args: Any, **kwargs: Any) -> Any:
+            nonlocal first_result_trace
+            if first_result_trace is None:
+                first_result_trace = trace.copy()
+            return await original_result(*args, **kwargs)
+
+        monkeypatch.setattr(service, "_ensure_restart_epoch", epoch_init)
+        monkeypatch.setattr(service, "_read_fault_lease_fail_closed", lease)
+        monkeypatch.setattr(tmp_store, "active_run", active)
+        monkeypatch.setattr(tmp_store, "read_latest_run", latest)
+        monkeypatch.setattr(tmp_store, "read_process_restart_clearance", gate)
+        monkeypatch.setattr(roaster, "read_session_presence", presence)
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", transaction)
+        monkeypatch.setattr(service, "_stranded_fault_retirement_result", capture_first_result)
+        if stale_after == "lock" and binding_change != "unperturbed":
+            monkeypatch.setattr(service, "_capture_retirement_identity", capture_identity)
+            await service._restart_clearance_lock.acquire()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            lock_held = True
+            request_task = asyncio.create_task(service.retire_stranded_fault(_retirement_request()))
+            await identity_captured.wait()
+            make_stale()
+            service._restart_clearance_lock.release()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            lock_held = False
+            result = await request_task
+        else:
+            result = await service.retire_stranded_fault(_retirement_request())
+
+        assert first_result_trace is not None
+        if binding_change == "unperturbed":
+            assert result.outcome == "confirmed"
+            assert first_result_trace == [
+                "epoch-init",
+                "lease",
+                "active",
+                "latest",
+                "gate",
+                "presence",
+                "transaction",
+            ]
+            assert presence_calls == 1
+            assert transaction_calls == 1
+        else:
+            expected = {
+                "lock": [],
+                "epoch-init": ["epoch-init"],
+                "lease": ["epoch-init", "lease"],
+                "active": ["epoch-init", "lease", "active"],
+                "latest": ["epoch-init", "lease", "active", "latest"],
+            }[stale_after]
+            if stale_after == "lock" and binding_change == "hardware_clear":
+                expected = ["epoch-init"]
+            assert result.outcome == "rejected"
+            assert result.attempted_generation is None
+            assert first_result_trace == expected
+            assert presence_calls == 0
+            assert transaction_calls == 0
+            assert service._unconfirmed_stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        if lock_held:
+            service._restart_clearance_lock.release()  # type: ignore[union-attr]  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
         await tmp_store.close()
