@@ -2881,8 +2881,12 @@ async def test_tb_proj_actual_persisted_g_plus_one_is_honestly_projected_at_ever
             assert (await service.retire_stranded_fault(_retirement_request())).outcome == "confirmed"
         old_lease = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         old_context = _test_retirement_context(service, old_lease)
+        prior_ledger = service._retirement_event_ledger  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         frames = service.events.subscribe()
         triggered = False
+        advance_error: Exception | None = None
+        admitted_result: Any = None
+        admitted_durable: FaultControlLease | None = None
         in_shared_snapshot = consumer == "result"
         shared_snapshot: Any = None
 
@@ -2902,18 +2906,25 @@ async def test_tb_proj_actual_persisted_g_plus_one_is_honestly_projected_at_ever
 
         monkeypatch.setattr(service, "_execute_terminal_emergency_stop", failed_terminal_dispatch)
         service._fault_control_executor = cast("Any", object())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        roaster.set_latest_fault_session_id(cast(str, old_lease.mcp_session_id))
+        terminal_runner = _PendingLiveRunner(cast(str, old_lease.run_id))
+        terminal_runner.finalized = True
+        service.active_run_id = terminal_runner.run_id
+        service.runner = cast("Any", terminal_runner)
 
         async def advance_generation() -> None:
-            nonlocal triggered
+            nonlocal admitted_durable, admitted_result, advance_error, triggered
             if triggered:
                 return
             triggered = True
-            await service._submit_fault_controls_emergency_stop()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-            assert await service.settle_fault_lease_persistence_for_teardown()
-            durable = await tmp_store.read_fault_control_lease()
-            assert durable.status is FaultLeaseStatus.OPEN
-            assert durable.generation == old_lease.generation + 1
-            assert service._fault_lease_cache == durable  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            try:
+                admitted_result = await service._submit_fault_controls_emergency_stop()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                service.runner = None
+                service.active_run_id = None
+                await service.settle_fault_lease_persistence_for_teardown()
+                admitted_durable = await tmp_store.read_fault_control_lease()
+            except Exception as error:  # noqa: BLE001 - must escape snapshot's fail-closed handler
+                advance_error = error
 
         if read_name == "lease":
             original = service._read_fault_lease_fail_closed  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
@@ -2986,6 +2997,12 @@ async def test_tb_proj_actual_persisted_g_plus_one_is_honestly_projected_at_ever
         await service._emit_stranded_fault_retirement(result, 1, old_context, snapshot)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
 
         assert triggered
+        assert advance_error is None
+        assert admitted_result is not None
+        assert admitted_durable is not None
+        assert admitted_durable.status is FaultLeaseStatus.OPEN
+        assert admitted_durable.generation == old_lease.generation + 1
+        assert service._fault_lease_cache == admitted_durable  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         assert result.attempted_generation == 1
         assert controls.status is FaultLeaseStatus.OPEN
         assert controls.generation == old_lease.generation + 1
@@ -2993,7 +3010,7 @@ async def test_tb_proj_actual_persisted_g_plus_one_is_honestly_projected_at_ever
         assert controls.physical_stop_operative is True
         assert result.restart_clearance.eligible is False
         assert frames.empty()
-        assert service._retirement_event_ledger is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert service._retirement_event_ledger == prior_ledger  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         assert roaster.calls == []
         service._fault_control_executor = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         await service.shutdown()
