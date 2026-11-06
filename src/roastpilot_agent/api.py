@@ -4108,6 +4108,8 @@ class RoastService:
             or not child.running
             or child.stop_unconfirmed
             or child.child_epoch != context.identity.child_epoch
+            or self._emergency_stop_admission_epoch
+            != context.identity.emergency_stop_admission_epoch
             or self._emergency_stop_admission_epoch != current.emergency_stop_admission_epoch
             or self._fault_lease_cache != current.expected_cache
         ):
