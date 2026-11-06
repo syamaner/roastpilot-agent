@@ -3147,3 +3147,110 @@ async def test_precondition_rejected_releases_only_its_owned_fence_without_histo
         await service.shutdown()
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_roaster_presence_is_an_independent_total_retirement_conditions_predicate(
+    tmp_store: RoastStore,
+) -> None:
+    """MB1 term19: missing roaster closes the transient predicate without raising."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        assert service._retirement_conditions_hold()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        service._roaster = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        try:
+            held = service._retirement_conditions_hold()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        except Exception as error:  # noqa: BLE001 - exact total-function oracle
+            pytest.fail(f"roaster predicate raised {type(error).__name__}")
+        assert held is False
+        assert service._capture_retirement_identity() is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "term",
+    ["cache", "status", "generation", "run_id", "session_id", "same_fence", "higher_fence"],
+)
+async def test_every_open_admission_term_is_isolated_from_cache_equality_masking(
+    tmp_store: RoastStore, term: str
+) -> None:
+    """MB1: each normal OPEN-admission conjunct has a direct total-function oracle."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        identity = service._capture_retirement_identity()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert identity is not None
+        valid = identity.cache_lease
+        assert service._retirement_open_admission(valid, identity)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        candidate = valid
+        if term == "cache":
+            candidate = valid.model_copy(update={"mcp_session_id": "other-session"})
+        elif term == "status":
+            candidate = valid.model_copy(update={"status": FaultLeaseStatus.CLOSED})
+        elif term == "generation":
+            candidate = valid.model_copy(update={"generation": 0})
+        elif term == "run_id":
+            candidate = valid.model_copy(update={"run_id": None})
+        elif term == "session_id":
+            candidate = valid.model_copy(update={"mcp_session_id": None})
+        elif term == "same_fence":
+            service._unconfirmed_stranded_fault_retirement = _test_retirement_context(service, valid)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif term == "higher_fence":
+            context = _test_retirement_context(service, valid)
+            service._unconfirmed_stranded_fault_retirement = replace(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                context,
+                expected_lease=valid.model_copy(update={"generation": valid.generation + 1}),
+            )
+        if term in {"status", "generation", "run_id", "session_id"}:
+            service._fault_lease_cache = candidate  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            identity = replace(identity, cache_lease=candidate)
+        try:
+            admitted = service._retirement_open_admission(candidate, identity)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        except Exception as error:  # noqa: BLE001 - exact total-function oracle
+            pytest.fail(f"open admission term {term} raised {type(error).__name__}")
+        assert admitted is False
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("term", ["fence", "reservation", "context", "task"])
+async def test_every_context_ownership_pointer_term_is_isolated_and_total(
+    tmp_store: RoastStore, term: str
+) -> None:
+    """MB1: D225 ownership requires its exact fence, tuple, context, and current task."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        context = _test_retirement_context(service, service._fault_lease_cache)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        current = asyncio.current_task()
+        assert current is not None
+        service._unconfirmed_stranded_fault_retirement = context  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        service._stranded_fault_retirement = (context, cast("Any", current))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert service._retirement_context_is_owned(context)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        if term == "fence":
+            service._unconfirmed_stranded_fault_retirement = replace(context, operation_id="f" * 32)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif term == "reservation":
+            service._stranded_fault_retirement = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif term == "context":
+            service._stranded_fault_retirement = (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                replace(context, operation_id="f" * 32), cast("Any", current)
+            )
+        else:
+            service._stranded_fault_retirement = (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                context, cast("Any", await _settled_task())
+            )
+        try:
+            owned = service._retirement_context_is_owned(context)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        except Exception as error:  # noqa: BLE001 - exact total-function oracle
+            pytest.fail(f"ownership term {term} raised {type(error).__name__}")
+        assert owned is False
+        service._stranded_fault_retirement = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
