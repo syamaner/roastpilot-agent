@@ -23,6 +23,7 @@ from roastpilot_agent.models import (
     FaultLeaseClosureProvenance,
     FaultLeaseStatus,
     OperatorAction,
+    OperatorActionRequest,
     RestartClearanceRequest,
     RestartClearanceState,
     RoastEventKind,
@@ -76,6 +77,25 @@ class _SafeZeroFaultPort(FakeMCPClient):
         if self.on_latest is not None:
             self.on_latest()
         return self.state
+
+
+class _PendingLiveRunner:
+    """Minimal live-runner seam for the two controller e-stop dispatch sites."""
+
+    finalized = False
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.invalidations = 0
+        self.admissions = 0
+
+    def invalidate_fault_acknowledgement_for_emergency_stop(self) -> None:
+        """Record the synchronous e-stop invalidation."""
+        self.invalidations += 1
+
+    def admit_emergency_stop(self) -> None:
+        """Record priority admission before task creation."""
+        self.admissions += 1
 
 
 def _profile() -> RoastProfile:
@@ -257,7 +277,17 @@ async def test_owned_fence_reconciles_exactly_once_without_a_second_transaction(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stale_binding", ["child_epoch", "process", "stop_unconfirmed"])
+@pytest.mark.parametrize(
+    "stale_binding",
+    [
+        "child_epoch",
+        "process",
+        "stop_unconfirmed",
+        "foreign_fence",
+        "d220_fence",
+        "estop_unknown",
+    ],
+)
 async def test_foreign_child_binding_cannot_reconcile_an_owned_fence(
     tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, stale_binding: str
 ) -> None:
@@ -298,7 +328,7 @@ async def test_foreign_child_binding_cannot_reconcile_an_owned_fence(
             child.child_epoch += 1
         elif stale_binding == "process":
             service.instance_id = "a" * 32
-        else:
+        elif stale_binding == "stop_unconfirmed":
             # T-F1b's stop-unconfirmed case must enter with a valid captured
             # child, then become stale at an await.  T-F5 separately pins the
             # pre-capture stop-unconfirmed rejection.
@@ -311,6 +341,17 @@ async def test_foreign_child_binding_cannot_reconcile_an_owned_fence(
 
             monkeypatch.setattr(service, "_read_fault_lease_fail_closed", stop_after_lease_read)
             expected_outcome = "unconfirmed"
+        elif stale_binding == "foreign_fence":
+            fence = service._unconfirmed_stranded_fault_retirement  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            assert fence is not None
+            service._unconfirmed_stranded_fault_retirement = replace(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                fence,
+                identity=replace(fence.identity, process_id="c" * 32),
+            )
+        elif stale_binding == "d220_fence":
+            service._unconfirmed_safety_record_generation = 1  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        else:
+            service._note_emergency_stop_admission()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
 
         assert (await service.retire_stranded_fault(request)).outcome == expected_outcome
         assert len(verifier_calls) == 1
@@ -645,6 +686,57 @@ async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g
         assert retirement_audit is not None
         assert retirement_audit[0] == 1
         service._fault_control_executor = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("site", ["global_live", "per_run"])
+async def test_mb14_each_live_dispatch_site_tracks_pending_task_then_discards_it_on_settlement(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    """MB14: each actual live e-stop create-task site owns its visible task lifetime."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        run_id = f"mb14-{site}"
+        await tmp_store.create_run(
+            run_id=run_id,
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.PREHEATING,
+        )
+        runner = _PendingLiveRunner(run_id)
+        service.active_run_id = run_id
+        service.runner = cast("Any", runner)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def parked_dispatch(**_kwargs: object) -> bool:
+            entered.set()
+            await release.wait()
+            return True
+
+        monkeypatch.setattr(service, "_dispatch_admitted_live_emergency_stop", parked_dispatch)
+        if site == "global_live":
+            attempt = asyncio.create_task(service._submit_fault_controls_emergency_stop())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        else:
+            attempt = asyncio.create_task(
+                service._submit_live_emergency_stop(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                    run_id,
+                    OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP),
+                )
+            )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        assert len(service._emergency_stop_dispatch_tasks) == 1  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert runner.invalidations == 1
+        assert runner.admissions == 1
+        release.set()
+        await attempt
+
+        assert service._emergency_stop_dispatch_tasks == set()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         await service.shutdown()
     finally:
         await tmp_store.close()
@@ -1009,6 +1101,12 @@ async def test_every_transient_admission_term_rejects_before_presence_or_transac
         else:
             service._closure_end_task = ("run", await _settled_task())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
 
+        if mutate == "not_live_restart_clearance":
+            assert service._capture_retirement_identity() is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        elif mutate == "durable_gate_cleared":
+            assert service._retirement_conditions_hold()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        else:
+            assert not service._retirement_conditions_hold()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         result = await service.retire_stranded_fault(_retirement_request())
 
         assert result.outcome == "rejected"
@@ -1052,6 +1150,7 @@ async def test_tf5_invalid_identity_capture_is_typed_pre_reservation_rejection(
         else:
             service._recording_replay_mode = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
 
+        assert service._capture_retirement_identity() is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         result = await service.retire_stranded_fault(_retirement_request())
 
         assert result.outcome == "rejected"
@@ -1059,6 +1158,48 @@ async def test_tf5_invalid_identity_capture_is_typed_pre_reservation_rejection(
         assert presence_calls == 0
         assert service._stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         assert service._unconfirmed_stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "lease",
+    [
+        FaultControlLease(
+            generation=1,
+            status=FaultLeaseStatus.CLOSED,
+            run_id="terminal-faulted-run",
+            mcp_session_id="fault-session",
+        ),
+        FaultControlLease(
+            generation=1, status=FaultLeaseStatus.OPEN, run_id=None, mcp_session_id="fault-session"
+        ),
+        FaultControlLease(
+            generation=1,
+            status=FaultLeaseStatus.OPEN,
+            run_id="terminal-faulted-run",
+            mcp_session_id=None,
+        ),
+        FaultControlLease(
+            generation=0,
+            status=FaultLeaseStatus.OPEN,
+            run_id="terminal-faulted-run",
+            mcp_session_id="fault-session",
+        ),
+    ],
+)
+async def test_each_normal_open_lease_field_is_a_closed_admission_predicate(
+    tmp_store: RoastStore, lease: FaultControlLease
+) -> None:
+    """MB1: a malformed/non-open normal lease cannot pass the separate OPEN predicate."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        identity = service._capture_retirement_identity()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert identity is not None
+        assert not service._retirement_open_admission(lease, identity)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         await service.shutdown()
     finally:
         await tmp_store.close()
