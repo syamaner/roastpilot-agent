@@ -1673,6 +1673,9 @@ class RoastStore:
         )
         connection: aiosqlite.Connection | None = None
         propagating_base_exception = False
+        close_failed = False
+        committed = False
+        outcome = StrandedFaultRetirementCommit.INDETERMINATE
         try:
             connection = await aiosqlite.connect(self._db_path)
             connection.row_factory = aiosqlite.Row
@@ -1691,79 +1694,88 @@ class RoastStore:
                 or str(lease["status"]) != FaultLeaseStatus.OPEN.value
             ):
                 await connection.rollback()
-                return StrandedFaultRetirementCommit.PRECONDITION_REJECTED
-            async with connection.execute(
-                "SELECT 1 FROM process_epoch WHERE singleton = 1 AND process_id = ? "
-                "AND status = 'unclean'",
-                (process_id,),
-            ) as cursor:
-                epoch = await cursor.fetchone()
-            async with connection.execute(
-                "SELECT 1 FROM process_restart_clearance WHERE process_id = ? AND state = ?",
-                (process_id, RestartClearanceState.REQUIRED.value),
-            ) as cursor:
-                clearance = await cursor.fetchone()
-            async with connection.execute(
-                "SELECT 1 FROM roast_runs WHERE completed_at_utc IS NULL LIMIT 1"
-            ) as cursor:
-                active = await cursor.fetchone()
-            async with connection.execute(
-                "SELECT id, completed_at_utc, outcome, agent_phase FROM roast_runs "
-                "ORDER BY started_at_utc DESC, rowid DESC LIMIT 1"
-            ) as cursor:
-                latest_run = await cursor.fetchone()
-            if (
-                epoch is None
-                or clearance is None
-                or active is not None
-                or latest_run is None
-                or latest_run["id"] != run_id
-                or latest_run["completed_at_utc"] is None
-                or str(latest_run["outcome"]) != "faulted"
-                or str(latest_run["agent_phase"]) != RoastPhase.FAULTED.value
-                or await self._has_confirmed_fault_control_close(connection, run_id, generation)
-                or await self._has_accepted_stranded_fault_retirement_generation(
-                    connection, run_id, generation
-                )
-            ):
-                await connection.rollback()
-                return StrandedFaultRetirementCommit.PRECONDITION_REJECTED
-            now = _utc_now()
-            updated = await connection.execute(
-                "UPDATE fault_control_lease SET status = ?, updated_at_utc = ? "
-                "WHERE singleton = 1 AND generation = ? AND run_id = ? "
-                "AND mcp_session_id = ? AND status = ?",
-                (
-                    FaultLeaseStatus.CLOSED.value,
-                    now,
-                    generation,
-                    run_id,
-                    mcp_session_id,
-                    FaultLeaseStatus.OPEN.value,
-                ),
-            )
-            if updated.rowcount != 1:
-                await connection.rollback()
-                return StrandedFaultRetirementCommit.PRECONDITION_REJECTED
-            await connection.execute(
-                "INSERT INTO operator_actions "
-                "(run_id, action, payload_json, result, recorded_at_utc) "
-                "VALUES (?, ?, ?, 'accepted', ?)",
-                (
-                    run_id,
-                    OperatorAction.RETIRE_STRANDED_FAULT.value,
-                    self._stranded_fault_retirement_payload(
-                        generation, mcp_session_id, operation_id, process_id
-                    ),
-                    now,
-                ),
-            )
-            await connection.commit()
+                outcome = StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+            else:
+                async with connection.execute(
+                    "SELECT 1 FROM process_epoch WHERE singleton = 1 AND process_id = ? "
+                    "AND status = 'unclean'",
+                    (process_id,),
+                ) as cursor:
+                    epoch = await cursor.fetchone()
+                async with connection.execute(
+                    "SELECT 1 FROM process_restart_clearance WHERE process_id = ? AND state = ?",
+                    (process_id, RestartClearanceState.REQUIRED.value),
+                ) as cursor:
+                    clearance = await cursor.fetchone()
+                async with connection.execute(
+                    "SELECT 1 FROM roast_runs WHERE completed_at_utc IS NULL LIMIT 1"
+                ) as cursor:
+                    active = await cursor.fetchone()
+                async with connection.execute(
+                    "SELECT id, completed_at_utc, outcome, agent_phase FROM roast_runs "
+                    "ORDER BY started_at_utc DESC, rowid DESC LIMIT 1"
+                ) as cursor:
+                    latest_run = await cursor.fetchone()
+                if (
+                    epoch is None
+                    or clearance is None
+                    or active is not None
+                    or latest_run is None
+                    or latest_run["id"] != run_id
+                    or latest_run["completed_at_utc"] is None
+                    or str(latest_run["outcome"]) != "faulted"
+                    or str(latest_run["agent_phase"]) != RoastPhase.FAULTED.value
+                    or await self._has_confirmed_fault_control_close(connection, run_id, generation)
+                    or await self._has_accepted_stranded_fault_retirement_generation(
+                        connection, run_id, generation
+                    )
+                ):
+                    await connection.rollback()
+                    outcome = StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+                else:
+                    now = _utc_now()
+                    updated = await connection.execute(
+                        "UPDATE fault_control_lease SET status = ?, updated_at_utc = ? "
+                        "WHERE singleton = 1 AND generation = ? AND run_id = ? "
+                        "AND mcp_session_id = ? AND status = ?",
+                        (
+                            FaultLeaseStatus.CLOSED.value,
+                            now,
+                            generation,
+                            run_id,
+                            mcp_session_id,
+                            FaultLeaseStatus.OPEN.value,
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        await connection.rollback()
+                        outcome = StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+                    else:
+                        await connection.execute(
+                            "INSERT INTO operator_actions "
+                            "(run_id, action, payload_json, result, recorded_at_utc) "
+                            "VALUES (?, ?, ?, 'accepted', ?)",
+                            (
+                                run_id,
+                                OperatorAction.RETIRE_STRANDED_FAULT.value,
+                                self._stranded_fault_retirement_payload(
+                                    generation, mcp_session_id, operation_id, process_id
+                                ),
+                                now,
+                            ),
+                        )
+                        await connection.commit()
+                        committed = True
         except Exception:  # noqa: BLE001 - every persistence ambiguity fails closed
             if connection is not None:
-                with contextlib.suppress(Exception):
+                try:
                     await connection.rollback()
-            return StrandedFaultRetirementCommit.INDETERMINATE
+                except Exception:
+                    pass
+                except BaseException:
+                    propagating_base_exception = True
+                    raise
+            outcome = StrandedFaultRetirementCommit.INDETERMINATE
         except BaseException:
             propagating_base_exception = True
             if connection is not None:
@@ -1776,7 +1788,11 @@ class RoastStore:
                     await connection.close()
                 except Exception:  # noqa: BLE001 - cleanup ambiguity cannot report success
                     if not propagating_base_exception:
-                        return StrandedFaultRetirementCommit.INDETERMINATE
+                        close_failed = True
+        if close_failed:
+            return StrandedFaultRetirementCommit.INDETERMINATE
+        if not committed:
+            return outcome
         try:
             verified = await self.verify_stranded_fault_retirement(
                 process_id=process_id,
@@ -1804,6 +1820,7 @@ class RoastStore:
     ) -> bool:
         """Read-only proof for one exact committed D225 retirement operation."""
         connection: aiosqlite.Connection | None = None
+        verified = False
         try:
             connection = await aiosqlite.connect(self._db_path)
             connection.row_factory = aiosqlite.Row
@@ -1850,15 +1867,20 @@ class RoastStore:
                 (process_id, RestartClearanceState.REQUIRED.value),
             ) as cursor:
                 clearance = await cursor.fetchone()
-            return epoch is not None and clearance is not None
+            verified = epoch is not None and clearance is not None
         except Exception:  # noqa: BLE001 - unreadable evidence is not proof
             return False
         finally:
             if connection is not None:
-                with contextlib.suppress(Exception):
+                try:
                     await connection.rollback()
-                with contextlib.suppress(Exception):
+                except Exception:
+                    verified = False
+                try:
                     await connection.close()
+                except Exception:
+                    verified = False
+        return verified
 
     async def read_fault_control_lease_closure_provenance(
         self, lease: FaultControlLease

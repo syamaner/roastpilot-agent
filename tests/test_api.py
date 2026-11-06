@@ -1799,6 +1799,7 @@ async def test_generic_fault_controls_route_rejects_stranded_fault_retirement_wi
     mcp = FakeMCPClient([_reading(178.0, 185.0)])
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)
     commands_before = mcp.commands()
+    lease_before = await store.read_fault_control_lease()
     app = create_app(service)
     transport = ASGITransport(app=app)
 
@@ -1817,6 +1818,7 @@ async def test_generic_fault_controls_route_rejects_stranded_fault_retirement_wi
     assert service.operator_queue.empty()
     assert await _operator_action_rows(store, run_id) == []
     assert await _operator_action_rows(store, None) == []
+    assert await store.read_fault_control_lease() == lease_before
 
 
 @pytest.mark.asyncio
@@ -4564,6 +4566,7 @@ async def test_generic_operator_route_rejects_stranded_fault_retirement_without_
     """D225 retirement cannot use a run-bound queue or accepted audit path."""
     run_id = "run-d225-generic"
     await _make_run(store, run_id, RoastPhase.DEVELOPMENT)
+    lease_before = await store.read_fault_control_lease()
 
     response = await client.post(
         f"/api/roasts/{run_id}/operator-actions", json={"action": "retire_stranded_fault"}
@@ -4578,6 +4581,7 @@ async def test_generic_operator_route_rejects_stranded_fault_retirement_without_
     assert service.operator_queue.empty()
     assert await _operator_action_rows(store, run_id) == []
     assert await _operator_action_rows(store, None) == []
+    assert await store.read_fault_control_lease() == lease_before
 
 
 @pytest.mark.asyncio
