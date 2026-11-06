@@ -7,7 +7,7 @@ handshake's JSON round trip, and RoastProfile validation (D7).
 import json
 import math
 from datetime import UTC, datetime, timedelta
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any, cast, get_args
 
 import pydantic
@@ -25,6 +25,7 @@ from roastpilot_agent.models import (
     ClosureOnlyClearanceResult,
     EndRecoveredRunResult,
     FaultControlsProjection,
+    FaultLeaseClosureProvenance,
     FaultLeaseStatus,
     MicHealth,
     MicStatus,
@@ -52,6 +53,7 @@ from roastpilot_agent.models import (
     weight_loss_percent,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
+from roastpilot_agent.store import StrandedFaultRetirementCommit
 
 ALL_SHARED_ENUMS: list[type[Enum]] = [
     RoastPhase,
@@ -62,6 +64,17 @@ ALL_SHARED_ENUMS: list[type[Enum]] = [
     MicHealth,
     RoastStyle,
 ]
+
+
+def test_d225_vocabularies_are_plain_string_enums() -> None:
+    """D225 keeps its wire vocabularies typed rather than string-comparable."""
+    for enum_type in (FaultLeaseClosureProvenance, StrandedFaultRetirementCommit):
+        assert issubclass(enum_type, Enum)
+        assert not issubclass(enum_type, StrEnum)
+        assert all(
+            not isinstance(member, str) and isinstance(member.value, str) for member in enum_type
+        )
+    assert OperatorAction.RETIRE_STRANDED_FAULT.value == "retire_stranded_fault"
 
 
 def test_sse_event_render_replaces_nested_non_finite_floats() -> None:

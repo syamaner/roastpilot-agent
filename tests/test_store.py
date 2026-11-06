@@ -27,6 +27,7 @@ from roastpilot_agent.store import (
     PhysicallyImpossibleWeightError,
     RoastStore,
     RunActivelyDrivenError,
+    StrandedFaultRetirementCommit,
 )
 
 # The full migrated table set: the nine v1 tables plus the additive
@@ -1312,6 +1313,7 @@ from roastpilot_agent.advisor import AdvisorContext, RoastDecision  # noqa: E402
 from roastpilot_agent.config import AppConfig  # noqa: E402
 from roastpilot_agent.models import (  # noqa: E402
     DropReason,
+    FaultLeaseClosureProvenance,
     FaultLeaseStatus,
     OperatorAction,
     PostFcHeatAuthorityState,
@@ -8782,3 +8784,1624 @@ async def test_fault_acknowledgement_confirmation_audit_never_leaves_pending_suc
         ({"fault_acknowledgement": "superseded_by_emergency_stop"}, "failed"),
         ({"fault_acknowledgement": "confirmed"}, "accepted"),
     ]
+
+
+async def _d225_store_with_terminal_fault(
+    tmp_path: Path,
+    name: str,
+    *,
+    outcome: Literal["completed", "aborted", "faulted"] = "faulted",
+    phase: RoastPhase = RoastPhase.FAULTED,
+    terminal: bool = True,
+) -> RoastStore:
+    """Build D225's exact unclean, required-gate, terminal-faulted premise."""
+    path = tmp_path / f"{name}.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("f" * 32)
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    process_id = "a" * 32
+    assert not await store.begin_process_epoch(process_id)
+    assert await store.begin_process_restart_clearance(process_id) is RestartClearanceState.REQUIRED
+    await store.create_run(
+        run_id="d225-run",
+        profile=PROFILE,
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    if terminal:
+        await store.complete_run(run_id="d225-run", outcome=outcome, agent_phase=phase)
+    await store.open_fault_control_lease(
+        run_id="d225-run", mcp_session_id="d225-session", generation=7
+    )
+    return store
+
+
+async def _d225_run_snapshot(store: RoastStore) -> list[tuple[object, ...]]:
+    """Read all immutable run columns in durable insertion order for D225 tests."""
+    async with store.connection.execute("SELECT * FROM roast_runs ORDER BY rowid") as cursor:
+        return [tuple(row) for row in await cursor.fetchall()]
+
+
+async def _retire_d225(
+    store: RoastStore, operation_id: str = "b" * 32
+) -> StrandedFaultRetirementCommit:
+    """Attempt D225 retirement with the standard exact test identity."""
+    return await store.retire_stranded_fault_lease(
+        process_id="a" * 32,
+        generation=7,
+        run_id="d225-run",
+        mcp_session_id="d225-session",
+        operation_id=operation_id,
+    )
+
+
+async def _insert_d225_audit(store: RoastStore, payload: str, *, result: str = "accepted") -> None:
+    """Insert one raw D225 audit grammar candidate for a reader-proof test."""
+    await store.connection.execute(
+        "INSERT INTO operator_actions "
+        "(run_id, action, payload_json, result, recorded_at_utc) VALUES (?, ?, ?, ?, ?)",
+        (
+            "d225-run",
+            OperatorAction.RETIRE_STRANDED_FAULT.value,
+            payload,
+            result,
+            "2026-11-06T00:00:00+00:00",
+        ),
+    )
+    await store.connection.commit()
+
+
+@pytest.mark.asyncio
+async def test_d225_retirement_commits_one_exact_audit_without_mutating_run_or_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D225 closes only its exact lease and writes only its distinct audit row."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-commit")
+    process_id = "a" * 32
+    operation_id = "b" * 32
+    original_configure = store._configure_durable_connection  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    history_dml_attempts: list[tuple[int, str | None]] = []
+    lease_update_attempts: list[tuple[int, str | None]] = []
+
+    def deny_history_dml(
+        action: int,
+        argument1: str | None,
+        _argument2: str | None,
+        _database: str | None,
+        _trigger: str | None,
+    ) -> int:
+        if action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE} and (
+            argument1 in {"roast_runs", "roast_events"}
+        ):
+            history_dml_attempts.append((action, argument1))
+            return sqlite3.SQLITE_DENY
+        if action == sqlite3.SQLITE_UPDATE and argument1 == "fault_control_lease":
+            lease_update_attempts.append((action, argument1))
+        return sqlite3.SQLITE_OK
+
+    async def configure_with_history_dml_oracle(
+        connection: aiosqlite_module.Connection,
+    ) -> None:
+        await original_configure(connection)
+        await connection.set_authorizer(deny_history_dml)
+
+    monkeypatch.setattr(store, "_configure_durable_connection", configure_with_history_dml_oracle)
+    try:
+        runs_before = await _d225_run_snapshot(store)
+        events_before = await fetch_one(store, "SELECT COUNT(*) FROM roast_events")
+
+        outcome = await store.retire_stranded_fault_lease(
+            process_id=process_id,
+            generation=7,
+            run_id="d225-run",
+            mcp_session_id="d225-session",
+            operation_id=operation_id,
+        )
+
+        assert outcome is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+        assert await store.read_fault_control_lease() == FaultControlLease(
+            generation=7,
+            status=FaultLeaseStatus.CLOSED,
+            run_id="d225-run",
+            mcp_session_id="d225-session",
+        )
+        assert (
+            await store.read_fault_control_lease_closure_provenance(
+                await store.read_fault_control_lease()
+            )
+            is FaultLeaseClosureProvenance.OPERATOR_ATTESTED_RETIREMENT
+        )
+        assert await fetch_one(
+            store,
+            "SELECT action, payload_json, result FROM operator_actions WHERE run_id = ?",
+            ("d225-run",),
+        ) == (
+            OperatorAction.RETIRE_STRANDED_FAULT.value,
+            '{"generation": 7, "mcp_session_id": "d225-session", "operation_id": "'
+            + operation_id
+            + '", "process_id": "'
+            + process_id
+            + '", "retirement": "operator_attested"}',
+            "accepted",
+        )
+        assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == (1,)
+        assert await _d225_run_snapshot(store) == runs_before
+        assert await fetch_one(store, "SELECT COUNT(*) FROM roast_events") == events_before
+        assert history_dml_attempts == []
+        assert lease_update_attempts
+        assert set(lease_update_attempts) == {(sqlite3.SQLITE_UPDATE, "fault_control_lease")}
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "process_id,generation,run_id,mcp_session_id,operation_id",
+    [
+        ("a" * 32, True, "d225-run", "d225-session", "b" * 32),
+        ("a" * 32, 1.0, "d225-run", "d225-session", "b" * 32),
+        ("a" * 32, 0, "d225-run", "d225-session", "b" * 32),
+        ("a" * 32, -1, "d225-run", "d225-session", "b" * 32),
+        ("a" * 32, 7, "", "d225-session", "b" * 32),
+        ("a" * 32, 7, "d225-run", "", "b" * 32),
+        ("a" * 32, 7, "d225-run", "d225-session", "not-an-operation-id"),
+        ("a" * 32, 7, "d225-run", "d225-session", "B" * 32),
+        ("a" * 32, 7, "d225-run", "d225-session", "b" * 31),
+        ("not-a-process-id", 7, "d225-run", "d225-session", "b" * 32),
+        ("A" * 32, 7, "d225-run", "d225-session", "b" * 32),
+        ("a" * 31, 7, "d225-run", "d225-session", "b" * 32),
+        ("a" * 32, 7, 7, "d225-session", "b" * 32),
+    ],
+)
+async def test_d225_retirement_rejects_malformed_arguments_before_connecting(
+    tmp_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    process_id: str,
+    generation: object,
+    run_id: object,
+    mcp_session_id: str,
+    operation_id: str,
+) -> None:
+    """D225 reserves durable work for exact, typed operation identities only."""
+    connect_called = False
+    store_aiosqlite = cast("Any", store_module.aiosqlite)  # pyright: ignore[reportPrivateImportUsage]
+    original_connect: Any = store_aiosqlite.connect
+
+    async def spy_connect(*args: object, **kwargs: object) -> aiosqlite_module.Connection:
+        nonlocal connect_called
+        connect_called = True
+        return await original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(store_aiosqlite, "connect", spy_connect)
+    with pytest.raises(ValueError, match="invalid stranded-fault retirement identity"):
+        await tmp_store.retire_stranded_fault_lease(
+            process_id=process_id,
+            generation=cast(int, generation),
+            run_id=cast(str, run_id),
+            mcp_session_id=mcp_session_id,
+            operation_id=operation_id,
+        )
+    assert not connect_called
+
+
+@pytest.mark.asyncio
+async def test_d225_retirement_rejects_stale_lease_or_nonrequired_process_markers(
+    tmp_path: Path,
+) -> None:
+    """D225 does not close a lease when any durable CAS premise is stale."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-reject")
+    try:
+        before = await fetch_one(store, "SELECT status FROM fault_control_lease")
+        assert (
+            await store.retire_stranded_fault_lease(
+                process_id="a" * 32,
+                generation=8,
+                run_id="d225-run",
+                mcp_session_id="d225-session",
+                operation_id="b" * 32,
+            )
+            is StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+        )
+        await store.connection.execute(
+            "UPDATE process_restart_clearance SET state = 'cleared' WHERE process_id = ?",
+            ("a" * 32,),
+        )
+        await store.connection.commit()
+        assert (
+            await store.retire_stranded_fault_lease(
+                process_id="a" * 32,
+                generation=7,
+                run_id="d225-run",
+                mcp_session_id="d225-session",
+                operation_id="b" * 32,
+            )
+            is StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+        )
+        assert await fetch_one(store, "SELECT status FROM fault_control_lease") == before
+        assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["duplicate", "malformed", "mismatch", "legacy"])
+async def test_d225_closed_reader_rejects_duplicate_malformed_mismatched_or_dual_proofs(
+    tmp_path: Path, kind: str
+) -> None:
+    """D225's reader fails closed for every ambiguous proof grammar branch."""
+    store = await _d225_store_with_terminal_fault(tmp_path, f"d225-{kind}")
+    try:
+        assert (
+            await store.retire_stranded_fault_lease(
+                process_id="a" * 32,
+                generation=7,
+                run_id="d225-run",
+                mcp_session_id="d225-session",
+                operation_id="b" * 32,
+            )
+            is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+        )
+        if kind == "legacy":
+            await store.connection.execute(
+                "INSERT INTO roast_events "
+                "(run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json) "
+                "VALUES (?, ?, ?, NULL, ?, ?)",
+                (
+                    "d225-run",
+                    RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED.value,
+                    RoastEventSource.OPERATOR.value,
+                    "2026-11-06T00:00:00+00:00",
+                    '{"generation": 7, "outcome": "confirmed", "status": "closed"}',
+                ),
+            )
+        else:
+            if kind == "duplicate":
+                payload = store._stranded_fault_retirement_payload(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                    7, "d225-session", "c" * 32, "d" * 32
+                )
+            elif kind == "mismatch":
+                payload = store._stranded_fault_retirement_payload(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                    7, "other-session", "c" * 32, "d" * 32
+                )
+            else:
+                payload = '{"generation": 7, "mcp_session_id": "d225-session"}'
+            await store.connection.execute(
+                "INSERT INTO operator_actions "
+                "(run_id, action, payload_json, result, recorded_at_utc) "
+                "VALUES (?, ?, ?, 'accepted', ?)",
+                (
+                    "d225-run",
+                    OperatorAction.RETIRE_STRANDED_FAULT.value,
+                    payload,
+                    "2026-11-06T00:00:00+00:00",
+                ),
+            )
+        await store.connection.commit()
+
+        lease = await store.read_fault_control_lease()
+        assert lease.status is FaultLeaseStatus.UNKNOWN
+        assert await store.read_fault_control_lease_closure_provenance(lease) is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [None, "[]"], ids=["null", "non-dict-json"])
+async def test_d225_closed_reader_rejects_null_or_non_dict_retirement_payload(
+    tmp_path: Path, payload: object
+) -> None:
+    """A NULL or JSON non-object retirement row is never closed-lease proof."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-nonobject-payload")
+    try:
+        await store.connection.execute("UPDATE fault_control_lease SET status = 'closed'")
+        await store.connection.execute(
+            "INSERT INTO operator_actions "
+            "(run_id, action, payload_json, result, recorded_at_utc) "
+            "VALUES (?, ?, ?, 'accepted', ?)",
+            (
+                "d225-run",
+                OperatorAction.RETIRE_STRANDED_FAULT.value,
+                payload,
+                "2026-11-06T00:00:00+00:00",
+            ),
+        )
+        await store.connection.commit()
+
+        assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.UNKNOWN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind,expected_outcome,expected_status,expected_provenance",
+    [
+        ("null", StrandedFaultRetirementCommit.INDETERMINATE, FaultLeaseStatus.UNKNOWN, None),
+        ("bad-json", StrandedFaultRetirementCommit.INDETERMINATE, FaultLeaseStatus.UNKNOWN, None),
+        (
+            "non-dict-json",
+            StrandedFaultRetirementCommit.INDETERMINATE,
+            FaultLeaseStatus.UNKNOWN,
+            None,
+        ),
+        (
+            "other-generation",
+            StrandedFaultRetirementCommit.COMMITTED_VERIFIED,
+            FaultLeaseStatus.CLOSED,
+            FaultLeaseClosureProvenance.OPERATOR_ATTESTED_RETIREMENT,
+        ),
+    ],
+)
+async def test_d225_retirement_handles_accepted_nonmatching_audit_payloads(
+    tmp_path: Path,
+    kind: str,
+    expected_outcome: StrandedFaultRetirementCommit,
+    expected_status: FaultLeaseStatus,
+    expected_provenance: FaultLeaseClosureProvenance | None,
+) -> None:
+    """Only a matching accepted D225 generation blocks retirement before its write."""
+    store = await _d225_store_with_terminal_fault(tmp_path, f"d225-existing-{kind}")
+    try:
+        payload: object
+        if kind == "null":
+            payload = None
+        elif kind == "bad-json":
+            payload = "not-json"
+        elif kind == "non-dict-json":
+            payload = "[]"
+        else:
+            payload = store._stranded_fault_retirement_payload(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                8, "d225-session", "c" * 32, "a" * 32
+            )
+        await store.connection.execute(
+            "INSERT INTO operator_actions "
+            "(run_id, action, payload_json, result, recorded_at_utc) "
+            "VALUES (?, ?, ?, 'accepted', ?)",
+            (
+                "d225-run",
+                OperatorAction.RETIRE_STRANDED_FAULT.value,
+                payload,
+                "2026-11-06T00:00:00+00:00",
+            ),
+        )
+        await store.connection.commit()
+
+        assert await _retire_d225(store) is expected_outcome
+        assert await fetch_one(store, "SELECT status FROM fault_control_lease") == ("closed",)
+        assert (lease := await store.read_fault_control_lease()).status is expected_status
+        assert await store.read_fault_control_lease_closure_provenance(lease) is expected_provenance
+        assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == (2,)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["exception", "cancellation"])
+async def test_d225_retirement_connect_failure_is_not_a_durable_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """D225 has no result to certify when opening its dedicated connection fails."""
+    store = await _d225_store_with_terminal_fault(tmp_path, f"d225-connect-{failure}")
+    store_aiosqlite = cast("Any", store_module.aiosqlite)  # pyright: ignore[reportPrivateImportUsage]
+    connect_attempts = 0
+    try:
+        before_lease = await fetch_one(
+            store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+        )
+
+        async def failing_connect(*_args: object, **_kwargs: object) -> NoReturn:
+            nonlocal connect_attempts
+            connect_attempts += 1
+            if failure == "cancellation":
+                raise asyncio.CancelledError("synthetic D225 connect cancellation")
+            raise OSError("synthetic D225 connect failure")
+
+        monkeypatch.setattr(store_aiosqlite, "connect", failing_connect)
+        if failure == "cancellation":
+            with pytest.raises(asyncio.CancelledError, match="synthetic D225 connect cancellation"):
+                await _retire_d225(store)
+        else:
+            assert await _retire_d225(store) is StrandedFaultRetirementCommit.INDETERMINATE
+        assert connect_attempts == 1
+        assert (
+            await fetch_one(
+                store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+            )
+            == before_lease
+        )
+        assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_verifier_is_exact_and_read_only(tmp_path: Path) -> None:
+    """D225 verification accepts neither foreign ids nor changed process markers."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-verifier")
+    try:
+        assert (
+            await store.retire_stranded_fault_lease(
+                process_id="a" * 32,
+                generation=7,
+                run_id="d225-run",
+                mcp_session_id="d225-session",
+                operation_id="b" * 32,
+            )
+            is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+        )
+        before_audit = await fetch_one(store, "SELECT COUNT(*) FROM operator_actions")
+        before_lease = await fetch_one(
+            store, "SELECT generation, status, run_id, mcp_session_id FROM fault_control_lease"
+        )
+        assert not await store.verify_stranded_fault_retirement(
+            process_id="a" * 32,
+            generation=7,
+            run_id="d225-run",
+            mcp_session_id="d225-session",
+            operation_id="c" * 32,
+        )
+        await store.connection.execute(
+            "UPDATE process_epoch SET status = 'clean' WHERE singleton = 1"
+        )
+        await store.connection.commit()
+        assert not await store.verify_stranded_fault_retirement(
+            process_id="a" * 32,
+            generation=7,
+            run_id="d225-run",
+            mcp_session_id="d225-session",
+            operation_id="b" * 32,
+        )
+        assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == before_audit
+        assert (
+            await fetch_one(
+                store, "SELECT generation, status, run_id, mcp_session_id FROM fault_control_lease"
+            )
+            == before_lease
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_verifier_returns_false_for_wrong_lease_and_unreadable_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifier mismatch and read failures cannot mutate or certify the retirement."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-verifier-unreadable")
+    store_aiosqlite = cast("Any", store_module.aiosqlite)  # pyright: ignore[reportPrivateImportUsage]
+    try:
+        assert await _retire_d225(store) is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+        before_lease = await fetch_one(
+            store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+        )
+        before_audits = await fetch_one(
+            store,
+            "SELECT action, payload_json, result FROM operator_actions ORDER BY id",
+        )
+        before_runs = await _d225_run_snapshot(store)
+        before_events = await fetch_one(store, "SELECT COUNT(*) FROM roast_events")
+
+        assert not await store.verify_stranded_fault_retirement(
+            process_id="a" * 32,
+            generation=7,
+            run_id="d225-run",
+            mcp_session_id="other-session",
+            operation_id="b" * 32,
+        )
+
+        async def failing_connect(*_args: object, **_kwargs: object) -> NoReturn:
+            raise OSError("synthetic D225 verifier connect failure")
+
+        monkeypatch.setattr(store_aiosqlite, "connect", failing_connect)
+        assert not await store.verify_stranded_fault_retirement(
+            process_id="a" * 32,
+            generation=7,
+            run_id="d225-run",
+            mcp_session_id="d225-session",
+            operation_id="b" * 32,
+        )
+        monkeypatch.undo()
+
+        async def failing_read(_connection: aiosqlite_module.Connection) -> FaultControlLease:
+            raise OSError("synthetic D225 verifier read failure")
+
+        monkeypatch.setattr(store, "_read_fault_control_lease_from_connection", failing_read)
+        assert not await store.verify_stranded_fault_retirement(
+            process_id="a" * 32,
+            generation=7,
+            run_id="d225-run",
+            mcp_session_id="d225-session",
+            operation_id="b" * 32,
+        )
+        assert (
+            await fetch_one(
+                store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+            )
+            == before_lease
+        )
+        assert (
+            await fetch_one(
+                store,
+                "SELECT action, payload_json, result FROM operator_actions ORDER BY id",
+            )
+            == before_audits
+        )
+        assert await _d225_run_snapshot(store) == before_runs
+        assert await fetch_one(store, "SELECT COUNT(*) FROM roast_events") == before_events
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_write_and_cleanup_uncertainty_return_indeterminate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D225 never reports a determinate result after a write or cleanup failure."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-uncertain")
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_execute: Any = connection_type._execute
+    original_close: Any = connection_type.close
+
+    async def fail_audit_insert(
+        connection: aiosqlite_module.Connection, function: Any, *args: Any, **kwargs: Any
+    ) -> object:
+        sql = args[0] if args else None
+        if (
+            connection is not store.connection
+            and isinstance(sql, str)
+            and sql.startswith("INSERT INTO operator_actions")
+        ):
+            raise RuntimeError("synthetic D225 insert failure")
+        return await original_execute(connection, function, *args, **kwargs)
+
+    monkeypatch.setattr(connection_type, "_execute", fail_audit_insert)
+    try:
+        assert (
+            await store.retire_stranded_fault_lease(
+                process_id="a" * 32,
+                generation=7,
+                run_id="d225-run",
+                mcp_session_id="d225-session",
+                operation_id="b" * 32,
+            )
+            is StrandedFaultRetirementCommit.INDETERMINATE
+        )
+    finally:
+        monkeypatch.undo()
+
+    async def close_then_raise(connection: aiosqlite_module.Connection) -> None:
+        await original_close(connection)
+        if connection is not store.connection:
+            raise RuntimeError("synthetic D225 close failure")
+
+    monkeypatch.setattr(connection_type, "close", close_then_raise)
+    try:
+        assert (
+            await store.retire_stranded_fault_lease(
+                process_id="a" * 32,
+                generation=7,
+                run_id="d225-run",
+                mcp_session_id="d225-session",
+                operation_id="b" * 32,
+            )
+            is StrandedFaultRetirementCommit.INDETERMINATE
+        )
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_compare_and_swap_rowcount_loss_is_a_clean_rejection(tmp_path: Path) -> None:
+    """An ignored lease UPDATE leaves D225 OPEN and emits no retirement audit."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-cas-rowcount")
+    try:
+        before_lease = await fetch_one(
+            store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+        )
+        await store.connection.execute(
+            "CREATE TRIGGER ignore_d225_lease_compare_and_swap "
+            "BEFORE UPDATE ON fault_control_lease WHEN NEW.status = 'closed' "
+            "BEGIN SELECT RAISE(IGNORE); END"
+        )
+        await store.connection.commit()
+
+        assert await _retire_d225(store) is StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+        assert (
+            await fetch_one(
+                store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+            )
+            == before_lease
+        )
+        assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_precondition_rejection_with_transaction_close_failure_is_indeterminate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transaction close failure overrides a rejected premise before verification runs."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-precondition-close")
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_close: Any = connection_type.close
+    verifier_called = False
+    try:
+        before_lease = await fetch_one(
+            store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+        )
+
+        async def close_then_raise(connection: aiosqlite_module.Connection) -> None:
+            await original_close(connection)
+            if connection is not store.connection:
+                raise RuntimeError("synthetic D225 transaction close failure")
+
+        async def verifier_must_not_run(**_kwargs: object) -> bool:
+            nonlocal verifier_called
+            verifier_called = True
+            return False
+
+        monkeypatch.setattr(connection_type, "close", close_then_raise)
+        monkeypatch.setattr(store, "verify_stranded_fault_retirement", verifier_must_not_run)
+        assert (
+            await store.retire_stranded_fault_lease(
+                process_id="a" * 32,
+                generation=8,
+                run_id="d225-run",
+                mcp_session_id="d225-session",
+                operation_id="b" * 32,
+            )
+            is StrandedFaultRetirementCommit.INDETERMINATE
+        )
+        assert not verifier_called
+        assert (
+            await fetch_one(
+                store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+            )
+            == before_lease
+        )
+        assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_cancellation_reraises_after_closing_its_dedicated_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D225 lets cancellation win while still cleaning up its transaction connection."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-cancel")
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_execute: Any = connection_type._execute
+    original_close: Any = connection_type.close
+    closed = False
+
+    before_lease = await fetch_one(
+        store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+    )
+
+    async def cancel_update(
+        connection: aiosqlite_module.Connection, function: Any, *args: Any, **kwargs: Any
+    ) -> object:
+        sql = args[0] if args else None
+        if (
+            connection is not store.connection
+            and isinstance(sql, str)
+            and sql.startswith("UPDATE fault_control_lease SET status")
+        ):
+            raise asyncio.CancelledError("synthetic D225 cancellation")
+        return await original_execute(connection, function, *args, **kwargs)
+
+    async def close_spy(connection: aiosqlite_module.Connection) -> None:
+        nonlocal closed
+        if connection is not store.connection:
+            closed = True
+        await original_close(connection)
+
+    monkeypatch.setattr(connection_type, "_execute", cancel_update)
+    monkeypatch.setattr(connection_type, "close", close_spy)
+    try:
+        with pytest.raises(asyncio.CancelledError, match="synthetic D225 cancellation"):
+            await store.retire_stranded_fault_lease(
+                process_id="a" * 32,
+                generation=7,
+                run_id="d225-run",
+                mcp_session_id="d225-session",
+                operation_id="b" * 32,
+            )
+        assert closed
+        assert (
+            await fetch_one(
+                store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+            )
+            == before_lease
+        )
+        assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_close_failure_is_indeterminate_inside_a_callers_handled_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller's handled exception cannot hide D225's own cleanup ambiguity."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-close-in-except")
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_close: Any = connection_type.close
+
+    async def close_then_raise(connection: aiosqlite_module.Connection) -> None:
+        await original_close(connection)
+        if connection is not store.connection:
+            raise RuntimeError("synthetic D225 close failure")
+
+    monkeypatch.setattr(connection_type, "close", close_then_raise)
+    try:
+        try:
+            raise RuntimeError("caller context")
+        except RuntimeError:
+            outcome = await store.retire_stranded_fault_lease(
+                process_id="a" * 32,
+                generation=7,
+                run_id="d225-run",
+                mcp_session_id="d225-session",
+                operation_id="b" * 32,
+            )
+        assert outcome is StrandedFaultRetirementCommit.INDETERMINATE
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "closed",
+        "unknown",
+        "run",
+        "session",
+        "null-session",
+        "absent",
+        "epoch-clean",
+        "epoch-other",
+        "gate-cleared",
+        "gate-closure-only",
+        "gate-unknown",
+        "gate-absent",
+        "active-run",
+        "latest-completed",
+        "latest-aborted",
+        "latest-phase",
+        "latest-uncompleted",
+        "newer-later",
+        "newer-equal-rowid",
+        "legacy",
+        "retirement",
+        "retirement-noncanonical",
+    ],
+)
+async def test_d225_retirement_rejects_each_durable_precondition(tmp_path: Path, case: str) -> None:
+    """Every D225 precondition rejects without changing its lease or audit count."""
+    outcome = "faulted"
+    if case == "latest-completed":
+        outcome = "completed"
+    elif case == "latest-aborted":
+        outcome = "aborted"
+    phase = RoastPhase.COMPLETE if case == "latest-phase" else RoastPhase.FAULTED
+    store = await _d225_store_with_terminal_fault(
+        tmp_path,
+        f"d225-premise-{case}",
+        outcome=outcome,
+        phase=phase,
+        terminal=case != "latest-uncompleted",
+    )
+    try:
+        if not case.startswith("latest-"):
+            assert await fetch_one(
+                store,
+                "SELECT id, agent_phase, outcome, completed_at_utc IS NOT NULL "
+                "FROM roast_runs ORDER BY started_at_utc DESC, rowid DESC LIMIT 1",
+            ) == ("d225-run", RoastPhase.FAULTED.value, "faulted", 1)
+            assert await fetch_one(
+                store,
+                "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease",
+            ) == ("d225-run", "d225-session", 7, FaultLeaseStatus.OPEN.value)
+        if case in {"closed", "unknown"}:
+            await store.connection.execute("UPDATE fault_control_lease SET status = ?", (case,))
+        elif case == "run":
+            await store.create_run(
+                run_id="other-run",
+                profile=PROFILE,
+                config=AppConfig(),
+                agent_phase=RoastPhase.FAULTED,
+                started_at_utc="2000-01-01T00:00:00+00:00",
+            )
+            await store.complete_run(
+                run_id="other-run", outcome="faulted", agent_phase=RoastPhase.FAULTED
+            )
+            await store.connection.execute("UPDATE fault_control_lease SET run_id = 'other-run'")
+        elif case == "session":
+            await store.connection.execute(
+                "UPDATE fault_control_lease SET mcp_session_id = 'other-session'"
+            )
+        elif case == "null-session":
+            await store.connection.execute("UPDATE fault_control_lease SET mcp_session_id = NULL")
+        elif case == "absent":
+            await store.connection.execute("DELETE FROM fault_control_lease")
+        elif case == "epoch-clean":
+            await store.connection.execute("UPDATE process_epoch SET status = 'clean'")
+        elif case == "epoch-other":
+            await store.connection.execute(
+                "UPDATE process_epoch SET process_id = 'e' || process_id"
+            )
+        elif case.startswith("gate-"):
+            if case == "gate-absent":
+                await store.connection.execute("DELETE FROM process_restart_clearance")
+            else:
+                state = case.removeprefix("gate-").replace("-", "_")
+                await store.connection.execute(
+                    "UPDATE process_restart_clearance SET state = ?", (state,)
+                )
+        elif case == "active-run":
+            await store.create_run(
+                run_id="active-run",
+                profile=PROFILE,
+                config=AppConfig(),
+                agent_phase=RoastPhase.FAULTED,
+                started_at_utc="2000-01-01T00:00:00+00:00",
+            )
+        elif case.startswith("newer-"):
+            started = "2026-11-07T00:00:00+00:00"
+            if case == "newer-equal-rowid":
+                async with store.connection.execute(
+                    "SELECT started_at_utc FROM roast_runs WHERE id = 'd225-run'"
+                ) as cursor:
+                    row = await cursor.fetchone()
+                assert row is not None
+                started = str(row["started_at_utc"])
+            await store.create_run(
+                run_id="newer-run",
+                profile=PROFILE,
+                config=AppConfig(),
+                agent_phase=RoastPhase.FAULTED,
+                started_at_utc=started,
+            )
+            await store.complete_run(
+                run_id="newer-run", outcome="faulted", agent_phase=RoastPhase.FAULTED
+            )
+        elif case == "legacy":
+            await store.connection.execute(
+                "INSERT INTO roast_events "
+                "(run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json) "
+                "VALUES (?, ?, ?, NULL, ?, ?)",
+                (
+                    "d225-run",
+                    RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED.value,
+                    RoastEventSource.OPERATOR.value,
+                    "2026-11-06T00:00:00+00:00",
+                    '{"generation": 7, "outcome": "confirmed", "status": "closed"}',
+                ),
+            )
+        else:
+            payload = store._stranded_fault_retirement_payload(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                7, "d225-session", "c" * 32, "d" * 32
+            )
+            if case == "retirement-noncanonical":
+                payload = payload.replace(", ", ",")
+            await _insert_d225_audit(
+                store,
+                payload,
+            )
+        await store.connection.commit()
+        lease_before = (
+            await fetch_one(
+                store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+            )
+            if case != "absent"
+            else None
+        )
+        audits_before = await fetch_one(store, "SELECT COUNT(*) FROM operator_actions")
+
+        assert await _retire_d225(store) is StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+        if lease_before is not None:
+            assert (
+                await fetch_one(
+                    store,
+                    "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease",
+                )
+                == lease_before
+            )
+        assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == audits_before
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "not-json",
+        "extra-key",
+        "string-generation",
+        "bool-generation",
+        "empty-session",
+        "noncanonical-spacing",
+        "uppercase-operation",
+        "uppercase-process",
+        "nonhex-process",
+    ],
+)
+@pytest.mark.parametrize("with_legacy", [False, True])
+async def test_d225_reader_rejects_every_malformed_audit_with_or_without_legacy_proof(
+    tmp_path: Path, kind: str, with_legacy: bool
+) -> None:
+    """Malformed D225 evidence never becomes a legacy or retirement close proof."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-malformed")
+    try:
+        await store.connection.execute("UPDATE fault_control_lease SET status = 'closed'")
+        session_id = "" if kind == "empty-session" else "d225-session"
+        if kind == "empty-session":
+            await store.connection.execute("UPDATE fault_control_lease SET mcp_session_id = ''")
+        canonical = store._stranded_fault_retirement_payload(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            7, session_id, "b" * 32, "a" * 32
+        )
+        decoded = json.loads(canonical)
+        if kind == "not-json":
+            payload = "not-json"
+        elif kind == "extra-key":
+            decoded["extra"] = True
+            payload = json.dumps(decoded, sort_keys=True)
+        elif kind == "string-generation":
+            decoded["generation"] = "7"
+            payload = json.dumps(decoded, sort_keys=True)
+        elif kind == "bool-generation":
+            decoded["generation"] = True
+            payload = json.dumps(decoded, sort_keys=True)
+        elif kind == "noncanonical-spacing":
+            payload = canonical.replace(", ", ",")
+        elif kind == "uppercase-operation":
+            decoded["operation_id"] = "B" * 32
+            payload = json.dumps(decoded, sort_keys=True)
+        elif kind == "uppercase-process":
+            decoded["process_id"] = "A" * 32
+            payload = json.dumps(decoded, sort_keys=True)
+        else:
+            decoded["process_id"] = "g" * 32
+            payload = json.dumps(decoded, sort_keys=True)
+        await _insert_d225_audit(store, payload)
+        if with_legacy:
+            await store.connection.execute(
+                "INSERT INTO roast_events "
+                "(run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json) "
+                "VALUES (?, ?, ?, NULL, ?, ?)",
+                (
+                    "d225-run",
+                    RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED.value,
+                    RoastEventSource.OPERATOR.value,
+                    "2026-11-06T00:00:00+00:00",
+                    '{"generation": 7, "outcome": "confirmed", "status": "closed"}',
+                ),
+            )
+            await store.connection.commit()
+        assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.UNKNOWN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case,expected_status,expected_provenance",
+    [
+        (
+            "d212-duplicate",
+            FaultLeaseStatus.CLOSED,
+            FaultLeaseClosureProvenance.EXACT_SESSION_SAFE_ZERO,
+        ),
+        ("other-generation", FaultLeaseStatus.UNKNOWN, None),
+        ("rejected", FaultLeaseStatus.UNKNOWN, None),
+        ("null-session", FaultLeaseStatus.UNKNOWN, None),
+    ],
+)
+async def test_d225_reader_preserves_legacy_and_rejects_nonmatching_retirement_rows(
+    tmp_path: Path,
+    case: str,
+    expected_status: FaultLeaseStatus,
+    expected_provenance: FaultLeaseClosureProvenance | None,
+) -> None:
+    """D225 retains D212's LIMIT 1 behavior and ignores non-candidate rows."""
+    store = await _d225_store_with_terminal_fault(tmp_path, f"d225-reader-{case}")
+    try:
+        await store.connection.execute("UPDATE fault_control_lease SET status = 'closed'")
+        if case == "d212-duplicate":
+            for _ in range(2):
+                await store.connection.execute(
+                    "INSERT INTO roast_events "
+                    "(run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json) "
+                    "VALUES (?, ?, ?, NULL, ?, ?)",
+                    (
+                        "d225-run",
+                        RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED.value,
+                        RoastEventSource.OPERATOR.value,
+                        "2026-11-06T00:00:00+00:00",
+                        '{"generation": 7, "outcome": "confirmed", "status": "closed"}',
+                    ),
+                )
+        else:
+            generation = 8 if case == "other-generation" else 7
+            if case == "null-session":
+                await store.connection.execute(
+                    "UPDATE fault_control_lease SET mcp_session_id = NULL"
+                )
+            await _insert_d225_audit(
+                store,
+                store._stranded_fault_retirement_payload(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                    generation, "d225-session", "b" * 32, "a" * 32
+                ),
+                result="rejected" if case == "rejected" else "accepted",
+            )
+        await store.connection.commit()
+        lease = await store.read_fault_control_lease()
+        assert lease.status is expected_status
+        assert await store.read_fault_control_lease_closure_provenance(lease) is expected_provenance
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_reader_rejects_a_lone_same_generation_different_session_audit(
+    tmp_path: Path,
+) -> None:
+    """A session mismatch is unsafe even without a duplicate matching candidate."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-lone-session-mismatch")
+    try:
+        await store.connection.execute("UPDATE fault_control_lease SET status = 'closed'")
+        await _insert_d225_audit(
+            store,
+            store._stranded_fault_retirement_payload(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                7, "different-session", "b" * 32, "a" * 32
+            ),
+        )
+        assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.UNKNOWN
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_provenance_preserves_d220_and_absence_baselines(tmp_path: Path) -> None:
+    """D225 provenance does not alter D220 or trusted/untrusted absence semantics."""
+    fresh = RoastStore(tmp_path / "d225-trusted.sqlite3")
+    await fresh.initialize()
+    try:
+        trusted = await fresh.read_fault_control_lease()
+        assert trusted == FaultControlLease(
+            generation=0,
+            status=FaultLeaseStatus.CLOSED,
+            run_id=None,
+            mcp_session_id=None,
+        )
+        assert (
+            await fresh.read_fault_control_lease_closure_provenance(trusted)
+            is FaultLeaseClosureProvenance.BASELINE
+        )
+        assert (
+            await fresh.read_fault_control_lease_closure_provenance(
+                trusted.model_copy(update={"status": FaultLeaseStatus.UNKNOWN})
+            )
+            is None
+        )
+    finally:
+        await fresh.close()
+
+    store = await _d220_store_with_unclean_epoch(tmp_path, "d225-d220-provenance")
+    try:
+        untrusted = await store.read_fault_control_lease()
+        assert untrusted == FaultControlLease(
+            generation=0,
+            status=FaultLeaseStatus.UNKNOWN,
+            run_id=None,
+            mcp_session_id=None,
+        )
+        assert await store.read_fault_control_lease_closure_provenance(untrusted) is None
+        assert await store.initialize_missing_fault_control_safety_record(
+            process_id="d220-process", generation=1, operation_id="d220-operation"
+        )
+        d220 = await store.read_fault_control_lease()
+        assert d220.status is FaultLeaseStatus.CLOSED and d220.run_id is None
+        assert (
+            await store.read_fault_control_lease_closure_provenance(d220)
+            is FaultLeaseClosureProvenance.BASELINE
+        )
+        await store.create_run(
+            run_id="unrelated-run",
+            profile=PROFILE,
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+            started_at_utc="2000-01-01T00:00:00+00:00",
+        )
+        await store.complete_run(
+            run_id="unrelated-run", outcome="faulted", agent_phase=RoastPhase.FAULTED
+        )
+        await store.connection.execute(
+            "INSERT INTO operator_actions "
+            "(run_id, action, payload_json, result, recorded_at_utc) "
+            "VALUES (?, ?, ?, 'accepted', ?)",
+            (
+                "unrelated-run",
+                OperatorAction.RETIRE_STRANDED_FAULT.value,
+                store._stranded_fault_retirement_payload(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                    9, "other-session", "b" * 32, "a" * 32
+                ),
+                "2026-11-06T00:00:00+00:00",
+            ),
+        )
+        await store.connection.commit()
+        assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_provenance_requires_a_closed_matching_read_and_fails_closed_on_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D225 provenance cannot be borrowed from an OPEN or mismatched lease read."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-provenance-fences")
+    try:
+        open_lease = await store.read_fault_control_lease()
+        assert await store.read_fault_control_lease_closure_provenance(open_lease) is None
+        mismatch = open_lease.model_copy(update={"generation": 8})
+        assert await store.read_fault_control_lease_closure_provenance(mismatch) is None
+
+        async def unreadable(_connection: aiosqlite_module.Connection) -> FaultControlLease:
+            raise OSError("synthetic D225 provenance failure")
+
+        monkeypatch.setattr(store, "_read_fault_control_lease_from_connection", unreadable)
+        assert await store.read_fault_control_lease_closure_provenance(open_lease) is None
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["update", "insert", "commit", "verifier", "rollback"])
+async def test_d225_every_write_or_verification_exception_is_indeterminate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """D225 never turns an exception, including failed rollback, into a rejection."""
+    store = await _d225_store_with_terminal_fault(tmp_path, f"d225-{failure}-failure")
+    runs_before = await _d225_run_snapshot(store)
+    events_before = await fetch_one(store, "SELECT COUNT(*) FROM roast_events")
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_execute: Any = connection_type._execute
+    original_commit: Any = connection_type.commit
+    original_rollback: Any = connection_type.rollback
+
+    async def failing_execute(
+        connection: aiosqlite_module.Connection, function: Any, *args: Any, **kwargs: Any
+    ) -> object:
+        sql = args[0] if args else None
+        if (
+            connection is not store.connection
+            and isinstance(sql, str)
+            and (
+                (failure == "update" and sql.startswith("UPDATE fault_control_lease SET status"))
+                or (failure == "insert" and sql.startswith("INSERT INTO operator_actions"))
+            )
+        ):
+            raise RuntimeError(f"synthetic D225 {failure} failure")
+        return await original_execute(connection, function, *args, **kwargs)
+
+    async def failing_commit(connection: aiosqlite_module.Connection) -> None:
+        if connection is not store.connection and failure == "commit":
+            raise RuntimeError("synthetic D225 commit failure")
+        await original_commit(connection)
+
+    async def failing_rollback(connection: aiosqlite_module.Connection) -> None:
+        if connection is not store.connection and failure == "rollback":
+            raise RuntimeError("synthetic D225 rollback failure")
+        await original_rollback(connection)
+
+    async def failing_verifier(**_kwargs: object) -> bool:
+        raise RuntimeError("synthetic D225 verifier failure")
+
+    monkeypatch.setattr(connection_type, "_execute", failing_execute)
+    monkeypatch.setattr(connection_type, "commit", failing_commit)
+    monkeypatch.setattr(connection_type, "rollback", failing_rollback)
+    if failure == "verifier":
+        monkeypatch.setattr(store, "verify_stranded_fault_retirement", failing_verifier)
+    try:
+        if failure == "rollback":
+            result = await store.retire_stranded_fault_lease(
+                process_id="a" * 32,
+                generation=8,
+                run_id="d225-run",
+                mcp_session_id="d225-session",
+                operation_id="b" * 32,
+            )
+        else:
+            result = await _retire_d225(store)
+        assert result is StrandedFaultRetirementCommit.INDETERMINATE
+        assert await _d225_run_snapshot(store) == runs_before
+        assert await fetch_one(store, "SELECT COUNT(*) FROM roast_events") == events_before
+        if failure in {"update", "insert", "commit"}:
+            assert await fetch_one(
+                store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+            ) == ("d225-run", "d225-session", 7, "open")
+            assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_and_d212_verifiers_never_accept_each_others_audit_kind(tmp_path: Path) -> None:
+    """The two proof verifiers remain deliberately disjoint across audit kinds."""
+    retirement = await _d225_store_with_terminal_fault(tmp_path, "d225-cross-kind-retirement")
+    try:
+        assert await _retire_d225(retirement) is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+        d212_result = await retirement.verify_fault_control_lease_close(
+            generation=7,
+            run_id="d225-run",
+            mcp_session_id="d225-session",
+            requires_faulted_history=True,
+        )
+        assert not d212_result.historically_committed
+    finally:
+        await retirement.close()
+
+    legacy = await _d225_store_with_terminal_fault(tmp_path, "d225-cross-kind-d212")
+    try:
+        await legacy.connection.execute("UPDATE fault_control_lease SET status = 'closed'")
+        await legacy.connection.execute(
+            "INSERT INTO roast_events "
+            "(run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json) "
+            "VALUES (?, ?, ?, NULL, ?, ?)",
+            (
+                "d225-run",
+                RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED.value,
+                RoastEventSource.OPERATOR.value,
+                "2026-11-06T00:00:00+00:00",
+                '{"generation": 7, "outcome": "confirmed", "status": "closed"}',
+            ),
+        )
+        await legacy.connection.commit()
+        assert not await legacy.verify_stranded_fault_retirement(
+            process_id="a" * 32,
+            generation=7,
+            run_id="d225-run",
+            mcp_session_id="d225-session",
+            operation_id="b" * 32,
+        )
+    finally:
+        await legacy.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_preserves_rollback_cancellation_when_close_also_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cleanup cannot turn a rollback cancellation into an indeterminate return."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-rollback-cancellation")
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_execute: Any = connection_type._execute
+    original_close: Any = connection_type.close
+    close_attempted = False
+
+    async def fail_insert(
+        connection: aiosqlite_module.Connection, function: Any, *args: Any, **kwargs: Any
+    ) -> object:
+        sql = args[0] if args else None
+        if (
+            connection is not store.connection
+            and isinstance(sql, str)
+            and sql.startswith("INSERT INTO operator_actions")
+        ):
+            raise RuntimeError("synthetic insert failure")
+        return await original_execute(connection, function, *args, **kwargs)
+
+    async def cancel_rollback(_connection: aiosqlite_module.Connection) -> None:
+        raise asyncio.CancelledError("synthetic rollback cancellation")
+
+    async def failing_close(connection: aiosqlite_module.Connection) -> None:
+        nonlocal close_attempted
+        if connection is not store.connection:
+            close_attempted = True
+            await original_close(connection)
+            raise RuntimeError("synthetic close failure")
+        await original_close(connection)
+
+    monkeypatch.setattr(connection_type, "_execute", fail_insert)
+    monkeypatch.setattr(connection_type, "rollback", cancel_rollback)
+    monkeypatch.setattr(connection_type, "close", failing_close)
+    try:
+        with pytest.raises(asyncio.CancelledError, match="synthetic rollback cancellation"):
+            await _retire_d225(store)
+        assert close_attempted
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_stale_lease_rejects_before_later_epoch_read_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordered identity check rejects stale work before later durable reads."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-order")
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_execute: Any = connection_type._execute
+
+    async def fail_epoch_read(
+        connection: aiosqlite_module.Connection, function: Any, *args: Any, **kwargs: Any
+    ) -> object:
+        sql = args[0] if args else None
+        if (
+            connection is not store.connection
+            and isinstance(sql, str)
+            and "SELECT 1 FROM process_epoch" in sql
+        ):
+            raise RuntimeError("later epoch read must not run")
+        return await original_execute(connection, function, *args, **kwargs)
+
+    monkeypatch.setattr(connection_type, "_execute", fail_epoch_read)
+    try:
+        before_lease = await fetch_one(
+            store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+        )
+        assert (
+            await store.retire_stranded_fault_lease(
+                process_id="a" * 32,
+                generation=8,
+                run_id="d225-run",
+                mcp_session_id="d225-session",
+                operation_id="b" * 32,
+            )
+            is StrandedFaultRetirementCommit.PRECONDITION_REJECTED
+        )
+        assert (
+            await fetch_one(
+                store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+            )
+            == before_lease
+        )
+        assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_verifier_isolates_foreign_process_and_nonrequired_gate(tmp_path: Path) -> None:
+    """Verifier process and gate checks each fail with every other proof intact."""
+    foreign = "c" * 32
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-foreign-process")
+    try:
+        assert await _retire_d225(store) is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+        await store.connection.execute(
+            "UPDATE process_epoch SET process_id = ? WHERE singleton = 1", (foreign,)
+        )
+        await store.connection.commit()
+        assert (
+            await store.begin_process_restart_clearance(foreign) is RestartClearanceState.REQUIRED
+        )
+        before_lease = await fetch_one(
+            store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+        )
+        before_audit = await fetch_one(
+            store, "SELECT action, payload_json, result FROM operator_actions ORDER BY id"
+        )
+        assert not await store.verify_stranded_fault_retirement(
+            process_id=foreign,
+            generation=7,
+            run_id="d225-run",
+            mcp_session_id="d225-session",
+            operation_id="b" * 32,
+        )
+        assert (
+            await fetch_one(
+                store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+            )
+            == before_lease
+        )
+        assert (
+            await fetch_one(
+                store, "SELECT action, payload_json, result FROM operator_actions ORDER BY id"
+            )
+            == before_audit
+        )
+    finally:
+        await store.close()
+
+    gate_store = await _d225_store_with_terminal_fault(tmp_path, "d225-nonrequired-gate")
+    try:
+        assert await _retire_d225(gate_store) is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+        await gate_store.connection.execute(
+            "UPDATE process_restart_clearance SET state = 'cleared' WHERE process_id = ?",
+            ("a" * 32,),
+        )
+        await gate_store.connection.commit()
+        before_lease = await fetch_one(
+            gate_store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+        )
+        before_audit = await fetch_one(
+            gate_store, "SELECT action, payload_json, result FROM operator_actions ORDER BY id"
+        )
+        assert not await gate_store.verify_stranded_fault_retirement(
+            process_id="a" * 32,
+            generation=7,
+            run_id="d225-run",
+            mcp_session_id="d225-session",
+            operation_id="b" * 32,
+        )
+        assert (
+            await fetch_one(
+                gate_store,
+                "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease",
+            )
+            == before_lease
+        )
+        assert (
+            await fetch_one(
+                gate_store, "SELECT action, payload_json, result FROM operator_actions ORDER BY id"
+            )
+            == before_audit
+        )
+    finally:
+        await gate_store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_provenance_rejects_an_identity_mismatch_after_a_real_retirement(
+    tmp_path: Path,
+) -> None:
+    """A CLOSED proof cannot be projected through a different lease identity."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-closed-provenance-mismatch")
+    try:
+        assert await _retire_d225(store) is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+        closed = await store.read_fault_control_lease()
+        assert closed.status is FaultLeaseStatus.CLOSED
+        assert (
+            await store.read_fault_control_lease_closure_provenance(
+                closed.model_copy(update={"generation": 8})
+            )
+            is None
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["rollback", "close"])
+async def test_d225_verifier_cleanup_exception_cannot_certify_true(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Ordinary verifier cleanup failures are false, not a durable certification."""
+    store = await _d225_store_with_terminal_fault(tmp_path, f"d225-verifier-{failure}")
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_rollback: Any = connection_type.rollback
+    original_close: Any = connection_type.close
+    try:
+        assert await _retire_d225(store) is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+        before_lease = await fetch_one(
+            store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+        )
+        before_audits = await fetch_one(store, "SELECT COUNT(*) FROM operator_actions")
+
+        async def failing_rollback(connection: aiosqlite_module.Connection) -> None:
+            if connection is not store.connection:
+                raise RuntimeError("synthetic verifier rollback failure")
+            await original_rollback(connection)
+
+        async def close_then_raise(connection: aiosqlite_module.Connection) -> None:
+            await original_close(connection)
+            if connection is not store.connection:
+                raise RuntimeError("synthetic verifier close failure")
+
+        if failure == "rollback":
+            monkeypatch.setattr(connection_type, "rollback", failing_rollback)
+        else:
+            monkeypatch.setattr(connection_type, "close", close_then_raise)
+        assert not await store.verify_stranded_fault_retirement(
+            process_id="a" * 32,
+            generation=7,
+            run_id="d225-run",
+            mcp_session_id="d225-session",
+            operation_id="b" * 32,
+        )
+        assert (
+            await fetch_one(
+                store, "SELECT run_id, mcp_session_id, generation, status FROM fault_control_lease"
+            )
+            == before_lease
+        )
+        assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == before_audits
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_verifier_preserves_cleanup_cancellation_after_closing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifier cleanup cancellation is never converted into a false return."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-verifier-cancellation")
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_close: Any = connection_type.close
+    close_attempted = False
+    try:
+        assert await _retire_d225(store) is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+
+        async def cancel_rollback(_connection: aiosqlite_module.Connection) -> None:
+            raise asyncio.CancelledError("synthetic verifier rollback cancellation")
+
+        async def close_spy(connection: aiosqlite_module.Connection) -> None:
+            nonlocal close_attempted
+            if connection is not store.connection:
+                close_attempted = True
+            await original_close(connection)
+
+        monkeypatch.setattr(connection_type, "rollback", cancel_rollback)
+        monkeypatch.setattr(connection_type, "close", close_spy)
+        with pytest.raises(
+            asyncio.CancelledError, match="synthetic verifier rollback cancellation"
+        ):
+            await store.verify_stranded_fault_retirement(
+                process_id="a" * 32,
+                generation=7,
+                run_id="d225-run",
+                mcp_session_id="d225-session",
+                operation_id="b" * 32,
+            )
+        assert close_attempted
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_d225_commit_acknowledgement_failure_after_commit_is_indeterminate_but_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-commit driver error is not a rejection even when bytes are durable."""
+    store = await _d225_store_with_terminal_fault(tmp_path, "d225-commit-after")
+    runs_before = await _d225_run_snapshot(store)
+    events_before = await fetch_one(store, "SELECT COUNT(*) FROM roast_events")
+    connection_type = cast("Any", aiosqlite_module.Connection)
+    original_commit: Any = connection_type.commit
+
+    async def commit_then_raise(connection: aiosqlite_module.Connection) -> None:
+        await original_commit(connection)
+        if connection is not store.connection:
+            raise RuntimeError("synthetic post-commit acknowledgement failure")
+
+    monkeypatch.setattr(connection_type, "commit", commit_then_raise)
+    try:
+        assert await _retire_d225(store) is StrandedFaultRetirementCommit.INDETERMINATE
+    finally:
+        monkeypatch.undo()
+    try:
+        assert await store.read_fault_control_lease() == FaultControlLease(
+            generation=7,
+            status=FaultLeaseStatus.CLOSED,
+            run_id="d225-run",
+            mcp_session_id="d225-session",
+        )
+        assert await fetch_one(store, "SELECT COUNT(*) FROM operator_actions") == (1,)
+        assert await _d225_run_snapshot(store) == runs_before
+        assert await fetch_one(store, "SELECT COUNT(*) FROM roast_events") == events_before
+    finally:
+        await store.close()

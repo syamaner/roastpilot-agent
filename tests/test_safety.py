@@ -765,11 +765,13 @@ def test_every_operator_action_is_reachable_in_some_phase() -> None:
         OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
         OperatorAction.END_RECOVERED_RUN,
         OperatorAction.INITIALIZE_SAFETY_RECORD,
+        OperatorAction.RETIRE_STRANDED_FAULT,
     }
     assert reachable == direct_actions
     assert OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE not in reachable
     assert OperatorAction.END_RECOVERED_RUN not in reachable
     assert OperatorAction.INITIALIZE_SAFETY_RECORD not in reachable
+    assert OperatorAction.RETIRE_STRANDED_FAULT not in reachable
 
 
 def test_emergency_stop_matrix_row_is_every_phase() -> None:

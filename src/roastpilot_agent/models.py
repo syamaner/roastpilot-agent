@@ -1320,6 +1320,14 @@ class FaultLeaseStatus(Enum):
     UNKNOWN = "unknown"
 
 
+class FaultLeaseClosureProvenance(Enum):
+    """Durable proof kind for a CLOSED fault-control lease (#1071/D225)."""
+
+    EXACT_SESSION_SAFE_ZERO = "exact_session_safe_zero"
+    OPERATOR_ATTESTED_RETIREMENT = "operator_attested_retirement"
+    BASELINE = "baseline"
+
+
 class OperatorAction(Enum):
     """The operator actions the API accepts (plan §6 enum).
 
@@ -1356,6 +1364,7 @@ class OperatorAction(Enum):
     STOP_COOLING_AND_ACKNOWLEDGE = "stop_cooling_and_acknowledge"
     END_RECOVERED_RUN = "end_recovered_run"
     INITIALIZE_SAFETY_RECORD = "initialize_safety_record"
+    RETIRE_STRANDED_FAULT = "retire_stranded_fault"
 
 
 def _empty_restart_clearance_actions() -> list[OperatorAction]:

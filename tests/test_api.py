@@ -1791,6 +1791,37 @@ async def test_generic_fault_controls_route_rejects_safety_record_initialisation
 
 
 @pytest.mark.asyncio
+async def test_generic_fault_controls_route_rejects_stranded_fault_retirement_without_mutation(
+    store: RoastStore,
+) -> None:
+    """D225 retirement cannot enter the global executor, queue, or audit path."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    commands_before = mcp.commands()
+    lease_before = await store.read_fault_control_lease()
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/fault-controls/actions", json={"action": "retire_stranded_fault"}
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": (
+            "retire_stranded_fault is available only through the stranded-fault retirement path"
+        )
+    }
+    assert mcp.commands() == commands_before
+    assert service.operator_queue.empty()
+    assert await _operator_action_rows(store, run_id) == []
+    assert await _operator_action_rows(store, None) == []
+    assert await store.read_fault_control_lease() == lease_before
+
+
+@pytest.mark.asyncio
 async def test_global_estop_uses_live_runner_without_a_terminal_fault_lease(
     store: RoastStore,
 ) -> None:
@@ -4526,6 +4557,31 @@ async def test_generic_operator_route_rejects_safety_record_initialisation_witho
     assert service.operator_queue.empty()
     assert await _operator_action_rows(store, run_id) == []
     assert await _operator_action_rows(store, None) == []
+
+
+@pytest.mark.asyncio
+async def test_generic_operator_route_rejects_stranded_fault_retirement_without_mutation(
+    client: AsyncClient, service: RoastService, store: RoastStore
+) -> None:
+    """D225 retirement cannot use a run-bound queue or accepted audit path."""
+    run_id = "run-d225-generic"
+    await _make_run(store, run_id, RoastPhase.DEVELOPMENT)
+    lease_before = await store.read_fault_control_lease()
+
+    response = await client.post(
+        f"/api/roasts/{run_id}/operator-actions", json={"action": "retire_stranded_fault"}
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": (
+            "retire_stranded_fault is available only through the stranded-fault retirement path"
+        )
+    }
+    assert service.operator_queue.empty()
+    assert await _operator_action_rows(store, run_id) == []
+    assert await _operator_action_rows(store, None) == []
+    assert await store.read_fault_control_lease() == lease_before
 
 
 @pytest.mark.asyncio

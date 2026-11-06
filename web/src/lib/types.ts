@@ -209,7 +209,9 @@ export type OperatorAction =
   /** D216: the separately admitted, server-owned recovered-run closure path. */
   | "end_recovered_run"
   /** D220: the separately admitted, server-owned missing-record baseline path. */
-  | "initialize_safety_record";
+  | "initialize_safety_record"
+  /** D225: server-owned stranded-fault retirement path. */
+  | "retire_stranded_fault";
 
 export interface OperatorActionRequest {
   action: OperatorAction;
@@ -295,7 +297,10 @@ export type FaultControlsActionRequest =
   | {
       action: Exclude<
         OperatorAction,
-        "stop_cooling_and_acknowledge" | "end_recovered_run" | "initialize_safety_record"
+        | "stop_cooling_and_acknowledge"
+        | "end_recovered_run"
+        | "initialize_safety_record"
+        | "retire_stranded_fault"
       >;
       confirmation?: never;
       expected_generation?: never;
