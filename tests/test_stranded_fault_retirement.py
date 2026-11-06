@@ -598,6 +598,7 @@ async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g
         transaction_entered = asyncio.Event()
         release_transaction = asyncio.Event()
         dispatch_reached = asyncio.Event()
+        release_dispatch = asyncio.Event()
         original_execute = cast("Any", aiosqlite.Connection._execute)  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]
         held_once = False
 
@@ -614,6 +615,7 @@ async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g
 
         async def observe_terminal_dispatch(**_kwargs: object) -> bool:
             dispatch_reached.set()
+            await release_dispatch.wait()
             return False
 
         monkeypatch.setattr(aiosqlite.Connection, "_execute", hold_first_begin_immediate)
@@ -625,12 +627,15 @@ async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g
         await asyncio.wait_for(dispatch_reached.wait(), timeout=2.0)
 
         assert service._fault_lease_cache.generation == 2  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert len(service._emergency_stop_dispatch_tasks) == 1  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         release_transaction.set()
+        release_dispatch.set()
         retirement_result = await retirement
         estop_result = await estop
 
         assert retirement_result.outcome == "unconfirmed"
         assert estop_result.action is OperatorAction.EMERGENCY_STOP
+        assert service._emergency_stop_dispatch_tasks == set()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         assert (await tmp_store.read_fault_control_lease()).generation == 2
         async with tmp_store.connection.execute(
             "SELECT COUNT(*) FROM operator_actions WHERE action = ?",
@@ -1156,7 +1161,7 @@ async def test_tb_evt_pre_reservation_rejections_emit_no_frame(
 
 @pytest.mark.asyncio
 async def test_tb_evt_is_broadcast_only_and_never_exposes_private_retirement_identity(
-    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """TB-EVT/MB19-21: D225 has one public changed frame and no history write/leak."""
     await tmp_store.initialize()
@@ -1172,7 +1177,12 @@ async def test_tb_evt_is_broadcast_only_and_never_exposes_private_retirement_ide
         frames = service.events.subscribe()
         result = await service.retire_stranded_fault(_retirement_request())
         emitted = frames.get_nowait()
-        rendered = f"{result.model_dump(mode='json')}|{emitted.data}"
+        rendered = "|".join(
+            (
+                f"{result.model_dump(mode='json')}|{emitted.data}",
+                *(record.getMessage() for record in caplog.records),
+            )
+        )
 
         assert result.outcome == "confirmed"
         assert record_event_calls == 0
@@ -1354,6 +1364,32 @@ async def test_tb12_cancelling_owned_task_retains_its_uncertainty_fence_without_
         release.set()
         await service.shutdown()
     finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_tb12_c0_cancellation_before_lock_admission_installs_no_reservation_or_fence(
+    tmp_store: RoastStore,
+) -> None:
+    """TB12 C0: cancellation before the lock cannot leave D225 local authority behind."""
+    await tmp_store.initialize()
+    service: RoastService | None = None
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        await service._restart_clearance_lock.acquire()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        waiter = asyncio.create_task(service.retire_stranded_fault(_retirement_request()))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        assert service._stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert service._unconfirmed_stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        service._restart_clearance_lock.release()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        if service is not None and service._restart_clearance_lock.locked():  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            service._restart_clearance_lock.release()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         await tmp_store.close()
 
 
