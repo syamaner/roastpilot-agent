@@ -10,6 +10,7 @@ from roastpilot_agent.config import AppConfig, ControllerConfig
 from roastpilot_agent.mcp_client import MCPServerProcess
 from roastpilot_agent.models import (
     FaultLeaseStatus,
+    OperatorAction,
     RestartClearanceRequest,
     RestartClearanceState,
     RoastPhase,
@@ -346,6 +347,55 @@ async def test_retirement_stays_required_until_a_new_d213_presence_proof(
                 RestartClearanceRequest(physical_confirmation=True)
             )
         assert service._restart_clearance_state is RestartClearanceState.REQUIRED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_health_projects_retirement_without_an_mcp_presence_read(
+    tmp_store: RoastStore,
+) -> None:
+    """D225 health eligibility is a store snapshot, not another MCP proof."""
+    await tmp_store.initialize()
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+
+        async def unexpected_presence_read() -> str:
+            raise AssertionError("health must not read MCP session presence")
+
+        roaster.read_session_presence = unexpected_presence_read  # type: ignore[method-assign]
+        health = await service.health()
+
+        assert health.restart_clearance.enabled_actions == [OperatorAction.RETIRE_STRANDED_FAULT]
+        assert health.fault_controls.physical_stop_operative is True
+        assert health.fault_controls.closure_provenance is None
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_health_fails_closed_when_child_changes_during_snapshot_read(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child-epoch race cannot advertise stale D225 availability."""
+    await tmp_store.initialize()
+    try:
+        service, _roaster = await _eligible_service(tmp_store)
+        original_latest = tmp_store.read_latest_run
+
+        async def replace_child_during_latest_read() -> object:
+            child = cast("_CurrentChild", service._mcp)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            child.child_epoch += 1
+            return await original_latest()
+
+        monkeypatch.setattr(tmp_store, "read_latest_run", replace_child_during_latest_read)
+        health = await service.health()
+
+        assert OperatorAction.RETIRE_STRANDED_FAULT not in health.restart_clearance.enabled_actions
+        assert health.fault_controls.status is FaultLeaseStatus.OPEN
+        assert health.fault_controls.physical_stop_operative is True
         await service.shutdown()
     finally:
         await tmp_store.close()
