@@ -4383,12 +4383,6 @@ class RoastService:
         ):
             return await self._reject_stranded_fault_retirement(context)
         try:
-            if (
-                not self._retirement_context_is_owned(context)
-                or not self._retirement_identity_holds(context.identity)
-                or not self._retirement_conditions_hold()
-            ):
-                return await self._reject_stranded_fault_retirement(context)
             outcome = await self._store.retire_stranded_fault_lease(
                 process_id=context.identity.process_id,
                 generation=generation,
