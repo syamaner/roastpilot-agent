@@ -1084,6 +1084,96 @@ async def test_tb_evt_is_broadcast_only_and_never_exposes_private_retirement_ide
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "boundary",
+    ["epoch", "lease", "active", "latest", "gate", "presence", "transaction"],
+)
+async def test_tb_child_race_after_each_normal_admission_await_never_hydrates_stale_success(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    """TB-CHILD/MB4: every normal admission await revalidates the captured child."""
+    await tmp_store.initialize()
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        transaction_calls = 0
+        original_epoch = service._ensure_restart_epoch  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        original_lease = service._read_fault_lease_fail_closed  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        original_active = tmp_store.active_run
+        original_latest = tmp_store.read_latest_run
+        original_gate = tmp_store.read_process_restart_clearance
+        original_presence = roaster.read_session_presence
+        original_transaction = tmp_store.retire_stranded_fault_lease
+
+        def stale_child() -> None:
+            cast("_CurrentChild", service._mcp).child_epoch += 1  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        async def epoch_then_stale() -> None:
+            await original_epoch()
+            stale_child()
+
+        async def lease_then_stale() -> object:
+            value = await original_lease()
+            stale_child()
+            return value
+
+        async def active_then_stale() -> object:
+            value = await original_active()
+            stale_child()
+            return value
+
+        async def latest_then_stale() -> object:
+            value = await original_latest()
+            stale_child()
+            return value
+
+        async def gate_then_stale(process_id: str) -> RestartClearanceState:
+            value = await original_gate(process_id)
+            stale_child()
+            return value
+
+        async def presence_then_stale() -> str:
+            value = await original_presence()
+            stale_child()
+            return value
+
+        async def transaction_then_stale(**kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal transaction_calls
+            transaction_calls += 1
+            value = await original_transaction(**kwargs)  # type: ignore[arg-type]
+            stale_child()
+            return value
+
+        if boundary == "epoch":
+            monkeypatch.setattr(service, "_ensure_restart_epoch", epoch_then_stale)
+        elif boundary == "lease":
+            monkeypatch.setattr(service, "_read_fault_lease_fail_closed", lease_then_stale)
+        elif boundary == "active":
+            monkeypatch.setattr(tmp_store, "active_run", active_then_stale)
+        elif boundary == "latest":
+            monkeypatch.setattr(tmp_store, "read_latest_run", latest_then_stale)
+        elif boundary == "gate":
+            monkeypatch.setattr(tmp_store, "read_process_restart_clearance", gate_then_stale)
+        elif boundary == "presence":
+            roaster.read_session_presence = presence_then_stale  # type: ignore[method-assign]
+        else:
+            monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", transaction_then_stale)
+
+        result = await service.retire_stranded_fault(_retirement_request())
+
+        if boundary == "transaction":
+            assert result.outcome == "unconfirmed"
+            assert transaction_calls == 1
+            assert service._unconfirmed_stranded_fault_retirement is not None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        else:
+            assert result.outcome == "rejected"
+            assert transaction_calls == 0
+            assert service._unconfirmed_stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "change",
     ["child_epoch", "stop_unconfirmed", "shutdown", "hardware_clear", "starting", "runner", "loop"],
 )
