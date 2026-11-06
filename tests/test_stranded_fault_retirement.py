@@ -2862,3 +2862,140 @@ async def test_shutdown_cancels_and_awaits_the_owned_retirement_task_without_cle
             with pytest.raises(asyncio.CancelledError):
                 await request_task
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", ["health", "result"])
+@pytest.mark.parametrize("read_name", ["lease", "active", "latest", "gate", "provenance"])
+async def test_tb_proj_actual_persisted_g_plus_one_is_honestly_projected_at_every_snapshot_await(
+    tmp_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    consumer: str,
+    read_name: str,
+) -> None:
+    """TB-PROJ/T-F7: a real e-stop G+1 supersedes each old D225 snapshot read."""
+    await tmp_store.initialize()
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        if read_name == "provenance":
+            assert (await service.retire_stranded_fault(_retirement_request())).outcome == "confirmed"
+        old_lease = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        old_context = _test_retirement_context(service, old_lease)
+        frames = service.events.subscribe()
+        triggered = False
+        in_shared_snapshot = consumer == "result"
+        shared_snapshot: Any = None
+
+        if consumer == "health":
+            original_snapshot = service._stranded_fault_retirement_snapshot  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+            async def capture_shared_snapshot() -> Any:
+                nonlocal in_shared_snapshot, shared_snapshot
+                in_shared_snapshot = True
+                shared_snapshot = await original_snapshot()
+                return shared_snapshot
+
+            monkeypatch.setattr(service, "_stranded_fault_retirement_snapshot", capture_shared_snapshot)
+
+        async def failed_terminal_dispatch(**_kwargs: object) -> bool:
+            return False
+
+        monkeypatch.setattr(service, "_execute_terminal_emergency_stop", failed_terminal_dispatch)
+        service._fault_control_executor = cast("Any", object())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        async def advance_generation() -> None:
+            nonlocal triggered
+            if triggered:
+                return
+            triggered = True
+            await service._submit_fault_controls_emergency_stop()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            assert await service.settle_fault_lease_persistence_for_teardown()
+            durable = await tmp_store.read_fault_control_lease()
+            assert durable.status is FaultLeaseStatus.OPEN
+            assert durable.generation == old_lease.generation + 1
+            assert service._fault_lease_cache == durable  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        if read_name == "lease":
+            original = service._read_fault_lease_fail_closed  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+            async def read_lease() -> FaultControlLease:
+                value = await original()
+                if in_shared_snapshot:
+                    await advance_generation()
+                return value
+
+            monkeypatch.setattr(service, "_read_fault_lease_fail_closed", read_lease)
+        elif read_name == "active":
+            original = tmp_store.active_run
+
+            async def read_active() -> object:
+                value = await original()
+                if in_shared_snapshot:
+                    await advance_generation()
+                return value
+
+            monkeypatch.setattr(tmp_store, "active_run", read_active)
+        elif read_name == "latest":
+            original = tmp_store.read_latest_run
+
+            async def read_latest() -> object:
+                value = await original()
+                if in_shared_snapshot:
+                    await advance_generation()
+                return value
+
+            monkeypatch.setattr(tmp_store, "read_latest_run", read_latest)
+        elif read_name == "gate":
+            original = tmp_store.read_process_restart_clearance
+
+            async def read_gate(process_id: str) -> RestartClearanceState:
+                value = await original(process_id)
+                if in_shared_snapshot:
+                    await advance_generation()
+                return value
+
+            monkeypatch.setattr(tmp_store, "read_process_restart_clearance", read_gate)
+        else:
+            original = tmp_store.read_fault_control_lease_closure_provenance
+
+            async def read_provenance(
+                lease: FaultControlLease,
+            ) -> FaultLeaseClosureProvenance | None:
+                value = await original(lease)
+                if in_shared_snapshot:
+                    await advance_generation()
+                return value
+
+            monkeypatch.setattr(
+                tmp_store, "read_fault_control_lease_closure_provenance", read_provenance
+            )
+
+        if consumer == "health":
+            health = await service.health()
+            snapshot = shared_snapshot
+            assert snapshot is not None
+            result = await service._stranded_fault_retirement_result("unconfirmed", 1, snapshot)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            controls = health.fault_controls
+        else:
+            snapshot = await service._stranded_fault_retirement_snapshot()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            result = await service._stranded_fault_retirement_result("unconfirmed", 1, snapshot)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            controls = result.fault_controls
+        if not frames.empty():
+            estop_frame = frames.get_nowait()
+            assert estop_frame.data["generation"] == old_lease.generation + 1
+        await service._emit_stranded_fault_retirement(result, 1, old_context, snapshot)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        assert triggered
+        assert result.attempted_generation == 1
+        assert controls.status is FaultLeaseStatus.OPEN
+        assert controls.generation == old_lease.generation + 1
+        assert controls.closure_provenance is None
+        assert controls.physical_stop_operative is True
+        assert result.restart_clearance.eligible is False
+        assert frames.empty()
+        assert service._retirement_event_ledger is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert roaster.calls == []
+        service._fault_control_executor = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
