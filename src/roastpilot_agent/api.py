@@ -3811,6 +3811,9 @@ class RoastService:
             and not any(not task.done() for task in self._emergency_stop_dispatch_tasks)
             and not self._command_arbiter.emergency_stop_active
             and not self._fault_acknowledgement_gate.fault_finalization_started
+            and not self._command_arbiter.close_reservation_is_current(
+                self._command_arbiter.generation
+            )
             and self._unconfirmed_fault_lease_generation is None
             and not self._fault_lease_persistence_tasks
             and self._safety_record_initialization is None
@@ -3973,6 +3976,7 @@ class RoastService:
             id(self._detached_recovery_loop),
             self._fault_acknowledgement_gate.fault_finalization_started,
             self._command_arbiter.emergency_stop_active,
+            self._command_arbiter.close_reservation_is_current(self._command_arbiter.generation),
             id(self._unconfirmed_stranded_fault_retirement),
             id(reservation),
             False if reservation is None else reservation[1].done(),
