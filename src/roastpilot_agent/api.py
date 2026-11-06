@@ -4058,7 +4058,7 @@ class RoastService:
         except Exception:  # noqa: BLE001 - exact verification is the only recovery
             outcome = StrandedFaultRetirementCommit.INDETERMINATE
         if outcome is StrandedFaultRetirementCommit.PRECONDITION_REJECTED:
-            if self._unconfirmed_stranded_fault_retirement == context:
+            if self._unconfirmed_stranded_fault_retirement is context:
                 self._unconfirmed_stranded_fault_retirement = None
             result = await self._stranded_fault_retirement_result("rejected", generation)
             await self._emit_stranded_fault_retirement(result, generation, context)
@@ -4066,7 +4066,7 @@ class RoastService:
         confirmed = outcome is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
         if (
             not confirmed
-            and self._unconfirmed_stranded_fault_retirement == context
+            and self._unconfirmed_stranded_fault_retirement is context
             and self._retirement_identity_holds(context.identity)
             and self._retirement_conditions_hold()
         ):
@@ -4082,9 +4082,9 @@ class RoastService:
                 confirmed = False
         if (
             confirmed
-            and self._unconfirmed_stranded_fault_retirement == context
+            and self._unconfirmed_stranded_fault_retirement is context
             and self._stranded_fault_retirement is not None
-            and self._stranded_fault_retirement[0] == context
+            and self._stranded_fault_retirement[0] is context
             and self._retirement_identity_holds(context.identity)
             and self._retirement_conditions_hold()
         ):
@@ -4094,7 +4094,7 @@ class RoastService:
                 run_id=context.expected_lease.run_id,
                 mcp_session_id=context.expected_lease.mcp_session_id,
             )
-            if self._unconfirmed_stranded_fault_retirement == context:
+            if self._unconfirmed_stranded_fault_retirement is context:
                 self._unconfirmed_stranded_fault_retirement = None
             result = await self._stranded_fault_retirement_result("confirmed", generation)
         else:
@@ -4106,7 +4106,7 @@ class RoastService:
         self, context: _StrandedFaultRetirementContext
     ) -> StrandedFaultRetirementResult:
         """Release one pre-write fence and report its bounded rejected outcome."""
-        if self._unconfirmed_stranded_fault_retirement == context:
+        if self._unconfirmed_stranded_fault_retirement is context:
             self._unconfirmed_stranded_fault_retirement = None
         result = await self._stranded_fault_retirement_result(
             "rejected", context.expected_lease.generation
@@ -4122,7 +4122,11 @@ class RoastService:
         task: asyncio.Task[StrandedFaultRetirementResult],
     ) -> None:
         """Release only the finished reservation that still belongs to this task."""
-        if self._stranded_fault_retirement == (context, task):
+        if (
+            self._stranded_fault_retirement is not None
+            and self._stranded_fault_retirement[0] is context
+            and self._stranded_fault_retirement[1] is task
+        ):
             self._stranded_fault_retirement = None
         with contextlib.suppress(asyncio.CancelledError, Exception):
             task.exception()
