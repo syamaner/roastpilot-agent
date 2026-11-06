@@ -3790,6 +3790,8 @@ class RoastService:
             and self._restart_clearance_state is RestartClearanceState.REQUIRED
             and not self._hardware_clear_request_in_flight
             and not any(not task.done() for task in self._emergency_stop_dispatch_tasks)
+            and not self._command_arbiter.emergency_stop_active
+            and not self._fault_acknowledgement_gate.fault_finalization_started
             and self._unconfirmed_fault_lease_generation is None
             and not self._fault_lease_persistence_tasks
             and self._safety_record_initialization is None
@@ -3814,7 +3816,11 @@ class RoastService:
             and lease.generation > 0
             and lease.run_id is not None
             and lease.mcp_session_id is not None
-            and self._unconfirmed_stranded_fault_retirement is None
+            and (
+                self._unconfirmed_stranded_fault_retirement is None
+                or self._unconfirmed_stranded_fault_retirement.expected_lease.generation
+                < lease.generation
+            )
         )
 
     async def _stranded_fault_retirement_result(
@@ -3931,6 +3937,13 @@ class RoastService:
                     fence.identity != identity
                     or not self._retirement_conditions_hold()
                     or self._stranded_fault_retirement is not None
+                    or lease
+                    != FaultControlLease(
+                        generation=fence.expected_lease.generation,
+                        status=FaultLeaseStatus.UNKNOWN,
+                        run_id=fence.expected_lease.run_id,
+                        mcp_session_id=fence.expected_lease.mcp_session_id,
+                    )
                 ):
                     return await self._stranded_fault_retirement_result(
                         "unconfirmed", fence.expected_lease.generation
@@ -3973,7 +3986,17 @@ class RoastService:
                 return await self._stranded_fault_retirement_result("rejected", None)
             try:
                 active = await self._store.active_run()
+                if (
+                    not self._retirement_identity_holds(identity)
+                    or not self._retirement_conditions_hold()
+                ):
+                    return await self._stranded_fault_retirement_result("rejected", None)
                 latest = await self._store.read_latest_run()
+                if (
+                    not self._retirement_identity_holds(identity)
+                    or not self._retirement_conditions_hold()
+                ):
+                    return await self._stranded_fault_retirement_result("rejected", None)
                 gate = await self._store.read_process_restart_clearance(self.instance_id)
             except Exception:  # noqa: BLE001 - unreadable durable evidence rejects
                 return await self._stranded_fault_retirement_result("rejected", None)
@@ -4041,7 +4064,12 @@ class RoastService:
             await self._emit_stranded_fault_retirement(result, generation, context)
             return result
         confirmed = outcome is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
-        if not confirmed and self._retirement_identity_holds(context.identity):
+        if (
+            not confirmed
+            and self._unconfirmed_stranded_fault_retirement == context
+            and self._retirement_identity_holds(context.identity)
+            and self._retirement_conditions_hold()
+        ):
             try:
                 confirmed = await self._store.verify_stranded_fault_retirement(
                     process_id=context.identity.process_id,
@@ -4054,6 +4082,9 @@ class RoastService:
                 confirmed = False
         if (
             confirmed
+            and self._unconfirmed_stranded_fault_retirement == context
+            and self._stranded_fault_retirement is not None
+            and self._stranded_fault_retirement[0] == context
             and self._retirement_identity_holds(context.identity)
             and self._retirement_conditions_hold()
         ):
