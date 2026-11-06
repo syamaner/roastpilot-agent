@@ -1672,7 +1672,6 @@ class RoastStore:
             operation_id=operation_id,
         )
         connection: aiosqlite.Connection | None = None
-        propagating_base_exception = False
         close_failed = False
         committed = False
         outcome = StrandedFaultRetirementCommit.INDETERMINATE
@@ -1773,11 +1772,9 @@ class RoastStore:
                 except Exception:
                     pass
                 except BaseException:
-                    propagating_base_exception = True
                     raise
             outcome = StrandedFaultRetirementCommit.INDETERMINATE
         except BaseException:
-            propagating_base_exception = True
             if connection is not None:
                 with contextlib.suppress(Exception):
                     await connection.rollback()
@@ -1787,8 +1784,7 @@ class RoastStore:
                 try:
                     await connection.close()
                 except Exception:  # noqa: BLE001 - cleanup ambiguity cannot report success
-                    if not propagating_base_exception:
-                        close_failed = True
+                    close_failed = True
         if close_failed:
             return StrandedFaultRetirementCommit.INDETERMINATE
         if not committed:
