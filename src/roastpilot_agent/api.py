@@ -700,6 +700,8 @@ class _FaultControlsProjectionBinding:
     emergency_stop_admission_epoch: int
     requires_live_restart_clearance: bool
     restart_clearance_state: RestartClearanceState
+    shutdown_started: bool
+    recording_replay_mode: bool
     transients: "_RetirementSnapshotTransients"
 
 
@@ -4009,6 +4011,8 @@ class RoastService:
             emergency_stop_admission_epoch=self._emergency_stop_admission_epoch,
             requires_live_restart_clearance=self._requires_live_restart_clearance,
             restart_clearance_state=self._restart_clearance_state,
+            shutdown_started=self._shutdown_started,
+            recording_replay_mode=self._recording_replay_mode,
             transients=self._retirement_snapshot_transient_marker(),
         )
 
@@ -4029,6 +4033,10 @@ class RoastService:
             and self._emergency_stop_admission_epoch == expected.emergency_stop_admission_epoch
             and self._requires_live_restart_clearance == expected.requires_live_restart_clearance
             and self._restart_clearance_state is expected.restart_clearance_state
+            and not self._shutdown_started
+            and not self._recording_replay_mode
+            and self._shutdown_started == expected.shutdown_started
+            and self._recording_replay_mode == expected.recording_replay_mode
             and self._retirement_snapshot_transients_hold(expected.transients)
         )
 
