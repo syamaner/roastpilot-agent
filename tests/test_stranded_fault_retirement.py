@@ -158,6 +158,103 @@ async def _eligible_service(
     return service, roaster
 
 
+async def _d220_absent_service(tmp_path: Path) -> tuple[RoastStore, RoastService, FakeMCPClient]:
+    """Build an unclean reopened store with the D220 absence provenance."""
+    path = tmp_path / "d220-unclean-absence.sqlite3"
+    crashed = RoastStore(path)
+    await crashed.initialize()
+    try:
+        assert await crashed.begin_process_epoch("crashed-process")
+    finally:
+        await crashed.close()
+
+    store = RoastStore(path)
+    await store.initialize()
+    roaster = FakeMCPClient()
+
+    async def no_session() -> str:
+        return "none"
+
+    roaster.read_session_presence = no_session  # type: ignore[method-assign]
+    service = RoastService(
+        store,
+        config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+        mcp=cast("MCPServerProcess", _CurrentChild()),
+        roaster=roaster,
+        live_serve_mode=True,
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    return store, service, roaster
+
+
+@pytest.mark.asyncio
+async def test_health_d220_action_uses_the_final_current_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed D220 baseline cannot leave an obsolete health action behind."""
+    store, service, roaster = await _d220_absent_service(tmp_path)
+    try:
+        before = await service.health()
+        assert before.restart_clearance.enabled_actions == [OperatorAction.INITIALIZE_SAFETY_RECORD]
+
+        original_snapshot = service._stranded_fault_retirement_snapshot  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        initialization = None
+
+        async def snapshot_after_d220() -> Any:
+            nonlocal initialization
+            monkeypatch.setattr(service, "_stranded_fault_retirement_snapshot", original_snapshot)
+            initialization = await service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+            return await original_snapshot()
+
+        monkeypatch.setattr(service, "_stranded_fault_retirement_snapshot", snapshot_after_d220)
+        raced = await service.health()
+
+        assert initialization is not None
+        assert initialization.outcome == "confirmed"
+        assert raced.restart_clearance.enabled_actions == []
+        lease = await store.read_fault_control_lease()
+        assert lease.generation == 1
+        assert lease.status is FaultLeaseStatus.CLOSED
+        assert roaster.commands() == []
+        await service.shutdown()
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_health_d220_action_hides_when_final_snapshot_read_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful early absence proof cannot outlive a failed final snapshot."""
+    store, service, roaster = await _d220_absent_service(tmp_path)
+    try:
+        original_active = store.active_run
+        active_reads = 0
+
+        async def active_then_fail() -> PersistedRun | None:
+            nonlocal active_reads
+            active_reads += 1
+            if active_reads == 2:
+                raise OSError("synthetic final snapshot failure")
+            return await original_active()
+
+        monkeypatch.setattr(store, "active_run", active_then_fail)
+        health = await service.health()
+
+        assert active_reads == 2
+        assert health.restart_clearance.enabled_actions == []
+        lease = await store.read_fault_control_lease()
+        assert lease.generation == 0
+        assert lease.status is FaultLeaseStatus.UNKNOWN
+        assert roaster.commands() == []
+        await service.shutdown()
+    finally:
+        await store.close()
+
+
 @pytest.mark.asyncio
 async def test_retirement_closes_only_the_current_terminal_faulted_lease(
     tmp_store: RoastStore,

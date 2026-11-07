@@ -2854,7 +2854,12 @@ class RoastService:
         restart_clearance = self._restart_clearance_projection(
             lease,
             active=active,
-            safety_record_initialization_available=safety_record_initialization_available,
+            safety_record_initialization_available=(
+                safety_record_initialization_available
+                and snapshot.fresh
+                and not snapshot.read_failed
+                and self._safety_record_initialization_entry_conditions_hold(lease, active)
+            ),
             retirement_available=snapshot.available,
         )
         fault_controls = (
@@ -2963,8 +2968,22 @@ class RoastService:
         self, lease: FaultControlLease, active: PersistedRun | None
     ) -> bool:
         """Return the fail-closed D220 snapshot eligibility projection."""
+        if not self._safety_record_initialization_entry_conditions_hold(lease, active):
+            return False
+        try:
+            return (
+                await self._store.probe_fault_control_lease_absence()
+                is FaultControlLeaseAbsence.ABSENT_UNTRUSTED
+            )
+        except Exception:  # noqa: BLE001 - an unreadable absence is never advertised
+            return False
+
+    def _safety_record_initialization_entry_conditions_hold(
+        self, lease: FaultControlLease, active: PersistedRun | None
+    ) -> bool:
+        """Return whether D220's local no-await eligibility conditions hold."""
         child = self._mcp
-        if (
+        return not (
             self._shutdown_started
             or not self._restart_epoch_initialized
             or self._restart_clearance_state is not RestartClearanceState.REQUIRED
@@ -2982,15 +3001,7 @@ class RoastService:
             or child is None
             or not child.running
             or self._roaster is None
-        ):
-            return False
-        try:
-            return (
-                await self._store.probe_fault_control_lease_absence()
-                is FaultControlLeaseAbsence.ABSENT_UNTRUSTED
-            )
-        except Exception:  # noqa: BLE001 - an unreadable absence is never advertised
-            return False
+        )
 
     def _restart_clearance_projection(
         self,
