@@ -53,6 +53,7 @@ import type {
   TelemetrySeries,
   StrandedFaultRetirementResult,
 } from "@/lib/types";
+import { api, ApiError } from "@/lib/api";
 import { LivePage } from "./LivePage";
 import {
   FIXTURE_FINISHED_DETAIL,
@@ -2038,6 +2039,50 @@ describe("LivePage stranded-fault retirement (#1071, D225)", () => {
     expect(retireStrandedFaultMock).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(invalidate).toHaveBeenCalledTimes(1));
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["health"] });
+  });
+
+  it.each([
+    ["confirmed", "Stranded fault record retired by your attestation."],
+    ["unconfirmed", "Retirement is unconfirmed."],
+    ["rejected", "Retirement was rejected."],
+    ["error", "Retirement result could not be confirmed."],
+  ] as const)("TL1/TS9: %s settles once with fixed copy, one invalidation, and no automatic clearance", async (kind, fixedCopy) => {
+    eligibleHealth();
+    const { client } = renderPage();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const acknowledge = vi.spyOn(api, "acknowledgeRestartClearance");
+    const privateDetail = "run-private-77 /var/private/roastpilot.sqlite3";
+    if (kind === "error") {
+      retireStrandedFaultMock.mockRejectedValueOnce(new ApiError(500, privateDetail));
+    } else {
+      retireStrandedFaultMock.mockResolvedValueOnce({
+        outcome: kind,
+        attempted_generation: kind === "rejected" ? null : 3,
+        restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
+        fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"] },
+      });
+    }
+
+    tickAll();
+    fireEvent.click(screen.getByTestId("stranded-fault-submit"));
+    expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-outcome")).toHaveTextContent(fixedCopy));
+    expect(screen.queryByTestId("stranded-fault-retirement-pending")).toBeNull();
+    expect(retireStrandedFaultMock).toHaveBeenCalledTimes(1);
+    expect(acknowledge).not.toHaveBeenCalled();
+    await waitFor(() => expect(invalidate).toHaveBeenCalledTimes(1));
+    expect(document.body.innerHTML).not.toContain(privateDetail);
+
+    fireEvent.click(screen.getByTestId("stranded-fault-open"));
+    for (const id of ["stranded-fault-stopped-empty", "stranded-fault-heat-off", "stranded-fault-fan-cooling-off", "stranded-fault-independent-stop"]) {
+      expect(screen.getByTestId(id)).not.toBeChecked();
+    }
+    if (kind === "confirmed") {
+      fireEvent.click(screen.getByTestId("stranded-fault-refresh-status"));
+      await waitFor(() => expect(invalidate).toHaveBeenCalledTimes(2));
+      expect(retireStrandedFaultMock).toHaveBeenCalledTimes(1);
+    }
+    acknowledge.mockRestore();
   });
 
   it("TL1: generation and observed-process reset keys discard unsubmitted ticks, while a fresh same-key poll preserves them", () => {
