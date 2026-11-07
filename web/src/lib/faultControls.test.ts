@@ -106,6 +106,11 @@ describe("stranded-fault retirement result parser", () => {
       { ...result, outcome: "unconfirmed", attempted_generation: null },
       ...[0, -1, 1.5, "1"].map((attempted_generation) => ({
         ...result,
+        outcome: "unconfirmed",
+        attempted_generation,
+      })),
+      ...[0, -1, 1.5, "1"].map((attempted_generation) => ({
+        ...result,
         outcome: "rejected",
         attempted_generation,
       })),
