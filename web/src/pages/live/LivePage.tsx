@@ -820,7 +820,7 @@ function LiveTerminalFaultControls({
       {restartClearanceRequired && (retirementRequest.pending ? (
         <StrandedFaultRetirementPendingNotice />
       ) : retirement.kind === "available" && healthProjectionStale ? (
-        <p data-testid="live-retirement-status-refreshing">
+        <p data-testid="live-retirement-status-refreshing" role="status" className="mx-auto max-w-xl px-6 py-4 text-center text-sm text-muted-foreground">
           Waiting for current status before retirement can be offered.
         </p>
       ) : retirement.kind === "available" ? (
