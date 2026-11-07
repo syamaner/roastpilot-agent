@@ -221,6 +221,7 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
     expect(screen.getByTestId("start-restart-clearance-emergency-stop")).toBeInTheDocument();
     expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
     healthState.data = undefined;
     healthState.isSuccess = false;
@@ -230,6 +231,7 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     expect(screen.getByTestId("start-roast-status-unknown")).toBeInTheDocument();
     expect(screen.getByTestId("start-health-error-emergency-stop-submit")).toBeInTheDocument();
     expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
     eligibleHealth();
     healthState.isSuccess = true;
@@ -240,6 +242,11 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     expect(retireStrandedFaultMock).toHaveBeenCalledTimes(1);
     resolve({ outcome: "confirmed", attempted_generation: 3, restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false }, fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"] } });
     await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-outcome")).toBeInTheDocument());
+    expect(screen.queryByTestId("stranded-fault-retirement-pending")).toBeNull();
+    expect(screen.getByTestId("stranded-fault-retirement-card")).toBeInTheDocument();
+    expect(retireStrandedFaultMock).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByTestId("stranded-fault-open"));
+    for (const id of ["stranded-fault-stopped-empty", "stranded-fault-heat-off", "stranded-fault-fan-cooling-off", "stranded-fault-independent-stop"]) expect(screen.getByTestId(id)).not.toBeChecked();
   });
 
   it.each([
@@ -262,8 +269,10 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-outcome")).toBeInTheDocument());
     expect(retireStrandedFaultMock).toHaveBeenCalledTimes(1);
     expect(invalidate).toHaveBeenCalledTimes(1);
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["health"] });
     expect(acknowledgeRestartClearanceMock).not.toHaveBeenCalled();
     expect(startRoastMock).not.toHaveBeenCalled();
+    if (_name === "error") expect(document.body.textContent).not.toMatch(/run-abc|\/var\/db|private-id/);
     if (_name === "confirmed") {
       fireEvent.click(screen.getByTestId("stranded-fault-refresh-status"));
       expect(invalidate).toHaveBeenCalledTimes(2);
