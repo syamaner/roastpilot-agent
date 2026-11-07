@@ -216,13 +216,59 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
     expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    healthState.data = { ...(healthState.data as object), fault_controls: { status: "open", generation: 3, enabled_actions: ["emergency_stop"], physical_stop_operative: true }, restart_clearance: { state: "required", eligible: false, enabled_actions: "retire_stranded_fault", closure_only_available: false } } as never;
+    rerender();
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.getByTestId("start-restart-clearance-emergency-stop")).toBeInTheDocument();
+    expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    healthState.data = undefined;
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    healthState.isFresh = true;
+    rerender();
+    expect(screen.getByTestId("start-roast-status-unknown")).toBeInTheDocument();
+    expect(screen.getByTestId("start-health-error-emergency-stop-submit")).toBeInTheDocument();
+    expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
     eligibleHealth();
+    healthState.isSuccess = true;
+    healthState.isError = false;
     rerender();
     expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
     expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
     expect(retireStrandedFaultMock).toHaveBeenCalledTimes(1);
     resolve({ outcome: "confirmed", attempted_generation: 3, restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false }, fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"] } });
     await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-outcome")).toBeInTheDocument());
+  });
+
+  it.each([
+    ["confirmed", { outcome: "confirmed", attempted_generation: 3 }],
+    ["unconfirmed", { outcome: "unconfirmed", attempted_generation: 3 }],
+    ["rejected", { outcome: "rejected", attempted_generation: null }],
+    ["error", null],
+  ] as const)("TS9: %s retires once and invalidates health exactly once", async (_name, response) => {
+    eligibleHealth();
+    if (response === null) retireStrandedFaultMock.mockRejectedValueOnce(new ApiError(409, "run-abc /var/db private-id"));
+    else retireStrandedFaultMock.mockResolvedValueOnce({
+      ...response,
+      restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
+      fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"] },
+    });
+    const { client } = renderView();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    tickAll();
+    fireEvent.click(screen.getByTestId("stranded-fault-submit"));
+    await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-outcome")).toBeInTheDocument());
+    expect(retireStrandedFaultMock).toHaveBeenCalledTimes(1);
+    expect(invalidate).toHaveBeenCalledTimes(1);
+    expect(acknowledgeRestartClearanceMock).not.toHaveBeenCalled();
+    expect(startRoastMock).not.toHaveBeenCalled();
+    if (_name === "confirmed") {
+      fireEvent.click(screen.getByTestId("stranded-fault-refresh-status"));
+      expect(invalidate).toHaveBeenCalledTimes(2);
+      expect(retireStrandedFaultMock).toHaveBeenCalledTimes(1);
+    }
   });
 
   it("TS13/TS-O5b/c: generation changes reset ticks, identical polls preserve them, and action loss remounts empty", () => {
