@@ -36,11 +36,13 @@ import type {
   RoastProfile,
   RoastTimeline,
   RestartClearanceResult,
+  StrandedFaultRetirementResult,
   TastingEntryRequest,
   TastingList,
   TelemetrySeries,
 } from "./types";
 import { parseCatalogueRecommendationList } from "./types";
+import { parseStrandedFaultRetirementResult } from "./faultControls";
 
 /** API base. Empty string in the browser: requests are same-origin and Vite
  *  proxies `/api` to the agent in dev. Overridable for tests/SSR. */
@@ -224,6 +226,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ physical_confirmation: true }),
     }),
+
+  /** Retire only the server-projected stranded-fault bookkeeping record. */
+  retireStrandedFault: () =>
+    request<unknown>("/api/restart-clearance/retire-stranded-fault", {
+      method: "POST",
+      body: JSON.stringify({
+        stranded_fault_confirmation:
+          "roaster_stopped_empty_heat_fan_cooling_off_physical_stop_ready",
+      }),
+    }).then(parseStrandedFaultRetirementResult) as Promise<StrandedFaultRetirementResult>,
 
   /** `GET /api/roasts/{id}/tastings` — the run's tasting entries (#522, D91). */
   tastings: (runId: string) => request<TastingList>(`/api/roasts/${runId}/tastings`),

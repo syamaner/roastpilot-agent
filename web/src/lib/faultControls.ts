@@ -1,6 +1,6 @@
 /** Runtime admission for the public D212/D213 fault-controls health projection. */
 
-import type { FaultControls, RestartClearance } from "./types";
+import type { FaultControls, RestartClearance, StrandedFaultRetirementResult } from "./types";
 
 const TERMINAL_FAULT_ACTIONS = new Set<string>([
   "emergency_stop",
@@ -13,7 +13,23 @@ const TERMINAL_FAULT_ACTIONS = new Set<string>([
 const RESTART_CLEARANCE_ACTIONS = new Set<string>([
   "end_recovered_run",
   "initialize_safety_record",
+  "retire_stranded_fault",
 ]);
+
+const FAULT_CLOSURE_PROVENANCE = new Set<string>([
+  "exact_session_safe_zero",
+  "operator_attested_retirement",
+  "baseline",
+]);
+
+const RETIRE_STRANDED_FAULT = "retire_stranded_fault";
+const RETIREMENT_RESULT_KEYS = new Set([
+  "outcome",
+  "attempted_generation",
+  "restart_clearance",
+  "fault_controls",
+]);
+const RETIREMENT_RESULT_ERROR = "Stranded-fault retirement result could not be confirmed.";
 
 /**
  * Validate untrusted health JSON before it decides a Start or terminal-control
@@ -25,6 +41,8 @@ export function isCoherentFaultControls(value: unknown): value is FaultControls 
   const status = candidate.status;
   const generation = candidate.generation;
   const actions = candidate.enabled_actions;
+  const provenance = candidate.closure_provenance;
+  const physicalStopOperative = candidate.physical_stop_operative;
   if (status !== "closed" && status !== "open" && status !== "unknown") return false;
   if (
     generation !== null &&
@@ -48,6 +66,17 @@ export function isCoherentFaultControls(value: unknown): value is FaultControls 
     return false;
   }
   if (status === "open" && generation === null) return false;
+  if (
+    provenance !== undefined &&
+    provenance !== null &&
+    (typeof provenance !== "string" || !FAULT_CLOSURE_PROVENANCE.has(provenance))
+  ) {
+    return false;
+  }
+  if (physicalStopOperative !== undefined && typeof physicalStopOperative !== "boolean") {
+    return false;
+  }
+  if (provenance !== undefined && provenance !== null && status !== "closed") return false;
   return !(status === "unknown" && actions.some((action) => action !== "emergency_stop"));
 }
 
@@ -74,7 +103,8 @@ export function isCoherentRestartClearance(value: unknown): value is RestartClea
         candidate.eligible === false &&
         (candidate.enabled_actions.length === 0 ||
           (candidate.enabled_actions.length === 1 &&
-            candidate.enabled_actions[0] === "initialize_safety_record" &&
+            (candidate.enabled_actions[0] === "initialize_safety_record" ||
+              candidate.enabled_actions[0] === RETIRE_STRANDED_FAULT) &&
             candidate.closure_only_available === false))
       );
     case "closure_only":
@@ -96,4 +126,52 @@ export function isCoherentRestartClearance(value: unknown): value is RestartClea
     default:
       return false;
   }
+}
+
+/** Server-projected availability for one operator-attested stranded-fault retirement. */
+export function strandedFaultRetirementState(
+  restart: RestartClearance,
+  controls: FaultControls,
+  instanceId: unknown,
+):
+  | { kind: "absent" }
+  | { kind: "incoherent" }
+  | { kind: "available"; resetKey: string } {
+  if (!restart.enabled_actions.includes(RETIRE_STRANDED_FAULT)) return { kind: "absent" };
+  if (
+    controls.status !== "open" ||
+    typeof controls.generation !== "number" ||
+    !Number.isSafeInteger(controls.generation) ||
+    controls.generation < 1 ||
+    controls.physical_stop_operative !== true ||
+    typeof instanceId !== "string" ||
+    instanceId.length === 0
+  ) {
+    return { kind: "incoherent" };
+  }
+  return { kind: "available", resetKey: `${instanceId}#${controls.generation}` };
+}
+
+/** Parse the closed grammar returned by the stranded-fault retirement endpoint. */
+export function parseStrandedFaultRetirementResult(value: unknown): StrandedFaultRetirementResult {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(RETIREMENT_RESULT_ERROR);
+  }
+  const candidate = value as Record<string, unknown>;
+  const keys = Object.keys(candidate);
+  if (keys.length !== RETIREMENT_RESULT_KEYS.size || keys.some((key) => !RETIREMENT_RESULT_KEYS.has(key))) {
+    throw new Error(RETIREMENT_RESULT_ERROR);
+  }
+  const outcome = candidate.outcome;
+  const generation = candidate.attempted_generation;
+  if (outcome !== "confirmed" && outcome !== "rejected" && outcome !== "unconfirmed") {
+    throw new Error(RETIREMENT_RESULT_ERROR);
+  }
+  const validGeneration = typeof generation === "number" && Number.isSafeInteger(generation) && generation >= 1;
+  if ((outcome === "rejected" ? generation !== null && !validGeneration : !validGeneration) ||
+    !isCoherentRestartClearance(candidate.restart_clearance) ||
+    !isCoherentFaultControls(candidate.fault_controls)) {
+    throw new Error(RETIREMENT_RESULT_ERROR);
+  }
+  return candidate as unknown as StrandedFaultRetirementResult;
 }
