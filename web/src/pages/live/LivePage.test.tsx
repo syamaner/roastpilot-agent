@@ -1911,6 +1911,37 @@ describe("LivePage stranded-fault retirement (#1071, D225)", () => {
     await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-outcome")).toBeInTheDocument());
   });
 
+  it("TL1: pending retirement keeps the only server-advertised e-stop actionable across withdrawn, unknown and closed projections", async () => {
+    retireStrandedFaultMock.mockImplementationOnce(() => new Promise<StrandedFaultRetirementResult>(() => undefined));
+    eligibleHealth();
+    const { rerender } = renderPage();
+    tickAll();
+    fireEvent.click(screen.getByTestId("stranded-fault-submit"));
+
+    for (const fault_controls of [
+      { status: "open", generation: 3, enabled_actions: ["emergency_stop"], physical_stop_operative: true },
+      { status: "unknown", generation: 3, enabled_actions: ["emergency_stop"], physical_stop_operative: true },
+      { status: "closed", generation: 3, enabled_actions: ["emergency_stop"], closure_provenance: "operator_attested_retirement" },
+    ]) {
+      healthState.data = {
+        active_run_id: null,
+        instance_id: "process-1",
+        restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
+        fault_controls,
+      } as never;
+      rerender();
+      expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
+      expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
+      expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+      expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeInTheDocument();
+    }
+
+    fireEvent.click(screen.getByTestId("terminal-fault-action-emergency_stop"));
+    fireEvent.click(screen.getByTestId("terminal-fault-action-emergency_stop"));
+    await waitFor(() => expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }));
+    expect(retireStrandedFaultMock).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps the unknown-view emergency stop while a pending request sees a contradictory closed retirement projection", () => {
     retireStrandedFaultMock.mockImplementationOnce(() => new Promise<StrandedFaultRetirementResult>(() => undefined));
     eligibleHealth();
@@ -1938,10 +1969,113 @@ describe("LivePage stranded-fault retirement (#1071, D225)", () => {
     expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
     healthState.isError = false;
     healthState.isSuccess = true;
-    healthState.data = { ...healthState.data!, instance_id: "process-2" } as never;
+    healthState.data = {
+      active_run_id: null, instance_id: "process-2",
+      restart_clearance: { state: "required", eligible: false, enabled_actions: ["retire_stranded_fault"], closure_only_available: false },
+      fault_controls: { status: "open", generation: 4, enabled_actions: ["emergency_stop"], physical_stop_operative: true },
+    } as never;
     rerender();
     expect(screen.getByTestId("stranded-fault-retirement-card")).toBeInTheDocument();
     expect(screen.queryByTestId("live-status-instance-mismatch")).toBeNull();
+  });
+
+  it("TL3/TL4: stale retirement keeps its e-stop, and a retirement id change after an armed match does not raise the mismatch view", async () => {
+    eligibleHealth();
+    const { rerender } = renderPage("/live", { expectedInstanceId: "process-1" });
+    await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-card")).toBeInTheDocument());
+    healthState.isError = true;
+    healthState.isSuccess = false;
+    healthState.isFresh = true;
+    rerender();
+    expect(screen.getByTestId("live-retirement-status-refreshing")).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeInTheDocument();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
+
+    healthState.isError = false;
+    healthState.isSuccess = true;
+    rerender();
+    await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-card")).toBeInTheDocument());
+    healthState.data = { ...healthState.data!, instance_id: "process-2" } as never;
+    rerender();
+    expect(screen.getByTestId("stranded-fault-retirement-card")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+    expect(retireStrandedFaultMock).not.toHaveBeenCalled();
+  });
+
+  it("TL1/TL2: a confirmed request stays blocked until a fresh D213 projection and survives an incoherent early return", async () => {
+    let resolve!: (value: StrandedFaultRetirementResult) => void;
+    retireStrandedFaultMock.mockImplementationOnce(() => new Promise<StrandedFaultRetirementResult>((done) => { resolve = done; }));
+    eligibleHealth();
+    const { client, rerender } = renderPage();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    tickAll();
+    fireEvent.click(screen.getByTestId("stranded-fault-submit"));
+
+    healthState.data = { ...healthState.data!, fault_controls: { status: "open", generation: 3, enabled_actions: ["emergency_stop"], physical_stop_operative: "true" } } as never;
+    rerender();
+    expect(screen.getByTestId("live-fault-controls-status-unknown")).toBeInTheDocument();
+    expect(screen.getByTestId("live-fault-controls-emergency-stop")).toBeInTheDocument();
+
+    eligibleHealth();
+    rerender();
+    expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
+    expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
+    resolve({
+      outcome: "confirmed", attempted_generation: 3,
+      restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
+      fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"] },
+    });
+    healthState.data = {
+      active_run_id: null, instance_id: "process-1",
+      restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
+      fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"], closure_provenance: "operator_attested_retirement" },
+    } as never;
+    rerender();
+    await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-outcome")).toHaveTextContent(/retired by your attestation/i));
+    expect(screen.getByTestId("restart-clearance-required")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(retireStrandedFaultMock).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(invalidate).toHaveBeenCalledTimes(1));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["health"] });
+  });
+
+  it("TL1: generation and observed-process reset keys discard unsubmitted ticks, while a fresh same-key poll preserves them", () => {
+    eligibleHealth();
+    const { rerender } = renderPage();
+    fireEvent.click(screen.getByTestId("stranded-fault-open"));
+    for (const id of ["stranded-fault-stopped-empty", "stranded-fault-heat-off", "stranded-fault-fan-cooling-off"]) fireEvent.click(screen.getByTestId(id));
+    const boxes = ["stranded-fault-stopped-empty", "stranded-fault-heat-off", "stranded-fault-fan-cooling-off", "stranded-fault-independent-stop"];
+    expect((screen.getByTestId(boxes[0]) as HTMLInputElement).checked).toBe(true);
+
+    healthState.data = {
+      active_run_id: null, instance_id: "process-1",
+      restart_clearance: { state: "required", eligible: false, enabled_actions: ["retire_stranded_fault"], closure_only_available: false },
+      fault_controls: { status: "open", generation: 3, enabled_actions: ["emergency_stop"], physical_stop_operative: true },
+    } as never;
+    rerender();
+    expect((screen.getByTestId(boxes[0]) as HTMLInputElement).checked).toBe(true);
+
+    healthState.data = {
+      active_run_id: null, instance_id: "process-1",
+      restart_clearance: { state: "required", eligible: false, enabled_actions: ["retire_stranded_fault"], closure_only_available: false },
+      fault_controls: { status: "open", generation: 4, enabled_actions: ["emergency_stop"], physical_stop_operative: true },
+    } as never;
+    rerender();
+    expect(screen.getByTestId("stranded-fault-open")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("stranded-fault-open"));
+    for (const id of boxes) expect(screen.getByTestId(id)).not.toBeChecked();
+
+    for (const id of boxes.slice(0, 3)) fireEvent.click(screen.getByTestId(id));
+    healthState.data = {
+      active_run_id: null, instance_id: "process-2",
+      restart_clearance: { state: "required", eligible: false, enabled_actions: ["retire_stranded_fault"], closure_only_available: false },
+      fault_controls: { status: "open", generation: 4, enabled_actions: ["emergency_stop"], physical_stop_operative: true },
+    } as never;
+    rerender();
+    expect(screen.getByTestId("stranded-fault-open")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+    expect(retireStrandedFaultMock).not.toHaveBeenCalled();
   });
 
   it("TL1 provenance: preserves the closed-lease e-stop and retirement note", () => {
