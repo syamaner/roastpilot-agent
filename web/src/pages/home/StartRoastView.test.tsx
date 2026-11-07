@@ -178,7 +178,7 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     tickAll();
     fireEvent.click(screen.getByTestId("stranded-fault-submit"));
     healthState.data = {
-      ...healthState.data!,
+      ...(healthState.data as object),
       restart_clearance: { state: "required", eligible: false, enabled_actions: ["retire_stranded_fault"], closure_only_available: false },
       fault_controls: { status: "closed", generation: 3, enabled_actions: [] },
     } as never;
@@ -208,6 +208,71 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     rerender();
     fireEvent.click(screen.getByTestId("stranded-fault-open"));
     expect(screen.getByTestId("stranded-fault-stopped-empty")).not.toBeChecked();
+  });
+
+  it("TS11/MC3: every invalid non-null provenance on an otherwise coherent CLOSED projection fails closed", () => {
+    eligibleHealth();
+    const { rerender } = renderView();
+    for (const closure_provenance of ["safe_zero", "Baseline", 1]) {
+      healthState.data = {
+        active_run_id: null,
+        instance_id: "process-1",
+        restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
+        fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"], closure_provenance },
+      } as never;
+      rerender();
+      expect(screen.getByTestId("fault-controls-status-unknown")).toBeInTheDocument();
+      expect(screen.getByTestId("start-fault-controls-emergency-stop")).toBeInTheDocument();
+      expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
+      expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    }
+  });
+
+  it("TS8/TS14/TS-O5d/MC36: a confirmed POST remains blocked, hides stale outcome beside a new card, and never leaks its process id", async () => {
+    const syntheticId = "process-identifier-not-for-dom";
+    eligibleHealth();
+    healthState.data = { ...healthState.data!, instance_id: syntheticId } as never;
+    retireStrandedFaultMock.mockRejectedValueOnce(new Error("run-abc /var/db " + syntheticId));
+    const logSpy = vi.spyOn(console, "log");
+    const warnSpy = vi.spyOn(console, "warn");
+    const errorSpy = vi.spyOn(console, "error");
+    const { rerender } = renderView();
+    tickAll();
+    fireEvent.click(screen.getByTestId("stranded-fault-submit"));
+    await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-outcome")).toBeInTheDocument());
+    expect(retireStrandedFaultMock).toHaveBeenCalledWith();
+    expect(document.body.innerHTML).not.toContain(syntheticId);
+    for (const spy of [logSpy, warnSpy, errorSpy]) {
+      expect(spy.mock.calls.flat().join(" ")).not.toContain(syntheticId);
+      spy.mockRestore();
+    }
+    healthState.data = {
+      active_run_id: null,
+      instance_id: syntheticId,
+      restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
+      fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"], closure_provenance: "operator_attested_retirement" },
+    } as never;
+    rerender();
+    expect(screen.getByTestId("restart-clearance-required")).toBeInTheDocument();
+    expect(screen.getByTestId("retirement-provenance-note")).toBeInTheDocument();
+    expect(screen.getByTestId("stranded-fault-retirement-outcome")).toBeInTheDocument();
+    expect(acknowledgeRestartClearanceMock).not.toHaveBeenCalled();
+    expect(startRoastMock).not.toHaveBeenCalled();
+    healthState.data = {
+      ...(healthState.data as object),
+      restart_clearance: { state: "required", eligible: false, enabled_actions: ["retire_stranded_fault"], closure_only_available: false },
+      fault_controls: { status: "open", generation: 4, enabled_actions: ["emergency_stop"], physical_stop_operative: true },
+    } as never;
+    rerender();
+    expect(screen.getByTestId("stranded-fault-retirement-card")).toBeInTheDocument();
+    expect(screen.queryByTestId("stranded-fault-retirement-outcome")).toBeNull();
+    healthState.data = {
+      ...(healthState.data as object),
+      restart_clearance: { state: "cleared", eligible: true, enabled_actions: [], closure_only_available: false },
+      fault_controls: { status: "closed", generation: 4, enabled_actions: [] },
+    } as never;
+    rerender();
+    expect(screen.getByTestId("start-roast-form")).toBeInTheDocument();
   });
 });
 

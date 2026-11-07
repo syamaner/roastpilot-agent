@@ -28,7 +28,7 @@ const confirmed = {
 
 describe("useStrandedFaultRetirementRequest", () => {
   beforeEach(() => retireMock.mockReset());
-  it("allows one synchronous in-flight POST and records its settled outcome", async () => {
+  it("TH1: allows one synchronous in-flight POST and records its settled outcome", async () => {
     const pending = deferred<typeof confirmed>();
     retireMock.mockReturnValueOnce(pending.promise);
     const client = new QueryClient();
@@ -43,7 +43,7 @@ describe("useStrandedFaultRetirementRequest", () => {
     expect(invalidate).toHaveBeenCalledTimes(1);
   });
 
-  it("invalidates after an unmounted request without issuing another POST", async () => {
+  it("TH3: invalidates after an unmounted request without issuing another POST", async () => {
     const pending = deferred<typeof confirmed>();
     retireMock.mockReturnValueOnce(pending.promise);
     const client = new QueryClient();
@@ -56,12 +56,13 @@ describe("useStrandedFaultRetirementRequest", () => {
     expect(retireMock).toHaveBeenCalledTimes(1);
   });
 
-  it("maps parser and transport failures to the fixed local error outcome", async () => {
+  it("TH2: maps parser and transport failures to the fixed local error outcome", async () => {
     retireMock.mockRejectedValueOnce(new Error("run-abc /var/db"));
     const client = new QueryClient();
     const { result } = renderHook(useStrandedFaultRetirementRequest, { wrapper: wrapper(client) });
     act(() => result.current.submit("p1#1"));
     await waitFor(() => expect(result.current.outcome).toEqual({ kind: "error", key: "p1#1" }));
+    expect(result.current.pending).toBe(false);
   });
 
   it.each([
@@ -96,6 +97,7 @@ describe("useStrandedFaultRetirementRequest", () => {
   it("TH4: restores the mounted fence after Strict Mode effect replay", async () => {
     retireMock.mockResolvedValueOnce(confirmed);
     const client = new QueryClient();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
     const strictWrapper = ({ children }: { children: ReactNode }) => (
       <StrictMode><QueryClientProvider client={client}>{children}</QueryClientProvider></StrictMode>
     );
@@ -103,5 +105,6 @@ describe("useStrandedFaultRetirementRequest", () => {
     act(() => result.current.submit("p1#1"));
     await waitFor(() => expect(result.current.outcome).toEqual({ kind: "confirmed", key: "p1#1" }));
     expect(result.current.pending).toBe(false);
+    expect(invalidate).toHaveBeenCalledTimes(1);
   });
 });

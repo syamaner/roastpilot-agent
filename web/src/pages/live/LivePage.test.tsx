@@ -1956,4 +1956,41 @@ describe("LivePage stranded-fault retirement (#1071, D225)", () => {
     expect(screen.getByTestId("retirement-provenance-note")).toBeInTheDocument();
     expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeInTheDocument();
   });
+
+  it("TL1/TS12: displays provenance only for operator-attested retirement and retains the ordinary D213 gate", () => {
+    for (const closure_provenance of ["exact_session_safe_zero", "baseline", null]) {
+      healthState.isSuccess = true;
+      healthState.isError = false;
+      healthState.isFresh = true;
+      healthState.data = {
+        active_run_id: null,
+        restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
+        fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"], closure_provenance },
+      } as never;
+      renderPage();
+      expect(screen.getByTestId("restart-clearance-required")).toBeInTheDocument();
+      expect(screen.queryByTestId("retirement-provenance-note")).toBeNull();
+      cleanup();
+    }
+  });
+
+  it("TL1/TS-O5d/MC36: the actual card submit keeps the id out of DOM, calls, and console", async () => {
+    const syntheticId = "live-process-identifier-not-for-dom";
+    eligibleHealth();
+    healthState.data = { ...healthState.data!, instance_id: syntheticId } as never;
+    retireStrandedFaultMock.mockRejectedValueOnce(new Error("run-abc /var/db " + syntheticId));
+    const logSpy = vi.spyOn(console, "log");
+    const warnSpy = vi.spyOn(console, "warn");
+    const errorSpy = vi.spyOn(console, "error");
+    renderPage();
+    tickAll();
+    fireEvent.click(screen.getByTestId("stranded-fault-submit"));
+    await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-outcome")).toBeInTheDocument());
+    expect(retireStrandedFaultMock).toHaveBeenCalledWith();
+    expect(document.body.innerHTML).not.toContain(syntheticId);
+    for (const spy of [logSpy, warnSpy, errorSpy]) {
+      expect(spy.mock.calls.flat().join(" ")).not.toContain(syntheticId);
+      spy.mockRestore();
+    }
+  });
 });

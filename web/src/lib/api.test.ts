@@ -103,7 +103,7 @@ describe("api client", () => {
     });
   });
 
-  it("POST retirement sends only its fixed literal and rejects a malformed success body", async () => {
+  it("TC5: POST retirement sends only its fixed literal and rejects a malformed success body", async () => {
     mockFetch(200, {
       outcome: "confirmed",
       attempted_generation: 1,
@@ -119,6 +119,7 @@ describe("api client", () => {
     expect(JSON.parse((init as RequestInit).body as string)).toEqual({
       stranded_fault_confirmation: "roaster_stopped_empty_heat_fan_cooling_off_physical_stop_ready",
     });
+    expect(JSON.parse((init as RequestInit).body as string)).not.toHaveProperty("instance_id");
     mockFetch(200, {
       outcome: "confirmed", attempted_generation: 1,
       restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
@@ -128,6 +129,10 @@ describe("api client", () => {
     await expect(api.retireStrandedFault()).rejects.toThrow(
       "Stranded-fault retirement result could not be confirmed.",
     );
+    for (const status of [409, 422]) {
+      mockFetch(status, { detail: "run-abc /var/db" });
+      await expect(api.retireStrandedFault()).rejects.toBeInstanceOf(ApiError);
+    }
   });
 
   it("preserves a fail-closed restart-clearance response and its projections", async () => {
