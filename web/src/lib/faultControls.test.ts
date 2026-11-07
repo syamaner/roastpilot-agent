@@ -104,6 +104,11 @@ describe("stranded-fault retirement result parser", () => {
     const generationCases = [
       ...invalidGenerations.map((attempted_generation) => ({ ...result, attempted_generation })),
       { ...result, outcome: "unconfirmed", attempted_generation: null },
+      ...[0, -1, 1.5, "1"].map((attempted_generation) => ({
+        ...result,
+        outcome: "rejected",
+        attempted_generation,
+      })),
     ];
     for (const value of [
       null, "x", [], [1, 2, 3, 4],
