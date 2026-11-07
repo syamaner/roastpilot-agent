@@ -1935,6 +1935,13 @@ describe("LivePage stranded-fault retirement (#1071, D225)", () => {
       expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
       expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
       expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeInTheDocument();
+      if (fault_controls.status === "closed") {
+        expect(screen.getByTestId("retirement-provenance-note")).toHaveTextContent(
+          /retired by operator attestation.*new restart clearance.*fresh physical confirmation/i,
+        );
+      } else {
+        expect(screen.queryByTestId("retirement-provenance-note")).toBeNull();
+      }
     }
 
     fireEvent.click(screen.getByTestId("terminal-fault-action-emergency_stop"));
