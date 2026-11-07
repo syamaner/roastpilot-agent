@@ -101,7 +101,9 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     const { rerender } = renderView();
     expect(screen.getByTestId("terminal-fault-controls")).toBeInTheDocument();
     expect(screen.getByTestId("stranded-fault-retirement-card")).toBeInTheDocument();
+    expect(screen.getByTestId("stranded-fault-physical-stop-operative")).toBeInTheDocument();
     expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
     healthState.data = { ...healthState.data!, fault_controls: { status: "open", generation: 3, enabled_actions: ["emergency_stop"], physical_stop_operative: "true" } } as never;
     rerender();
     expect(screen.getAllByTestId("fault-controls-status-unknown").length).toBeGreaterThan(0);
@@ -159,9 +161,11 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     rerender();
     expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
     expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeInTheDocument();
     healthState.data = { ...(healthState.data as object), fault_controls: { status: "unknown", generation: 3, enabled_actions: ["emergency_stop"], physical_stop_operative: true } } as never;
     rerender();
     expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeInTheDocument();
     healthState.data = { ...(healthState.data as object), fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"], closure_provenance: "operator_attested_retirement" } } as never;
     rerender();
     expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
@@ -198,6 +202,15 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     fireEvent.click(screen.getByTestId("stranded-fault-stopped-empty"));
     rerender();
     expect(screen.getByTestId("stranded-fault-stopped-empty")).toBeChecked();
+    healthState.data = { ...(healthState.data as object), instance_id: "process-2" } as never;
+    rerender();
+    expect(screen.queryByTestId("stranded-fault-stopped-empty")).toBeNull();
+    expect(screen.getByTestId("stranded-fault-retirement-card")).toBeInTheDocument();
+    expect(retireStrandedFaultMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("stranded-fault-open"));
+    expect(screen.getByTestId("stranded-fault-stopped-empty")).not.toBeChecked();
+    healthState.data = { ...(healthState.data as object), instance_id: "process-1" } as never;
+    rerender();
     healthState.data = { ...(healthState.data as object), fault_controls: { status: "open", generation: 4, enabled_actions: ["emergency_stop"], physical_stop_operative: true } } as never;
     rerender();
     fireEvent.click(screen.getByTestId("stranded-fault-open"));

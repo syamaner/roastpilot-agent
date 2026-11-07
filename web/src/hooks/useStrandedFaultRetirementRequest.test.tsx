@@ -95,7 +95,8 @@ describe("useStrandedFaultRetirementRequest", () => {
   });
 
   it("TH4: restores the mounted fence after Strict Mode effect replay", async () => {
-    retireMock.mockResolvedValueOnce(confirmed);
+    const pending = deferred<typeof confirmed>();
+    retireMock.mockReturnValueOnce(pending.promise);
     const client = new QueryClient();
     const invalidate = vi.spyOn(client, "invalidateQueries");
     const strictWrapper = ({ children }: { children: ReactNode }) => (
@@ -103,6 +104,9 @@ describe("useStrandedFaultRetirementRequest", () => {
     );
     const { result } = renderHook(useStrandedFaultRetirementRequest, { wrapper: strictWrapper });
     act(() => result.current.submit("p1#1"));
+    expect(result.current.pending).toBe(true);
+    expect(retireMock).toHaveBeenCalledTimes(1);
+    await act(async () => { pending.resolve(confirmed); await pending.promise; });
     await waitFor(() => expect(result.current.outcome).toEqual({ kind: "confirmed", key: "p1#1" }));
     expect(result.current.pending).toBe(false);
     expect(invalidate).toHaveBeenCalledTimes(1);
