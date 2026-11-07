@@ -1,6 +1,6 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { ReactNode } from "react";
+import { StrictMode, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const retireMock = vi.hoisted(() => vi.fn());
@@ -62,5 +62,17 @@ describe("useStrandedFaultRetirementRequest", () => {
     const { result } = renderHook(useStrandedFaultRetirementRequest, { wrapper: wrapper(client) });
     act(() => result.current.submit("p1#1"));
     await waitFor(() => expect(result.current.outcome).toEqual({ kind: "error", key: "p1#1" }));
+  });
+
+  it("TH4: restores the mounted fence after Strict Mode effect replay", async () => {
+    retireMock.mockResolvedValueOnce(confirmed);
+    const client = new QueryClient();
+    const strictWrapper = ({ children }: { children: ReactNode }) => (
+      <StrictMode><QueryClientProvider client={client}>{children}</QueryClientProvider></StrictMode>
+    );
+    const { result } = renderHook(useStrandedFaultRetirementRequest, { wrapper: strictWrapper });
+    act(() => result.current.submit("p1#1"));
+    await waitFor(() => expect(result.current.outcome).toEqual({ kind: "confirmed", key: "p1#1" }));
+    expect(result.current.pending).toBe(false);
   });
 });
