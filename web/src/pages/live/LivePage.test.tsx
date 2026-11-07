@@ -1889,13 +1889,24 @@ describe("LivePage stranded-fault retirement (#1071, D225)", () => {
     let resolve!: (value: StrandedFaultRetirementResult) => void;
     retireStrandedFaultMock.mockImplementationOnce(() => new Promise<StrandedFaultRetirementResult>((done) => { resolve = done; }));
     eligibleHealth();
-    renderPage();
+    const { rerender } = renderPage();
     expect(screen.getByTestId("stranded-fault-retirement-card")).toBeInTheDocument();
     expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeInTheDocument();
     tickAll();
     fireEvent.click(screen.getByTestId("stranded-fault-submit"));
     expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
     expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    healthState.data = {
+      ...healthState.data!,
+      fault_controls: { status: "open", generation: 3, enabled_actions: ["emergency_stop"], physical_stop_operative: "true" },
+    } as never;
+    rerender();
+    expect(screen.getByTestId("live-fault-controls-status-unknown")).toBeInTheDocument();
+    expect(screen.getByTestId("live-fault-controls-emergency-stop")).toBeInTheDocument();
+    eligibleHealth();
+    rerender();
+    expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
+    expect(retireStrandedFaultMock).toHaveBeenCalledTimes(1);
     resolve({ outcome: "confirmed", attempted_generation: 3, restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false }, fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"] } });
     await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-outcome")).toBeInTheDocument());
   });

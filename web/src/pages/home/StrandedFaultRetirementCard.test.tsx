@@ -38,4 +38,10 @@ describe("StrandedFaultRetirementCard", () => {
     expect(screen.getByTestId("stranded-fault-retirement-outcome")).toHaveTextContent(/could not be confirmed/i);
     expect(screen.queryByTestId("stranded-fault-refresh-status")).toBeNull();
   });
+
+  it.each(["unconfirmed", "rejected", "error"] as const)("renders fixed %s outcome without a control", (kind) => {
+    render(<StrandedFaultRetirementOutcomeNotice kind={kind} onRefreshStatus={vi.fn()} />);
+    expect(screen.getByTestId("stranded-fault-retirement-outcome")).toBeInTheDocument();
+    expect(screen.queryByTestId("stranded-fault-refresh-status")).toBeNull();
+  });
 });

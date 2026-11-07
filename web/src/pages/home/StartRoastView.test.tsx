@@ -111,12 +111,18 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     let resolve!: (value: StrandedFaultRetirementResult) => void;
     retireStrandedFaultMock.mockImplementationOnce(() => new Promise<StrandedFaultRetirementResult>((done) => { resolve = done; }));
     eligibleHealth();
-    const { rerender } = renderView();
+    const { rerender, client } = renderView();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
     tickAll();
     fireEvent.click(screen.getByTestId("stranded-fault-submit"));
     expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
     expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
     expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("terminal-fault-action-emergency_stop"));
+    fireEvent.click(screen.getByTestId("terminal-fault-action-emergency_stop"));
+    await waitFor(() =>
+      expect(faultControlsActionMock).toHaveBeenCalledWith({ action: "emergency_stop" }),
+    );
     healthState.data = { ...healthState.data!, instance_id: "process-2" } as never;
     rerender();
     expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
@@ -124,6 +130,7 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     resolve({ outcome: "confirmed", attempted_generation: 3, restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false }, fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"] } });
     await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-card")).toBeInTheDocument());
     expect(screen.queryByTestId("stranded-fault-retirement-outcome")).toBeNull();
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["health"] });
   });
 
   it("TS5/TS8/TS12/TS14: retains pending precedence and displays retirement provenance without unlocking start", () => {
