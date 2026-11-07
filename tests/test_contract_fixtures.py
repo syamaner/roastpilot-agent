@@ -54,12 +54,16 @@ from roastpilot_agent.config import AppConfig, ControllerConfig, PostFirstCrackC
 from roastpilot_agent.models import (
     CatalogueRecommendation,
     CatalogueRecommendationList,
+    FaultLeaseClosureProvenance,
+    FaultLeaseStatus,
     MicStatus,
     RoastDetail,
     RoastEventKind,
     RoastSummary,
     SseEvent,
     SseEventType,
+    StrandedFaultRetirementEventData,
+    StrandedFaultRetirementEventOutcome,
     TelemetryEventData,
     TelemetrySeries,
 )
@@ -398,6 +402,20 @@ def _gap_fill_frames() -> list[SseEvent]:
         RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED,
         {"generation": 1, "status": "closed", "outcome": "confirmed"},
     )
+    broadcaster.emit(
+        RoastEventKind.FAULT_CONTROLS_CHANGED,
+        StrandedFaultRetirementEventData(
+            generation=1,
+            status=FaultLeaseStatus.CLOSED,
+            closure_provenance=FaultLeaseClosureProvenance.OPERATOR_ATTESTED_RETIREMENT,
+            physical_stop_operative=False,
+            retirement=StrandedFaultRetirementEventOutcome(
+                attempted_generation=1,
+                outcome="confirmed",
+                available=False,
+            ),
+        ).model_dump(mode="json"),
+    )
 
     # controller.py command-failure emit site shape (a rejected e-stop carries a reason).
     broadcaster.emit(
@@ -557,17 +575,23 @@ def _build_sse_payload(all_sse_frames: list[SseEvent]) -> _FixturePayload:
         for f in all_sse_frames
         if f.event is SseEventType.COMMAND_EXECUTED and f.data.get("command") == "drop_beans"
     ]
+    fault_controls_variants: list[_JsonObj] = [
+        _normalize_sse_frame(f.model_dump(mode="json"))
+        for f in all_sse_frames
+        if f.event is SseEventType.FAULT_CONTROLS_CHANGED and "retirement" in f.data
+    ]
 
     assert command_variants, "no drop_beans command_executed frame captured"
     # Re-validate: every frame still round-trips through the real SseEvent model
     # after normalization (so the fixture can never go stale silently vs the model).
-    for raw in primary + advisory_variants + command_variants:
+    for raw in primary + advisory_variants + command_variants + fault_controls_variants:
         SseEvent.model_validate(raw)
 
     return {
         "frames": primary,
         "advisory_variants": advisory_variants,
         "command_variants": command_variants,
+        "fault_controls_variants": fault_controls_variants,
     }
 
 
@@ -827,7 +851,12 @@ def test_committed_sse_fixture_matches_models() -> None:
     assert by_event == {t.value for t in SseEventType}, (
         "committed sse_frames.json is missing/extra event types — regenerate it"
     )
-    for frame in raw["frames"] + raw["advisory_variants"] + raw["command_variants"]:
+    for frame in (
+        raw["frames"]
+        + raw["advisory_variants"]
+        + raw["command_variants"]
+        + raw["fault_controls_variants"]
+    ):
         SseEvent.model_validate(frame)
 
 

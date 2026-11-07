@@ -26,6 +26,23 @@
       "id": 0
     }
   ],
+  "fault_controls_variants": [
+    {
+      "data": {
+        "closure_provenance": "operator_attested_retirement",
+        "generation": 1,
+        "physical_stop_operative": false,
+        "retirement": {
+          "attempted_generation": 1,
+          "available": false,
+          "outcome": "confirmed"
+        },
+        "status": "closed"
+      },
+      "event": "fault_controls_changed",
+      "id": 0
+    }
+  ],
   "frames": [
     {
       "data": {

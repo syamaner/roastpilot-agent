@@ -188,6 +188,7 @@ async def test_health_reports_version_and_no_active_run(client: AsyncClient) -> 
         "/api/restart-clearance",
         "/api/restart-clearance/closure-only",
         "/api/restart-clearance/initialize-safety-record",
+        "/api/restart-clearance/retire-stranded-fault",
         "/api/fault-controls/actions",
     ],
 )
@@ -234,6 +235,17 @@ async def test_fault_control_routes_bound_declared_and_chunked_bodies(
             "/api/restart-clearance/initialize-safety-record",
             {"physical_confirmation": True},
             "physical_confirmation",
+            200,
+            None,
+        ),
+        (
+            "/api/restart-clearance/retire-stranded-fault",
+            {
+                "stranded_fault_confirmation": (
+                    "roaster_stopped_empty_heat_fan_cooling_off_physical_stop_ready"
+                )
+            },
+            "stranded_fault_confirmation",
             200,
             None,
         ),
@@ -293,6 +305,55 @@ async def test_safety_record_initialization_body_forbids_unrecognised_fields(
 
     assert valid.status_code == 200
     assert valid.json()["outcome"] == "rejected"
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_stranded_fault_retirement_body_forbids_cross_route_confirmation_and_extras(
+    store: RoastStore,
+) -> None:
+    """D225's attestation grammar is distinct from other clearance routes."""
+    app = create_app(RoastService(store))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        d213_body = await instance.post(
+            "/api/restart-clearance/retire-stranded-fault", json={"physical_confirmation": True}
+        )
+        extra = await instance.post(
+            "/api/restart-clearance/retire-stranded-fault",
+            json={
+                "stranded_fault_confirmation": (
+                    "roaster_stopped_empty_heat_fan_cooling_off_physical_stop_ready"
+                ),
+                "operation_id": "not-public",
+            },
+        )
+    assert d213_body.status_code == extra.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/restart-clearance",
+        "/api/restart-clearance/initialize-safety-record",
+    ],
+)
+async def test_other_restart_clearance_routes_reject_the_d225_attestation_body(
+    store: RoastStore, path: str
+) -> None:
+    """D213 and D220 never accept D225's distinct operator attestation."""
+    app = create_app(RoastService(store))
+    transport = ASGITransport(app=app)
+    body = {
+        "stranded_fault_confirmation": (
+            "roaster_stopped_empty_heat_fan_cooling_off_physical_stop_ready"
+        )
+    }
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(path, json=body)
+
     assert response.status_code == 422
 
 

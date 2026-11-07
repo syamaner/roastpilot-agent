@@ -118,6 +118,7 @@ from roastpilot_agent.models import (
     FaultControlsProjection,
     FaultControlState,
     FaultCoolingStopResult,
+    FaultLeaseClosureProvenance,
     FaultLeaseStatus,
     HardwareClearAcknowledgementRequest,
     HardwareClearAcknowledgementResult,
@@ -147,6 +148,10 @@ from roastpilot_agent.models import (
     RoastTimeline,
     SseEvent,
     SseEventType,
+    StrandedFaultRetirementEventData,
+    StrandedFaultRetirementEventOutcome,
+    StrandedFaultRetirementRequest,
+    StrandedFaultRetirementResult,
     TastingEntryRequest,
     TastingList,
     TelemetryEventData,
@@ -174,6 +179,7 @@ from roastpilot_agent.store import (
     PhysicallyImpossibleWeightError,
     RoastStore,
     RunActivelyDrivenError,
+    StrandedFaultRetirementCommit,
 )
 
 _log = logging.getLogger(__name__)
@@ -546,6 +552,7 @@ _HARDWARE_CLEAR_MIN_INTERVAL_SECONDS = 1.0
 _RESTART_CLEARANCE_PATH = "/api/restart-clearance"
 _CLOSURE_ONLY_CLEARANCE_PATH = "/api/restart-clearance/closure-only"
 _INITIALIZE_SAFETY_RECORD_PATH = "/api/restart-clearance/initialize-safety-record"
+_RETIRE_STRANDED_FAULT_PATH = "/api/restart-clearance/retire-stranded-fault"
 _FAULT_CONTROLS_ACTIONS_PATH = "/api/fault-controls/actions"
 _FAULT_CONTROLS_MAX_BODY_BYTES = 1024
 
@@ -639,6 +646,89 @@ class _SafetyRecordInitializationContext:
     emergency_stop_admission_epoch: int
     generation: int
     operation_id: str
+
+
+@dataclass(frozen=True)
+class _RetirementIdentity:
+    """No-await binding for one stranded-fault retirement attempt."""
+
+    process_id: str
+    child: MCPServerProcess
+    child_epoch: int
+    cache_lease: FaultControlLease
+    emergency_stop_admission_epoch: int
+
+
+@dataclass(frozen=True)
+class _StrandedFaultRetirementContext:
+    """One owned D225 operation bound to an exact open lease."""
+
+    identity: _RetirementIdentity
+    expected_lease: FaultControlLease
+    operation_id: str
+
+
+@dataclass(frozen=True)
+class _StrandedFaultRetirementSnapshot:
+    """One coherent, fail-closed public view of D225 retirement state."""
+
+    lease: FaultControlLease
+    active: PersistedRun | None
+    latest: PersistedRun | None
+    gate: RestartClearanceState | None
+    provenance: FaultLeaseClosureProvenance | None
+    available: bool
+    physical_stop_operative: bool
+    fresh: bool
+    read_failed: bool
+    expected_cache: FaultControlLease
+    emergency_stop_admission_epoch: int
+
+
+@dataclass(frozen=True)
+class _FaultControlsProjectionBinding:
+    """No-await binding for preserving an established D212 controls projection."""
+
+    process_id: str
+    child: MCPServerProcess | None
+    child_epoch: int | None
+    child_running: bool | None
+    child_stop_unconfirmed: bool | None
+    roaster: object | None
+    executor: object | None
+    cache_lease: FaultControlLease
+    emergency_stop_admission_epoch: int
+    requires_live_restart_clearance: bool
+    restart_clearance_state: RestartClearanceState
+    shutdown_started: bool
+    recording_replay_mode: bool
+    transients: "_RetirementSnapshotTransients"
+
+
+@dataclass(frozen=True)
+class _RetirementSnapshotTransients:
+    """Reference-preserving local bindings for one D225 projection read."""
+
+    hardware_clear_request_in_flight: bool
+    starting_run_id: str | None
+    unpublished_start_run_id: str | None
+    active_run_id: str | None
+    runner: object | None
+    loop_task: object | None
+    detached_recovery_loop: object | None
+    fault_finalization_started: bool
+    emergency_stop_active: bool
+    d212_close_reserved: bool
+    retirement_fence: _StrandedFaultRetirementContext | None
+    retirement_reservation: object | None
+    retirement_reservation_done: bool
+    safety_record_initialization: object | None
+    safety_record_initialization_done: bool
+    unconfirmed_safety_record_generation: int | None
+    unconfirmed_fault_lease_generation: int | None
+    fault_lease_persistence_count: int
+    emergency_dispatch_active: bool
+    closure_end_task: object | None
 
 
 @dataclass(frozen=True)
@@ -2446,6 +2536,14 @@ class RoastService:
         # is rechecked. Until that exact operation proves current, never let a
         # health read turn its durable CLOSED row into local Start authority.
         self._unconfirmed_safety_record_generation: int | None = None
+        self._stranded_fault_retirement: (
+            tuple[_StrandedFaultRetirementContext, asyncio.Task[StrandedFaultRetirementResult]]
+            | None
+        ) = None
+        self._unconfirmed_stranded_fault_retirement: _StrandedFaultRetirementContext | None = None
+        self._retirement_event_ledger: (
+            tuple[int, frozenset[Literal["confirmed", "rejected", "unconfirmed"]]] | None
+        ) = None
         self._closure_end_task: tuple[str, asyncio.Task[EndRecoveredRunResult]] | None = None
         self._closure_end_lock = asyncio.Lock()
         # Serializes only recovered-run history mutations with D216's durable
@@ -2470,6 +2568,7 @@ class RoastService:
         # ordered live teardown drains these owned tasks before considering its
         # process epoch clean.
         self._fault_lease_persistence_tasks: set[asyncio.Task[None]] = set()
+        self._emergency_stop_dispatch_tasks: set[asyncio.Task[bool]] = set()
         # A bounded terminal-control settle timeout is an unclean teardown
         # outcome. It must prevent a later ordered teardown from claiming this
         # process epoch clean, even though service.shutdown itself stays
@@ -2736,15 +2835,46 @@ class RoastService:
         """
         if self._requires_live_restart_clearance:
             await self._ensure_restart_epoch()
-        active = await self._store.active_run()
-        lease = await self._read_fault_lease_fail_closed()
+        pre_snapshot_lease = await self._read_fault_lease_fail_closed()
+        pre_snapshot_controls_binding = self._capture_fault_controls_projection_binding()
+        pre_snapshot_active = await self._store.active_run()
         safety_record_initialization_available = (
-            await self._safety_record_initialization_may_be_admitted(lease, active)
+            await self._safety_record_initialization_may_be_admitted(
+                pre_snapshot_lease, pre_snapshot_active
+            )
         )
+        # Preserve the established D212 projection while the final D225
+        # snapshot proves the inputs have not changed underneath it.
+        pre_snapshot_controls = await self._fault_controls_projection(pre_snapshot_lease)
+        # This is deliberately the final await sequence for the D225-facing
+        # fields: all returned retirement state comes from this one snapshot.
+        snapshot = await self._stranded_fault_retirement_snapshot()
+        active = snapshot.active
+        lease = snapshot.lease
         restart_clearance = self._restart_clearance_projection(
             lease,
             active=active,
-            safety_record_initialization_available=safety_record_initialization_available,
+            safety_record_initialization_available=(
+                safety_record_initialization_available
+                and snapshot.fresh
+                and not snapshot.read_failed
+                and self._safety_record_initialization_entry_conditions_hold(lease, active)
+            ),
+            retirement_available=snapshot.available,
+        )
+        fault_controls = (
+            pre_snapshot_controls.model_copy(
+                update={
+                    "closure_provenance": snapshot.provenance,
+                    "physical_stop_operative": snapshot.physical_stop_operative,
+                }
+            )
+            if (
+                not snapshot.read_failed
+                and pre_snapshot_lease == snapshot.lease
+                and self._fault_controls_projection_binding_holds(pre_snapshot_controls_binding)
+            )
+            else self._fault_controls_snapshot_projection(snapshot)
         )
         return HealthResponse(
             version=__version__,
@@ -2758,7 +2888,7 @@ class RoastService:
             advisor=self._advisor_health,
             restart_clearance=restart_clearance,
             restart_clearance_required=not restart_clearance.eligible,
-            fault_controls=await self._fault_controls_projection(lease),
+            fault_controls=fault_controls,
         )
 
     async def _ensure_restart_epoch(self) -> None:
@@ -2819,6 +2949,18 @@ class RoastService:
                     run_id=None,
                     mcp_session_id=None,
                 )
+        retirement_fence = self._unconfirmed_stranded_fault_retirement
+        if (
+            retirement_fence is not None
+            and live.generation <= retirement_fence.expected_lease.generation
+            and lease.generation <= retirement_fence.expected_lease.generation
+        ):
+            return FaultControlLease(
+                generation=retirement_fence.expected_lease.generation,
+                status=FaultLeaseStatus.UNKNOWN,
+                run_id=retirement_fence.expected_lease.run_id,
+                mcp_session_id=retirement_fence.expected_lease.mcp_session_id,
+            )
         self._fault_lease_cache = lease
         return lease
 
@@ -2826,8 +2968,22 @@ class RoastService:
         self, lease: FaultControlLease, active: PersistedRun | None
     ) -> bool:
         """Return the fail-closed D220 snapshot eligibility projection."""
+        if not self._safety_record_initialization_entry_conditions_hold(lease, active):
+            return False
+        try:
+            return (
+                await self._store.probe_fault_control_lease_absence()
+                is FaultControlLeaseAbsence.ABSENT_UNTRUSTED
+            )
+        except Exception:  # noqa: BLE001 - an unreadable absence is never advertised
+            return False
+
+    def _safety_record_initialization_entry_conditions_hold(
+        self, lease: FaultControlLease, active: PersistedRun | None
+    ) -> bool:
+        """Return whether D220's local no-await eligibility conditions hold."""
         child = self._mcp
-        if (
+        return not (
             self._shutdown_started
             or not self._restart_epoch_initialized
             or self._restart_clearance_state is not RestartClearanceState.REQUIRED
@@ -2845,15 +3001,7 @@ class RoastService:
             or child is None
             or not child.running
             or self._roaster is None
-        ):
-            return False
-        try:
-            return (
-                await self._store.probe_fault_control_lease_absence()
-                is FaultControlLeaseAbsence.ABSENT_UNTRUSTED
-            )
-        except Exception:  # noqa: BLE001 - an unreadable absence is never advertised
-            return False
+        )
 
     def _restart_clearance_projection(
         self,
@@ -2861,6 +3009,7 @@ class RoastService:
         *,
         active: PersistedRun | None = None,
         safety_record_initialization_available: bool = False,
+        retirement_available: bool = False,
     ) -> RestartClearanceProjection:
         """Project the process gate; OPEN/UNKNOWN leases keep Start ineligible."""
         context = self._closure_only_context
@@ -2893,6 +3042,8 @@ class RoastService:
                 if closure_binding_current
                 else [OperatorAction.INITIALIZE_SAFETY_RECORD]
                 if safety_record_initialization_available
+                else [OperatorAction.RETIRE_STRANDED_FAULT]
+                if retirement_available
                 else []
             ),
             closure_only_available=closure_available,
@@ -3651,6 +3802,686 @@ class RoastService:
                 exc_info=(type(error), error, error.__traceback__),
             )
 
+    def _capture_retirement_identity(self) -> _RetirementIdentity | None:
+        """Capture the current child and lease before a D225 await."""
+        child = self._mcp
+        if (
+            not self._requires_live_restart_clearance
+            or self._shutdown_started
+            or self._recording_replay_mode
+            or child is None
+            or not child.running
+            or child.stop_unconfirmed
+            or self._roaster is None
+        ):
+            return None
+        return _RetirementIdentity(
+            process_id=self.instance_id,
+            child=child,
+            child_epoch=child.child_epoch,
+            cache_lease=self._fault_lease_cache,
+            emergency_stop_admission_epoch=self._emergency_stop_admission_epoch,
+        )
+
+    def _retirement_identity_holds(self, identity: _RetirementIdentity) -> bool:
+        """Return whether an awaited D225 proof still names this child and lease."""
+        child = identity.child
+        return (
+            self._requires_live_restart_clearance
+            and not self._shutdown_started
+            and not self._recording_replay_mode
+            and self.instance_id == identity.process_id
+            and self._mcp is child
+            and child.running
+            and not child.stop_unconfirmed
+            and child.child_epoch == identity.child_epoch
+            and self._roaster is not None
+            and self._fault_lease_cache == identity.cache_lease
+            and self._emergency_stop_admission_epoch == identity.emergency_stop_admission_epoch
+            and self._restart_clearance_state is RestartClearanceState.REQUIRED
+        )
+
+    def _retirement_conditions_hold(self) -> bool:
+        """Return the transient no-run/no-e-stop D225 admission predicate."""
+        return (
+            self._restart_epoch_initialized
+            and self._restart_clearance_state is RestartClearanceState.REQUIRED
+            and not self._hardware_clear_request_in_flight
+            and not any(not task.done() for task in self._emergency_stop_dispatch_tasks)
+            and not self._command_arbiter.emergency_stop_active
+            and not self._fault_acknowledgement_gate.fault_finalization_started
+            and not self._command_arbiter.close_reservation_is_current(
+                self._command_arbiter.generation
+            )
+            and self._unconfirmed_fault_lease_generation is None
+            and not self._fault_lease_persistence_tasks
+            and self._safety_record_initialization is None
+            and self._unconfirmed_safety_record_generation is None
+            and self._closure_end_task is None
+            and self._closure_only_context is None
+            and self._starting_run_id is None
+            and self._unpublished_start_run_id is None
+            and self.active_run_id is None
+            and self.runner is None
+            and self._loop_task is None
+            and self._detached_recovery_loop is None
+            and self._roaster is not None
+        )
+
+    def _retirement_open_admission(
+        self, lease: FaultControlLease, identity: _RetirementIdentity
+    ) -> bool:
+        """Return whether the durable reader and captured cache name one OPEN lease."""
+        return (
+            lease == identity.cache_lease
+            and lease.status is FaultLeaseStatus.OPEN
+            and lease.generation > 0
+            and lease.run_id is not None
+            and lease.mcp_session_id is not None
+            and (
+                self._unconfirmed_stranded_fault_retirement is None
+                or self._unconfirmed_stranded_fault_retirement.expected_lease.generation
+                < lease.generation
+            )
+        )
+
+    def _retirement_context_is_owned(self, context: _StrandedFaultRetirementContext) -> bool:
+        """Return whether both D225 reservations still belong to ``context``."""
+        reservation = self._stranded_fault_retirement
+        return (
+            self._unconfirmed_stranded_fault_retirement is context
+            and reservation is not None
+            and reservation[0] is context
+            and reservation[1] is asyncio.current_task()
+        )
+
+    def _owned_retirement_fence_for(
+        self, identity: _RetirementIdentity
+    ) -> _StrandedFaultRetirementContext | None:
+        """Return the exact captured fence that may only reconcile read-only.
+
+        A caller that captured a valid identity can lose a local binding while
+        waiting for the lock or a later admission read. If it already names its
+        own retained uncertainty fence, that is an honest unconfirmed result,
+        never a fresh admission rejection. Foreign and newer fences remain
+        ordinary rejections.
+        """
+        fence = self._unconfirmed_stranded_fault_retirement
+        if (
+            fence is not None
+            and fence.identity == identity
+            and fence.expected_lease == identity.cache_lease
+        ):
+            return fence
+        return None
+
+    async def _stranded_fault_retirement_snapshot(self) -> _StrandedFaultRetirementSnapshot:
+        """Read one current D225 projection without asking the MCP child.
+
+        The entry identity is deliberately captured before the first store
+        await.  The ordinary reader may itself hydrate the cache, so its
+        post-read cache becomes the expected snapshot cache only when every
+        other captured binding still holds.  A later mismatch refreshes solely
+        through that ordinary reader; it never fabricates a newer UNKNOWN.
+        """
+        entry_identity = self._capture_retirement_identity()
+        entry_transients = self._retirement_snapshot_transient_marker()
+        lease = await self._read_fault_lease_fail_closed()
+        expected_cache = self._fault_lease_cache
+        expected_emergency_stop_admission_epoch = self._emergency_stop_admission_epoch
+        read_failed = False
+        try:
+            active = await self._store.active_run()
+            latest = await self._store.read_latest_run()
+            gate = await self._store.read_process_restart_clearance(self.instance_id)
+        except Exception:  # noqa: BLE001 - projection never grants on a read error
+            read_failed = True
+            active = None
+            latest = None
+            gate = None
+        provenance: FaultLeaseClosureProvenance | None = None
+        if not read_failed and lease.status is FaultLeaseStatus.CLOSED:
+            try:
+                candidate = await self._store.read_fault_control_lease_closure_provenance(lease)
+            except Exception:  # noqa: BLE001 - provenance is never inferred
+                read_failed = True
+                candidate = None
+            if self._fault_lease_cache == expected_cache:
+                provenance = candidate
+        binding_current = (
+            self._retirement_snapshot_binding_holds(
+                entry_identity, expected_cache, entry_transients
+            )
+            and not read_failed
+        )
+        if not binding_current:
+            # The ordinary reader has the closed precedence order for e-stop,
+            # newer live leases and both fences.  It is the only honest refresh.
+            lease = await self._read_fault_lease_fail_closed()
+            provenance = None
+        available = (
+            binding_current
+            and entry_identity is not None
+            and self._retirement_conditions_hold()
+            and active is None
+            and gate is RestartClearanceState.REQUIRED
+            and latest is not None
+            and latest.run_id == lease.run_id
+            and latest.completed_at_utc is not None
+            and latest.outcome == "faulted"
+            and latest.agent_phase is RoastPhase.FAULTED
+            and self._retirement_open_admission(lease, entry_identity)
+            and self._stranded_fault_retirement is None
+        )
+        # This describes only whether the separately-operated physical stop is
+        # the conservative control in a stranded or uncertain lease state.
+        physical_stop_operative = (
+            lease.status in (FaultLeaseStatus.OPEN, FaultLeaseStatus.UNKNOWN)
+            and self.runner is None
+            and (
+                available
+                or self._stranded_fault_retirement is not None
+                or self._unconfirmed_stranded_fault_retirement is not None
+                or not binding_current
+            )
+        )
+        if not binding_current:
+            provenance = None
+        return _StrandedFaultRetirementSnapshot(
+            lease=lease,
+            active=active,
+            latest=latest,
+            gate=gate,
+            provenance=provenance,
+            available=available,
+            physical_stop_operative=physical_stop_operative,
+            fresh=binding_current,
+            read_failed=read_failed,
+            expected_cache=expected_cache,
+            emergency_stop_admission_epoch=expected_emergency_stop_admission_epoch,
+        )
+
+    def _capture_fault_controls_projection_binding(self) -> _FaultControlsProjectionBinding:
+        """Capture the local state that makes an established D212 projection current.
+
+        D212 can be valid for a legacy terminal lease without a process child.
+        That is distinct from D225, whose retirement admission requires a live,
+        typed child. The optional child is held by reference so the historical
+        controls never survive a process-local replacement or status change.
+        """
+        child = self._mcp
+        return _FaultControlsProjectionBinding(
+            process_id=self.instance_id,
+            child=child,
+            child_epoch=None if child is None else child.child_epoch,
+            child_running=None if child is None else child.running,
+            child_stop_unconfirmed=None if child is None else child.stop_unconfirmed,
+            roaster=self._roaster,
+            executor=self._fault_control_executor,
+            cache_lease=self._fault_lease_cache,
+            emergency_stop_admission_epoch=self._emergency_stop_admission_epoch,
+            requires_live_restart_clearance=self._requires_live_restart_clearance,
+            restart_clearance_state=self._restart_clearance_state,
+            shutdown_started=self._shutdown_started,
+            recording_replay_mode=self._recording_replay_mode,
+            transients=self._retirement_snapshot_transient_marker(),
+        )
+
+    def _fault_controls_projection_binding_holds(
+        self, expected: _FaultControlsProjectionBinding
+    ) -> bool:
+        """Return whether an established D212 projection remains current."""
+        child = self._mcp
+        return (
+            self.instance_id == expected.process_id
+            and child is expected.child
+            and (child is None or child.child_epoch == expected.child_epoch)
+            and (child is None or child.running == expected.child_running)
+            and (child is None or child.stop_unconfirmed == expected.child_stop_unconfirmed)
+            and self._roaster is expected.roaster
+            and self._fault_control_executor is expected.executor
+            and self._fault_lease_cache == expected.cache_lease
+            and self._emergency_stop_admission_epoch == expected.emergency_stop_admission_epoch
+            and self._requires_live_restart_clearance == expected.requires_live_restart_clearance
+            and self._restart_clearance_state is expected.restart_clearance_state
+            and not self._shutdown_started
+            and not self._recording_replay_mode
+            and self._shutdown_started == expected.shutdown_started
+            and self._recording_replay_mode == expected.recording_replay_mode
+            and self._retirement_snapshot_transients_hold(expected.transients)
+        )
+
+    def _retirement_snapshot_binding_holds(
+        self,
+        identity: _RetirementIdentity | None,
+        expected_cache: FaultControlLease,
+        expected_transients: _RetirementSnapshotTransients,
+    ) -> bool:
+        """Return whether a projection read retained its non-eligibility binding."""
+        if identity is None:
+            return False
+        child = identity.child
+        return (
+            self._requires_live_restart_clearance
+            and not self._shutdown_started
+            and not self._recording_replay_mode
+            and self.instance_id == identity.process_id
+            and self._mcp is child
+            and child.running
+            and not child.stop_unconfirmed
+            and child.child_epoch == identity.child_epoch
+            and self._roaster is not None
+            and self._fault_lease_cache == expected_cache
+            and self._emergency_stop_admission_epoch == identity.emergency_stop_admission_epoch
+            and self._retirement_snapshot_transients_hold(expected_transients)
+        )
+
+    def _retirement_snapshot_transient_marker(self) -> _RetirementSnapshotTransients:
+        """Capture local state that can stale a D225 projection without a lease move."""
+        reservation = self._stranded_fault_retirement
+        initialization = self._safety_record_initialization
+        return _RetirementSnapshotTransients(
+            hardware_clear_request_in_flight=self._hardware_clear_request_in_flight,
+            starting_run_id=self._starting_run_id,
+            unpublished_start_run_id=self._unpublished_start_run_id,
+            active_run_id=self.active_run_id,
+            runner=self.runner,
+            loop_task=self._loop_task,
+            detached_recovery_loop=self._detached_recovery_loop,
+            fault_finalization_started=self._fault_acknowledgement_gate.fault_finalization_started,
+            emergency_stop_active=self._command_arbiter.emergency_stop_active,
+            d212_close_reserved=self._command_arbiter.close_reservation_is_current(
+                self._command_arbiter.generation
+            ),
+            retirement_fence=self._unconfirmed_stranded_fault_retirement,
+            retirement_reservation=reservation,
+            retirement_reservation_done=False if reservation is None else reservation[1].done(),
+            safety_record_initialization=initialization,
+            safety_record_initialization_done=(
+                False if initialization is None else initialization[1].done()
+            ),
+            unconfirmed_safety_record_generation=self._unconfirmed_safety_record_generation,
+            unconfirmed_fault_lease_generation=self._unconfirmed_fault_lease_generation,
+            fault_lease_persistence_count=len(self._fault_lease_persistence_tasks),
+            emergency_dispatch_active=any(
+                not task.done() for task in self._emergency_stop_dispatch_tasks
+            ),
+            closure_end_task=self._closure_end_task,
+        )
+
+    def _retirement_snapshot_transients_hold(self, expected: _RetirementSnapshotTransients) -> bool:
+        """Return whether scalar and reference-bearing snapshot state is unchanged."""
+        current = self._retirement_snapshot_transient_marker()
+        return (
+            current.hardware_clear_request_in_flight == expected.hardware_clear_request_in_flight
+            and current.starting_run_id == expected.starting_run_id
+            and current.unpublished_start_run_id == expected.unpublished_start_run_id
+            and current.active_run_id == expected.active_run_id
+            and current.runner is expected.runner
+            and current.loop_task is expected.loop_task
+            and current.detached_recovery_loop is expected.detached_recovery_loop
+            and current.fault_finalization_started == expected.fault_finalization_started
+            and current.emergency_stop_active == expected.emergency_stop_active
+            and current.d212_close_reserved == expected.d212_close_reserved
+            and current.retirement_fence is expected.retirement_fence
+            and current.retirement_reservation is expected.retirement_reservation
+            and current.retirement_reservation_done == expected.retirement_reservation_done
+            and current.safety_record_initialization is expected.safety_record_initialization
+            and current.safety_record_initialization_done
+            == expected.safety_record_initialization_done
+            and current.unconfirmed_safety_record_generation
+            == expected.unconfirmed_safety_record_generation
+            and current.unconfirmed_fault_lease_generation
+            == expected.unconfirmed_fault_lease_generation
+            and current.fault_lease_persistence_count == expected.fault_lease_persistence_count
+            and current.emergency_dispatch_active == expected.emergency_dispatch_active
+            and current.closure_end_task is expected.closure_end_task
+        )
+
+    def _fault_controls_snapshot_projection(
+        self, snapshot: _StrandedFaultRetirementSnapshot
+    ) -> FaultControlsProjection:
+        """Project D225 fields without adding an MCP read to a snapshot."""
+        lease = snapshot.lease
+        actions = (
+            [OperatorAction.EMERGENCY_STOP]
+            if (
+                self._requires_live_restart_clearance
+                and self._restart_clearance_state is not RestartClearanceState.CLEARED
+            )
+            or lease.status in (FaultLeaseStatus.OPEN, FaultLeaseStatus.UNKNOWN)
+            else []
+        )
+        return FaultControlsProjection(
+            status=lease.status,
+            generation=None if lease.generation == 0 else lease.generation,
+            enabled_actions=actions,
+            closure_provenance=snapshot.provenance,
+            physical_stop_operative=snapshot.physical_stop_operative,
+        )
+
+    async def _stranded_fault_retirement_result(
+        self,
+        outcome: Literal["confirmed", "rejected", "unconfirmed"],
+        attempted_generation: int | None,
+        snapshot: _StrandedFaultRetirementSnapshot | None = None,
+    ) -> StrandedFaultRetirementResult:
+        """Build a current public D225 result without exposing operation identities."""
+        current = snapshot or await self._stranded_fault_retirement_snapshot()
+        controls = self._fault_controls_snapshot_projection(current)
+        return StrandedFaultRetirementResult(
+            outcome=outcome,
+            attempted_generation=attempted_generation,
+            restart_clearance=self._restart_clearance_projection(
+                current.lease,
+                active=current.active,
+                retirement_available=current.available,
+            ),
+            fault_controls=controls,
+        )
+
+    async def _emit_stranded_fault_retirement(
+        self,
+        result: StrandedFaultRetirementResult,
+        attempted_generation: int,
+        context: _StrandedFaultRetirementContext,
+        snapshot: _StrandedFaultRetirementSnapshot | None = None,
+    ) -> None:
+        """Broadcast one bounded current D225 outcome without durable history writes."""
+        ledger = self._retirement_event_ledger
+        if ledger is not None and attempted_generation < ledger[0]:
+            return
+        emitted: frozenset[Literal["confirmed", "rejected", "unconfirmed"]] = (
+            frozenset() if ledger is None or attempted_generation > ledger[0] else ledger[1]
+        )
+        if result.outcome in emitted:
+            return
+        current = snapshot or await self._stranded_fault_retirement_snapshot()
+        # The result and the event use the same snapshot; do not reinterpret a
+        # later e-stop as an invented retirement frame.
+        child = context.identity.child
+        if (
+            self._shutdown_started
+            or self.instance_id != context.identity.process_id
+            or self._mcp is not child
+            or not child.running
+            or child.stop_unconfirmed
+            or child.child_epoch != context.identity.child_epoch
+            or self._emergency_stop_admission_epoch
+            != context.identity.emergency_stop_admission_epoch
+            or self._emergency_stop_admission_epoch != current.emergency_stop_admission_epoch
+            or self._fault_lease_cache != current.expected_cache
+        ):
+            return
+        payload = StrandedFaultRetirementEventData(
+            generation=None if current.lease.generation == 0 else current.lease.generation,
+            status=current.lease.status,
+            closure_provenance=current.provenance,
+            physical_stop_operative=current.physical_stop_operative,
+            retirement=StrandedFaultRetirementEventOutcome(
+                attempted_generation=attempted_generation,
+                outcome=result.outcome,
+                available=current.available,
+            ),
+        ).model_dump(mode="json")
+        self.events.emit(RoastEventKind.FAULT_CONTROLS_CHANGED, payload)
+        self._retirement_event_ledger = (
+            attempted_generation,
+            emitted | frozenset((result.outcome,)),
+        )
+
+    async def retire_stranded_fault(
+        self, request: StrandedFaultRetirementRequest
+    ) -> StrandedFaultRetirementResult:
+        """Retire only one verified terminal-faulted lease while restart stays gated."""
+        del request
+        identity = self._capture_retirement_identity()
+        if identity is None:
+            return await self._stranded_fault_retirement_result("rejected", None)
+        async with self._restart_clearance_lock:
+            existing = self._stranded_fault_retirement
+            if existing is not None:
+                if existing[1].done():
+                    self._finish_stranded_fault_retirement(existing[0], existing[1])
+                else:
+                    return await self._stranded_fault_retirement_result("rejected", None)
+            if not self._retirement_identity_holds(identity):
+                fence = self._owned_retirement_fence_for(identity)
+                if fence is not None:
+                    return await self._stranded_fault_retirement_result(
+                        "unconfirmed", fence.expected_lease.generation
+                    )
+                return await self._stranded_fault_retirement_result("rejected", None)
+            await self._ensure_restart_epoch()
+            if (
+                not self._retirement_identity_holds(identity)
+                or not self._retirement_conditions_hold()
+            ):
+                fence = self._owned_retirement_fence_for(identity)
+                if fence is not None:
+                    return await self._stranded_fault_retirement_result(
+                        "unconfirmed", fence.expected_lease.generation
+                    )
+                return await self._stranded_fault_retirement_result("rejected", None)
+            lease = await self._read_fault_lease_fail_closed()
+            if (
+                not self._retirement_identity_holds(identity)
+                or not self._retirement_conditions_hold()
+            ):
+                fence = self._owned_retirement_fence_for(identity)
+                if fence is not None:
+                    return await self._stranded_fault_retirement_result(
+                        "unconfirmed", fence.expected_lease.generation
+                    )
+                return await self._stranded_fault_retirement_result("rejected", None)
+            fence = self._unconfirmed_stranded_fault_retirement
+            if (
+                fence is not None
+                and fence.expected_lease.generation == identity.cache_lease.generation
+            ):
+                if (
+                    fence.identity != identity
+                    or not self._retirement_conditions_hold()
+                    or self._stranded_fault_retirement is not None
+                    or lease
+                    != FaultControlLease(
+                        generation=fence.expected_lease.generation,
+                        status=FaultLeaseStatus.UNKNOWN,
+                        run_id=fence.expected_lease.run_id,
+                        mcp_session_id=fence.expected_lease.mcp_session_id,
+                    )
+                ):
+                    return await self._stranded_fault_retirement_result(
+                        "unconfirmed", fence.expected_lease.generation
+                    )
+                try:
+                    verified = await self._store.verify_stranded_fault_retirement(
+                        process_id=fence.identity.process_id,
+                        generation=fence.expected_lease.generation,
+                        run_id=cast(str, fence.expected_lease.run_id),
+                        mcp_session_id=cast(str, fence.expected_lease.mcp_session_id),
+                        operation_id=fence.operation_id,
+                    )
+                except Exception:  # noqa: BLE001 - only exact proof can clear this fence
+                    verified = False
+                if (
+                    verified
+                    and self._unconfirmed_stranded_fault_retirement is fence
+                    and self._retirement_identity_holds(identity)
+                    and self._retirement_conditions_hold()
+                ):
+                    self._fault_lease_cache = FaultControlLease(
+                        generation=fence.expected_lease.generation,
+                        status=FaultLeaseStatus.CLOSED,
+                        run_id=fence.expected_lease.run_id,
+                        mcp_session_id=fence.expected_lease.mcp_session_id,
+                    )
+                    self._unconfirmed_stranded_fault_retirement = None
+                    retirement_outcome: Literal["confirmed", "unconfirmed"] = "confirmed"
+                else:
+                    retirement_outcome = "unconfirmed"
+                snapshot = await self._stranded_fault_retirement_snapshot()
+                result = await self._stranded_fault_retirement_result(
+                    retirement_outcome, fence.expected_lease.generation, snapshot
+                )
+                await self._emit_stranded_fault_retirement(
+                    result, fence.expected_lease.generation, fence, snapshot
+                )
+                return result
+            if not self._retirement_open_admission(lease, identity):
+                return await self._stranded_fault_retirement_result("rejected", None)
+            try:
+                active = await self._store.active_run()
+                if (
+                    not self._retirement_identity_holds(identity)
+                    or not self._retirement_conditions_hold()
+                ):
+                    return await self._stranded_fault_retirement_result("rejected", None)
+                latest = await self._store.read_latest_run()
+                if (
+                    not self._retirement_identity_holds(identity)
+                    or not self._retirement_conditions_hold()
+                ):
+                    return await self._stranded_fault_retirement_result("rejected", None)
+                gate = await self._store.read_process_restart_clearance(self.instance_id)
+            except Exception:  # noqa: BLE001 - unreadable durable evidence rejects
+                return await self._stranded_fault_retirement_result("rejected", None)
+            if (
+                not self._retirement_identity_holds(identity)
+                or not self._retirement_conditions_hold()
+                or gate is not RestartClearanceState.REQUIRED
+                or active is not None
+                or latest is None
+                or latest.run_id != lease.run_id
+                or latest.completed_at_utc is None
+                or latest.outcome != "faulted"
+                or latest.agent_phase is not RoastPhase.FAULTED
+            ):
+                return await self._stranded_fault_retirement_result("rejected", None)
+            context = _StrandedFaultRetirementContext(
+                identity=identity, expected_lease=lease, operation_id=uuid.uuid4().hex
+            )
+            self._unconfirmed_stranded_fault_retirement = context
+            task = asyncio.create_task(self._retire_stranded_fault_task(context))
+            self._stranded_fault_retirement = (context, task)
+            task.add_done_callback(
+                lambda completed: self._finish_stranded_fault_retirement(context, completed)
+            )
+        return await asyncio.shield(task)
+
+    async def _retire_stranded_fault_task(
+        self, context: _StrandedFaultRetirementContext
+    ) -> StrandedFaultRetirementResult:
+        """Own the one presence proof and D225 store operation."""
+        generation = context.expected_lease.generation
+        if (
+            not self._retirement_context_is_owned(context)
+            or not self._retirement_identity_holds(context.identity)
+            or not self._retirement_conditions_hold()
+        ):
+            return await self._reject_stranded_fault_retirement(context)
+        try:
+            presence = await cast(RoasterControl, self._roaster).read_session_presence()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - unproven current presence rejects
+            return await self._reject_stranded_fault_retirement(context)
+        if (
+            presence != "none"
+            or not self._retirement_context_is_owned(context)
+            or not self._retirement_identity_holds(context.identity)
+            or not self._retirement_conditions_hold()
+        ):
+            return await self._reject_stranded_fault_retirement(context)
+        try:
+            outcome = await self._store.retire_stranded_fault_lease(
+                process_id=context.identity.process_id,
+                generation=generation,
+                run_id=cast(str, context.expected_lease.run_id),
+                mcp_session_id=cast(str, context.expected_lease.mcp_session_id),
+                operation_id=context.operation_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - exact verification is the only recovery
+            outcome = StrandedFaultRetirementCommit.INDETERMINATE
+        if outcome is StrandedFaultRetirementCommit.PRECONDITION_REJECTED:
+            if self._unconfirmed_stranded_fault_retirement is context:
+                self._unconfirmed_stranded_fault_retirement = None
+            snapshot = await self._stranded_fault_retirement_snapshot()
+            result = await self._stranded_fault_retirement_result("rejected", generation, snapshot)
+            await self._emit_stranded_fault_retirement(result, generation, context, snapshot)
+            return result
+        confirmed = outcome is StrandedFaultRetirementCommit.COMMITTED_VERIFIED
+        if (
+            not confirmed
+            and self._unconfirmed_stranded_fault_retirement is context
+            and self._retirement_identity_holds(context.identity)
+            and self._retirement_conditions_hold()
+        ):
+            try:
+                confirmed = await self._store.verify_stranded_fault_retirement(
+                    process_id=context.identity.process_id,
+                    generation=generation,
+                    run_id=cast(str, context.expected_lease.run_id),
+                    mcp_session_id=cast(str, context.expected_lease.mcp_session_id),
+                    operation_id=context.operation_id,
+                )
+            except Exception:  # noqa: BLE001 - retain uncertainty fence
+                confirmed = False
+        if (
+            confirmed
+            and self._retirement_context_is_owned(context)
+            and self._retirement_identity_holds(context.identity)
+            and self._retirement_conditions_hold()
+        ):
+            self._fault_lease_cache = FaultControlLease(
+                generation=generation,
+                status=FaultLeaseStatus.CLOSED,
+                run_id=context.expected_lease.run_id,
+                mcp_session_id=context.expected_lease.mcp_session_id,
+            )
+            self._unconfirmed_stranded_fault_retirement = None
+            retirement_outcome = "confirmed"
+        else:
+            retirement_outcome = "unconfirmed"
+        snapshot = await self._stranded_fault_retirement_snapshot()
+        result = await self._stranded_fault_retirement_result(
+            retirement_outcome, generation, snapshot
+        )
+        await self._emit_stranded_fault_retirement(result, generation, context, snapshot)
+        return result
+
+    async def _reject_stranded_fault_retirement(
+        self, context: _StrandedFaultRetirementContext
+    ) -> StrandedFaultRetirementResult:
+        """Release one pre-write fence and report its bounded rejected outcome."""
+        if self._unconfirmed_stranded_fault_retirement is context:
+            self._unconfirmed_stranded_fault_retirement = None
+        snapshot = await self._stranded_fault_retirement_snapshot()
+        result = await self._stranded_fault_retirement_result(
+            "rejected", context.expected_lease.generation, snapshot
+        )
+        await self._emit_stranded_fault_retirement(
+            result, context.expected_lease.generation, context, snapshot
+        )
+        return result
+
+    def _finish_stranded_fault_retirement(
+        self,
+        context: _StrandedFaultRetirementContext,
+        task: asyncio.Task[StrandedFaultRetirementResult],
+    ) -> None:
+        """Release only the finished reservation that still belongs to this task."""
+        if (
+            self._stranded_fault_retirement is not None
+            and self._stranded_fault_retirement[0] is context
+            and self._stranded_fault_retirement[1] is task
+        ):
+            self._stranded_fault_retirement = None
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            task.exception()
+
     def _restart_clearance_admission_is_current(
         self,
         expected_cached_lease: FaultControlLease,
@@ -4157,6 +4988,7 @@ class RoastService:
                     live_runner=live_runner,
                 )
             )
+            self._track_emergency_stop_dispatch(dispatch)
             try:
                 confirmed = await asyncio.shield(dispatch)
             except asyncio.CancelledError:
@@ -4199,6 +5031,7 @@ class RoastService:
                 emergency_generation=emergency_generation,
             )
         )
+        self._track_emergency_stop_dispatch(dispatch)
         try:
             dispatched = await asyncio.shield(dispatch)
         except asyncio.CancelledError:
@@ -4274,6 +5107,11 @@ class RoastService:
     async def _fault_controls_projection_after_action(self) -> FaultControlsProjection:
         """Refresh the server-owned lease projection after a control admission."""
         return await self._fault_controls_projection(await self._read_fault_lease_fail_closed())
+
+    def _track_emergency_stop_dispatch(self, task: asyncio.Task[bool]) -> None:
+        """Keep an in-flight emergency dispatch visible to D225 admission."""
+        self._emergency_stop_dispatch_tasks.add(task)
+        task.add_done_callback(self._emergency_stop_dispatch_tasks.discard)
 
     def _admit_fault_control_lease(
         self,
@@ -5619,6 +6457,11 @@ class RoastService:
             initialization[1].cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await initialization[1]
+        retirement = self._stranded_fault_retirement
+        if retirement is not None and not retirement[1].done():
+            retirement[1].cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await retirement[1]
         closure_end = self._closure_end_task
         if closure_end is not None and not closure_end[1].done():
             try:
@@ -6594,6 +7437,7 @@ class RoastService:
                     emergency_generation=emergency_generation,
                 )
             )
+            self._track_emergency_stop_dispatch(dispatch)
             # An HTTP disconnect only cancels this waiter. The admitted stop
             # remains controller-owned until its dispatch reports an outcome.
             try:
@@ -7611,6 +8455,13 @@ async def initialize_safety_record(
     return await service.initialize_missing_fault_control_safety_record(request)
 
 
+async def retire_stranded_fault(
+    request: StrandedFaultRetirementRequest, service: ServiceDep
+) -> StrandedFaultRetirementResult:
+    """``POST /api/restart-clearance/retire-stranded-fault`` — D225 only."""
+    return await service.retire_stranded_fault(request)
+
+
 async def end_recovered_run(run_id: str, service: ServiceDep) -> EndRecoveredRunResult:
     """``POST /api/roasts/{run_id}/end-recovered-run`` — close one recovered run."""
     try:
@@ -8482,6 +9333,11 @@ def create_app(
     )
     app.add_middleware(
         _RouteBodyLimitMiddleware,
+        path=_RETIRE_STRANDED_FAULT_PATH,
+        max_body_bytes=_FAULT_CONTROLS_MAX_BODY_BYTES,
+    )
+    app.add_middleware(
+        _RouteBodyLimitMiddleware,
         path=_FAULT_CONTROLS_ACTIONS_PATH,
         max_body_bytes=_FAULT_CONTROLS_MAX_BODY_BYTES,
     )
@@ -8494,6 +9350,7 @@ def create_app(
     app.post(_RESTART_CLEARANCE_PATH)(acknowledge_restart_clearance)
     app.post(_CLOSURE_ONLY_CLEARANCE_PATH)(acknowledge_closure_only_clearance)
     app.post(_INITIALIZE_SAFETY_RECORD_PATH)(initialize_safety_record)
+    app.post(_RETIRE_STRANDED_FAULT_PATH)(retire_stranded_fault)
     app.post(_FAULT_CONTROLS_ACTIONS_PATH)(submit_fault_controls_action)
     app.post("/api/roasts", status_code=201)(start_roast)
     app.get("/api/roasts")(list_roasts)
