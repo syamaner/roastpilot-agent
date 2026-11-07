@@ -652,6 +652,7 @@ async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g
             return "none"
 
         _roaster.read_session_presence = counted_none  # type: ignore[method-assign]
+        frames = service.events.subscribe()
         transaction_entered = asyncio.Event()
         release_transaction = asyncio.Event()
         dispatch_reached = asyncio.Event()
@@ -719,6 +720,9 @@ async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g
         assert retirement_result.outcome == "unconfirmed"
         assert estop_result.action is OperatorAction.EMERGENCY_STOP
         assert service._emergency_stop_dispatch_tasks == set()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        estop_frame = frames.get_nowait()
+        assert estop_frame.event.value == RoastEventKind.FAULT_CONTROLS_CHANGED.value
+        assert estop_frame.data["generation"] == 2
         await service.settle_fault_lease_persistence_for_teardown()
         generation_two = await tmp_store.read_fault_control_lease()
         assert generation_two.generation == 2
@@ -1467,6 +1471,80 @@ async def test_tb_evt_is_broadcast_only_and_never_exposes_private_retirement_ide
         assert frames.empty()
         assert emitted.event.value == RoastEventKind.FAULT_CONTROLS_CHANGED.value
         assert "outcome" not in emitted.data
+        for private_value in (
+            "terminal-faulted-run",
+            "fault-session",
+            service.instance_id,
+            operation_ids[0],
+            str(tmp_store._db_path),  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        ):
+            assert private_value not in rendered
+        await service.shutdown()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "presence"),
+    [("unconfirmed", "none"), ("rejected", "active")],
+)
+async def test_retirement_public_unconfirmed_and_reserved_rejection_paths_never_log_or_return_ids(
+    tmp_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outcome: str,
+    presence: str,
+) -> None:
+    """TB privacy: all completed D225 public outcomes exclude private identifiers."""
+    await tmp_store.initialize()
+    try:
+        service, roaster = await _eligible_service(tmp_store)
+        caplog.set_level(logging.DEBUG, logger=api_module.__name__)
+        caplog.clear()
+        operation_ids: list[str] = []
+        original_retire = tmp_store.retire_stranded_fault_lease
+        original_emit = service._emit_stranded_fault_retirement  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+        async def capture_operation(**kwargs: object) -> StrandedFaultRetirementCommit:
+            if outcome == "unconfirmed":
+                return StrandedFaultRetirementCommit.INDETERMINATE
+            return await original_retire(**cast("Any", kwargs))
+
+        async def capture_emit(
+            result: Any, attempted_generation: int, context: Any, snapshot: Any = None
+        ) -> None:
+            operation_ids.append(context.operation_id)
+            await original_emit(result, attempted_generation, context, snapshot)
+
+        async def selected_presence() -> str:
+            return presence
+
+        roaster.read_session_presence = selected_presence  # type: ignore[method-assign]
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", capture_operation)
+        monkeypatch.setattr(service, "_emit_stranded_fault_retirement", capture_emit)
+        frames = service.events.subscribe()
+        app = create_app(service)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/restart-clearance/retire-stranded-fault",
+                json=_retirement_request().model_dump(mode="json"),
+            )
+
+        body = response.json()
+        emitted = frames.get_nowait()
+        application_logs = [
+            record.getMessage() for record in caplog.records if record.name == api_module.__name__
+        ]
+        rendered = "|".join((response.text, str(body), str(emitted.data), *application_logs))
+
+        assert response.status_code == 200
+        assert body["outcome"] == outcome
+        assert emitted.event.value == RoastEventKind.FAULT_CONTROLS_CHANGED.value
+        assert emitted.data["retirement"]["outcome"] == outcome
+        assert len(operation_ids) == 1
+        assert frames.empty()
         for private_value in (
             "terminal-faulted-run",
             "fault-session",
