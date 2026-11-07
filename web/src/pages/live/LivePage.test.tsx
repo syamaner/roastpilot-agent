@@ -1958,14 +1958,14 @@ describe("LivePage stranded-fault retirement (#1071, D225)", () => {
   });
 
   it("TL1/TS12: displays provenance only for operator-attested retirement and retains the ordinary D213 gate", () => {
-    for (const closure_provenance of ["exact_session_safe_zero", "baseline", null]) {
+    for (const closure_provenance of ["exact_session_safe_zero", "baseline", null, undefined]) {
       healthState.isSuccess = true;
       healthState.isError = false;
       healthState.isFresh = true;
       healthState.data = {
         active_run_id: null,
         restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
-        fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"], closure_provenance },
+        fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"], ...(closure_provenance === undefined ? {} : { closure_provenance }) },
       } as never;
       renderPage();
       expect(screen.getByTestId("restart-clearance-required")).toBeInTheDocument();

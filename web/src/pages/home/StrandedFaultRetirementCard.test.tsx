@@ -6,21 +6,34 @@ import { StrandedFaultRetirementCard, StrandedFaultRetirementOutcomeNotice, Stra
 const boxes = ["stranded-fault-stopped-empty", "stranded-fault-heat-off", "stranded-fault-fan-cooling-off", "stranded-fault-independent-stop"];
 
 describe("StrandedFaultRetirementCard", () => {
-  it("TC6a-d/TC7: requires all four fresh checks and consumes a submit gesture synchronously", () => {
+  it.each(boxes)("TC6: requires the independently missing %s check", (missing) => {
     const submit = vi.fn();
     render(<StrandedFaultRetirementCard onSubmit={submit} />);
     fireEvent.click(screen.getByTestId("stranded-fault-open"));
-    expect(screen.getByTestId("stranded-fault-stopped-empty")).toHaveFocus();
+    for (const id of boxes.filter((id) => id !== missing)) fireEvent.click(screen.getByTestId(id));
     const button = screen.getByTestId("stranded-fault-submit");
-    for (const id of boxes) { expect(button).toBeDisabled(); fireEvent.click(screen.getByTestId(id)); }
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(submit).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId(missing));
     expect(button).toBeEnabled();
-    fireEvent.click(button); fireEvent.click(button);
+    fireEvent.click(button);
     expect(submit).toHaveBeenCalledTimes(1);
+  });
+  it("TC7/MC38: synchronously consumes a re-entrant submit while its button is still mounted", () => {
+    let reentered = false;
+    const submit = vi.fn(() => {
+      if (!reentered) {
+        reentered = true;
+        fireEvent.click(screen.getByTestId("stranded-fault-submit"));
+      }
+    });
+    render(<StrandedFaultRetirementCard onSubmit={submit} />);
     fireEvent.click(screen.getByTestId("stranded-fault-open"));
-    expect(screen.getByTestId("stranded-fault-submit")).toBeDisabled();
+    expect(screen.getByTestId("stranded-fault-stopped-empty")).toHaveFocus();
     for (const id of boxes) fireEvent.click(screen.getByTestId(id));
     fireEvent.click(screen.getByTestId("stranded-fault-submit"));
-    expect(submit).toHaveBeenCalledTimes(2);
+    expect(submit).toHaveBeenCalledTimes(1);
   });
   it("cancels fresh ticks and always carries the physical-stop notice", () => {
     render(<StrandedFaultRetirementCard onSubmit={vi.fn()} />);

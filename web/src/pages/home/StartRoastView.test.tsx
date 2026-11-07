@@ -228,6 +228,25 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     }
   });
 
+  it("TS12/MC28: renders the provenance note only for operator-attested CLOSED REQUIRED health", () => {
+    const { rerender } = renderView();
+    const closed = (closure_provenance?: unknown) => {
+      healthState.data = {
+        active_run_id: null,
+        instance_id: "process-1",
+        restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
+        fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"], ...(closure_provenance === undefined ? {} : { closure_provenance }) },
+      } as never;
+      rerender();
+    };
+    closed("operator_attested_retirement");
+    expect(screen.getByTestId("retirement-provenance-note")).toBeInTheDocument();
+    for (const provenance of ["exact_session_safe_zero", "baseline", null, undefined]) {
+      closed(provenance);
+      expect(screen.queryByTestId("retirement-provenance-note")).toBeNull();
+    }
+  });
+
   it("TS8/TS14/TS-O5d/MC36: a confirmed POST remains blocked, hides stale outcome beside a new card, and never leaks its process id", async () => {
     const syntheticId = "process-identifier-not-for-dom";
     eligibleHealth();
