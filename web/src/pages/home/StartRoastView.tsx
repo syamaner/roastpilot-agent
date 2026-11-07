@@ -93,7 +93,12 @@ import {
   useUpdateBeanProfile,
 } from "@/hooks/queries";
 import { api } from "@/lib/api";
-import { isCoherentFaultControls, isCoherentRestartClearance } from "@/lib/faultControls";
+import {
+  isCoherentFaultControls,
+  isCoherentRestartClearance,
+  strandedFaultRetirementState,
+} from "@/lib/faultControls";
+import { useStrandedFaultRetirementRequest } from "@/hooks/useStrandedFaultRetirementRequest";
 import type {
   BeanProfileInput,
   HardwareClearAcknowledgementRequest,
@@ -105,6 +110,11 @@ import type { LiveNavigationState } from "@/pages/live/LivePage";
 import { StartRoastForm } from "@/pages/dashboard/StartRoastForm";
 import { InitializeSafetyRecordCard } from "./InitializeSafetyRecordCard";
 import { RestartClearanceCard } from "./RestartClearanceCard";
+import {
+  StrandedFaultRetirementCard,
+  StrandedFaultRetirementOutcomeNotice,
+  StrandedFaultRetirementPendingNotice,
+} from "./StrandedFaultRetirementCard";
 import { TerminalFaultControls } from "./TerminalFaultControls";
 import { UnknownStatusEmergencyStop } from "./UnknownStatusEmergencyStop";
 
@@ -564,6 +574,7 @@ export function StartRoastView(): React.JSX.Element {
     },
     [navigate, queryClient],
   );
+  const retirementRequest = useStrandedFaultRetirementRequest();
 
   // #513 follow-up (post-#514/#515 review): hold until health has produced a
   // GENUINELY FRESH read (`useFreshHealthGate`'s `isFresh` — false while
@@ -611,11 +622,21 @@ export function StartRoastView(): React.JSX.Element {
   const closedLeaseEmergencyStopAdvertised =
     coherentFaultControls?.status === "closed" &&
     coherentFaultControls.enabled_actions.includes("emergency_stop");
+  const retirement =
+    health.isSuccess && coherentRestartClearance !== null && coherentFaultControls !== null
+      ? strandedFaultRetirementState(
+          coherentRestartClearance,
+          coherentFaultControls,
+          health.data.instance_id,
+        )
+      : { kind: "absent" as const };
 
   // The server alone exposes D220. Its dedicated confirmation cannot fall
   // through to D213 or Start; after a confirmed result a fresh health snapshot
   // replaces this card with the ordinary D213 clearance card.
-  const restartGate = initializeSafetyRecordAvailable ? (
+  const restartGate = retirementRequest.pending ? (
+    <StrandedFaultRetirementPendingNotice />
+  ) : initializeSafetyRecordAvailable ? (
     <InitializeSafetyRecordCard
       available
       onInitialize={async () => {
@@ -626,6 +647,11 @@ export function StartRoastView(): React.JSX.Element {
         }
       }}
       onRefreshStatus={() => queryClient.invalidateQueries({ queryKey: roastKeys.health })}
+    />
+  ) : retirement.kind === "available" ? (
+    <StrandedFaultRetirementCard
+      key={`retire-${retirement.resetKey}`}
+      onSubmit={() => retirementRequest.submit(retirement.resetKey)}
     />
   ) : (
     <RestartClearanceCard
@@ -640,11 +666,23 @@ export function StartRoastView(): React.JSX.Element {
       onRefreshStatus={() => queryClient.invalidateQueries({ queryKey: roastKeys.health })}
     />
   );
+  const retirementOutcome =
+    retirementRequest.outcome !== null &&
+    !retirementRequest.pending &&
+    !(retirement.kind === "available" && retirement.resetKey !== retirementRequest.outcome.key) ? (
+      <StrandedFaultRetirementOutcomeNotice
+        kind={retirementRequest.outcome.kind}
+        onRefreshStatus={() => queryClient.invalidateQueries({ queryKey: roastKeys.health })}
+      />
+    ) : null;
 
   if (health.isSuccess && coherentFaultControls === null) {
     return <FaultControlsStatusIncomplete />;
   }
   if (health.isSuccess && coherentRestartClearance === null) {
+    return <RestartClearanceStatusIncomplete />;
+  }
+  if (health.isSuccess && retirement.kind === "incoherent") {
     return <RestartClearanceStatusIncomplete />;
   }
   if (health.isSuccess && coherentFaultControls !== null && coherentFaultControls.status !== "closed") {
@@ -674,6 +712,7 @@ export function StartRoastView(): React.JSX.Element {
           }}
         />
         {restartClearanceRequired && restartGate}
+        {retirementOutcome}
       </AppFrame>
     );
   }
@@ -733,6 +772,14 @@ export function StartRoastView(): React.JSX.Element {
         }
       >
         {restartGate}
+        {retirementOutcome}
+        {coherentFaultControls?.closure_provenance === "operator_attested_retirement" && (
+          <p data-testid="retirement-provenance-note" className="mx-auto max-w-xl px-6 pb-4 text-center text-sm text-muted-foreground">
+            The previous fault record was retired by operator attestation, not by a confirmed
+            safe-state reading. A new restart clearance with a fresh physical confirmation is
+            still required.
+          </p>
+        )}
         {closedLeaseEmergencyStopAdvertised && (
           <UnknownStatusEmergencyStop testIdPrefix="start-restart-clearance-emergency-stop" />
         )}

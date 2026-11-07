@@ -1050,11 +1050,14 @@ export type MCPChildStatus = "running" | "stopped" | "not_configured";
 export interface HealthResponse {
   status: "ok";
   version: string;
-  // A uuid4 minted once per server process (#516) — never compare this on a
-  // passive read (nav chip, dashboard); only the start-roast confirm loop
-  // does, to detect a DIFFERENT process answering than the one that
-  // accepted the start (the #513 port-impostor signature). See
-  // HealthResponse's Python docstring for the full rationale.
+  // A uuid4 minted once per server process (#516). Only the start-roast
+  // confirm loop compares it for process verification, to detect a DIFFERENT
+  // process answering than the one that accepted the start (the #513
+  // port-impostor signature); passive reads (nav chip, dashboard) never
+  // compare it or alarm on it. The D225 retirement page state may additionally
+  // use it only inside a local reset key so an observed process change discards
+  // unsubmitted attestation ticks; that use never alarms, latches, blocks a
+  // view or decides eligibility. See HealthResponse's Python docstring.
   instance_id: string;
   mcp_child: MCPChildStatus;
   mcp_hardware_clear_required: boolean;

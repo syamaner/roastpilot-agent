@@ -124,6 +124,12 @@ Acceptance criteria:
 
 ### E11-S3 — Pi 5 single-primary-mic complete-appliance cold characterisation (overflow validation)
 
+#1071 (D225): the operator-attested stranded-fault retirement software (store transaction,
+service and endpoint, and operator UI) is delivered and tested hardware-free only; it is not
+deployed or validated on Pi hardware. E11-S3 remains in progress and #954 stays open. D225
+clauses 9 and 10 (successor candidate binding and any retained-Pi database action) remain
+separate operator-gated steps.
+
 **Scope (D194):** one primary microphone delivering one mono 16 kHz / 16-bit
 stream, on the complete appliance (Pi 5, Hottop serial link, first-crack
 detector and advisory-only advisor), run under

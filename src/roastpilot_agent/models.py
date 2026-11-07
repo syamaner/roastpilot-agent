@@ -1509,9 +1509,11 @@ class HealthResponse(BaseModel):
     the start-roast confirm path compares the id observed with the 201
     against a subsequent fresh health read and surfaces "answers are coming
     from a different server process" distinctly from a generic failure.
-    Passive health consumers (nav chip, dashboard) must NOT compare it —
-    only the confirm-loop's cross-request check does, otherwise a normal
-    server restart would false-alarm every passive consumer.
+    Only the start-roast confirm loop compares it for process verification;
+    passive health consumers (nav chip, dashboard) must not compare or alarm
+    on it, otherwise a normal server restart would false-alarm them. The D225
+    retirement UI may also use it only as a local reset key for unsubmitted
+    attestation ticks, never as an alarm or eligibility input.
     """
 
     status: Literal["ok"] = "ok"

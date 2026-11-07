@@ -839,6 +839,12 @@ Current runtime requires the revised exact result class/revision. See the D211
 section of `docs/deployment/cold-characterisation-runbook.md` for evidence limits.
 
 
+#1071 (D225): the operator-attested stranded-fault retirement software (store transaction,
+service and endpoint, and operator UI) is delivered and tested hardware-free only; it is not
+deployed or validated on Pi hardware. E11-S3 remains in progress and #954 stays open. D225
+clauses 9 and 10 (successor candidate binding and any retained-Pi database action) remain
+separate operator-gated steps.
+
 ## Active Epic
 
 **6 Sep 2026 — D-ToS-1 governance reconciliation (#938).** Verified live

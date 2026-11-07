@@ -80,9 +80,10 @@
  * fresh-health-gate / recovery flow already in place, not to this one-shot
  * start-confirmation check.
  *
- * Passive health consumers elsewhere (NavBar, DashboardPage) never read or
- * compare `instance_id` — only this one-shot comparison does, so a normal
- * server RESTART (once this check has disarmed) never false-alarms them.
+ * Only this one-shot comparison checks `instance_id` for process verification;
+ * passive health consumers elsewhere (NavBar, DashboardPage) never compare it,
+ * so a normal server RESTART (once this check has disarmed) never false-alarms
+ * them. The D225 retirement gate uses it only inside a local attestation reset key.
  *
  * THE STRIP IS EXPLICIT, NOT A BROWSER BEHAVIOUR (#556, capped #537/#536
  * findings): the original design assumed a reload's "fresh navigation" drops
@@ -126,10 +127,20 @@ import {
   useTelemetry,
 } from "@/hooks/queries";
 import { api } from "@/lib/api";
-import { isCoherentFaultControls, isCoherentRestartClearance } from "@/lib/faultControls";
+import {
+  isCoherentFaultControls,
+  isCoherentRestartClearance,
+  strandedFaultRetirementState,
+} from "@/lib/faultControls";
+import { useStrandedFaultRetirementRequest } from "@/hooks/useStrandedFaultRetirementRequest";
 import type { FaultControls } from "@/lib/types";
 import { DashboardPage } from "@/pages/dashboard/DashboardPage";
 import { RestartClearanceCard } from "@/pages/home/RestartClearanceCard";
+import {
+  StrandedFaultRetirementCard,
+  StrandedFaultRetirementOutcomeNotice,
+  StrandedFaultRetirementPendingNotice,
+} from "@/pages/home/StrandedFaultRetirementCard";
 import { TerminalFaultControls } from "@/pages/home/TerminalFaultControls";
 import { UnknownStatusEmergencyStop } from "@/pages/home/UnknownStatusEmergencyStop";
 import { headlineStats, toCurveMarkers, toCurvePoints } from "@/pages/detail/traceModel";
@@ -223,6 +234,7 @@ export function LivePage(): React.JSX.Element {
   // a false claim about restart clearance.
   const healthProjectionStale = health.isError || !health.isSuccess;
   const queryClient = useQueryClient();
+  const retirementRequest = useStrandedFaultRetirementRequest();
 
   // #516: the instance_id StartRoastView observed on the 201 response, if
   // this render is the direct result of a start-roast navigation. `state` is
@@ -596,6 +608,14 @@ export function LivePage(): React.JSX.Element {
   if (!isCoherentRestartClearance(restartClearance)) {
     return <LiveRestartClearanceStatusUnknownView />;
   }
+  const retirement = strandedFaultRetirementState(
+    restartClearance,
+    faultControls,
+    health.data?.instance_id,
+  );
+  if (retirement.kind === "incoherent") {
+    return <LiveRestartClearanceStatusUnknownView />;
+  }
   if (faultControls.status !== "closed") {
     return (
       <LiveTerminalFaultControls
@@ -605,6 +625,9 @@ export function LivePage(): React.JSX.Element {
         }
         routineControlsDisabled={healthProjectionStale || restartClearance.state !== "cleared"}
         routineControlsRefreshPending={health.isFetching}
+        retirement={retirement}
+        retirementRequest={retirementRequest}
+        healthProjectionStale={healthProjectionStale}
       />
     );
   }
@@ -633,6 +656,9 @@ export function LivePage(): React.JSX.Element {
         restartClearanceRequired={restartClearance.state === "required"}
         routineControlsDisabled={false}
         routineControlsRefreshPending={health.isFetching}
+        retirement={{ kind: "absent" }}
+        retirementRequest={retirementRequest}
+        healthProjectionStale={healthProjectionStale}
       />
     );
   }
@@ -752,11 +778,17 @@ function LiveTerminalFaultControls({
   restartClearanceRequired,
   routineControlsDisabled,
   routineControlsRefreshPending,
+  retirement,
+  retirementRequest,
+  healthProjectionStale,
 }: {
   controls: FaultControls;
   restartClearanceRequired: boolean;
   routineControlsDisabled: boolean;
   routineControlsRefreshPending: boolean;
+  retirement: ReturnType<typeof strandedFaultRetirementState>;
+  retirementRequest: ReturnType<typeof useStrandedFaultRetirementRequest>;
+  healthProjectionStale: boolean;
 }): React.JSX.Element {
   const queryClient = useQueryClient();
   return (
@@ -785,7 +817,18 @@ function LiveTerminalFaultControls({
           }
         }}
       />
-      {restartClearanceRequired && (
+      {restartClearanceRequired && (retirementRequest.pending ? (
+        <StrandedFaultRetirementPendingNotice />
+      ) : retirement.kind === "available" && healthProjectionStale ? (
+        <p data-testid="live-retirement-status-refreshing" role="status" className="mx-auto max-w-xl px-6 py-4 text-center text-sm text-muted-foreground">
+          Waiting for current status before retirement can be offered.
+        </p>
+      ) : retirement.kind === "available" ? (
+        <StrandedFaultRetirementCard
+          key={`retire-${retirement.resetKey}`}
+          onSubmit={() => retirementRequest.submit(retirement.resetKey)}
+        />
+      ) : (
         <RestartClearanceCard
           onAcknowledge={async () => {
             try {
@@ -797,7 +840,24 @@ function LiveTerminalFaultControls({
           }}
           onRefreshStatus={() => queryClient.invalidateQueries({ queryKey: roastKeys.health })}
         />
-      )}
+      ))}
+      {retirementRequest.outcome !== null &&
+        !retirementRequest.pending &&
+        !(retirement.kind === "available" && retirement.resetKey !== retirementRequest.outcome.key) && (
+          <StrandedFaultRetirementOutcomeNotice
+            kind={retirementRequest.outcome.kind}
+            onRefreshStatus={() => queryClient.invalidateQueries({ queryKey: roastKeys.health })}
+          />
+        )}
+      {controls.status === "closed" &&
+        controls.closure_provenance === "operator_attested_retirement" &&
+        restartClearanceRequired && (
+          <p data-testid="retirement-provenance-note" className="mx-auto max-w-xl px-6 pb-4 text-center text-sm text-muted-foreground">
+            The previous fault record was retired by operator attestation, not by a confirmed
+            safe-state reading. A new restart clearance with a fresh physical confirmation is
+            still required.
+          </p>
+        )}
     </AppFrame>
   );
 }
