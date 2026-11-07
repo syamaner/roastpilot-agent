@@ -852,7 +852,7 @@ function LiveTerminalFaultControls({
       {controls.status === "closed" &&
         controls.closure_provenance === "operator_attested_retirement" &&
         restartClearanceRequired && (
-          <p data-testid="retirement-provenance-note">
+          <p data-testid="retirement-provenance-note" className="mx-auto max-w-xl px-6 pb-4 text-center text-sm text-muted-foreground">
             The previous fault record was retired by operator attestation, not by a confirmed
             safe-state reading. A new restart clearance with a fresh physical confirmation is
             still required.
