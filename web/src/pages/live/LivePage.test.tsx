@@ -1911,6 +1911,26 @@ describe("LivePage stranded-fault retirement (#1071, D225)", () => {
     await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-outcome")).toBeInTheDocument());
   });
 
+  it("keeps the unknown-view emergency stop while a pending request sees a contradictory closed retirement projection", () => {
+    retireStrandedFaultMock.mockImplementationOnce(() => new Promise<StrandedFaultRetirementResult>(() => undefined));
+    eligibleHealth();
+    const { rerender } = renderPage();
+    tickAll();
+    fireEvent.click(screen.getByTestId("stranded-fault-submit"));
+    healthState.data = {
+      ...healthState.data!,
+      restart_clearance: { state: "required", eligible: false, enabled_actions: ["retire_stranded_fault"], closure_only_available: false },
+      fault_controls: { status: "closed", generation: 3, enabled_actions: [] },
+    } as never;
+    rerender();
+
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.getByTestId("live-restart-clearance-emergency-stop")).toBeInTheDocument();
+    expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
+  });
+
   it("TL3/TL4: holds a stale advertised retirement and never turns an id change into a mismatch alarm", () => {
     eligibleHealth(true);
     const { rerender } = renderPage();

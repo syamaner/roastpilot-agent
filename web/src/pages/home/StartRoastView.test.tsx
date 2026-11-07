@@ -171,6 +171,26 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     resolve({ outcome: "confirmed", attempted_generation: 3, restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false }, fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"] } });
   });
 
+  it("keeps the unknown-view emergency stop while a pending request sees a contradictory closed retirement projection", () => {
+    retireStrandedFaultMock.mockImplementationOnce(() => new Promise<StrandedFaultRetirementResult>(() => undefined));
+    eligibleHealth();
+    const { rerender } = renderView();
+    tickAll();
+    fireEvent.click(screen.getByTestId("stranded-fault-submit"));
+    healthState.data = {
+      ...healthState.data!,
+      restart_clearance: { state: "required", eligible: false, enabled_actions: ["retire_stranded_fault"], closure_only_available: false },
+      fault_controls: { status: "closed", generation: 3, enabled_actions: [] },
+    } as never;
+    rerender();
+
+    expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+    expect(screen.getByTestId("start-restart-clearance-emergency-stop")).toBeInTheDocument();
+    expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
   it("TS13/TS-O5b/c: generation changes reset ticks, identical polls preserve them, and action loss remounts empty", () => {
     eligibleHealth();
     const { rerender } = renderView();
