@@ -296,8 +296,6 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     expect(screen.getByTestId("stranded-fault-stopped-empty")).not.toBeChecked();
     fireEvent.click(screen.getByTestId("stranded-fault-stopped-empty"));
     expect(screen.getByTestId("stranded-fault-stopped-empty")).toBeChecked();
-    healthState.data = { ...(healthState.data as object), instance_id: "process-1" } as never;
-    rerender();
     healthState.data = { ...(healthState.data as object), fault_controls: { status: "open", generation: 4, enabled_actions: ["emergency_stop"], physical_stop_operative: true } } as never;
     rerender();
     expect(screen.queryByTestId("stranded-fault-stopped-empty")).toBeNull();
