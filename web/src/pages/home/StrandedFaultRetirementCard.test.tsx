@@ -42,7 +42,7 @@ describe("StrandedFaultRetirementCard", () => {
     render(<StrandedFaultRetirementCard onSubmit={vi.fn()} />);
     expect(screen.getByTestId("stranded-fault-physical-stop-operative")).toHaveTextContent(/operative stop/i);
     fireEvent.click(screen.getByTestId("stranded-fault-open"));
-    fireEvent.click(screen.getByTestId(boxes[0]));
+    for (const id of boxes) fireEvent.click(screen.getByTestId(id));
     fireEvent.click(screen.getByTestId("stranded-fault-cancel"));
     for (const id of boxes) expect(screen.queryByTestId(id)).toBeNull();
     fireEvent.click(screen.getByTestId("stranded-fault-open"));
