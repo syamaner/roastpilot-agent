@@ -5,7 +5,9 @@ import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, cast
+from unittest import mock
 
 import aiosqlite
 import pytest
@@ -19,7 +21,6 @@ from roastpilot_agent.api import (
     create_app,
 )
 from roastpilot_agent.config import AppConfig, ControllerConfig
-from roastpilot_agent.controller import FaultControlExecutor
 from roastpilot_agent.mcp_client import MCPServerProcess
 from roastpilot_agent.models import (
     FaultControlState,
@@ -82,6 +83,14 @@ class _SafeZeroFaultPort(FakeMCPClient):
             self.on_latest()
         return self.state
 
+    async def write_fault_control(
+        self, action: OperatorAction, *, expected_session_id: str
+    ) -> None:
+        """Record the exact-session, hardware-free terminal e-stop write."""
+        assert action is OperatorAction.EMERGENCY_STOP
+        assert expected_session_id == "fault-session"
+        self.calls.append(("emergency_stop", {"expected_session_id": expected_session_id}))
+
 
 class _PendingLiveRunner:
     """Minimal live-runner seam for the two controller e-stop dispatch sites."""
@@ -115,7 +124,9 @@ def _profile() -> RoastProfile:
     )
 
 
-async def _eligible_service(store: RoastStore) -> tuple[RoastService, FakeMCPClient]:
+async def _eligible_service(
+    store: RoastStore, *, roaster: FakeMCPClient | None = None
+) -> tuple[RoastService, FakeMCPClient]:
     """Build the smallest terminal-faulted, exact-session D225 fixture."""
     run_id = "terminal-faulted-run"
     await store.create_run(
@@ -128,7 +139,7 @@ async def _eligible_service(store: RoastStore) -> tuple[RoastService, FakeMCPCli
     await store.open_fault_control_lease(
         run_id=run_id, mcp_session_id="fault-session", generation=1
     )
-    roaster = FakeMCPClient()
+    roaster = roaster or FakeMCPClient()
 
     async def no_session() -> str:
         return "none"
@@ -643,15 +654,13 @@ async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g
     retirement: asyncio.Task[object] | None = None
     estop: asyncio.Task[object] | None = None
     try:
-        service, _roaster = await _eligible_service(tmp_store)
-        presence_calls = 0
-
-        async def counted_none() -> str:
-            nonlocal presence_calls
-            presence_calls += 1
-            return "none"
-
-        _roaster.read_session_presence = counted_none  # type: ignore[method-assign]
+        control_port = _SafeZeroFaultPort()
+        control_port.set_latest_fault_session_id("fault-session")
+        counted_none = mock.AsyncMock(return_value="none")
+        control_port.read_session_presence = counted_none  # type: ignore[method-assign]
+        service, _roaster = await _eligible_service(tmp_store, roaster=control_port)
+        assert service._roaster is control_port  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        control_port.read_session_presence = counted_none  # type: ignore[method-assign]
         frames = service.events.subscribe()
         transaction_entered = asyncio.Event()
         release_transaction = asyncio.Event()
@@ -681,23 +690,8 @@ async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g
 
         monkeypatch.setattr(aiosqlite.Connection, "_execute", hold_first_begin_immediate)
         monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", capture_operation)
-        retirement = asyncio.create_task(service.retire_stranded_fault(_retirement_request()))
-        await asyncio.wait_for(transaction_entered.wait(), timeout=2.0)
-        open_cache = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        interim_health = await service.health()
-        assert interim_health.fault_controls.status is FaultLeaseStatus.UNKNOWN
-        assert service._fault_lease_cache == open_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        assert presence_calls == 1
-        control_port = _SafeZeroFaultPort()
-        control_port.set_latest_fault_session_id("fault-session")
-        control_port.read_session_presence = counted_none  # type: ignore[method-assign]
-        service._roaster = control_port  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        executor = FaultControlExecutor(
-            service._safety,  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-            cast("Any", control_port),
-            arbiter=service._command_arbiter,  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-            trace_sink=tmp_store,
-        )
+        executor = service._fault_control_executor  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert executor is not None
         original_dispatch = executor.execute
 
         async def observe_terminal_dispatch(*args: Any, **kwargs: Any) -> Any:
@@ -706,7 +700,14 @@ async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g
             return await original_dispatch(*args, **kwargs)
 
         monkeypatch.setattr(executor, "execute", observe_terminal_dispatch)
-        service._fault_control_executor = executor  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        retirement = asyncio.create_task(service.retire_stranded_fault(_retirement_request()))
+        await asyncio.wait_for(transaction_entered.wait(), timeout=2.0)
+        open_cache = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        presence_before_projection = counted_none.await_count
+        interim_health = await service.health()
+        assert interim_health.fault_controls.status is FaultLeaseStatus.UNKNOWN
+        assert service._fault_lease_cache == open_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert counted_none.await_count == presence_before_projection
         estop = asyncio.create_task(service._submit_fault_controls_emergency_stop())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         await asyncio.wait_for(dispatch_reached.wait(), timeout=2.0)
 
@@ -740,11 +741,10 @@ async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g
         ) as cursor:
             generation_one_audits = [tuple(row) for row in await cursor.fetchall()]
         assert len(generation_one_audits) == 1
-        service._fault_control_executor = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         successor = await service.retire_stranded_fault(_retirement_request())
         assert successor.outcome == "confirmed"
         assert successor.attempted_generation == 2
-        assert presence_calls == 2
+        assert counted_none.await_count == presence_before_projection + 1
         assert len(set(operation_ids)) == 2
         async with tmp_store.connection.execute(
             "SELECT rowid, * FROM operator_actions WHERE action = ? ORDER BY rowid",
@@ -1102,33 +1102,81 @@ async def test_tb3_ordered_teardown_stays_unclean_until_separate_d213_then_can_m
 
 @pytest.mark.asyncio
 async def test_tb3_successor_recovers_unclean_retirement_epoch_without_start_or_mcp_write(
-    tmp_store: RoastStore,
+    tmp_path: Path,
 ) -> None:
-    """TB3: a distinct successor process inherits D225's still-unclean epoch."""
-    await tmp_store.initialize()
+    """TB3: distinct Store/service lifecycles preserve D225's unclean epoch."""
+    database_path = tmp_path / "tb3-successor.sqlite3"
     first: RoastService | None = None
+    retirement_service: RoastService | None = None
     successor: RoastService | None = None
+    first_store: RoastStore | None = None
+    retirement_store: RoastStore | None = None
+    successor_store: RoastStore | None = None
+    first_process_id: str | None = None
+    retirement_process_id: str | None = None
+    first_roaster: FakeMCPClient | None = None
+    retirement_roaster: FakeMCPClient | None = None
+    successor_roaster: FakeMCPClient | None = None
+
+    def fresh_no_session_roaster() -> FakeMCPClient:
+        """Return one process-local, hardware-free current-session reader."""
+        roaster = FakeMCPClient()
+
+        async def no_session() -> str:
+            return "none"
+
+        roaster.read_session_presence = no_session  # type: ignore[method-assign]
+        return roaster
+
     try:
-        first, roaster = await _eligible_service(tmp_store)
+        first_store = RoastStore(database_path)
+        await first_store.initialize()
+        first_roaster = fresh_no_session_roaster()
+        first, _ = await _eligible_service(first_store, roaster=first_roaster)
         first_process_id = first.instance_id
-        assert (await first.retire_stranded_fault(_retirement_request())).outcome == "confirmed"
-        await first.mark_process_epoch_clean_after_ordered_teardown()
         await first.shutdown()
         first = None
+        await first_store.close()
+        first_store = None
 
-        child = _CurrentChild()
-        successor = RoastService(
-            tmp_store,
+        retirement_store = RoastStore(database_path)
+        await retirement_store.initialize()
+        retirement_roaster = fresh_no_session_roaster()
+        retirement_service = RoastService(
+            retirement_store,
             config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
-            mcp=cast("MCPServerProcess", child),
-            roaster=roaster,
+            mcp=cast("MCPServerProcess", _CurrentChild()),
+            roaster=retirement_roaster,
             live_serve_mode=True,
             run_loop=False,
             clock=FakeClock(),
         )
-        assert successor.instance_id != first_process_id
-        await successor.recover_on_start()
+        assert retirement_service.instance_id != first_process_id
+        retirement_process_id = retirement_service.instance_id
+        await retirement_service.recover_on_start()
+        assert (
+            await retirement_service.retire_stranded_fault(_retirement_request())
+        ).outcome == "confirmed"
+        await retirement_service.mark_process_epoch_clean_after_ordered_teardown()
+        await retirement_service.shutdown()
+        retirement_service = None
+        await retirement_store.close()
+        retirement_store = None
 
+        successor_store = RoastStore(database_path)
+        await successor_store.initialize()
+        successor_roaster = fresh_no_session_roaster()
+        successor = RoastService(
+            successor_store,
+            config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+            mcp=cast("MCPServerProcess", _CurrentChild()),
+            roaster=successor_roaster,
+            live_serve_mode=True,
+            run_loop=False,
+            clock=FakeClock(),
+        )
+        assert successor.instance_id != retirement_process_id
+        await successor.recover_on_start()
         assert successor._restart_clearance_state is RestartClearanceState.REQUIRED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         health = await successor.health()
         assert (
@@ -1137,13 +1185,22 @@ async def test_tb3_successor_recovers_unclean_retirement_epoch_without_start_or_
         )
         with pytest.raises(RoastRunConflictError):
             await successor.start_roast(_profile())
-        assert roaster.calls == []
+        assert first_roaster.calls == []
+        assert retirement_roaster.calls == []
+        assert successor_roaster.calls == []
     finally:
         if first is not None:
             await first.shutdown()
+        if retirement_service is not None:
+            await retirement_service.shutdown()
         if successor is not None:
             await successor.shutdown()
-        await tmp_store.close()
+        if first_store is not None:
+            await first_store.close()
+        if retirement_store is not None:
+            await retirement_store.close()
+        if successor_store is not None:
+            await successor_store.close()
 
 
 @pytest.mark.asyncio
