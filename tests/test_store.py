@@ -9664,14 +9664,22 @@ async def test_d225_retirement_rejects_each_durable_precondition(tmp_path: Path,
                 started_at_utc="2000-01-01T00:00:00+00:00",
             )
         elif case.startswith("newer-"):
-            started = "2026-11-07T00:00:00+00:00"
-            if case == "newer-equal-rowid":
-                async with store.connection.execute(
-                    "SELECT started_at_utc FROM roast_runs WHERE id = 'd225-run'"
-                ) as cursor:
-                    row = await cursor.fetchone()
-                assert row is not None
-                started = str(row["started_at_utc"])
+            async with store.connection.execute(
+                "SELECT started_at_utc FROM roast_runs WHERE id = 'd225-run'"
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+            target_started = str(row["started_at_utc"])
+            started = target_started
+            if case == "newer-later":
+                started = (
+                    datetime.fromisoformat(target_started) + timedelta(seconds=1)
+                ).isoformat()
+            assert (
+                datetime.fromisoformat(started) > datetime.fromisoformat(target_started)
+                if case == "newer-later"
+                else started == target_started
+            )
             await store.create_run(
                 run_id="newer-run",
                 profile=PROFILE,
