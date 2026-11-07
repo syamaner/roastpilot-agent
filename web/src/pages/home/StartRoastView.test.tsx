@@ -140,6 +140,48 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     expect(screen.getByTestId("start-restart-clearance-emergency-stop")).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
   });
+
+  it("TS3–TS7: preserves the pending notice across withdrawn, UNKNOWN and CLOSED projections and never starts or acknowledges", () => {
+    let resolve!: (value: StrandedFaultRetirementResult) => void;
+    retireStrandedFaultMock.mockImplementationOnce(() => new Promise<StrandedFaultRetirementResult>((done) => { resolve = done; }));
+    eligibleHealth();
+    const { rerender } = renderView();
+    tickAll();
+    fireEvent.click(screen.getByTestId("stranded-fault-submit"));
+    healthState.data = { ...(healthState.data as object), restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false } } as never;
+    rerender();
+    expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    healthState.data = { ...(healthState.data as object), fault_controls: { status: "unknown", generation: 3, enabled_actions: ["emergency_stop"], physical_stop_operative: true } } as never;
+    rerender();
+    expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
+    healthState.data = { ...(healthState.data as object), fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"], closure_provenance: "operator_attested_retirement" } } as never;
+    rerender();
+    expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
+    expect(screen.getByTestId("retirement-provenance-note")).toBeInTheDocument();
+    expect(acknowledgeRestartClearanceMock).not.toHaveBeenCalled();
+    expect(startRoastMock).not.toHaveBeenCalled();
+    resolve({ outcome: "confirmed", attempted_generation: 3, restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false }, fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"] } });
+  });
+
+  it("TS13/TS-O5b/c: generation changes reset ticks, identical polls preserve them, and action loss remounts empty", () => {
+    eligibleHealth();
+    const { rerender } = renderView();
+    fireEvent.click(screen.getByTestId("stranded-fault-open"));
+    fireEvent.click(screen.getByTestId("stranded-fault-stopped-empty"));
+    rerender();
+    expect(screen.getByTestId("stranded-fault-stopped-empty")).toBeChecked();
+    healthState.data = { ...(healthState.data as object), fault_controls: { status: "open", generation: 4, enabled_actions: ["emergency_stop"], physical_stop_operative: true } } as never;
+    rerender();
+    fireEvent.click(screen.getByTestId("stranded-fault-open"));
+    expect(screen.getByTestId("stranded-fault-stopped-empty")).not.toBeChecked();
+    healthState.data = { ...(healthState.data as object), restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false } } as never;
+    rerender();
+    healthState.data = { ...(healthState.data as object), restart_clearance: { state: "required", eligible: false, enabled_actions: ["retire_stranded_fault"], closure_only_available: false } } as never;
+    rerender();
+    fireEvent.click(screen.getByTestId("stranded-fault-open"));
+    expect(screen.getByTestId("stranded-fault-stopped-empty")).not.toBeChecked();
+  });
 });
 
 // Mutable health stub — mirrors LivePage.test.tsx's pattern (#513): the active-

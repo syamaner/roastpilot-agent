@@ -64,6 +64,35 @@ describe("useStrandedFaultRetirementRequest", () => {
     await waitFor(() => expect(result.current.outcome).toEqual({ kind: "error", key: "p1#1" }));
   });
 
+  it.each([
+    ["confirmed", { ...confirmed, outcome: "confirmed" as const }, "confirmed"],
+    ["unconfirmed", { ...confirmed, outcome: "unconfirmed" as const }, "unconfirmed"],
+    ["rejected", { ...confirmed, outcome: "rejected" as const, attempted_generation: null }, "rejected"],
+  ])("TH2: settles %s, invalidates once, and admits a later deliberate submit", async (_name, response, kind) => {
+    retireMock.mockResolvedValueOnce(response).mockResolvedValueOnce(confirmed);
+    const client = new QueryClient();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const { result } = renderHook(useStrandedFaultRetirementRequest, { wrapper: wrapper(client) });
+    act(() => result.current.submit("p1#1"));
+    await waitFor(() => expect(result.current.outcome).toEqual({ kind, key: "p1#1" }));
+    expect(result.current.pending).toBe(false);
+    expect(invalidate).toHaveBeenCalledTimes(1);
+    act(() => result.current.submit("p1#1"));
+    await waitFor(() => expect(retireMock).toHaveBeenCalledTimes(2));
+    expect(invalidate).toHaveBeenCalledTimes(2);
+  });
+
+  it("TH2: maps a rejected transport call to error, clears pending and invalidates once", async () => {
+    retireMock.mockRejectedValueOnce(new Error("rejected"));
+    const client = new QueryClient();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const { result } = renderHook(useStrandedFaultRetirementRequest, { wrapper: wrapper(client) });
+    act(() => result.current.submit("p1#1"));
+    await waitFor(() => expect(result.current.outcome).toEqual({ kind: "error", key: "p1#1" }));
+    expect(result.current.pending).toBe(false);
+    expect(invalidate).toHaveBeenCalledTimes(1);
+  });
+
   it("TH4: restores the mounted fence after Strict Mode effect replay", async () => {
     retireMock.mockResolvedValueOnce(confirmed);
     const client = new QueryClient();

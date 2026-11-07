@@ -613,7 +613,7 @@ export function LivePage(): React.JSX.Element {
     faultControls,
     health.data?.instance_id,
   );
-  if (retirement.kind === "incoherent") {
+  if (retirement.kind === "incoherent" && !retirementRequest.pending) {
     return <LiveRestartClearanceStatusUnknownView />;
   }
   if (faultControls.status !== "closed") {

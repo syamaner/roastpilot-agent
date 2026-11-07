@@ -682,7 +682,7 @@ export function StartRoastView(): React.JSX.Element {
   if (health.isSuccess && coherentRestartClearance === null) {
     return <RestartClearanceStatusIncomplete />;
   }
-  if (health.isSuccess && retirement.kind === "incoherent") {
+  if (health.isSuccess && retirement.kind === "incoherent" && !retirementRequest.pending) {
     return <RestartClearanceStatusIncomplete />;
   }
   if (health.isSuccess && coherentFaultControls !== null && coherentFaultControls.status !== "closed") {
