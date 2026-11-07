@@ -34,6 +34,9 @@ describe("StrandedFaultRetirementCard", () => {
     for (const id of boxes) fireEvent.click(screen.getByTestId(id));
     fireEvent.click(screen.getByTestId("stranded-fault-submit"));
     expect(submit).toHaveBeenCalledTimes(1);
+    for (const id of boxes) expect(screen.queryByTestId(id)).toBeNull();
+    fireEvent.click(screen.getByTestId("stranded-fault-open"));
+    for (const id of boxes) expect(screen.getByTestId(id)).not.toBeChecked();
   });
   it("cancels fresh ticks and always carries the physical-stop notice", () => {
     render(<StrandedFaultRetirementCard onSubmit={vi.fn()} />);
@@ -41,8 +44,17 @@ describe("StrandedFaultRetirementCard", () => {
     fireEvent.click(screen.getByTestId("stranded-fault-open"));
     fireEvent.click(screen.getByTestId(boxes[0]));
     fireEvent.click(screen.getByTestId("stranded-fault-cancel"));
+    for (const id of boxes) expect(screen.queryByTestId(id)).toBeNull();
     fireEvent.click(screen.getByTestId("stranded-fault-open"));
-    expect(screen.getByTestId(boxes[0])).not.toBeChecked();
+    for (const id of boxes) expect(screen.getByTestId(id)).not.toBeChecked();
+    expect(screen.getByTestId("stranded-fault-physical-stop-operative")).toBeInTheDocument();
+  });
+  it("TC10: keeps the physical-stop notice in closed, open, submitted and cancelled states", () => {
+    render(<StrandedFaultRetirementCard onSubmit={vi.fn()} />);
+    const notice = () => expect(screen.getByTestId("stranded-fault-physical-stop-operative")).toBeInTheDocument();
+    notice();
+    fireEvent.click(screen.getByTestId("stranded-fault-open")); notice();
+    fireEvent.click(screen.getByTestId("stranded-fault-cancel")); notice();
   });
   it("TC9: never submits from timers and renders only fixed non-diagnostic card copy", () => {
     vi.useFakeTimers();
@@ -70,9 +82,16 @@ describe("StrandedFaultRetirementCard", () => {
     expect(screen.getByTestId("stranded-fault-retirement-outcome")).not.toHaveTextContent(/run-abc|\/var\/db|process-1/i);
   });
 
-  it.each(["unconfirmed", "rejected", "error"] as const)("TC11: renders fixed %s outcome without a control", (kind) => {
+  it.each([
+    ["confirmed", "Stranded fault record retired by your attestation."],
+    ["unconfirmed", "Retirement is unconfirmed."],
+    ["rejected", "Retirement was rejected."],
+    ["error", "Retirement result could not be confirmed."],
+  ] as const)("TC11: renders exact fixed %s outcome without diagnostic detail", (kind, text) => {
     render(<StrandedFaultRetirementOutcomeNotice kind={kind} onRefreshStatus={vi.fn()} />);
-    expect(screen.getByTestId("stranded-fault-retirement-outcome")).toBeInTheDocument();
-    expect(screen.queryByTestId("stranded-fault-refresh-status")).toBeNull();
+    expect(screen.getByTestId("stranded-fault-retirement-outcome")).toHaveTextContent(text);
+    expect(screen.getByTestId("stranded-fault-retirement-outcome")).not.toHaveTextContent(/run-abc|\/var\/db/i);
+    if (kind === "confirmed") expect(screen.getByTestId("stranded-fault-refresh-status")).toBeInTheDocument();
+    else expect(screen.queryByTestId("stranded-fault-refresh-status")).toBeNull();
   });
 });
