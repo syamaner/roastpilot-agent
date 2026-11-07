@@ -332,6 +332,32 @@ async def test_stranded_fault_retirement_body_forbids_cross_route_confirmation_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/restart-clearance",
+        "/api/restart-clearance/initialize-safety-record",
+    ],
+)
+async def test_other_restart_clearance_routes_reject_the_d225_attestation_body(
+    store: RoastStore, path: str
+) -> None:
+    """D213 and D220 never accept D225's distinct operator attestation."""
+    app = create_app(RoastService(store))
+    transport = ASGITransport(app=app)
+    body = {
+        "stranded_fault_confirmation": (
+            "roaster_stopped_empty_heat_fan_cooling_off_physical_stop_ready"
+        )
+    }
+
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(path, json=body)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_fault_control_routes_map_service_conflicts_to_typed_409(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

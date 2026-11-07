@@ -1,6 +1,8 @@
 """D225 stranded-fault retirement service behaviour (hardware-free)."""
 
 import asyncio
+import contextlib
+import logging
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any, cast
@@ -17,6 +19,7 @@ from roastpilot_agent.api import (
     create_app,
 )
 from roastpilot_agent.config import AppConfig, ControllerConfig
+from roastpilot_agent.controller import FaultControlExecutor
 from roastpilot_agent.mcp_client import MCPServerProcess
 from roastpilot_agent.models import (
     FaultControlState,
@@ -635,14 +638,34 @@ async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g
 ) -> None:
     """TB6/TB7: priority e-stop dispatch runs before G's transaction releases."""
     await tmp_store.initialize()
+    release_transaction: asyncio.Event | None = None
+    release_dispatch: asyncio.Event | None = None
+    retirement: asyncio.Task[object] | None = None
+    estop: asyncio.Task[object] | None = None
     try:
         service, _roaster = await _eligible_service(tmp_store)
+        presence_calls = 0
+
+        async def counted_none() -> str:
+            nonlocal presence_calls
+            presence_calls += 1
+            return "none"
+
+        _roaster.read_session_presence = counted_none  # type: ignore[method-assign]
         transaction_entered = asyncio.Event()
         release_transaction = asyncio.Event()
         dispatch_reached = asyncio.Event()
         release_dispatch = asyncio.Event()
         original_execute = cast("Any", aiosqlite.Connection._execute)  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]
+        original_retire = tmp_store.retire_stranded_fault_lease
+        operation_ids: list[str] = []
         held_once = False
+
+        async def capture_operation(**kwargs: object) -> StrandedFaultRetirementCommit:
+            operation_id = kwargs.get("operation_id")
+            assert isinstance(operation_id, str)
+            operation_ids.append(operation_id)
+            return await original_retire(**cast("Any", kwargs))
 
         async def hold_first_begin_immediate(
             connection: Any, function: Any, *args: Any, **kwargs: Any
@@ -655,16 +678,34 @@ async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g
                 await release_transaction.wait()
             return result
 
-        async def observe_terminal_dispatch(**_kwargs: object) -> bool:
-            dispatch_reached.set()
-            await release_dispatch.wait()
-            return False
-
         monkeypatch.setattr(aiosqlite.Connection, "_execute", hold_first_begin_immediate)
-        monkeypatch.setattr(service, "_execute_terminal_emergency_stop", observe_terminal_dispatch)
-        service._fault_control_executor = cast("Any", object())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", capture_operation)
         retirement = asyncio.create_task(service.retire_stranded_fault(_retirement_request()))
         await asyncio.wait_for(transaction_entered.wait(), timeout=2.0)
+        open_cache = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        interim_health = await service.health()
+        assert interim_health.fault_controls.status is FaultLeaseStatus.UNKNOWN
+        assert service._fault_lease_cache == open_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert presence_calls == 1
+        control_port = _SafeZeroFaultPort()
+        control_port.set_latest_fault_session_id("fault-session")
+        control_port.read_session_presence = counted_none  # type: ignore[method-assign]
+        service._roaster = control_port  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        executor = FaultControlExecutor(
+            service._safety,  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            cast("Any", control_port),
+            arbiter=service._command_arbiter,  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            trace_sink=tmp_store,
+        )
+        original_dispatch = executor.execute
+
+        async def observe_terminal_dispatch(*args: Any, **kwargs: Any) -> Any:
+            dispatch_reached.set()
+            await release_dispatch.wait()
+            return await original_dispatch(*args, **kwargs)
+
+        monkeypatch.setattr(executor, "execute", observe_terminal_dispatch)
+        service._fault_control_executor = executor  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         estop = asyncio.create_task(service._submit_fault_controls_emergency_stop())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         await asyncio.wait_for(dispatch_reached.wait(), timeout=2.0)
 
@@ -678,7 +719,10 @@ async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g
         assert retirement_result.outcome == "unconfirmed"
         assert estop_result.action is OperatorAction.EMERGENCY_STOP
         assert service._emergency_stop_dispatch_tasks == set()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        assert (await tmp_store.read_fault_control_lease()).generation == 2
+        await service.settle_fault_lease_persistence_for_teardown()
+        generation_two = await tmp_store.read_fault_control_lease()
+        assert generation_two.generation == 2
+        assert generation_two.status is FaultLeaseStatus.OPEN
         async with tmp_store.connection.execute(
             "SELECT COUNT(*) FROM operator_actions WHERE action = ?",
             (OperatorAction.RETIRE_STRANDED_FAULT.value,),
@@ -686,9 +730,36 @@ async def test_tb6_tb7_estop_dispatch_preempts_held_retirement_transaction_and_g
             retirement_audit = await cursor.fetchone()
         assert retirement_audit is not None
         assert retirement_audit[0] == 1
+        async with tmp_store.connection.execute(
+            "SELECT rowid, * FROM operator_actions WHERE action = ? ORDER BY rowid",
+            (OperatorAction.RETIRE_STRANDED_FAULT.value,),
+        ) as cursor:
+            generation_one_audits = [tuple(row) for row in await cursor.fetchall()]
+        assert len(generation_one_audits) == 1
         service._fault_control_executor = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        successor = await service.retire_stranded_fault(_retirement_request())
+        assert successor.outcome == "confirmed"
+        assert successor.attempted_generation == 2
+        assert presence_calls == 2
+        assert len(set(operation_ids)) == 2
+        async with tmp_store.connection.execute(
+            "SELECT rowid, * FROM operator_actions WHERE action = ? ORDER BY rowid",
+            (OperatorAction.RETIRE_STRANDED_FAULT.value,),
+        ) as cursor:
+            all_audits = [tuple(row) for row in await cursor.fetchall()]
+        assert len(all_audits) == 2
+        assert all_audits[0] == generation_one_audits[0]
         await service.shutdown()
     finally:
+        if release_transaction is not None:
+            release_transaction.set()
+        if release_dispatch is not None:
+            release_dispatch.set()
+        for task in (retirement, estop):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         await tmp_store.close()
 
 
@@ -1026,6 +1097,52 @@ async def test_tb3_ordered_teardown_stays_unclean_until_separate_d213_then_can_m
 
 
 @pytest.mark.asyncio
+async def test_tb3_successor_recovers_unclean_retirement_epoch_without_start_or_mcp_write(
+    tmp_store: RoastStore,
+) -> None:
+    """TB3: a distinct successor process inherits D225's still-unclean epoch."""
+    await tmp_store.initialize()
+    first: RoastService | None = None
+    successor: RoastService | None = None
+    try:
+        first, roaster = await _eligible_service(tmp_store)
+        first_process_id = first.instance_id
+        assert (await first.retire_stranded_fault(_retirement_request())).outcome == "confirmed"
+        await first.mark_process_epoch_clean_after_ordered_teardown()
+        await first.shutdown()
+        first = None
+
+        child = _CurrentChild()
+        successor = RoastService(
+            tmp_store,
+            config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+            mcp=cast("MCPServerProcess", child),
+            roaster=roaster,
+            live_serve_mode=True,
+            run_loop=False,
+            clock=FakeClock(),
+        )
+        assert successor.instance_id != first_process_id
+        await successor.recover_on_start()
+
+        assert successor._restart_clearance_state is RestartClearanceState.REQUIRED  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        health = await successor.health()
+        assert (
+            health.fault_controls.closure_provenance
+            is FaultLeaseClosureProvenance.OPERATOR_ATTESTED_RETIREMENT
+        )
+        with pytest.raises(RoastRunConflictError):
+            await successor.start_roast(_profile())
+        assert roaster.calls == []
+    finally:
+        if first is not None:
+            await first.shutdown()
+        if successor is not None:
+            await successor.shutdown()
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -1313,6 +1430,8 @@ async def test_tb_evt_is_broadcast_only_and_never_exposes_private_retirement_ide
     await tmp_store.initialize()
     try:
         service, _roaster = await _eligible_service(tmp_store)
+        caplog.set_level(logging.DEBUG, logger=api_module.__name__)
+        caplog.clear()
         record_event_calls = 0
         operation_ids: list[str] = []
         original_retire = tmp_store.retire_stranded_fault_lease
@@ -1495,12 +1614,21 @@ async def test_tf3_projection_rechecks_each_local_binding_during_store_reads(
 
 @pytest.mark.asyncio
 async def test_tb12_cancelling_owned_task_retains_its_uncertainty_fence_without_a_frame(
-    tmp_store: RoastStore,
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """TB12 C1: task cancellation after reservation preserves fail-closed uncertainty."""
     await tmp_store.initialize()
     try:
         service, roaster = await _eligible_service(tmp_store)
+        transactions = 0
+        original_retire = tmp_store.retire_stranded_fault_lease
+
+        async def counted_transaction(**kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal transactions
+            transactions += 1
+            return await original_retire(**cast("Any", kwargs))
+
+        monkeypatch.setattr(tmp_store, "retire_stranded_fault_lease", counted_transaction)
         entered = asyncio.Event()
         release = asyncio.Event()
 
@@ -1519,7 +1647,10 @@ async def test_tb12_cancelling_owned_task_retains_its_uncertainty_fence_without_
         with pytest.raises(asyncio.CancelledError):
             await waiter
 
+        await asyncio.sleep(0)
         assert service._unconfirmed_stranded_fault_retirement is owned[0]  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert service._stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert transactions == 0
         assert frames.empty()
         release.set()
         await service.shutdown()
@@ -1562,15 +1693,20 @@ async def test_tb12_c2_c3_cancellation_after_reservation_retains_fence_and_emits
     await tmp_store.initialize()
     try:
         service, _roaster = await _eligible_service(tmp_store)
+        transactions = 0
         entered = asyncio.Event()
         release = asyncio.Event()
 
         async def parked_transaction(**_kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal transactions
+            transactions += 1
             entered.set()
             await release.wait()
             return StrandedFaultRetirementCommit.INDETERMINATE
 
         async def indeterminate_transaction(**_kwargs: object) -> StrandedFaultRetirementCommit:
+            nonlocal transactions
+            transactions += 1
             return StrandedFaultRetirementCommit.INDETERMINATE
 
         async def parked_verifier(**_kwargs: object) -> bool:
@@ -1592,7 +1728,10 @@ async def test_tb12_c2_c3_cancellation_after_reservation_retains_fence_and_emits
         with pytest.raises(asyncio.CancelledError):
             await waiter
 
+        await asyncio.sleep(0)
         assert service._unconfirmed_stranded_fault_retirement is owned[0]  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert service._stranded_fault_retirement is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert transactions == 1
         assert frames.empty()
         release.set()
         await service.shutdown()
@@ -2882,6 +3021,14 @@ async def test_tb_proj_actual_persisted_g_plus_one_is_honestly_projected_at_ever
             assert (
                 await service.retire_stranded_fault(_retirement_request())
             ).outcome == "confirmed"
+        projection_presence_calls = 0
+
+        async def counted_projection_presence() -> str:
+            nonlocal projection_presence_calls
+            projection_presence_calls += 1
+            return "none"
+
+        roaster.read_session_presence = counted_projection_presence  # type: ignore[method-assign]
         old_lease = service._fault_lease_cache  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         old_context = _test_retirement_context(service, old_lease)
         prior_ledger = service._retirement_event_ledger  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
@@ -3016,6 +3163,7 @@ async def test_tb_proj_actual_persisted_g_plus_one_is_honestly_projected_at_ever
         assert result.restart_clearance.eligible is False
         assert frames.empty()
         assert service._retirement_event_ledger == prior_ledger  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert projection_presence_calls == 0
         assert roaster.calls == []
         service._fault_control_executor = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         await service.shutdown()
