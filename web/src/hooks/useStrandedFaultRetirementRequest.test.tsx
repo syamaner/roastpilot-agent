@@ -30,7 +30,7 @@ describe("useStrandedFaultRetirementRequest", () => {
   beforeEach(() => retireMock.mockReset());
   it("TH1: allows one synchronous in-flight POST and records its settled outcome", async () => {
     const pending = deferred<typeof confirmed>();
-    retireMock.mockReturnValueOnce(pending.promise);
+    retireMock.mockReturnValue(pending.promise);
     const client = new QueryClient();
     const invalidate = vi.spyOn(client, "invalidateQueries");
     const { result } = renderHook(useStrandedFaultRetirementRequest, { wrapper: wrapper(client) });
