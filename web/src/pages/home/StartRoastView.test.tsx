@@ -241,6 +241,29 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     }
   });
 
+  it("TS10: every advertised incoherent retirement projection stays in the e-stop unknown view", () => {
+    const { rerender } = renderView();
+    const variants = [
+      { fault_controls: { status: "open", generation: 3, enabled_actions: ["emergency_stop"], physical_stop_operative: false } },
+      { fault_controls: { status: "open", generation: 3, enabled_actions: ["emergency_stop"] } },
+      { fault_controls: { status: "open", generation: 0, enabled_actions: ["emergency_stop"], physical_stop_operative: true } },
+      { fault_controls: { status: "unknown", generation: 3, enabled_actions: ["emergency_stop"], physical_stop_operative: true } },
+    ];
+    for (const instance_id of [undefined, "", 42, null]) variants.push({ instance_id, fault_controls: { status: "open", generation: 3, enabled_actions: ["emergency_stop"], physical_stop_operative: true } } as never);
+    for (const variant of variants) {
+      healthState.data = {
+        active_run_id: null,
+        instance_id: "process-1",
+        restart_clearance: { state: "required", eligible: false, enabled_actions: ["retire_stranded_fault"], closure_only_available: false },
+        ...variant,
+      } as never;
+      rerender();
+      expect(screen.getByTestId("restart-clearance-status-unknown")).toBeInTheDocument();
+      expect(screen.getByTestId("start-restart-clearance-emergency-stop")).toBeInTheDocument();
+      expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
+    }
+  });
+
   it("TS12/MC28: renders the provenance note only for operator-attested CLOSED REQUIRED health", () => {
     const { rerender } = renderView();
     const closed = (closure_provenance?: unknown) => {
@@ -305,6 +328,30 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     } as never;
     rerender();
     expect(screen.getByTestId("start-roast-form")).toBeInTheDocument();
+  });
+
+  it("TS8: a true confirmed retirement requires fresh CLOSED/REQUIRED health for D213 and never auto-unlocks Start", async () => {
+    eligibleHealth();
+    retireStrandedFaultMock.mockResolvedValueOnce({
+      outcome: "confirmed", attempted_generation: 3,
+      restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
+      fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"] },
+    });
+    const { rerender } = renderView();
+    tickAll();
+    fireEvent.click(screen.getByTestId("stranded-fault-submit"));
+    await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-outcome")).toBeInTheDocument());
+    healthState.data = {
+      active_run_id: null,
+      instance_id: "process-1",
+      restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false },
+      fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"], closure_provenance: "operator_attested_retirement" },
+    } as never;
+    rerender();
+    expect(screen.getByTestId("restart-clearance-required")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(acknowledgeRestartClearanceMock).not.toHaveBeenCalled();
+    expect(startRoastMock).not.toHaveBeenCalled();
   });
 });
 
