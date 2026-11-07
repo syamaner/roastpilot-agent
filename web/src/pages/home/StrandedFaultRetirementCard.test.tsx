@@ -50,11 +50,16 @@ describe("StrandedFaultRetirementCard", () => {
     expect(screen.getByTestId("stranded-fault-physical-stop-operative")).toBeInTheDocument();
   });
   it("TC10: keeps the physical-stop notice in closed, open, submitted and cancelled states", () => {
-    render(<StrandedFaultRetirementCard onSubmit={vi.fn()} />);
+    const submit = vi.fn();
+    render(<StrandedFaultRetirementCard onSubmit={submit} />);
     const notice = () => expect(screen.getByTestId("stranded-fault-physical-stop-operative")).toBeInTheDocument();
     notice();
     fireEvent.click(screen.getByTestId("stranded-fault-open")); notice();
     fireEvent.click(screen.getByTestId("stranded-fault-cancel")); notice();
+    fireEvent.click(screen.getByTestId("stranded-fault-open"));
+    for (const id of boxes) fireEvent.click(screen.getByTestId(id));
+    fireEvent.click(screen.getByTestId("stranded-fault-submit"));
+    expect(submit).toHaveBeenCalledTimes(1); notice();
   });
   it("TC9: never submits from timers and renders only fixed non-diagnostic card copy", () => {
     vi.useFakeTimers();
@@ -72,6 +77,7 @@ describe("StrandedFaultRetirementCard", () => {
     expect(screen.getByTestId("stranded-fault-retirement-pending")).toHaveAttribute("role", "status");
     expect(screen.getByTestId("stranded-fault-retirement-pending")).toHaveAttribute("aria-live", "polite");
     expect(screen.getByTestId("stranded-fault-retirement-pending").querySelector("button")).toBeNull();
+    expect(screen.getByTestId("stranded-fault-retirement-pending")).toHaveTextContent("A stranded-fault retirement request from this page is still pending. Starting remains blocked. The independent physical emergency stop is the operative stop.");
     rerender(<StrandedFaultRetirementOutcomeNotice kind="confirmed" onRefreshStatus={refresh} />);
     fireEvent.click(screen.getByTestId("stranded-fault-refresh-status"));
     expect(refresh).toHaveBeenCalledTimes(1);
@@ -83,10 +89,10 @@ describe("StrandedFaultRetirementCard", () => {
   });
 
   it.each([
-    ["confirmed", "Stranded fault record retired by your attestation."],
-    ["unconfirmed", "Retirement is unconfirmed."],
-    ["rejected", "Retirement was rejected."],
-    ["error", "Retirement result could not be confirmed."],
+    ["confirmed", "Stranded fault record retired by your attestation. This is not proof that the roaster is in a safe state. Starting remains blocked until you complete a new, separate restart clearance with a fresh physical confirmation."],
+    ["unconfirmed", "Retirement is unconfirmed. Starting remains blocked. Check refreshed status before any further action."],
+    ["rejected", "Retirement was rejected. Check current status."],
+    ["error", "Retirement result could not be confirmed. Check current status."],
   ] as const)("TC11: renders exact fixed %s outcome without diagnostic detail", (kind, text) => {
     render(<StrandedFaultRetirementOutcomeNotice kind={kind} onRefreshStatus={vi.fn()} />);
     expect(screen.getByTestId("stranded-fault-retirement-outcome")).toHaveTextContent(text);

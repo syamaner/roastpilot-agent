@@ -22,6 +22,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { StartRoastView } from "./StartRoastView";
 import type { StrandedFaultRetirementResult } from "@/lib/types";
+import { ApiError } from "@/lib/api";
 
 // #516: instance_id defaults present (matching a real 201 response) so the
 // existing pre-#516 tests below stay representative of real server
@@ -161,15 +162,21 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     rerender();
     expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
     expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
     expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeInTheDocument();
     healthState.data = { ...(healthState.data as object), fault_controls: { status: "unknown", generation: 3, enabled_actions: ["emergency_stop"], physical_stop_operative: true } } as never;
     rerender();
     expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
     expect(screen.getByTestId("terminal-fault-action-emergency_stop")).toBeInTheDocument();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
     healthState.data = { ...(healthState.data as object), fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"], closure_provenance: "operator_attested_retirement" } } as never;
     rerender();
     expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
     expect(screen.getByTestId("retirement-provenance-note")).toBeInTheDocument();
+    expect(screen.getByTestId("start-restart-clearance-emergency-stop")).toBeInTheDocument();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
     expect(acknowledgeRestartClearanceMock).not.toHaveBeenCalled();
     expect(startRoastMock).not.toHaveBeenCalled();
     resolve({ outcome: "confirmed", attempted_generation: 3, restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false }, fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"] } });
@@ -193,6 +200,29 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
     expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("TS6/TS7: a pending request survives malformed projections, then recovers on the same key without a second POST", async () => {
+    let resolve!: (value: StrandedFaultRetirementResult) => void;
+    retireStrandedFaultMock.mockImplementationOnce(() => new Promise<StrandedFaultRetirementResult>((done) => { resolve = done; }));
+    eligibleHealth();
+    const { rerender } = renderView();
+    tickAll();
+    fireEvent.click(screen.getByTestId("stranded-fault-submit"));
+    healthState.data = { ...(healthState.data as object), fault_controls: { status: "open", generation: 3, enabled_actions: "emergency_stop" } } as never;
+    rerender();
+    expect(screen.getByTestId("fault-controls-status-unknown")).toBeInTheDocument();
+    expect(screen.getByTestId("start-fault-controls-emergency-stop")).toBeInTheDocument();
+    expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
+    expect(screen.queryByTestId("restart-clearance-required")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    eligibleHealth();
+    rerender();
+    expect(screen.getByTestId("stranded-fault-retirement-pending")).toBeInTheDocument();
+    expect(screen.queryByTestId("stranded-fault-retirement-card")).toBeNull();
+    expect(retireStrandedFaultMock).toHaveBeenCalledTimes(1);
+    resolve({ outcome: "confirmed", attempted_generation: 3, restart_clearance: { state: "required", eligible: false, enabled_actions: [], closure_only_available: false }, fault_controls: { status: "closed", generation: 3, enabled_actions: ["emergency_stop"] } });
+    await waitFor(() => expect(screen.getByTestId("stranded-fault-retirement-outcome")).toBeInTheDocument());
   });
 
   it("TS13/TS-O5b/c: generation changes reset ticks, identical polls preserve them, and action loss remounts empty", () => {
@@ -287,7 +317,7 @@ describe("StartRoastView stranded-fault retirement (#1071, D225)", () => {
     const syntheticId = "process-identifier-not-for-dom";
     eligibleHealth();
     healthState.data = { ...healthState.data!, instance_id: syntheticId } as never;
-    retireStrandedFaultMock.mockRejectedValueOnce(new Error("run-abc /var/db " + syntheticId));
+    retireStrandedFaultMock.mockRejectedValueOnce(new ApiError(409, "run-abc /var/db " + syntheticId));
     const logSpy = vi.spyOn(console, "log");
     const warnSpy = vi.spyOn(console, "warn");
     const errorSpy = vi.spyOn(console, "error");

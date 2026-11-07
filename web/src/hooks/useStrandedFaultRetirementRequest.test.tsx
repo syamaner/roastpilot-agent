@@ -59,10 +59,12 @@ describe("useStrandedFaultRetirementRequest", () => {
   it("TH2: maps parser and transport failures to the fixed local error outcome", async () => {
     retireMock.mockRejectedValueOnce(new Error("run-abc /var/db"));
     const client = new QueryClient();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
     const { result } = renderHook(useStrandedFaultRetirementRequest, { wrapper: wrapper(client) });
     act(() => result.current.submit("p1#1"));
     await waitFor(() => expect(result.current.outcome).toEqual({ kind: "error", key: "p1#1" }));
     expect(result.current.pending).toBe(false);
+    expect(invalidate).toHaveBeenCalledTimes(1);
   });
 
   it.each([
