@@ -1,5 +1,20 @@
 # RoastPilot Agent Project State Registry
 
+**11 Nov 2026, #1079 watchdog probe import-readiness split:**
+The A1 S1 full native gate failed at
+`test_live_exit_watchdog_bounds_cancellation_resistant_owner` inside the
+exhaustive QA wrapper. The original receipt remains failed evidence. The four
+subsequent bounded probes (D/W/D/W) are diagnostics only. The original
+failure has no proven cause.
+
+The probe now reuses the 30 s startup budget for interpreter startup and the
+real CLI and API imports. The 5 s lifecycle bound starts at the last reading
+that saw the readiness marker absent, before the stand-in spawn and teardown.
+The watchdog grace remains 0.25 s. Post-kill output collection now uses the
+phased helper's single 5 s collection. The total observation bound changes
+from roughly 5 s plus 2 s to less than 30 s plus 5 s plus 5 s. This is
+test-only evidence and makes no A1, E11, #954 or live-readiness claim.
+
 **5 Nov 2026, #1069 software-only first-crack diagnostic retention:**
 The normal MCP mirror and existing raw-state, detail, SSE and SPA type paths
 retain four MCP-computed inference diagnostics as values or explicit null.
