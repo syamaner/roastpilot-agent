@@ -23,7 +23,9 @@ from roastpilot_agent.diagnostic_collector import (
 from roastpilot_agent.diagnostic_collector.bundle_schema import (
     AdmittedBundle,
     HumanFirstCrackPayload,
+    RoomReadingPayload,
     ShadowEventPayload,
+    TemperatureTurnPayload,
 )
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "d230_collector" / "synthetic-v1.jsonl"
@@ -192,6 +194,105 @@ def test_header_refusal_precedes_a_later_envelope_fault() -> None:
     _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
 
 
+@pytest.mark.parametrize(
+    ("stream", "field", "value"),
+    [
+        (CollectorStream.IDENTITY, "agent_sha256", "not-a-digest"),
+        (CollectorStream.SHADOW_WINDOW, "status", "unknown"),
+        (CollectorStream.INFERENCE_CONFIG, "window_seconds", 0),
+        (CollectorStream.RECORDING_SEGMENT, "sample_count", 0),
+        (CollectorStream.PERSISTENCE_ACK, "status", "bad"),
+        (CollectorStream.OPERATOR_OBSERVATION, "effect", "bad"),
+        (CollectorStream.ENDPOINT, "outcome", "bad"),
+    ],
+)
+def test_additional_stream_payload_guards_are_isolated(
+    stream: CollectorStream, field: str, value: object
+) -> None:
+    """Each remaining stream-local guard refuses only its own stream."""
+
+    lines = _canonical_lines()
+    _object_field(_stream(lines, stream), "payload")[field] = value
+    result = _read(lines)
+    entry = next(item for item in result.streams if item.stream is stream)
+    assert entry.state is CollectorStreamState.MALFORMED
+    assert entry.reason is CollectorStreamReason.PAYLOAD_INVALID
+
+
+def test_header_and_envelope_container_guards_are_typed_refusals() -> None:
+    """Container type and key faults do not escape as raw parser exceptions."""
+
+    lines = _canonical_lines()
+    lines[0]["inventory"] = []
+    _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
+
+    lines = _canonical_lines()
+    _object_field(lines[0], "inventory")["identity"] = True
+    _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
+
+    lines = _canonical_lines()
+    lines[0]["alignments"] = [{"source_clock": "agent_monotonic_seconds"}]
+    _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
+
+    lines = _canonical_lines()
+    _stream(lines, CollectorStream.HUMAN_FC).pop("seq")
+    _expect(CollectorAdmissionReason.ENVELOPE_INVALID, _bundle(lines))
+
+
+def test_decoder_and_post_decode_defence_guards_are_closed() -> None:
+    """Invalid byte decoding and redundant post-decode bounds remain fail-closed."""
+
+    _expect(CollectorAdmissionReason.FRAMING, b"\xff\n")
+    walk_json = typing.cast(
+        typing.Callable[[object, int], CollectorAdmissionReason | None],
+        bundle_reader._walk_json,  # pyright: ignore[reportPrivateUsage]
+    )
+    assert walk_json(float("inf"), 1) is CollectorAdmissionReason.JSON_INVALID
+    assert walk_json({"a": {"b": {"c": {"d": {"e": {"f": 1}}}}}}, 2) is (
+        CollectorAdmissionReason.NESTING_LIMIT
+    )
+    assert walk_json([[[[[[1]]]]]], 2) is CollectorAdmissionReason.NESTING_LIMIT
+
+
+@pytest.mark.parametrize(
+    ("stream", "field", "value"),
+    [
+        (CollectorStream.HUMAN_FC, "accepted_at", []),
+        (CollectorStream.HUMAN_FC, "accepted_at", {"clock": "unknown", "value": 1}),
+        (CollectorStream.HUMAN_FC, "accepted_at", {"clock": "recording_samples", "value": 1.5}),
+    ],
+)
+def test_instant_guards_are_stream_local(
+    stream: CollectorStream, field: str, value: object
+) -> None:
+    """Nested instant type, vocabulary, and sample-integrality faults are isolated."""
+
+    lines = _canonical_lines()
+    _object_field(_stream(lines, stream), "payload")[field] = value
+    result = _read(lines)
+    entry = next(item for item in result.streams if item.stream is stream)
+    assert entry.state is CollectorStreamState.MALFORMED
+    assert entry.reason is CollectorStreamReason.PAYLOAD_INVALID
+
+
+def test_non_object_payload_and_later_rows_do_not_restore_a_malformed_stream() -> None:
+    """A malformed stream stays empty even when later structural rows are valid."""
+
+    lines = _canonical_lines()
+    shadow = _stream(lines, CollectorStream.SHADOW_EVENT)
+    shadow["payload"] = []
+    later = _stream(_canonical_lines(), CollectorStream.SHADOW_EVENT)
+    later["seq"] = 1
+    lines.append(later)
+    lines.append(later.copy())
+    _object_field(lines[0], "inventory")["shadow_event"] = 3
+    result = _read(lines)
+    entry = next(item for item in result.streams if item.stream is CollectorStream.SHADOW_EVENT)
+    assert entry.state is CollectorStreamState.MALFORMED
+    assert entry.reason is CollectorStreamReason.PAYLOAD_INVALID
+    assert entry.records == ()
+
+
 def test_parser_rejects_an_escaped_lone_surrogate_as_json_invalid() -> None:
     """A canonical JSON escape must still name a valid Unicode scalar string."""
 
@@ -231,20 +332,34 @@ def test_bad_shadow_payload_is_isolated_while_human_first_crack_is_admitted() ->
     assert isinstance(human.records[0].payload, HumanFirstCrackPayload)
 
 
-def test_non_representable_temperature_integer_is_isolated_without_losing_human_fc() -> None:
-    """A huge JSON integer is not silently converted to a temperature float."""
+def test_large_finite_integer_measurements_are_admitted_without_float_coercion() -> None:
+    """Finite JSON integer measurements retain their exact integer value."""
 
     lines = _canonical_lines()
-    _object_field(_stream(lines, CollectorStream.TEMPERATURE_TURN), "payload")["bt_c"] = 10**400
+    large_integer = 10**400
+    temperature_payload = _object_field(_stream(lines, CollectorStream.TEMPERATURE_TURN), "payload")
+    temperature_payload["bt_c"] = large_integer
+    temperature_payload["et_c"] = large_integer
+    room_payload = _object_field(_stream(lines, CollectorStream.ROOM_READING), "payload")
+    room_payload["temperature_c"] = large_integer
     result = _read(lines)
 
     temperature = next(
         entry for entry in result.streams if entry.stream is CollectorStream.TEMPERATURE_TURN
     )
-    human = next(entry for entry in result.streams if entry.stream is CollectorStream.HUMAN_FC)
-    assert temperature.state is CollectorStreamState.MALFORMED
-    assert temperature.reason is CollectorStreamReason.PAYLOAD_INVALID
-    assert human.state is CollectorStreamState.ADMITTED
+    room = next(entry for entry in result.streams if entry.stream is CollectorStream.ROOM_READING)
+    assert temperature.state is CollectorStreamState.ADMITTED
+    assert room.state is CollectorStreamState.ADMITTED
+    typed_temperature = temperature.records[0].payload
+    typed_room = room.records[0].payload
+    assert isinstance(typed_temperature, TemperatureTurnPayload)
+    assert isinstance(typed_room, RoomReadingPayload)
+    assert typed_temperature.bt_c == large_integer
+    assert typed_temperature.et_c == large_integer
+    assert typed_room.temperature_c == large_integer
+    assert type(typed_temperature.bt_c) is int
+    assert type(typed_temperature.et_c) is int
+    assert type(typed_room.temperature_c) is int
 
 
 def test_duplicate_sequence_precedes_payload_for_the_same_stream() -> None:

@@ -109,17 +109,6 @@ def _finite_number(value: object) -> typing.TypeGuard[int | float]:
     return type(value) is float and math.isfinite(value)
 
 
-def _representable_measurement(value: object) -> bool:
-    """Return whether a finite JSON measurement fits the retained float domain."""
-
-    if not _finite_number(value):
-        return False
-    try:
-        return math.isfinite(float(value))
-    except OverflowError:
-        return False
-
-
 def _token(value: object) -> bool:
     """Return whether ``value`` is a bounded synthetic identifier token."""
 
@@ -297,9 +286,7 @@ def _payload(value: object, stream: CollectorStream) -> CollectorPayload:
     elif stream is CollectorStream.TEMPERATURE_TURN:
         raw = require({"turn_id", "observed_at", "bt_c", "et_c", "status"})
         _instant(raw["observed_at"])
-        valid_pair = _representable_measurement(raw["bt_c"]) and _representable_measurement(
-            raw["et_c"]
-        )
+        valid_pair = _finite_number(raw["bt_c"]) and _finite_number(raw["et_c"])
         null_pair = raw["bt_c"] is None and raw["et_c"] is None
         if (
             not _token(raw["turn_id"])
@@ -311,7 +298,7 @@ def _payload(value: object, stream: CollectorStream) -> CollectorPayload:
     elif stream is CollectorStream.ROOM_READING:
         raw = require({"observed_at", "temperature_c", "placement_id", "status"})
         _instant(raw["observed_at"])
-        temperature_valid = _representable_measurement(raw["temperature_c"])
+        temperature_valid = _finite_number(raw["temperature_c"])
         placement_valid = raw["placement_id"] is None or _token(raw["placement_id"])
         if (
             not placement_valid
