@@ -148,6 +148,23 @@ def test_digest_and_framing_order_are_closed() -> None:
     _expect(CollectorAdmissionReason.FRAMING, b"\xef\xbb\xbf{}\n")
     _expect(CollectorAdmissionReason.FRAMING, b"{}\r\n")
     _expect(CollectorAdmissionReason.FRAMING, b"{}\n\n")
+    _expect(
+        CollectorAdmissionReason.BUNDLE_SIZE,
+        b"x" * (bundle_reader.MAX_BUNDLE_BYTES + 1),
+        "bad",
+    )
+    _expect(CollectorAdmissionReason.EXPECTED_DIGEST_INVALID, b"{}\n", "a" * 63)
+    _expect(CollectorAdmissionReason.EXPECTED_DIGEST_INVALID, b"{}\n", "a" * 64 + "\n")
+
+
+def test_quoted_brackets_and_escaped_content_reach_header_validation() -> None:
+    """The raw nesting scanner ignores brackets, quotes, and backslashes inside strings."""
+
+    value = {"quoted": '[[[[[[[\\"\\\\]]]]]]]'}
+    data = (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode() + b"\n"
+    )
+    _expect(CollectorAdmissionReason.HEADER_INVALID, data)
 
 
 def test_record_line_nesting_json_string_and_canonical_bounds() -> None:
@@ -415,6 +432,40 @@ def test_file_start_bom_and_later_bom_have_distinct_staged_refusals() -> None:
     _expect(CollectorAdmissionReason.JSON_INVALID, b"{}\n\xef\xbb\xbf{}\n")
 
 
+def test_recording_sample_coordinates_are_unbounded_nonnegative_integers() -> None:
+    """Clock samples are not count fields and retain integers above the wire count max."""
+
+    for value in (2**53, 1.5, True, -1):
+        lines = _canonical_lines()
+        _object_field(_stream(lines, CollectorStream.HUMAN_FC), "payload")["accepted_at"] = {
+            "clock": "recording_samples",
+            "value": value,
+        }
+        result = _read(lines)
+        human = next(entry for entry in result.streams if entry.stream is CollectorStream.HUMAN_FC)
+        assert (human.state is CollectorStreamState.ADMITTED) is (value == 2**53)
+        if value == 2**53:
+            payload = human.records[0].payload
+            assert isinstance(payload, HumanFirstCrackPayload)
+            assert payload.accepted_at.value == 2**53
+            assert type(payload.accepted_at.value) is int
+
+    for value in (2**53, 1.5, True, -1):
+        lines = _canonical_lines()
+        lines[0]["alignments"] = [
+            {
+                "source_clock": "recording_samples",
+                "source_value": value,
+                "target_clock": "agent_monotonic_seconds",
+                "target_value": 1,
+            }
+        ]
+        if value == 2**53:
+            assert _read(lines).header.alignments[0].source_value == value
+        else:
+            _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
+
+
 def test_empty_bytes_and_leading_lf_are_framing_refusals() -> None:
     """No empty or blank-framed input reaches later validation stages."""
 
@@ -461,6 +512,77 @@ def test_header_envelope_and_inventory_are_whole_bundle_refusals() -> None:
     lines = _canonical_lines()
     _object_field(lines[0], "inventory")["human_fc"] = 2
     _expect(CollectorAdmissionReason.INVENTORY_MISMATCH, _bundle(lines))
+
+
+def test_header_and_envelope_extra_or_missing_keys_are_closed_refusals() -> None:
+    """Header inventory and envelope key sets are exact before stream isolation."""
+
+    lines = _canonical_lines()
+    _object_field(lines[0], "inventory").pop(CollectorStream.ENDPOINT.value)
+    _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
+
+    lines = _canonical_lines()
+    _stream(lines, CollectorStream.HUMAN_FC)["extra"] = True
+    _expect(CollectorAdmissionReason.ENVELOPE_INVALID, _bundle(lines))
+
+
+def test_invalid_header_tokens_and_same_clock_anchor_are_refused() -> None:
+    """Header identifiers and raw anchor identities remain closed grammar fields."""
+
+    for field in ("bundle_id", "session_id"):
+        lines = _canonical_lines()
+        lines[0][field] = "bad id"
+        _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
+
+    lines = _canonical_lines()
+    lines[0]["alignments"] = [
+        {
+            "source_clock": "agent_monotonic_seconds",
+            "source_value": 1,
+            "target_clock": "agent_monotonic_seconds",
+            "target_value": 2,
+        }
+    ]
+    _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
+
+
+def test_extra_or_list_valued_payload_fields_isolate_only_that_stream() -> None:
+    """Payload shape and enum type faults preserve independently valid human evidence."""
+
+    lines = _canonical_lines()
+    _object_field(_stream(lines, CollectorStream.HUMAN_FC), "payload")["extra"] = True
+    result = _read(lines)
+    human = next(entry for entry in result.streams if entry.stream is CollectorStream.HUMAN_FC)
+    assert human.state is CollectorStreamState.MALFORMED
+    assert human.reason is CollectorStreamReason.PAYLOAD_INVALID
+
+    lines = _canonical_lines()
+    _object_field(_stream(lines, CollectorStream.PERSISTENCE_ACK), "payload")["status"] = []
+    result = _read(lines)
+    persistence = next(
+        entry for entry in result.streams if entry.stream is CollectorStream.PERSISTENCE_ACK
+    )
+    human = next(entry for entry in result.streams if entry.stream is CollectorStream.HUMAN_FC)
+    assert persistence.state is CollectorStreamState.MALFORMED
+    assert human.state is CollectorStreamState.ADMITTED
+
+
+def test_sequence_gaps_are_retained_in_input_order() -> None:
+    """Strictly increasing sequence gaps are evidence, not an admission fault."""
+
+    lines = _canonical_lines()
+    human = _stream(lines, CollectorStream.HUMAN_FC)
+    human["seq"] = 1
+    fourth = human.copy()
+    fourth["seq"] = 4
+    ninth = human.copy()
+    ninth["seq"] = 9
+    lines.extend((fourth, ninth))
+    _object_field(lines[0], "inventory")[CollectorStream.HUMAN_FC.value] = 3
+    result = _read(lines)
+    entry = next(item for item in result.streams if item.stream is CollectorStream.HUMAN_FC)
+    assert entry.state is CollectorStreamState.ADMITTED
+    assert tuple(record.seq for record in entry.records) == (1, 4, 9)
 
 
 def test_unknown_versions_stream_and_session_sequence_rules_are_whole_bundle_refusals() -> None:
@@ -868,6 +990,8 @@ def _boundary_violations(source: str) -> set[str]:
                 and node.func.attr in {"load", "dump"}
             ):
                 violations.add(f"json.{node.func.attr}")
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "parse_file":
+                violations.add("parse_file")
     return violations
 
 
@@ -875,6 +999,11 @@ def test_collector_module_boundary_rejects_import_io_and_entrypoint_drift() -> N
     """All collector modules stay stdlib/Pydantic-only, with one reader entrypoint."""
 
     modules = (collector_package, bundle_schema, bundle_reader)
+    assert {Path(module.__file__).name for module in modules if module.__file__ is not None} == {
+        "__init__.py",
+        "bundle_schema.py",
+        "bundle_reader.py",
+    }
     for module in modules:
         assert module.__file__ is not None
         source = Path(module.__file__).read_text(encoding="utf-8")
@@ -888,6 +1017,7 @@ def test_collector_module_boundary_rejects_import_io_and_entrypoint_drift() -> N
         assert _boundary_violations(source + "\nexec('pass')\n")
         assert _boundary_violations(source + "\njson.load(None)\n")
         assert _boundary_violations(source + "\njson.dump({}, None)\n")
+        assert _boundary_violations(source + "\npydantic.BaseModel.parse_file('forbidden')\n")
         assert _boundary_violations(source + "\nfrom .. import store\n")
         assert _boundary_violations(source + "\nfrom .bundle_schema import BundleHeader\n") == set()
 

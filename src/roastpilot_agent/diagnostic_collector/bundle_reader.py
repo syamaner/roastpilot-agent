@@ -102,6 +102,12 @@ def _strict_int(value: object, *, maximum: int = MAX_SEQUENCE) -> typing.TypeGua
     return type(value) is int and 0 <= value <= maximum
 
 
+def _nonnegative_int(value: object) -> typing.TypeGuard[int]:
+    """Return whether ``value`` is a non-boolean nonnegative JSON integer."""
+
+    return type(value) is int and value >= 0
+
+
 def _finite_number(value: object) -> typing.TypeGuard[int | float]:
     """Return whether ``value`` is a finite JSON measurement number."""
 
@@ -266,7 +272,7 @@ def _instant(value: object) -> Instant:
         or value["value"] < 0
     ):
         raise ValueError
-    if value["clock"] == ClockName.RECORDING_SAMPLES.value and not _strict_int(value["value"]):
+    if value["clock"] == ClockName.RECORDING_SAMPLES.value and not _nonnegative_int(value["value"]):
         raise ValueError
     return Instant.model_validate(value)
 
@@ -503,9 +509,11 @@ def _header(value: object) -> BundleHeader:
         if invalid_anchor:
             _refuse(CollectorAdmissionReason.HEADER_INVALID)
         invalid_sample_coordinate = (
-            source == ClockName.RECORDING_SAMPLES.value and not _strict_int(anchor["source_value"])
+            source == ClockName.RECORDING_SAMPLES.value
+            and not _nonnegative_int(anchor["source_value"])
         ) or (
-            target == ClockName.RECORDING_SAMPLES.value and not _strict_int(anchor["target_value"])
+            target == ClockName.RECORDING_SAMPLES.value
+            and not _nonnegative_int(anchor["target_value"])
         )
         if invalid_sample_coordinate:
             _refuse(CollectorAdmissionReason.HEADER_INVALID)
