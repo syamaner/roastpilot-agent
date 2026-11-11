@@ -184,17 +184,10 @@ class RoastEventSource(Enum):
 
 
 class DropReason(Enum):
-    """Which deterministic drop path fired (#405 Slice C/D88 amendment A1).
+    """Reason for a deterministic drop in command event payloads.
 
-    Two policy-driven ``drop_beans`` paths share the same ``"policy"``
-    command-trace source (D84's dev%/temp anchor and D88's decoupled ceiling
-    guard — see ``CommandTraceSource`` in this module) — this typed value
-    distinguishes WHICH one fired, carried as ``.value`` in the
-    ``COMMAND_EXECUTED``/``COMMAND_FAILED`` event payload's ``reason`` key
-    (observability only: no controller/safety code path branches on it, so it
-    is never a string comparison in core logic, D15 — it exists purely so a
-    trace reader, or a test, can tell the two apart without re-deriving it
-    from bean temperature and dev% after the fact).
+    The value identifies the development anchor, automatic ceiling guard, or
+    human protection path. Command-event producers serialize the enum value.
     """
 
     #: D84's deterministic anchor: ``bean_temp_c >= target_drop_temp_c`` AND
@@ -207,6 +200,8 @@ class DropReason(Enum):
     #: regardless of the RoR-taper loop's flag or engagement (the safety
     #: anchor every roast needs, not a taper feature).
     CEILING_GUARD = "ceiling_guard"
+    #: D230's charged human-mode protective endpoint.
+    HUMAN_PROTECTION = "human_protection"
 
 
 class PostFcHeatAuthorityState(Enum):

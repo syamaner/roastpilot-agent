@@ -7176,10 +7176,14 @@ async def test_ceiling_guard_fires_identically_with_joint_window_flag_on_or_off(
     assert executed_by_flag[True] == executed_by_flag[False]
 
 
-def test_drop_reason_has_exactly_two_members() -> None:
-    """T46 (AC2): #710 grants no new ``DropReason`` — the closed set stays
-    exactly the two pre-existing members."""
-    assert set(DropReason) == {DropReason.DEVELOPMENT_TARGET, DropReason.CEILING_GUARD}
+def test_drop_reason_has_closed_members() -> None:
+    """Pin the two automatic reasons and the D230 human protection reason."""
+    assert set(DropReason) == {
+        DropReason.DEVELOPMENT_TARGET,
+        DropReason.CEILING_GUARD,
+        DropReason.HUMAN_PROTECTION,
+    }
+    assert DropReason.HUMAN_PROTECTION.value == "human_protection"
 
 
 def test_fan_ceiling_release_latch_survives_transitions_within_a_run() -> None:
