@@ -309,6 +309,7 @@ _WATCHDOG_PROBE: Final = textwrap.dedent(
     evidence = Path(sys.argv[1])
     pid_file = Path(sys.argv[2])
     marker = Path(sys.argv[3])
+    released = Path(sys.argv[4])
 
     def publish_ready() -> None:
         print(
@@ -326,8 +327,17 @@ _WATCHDOG_PROBE: Final = textwrap.dedent(
     import roastpilot_agent.api
 
     publish_ready()
+    # The outer process owns the sole writer, so its exit releases the stand-in
+    # even if the helper cannot read the PID file yet.
     child = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)"],
+        [
+            sys.executable,
+            "-c",
+            "import select, sys; from pathlib import Path; "
+            "select.select([0], [], [], 60); Path(sys.argv[1]).write_text('released')",
+            str(released),
+        ],
+        stdin=subprocess.PIPE,
         start_new_session=True,
     )
     pid_file.write_text(str(child.pid))
@@ -381,12 +391,13 @@ _WATCHDOG_PROBE: Final = textwrap.dedent(
 )
 
 
-def _watchdog_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
-    """Return the watchdog probe's evidence, PID file and readiness marker."""
+def _watchdog_paths(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """Return the watchdog probe's evidence, PID file, readiness and release markers."""
     return (
         tmp_path / "teardown-evidence.txt",
         tmp_path / "mcp-child.pid",
         tmp_path / "watchdog-ready.marker",
+        tmp_path / "stand-in-released.marker",
     )
 
 
@@ -394,9 +405,17 @@ def _run_watchdog_probe(
     tmp_path: Path, *, clock: Callable[[], float] = time.monotonic
 ) -> tuple[subprocess.Popen[str], str, str]:
     """Run the real imports and the watchdog lifecycle under their separate budgets."""
-    evidence, pid_file, marker = _watchdog_paths(tmp_path)
+    evidence, pid_file, marker, released = _watchdog_paths(tmp_path)
     return _run_phased_lifecycle_probe(
-        [sys.executable, "-c", _WATCHDOG_PROBE, str(evidence), str(pid_file), str(marker)],
+        [
+            sys.executable,
+            "-c",
+            _WATCHDOG_PROBE,
+            str(evidence),
+            str(pid_file),
+            str(marker),
+            str(released),
+        ],
         ready_marker=marker,
         mcp_pid_file=pid_file,
         import_budget_seconds=_IMPORT_READY_BUDGET_SECONDS,
@@ -406,19 +425,28 @@ def _run_watchdog_probe(
 
 
 def _assert_watchdog_outcome(
-    child: subprocess.Popen[str], stdout: str, stderr: str, evidence: Path, pid_file: Path
+    child: subprocess.Popen[str],
+    stdout: str,
+    stderr: str,
+    evidence: Path,
+    pid_file: Path,
+    released: Path,
 ) -> None:
     """Check owned-process cleanup, ordered teardown and the guard's forced exit."""
     output = f"stdout:\n{stdout}\nstderr:\n{stderr}"
     assert pid_file.exists(), f"missing stand-in PID file\n{output}"
     pid = int(pid_file.read_text().strip())
+    survived = False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         pass
     else:
         _kill_captured_process_group(pid_file)
-        pytest.fail(f"stand-in {pid} survived\n{output}")
+        survived = True
+
+    assert not released.exists(), f"stand-in released instead of killed by MCP.stop\n{output}"
+    assert not survived, f"stand-in {pid} survived\n{output}"
 
     assert child.returncode == 70, f"expected exit 70, got {child.returncode}\n{output}"
     assert evidence.exists(), f"missing teardown evidence\n{output}"
@@ -438,8 +466,8 @@ def _assert_watchdog_outcome(
 def test_live_exit_watchdog_bounds_cancellation_resistant_owner(tmp_path: Path) -> None:
     """Ordered teardown is durable before a stuck owner forces exit 70."""
     child, stdout, stderr = _run_watchdog_probe(tmp_path)
-    evidence, pid_file, _ = _watchdog_paths(tmp_path)
-    _assert_watchdog_outcome(child, stdout, stderr, evidence, pid_file)
+    evidence, pid_file, _, released = _watchdog_paths(tmp_path)
+    _assert_watchdog_outcome(child, stdout, stderr, evidence, pid_file, released)
 
 
 def test_live_exit_watchdog_bounds_startup_failure_owner(tmp_path: Path) -> None:
@@ -798,15 +826,15 @@ def test_watchdog_probe_slow_startup_consumes_import_budget(tmp_path: Path) -> N
     child, stdout, stderr = _run_watchdog_probe(
         tmp_path, clock=_after_first_read_offset_clock(10.0)
     )
-    evidence, pid_file, _ = _watchdog_paths(tmp_path)
-    _assert_watchdog_outcome(child, stdout, stderr, evidence, pid_file)
+    evidence, pid_file, _, released = _watchdog_paths(tmp_path)
+    _assert_watchdog_outcome(child, stdout, stderr, evidence, pid_file, released)
 
 
 @_requires_killpg
 def test_watchdog_probe_import_budget_is_finite(harness: _ProofHarness) -> None:
     """An expired import budget fails and collects the outer child."""
     harness.arm(sleeper=False)
-    _, pid_file, _ = _watchdog_paths(harness.tmp_path)
+    _, pid_file, _, _ = _watchdog_paths(harness.tmp_path)
     try:
         with pytest.raises(
             pytest.fail.Exception, match=r"readiness marker not published within 30\.0 seconds"
@@ -829,11 +857,55 @@ def test_watchdog_probe_import_budget_is_finite(harness: _ProofHarness) -> None:
 def test_watchdog_probe_late_post_readiness_exit_fails_5s_bound(harness: _ProofHarness) -> None:
     """A lifecycle offset triggered by the stand-in's PID file still fails the five-second bound."""
     harness.arm(sleeper=False)
-    _, pid_file, _ = _watchdog_paths(harness.tmp_path)
+    _, pid_file, _, _ = _watchdog_paths(harness.tmp_path)
     with pytest.raises(pytest.fail.Exception, match=r"lifecycle did not exit within 5\.0 seconds"):
         _run_watchdog_probe(harness.tmp_path, clock=_offset_clock(pid_file, 5.5))
     assert pid_file.exists()
     _assert_watchdog_stand_in_gone(int(pid_file.read_text().strip()))
+
+
+@_requires_killpg
+def test_watchdog_probe_stand_in_released_before_pid_publication(
+    harness: _ProofHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Killing the outer before PID publication releases the owned stand-in."""
+    harness.arm(sleeper=False)
+    tmp_path = harness.tmp_path
+    _, pid_file, _, released = _watchdog_paths(tmp_path)
+    owned = tmp_path / "owned-stand-in.pid"
+    publish_pid = "pid_file.write_text(str(child.pid))"
+    assert _WATCHDOG_PROBE.count(publish_pid) == 1
+    injected = _WATCHDOG_PROBE.replace(
+        publish_pid,
+        textwrap.dedent(
+            f"""\
+            owned = Path({str(owned)!r})
+            staging = owned.with_suffix(".tmp")
+            staging.write_text(str(child.pid), encoding="utf-8")
+            os.replace(staging, owned)
+            import threading
+            threading.Event().wait()
+            {publish_pid}"""
+        ),
+    )
+    monkeypatch.setitem(globals(), "_WATCHDOG_PROBE", injected)
+    try:
+        with pytest.raises(
+            pytest.fail.Exception, match=r"^lifecycle did not exit within 5\.0 seconds"
+        ):
+            _run_watchdog_probe(tmp_path, clock=_offset_clock(owned, 5.5))
+        assert not pid_file.exists()
+        assert owned.exists()
+        _assert_watchdog_stand_in_gone(int(owned.read_text(encoding="utf-8")))
+        assert released.exists()
+    finally:
+        if owned.exists():
+            pid = int(owned.read_text(encoding="utf-8"))
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, 0)
+                if os.getpgid(pid) == pid:
+                    harness.real_killpg(pid, signal.SIGKILL)
+            _assert_watchdog_stand_in_gone(pid)
 
 
 def test_watchdog_probe_runner_binds_paths_and_budgets(
@@ -857,6 +929,7 @@ def test_watchdog_probe_runner_binds_paths_and_budgets(
         assert argv[3:] == [str(path) for path in _watchdog_paths(tmp_path)]
         assert mcp_pid_file == Path(argv[4])
         assert ready_marker == Path(argv[5])
+        assert Path(argv[6]) == _watchdog_paths(tmp_path)[3]
         assert import_budget_seconds == 30.0
         assert lifecycle_budget_seconds == 5.0
         assert clock is injected_clock
