@@ -6,6 +6,7 @@ does not read files, contact providers, import a hardware-control surface, or
 interpret evidence.
 """
 
+import contextlib
 import hashlib
 import json
 import math
@@ -202,11 +203,11 @@ def _parse_lines(data: bytes) -> list[object]:
 
     if not data or not data.endswith(b"\n") or data.startswith(b"\xef\xbb\xbf") or b"\r" in data:
         _refuse(CollectorAdmissionReason.FRAMING)
-    lines = data[:-1].split(b"\n")
-    if any(not line for line in lines):
+    if data.startswith(b"\n") or b"\n\n" in data:
         _refuse(CollectorAdmissionReason.FRAMING)
-    if len(lines) - 1 > MAX_RECORDS:
+    if data.count(b"\n") - 1 > MAX_RECORDS:
         _refuse(CollectorAdmissionReason.RECORD_LIMIT)
+    lines = data[:-1].split(b"\n")
     if any(len(line) > MAX_LINE_BYTES for line in lines):
         _refuse(CollectorAdmissionReason.LINE_LIMIT)
 
@@ -214,28 +215,40 @@ def _parse_lines(data: bytes) -> list[object]:
     for line in lines:
         if _raw_nesting_exceeds(line):
             _refuse(CollectorAdmissionReason.NESTING_LIMIT)
+        decode_failed = False
         try:
             text = line.decode("utf-8", errors="strict")
         except UnicodeDecodeError:
+            decode_failed = True
+            text = ""
+        if decode_failed:
             _refuse(CollectorAdmissionReason.FRAMING)
+        json_failed = False
         try:
             value = json.loads(
                 text,
                 object_pairs_hook=_object_pairs,
                 parse_constant=_reject_constant,
             )
-        except (_DuplicateJsonKey, _InvalidJson, json.JSONDecodeError, RecursionError):
+        except (_DuplicateJsonKey, _InvalidJson, json.JSONDecodeError, RecursionError, ValueError):
+            json_failed = True
+            value = None
+        if json_failed:
             _refuse(CollectorAdmissionReason.JSON_INVALID)
         walked = _walk_json(value)
         if walked is not None:
             _refuse(walked)
+        canonical_failed = False
         try:
             canonical = json.dumps(
                 value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
             )
         except (TypeError, ValueError):
+            canonical_failed = True
+            canonical = ""
+        if canonical_failed:
             _refuse(CollectorAdmissionReason.JSON_INVALID)
-        if canonical != text:
+        elif canonical != text:
             _refuse(CollectorAdmissionReason.NON_CANONICAL)
         parsed.append(value)
     return parsed
@@ -504,10 +517,12 @@ def _header(value: object) -> BundleHeader:
     typed_value["inventory"] = tuple(
         {"stream": stream, "count": count} for stream, count in inventory.items()
     )
-    try:
-        return BundleHeader.model_validate(typed_value)
-    except pydantic.ValidationError:
+    typed_header: BundleHeader | None = None
+    with contextlib.suppress(pydantic.ValidationError):
+        typed_header = BundleHeader.model_validate(typed_value)
+    if typed_header is None:
         _refuse(CollectorAdmissionReason.HEADER_INVALID)
+    return typed_header
 
 
 def _envelope(value: object, session_id: str) -> tuple[CollectorStream, int, object]:

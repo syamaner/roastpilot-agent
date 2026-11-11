@@ -3,12 +3,16 @@
 import ast
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import typing
 from pathlib import Path
 
 import pydantic
 import pytest
 
+import roastpilot_agent.diagnostic_collector as collector_package
 from roastpilot_agent.diagnostic_collector import (
     CollectorAdmissionError,
     CollectorAdmissionReason,
@@ -67,6 +71,7 @@ def _expect(reason: CollectorAdmissionReason, data: bytes, expected: str | None 
     assert raised.value.reason is reason
     assert str(raised.value) == "synthetic collector bundle refused"
     assert raised.value.__suppress_context__ is True
+    assert raised.value.__context__ is None
 
 
 def _stream(lines: list[dict[str, object]], stream: CollectorStream) -> dict[str, object]:
@@ -155,6 +160,68 @@ def test_record_line_nesting_json_string_and_canonical_bounds() -> None:
     _expect(CollectorAdmissionReason.JSON_INVALID, b'{"x":1,"x":2}\n')
     _expect(CollectorAdmissionReason.STRING_LIMIT, b'{"' + b"x" * 129 + b'":0}\n')
     _expect(CollectorAdmissionReason.NON_CANONICAL, b'{ "x":0}\n')
+
+
+def test_staged_mixed_fault_order_uses_prechecks_then_decoded_traversal() -> None:
+    """Ratified mixed faults select byte prechecks, then key/value traversal order."""
+
+    _expect(
+        CollectorAdmissionReason.LINE_LIMIT,
+        b"\xff\n" + b"x" * (bundle_reader.MAX_LINE_BYTES + 1) + b"\n",
+    )
+    oversized = b"x" * (bundle_reader.MAX_STRING_BYTES + 1)
+    _expect(CollectorAdmissionReason.STRING_LIMIT, b'{"x":"' + oversized + b'","y":1e400}\n')
+    _expect(CollectorAdmissionReason.JSON_INVALID, b'{"y":1e400,"x":"' + oversized + b'"}\n')
+
+
+def test_json_digit_limit_value_error_is_a_sanitised_json_refusal() -> None:
+    """A lowered interpreter digit guard cannot leak a raw parser ValueError."""
+
+    previous = sys.get_int_max_str_digits()
+    try:
+        sys.set_int_max_str_digits(640)
+        _expect(CollectorAdmissionReason.JSON_INVALID, b'{"x":' + b"1" * 700 + b"}\n")
+    finally:
+        sys.set_int_max_str_digits(previous)
+
+
+def test_exact_resource_limits_reach_later_validation_and_above_limits_refuse() -> None:
+    """Exact byte, record, and per-stream bounds admit before their next validation stage."""
+
+    _expect(
+        CollectorAdmissionReason.LINE_LIMIT,
+        b" " * (bundle_reader.MAX_BUNDLE_BYTES - 1) + b"\n",
+    )
+    _expect(CollectorAdmissionReason.BUNDLE_SIZE, b"x" * (bundle_reader.MAX_BUNDLE_BYTES + 1))
+    _expect(CollectorAdmissionReason.HEADER_INVALID, b"{}\n" * (bundle_reader.MAX_RECORDS + 1))
+
+    lines = _canonical_lines()
+    header = lines[0]
+    header["inventory"] = {stream.value: 0 for stream in CollectorStream}
+    header["inventory"][CollectorStream.HUMAN_FC.value] = bundle_reader.MAX_STREAM_RECORDS
+    header["inventory"][CollectorStream.ENDPOINT.value] = bundle_reader.MAX_STREAM_RECORDS
+    human = _stream(lines, CollectorStream.HUMAN_FC)
+    endpoint = _stream(lines, CollectorStream.ENDPOINT)
+    bounded = [header]
+    for sequence in range(bundle_reader.MAX_STREAM_RECORDS):
+        human_row = human.copy()
+        human_row["seq"] = sequence
+        endpoint_row = endpoint.copy()
+        endpoint_row["seq"] = sequence
+        bounded.extend((human_row, endpoint_row))
+    result = _read(bounded)
+    assert sum(len(entry.records) for entry in result.streams) == bundle_reader.MAX_RECORDS
+    assert all(
+        len(entry.records) == bundle_reader.MAX_STREAM_RECORDS
+        for entry in result.streams
+        if entry.stream in {CollectorStream.HUMAN_FC, CollectorStream.ENDPOINT}
+    )
+
+    lines = _canonical_lines()
+    _object_field(lines[0], "inventory")[CollectorStream.HUMAN_FC.value] = (
+        bundle_reader.MAX_STREAM_RECORDS + 1
+    )
+    _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
 
 
 def test_exact_parser_bounds_admit_the_boundary_before_later_validation() -> None:
@@ -314,6 +381,78 @@ def test_header_envelope_and_inventory_are_whole_bundle_refusals() -> None:
     lines = _canonical_lines()
     _object_field(lines[0], "inventory")["human_fc"] = 2
     _expect(CollectorAdmissionReason.INVENTORY_MISMATCH, _bundle(lines))
+
+
+def test_unknown_versions_stream_and_session_sequence_rules_are_whole_bundle_refusals() -> None:
+    """Version, stream, session, and structural sequence-envelope grammar is closed."""
+
+    lines = _canonical_lines()
+    lines[0]["schema_version"] = 2
+    _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
+
+    lines = _canonical_lines()
+    _stream(lines, CollectorStream.HUMAN_FC)["schema_version"] = 2
+    _expect(CollectorAdmissionReason.ENVELOPE_INVALID, _bundle(lines))
+
+    lines = _canonical_lines()
+    _stream(lines, CollectorStream.HUMAN_FC)["stream"] = "unknown"
+    _expect(CollectorAdmissionReason.ENVELOPE_INVALID, _bundle(lines))
+
+
+def test_decreasing_sequence_isolated_without_erasing_other_streams() -> None:
+    """A decreasing sequence marks only its stream malformed."""
+
+    lines = _canonical_lines()
+    duplicate = _stream(lines, CollectorStream.HUMAN_FC).copy()
+    duplicate["seq"] = 0
+    lines.append(duplicate)
+    _object_field(lines[0], "inventory")[CollectorStream.HUMAN_FC.value] = 2
+    result = _read(lines)
+    human = next(entry for entry in result.streams if entry.stream is CollectorStream.HUMAN_FC)
+    shadow = next(entry for entry in result.streams if entry.stream is CollectorStream.SHADOW_EVENT)
+    assert human.state is CollectorStreamState.MALFORMED
+    assert human.reason is CollectorStreamReason.SEQUENCE_CONFLICT
+    assert shadow.state is CollectorStreamState.ADMITTED
+
+
+def test_temperature_room_and_command_nullable_status_rules_are_exact() -> None:
+    """Nullable status fields accept only their ratified valid combinations."""
+
+    lines = _canonical_lines()
+    temperature = _object_field(_stream(lines, CollectorStream.TEMPERATURE_TURN), "payload")
+    temperature.update(status="accepted", bt_c=None, et_c=None)
+    room = _object_field(_stream(lines, CollectorStream.ROOM_READING), "payload")
+    room.update(status="valid", temperature_c=None)
+    command = _object_field(_stream(lines, CollectorStream.COMMAND), "payload")
+    command.update(disposition="unknown", commanded_heat_percent=10)
+    result = _read(lines)
+    for stream in (
+        CollectorStream.TEMPERATURE_TURN,
+        CollectorStream.ROOM_READING,
+        CollectorStream.COMMAND,
+    ):
+        entry = next(item for item in result.streams if item.stream is stream)
+        assert entry.state is CollectorStreamState.MALFORMED
+        assert entry.reason is CollectorStreamReason.PAYLOAD_INVALID
+
+    lines = _canonical_lines()
+    temperature = _object_field(_stream(lines, CollectorStream.TEMPERATURE_TURN), "payload")
+    temperature.update(status="invalid", bt_c=1, et_c=2)
+    result = _read(lines)
+    entry = next(item for item in result.streams if item.stream is CollectorStream.TEMPERATURE_TURN)
+    assert entry.state is CollectorStreamState.MALFORMED
+
+    lines = _canonical_lines()
+    temperature = _object_field(_stream(lines, CollectorStream.TEMPERATURE_TURN), "payload")
+    temperature.update(status="invalid", bt_c=None, et_c=None)
+    room = _object_field(_stream(lines, CollectorStream.ROOM_READING), "payload")
+    room.update(status="invalid", temperature_c=None)
+    result = _read(lines)
+    assert all(
+        next(item for item in result.streams if item.stream is stream).state
+        is CollectorStreamState.ADMITTED
+        for stream in (CollectorStream.TEMPERATURE_TURN, CollectorStream.ROOM_READING)
+    )
 
 
 def test_bad_shadow_payload_is_isolated_while_human_first_crack_is_admitted() -> None:
@@ -511,25 +650,78 @@ def test_header_inventory_is_immutable_after_admission() -> None:
     _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
 
 
-def test_boundary_has_one_reader_entrypoint_and_no_hardware_or_io_imports() -> None:
-    """The S1 package remains callable, stdlib/Pydantic-only, and hardware-free."""
+def _boundary_violations(source: str) -> set[str]:
+    """Return forbidden import, file-I/O, and public-entrypoint boundary violations."""
 
-    assert [name for name in dir(bundle_reader) if name == "read_synthetic_bundle"] == [
-        "read_synthetic_bundle"
-    ]
+    tree = ast.parse(source)
+    allowed_stdlib = {"contextlib", "enum", "hashlib", "json", "math", "re", "typing"}
+    violations: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root not in allowed_stdlib and root != "pydantic":
+                    violations.add(f"import:{alias.name}")
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            root = node.module.split(".")[0]
+            if (
+                root not in allowed_stdlib
+                and root != "pydantic"
+                and not node.module.startswith("roastpilot_agent.diagnostic_collector")
+            ):
+                violations.add(f"from:{node.module}")
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id == "open":
+                violations.add("open")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "builtins"
+                and node.func.attr == "open"
+            ):
+                violations.add("open")
+    return violations
+
+
+def test_collector_module_boundary_rejects_import_io_and_entrypoint_drift() -> None:
+    """All collector modules stay stdlib/Pydantic-only, with one reader entrypoint."""
+
+    modules = (collector_package, bundle_schema, bundle_reader)
+    for module in modules:
+        assert module.__file__ is not None
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert _boundary_violations(source) == set()
+        assert _boundary_violations(source + "\nimport roastpilot_agent.controller\n")
+        assert _boundary_violations(source + "\nimport roastpilot_agent.safety\n")
+        assert _boundary_violations(source + "\nimport roastpilot_agent.mcp_client\n")
+        assert _boundary_violations(source + "\nopen('forbidden')\n")
+
     reader_tree = ast.parse(Path(bundle_reader.__file__).read_text(encoding="utf-8"))
-    imported = {
-        alias.name.split(".")[0]
-        for node in ast.walk(reader_tree)
-        if isinstance(node, ast.Import)
-        for alias in node.names
-    }
-    imported.update(
-        node.module.split(".")[0]
-        for node in ast.walk(reader_tree)
-        if isinstance(node, ast.ImportFrom) and node.module is not None
+    public_functions = [
+        node.name
+        for node in reader_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.name.startswith("_")
+    ]
+    assert public_functions == ["read_synthetic_bundle"]
+    assert collector_package.__all__[-1] == "read_synthetic_bundle"
+
+
+def test_fresh_collector_import_loads_no_runtime_or_control_modules() -> None:
+    """A fresh interpreter imports the boundary without runtime/control dependencies."""
+
+    program = (
+        "import sys\n"
+        "import roastpilot_agent.diagnostic_collector\n"
+        "blocked = {'controller', 'safety', 'mcp_client', 'live', 'mcp'}\n"
+        "loaded = {name.rsplit('.', 1)[-1] for name in sys.modules}\n"
+        "raise SystemExit(bool(loaded & blocked))\n"
     )
-    assert imported <= {"hashlib", "json", "math", "re", "typing", "pydantic", "roastpilot_agent"}
-    assert not {"mcp_client", "controller", "live", "serial", "sounddevice"} & imported
-    assert not hasattr(bundle_reader, "open")
-    assert tuple(CollectorStream) == tuple(bundle_schema.CollectorStream)
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"PATH": os.defpath},
+    )
+    assert completed.returncode == 0
