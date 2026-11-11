@@ -174,6 +174,49 @@ def test_staged_mixed_fault_order_uses_prechecks_then_decoded_traversal() -> Non
     _expect(CollectorAdmissionReason.JSON_INVALID, b'{"y":1e400,"x":"' + oversized + b'"}\n')
 
 
+def test_staged_fault_order_across_raw_parse_header_envelope_and_inventory() -> None:
+    """Each stage wins only after every earlier stage has admitted the bytes."""
+
+    _expect(CollectorAdmissionReason.NESTING_LIMIT, b"[[[[[[[\xff\n")
+    _expect(CollectorAdmissionReason.NON_CANONICAL, b'{ "x":0}\n[[[[[[[]]]]]]]\n')
+
+    lines = _canonical_lines()
+    lines[0]["evidence_class"] = "live"
+    _expect(CollectorAdmissionReason.JSON_INVALID, _bundle(lines) + b'{"x":\n')
+
+    lines = _canonical_lines()
+    _object_field(lines[0], "inventory")[CollectorStream.HUMAN_FC.value] = 2
+    _stream(lines, CollectorStream.ENDPOINT)["session_id"] = "foreign"
+    _expect(CollectorAdmissionReason.ENVELOPE_INVALID, _bundle(lines))
+
+
+def test_precheck_order_is_framing_then_record_count_then_line_length() -> None:
+    """Whole-bundle byte prechecks retain their ratified priority."""
+
+    _expect(CollectorAdmissionReason.FRAMING, b"\n" * (bundle_reader.MAX_RECORDS + 3))
+    _expect(
+        CollectorAdmissionReason.RECORD_LIMIT,
+        b"{}\n" * (bundle_reader.MAX_RECORDS + 2)
+        + b"x" * (bundle_reader.MAX_LINE_BYTES + 1)
+        + b"\n",
+    )
+
+
+def test_utf8_string_limit_counts_encoded_bytes_not_characters() -> None:
+    """A two-byte decoded character reaches 128 bytes at 64 copies, not 128 copies."""
+
+    lines = _canonical_lines()
+    _object_field(_stream(lines, CollectorStream.HUMAN_FC), "payload")["event_id"] = "é" * 64
+    result = _read(lines)
+    human = next(entry for entry in result.streams if entry.stream is CollectorStream.HUMAN_FC)
+    assert human.state is CollectorStreamState.MALFORMED
+    assert human.reason is CollectorStreamReason.PAYLOAD_INVALID
+
+    lines = _canonical_lines()
+    _object_field(_stream(lines, CollectorStream.HUMAN_FC), "payload")["event_id"] = "é" * 65
+    _expect(CollectorAdmissionReason.STRING_LIMIT, _bundle(lines))
+
+
 def test_json_digit_limit_value_error_is_a_sanitised_json_refusal() -> None:
     """A lowered interpreter digit guard cannot leak a raw parser ValueError."""
 
@@ -342,6 +385,43 @@ def test_instant_guards_are_stream_local(
     assert entry.reason is CollectorStreamReason.PAYLOAD_INVALID
 
 
+def test_negative_instant_and_shadow_probability_combinations_are_isolated() -> None:
+    """Nested numeric and nullable shadow grammar faults remain stream-local."""
+
+    lines = _canonical_lines()
+    _object_field(_stream(lines, CollectorStream.HUMAN_FC), "payload")["accepted_at"] = {
+        "clock": "agent_monotonic_seconds",
+        "value": -1,
+    }
+    result = _read(lines)
+    human = next(entry for entry in result.streams if entry.stream is CollectorStream.HUMAN_FC)
+    assert human.state is CollectorStreamState.MALFORMED
+
+    for status, probability in (("not_inferred", 0.1), ("confirmed", None)):
+        lines = _canonical_lines()
+        payload = _object_field(_stream(lines, CollectorStream.SHADOW_WINDOW), "payload")
+        payload.update(eligibility="eligible", status=status, probability=probability)
+        result = _read(lines)
+        shadow = next(
+            entry for entry in result.streams if entry.stream is CollectorStream.SHADOW_WINDOW
+        )
+        assert shadow.state is CollectorStreamState.MALFORMED
+
+
+def test_file_start_bom_and_later_bom_have_distinct_staged_refusals() -> None:
+    """Only a file-start BOM is framing; a later prefix fails JSON parsing."""
+
+    _expect(CollectorAdmissionReason.FRAMING, b"\xef\xbb\xbf{}\n")
+    _expect(CollectorAdmissionReason.JSON_INVALID, b"{}\n\xef\xbb\xbf{}\n")
+
+
+def test_empty_bytes_and_leading_lf_are_framing_refusals() -> None:
+    """No empty or blank-framed input reaches later validation stages."""
+
+    _expect(CollectorAdmissionReason.FRAMING, b"")
+    _expect(CollectorAdmissionReason.FRAMING, b"\n{}\n")
+
+
 def test_non_object_payload_and_later_rows_do_not_restore_a_malformed_stream() -> None:
     """A malformed stream stays empty even when later structural rows are valid."""
 
@@ -403,6 +483,7 @@ def test_decreasing_sequence_isolated_without_erasing_other_streams() -> None:
     """A decreasing sequence marks only its stream malformed."""
 
     lines = _canonical_lines()
+    _stream(lines, CollectorStream.HUMAN_FC)["seq"] = 1
     duplicate = _stream(lines, CollectorStream.HUMAN_FC).copy()
     duplicate["seq"] = 0
     lines.append(duplicate)
@@ -413,6 +494,32 @@ def test_decreasing_sequence_isolated_without_erasing_other_streams() -> None:
     assert human.state is CollectorStreamState.MALFORMED
     assert human.reason is CollectorStreamReason.SEQUENCE_CONFLICT
     assert shadow.state is CollectorStreamState.ADMITTED
+
+
+def test_sequence_bounds_reject_bool_negative_and_above_wire_maximum() -> None:
+    """Envelope and payload count fields use the exact non-boolean wire integer range."""
+
+    for sequence in (True, -1, 2**53):
+        lines = _canonical_lines()
+        _stream(lines, CollectorStream.HUMAN_FC)["seq"] = sequence
+        _expect(CollectorAdmissionReason.ENVELOPE_INVALID, _bundle(lines))
+
+    lines = _canonical_lines()
+    _stream(lines, CollectorStream.HUMAN_FC)["seq"] = (2**53) - 1
+    result = _read(lines)
+    human = next(entry for entry in result.streams if entry.stream is CollectorStream.HUMAN_FC)
+    assert human.records[0].seq == (2**53) - 1
+
+    for count in ((2**53) - 1, 2**53):
+        lines = _canonical_lines()
+        _object_field(_stream(lines, CollectorStream.SHADOW_EVENT), "payload")[
+            "confirming_window_seq"
+        ] = count
+        result = _read(lines)
+        shadow = next(
+            entry for entry in result.streams if entry.stream is CollectorStream.SHADOW_EVENT
+        )
+        assert (shadow.state is CollectorStreamState.ADMITTED) is (count == (2**53) - 1)
 
 
 def test_temperature_room_and_command_nullable_status_rules_are_exact() -> None:
@@ -453,6 +560,69 @@ def test_temperature_room_and_command_nullable_status_rules_are_exact() -> None:
         is CollectorStreamState.ADMITTED
         for stream in (CollectorStream.TEMPERATURE_TURN, CollectorStream.ROOM_READING)
     )
+
+
+def test_token_probability_and_heat_boundaries_are_exact() -> None:
+    """Closed field bounds admit endpoints and reject only values outside them."""
+
+    for identifier in ("x" * 64, "x" * 65):
+        lines = _canonical_lines()
+        _object_field(_stream(lines, CollectorStream.HUMAN_FC), "payload")["event_id"] = identifier
+        result = _read(lines)
+        human = next(entry for entry in result.streams if entry.stream is CollectorStream.HUMAN_FC)
+        assert (human.state is CollectorStreamState.ADMITTED) is (len(identifier) == 64)
+
+    for probability in (0, 1, 1.01):
+        lines = _canonical_lines()
+        _object_field(_stream(lines, CollectorStream.SHADOW_WINDOW), "payload")["probability"] = (
+            probability
+        )
+        result = _read(lines)
+        shadow = next(
+            entry for entry in result.streams if entry.stream is CollectorStream.SHADOW_WINDOW
+        )
+        assert (shadow.state is CollectorStreamState.ADMITTED) is (probability in {0, 1})
+
+    for heat in (0, 100, 100.01):
+        lines = _canonical_lines()
+        command_payload = _object_field(_stream(lines, CollectorStream.COMMAND), "payload")
+        command_payload["commanded_heat_percent"] = heat
+        result = _read(lines)
+        command = next(entry for entry in result.streams if entry.stream is CollectorStream.COMMAND)
+        assert (command.state is CollectorStreamState.ADMITTED) is (heat in {0, 100})
+
+    lines = _canonical_lines()
+    command_payload = _object_field(_stream(lines, CollectorStream.COMMAND), "payload")
+    command_payload["commanded_heat_percent"] = None
+    result = _read(lines)
+    command = next(entry for entry in result.streams if entry.stream is CollectorStream.COMMAND)
+    assert command.state is CollectorStreamState.MALFORMED
+
+
+def test_anchor_pair_limit_admits_six_distinct_unordered_pairs_only() -> None:
+    """Each unordered clock pair can occur once and at most six anchors are admitted."""
+
+    clocks = [
+        "agent_monotonic_seconds",
+        "mcp_session_seconds",
+        "recording_samples",
+        "utc_epoch_seconds",
+    ]
+    pairs = [(clocks[left], clocks[right]) for left in range(4) for right in range(left + 1, 4)]
+    lines = _canonical_lines()
+    lines[0]["alignments"] = [
+        {
+            "source_clock": source,
+            "source_value": 1 if source == "recording_samples" else 1.0,
+            "target_clock": target,
+            "target_value": 2 if target == "recording_samples" else 2.0,
+        }
+        for source, target in pairs
+    ]
+    assert _read(lines).header.alignments
+
+    lines[0]["alignments"].append(lines[0]["alignments"][0].copy())
+    _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
 
 
 def test_bad_shadow_payload_is_isolated_while_human_first_crack_is_admitted() -> None:
@@ -662,17 +832,28 @@ def _boundary_violations(source: str) -> set[str]:
                 root = alias.name.split(".")[0]
                 if root not in allowed_stdlib and root != "pydantic":
                     violations.add(f"import:{alias.name}")
-        elif isinstance(node, ast.ImportFrom) and node.module is not None:
-            root = node.module.split(".")[0]
-            if (
-                root not in allowed_stdlib
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module
+            root = module.split(".")[0] if module is not None else ""
+            invalid_relative = node.level > 1 or (
+                node.level == 1 and module not in {"bundle_reader", "bundle_schema"}
+            )
+            invalid_absolute = module is not None and (
+                node.level == 0
+                and root not in allowed_stdlib
                 and root != "pydantic"
-                and not node.module.startswith("roastpilot_agent.diagnostic_collector")
-            ):
-                violations.add(f"from:{node.module}")
+                and not module.startswith("roastpilot_agent.diagnostic_collector")
+            )
+            if invalid_relative or invalid_absolute:
+                violations.add(f"from:{module}")
         elif isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id == "open":
-                violations.add("open")
+            if isinstance(node.func, ast.Name) and node.func.id in {
+                "open",
+                "__import__",
+                "eval",
+                "exec",
+            }:
+                violations.add(node.func.id)
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -680,6 +861,13 @@ def _boundary_violations(source: str) -> set[str]:
                 and node.func.attr == "open"
             ):
                 violations.add("open")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "json"
+                and node.func.attr in {"load", "dump"}
+            ):
+                violations.add(f"json.{node.func.attr}")
     return violations
 
 
@@ -695,6 +883,13 @@ def test_collector_module_boundary_rejects_import_io_and_entrypoint_drift() -> N
         assert _boundary_violations(source + "\nimport roastpilot_agent.safety\n")
         assert _boundary_violations(source + "\nimport roastpilot_agent.mcp_client\n")
         assert _boundary_violations(source + "\nopen('forbidden')\n")
+        assert _boundary_violations(source + "\n__import__('roastpilot_agent.controller')\n")
+        assert _boundary_violations(source + "\neval('1')\n")
+        assert _boundary_violations(source + "\nexec('pass')\n")
+        assert _boundary_violations(source + "\njson.load(None)\n")
+        assert _boundary_violations(source + "\njson.dump({}, None)\n")
+        assert _boundary_violations(source + "\nfrom .. import store\n")
+        assert _boundary_violations(source + "\nfrom .bundle_schema import BundleHeader\n") == set()
 
     reader_tree = ast.parse(Path(bundle_reader.__file__).read_text(encoding="utf-8"))
     public_functions = [
