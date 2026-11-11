@@ -15,6 +15,24 @@ phased helper's single 5 s collection. The total observation bound changes
 from roughly 5 s plus 2 s to less than 30 s plus 5 s plus 5 s. This is
 test-only evidence and makes no A1, E11, #954 or live-readiness claim.
 
+Review after the full gate passed at `4b11345c` found a registration race
+between spawning the stand-in and publishing its PID. That gate did not
+cover the race. Its receipts stay bound to `4b11345c`.
+
+The stand-in now exits on stdin EOF or after 60 s. If the outer probe is
+killed before it can publish the PID, closing the pipe releases the stand-in.
+A release marker distinguishes that path from the expected SIGKILL during
+normal teardown. The new test exercises the window after `Popen` returns and
+before PID publication. The fork-to-exec window is reasoned from descriptor
+inheritance and exec semantics. The topology probe's nested spawn at
+`tests/test_process_exit.py:190` at `4b11345c` has a similar publication
+window and remains a follow-up.
+
+The earlier A6 paired receipts already isolated inherited output. The
+survivor assertion failed with the assertion present, and the paired test
+passed after assertion removal, with success recorded before final cleanup.
+Those receipts demonstrate no second A6 defect.
+
 **5 Nov 2026, #1069 software-only first-crack diagnostic retention:**
 The normal MCP mirror and existing raw-state, detail, SSE and SPA type paths
 retain four MCP-computed inference diagnostics as values or explicit null.
