@@ -465,6 +465,33 @@ def test_recording_sample_coordinates_are_unbounded_nonnegative_integers() -> No
         else:
             _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
 
+    for value in (2**53, 1.5, True, -1):
+        lines = _canonical_lines()
+        lines[0]["alignments"] = [
+            {
+                "source_clock": "agent_monotonic_seconds",
+                "source_value": 1,
+                "target_clock": "recording_samples",
+                "target_value": value,
+            }
+        ]
+        if value == 2**53:
+            assert _read(lines).header.alignments[0].target_value == value
+        else:
+            _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
+
+    for source_value, target_value in ((-1, 1), (1, -1)):
+        lines = _canonical_lines()
+        lines[0]["alignments"] = [
+            {
+                "source_clock": "agent_monotonic_seconds",
+                "source_value": source_value,
+                "target_clock": "mcp_session_seconds",
+                "target_value": target_value,
+            }
+        ]
+        _expect(CollectorAdmissionReason.HEADER_INVALID, _bundle(lines))
+
 
 def test_empty_bytes_and_leading_lf_are_framing_refusals() -> None:
     """No empty or blank-framed input reaches later validation stages."""
@@ -882,8 +909,8 @@ def test_shadow_window_nullable_and_enum_rules(
     assert (entry.state is CollectorStreamState.ADMITTED) is valid
 
 
-def test_bundle_header_rejects_duplicate_alignment_pair_and_recording_float() -> None:
-    """Anchors preserve only distinct raw clock pairs and integral sample coordinates."""
+def test_bundle_header_rejects_duplicate_unordered_alignment_pair() -> None:
+    """Anchors preserve only distinct unordered clock pairs."""
 
     lines = _canonical_lines()
     lines[0]["alignments"] = [
