@@ -1,5 +1,38 @@
 # RoastPilot Agent Project State Registry
 
+**11 Nov 2026, #1079 watchdog probe import-readiness split:**
+The A1 S1 full native gate failed at
+`test_live_exit_watchdog_bounds_cancellation_resistant_owner` inside the
+exhaustive QA wrapper. The original receipt remains failed evidence. The four
+subsequent bounded probes (D/W/D/W) are diagnostics only. The original
+failure has no proven cause.
+
+The probe now reuses the 30 s startup budget for interpreter startup and the
+real CLI and API imports. The 5 s lifecycle bound starts at the last reading
+that saw the readiness marker absent, before the stand-in spawn and teardown.
+The watchdog grace remains 0.25 s. Post-kill output collection now uses the
+phased helper's single 5 s collection. The total observation bound changes
+from roughly 5 s plus 2 s to less than 30 s plus 5 s plus 5 s. This is
+test-only evidence and makes no A1, E11, #954 or live-readiness claim.
+
+Review after the full gate passed at `4b11345c` found a registration race
+between spawning the stand-in and publishing its PID. That gate did not
+cover the race. Its receipts stay bound to `4b11345c`.
+
+The stand-in now exits on stdin EOF or after 60 s. If the outer probe is
+killed before it can publish the PID, closing the pipe releases the stand-in.
+A release marker distinguishes that path from the expected SIGKILL during
+normal teardown. The new test exercises the window after `Popen` returns and
+before PID publication. The fork-to-exec window is reasoned from descriptor
+inheritance and exec semantics. The topology probe's nested spawn at
+`tests/test_process_exit.py:190` at `4b11345c` has a similar publication
+window and remains a follow-up.
+
+The earlier A6 paired receipts already isolated inherited output. The
+survivor assertion failed with the assertion present, and the paired test
+passed after assertion removal, with success recorded before final cleanup.
+Those receipts demonstrate no second A6 defect.
+
 **5 Nov 2026, #1069 software-only first-crack diagnostic retention:**
 The normal MCP mirror and existing raw-state, detail, SSE and SPA type paths
 retain four MCP-computed inference diagnostics as values or explicit null.
