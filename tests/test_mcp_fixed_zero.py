@@ -14,6 +14,7 @@ import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import CallToolResult, ImageContent, ListToolsResult, TextContent, Tool
+from pydantic import ValidationError
 from test_mcp_client import SESSION_STATE_PAYLOAD, FakeSession
 
 import roastpilot_agent.live as live_module
@@ -24,7 +25,10 @@ from roastpilot_agent.human_protection import (
     ContainmentReason,
     ContainmentResult,
     CounterClass,
+    CounterEvidence,
+    RawTemperature,
     ToolDiscovery,
+    extract_accepted_counters,
 )
 from roastpilot_agent.mcp_client import (
     InitializableSession,
@@ -34,6 +38,8 @@ from roastpilot_agent.mcp_client import (
     MCPToolTimeoutError,
     RoasterControlAdapter,
     RoasterMCPClient,
+    RoastSessionState,
+    project_session_state,
 )
 from roastpilot_agent.replay import ReplayRoasterControl
 
@@ -478,6 +484,16 @@ def _changed_schema(key: str, value: object, property_name: str | None = None) -
     return _tool(schema)
 
 
+def _non_object_or_missing_schema_property(name: str, value: object) -> Tool:
+    schema = _schema()
+    properties = cast("dict[str, object]", schema["properties"])
+    if value is ...:
+        del properties[name]
+    else:
+        properties[name] = value
+    return _tool(schema)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "inventory",
@@ -503,6 +519,19 @@ def _changed_schema(key: str, value: object, property_name: str | None = None) -
         ListToolsResult(tools=[_changed_schema("const", "fixed_zero/v2", "containment_protocol")]),
         ListToolsResult(tools=[_changed_schema("extra", "unexpected", "containment_protocol")]),
         ListToolsResult(tools=[_changed_schema("extra", "unexpected", "expected_session_id")]),
+        *[
+            ListToolsResult(tools=[_changed_schema("type", "number", property_name)])
+            for property_name in ("expected_session_id", "containment_protocol")
+        ],
+        *[
+            ListToolsResult(tools=[_changed_schema(bound, ..., "expected_session_id")])
+            for bound in ("minLength", "maxLength")
+        ],
+        *[
+            ListToolsResult(tools=[_non_object_or_missing_schema_property(property_name, value)])
+            for property_name in ("expected_session_id", "containment_protocol")
+            for value in ("string", ...)
+        ],
         *[
             ListToolsResult(tools=[_changed_schema("minLength", bad, "expected_session_id")])
             for bad in [True, 1.0, "1", 2]
@@ -745,56 +774,372 @@ async def test_dev_pin_does_not_advertise_fixed_zero() -> None:
         await process.stop()
 
 
+_HUMAN_READ_CALL: list[tuple[str, dict[str, object]]] = [("get_roast_state", {})]
+
+
+class _DecodedRead:
+    def __init__(self, payload: object) -> None:
+        self.payload = payload
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.now = 10.0
+        self.clocks: list[float] = []
+        self.client = RoasterMCPClient(self.call)
+        self.adapter = RoasterControlAdapter(self.client, clock=self.clock)
+
+    async def call(self, name: str, arguments: dict[str, object]) -> object:
+        self.calls.append((name, arguments))
+        self.now += 3
+        if isinstance(self.payload, BaseException):
+            raise self.payload
+        return self.payload
+
+    def clock(self) -> float:
+        self.clocks.append(self.now)
+        return self.now
+
+
+def _state_payload(*, session_id: str = _SESSION) -> dict[str, object]:
+    return {**deepcopy(SESSION_STATE_PAYLOAD), "session_id": session_id}
+
+
+def _set_field(fields: dict[str, object], key: str, value: object) -> None:
+    if value is ...:
+        del fields[key]
+    else:
+        fields[key] = value
+
+
+async def _assert_automatic_read(payload: object) -> None:
+    reader = _DecodedRead(payload)
+    try:
+        expected = RoastSessionState.model_validate(payload)
+    except (ValidationError, OverflowError) as error:
+        with pytest.raises(type(error)):
+            await reader.client.get_roast_state()
+        with pytest.raises(type(error)):
+            await reader.adapter.read_telemetry()
+        assert reader.clocks == []
+        assert reader.adapter.last_state is None
+    else:
+        assert await reader.client.get_roast_state() == expected
+        assert await reader.adapter.read_telemetry() == project_session_state(
+            expected, age_seconds=0, ambient_age_seconds=0
+        )
+        assert reader.clocks == [16]
+        assert reader.adapter.last_state == expected
+    assert reader.calls == _HUMAN_READ_CALL * 2
+
+
+def _assert_projection_state(reader: _DecodedRead, expected: RoastSessionState) -> None:
+    assert reader.adapter.last_state == expected
+    assert reader.adapter._last_elapsed == expected.elapsed_monotonic_seconds  # pyright: ignore[reportPrivateUsage]
+    assert reader.adapter._last_change_monotonic == 13  # pyright: ignore[reportPrivateUsage]
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["bean_temp_c", "env_temp_c"])
 @pytest.mark.parametrize(
-    ("temperature", "counter", "counter_class"),
+    ("temperature", "classification"),
     [
-        (196, 23, CounterClass.PRESENT),
-        (196.0, 23, CounterClass.PRESENT),
-        (196.0, "23", CounterClass.INVALID),
-        (196.0, True, CounterClass.INVALID),
-        (196.0, 23.0, CounterClass.INVALID),
-        (196.0, ..., CounterClass.ABSENT),
-        ("196", 23, CounterClass.PRESENT),
-        (True, 23, CounterClass.PRESENT),
-        (float("nan"), 23, CounterClass.PRESENT),
+        pytest.param(196, RawTemperature.VALID, id="int"),
+        pytest.param(196.0, RawTemperature.VALID, id="float"),
+        pytest.param(2**53, RawTemperature.VALID, id="upper-bound"),
+        pytest.param(-(2**53), RawTemperature.VALID, id="lower-bound"),
+        pytest.param(2**53 + 1, RawTemperature.INVALID, id="above-bound"),
+        pytest.param(-(2**53) - 1, RawTemperature.INVALID, id="below-bound"),
+        pytest.param(10**400, RawTemperature.INVALID, id="huge"),
+        pytest.param("196", RawTemperature.INVALID, id="string"),
+        pytest.param(True, RawTemperature.INVALID, id="true"),
+        pytest.param(False, RawTemperature.INVALID, id="false"),
+        pytest.param([], RawTemperature.INVALID, id="array"),
+        pytest.param({}, RawTemperature.INVALID, id="object"),
+        pytest.param(float("nan"), RawTemperature.INVALID, id="nan"),
+        pytest.param(float("inf"), RawTemperature.INVALID, id="positive-inf"),
+        pytest.param(float("-inf"), RawTemperature.INVALID, id="negative-inf"),
+        pytest.param(..., RawTemperature.ABSENT, id="missing"),
+        pytest.param(None, RawTemperature.ABSENT, id="null"),
     ],
 )
 async def test_human_evidence_reads_once_and_captures_request_admission(
-    temperature: object, counter: object, counter_class: CounterClass
+    key: str, temperature: object, classification: RawTemperature
 ) -> None:
-    payload = deepcopy(SESSION_STATE_PAYLOAD)
+    payload = _state_payload()
     device = cast("dict[str, object]", payload["device_state"])
-    device["bean_temp_c"] = temperature
-    vendor: dict[str, object] = {"ignored_temperature_packet_count": 2}
-    if counter is not ...:
-        vendor["status_packet_count"] = counter
-    device["raw_vendor_data"] = vendor
-    reads: list[str] = []
-    now = 10.0
-    clocks: list[float] = []
-
-    async def call(name: str, arguments: dict[str, object]) -> object:
-        nonlocal now
-        reads.append(name)
-        assert arguments == {}
-        now += 3
-        return payload
-
-    def clock() -> float:
-        clocks.append(now)
-        return now
-
-    adapter = RoasterControlAdapter(RoasterMCPClient(call), clock=clock)
-    telemetry, counters, admitted_at = await adapter.read_human_evidence()
-    assert reads == ["get_roast_state"]
-    assert admitted_at == 10 and clocks == [10, 13]
-    assert counters.class_ is counter_class
-    assert adapter.last_state is not None
-    if type(temperature) in (int, float) and temperature == 196:
-        assert telemetry is not None and telemetry.bean_temp_c == 196
+    _set_field(device, key, temperature)
+    device["raw_vendor_data"] = {"status_packet_count": 23, "ignored_temperature_packet_count": 2}
+    before = deepcopy(payload)
+    reader = _DecodedRead(payload)
+    evidence = await reader.adapter.read_human_evidence()
+    assert reader.calls == _HUMAN_READ_CALL
+    assert evidence.request_admitted_at == 10
+    assert reader.clocks == [10, 13]
+    assert evidence.device_object
+    assert evidence.bound_child_epoch is None
+    assert evidence.counters == CounterEvidence(23, 2, CounterClass.PRESENT)
+    if key == "bean_temp_c":
+        measured, raw = evidence.bean, evidence.bean_temp_c
+        assert evidence.env is RawTemperature.VALID and evidence.env_temp_c == 214.0
     else:
-        assert telemetry is None
+        measured, raw = evidence.env, evidence.env_temp_c
+        assert evidence.bean is RawTemperature.VALID and evidence.bean_temp_c == 196.0
+    assert measured is classification
+    expected_temperature = None
+    if classification is RawTemperature.VALID:
+        assert raw is temperature
+        assert type(raw) is type(temperature)
+        assert raw is not None and evidence.telemetry is not None
+        expected_temperature = float(raw)
+        assert getattr(evidence.telemetry, key) == expected_temperature
+    else:
+        assert raw is None and evidence.telemetry is None
+    assert payload == before
+    _assert_projection_state(
+        reader,
+        RoastSessionState.model_validate(
+            {**payload, "device_state": {**device, key: expected_temperature}}
+        ),
+    )
+    await _assert_automatic_read(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("valid_shape", [True, False])
+async def test_human_evidence_validates_one_mirror_payload(
+    monkeypatch: pytest.MonkeyPatch, valid_shape: bool
+) -> None:
+    payload = _state_payload()
+    device = cast("dict[str, object]", payload["device_state"])
+    device["bean_temp_c"] = "196"
+    if not valid_shape:
+        payload["device_state"] = "malformed-device"
+    original_validate = RoastSessionState.model_validate
+    seen: list[object] = []
+
+    def validate(candidate: object) -> RoastSessionState:
+        seen.append(candidate)
+        return original_validate(candidate)
+
+    monkeypatch.setattr(RoastSessionState, "model_validate", validate)
+    reader = _DecodedRead(payload)
+    if valid_shape:
+        evidence = await reader.adapter.read_human_evidence()
+        assert evidence.bean is RawTemperature.INVALID and evidence.telemetry is None
+        assert len(seen) == 1
+        expected = {**payload, "device_state": {**device, "bean_temp_c": None}}
+        assert seen[0] == expected and seen[0] is not payload
+    else:
+        with pytest.raises(ValidationError):
+            await reader.adapter.read_human_evidence()
+        assert len(seen) == 1 and seen[0] is payload
+    assert reader.calls == _HUMAN_READ_CALL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("device", [..., None], ids=["missing", "null"])
+async def test_human_evidence_absent_device(device: object) -> None:
+    payload = _state_payload()
+    _set_field(payload, "device_state", device)
+    before = deepcopy(payload)
+    reader = _DecodedRead(payload)
+    try:
+        evidence = await reader.adapter.read_human_evidence()
+    except ValidationError as error:
+        pytest.fail(f"missing or null device must produce an envelope: {error}")
+    assert reader.calls == _HUMAN_READ_CALL
+    assert evidence.request_admitted_at == 10 and reader.clocks == [10, 13]
+    assert not evidence.device_object
+    assert evidence.bean is evidence.env is RawTemperature.ABSENT
+    assert evidence.bean_temp_c is evidence.env_temp_c is evidence.telemetry is None
+    assert evidence.counters == CounterEvidence(None, None, CounterClass.ABSENT)
+    assert evidence.bound_child_epoch is None
+    assert payload == before
+    _assert_projection_state(
+        reader, RoastSessionState.model_validate({**payload, "device_state": None})
+    )
+    await _assert_automatic_read(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "key", "value"),
+    [
+        pytest.param("top", "", [], id="top-list"),
+        pytest.param("top", "", "state", id="top-string"),
+        pytest.param("top", "", None, id="top-null"),
+        pytest.param("session", "device_state", "device", id="device-string"),
+        pytest.param("session", "device_state", 0, id="device-int"),
+        pytest.param("session", "device_state", True, id="device-bool"),
+        pytest.param("session", "device_state", [], id="device-list"),
+        pytest.param("session", "session_id", ..., id="missing-id"),
+        pytest.param("session", "phase", "unknown", id="unknown-phase"),
+        pytest.param("device", "raw_vendor_data", [], id="vendor-list"),
+        pytest.param("device", "raw_vendor_data", {"status_packet_count": []}, id="vendor-entry"),
+        pytest.param("device", "heat_level_percent", "not-an-integer", id="heat"),
+        pytest.param("mixed", "phase", "unknown", id="temperature-and-phase"),
+    ],
+)
+async def test_human_evidence_preserves_non_temperature_failure(
+    monkeypatch: pytest.MonkeyPatch, scope: str, key: str, value: object
+) -> None:
+    payload: object
+    if scope == "top":
+        payload = value
+    else:
+        state = _state_payload()
+        device = cast("dict[str, object]", state["device_state"])
+        _set_field(device if scope == "device" else state, key, value)
+        if scope == "mixed":
+            device["bean_temp_c"] = []
+        payload = state
+
+    before = deepcopy(payload)
+    last = RoastSessionState.model_validate(SESSION_STATE_PAYLOAD)
+    reader = _DecodedRead(payload)
+    monkeypatch.setattr(reader.adapter, "_last_state", last)
+    with pytest.raises(ValidationError) as original:
+        RoastSessionState.model_validate(payload)
+    with pytest.raises(type(original.value)):
+        await reader.adapter.read_human_evidence()
+    assert reader.calls == _HUMAN_READ_CALL
+    assert reader.clocks == [10]
+    assert reader.adapter.last_state is last
+    assert payload == before
+    await _assert_automatic_read(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        MCPToolTimeoutError("local timeout"),
+        MCPConnectionError("pipe"),
+        MCPToolError("tool error"),
+        TimeoutError("deadline"),
+        RuntimeError("runtime failure"),
+        asyncio.CancelledError(),
+    ],
+)
+async def test_human_evidence_propagates_read_failure(
+    monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    last = RoastSessionState.model_validate(SESSION_STATE_PAYLOAD)
+    reader = _DecodedRead(failure)
+    monkeypatch.setattr(reader.adapter, "_last_state", last)
+    with pytest.raises(type(failure)) as result:
+        await reader.adapter.read_human_evidence()
+    assert result.value is failure
+    assert reader.calls == _HUMAN_READ_CALL
+    assert reader.clocks == [10]
+    assert reader.adapter.last_state is last
+    with pytest.raises(type(failure)) as automatic:
+        await reader.adapter.read_telemetry()
+    assert automatic.value is failure
+    assert reader.calls == _HUMAN_READ_CALL * 2
+    assert reader.clocks == [10]
+    assert reader.adapter.last_state is last
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("counter", "counter_class"),
+    [
+        (23, CounterClass.PRESENT),
+        ("23", CounterClass.INVALID),
+        (True, CounterClass.INVALID),
+        (23.0, CounterClass.INVALID),
+        (..., CounterClass.ABSENT),
+    ],
+)
+async def test_human_evidence_extracts_raw_vendor_object(
+    monkeypatch: pytest.MonkeyPatch, counter: object, counter_class: CounterClass
+) -> None:
+    payload = _state_payload()
+    device = cast("dict[str, object]", payload["device_state"])
+    vendor = {"status_packet_count": counter, "ignored_temperature_packet_count": 2}
+    _set_field(vendor, "status_packet_count", counter)
+    device["raw_vendor_data"] = vendor
+    before = deepcopy(payload)
+    seen: list[object] = []
+
+    def extract(raw: dict[str, object] | None) -> CounterEvidence:
+        seen.append(raw)
+        return extract_accepted_counters(raw)
+
+    monkeypatch.setattr(adapter_module, "extract_accepted_counters", extract)
+    reader = _DecodedRead(payload)
+    evidence = await reader.adapter.read_human_evidence()
+    assert len(seen) == 1 and seen[0] is vendor
+    assert evidence.counters.class_ is counter_class
+    assert evidence.telemetry is not None
+    assert reader.calls == _HUMAN_READ_CALL
+    assert evidence.request_admitted_at == 10 and reader.clocks == [10, 13]
+    assert payload == before
+    monkeypatch.undo()
+    await _assert_automatic_read(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["bound", "no-start", "different-session", "different-epoch"])
+async def test_human_evidence_binds_only_to_same_start_and_child(case: str) -> None:
+    payload = _state_payload(session_id="other" if case == "different-session" else _SESSION)
+    session = _Session(_result(payload))
+    process = _LifecycleSpy(session)
+    adapter = RoasterControlAdapter.from_process(process)
+    if case != "no-start":
+        await adapter.start_session()
+        session.calls.clear()
+    if case == "different-epoch":
+        session = _Session(_result(payload))
+        process.replace(session)
+    evidence = await adapter.read_human_evidence()
+    assert evidence.bound_child_epoch == (process.child_epoch if case == "bound" else None)
+    assert evidence.telemetry is not None
+    assert session.calls == _HUMAN_READ_CALL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["replacement", "first-start", "new-session", "replacement-start"])
+async def test_human_evidence_binding_does_not_follow_suspended_read(case: str) -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class SuspendedRead(_Session):
+        async def call_tool(self, name: str, arguments: dict[str, object] | None = None) -> object:
+            if name == "get_roast_state":
+                entered.set()
+                await release.wait()
+            return await super().call_tool(name, arguments)
+
+    session = SuspendedRead(_result(_state_payload()))
+    replacement = _Session(_result(_state_payload()))
+    process = _LifecycleSpy(replacement if case == "replacement-start" else session)
+    adapter = RoasterControlAdapter.from_process(process)
+    if case != "first-start":
+        await adapter.start_session()
+        session.calls.clear()
+    if case == "replacement-start":
+        replacement.calls.clear()
+        process.replace(session)
+    async with asyncio.TaskGroup() as tasks:
+        read = tasks.create_task(adapter.read_human_evidence())
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        try:
+            if case == "replacement":
+                process.replace(replacement)
+            else:
+                if case == "new-session":
+                    session.session_id = "next-session"
+                await adapter.start_session()
+        finally:
+            release.set()
+        evidence = await read
+    assert evidence.bound_child_epoch == (process.child_epoch if case == "new-session" else None)
+    assert evidence.telemetry is not None
+    assert session.calls == (
+        _HUMAN_READ_CALL
+        if case == "replacement"
+        else [("start_roast_session", {}), *_HUMAN_READ_CALL]
+    )
+    assert replacement.calls == []
 
 
 @pytest.mark.asyncio

@@ -76,7 +76,10 @@ from roastpilot_agent.human_protection import (
     ContainmentReason,
     ContainmentResult,
     CounterEvidence,
+    HumanReadEvidence,
+    RawTemperature,
     ToolDiscovery,
+    classify_raw_temperature,
     extract_accepted_counters,
 )
 from roastpilot_agent.models import (
@@ -506,6 +509,17 @@ class ExportRoastLogResult(MCPMirror):
 ToolCaller = Callable[[str, dict[str, object]], Awaitable[object]]
 
 
+@dataclass(frozen=True)
+class _HumanStateRead:
+    state: RoastSessionState
+    device_object: bool
+    bean: RawTemperature
+    env: RawTemperature
+    bean_temp_c: int | float | None
+    env_temp_c: int | float | None
+    counters: CounterEvidence
+
+
 class RoasterMCPClient:
     """Typed client for the 14 roast tools of the 15-tool MCP surface.
 
@@ -543,16 +557,38 @@ class RoasterMCPClient:
         args: dict[str, object] = {} if session_id is None else {"session_id": session_id}
         return RoastSessionState.model_validate(await self._call("get_roast_state", args))
 
-    async def _read_human_state(self) -> tuple[RoastSessionState, bool]:
-        """Read once and retain temperature type evidence before mirror coercion."""
+    async def _read_human_state(self) -> _HumanStateRead:
+        """Read once, preserving raw evidence before tolerant mirror validation."""
         payload = await self._call("get_roast_state", {})
-        state = RoastSessionState.model_validate(payload)
         raw = _json_object(payload)
-        device = None if raw is None else _json_object(raw.get("device_state"))
-        exact_temperatures = device is not None and all(
-            type(device.get(key)) in (int, float) for key in ("bean_temp_c", "env_temp_c")
+        raw_device = None if raw is None else raw.get("device_state")
+        device = _json_object(raw_device)
+        raw_bean = None if device is None else device.get("bean_temp_c")
+        raw_env = None if device is None else device.get("env_temp_c")
+        bean = classify_raw_temperature(raw_bean)
+        env = classify_raw_temperature(raw_env)
+        bean_temp_c = cast("int | float", raw_bean) if bean is RawTemperature.VALID else None
+        env_temp_c = cast("int | float", raw_env) if env is RawTemperature.VALID else None
+
+        mirror_payload = payload
+        if raw is not None and (raw_device is None or device is not None):
+            mirror_device = (
+                None
+                if device is None
+                else {**device, "bean_temp_c": bean_temp_c, "env_temp_c": env_temp_c}
+            )
+            mirror_payload = {**raw, "device_state": mirror_device}
+        state = RoastSessionState.model_validate(mirror_payload)
+        vendor = None if device is None else cast("dict[str, object]", device["raw_vendor_data"])
+        return _HumanStateRead(
+            state,
+            device is not None,
+            bean,
+            env,
+            bean_temp_c,
+            env_temp_c,
+            extract_accepted_counters(vendor),
         )
-        return state, exact_temperatures
 
     async def set_heat(self, heat_level_percent: int) -> ControlCommandResult:
         return ControlCommandResult.model_validate(
@@ -1544,14 +1580,40 @@ class RoasterControlAdapter:
     async def read_telemetry(self) -> RoastTelemetry | None:
         return self._project_telemetry(await self._client.get_roast_state())
 
-    async def read_human_evidence(self) -> tuple[RoastTelemetry | None, CounterEvidence, float]:
-        """Return one reading and its accepted-counter and admission-time evidence."""
+    async def read_human_evidence(self) -> HumanReadEvidence:
+        """Return one reading with raw temperatures and child-bound freshness evidence."""
         request_admitted_at = self._clock()
-        state, exact_temperatures = await self._client._read_human_state()  # pyright: ignore[reportPrivateUsage]
-        telemetry = self._project_telemetry(state)
-        device = state.device_state
-        counters = extract_accepted_counters(device.raw_vendor_data if device else None)
-        return telemetry if exact_temperatures else None, counters, request_admitted_at
+        transport = self._fixed_zero_transport
+        epoch_before = None if transport is None else transport.child_epoch
+        started_session = self._started_session_id
+        started_epoch = self._started_child_epoch
+        read = await self._client._read_human_state()  # pyright: ignore[reportPrivateUsage]
+        telemetry = self._project_telemetry(read.state)
+        bound_child_epoch = None
+        if (
+            transport is not None
+            and type(epoch_before) is int
+            and epoch_before == started_epoch
+            and transport.child_epoch == epoch_before
+            and isinstance(started_session, str)
+            and read.state.session_id == started_session
+        ):
+            bound_child_epoch = epoch_before
+        return HumanReadEvidence(
+            telemetry=(
+                telemetry
+                if read.bean is RawTemperature.VALID and read.env is RawTemperature.VALID
+                else None
+            ),
+            device_object=read.device_object,
+            bean=read.bean,
+            env=read.env,
+            bean_temp_c=read.bean_temp_c,
+            env_temp_c=read.env_temp_c,
+            counters=read.counters,
+            request_admitted_at=request_admitted_at,
+            bound_child_epoch=bound_child_epoch,
+        )
 
     def _project_telemetry(self, state: RoastSessionState) -> RoastTelemetry | None:
         now = self._clock()

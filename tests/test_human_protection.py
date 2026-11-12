@@ -1,6 +1,6 @@
 """Behavioural contract for D230 accepted-reading evidence and drop eligibility."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import pytest
@@ -18,12 +18,16 @@ from roastpilot_agent.human_protection import (
     CounterEvidence,
     EndpointDisposition,
     EndpointOwner,
+    HumanReadEvidence,
+    RawTemperature,
     ReadingFreshness,
+    ToolDiscovery,
     WriteClass,
+    classify_raw_temperature,
     extract_accepted_counters,
     protection_eligible,
 )
-from roastpilot_agent.models import DropReason, RoastPhase
+from roastpilot_agent.models import DropReason, RoastPhase, RoastTelemetry
 
 
 def _eligible(
@@ -109,10 +113,134 @@ def test_constant_equals_bitter_ceiling_default() -> None:
         ContainmentReason,
         ContainmentAttempt,
         DropReason,
+        RawTemperature,
+        ToolDiscovery,
     ],
 )
 def test_new_enums_plain_enum(enum: type[Enum]) -> None:
     assert enum.__bases__ == (Enum,)
+
+
+class _IntSubclass(int):
+    pass
+
+
+class _FloatSubclass(float):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (196, RawTemperature.VALID),
+        (196.0, RawTemperature.VALID),
+        (2**53, RawTemperature.VALID),
+        (-(2**53), RawTemperature.VALID),
+        (2**53 + 1, RawTemperature.INVALID),
+        (-(2**53) - 1, RawTemperature.INVALID),
+        (10**400, RawTemperature.INVALID),
+        (_IntSubclass(196), RawTemperature.INVALID),
+        (_FloatSubclass(196), RawTemperature.INVALID),
+        ("196", RawTemperature.INVALID),
+        (True, RawTemperature.INVALID),
+        (False, RawTemperature.INVALID),
+        ([], RawTemperature.INVALID),
+        ({}, RawTemperature.INVALID),
+        (float("nan"), RawTemperature.INVALID),
+        (float("inf"), RawTemperature.INVALID),
+        (float("-inf"), RawTemperature.INVALID),
+        (None, RawTemperature.ABSENT),
+    ],
+)
+def test_classify_raw_temperature(value: object, expected: RawTemperature) -> None:
+    assert classify_raw_temperature(value) is expected
+
+
+def _human_evidence() -> HumanReadEvidence:
+    return HumanReadEvidence(
+        telemetry=RoastTelemetry(bean_temp_c=196.0, env_temp_c=214.0),
+        device_object=True,
+        bean=RawTemperature.VALID,
+        env=RawTemperature.VALID,
+        bean_temp_c=196,
+        env_temp_c=214.0,
+        counters=CounterEvidence(23, 2, CounterClass.PRESENT),
+        request_admitted_at=10.0,
+        bound_child_epoch=4,
+    )
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    [
+        pytest.param({"device_object": 1}, "types", id="I1-device"),
+        pytest.param({"bean": "valid"}, "types", id="I1-bean"),
+        pytest.param({"env": "valid"}, "types", id="I1-env"),
+        pytest.param({"counters": {}}, "types", id="I1-counters"),
+        pytest.param({"bean_temp_c": None}, "exact raw value", id="I2-missing-valid"),
+        pytest.param({"env_temp_c": True}, "exact raw value", id="I2-malformed-valid"),
+        pytest.param(
+            {"env": RawTemperature.INVALID, "telemetry": None},
+            "cannot retain",
+            id="I2-invalid-with-value",
+        ),
+        pytest.param(
+            {
+                "device_object": False,
+                "env": RawTemperature.ABSENT,
+                "env_temp_c": None,
+                "telemetry": None,
+                "counters": CounterEvidence(None, None, CounterClass.ABSENT),
+            },
+            "absent device",
+            id="I3-bean",
+        ),
+        pytest.param(
+            {
+                "device_object": False,
+                "bean": RawTemperature.ABSENT,
+                "bean_temp_c": None,
+                "telemetry": None,
+                "counters": CounterEvidence(None, None, CounterClass.ABSENT),
+            },
+            "absent device",
+            id="I3-env",
+        ),
+        pytest.param(
+            {
+                "device_object": False,
+                "bean": RawTemperature.ABSENT,
+                "env": RawTemperature.ABSENT,
+                "bean_temp_c": None,
+                "env_temp_c": None,
+                "telemetry": None,
+            },
+            "absent device",
+            id="I3-counters",
+        ),
+        pytest.param({"telemetry": None}, "valid temperature pair", id="I4-no-telemetry"),
+        pytest.param(
+            {"bean": RawTemperature.INVALID, "bean_temp_c": None},
+            "valid temperature pair",
+            id="I4-unusable-pair",
+        ),
+        pytest.param({"bean_temp_c": 195}, "must match", id="I4-mismatched-bean"),
+        pytest.param({"env_temp_c": 213.0}, "must match", id="I4-mismatched-env"),
+        pytest.param({"bound_child_epoch": True}, "exact integer", id="I5-bool"),
+        pytest.param({"bound_child_epoch": 4.0}, "exact integer", id="I5-float"),
+        pytest.param({"request_admitted_at": False}, "exact number", id="I6-bool"),
+        pytest.param({"request_admitted_at": "10"}, "exact number", id="I6-string"),
+    ],
+)
+def test_human_evidence_enforces_invariants(changes: dict[str, object], error: str) -> None:
+    with pytest.raises(ValueError, match=error):
+        replace(_human_evidence(), **changes)
+
+
+@pytest.mark.parametrize("admission", [10, 10.0, float("inf")])
+def test_human_evidence_leaves_clock_finiteness_to_tracker(admission: float) -> None:
+    evidence = replace(_human_evidence(), request_admitted_at=admission)
+    assert evidence.request_admitted_at is admission
 
 
 def test_only_unknown_containment_outcomes_are_unknown() -> None:
