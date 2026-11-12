@@ -261,6 +261,23 @@ class ContainmentReason(Enum):
     PROJECTION_UNCONFIRMED = "projection_unconfirmed"
 
 
+@dataclass(frozen=True)
+class ContainmentResult:
+    """Classified containment evidence, independent of MCP and physical state."""
+
+    outcome: ContainmentOutcome
+    reason: ContainmentReason | None = None
+    evidence_heat_zero_commanded: bool | None = None
+    evidence_is_pre_fallback: bool = False
+
+
+class ToolDiscovery(Enum):
+    """Whether the current child advertises the fixed-zero wire contract."""
+
+    DISCOVERED = "discovered"
+    ABSENT = "absent"
+
+
 class ContainmentAttempt(Enum):
     """Run-local one-attempt containment budget."""
 
