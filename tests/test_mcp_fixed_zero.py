@@ -620,7 +620,9 @@ async def test_unknown_completion_marked_pre_fallback_not_latest() -> None:
     assert result.evidence_is_pre_fallback is True
 
 
-def _stdio_process(tmp_path: Path, mode: str) -> MCPServerProcess:
+def _stdio_process(
+    tmp_path: Path, mode: str, *, config: MCPConfig | None = None
+) -> MCPServerProcess:
     script = Path(__file__).parent / "fixtures" / "fixed_zero_stdio_peer.py"
     (tmp_path / "start.json").write_text(
         json.dumps({"session": {**SESSION_STATE_PAYLOAD, "session_id": _SESSION}})
@@ -635,7 +637,9 @@ def _stdio_process(tmp_path: Path, mode: str) -> MCPServerProcess:
         async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
             yield session
 
-    return MCPServerProcess(MCPConfig(call_timeout_seconds=1.5), session_factory=factory)
+    if config is None:
+        config = MCPConfig(call_timeout_seconds=1.5)
+    return MCPServerProcess(config, session_factory=factory)
 
 
 def _calls(tmp_path: Path) -> list[str]:
@@ -656,13 +660,17 @@ async def test_real_stdio_timeout_leaves_remote_completion_unknown(
     tmp_path: Path, mode: str
 ) -> None:
     sdk = f"mcp={version('mcp')}, pydantic={version('pydantic')}, handler={mode}"
-    process = _stdio_process(tmp_path, mode)
+    config = MCPConfig()
+    process = _stdio_process(tmp_path, mode, config=config)
     await process.start()
     try:
         assert await process.discover_fixed_zero() is ToolDiscovery.DISCOVERED, sdk
         adapter = RoasterControlAdapter.from_process(process)
         await adapter.start_session()
         lists_before = _calls(tmp_path).count("list")
+        # Apply the measured deadline after startup, discovery and Start.
+        config.call_timeout_seconds = 1.5
+        assert process._config.call_timeout_seconds == 1.5, sdk  # pyright: ignore[reportPrivateUsage]
         async with asyncio.TaskGroup() as tasks:
             attempt = tasks.create_task(adapter.contain_heat_fixed_zero())
             await _wait_for_file(tmp_path / "entered")
