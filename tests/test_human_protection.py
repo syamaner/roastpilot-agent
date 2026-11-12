@@ -237,6 +237,15 @@ def test_human_evidence_enforces_invariants(changes: dict[str, object], error: s
         replace(_human_evidence(), **changes)
 
 
+def test_human_evidence_rejects_raw_bool_even_when_projection_matches() -> None:
+    with pytest.raises(ValueError, match="exact raw value"):
+        replace(
+            _human_evidence(),
+            env_temp_c=True,
+            telemetry=RoastTelemetry(bean_temp_c=196.0, env_temp_c=1.0),
+        )
+
+
 @pytest.mark.parametrize("admission", [10, 10.0, float("inf")])
 def test_human_evidence_leaves_clock_finiteness_to_tracker(admission: float) -> None:
     evidence = replace(_human_evidence(), request_admitted_at=admission)
