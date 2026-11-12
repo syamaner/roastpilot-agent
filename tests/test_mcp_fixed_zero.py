@@ -13,11 +13,12 @@ from typing import cast
 import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
+from mcp.types import CallToolResult, ImageContent, ListToolsResult, TextContent, Tool
 from test_mcp_client import SESSION_STATE_PAYLOAD, FakeSession
 
+import roastpilot_agent.live as live_module
 import roastpilot_agent.mcp_client as adapter_module
-from roastpilot_agent.config import MCPConfig
+from roastpilot_agent.config import AppConfig, MCPConfig
 from roastpilot_agent.human_protection import (
     ContainmentOutcome,
     ContainmentReason,
@@ -34,6 +35,7 @@ from roastpilot_agent.mcp_client import (
     RoasterControlAdapter,
     RoasterMCPClient,
 )
+from roastpilot_agent.replay import ReplayRoasterControl
 
 _TOOL = "contain_heat_fixed_zero"
 _PROTOCOL = "fixed_zero/v1"
@@ -869,3 +871,166 @@ async def test_replacement_during_containment_keeps_result_unknown() -> None:
     assert [name for name, _ in old.calls] == ["start_roast_session", _TOOL]
     assert new.calls == []
     assert process.lifecycle == []
+
+
+@pytest.mark.asyncio
+async def test_late_start_identity_cannot_authorize_containment_on_replacement() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class SuspendedStart(_Session):
+        async def call_tool(self, name: str, arguments: dict[str, object] | None = None) -> object:
+            if name == "start_roast_session":
+                entered.set()
+                await release.wait()
+            return await super().call_tool(name, arguments)
+
+    # Both children could return the same string. Only the first child started.
+    old = SuspendedStart(_result(_payload()))
+    replacement = _Session(_result(_payload()))
+    process = _LifecycleSpy(old)
+    adapter = RoasterControlAdapter.from_process(process)
+    assert await process.discover_fixed_zero() is ToolDiscovery.DISCOVERED
+    async with asyncio.TaskGroup() as tasks:
+        start = tasks.create_task(adapter.start_session())
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        try:
+            process.replace(replacement)
+            assert await process.discover_fixed_zero() is ToolDiscovery.DISCOVERED
+        finally:
+            release.set()
+        await start
+    assert adapter.latest_fault_session_id == _SESSION
+    assert (await adapter.contain_heat_fixed_zero()).outcome is ContainmentOutcome.NOT_ATTEMPTED
+    assert old.calls == [("start_roast_session", {})]
+    assert replacement.calls == []
+    assert process.lifecycle == []
+
+
+@pytest.mark.asyncio
+async def test_overlapping_discovery_reserves_only_one_inventory_call() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class SuspendedInventory(_Session):
+        async def list_tools(self) -> object:
+            # Count entry before waiting. An erroneous second call returns
+            # promptly so the causal failure cannot be a harness timeout.
+            self.list_calls += 1
+            if self.list_calls == 1:
+                entered.set()
+                await release.wait()
+            return self.inventory
+
+    session = SuspendedInventory(None)
+    process = _LifecycleSpy(session)
+    async with asyncio.TaskGroup() as tasks:
+        first = tasks.create_task(process.discover_fixed_zero())
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        try:
+            assert await process.discover_fixed_zero() is ToolDiscovery.ABSENT
+            assert session.list_calls == 1
+        finally:
+            release.set()
+        assert await first is ToolDiscovery.DISCOVERED
+    assert session.calls == []
+    assert process.lifecycle == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason_code", ["unrecognised_reason", {"reason": "unknown_session"}])
+async def test_unknown_reason_code_returns_malformed_evidence(reason_code: object) -> None:
+    payload = _payload(_ROWS[0])
+    payload["reason_code"] = reason_code
+    adapter, process, session = await _prepared(_result(payload))
+    assert await adapter.contain_heat_fixed_zero() == ContainmentResult(
+        ContainmentOutcome.UNKNOWN_MALFORMED_RESPONSE
+    )
+    assert len(session.calls) == 1
+    assert process.lifecycle == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_completion_requires_valid_prefallback_state() -> None:
+    payload = _payload(_ROWS[-1])
+    state = cast("dict[str, object]", payload["commanded_state"])
+    state["heat_level_percent"] = 1
+    adapter, _, session = await _prepared(_result(payload))
+    assert await adapter.contain_heat_fixed_zero() == ContainmentResult(
+        ContainmentOutcome.UNKNOWN_MALFORMED_RESPONSE
+    )
+    assert len(session.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_transport_without_session_returns_unknown() -> None:
+    process = MCPServerProcess()
+    result = await process._contain_heat_fixed_zero(_SESSION)  # pyright: ignore[reportPrivateUsage]
+    assert result == ContainmentResult(ContainmentOutcome.UNKNOWN_TRANSPORT)
+    assert not process.running
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        object(),
+        CallToolResult(content=[ImageContent(type="image", data="AA==", mimeType="image/png")]),
+    ],
+    ids=["absent-content", "nontext-content"],
+)
+async def test_legacy_call_without_readable_content_remains_typed(raw: object) -> None:
+    session = FakeSession(raw)
+    process = MCPServerProcess(session=session)
+    with pytest.raises(MCPConnectionError, match="no structured or text content"):
+        await process.call_tool("get_roast_state", {})
+    assert session.calls == [("get_roast_state", {})]
+
+
+@pytest.mark.asyncio
+async def test_discovery_rejects_schema_with_too_many_semantic_members() -> None:
+    schema = {**_schema(), "extra_a": None, "extra_b": None, "extra_c": None}
+    session = _Session(None, ListToolsResult(tools=[_tool(schema)]))
+    process = _LifecycleSpy(session)
+    assert await process.discover_fixed_zero() is ToolDiscovery.ABSENT
+    assert session.list_calls == 1
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_replay_contains_no_live_fixed_zero_capability() -> None:
+    replay = ReplayRoasterControl()
+    assert await replay.contain_heat_fixed_zero() == ContainmentResult(
+        ContainmentOutcome.NOT_ATTEMPTED
+    )
+    assert replay.commands == []
+
+
+@pytest.mark.asyncio
+async def test_live_composition_binds_discovery_and_start_to_one_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = _Session(_result(_payload()))
+    process = _LifecycleSpy(session)
+
+    def process_factory(_config: MCPConfig, **_kwargs: object) -> MCPServerProcess:
+        return process
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(live_module, "MCPServerProcess", process_factory)
+    service, transport, store = await live_module.build_live_service(
+        AppConfig(), store_path=tmp_path / "live.sqlite3"
+    )
+    try:
+        assert transport is process
+        assert session.list_calls == 0
+        assert session.calls == []
+        roaster = service._roaster  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(roaster, RoasterControlAdapter)
+        assert await transport.discover_fixed_zero() is ToolDiscovery.DISCOVERED
+        await roaster.start_session()
+        assert await roaster.contain_heat_fixed_zero() == ContainmentResult(
+            ContainmentOutcome.COMMAND_STATE_RETURNED, evidence_heat_zero_commanded=True
+        )
+        assert [name for name, _ in session.calls] == ["start_roast_session", _TOOL]
+    finally:
+        await transport.stop()
+        await store.close()
