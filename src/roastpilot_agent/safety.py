@@ -15,6 +15,14 @@ from pydantic import BaseModel, Field
 
 from roastpilot_agent.config import SafetyLimits
 from roastpilot_agent.control_policy import PhaseControlLimits
+from roastpilot_agent.human_protection import (
+    HUMAN_CHARGED_ROAST_PHASES,
+    CommandDisposition,
+    ControlAuthority,
+    EndpointDisposition,
+    ReadingFreshness,
+    protection_eligible,
+)
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
     OperatorAction,
@@ -301,6 +309,8 @@ class SafetyPolicy:
         phase: RoastPhase,
         telemetry_age_seconds: float | None,
         max_stale_seconds: float,
+        authority: ControlAuthority = ControlAuthority.AUTOMATIC,
+        charged: bool = False,
     ) -> SafetyEvaluation:
         """Stale/missing telemetry rules (E3-S2).
 
@@ -310,7 +320,9 @@ class SafetyPolicy:
         (caller passes ``ControllerConfig.max_stale_telemetry_seconds``)
         fails closed: heat 0 %, safe fan, FAULT (AGENTS.md: unsafe or
         uncertain behavior fails closed). The bound is strict — exactly
-        ``max_stale_seconds`` old is still fresh.
+        ``max_stale_seconds`` old is still fresh. For a charged HUMAN run,
+        RD-3 maps the session-clock failures to reading recovery instead.
+        MCP operation failures are evaluated separately.
         """
         if phase not in ACTIVE_ROAST_PHASES:
             return SafetyEvaluation(
@@ -319,6 +331,15 @@ class SafetyPolicy:
                 reason=f"telemetry validity not enforced in phase {phase.value}",
             )
         limits = self._limits
+        if authority is ControlAuthority.HUMAN and charged:
+            if telemetry_age_seconds is None:
+                return self.evaluate_human_reading(
+                    phase=phase, charged=charged, freshness=ReadingFreshness.UNPROVEN
+                )
+            if telemetry_age_seconds > max_stale_seconds:
+                return self.evaluate_human_reading(
+                    phase=phase, charged=charged, freshness=ReadingFreshness.STALE
+                )
         if telemetry_age_seconds is None:
             return SafetyEvaluation(
                 rule="missing_telemetry",
@@ -346,6 +367,167 @@ class SafetyPolicy:
             rule="all_clear",
             verdict=SafetyVerdict.ALLOW,
             reason="telemetry is fresh",
+        )
+
+    def evaluate_human_protective_drop(
+        self,
+        *,
+        authority: ControlAuthority,
+        charged: bool,
+        phase: RoastPhase,
+        freshness: ReadingFreshness,
+        bean_temp_c: object,
+        endpoint: EndpointDisposition,
+        command: CommandDisposition,
+    ) -> SafetyEvaluation:
+        """Admit the compound protective drop only on proven D230 eligibility.
+
+        Args:
+            authority: Authority selected for the run.
+            charged: Whether charge is confirmed.
+            phase: Current effective control phase.
+            freshness: Freshness of the accepted reading.
+            bean_temp_c: Canonical bean temperature in Celsius.
+            endpoint: Current drop disposition.
+            command: Current command disposition.
+
+        Returns:
+            Safety evaluation for admission of the protective drop.
+        """
+        allowed = protection_eligible(
+            authority=authority,
+            charged=charged,
+            phase=phase,
+            freshness=freshness,
+            bean_temp_c=bean_temp_c,
+            endpoint=endpoint,
+            command=command,
+        )
+        return SafetyEvaluation(
+            rule="human_protective_drop",
+            verdict=SafetyVerdict.ALLOW if allowed else SafetyVerdict.REJECT,
+            reason=(
+                "human protection threshold reached with eligible evidence"
+                if allowed
+                else "human protective drop eligibility is not established"
+            ),
+        )
+
+    def evaluate_human_reading(
+        self, *, phase: RoastPhase, charged: bool, freshness: ReadingFreshness
+    ) -> SafetyEvaluation:
+        """Require fresh reading evidence during a charged human roast.
+
+        Args:
+            phase: Current control phase.
+            charged: Whether charge is confirmed.
+            freshness: Freshness of the accepted reading.
+
+        Returns:
+            Recovery with no actuator adjustments for a non-fresh charged
+            active roast, or ALLOW to proceed with the other safety rules.
+        """
+        if charged and phase in ACTIVE_ROAST_PHASES and freshness is not ReadingFreshness.FRESH:
+            return SafetyEvaluation(
+                rule="human_reading_invalid",
+                verdict=SafetyVerdict.RECOVERY,
+                reason=(
+                    f"accepted human-mode reading is {freshness.value}; operator recovery required"
+                ),
+            )
+        return SafetyEvaluation(
+            rule="all_clear",
+            verdict=SafetyVerdict.ALLOW,
+            reason="human reading recovery rule did not fire",
+        )
+
+    def evaluate_human_recovery_drop(
+        self,
+        *,
+        phase: RoastPhase,
+        session_matches: bool,
+        charged: bool,
+        freshness_at_eval: ReadingFreshness,
+        endpoint: EndpointDisposition,
+        command: CommandDisposition,
+    ) -> SafetyEvaluation:
+        """Evaluate a software drop explicitly requested in human recovery.
+
+        Args:
+            phase: Current control phase.
+            session_matches: Whether exact session identity was established.
+            charged: Whether charge is confirmed.
+            freshness_at_eval: Freshness at evaluation time.
+            endpoint: Current drop disposition.
+            command: Current command disposition.
+
+        Returns:
+            Safety evaluation for a recovery or fault-control drop.
+        """
+        allowed = (
+            phase in {RoastPhase.OPERATOR_RECOVERY_REQUIRED, RoastPhase.FAULTED}
+            and session_matches
+            and charged
+            and freshness_at_eval is ReadingFreshness.FRESH
+            and endpoint in {EndpointDisposition.NONE, EndpointDisposition.WITHHELD}
+            and command is CommandDisposition.SETTLED
+        )
+        return SafetyEvaluation(
+            rule="human_recovery_drop",
+            verdict=SafetyVerdict.ALLOW if allowed else SafetyVerdict.REJECT,
+            reason=(
+                "operator drop is eligible in human recovery"
+                if allowed
+                else "software drop unavailable; physical intervention or reconciliation required"
+            ),
+        )
+
+    def evaluate_human_continuation(
+        self,
+        *,
+        target: RoastPhase,
+        session_matches: bool,
+        charged: bool,
+        canonical_human_fc_confirmed: bool,
+        freshness: ReadingFreshness,
+        endpoint: EndpointDisposition,
+        command: CommandDisposition,
+    ) -> SafetyEvaluation:
+        """Evaluate explicit continuation of a charged human roast from recovery.
+
+        Non-heating dispositions use their existing policy.
+
+        Args:
+            target: Requested heating phase.
+            session_matches: Whether the request matches the exact run, session,
+                and child generation.
+            charged: Whether charge is confirmed.
+            canonical_human_fc_confirmed: Whether canonical human FC evidence
+                confirms first crack.
+            freshness: Freshness of the accepted reading.
+            endpoint: Current drop disposition.
+            command: Current command disposition.
+
+        Returns:
+            Safety evaluation for continuation into the requested phase.
+        """
+        allowed = (
+            target in HUMAN_CHARGED_ROAST_PHASES
+            and charged
+            and (target is RoastPhase.DEVELOPMENT) is canonical_human_fc_confirmed
+            and endpoint is EndpointDisposition.NONE
+            and command is CommandDisposition.SETTLED
+            and freshness is ReadingFreshness.FRESH
+            and session_matches
+        )
+        return SafetyEvaluation(
+            rule="human_continuation",
+            verdict=SafetyVerdict.ALLOW if allowed else SafetyVerdict.REJECT,
+            reason=(
+                "explicit continuation is eligible for a fresh protection check"
+                if allowed
+                else "human roast continuation eligibility is not established"
+            ),
         )
 
     def evaluate_mcp_failure(
