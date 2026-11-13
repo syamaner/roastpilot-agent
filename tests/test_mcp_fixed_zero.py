@@ -397,6 +397,42 @@ async def test_transport_errors_do_not_retry_or_replace(failure: Exception) -> N
     assert process.lifecycle == []
 
 
+async def _assert_rejected_containment_replaces_latest_result(
+    adapter: RoasterControlAdapter, process: _LifecycleSpy, prior_session: _Session
+) -> None:
+    prior_calls = prior_session.calls.copy()
+    replacement = _Session(_result(_payload()))
+    process.replace(replacement)
+    assert await process.discover_fixed_zero() is ToolDiscovery.DISCOVERED
+    rejected = await adapter.contain_heat_fixed_zero()
+    assert rejected == ContainmentResult(ContainmentOutcome.NOT_ATTEMPTED)
+    assert adapter.last_containment_result == rejected
+    assert prior_session.calls == prior_calls
+    assert replacement.calls == []
+    assert process.lifecycle == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reply", "outcome"),
+    [
+        pytest.param(_result(_payload()), ContainmentOutcome.COMMAND_STATE_RETURNED, id="success"),
+        pytest.param(
+            MCPToolTimeoutError("local timeout"), ContainmentOutcome.UNKNOWN_TRANSPORT, id="unknown"
+        ),
+    ],
+)
+async def test_containment_rejection_updates_cache_after_prior_attempt(
+    reply: object, outcome: ContainmentOutcome
+) -> None:
+    adapter, process, session = await _prepared(reply)
+    prior = await adapter.contain_heat_fixed_zero()
+    assert prior.outcome is outcome
+    assert adapter.last_containment_result == prior
+    assert len(session.calls) == 1
+    await _assert_rejected_containment_replaces_latest_result(adapter, process, session)
+
+
 @pytest.mark.asyncio
 async def test_cancel_records_transport_unknown_and_propagates() -> None:
     adapter, process, _ = await _prepared(_result(_payload()))
@@ -425,6 +461,7 @@ async def test_cancel_records_transport_unknown_and_propagates() -> None:
     )
     assert len(session.calls) == 1
     assert process.lifecycle == []
+    await _assert_rejected_containment_replaces_latest_result(adapter, process, session)
 
 
 @pytest.mark.asyncio

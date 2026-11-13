@@ -1775,7 +1775,9 @@ class RoasterControlAdapter:
             or not isinstance(session_id, str)
             or not 1 <= len(session_id) <= 128
         ):
-            return ContainmentResult(ContainmentOutcome.NOT_ATTEMPTED)
+            result = ContainmentResult(ContainmentOutcome.NOT_ATTEMPTED)
+            self._last_containment_result = result
+            return result
         try:
             result = await transport._contain_heat_fixed_zero(session_id)  # pyright: ignore[reportPrivateUsage]
         except asyncio.CancelledError:
