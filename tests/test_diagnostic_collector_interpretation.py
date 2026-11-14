@@ -373,6 +373,35 @@ def test_omitted_and_null_expectations_are_unbound() -> None:
     assert all(item.evidence for item in report.checks[:5])
 
 
+@pytest.mark.parametrize(
+    ("field", "dependent_checks"),
+    [
+        ("bt_range_c", (CheckName.TEMPERATURE_PLAUSIBILITY,)),
+        ("et_range_c", (CheckName.TEMPERATURE_PLAUSIBILITY,)),
+        ("evaluation_at", (CheckName.TEMPERATURE_AGE, CheckName.ROOM_AGE)),
+        ("max_temperature_age_seconds", (CheckName.TEMPERATURE_AGE,)),
+        ("max_room_age_seconds", (CheckName.ROOM_AGE,)),
+        ("room_range_c", (CheckName.ROOM_AGE,)),
+    ],
+)
+def test_individually_unbound_expectations_affect_only_dependent_checks(
+    field: str, dependent_checks: tuple[CheckName, ...]
+) -> None:
+    """Dropping one expectation leaves every unrelated check record intact."""
+
+    lines = _baseline()
+    baseline = _report(lines)
+    report = _report(lines, _expect(**{field: None}))
+    for before, after in zip(baseline.checks, report.checks, strict=True):
+        assert after.check is before.check
+        if before.check in dependent_checks:
+            assert before.status is CheckStatus.SATISFIED
+            assert after.reason is CheckReason.EXPECTATION_UNBOUND
+            assert after.status is CheckStatus.UNRESOLVED
+        else:
+            assert after == before
+
+
 def test_b4_exact_scope_and_component_identity() -> None:
     """Identity uses separately bound scope, digests, and matching repeat records."""
 
