@@ -21,6 +21,7 @@ from roastpilot_agent.advisor import (
     FakeAdvisor,
     RoastDecision,
 )
+from roastpilot_agent.human_protection import ContainmentOutcome, ContainmentResult
 from roastpilot_agent.mcp_client import (
     ExportRoastLogResult,
     SessionPresence,
@@ -148,6 +149,10 @@ class FakeMCPClient:
     async def mark_first_crack(self) -> None:
         self._log.append("mark_first_crack")
         self.calls.append(("mark_first_crack", {}))
+
+    async def contain_heat_fixed_zero(self) -> ContainmentResult:
+        """Report that this legacy fake provides no containment evidence."""
+        return ContainmentResult(ContainmentOutcome.NOT_ATTEMPTED)
 
     async def drop_beans(self) -> AppliedRoasterState | None:
         self._log.append("drop_beans")
@@ -345,6 +350,10 @@ class RecordingExecutor:
     async def mark_first_crack(self) -> None:
         self._log.append("mark_first_crack")
         self.commands.append("mark_first_crack")
+
+    async def contain_heat_fixed_zero(self) -> ContainmentResult:
+        """Report that this legacy fake provides no containment evidence."""
+        return ContainmentResult(ContainmentOutcome.NOT_ATTEMPTED)
 
     async def drop_beans(self) -> AppliedRoasterState | None:
         self._log.append("drop_beans")
