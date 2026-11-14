@@ -37,6 +37,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -44,11 +45,20 @@ import sys
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Literal, Protocol, TypeVar, cast
+from typing import Annotated, Any, Literal, Protocol, TypeVar, cast, runtime_checkable
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.types import (
+    CallToolRequest,
+    CallToolRequestParams,
+    CallToolResult,
+    ClientRequest,
+    ListToolsResult,
+    Result,
+)
 from pydantic import (
     BaseModel,
     BeforeValidator,
@@ -61,6 +71,17 @@ from pydantic import (
 )
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceConfig
+from roastpilot_agent.human_protection import (
+    ContainmentOutcome,
+    ContainmentReason,
+    ContainmentResult,
+    CounterEvidence,
+    HumanReadEvidence,
+    RawTemperature,
+    ToolDiscovery,
+    classify_raw_temperature,
+    extract_accepted_counters,
+)
 from roastpilot_agent.models import (
     AppliedRoasterState,
     FaultAcknowledgementState,
@@ -488,6 +509,17 @@ class ExportRoastLogResult(MCPMirror):
 ToolCaller = Callable[[str, dict[str, object]], Awaitable[object]]
 
 
+@dataclass(frozen=True)
+class _HumanStateRead:
+    state: RoastSessionState
+    device_object: bool
+    bean: RawTemperature
+    env: RawTemperature
+    bean_temp_c: int | float | None
+    env_temp_c: int | float | None
+    counters: CounterEvidence
+
+
 class RoasterMCPClient:
     """Typed client for the 14 roast tools of the 15-tool MCP surface.
 
@@ -524,6 +556,39 @@ class RoasterMCPClient:
         # treat an explicit null differently from an absent optional arg.
         args: dict[str, object] = {} if session_id is None else {"session_id": session_id}
         return RoastSessionState.model_validate(await self._call("get_roast_state", args))
+
+    async def _read_human_state(self) -> _HumanStateRead:
+        """Read once, preserving raw evidence before tolerant mirror validation."""
+        payload = await self._call("get_roast_state", {})
+        raw = _json_object(payload)
+        raw_device = None if raw is None else raw.get("device_state")
+        device = _json_object(raw_device)
+        raw_bean = None if device is None else device.get("bean_temp_c")
+        raw_env = None if device is None else device.get("env_temp_c")
+        bean = classify_raw_temperature(raw_bean)
+        env = classify_raw_temperature(raw_env)
+        bean_temp_c = cast("int | float", raw_bean) if bean is RawTemperature.VALID else None
+        env_temp_c = cast("int | float", raw_env) if env is RawTemperature.VALID else None
+
+        mirror_payload = payload
+        if raw is not None and (raw_device is None or device is not None):
+            mirror_device = (
+                None
+                if device is None
+                else {**device, "bean_temp_c": bean_temp_c, "env_temp_c": env_temp_c}
+            )
+            mirror_payload = {**raw, "device_state": mirror_device}
+        state = RoastSessionState.model_validate(mirror_payload)
+        vendor = None if device is None else cast("dict[str, object]", device["raw_vendor_data"])
+        return _HumanStateRead(
+            state,
+            device is not None,
+            bean,
+            env,
+            bean_temp_c,
+            env_temp_c,
+            extract_accepted_counters(vendor),
+        )
 
     async def set_heat(self, heat_level_percent: int) -> ControlCommandResult:
         return ControlCommandResult.model_validate(
@@ -1256,6 +1321,46 @@ def _warn_non_finite_telemetry_field(field_name: str) -> None:
     )
 
 
+@dataclass(frozen=True)
+class _IdentitySnapshot:
+    generation: int
+    started_session_id: str | None
+    started_child_epoch: int | None
+    transport_child_epoch: int | None
+
+
+@dataclass(frozen=True)
+class _ProjectionAnchors:
+    last_elapsed: float | None
+    last_change_monotonic: float | None
+    last_ambient_token: float | None
+    ambient_token_change_monotonic: float | None
+
+
+def _project_human_view(
+    state: RoastSessionState, anchors: _ProjectionAnchors, *, now: float
+) -> tuple[RoastTelemetry | None, _ProjectionAnchors]:
+    """Project telemetry and propose anchor updates without committing them."""
+    elapsed, change = anchors.last_elapsed, anchors.last_change_monotonic
+    if elapsed is None or state.elapsed_monotonic_seconds != elapsed:
+        elapsed, change = state.elapsed_monotonic_seconds, now
+    age = 0.0 if change is None else now - change
+
+    status = state.ambient_status
+    token = ambient_reading_token(status) if ambient_reading_is_live(status) else None
+    if token is None:
+        ambient_token, ambient_change, ambient_age = None, None, None
+    else:
+        ambient_token = anchors.last_ambient_token
+        ambient_change = anchors.ambient_token_change_monotonic
+        if ambient_change is None or token != ambient_token:
+            ambient_token, ambient_change = token, now
+        ambient_age = now - ambient_change
+
+    telemetry = project_session_state(state, age_seconds=age, ambient_age_seconds=ambient_age)
+    return telemetry, _ProjectionAnchors(elapsed, change, ambient_token, ambient_change)
+
+
 class RoasterControlAdapter:
     """Adapts :class:`RoasterMCPClient` to the controller's ``StateReader`` and
     ``CommandExecutor`` protocols (E9 wiring seam).
@@ -1289,12 +1394,25 @@ class RoasterControlAdapter:
     ) -> None:
         self._client = client
         self._clock = clock
+        self._fixed_zero_transport: MCPServerProcess | None = None
+        self._identity_generation: int = 0
+        self._started_child_epoch: int | None = None
+        self._last_containment_result: ContainmentResult | None = None
         self._last_state: RoastSessionState | None = None
         self._started_session_id: str | None = None
         self._last_elapsed: float | None = None
         self._last_change_monotonic: float | None = None
         self._last_ambient_token: float | None = None
         self._ambient_token_change_monotonic: float | None = None
+
+    @classmethod
+    def from_process(
+        cls, transport: "MCPServerProcess", *, clock: Callable[[], float] = time.monotonic
+    ) -> "RoasterControlAdapter":
+        """Bind Start, evidence reads and containment to the same MCP process."""
+        adapter = cls(RoasterMCPClient(transport.call_tool), clock=clock)
+        adapter._fixed_zero_transport = transport
+        return adapter
 
     @property
     def last_state(self) -> RoastSessionState | None:
@@ -1318,12 +1436,32 @@ class RoasterControlAdapter:
         Clearing synchronously prevents an e-stop in that interval from
         attaching a prior run's cached session to the new run.
         """
+        self._identity_generation += 1
         self._last_state = None
         self._started_session_id = None
+        self._started_child_epoch = None
         self._last_elapsed = None
         self._last_change_monotonic = None
         self._last_ambient_token = None
         self._ambient_token_change_monotonic = None
+        self._last_containment_result = None
+
+    def _identity_snapshot(self) -> _IdentitySnapshot:
+        transport = self._fixed_zero_transport
+        return _IdentitySnapshot(
+            self._identity_generation,
+            self._started_session_id,
+            self._started_child_epoch,
+            None if transport is None else transport.child_epoch,
+        )
+
+    def _projection_anchors(self) -> _ProjectionAnchors:
+        return _ProjectionAnchors(
+            self._last_elapsed,
+            self._last_change_monotonic,
+            self._last_ambient_token,
+            self._ambient_token_change_monotonic,
+        )
 
     async def read_session_presence(self) -> SessionPresence:
         """Read the current child's typed MCP session-presence snapshot.
@@ -1500,7 +1638,49 @@ class RoasterControlAdapter:
         return None
 
     async def read_telemetry(self) -> RoastTelemetry | None:
-        state = await self._client.get_roast_state()
+        return self._project_telemetry(await self._client.get_roast_state())
+
+    async def read_human_evidence(self) -> HumanReadEvidence:
+        """Return one reading with raw temperatures and child-bound freshness evidence."""
+        request_admitted_at = self._clock()
+        before = self._identity_snapshot()
+        read = await self._client._read_human_state()  # pyright: ignore[reportPrivateUsage]
+        now = self._clock()
+        after = self._identity_snapshot()
+        bound = (
+            self._fixed_zero_transport is not None
+            and before == after
+            and type(before.transport_child_epoch) is int
+            and before.transport_child_epoch == before.started_child_epoch
+            and isinstance(before.started_session_id, str)
+            and read.state.session_id == before.started_session_id
+        )
+        bound_child_epoch = before.transport_child_epoch if bound else None
+        telemetry, proposed = _project_human_view(read.state, self._projection_anchors(), now=now)
+        evidence = HumanReadEvidence(
+            telemetry=(
+                telemetry
+                if read.bean is RawTemperature.VALID and read.env is RawTemperature.VALID
+                else None
+            ),
+            device_object=read.device_object,
+            bean=read.bean,
+            env=read.env,
+            bean_temp_c=read.bean_temp_c,
+            env_temp_c=read.env_temp_c,
+            counters=read.counters,
+            request_admitted_at=request_admitted_at,
+            bound_child_epoch=bound_child_epoch,
+        )
+        if bound:
+            self._last_elapsed = proposed.last_elapsed
+            self._last_change_monotonic = proposed.last_change_monotonic
+            self._last_ambient_token = proposed.last_ambient_token
+            self._ambient_token_change_monotonic = proposed.ambient_token_change_monotonic
+            self._last_state = read.state
+        return evidence
+
+    def _project_telemetry(self, state: RoastSessionState) -> RoastTelemetry | None:
         now = self._clock()
         if self._last_elapsed is None or state.elapsed_monotonic_seconds != self._last_elapsed:
             self._last_elapsed = state.elapsed_monotonic_seconds
@@ -1638,8 +1818,43 @@ class RoasterControlAdapter:
                     recording_roast_num,
                     exc_info=True,
                 )
+        transport = self._fixed_zero_transport
+        child_epoch = transport.child_epoch if transport is not None else None
         result = await self._client.start_roast_session()
         self._started_session_id = result.session.session_id
+        self._started_child_epoch = child_epoch
+
+    @property
+    def last_containment_result(self) -> ContainmentResult | None:
+        """Return diagnostic evidence of the latest attempt in this generation."""
+        return self._last_containment_result
+
+    async def contain_heat_fixed_zero(self) -> ContainmentResult:
+        """Send one safety-approved fixed-zero request for the exact started session."""
+        transport = self._fixed_zero_transport
+        session_id = self._started_session_id
+        if (
+            transport is None
+            or transport.fixed_zero_discovery is not ToolDiscovery.DISCOVERED
+            or self._started_child_epoch != transport.child_epoch
+            or not isinstance(session_id, str)
+            or not 1 <= len(session_id) <= 128
+        ):
+            result = ContainmentResult(ContainmentOutcome.NOT_ATTEMPTED)
+            self._last_containment_result = result
+            return result
+        generation = self._identity_generation
+        try:
+            result = await transport._contain_heat_fixed_zero(session_id)  # pyright: ignore[reportPrivateUsage]
+        except asyncio.CancelledError:
+            if self._identity_generation == generation:
+                self._last_containment_result = ContainmentResult(
+                    ContainmentOutcome.UNKNOWN_TRANSPORT
+                )
+            raise
+        if self._identity_generation == generation:
+            self._last_containment_result = result
+        return result
 
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
         await self._client.set_heat(heat_percent)
@@ -1772,6 +1987,15 @@ class InitializableSession(ToolSession, Protocol):
 
     async def initialize(self) -> object:
         """Run the MCP initialization handshake."""
+        ...
+
+
+@runtime_checkable
+class ToolDiscoverySession(Protocol):
+    """Separate read-only tool inventory capability of an initialized MCP session."""
+
+    async def list_tools(self) -> object:
+        """Read one tool inventory page."""
         ...
 
 
@@ -1971,6 +2195,259 @@ def _result_text(result: object) -> str | None:
     return None
 
 
+_FIXED_ZERO_TOOL = "contain_heat_fixed_zero"
+_FIXED_ZERO_PROTOCOL = "fixed_zero/v1"
+
+
+def _json_object(value: object) -> dict[str, object] | None:
+    if type(value) is not dict:
+        return None
+    return cast("dict[str, object]", value)
+
+
+def _semantic_schema_matches(schema: dict[str, object], fields: set[str]) -> bool:
+    return (
+        len(schema) <= len(fields) + 2
+        and fields <= schema.keys()
+        and all(key in fields or key in {"title", "description"} for key in schema)
+    )
+
+
+def _advertises_fixed_zero(inventory: object) -> bool:
+    if not isinstance(inventory, ListToolsResult) or inventory.nextCursor is not None:
+        return False
+    matches = (tool for tool in inventory.tools if tool.name == _FIXED_ZERO_TOOL)
+    match = next(matches, None)
+    if match is None or next(matches, None) is not None:
+        return False
+    schema: dict[str, object] = match.inputSchema
+    if (
+        not _semantic_schema_matches(
+            schema, {"type", "additionalProperties", "required", "properties"}
+        )
+        or schema.get("type") != "object"
+        or schema.get("additionalProperties") is not False
+    ):
+        return False
+    required = schema.get("required")
+    if type(required) is not list or required not in (
+        ["expected_session_id", "containment_protocol"],
+        ["containment_protocol", "expected_session_id"],
+    ):
+        return False
+    properties = _json_object(schema.get("properties"))
+    if properties is None or properties.keys() != {"expected_session_id", "containment_protocol"}:
+        return False
+    identity = _json_object(properties["expected_session_id"])
+    protocol = _json_object(properties["containment_protocol"])
+    return (
+        identity is not None
+        and _semantic_schema_matches(identity, {"type", "minLength", "maxLength"})
+        and identity.get("type") == "string"
+        and type(identity.get("minLength")) is int
+        and identity.get("minLength") == 1
+        and type(identity.get("maxLength")) is int
+        and identity.get("maxLength") == 128
+        and protocol is not None
+        and _semantic_schema_matches(protocol, {"type", "const"})
+        and protocol.get("type") == "string"
+        and protocol.get("const") == _FIXED_ZERO_PROTOCOL
+    )
+
+
+@dataclass(frozen=True)
+class _FixedZeroRow:
+    outcome: ContainmentOutcome
+    dispatch: str
+    validates_identity: bool
+    projection: str
+    has_commanded_state: bool
+    reasons: tuple[ContainmentReason | None, ...]
+
+
+_FIXED_ZERO_ROWS = {
+    row.outcome.value: row
+    for row in (
+        _FixedZeroRow(
+            ContainmentOutcome.REFUSED_IDENTITY,
+            "not_invoked",
+            False,
+            "not_changed",
+            False,
+            (
+                ContainmentReason.UNKNOWN_SESSION,
+                ContainmentReason.NOT_LATEST_SESSION,
+                ContainmentReason.SESSION_NOT_ACTIVE,
+                ContainmentReason.SESSION_FAULTED,
+            ),
+        ),
+        _FixedZeroRow(
+            ContainmentOutcome.REFUSED_CAPABILITY,
+            "not_invoked",
+            True,
+            "not_changed",
+            False,
+            (
+                ContainmentReason.CAPABILITY_ABSENT,
+                ContainmentReason.CAPABILITY_VERSION_UNSUPPORTED,
+                ContainmentReason.CAPABILITY_MALFORMED,
+                ContainmentReason.CAPABILITY_UNREADABLE,
+                ContainmentReason.CAPABILITY_PORT_MISSING,
+            ),
+        ),
+        _FixedZeroRow(
+            ContainmentOutcome.REFUSED_BUSY,
+            "not_invoked",
+            True,
+            "not_changed",
+            False,
+            (ContainmentReason.FINALISATION_IN_PROGRESS, ContainmentReason.COMMAND_IN_PROGRESS),
+        ),
+        _FixedZeroRow(
+            ContainmentOutcome.COMMAND_STATE_RETURNED,
+            "invoked",
+            True,
+            "recorded_in_memory",
+            True,
+            (None,),
+        ),
+        _FixedZeroRow(
+            ContainmentOutcome.UNKNOWN_DRIVER_RESULT,
+            "invoked",
+            True,
+            "unknown",
+            False,
+            (
+                ContainmentReason.DRIVER_RAISED,
+                ContainmentReason.DRIVER_RESULT_MISSING,
+                ContainmentReason.DRIVER_RESULT_INVALID,
+            ),
+        ),
+        _FixedZeroRow(
+            ContainmentOutcome.UNKNOWN_COMPLETION,
+            "invoked",
+            True,
+            "unknown",
+            True,
+            (
+                ContainmentReason.COMPLETION_OWNERSHIP_CHANGED,
+                ContainmentReason.PROJECTION_UNCONFIRMED,
+            ),
+        ),
+    )
+}
+_FIXED_ZERO_RESULT_KEYS = {
+    "containment_protocol",
+    "containment_version",
+    "outcome",
+    "request_dispatch",
+    "automatic_retry_permitted",
+    "requested_session_id",
+    "validated_session_id",
+    "commanded_state",
+    "session_projection",
+    "durability",
+    "reason_code",
+}
+_FIXED_ZERO_MOTORS = ("drum_motor_on", "cooling_motor_on", "solenoid_open")
+_FIXED_ZERO_FANS = ("roast_fan_level_percent", "main_fan_level_percent")
+_FIXED_ZERO_STATE_KEYS = {
+    "driver",
+    "capability_version",
+    "heat_level_percent",
+    *_FIXED_ZERO_FANS,
+    *_FIXED_ZERO_MOTORS,
+}
+
+
+def _valid_fixed_zero_state(value: object) -> bool:
+    state = _json_object(value)
+    if state is None or state.keys() != _FIXED_ZERO_STATE_KEYS:
+        return False
+    driver = state["driver"]
+    version = state["capability_version"]
+    heat = state["heat_level_percent"]
+    fans = (state[key] for key in _FIXED_ZERO_FANS)
+    return (
+        isinstance(driver, str)
+        and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", driver, flags=re.ASCII) is not None
+        and type(version) is int
+        and version == 1
+        and type(heat) is int
+        and heat == 0
+        and all(type(fan) is int and 0 <= fan <= 100 for fan in fans)
+        and all(type(state[key]) is bool for key in _FIXED_ZERO_MOTORS)
+    )
+
+
+def _decode_fixed_zero(payload: object, requested_session: str) -> ContainmentResult:
+    malformed = ContainmentResult(ContainmentOutcome.UNKNOWN_MALFORMED_RESPONSE)
+    data = _json_object(payload)
+    if data is None or data.keys() != _FIXED_ZERO_RESULT_KEYS:
+        return malformed
+    if (
+        type(data["containment_protocol"]) is not str
+        or data["containment_protocol"] != _FIXED_ZERO_PROTOCOL
+        or type(data["containment_version"]) is not int
+        or data["containment_version"] != 1
+        or data["automatic_retry_permitted"] is not False
+        or data["requested_session_id"] != requested_session
+        or data["durability"] != "not_provided_by_this_tool"
+    ):
+        return malformed
+    outcome = data["outcome"]
+    row = _FIXED_ZERO_ROWS.get(outcome) if isinstance(outcome, str) else None
+    if row is None:
+        return malformed
+    commanded = data["commanded_state"]
+    if (
+        data["request_dispatch"] != row.dispatch
+        or data["validated_session_id"] != (requested_session if row.validates_identity else None)
+        or data["session_projection"] != row.projection
+        or (commanded is not None) != row.has_commanded_state
+        or (row.has_commanded_state and not _valid_fixed_zero_state(commanded))
+    ):
+        return malformed
+    reason_code = data["reason_code"]
+    try:
+        reason = None if reason_code is None else ContainmentReason(reason_code)
+    except ValueError:
+        return malformed
+    if reason not in row.reasons:
+        return malformed
+    return ContainmentResult(
+        outcome=row.outcome,
+        reason=reason,
+        evidence_heat_zero_commanded=True if row.has_commanded_state else None,
+        evidence_is_pre_fallback=row.outcome is ContainmentOutcome.UNKNOWN_COMPLETION,
+    )
+
+
+class _FixedZeroSDKResult(Result):
+    """Keep the actual structured member, including malformed JSON values.
+
+    ClientSession.call_tool validates against the child's output schema and can
+    do an implicit tools/list. The fixed-zero call instead uses send_request
+    with this envelope, then applies the consumer-owned closed grammar.
+    """
+
+    isError: StrictBool = False
+    structuredContent: object = None
+
+
+async def _call_fixed_zero_sdk(session: ToolSession, arguments: dict[str, object]) -> object:
+    if isinstance(session, ClientSession):
+        return await session.send_request(
+            ClientRequest(
+                CallToolRequest(
+                    params=CallToolRequestParams(name=_FIXED_ZERO_TOOL, arguments=arguments)
+                )
+            ),
+            _FixedZeroSDKResult,
+        )
+    return await session.call_tool(_FIXED_ZERO_TOOL, arguments)
+
+
 class MCPServerProcess:
     """Owns the coffee-roaster-mcp stdio child process (D6, E5-S2).
 
@@ -2016,6 +2493,7 @@ class MCPServerProcess:
         #: clearance records this before a fresh read and rejects a proof when
         #: a stop or replacement changes it before durable confirmation.
         self._child_epoch = 1 if session is not None else 0
+        self._fixed_zero_discovery: ToolDiscovery | None = None
         self._session_factory: SessionFactory = (
             session_factory if session_factory is not None else self._default_session_factory
         )
@@ -2237,6 +2715,35 @@ class MCPServerProcess:
             return
         self._session = session
         self._child_epoch += 1
+        self._fixed_zero_discovery = None
+
+    @property
+    def fixed_zero_discovery(self) -> ToolDiscovery:
+        """Return cached advertisement evidence for the current child."""
+        return self._fixed_zero_discovery or ToolDiscovery.ABSENT
+
+    async def discover_fixed_zero(self) -> ToolDiscovery:
+        """Check one terminal inventory on the initialized child, before Start."""
+        session = self._session
+        if session is None or self._fixed_zero_discovery is not None:
+            return self.fixed_zero_discovery
+        epoch = self._child_epoch
+        # Reserve the attempt before awaiting, so overlapping preparation cannot
+        # send a second listing. Until evidence arrives callers see ABSENT.
+        self._fixed_zero_discovery = ToolDiscovery.ABSENT
+        if not isinstance(session, ToolDiscoverySession):
+            return ToolDiscovery.ABSENT
+        try:
+            inventory = await asyncio.wait_for(
+                session.list_tools(), timeout=self._config.call_timeout_seconds
+            )
+        except Exception:
+            return ToolDiscovery.ABSENT
+        if epoch != self._child_epoch:
+            return ToolDiscovery.ABSENT
+        if _advertises_fixed_zero(inventory):
+            self._fixed_zero_discovery = ToolDiscovery.DISCOVERED
+        return self.fixed_zero_discovery
 
     @property
     def stop_unconfirmed(self) -> bool:
@@ -2705,6 +3212,35 @@ class MCPServerProcess:
                 "no force-terminate hook registered for wedged MCP child — "
                 "child may survive agent exit"
             )
+
+    async def _contain_heat_fixed_zero(self, session_id: str) -> ContainmentResult:
+        """Classify one bounded SDK call without legacy parsing or cleanup."""
+        session = self._session
+        epoch = self._child_epoch
+        if session is None:
+            return ContainmentResult(ContainmentOutcome.UNKNOWN_TRANSPORT)
+        try:
+            async with asyncio.timeout(self._config.call_timeout_seconds):
+                raw = await _call_fixed_zero_sdk(
+                    session,
+                    {
+                        "expected_session_id": session_id,
+                        "containment_protocol": _FIXED_ZERO_PROTOCOL,
+                    },
+                )
+        except Exception:
+            # Includes typed MCP failures, local timeout and SDK protocol/IO
+            # errors. Cancellation propagates for recording by the adapter.
+            return ContainmentResult(ContainmentOutcome.UNKNOWN_TRANSPORT)
+        if isinstance(raw, (_FixedZeroSDKResult, CallToolResult)):
+            if raw.isError:
+                return ContainmentResult(ContainmentOutcome.UNKNOWN_TRANSPORT)
+            payload: object = raw.structuredContent
+        else:
+            payload = None
+        if epoch != self._child_epoch:
+            return ContainmentResult(ContainmentOutcome.UNKNOWN_TRANSPORT)
+        return _decode_fixed_zero(payload, session_id)
 
     async def call_tool(self, name: str, arguments: dict[str, object]) -> object:
         """ToolCaller implementation: timeout-bounded, typed failures only."""

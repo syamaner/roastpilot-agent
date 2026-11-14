@@ -78,6 +78,7 @@ from roastpilot_agent.config import (
     PostFirstCrackControl,
     ReferenceCurve,
 )
+from roastpilot_agent.human_protection import ContainmentOutcome, ContainmentResult
 from roastpilot_agent.live import mount_spa
 from roastpilot_agent.mcp_client import (
     EventSnapshot,
@@ -584,6 +585,10 @@ class ReplayRoasterControl(RecordingReplayControl):
 
     async def mark_first_crack(self) -> None:
         self.commands.append(("mark_first_crack", {}))
+
+    async def contain_heat_fixed_zero(self) -> ContainmentResult:
+        """Report that replay has no live containment capability."""
+        return ContainmentResult(ContainmentOutcome.NOT_ATTEMPTED)
 
     async def drop_beans(self) -> AppliedRoasterState:
         self.commands.append(("drop_beans", {}))

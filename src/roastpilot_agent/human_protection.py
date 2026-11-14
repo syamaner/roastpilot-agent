@@ -4,10 +4,12 @@ import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import TypeGuard
+from typing import TypeGuard, cast
 
-from roastpilot_agent.models import RoastPhase
+from roastpilot_agent.models import RoastPhase, RoastTelemetry
 
+# Every integer in this range converts exactly to float.
+HUMAN_EXACT_INT_LIMIT = 2**53
 HUMAN_PROTECTION_BT_C = 196.0
 HUMAN_CHARGED_ROAST_PHASES = frozenset(
     {RoastPhase.ROASTING_PRE_FIRST_CRACK, RoastPhase.DEVELOPMENT}
@@ -56,6 +58,77 @@ class CounterEvidence:
     status: int | None
     ignored: int | None
     class_: CounterClass
+
+
+class RawTemperature(Enum):
+    """Validity of one raw Celsius measurement."""
+
+    VALID = "valid"
+    ABSENT = "absent"
+    INVALID = "invalid"
+
+
+def classify_raw_temperature(value: object) -> RawTemperature:
+    """Classify a raw Celsius measurement by exact type and representability."""
+    if value is None:
+        return RawTemperature.ABSENT
+    if type(value) is int and -HUMAN_EXACT_INT_LIMIT <= value <= HUMAN_EXACT_INT_LIMIT:
+        return RawTemperature.VALID
+    if type(value) is float and math.isfinite(value):
+        return RawTemperature.VALID
+    return RawTemperature.INVALID
+
+
+@dataclass(frozen=True)
+class HumanReadEvidence:
+    """One successful read with raw temperature evidence and optional telemetry."""
+
+    telemetry: RoastTelemetry | None
+    device_object: bool
+    bean: RawTemperature
+    env: RawTemperature
+    bean_temp_c: int | float | None
+    env_temp_c: int | float | None
+    counters: CounterEvidence
+    request_admitted_at: float
+    bound_child_epoch: int | None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.device_object) is not bool
+            or type(self.bean) is not RawTemperature
+            or type(self.env) is not RawTemperature
+            or not isinstance(self.counters, CounterEvidence)  # pyright: ignore[reportUnnecessaryIsInstance]
+        ):
+            raise ValueError("invalid human read evidence types")
+
+        for classification, value in ((self.bean, self.bean_temp_c), (self.env, self.env_temp_c)):
+            if classification is RawTemperature.VALID:
+                if classify_raw_temperature(value) is not RawTemperature.VALID:
+                    raise ValueError("valid temperature requires an exact raw value")
+            elif value is not None:
+                raise ValueError("non-valid temperature cannot retain a raw value")
+
+        if not self.device_object and (
+            self.bean is not RawTemperature.ABSENT
+            or self.env is not RawTemperature.ABSENT
+            or self.counters.class_ is not CounterClass.ABSENT
+        ):
+            raise ValueError("absent device cannot carry temperature or counter evidence")
+
+        pair_valid = self.bean is RawTemperature.VALID and self.env is RawTemperature.VALID
+        if (self.telemetry is not None) != pair_valid:
+            raise ValueError("telemetry requires a valid temperature pair")
+        if self.telemetry is not None and (
+            self.telemetry.bean_temp_c != float(cast("int | float", self.bean_temp_c))
+            or self.telemetry.env_temp_c != float(cast("int | float", self.env_temp_c))
+        ):
+            raise ValueError("telemetry must match the raw temperature pair")
+
+        if self.bound_child_epoch is not None and type(self.bound_child_epoch) is not int:
+            raise ValueError("bound child epoch must be an exact integer")
+        if type(self.request_admitted_at) not in (int, float):
+            raise ValueError("request admission time must be an exact number")
 
 
 def extract_accepted_counters(raw: Mapping[str, object] | None) -> CounterEvidence:
@@ -259,6 +332,23 @@ class ContainmentReason(Enum):
     DRIVER_RESULT_INVALID = "driver_result_invalid"
     COMPLETION_OWNERSHIP_CHANGED = "completion_ownership_changed"
     PROJECTION_UNCONFIRMED = "projection_unconfirmed"
+
+
+@dataclass(frozen=True)
+class ContainmentResult:
+    """Classified containment evidence, independent of MCP and physical state."""
+
+    outcome: ContainmentOutcome
+    reason: ContainmentReason | None = None
+    evidence_heat_zero_commanded: bool | None = None
+    evidence_is_pre_fallback: bool = False
+
+
+class ToolDiscovery(Enum):
+    """Whether the current child advertises the fixed-zero wire contract."""
+
+    DISCOVERED = "discovered"
+    ABSENT = "absent"
 
 
 class ContainmentAttempt(Enum):

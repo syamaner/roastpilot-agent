@@ -43,6 +43,7 @@ from roastpilot_agent.control_policy import (
     RoastControlPolicy,
     TrimSignal,
 )
+from roastpilot_agent.human_protection import ContainmentResult
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
     AppliedRoasterState,
@@ -466,6 +467,10 @@ class CommandExecutor(Protocol):
 
     async def mark_first_crack(self) -> None:
         """Record the operator first-crack override with MCP."""
+        ...
+
+    async def contain_heat_fixed_zero(self) -> ContainmentResult:
+        """Execute one safety-approved exact-session fixed-zero request."""
         ...
 
     async def drop_beans(self) -> AppliedRoasterState | None:

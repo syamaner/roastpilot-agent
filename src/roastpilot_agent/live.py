@@ -37,7 +37,6 @@ from roastpilot_agent.config import AppConfig
 from roastpilot_agent.mcp_client import (
     MCPServerProcess,
     RoasterControlAdapter,
-    RoasterMCPClient,
 )
 from roastpilot_agent.models import AdvisorHealth, AdvisorHealthStatus
 from roastpilot_agent.store import RoastStore
@@ -189,7 +188,7 @@ async def build_live_service(
         await mcp.stop()
         raise
 
-    adapter = RoasterControlAdapter(RoasterMCPClient(mcp.call_tool))
+    adapter = RoasterControlAdapter.from_process(mcp)
     advisor = build_advisor(config)
     store = RoastStore(store_path)
     service = RoastService(
