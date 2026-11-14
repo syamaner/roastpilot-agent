@@ -1321,6 +1321,46 @@ def _warn_non_finite_telemetry_field(field_name: str) -> None:
     )
 
 
+@dataclass(frozen=True)
+class _IdentitySnapshot:
+    generation: int
+    started_session_id: str | None
+    started_child_epoch: int | None
+    transport_child_epoch: int | None
+
+
+@dataclass(frozen=True)
+class _ProjectionAnchors:
+    last_elapsed: float | None
+    last_change_monotonic: float | None
+    last_ambient_token: float | None
+    ambient_token_change_monotonic: float | None
+
+
+def _project_human_view(
+    state: RoastSessionState, anchors: _ProjectionAnchors, *, now: float
+) -> tuple[RoastTelemetry | None, _ProjectionAnchors]:
+    """Project telemetry and propose anchor updates without committing them."""
+    elapsed, change = anchors.last_elapsed, anchors.last_change_monotonic
+    if elapsed is None or state.elapsed_monotonic_seconds != elapsed:
+        elapsed, change = state.elapsed_monotonic_seconds, now
+    age = 0.0 if change is None else now - change
+
+    status = state.ambient_status
+    token = ambient_reading_token(status) if ambient_reading_is_live(status) else None
+    if token is None:
+        ambient_token, ambient_change, ambient_age = None, None, None
+    else:
+        ambient_token = anchors.last_ambient_token
+        ambient_change = anchors.ambient_token_change_monotonic
+        if ambient_change is None or token != ambient_token:
+            ambient_token, ambient_change = token, now
+        ambient_age = now - ambient_change
+
+    telemetry = project_session_state(state, age_seconds=age, ambient_age_seconds=ambient_age)
+    return telemetry, _ProjectionAnchors(elapsed, change, ambient_token, ambient_change)
+
+
 class RoasterControlAdapter:
     """Adapts :class:`RoasterMCPClient` to the controller's ``StateReader`` and
     ``CommandExecutor`` protocols (E9 wiring seam).
@@ -1355,6 +1395,7 @@ class RoasterControlAdapter:
         self._client = client
         self._clock = clock
         self._fixed_zero_transport: MCPServerProcess | None = None
+        self._identity_generation: int = 0
         self._started_child_epoch: int | None = None
         self._last_containment_result: ContainmentResult | None = None
         self._last_state: RoastSessionState | None = None
@@ -1395,6 +1436,7 @@ class RoasterControlAdapter:
         Clearing synchronously prevents an e-stop in that interval from
         attaching a prior run's cached session to the new run.
         """
+        self._identity_generation += 1
         self._last_state = None
         self._started_session_id = None
         self._started_child_epoch = None
@@ -1402,6 +1444,24 @@ class RoasterControlAdapter:
         self._last_change_monotonic = None
         self._last_ambient_token = None
         self._ambient_token_change_monotonic = None
+        self._last_containment_result = None
+
+    def _identity_snapshot(self) -> _IdentitySnapshot:
+        transport = self._fixed_zero_transport
+        return _IdentitySnapshot(
+            self._identity_generation,
+            self._started_session_id,
+            self._started_child_epoch,
+            None if transport is None else transport.child_epoch,
+        )
+
+    def _projection_anchors(self) -> _ProjectionAnchors:
+        return _ProjectionAnchors(
+            self._last_elapsed,
+            self._last_change_monotonic,
+            self._last_ambient_token,
+            self._ambient_token_change_monotonic,
+        )
 
     async def read_session_presence(self) -> SessionPresence:
         """Read the current child's typed MCP session-presence snapshot.
@@ -1583,23 +1643,21 @@ class RoasterControlAdapter:
     async def read_human_evidence(self) -> HumanReadEvidence:
         """Return one reading with raw temperatures and child-bound freshness evidence."""
         request_admitted_at = self._clock()
-        transport = self._fixed_zero_transport
-        epoch_before = None if transport is None else transport.child_epoch
-        started_session = self._started_session_id
-        started_epoch = self._started_child_epoch
+        before = self._identity_snapshot()
         read = await self._client._read_human_state()  # pyright: ignore[reportPrivateUsage]
-        telemetry = self._project_telemetry(read.state)
-        bound_child_epoch = None
-        if (
-            transport is not None
-            and type(epoch_before) is int
-            and epoch_before == started_epoch
-            and transport.child_epoch == epoch_before
-            and isinstance(started_session, str)
-            and read.state.session_id == started_session
-        ):
-            bound_child_epoch = epoch_before
-        return HumanReadEvidence(
+        now = self._clock()
+        after = self._identity_snapshot()
+        bound = (
+            self._fixed_zero_transport is not None
+            and before == after
+            and type(before.transport_child_epoch) is int
+            and before.transport_child_epoch == before.started_child_epoch
+            and isinstance(before.started_session_id, str)
+            and read.state.session_id == before.started_session_id
+        )
+        bound_child_epoch = before.transport_child_epoch if bound else None
+        telemetry, proposed = _project_human_view(read.state, self._projection_anchors(), now=now)
+        evidence = HumanReadEvidence(
             telemetry=(
                 telemetry
                 if read.bean is RawTemperature.VALID and read.env is RawTemperature.VALID
@@ -1614,6 +1672,13 @@ class RoasterControlAdapter:
             request_admitted_at=request_admitted_at,
             bound_child_epoch=bound_child_epoch,
         )
+        if bound:
+            self._last_elapsed = proposed.last_elapsed
+            self._last_change_monotonic = proposed.last_change_monotonic
+            self._last_ambient_token = proposed.last_ambient_token
+            self._ambient_token_change_monotonic = proposed.ambient_token_change_monotonic
+            self._last_state = read.state
+        return evidence
 
     def _project_telemetry(self, state: RoastSessionState) -> RoastTelemetry | None:
         now = self._clock()
@@ -1761,7 +1826,7 @@ class RoasterControlAdapter:
 
     @property
     def last_containment_result(self) -> ContainmentResult | None:
-        """Return the latest classified attempt, including a cancelled await."""
+        """Return diagnostic evidence of the latest attempt in this generation."""
         return self._last_containment_result
 
     async def contain_heat_fixed_zero(self) -> ContainmentResult:
@@ -1778,12 +1843,17 @@ class RoasterControlAdapter:
             result = ContainmentResult(ContainmentOutcome.NOT_ATTEMPTED)
             self._last_containment_result = result
             return result
+        generation = self._identity_generation
         try:
             result = await transport._contain_heat_fixed_zero(session_id)  # pyright: ignore[reportPrivateUsage]
         except asyncio.CancelledError:
-            self._last_containment_result = ContainmentResult(ContainmentOutcome.UNKNOWN_TRANSPORT)
+            if self._identity_generation == generation:
+                self._last_containment_result = ContainmentResult(
+                    ContainmentOutcome.UNKNOWN_TRANSPORT
+                )
             raise
-        self._last_containment_result = result
+        if self._identity_generation == generation:
+            self._last_containment_result = result
         return result
 
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:

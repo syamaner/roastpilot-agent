@@ -823,8 +823,17 @@ class _DecodedRead:
         self.client = RoasterMCPClient(self.call)
         self.adapter = RoasterControlAdapter(self.client, clock=self.clock)
 
+    async def bind(self) -> int:
+        process = _LifecycleSpy(_Session(_result(_state_payload())))
+        self.adapter._fixed_zero_transport = process  # pyright: ignore[reportPrivateUsage]
+        await self.adapter.start_session()
+        self.calls.clear()
+        return process.child_epoch
+
     async def call(self, name: str, arguments: dict[str, object]) -> object:
         self.calls.append((name, arguments))
+        if name == "start_roast_session":
+            return {"session": _state_payload()}
         self.now += 3
         if isinstance(self.payload, BaseException):
             raise self.payload
@@ -867,10 +876,22 @@ async def _assert_automatic_read(payload: object) -> None:
     assert reader.calls == _HUMAN_READ_CALL * 2
 
 
+def _anchors(adapter: RoasterControlAdapter) -> tuple[float | None, ...]:
+    return (
+        adapter._last_elapsed,  # pyright: ignore[reportPrivateUsage]
+        adapter._last_change_monotonic,  # pyright: ignore[reportPrivateUsage]
+        adapter._last_ambient_token,  # pyright: ignore[reportPrivateUsage]
+        adapter._ambient_token_change_monotonic,  # pyright: ignore[reportPrivateUsage]
+    )
+
+
+def _generation(adapter: RoasterControlAdapter) -> int:
+    return adapter._identity_generation  # pyright: ignore[reportPrivateUsage]
+
+
 def _assert_projection_state(reader: _DecodedRead, expected: RoastSessionState) -> None:
     assert reader.adapter.last_state == expected
-    assert reader.adapter._last_elapsed == expected.elapsed_monotonic_seconds  # pyright: ignore[reportPrivateUsage]
-    assert reader.adapter._last_change_monotonic == 13  # pyright: ignore[reportPrivateUsage]
+    assert _anchors(reader.adapter) == (expected.elapsed_monotonic_seconds, 13, 1200, 13)
 
 
 @pytest.mark.asyncio
@@ -906,12 +927,13 @@ async def test_human_evidence_reads_once_and_captures_request_admission(
     device["raw_vendor_data"] = {"status_packet_count": 23, "ignored_temperature_packet_count": 2}
     before = deepcopy(payload)
     reader = _DecodedRead(payload)
+    epoch = await reader.bind()
     evidence = await reader.adapter.read_human_evidence()
     assert reader.calls == _HUMAN_READ_CALL
     assert evidence.request_admitted_at == 10
     assert reader.clocks == [10, 13]
     assert evidence.device_object
-    assert evidence.bound_child_epoch is None
+    assert evidence.bound_child_epoch == epoch
     assert evidence.counters == CounterEvidence(23, 2, CounterClass.PRESENT)
     if key == "bean_temp_c":
         measured, raw = evidence.bean, evidence.bean_temp_c
@@ -978,6 +1000,7 @@ async def test_human_evidence_absent_device(device: object) -> None:
     _set_field(payload, "device_state", device)
     before = deepcopy(payload)
     reader = _DecodedRead(payload)
+    epoch = await reader.bind()
     try:
         evidence = await reader.adapter.read_human_evidence()
     except ValidationError as error:
@@ -988,7 +1011,7 @@ async def test_human_evidence_absent_device(device: object) -> None:
     assert evidence.bean is evidence.env is RawTemperature.ABSENT
     assert evidence.bean_temp_c is evidence.env_temp_c is evidence.telemetry is None
     assert evidence.counters == CounterEvidence(None, None, CounterClass.ABSENT)
-    assert evidence.bound_child_epoch is None
+    assert evidence.bound_child_epoch == epoch
     assert payload == before
     _assert_projection_state(
         reader, RoastSessionState.model_validate({**payload, "device_state": None})
@@ -1056,24 +1079,30 @@ async def test_human_evidence_preserves_non_temperature_failure(
         asyncio.CancelledError(),
     ],
 )
-async def test_human_evidence_propagates_read_failure(
-    monkeypatch: pytest.MonkeyPatch, failure: BaseException
-) -> None:
+async def test_human_evidence_propagates_read_failure(failure: BaseException) -> None:
     last = RoastSessionState.model_validate(SESSION_STATE_PAYLOAD)
     reader = _DecodedRead(failure)
-    monkeypatch.setattr(reader.adapter, "_last_state", last)
+    await reader.bind()
+    reader.adapter._project_telemetry(last)  # pyright: ignore[reportPrivateUsage]
+    reader.clocks.clear()
+    generation = _generation(reader.adapter)
+    anchors = _anchors(reader.adapter)
     with pytest.raises(type(failure)) as result:
         await reader.adapter.read_human_evidence()
     assert result.value is failure
     assert reader.calls == _HUMAN_READ_CALL
     assert reader.clocks == [10]
     assert reader.adapter.last_state is last
+    assert _anchors(reader.adapter) == anchors
+    assert _generation(reader.adapter) == generation
     with pytest.raises(type(failure)) as automatic:
         await reader.adapter.read_telemetry()
     assert automatic.value is failure
     assert reader.calls == _HUMAN_READ_CALL * 2
     assert reader.clocks == [10]
     assert reader.adapter.last_state is last
+    assert _anchors(reader.adapter) == anchors
+    assert _generation(reader.adapter) == generation
 
 
 @pytest.mark.asyncio
@@ -1116,27 +1145,65 @@ async def test_human_evidence_extracts_raw_vendor_object(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["bound", "no-start", "different-session", "different-epoch"])
+@pytest.mark.parametrize(
+    "case", ["bound", "no-transport", "no-start", "different-session", "different-epoch"]
+)
 async def test_human_evidence_binds_only_to_same_start_and_child(case: str) -> None:
     payload = _state_payload(session_id="other" if case == "different-session" else _SESSION)
     session = _Session(_result(payload))
     process = _LifecycleSpy(session)
-    adapter = RoasterControlAdapter.from_process(process)
+    clocks: list[float] = []
+
+    def clock() -> float:
+        clocks.append(float(len(clocks) + 1))
+        return clocks[-1]
+
+    if case == "no-transport":
+        adapter = RoasterControlAdapter(RoasterMCPClient(process.call_tool), clock=clock)
+    else:
+        adapter = RoasterControlAdapter.from_process(process, clock=clock)
     if case != "no-start":
         await adapter.start_session()
         session.calls.clear()
     if case == "different-epoch":
         session = _Session(_result(payload))
         process.replace(session)
+
+    prior = RoastSessionState.model_validate({**_state_payload(), "elapsed_monotonic_seconds": 1})
+    adapter._project_telemetry(prior)  # pyright: ignore[reportPrivateUsage]
+    anchors = _anchors(adapter)
     evidence = await adapter.read_human_evidence()
+
     assert evidence.bound_child_epoch == (process.child_epoch if case == "bound" else None)
+    assert (evidence.bean_temp_c, evidence.env_temp_c) == (196, 214)
     assert evidence.telemetry is not None
+    assert evidence.request_admitted_at == 2 and clocks == [1, 2, 3]
+    if case == "bound":
+        assert adapter.last_state == RoastSessionState.model_validate(payload)
+        assert _anchors(adapter) == (1200.5, 3, 1200, 1)
+    else:
+        assert adapter.last_state is prior
+        assert _anchors(adapter) == anchors
     assert session.calls == _HUMAN_READ_CALL
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["replacement", "first-start", "new-session", "replacement-start"])
-async def test_human_evidence_binding_does_not_follow_suspended_read(case: str) -> None:
+@pytest.mark.parametrize(
+    "case",
+    [
+        "replacement",
+        "first-start",
+        "new-session",
+        "same-session",
+        "reset",
+        "replacement-start",
+        "session-drift",
+        "epoch-drift",
+    ],
+)
+async def test_human_evidence_binding_does_not_follow_suspended_read(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
     entered, release = asyncio.Event(), asyncio.Event()
 
     class SuspendedRead(_Session):
@@ -1148,35 +1215,202 @@ async def test_human_evidence_binding_does_not_follow_suspended_read(case: str) 
 
     session = SuspendedRead(_result(_state_payload()))
     replacement = _Session(_result(_state_payload()))
-    process = _LifecycleSpy(replacement if case == "replacement-start" else session)
+    process = _LifecycleSpy(session)
     adapter = RoasterControlAdapter.from_process(process)
-    if case != "first-start":
+    started_session = None if case == "first-start" else _SESSION
+    if started_session is not None:
         await adapter.start_session()
         session.calls.clear()
-    if case == "replacement-start":
-        replacement.calls.clear()
-        process.replace(session)
     async with asyncio.TaskGroup() as tasks:
         read = tasks.create_task(adapter.read_human_evidence())
         await asyncio.wait_for(entered.wait(), timeout=2)
         try:
-            if case == "replacement":
+            if case in {"replacement", "replacement-start"}:
                 process.replace(replacement)
-            else:
-                if case == "new-session":
-                    session.session_id = "next-session"
+            if case in {"first-start", "new-session", "same-session", "replacement-start"}:
+                start_peer = replacement if case == "replacement-start" else session
+                if case in {"new-session", "replacement-start"}:
+                    start_peer.session_id = "next-session"
                 await adapter.start_session()
+                started_session = start_peer.session_id
+            if case == "reset":
+                adapter.reset_session_identity_for_new_run()
+                started_session = None
+            if case == "session-drift":
+                started_session = "drifted-session"
+                monkeypatch.setattr(adapter, "_started_session_id", started_session)
+            if case == "epoch-drift":
+                monkeypatch.setattr(adapter, "_started_child_epoch", process.child_epoch + 1)
+            last = adapter.last_state
+            anchors = _anchors(adapter)
         finally:
             release.set()
         evidence = await read
-    assert evidence.bound_child_epoch == (process.child_epoch if case == "new-session" else None)
+
+    assert evidence.bound_child_epoch is None
+    assert (evidence.bean_temp_c, evidence.env_temp_c) == (196, 214)
     assert evidence.telemetry is not None
-    assert session.calls == (
-        _HUMAN_READ_CALL
-        if case == "replacement"
-        else [("start_roast_session", {}), *_HUMAN_READ_CALL]
+    assert adapter.latest_fault_session_id == started_session
+    assert adapter.last_state is last
+    assert _anchors(adapter) == anchors
+    start_call: list[tuple[str, dict[str, object]]] = [("start_roast_session", {})]
+    expected_calls = start_call if case in {"first-start", "new-session", "same-session"} else []
+    assert session.calls == [*expected_calls, *_HUMAN_READ_CALL]
+    assert replacement.calls == (start_call if case == "replacement-start" else [])
+    assert process.lifecycle == []
+
+
+@pytest.mark.asyncio
+async def test_identity_generation_advances_only_on_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _Session(_result(_state_payload()))
+    process = _LifecycleSpy(session)
+    adapter = RoasterControlAdapter.from_process(process)
+    assert type(_generation(adapter)) is int and _generation(adapter) == 0
+    for expected in (1, 2):
+        adapter.reset_session_identity_for_new_run()
+        assert _generation(adapter) == expected
+    await adapter.start_session()
+    assert _generation(adapter) == 3
+    await adapter.read_human_evidence()
+    assert _generation(adapter) == 3
+    await adapter.read_telemetry()
+    assert _generation(adapter) == 3
+    monkeypatch.setattr(session, "_result", _result(_payload()))
+    assert await process.discover_fixed_zero() is ToolDiscovery.DISCOVERED
+    assert (
+        await adapter.contain_heat_fixed_zero()
+    ).outcome is ContainmentOutcome.COMMAND_STATE_RETURNED
+    assert _generation(adapter) == 3
+
+
+def _projection_payload(*, elapsed: float, token: float, live: bool = True) -> dict[str, object]:
+    payload = _state_payload()
+    ambient = cast("dict[str, object]", payload["ambient_status"])
+    ambient["ambient_running"] = live
+    ambient["last_reading_monotonic_seconds"] = token
+    payload["elapsed_monotonic_seconds"] = elapsed
+    return payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elapsed", [100.0, 200.0])
+@pytest.mark.parametrize("token", [1200.0, 1300.0])
+async def test_unbound_human_view_projects_ages_without_writing_anchors(
+    elapsed: float, token: float
+) -> None:
+    reader = _DecodedRead(_projection_payload(elapsed=elapsed, token=token))
+    prior = RoastSessionState.model_validate(_projection_payload(elapsed=100, token=1200))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def suspended_read(name: str, arguments: dict[str, object]) -> object:
+        entered.set()
+        await release.wait()
+        return await reader.call(name, arguments)
+
+    reader.client._call = suspended_read  # pyright: ignore[reportPrivateUsage]
+    async with asyncio.TaskGroup() as tasks:
+        read = tasks.create_task(reader.adapter.read_human_evidence())
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        reader.now = 11
+        reader.adapter._project_telemetry(prior)  # pyright: ignore[reportPrivateUsage]
+        anchors = _anchors(reader.adapter)
+        release.set()
+        evidence = await read
+
+    assert evidence.bound_child_epoch is None
+    assert evidence.telemetry is not None
+    assert evidence.telemetry.age_seconds == (3 if elapsed == 100 else 0)
+    assert evidence.telemetry.ambient_age_seconds == (3 if token == 1200 else 0)
+    assert (evidence.bean_temp_c, evidence.env_temp_c) == (196, 214)
+    assert reader.adapter.last_state is prior
+    assert _anchors(reader.adapter) == anchors
+    assert reader.clocks == [10, 11, 14]
+    assert reader.calls == _HUMAN_READ_CALL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elapsed", [100.0, 200.0])
+@pytest.mark.parametrize("ambient", ["stopped", "unchanged", "changed", "unusable"])
+@pytest.mark.parametrize("prior_elapsed", [None, 100.0])
+@pytest.mark.parametrize("non_finite_rate", [False, True])
+async def test_bound_human_projection_matches_legacy(
+    elapsed: float, ambient: str, prior_elapsed: float | None, non_finite_rate: bool
+) -> None:
+    payload = _projection_payload(
+        elapsed=elapsed, token=1300 if ambient == "changed" else 1200, live=ambient != "stopped"
     )
-    assert replacement.calls == []
+    if ambient == "unusable":
+        cast("dict[str, object]", payload["ambient_status"])["temperature_c"] = float("nan")
+    if non_finite_rate:
+        payload.update(bean_ror_c_per_min=float("nan"), env_ror_c_per_min=float("inf"))
+    reader = _DecodedRead(payload)
+    epoch = await reader.bind()
+    reference = RoasterControlAdapter(reader.client, clock=lambda: reader.now)
+    if prior_elapsed is not None:
+        prior = RoastSessionState.model_validate(
+            _projection_payload(elapsed=prior_elapsed, token=1200)
+        )
+        reader.adapter._project_telemetry(prior)  # pyright: ignore[reportPrivateUsage]
+        reference._project_telemetry(prior)  # pyright: ignore[reportPrivateUsage]
+
+    evidence = await reader.adapter.read_human_evidence()
+    state = RoastSessionState.model_validate(payload)
+    assert evidence.bound_child_epoch == epoch
+    assert reader.adapter.last_state is not None
+    assert reader.adapter.last_state.model_dump_json() == state.model_dump_json()
+    expected = reference._project_telemetry(state)  # pyright: ignore[reportPrivateUsage]
+    assert evidence.telemetry == expected
+    assert _anchors(reader.adapter) == _anchors(reference)
+
+
+@pytest.mark.asyncio
+async def test_human_envelope_construction_failure_keeps_prior_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = _DecodedRead(_state_payload())
+    await reader.bind()
+    prior = RoastSessionState.model_validate(_projection_payload(elapsed=100, token=1))
+    reader.adapter._project_telemetry(prior)  # pyright: ignore[reportPrivateUsage]
+    reader.clocks.clear()
+    anchors = _anchors(reader.adapter)
+    failure = ValueError("invalid envelope")
+
+    def reject_envelope(**_fields: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(adapter_module, "HumanReadEvidence", reject_envelope)
+    with pytest.raises(ValueError) as raised:
+        await reader.adapter.read_human_evidence()
+    assert raised.value is failure
+    assert reader.adapter.last_state is prior
+    assert _anchors(reader.adapter) == anchors
+    assert reader.calls == _HUMAN_READ_CALL
+    assert reader.clocks == [10, 13]
+
+
+@pytest.mark.asyncio
+async def test_legacy_telemetry_still_commits_after_reset_during_read() -> None:
+    reader = _DecodedRead(_state_payload())
+    await reader.bind()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def suspended_read(name: str, arguments: dict[str, object]) -> object:
+        entered.set()
+        await release.wait()
+        return await reader.call(name, arguments)
+
+    reader.client._call = suspended_read  # pyright: ignore[reportPrivateUsage]
+    async with asyncio.TaskGroup() as tasks:
+        read = tasks.create_task(reader.adapter.read_telemetry())
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        reader.adapter.reset_session_identity_for_new_run()
+        assert reader.adapter.last_state is None
+        release.set()
+        assert await read is not None
+    assert reader.adapter.latest_fault_session_id == _SESSION
+    assert reader.adapter.last_state == RoastSessionState.model_validate(reader.payload)
+    assert reader.clocks == [13]
+    assert reader.calls == _HUMAN_READ_CALL
 
 
 @pytest.mark.asyncio
@@ -1236,6 +1470,115 @@ async def test_identity_reset_and_child_detach_invalidate_containment() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True], ids=["reset", "start"])
+@pytest.mark.parametrize("outcome", list(ContainmentOutcome), ids=lambda outcome: outcome.name)
+async def test_containment_cache_clears_for_each_classified_outcome(
+    monkeypatch: pytest.MonkeyPatch, restart: bool, outcome: ContainmentOutcome
+) -> None:
+    adapter, process, session = await _prepared(_result(_payload()))
+    expected = ContainmentResult(outcome)
+    calls: list[str] = []
+
+    async def contain(session_id: str) -> ContainmentResult:
+        calls.append(session_id)
+        return expected
+
+    monkeypatch.setattr(process, "_contain_heat_fixed_zero", contain)
+    if outcome is ContainmentOutcome.NOT_ATTEMPTED:
+        monkeypatch.setattr(adapter, "_started_session_id", None)
+    actual = await adapter.contain_heat_fixed_zero()
+    assert actual == expected
+    assert adapter.last_containment_result is actual
+    assert calls == ([] if outcome is ContainmentOutcome.NOT_ATTEMPTED else [_SESSION])
+
+    if restart:
+        await adapter.start_session()
+    else:
+        adapter.reset_session_identity_for_new_run()
+
+    assert adapter.last_containment_result is None
+    assert session.calls == ([("start_roast_session", {})] if restart else [])
+    assert process.lifecycle == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["reset", "new-session", "same-session", "new-attempt"])
+@pytest.mark.parametrize("cancel", [False, True], ids=["completion", "cancellation"])
+async def test_late_containment_cannot_publish_into_new_generation(
+    monkeypatch: pytest.MonkeyPatch, action: str, cancel: bool
+) -> None:
+    adapter, process, session = await _prepared(_result(_payload()))
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls: list[str] = []
+    classified = ContainmentResult(
+        ContainmentOutcome.REFUSED_BUSY, ContainmentReason.COMMAND_IN_PROGRESS
+    )
+    cancellation = asyncio.CancelledError("containment cancelled")
+
+    async def contain(session_id: str) -> ContainmentResult:
+        calls.append(session_id)
+        entered.set()
+        await release.wait()
+        if cancel:
+            raise cancellation
+        return classified
+
+    monkeypatch.setattr(process, "_contain_heat_fixed_zero", contain)
+    expected_cache = None
+    async with asyncio.TaskGroup() as tasks:
+        attempt = tasks.create_task(adapter.contain_heat_fixed_zero())
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        try:
+            adapter.reset_session_identity_for_new_run()
+            if action in {"new-session", "same-session"}:
+                if action == "new-session":
+                    session.session_id = "next-session"
+                await adapter.start_session()
+            if action == "new-attempt":
+                expected_cache = await adapter.contain_heat_fixed_zero()
+                assert expected_cache.outcome is ContainmentOutcome.NOT_ATTEMPTED
+        finally:
+            release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError) as raised:
+                await attempt
+            assert raised.value is cancellation
+        else:
+            assert await attempt is classified
+
+    assert adapter.last_containment_result is expected_cache
+    assert calls == [_SESSION]
+    expected_starts: list[tuple[str, dict[str, object]]] = (
+        [("start_roast_session", {})] if action in {"new-session", "same-session"} else []
+    )
+    assert session.calls == expected_starts
+    assert process.lifecycle == []
+
+
+@pytest.mark.asyncio
+async def test_escaping_containment_exception_keeps_diagnostic_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, process, session = await _prepared(_result(_payload()))
+    prior = await adapter.contain_heat_fixed_zero()
+    failure = RuntimeError("unexpected transport error")
+    calls: list[str] = []
+
+    async def fail(session_id: str) -> ContainmentResult:
+        calls.append(session_id)
+        raise failure
+
+    monkeypatch.setattr(process, "_contain_heat_fixed_zero", fail)
+    with pytest.raises(RuntimeError) as raised:
+        await adapter.contain_heat_fixed_zero()
+    assert raised.value is failure
+    assert adapter.last_containment_result is prior
+    assert calls == [_SESSION]
+    assert len(session.calls) == 1
+    assert process.lifecycle == []
+
+
+@pytest.mark.asyncio
 async def test_replacement_during_containment_keeps_result_unknown() -> None:
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -1257,7 +1600,9 @@ async def test_replacement_during_containment_keeps_result_unknown() -> None:
         await asyncio.wait_for(entered.wait(), timeout=2)
         process.replace(new)
         release.set()
-        assert (await attempt).outcome is ContainmentOutcome.UNKNOWN_TRANSPORT
+        result = await attempt
+        assert result.outcome is ContainmentOutcome.UNKNOWN_TRANSPORT
+    assert adapter.last_containment_result is result
     assert [name for name, _ in old.calls] == ["start_roast_session", _TOOL]
     assert new.calls == []
     assert process.lifecycle == []
