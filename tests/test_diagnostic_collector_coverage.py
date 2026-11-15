@@ -591,6 +591,23 @@ def test_b3_report_validates_detail_and_inventory() -> None:
     report = _coverage(_data())
     expected_order = tuple(CoverageCheckName)
     assert tuple(result.check for result in report.checks) == expected_order
+    assert tuple(result.check.value for result in report.checks) == (
+        "lattice_score_coverage",
+        "detector_capture_continuity",
+        "recording_extent_coverage",
+        "recording_capture_continuity",
+        "observed_provenance",
+    )
+    assert tuple(limit.value for limit in report.adapter_limits) == (
+        "detector_sample_clock_binding",
+        "detector_capture_continuity_witness",
+        "published_window_timestamp_chronology",
+        "producer_unscored_eligible_rows",
+        "recording_stream_identity",
+        "recording_capture_witness",
+        "observed_provenance",
+        "clock_rate_and_drift",
+    )
     assert report.report_schema_version == 1
     assert report.report_name.value == "coverage"
     assert report.authority is CollectorAuthority.NONE
@@ -601,6 +618,7 @@ def test_b3_report_validates_detail_and_inventory() -> None:
         {"checks": report.checks[1:]},
         {"checks": tuple(reversed(report.checks))},
         {"adapter_limits": report.adapter_limits[:-1]},
+        {"adapter_limits": tuple(reversed(report.adapter_limits))},
     ):
         with pytest.raises(pydantic.ValidationError):
             CoverageReport.model_validate(vars(report) | changes)
@@ -619,6 +637,36 @@ def test_b3_report_validates_detail_and_inventory() -> None:
             LatticeCoverageDetail.model_validate(vars(lattice.detail) | changes)
     with pytest.raises(pydantic.ValidationError):
         RecordingExtentDetail.model_validate(vars(extent.detail) | {"uncovered_samples": 1})
+
+
+@pytest.mark.parametrize("reason", [None, CoverageReason.CONFLICT, CoverageReason.GAP])
+def test_b3_recording_extent_requires_detail(reason: CoverageReason | None) -> None:
+    """An extent summary accompanies each of the three extent-count outcomes."""
+    status = CheckStatus.SATISFIED if reason is None else COVERAGE_REASON_STATUS[reason]
+    with pytest.raises(pydantic.ValidationError, match="detail does not match"):
+        CoverageCheckResult(
+            check=CoverageCheckName.RECORDING_EXTENT_COVERAGE,
+            status=status,
+            reason=reason,
+            evidence=(),
+            detail=None,
+        )
+
+
+def test_b3_refuses_detail_for_unavailable_extent_and_continuity() -> None:
+    """A count summary belongs only to the corresponding coverage check."""
+    report = _coverage(_data())
+    lattice, detector_continuity, extent, recording_continuity, _ = report.checks
+    unavailable = _extent(_coverage(_data(segments=[])))
+    assert unavailable.reason is CoverageReason.EVIDENCE_ABSENT
+    assert lattice.detail is not None and extent.detail is not None
+    for result, detail in (
+        (unavailable, extent.detail),
+        (detector_continuity, lattice.detail),
+        (recording_continuity, extent.detail),
+    ):
+        with pytest.raises(pydantic.ValidationError, match="detail does not match"):
+            CoverageCheckResult.model_validate(vars(result) | {"detail": detail})
 
 
 def _lattice_detail(expected: int, missed: int) -> LatticeCoverageDetail:
@@ -1060,6 +1108,15 @@ def test_l8_detector_clock_uses_bound_anchor_and_allows_fractional_decision() ->
         _lattice(_coverage(fractional_start, _expect(detector=_clock_case()))).reason
         is CoverageReason.OFF_LATTICE
     )
+
+
+def test_l8_exact_length_fractional_boundaries_are_off_lattice() -> None:
+    """At four samples per second, 0.5 to 4.5 has exact length but fractional boundaries."""
+    row = _seconds_window(start=0.125, decision=1.125) | {"end_at": _at(1.125, _A)}
+    result = _lattice(_coverage(_data([row]), _expect(detector=_clock_case())))
+    assert result.reason is CoverageReason.OFF_LATTICE
+    assert result.status is CheckStatus.INVALID and result.detail is None
+    assert [ref.seq for ref in result.evidence] == [0]
 
 
 def test_l8_disagreeing_seconds_paths_stay_unresolved() -> None:
