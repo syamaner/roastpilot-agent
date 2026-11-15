@@ -6780,18 +6780,22 @@ class RoastService:
         if (
             self._authority is ControlAuthority.HUMAN
             and detail.completed_at_utc is None
-            and detail.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+            and detail.agent_phase in (RoastPhase.OPERATOR_RECOVERY_REQUIRED, RoastPhase.FAULTED)
             and (
                 not self._requires_live_restart_clearance
                 or self._restart_clearance_state is RestartClearanceState.CLEARED
             )
             and (lease.run_id != run_id or lease.status is FaultLeaseStatus.CLOSED)
         ):
+            actions = [
+                action
+                for action in detail.enabled_actions
+                if action is not OperatorAction.DROP_BEANS
+            ]
             controller = self._human_fault_drop_controller(run_id)
             if controller is not None and controller.human_recovery_drop_allowed():
-                detail = detail.model_copy(
-                    update={"enabled_actions": [*detail.enabled_actions, OperatorAction.DROP_BEANS]}
-                )
+                actions.append(OperatorAction.DROP_BEANS)
+            detail = detail.model_copy(update={"enabled_actions": actions})
         return detail
 
     async def _preempt_bean_drafts_for_roast_start(self) -> None:
@@ -7525,7 +7529,7 @@ class RoastService:
         elif (
             self._authority is ControlAuthority.HUMAN
             and request.action is OperatorAction.DROP_BEANS
-            and detail.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+            and detail.agent_phase in (RoastPhase.OPERATOR_RECOVERY_REQUIRED, RoastPhase.FAULTED)
         ):
             controller = self._human_fault_drop_controller(run_id)
             if controller is not None and controller.human_recovery_drop_allowed():

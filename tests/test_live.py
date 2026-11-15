@@ -36,6 +36,7 @@ from roastpilot_agent.config import (
     MCPDeviceConfig,
 )
 from roastpilot_agent.controller import ControllerSnapshot, RoastController
+from roastpilot_agent.human_protection import ControlAuthority
 from roastpilot_agent.mcp_client import (
     MCPConnectionError,
     MCPServerProcess,
@@ -641,8 +642,9 @@ def test_packaged_spa_dir_none_when_web_dist_missing_index(
 
 
 class _SnapshotOnlyController:
-    """A minimal controller stand-in exposing just ``snapshot()`` (the only method
-    ``RoastRunner._publish_and_persist_telemetry`` calls)."""
+    """The AUTOMATIC controller projection consumed by telemetry persistence."""
+
+    authority = ControlAuthority.AUTOMATIC
 
     def __init__(self, snapshot: ControllerSnapshot) -> None:
         self._snapshot = snapshot

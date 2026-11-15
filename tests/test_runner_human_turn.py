@@ -323,3 +323,46 @@ async def test_t49_human_faulted_restart_retains_unknown_ownership(store: RoastS
     with pytest.raises(RoastRunConflictError, match="HUMAN.*ownership"):
         await service.start_roast(PROFILE)
     assert actuator.commands() == []
+
+
+@pytest.mark.parametrize("phase", [RoastPhase.FAULTED, RoastPhase.OPERATOR_RECOVERY_REQUIRED])
+async def test_t44_recovery_drop_projection_and_admission_require_current_evidence(
+    store: RoastStore, phase: RoastPhase
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    child = _LifecycleSpy(_Session(_result({})))
+    actuator.epoch = child.child_epoch
+    service = RoastService(
+        store,
+        mcp=child,
+        roaster=actuator,
+        raw_state=actuator,
+        authority=ControlAuthority.HUMAN,
+        config=AppConfig(controller=ControllerConfig(t0_debounce_ticks=1)),
+        clock=clock,
+        run_loop=False,
+    )
+    run = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    clock.advance(0.25)
+    await runner.tick_once()
+    actuator.charged = True
+    clock.advance(0.25)
+    await runner.tick_once()
+    controller.transition_to(phase)
+    clock.advance(0.25)
+    await runner.tick_once()
+    assert OperatorAction.DROP_BEANS in (await service.detail(run.id)).enabled_actions
+    clock.advance(20)
+    assert OperatorAction.DROP_BEANS not in (await service.detail(run.id)).enabled_actions
+    rejected = await service.submit_operator_action(
+        run.id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
+    )
+    assert rejected.result == "rejected"
+    assert not rejected.queued
+    assert "physical intervention" in rejected.reason
+    assert actuator.commands().count("drop_beans") == 0
