@@ -13,7 +13,12 @@ import pytest
 from roastpilot_agent import controller as controller_module
 from roastpilot_agent.advisor import FakeAdvisor, RoastAdvisor
 from roastpilot_agent.config import AppConfig, ControllerConfig, SafetyLimits
-from roastpilot_agent.controller import CommandArbiter, FaultControlExecutor, RoastController
+from roastpilot_agent.controller import (
+    CommandArbiter,
+    FaultControlExecutor,
+    InvalidTransitionError,
+    RoastController,
+)
 from roastpilot_agent.human_protection import (
     CommandDisposition,
     ContainmentAttempt,
@@ -1760,3 +1765,47 @@ async def test_t45_emergency_is_independent_of_every_human_ownership_value(
     assert h.controller.phase is RoastPhase.FAULTED
     assert owner.endpoint is endpoint
     assert owner.command is command
+
+
+async def test_t43_legacy_resume_cannot_bypass_human_continuation() -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    h.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    h.actuator.calls.clear()
+    with pytest.raises(InvalidTransitionError):
+        h.controller.operator_resume(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert h.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert h.actuator.calls == []
+
+
+async def test_t38_operator_drop_rechecks_generation_after_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    h.actuator.calls.clear()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = h.sink.persist_evaluation
+
+    async def audit(row: SafetyEvaluation) -> int | None:
+        if row.rule == "command_phase_validity":
+            assert row.verdict is SafetyVerdict.ALLOW
+            entered.set()
+            await release.wait()
+        return await original(row)
+
+    monkeypatch.setattr(h.sink, "persist_evaluation", audit)
+    request = asyncio.create_task(h.controller.operator_drop_beans())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert h.controller.snapshot().human_endpoint is EndpointDisposition.NONE
+        assert await h.controller.operator_emergency_stop("superseded pending drop")
+    finally:
+        release.set()
+        await request
+    assert h.commands == ["emergency_stop"]
+    assert h.controller.phase is RoastPhase.FAULTED
+    assert h.controller.snapshot().human_endpoint is EndpointDisposition.NONE
+    assert h.actuator.containments == 0

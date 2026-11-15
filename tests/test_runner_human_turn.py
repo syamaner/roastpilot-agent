@@ -1072,6 +1072,6 @@ async def test_t32_queued_operator_drop_joins_same_turn_protection(
     outcomes = [
         event.payload.get("outcome")
         for event in timeline.events
-        if event.payload.get("command") == "drop_beans"
+        if event.payload is not None and event.payload.get("command") == "drop_beans"
     ]
     assert "joined_protective_endpoint" in outcomes
