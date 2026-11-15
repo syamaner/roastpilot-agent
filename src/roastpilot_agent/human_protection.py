@@ -240,14 +240,21 @@ class AcceptedReadingTracker:
         return self._clear(ReadingFreshness.INVALID)
 
     def recheck(self) -> ReadingFreshness:
-        """Evaluate the retained evidence at the current monotonic time."""
+        """Evaluate the evidence, invalidating history on unsafe chronology."""
+        freshness = self.project_freshness()
+        if freshness is ReadingFreshness.INVALID:
+            self._clear(freshness)
+        return freshness
+
+    def project_freshness(self) -> ReadingFreshness:
+        """Read current freshness for presentation without changing authority."""
         previous = self._previous
         if previous is None:
             return self._without_bound
         now = self._clock()
         # The newest admission is at least as recent as any retained bound.
         if not math.isfinite(now) or now < previous.admitted_at:
-            return self._clear(ReadingFreshness.INVALID)
+            return ReadingFreshness.INVALID
         if self._acceptance_bound is None:
             return self._without_bound
         if now - self._acceptance_bound <= self._max_age_s:

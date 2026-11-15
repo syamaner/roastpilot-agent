@@ -1,27 +1,37 @@
 """HUMAN runner turn ordering and service lifecycle ownership witnesses."""
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from pathlib import Path
+from typing import cast
 
 import pytest
 import pytest_asyncio
+from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 
 from roastpilot_agent.api import (
     QueuedOperatorAction,
     RoastRunConflictError,
     RoastService,
+    ShutdownHeatOffOutcome,
     create_app,
+    stream_events,
 )
 from roastpilot_agent.config import AppConfig, ControllerConfig
 from roastpilot_agent.human_protection import ControlAuthority, EndpointDisposition
-from roastpilot_agent.human_run_ownership import PendingHumanCall
+from roastpilot_agent.human_run_ownership import HumanCallAdmissionFence, PendingHumanCall
 from roastpilot_agent.mcp_client import RoasterControlAdapter, RoastSessionState
 from roastpilot_agent.models import OperatorAction, OperatorActionRequest, RoastPhase
 from roastpilot_agent.store import RoastStore
 from tests.conftest import FakeClock
+from tests.test_api import (
+    _collect_frames,  # pyright: ignore[reportPrivateUsage]
+    _FakeRequest,  # pyright: ignore[reportPrivateUsage]
+    _parse_frame,  # pyright: ignore[reportPrivateUsage]
+)
 from tests.test_controller import PROFILE
 from tests.test_controller_human_mode import HumanRoaster
 from tests.test_mcp_fixed_zero import (  # pyright: ignore[reportPrivateImportUsage]
@@ -59,9 +69,15 @@ class _RunnerRoaster(HumanRoaster):
         return self.session_id
 
 
-def _service(store: RoastStore, clock: FakeClock, actuator: _RunnerRoaster) -> RoastService:
+def _service(
+    store: RoastStore, clock: FakeClock, actuator: _RunnerRoaster, *, exact_child: bool = False
+) -> RoastService:
+    child = _LifecycleSpy(_Session(_result({}))) if exact_child else None
+    if child is not None:
+        actuator.epoch = child.child_epoch
     return RoastService(
         store,
+        mcp=child,
         roaster=actuator,
         raw_state=actuator,
         authority=ControlAuthority.HUMAN,
@@ -331,18 +347,7 @@ async def test_t44_recovery_drop_projection_and_admission_require_current_eviden
 ) -> None:
     clock = FakeClock()
     actuator = _RunnerRoaster(clock, [])
-    child = _LifecycleSpy(_Session(_result({})))
-    actuator.epoch = child.child_epoch
-    service = RoastService(
-        store,
-        mcp=child,
-        roaster=actuator,
-        raw_state=actuator,
-        authority=ControlAuthority.HUMAN,
-        config=AppConfig(controller=ControllerConfig(t0_debounce_ticks=1)),
-        clock=clock,
-        run_loop=False,
-    )
+    service = _service(store, clock, actuator, exact_child=True)
     run = await service.start_roast(PROFILE)
     runner = service.runner
     assert runner is not None
@@ -366,3 +371,132 @@ async def test_t44_recovery_drop_projection_and_admission_require_current_eviden
     assert not rejected.queued
     assert "physical intervention" in rejected.reason
     assert actuator.commands().count("drop_beans") == 0
+
+
+async def _charge_live_runner(
+    service: RoastService, actuator: _RunnerRoaster, clock: FakeClock
+) -> None:
+    runner = service.runner
+    assert runner is not None
+    actuator.charged = False
+    clock.advance(0.25)
+    await runner.tick_once()
+    actuator.charged = True
+    clock.advance(0.25)
+    await runner.tick_once()
+
+
+@pytest.mark.parametrize("fresh", [True, False])
+async def test_human_live_recovery_frame_matches_rest_without_private_fields(
+    store: RoastStore, fresh: bool
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    run = await service.start_roast(PROFILE)
+    await _charge_live_runner(service, actuator, clock)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    response = await stream_events(run.id, cast(Request, _FakeRequest()), service)
+    controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    clock.advance(0.25)
+    await runner.tick_once()
+    if not fresh:
+        clock.advance(20)
+    frames = await asyncio.wait_for(_collect_frames(response, 2), 1)
+    phase = _parse_frame(frames[1])
+    expected = (await service.detail(run.id)).enabled_actions
+    assert (OperatorAction.DROP_BEANS in expected) is fresh
+    assert phase["data"] == {
+        "phase": RoastPhase.OPERATOR_RECOVERY_REQUIRED.value,
+        "enabled_actions": [action.value for action in expected],
+    }
+    async with store.connection.execute(
+        "SELECT payload_json FROM roast_events WHERE run_id = ? AND kind = 'phase_changed' "
+        "ORDER BY id DESC LIMIT 1",
+        (run.id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert json.loads(row[0]) == {"phase": RoastPhase.OPERATOR_RECOVERY_REQUIRED.value}
+
+
+@pytest.mark.parametrize("obsolete", ["different-phase", "same-phase", "foreign-run"])
+async def test_human_replay_withholds_drop_for_obsolete_run_or_phase(
+    store: RoastStore, obsolete: str
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    previous = await service.start_roast(PROFILE)
+    await _charge_live_runner(service, actuator, clock)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    resume_from = service.events.last_event_id
+    obsolete_phase = (
+        RoastPhase.OPERATOR_RECOVERY_REQUIRED
+        if obsolete == "different-phase"
+        else RoastPhase.FAULTED
+    )
+    controller.transition_to(obsolete_phase)
+
+    if obsolete == "foreign-run":
+        await store.complete_run(
+            run_id=previous.id, outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        runner._finalized = True  # pyright: ignore[reportPrivateUsage]
+        controller.note_human_run_durably_closed()
+        current = await service.start_roast(PROFILE)
+        await _charge_live_runner(service, actuator, clock)
+    else:
+        current = previous
+        if obsolete == "same-phase":
+            controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+
+    current_runner = service.runner
+    assert current_runner is not None
+    current_controller = current_runner.controller_for_human_fault_drop()
+    assert current_controller is not None
+    current_controller.transition_to(RoastPhase.FAULTED)
+    clock.advance(0.25)
+    await current_runner.tick_once()
+    assert OperatorAction.DROP_BEANS in (await service.detail(current.id)).enabled_actions
+    response = await stream_events(
+        current.id, cast(Request, _FakeRequest(last_event_id_header=str(resume_from))), service
+    )
+    frames = await asyncio.wait_for(_collect_frames(response, 2), 1)
+    obsolete_data = cast("dict[str, object]", _parse_frame(frames[1])["data"])
+    assert obsolete_data["phase"] == obsolete_phase.value
+    actions = cast("list[str]", obsolete_data["enabled_actions"])
+    assert OperatorAction.DROP_BEANS.value not in actions
+    assert set(obsolete_data) == {"phase", "enabled_actions"}
+
+
+async def test_human_emergency_publish_never_reads_action_fence(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    run = await service.start_roast(PROFILE)
+    await _charge_live_runner(service, actuator, clock)
+    queue = service.events.subscribe()
+
+    def forbidden(_: HumanCallAdmissionFence) -> None:
+        pytest.fail("publishing a shutdown e-stop frame read the HUMAN fence")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(HumanCallAdmissionFence, "closed_reason", property(forbidden))
+            assert await service.safe_shutdown_heat_off() is ShutdownHeatOffOutcome.DISPATCHED
+        queued = [queue.get_nowait() for _ in range(queue.qsize())]
+        phases = [event for event in queued if event.event.value == "phase_changed"]
+        [fault] = phases
+        projected = service.project_stream_event(run.id, fault)
+        assert projected.data["enabled_actions"] == [OperatorAction.EMERGENCY_STOP.value]
+    finally:
+        service.events.unsubscribe(queue)

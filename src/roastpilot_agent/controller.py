@@ -1984,7 +1984,10 @@ class RoastController:
             or run.endpoint is EndpointDisposition.WITHHELD
             or (
                 self._phase in TERMINAL_LATCH_PHASES
-                and self._human_recovery_drop_evaluation().verdict is not SafetyVerdict.ALLOW
+                and self._human_recovery_drop_evaluation(
+                    freshness=self._accepted_readings.project_freshness()
+                ).verdict
+                is not SafetyVerdict.ALLOW
             )
         )
         return ControllerSnapshot(
@@ -2853,7 +2856,7 @@ class RoastController:
         generation = turn.generation
         confirm_charge = False
         if self._phase is RoastPhase.PREHEATING:
-            if telemetry is None:
+            if telemetry is None or evidence.bound_child_epoch is None:
                 self._reset_t0_debounce()
             else:
                 self._observe_charge_streak(telemetry)
@@ -3975,7 +3978,11 @@ class RoastController:
         return True
 
     def _human_recovery_drop_evaluation(
-        self, *, session_matches: bool = True, endpoint: EndpointDisposition | None = None
+        self,
+        *,
+        session_matches: bool = True,
+        endpoint: EndpointDisposition | None = None,
+        freshness: ReadingFreshness | None = None,
     ) -> SafetyEvaluation:
         run = self._human_run
         assert run is not None
@@ -3983,7 +3990,9 @@ class RoastController:
             phase=self._phase,
             session_matches=session_matches and self._known_human_identity() is not None,
             charged=self._t0_confirmed,
-            freshness_at_eval=self._accepted_readings.recheck(),
+            freshness_at_eval=(
+                self._accepted_readings.recheck() if freshness is None else freshness
+            ),
             endpoint=run.endpoint if endpoint is None else endpoint,
             command=run.command,
         )
@@ -3995,7 +4004,10 @@ class RoastController:
             run is not None
             and (session_id is None or run.session_id == session_id)
             and self._human_actuation_admitted()
-            and self._human_recovery_drop_evaluation().verdict is SafetyVerdict.ALLOW
+            and self._human_recovery_drop_evaluation(
+                freshness=self._accepted_readings.project_freshness()
+            ).verdict
+            is SafetyVerdict.ALLOW
         )
 
     async def execute_human_fault_drop(

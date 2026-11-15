@@ -3,12 +3,14 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import cast
 
 import pytest
 
-from roastpilot_agent.config import ControllerConfig, SafetyLimits
-from roastpilot_agent.controller import CommandArbiter, RoastController
+from roastpilot_agent.advisor import FakeAdvisor, RoastAdvisor
+from roastpilot_agent.config import AppConfig, ControllerConfig, SafetyLimits
+from roastpilot_agent.controller import CommandArbiter, FaultControlExecutor, RoastController
 from roastpilot_agent.human_protection import (
     CommandDisposition,
     ContainmentAttempt,
@@ -30,10 +32,18 @@ from roastpilot_agent.human_run_ownership import (
     HumanRunOwnership,
     PendingHumanCall,
 )
-from roastpilot_agent.models import AppliedRoasterState, RoastEventKind, RoastPhase
+from roastpilot_agent.models import (
+    AppliedRoasterState,
+    DropReason,
+    FaultControlState,
+    OperatorAction,
+    RoastEventKind,
+    RoastPhase,
+)
 from roastpilot_agent.safety import SafetyPolicy
+from roastpilot_agent.store import RoastStore
 from tests.conftest import EventSink, FakeClock, FakeMCPClient, RecordingSnapshotSink
-from tests.test_controller import PROFILE, reading
+from tests.test_controller import PROFILE, decision, reading
 
 pytestmark = pytest.mark.asyncio
 
@@ -107,6 +117,9 @@ async def make_human(
     *,
     teardown_unconfirmed: Callable[[], bool] = lambda: False,
     discovered: bool = True,
+    charge_debounce: int = 1,
+    start: bool = True,
+    advisor: RoastAdvisor | None = None,
 ) -> HumanHarness:
     clock = FakeClock()
     log: list[str] = []
@@ -117,13 +130,14 @@ async def make_human(
     fence = HumanCallAdmissionFence()
     arbiter = CommandArbiter()
     controller = RoastController(
-        config=ControllerConfig(t0_debounce_ticks=1),
+        config=ControllerConfig(t0_debounce_ticks=charge_debounce),
         safety=SafetyPolicy(SafetyLimits()),
         state_reader=actuator,
         command_executor=actuator,
         snapshot_sink=sink,
         event_emitter=emitter,
         clock=clock,
+        advisor=advisor,
         actuator_arbiter=arbiter,
         authority=ControlAuthority.HUMAN,
         run_id="synthetic-run",
@@ -135,7 +149,8 @@ async def make_human(
         current_child_generation=lambda: actuator.epoch,
         containment_discovered=lambda: discovered,
     )
-    await controller.start_run(PROFILE)
+    if start:
+        await controller.start_run(PROFILE)
     return HumanHarness(clock, actuator, sink, emitter, controller, ownership, fence, arbiter, log)
 
 
@@ -609,3 +624,358 @@ async def test_t50_machine_fc_and_post_endpoint_human_note_do_not_advance_phase(
     assert before.development_percent is after.development_percent is None
     assert after.human_endpoint is EndpointDisposition.ISSUED
     assert "mark_first_crack" not in h.commands
+
+
+async def test_unbound_t0_breaks_charge_debounce_before_bound_confirmation() -> None:
+    h = await make_human(charge_debounce=2)
+    await h.turn(bean=180, t0=True)
+    h.actuator.bound = False
+    await h.turn(bean=196, t0=True)
+    assert h.controller.phase is RoastPhase.PREHEATING
+    assert not h.controller.snapshot().charge_detected
+    assert RoastEventKind.T0_DETECTED not in h.emitter.kinds()
+    h.actuator.bound = True
+    await h.turn(bean=196, t0=True)
+    assert h.controller.phase is RoastPhase.PREHEATING
+    assert not h.controller.snapshot().charge_detected
+    assert h.commands.count("drop_beans") == 0
+    await h.turn(bean=196, t0=True)
+    assert h.controller.snapshot().charge_detected
+    assert h.controller.phase is RoastPhase.COOLING
+    assert h.emitter.kinds().count(RoastEventKind.T0_DETECTED) == 1
+    assert h.commands.count("drop_beans") == 1
+
+
+async def test_unbound_t0_cannot_charge_but_still_reaches_existing_hard_limit() -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    h.actuator.bound = False
+    await h.turn(bean=260, t0=True)
+    assert not h.controller.snapshot().charge_detected
+    assert h.controller.phase is RoastPhase.FAULTED
+    assert h.commands.count("emergency_stop") == 1
+    assert h.commands.count("drop_beans") == 0
+
+
+async def test_unbound_temperature_preserves_prior_bound_charge() -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    assert h.controller.snapshot().charge_detected
+    h.actuator.bound = False
+    await h.turn(bean=196, t0=False)
+    assert h.controller.snapshot().charge_detected
+    assert h.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert h.commands.count("drop_beans") == 0
+
+
+@pytest.mark.parametrize("latched", [False, True])
+async def test_t56_human_read_failure_counts_once_outside_latch(latched: bool) -> None:
+    h = await make_human()
+    if latched:
+        h.controller.transition_to(RoastPhase.FAULTED)
+
+    async def failed_read() -> None:
+        raise ConnectionError("synthetic detached child")
+
+    h.actuator.collect = failed_read
+    await h.turn(bean=185)
+    assert h.actuator.reads == 1
+    assert h.controller._consecutive_read_failures == (0 if latched else 1)  # pyright: ignore[reportPrivateUsage]
+    assert h.controller._accepted_readings.project_freshness() is ReadingFreshness.INVALID  # pyright: ignore[reportPrivateUsage]
+    assert "set_heat" not in h.commands
+    assert "drop_beans" not in h.commands
+
+
+async def test_t56_cancelled_read_breaks_history_and_releases_only_read() -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    entered = asyncio.Event()
+
+    async def held_read() -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    h.actuator.collect = held_read
+    task = asyncio.create_task(h.turn(bean=185))
+    await asyncio.wait_for(entered.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not h.ownership.pending(PendingHumanCall.READ)
+    assert h.controller._consecutive_read_failures == 0  # pyright: ignore[reportPrivateUsage]
+    assert h.controller._accepted_readings.project_freshness() is ReadingFreshness.INVALID  # pyright: ignore[reportPrivateUsage]
+    assert h.controller.snapshot().human_command_disposition is CommandDisposition.SETTLED
+
+
+@pytest.mark.parametrize("outcome", ["cancel", "timeout", "malformed", "commanded"])
+async def test_td4_pending_containment_classifies_before_releasing_ownership(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    from collections.abc import Generator
+    from contextlib import contextmanager
+
+    h = await make_human()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    before_exit: list[CommandDisposition | None] = []
+    base_hold = h.ownership.hold
+
+    @contextmanager
+    def observe_exit(kind: PendingHumanCall) -> Generator[None, None, None]:
+        with base_hold(kind):
+            try:
+                yield
+            finally:
+                assert h.ownership.pending(PendingHumanCall.CONTAINMENT)
+                before_exit.append(h.controller.snapshot().human_command_disposition)
+
+    async def held_containment() -> ContainmentResult:
+        entered.set()
+        await release.wait()
+        if outcome == "timeout":
+            raise TimeoutError()
+        if outcome == "malformed":
+            return cast("ContainmentResult", object())
+        return ContainmentResult(
+            ContainmentOutcome.COMMAND_STATE_RETURNED, evidence_heat_zero_commanded=True
+        )
+
+    monkeypatch.setattr(h.ownership, "hold", observe_exit)
+    h.actuator.contain = held_containment
+    task = asyncio.create_task(
+        h.controller._contain_human_heat(generation=h.arbiter.generation)  # pyright: ignore[reportPrivateUsage]
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    assert h.ownership.pending(PendingHumanCall.CONTAINMENT)
+    h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+    if outcome == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        release.set()
+        result = await task
+        assert (
+            result.outcome
+            is {
+                "timeout": ContainmentOutcome.UNKNOWN_TRANSPORT,
+                "malformed": ContainmentOutcome.UNKNOWN_MALFORMED_RESPONSE,
+                "commanded": ContainmentOutcome.COMMAND_STATE_RETURNED,
+            }[outcome]
+        )
+    assert not h.ownership.pending(PendingHumanCall.CONTAINMENT)
+    assert before_exit == [
+        CommandDisposition.SETTLED if outcome == "commanded" else CommandDisposition.UNKNOWN
+    ]
+    assert h.actuator.containments == 1
+
+
+async def test_t38_issued_operator_drop_joins_later_requests() -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    await h.controller.operator_drop_beans()
+    assert h.controller.phase is RoastPhase.COOLING
+    assert h.controller.snapshot().human_endpoint is EndpointDisposition.ISSUED
+    await h.controller.operator_drop_beans()
+    assert h.commands.count("drop_beans") == 1
+    assert any(
+        isinstance(payload, dict)
+        and cast("dict[str, object]", payload).get("outcome") == "joined_protective_endpoint"
+        for _, payload in h.emitter.events
+    )
+
+
+async def test_l1_continuation_rechecks_exact_run_evidence_before_clearing() -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    h.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    assert await h.controller.human_operator_continue(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    h.actuator.session_id = "synthetic-new-identity"
+    h.actuator.calls.clear()
+    await h.turn(bean=185)
+    assert h.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert h.controller._routine_inhibited  # pyright: ignore[reportPrivateUsage]
+    assert h.controller._protection_check_pending  # pyright: ignore[reportPrivateUsage]
+    assert h.commands == []
+
+
+@pytest.mark.parametrize("kind", [WriteClass.HEAT, WriteClass.FAN, WriteClass.SESSION_START])
+async def test_te17_unconfirmed_owner_discards_each_guarded_write(kind: WriteClass) -> None:
+    unconfirmed = False
+    h = await make_human(
+        teardown_unconfirmed=lambda: unconfirmed, start=kind is not WriteClass.SESSION_START
+    )
+    if kind is not WriteClass.SESSION_START:
+        await h.turn(bean=180)
+        await h.turn(bean=185, t0=True)
+    calls: list[WriteClass] = []
+
+    async def dispatch() -> None:
+        calls.append(kind)
+
+    unconfirmed = True
+    discarded = await h.controller._run_routine_write(  # pyright: ignore[reportPrivateUsage]
+        h.arbiter.generation, dispatch, write_class=kind
+    )
+    assert discarded == (False, None)
+    assert calls == []
+    unconfirmed = False
+    admitted = await h.controller._run_routine_write(  # pyright: ignore[reportPrivateUsage]
+        h.arbiter.generation, dispatch, write_class=kind
+    )
+    assert admitted == (True, None)
+    assert calls == [kind]
+
+
+async def test_te17_unconfirmed_owner_leaves_non_heat_and_refuses_containment() -> None:
+    unconfirmed = False
+    h = await make_human(teardown_unconfirmed=lambda: unconfirmed)
+    h.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    unconfirmed = True
+    await h.controller.operator_start_cooling()
+    assert h.commands.count("start_cooling") == 1
+    result = await h.controller._contain_human_heat(  # pyright: ignore[reportPrivateUsage]
+        generation=h.arbiter.generation
+    )
+    assert result.outcome is ContainmentOutcome.NOT_ATTEMPTED
+    assert h.actuator.containments == 0
+    assert not h.ownership.pending(PendingHumanCall.CONTAINMENT)
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+async def test_superseded_in_flight_drop_cannot_release_new_phase_owner(
+    monkeypatch: pytest.MonkeyPatch, malformed: bool
+) -> None:
+    h = await make_human()
+    original = h.actuator.drop_beans
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_drop() -> AppliedRoasterState | None:
+        entered.set()
+        await release.wait()
+        result = await original()
+        return None if malformed else result
+
+    monkeypatch.setattr(h.actuator, "drop_beans", blocked_drop)
+    await h.turn(bean=180)
+    turn = asyncio.create_task(h.turn(bean=196, t0=True))
+    await asyncio.wait_for(entered.wait(), 1)
+    h.controller.admit_emergency_stop()
+    h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+    stop = asyncio.create_task(
+        h.controller.operator_emergency_stop("supersede dispatched drop", already_admitted=True)
+    )
+    release.set()
+    await asyncio.gather(turn, stop)
+    assert h.controller.phase is RoastPhase.FAULTED
+    assert h.controller.snapshot().human_endpoint is (
+        EndpointDisposition.UNKNOWN if malformed else EndpointDisposition.IN_FLIGHT
+    )
+    assert h.controller.snapshot().human_command_disposition is (
+        CommandDisposition.UNKNOWN if malformed else CommandDisposition.SETTLED
+    )
+    assert h.commands.count("drop_beans") == h.commands.count("emergency_stop") == 1
+    await h.controller.operator_drop_beans()
+    assert h.commands.count("drop_beans") == 1
+
+
+@pytest.mark.parametrize("binding", ["missing", "stale", "fresh"])
+async def test_t39_exact_fault_executor_uses_the_human_drop_owner(
+    tmp_path: Path, binding: str
+) -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    h.controller.transition_to(RoastPhase.FAULTED)
+    if binding == "stale":
+        h.clock.advance(20)
+    writes: list[OperatorAction] = []
+
+    class FaultPort:
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            return FaultControlState(
+                session_id=session_id,
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=False,
+                beans_added=True,
+                beans_dropped=bool(writes),
+            )
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            return await self.read_fault_control_state(h.actuator.session_id)
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            assert expected_session_id == h.actuator.session_id
+            writes.append(action)
+
+    store = RoastStore(tmp_path / "synthetic-fault-controls.sqlite3")
+    await store.initialize()
+    try:
+        await store.create_run(
+            run_id="synthetic-run",
+            profile=PROFILE,
+            config=AppConfig(),
+            agent_phase=RoastPhase.FAULTED,
+        )
+        executor = FaultControlExecutor(
+            SafetyPolicy(SafetyLimits()),
+            FaultPort(),
+            arbiter=h.arbiter,
+            trace_sink=store,
+            human_drop_controller=lambda _: h.controller if binding != "missing" else None,
+        )
+        result = await executor.execute(
+            OperatorAction.DROP_BEANS,
+            h.actuator.session_id,
+            run_id="synthetic-run",
+            is_current_generation=lambda: True,
+        )
+        assert (result is not None) is (binding == "fresh")
+        assert writes == ([OperatorAction.DROP_BEANS] if binding == "fresh" else [])
+        assert await executor.settle_for_shutdown()
+    finally:
+        await store.close()
+
+
+async def test_t32_human_legacy_drop_requests_do_not_duplicate_the_endpoint() -> None:
+    h = await make_human(advisor=FakeAdvisor([decision(drop=True)]))
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    await h.controller.operator_mark_first_crack()
+    assert h.controller.phase is RoastPhase.DEVELOPMENT
+    await h.turn(bean=195)
+    assert h.commands.count("drop_beans") == 0
+    await h.turn(bean=196)
+    assert h.commands.count("drop_beans") == 1
+    assert (
+        await h.controller._execute_deterministic_drop(  # pyright: ignore[reportPrivateUsage]
+            DropReason.CEILING_GUARD, generation=h.arbiter.generation
+        )
+        is False
+    )
+    assert h.commands.count("drop_beans") == 1
+
+
+async def test_pending_scope_cannot_be_claimed_twice_or_replaced() -> None:
+    owner = HumanRunOwnership()
+    active = owner.claim_run("active")
+    active.durably_closed = True
+    with owner.hold(PendingHumanCall.READ):
+        with (
+            pytest.raises(RuntimeError, match="already pending"),
+            owner.hold(PendingHumanCall.READ),
+        ):
+            pytest.fail("duplicate scope was opened")
+        with pytest.raises(RuntimeError, match="unresolved HUMAN ownership"):
+            owner.claim_run("replacement")
+    assert owner.claim_run("replacement").run_id == "replacement"

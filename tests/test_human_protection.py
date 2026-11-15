@@ -497,3 +497,45 @@ def test_exact_age_request_gap_retains_ordered_history(
     assert _observe(tracker, 0.0, 10) is ReadingFreshness.UNPROVEN
     clock.now = 2.0
     assert _observe(tracker, 2.0, 11) is ReadingFreshness.FRESH
+
+
+@pytest.mark.parametrize(
+    ("history", "now", "expected", "clock_samples"),
+    [
+        ("empty", 0.0, ReadingFreshness.UNPROVEN, 0),
+        ("fresh", 1.25, ReadingFreshness.FRESH, 1),
+        ("fresh", 2.25, ReadingFreshness.STALE, 1),
+        ("fresh", 0.5, ReadingFreshness.INVALID, 1),
+        ("fresh", float("nan"), ReadingFreshness.INVALID, 1),
+        ("fresh", float("inf"), ReadingFreshness.INVALID, 1),
+        ("reset", 1.25, ReadingFreshness.INVALID, 0),
+    ],
+)
+def test_projection_is_read_only_and_dispatch_recheck_still_invalidates(
+    history: str, now: float, expected: ReadingFreshness, clock_samples: int
+) -> None:
+    class SampleClock(_Clock):
+        calls = 0
+
+        def __call__(self) -> float:
+            self.calls += 1
+            return self.now
+
+    clock = SampleClock()
+    tracker = AcceptedReadingTracker(clock, max_age_s=2.0)
+    if history != "empty":
+        _establish_fresh(clock, tracker)
+    if history == "reset":
+        assert tracker.record_read_failure() is ReadingFreshness.INVALID
+    clock.now = now
+    clock.calls = 0
+    before = vars(tracker).copy()
+    assert tracker.project_freshness() is expected
+    assert vars(tracker) == before
+    assert clock.calls == clock_samples
+    clock.calls = 0
+    assert tracker.recheck() is expected
+    assert clock.calls == clock_samples
+    if history == "fresh" and expected is ReadingFreshness.INVALID:
+        clock.now = 1.25
+        assert _observe(tracker, clock.now, 12, 2) is ReadingFreshness.UNPROVEN

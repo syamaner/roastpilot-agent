@@ -34,7 +34,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, PrivateAttr, ValidationError
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from roastpilot_agent import __version__
@@ -382,24 +382,41 @@ def _as_event_data(payload: object) -> dict[str, Any]:
     return {"value": payload}
 
 
-def _phase_changed_with_actions(data: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of a ``phase_changed`` payload with ``enabled_actions`` added.
+_HUMAN_RECOVERY_PHASES = frozenset({RoastPhase.OPERATOR_RECOVERY_REQUIRED, RoastPhase.FAULTED})
 
-    The controller emits ``{"phase": <value>}``; this adds the operator actions
-    the server would accept in that phase (E10 option (a), D25) — a read-only
-    projection over :data:`~roastpilot_agent.safety.COMMAND_PHASE_MATRIX`. A NEW
-    dict is returned so the original (buffered for the persisted decision-trace
-    timeline) stays lean. A missing/unknown phase — never expected from the
-    controller's emit site — passes through unchanged rather than raising on the
-    SSE hot path."""
+
+def _without_recovery_drop(actions: list[OperatorAction]) -> list[OperatorAction]:
+    return [action for action in actions if action is not OperatorAction.DROP_BEANS]
+
+
+def _phase_changed_target(data: dict[str, Any]) -> RoastPhase | None:
     phase_value = data.get("phase")
     if not isinstance(phase_value, str):
-        return data  # pragma: no cover — controller always emits a phase string
+        return None  # pragma: no cover — controller always emits a phase string
     try:
-        phase = RoastPhase(phase_value)
+        return RoastPhase(phase_value)
     except ValueError:  # pragma: no cover — controller emits valid phase values
-        return data
-    return {**data, "enabled_actions": [a.value for a in enabled_operator_actions(phase)]}
+        return None
+
+
+class _HumanRecoveryPhaseEvent(SseEvent):
+    """Keep run identity private while a recovery frame is queued or buffered."""
+
+    _run_id: str = PrivateAttr()
+    _phase: RoastPhase = PrivateAttr()
+
+    def __init__(self, *, run_id: str, phase: RoastPhase, data: dict[str, Any], id: int) -> None:
+        super().__init__(event=SseEventType.PHASE_CHANGED, data=data, id=id)
+        self._run_id = run_id
+        self._phase = phase
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
+
+    @property
+    def phase(self) -> RoastPhase:
+        return self._phase
 
 
 class EventBroadcaster:
@@ -518,12 +535,27 @@ class EventBroadcaster:
         """Remove a subscriber (idempotent — safe in a generator's finally)."""
         self._subscribers.discard(queue)
 
-    def _publish(self, event_type: SseEventType, data: dict[str, Any]) -> None:
+    def _publish(
+        self,
+        event_type: SseEventType,
+        data: dict[str, Any],
+        *,
+        human_recovery: tuple[str, RoastPhase] | None = None,
+    ) -> None:
         # Stamp the sequence at construction (never mutate post-build): one
         # frame object is fanned out to every subscriber, read-only via
         # render(), so no client can observe another's state.
         self._sequence += 1
-        event = SseEvent(event=event_type, data=data, id=self._sequence)
+        event = (
+            SseEvent(event=event_type, data=data, id=self._sequence)
+            if human_recovery is None
+            else _HumanRecoveryPhaseEvent(
+                run_id=human_recovery[0],
+                phase=human_recovery[1],
+                data=data,
+                id=self._sequence,
+            )
+        )
         # Retain in the ring buffer for Last-Event-ID resume (O(1), bounded by
         # maxlen — oldest evicted automatically). Done before fan-out so a
         # subscriber that reconnects mid-publish never sees a frame missing from
@@ -535,20 +567,26 @@ class EventBroadcaster:
             with contextlib.suppress(asyncio.QueueFull):
                 queue.put_nowait(event)
 
-    def emit(self, kind: RoastEventKind, payload: object) -> None:
-        """``EventEmitter`` protocol: publish a controller event (E9 sink).
+    def emit(
+        self, kind: RoastEventKind, payload: object, *, human_run_id: str | None = None
+    ) -> None:
+        """Publish a controller event without reading dynamic control authority.
 
-        The ``phase_changed`` frame is enriched with ``enabled_actions`` — the
-        operator actions the server would accept in the new phase, a read-only
-        projection over the command×phase matrix (E10 option (a), D25) — so the
-        SPA's action bar updates on every transition without hardcoding a
-        client-side matrix. The enrichment builds a NEW payload; the controller's
-        original dict (also buffered for the lean decision-trace timeline) is
-        untouched."""
+        Ordinary phase frames use the command matrix. HUMAN recovery frames
+        carry private run identity and a conservative action list until the
+        stream renders the current projection outside controller execution.
+        """
         data = _as_event_data(payload)
+        human_recovery: tuple[str, RoastPhase] | None = None
         if kind is RoastEventKind.PHASE_CHANGED:
-            data = _phase_changed_with_actions(data)
-        self._publish(SseEventType(kind.value), data)
+            phase = _phase_changed_target(data)
+            if phase is not None:
+                actions = enabled_operator_actions(phase)
+                if human_run_id is not None and phase in _HUMAN_RECOVERY_PHASES:
+                    human_recovery = (human_run_id, phase)
+                    actions = _without_recovery_drop(actions)
+                data = {**data, "enabled_actions": [action.value for action in actions]}
+        self._publish(SseEventType(kind.value), data, human_recovery=human_recovery)
 
     def emit_telemetry(self, data: TelemetryEventData) -> None:
         """Publish the per-tick ``telemetry`` event (plan §6)."""
@@ -813,14 +851,24 @@ class BufferingEventEmitter:
     decision trace preserves intra-tick ordering (e.g. an operator drop before a
     safety fault in the same tick), not a single flush-time stamp."""
 
-    def __init__(self, broadcaster: "EventBroadcaster", *, clock: Callable[[], float]) -> None:
+    def __init__(
+        self,
+        broadcaster: "EventBroadcaster",
+        *,
+        clock: Callable[[], float],
+        human_run_id: str | None = None,
+    ) -> None:
         self._broadcaster = broadcaster
+        self._human_run_id = human_run_id
+        self.human_phase_frame_id: int | None = None
         self._clock = clock
         self._buffer: list[_BufferedEvent] = []
 
     def emit(self, kind: RoastEventKind, payload: object) -> None:
         """``EventEmitter`` protocol: publish to SSE now, buffer for persistence."""
-        self._broadcaster.emit(kind, payload)
+        self._broadcaster.emit(kind, payload, human_run_id=self._human_run_id)
+        if self._human_run_id is not None and kind is RoastEventKind.PHASE_CHANGED:
+            self.human_phase_frame_id = self._broadcaster.last_event_id
         self._buffer.append(_BufferedEvent(kind, payload, self._clock()))
 
     def emit_telemetry(self, data: TelemetryEventData) -> None:
@@ -1343,6 +1391,10 @@ class RoastRunner:
     def finalized(self) -> bool:
         """Whether the run reached a terminal phase and was completed."""
         return self._finalized
+
+    def owns_human_phase_frame(self, event_id: int | None) -> bool:
+        """Recognize only the current phase publication for this runner."""
+        return event_id is not None and event_id == self._emitter.human_phase_frame_id
 
     def controller_for_human_fault_drop(self) -> RoastController | None:
         """Bind terminal drop checks to this exact HUMAN controller."""
@@ -6162,7 +6214,11 @@ class RoastService:
         )
         counter = _TickCounter()
         sink = StoreSnapshotSink(self._store, run_id, lambda: counter.value)
-        emitter = BufferingEventEmitter(self.events, clock=self._clock)
+        emitter = BufferingEventEmitter(
+            self.events,
+            clock=self._clock,
+            human_run_id=run_id if self._authority is ControlAuthority.HUMAN else None,
+        )
         reset_non_finite_telemetry_warnings()
         controller = RoastController(
             config=run_config.controller,
@@ -6718,6 +6774,66 @@ class RoastService:
         """The roast history list, newest first (plan §6)."""
         return RoastHistory(runs=await self._store.list_runs())
 
+    def _human_recovery_actions(
+        self,
+        controller: RoastController,
+        run_id: str,
+        phase: RoastPhase,
+        actions: list[OperatorAction],
+        lease: FaultControlLease,
+    ) -> list[OperatorAction]:
+        """Qualify the existing recovery action list for server presentation."""
+        if (
+            self._requires_live_restart_clearance
+            and self._restart_clearance_state is not RestartClearanceState.CLEARED
+        ) or (lease.run_id == run_id and lease.status is not FaultLeaseStatus.CLOSED):
+            return [OperatorAction.EMERGENCY_STOP]
+        context = self._closure_only_context
+        if (
+            context is not None
+            and context.run_id == run_id
+            and self._closure_only_binding_is_current(context)
+            and lease == context.lease
+        ):
+            return [OperatorAction.END_RECOVERED_RUN, OperatorAction.EMERGENCY_STOP]
+        qualified = _without_recovery_drop(actions)
+        if controller.phase is phase and controller.human_recovery_drop_allowed():
+            qualified.append(OperatorAction.DROP_BEANS)
+        return qualified
+
+    def project_stream_event(self, run_id: str, event: SseEvent) -> SseEvent:
+        """Project HUMAN recovery actions when delivering a queued phase frame.
+
+        The original frame keeps only phase-owned actions and its private run
+        binding. Delivery cannot grant control based on an old or foreign frame,
+        and presentation does not run during the publishing emergency operation.
+        """
+        if not isinstance(event, _HumanRecoveryPhaseEvent) or event.run_id != run_id:
+            return event
+        runner = self.runner
+        if (
+            self.active_run_id != run_id
+            or runner is None
+            or runner.finalized
+            or not runner.owns_human_phase_frame(event.id)
+        ):
+            return event
+        controller = self._human_fault_drop_controller(run_id)
+        if controller is None or controller.phase is not event.phase:
+            return event
+        actions = self._human_recovery_actions(
+            controller,
+            run_id,
+            event.phase,
+            enabled_operator_actions(event.phase),
+            self._fault_lease_cache,
+        )
+        return SseEvent(
+            event=event.event,
+            data={**event.data, "enabled_actions": [action.value for action in actions]},
+            id=event.id,
+        )
+
     async def detail(self, run_id: str) -> RoastDetail:
         """Run detail, or 404 (plan §6).
 
@@ -6780,21 +6896,16 @@ class RoastService:
         if (
             self._authority is ControlAuthority.HUMAN
             and detail.completed_at_utc is None
-            and detail.agent_phase in (RoastPhase.OPERATOR_RECOVERY_REQUIRED, RoastPhase.FAULTED)
-            and (
-                not self._requires_live_restart_clearance
-                or self._restart_clearance_state is RestartClearanceState.CLEARED
-            )
-            and (lease.run_id != run_id or lease.status is FaultLeaseStatus.CLOSED)
+            and detail.agent_phase in _HUMAN_RECOVERY_PHASES
         ):
-            actions = [
-                action
-                for action in detail.enabled_actions
-                if action is not OperatorAction.DROP_BEANS
-            ]
             controller = self._human_fault_drop_controller(run_id)
-            if controller is not None and controller.human_recovery_drop_allowed():
-                actions.append(OperatorAction.DROP_BEANS)
+            actions = (
+                _without_recovery_drop(detail.enabled_actions)
+                if controller is None
+                else self._human_recovery_actions(
+                    controller, run_id, detail.agent_phase, detail.enabled_actions, lease
+                )
+            )
             detail = detail.model_copy(update={"enabled_actions": actions})
         return detail
 
@@ -9410,7 +9521,7 @@ async def stream_events(
                 except TimeoutError:
                     yield SseEvent(event=SseEventType.HEARTBEAT).render().encode()
                     continue
-                yield event.render().encode()
+                yield service.project_stream_event(run_id, event).render().encode()
         finally:
             service.events.unsubscribe(queue)
 
