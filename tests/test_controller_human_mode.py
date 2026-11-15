@@ -1861,6 +1861,44 @@ async def test_te22_queued_non_heat_obeys_existing_ownership_without_fence_reads
     assert h.controller.phase is (setup_phase if uncertain else settled_phase)
 
 
+async def test_te20_automatic_routine_dispatch_does_not_consult_human_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actuator = FakeMCPClient()
+    fence = HumanCallAdmissionFence()
+    sink = RecordingSnapshotSink([])
+    controller = RoastController(
+        config=ControllerConfig(),
+        safety=SafetyPolicy(SafetyLimits()),
+        state_reader=actuator,
+        command_executor=actuator,
+        snapshot_sink=sink,
+        event_emitter=EventSink(),
+        clock=FakeClock(),
+        authority=ControlAuthority.AUTOMATIC,
+        human_admission=fence,
+    )
+    await controller.start_run(PROFILE)
+    assert controller.phase is RoastPhase.PREHEATING
+    actuator.calls.clear()
+    fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+
+    def forbidden() -> bool:
+        pytest.fail("AUTOMATIC routine dispatch consulted guarded HUMAN admission")
+
+    admission = Mock(side_effect=forbidden)
+    fence_read = PropertyMock(side_effect=forbidden)
+    monkeypatch.setattr(controller, "_human_actuation_admitted", admission)
+    monkeypatch.setattr(controller, "_human_routine_permitted", admission)
+    monkeypatch.setattr(controller, "_teardown_unconfirmed", admission)
+    monkeypatch.setattr(HumanCallAdmissionFence, "closed_reason", fence_read)
+    await controller.operator_mark_beans_added()
+    assert actuator.calls == [("mark_beans_added", {})]
+    assert sink.evaluations[-1].verdict is SafetyVerdict.ALLOW
+    admission.assert_not_called()
+    fence_read.assert_not_called()
+
+
 @pytest.mark.parametrize("target", [RoastPhase.IDLE, RoastPhase.COMPLETE, RoastPhase.COOLING])
 async def test_human_nonheating_continuation_transitions_without_hardware_command(
     target: RoastPhase,
