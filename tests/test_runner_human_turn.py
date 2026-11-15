@@ -210,7 +210,7 @@ async def test_te19_pending_start_never_allows_reset_or_new_start(
                 await release.wait()
             if name == "set_recording_metadata":
                 self.calls.append((name, arguments))
-                return _result({"recording_origin": "synthetic"})
+                return _result({"origin": "ethiopia-harness", "roast_num": 1})
             return await super().call_tool(name, arguments)
 
     session = Session(_result({}))
