@@ -5,9 +5,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 
+from roastpilot_agent import controller as controller_module
 from roastpilot_agent.advisor import FakeAdvisor, RoastAdvisor
 from roastpilot_agent.config import AppConfig, ControllerConfig, SafetyLimits
 from roastpilot_agent.controller import CommandArbiter, FaultControlExecutor, RoastController
@@ -39,9 +41,10 @@ from roastpilot_agent.models import (
     FaultControlState,
     OperatorAction,
     RoastEventKind,
+    RoastEventSource,
     RoastPhase,
 )
-from roastpilot_agent.safety import SafetyPolicy, SafetyVerdict
+from roastpilot_agent.safety import SafetyEvaluation, SafetyPolicy, SafetyVerdict
 from roastpilot_agent.store import RoastStore
 from tests.conftest import EventSink, FakeClock, FakeMCPClient, RecordingSnapshotSink
 from tests.test_controller import PROFILE, decision, reading
@@ -109,7 +112,7 @@ class HumanHarness:
     def commands(self) -> list[str]:
         return [command for command, _ in self.actuator.calls]
 
-    async def turn(self, *, bean: float, t0: bool = False) -> None:
+    async def turn(self, *, bean: int | float, t0: bool = False) -> None:
         self.clock.advance(0.25)
         self.actuator.bean = bean
         self.actuator.charged = t0
@@ -602,11 +605,35 @@ async def test_td7_second_read_is_typed_refusal_without_opening_scope() -> None:
     assert not h.ownership.pending(PendingHumanCall.READ)
 
 
-async def test_t49_restart_does_not_replay_heat_or_drop() -> None:
-    h = await make_human()
-    h.actuator.calls.clear()
-    await h.controller.recover_from_restart(RoastPhase.DEVELOPMENT)
-    assert h.controller.snapshot().human_endpoint is EndpointDisposition.HISTORY_UNKNOWN
+@pytest.mark.parametrize("persisted_phase", [RoastPhase.DEVELOPMENT, RoastPhase.FAULTED])
+async def test_t49_restart_does_not_replay_heat_or_drop_at_blocked_sink(
+    monkeypatch: pytest.MonkeyPatch, persisted_phase: RoastPhase
+) -> None:
+    h = await make_human(start=False)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = h.sink.persist_evaluation
+
+    async def persist(evaluation: SafetyEvaluation) -> int | None:
+        entered.set()
+        await release.wait()
+        return await original(evaluation)
+
+    monkeypatch.setattr(h.sink, "persist_evaluation", persist)
+    restart = (
+        h.controller.recover_into_faulted
+        if persisted_phase is RoastPhase.FAULTED
+        else h.controller.recover_from_restart
+    )
+    recovering = asyncio.create_task(restart(persisted_phase))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert h.controller.snapshot().human_endpoint is EndpointDisposition.HISTORY_UNKNOWN
+        assert h.controller.snapshot().human_command_disposition is CommandDisposition.UNKNOWN
+        assert h.actuator.calls == []
+        assert h.actuator.reads == h.actuator.containments == 0
+    finally:
+        release.set()
+        await recovering
     assert h.controller.snapshot().physical_intervention_required
     assert not await h.controller.human_operator_continue(RoastPhase.DEVELOPMENT)
     await h.controller.operator_drop_beans()
@@ -1394,3 +1421,137 @@ async def test_t46c_containment_is_not_attempted_while_prior_command_in_flight(
         release.set()
         if pending is not None:
             await pending
+
+
+async def test_t30_refused_mcp_charge_cannot_latch_protective_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    original = SafetyPolicy.evaluate_event_source
+
+    def evaluate(
+        policy: SafetyPolicy, *, transition: str, source: RoastEventSource
+    ) -> SafetyEvaluation:
+        if transition == "t0" and source is RoastEventSource.MCP:
+            return SafetyEvaluation(
+                verdict=SafetyVerdict.REJECT,
+                rule="event_source_validity",
+                reason="synthetic refusal",
+            )
+        return original(policy, transition=transition, source=source)
+
+    with monkeypatch.context() as rejected:
+        rejected.setattr(SafetyPolicy, "evaluate_event_source", evaluate)
+        await h.turn(bean=196, t0=True)
+    assert h.controller.phase is RoastPhase.PREHEATING
+    assert not h.controller.snapshot().charge_detected
+    assert RoastEventKind.T0_DETECTED not in h.emitter.kinds()
+    assert "drop_beans" not in h.commands
+    assert any(
+        row.rule == "event_source_validity" and row.verdict is SafetyVerdict.REJECT
+        for row in h.sink.evaluations
+    )
+    await h.turn(bean=196, t0=True)
+    assert h.commands.count("drop_beans") == 1
+    assert h.controller.snapshot().human_endpoint is EndpointDisposition.ISSUED
+
+
+async def test_tb7_exact_raw_integer_drives_protection_beside_float_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = await make_human()
+    original = h.actuator.read_human_evidence
+
+    async def raw_int_read() -> HumanReadEvidence:
+        evidence = await original()
+        assert evidence.telemetry is not None
+        assert type(evidence.bean_temp_c) is int
+        assert type(evidence.telemetry.bean_temp_c) is float
+        return evidence
+
+    monkeypatch.setattr(h.actuator, "read_human_evidence", raw_int_read)
+    eligibility = Mock(wraps=controller_module.protection_eligible)
+    monkeypatch.setattr(controller_module, "protection_eligible", eligibility)
+    await h.turn(bean=180)
+    await h.turn(bean=196, t0=True)
+    assert type(eligibility.call_args.kwargs["bean_temp_c"]) is int
+    assert eligibility.call_args.kwargs["bean_temp_c"] == 196
+    assert h.commands.count("drop_beans") == 1
+    assert h.controller.snapshot().human_endpoint is EndpointDisposition.ISSUED
+    assert any(
+        row.rule == "human_protective_drop" and row.verdict is SafetyVerdict.ALLOW
+        for row in h.sink.evaluations
+    )
+
+
+async def test_t56_exhausted_read_failures_fault_without_routine_heat_off() -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    h.actuator.calls.clear()
+    h.sink.evaluations.clear()
+    attempts = SafetyLimits().max_consecutive_mcp_failures
+
+    async def failed_read() -> None:
+        raise ConnectionError("synthetic genuine read failure")
+
+    h.actuator.collect = failed_read
+    for _ in range(attempts):
+        await h.turn(bean=185)
+    assert h.actuator.reads == attempts + 1
+    assert h.controller._consecutive_read_failures == attempts  # pyright: ignore[reportPrivateUsage]
+    assert h.sink.evaluations[-1].rule == "mcp_read_failures_exhausted"
+    assert h.sink.evaluations[-1].verdict is SafetyVerdict.FAULT
+    assert h.controller.phase is RoastPhase.FAULTED
+    assert h.actuator.calls == []
+    assert h.actuator.containments == 0
+    assert h.controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
+    evaluation_count = len(h.sink.evaluations)
+    await h.turn(bean=185)
+    assert h.controller._consecutive_read_failures == attempts  # pyright: ignore[reportPrivateUsage]
+    assert len(h.sink.evaluations) == evaluation_count
+    assert h.actuator.calls == []
+
+
+@pytest.mark.parametrize("invalidated_by", ["identity", "emergency", "expiry"])
+async def test_t43_continuation_rechecks_authority_after_audit_await(
+    monkeypatch: pytest.MonkeyPatch, invalidated_by: str
+) -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    h.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    h.actuator.calls.clear()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = h.sink.persist_evaluation
+
+    async def audit(evaluation: SafetyEvaluation) -> int | None:
+        if evaluation.rule == "human_continuation":
+            assert evaluation.verdict is SafetyVerdict.ALLOW
+            entered.set()
+            await release.wait()
+        return await original(evaluation)
+
+    monkeypatch.setattr(h.sink, "persist_evaluation", audit)
+    continuation = asyncio.create_task(
+        h.controller.human_operator_continue(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        if invalidated_by == "identity":
+            h.actuator.session_id = "unreconciled-replacement"
+        elif invalidated_by == "emergency":
+            assert await h.controller.operator_emergency_stop("superseded continuation")
+        else:
+            h.clock.advance(20)
+    finally:
+        release.set()
+        admitted = await continuation
+    assert not admitted
+    assert h.commands == (["emergency_stop"] if invalidated_by == "emergency" else [])
+    assert h.controller.phase is (
+        RoastPhase.FAULTED
+        if invalidated_by == "emergency"
+        else RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    )
+    assert not h.controller._protection_check_pending  # pyright: ignore[reportPrivateUsage]

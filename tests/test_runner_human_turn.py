@@ -20,13 +20,14 @@ from roastpilot_agent.api import (
     create_app,
     stream_events,
 )
-from roastpilot_agent.config import AppConfig, ControllerConfig
+from roastpilot_agent.config import AppConfig, ControllerConfig, MCPDeviceConfig
 from roastpilot_agent.human_protection import (
     CommandDisposition,
     ContainmentOutcome,
     ControlAuthority,
     EndpointDisposition,
     HumanReadEvidence,
+    ReadingFreshness,
     WriteClass,
 )
 from roastpilot_agent.human_run_ownership import (
@@ -53,6 +54,7 @@ from tests.test_api import (
 )
 from tests.test_controller import PROFILE
 from tests.test_controller_human_mode import HumanRoaster
+from tests.test_mcp_client import EMERGENCY_STOP_EVENT_RESULT_PAYLOAD
 from tests.test_mcp_fixed_zero import (  # pyright: ignore[reportPrivateImportUsage]
     SESSION_STATE_PAYLOAD,
     _LifecycleSpy,  # pyright: ignore[reportPrivateUsage]
@@ -826,3 +828,127 @@ async def test_td8_losing_adapter_diagnostic_does_not_settle_owned_unknown(
     assert generation == adapter._identity_generation  # pyright: ignore[reportPrivateUsage]
     assert session.calls == calls
     assert process.lifecycle == []
+
+
+@pytest.mark.parametrize(
+    ("replace_child", "reused_id"), [(False, False), (True, False), (False, True)]
+)
+async def test_td2_td3_td5_late_read_cannot_seed_the_next_started_session(
+    store: RoastStore, replace_child: bool, reused_id: bool
+) -> None:
+    clock = FakeClock()
+    entered, release = asyncio.Event(), asyncio.Event()
+    hold_reads = False
+
+    class Session(_Session):
+        status = 0
+
+        async def call_tool(self, name: str, arguments: dict[str, object] | None = None) -> object:
+            if name == "set_recording_metadata":
+                self.calls.append((name, arguments))
+                return _result({"origin": "synthetic", "roast_num": 1})
+            if name == "emergency_stop":
+                self.calls.append((name, arguments))
+                return _result(
+                    {**EMERGENCY_STOP_EVENT_RESULT_PAYLOAD, "session_id": self.session_id}
+                )
+            if name != "get_roast_state":
+                return await super().call_tool(name, arguments)
+            self.calls.append((name, arguments))
+            self.status += 1
+            if hold_reads:
+                entered.set()
+                await release.wait()
+            device = cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"])
+            return _result(
+                {
+                    **SESSION_STATE_PAYLOAD,
+                    "session_id": self.session_id,
+                    "elapsed_monotonic_seconds": float(self.status),
+                    "device_state": {
+                        **device,
+                        "bean_temp_c": 185,
+                        "raw_vendor_data": {
+                            "status_packet_count": self.status,
+                            "ignored_temperature_packet_count": 0,
+                        },
+                    },
+                }
+            )
+
+    initial = Session(_result({}), session_id="session-a")
+    next_id = "session-a" if reused_id else "session-b"
+    replacement = Session(_result({}), session_id=next_id)
+
+    class Process(_LifecycleSpy):
+        async def start(self) -> None:
+            await super().start()
+            self.replace(replacement)
+
+    process = Process(initial)
+    adapter = RoasterControlAdapter.from_process(process, clock=clock)
+    service = RoastService(
+        store,
+        mcp=process,
+        roaster=adapter,
+        raw_state=adapter,
+        authority=ControlAuthority.HUMAN,
+        clock=clock,
+        run_loop=False,
+    )
+    first = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    for _ in range(2):
+        clock.advance(0.25)
+        await controller.human_urgent_stage()
+    assert controller._accepted_readings.project_freshness() is ReadingFreshness.FRESH  # pyright: ignore[reportPrivateUsage]
+    await store.complete_run(run_id=first.id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    runner._finalized = True  # pyright: ignore[reportPrivateUsage]
+    controller.note_human_run_durably_closed()
+    prior_epoch = process.child_epoch
+    generation = adapter._identity_generation  # pyright: ignore[reportPrivateUsage]
+
+    hold_reads = True
+    clock.advance(0.25)
+    late_read = asyncio.create_task(controller.human_urgent_stage())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        with pytest.raises(RoastRunConflictError, match="HUMAN.*ownership"):
+            await service.start_roast(PROFILE)
+        if replace_child:
+            with pytest.raises(RoastRunConflictError, match="HUMAN.*ownership"):
+                await service._respawn_mcp_for_device_config(MCPDeviceConfig())  # pyright: ignore[reportPrivateUsage]
+            assert process.lifecycle == ["stop"]
+        else:
+            assert process.lifecycle == []
+        assert process.child_epoch == prior_epoch
+        assert adapter._identity_generation == generation  # pyright: ignore[reportPrivateUsage]
+        assert [name for name, _ in initial.calls].count("start_roast_session") == 1
+        assert len((await service.history()).runs) == 1
+    finally:
+        hold_reads = False
+        release.set()
+        await late_read
+
+    if replace_child:
+        await service._respawn_mcp_for_device_config(MCPDeviceConfig())  # pyright: ignore[reportPrivateUsage]
+        assert process.lifecycle == ["stop", "stop", "start"]
+        assert process.child_epoch != prior_epoch
+    else:
+        initial.session_id = next_id
+    second = await service.start_roast(PROFILE)
+    active = service.runner
+    assert active is not None and active is not runner
+    current = active.controller_for_human_fault_drop()
+    assert current is not None
+    assert adapter.latest_fault_session_id == next_id
+    clock.advance(0.25)
+    await current.human_urgent_stage()
+    assert current._accepted_readings.project_freshness() is ReadingFreshness.UNPROVEN  # pyright: ignore[reportPrivateUsage]
+    assert await service.safe_shutdown_heat_off() is ShutdownHeatOffOutcome.DISPATCHED
+    lease = service._fault_lease_cache  # pyright: ignore[reportPrivateUsage]
+    assert lease.run_id == second.id
+    assert lease.mcp_session_id == next_id
