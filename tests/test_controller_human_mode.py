@@ -1586,3 +1586,66 @@ async def test_t43_continuation_rechecks_authority_after_audit_await(
         else RoastPhase.OPERATOR_RECOVERY_REQUIRED
     )
     assert not h.controller._protection_check_pending  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("source", ["cancelled_stop", "latched_escalation", "exact_fault_rearm"])
+async def test_te25_other_existing_emergency_retry_sources_survive_closure(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+
+    def forbidden_teardown_read() -> bool:
+        pytest.fail("an admitted emergency retry read child-teardown evidence")
+
+    async def failed_emergency(*, reason: str) -> AppliedRoasterState | None:
+        raise TimeoutError(reason)
+
+    if source == "cancelled_stop":
+        entered = asyncio.Event()
+
+        async def pending_emergency(*, reason: str) -> AppliedRoasterState | None:
+            entered.set()
+            await asyncio.Event().wait()
+            pytest.fail(reason)
+
+        monkeypatch.setattr(h.actuator, "emergency_stop", pending_emergency)
+        h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+        stop = asyncio.create_task(h.controller.operator_emergency_stop("cancelled stop"))
+        await asyncio.wait_for(entered.wait(), 1)
+        stop.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stop
+    elif source == "latched_escalation":
+
+        async def delay() -> None:
+            h.clock.advance(20)
+
+        h.actuator.collect = delay
+        await h.turn(bean=186)
+        assert h.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+
+        async def close_during_read() -> None:
+            h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+
+        monkeypatch.setattr(h.actuator, "emergency_stop", failed_emergency)
+        h.actuator.collect = close_during_read
+        await h.turn(bean=260)
+    else:
+        h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+        h.controller.transition_to(RoastPhase.FAULTED)
+        h.controller.rearm_emergency_stop_fail_safe()
+
+    assert h.controller.phase is RoastPhase.FAULTED
+    assert h.fence.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+    assert h.controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(h.controller, "_teardown_unconfirmed", forbidden_teardown_read)
+    h.actuator.calls.clear()
+    await h.controller.tick()
+    assert h.actuator.calls == [
+        ("set_heat", {"heat_percent": 0}),
+        ("set_fan", {"fan_percent": SafetyLimits().overrun_safe_fan_percent}),
+    ]
+    assert not await h.controller._set_targets(heat_percent=0, fan_percent=0)  # pyright: ignore[reportPrivateUsage]
+    assert h.commands == ["set_heat", "set_fan"]
