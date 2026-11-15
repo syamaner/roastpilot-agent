@@ -2,9 +2,10 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from unittest.mock import Mock
 
 import pytest
@@ -28,12 +29,15 @@ from roastpilot_agent.human_protection import (
     RawTemperature,
     ReadingFreshness,
     WriteClass,
+    protection_eligible,
 )
 from roastpilot_agent.human_run_ownership import (
     AdmissionCloseReason,
     HumanCallAdmissionFence,
+    HumanCallRefusal,
     HumanRunOwnership,
     PendingHumanCall,
+    RefusedHumanCall,
 )
 from roastpilot_agent.models import (
     AppliedRoasterState,
@@ -276,6 +280,15 @@ async def test_te23_late_read_retains_evidence_and_cannot_drive_guarded_writes(
 
 @pytest.mark.parametrize("latched", [False, True])
 async def test_te11_refused_read_breaks_continuity_without_failure_verdict(latched: bool) -> None:
+    await _assert_te11_refusal(latched=latched, reason=HumanCallRefusal.ADMISSION_CLOSED)
+
+
+@pytest.mark.parametrize("latched", [False, True])
+async def test_te11_duplicate_read_has_the_same_non_failure_effects(latched: bool) -> None:
+    await _assert_te11_refusal(latched=latched, reason=HumanCallRefusal.READ_ALREADY_PENDING)
+
+
+async def _assert_te11_refusal(*, latched: bool, reason: HumanCallRefusal) -> None:
     h = await make_human()
     await h.turn(bean=180)
     await h.turn(bean=185, t0=True)
@@ -284,18 +297,36 @@ async def test_te11_refused_read_breaks_continuity_without_failure_verdict(latch
     before = h.controller.phase
     evaluations = list(h.sink.evaluations)
     old_reads = h.actuator.reads
-    h.fence.close(AdmissionCloseReason.DEVICE_RESPAWN)
-    await h.turn(bean=196)
-    assert h.actuator.reads == old_reads
+    h.actuator.calls.clear()
+    h.controller._consecutive_read_failures = 1  # pyright: ignore[reportPrivateUsage]
+    if reason is HumanCallRefusal.ADMISSION_CLOSED:
+        h.fence.close(AdmissionCloseReason.DEVICE_RESPAWN)
+    with (
+        h.ownership.hold(PendingHumanCall.READ)
+        if reason is HumanCallRefusal.READ_ALREADY_PENDING
+        else nullcontext()
+    ):
+        refused = await h.controller._read_human_call()  # pyright: ignore[reportPrivateUsage]
+        assert refused == RefusedHumanCall(PendingHumanCall.READ, reason)
+        await h.turn(bean=196)
+        assert h.actuator.reads == old_reads
+        assert h.ownership.pending(PendingHumanCall.READ) is (
+            reason is HumanCallRefusal.READ_ALREADY_PENDING
+        )
     assert h.controller.phase is before
     assert h.sink.evaluations == evaluations
+    assert h.controller._consecutive_read_failures == 1  # pyright: ignore[reportPrivateUsage]
+    assert h.controller._routine_inhibited  # pyright: ignore[reportPrivateUsage]
     assert h.controller._accepted_readings.recheck() is ReadingFreshness.INVALID  # pyright: ignore[reportPrivateUsage]
-    assert h.fence.reopen_after_respawn(
-        child_started=True,
-        teardown_unconfirmed=False,
-        lifecycle_blocked=False,
-        shutdown_started=False,
-    )
+    assert h.actuator.calls == []
+    assert h.actuator.containments == 0
+    if reason is HumanCallRefusal.ADMISSION_CLOSED:
+        assert h.fence.reopen_after_respawn(
+            child_started=True,
+            teardown_unconfirmed=False,
+            lifecycle_blocked=False,
+            shutdown_started=False,
+        )
     h.controller.transition_to(RoastPhase.FAULTED)
     await h.turn(bean=184)
     assert h.controller._accepted_readings.recheck() is ReadingFreshness.UNPROVEN  # pyright: ignore[reportPrivateUsage]
@@ -1431,7 +1462,7 @@ async def test_t30_refused_mcp_charge_cannot_latch_protective_drop(
     original = SafetyPolicy.evaluate_event_source
 
     def evaluate(
-        policy: SafetyPolicy, *, transition: str, source: RoastEventSource
+        policy: SafetyPolicy, *, transition: Literal["t0", "first_crack"], source: RoastEventSource
     ) -> SafetyEvaluation:
         if transition == "t0" and source is RoastEventSource.MCP:
             return SafetyEvaluation(
@@ -1471,7 +1502,7 @@ async def test_tb7_exact_raw_integer_drives_protection_beside_float_projection(
         return evidence
 
     monkeypatch.setattr(h.actuator, "read_human_evidence", raw_int_read)
-    eligibility = Mock(wraps=controller_module.protection_eligible)
+    eligibility = Mock(wraps=protection_eligible)
     monkeypatch.setattr(controller_module, "protection_eligible", eligibility)
     await h.turn(bean=180)
     await h.turn(bean=196, t0=True)
