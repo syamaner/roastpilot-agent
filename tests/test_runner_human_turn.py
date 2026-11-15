@@ -23,8 +23,11 @@ from roastpilot_agent.api import (
 from roastpilot_agent.config import AppConfig, ControllerConfig
 from roastpilot_agent.human_protection import (
     CommandDisposition,
+    ContainmentOutcome,
     ControlAuthority,
     EndpointDisposition,
+    HumanReadEvidence,
+    WriteClass,
 )
 from roastpilot_agent.human_run_ownership import (
     AdmissionCloseReason,
@@ -557,10 +560,34 @@ async def test_t42b_h3_continuation_does_not_allow_same_turn_levers(store: Roast
 
 async def test_te16_old_and_replacement_runner_share_read_scope_and_fence(
     store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = FakeClock()
-    actuator = _RunnerRoaster(clock, [])
-    service = _service(store, clock, actuator, exact_child=True)
+    entered, release = asyncio.Event(), asyncio.Event()
+    hold_reads = False
+
+    class HeldSession(_Session):
+        async def call_tool(self, name: str, arguments: dict[str, object] | None = None) -> object:
+            if name == "set_recording_metadata":
+                self.calls.append((name, arguments))
+                return _result({"origin": "synthetic", "roast_num": 1})
+            if name == "get_roast_state" and hold_reads:
+                entered.set()
+                await release.wait()
+            return await super().call_tool(name, arguments)
+
+    session = HeldSession(_result(SESSION_STATE_PAYLOAD))
+    process = _LifecycleSpy(session)
+    adapter = RoasterControlAdapter.from_process(process, clock=clock)
+    service = RoastService(
+        store,
+        mcp=process,
+        roaster=adapter,
+        raw_state=adapter,
+        authority=ControlAuthority.HUMAN,
+        clock=clock,
+        run_loop=False,
+    )
     first = await service.start_roast(PROFILE)
     first_runner = service.runner
     assert first_runner is not None
@@ -577,13 +604,31 @@ async def test_te16_old_and_replacement_runner_share_read_scope_and_fence(
     fence = service._human_admission  # pyright: ignore[reportPrivateUsage]
     assert first_controller._human_admission is fence  # pyright: ignore[reportPrivateUsage]
     assert second_controller._human_admission is fence  # pyright: ignore[reportPrivateUsage]
-    entered, release = asyncio.Event(), asyncio.Event()
 
-    async def held() -> None:
-        entered.set()
-        await release.wait()
+    before = list(session.calls)
+    assert fence.closed_reason is None
+    with monkeypatch.context() as synthetic_teardown:
+        synthetic_teardown.setattr(process, "_stop_unconfirmed", True)
+        for controller in (first_controller, second_controller):
+            assert not controller._human_actuation_admitted()  # pyright: ignore[reportPrivateUsage]
+            reading = await controller._read_human_call()  # pyright: ignore[reportPrivateUsage]
+            assert isinstance(reading, HumanReadEvidence)
+            result = await controller._contain_human_heat(  # pyright: ignore[reportPrivateUsage]
+                generation=controller.command_generation
+            )
+            assert result.outcome is ContainmentOutcome.NOT_ATTEMPTED
 
-    actuator.collect = held
+        async def illegal_write() -> None:
+            pytest.fail("teardown-unconfirmed child admitted a HUMAN heat operation")
+
+        assert await second_controller._run_routine_write(  # pyright: ignore[reportPrivateUsage]
+            second_controller.command_generation, illegal_write, write_class=WriteClass.HEAT
+        ) == (False, None)
+    assert session.calls[len(before) :] == [("get_roast_state", {})] * 2
+    assert not entered.is_set()
+    before = list(session.calls)
+    hold_reads = True
+
     previous_read = asyncio.create_task(
         first_controller._read_human_call()  # pyright: ignore[reportPrivateUsage]
     )
@@ -600,7 +645,7 @@ async def test_te16_old_and_replacement_runner_share_read_scope_and_fence(
     for controller in (first_controller, second_controller):
         refused = await controller._read_human_call()  # pyright: ignore[reportPrivateUsage]
         assert refused == RefusedHumanCall(PendingHumanCall.READ, HumanCallRefusal.ADMISSION_CLOSED)
-    assert actuator.reads == 1
+    assert session.calls[len(before) :] == [("get_roast_state", {})]
 
 
 async def test_human_open_fault_lease_projection_preserves_exact_recovery_evaluator(
@@ -696,3 +741,88 @@ async def test_unknown_human_ownership_prevents_false_clean_epoch(
     await service.mark_process_epoch_clean_after_ordered_teardown()
     assert owner.command is CommandDisposition.UNKNOWN
     assert actuator.calls == []
+
+
+@pytest.mark.parametrize(
+    ("command", "endpoint"),
+    [
+        (CommandDisposition.UNKNOWN, EndpointDisposition.NONE),
+        (CommandDisposition.SETTLED, EndpointDisposition.UNKNOWN),
+        (CommandDisposition.SETTLED, EndpointDisposition.HISTORY_UNKNOWN),
+    ],
+)
+async def test_lifecycle_blocks_each_uncertain_owner_after_durable_close(
+    store: RoastStore,
+    command: CommandDisposition,
+    endpoint: EndpointDisposition,
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    first = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    await store.complete_run(run_id=first.id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    runner._finalized = True  # pyright: ignore[reportPrivateUsage]
+    controller.note_human_run_durably_closed()
+    owner = controller._human_run  # pyright: ignore[reportPrivateUsage]
+    assert owner is not None and owner.durably_closed
+    assert not service._human_ownership.lifecycle_blocked  # pyright: ignore[reportPrivateUsage]
+    assert not service._human_ownership.has_pending_call  # pyright: ignore[reportPrivateUsage]
+    owner.command = command
+    owner.endpoint = endpoint
+    with pytest.raises(RoastRunConflictError, match="HUMAN.*ownership"):
+        await service.start_roast(PROFILE)
+    with pytest.raises(RoastRunConflictError, match="HUMAN.*ownership"):
+        await service._build_runner("replacement", PROFILE)  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(RoastRunConflictError, match="HUMAN.*ownership"):
+        await service.recover_on_start()
+    assert actuator.resets == 1
+    assert actuator.commands().count("start_session") == 1
+    assert len((await service.history()).runs) == 1
+    assert service.runner is runner
+
+
+async def test_td8_losing_adapter_diagnostic_does_not_settle_owned_unknown(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = _Session(_result({"origin": "synthetic", "roast_num": 1}))
+    process = _LifecycleSpy(session)
+    adapter = RoasterControlAdapter.from_process(process)
+    await process.discover_fixed_zero()
+    service = RoastService(
+        store,
+        mcp=process,
+        roaster=adapter,
+        raw_state=adapter,
+        authority=ControlAuthority.HUMAN,
+        run_loop=False,
+    )
+    first = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    result = await controller._contain_human_heat(  # pyright: ignore[reportPrivateUsage]
+        generation=controller.command_generation
+    )
+    assert result.outcome is ContainmentOutcome.UNKNOWN_MALFORMED_RESPONSE
+    assert adapter.last_containment_result is result
+    await store.complete_run(run_id=first.id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    runner._finalized = True  # pyright: ignore[reportPrivateUsage]
+    controller.note_human_run_durably_closed()
+    generation = adapter._identity_generation  # pyright: ignore[reportPrivateUsage]
+    calls = list(session.calls)
+    with pytest.raises(RoastRunConflictError, match="HUMAN.*ownership"):
+        await service.start_roast(PROFILE)
+    monkeypatch.setattr(adapter, "_last_containment_result", None)
+    assert adapter.last_containment_result is None
+    assert controller.snapshot().human_command_disposition is CommandDisposition.UNKNOWN
+    with pytest.raises(RoastRunConflictError, match="HUMAN.*ownership"):
+        await service.start_roast(PROFILE)
+    assert len((await service.history()).runs) == 1
+    assert generation == adapter._identity_generation  # pyright: ignore[reportPrivateUsage]
+    assert session.calls == calls
+    assert process.lifecycle == []
