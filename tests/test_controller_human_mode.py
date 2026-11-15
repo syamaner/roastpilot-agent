@@ -1055,9 +1055,9 @@ async def test_pending_scope_cannot_be_claimed_twice_or_replaced() -> None:
     assert owner.claim_run("replacement").run_id == "replacement"
 
 
-@pytest.mark.parametrize("applied", [True, False])
+@pytest.mark.parametrize("applied", [True, False, "timeout", "exception"])
 async def test_te24_closure_does_not_reclassify_started_drop(
-    monkeypatch: pytest.MonkeyPatch, applied: bool
+    monkeypatch: pytest.MonkeyPatch, applied: bool | str
 ) -> None:
     h = await make_human()
     original = h.actuator.drop_beans
@@ -1067,7 +1067,11 @@ async def test_te24_closure_does_not_reclassify_started_drop(
         entered.set()
         await release.wait()
         result = await original()
-        return result if applied else None
+        if applied == "timeout":
+            raise TimeoutError("synthetic late response timeout")
+        if applied == "exception":
+            raise RuntimeError("synthetic late operation failure")
+        return result if applied is True else None
 
     monkeypatch.setattr(h.actuator, "drop_beans", held_drop)
     await h.turn(bean=180)
@@ -1078,7 +1082,7 @@ async def test_te24_closure_does_not_reclassify_started_drop(
     release.set()
     await turn
     assert h.controller.snapshot().human_endpoint is (
-        EndpointDisposition.ISSUED if applied else EndpointDisposition.UNKNOWN
+        EndpointDisposition.ISSUED if applied is True else EndpointDisposition.UNKNOWN
     )
     assert h.commands.count("drop_beans") == 1
     assert h.actuator.containments == 0
@@ -1693,9 +1697,12 @@ async def test_te22_queued_non_heat_obeys_existing_ownership_without_fence_reads
     def forbidden() -> bool:
         pytest.fail("ordinary NON_HEAT checked a newly added admission predicate")
 
+    async def invoke() -> None:
+        await callback()
+
     with monkeypatch.context() as guarded:
         async with h.arbiter._condition:  # pyright: ignore[reportPrivateUsage]
-            pending = asyncio.create_task(callback())
+            pending = asyncio.create_task(invoke())
             await asyncio.sleep(0)
             assert not pending.done()
             h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
@@ -1721,3 +1728,35 @@ async def test_human_nonheating_continuation_transitions_without_hardware_comman
     assert h.controller.phase is target
     assert h.actuator.calls == []
     assert not h.controller._protection_check_pending  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("inhibited", [False, True])
+@pytest.mark.parametrize("command", list(CommandDisposition))
+@pytest.mark.parametrize("endpoint", list(EndpointDisposition))
+async def test_t45_emergency_is_independent_of_every_human_ownership_value(
+    monkeypatch: pytest.MonkeyPatch,
+    inhibited: bool,
+    command: CommandDisposition,
+    endpoint: EndpointDisposition,
+) -> None:
+    h = await make_human()
+    owner = h.controller._human_run  # pyright: ignore[reportPrivateUsage]
+    assert owner is not None
+    owner.endpoint = endpoint
+    owner.command = command
+    h.controller._routine_inhibited = inhibited  # pyright: ignore[reportPrivateUsage]
+    h.actuator.calls.clear()
+    h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+
+    def forbidden() -> bool:
+        pytest.fail("an independent emergency consulted guarded HUMAN admission")
+
+    monkeypatch.setattr(
+        HumanCallAdmissionFence, "closed_reason", PropertyMock(side_effect=forbidden)
+    )
+    monkeypatch.setattr(h.controller, "_teardown_unconfirmed", forbidden)
+    assert await h.controller.operator_emergency_stop("independent synthetic e-stop")
+    assert h.commands == ["emergency_stop"]
+    assert h.controller.phase is RoastPhase.FAULTED
+    assert owner.endpoint is endpoint
+    assert owner.command is command

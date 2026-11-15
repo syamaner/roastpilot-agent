@@ -1037,3 +1037,41 @@ async def test_te12_containment_refusal_preserves_attempt_and_adapter_diagnostic
     assert adapter.last_containment_result is prior_diagnostic
     assert not service._human_ownership.has_pending_call  # pyright: ignore[reportPrivateUsage]
     assert session.calls == before
+
+
+async def test_t32_queued_operator_drop_joins_same_turn_protection(
+    store: RoastStore,
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator)
+    run = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+
+    clock.advance(0.25)
+    await runner.tick_once()
+    actuator.charged = True
+    actuator.bean = 185
+    clock.advance(0.25)
+    await runner.tick_once()
+    assert runner.controller_snapshot().phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    response = await service.submit_operator_action(
+        run.id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
+    )
+    assert response.queued
+    actuator.calls.clear()
+    actuator.bean = 196
+    clock.advance(0.25)
+    await runner.tick_once()
+    assert runner.controller_snapshot().human_endpoint is EndpointDisposition.ISSUED
+    clock.advance(0.25)
+    await runner.tick_once()
+    assert actuator.commands().count("drop_beans") == 1
+    timeline = await store.read_timeline(run.id)
+    outcomes = [
+        event.payload.get("outcome")
+        for event in timeline.events
+        if event.payload.get("command") == "drop_beans"
+    ]
+    assert "joined_protective_endpoint" in outcomes
