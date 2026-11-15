@@ -432,6 +432,46 @@ def test_b1_nonbytes_refused_before_admission(
         assert str(caught.value) == "synthetic collector interpretation input refused"
 
 
+def test_b1_nonbytes_precede_invalid_expectations(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Invalid expectations cannot obscure the refusal of non-byte input."""
+
+    def unexpected(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("admission called for invalid arguments")
+
+    monkeypatch.setattr(bundle_reader, "read_synthetic_bundle", unexpected)
+    expect = CoverageExpectations.model_construct(session_id="")
+    with pytest.raises(InterpretationInputError) as caught:
+        interpret_coverage_bundle(
+            cast(bytes, bytearray(b"{}")), expected_sha256="x", expectations=expect
+        )
+    assert caught.value.reason is InterpretationInputReason.DATA_NOT_BYTES
+
+
+@pytest.mark.parametrize("factor, source_clock", [(0, _U), (1, _S)])
+def test_b1_revalidates_constructed_clock_scale(
+    factor: int, source_clock: ClockName, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Invalid scale factors and sample-clock scales both refuse before S1."""
+    scale = ClockScale.model_construct(
+        source_clock=source_clock,
+        target_clock=_A,
+        target_per_source=factor,
+        valid_from=0,
+        valid_to=100,
+    )
+    expect = CoverageExpectations.model_construct(
+        session_id="session_1", bundle_id="bundle_1", clock_scales=(scale,)
+    )
+
+    def unexpected(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("admission called before revalidating a nested scale")
+
+    monkeypatch.setattr(bundle_reader, "read_synthetic_bundle", unexpected)
+    with pytest.raises(InterpretationInputError) as caught:
+        interpret_coverage_bundle(b"", expected_sha256="x", expectations=expect)
+    assert caught.value.reason is InterpretationInputReason.EXPECTATIONS_INVALID
+
+
 @pytest.mark.parametrize(
     "field, bad",
     [
@@ -535,6 +575,15 @@ def test_b3_report_rejects_reason_status_mismatches(reason: CoverageReason) -> N
                 evidence=(),
                 detail=None,
             )
+
+
+@pytest.mark.parametrize("status", [CheckStatus.INVALID, CheckStatus.UNRESOLVED])
+def test_b3_report_rejects_missing_reason_for_non_satisfied_status(status: CheckStatus) -> None:
+    """A null reason accompanies only a satisfied check."""
+    lattice = _lattice(_coverage(_data()))
+    assert lattice.reason is None and lattice.status is CheckStatus.SATISFIED
+    with pytest.raises(pydantic.ValidationError, match="reason does not match"):
+        CoverageCheckResult.model_validate(vars(lattice) | {"status": status})
 
 
 def test_b3_report_validates_detail_and_inventory() -> None:
@@ -660,12 +709,19 @@ def test_b4_fresh_process_has_no_control_imports() -> None:
     """Transitive imports from the coverage entrypoint stay offline and control-free."""
     code = """
 import sys
-import roastpilot_agent.diagnostic_collector.coverage_interpreter
+from pathlib import Path
+import roastpilot_agent.diagnostic_collector.coverage_interpreter as reviewed
+assert reviewed.__file__ is not None
+assert Path(reviewed.__file__).resolve() == Path(sys.argv[1]).resolve()
 blocked = {'controller', 'safety', 'mcp_client', 'live', 'mcp'}
 assert blocked.isdisjoint(name.rsplit('.', 1)[-1] for name in sys.modules)
 """
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src/roastpilot_agent/diagnostic_collector/coverage_interpreter.py"
+    )
     result = subprocess.run(
-        [sys.executable, "-B", "-c", code],
+        [sys.executable, "-B", "-c", code, str(source)],
         check=False,
         capture_output=True,
         text=True,
@@ -733,6 +789,32 @@ def test_l4_charge_inclusive_and_drop_strict() -> None:
     assert trailing.status is CheckStatus.SATISFIED
     assert _lattice_counts(trailing).expected_slots == 5
     assert _lattice_counts(trailing).ineligible_rows == 1
+
+
+@pytest.mark.parametrize("charge", [1000, 5333])
+@pytest.mark.parametrize("include_pre_charge_skip", [False, True])
+def test_l4_nonzero_charge_sets_first_eligible_slot(
+    charge: int, include_pre_charge_skip: bool
+) -> None:
+    """Use the first lattice point at or after charge and count each scored status."""
+    expectations = _expect(detector=_detector(charge_sample=charge))
+    skips = [_skip(0, "pre_charge")] if include_pre_charge_skip else []
+    scored = [
+        _window(5333),
+        _window(10666, status="candidate", probability=0.75),
+        _window(15999, status="confirmed", probability=0.95),
+        _window(21332),
+    ]
+    for rows, missed in ((scored, 0), (scored[:-1], 1)):
+        result = _lattice(_coverage(_data(skips + rows), expectations))
+        assert result.reason is (CoverageReason.SLOTS_MISSED if missed else None)
+        counts = _lattice_counts(result)
+        assert (counts.expected_slots, counts.scored_slots, counts.missed_slots) == (
+            4,
+            4 - missed,
+            missed,
+        )
+        assert counts.ineligible_rows == len(skips)
 
 
 def test_l5_post_drop_precedes_pre_charge_and_empty_denominator() -> None:
@@ -828,6 +910,29 @@ def test_l8_disagreeing_seconds_paths_stay_unresolved() -> None:
     )
     assert result.reason is CoverageReason.CLOCK_PATH_CONFLICT
     assert result.status is CheckStatus.UNRESOLVED and result.detail is None
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_l8_clock_failure_precedence_across_admitted_rows(reverse: bool) -> None:
+    """Out-of-domain outranks unresolved alignment, which outranks path conflict."""
+    anchors = (((_U, 0), (_A, 0)), ((_U, 0), (_M, 0)), ((_M, 0), (_A, 0)))
+    scales = (_scale(_U, _A, end=2), _scale(_U, _M, end=2), _scale(_M, _A, 2))
+    expected = _expect(detector=_clock_case(), clock_scales=scales)
+    conflict = _seconds_window() | {"decision_at": _at(1, _U)}
+    unresolved = _seconds_window() | {"decision_at": _at(10, _U)}
+    out_of_domain = _seconds_window() | {"decision_at": _at(MAX_COORDINATE + 1, _A)}
+    for rows, reason in (
+        ([conflict], CoverageReason.CLOCK_PATH_CONFLICT),
+        ([unresolved], CoverageReason.CLOCK_ALIGNMENT_UNRESOLVED),
+        ([out_of_domain], CoverageReason.INSTANT_OUT_OF_DOMAIN),
+        ([conflict, unresolved], CoverageReason.CLOCK_ALIGNMENT_UNRESOLVED),
+        ([conflict, unresolved, out_of_domain], CoverageReason.INSTANT_OUT_OF_DOMAIN),
+    ):
+        data = _data(rows[::-1] if reverse else rows, anchors=anchors)
+        result = _lattice(_coverage(data, expected))
+        assert result.reason is reason
+        assert result.status is CheckStatus.UNRESOLVED and result.detail is None
+        assert [ref.seq for ref in result.evidence] == list(range(len(rows)))
 
 
 def test_l9_huge_denominator_does_not_construct_slots() -> None:
@@ -947,6 +1052,48 @@ def test_i1_missing_and_malformed_streams_are_isolated(
                 CollectorStream.SHADOW_WINDOW if index < 2 else CollectorStream.RECORDING_SEGMENT
             )
             assert all(ref.stream is dependent for ref in after.evidence)
+
+
+@pytest.mark.parametrize(
+    "matched, bound, stream_state, reason, receipt",
+    [
+        (False, True, "present", CoverageReason.SCOPE_MISMATCH, (5, 1)),
+        (False, False, "malformed", CoverageReason.SCOPE_MISMATCH, (0, 0)),
+        (True, False, "present", CoverageReason.EXPECTATION_UNBOUND, (5, 1)),
+        (True, False, "absent", CoverageReason.EXPECTATION_UNBOUND, (0, 0)),
+        (True, False, "malformed", CoverageReason.EVIDENCE_MALFORMED, (0, 0)),
+        (True, True, "malformed", CoverageReason.EVIDENCE_MALFORMED, (0, 0)),
+    ],
+)
+def test_i1_prerequisites_cover_extent_and_both_continuity_checks(
+    matched: bool,
+    bound: bool,
+    stream_state: str,
+    reason: CoverageReason,
+    receipt: tuple[int, int],
+) -> None:
+    """Prerequisite reasons precede coverage math and producer-witness absence."""
+    rows_by_state: dict[str, list[dict[str, object]] | None] = {
+        "present": None,
+        "absent": [],
+        "malformed": [{}],
+    }
+    rows = rows_by_state[stream_state]
+    data = _data(rows, rows, session="session_1" if matched else "session_2")
+    expected = _expect(
+        detector=_detector() if bound else None,
+        recording=_recording() if bound else None,
+    )
+    report = _coverage(data, expected)
+    for index, result in enumerate(report.checks[:4]):
+        stream = CollectorStream.SHADOW_WINDOW if index < 2 else CollectorStream.RECORDING_SEGMENT
+        size = receipt[index // 2]
+        assert result.reason is reason
+        assert result.status is COVERAGE_REASON_STATUS[reason]
+        assert result.detail is None
+        assert [(ref.stream, ref.seq) for ref in result.evidence] == [
+            (stream, seq) for seq in range(size)
+        ]
 
 
 def test_i2_detector_and_recording_bindings_do_not_supply_one_another() -> None:

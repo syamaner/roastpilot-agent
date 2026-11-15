@@ -132,7 +132,10 @@ def _lattice_coverage(
     if bad_order:
         return CoverageReason.ORDER_CONFLICT, None
 
-    scored = sum(first <= slot <= last and row.status != "error" for slot, row in slots.items())
+    scored = sum(
+        first <= slot <= last and row.status in ("negative", "candidate", "confirmed")
+        for slot, row in slots.items()
+    )
     errored = sum(first <= slot <= last and row.status == "error" for slot, row in slots.items())
     missed = expected - scored
     detail = LatticeCoverageDetail(
