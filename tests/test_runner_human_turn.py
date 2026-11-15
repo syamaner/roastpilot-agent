@@ -319,8 +319,9 @@ async def test_t30c_queued_emergency_suppresses_human_read_and_urgent_drop(
     assert actuator.commands().count("drop_beans") == 0
 
 
-async def test_t51b_malformed_ambient_is_persisted_as_invalid_not_sample(
-    store: RoastStore,
+@pytest.mark.parametrize("ambient_validity", ["invalid", "absent", "valid"])
+async def test_t51b_ambient_class_is_persisted_without_fabricating_evidence(
+    store: RoastStore, ambient_validity: str
 ) -> None:
     clock = FakeClock()
     actuator = _RunnerRoaster(clock, [])
@@ -329,15 +330,26 @@ async def test_t51b_malformed_ambient_is_persisted_as_invalid_not_sample(
     runner = service.runner
     assert runner is not None
     state = RoastSessionState.model_validate(SESSION_STATE_PAYLOAD)
-    malformed = state.ambient_status.model_copy(update={"temperature_c": float("nan")})
-    actuator.last_state = state.model_copy(update={"ambient_status": malformed})
+    status = state.ambient_status
+    if ambient_validity == "invalid":
+        status = status.model_copy(update={"temperature_c": float("nan")})
+    elif ambient_validity == "absent":
+        status = status.model_copy(
+            update={
+                "temperature_c": None,
+                "humidity_percent": None,
+                "pressure_hpa": None,
+                "last_reading_monotonic_seconds": None,
+            }
+        )
+    actuator.last_state = state.model_copy(update={"ambient_status": status})
     clock.advance(0.25)
     await runner.tick_once()
     async with store.connection.execute(
         "SELECT reason FROM safety_evaluations WHERE run_id = ?", (detail.id,)
     ) as cursor:
         rows = await cursor.fetchall()
-    assert any("ambient invalid, ambient age seconds None" in row[0] for row in rows)
+    assert any(f"ambient {ambient_validity}, ambient age seconds None" in row[0] for row in rows)
 
 
 async def test_t49_human_faulted_restart_retains_unknown_ownership(store: RoastStore) -> None:

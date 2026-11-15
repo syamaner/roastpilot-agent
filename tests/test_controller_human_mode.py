@@ -6,7 +6,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
-from unittest.mock import Mock
+from unittest.mock import Mock, PropertyMock
 
 import pytest
 
@@ -1649,3 +1649,75 @@ async def test_te25_other_existing_emergency_retry_sources_survive_closure(
     ]
     assert not await h.controller._set_targets(heat_percent=0, fan_percent=0)  # pyright: ignore[reportPrivateUsage]
     assert h.commands == ["set_heat", "set_fan"]
+
+
+@pytest.mark.parametrize("uncertain", [False, True])
+@pytest.mark.parametrize(
+    ("method", "command", "setup_phase", "settled_phase"),
+    [
+        (
+            "operator_mark_beans_added",
+            "mark_beans_added",
+            RoastPhase.PREHEATING,
+            RoastPhase.PREHEATING,
+        ),
+        (
+            "operator_mark_first_crack",
+            "mark_first_crack",
+            RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            RoastPhase.DEVELOPMENT,
+        ),
+        ("operator_start_cooling", "start_cooling", RoastPhase.FAULTED, RoastPhase.FAULTED),
+        ("operator_stop_cooling", "stop_cooling", RoastPhase.FAULTED, RoastPhase.FAULTED),
+    ],
+)
+async def test_te22_queued_non_heat_obeys_existing_ownership_without_fence_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    uncertain: bool,
+    method: str,
+    command: str,
+    setup_phase: RoastPhase,
+    settled_phase: RoastPhase,
+) -> None:
+    h = await make_human()
+    if setup_phase is RoastPhase.ROASTING_PRE_FIRST_CRACK:
+        await h.turn(bean=180)
+        await h.turn(bean=185, t0=True)
+    elif setup_phase is RoastPhase.FAULTED:
+        h.controller.transition_to(RoastPhase.FAULTED)
+    h.actuator.calls.clear()
+    callback = cast("Callable[[], Awaitable[None]]", getattr(h.controller, method))
+    owner = h.controller._human_run  # pyright: ignore[reportPrivateUsage]
+    assert owner is not None and h.controller.phase is setup_phase
+
+    def forbidden() -> bool:
+        pytest.fail("ordinary NON_HEAT checked a newly added admission predicate")
+
+    with monkeypatch.context() as guarded:
+        async with h.arbiter._condition:  # pyright: ignore[reportPrivateUsage]
+            pending = asyncio.create_task(callback())
+            await asyncio.sleep(0)
+            assert not pending.done()
+            h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+            guarded.setattr(
+                HumanCallAdmissionFence, "closed_reason", PropertyMock(side_effect=forbidden)
+            )
+            guarded.setattr(h.controller, "_teardown_unconfirmed", forbidden)
+            if uncertain:
+                owner.command = CommandDisposition.UNKNOWN
+        await pending
+    assert h.commands == ([] if uncertain else [command])
+    assert h.controller.phase is (setup_phase if uncertain else settled_phase)
+
+
+@pytest.mark.parametrize("target", [RoastPhase.IDLE, RoastPhase.COMPLETE, RoastPhase.COOLING])
+async def test_human_nonheating_continuation_transitions_without_hardware_command(
+    target: RoastPhase,
+) -> None:
+    h = await make_human()
+    h.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    h.actuator.calls.clear()
+    assert await h.controller.human_operator_continue(target)
+    assert h.controller.phase is target
+    assert h.actuator.calls == []
+    assert not h.controller._protection_check_pending  # pyright: ignore[reportPrivateUsage]
