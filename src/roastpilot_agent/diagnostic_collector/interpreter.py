@@ -6,9 +6,9 @@ from typing import Iterator, TypeVar, cast  # noqa: UP035 - synthetic import all
 from pydantic import ValidationError
 
 import roastpilot_agent.diagnostic_collector.bundle_reader as bundle_reader
+from roastpilot_agent.diagnostic_collector._clock_projection import ClockProjection
 from roastpilot_agent.diagnostic_collector.bundle_schema import (
     AdmittedBundle,
-    AlignmentAnchor,
     ClockName,
     CollectorAuthority,
     CollectorEnvelope,
@@ -31,7 +31,6 @@ from roastpilot_agent.diagnostic_collector.interpretation_schema import (
     CheckReason,
     CheckResult,
     CheckStatus,
-    ClockScale,
     ComponentIdentity,
     EvidenceRef,
     InterpretationInputError,
@@ -60,107 +59,10 @@ _Outcome = CheckReason | Fraction | None
 _Payload = TypeVar("_Payload", bound=CollectorPayload)
 
 
-class _ClockEdge:
-    """An anchored affine mapping in the rate's declared source coordinates."""
-
-    def __init__(self, anchor: AlignmentAnchor, scale: ClockScale | None, rate: int | None) -> None:
-        source, target = anchor.source_clock, anchor.target_clock
-        source_value, target_value = anchor.source_value, anchor.target_value
-        if scale is not None and source is not scale.source_clock:
-            source, target = target, source
-            source_value, target_value = target_value, source_value
-        self.source = source
-        self.target = target
-        self.source_value = Fraction(source_value)
-        self.target_value = Fraction(target_value)
-        if scale is not None:
-            self.scale = Fraction(scale.target_per_source)
-        else:
-            sample_rate = cast(int, rate)  # Sample edges exist only with a bound rate.
-            self.scale = (
-                Fraction(1, sample_rate)
-                if source is ClockName.RECORDING_SAMPLES
-                else Fraction(sample_rate)
-            )
-        self.validity = None if scale is None else (scale.valid_from, scale.valid_to)
-
-    def project(self, source: ClockName, point: Fraction) -> tuple[ClockName, Fraction] | None:
-        if source is self.source:
-            source_point = point
-            destination = self.target
-            projection = self.target_value + (point - self.source_value) * self.scale
-        else:
-            source_point = self.source_value + (point - self.target_value) / self.scale
-            destination = self.source
-            projection = source_point
-        if self.validity is not None:
-            low, high = self.validity
-            if not (low <= self.source_value <= high and low <= source_point <= high):
-                return None
-        return destination, projection
-
-
-class _Clocks:
-    """Resolve a fixed target through all usable simple clock paths."""
-
-    def __init__(
-        self, anchors: tuple[AlignmentAnchor, ...], expectations: SyntheticExpectations
-    ) -> None:
-        self.rate = expectations.recording_sample_rate_hz
-        self.edges: dict[ClockName, list[_ClockEdge]] = {clock: [] for clock in ClockName}
-        scales = {
-            frozenset((scale.source_clock, scale.target_clock)): scale
-            for scale in expectations.clock_scales
-        }
-        for anchor in anchors:
-            pair = frozenset((anchor.source_clock, anchor.target_clock))
-            scale = scales.get(pair)
-            if scale is None and (ClockName.RECORDING_SAMPLES not in pair or self.rate is None):
-                continue
-            edge = _ClockEdge(anchor, scale, self.rate)
-            self.edges[edge.source].append(edge)
-            self.edges[edge.target].append(edge)
-
-    def point(self, instant: Instant, target: ClockName) -> Fraction | CheckReason:
-        if instant.value > MAX_COORDINATE:
-            return CheckReason.INSTANT_OUT_OF_DOMAIN
-        if instant.clock is target:
-            return Fraction(instant.value)
-
-        values: set[Fraction] = set()
-        paths = [(instant.clock, Fraction(instant.value), frozenset((instant.clock,)), False)]
-        while paths:
-            clock, point, visited, out_of_domain = paths.pop()
-            for edge in self.edges[clock]:
-                neighbor = edge.target if clock is edge.source else edge.source
-                if neighbor in visited:
-                    continue
-                step = edge.project(clock, point)
-                if step is None:
-                    continue
-                destination, projected = step
-                outside = out_of_domain or not (
-                    0 <= projected <= MAX_COORDINATE
-                    and edge.source_value <= MAX_COORDINATE
-                    and edge.target_value <= MAX_COORDINATE
-                )
-                if destination is target:
-                    if outside:
-                        return CheckReason.INSTANT_OUT_OF_DOMAIN
-                    values.add(projected)
-                else:
-                    paths.append((destination, projected, visited | {destination}, outside))
-        if not values:
-            return CheckReason.CLOCK_ALIGNMENT_UNRESOLVED
-        if len(values) > 1:
-            return CheckReason.CLOCK_PATH_CONFLICT
-        return values.pop()
-
-
 class _Chronology:
     """Accumulate exact observations and precedence in the chosen metric clock."""
 
-    def __init__(self, clocks: _Clocks, metric: Instant) -> None:
+    def __init__(self, clocks: ClockProjection, metric: Instant) -> None:
         self.clocks = clocks
         self.metric = metric
         self.last: Fraction | None = None
@@ -250,7 +152,11 @@ class _Interpretation:
     def __init__(self, bundle: AdmittedBundle, expectations: SyntheticExpectations) -> None:
         self.bundle = bundle
         self.expected = expectations
-        self.clocks = _Clocks(bundle.header.alignments, expectations)
+        self.clocks = ClockProjection(
+            bundle.header.alignments,
+            expectations.clock_scales,
+            expectations.recording_sample_rate_hz,
+        )
         self.scope_matches = (
             bundle.header.session_id == expectations.session_id
             and bundle.header.bundle_id == expectations.bundle_id
