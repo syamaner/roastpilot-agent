@@ -180,6 +180,36 @@ COVERAGE_REASON_STATUS = {
 }
 
 
+_PREREQUISITE_REASONS = frozenset(
+    {
+        CoverageReason.SCOPE_MISMATCH,
+        CoverageReason.EVIDENCE_MALFORMED,
+        CoverageReason.EXPECTATION_UNBOUND,
+        CoverageReason.EVIDENCE_ABSENT,
+    }
+)
+_CONTINUITY_REASONS = _PREREQUISITE_REASONS | {CoverageReason.PRODUCER_WITNESS_ABSENT}
+_REASONS_BY_CHECK: dict[CoverageCheckName, frozenset[CoverageReason | None]] = {
+    CoverageCheckName.LATTICE_SCORE_COVERAGE: _PREREQUISITE_REASONS
+    | {
+        None,
+        CoverageReason.INSTANT_OUT_OF_DOMAIN,
+        CoverageReason.CLOCK_ALIGNMENT_UNRESOLVED,
+        CoverageReason.CLOCK_PATH_CONFLICT,
+        CoverageReason.OFF_LATTICE,
+        CoverageReason.CONFLICT,
+        CoverageReason.ORDER_CONFLICT,
+        CoverageReason.EMPTY_DENOMINATOR,
+        CoverageReason.SLOTS_MISSED,
+    },
+    CoverageCheckName.DETECTOR_CAPTURE_CONTINUITY: _CONTINUITY_REASONS,
+    CoverageCheckName.RECORDING_EXTENT_COVERAGE: _PREREQUISITE_REASONS
+    | {None, CoverageReason.INSTANT_OUT_OF_DOMAIN, CoverageReason.CONFLICT, CoverageReason.GAP},
+    CoverageCheckName.RECORDING_CAPTURE_CONTINUITY: _CONTINUITY_REASONS,
+    CoverageCheckName.OBSERVED_PROVENANCE: frozenset({CoverageReason.SYNTHETIC_EVIDENCE}),
+}
+
+
 class CoverageAdapterLimit(Enum):
     """Evidence requirements for later producers and qualification."""
 
@@ -255,6 +285,10 @@ class CoverageCheckResult(_ClosedModel):
         )
         if self.status is not status:
             raise ValueError("reason does not match check status")
+        if self.reason not in _REASONS_BY_CHECK[self.check]:
+            raise ValueError("reason is unreachable for this check")
+        if self.check is CoverageCheckName.OBSERVED_PROVENANCE and self.evidence:
+            raise ValueError("expected empty provenance evidence")
         expected_detail: type[object] = type(None)
         if self.check is CoverageCheckName.LATTICE_SCORE_COVERAGE and self.reason in (
             None,
@@ -270,13 +304,28 @@ class CoverageCheckResult(_ClosedModel):
             expected_detail = RecordingExtentDetail
         if type(self.detail) is not expected_detail:
             raise ValueError("detail does not match check and reason")
-        if (
-            self.reason is CoverageReason.EMPTY_DENOMINATOR
-            and isinstance(self.detail, LatticeCoverageDetail)
-            and self.detail.expected_slots != 0
-        ):
-            raise ValueError("expected an empty denominator")
+        if isinstance(self.detail, LatticeCoverageDetail):
+            self._validate_lattice_counts(self.detail)
+        if isinstance(self.detail, RecordingExtentDetail):
+            self._validate_extent_counts(self.detail)
         return self
+
+    def _validate_lattice_counts(self, detail: LatticeCoverageDetail) -> None:
+        if self.reason is None and (detail.expected_slots == 0 or detail.missed_slots != 0):
+            raise ValueError("expected a positive lattice with zero misses")
+        if self.reason is CoverageReason.SLOTS_MISSED and detail.missed_slots == 0:
+            raise ValueError("expected positive lattice misses")
+        if self.reason is CoverageReason.EMPTY_DENOMINATOR and detail.expected_slots != 0:
+            raise ValueError("expected an empty denominator")
+
+    def _validate_extent_counts(self, detail: RecordingExtentDetail) -> None:
+        conflict = detail.overlapping_spans > 0 or detail.rate_mismatch_rows > 0
+        if self.reason is None and (detail.uncovered_samples != 0 or conflict):
+            raise ValueError("expected an extent without gaps or conflicts")
+        if self.reason is CoverageReason.GAP and (detail.uncovered_samples == 0 or conflict):
+            raise ValueError("expected an extent gap without conflicts")
+        if self.reason is CoverageReason.CONFLICT and not conflict:
+            raise ValueError("expected an extent overlap or rate mismatch")
 
 
 class CoverageReport(_ClosedModel):

@@ -621,6 +621,168 @@ def test_b3_report_validates_detail_and_inventory() -> None:
         RecordingExtentDetail.model_validate(vars(extent.detail) | {"uncovered_samples": 1})
 
 
+def _lattice_detail(expected: int, missed: int) -> LatticeCoverageDetail:
+    return LatticeCoverageDetail(
+        expected_slots=expected,
+        scored_slots=expected - missed,
+        errored_slots=0,
+        missed_slots=missed,
+        duplicate_rows=0,
+        ineligible_rows=0,
+    )
+
+
+def _extent_detail(*, gap: int = 0, overlap: int = 0, rate: int = 0) -> RecordingExtentDetail:
+    return RecordingExtentDetail(
+        required_samples=1000,
+        covered_samples=1000 - gap,
+        uncovered_samples=gap,
+        selected_rows=2,
+        foreign_rows=0,
+        exact_duplicate_rows=0,
+        rate_mismatch_rows=rate,
+        contained_spans=0,
+        overlapping_spans=overlap,
+    )
+
+
+@pytest.mark.parametrize(
+    "check, additional",
+    [
+        (
+            CoverageCheckName.LATTICE_SCORE_COVERAGE,
+            {
+                None,
+                CoverageReason.INSTANT_OUT_OF_DOMAIN,
+                CoverageReason.CLOCK_ALIGNMENT_UNRESOLVED,
+                CoverageReason.CLOCK_PATH_CONFLICT,
+                CoverageReason.OFF_LATTICE,
+                CoverageReason.CONFLICT,
+                CoverageReason.ORDER_CONFLICT,
+                CoverageReason.EMPTY_DENOMINATOR,
+                CoverageReason.SLOTS_MISSED,
+            },
+        ),
+        (CoverageCheckName.DETECTOR_CAPTURE_CONTINUITY, {CoverageReason.PRODUCER_WITNESS_ABSENT}),
+        (
+            CoverageCheckName.RECORDING_EXTENT_COVERAGE,
+            {
+                None,
+                CoverageReason.INSTANT_OUT_OF_DOMAIN,
+                CoverageReason.CONFLICT,
+                CoverageReason.GAP,
+            },
+        ),
+        (CoverageCheckName.RECORDING_CAPTURE_CONTINUITY, {CoverageReason.PRODUCER_WITNESS_ABSENT}),
+        (CoverageCheckName.OBSERVED_PROVENANCE, {CoverageReason.SYNTHETIC_EVIDENCE}),
+    ],
+)
+@pytest.mark.parametrize("reason", [None, *CoverageReason])
+def test_b3_check_reason_grammar(
+    check: CoverageCheckName,
+    additional: set[CoverageReason | None],
+    reason: CoverageReason | None,
+) -> None:
+    """Only reachable check/reason pairs validate through the strict report model."""
+    common = {
+        CoverageReason.SCOPE_MISMATCH,
+        CoverageReason.EVIDENCE_MALFORMED,
+        CoverageReason.EXPECTATION_UNBOUND,
+        CoverageReason.EVIDENCE_ABSENT,
+    }
+    allowed = additional if check is CoverageCheckName.OBSERVED_PROVENANCE else additional | common
+    detail: LatticeCoverageDetail | RecordingExtentDetail | None = None
+    if check is CoverageCheckName.LATTICE_SCORE_COVERAGE:
+        detail = {
+            None: _lattice_detail(1, 0),
+            CoverageReason.SLOTS_MISSED: _lattice_detail(1, 1),
+            CoverageReason.EMPTY_DENOMINATOR: _lattice_detail(0, 0),
+        }.get(reason)
+    if check is CoverageCheckName.RECORDING_EXTENT_COVERAGE:
+        detail = {
+            None: _extent_detail(),
+            CoverageReason.GAP: _extent_detail(gap=10),
+            CoverageReason.CONFLICT: _extent_detail(overlap=1),
+        }.get(reason)
+    status = CheckStatus.SATISFIED if reason is None else COVERAGE_REASON_STATUS[reason]
+    fields = dict(check=check, reason=reason, status=status, detail=detail, evidence=())
+    if reason not in allowed:
+        with pytest.raises(pydantic.ValidationError, match="reason is unreachable"):
+            CoverageCheckResult.model_validate(fields)
+        return
+    result = CoverageCheckResult.model_validate(fields)
+    assert CoverageCheckResult.model_validate(result.model_dump()) == result
+
+
+def test_b3_provenance_refuses_evidence_reference() -> None:
+    """Synthetic provenance cannot carry unrelated references."""
+    report = _coverage(_data())
+    reference = _lattice(report).evidence[:1]
+    assert len(reference) == 1
+    with pytest.raises(pydantic.ValidationError, match="empty provenance evidence"):
+        CoverageCheckResult.model_validate(vars(report.checks[-1]) | {"evidence": reference})
+
+
+@pytest.mark.parametrize(
+    "reason, expected, missed, message",
+    [
+        (None, 0, 0, "positive lattice with zero misses"),
+        (None, 2, 1, "positive lattice with zero misses"),
+        (CoverageReason.SLOTS_MISSED, 2, 0, "positive lattice misses"),
+        (CoverageReason.EMPTY_DENOMINATOR, 2, 2, "empty denominator"),
+    ],
+)
+def test_b3_rejects_contradictory_lattice_counts(
+    reason: CoverageReason | None, expected: int, missed: int, message: str
+) -> None:
+    """Internally consistent lattice counts must also support the claimed result."""
+    status = CheckStatus.SATISFIED if reason is None else COVERAGE_REASON_STATUS[reason]
+    with pytest.raises(pydantic.ValidationError, match=message):
+        CoverageCheckResult(
+            check=CoverageCheckName.LATTICE_SCORE_COVERAGE,
+            status=status,
+            reason=reason,
+            evidence=(),
+            detail=_lattice_detail(expected, missed),
+        )
+
+
+@pytest.mark.parametrize(
+    "reason, gap, overlap, rate, valid",
+    [
+        (None, 10, 0, 0, False),
+        (None, 0, 1, 0, False),
+        (None, 0, 0, 1, False),
+        (CoverageReason.GAP, 0, 0, 0, False),
+        (CoverageReason.GAP, 10, 1, 0, False),
+        (CoverageReason.GAP, 10, 0, 1, False),
+        (CoverageReason.CONFLICT, 0, 0, 0, False),
+        (CoverageReason.CONFLICT, 10, 0, 0, False),
+        (CoverageReason.CONFLICT, 0, 1, 0, True),
+        (CoverageReason.CONFLICT, 10, 1, 0, True),
+        (CoverageReason.CONFLICT, 0, 0, 1, True),
+        (CoverageReason.CONFLICT, 10, 0, 1, True),
+    ],
+)
+def test_b3_extent_counts_support_reason(
+    reason: CoverageReason | None, gap: int, overlap: int, rate: int, valid: bool
+) -> None:
+    """Either kind of conflict takes precedence over a gap in a validated result."""
+    status = CheckStatus.SATISFIED if reason is None else COVERAGE_REASON_STATUS[reason]
+    fields = {
+        "check": CoverageCheckName.RECORDING_EXTENT_COVERAGE,
+        "status": status,
+        "reason": reason,
+        "evidence": (),
+        "detail": _extent_detail(gap=gap, overlap=overlap, rate=rate),
+    }
+    if valid:
+        assert CoverageCheckResult.model_validate(fields).reason is reason
+    else:
+        with pytest.raises(pydantic.ValidationError, match="expected an extent"):
+            CoverageCheckResult.model_validate(fields)
+
+
 @pytest.mark.parametrize(
     "module, plain, collector_modules, classes, functions",
     [
@@ -821,9 +983,11 @@ def test_l5_post_drop_precedes_pre_charge_and_empty_denominator() -> None:
     """A valid straddle cannot certify coverage, and a wrong label is a conflict."""
     expectations = _expect(detector=_detector(charge_sample=1000, drop_sample=7000))
     wrong = _lattice(_coverage(_data([_skip(0, "pre_charge")]), expectations))
+    eligible = _lattice(_coverage(_data([_window(0)]), expectations))
     correct = _lattice(_coverage(_data([_skip(0)]), expectations))
     absent = _lattice(_coverage(_data([]), expectations))
     assert wrong.reason is CoverageReason.CONFLICT and wrong.detail is None
+    assert eligible.reason is CoverageReason.CONFLICT and eligible.detail is None
     assert correct.reason is CoverageReason.EMPTY_DENOMINATOR
     assert _lattice_counts(correct).expected_slots == 0
     assert absent.reason is CoverageReason.EVIDENCE_ABSENT and absent.detail is None
