@@ -254,6 +254,22 @@ class AcceptedReadingTracker:
             return ReadingFreshness.FRESH
         return ReadingFreshness.STALE
 
+    def acceptance_age_seconds(self) -> float | None:
+        """Sample elapsed time since the conservative bound for diagnostics.
+
+        This is an age relative to request admission, not a physical sample
+        timestamp. Reading the diagnostic does not change tracker state.
+        """
+        bound = self._acceptance_bound
+        previous = self._previous
+        if bound is None or previous is None:
+            return None
+        now = self._clock()
+        if not math.isfinite(now) or now < previous.admitted_at:
+            return None
+        age = now - bound
+        return age if math.isfinite(age) else None
+
     def _clear(self, freshness: ReadingFreshness) -> ReadingFreshness:
         self._previous = None
         self._acceptance_bound = None
