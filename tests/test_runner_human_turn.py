@@ -2029,6 +2029,7 @@ async def test_tf19_uncertain_completion_stays_closed_after_another_noncommit(
         else:
             assert not await runner.tick_once()
         assert controller.human_drop_closed()
+        assert runner._completion_persistence_initiated is True  # pyright: ignore[reportPrivateUsage]
     setting = "proven"
     if prior != "raised":
         assert (await service.submit_operator_action(run_id, request)).queued
@@ -2638,6 +2639,7 @@ async def test_am5_estop_route_during_owned_human_evaluation(
     cancelled_waiter_consumed = asyncio.Event()
     cooling_samples: list[tuple[str, str]] = []
     advertised_cooling_while_blocked = False
+    reservation_after_stop = False
 
     original_record = store.record_safety_evaluation
     original_ack = actuator.read_fault_acknowledgement_state
@@ -2846,7 +2848,10 @@ async def test_am5_estop_route_during_owned_human_evaluation(
                 await request
         if cooling_samples:
             assert await service.settle_fault_lease_persistence_for_teardown()
-            cooling_samples.append(await cooling_sample())
+            gate = service._fault_acknowledgement_gate  # pyright: ignore[reportPrivateUsage]
+            reservation_after_stop = gate.fault_finalization_started
+            if reservation_after_stop:
+                cooling_samples.append(await cooling_sample())
             durable = await store.read_fault_control_lease()
             projection = await service._fault_controls_projection(durable)  # pyright: ignore[reportPrivateUsage]
             advertised_cooling_while_blocked = (
