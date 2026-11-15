@@ -15,8 +15,10 @@ from httpx import ASGITransport, AsyncClient
 from roastpilot_agent.api import (
     QueuedOperatorAction,
     RoastRunConflictError,
+    RoastRunner,
     RoastService,
     ShutdownHeatOffOutcome,
+    _FinalisationCloseEvidence,  # pyright: ignore[reportPrivateUsage]
     create_app,
     stream_events,
 )
@@ -42,13 +44,18 @@ from roastpilot_agent.human_run_ownership import (
 )
 from roastpilot_agent.mcp_client import RoasterControlAdapter, RoastSessionState
 from roastpilot_agent.models import (
+    FaultControlsActionRequest,
     FaultControlState,
+    FaultLeaseStatus,
     OperatorAction,
     OperatorActionRequest,
     RestartClearanceState,
+    RoastCommand,
+    RoastEventKind,
     RoastPhase,
 )
-from roastpilot_agent.store import RoastStore
+from roastpilot_agent.safety import SafetyEvaluation
+from roastpilot_agent.store import FaultControlCloseResult, FaultControlLease, RoastStore
 from tests.conftest import FakeClock, FakeMCPClient
 from tests.test_api import (
     _collect_frames,  # pyright: ignore[reportPrivateUsage]
@@ -969,8 +976,9 @@ async def test_td2_td3_td5_late_read_cannot_seed_the_next_started_session(
     assert lease.mcp_session_id == next_id
 
 
+@pytest.mark.parametrize("failure", ["admission", "raises", "timeout"])
 async def test_te5_shutdown_admission_failure_keeps_fence_terminal(
-    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     clock = FakeClock()
     actuator = _RunnerRoaster(clock, [])
@@ -986,12 +994,41 @@ async def test_te5_shutdown_admission_failure_keeps_fence_terminal(
         assert service._human_admission.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN  # pyright: ignore[reportPrivateUsage]
         raise RuntimeError("synthetic shutdown priority admission failure")
 
-    monkeypatch.setattr(service, "_admit_shutdown_emergency_stop", cannot_admit)
+    async def failed_write(*, reason: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        assert service._human_admission.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN  # pyright: ignore[reportPrivateUsage]
+        if failure == "timeout":
+            await asyncio.Future[None]()
+        raise RuntimeError(reason)
+
+    if failure == "admission":
+        monkeypatch.setattr(service, "_admit_shutdown_emergency_stop", cannot_admit)
+    else:
+        monkeypatch.setattr(actuator, "emergency_stop", failed_write)
     actuator.calls.clear()
-    assert await service.safe_shutdown_heat_off() is ShutdownHeatOffOutcome.UNCONFIRMED
+    assert (
+        await service.safe_shutdown_heat_off(timeout_seconds=0.05)
+        is ShutdownHeatOffOutcome.UNCONFIRMED
+    )
     assert attempts == 2
-    await runner.tick_once()
-    assert actuator.calls == []
+    ticked = asyncio.Event()
+
+    async def old_loop() -> None:
+        await runner.tick_once()
+        ticked.set()
+        await asyncio.Future[None]()
+
+    loop = asyncio.create_task(old_loop())
+    monkeypatch.setattr(service, "_loop_task", loop)
+    try:
+        await asyncio.wait_for(ticked.wait(), 1)
+    finally:
+        await service.shutdown()
+    assert loop.cancelled()
+    assert actuator.commands() == ([] if failure == "admission" else ["set_heat", "set_fan"])
+    if failure != "admission":
+        assert actuator.calls[0] == ("set_heat", {"heat_percent": 0})
     assert actuator.reads == actuator.containments == 0
     assert service._human_admission.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN  # pyright: ignore[reportPrivateUsage]
 
@@ -1201,3 +1238,721 @@ async def test_t51_stale_read_persists_conservative_age_in_safety_evaluation(
         "BT valid, ET valid, accepted reading stale, conservative age seconds 20.25" in reason
         for reason in reasons
     )
+
+
+class _ExactFaultRunner(_RunnerRoaster):
+    """Synthetic exact-session fault port with separately controlled readback."""
+
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__(clock, [])
+        self.set_latest_fault_session_id(self.session_id)
+        self.fault_writes: list[OperatorAction] = []
+        self.issued_readback = "confirmed"
+        self.after_drop_read: asyncio.Event | None = None
+        self.release_drop_read: asyncio.Event | None = None
+        self.cooling = False
+        self.fault_reads: list[str] = []
+
+    async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+        assert session_id == self.session_id
+        self.fault_reads.append(session_id)
+        issued = OperatorAction.DROP_BEANS in self.fault_writes
+        outcome = self.issued_readback if issued else "before"
+        if issued and self.after_drop_read is not None:
+            assert self.release_drop_read is not None
+            self.after_drop_read.set()
+            await self.release_drop_read.wait()
+        if outcome == "timeout":
+            raise TimeoutError("synthetic absent readback")
+        if outcome == "error":
+            raise RuntimeError("synthetic failed readback")
+        state = FaultControlState(
+            session_id=session_id,
+            mcp_phase="fault",
+            active=False,
+            device_connected=outcome != "contradiction_disconnected",
+            heat_level_percent=0,
+            fan_level_percent=0,
+            cooling_on=self.cooling,
+            beans_added=True,
+            beans_dropped=outcome in {"confirmed", "nonconfirming"},
+        )
+        if outcome in {"contradiction_nonfault", "nonconfirming"}:
+            return state.model_copy(update={"mcp_phase": "cooling"})
+        return state
+
+    async def read_latest_fault_control_state(self) -> FaultControlState:
+        return await self.read_fault_control_state(self.session_id)
+
+    async def write_fault_control(
+        self, action: OperatorAction, *, expected_session_id: str
+    ) -> None:
+        assert expected_session_id == self.session_id
+        self.fault_writes.append(action)
+        if action in (OperatorAction.START_COOLING, OperatorAction.STOP_COOLING):
+            self.cooling = action is OperatorAction.START_COOLING
+
+
+async def _faulted_run(
+    store: RoastStore, *, open_lease: bool = True
+) -> tuple[RoastService, RoastRunner, _ExactFaultRunner, str, FaultControlLease | None]:
+    clock = FakeClock()
+    actuator = _ExactFaultRunner(clock)
+    service = _service(store, clock, actuator, exact_child=True)
+    run = await service.start_roast(PROFILE)
+    await _charge_live_runner(service, actuator, clock)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    controller.transition_to(RoastPhase.FAULTED)
+    clock.advance(0.25)
+    await runner.tick_once()
+    assert controller.human_recovery_drop_allowed(session_id=actuator.session_id)
+    lease = (
+        await store.open_fault_control_lease(run_id=run.id, mcp_session_id=actuator.session_id)
+        if open_lease
+        else None
+    )
+    actuator.calls.clear()
+    return service, runner, actuator, run.id, lease
+
+
+@pytest.mark.parametrize(
+    ("readback", "expected", "confirmation"),
+    [
+        ("confirmed", EndpointDisposition.ISSUED, "read_back"),
+        ("contradiction", EndpointDisposition.UNKNOWN, "rejected_readback"),
+        ("contradiction_nonfault", EndpointDisposition.UNKNOWN, "rejected_readback"),
+        ("contradiction_disconnected", EndpointDisposition.UNKNOWN, "rejected_readback"),
+        ("nonconfirming", EndpointDisposition.ISSUED, "rejected_readback"),
+        ("timeout", EndpointDisposition.ISSUED, "readback_failed"),
+        ("error", EndpointDisposition.ISSUED, "readback_failed"),
+    ],
+)
+async def test_tf2_tf8_exact_human_drop_classifies_the_returned_fault_state(
+    store: RoastStore, readback: str, expected: EndpointDisposition, confirmation: str
+) -> None:
+    service, runner, actuator, run_id, lease = await _faulted_run(store)
+    assert lease is not None
+    actuator.issued_readback = readback
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    response = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
+    )
+    assert response.result == ("accepted" if readback == "confirmed" else "failed")
+    assert response.reason == (
+        "fault action accepted through exact-session controller dispatch"
+        if readback == "confirmed"
+        else "exact fault-session action was not confirmed"
+    )
+    assert actuator.fault_writes == [OperatorAction.DROP_BEANS]
+    assert actuator.fault_reads == [actuator.session_id] * 2
+    assert controller.phase is RoastPhase.FAULTED
+    assert controller.snapshot().human_endpoint is expected
+    assert controller.snapshot().human_command_disposition is (
+        CommandDisposition.UNKNOWN
+        if expected is EndpointDisposition.UNKNOWN
+        else CommandDisposition.SETTLED
+    )
+    assert not controller.has_pending_fault_drop_readback()
+    assert await store.read_fault_control_lease() == lease
+    assert actuator.commands() == []
+    executor = service._fault_control_executor  # pyright: ignore[reportPrivateUsage]
+    assert executor is not None
+    assert await executor.settle_for_shutdown()
+    await runner.tick_once()
+    timeline = await store.read_timeline(run_id)
+    assert any(
+        entry.tool is RoastCommand.DROP_BEANS
+        and entry.result is not None
+        and entry.result.get("confirmation") == confirmation
+        for entry in timeline.commands
+    )
+    assert (
+        sum(
+            event.kind is RoastEventKind.COMMAND_EXECUTED
+            and event.payload is not None
+            and event.payload.get("command") == "drop_beans"
+            for event in timeline.events
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize("route", ["d212", "complete", "legacy"])
+async def test_tf20_completion_persistence_waits_for_owned_drop_evaluation(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    service, runner, actuator, run_id, lease = await _faulted_run(store, open_lease=route == "d212")
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    held, release, barrier = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    order: list[str] = []
+    original_record = store.record_safety_evaluation
+    original_settle = controller.settle_human_drop_evaluations
+    original_complete = store.complete_run
+    original_close = store.close_fault_control_lease_atomically
+
+    async def record(*, run_id: str, tick: int, evaluation: SafetyEvaluation) -> int:
+        target = evaluation.rule == "human_recovery_drop"
+        if target:
+            held.set()
+            await release.wait()
+        row = await original_record(run_id=run_id, tick=tick, evaluation=evaluation)
+        if target:
+            order.append("evaluation committed")
+        return row
+
+    async def settle() -> bool:
+        assert controller.human_drop_closed()
+        barrier.set()
+        return await original_settle()
+
+    async def finish(**kwargs: object) -> None:
+        order.append("complete_run")
+        await original_complete(**kwargs)  # type: ignore[arg-type]
+
+    async def close(**kwargs: object) -> FaultControlCloseResult:
+        order.append("D212 close")
+        return await original_close(**kwargs)  # type: ignore[arg-type]
+
+    async def export() -> None:
+        order.append("export")
+
+    async def impossible_write() -> None:
+        pytest.fail("DROP evaluation completed after admission closed")
+
+    monkeypatch.setattr(store, "record_safety_evaluation", record)
+    monkeypatch.setattr(store, "complete_run", finish)
+    monkeypatch.setattr(store, "close_fault_control_lease_atomically", close)
+    monkeypatch.setattr(runner, "_export_logs", export)
+    monkeypatch.setattr(controller, "settle_human_drop_evaluations", settle)
+    drop = asyncio.create_task(
+        controller.execute_human_fault_drop(
+            actuator.session_id,
+            generation=controller.command_generation,
+            lease_current=lambda: True,
+            operation=impossible_write,
+        )
+    )
+    try:
+        await asyncio.wait_for(held.wait(), 1)
+        if route == "complete":
+            # Reach COMPLETE through the normal phase sequence without
+            # dispatching a second drop into the held evaluation.
+            monkeypatch.setattr(controller, "_phase", RoastPhase.COOLING)
+            controller.transition_to(RoastPhase.COMPLETE)
+        else:
+            action = (
+                OperatorAction.ACKNOWLEDGE_FAULT
+                if lease is None
+                else OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE
+            )
+            payload = (
+                None
+                if lease is None
+                else {"confirmation": True, "expected_generation": lease.generation}
+            )
+            admitted = await service.submit_operator_action(
+                run_id, OperatorActionRequest(action=action, payload=payload)
+            )
+            assert admitted.result == "accepted" and admitted.queued
+        completion = asyncio.create_task(runner.tick_once())
+        try:
+            await asyncio.wait_for(barrier.wait(), 1)
+            assert controller.human_drop_closed()
+            assert not completion.done()
+            assert order == []
+            detail = await store.read_run(run_id)
+            assert detail is not None and detail.completed_at_utc is None
+        finally:
+            release.set()
+            completed = await completion
+        assert completed
+        assert not await drop
+        assert controller.snapshot().human_endpoint is EndpointDisposition.NONE
+        assert not actuator.fault_writes
+        assert (
+            order
+            == {
+                "d212": ["evaluation committed", "D212 close"],
+                "complete": ["evaluation committed", "export", "complete_run"],
+                "legacy": ["evaluation committed", "complete_run"],
+            }[route]
+        )
+    finally:
+        release.set()
+        await drop
+
+
+@pytest.mark.parametrize("readback", ["confirmed", "contradiction"])
+async def test_tf6_tf9_pending_readback_blocks_lifecycle_even_after_d212(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, readback: str
+) -> None:
+    service, runner, actuator, run_id, lease = await _faulted_run(store)
+    assert lease is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    actuator.after_drop_read, actuator.release_drop_read = asyncio.Event(), asyncio.Event()
+    actuator.issued_readback = readback
+    calls: list[FaultControlState | None] = []
+    original_resolve = controller.resolve_fault_drop_readback
+
+    def resolver(session: str, state: FaultControlState | None) -> None:
+        calls.append(state)
+        original_resolve(session, state)
+
+    monkeypatch.setattr(controller, "resolve_fault_drop_readback", resolver)
+    drop = asyncio.create_task(
+        service.submit_operator_action(
+            run_id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
+        )
+    )
+    try:
+        await asyncio.wait_for(actuator.after_drop_read.wait(), 1)
+        assert controller.has_pending_fault_drop_readback()
+        close = await service.submit_operator_action(
+            run_id,
+            OperatorActionRequest(
+                action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+                payload={"confirmation": True, "expected_generation": lease.generation},
+            ),
+        )
+        assert close.result == "accepted" and close.queued
+        assert await runner.tick_once()
+        assert runner.finalized
+        assert controller.phase is RoastPhase.FAULTED
+        assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+        controller_binding = service._human_fault_drop_controller(run_id)  # pyright: ignore[reportPrivateUsage]
+        assert controller_binding is None
+        process = service._mcp  # pyright: ignore[reportPrivateUsage]
+        assert process is not None
+
+        async def forbidden_stop() -> None:
+            pytest.fail("pending readback triggered MCP stop")
+
+        monkeypatch.setattr(process, "stop", forbidden_stop)
+        with pytest.raises(RoastRunConflictError, match="ownership remains unresolved"):
+            await service.start_roast(PROFILE)
+        with pytest.raises(RoastRunConflictError, match="ownership remains unresolved"):
+            await service._build_runner("replacement", PROFILE)  # pyright: ignore[reportPrivateUsage]
+        async with AsyncClient(
+            transport=ASGITransport(app=create_app(service)), base_url="http://test"
+        ) as client:
+            response = await client.post("/api/roasts", json=PROFILE.model_dump(mode="json"))
+        assert response.status_code == 409 and "ownership remains unresolved" in response.text
+        timeline_before = await store.read_timeline(run_id)
+    finally:
+        actuator.release_drop_read.set()
+        result = await drop
+    assert result.result == ("accepted" if readback == "confirmed" else "failed")
+    assert not controller.has_pending_fault_drop_readback()
+    assert len(calls) == 1 and calls[0] is not None
+    assert actuator.fault_writes == [OperatorAction.DROP_BEANS]
+    timeline_after = await store.read_timeline(run_id)
+    assert timeline_after.events == timeline_before.events
+    if readback == "confirmed":
+        assert (await service.start_roast(PROFILE)).id != run_id
+    else:
+        assert controller.snapshot().human_endpoint is EndpointDisposition.UNKNOWN
+        assert controller.snapshot().human_command_disposition is CommandDisposition.UNKNOWN
+        with pytest.raises(RoastRunConflictError, match="ownership remains unresolved"):
+            await service.start_roast(PROFILE)
+
+
+@pytest.mark.parametrize("route", ["legacy", "d212"])
+async def test_fault_acknowledgement_superseded_during_evaluation_barrier(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    service, runner, actuator, run_id, lease = await _faulted_run(store, open_lease=route == "d212")
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    held, release, barrier = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original_record = store.record_safety_evaluation
+    original_settle = controller.settle_human_drop_evaluations
+
+    async def record(*, run_id: str, tick: int, evaluation: SafetyEvaluation) -> int:
+        if evaluation.rule == "human_recovery_drop":
+            held.set()
+            await release.wait()
+        return await original_record(run_id=run_id, tick=tick, evaluation=evaluation)
+
+    async def settle() -> bool:
+        barrier.set()
+        return await original_settle()
+
+    async def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("superseded acknowledgement initiated completion or DROP")
+
+    monkeypatch.setattr(store, "record_safety_evaluation", record)
+    monkeypatch.setattr(store, "complete_run", forbidden)
+    monkeypatch.setattr(runner, "_fault_lease_close", forbidden)
+    monkeypatch.setattr(runner, "_export_logs", forbidden)
+    monkeypatch.setattr(controller, "settle_human_drop_evaluations", settle)
+    drop = asyncio.create_task(
+        controller.execute_human_fault_drop(
+            actuator.session_id,
+            generation=controller.command_generation,
+            lease_current=lambda: True,
+            operation=forbidden,
+        )
+    )
+    try:
+        await asyncio.wait_for(held.wait(), 1)
+        action = (
+            OperatorAction.ACKNOWLEDGE_FAULT
+            if lease is None
+            else OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE
+        )
+        payload = (
+            None
+            if lease is None
+            else {"confirmation": True, "expected_generation": lease.generation}
+        )
+        admitted = await service.submit_operator_action(
+            run_id, OperatorActionRequest(action=action, payload=payload)
+        )
+        assert admitted.result == "accepted" and admitted.queued
+        completion = asyncio.create_task(runner.tick_once())
+        try:
+            await asyncio.wait_for(barrier.wait(), 1)
+            stopped = await service.submit_fault_controls_action(
+                FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+            assert stopped.result == "confirmed"
+            assert await service.settle_fault_lease_persistence_for_teardown()
+            current_lease = await store.read_fault_control_lease()
+            assert current_lease.status is FaultLeaseStatus.OPEN
+            projection = await service._fault_controls_projection(current_lease)  # pyright: ignore[reportPrivateUsage]
+            assert OperatorAction.START_COOLING in projection.enabled_actions
+        finally:
+            release.set()
+            assert not await completion
+        assert not await drop
+        detail = await store.read_run(run_id)
+        assert detail is not None and detail.completed_at_utc is None
+        assert detail.agent_phase is RoastPhase.FAULTED
+        assert controller.human_drop_closed()
+        assert not controller.human_recovery_drop_allowed()
+    finally:
+        release.set()
+        await drop
+
+
+async def test_tf18_completed_human_drop_refusal_has_no_history_effect(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, runner, actuator, run_id, lease = await _faulted_run(store)
+    assert lease is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    committed, release = asyncio.Event(), asyncio.Event()
+    original = store.close_fault_control_lease_atomically
+
+    async def pause_after_commit(**kwargs: object) -> FaultControlCloseResult:
+        result = await original(**kwargs)  # type: ignore[arg-type]
+        assert result.historically_committed
+        committed.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(store, "close_fault_control_lease_atomically", pause_after_commit)
+    request = OperatorActionRequest(
+        action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+        payload={"confirmation": True, "expected_generation": lease.generation},
+    )
+    assert (await service.submit_operator_action(run_id, request)).queued
+    completion = asyncio.create_task(runner.tick_once())
+    try:
+        await asyncio.wait_for(committed.wait(), 1)
+        stop = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+        assert stop.result == "confirmed"
+        assert await service.settle_fault_lease_persistence_for_teardown()
+    finally:
+        release.set()
+        assert await completion
+    assert runner.finalized
+    later_lease = await store.read_fault_control_lease()
+    assert later_lease.status is FaultLeaseStatus.OPEN
+    assert later_lease.generation > lease.generation
+    assert later_lease.mcp_session_id == actuator.session_id
+    executor = service._fault_control_executor  # pyright: ignore[reportPrivateUsage]
+    assert executor is not None and await executor.settle_for_shutdown()
+    projection = await service._fault_controls_projection(later_lease)  # pyright: ignore[reportPrivateUsage]
+    assert OperatorAction.DROP_BEANS not in projection.enabled_actions
+    assert OperatorAction.START_COOLING in projection.enabled_actions
+    before = await store.read_timeline(run_id)
+    assert controller.snapshot().human_endpoint is EndpointDisposition.NONE
+
+    async def no_executor(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("historical HUMAN DROP reached the executor")
+
+    monkeypatch.setattr(executor, "execute", no_executor)
+    response = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.DROP_BEANS)
+    )
+    assert response.result == "failed"
+    assert response.reason == "exact terminal fault control is unavailable"
+    assert OperatorAction.DROP_BEANS not in response.fault_controls.enabled_actions
+    assert controller.snapshot().human_endpoint is EndpointDisposition.NONE
+    assert actuator.fault_writes == [OperatorAction.EMERGENCY_STOP]
+    assert await store.read_timeline(run_id) == before
+
+
+@pytest.mark.parametrize("action", [OperatorAction.START_COOLING, OperatorAction.STOP_COOLING])
+async def test_tf12_non_drop_admission_is_independent_of_human_drop_guard(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, action: OperatorAction
+) -> None:
+    service, _runner, actuator, _run_id, lease = await _faulted_run(store)
+    assert lease is not None
+    actuator.cooling = action is OperatorAction.STOP_COOLING
+    service.close_human_call_admission(AdmissionCloseReason.APPLICATION_TEARDOWN)
+    reads: list[tuple[OperatorAction, ...]] = []
+
+    def broken_term(_run_id: str | None) -> None:
+        reads.append(tuple(actuator.fault_writes))
+        raise RuntimeError("guarded fault DROP dependency is unavailable")
+
+    monkeypatch.setattr(service, "_human_fault_drop_controller", broken_term)
+    result = await service.submit_fault_controls_action(FaultControlsActionRequest(action=action))
+    assert result.result == "accepted"
+    assert actuator.fault_writes == [action]
+    assert reads == [(action,)]
+    assert OperatorAction.DROP_BEANS not in result.fault_controls.enabled_actions
+    assert OperatorAction.EMERGENCY_STOP in result.fault_controls.enabled_actions
+
+
+async def test_tf13_raising_drop_projection_omits_only_drop_in_rest_sse_and_admission(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    actuator = _ExactFaultRunner(clock)
+    service = _service(store, clock, actuator, exact_child=True)
+    run = await service.start_roast(PROFILE)
+    await _charge_live_runner(service, actuator, clock)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    response = await stream_events(run.id, cast(Request, _FakeRequest()), service)
+    controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    clock.advance(0.25)
+    await runner.tick_once()
+    before = (await service.detail(run.id)).enabled_actions
+    assert OperatorAction.DROP_BEANS in before
+
+    def broken_term(_run_id: str | None) -> None:
+        raise RuntimeError("guarded HUMAN drop dependency failed")
+
+    monkeypatch.setattr(service, "_human_fault_drop_controller", broken_term)
+    admitted = await service.submit_operator_action(
+        run.id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
+    )
+    assert admitted.result == "rejected"
+    assert (
+        admitted.reason
+        == "software drop unavailable; physical intervention or reconciliation required"
+    )
+    expected = [action for action in before if action is not OperatorAction.DROP_BEANS]
+    assert (await service.detail(run.id)).enabled_actions == expected
+    frames = await asyncio.wait_for(_collect_frames(response, 2), 1)
+    assert _parse_frame(frames[1])["data"] == {
+        "phase": RoastPhase.OPERATOR_RECOVERY_REQUIRED.value,
+        "enabled_actions": [action.value for action in expected],
+    }
+    assert not actuator.fault_writes
+    controller.transition_to(RoastPhase.FAULTED)
+    clock.advance(0.25)
+    await runner.tick_once()
+    await store.open_fault_control_lease(run_id=run.id, mcp_session_id=actuator.session_id)
+    result = await service.submit_fault_controls_action(
+        FaultControlsActionRequest(action=OperatorAction.DROP_BEANS)
+    )
+    assert result.result == "rejected"
+    assert result.reason == "action is not enabled for the current fault controls"
+    assert OperatorAction.EMERGENCY_STOP in result.fault_controls.enabled_actions
+    assert not actuator.fault_writes
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("no_reservation", _FinalisationCloseEvidence.PROVEN_NOT_COMMITTED),
+        ("no_open_lease", _FinalisationCloseEvidence.PROVEN_NOT_COMMITTED),
+        ("wrong_generation", _FinalisationCloseEvidence.PROVEN_NOT_COMMITTED),
+        ("wrong_identity", _FinalisationCloseEvidence.PROVEN_NOT_COMMITTED),
+        ("missing_identity", _FinalisationCloseEvidence.PROVEN_NOT_COMMITTED),
+        ("known_rollback", _FinalisationCloseEvidence.PROVEN_NOT_COMMITTED),
+        ("store_raised", _FinalisationCloseEvidence.UNCERTAIN),
+        ("store_none", _FinalisationCloseEvidence.UNCERTAIN),
+        ("verify_unavailable", _FinalisationCloseEvidence.UNCERTAIN),
+        ("changed_durable_shape", _FinalisationCloseEvidence.UNCERTAIN),
+        ("historical_commit", _FinalisationCloseEvidence.COMMITTED),
+        ("unconfirmed_commit", _FinalisationCloseEvidence.COMMITTED),
+        ("confirmed_commit", _FinalisationCloseEvidence.COMMITTED),
+    ],
+)
+async def test_tf19_fault_close_evidence_preserves_existing_results(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    expected: _FinalisationCloseEvidence,
+) -> None:
+    service, _runner, actuator, _run_id, initial = await _faulted_run(store)
+    assert initial is not None
+    gate = service._fault_acknowledgement_gate  # pyright: ignore[reportPrivateUsage]
+    gate.fault_finalization_started = path != "no_reservation"
+    lease = initial
+    if path == "no_open_lease":
+        lease = initial.model_copy(update={"status": FaultLeaseStatus.CLOSED})
+    generation = initial.generation + int(path == "wrong_generation")
+    session_id = (
+        None
+        if path == "missing_identity"
+        else "other"
+        if path == "wrong_identity"
+        else actuator.session_id
+    )
+    commit = path in {"historical_commit", "confirmed_commit", "unconfirmed_commit"}
+    base_result = FaultControlCloseResult(
+        historically_committed=commit,
+        confirmed=commit and path != "unconfirmed_commit",
+        run_completed=commit,
+        verification_unavailable=path == "verify_unavailable",
+    )
+    store_calls: list[int] = []
+
+    async def close(**_kwargs: object) -> FaultControlCloseResult | None:
+        store_calls.append(1)
+        if path == "store_raised":
+            raise RuntimeError("commit outcome lost")
+        if path == "historical_commit":
+            monkeypatch.setattr(
+                service,
+                "_fault_lease_cache",
+                initial.model_copy(update={"generation": initial.generation + 1}),
+            )
+        return None if path == "store_none" else base_result
+
+    async def verify(**_kwargs: object) -> FaultControlCloseResult:
+        assert path == "verify_unavailable"
+        return base_result
+
+    async def reread() -> FaultControlLease:
+        return (
+            initial.model_copy(update={"status": FaultLeaseStatus.UNKNOWN})
+            if path in {"verify_unavailable", "changed_durable_shape", "unconfirmed_commit"}
+            else initial
+        )
+
+    async def mark_unknown(_generation: int, _lease: FaultControlLease) -> None:
+        assert expected is _FinalisationCloseEvidence.UNCERTAIN or path == "unconfirmed_commit"
+
+    monkeypatch.setattr(store, "close_fault_control_lease_atomically", close)
+    monkeypatch.setattr(store, "verify_fault_control_lease_close", verify)
+    monkeypatch.setattr(service, "_read_fault_lease_fail_closed", reread)
+    monkeypatch.setattr(service, "_mark_unconfirmed_fault_lease_unknown", mark_unknown)
+    monkeypatch.setattr(service, "_fault_lease_cache", lease)
+    evidence = await service._close_current_fault_lease_for_finalisation(  # pyright: ignore[reportPrivateUsage]
+        generation, "synthetic", session_id
+    )
+    assert evidence is expected
+
+    monkeypatch.setattr(service, "_fault_lease_cache", lease)
+    result = await service._close_current_fault_lease_for_acknowledgement_result(  # pyright: ignore[reportPrivateUsage]
+        generation, "synthetic", session_id
+    )
+    assert result.historically_committed is commit
+    assert result.run_completed is commit
+    assert result.confirmed is (path == "confirmed_commit")
+
+    monkeypatch.setattr(service, "_fault_lease_cache", lease)
+    assert (
+        await service._close_current_fault_lease_for_acknowledgement(  # pyright: ignore[reportPrivateUsage]
+            generation, "synthetic", session_id
+        )
+        is commit
+    )
+    assert store_calls == (
+        []
+        if path
+        in {
+            "no_reservation",
+            "no_open_lease",
+            "wrong_generation",
+            "wrong_identity",
+            "missing_identity",
+        }
+        else [1, 1, 1]
+    )
+
+
+@pytest.mark.parametrize("prior", ["none", "uncertain", "raised"])
+@pytest.mark.parametrize("proof", ["pre_store", "rollback"])
+async def test_tf19_uncertain_completion_stays_closed_after_another_noncommit(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, prior: str, proof: str
+) -> None:
+    service, runner, actuator, run_id, initial = await _faulted_run(store)
+    assert initial is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    wrapped_close = service._close_current_fault_lease_for_finalisation  # pyright: ignore[reportPrivateUsage]
+    setting = prior
+
+    async def early_result(
+        generation: int | None, reason: str | None, session_id: str | None
+    ) -> _FinalisationCloseEvidence:
+        assert controller.human_drop_closed()
+        if setting == "raised":
+            raise RuntimeError("synthetic lost completion commit")
+        if setting == "uncertain":
+            return _FinalisationCloseEvidence.UNCERTAIN
+        if proof == "pre_store":
+            session_id = "wrong-session"
+        return await wrapped_close(generation, reason, session_id)
+
+    async def rollback(**_kwargs: object) -> FaultControlCloseResult:
+        assert proof == "rollback"
+        return FaultControlCloseResult(
+            historically_committed=False, confirmed=False, run_completed=False
+        )
+
+    monkeypatch.setattr(runner, "_fault_lease_close", early_result)
+    monkeypatch.setattr(store, "close_fault_control_lease_atomically", rollback)
+    request = OperatorActionRequest(
+        action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+        payload={"confirmation": True, "expected_generation": initial.generation},
+    )
+    if prior != "none":
+        assert (await service.submit_operator_action(run_id, request)).queued
+        actuator.clock.advance(0.25)
+        if prior == "raised":
+            with pytest.raises(RuntimeError, match="synthetic lost completion commit"):
+                await runner.tick_once()
+        else:
+            assert not await runner.tick_once()
+        assert controller.human_drop_closed()
+    setting = "proven"
+    if prior != "raised":
+        assert (await service.submit_operator_action(run_id, request)).queued
+    # The base propagation path leaves the already-reserved proof in place.
+    actuator.clock.advance(0.25)
+    assert not await runner.tick_once()
+    assert controller.human_drop_closed() is (prior != "none")
+    assert controller.human_recovery_drop_allowed(session_id=actuator.session_id) is (
+        prior == "none"
+    )
+    detail = await store.read_run(run_id)
+    assert detail is not None and detail.completed_at_utc is None
+
+    later_drop = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
+    )
+    assert later_drop.result == ("accepted" if prior == "none" else "failed")
+    assert actuator.fault_writes == ([OperatorAction.DROP_BEANS] if prior == "none" else [])

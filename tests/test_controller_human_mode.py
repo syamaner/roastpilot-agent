@@ -553,19 +553,10 @@ async def test_t42_explicit_continuation_rechecks_before_any_lever(bean: float) 
         )
 
 
-@pytest.mark.parametrize(
-    ("endpoint", "owner", "closed", "allowed"),
-    [
-        (EndpointDisposition.ISSUED, EndpointOwner.FAULT_CONTROL, False, True),
-        (EndpointDisposition.ISSUED, EndpointOwner.OPERATOR_RECOVERY, False, True),
-        (EndpointDisposition.ISSUED, EndpointOwner.OPERATOR_RECOVERY, True, False),
-        (EndpointDisposition.ISSUED, EndpointOwner.PROTECTION, False, False),
-        (EndpointDisposition.UNKNOWN, EndpointOwner.FAULT_CONTROL, False, False),
-        (EndpointDisposition.WITHHELD, EndpointOwner.FAULT_CONTROL, False, False),
-    ],
-)
-async def test_fault_drop_cooling_transition_is_owned_and_live(
-    endpoint: EndpointDisposition, owner: EndpointOwner, closed: bool, allowed: bool
+@pytest.mark.parametrize("endpoint", list(EndpointDisposition))
+@pytest.mark.parametrize("owner", [None, *EndpointOwner])
+async def test_tf1_faulted_has_no_cooling_edge(
+    endpoint: EndpointDisposition, owner: EndpointOwner | None
 ) -> None:
     h = await make_human()
     h.controller.transition_to(RoastPhase.FAULTED)
@@ -573,8 +564,7 @@ async def test_fault_drop_cooling_transition_is_owned_and_live(
     assert run is not None
     run.endpoint = endpoint
     run.endpoint_owner = owner
-    run.durably_closed = closed
-    assert h.controller.can_transition(RoastPhase.COOLING) is allowed
+    assert not h.controller.can_transition(RoastPhase.COOLING)
 
 
 async def test_t44_live_faulted_recovery_drop_uses_current_evidence() -> None:
@@ -595,7 +585,7 @@ async def test_t44_live_faulted_recovery_drop_uses_current_evidence() -> None:
         operation=write,
     )
     assert dispatched == ["fault_drop"]
-    assert h.controller.phase is RoastPhase.COOLING
+    assert h.controller.phase is RoastPhase.FAULTED
     assert h.controller.snapshot().human_endpoint is EndpointDisposition.ISSUED
 
 
@@ -621,6 +611,13 @@ async def test_te26_fault_drop_fence_preserves_known_withheld(unconfirmed: bool)
         operation=write,
     )
     snapshot = h.controller.snapshot()
+    assert snapshot.phase is RoastPhase.FAULTED
+    assert h.controller._latched_verdict is SafetyVerdict.RECOVERY  # pyright: ignore[reportPrivateUsage]
+    assert h.controller._routine_inhibited  # pyright: ignore[reportPrivateUsage]
+    assert (
+        RoastEventKind.RECOVERY_REQUIRED,
+        {"endpoint": "withheld", "physical_intervention_required": True},
+    ) in h.emitter.events
     assert snapshot.human_endpoint is EndpointDisposition.WITHHELD
     assert snapshot.human_command_disposition is CommandDisposition.SETTLED
     assert snapshot.physical_intervention_required
@@ -1986,3 +1983,202 @@ async def test_t38_operator_drop_rechecks_generation_after_audit(
     assert h.controller.phase is RoastPhase.FAULTED
     assert h.controller.snapshot().human_endpoint is EndpointDisposition.NONE
     assert h.actuator.containments == 0
+
+
+@pytest.mark.parametrize(
+    ("admitted", "completed", "expected"),
+    [
+        (RoastPhase.FAULTED, RoastPhase.FAULTED, RoastPhase.FAULTED),
+        (
+            RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+            RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+            RoastPhase.COOLING,
+        ),
+        (RoastPhase.OPERATOR_RECOVERY_REQUIRED, RoastPhase.FAULTED, RoastPhase.FAULTED),
+        (
+            RoastPhase.FAULTED,
+            RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+            RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+        ),
+        (RoastPhase.ROASTING_PRE_FIRST_CRACK, RoastPhase.FAULTED, RoastPhase.FAULTED),
+    ],
+)
+async def test_tf3_tf4_human_drop_phase_is_bound_at_admission_and_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    admitted: RoastPhase,
+    completed: RoastPhase,
+    expected: RoastPhase,
+) -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    if h.controller.phase is not admitted:
+        h.controller.transition_to(admitted)
+
+    async def operation() -> None:
+        if h.controller.phase is not completed:
+            # The shared arbiter prevents this interleaving in production.
+            monkeypatch.setattr(h.controller, "_phase", completed)
+
+    if admitted is RoastPhase.ROASTING_PRE_FIRST_CRACK:
+        original_drop = h.actuator.drop_beans
+
+        async def protective_drop() -> AppliedRoasterState:
+            applied = await original_drop()
+            assert applied is not None
+            await operation()
+            return applied
+
+        monkeypatch.setattr(h.actuator, "drop_beans", protective_drop)
+        assert await h.controller._execute_human_drop(  # pyright: ignore[reportPrivateUsage]
+            EndpointOwner.PROTECTION, DropReason.CEILING_GUARD, generation=h.arbiter.generation
+        )
+    else:
+        assert await h.controller.execute_human_fault_drop(
+            h.actuator.session_id,
+            generation=h.arbiter.generation,
+            lease_current=lambda: True,
+            operation=operation,
+        )
+    assert h.controller.snapshot().human_endpoint is EndpointDisposition.ISSUED
+    assert h.controller.phase is expected
+
+
+@pytest.mark.parametrize("outcome", ["issued", "withheld", "unknown"])
+@pytest.mark.parametrize(
+    "latch", [None, SafetyVerdict.RECOVERY, SafetyVerdict.FAULT, SafetyVerdict.EMERGENCY_STOP]
+)
+async def test_tf15_fault_drop_recovery_does_not_lower_latch_or_leave_fault(
+    monkeypatch: pytest.MonkeyPatch, outcome: str, latch: SafetyVerdict | None
+) -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    h.controller.transition_to(RoastPhase.FAULTED)
+    monkeypatch.setattr(h.controller, "_latched_verdict", latch)
+    if outcome == "withheld":
+        h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+
+    async def operation() -> None:
+        if outcome == "unknown":
+            raise TimeoutError("unconfirmed drop")
+
+    dispatched = await h.controller.execute_human_fault_drop(
+        h.actuator.session_id,
+        generation=h.arbiter.generation,
+        lease_current=lambda: True,
+        operation=operation,
+    )
+
+    assert dispatched is (outcome == "issued")
+    snapshot = h.controller.snapshot()
+    assert snapshot.phase is RoastPhase.FAULTED
+    assert snapshot.human_endpoint is EndpointDisposition(outcome)
+    actual = h.controller._latched_verdict  # pyright: ignore[reportPrivateUsage]
+    assert actual is (latch if dispatched or latch is not None else SafetyVerdict.RECOVERY)
+    assert (RoastEventKind.RECOVERY_REQUIRED in h.emitter.kinds()) is not dispatched
+
+
+@pytest.mark.parametrize("durable", [False, True])
+async def test_tf21_closure_refuses_before_join_or_task_registration(
+    monkeypatch: pytest.MonkeyPatch, durable: bool
+) -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    h.controller.transition_to(RoastPhase.FAULTED)
+    assert h.controller.human_recovery_drop_allowed()
+    if durable:
+        h.controller.note_human_run_durably_closed()
+    else:
+        h.controller.begin_human_completion()
+    assert not h.controller.human_recovery_drop_allowed()
+
+    async def unexpected(*_args: object) -> None:
+        pytest.fail("closed DROP reached persistence or dispatch")
+
+    def unexpected_join() -> bool:
+        pytest.fail("closed DROP reached the join")
+
+    monkeypatch.setattr(h.sink, "persist_evaluation", unexpected)
+    monkeypatch.setattr(h.controller, "_join_human_drop", unexpected_join)
+    assert not await h.controller.execute_human_fault_drop(
+        h.actuator.session_id,
+        generation=h.arbiter.generation,
+        lease_current=lambda: True,
+        operation=unexpected,
+    )
+    assert h.controller.snapshot().human_endpoint is EndpointDisposition.NONE
+    assert await h.controller.settle_human_drop_evaluations()
+
+
+@pytest.mark.parametrize("cancellation", ["hook", "barrier", "task", "error"])
+async def test_tf22_drop_evaluation_remains_owned_across_failure_and_cancellation(
+    monkeypatch: pytest.MonkeyPatch, cancellation: str
+) -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    h.controller.transition_to(RoastPhase.FAULTED)
+    entered, release, settled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def hold(_evaluation: SafetyEvaluation) -> int:
+        entered.set()
+        await release.wait()
+        if cancellation == "error":
+            raise RuntimeError("synthetic evaluation COMMIT failure")
+        settled.set()
+        return 1
+
+    async def unexpected() -> None:
+        pytest.fail("failed or closed evaluation authorised a DROP")
+
+    monkeypatch.setattr(h.sink, "persist_evaluation", hold)
+    hook = asyncio.create_task(
+        h.controller.execute_human_fault_drop(
+            h.actuator.session_id,
+            generation=h.arbiter.generation,
+            lease_current=lambda: True,
+            operation=unexpected,
+        )
+    )
+    registry = h.controller._human_drop_evaluation_tasks  # pyright: ignore[reportPrivateUsage]
+    await asyncio.wait_for(entered.wait(), 1)
+    (persistence,) = registry
+    h.controller.begin_human_completion()
+    barrier = asyncio.create_task(h.controller.settle_human_drop_evaluations())
+    await asyncio.sleep(0)
+    assert not barrier.done()
+    try:
+        if cancellation == "hook":
+            hook.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await hook
+            assert persistence in registry and not persistence.done() and not barrier.done()
+        elif cancellation == "barrier":
+            barrier.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await barrier
+            assert persistence in registry and not persistence.done()
+        elif cancellation == "task":
+            persistence.cancel()
+        release.set()
+        if cancellation == "error":
+            with pytest.raises(RuntimeError, match="synthetic evaluation COMMIT failure"):
+                await hook
+        elif cancellation == "task":
+            with pytest.raises(asyncio.CancelledError):
+                await hook
+        elif cancellation == "barrier":
+            assert not await hook
+        if cancellation != "barrier":
+            assert (await barrier) is (cancellation == "hook")
+        assert settled.is_set() is (cancellation in {"hook", "barrier"})
+        assert h.controller.human_drop_closed()
+        assert h.controller.snapshot().human_endpoint is EndpointDisposition.NONE
+        assert (await h.controller.settle_human_drop_evaluations()) is (
+            cancellation in {"hook", "barrier"}
+        )
+    finally:
+        release.set()
+        await asyncio.gather(hook, barrier, return_exceptions=True)

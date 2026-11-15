@@ -62,6 +62,7 @@ from roastpilot_agent.human_run_ownership import (
     HumanCallAdmission,
     HumanCallRefusal,
     HumanRunOwnership,
+    HumanRunState,
     PendingHumanCall,
     RefusedHumanCall,
 )
@@ -956,75 +957,84 @@ class FaultControlExecutor:
         async def write() -> None:
             await self._port.write_fault_control(action, expected_session_id=session_id)
 
+        controller: RoastController | None = None
+        observed: FaultControlState | None = None
         try:
-            if action is OperatorAction.DROP_BEANS and self._human_drop_controller is not None:
-                controller = self._human_drop_controller(run_id)
-                dispatched = controller is not None and await controller.execute_human_fault_drop(
-                    session_id,
-                    generation=generation,
-                    lease_current=generation_current,
-                    operation=write,
+            try:
+                if action is OperatorAction.DROP_BEANS and self._human_drop_controller is not None:
+                    controller = self._human_drop_controller(run_id)
+                    dispatched = (
+                        controller is not None
+                        and await controller.execute_human_fault_drop(
+                            session_id,
+                            generation=generation,
+                            lease_current=generation_current,
+                            operation=write,
+                        )
+                    )
+                else:
+                    dispatched, _ = await self._arbiter.run_routine(
+                        generation,
+                        write,
+                        admitted=generation_current,
+                        close_reservation=close_reservation,
+                    )
+            except Exception:
+                self._schedule_command_trace(
+                    run_id, command, "failed", evaluation_id, self._unconfirmed_result("failed")
                 )
-            else:
-                dispatched, _ = await self._arbiter.run_routine(
-                    generation,
-                    write,
-                    admitted=generation_current,
-                    close_reservation=close_reservation,
+                raise
+            if (
+                not dispatched
+                or not generation_current()
+                or (
+                    close_reservation is not None
+                    and not self._arbiter.close_reservation_is_current(close_reservation)
                 )
-        except Exception:
-            self._schedule_command_trace(
-                run_id, command, "failed", evaluation_id, self._unconfirmed_result("failed")
-            )
-            raise
-        if (
-            not dispatched
-            or not generation_current()
-            or (
-                close_reservation is not None
-                and not self._arbiter.close_reservation_is_current(close_reservation)
-            )
-        ):
-            self._schedule_command_trace(
-                run_id, command, "failed", evaluation_id, self._not_completed_result()
-            )
-            return None
-        try:
-            state = await self._port.read_fault_control_state(session_id)
-        except Exception:
+            ):
+                self._schedule_command_trace(
+                    run_id, command, "failed", evaluation_id, self._not_completed_result()
+                )
+                return None
+            try:
+                observed = await self._port.read_fault_control_state(session_id)
+            except Exception:
+                self._schedule_command_trace(
+                    run_id,
+                    command,
+                    "failed",
+                    evaluation_id,
+                    {
+                        "admission": "allowed",
+                        "dispatch": "completed",
+                        "confirmation": "readback_failed",
+                    },
+                )
+                raise
+            if not self._readback_confirms(action, observed, session_id):
+                self._schedule_command_trace(
+                    run_id,
+                    command,
+                    "failed",
+                    evaluation_id,
+                    {
+                        "admission": "allowed",
+                        "dispatch": "completed",
+                        "confirmation": "rejected_readback",
+                    },
+                )
+                return None
             self._schedule_command_trace(
                 run_id,
                 command,
-                "failed",
+                "ok",
                 evaluation_id,
-                {
-                    "admission": "allowed",
-                    "dispatch": "completed",
-                    "confirmation": "readback_failed",
-                },
+                {"admission": "allowed", "dispatch": "completed", "confirmation": "read_back"},
             )
-            raise
-        if not self._readback_confirms(action, state, session_id):
-            self._schedule_command_trace(
-                run_id,
-                command,
-                "failed",
-                evaluation_id,
-                {
-                    "admission": "allowed",
-                    "dispatch": "completed",
-                    "confirmation": "rejected_readback",
-                },
-            )
-            return None
-        self._schedule_command_trace(
-            run_id,
-            command,
-            "ok",
-            evaluation_id,
-            {"admission": "allowed", "dispatch": "completed", "confirmation": "read_back"},
-        )
-        return state
+            return observed
+        finally:
+            if controller is not None:
+                controller.resolve_fault_drop_readback(session_id, observed)
 
     @staticmethod
     def _command_for_action(action: OperatorAction) -> RoastCommand | None:
@@ -1585,6 +1595,13 @@ class _HumanContinuation:
     child_generation: int
 
 
+@dataclass(frozen=True)
+class _FaultDropReadback:
+    run: HumanRunState
+    session_id: str
+    generation: int
+
+
 class RoastController:
     """Code-owned deterministic state machine and tick pipeline.
 
@@ -1627,6 +1644,11 @@ class RoastController:
         self._human_run = (
             self._human_ownership.claim_run(run_id) if authority is ControlAuthority.HUMAN else None
         )
+        if self._human_run is not None:
+            self._human_drop_evaluation_tasks: set[asyncio.Task[int | None]] = set()
+            self._human_closure_started = False
+            self._human_completion_uncertain = False
+            self._fault_drop_readback: _FaultDropReadback | None = None
         self._human_admission = human_admission
         self._teardown_unconfirmed = teardown_unconfirmed
         self._current_session_id = current_session_id
@@ -2285,16 +2307,6 @@ class RoastController:
         if target is self._phase:
             return False
         if target in UNIVERSAL_TARGETS:
-            return True
-        run = self._human_run
-        if (
-            run is not None
-            and not run.durably_closed
-            and self._phase is RoastPhase.FAULTED
-            and target is RoastPhase.COOLING
-            and run.endpoint is EndpointDisposition.ISSUED
-            and run.endpoint_owner in (EndpointOwner.OPERATOR_RECOVERY, EndpointOwner.FAULT_CONTROL)
-        ):
             return True
         return target in TRANSITION_TABLE[self._phase]
 
@@ -3997,11 +4009,80 @@ class RoastController:
             command=run.command,
         )
 
+    def human_drop_closed(self) -> bool:
+        """Return whether HUMAN drop evidence and admission are closed."""
+        run = self._human_run
+        return run is not None and (run.durably_closed or self._human_closure_started)
+
+    def begin_human_completion(self, *, uncertain: bool = False) -> None:
+        """Close HUMAN drop admission and retain any persistence uncertainty."""
+        self._human_closure_started = True
+        if uncertain:
+            self._human_completion_uncertain = True
+
+    def clear_human_completion_after_proven_non_commit(self) -> None:
+        """Reopen admission after definite non-commit without earlier uncertainty."""
+        if not self._human_completion_uncertain:
+            self._human_closure_started = False
+
+    @staticmethod
+    def _consume_human_drop_evaluation(task: asyncio.Task[int | None]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def settle_human_drop_evaluations(self) -> bool:
+        """Wait for registered writes and retain any unsettled evaluation evidence."""
+        tasks = tuple(self._human_drop_evaluation_tasks)
+        if tasks:
+            await asyncio.wait(tasks)
+        for task in tasks:
+            if not task.cancelled() and task.exception() is None:
+                self._human_drop_evaluation_tasks.discard(task)
+        return not self._human_drop_evaluation_tasks
+
+    def has_pending_fault_drop_readback(self) -> bool:
+        """Return whether a HUMAN fault drop still awaits exact-session readback."""
+        return self._human_run is not None and self._fault_drop_readback is not None
+
+    def resolve_fault_drop_readback(
+        self, session_id: str, observed: FaultControlState | None
+    ) -> None:
+        """Settle one readback record and classify contradictory drop evidence."""
+        if self._human_run is None:
+            return
+        record = self._fault_drop_readback
+        self._fault_drop_readback = None
+        if (
+            record is None
+            or not self._human_ownership.is_current(record.run)
+            or record.session_id != session_id
+            or record.run.session_id != session_id
+            or record.run.endpoint is not EndpointDisposition.ISSUED
+            or record.run.endpoint_owner is not EndpointOwner.FAULT_CONTROL
+        ):
+            return
+        if (
+            isinstance(observed, FaultControlState)
+            and observed.session_id == record.session_id
+            and type(observed.beans_dropped) is bool
+            and observed.beans_dropped is False
+        ):
+            record.run.endpoint = EndpointDisposition.UNKNOWN
+            record.run.command = CommandDisposition.UNKNOWN
+            if not self.human_drop_closed():
+                self._events.emit(
+                    RoastEventKind.COMMAND_FAILED,
+                    {"command": "drop_beans", "outcome": "unknown"},
+                )
+                if self._generation_is_current(record.generation):
+                    self._project_human_drop_recovery()
+
     def human_recovery_drop_allowed(self, *, session_id: str | None = None) -> bool:
         """Project whether available HUMAN evidence admits an explicit drop."""
         run = self._human_run
         return (
-            run is not None
+            not self.human_drop_closed()
+            and run is not None
             and (session_id is None or run.session_id == session_id)
             and self._human_actuation_admitted()
             and self._human_recovery_drop_evaluation(
@@ -4019,15 +4100,22 @@ class RoastController:
         operation: Callable[[], Awaitable[None]],
     ) -> bool:
         """Guard one exact fault-session drop through the HUMAN endpoint latch."""
+        if self.human_drop_closed():
+            return False
         run = self._human_run
         if run is None or self._join_human_drop():
             return False
         evaluation = self._human_recovery_drop_evaluation(
             session_matches=run.session_id == session_id
         )
-        await self._snapshots.persist_evaluation(evaluation)
+        task = asyncio.create_task(self._snapshots.persist_evaluation(evaluation))
+        self._human_drop_evaluation_tasks.add(task)
+        task.add_done_callback(self._consume_human_drop_evaluation)
+        await asyncio.shield(task)
+        self._human_drop_evaluation_tasks.discard(task)
         if (
-            evaluation.verdict is not SafetyVerdict.ALLOW
+            self.human_drop_closed()
+            or evaluation.verdict is not SafetyVerdict.ALLOW
             or not lease_current()
             or not self._generation_is_current(generation)
             or self._join_human_drop()
@@ -4053,6 +4141,7 @@ class RoastController:
         run = self._human_run
         assert run is not None
         prior_endpoint = run.endpoint
+        admission_phase = self._phase
         run.endpoint = EndpointDisposition.ADMITTED
         run.endpoint_owner = owner
         start_utc: datetime | None = None
@@ -4120,6 +4209,13 @@ class RoastController:
             self._human_drop_unknown(generation, interval())
             return False
         run.endpoint = EndpointDisposition.ISSUED
+        if (
+            owner is EndpointOwner.FAULT_CONTROL
+            and admission_phase is RoastPhase.FAULTED
+            and self._phase is RoastPhase.FAULTED
+        ):
+            assert run.session_id is not None
+            self._fault_drop_readback = _FaultDropReadback(run, run.session_id, generation)
         self._adopt_applied_state(applied)
         self._events.emit(
             RoastEventKind.COMMAND_EXECUTED,
@@ -4132,7 +4228,11 @@ class RoastController:
                 ),
             },
         )
-        if not run.durably_closed:
+        if (
+            admission_phase is not RoastPhase.FAULTED
+            and self._phase is not RoastPhase.FAULTED
+            and not run.durably_closed
+        ):
             self.transition_to(RoastPhase.COOLING)
         return True
 
@@ -4152,9 +4252,17 @@ class RoastController:
         run = self._human_run
         assert run is not None
         self._routine_inhibited = True
-        if not run.durably_closed and self._phase is not RoastPhase.OPERATOR_RECOVERY_REQUIRED:
-            self.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
-        self._latched_verdict = SafetyVerdict.RECOVERY
+        if self._phase is RoastPhase.FAULTED:
+            latched = self._latched_verdict
+            if latched is None or (
+                _TERMINAL_VERDICT_SEVERITY[latched]
+                < _TERMINAL_VERDICT_SEVERITY[SafetyVerdict.RECOVERY]
+            ):
+                self._latched_verdict = SafetyVerdict.RECOVERY
+        else:
+            if not run.durably_closed and self._phase is not RoastPhase.OPERATOR_RECOVERY_REQUIRED:
+                self.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+            self._latched_verdict = SafetyVerdict.RECOVERY
         self._events.emit(
             RoastEventKind.RECOVERY_REQUIRED,
             {"endpoint": run.endpoint.value, "physical_intervention_required": True},

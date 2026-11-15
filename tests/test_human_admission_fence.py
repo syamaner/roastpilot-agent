@@ -629,3 +629,97 @@ async def test_te8_unconfirmed_respawn_and_hardware_clear_keep_admission_closed(
     await service._respawn_mcp_for_device_config(MCPDeviceConfig())  # pyright: ignore[reportPrivateUsage]
     assert process.starts == 1
     assert fence.closed_reason is None
+
+
+@pytest.mark.asyncio
+async def test_te5c_outer_cancel_waits_for_shielded_teardown_and_exit_guard(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = RoastService(store)
+    process = _SyntheticProcess()
+    h = await make_human()
+    service._human_admission = h.fence  # pyright: ignore[reportPrivateUsage]
+    entered, release = asyncio.Event(), asyncio.Event()
+    order: list[str] = []
+
+    class ExitGuard:
+        def arm(self, _labels: tuple[str, ...]) -> None:
+            order.append("exit guard")
+
+    async def teardown(_service: RoastService, _mcp: MCPServerProcess, _store: RoastStore) -> None:
+        assert h.fence.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+        entered.set()
+        await release.wait()
+        await h.turn(bean=196, t0=True)
+        attempt = await h.controller._contain_human_heat(  # pyright: ignore[reportPrivateUsage]
+            generation=h.arbiter.generation
+        )
+        assert attempt.outcome is ContainmentOutcome.NOT_ATTEMPTED
+        order.append("teardown finished")
+
+    monkeypatch.setattr(cli, "_teardown_live", teardown)
+    task = asyncio.create_task(
+        cli._finish_live_teardown(  # pyright: ignore[reportPrivateUsage]
+            service,
+            process,
+            store,
+            cast(cli._LiveExitGuard, ExitGuard()),  # pyright: ignore[reportPrivateUsage]
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert order == []
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert order == ["teardown finished", "exit guard"]
+    assert h.actuator.reads == h.actuator.containments == 0
+    assert h.fence.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+
+
+@pytest.mark.asyncio
+async def test_te5d_shutdown_cancel_at_closure_end_shield_propagates(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = RoastService(store)
+    h = await make_human()
+    service._human_admission = h.fence  # pyright: ignore[reportPrivateUsage]
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_shield = asyncio.shield
+
+    async def closure_end() -> None:
+        await release.wait()
+
+    owned = asyncio.create_task(closure_end())
+
+    def observe_shield(task: asyncio.Future[None]) -> asyncio.Future[None]:
+        assert task is owned
+        assert h.fence.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+        entered.set()
+        return original_shield(task)
+
+    monkeypatch.setattr(asyncio, "shield", observe_shield)
+    monkeypatch.setattr(service, "_closure_end_task", ("synthetic", owned))
+    shutdown = asyncio.create_task(service.shutdown())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        shutdown.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown
+        assert not owned.done()
+        await h.turn(bean=196, t0=True)
+        attempt = await h.controller._contain_human_heat(  # pyright: ignore[reportPrivateUsage]
+            generation=h.arbiter.generation
+        )
+        assert attempt.outcome is ContainmentOutcome.NOT_ATTEMPTED
+    finally:
+        release.set()
+        await owned
+    assert h.actuator.reads == h.actuator.containments == 0
+    assert h.fence.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN
