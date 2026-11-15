@@ -13,7 +13,7 @@ from httpx import ASGITransport, AsyncClient
 
 import roastpilot_agent.cli as cli
 from roastpilot_agent.api import RoastRunConflictError, RoastService, create_app
-from roastpilot_agent.config import MCPDeviceConfig
+from roastpilot_agent.config import MCPDeviceConfig, SafetyLimits
 from roastpilot_agent.human_protection import (
     CommandDisposition,
     ContainmentOutcome,
@@ -30,7 +30,7 @@ from roastpilot_agent.human_run_ownership import (
     RefusedHumanCall,
 )
 from roastpilot_agent.mcp_client import MCPConnectionError, MCPServerProcess
-from roastpilot_agent.models import HardwareClearAcknowledgementRequest
+from roastpilot_agent.models import HardwareClearAcknowledgementRequest, RoastPhase
 from roastpilot_agent.store import RoastStore
 from tests.test_controller import PROFILE
 from tests.test_controller_human_mode import make_human
@@ -469,14 +469,22 @@ async def test_te5_cli_cleanup_failure_keeps_surviving_tick_fenced(
 
     heat_off_calls = 0
 
+    async def failed_stop(*, reason: str) -> None:
+        raise TimeoutError(reason)
+
     async def broken_heat_off() -> None:
         nonlocal heat_off_calls
         heat_off_calls += 1
         assert h.fence.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+        assert not await h.controller.operator_emergency_stop("synthetic heat-off failure")
+        assert h.controller.phase is RoastPhase.FAULTED
+        assert h.controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
         raise RuntimeError("synthetic heat-off failure")
 
     if failed_heat_off:
+        monkeypatch.setattr(h.actuator, "emergency_stop", failed_stop)
         monkeypatch.setattr(service, "safe_shutdown_heat_off", broken_heat_off)
+    h.actuator.calls.clear()
 
     child = asyncio.create_task(owner())
     old_tick = asyncio.create_task(old_loop())
@@ -502,6 +510,16 @@ async def test_te5_cli_cleanup_failure_keeps_surviving_tick_fenced(
         assert attempt.outcome is ContainmentOutcome.NOT_ATTEMPTED
         assert h.actuator.reads == h.actuator.containments == 0
         assert not h.ownership.has_pending_call
+        if failed_heat_off:
+            assert h.actuator.calls == [
+                ("set_heat", {"heat_percent": 0}),
+                ("set_fan", {"fan_percent": SafetyLimits().overrun_safe_fan_percent}),
+            ]
+            assert not await h.controller._set_targets(heat_percent=0, fan_percent=0)  # pyright: ignore[reportPrivateUsage]
+            await h.controller.operator_start_cooling()
+            assert h.commands == ["set_heat", "set_fan", "start_cooling"]
+        else:
+            assert h.actuator.calls == []
     finally:
         run_tick.set()
         release_owner.set()

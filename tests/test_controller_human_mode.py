@@ -2109,6 +2109,11 @@ async def test_tf21_closure_refuses_before_join_or_task_registration(
         operation=unexpected,
     )
     assert h.controller.snapshot().human_endpoint is EndpointDisposition.NONE
+
+    async def unexpected_wait(*_args: object) -> None:
+        pytest.fail("empty evaluation registry awaited a task")
+
+    monkeypatch.setattr(asyncio, "wait", unexpected_wait)
     assert await h.controller.settle_human_drop_evaluations()
 
 
@@ -2182,3 +2187,258 @@ async def test_tf22_drop_evaluation_remains_owned_across_failure_and_cancellatio
     finally:
         release.set()
         await asyncio.gather(hook, barrier, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    ("source", "outcome"),
+    [
+        ("exact fault rearm", EndpointDisposition.ISSUED),
+        ("exact fault rearm", EndpointDisposition.WITHHELD),
+        ("exact fault rearm", EndpointDisposition.UNKNOWN),
+        ("raising operator stop", EndpointDisposition.ISSUED),
+        ("cancelled operator stop", EndpointDisposition.ISSUED),
+        ("latched escalation", EndpointDisposition.ISSUED),
+    ],
+)
+async def test_tf5_emergency_retry_survives_each_fault_drop_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    outcome: EndpointDisposition,
+) -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    entered_stop = asyncio.Event()
+
+    async def failed_stop(*, reason: str) -> AppliedRoasterState:
+        entered_stop.set()
+        if source == "cancelled operator stop":
+            await asyncio.Future[None]()
+        raise TimeoutError(reason)
+
+    monkeypatch.setattr(h.actuator, "emergency_stop", failed_stop)
+    if source == "exact fault rearm":
+        h.controller.transition_to(RoastPhase.FAULTED)
+        h.controller.rearm_emergency_stop_fail_safe()
+    elif source == "cancelled operator stop":
+        stop = asyncio.create_task(h.controller.operator_emergency_stop("retry source"))
+        await asyncio.wait_for(entered_stop.wait(), 1)
+        stop.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stop
+    elif source == "latched escalation":
+        h.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+        monkeypatch.setattr(h.controller, "_latched_verdict", SafetyVerdict.RECOVERY)
+        h.clock.advance(0.25)
+        h.actuator.bean = 260.0
+        await h.controller.human_urgent_stage()
+    else:
+        assert not await h.controller.operator_emergency_stop("retry source")
+
+    h.clock.advance(0.25)
+    h.actuator.bean = 185.0
+    await h.controller.human_urgent_stage()
+    assert h.controller.phase is RoastPhase.FAULTED
+    assert h.controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
+    assert h.controller.human_recovery_drop_allowed()
+    h.actuator.calls.clear()
+    held, release = asyncio.Event(), asyncio.Event()
+    generation = h.arbiter.generation
+
+    async def occupy() -> None:
+        held.set()
+        await release.wait()
+
+    async def drop() -> None:
+        assert outcome is not EndpointDisposition.WITHHELD
+        h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+        if outcome is EndpointDisposition.UNKNOWN:
+            raise TimeoutError("strict write unconfirmed")
+
+    blocker = (
+        asyncio.create_task(h.arbiter.run_routine(generation, occupy))
+        if outcome is EndpointDisposition.WITHHELD
+        else None
+    )
+
+    async def observe_admission() -> None:
+        while h.controller.snapshot().human_endpoint is not EndpointDisposition.ADMITTED:
+            await asyncio.sleep(0)
+
+    if blocker is not None:
+        await asyncio.wait_for(held.wait(), 1)
+    task = asyncio.create_task(
+        h.controller.execute_human_fault_drop(
+            h.actuator.session_id,
+            generation=generation,
+            lease_current=lambda: True,
+            operation=drop,
+        )
+    )
+    try:
+        if blocker is not None:
+            await asyncio.wait_for(observe_admission(), 1)
+            h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+    finally:
+        release.set()
+        if blocker is not None:
+            assert (await blocker)[0]
+        assert (await task) is (outcome is EndpointDisposition.ISSUED)
+    assert h.controller.phase is RoastPhase.FAULTED
+    assert h.controller.snapshot().human_endpoint is outcome
+    assert h.controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
+    await h.controller.tick()
+    assert h.actuator.calls == [
+        ("set_heat", {"heat_percent": 0}),
+        ("set_fan", {"fan_percent": SafetyLimits().overrun_safe_fan_percent}),
+    ]
+    assert not await h.controller._set_targets(heat_percent=0, fan_percent=0)  # pyright: ignore[reportPrivateUsage]
+    assert h.commands == ["set_heat", "set_fan"]
+
+
+@pytest.mark.parametrize("revoked", ["freshness", "fence", "teardown", "D212"])
+async def test_tf14_queued_fault_drop_is_withheld_when_dispatch_authority_changes(
+    revoked: str,
+) -> None:
+    teardown = False
+    h = await make_human(teardown_unconfirmed=lambda: teardown)
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    h.controller.transition_to(RoastPhase.FAULTED)
+    held, release = asyncio.Event(), asyncio.Event()
+    generation = h.arbiter.generation
+
+    async def occupy() -> None:
+        held.set()
+        await release.wait()
+
+    async def forbidden() -> None:
+        pytest.fail("revoked fault drop reached the exact-session write")
+
+    async def observe_admission() -> None:
+        while h.controller.snapshot().human_endpoint is not EndpointDisposition.ADMITTED:
+            await asyncio.sleep(0)
+
+    blocker = asyncio.create_task(h.arbiter.run_routine(generation, occupy))
+    await asyncio.wait_for(held.wait(), 1)
+    requested = asyncio.create_task(
+        h.controller.execute_human_fault_drop(
+            h.actuator.session_id,
+            generation=generation,
+            lease_current=lambda: True,
+            operation=forbidden,
+        )
+    )
+    try:
+        await asyncio.wait_for(observe_admission(), 1)
+        if revoked == "freshness":
+            h.clock.advance(20)
+        elif revoked == "fence":
+            h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+        elif revoked == "teardown":
+            teardown = True
+        else:
+            assert h.arbiter.reserve_close(generation)
+    finally:
+        release.set()
+        assert (await blocker)[0]
+        assert not await requested
+    snapshot = h.controller.snapshot()
+    assert snapshot.phase is RoastPhase.FAULTED
+    assert snapshot.human_endpoint is EndpointDisposition.WITHHELD
+    assert snapshot.human_command_disposition is CommandDisposition.SETTLED
+    assert snapshot.physical_intervention_required
+    assert h.controller._routine_inhibited  # pyright: ignore[reportPrivateUsage]
+    assert h.emitter.kinds().count(RoastEventKind.RECOVERY_REQUIRED) == 1
+    assert h.actuator.containments <= 1
+
+
+@pytest.mark.parametrize(
+    ("condition", "expected", "projects"),
+    [
+        ("no_record", EndpointDisposition.NONE, False),
+        ("other_session", EndpointDisposition.ISSUED, False),
+        ("other_run_same_session", EndpointDisposition.ISSUED, False),
+        ("different_endpoint", EndpointDisposition.WITHHELD, False),
+        ("different_owner", EndpointDisposition.ISSUED, False),
+        ("readback_mismatch", EndpointDisposition.ISSUED, False),
+        ("non_bool", EndpointDisposition.ISSUED, False),
+        ("superseded", EndpointDisposition.UNKNOWN, False),
+        ("closing", EndpointDisposition.UNKNOWN, False),
+        ("closed", EndpointDisposition.UNKNOWN, False),
+        ("current", EndpointDisposition.UNKNOWN, True),
+    ],
+)
+async def test_tf9_resolver_keys_run_identity_and_never_reprojects_closed_or_stale_records(
+    condition: str,
+    expected: EndpointDisposition,
+    projects: bool,
+) -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    h.controller.transition_to(RoastPhase.FAULTED)
+    session_id = h.actuator.session_id
+    owner = h.controller._human_run  # pyright: ignore[reportPrivateUsage]
+    assert owner is not None
+
+    async def write() -> None:
+        pass
+
+    if condition != "no_record":
+        assert await h.controller.execute_human_fault_drop(
+            session_id,
+            generation=h.arbiter.generation,
+            lease_current=lambda: True,
+            operation=write,
+        )
+        assert h.controller.has_pending_fault_drop_readback()
+    if condition == "other_run_same_session":
+        owner.durably_closed = True
+        replacement = h.ownership.claim_run("replacement")
+        replacement.session_id = session_id
+    elif condition == "different_endpoint":
+        owner.endpoint = EndpointDisposition.WITHHELD
+    elif condition == "different_owner":
+        owner.endpoint_owner = EndpointOwner.OPERATOR_RECOVERY
+    elif condition == "superseded":
+        h.controller.admit_emergency_stop()
+    elif condition == "closing":
+        h.controller.begin_human_completion()
+    elif condition == "closed":
+        h.controller.note_human_run_durably_closed()
+
+    observed = FaultControlState(
+        session_id="other" if condition == "readback_mismatch" else session_id,
+        mcp_phase="fault",
+        active=False,
+        device_connected=True,
+        heat_level_percent=0,
+        fan_level_percent=0,
+        cooling_on=False,
+        beans_added=True,
+        beans_dropped=False,
+    )
+    if condition == "non_bool":
+        observed = observed.model_copy(update={"beans_dropped": 0})
+    h.emitter.events.clear()
+    h.controller.resolve_fault_drop_readback(
+        "other" if condition == "other_session" else session_id,
+        observed,
+    )
+    assert not h.controller.has_pending_fault_drop_readback()
+    assert owner.endpoint is expected
+    assert owner.command is (
+        CommandDisposition.UNKNOWN
+        if expected is EndpointDisposition.UNKNOWN
+        else CommandDisposition.SETTLED
+    )
+    assert h.controller.phase is RoastPhase.FAULTED
+    expected_events = (
+        [RoastEventKind.COMMAND_FAILED, RoastEventKind.RECOVERY_REQUIRED]
+        if projects
+        else [RoastEventKind.COMMAND_FAILED]
+        if condition == "superseded"
+        else []
+    )
+    assert h.emitter.kinds() == expected_events
