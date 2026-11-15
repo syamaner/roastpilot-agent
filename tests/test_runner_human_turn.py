@@ -21,12 +21,28 @@ from roastpilot_agent.api import (
     stream_events,
 )
 from roastpilot_agent.config import AppConfig, ControllerConfig
-from roastpilot_agent.human_protection import ControlAuthority, EndpointDisposition
-from roastpilot_agent.human_run_ownership import HumanCallAdmissionFence, PendingHumanCall
+from roastpilot_agent.human_protection import (
+    CommandDisposition,
+    ControlAuthority,
+    EndpointDisposition,
+)
+from roastpilot_agent.human_run_ownership import (
+    AdmissionCloseReason,
+    HumanCallAdmissionFence,
+    HumanCallRefusal,
+    PendingHumanCall,
+    RefusedHumanCall,
+)
 from roastpilot_agent.mcp_client import RoasterControlAdapter, RoastSessionState
-from roastpilot_agent.models import OperatorAction, OperatorActionRequest, RoastPhase
+from roastpilot_agent.models import (
+    FaultControlState,
+    OperatorAction,
+    OperatorActionRequest,
+    RestartClearanceState,
+    RoastPhase,
+)
 from roastpilot_agent.store import RoastStore
-from tests.conftest import FakeClock
+from tests.conftest import FakeClock, FakeMCPClient
 from tests.test_api import (
     _collect_frames,  # pyright: ignore[reportPrivateUsage]
     _FakeRequest,  # pyright: ignore[reportPrivateUsage]
@@ -362,6 +378,10 @@ async def test_t44_recovery_drop_projection_and_admission_require_current_eviden
     clock.advance(0.25)
     await runner.tick_once()
     assert OperatorAction.DROP_BEANS in (await service.detail(run.id)).enabled_actions
+    accepted = await service.submit_operator_action(
+        run.id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
+    )
+    assert accepted.result == "accepted" and accepted.queued
     clock.advance(20)
     assert OperatorAction.DROP_BEANS not in (await service.detail(run.id)).enabled_actions
     rejected = await service.submit_operator_action(
@@ -500,3 +520,179 @@ async def test_human_emergency_publish_never_reads_action_fence(
         assert projected.data["enabled_actions"] == [OperatorAction.EMERGENCY_STOP.value]
     finally:
         service.events.unsubscribe(queue)
+
+
+async def test_t42b_h3_continuation_does_not_allow_same_turn_levers(store: RoastStore) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    detail = await service.start_roast(PROFILE)
+    await _charge_live_runner(service, actuator, clock)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    clock.advance(0.25)
+    await runner.tick_once()
+    accepted = await service.submit_operator_action(
+        detail.id,
+        OperatorActionRequest(
+            action=OperatorAction.ACKNOWLEDGE_RECOVERY,
+            payload={"resume_to": RoastPhase.ROASTING_PRE_FIRST_CRACK.value},
+        ),
+    )
+    assert accepted.queued
+    actuator.calls.clear()
+    clock.advance(0.25)
+    await runner.tick_once()
+    assert controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert controller._protection_check_pending  # pyright: ignore[reportPrivateUsage]
+    assert actuator.calls == []
+    actuator.bean = 196
+    clock.advance(0.25)
+    await runner.tick_once()
+    assert actuator.commands() == ["drop_beans"]
+
+
+async def test_te16_old_and_replacement_runner_share_read_scope_and_fence(
+    store: RoastStore,
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    first = await service.start_roast(PROFILE)
+    first_runner = service.runner
+    assert first_runner is not None
+    first_controller = first_runner.controller_for_human_fault_drop()
+    assert first_controller is not None
+    await store.complete_run(run_id=first.id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    first_runner._finalized = True  # pyright: ignore[reportPrivateUsage]
+    first_controller.note_human_run_durably_closed()
+    await service.start_roast(PROFILE)
+    second_runner = service.runner
+    assert second_runner is not None and second_runner is not first_runner
+    second_controller = second_runner.controller_for_human_fault_drop()
+    assert second_controller is not None
+    fence = service._human_admission  # pyright: ignore[reportPrivateUsage]
+    assert first_controller._human_admission is fence  # pyright: ignore[reportPrivateUsage]
+    assert second_controller._human_admission is fence  # pyright: ignore[reportPrivateUsage]
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def held() -> None:
+        entered.set()
+        await release.wait()
+
+    actuator.collect = held
+    previous_read = asyncio.create_task(
+        first_controller._read_human_call()  # pyright: ignore[reportPrivateUsage]
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        refused = await second_controller._read_human_call()  # pyright: ignore[reportPrivateUsage]
+        assert refused == RefusedHumanCall(
+            PendingHumanCall.READ, HumanCallRefusal.READ_ALREADY_PENDING
+        )
+        service.close_human_call_admission(AdmissionCloseReason.APPLICATION_TEARDOWN)
+    finally:
+        release.set()
+        await previous_read
+    for controller in (first_controller, second_controller):
+        refused = await controller._read_human_call()  # pyright: ignore[reportPrivateUsage]
+        assert refused == RefusedHumanCall(PendingHumanCall.READ, HumanCallRefusal.ADMISSION_CLOSED)
+    assert actuator.reads == 1
+
+
+async def test_human_open_fault_lease_projection_preserves_exact_recovery_evaluator(
+    store: RoastStore,
+) -> None:
+    clock = FakeClock()
+
+    class FaultRunner(_RunnerRoaster):
+        async def read_fault_control_state(self, session_id: str) -> FaultControlState:
+            assert session_id == self.session_id
+            return FaultControlState(
+                session_id=session_id,
+                mcp_phase="fault",
+                active=False,
+                device_connected=True,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=False,
+                beans_added=True,
+                beans_dropped=False,
+            )
+
+        async def read_latest_fault_control_state(self) -> FaultControlState:
+            return await self.read_fault_control_state(self.session_id)
+
+        async def write_fault_control(
+            self, action: OperatorAction, *, expected_session_id: str
+        ) -> None:
+            pytest.fail("projecting available actions attempted a write")
+
+    actuator = FaultRunner(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    run = await service.start_roast(PROFILE)
+    await _charge_live_runner(service, actuator, clock)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    controller.transition_to(RoastPhase.FAULTED)
+    clock.advance(0.25)
+    await runner.tick_once()
+    await store.open_fault_control_lease(run_id=run.id, mcp_session_id=actuator.session_id)
+    detail = await service.detail(run.id)
+    assert detail.enabled_actions == [OperatorAction.EMERGENCY_STOP]
+    assert detail.fault_controls is not None
+    assert OperatorAction.DROP_BEANS in detail.fault_controls.enabled_actions
+    clock.advance(20)
+    stale = await service.detail(run.id)
+    assert stale.fault_controls is not None
+    assert OperatorAction.DROP_BEANS not in stale.fault_controls.enabled_actions
+
+
+async def test_human_runner_without_evidence_port_refuses_before_lifecycle_reset(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actuator = FakeMCPClient()
+
+    def reset() -> None:
+        pytest.fail("runner reset the identity before admitting the HUMAN read port")
+
+    monkeypatch.setattr(actuator, "reset_session_identity_for_new_run", reset, raising=False)
+    service = RoastService(
+        store, roaster=actuator, authority=ControlAuthority.HUMAN, run_loop=False
+    )
+    with pytest.raises(RoastRunConflictError, match="no HUMAN read capability"):
+        await service._build_runner("synthetic", PROFILE)  # pyright: ignore[reportPrivateUsage]
+    assert service.runner is None
+    assert actuator.calls == []
+
+
+async def test_unknown_human_ownership_prevents_false_clean_epoch(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    actuator = _RunnerRoaster(FakeClock(), [])
+    service = RoastService(
+        store,
+        roaster=actuator,
+        authority=ControlAuthority.HUMAN,
+        live_serve_mode=True,
+        run_loop=False,
+    )
+    service._restart_epoch_initialized = True  # pyright: ignore[reportPrivateUsage]
+    service._restart_clearance_state = RestartClearanceState.CLEARED  # pyright: ignore[reportPrivateUsage]
+    owner = service._human_ownership.claim_run("synthetic-unknown")  # pyright: ignore[reportPrivateUsage]
+    owner.command = CommandDisposition.UNKNOWN
+    owner.durably_closed = True
+
+    async def forbidden_clearance_lookup(_: str) -> None:
+        pytest.fail("UNKNOWN ownership reached the clean process epoch proof")
+
+    monkeypatch.setattr(store, "read_process_restart_clearance", forbidden_clearance_lookup)
+    await service.mark_process_epoch_clean_after_ordered_teardown()
+    assert owner.command is CommandDisposition.UNKNOWN
+    assert actuator.calls == []

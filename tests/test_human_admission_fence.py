@@ -1,6 +1,8 @@
 """Application shutdown and replacement tests with synthetic child ownership."""
 
 import asyncio
+import gc
+import warnings
 from contextlib import suppress
 from enum import Enum
 
@@ -23,6 +25,7 @@ from roastpilot_agent.human_run_ownership import (
     HumanCallRefusal,
     HumanRunOwnership,
     PendingHumanCall,
+    RefusedHumanCall,
 )
 from roastpilot_agent.mcp_client import MCPServerProcess
 from roastpilot_agent.store import RoastStore
@@ -445,3 +448,85 @@ async def test_te5_cli_cleanup_failure_keeps_surviving_tick_fenced(
         await teardown
         await old_tick
     assert h.fence.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+
+
+@pytest.mark.asyncio
+async def test_te6_fence_refuses_containment_during_healthy_attached_e6_stop(
+    store: RoastStore,
+) -> None:
+    process = _SyntheticProcess(attached=True)
+    service = RoastService(store, mcp=process)
+    h = await make_human(teardown_unconfirmed=lambda: process.stop_unconfirmed)
+    service._human_admission = h.fence  # pyright: ignore[reportPrivateUsage]
+    service._human_ownership = h.ownership  # pyright: ignore[reportPrivateUsage]
+    requested, release = asyncio.Event(), asyncio.Event()
+
+    async def owner() -> None:
+        await requested.wait()
+        await release.wait()
+
+    process._owner_task = asyncio.create_task(owner())  # pyright: ignore[reportPrivateUsage]
+    process._stop_requested = requested  # pyright: ignore[reportPrivateUsage]
+    stopping = asyncio.create_task(
+        service._respawn_mcp_for_device_config(MCPDeviceConfig())  # pyright: ignore[reportPrivateUsage]
+    )
+    try:
+        await asyncio.wait_for(requested.wait(), 1)
+        assert process._session is not None  # pyright: ignore[reportPrivateUsage]
+        assert not process.stop_unconfirmed
+        result = await h.controller._contain_human_heat(  # pyright: ignore[reportPrivateUsage]
+            generation=h.arbiter.generation
+        )
+        assert result.outcome is ContainmentOutcome.NOT_ATTEMPTED
+        assert h.actuator.containments == 0
+        assert not h.ownership.has_pending_call
+    finally:
+        release.set()
+        with pytest.raises(RoastRunConflictError):
+            await stopping
+    assert process.starts == 0
+
+
+@pytest.mark.asyncio
+async def test_te10_refusal_does_not_invoke_registration_or_construct_adapter_awaitable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = await make_human()
+    h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+
+    def forbidden(_: PendingHumanCall) -> None:
+        pytest.fail("refused HUMAN call reached pending-scope registration")
+
+    monkeypatch.setattr(h.ownership, "hold", forbidden)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        refusal = await h.controller._read_human_call()  # pyright: ignore[reportPrivateUsage]
+        containment = await h.controller._contain_human_heat(  # pyright: ignore[reportPrivateUsage]
+            generation=h.arbiter.generation
+        )
+        gc.collect()
+    assert refusal == RefusedHumanCall(PendingHumanCall.READ, HumanCallRefusal.ADMISSION_CLOSED)
+    assert containment.outcome is ContainmentOutcome.NOT_ATTEMPTED
+    assert h.actuator.reads == h.actuator.containments == 0
+    assert not h.ownership.has_pending_call
+    assert all("never awaited" not in str(item.message) for item in caught)
+
+
+@pytest.mark.asyncio
+async def test_te4_lifespan_closes_before_waiting_for_cleanup(store: RoastStore) -> None:
+    service = RoastService(store)
+    app = create_app(service)
+    observed: list[AdmissionCloseReason | None] = []
+
+    async def cleanup() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            observed.append(service._human_admission.closed_reason)  # pyright: ignore[reportPrivateUsage]
+            raise
+
+    async with app.router.lifespan_context(app):
+        task = asyncio.create_task(cleanup())
+        service._safety_record_initialization = (None, task)  # type: ignore[assignment]
+        await asyncio.sleep(0)
+    assert observed == [AdmissionCloseReason.APPLICATION_TEARDOWN]

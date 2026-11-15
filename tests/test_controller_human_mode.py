@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
@@ -598,8 +598,6 @@ async def test_t49_restart_does_not_replay_heat_or_drop() -> None:
 async def test_t50_machine_fc_and_post_endpoint_human_note_do_not_advance_phase(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from dataclasses import replace
-
     h = await make_human()
     await h.turn(bean=180)
     await h.turn(bean=185, t0=True)
@@ -979,3 +977,177 @@ async def test_pending_scope_cannot_be_claimed_twice_or_replaced() -> None:
         with pytest.raises(RuntimeError, match="unresolved HUMAN ownership"):
             owner.claim_run("replacement")
     assert owner.claim_run("replacement").run_id == "replacement"
+
+
+@pytest.mark.parametrize("applied", [True, False])
+async def test_te24_closure_does_not_reclassify_started_drop(
+    monkeypatch: pytest.MonkeyPatch, applied: bool
+) -> None:
+    h = await make_human()
+    original = h.actuator.drop_beans
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def held_drop() -> AppliedRoasterState | None:
+        entered.set()
+        await release.wait()
+        result = await original()
+        return result if applied else None
+
+    monkeypatch.setattr(h.actuator, "drop_beans", held_drop)
+    await h.turn(bean=180)
+    turn = asyncio.create_task(h.turn(bean=196, t0=True))
+    await asyncio.wait_for(entered.wait(), 1)
+    assert h.controller.snapshot().human_endpoint is EndpointDisposition.IN_FLIGHT
+    h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+    release.set()
+    await turn
+    assert h.controller.snapshot().human_endpoint is (
+        EndpointDisposition.ISSUED if applied else EndpointDisposition.UNKNOWN
+    )
+    assert h.commands.count("drop_beans") == 1
+    assert h.actuator.containments == 0
+
+
+async def test_te24_closure_allows_started_heat_operation_to_return() -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    h.actuator.calls.clear()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def held_heat() -> None:
+        entered.set()
+        await release.wait()
+        await h.actuator.set_heat(20)
+
+    dispatched = asyncio.create_task(
+        h.controller._run_routine_write(  # pyright: ignore[reportPrivateUsage]
+            h.arbiter.generation, held_heat, write_class=WriteClass.HEAT
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+    release.set()
+    assert await dispatched == (True, None)
+    assert h.commands == ["set_heat"]
+
+
+@pytest.mark.parametrize("kind", [WriteClass.HEAT, WriteClass.FAN])
+@pytest.mark.parametrize("blocked_by", ["endpoint", "freshness"])
+async def test_t37_queued_lever_rechecks_endpoint_and_freshness(
+    kind: WriteClass, blocked_by: str
+) -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    occupied, release = asyncio.Event(), asyncio.Event()
+
+    async def held() -> None:
+        occupied.set()
+        await release.wait()
+
+    commands: list[WriteClass] = []
+
+    async def lever() -> None:
+        commands.append(kind)
+
+    generation = h.arbiter.generation
+    prior = asyncio.create_task(h.arbiter.run_routine(generation, held))
+    await asyncio.wait_for(occupied.wait(), 1)
+    lever_task = asyncio.create_task(
+        h.controller._run_routine_write(generation, lever, write_class=kind)  # pyright: ignore[reportPrivateUsage]
+    )
+    await asyncio.sleep(0)
+    assert not lever_task.done()
+    drop: asyncio.Task[None] | None = None
+    try:
+        if blocked_by == "endpoint":
+            drop = asyncio.create_task(h.turn(bean=196))
+            await asyncio.sleep(0)
+            assert h.controller.snapshot().human_endpoint is EndpointDisposition.ADMITTED
+        else:
+            h.clock.advance(20)
+    finally:
+        release.set()
+        await prior
+        if drop is not None:
+            await drop
+    assert h.fence.closed_reason is None
+    assert await lever_task == (False, None)
+    assert commands == []
+    assert h.commands.count("drop_beans") == int(blocked_by == "endpoint")
+
+
+async def test_unusable_bound_thermal_pair_uses_human_validity_and_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    original = h.actuator.read_human_evidence
+
+    async def unusable_pair() -> HumanReadEvidence:
+        evidence = await original()
+        return replace(evidence, telemetry=None, bean=RawTemperature.INVALID, bean_temp_c=None)
+
+    monkeypatch.setattr(h.actuator, "read_human_evidence", unusable_pair)
+    h.actuator.calls.clear()
+    await h.turn(bean=196)
+    assert h.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert h.controller.snapshot().telemetry is None
+    assert h.controller.snapshot().charge_detected
+    assert h.actuator.calls == []
+
+
+async def test_superseded_pending_read_cannot_write_snapshot_into_emergency_turn() -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hold() -> None:
+        entered.set()
+        await release.wait()
+
+    h.actuator.collect = hold
+    before = list(h.sink.snapshots)
+    pending = asyncio.create_task(h.turn(bean=196, t0=True))
+    await asyncio.wait_for(entered.wait(), 1)
+    try:
+        assert await h.controller.operator_emergency_stop("synthetic pending READ")
+    finally:
+        release.set()
+        await pending
+    assert not h.controller.snapshot().charge_detected
+    assert h.controller.phase is RoastPhase.FAULTED
+    assert h.sink.snapshots == before
+    assert h.commands.count("drop_beans") == 0
+
+
+async def test_late_in_flight_fc_cannot_become_canonical_after_endpoint_latch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = await make_human()
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    entered, release = asyncio.Event(), asyncio.Event()
+    actual_mark = h.actuator.mark_first_crack
+
+    async def held_mark() -> None:
+        entered.set()
+        await release.wait()
+        await actual_mark()
+
+    monkeypatch.setattr(h.actuator, "mark_first_crack", held_mark)
+    mark = asyncio.create_task(h.controller.operator_mark_first_crack())
+    await asyncio.wait_for(entered.wait(), 1)
+    drop = asyncio.create_task(h.turn(bean=196))
+    try:
+        await asyncio.sleep(0)
+        assert h.controller.snapshot().human_endpoint is EndpointDisposition.ADMITTED
+    finally:
+        release.set()
+        await asyncio.gather(mark, drop)
+    assert h.commands.count("mark_first_crack") == h.commands.count("drop_beans") == 1
+    assert h.controller.phase is RoastPhase.COOLING
+    assert h.controller.snapshot().development_percent is None
+    assert RoastEventKind.FIRST_CRACK not in h.emitter.kinds()
