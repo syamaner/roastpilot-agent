@@ -4040,6 +4040,12 @@ class RoastController:
                 self._human_drop_evaluation_tasks.discard(task)
         return not self._human_drop_evaluation_tasks
 
+    def human_drop_evaluation_outstanding(self) -> bool:
+        """Whether pending or cancelled S3 evaluation ownership needs direct e-stop routing."""
+        return self._human_run is not None and any(
+            not task.done() or task.cancelled() for task in self._human_drop_evaluation_tasks
+        )
+
     def has_pending_fault_drop_readback(self) -> bool:
         """Return whether a HUMAN fault drop still awaits exact-session readback."""
         return self._human_run is not None and self._fault_drop_readback is not None

@@ -1106,6 +1106,7 @@ class RoastRunner:
         self._event_flush_lock = asyncio.Lock()
         self._sleep = sleep
         self._finalized = False
+        self._completion_persistence_initiated = False
         # D221: a pre-retirement e-stop can synchronously revoke D216 closure
         # authority after its durable End CAS has committed.  The runner then
         # remains alive solely to retry its already-admitted heat-off posture;
@@ -1408,6 +1409,15 @@ class RoastRunner:
         if self._controller.authority is ControlAuthority.HUMAN:
             return self._controller
         return None
+
+    def emergency_stop_must_bypass_terminal_writer(self) -> bool:
+        """Prove direct e-stop routing is needed before HUMAN completion persistence."""
+        controller = self.controller_for_human_fault_drop()
+        return (
+            controller is not None
+            and not self._completion_persistence_initiated
+            and controller.human_drop_evaluation_outstanding()
+        )
 
     def controller_snapshot(self) -> "ControllerSnapshot":
         """The controller's current post-tick snapshot (phase + commanded levels).
@@ -2081,6 +2091,8 @@ class RoastRunner:
                 and session_id is not None
                 and close is not None
             ):
+                if human:
+                    self._completion_persistence_initiated = True
                 try:
                     evidence = await close(
                         d212_generation,
@@ -2095,6 +2107,8 @@ class RoastRunner:
                 if human:
                     if evidence is _FinalisationCloseEvidence.PROVEN_NOT_COMMITTED:
                         self._controller.clear_human_completion_after_proven_non_commit()
+                        if not self._controller.human_drop_closed():
+                            self._completion_persistence_initiated = False
                     elif evidence is _FinalisationCloseEvidence.UNCERTAIN:
                         self._controller.begin_human_completion(uncertain=True)
             if not d212_closed_atomically:
@@ -2121,6 +2135,8 @@ class RoastRunner:
                 return False
         elif not settled:
             return False
+        if human:
+            self._completion_persistence_initiated = True
         try:
             if phase is RoastPhase.COMPLETE:
                 manifest = await self._export_logs()
@@ -5111,6 +5127,14 @@ class RoastService:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             dispatch.exception()
 
+    @staticmethod
+    def _live_estop_bypasses_terminal_writer(runner: RoastRunner) -> bool:
+        try:
+            return runner.emergency_stop_must_bypass_terminal_writer() is True
+        except Exception:  # noqa: BLE001 - uncertain routing evidence preserves the base route
+            _log.warning("Could not qualify direct live emergency dispatch")
+            return False
+
     async def _submit_fault_controls_emergency_stop(
         self, *, expected_run_id: str | None = None
     ) -> FaultControlsActionResult:
@@ -5240,7 +5264,10 @@ class RoastService:
         if (
             executor is not None
             and session_id is not None
-            and (live_runner is None or was_finalizing)
+            and (
+                live_runner is None
+                or (was_finalizing and not self._live_estop_bypasses_terminal_writer(live_runner))
+            )
         ):
             dispatch = asyncio.create_task(
                 self._execute_terminal_emergency_stop(
