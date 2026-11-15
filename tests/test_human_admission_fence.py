@@ -3,8 +3,10 @@
 import asyncio
 import gc
 import warnings
-from contextlib import suppress
+from collections.abc import Generator
+from contextlib import contextmanager, suppress
 from enum import Enum
+from typing import cast
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -27,7 +29,8 @@ from roastpilot_agent.human_run_ownership import (
     PendingHumanCall,
     RefusedHumanCall,
 )
-from roastpilot_agent.mcp_client import MCPServerProcess
+from roastpilot_agent.mcp_client import MCPConnectionError, MCPServerProcess
+from roastpilot_agent.models import HardwareClearAcknowledgementRequest
 from roastpilot_agent.store import RoastStore
 from tests.test_controller import PROFILE
 from tests.test_controller_human_mode import make_human
@@ -151,18 +154,31 @@ async def test_te4_cleanup_failure_cannot_reopen_admission(
 
 
 @pytest.mark.asyncio
-async def test_te13_e6_stops_existing_owner_during_pending_containment(
-    store: RoastStore,
+@pytest.mark.parametrize("entry", ["cli", "direct", "respawn"])
+@pytest.mark.parametrize("result", ["cancel", "timeout", "malformed", "commanded"])
+async def test_te13_stop_preserves_pending_containment_and_publishes_before_unwind(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, entry: str, result: str
 ) -> None:
-    process = _SyntheticProcess()
+    process = _SyntheticProcess(attached=True)
     service = RoastService(store, mcp=process)
     h = await make_human()
     service._human_admission = h.fence  # pyright: ignore[reportPrivateUsage]
     service._human_ownership = h.ownership  # pyright: ignore[reportPrivateUsage]
-    request_entered = asyncio.Event()
-    release_request = asyncio.Event()
-    stop_requested = asyncio.Event()
-    release_owner = asyncio.Event()
+    request_entered, release_request = asyncio.Event(), asyncio.Event()
+    stop_requested, release_owner = asyncio.Event(), asyncio.Event()
+    dispositions_at_scope_exit: list[CommandDisposition | None] = []
+    original_hold = h.ownership.hold
+
+    @contextmanager
+    def observe_scope(kind: PendingHumanCall) -> Generator[None, None, None]:
+        with original_hold(kind):
+            try:
+                yield
+            finally:
+                assert h.ownership.pending(kind)
+                dispositions_at_scope_exit.append(h.controller.snapshot().human_command_disposition)
+
+    monkeypatch.setattr(h.ownership, "hold", observe_scope)
 
     async def owner() -> None:
         await stop_requested.wait()
@@ -175,30 +191,62 @@ async def test_te13_e6_stops_existing_owner_during_pending_containment(
     async def contain() -> ContainmentResult:
         request_entered.set()
         await release_request.wait()
-        return ContainmentResult(ContainmentOutcome.UNKNOWN_MALFORMED_RESPONSE)
+        if result == "timeout":
+            raise TimeoutError("synthetic local timeout after closure")
+        if result == "malformed":
+            return cast("ContainmentResult", object())
+        return ContainmentResult(
+            ContainmentOutcome.COMMAND_STATE_RETURNED, evidence_heat_zero_commanded=True
+        )
+
+    async def close_and_stop() -> None:
+        if entry == "cli":
+            await cli._finish_live_teardown(service, process, store, None)  # pyright: ignore[reportPrivateUsage]
+        elif entry == "direct":
+            await cli._teardown_live(service, process, store)  # pyright: ignore[reportPrivateUsage]
+        else:
+            with pytest.raises(RoastRunConflictError, match="ownership"):
+                await service._respawn_mcp_for_device_config(MCPDeviceConfig())  # pyright: ignore[reportPrivateUsage]
 
     h.actuator.contain = contain
     request = asyncio.create_task(
         h.controller._contain_human_heat(generation=h.arbiter.generation)  # pyright: ignore[reportPrivateUsage]
     )
-    respawn: asyncio.Task[None] | None = None
+    closing: asyncio.Task[None] | None = None
     try:
         await asyncio.wait_for(request_entered.wait(), 1)
-        respawn = asyncio.create_task(
-            service._respawn_mcp_for_device_config(MCPDeviceConfig())  # pyright: ignore[reportPrivateUsage]
-        )
+        closing = asyncio.create_task(close_and_stop())
         await asyncio.wait_for(stop_requested.wait(), 1)
-        assert h.fence.closed_reason is AdmissionCloseReason.DEVICE_RESPAWN
+        assert h.fence.closed_reason is (
+            AdmissionCloseReason.DEVICE_RESPAWN
+            if entry == "respawn"
+            else AdmissionCloseReason.APPLICATION_TEARDOWN
+        )
+        assert not process.stop_unconfirmed
+        assert not request.done()
         assert h.ownership.pending(PendingHumanCall.CONTAINMENT)
         duplicate = await h.controller._contain_human_heat(generation=h.arbiter.generation)  # pyright: ignore[reportPrivateUsage]
         assert duplicate.outcome is ContainmentOutcome.NOT_ATTEMPTED
         assert h.actuator.containments == 1
-        release_request.set()
-        assert (await request).outcome is ContainmentOutcome.UNKNOWN_MALFORMED_RESPONSE
+        if result == "cancel":
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+        else:
+            release_request.set()
+            assert (await request).outcome is {
+                "timeout": ContainmentOutcome.UNKNOWN_TRANSPORT,
+                "malformed": ContainmentOutcome.UNKNOWN_MALFORMED_RESPONSE,
+                "commanded": ContainmentOutcome.COMMAND_STATE_RETURNED,
+            }[result]
         assert not h.ownership.pending(PendingHumanCall.CONTAINMENT)
+        disposition = (
+            CommandDisposition.SETTLED if result == "commanded" else CommandDisposition.UNKNOWN
+        )
+        assert dispositions_at_scope_exit == [disposition]
+        assert h.controller.snapshot().human_command_disposition is disposition
         release_owner.set()
-        with pytest.raises(RoastRunConflictError):
-            await respawn
+        await closing
         assert process.starts == 0
         assert not process.stop_unconfirmed
         assert h.ownership.lifecycle_blocked
@@ -206,10 +254,10 @@ async def test_te13_e6_stops_existing_owner_during_pending_containment(
         release_owner.set()
         release_request.set()
         await child
-        await request
-        if respawn is not None:
-            with suppress(RoastRunConflictError):
-                await respawn
+        with suppress(asyncio.CancelledError):
+            await request
+        if closing is not None:
+            await closing
 
 
 @pytest.mark.asyncio
@@ -389,11 +437,12 @@ async def test_te18_only_human_runner_is_refused_before_reset(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failed_heat_off", [False, True])
 @pytest.mark.parametrize(
     "failed_cleanup", ["_safety_record_initialization", "_stranded_fault_retirement"]
 )
 async def test_te5_cli_cleanup_failure_keeps_surviving_tick_fenced(
-    store: RoastStore, failed_cleanup: str
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, failed_cleanup: str, failed_heat_off: bool
 ) -> None:
     process = _SyntheticProcess(attached=True)
     service = RoastService(store, mcp=process)
@@ -417,6 +466,17 @@ async def test_te5_cli_cleanup_failure_keeps_surviving_tick_fenced(
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             raise RuntimeError("synthetic pre-cancellation teardown failure") from None
+
+    heat_off_calls = 0
+
+    async def broken_heat_off() -> None:
+        nonlocal heat_off_calls
+        heat_off_calls += 1
+        assert h.fence.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+        raise RuntimeError("synthetic heat-off failure")
+
+    if failed_heat_off:
+        monkeypatch.setattr(service, "safe_shutdown_heat_off", broken_heat_off)
 
     child = asyncio.create_task(owner())
     old_tick = asyncio.create_task(old_loop())
@@ -448,6 +508,7 @@ async def test_te5_cli_cleanup_failure_keeps_surviving_tick_fenced(
         await teardown
         await old_tick
     assert h.fence.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+    assert heat_off_calls == int(failed_heat_off)
 
 
 @pytest.mark.asyncio
@@ -530,3 +591,41 @@ async def test_te4_lifespan_closes_before_waiting_for_cleanup(store: RoastStore)
         service._safety_record_initialization = (None, task)  # type: ignore[assignment]
         await asyncio.sleep(0)
     assert observed == [AdmissionCloseReason.APPLICATION_TEARDOWN]
+
+
+@pytest.mark.asyncio
+async def test_te8_unconfirmed_respawn_and_hardware_clear_keep_admission_closed(
+    store: RoastStore,
+) -> None:
+    class UnconfirmedOnce(_SyntheticProcess):
+        stops = 0
+
+        async def stop(self) -> None:
+            self.stops += 1
+            if self.stops == 1:
+                self._fail_closed_teardown("synthetic detached child stop unconfirmed")  # pyright: ignore[reportPrivateUsage]
+                return
+            await super().stop()
+
+    process = UnconfirmedOnce()
+    service = RoastService(store, mcp=process, authority=ControlAuthority.HUMAN)
+    with pytest.raises(MCPConnectionError, match="teardown was unconfirmed"):
+        await service._respawn_mcp_for_device_config(MCPDeviceConfig())  # pyright: ignore[reportPrivateUsage]
+    fence = service._human_admission  # pyright: ignore[reportPrivateUsage]
+    assert fence.closed_reason is AdmissionCloseReason.DEVICE_RESPAWN
+    incident = process.teardown_incident_id
+    assert process.stop_unconfirmed and incident is not None
+    assert process.starts == 0
+    await service.acknowledge_hardware_clear(
+        HardwareClearAcknowledgementRequest(
+            hardware_clear=True,
+            teardown_incident_id=incident,
+            reason="synthetic detached child acknowledgement",
+        )
+    )
+    assert not process.stop_unconfirmed
+    assert process.starts == 0
+    assert fence.closed_reason is AdmissionCloseReason.DEVICE_RESPAWN
+    await service._respawn_mcp_for_device_config(MCPDeviceConfig())  # pyright: ignore[reportPrivateUsage]
+    assert process.starts == 1
+    assert fence.closed_reason is None

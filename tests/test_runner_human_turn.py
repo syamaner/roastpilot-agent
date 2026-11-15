@@ -23,7 +23,10 @@ from roastpilot_agent.api import (
 from roastpilot_agent.config import AppConfig, ControllerConfig, MCPDeviceConfig
 from roastpilot_agent.human_protection import (
     CommandDisposition,
+    ContainmentAttempt,
     ContainmentOutcome,
+    ContainmentReason,
+    ContainmentResult,
     ControlAuthority,
     EndpointDisposition,
     HumanReadEvidence,
@@ -964,3 +967,73 @@ async def test_td2_td3_td5_late_read_cannot_seed_the_next_started_session(
     lease = service._fault_lease_cache  # pyright: ignore[reportPrivateUsage]
     assert lease.run_id == second.id
     assert lease.mcp_session_id == next_id
+
+
+async def test_te5_shutdown_admission_failure_keeps_fence_terminal(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None and runner.controller_snapshot().phase is RoastPhase.PREHEATING
+    attempts = 0
+
+    def cannot_admit(_runner: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        assert service._human_admission.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN  # pyright: ignore[reportPrivateUsage]
+        raise RuntimeError("synthetic shutdown priority admission failure")
+
+    monkeypatch.setattr(service, "_admit_shutdown_emergency_stop", cannot_admit)
+    actuator.calls.clear()
+    assert await service.safe_shutdown_heat_off() is ShutdownHeatOffOutcome.UNCONFIRMED
+    assert attempts == 2
+    await runner.tick_once()
+    assert actuator.calls == []
+    assert actuator.reads == actuator.containments == 0
+    assert service._human_admission.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("stop_unconfirmed", [False, True])
+async def test_te12_containment_refusal_preserves_attempt_and_adapter_diagnostic(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, stop_unconfirmed: bool
+) -> None:
+    session = _Session(_result({"origin": "synthetic", "roast_num": 1}))
+    process = _LifecycleSpy(session)
+    adapter = RoasterControlAdapter.from_process(process)
+    service = RoastService(
+        store,
+        mcp=process,
+        roaster=adapter,
+        raw_state=adapter,
+        authority=ControlAuthority.HUMAN,
+        run_loop=False,
+    )
+    await process.discover_fixed_zero()
+    await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    owner = controller._human_run  # pyright: ignore[reportPrivateUsage]
+    assert owner is not None
+    prior_diagnostic = ContainmentResult(
+        ContainmentOutcome.REFUSED_BUSY, ContainmentReason.COMMAND_IN_PROGRESS
+    )
+    monkeypatch.setattr(adapter, "_last_containment_result", prior_diagnostic)
+    if stop_unconfirmed:
+        monkeypatch.setattr(process, "_stop_unconfirmed", True)
+    else:
+        service.close_human_call_admission(AdmissionCloseReason.APPLICATION_TEARDOWN)
+    before = list(session.calls)
+    outcome = await controller._contain_human_heat(  # pyright: ignore[reportPrivateUsage]
+        generation=controller.command_generation
+    )
+    assert outcome.outcome is ContainmentOutcome.NOT_ATTEMPTED
+    assert owner.containment is ContainmentAttempt.AVAILABLE
+    assert owner.command is CommandDisposition.SETTLED
+    assert adapter.last_containment_result is prior_diagnostic
+    assert not service._human_ownership.has_pending_call  # pyright: ignore[reportPrivateUsage]
+    assert session.calls == before
