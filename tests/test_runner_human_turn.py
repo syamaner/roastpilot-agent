@@ -1075,3 +1075,129 @@ async def test_t32_queued_operator_drop_joins_same_turn_protection(
         if event.payload is not None and event.payload.get("command") == "drop_beans"
     ]
     assert "joined_protective_endpoint" in outcomes
+
+
+@pytest.mark.parametrize("uncertainty", ["drop", "containment"])
+async def test_finalisation_preserves_unknown_ownership_at_http_and_respawn(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, uncertainty: str
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    process = _LifecycleSpy(_Session(_result({})))
+    await process.discover_fixed_zero()
+    actuator.epoch = process.child_epoch
+    service = RoastService(
+        store,
+        mcp=process,
+        roaster=actuator,
+        raw_state=actuator,
+        authority=ControlAuthority.HUMAN,
+        config=AppConfig(controller=ControllerConfig(t0_debounce_ticks=1)),
+        clock=clock,
+        run_loop=False,
+    )
+    first = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    owner = controller._human_run  # pyright: ignore[reportPrivateUsage]
+    assert owner is not None
+
+    async def unknown_drop() -> None:
+        actuator.calls.append(("drop_beans", {}))
+
+    async def unknown_containment() -> ContainmentResult:
+        return ContainmentResult(ContainmentOutcome.UNKNOWN_TRANSPORT)
+
+    clock.advance(0.25)
+    await runner.tick_once()
+    actuator.charged = True
+    actuator.bean = 185
+    clock.advance(0.25)
+    await runner.tick_once()
+    if uncertainty == "drop":
+        monkeypatch.setattr(actuator, "drop_beans", unknown_drop)
+        actuator.bean = 196
+    else:
+        actuator.contain = unknown_containment
+        actuator.bound = False
+    clock.advance(0.25)
+    await runner.tick_once()
+    assert controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert owner.command is CommandDisposition.UNKNOWN
+    assert owner.endpoint is (
+        EndpointDisposition.UNKNOWN if uncertainty == "drop" else EndpointDisposition.NONE
+    )
+    assert not owner.durably_closed
+    assert not runner.finalized
+
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app(service)), base_url="http://test"
+    ) as http:
+        response = await http.post(
+            f"/api/roasts/{first.id}/operator-actions",
+            json={"action": "acknowledge_recovery", "payload": {"resume_to": "complete"}},
+        )
+        assert response.status_code == 200
+        assert response.json()["queued"] is True
+        clock.advance(0.25)
+        assert await runner.tick_once()
+        assert runner.finalized and owner.durably_closed
+        completed = await store.read_run(first.id)
+        assert completed is not None and completed.completed_at_utc is not None
+        assert completed.agent_phase is RoastPhase.COMPLETE
+        assert owner.command is CommandDisposition.UNKNOWN
+        assert not service._human_ownership.has_pending_call  # pyright: ignore[reportPrivateUsage]
+        response = await http.post("/api/roasts", json=PROFILE.model_dump(mode="json"))
+        assert response.status_code == 409
+        assert "HUMAN" in response.json()["detail"]
+
+    with pytest.raises(RoastRunConflictError, match="HUMAN.*ownership"):
+        await service._respawn_mcp_for_device_config(MCPDeviceConfig())  # pyright: ignore[reportPrivateUsage]
+    assert owner.command is CommandDisposition.UNKNOWN
+    assert owner.containment is (
+        ContainmentAttempt.CONSUMED
+        if uncertainty == "containment"
+        else ContainmentAttempt.AVAILABLE
+    )
+    assert process.lifecycle == ["stop"]
+    assert actuator.resets == 1
+    assert actuator.commands().count("start_session") == 1
+    assert (await store.read_run(first.id)) == completed
+    assert len((await service.history()).runs) == 1
+
+
+async def test_t51_stale_read_persists_conservative_age_in_safety_evaluation(
+    store: RoastStore,
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator)
+    run = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    clock.advance(0.25)
+    await runner.tick_once()
+    actuator.charged = True
+    actuator.bean = 185
+    clock.advance(0.25)
+    await runner.tick_once()
+
+    async def delay_response() -> None:
+        clock.advance(20)
+
+    actuator.collect = delay_response
+    actuator.bean = 196
+    clock.advance(0.25)
+    await runner.tick_once()
+    assert runner.controller_snapshot().phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert "drop_beans" not in actuator.commands()
+    async with store.connection.execute(
+        "SELECT reason FROM safety_evaluations WHERE run_id = ?", (run.id,)
+    ) as cursor:
+        reasons = [row[0] for row in await cursor.fetchall()]
+    assert any(
+        "BT valid, ET valid, accepted reading stale, conservative age seconds 20.25" in reason
+        for reason in reasons
+    )

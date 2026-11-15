@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, cast
 from unittest.mock import Mock, PropertyMock
@@ -183,11 +184,15 @@ async def test_t31_charge_turn_commits_once_and_threshold_is_inclusive(
         RoastPhase.COOLING if expected else RoastPhase.ROASTING_PRE_FIRST_CRACK
     )
     if expected:
-        assert any(
-            isinstance(payload, dict)
-            and cast("dict[str, object]", payload).get("target_outcome") == "interrupted_unmet"
-            for _, payload in h.emitter.events
-        )
+        (record,) = [
+            cast("dict[str, object]", payload)
+            for kind, payload in h.emitter.events
+            if kind is RoastEventKind.COMMAND_EXECUTED
+            and isinstance(payload, dict)
+            and cast("dict[str, object]", payload).get("command") == "drop_beans"
+        ]
+        assert record["target_outcome"] == "interrupted_unmet"
+        _assert_dispatch_interval(record, duration=0.0)
 
 
 async def test_t30_protective_drop_precedes_any_sink_await(
@@ -221,6 +226,7 @@ async def test_t36_unknown_drop_never_retries_or_contains(
 
     async def drop() -> AppliedRoasterState | None:
         h.actuator.calls.append(("drop_beans", {}))
+        h.clock.advance(0.5)
         if failure == "timeout":
             raise TimeoutError()
         if failure == "cancel":
@@ -236,13 +242,46 @@ async def test_t36_unknown_drop_never_retries_or_contains(
             await h.turn(bean=196, t0=True)
     else:
         await h.turn(bean=196, t0=True)
+    unknown = _drop_outcome_event(h, "unknown")
+    _assert_dispatch_interval(unknown, duration=0.5)
     await h.controller.operator_drop_beans()
     assert h.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
     assert h.commands.count("drop_beans") == 1
     assert h.actuator.containments == 0
+    refused = _drop_outcome_event(h, "refused_unknown_prior_drop")
+    assert refused["physical_intervention_required"] is True
+    assert "dispatch_started_at_utc" not in refused
+    assert h.controller.snapshot().physical_intervention_required
+    previous_commands = list(h.actuator.calls)
+    assert h.controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
+    await h.turn(bean=185)
+    assert h.actuator.calls == previous_commands
+    assert "set_targets" not in h.commands
+    assert h.controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
     assert h.ownership.lifecycle_blocked
     assert h.controller._human_run is not None  # pyright: ignore[reportPrivateUsage]
     assert h.controller._human_run.command is CommandDisposition.UNKNOWN  # pyright: ignore[reportPrivateUsage]
+
+
+def _drop_outcome_event(h: HumanHarness, outcome: str) -> dict[str, object]:
+    (record,) = [
+        cast("dict[str, object]", payload)
+        for _, payload in h.emitter.events
+        if isinstance(payload, dict)
+        and cast("dict[str, object]", payload).get("command") == "drop_beans"
+        and cast("dict[str, object]", payload).get("outcome") == outcome
+    ]
+    return record
+
+
+def _assert_dispatch_interval(payload: dict[str, object], *, duration: float) -> None:
+    start = payload["dispatch_started_at_utc"]
+    end = payload["dispatch_ended_at_utc"]
+    assert isinstance(start, str) and isinstance(end, str)
+    started, ended = datetime.fromisoformat(start), datetime.fromisoformat(end)
+    assert started.utcoffset() == ended.utcoffset() == timedelta(0)
+    assert ended >= started
+    assert payload["dispatch_duration_seconds"] == duration
 
 
 @pytest.mark.parametrize(
@@ -339,9 +378,10 @@ async def _assert_te11_refusal(*, latched: bool, reason: HumanCallRefusal) -> No
 
 @pytest.mark.parametrize("action", [WriteClass.HEAT, WriteClass.FAN, WriteClass.SESSION_START])
 async def test_te22_queued_guarded_write_rechecks_closed_fence(action: WriteClass) -> None:
-    h = await make_human()
-    await h.turn(bean=180)
-    await h.turn(bean=185, t0=True)
+    h = await make_human(start=action is not WriteClass.SESSION_START)
+    if action is not WriteClass.SESSION_START:
+        await h.turn(bean=180)
+        await h.turn(bean=185, t0=True)
     entered = asyncio.Event()
     allow = asyncio.Event()
     attempted = asyncio.Event()
@@ -354,12 +394,18 @@ async def test_te22_queued_guarded_write_rechecks_closed_fence(action: WriteClas
         attempted.set()
 
     generation = h.arbiter.generation
+    assert await h.controller._run_routine_write(  # pyright: ignore[reportPrivateUsage]
+        generation, write, write_class=action
+    ) == (True, None)
+    assert attempted.is_set()
+    attempted.clear()
     blocker = asyncio.create_task(h.arbiter.run_routine(generation, occupied))
     await asyncio.wait_for(entered.wait(), 1)
     queued = asyncio.create_task(
         h.controller._run_routine_write(generation, write, write_class=action)  # pyright: ignore[reportPrivateUsage]
     )
     await asyncio.sleep(0)
+    assert not queued.done() and not attempted.is_set()
     h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
     allow.set()
     assert await queued == (False, None)
@@ -376,12 +422,21 @@ async def test_te22_queued_guarded_write_rechecks_closed_fence(action: WriteClas
         ContainmentOutcome.REFUSED_BUSY,
         ContainmentOutcome.UNKNOWN_COMPLETION,
         ContainmentOutcome.UNKNOWN_MALFORMED_RESPONSE,
+        ContainmentOutcome.UNKNOWN_TRANSPORT,
+        ContainmentOutcome.UNKNOWN_DRIVER_RESULT,
+        ContainmentOutcome.NOT_ATTEMPTED,
     ],
 )
 async def test_t46b_containment_budget_does_not_reset(
     outcome: ContainmentOutcome,
 ) -> None:
-    h = await make_human()
+    child_teardown_unconfirmed = False
+    h = await make_human(teardown_unconfirmed=lambda: child_teardown_unconfirmed)
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    h.actuator.calls.clear()
+    owner = h.controller._human_run  # pyright: ignore[reportPrivateUsage]
+    assert owner is not None
 
     async def contain() -> ContainmentResult:
         reasons = {
@@ -389,21 +444,71 @@ async def test_t46b_containment_budget_does_not_reset(
             ContainmentOutcome.REFUSED_CAPABILITY: ContainmentReason.CAPABILITY_ABSENT,
             ContainmentOutcome.REFUSED_BUSY: ContainmentReason.COMMAND_IN_PROGRESS,
             ContainmentOutcome.UNKNOWN_COMPLETION: ContainmentReason.PROJECTION_UNCONFIRMED,
+            ContainmentOutcome.UNKNOWN_DRIVER_RESULT: ContainmentReason.DRIVER_RAISED,
         }
-        return ContainmentResult(outcome, reasons.get(outcome))
+        h.clock.advance(0.375)
+        return ContainmentResult(
+            outcome,
+            reasons.get(outcome),
+            evidence_heat_zero_commanded=True
+            if outcome is ContainmentOutcome.COMMAND_STATE_RETURNED
+            else None,
+            evidence_is_pre_fallback=outcome is ContainmentOutcome.UNKNOWN_COMPLETION,
+        )
 
     h.actuator.contain = contain
     result = await h.controller._contain_human_heat(  # pyright: ignore[reportPrivateUsage]
         generation=h.arbiter.generation
     )
-    await h.controller._contain_human_heat(generation=h.arbiter.generation)  # pyright: ignore[reportPrivateUsage]
     assert result.outcome is outcome
-    assert h.actuator.containments == 1
-    assert h.controller.snapshot().human_command_disposition is (
+    assert owner.command is (
         CommandDisposition.UNKNOWN if outcome.is_unknown else CommandDisposition.SETTLED
     )
-    assert "set_heat" not in h.commands
-    assert "emergency_stop" not in h.commands
+    (record,) = [
+        cast("dict[str, object]", payload)
+        for _, payload in h.emitter.events
+        if isinstance(payload, dict)
+        and cast("dict[str, object]", payload).get("command") == "contain_heat_fixed_zero"
+    ]
+    _assert_dispatch_interval(record, duration=0.375)
+
+    async def stays_consumed() -> None:
+        assert owner.containment is ContainmentAttempt.CONSUMED
+        retry = await h.controller._contain_human_heat(  # pyright: ignore[reportPrivateUsage]
+            generation=h.arbiter.generation
+        )
+        assert retry.outcome is ContainmentOutcome.NOT_ATTEMPTED
+        assert h.actuator.containments == 1
+
+    await stays_consumed()
+    h.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    await stays_consumed()
+    await h.turn(bean=185)
+    await h.turn(bean=185)
+    assert h.controller._accepted_readings.project_freshness() is ReadingFreshness.FRESH  # pyright: ignore[reportPrivateUsage]
+    await stays_consumed()
+    child_teardown_unconfirmed = True
+    await stays_consumed()
+    child_teardown_unconfirmed = False
+    await stays_consumed()
+    h.actuator.epoch += 1
+    await stays_consumed()
+    h.actuator.epoch -= 1
+    await stays_consumed()
+    prior_session = h.actuator.session_id
+    h.actuator.session_id = "different-synthetic-session"
+    await stays_consumed()
+    h.actuator.session_id = prior_session
+    await stays_consumed()
+    resumed = await h.controller.human_operator_continue(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert resumed is (not outcome.is_unknown)
+    await stays_consumed()
+    if not resumed:
+        assert await h.controller.human_operator_continue(RoastPhase.COOLING)
+        await stays_consumed()
+    await h.controller.recover_from_restart(h.controller.phase)
+    await stays_consumed()
+    assert h.actuator.calls == []
 
 
 @pytest.mark.parametrize("bean", [195.0, 196.0, 197.0])
@@ -1118,9 +1223,12 @@ async def test_te24_closure_allows_started_heat_operation_to_return() -> None:
 
 
 @pytest.mark.parametrize("kind", [WriteClass.HEAT, WriteClass.FAN])
-@pytest.mark.parametrize("blocked_by", ["endpoint", "freshness"])
+@pytest.mark.parametrize(
+    "blocked_by",
+    ["endpoint", "freshness", "durably_closed", "_routine_inhibited", "_protection_check_pending"],
+)
 async def test_t37_queued_lever_rechecks_endpoint_and_freshness(
-    kind: WriteClass, blocked_by: str
+    monkeypatch: pytest.MonkeyPatch, kind: WriteClass, blocked_by: str
 ) -> None:
     h = await make_human()
     await h.turn(bean=180)
@@ -1137,6 +1245,11 @@ async def test_t37_queued_lever_rechecks_endpoint_and_freshness(
         commands.append(kind)
 
     generation = h.arbiter.generation
+    assert await h.controller._run_routine_write(  # pyright: ignore[reportPrivateUsage]
+        generation, lever, write_class=kind
+    ) == (True, None)
+    assert commands == [kind]
+    commands.clear()
     prior = asyncio.create_task(h.arbiter.run_routine(generation, held))
     await asyncio.wait_for(occupied.wait(), 1)
     lever_task = asyncio.create_task(
@@ -1150,8 +1263,12 @@ async def test_t37_queued_lever_rechecks_endpoint_and_freshness(
             drop = asyncio.create_task(h.turn(bean=196))
             await asyncio.sleep(0)
             assert h.controller.snapshot().human_endpoint is EndpointDisposition.ADMITTED
-        else:
+        elif blocked_by == "freshness":
             h.clock.advance(20)
+        elif blocked_by == "durably_closed":
+            h.controller.note_human_run_durably_closed()
+        else:
+            monkeypatch.setattr(h.controller, blocked_by, True)
     finally:
         release.set()
         await prior
@@ -1163,8 +1280,10 @@ async def test_t37_queued_lever_rechecks_endpoint_and_freshness(
     assert h.commands.count("drop_beans") == int(blocked_by == "endpoint")
 
 
+@pytest.mark.parametrize("invalid_et", [False, True])
 async def test_unusable_bound_thermal_pair_uses_human_validity_and_recovery(
     monkeypatch: pytest.MonkeyPatch,
+    invalid_et: bool,
 ) -> None:
     h = await make_human()
     await h.turn(bean=180)
@@ -1173,6 +1292,8 @@ async def test_unusable_bound_thermal_pair_uses_human_validity_and_recovery(
 
     async def unusable_pair() -> HumanReadEvidence:
         evidence = await original()
+        if invalid_et:
+            return replace(evidence, telemetry=None, env=RawTemperature.INVALID, env_temp_c=None)
         return replace(evidence, telemetry=None, bean=RawTemperature.INVALID, bean_temp_c=None)
 
     monkeypatch.setattr(h.actuator, "read_human_evidence", unusable_pair)
@@ -1182,6 +1303,12 @@ async def test_unusable_bound_thermal_pair_uses_human_validity_and_recovery(
     assert h.controller.snapshot().telemetry is None
     assert h.controller.snapshot().charge_detected
     assert h.actuator.calls == []
+    if invalid_et:
+        assert "BT valid, ET invalid" in h.sink.evaluations[-1].reason
+    assert h.controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
+    await h.turn(bean=196)
+    assert h.actuator.calls == []
+    assert h.controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
 
 
 async def test_superseded_pending_read_cannot_write_snapshot_into_emergency_turn() -> None:
@@ -1416,7 +1543,19 @@ async def test_t45_operator_emergency_after_unknown_never_uses_ordinary_fail_saf
     h.actuator.calls.clear()
     await h.turn(bean=186)
     assert h.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
-    assert h.controller.snapshot().human_command_disposition is CommandDisposition.UNKNOWN
+    snapshot = h.controller.snapshot()
+    assert snapshot.human_command_disposition is CommandDisposition.UNKNOWN
+    assert snapshot.human_endpoint is EndpointDisposition.NONE
+    assert snapshot.physical_intervention_required
+    disclosure = snapshot.emergency_fallback_disclosure
+    assert disclosure is not None
+    assert "stop the drum and close the chute" in disclosure
+    assert "does not establish physical evacuation" in disclosure
+    await h.controller.operator_drop_beans()
+    assert (
+        _drop_outcome_event(h, "refused_unknown_prior_drop")["physical_intervention_required"]
+        is True
+    )
     assert h.actuator.containments == 1
     h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
     await h.controller.tick()
