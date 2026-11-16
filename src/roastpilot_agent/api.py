@@ -5839,7 +5839,8 @@ class RoastService:
             self._fault_lease_cache.generation != generation
             or self._fault_lease_cache.status is not FaultLeaseStatus.CLOSED
         ):
-            return close.model_copy(
+            # The immediately preceding CLOSED cache assignment cannot yield.
+            return close.model_copy(  # pragma: no cover
                 update={"confirmed": False}
             ), _FinalisationCloseEvidence.COMMITTED
         self.events.emit(RoastEventKind.FAULT_CONTROLS_ACKNOWLEDGED, payload)
@@ -6995,7 +6996,8 @@ class RoastService:
             return event
         controller = runner.controller_for_human_fault_drop()
         if controller is None or controller.phase is not event.phase:
-            return event
+            # Only HUMAN owns this frame, replaced synchronously with its phase.
+            return event  # pragma: no cover
         actions = self._human_recovery_actions(
             run_id,
             event.phase,

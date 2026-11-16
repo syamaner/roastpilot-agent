@@ -136,6 +136,7 @@ async def make_human(
     charge_debounce: int = 1,
     start: bool = True,
     advisor: RoastAdvisor | None = None,
+    safety: SafetyPolicy | None = None,
     bind_session: bool = True,
     bind_child: bool = True,
     read_port: bool = True,
@@ -150,7 +151,7 @@ async def make_human(
     arbiter = CommandArbiter()
     controller = RoastController(
         config=ControllerConfig(t0_debounce_ticks=charge_debounce),
-        safety=SafetyPolicy(SafetyLimits()),
+        safety=safety if safety is not None else SafetyPolicy(SafetyLimits()),
         state_reader=actuator,
         command_executor=actuator,
         snapshot_sink=sink,
@@ -2473,6 +2474,15 @@ async def test_l1_accepted_continuation_stays_inhibited_after_evidence_changes(
     assert h.controller._routine_inhibited  # pyright: ignore[reportPrivateUsage]
     assert h.controller._protection_check_pending  # pyright: ignore[reportPrivateUsage]
     assert h.commands == []
+    outcome = h.sink.evaluations[-1]
+    if invalidated_by == "identity":
+        assert outcome.rule == "human_continuation"
+        assert outcome.verdict is SafetyVerdict.REJECT
+    else:
+        assert outcome.rule == "human_reading_invalid"
+        assert outcome.verdict is SafetyVerdict.RECOVERY
+        freshness = "invalid" if invalidated_by == "epoch" else "unproven"
+        assert f"reading is {freshness}" in outcome.reason
 
 
 @pytest.mark.parametrize("bean", [196.0, 197.0])
@@ -2729,3 +2739,36 @@ async def test_l1_pending_continuation_sees_recovery_entered_during_read() -> No
     assert h.sink.evaluations[-1].rule == "human_continuation"
     assert h.sink.evaluations[-1].verdict is SafetyVerdict.REJECT
     assert h.commands == []
+
+
+async def test_human_protective_drop_honours_injected_policy_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = SafetyPolicy(SafetyLimits())
+    rejection = SafetyEvaluation(
+        rule="human_protective_drop",
+        verdict=SafetyVerdict.REJECT,
+        reason="test policy rejects the protective drop",
+    )
+    evaluate = Mock(return_value=rejection)
+    monkeypatch.setattr(policy, "evaluate_human_protective_drop", evaluate)
+    h = await make_human(safety=policy)
+    await h.turn(bean=180)
+    await h.turn(bean=185, t0=True)
+    h.actuator.calls.clear()
+
+    await h.turn(bean=196)
+
+    evaluate.assert_called_once_with(
+        authority=ControlAuthority.HUMAN,
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        charged=True,
+        freshness=ReadingFreshness.FRESH,
+        bean_temp_c=196,
+        endpoint=EndpointDisposition.NONE,
+        command=CommandDisposition.SETTLED,
+    )
+    assert rejection in h.sink.evaluations
+    assert "drop_beans" not in h.commands
+    assert h.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert h.controller.snapshot().human_endpoint is EndpointDisposition.NONE

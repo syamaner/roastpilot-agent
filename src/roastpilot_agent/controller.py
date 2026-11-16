@@ -3003,7 +3003,8 @@ class RoastController:
         turn = self._human_turn
         self._human_turn = None
         if turn is None:
-            return
+            # The serial tick sets its turn before awaits; early clear rethrows.
+            return  # pragma: no cover
         if self._phase in TERMINAL_LATCH_PHASES and self._generation_is_current(turn.generation):
             await self._retry_pending_fail_safe(generation=turn.generation)
         if turn.evidence is not None:
@@ -4086,7 +4087,8 @@ class RoastController:
     ) -> None:
         """Settle one readback record and classify contradictory drop evidence."""
         if self._human_run is None:
-            return
+            # The executor captures its readback resolver from a HUMAN selector.
+            return  # pragma: no cover
         record = self._fault_drop_readback
         self._fault_drop_readback = None
         if (
@@ -5198,7 +5200,8 @@ class RoastController:
 
         async def dispatch() -> ContainmentResult:
             if self._containment_refusal() is not None:
-                return ContainmentResult(ContainmentOutcome.NOT_ATTEMPTED)
+                # The arbiter rechecks admission and enters dispatch without yielding.
+                return ContainmentResult(ContainmentOutcome.NOT_ATTEMPTED)  # pragma: no cover
             with self._human_ownership.hold(PendingHumanCall.CONTAINMENT):
                 start_utc = datetime.now(UTC)
                 started = self._clock()

@@ -15,6 +15,7 @@ from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 
 from roastpilot_agent.api import (
+    EventBroadcaster,
     QueuedOperatorAction,
     RoastRunConflictError,
     RoastRunner,
@@ -61,6 +62,7 @@ from roastpilot_agent.models import (
     RoastCommand,
     RoastEventKind,
     RoastPhase,
+    SseEventType,
 )
 from roastpilot_agent.safety import SafetyEvaluation
 from roastpilot_agent.store import FaultControlCloseResult, FaultControlLease, RoastStore
@@ -4197,3 +4199,19 @@ async def test_d216_stale_or_foreign_closure_does_not_expose_human_end(
     assert child.lifecycle == []
     if replacement is not None:
         assert replacement.calls == []
+
+
+async def test_malformed_phase_broadcast_preserves_payload_without_enabled_actions() -> None:
+    events = EventBroadcaster()
+    subscriber = events.subscribe()
+    payload = {"phase": "unsupported-phase", "detail": "unclassified phase payload"}
+
+    try:
+        events.emit(RoastEventKind.PHASE_CHANGED, payload, human_run_id="synthetic-human-run")
+        frame = subscriber.get_nowait()
+        assert frame.event is SseEventType.PHASE_CHANGED
+        assert frame.data == payload
+        assert "enabled_actions" not in frame.data
+        assert subscriber.empty()
+    finally:
+        events.unsubscribe(subscriber)
