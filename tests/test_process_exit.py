@@ -322,6 +322,7 @@ _WATCHDOG_PROBE: Final = textwrap.dedent(
         os.replace(staging, marker)
 
     from roastpilot_agent.cli import _LiveExitGuard, _finish_live_teardown
+    from roastpilot_agent.human_run_ownership import AdmissionCloseReason
 
     # Production imports the API before teardown in _serve_live (cli.py:919).
     import roastpilot_agent.api
@@ -349,6 +350,9 @@ _WATCHDOG_PROBE: Final = textwrap.dedent(
             os.fsync(stream.fileno())
 
     class Service:
+        def close_human_call_admission(self, reason: AdmissionCloseReason) -> None:
+            assert reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+
         async def safe_shutdown_heat_off(self) -> None:
             record("heat-off")
 

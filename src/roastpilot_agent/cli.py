@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, cast
 import uvicorn
 
 from roastpilot_agent import __version__
+from roastpilot_agent.human_run_ownership import AdmissionCloseReason
 
 if TYPE_CHECKING:
     from roastpilot_agent.api import RoastService
@@ -872,6 +873,7 @@ async def _finish_live_teardown(
     exit_guard: _LiveExitGuard | None,
 ) -> None:
     """Complete ordered teardown despite cancellation, then arm the exit bound."""
+    service.close_human_call_admission(AdmissionCloseReason.APPLICATION_TEARDOWN)
     teardown = asyncio.create_task(
         _teardown_live(service, mcp, store),
         name="roastpilot-live-ordered-teardown",
@@ -1068,6 +1070,7 @@ async def _teardown_live(
         mcp: The MCP child process to stop after heat-off has landed.
         store: The decision-trace store to close last.
     """
+    service.close_human_call_admission(AdmissionCloseReason.APPLICATION_TEARDOWN)
     # Import only on the live teardown path. Normal CLI operations (notably
     # ``--help`` and replay) must not initialise the API stack merely to name a
     # teardown-only outcome enum.

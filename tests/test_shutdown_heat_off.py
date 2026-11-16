@@ -23,6 +23,7 @@ from roastpilot_agent.advisor import FakeAdvisor, RoastDecision
 from roastpilot_agent.api import RoastService, ShutdownHeatOffOutcome
 from roastpilot_agent.cli import _teardown_live  # pyright: ignore[reportPrivateUsage]
 from roastpilot_agent.config import AppConfig, ControllerConfig
+from roastpilot_agent.human_run_ownership import AdmissionCloseReason
 from roastpilot_agent.mcp_client import MCPServerProcess
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
@@ -712,6 +713,11 @@ async def test_record_child_stop_unconfirmed_is_noop_without_runner(store: Roast
     await service.record_child_stop_unconfirmed(stop_unconfirmed=True)
 
 
+class _TeardownAdmission:
+    def close_human_call_admission(self, reason: AdmissionCloseReason) -> None:
+        assert reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+
+
 @pytest.mark.asyncio
 async def test_teardown_runs_heat_off_before_mcp_stop() -> None:
     """The live-serve teardown calls heat-off BEFORE stopping the MCP child.
@@ -725,7 +731,7 @@ async def test_teardown_runs_heat_off_before_mcp_stop() -> None:
     """
     order: list[str] = []
 
-    class _RecordingService:
+    class _RecordingService(_TeardownAdmission):
         async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
             order.append("safe_shutdown_heat_off")
             return ShutdownHeatOffOutcome.DISPATCHED
@@ -788,7 +794,7 @@ async def test_teardown_marks_clean_epoch_after_proven_idle_noop(
     """Either typed no-op may mark clean only when durable state is idle."""
     order: list[str] = []
 
-    class _IdleService:
+    class _IdleService(_TeardownAdmission):
         async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
             order.append("safe_shutdown_heat_off")
             return outcome
@@ -841,7 +847,7 @@ async def test_teardown_does_not_mark_clean_epoch_when_any_required_proof_fails(
     """An active or unconfirmed teardown outcome cannot certify a clean epoch."""
     marked = False
 
-    class _Service:
+    class _Service(_TeardownAdmission):
         async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
             return (
                 ShutdownHeatOffOutcome.UNCONFIRMED
@@ -897,7 +903,7 @@ async def test_teardown_does_not_mark_clean_epoch_for_typed_noop_without_durable
     """A typed no-op cannot certify an active or unreadable durable run state."""
     marked = False
 
-    class _NoopService:
+    class _NoopService(_TeardownAdmission):
         async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
             return outcome
 
@@ -940,7 +946,7 @@ async def test_teardown_continues_after_swallowed_unconfirmed_heat_off() -> None
     """A production-style unconfirmed heat-off still stops child and closes store."""
     order: list[str] = []
 
-    class _RaisingService:
+    class _RaisingService(_TeardownAdmission):
         async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
             order.append("safe_shutdown_heat_off")
             return ShutdownHeatOffOutcome.UNCONFIRMED
@@ -986,7 +992,7 @@ async def test_teardown_continues_in_order_after_raising_heat_off() -> None:
     """A failed heat-off attempt cannot skip the remaining ordered cleanup."""
     order: list[str] = []
 
-    class _RaisingHeatOffService:
+    class _RaisingHeatOffService(_TeardownAdmission):
         async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
             order.append("safe_shutdown_heat_off")
             raise RuntimeError("synthetic heat-off failure")
@@ -1035,7 +1041,7 @@ async def test_teardown_runs_mcp_stop_and_store_close_after_later_cleanup_failur
     """A service or child-stop failure still reaches every subsequent cleanup."""
     order: list[str] = []
 
-    class _Service:
+    class _Service(_TeardownAdmission):
         async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
             order.append("safe_shutdown_heat_off")
             return ShutdownHeatOffOutcome.DISPATCHED
@@ -1083,7 +1089,7 @@ async def test_teardown_rejects_unconfirmed_active_runner_with_empty_store() -> 
     """An active in-memory runner cannot be certified by an empty store read."""
     marked = False
 
-    class _ActiveService:
+    class _ActiveService(_TeardownAdmission):
         runner = object()
 
         async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:

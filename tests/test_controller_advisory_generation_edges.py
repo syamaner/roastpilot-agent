@@ -15,6 +15,7 @@ from roastpilot_agent.advisor import (
 )
 from roastpilot_agent.config import SafetyLimits
 from roastpilot_agent.controller import AdvisoryTrigger, RoastPhase
+from roastpilot_agent.human_protection import EndpointOwner, WriteClass
 from roastpilot_agent.models import AppliedRoasterState, RoastEventKind
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 from tests.conftest import RecordingExecutor
@@ -137,6 +138,8 @@ async def test_estop_during_advisor_drop_audit_cannot_dispatch_drop(
         generation: int,
         operation: Callable[[], Awaitable[AppliedRoasterState | None]],
         *,
+        write_class: WriteClass,
+        endpoint_owner: EndpointOwner | None = None,
         admitted: Callable[[], bool] | None = None,
         close_reservation: int | None = None,
         allow_emergency_stop_transition_for_heat_off: bool = False,
@@ -146,6 +149,8 @@ async def test_estop_during_advisor_drop_audit_cannot_dispatch_drop(
         return await original_run_routine_write(
             generation,
             operation,
+            write_class=write_class,
+            endpoint_owner=endpoint_owner,
             admitted=admitted,
             close_reservation=close_reservation,
             allow_emergency_stop_transition_for_heat_off=(

@@ -18,6 +18,7 @@ import uvicorn
 
 from roastpilot_agent import cli
 from roastpilot_agent.api import ShutdownHeatOffOutcome
+from roastpilot_agent.human_run_ownership import AdmissionCloseReason
 
 
 class _ForcedProcessExit(BaseException):
@@ -955,6 +956,9 @@ def test_serve_first_signal_cancels_non_returning_server_before_ordered_teardown
     server_started = asyncio.Event()
 
     class _Service:
+        def close_human_call_admission(self, reason: AdmissionCloseReason) -> None:
+            assert reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+
         async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
             order.append("heat-off")
             return ShutdownHeatOffOutcome.DISPATCHED
@@ -1401,6 +1405,9 @@ async def test_live_teardown_resists_repeated_cancellation() -> None:
     allow_heat_done = asyncio.Event()
 
     class _Service:
+        def close_human_call_admission(self, reason: AdmissionCloseReason) -> None:
+            assert reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+
         async def safe_shutdown_heat_off(self) -> None:
             heat_started.set()
             await allow_heat_done.wait()
@@ -1453,6 +1460,9 @@ async def test_live_teardown_never_marks_epoch_clean_after_unconfirmed_heat_off(
     order: list[str] = []
 
     class _Service:
+        def close_human_call_admission(self, reason: AdmissionCloseReason) -> None:
+            assert reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+
         async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
             order.append("heat-off")
             return ShutdownHeatOffOutcome.UNCONFIRMED

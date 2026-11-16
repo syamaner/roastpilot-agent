@@ -21,7 +21,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Literal, Protocol, TypeVar
+from typing import Literal, Protocol, TypeVar, runtime_checkable
 
 from roastpilot_agent.advisor import (
     AdvisorContext,
@@ -43,7 +43,29 @@ from roastpilot_agent.control_policy import (
     RoastControlPolicy,
     TrimSignal,
 )
-from roastpilot_agent.human_protection import ContainmentResult
+from roastpilot_agent.human_protection import (
+    HUMAN_PROTECTION_BT_C,
+    AcceptedReadingTracker,
+    CommandDisposition,
+    ContainmentAttempt,
+    ContainmentOutcome,
+    ContainmentResult,
+    ControlAuthority,
+    EndpointDisposition,
+    EndpointOwner,
+    HumanReadEvidence,
+    ReadingFreshness,
+    WriteClass,
+    protection_eligible,
+)
+from roastpilot_agent.human_run_ownership import (
+    HumanCallAdmission,
+    HumanCallRefusal,
+    HumanRunOwnership,
+    HumanRunState,
+    PendingHumanCall,
+    RefusedHumanCall,
+)
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
     AppliedRoasterState,
@@ -152,6 +174,11 @@ class CommandArbiter:
     def is_current(self, generation: int) -> bool:
         """Whether a previously admitted routine operation remains current."""
         return generation == self._generation
+
+    @property
+    def routine_write_in_flight(self) -> bool:
+        """Return whether a routine call already owns the MCP boundary."""
+        return self._in_flight and not self._emergency_stop_in_flight
 
     @property
     def emergency_stop_active(self) -> bool:
@@ -432,6 +459,15 @@ class StateReader(Protocol):
         ...
 
 
+@runtime_checkable
+class HumanEvidenceReader(Protocol):
+    """Read one HUMAN envelope without changing the ordinary read port."""
+
+    async def read_human_evidence(self) -> HumanReadEvidence:
+        """Return raw classification and accepted-reading evidence."""
+        ...
+
+
 class CommandExecutor(Protocol):
     """Executes safety-approved roaster writes (E5 wraps the MCP tools)."""
 
@@ -561,11 +597,13 @@ class FaultControlExecutor:
         *,
         arbiter: CommandArbiter | None = None,
         trace_sink: FaultControlTraceSink | None = None,
+        human_drop_controller: "Callable[[str | None], RoastController | None] | None" = None,
     ) -> None:
         self._safety = safety
         self._port = port
         self._arbiter = arbiter or CommandArbiter()
         self._trace_sink = trace_sink
+        self._human_drop_controller = human_drop_controller
         self._queue: asyncio.PriorityQueue[
             tuple[
                 int,
@@ -700,6 +738,121 @@ class FaultControlExecutor:
                 if not future.done():
                     future.set_result(result)
 
+    async def execute_priority_emergency_stop(
+        self,
+        session_id: str,
+        *,
+        run_id: str | None,
+        is_current_generation: Callable[[], bool],
+    ) -> FaultControlState | None:
+        """Run one already-admitted exact-session e-stop without the worker.
+
+        The caller must already hold exactly one shared-arbiter emergency
+        reservation. This method never admits, queues or retries.
+
+        Args:
+            session_id: Exact session from the admitted fault-control lease.
+            run_id: Run associated with the command audit.
+            is_current_generation: Whether the admitted lease is still current.
+
+        Returns:
+            Fresh exact-session readback when it confirms the stop, otherwise None.
+        """
+        return await self._execute_exact_emergency_stop(session_id, is_current_generation, run_id)
+
+    async def _execute_exact_emergency_stop(
+        self,
+        session_id: str,
+        generation_current: Callable[[], bool],
+        run_id: str | None,
+    ) -> FaultControlState | None:
+        action = OperatorAction.EMERGENCY_STOP
+        evaluation = self._safety.evaluate_emergency_stop(
+            phase=RoastPhase.FAULTED, operator_reason="terminal fault control"
+        )
+        if evaluation.verdict is not SafetyVerdict.EMERGENCY_STOP:
+            await self._arbiter.cancel_emergency_stop_admission()
+            self._schedule_estop_trace(
+                run_id,
+                evaluation,
+                "failed",
+                {
+                    "admission": "rejected",
+                    "dispatch": "not_attempted",
+                    "confirmation": "failed",
+                },
+            )
+            return None
+        # No pre-read may postpone an e-stop attempt.  The guarded command
+        # result and its fresh exact-session readback are the proof.
+        write_started = False
+
+        async def dispatch_estop() -> None:
+            """Mark entry to the adapter so admission failures are not called writes."""
+            nonlocal write_started
+            write_started = True
+            await self._port.write_fault_control(action, expected_session_id=session_id)
+
+        try:
+            await self._arbiter.run_emergency_stop(dispatch_estop, admitted=generation_current)
+        except Exception:
+            self._schedule_estop_trace(
+                run_id,
+                evaluation,
+                "failed",
+                {
+                    "admission": "allowed",
+                    "dispatch": "write_failed" if write_started else "not_dispatched",
+                    "confirmation": "not_attempted",
+                },
+            )
+            raise
+        if not generation_current():
+            self._schedule_estop_trace(
+                run_id,
+                evaluation,
+                "failed",
+                {
+                    "admission": "allowed",
+                    "dispatch": "completed",
+                    "confirmation": "superseded",
+                },
+            )
+            return None
+        try:
+            state = await self._port.read_fault_control_state(session_id)
+        except Exception:
+            self._schedule_estop_trace(
+                run_id,
+                evaluation,
+                "failed",
+                {
+                    "admission": "allowed",
+                    "dispatch": "completed",
+                    "confirmation": "readback_failed",
+                },
+            )
+            raise
+        if not self._readback_confirms(action, state, session_id):
+            self._schedule_estop_trace(
+                run_id,
+                evaluation,
+                "failed",
+                {
+                    "admission": "allowed",
+                    "dispatch": "completed",
+                    "confirmation": "rejected_readback",
+                },
+            )
+            return None
+        self._schedule_estop_trace(
+            run_id,
+            evaluation,
+            "ok",
+            {"admission": "allowed", "dispatch": "completed", "confirmation": "read_back"},
+        )
+        return state
+
     async def _execute_one(
         self,
         action: OperatorAction,
@@ -714,91 +867,7 @@ class FaultControlExecutor:
     ) -> FaultControlState | None:
         """Evaluate and execute one current generation's exact-session action."""
         if action is OperatorAction.EMERGENCY_STOP:
-            evaluation = self._safety.evaluate_emergency_stop(
-                phase=RoastPhase.FAULTED, operator_reason="terminal fault control"
-            )
-            if evaluation.verdict is not SafetyVerdict.EMERGENCY_STOP:
-                await self._arbiter.cancel_emergency_stop_admission()
-                self._schedule_estop_trace(
-                    run_id,
-                    evaluation,
-                    "failed",
-                    {
-                        "admission": "rejected",
-                        "dispatch": "not_attempted",
-                        "confirmation": "failed",
-                    },
-                )
-                return None
-            # No pre-read may postpone an e-stop attempt.  The guarded command
-            # result and its fresh exact-session readback are the proof.
-            write_started = False
-
-            async def dispatch_estop() -> None:
-                """Mark entry to the adapter so admission failures are not called writes."""
-                nonlocal write_started
-                write_started = True
-                await self._port.write_fault_control(action, expected_session_id=session_id)
-
-            try:
-                await self._arbiter.run_emergency_stop(dispatch_estop, admitted=generation_current)
-            except Exception:
-                self._schedule_estop_trace(
-                    run_id,
-                    evaluation,
-                    "failed",
-                    {
-                        "admission": "allowed",
-                        "dispatch": "write_failed" if write_started else "not_dispatched",
-                        "confirmation": "not_attempted",
-                    },
-                )
-                raise
-            if not generation_current():
-                self._schedule_estop_trace(
-                    run_id,
-                    evaluation,
-                    "failed",
-                    {
-                        "admission": "allowed",
-                        "dispatch": "completed",
-                        "confirmation": "superseded",
-                    },
-                )
-                return None
-            try:
-                state = await self._port.read_fault_control_state(session_id)
-            except Exception:
-                self._schedule_estop_trace(
-                    run_id,
-                    evaluation,
-                    "failed",
-                    {
-                        "admission": "allowed",
-                        "dispatch": "completed",
-                        "confirmation": "readback_failed",
-                    },
-                )
-                raise
-            if not self._readback_confirms(action, state, session_id):
-                self._schedule_estop_trace(
-                    run_id,
-                    evaluation,
-                    "failed",
-                    {
-                        "admission": "allowed",
-                        "dispatch": "completed",
-                        "confirmation": "rejected_readback",
-                    },
-                )
-                return None
-            self._schedule_estop_trace(
-                run_id,
-                evaluation,
-                "ok",
-                {"admission": "allowed", "dispatch": "completed", "confirmation": "read_back"},
-            )
-            return state
+            return await self._execute_exact_emergency_stop(session_id, generation_current, run_id)
         # execute() returns before queueing every unmapped routine action.
         if command is None:  # pragma: no cover
             return None
@@ -915,66 +984,88 @@ class FaultControlExecutor:
                 run_id, command, "failed", evaluation_id, self._not_completed_result()
             )
             return None
+
+        async def write() -> None:
+            await self._port.write_fault_control(action, expected_session_id=session_id)
+
+        controller: RoastController | None = None
+        observed: FaultControlState | None = None
         try:
-            dispatched, _ = await self._arbiter.run_routine(
-                generation,
-                lambda: self._port.write_fault_control(action, expected_session_id=session_id),
-                admitted=generation_current,
-                close_reservation=close_reservation,
-            )
-        except Exception:
-            self._schedule_command_trace(
-                run_id, command, "failed", evaluation_id, self._unconfirmed_result("failed")
-            )
-            raise
-        if (
-            not dispatched
-            or not generation_current()
-            or (
-                close_reservation is not None
-                and not self._arbiter.close_reservation_is_current(close_reservation)
-            )
-        ):
-            self._schedule_command_trace(
-                run_id, command, "failed", evaluation_id, self._not_completed_result()
-            )
-            return None
-        try:
-            state = await self._port.read_fault_control_state(session_id)
-        except Exception:
+            try:
+                if action is OperatorAction.DROP_BEANS and self._human_drop_controller is not None:
+                    controller = self._human_drop_controller(run_id)
+                    dispatched = (
+                        controller is not None
+                        and await controller.execute_human_fault_drop(
+                            session_id,
+                            generation=generation,
+                            lease_current=generation_current,
+                            operation=write,
+                        )
+                    )
+                else:
+                    dispatched, _ = await self._arbiter.run_routine(
+                        generation,
+                        write,
+                        admitted=generation_current,
+                        close_reservation=close_reservation,
+                    )
+            except Exception:
+                self._schedule_command_trace(
+                    run_id, command, "failed", evaluation_id, self._unconfirmed_result("failed")
+                )
+                raise
+            if (
+                not dispatched
+                or not generation_current()
+                or (
+                    close_reservation is not None
+                    and not self._arbiter.close_reservation_is_current(close_reservation)
+                )
+            ):
+                self._schedule_command_trace(
+                    run_id, command, "failed", evaluation_id, self._not_completed_result()
+                )
+                return None
+            try:
+                observed = await self._port.read_fault_control_state(session_id)
+            except Exception:
+                self._schedule_command_trace(
+                    run_id,
+                    command,
+                    "failed",
+                    evaluation_id,
+                    {
+                        "admission": "allowed",
+                        "dispatch": "completed",
+                        "confirmation": "readback_failed",
+                    },
+                )
+                raise
+            if not self._readback_confirms(action, observed, session_id):
+                self._schedule_command_trace(
+                    run_id,
+                    command,
+                    "failed",
+                    evaluation_id,
+                    {
+                        "admission": "allowed",
+                        "dispatch": "completed",
+                        "confirmation": "rejected_readback",
+                    },
+                )
+                return None
             self._schedule_command_trace(
                 run_id,
                 command,
-                "failed",
+                "ok",
                 evaluation_id,
-                {
-                    "admission": "allowed",
-                    "dispatch": "completed",
-                    "confirmation": "readback_failed",
-                },
+                {"admission": "allowed", "dispatch": "completed", "confirmation": "read_back"},
             )
-            raise
-        if not self._readback_confirms(action, state, session_id):
-            self._schedule_command_trace(
-                run_id,
-                command,
-                "failed",
-                evaluation_id,
-                {
-                    "admission": "allowed",
-                    "dispatch": "completed",
-                    "confirmation": "rejected_readback",
-                },
-            )
-            return None
-        self._schedule_command_trace(
-            run_id,
-            command,
-            "ok",
-            evaluation_id,
-            {"admission": "allowed", "dispatch": "completed", "confirmation": "read_back"},
-        )
-        return state
+            return observed
+        finally:
+            if controller is not None:
+                controller.resolve_fault_drop_readback(session_id, observed)
 
     @staticmethod
     def _command_for_action(action: OperatorAction) -> RoastCommand | None:
@@ -1513,6 +1604,33 @@ class ControllerSnapshot:
     #: Persistence uses this historical witness; live SSE uses the phase-gated
     #: current-authority fields above.
     accepted_post_fc_output: PostFcControlOutput | None = None
+    human_endpoint: EndpointDisposition | None = None
+    human_command_disposition: CommandDisposition | None = None
+    physical_intervention_required: bool = False
+    emergency_fallback_disclosure: str | None = None
+
+
+@dataclass
+class _HumanTurn:
+    generation: int
+    evaluations: list[SafetyEvaluation]
+    evidence: HumanReadEvidence | None = None
+    ambient_validity: str = "absent"
+
+
+@dataclass(frozen=True)
+class _HumanContinuation:
+    target: RoastPhase
+    command_generation: int
+    session_id: str
+    child_generation: int
+
+
+@dataclass(frozen=True)
+class _FaultDropReadback:
+    run: HumanRunState
+    session_id: str
+    generation: int
 
 
 class RoastController:
@@ -1540,7 +1658,40 @@ class RoastController:
         reference_roast: ReferenceRoast | None = None,
         start_write_permitted: Callable[[], bool] | None = None,
         actuator_arbiter: CommandArbiter | None = None,
+        authority: ControlAuthority = ControlAuthority.AUTOMATIC,
+        run_id: str = "",
+        human_reader: HumanEvidenceReader | None = None,
+        human_ownership: HumanRunOwnership | None = None,
+        human_admission: HumanCallAdmission | None = None,
+        teardown_unconfirmed: Callable[[], bool] | None = None,
+        current_session_id: Callable[[], str | None] | None = None,
+        current_child_generation: Callable[[], int | None] | None = None,
+        containment_discovered: Callable[[], bool] | None = None,
+        capture_bound_raw_read: Callable[[], str] | None = None,
     ) -> None:
+        self._authority = authority
+        self._human_reader = human_reader
+        self._human_ownership = human_ownership or HumanRunOwnership()
+        self._human_run = (
+            self._human_ownership.claim_run(run_id) if authority is ControlAuthority.HUMAN else None
+        )
+        if self._human_run is not None:
+            self._human_drop_evaluation_tasks: set[asyncio.Task[int | None]] = set()
+            self._human_closure_started = False
+            self._human_completion_uncertain = False
+            self._fault_drop_readback: _FaultDropReadback | None = None
+        self._human_admission = human_admission
+        self._teardown_unconfirmed = teardown_unconfirmed
+        self._current_session_id = current_session_id
+        self._current_child_generation = current_child_generation
+        self._containment_discovered = containment_discovered
+        self._capture_bound_raw_read = capture_bound_raw_read
+        self._canonical_human_fc_confirmed = False
+        self._human_turn: _HumanTurn | None = None
+        self._human_continuation: _HumanContinuation | None = None
+        self._accepted_readings = AcceptedReadingTracker(clock, config.max_stale_telemetry_seconds)
+        self._routine_inhibited = False
+        self._protection_check_pending = False
         self._config = config
         self._safety = safety
         self._reader = state_reader
@@ -1880,6 +2031,18 @@ class RoastController:
         post_fc_output = (
             self._last_post_fc_output if self._phase is RoastPhase.DEVELOPMENT else None
         )
+        run = self._human_run
+        physical_intervention = run is not None and (
+            run.command is CommandDisposition.UNKNOWN
+            or run.endpoint is EndpointDisposition.WITHHELD
+            or (
+                self._phase in TERMINAL_LATCH_PHASES
+                and self._human_recovery_drop_evaluation(
+                    freshness=self._accepted_readings.project_freshness()
+                ).verdict
+                is not SafetyVerdict.ALLOW
+            )
+        )
         return ControllerSnapshot(
             phase=self._phase,
             current_heat=self._current_heat,
@@ -1905,6 +2068,15 @@ class RoastController:
             advisory_paused=self._advisory_paused,
             charge_detected=self._charge_monotonic is not None,
             accepted_post_fc_output=self._accepted_post_fc_output,
+            human_endpoint=None if run is None else run.endpoint,
+            human_command_disposition=None if run is None else run.command,
+            physical_intervention_required=physical_intervention,
+            emergency_fallback_disclosure=(
+                None
+                if run is None
+                else "Emergency fallback may stop the drum and close the chute. "
+                "Admission or RPC return does not establish physical evacuation."
+            ),
         )
 
     def _roast_elapsed_seconds(self) -> float:
@@ -2488,11 +2660,13 @@ class RoastController:
         operation: Callable[[], Awaitable[_ActuationT]],
         *,
         close_reservation: int,
+        write_class: WriteClass,
     ) -> tuple[bool, _ActuationT | None]:
         """Run the policy-authorized D212 cooling stop through the shared arbiter."""
         return await self._run_routine_write(
             generation,
             operation,
+            write_class=write_class,
             admitted=lambda: self._arbiter.close_reservation_is_current(close_reservation),
             close_reservation=close_reservation,
         )
@@ -2513,11 +2687,84 @@ class RoastController:
         """Return whether the D212 write fence still belongs to ``generation``."""
         return self._arbiter.close_reservation_is_current(generation)
 
+    @property
+    def authority(self) -> ControlAuthority:
+        """Return the constructor-bound source of roast authority."""
+        return self._authority
+
+    def note_human_run_durably_closed(self) -> None:
+        """Record durable local finalization without resolving unknown commands."""
+        if self._human_run is not None:
+            self._human_run.durably_closed = True
+
+    def _human_actuation_admitted(self) -> bool:
+        return (self._human_admission is None or self._human_admission.closed_reason is None) and (
+            self._teardown_unconfirmed is None or not self._teardown_unconfirmed()
+        )
+
+    def _human_routine_permitted(
+        self, write_class: WriteClass, endpoint_owner: EndpointOwner | None
+    ) -> bool:
+        run = self._human_run
+        assert run is not None
+        # NON_HEAT retains base teardown/cooling policy and does not read the
+        # admission fence or child flag. Command uncertainty still owns the run.
+        if write_class is WriteClass.NON_HEAT:
+            return (
+                self._human_ownership.is_current(run) and run.command is CommandDisposition.SETTLED
+            )
+        if (
+            not self._human_ownership.is_current(run)
+            or not self._human_actuation_admitted()
+            or run.command is CommandDisposition.UNKNOWN
+        ):
+            return False
+        if write_class in (WriteClass.HEAT, WriteClass.FAN):
+            return (
+                not run.durably_closed
+                and run.endpoint is EndpointDisposition.NONE
+                and not self._routine_inhibited
+                and not self._protection_check_pending
+                and self._accepted_readings.recheck() is ReadingFreshness.FRESH
+            )
+        if write_class is WriteClass.DROP:
+            return (
+                endpoint_owner is not None
+                and run.endpoint_owner is endpoint_owner
+                and run.endpoint is EndpointDisposition.ADMITTED
+                and self._accepted_readings.recheck() is ReadingFreshness.FRESH
+            )
+        return True
+
+    async def _read_human_call(
+        self, turn: _HumanTurn | None = None
+    ) -> HumanReadEvidence | RefusedHumanCall:
+        kind = PendingHumanCall.READ
+        if self._human_admission is not None and self._human_admission.closed_reason is not None:
+            return RefusedHumanCall(kind, HumanCallRefusal.ADMISSION_CLOSED)
+        if self._human_ownership.pending(kind):
+            return RefusedHumanCall(kind, HumanCallRefusal.READ_ALREADY_PENDING)
+        reader = self._human_reader
+        if reader is None:
+            raise RuntimeError("HUMAN authority requires a human evidence reader")
+        with self._human_ownership.hold(kind):
+            evidence = await reader.read_human_evidence()
+            if (
+                evidence.bound_child_epoch is not None
+                and self._capture_bound_raw_read is not None
+                and turn is not None
+                and self._generation_is_current(turn.generation)
+            ):
+                turn.ambient_validity = self._capture_bound_raw_read()
+            return evidence
+
     async def _run_routine_write(
         self,
         generation: int,
         operation: Callable[[], Awaitable[_ActuationT]],
         *,
+        write_class: WriteClass,
+        endpoint_owner: EndpointOwner | None = None,
         admitted: Callable[[], bool] | None = None,
         close_reservation: int | None = None,
         allow_emergency_stop_transition_for_heat_off: bool = False,
@@ -2527,9 +2774,21 @@ class RoastController:
         def routine_admission_is_current() -> bool:
             """Reject writes until an admitted stop has committed FAULTED."""
             return (
-                allow_emergency_stop_transition_for_heat_off
-                or not self._emergency_stop_transition_pending
-            ) and (admitted is None or admitted())
+                (
+                    allow_emergency_stop_transition_for_heat_off
+                    or not self._emergency_stop_transition_pending
+                )
+                and (
+                    self._human_run is None
+                    or allow_emergency_stop_transition_for_heat_off
+                    or self._human_routine_permitted(write_class, endpoint_owner)
+                )
+                and (
+                    write_class is not WriteClass.SESSION_START
+                    or self._human_ownership.allows_session_start(self._human_run)
+                )
+                and (admitted is None or admitted())
+            )
 
         return await self._arbiter.run_routine(
             generation,
@@ -2558,6 +2817,7 @@ class RoastController:
         dispatched, _ = await self._run_routine_write(
             generation,
             lambda: self._executor.set_heat(heat_percent),
+            write_class=WriteClass.HEAT,
             allow_emergency_stop_transition_for_heat_off=(
                 allow_emergency_stop_transition_for_heat_off and heat_percent == 0
             ),
@@ -2567,11 +2827,207 @@ class RoastController:
         dispatched, _ = await self._run_routine_write(
             generation,
             lambda: self._executor.set_fan(fan_percent),
+            write_class=WriteClass.FAN,
             allow_emergency_stop_transition_for_heat_off=(
                 allow_emergency_stop_transition_for_heat_off and heat_percent == 0
             ),
         )
         return dispatched
+
+    async def human_urgent_stage(self, *, emergency_won_batch: bool = False) -> None:
+        """Read once and act on urgent HUMAN safety before any sink awaits."""
+        run = self._human_run
+        if run is None:
+            raise RuntimeError("HUMAN urgent stage requires HUMAN authority")
+        generation = self._arbiter.generation
+        turn = _HumanTurn(generation, [])
+        self._human_turn = turn
+        self._last_telemetry = None
+        self._accepted_post_fc_output = None
+        if emergency_won_batch or self._emergency_stop_transition_pending:
+            return
+        latched = self._phase in TERMINAL_LATCH_PHASES
+        try:
+            evidence = await self._read_human_call(turn)
+        except asyncio.CancelledError:
+            self._accepted_readings.record_read_failure()
+            self._human_turn = None
+            raise
+        except Exception:
+            self._accepted_readings.record_read_failure()
+            if not latched and self._generation_is_current(generation):
+                self._consecutive_read_failures += 1
+                evaluation = self._safety.evaluate_mcp_failure(
+                    operation="read", consecutive_failures=self._consecutive_read_failures
+                )
+                turn.evaluations.append(evaluation)
+                await self._act_on_safety(evaluation, generation=generation)
+            return
+        if not self._generation_is_current(generation):
+            return
+        if isinstance(evidence, RefusedHumanCall):
+            self._accepted_readings.record_read_failure()
+            self._routine_inhibited = True
+            return
+        turn.evidence = evidence
+        telemetry = evidence.telemetry
+        self._last_telemetry = telemetry
+        if not latched:
+            self._consecutive_read_failures = 0
+        if evidence.bound_child_epoch is None:
+            freshness = self._accepted_readings.record_read_failure()
+        else:
+            freshness = self._accepted_readings.observe(
+                child_epoch=evidence.bound_child_epoch,
+                counters=evidence.counters,
+                bean_temp_c=evidence.bean_temp_c,
+                env_temp_c=evidence.env_temp_c,
+                request_admitted_at=evidence.request_admitted_at,
+            )
+        if latched:
+            if telemetry is not None:
+                await self._human_escalate_if_needed(turn, telemetry)
+            return
+        await self._evaluate_human_turn(turn, evidence, freshness)
+
+    async def _evaluate_human_turn(
+        self, turn: _HumanTurn, evidence: HumanReadEvidence, freshness: ReadingFreshness
+    ) -> None:
+        run = self._human_run
+        assert run is not None
+        telemetry = evidence.telemetry
+        generation = turn.generation
+        confirm_charge = False
+        if self._phase is RoastPhase.PREHEATING:
+            if telemetry is None or evidence.bound_child_epoch is None:
+                self._reset_t0_debounce()
+            else:
+                self._observe_charge_streak(telemetry)
+                if self._t0_streak >= self._config.t0_debounce_ticks:
+                    source = self._safety.evaluate_event_source(
+                        transition="t0", source=RoastEventSource.MCP
+                    )
+                    turn.evaluations.append(source)
+                    confirm_charge = source.verdict is SafetyVerdict.ALLOW and self.can_transition(
+                        RoastPhase.ROASTING_PRE_FIRST_CRACK
+                    )
+        charged = self._t0_confirmed or confirm_charge
+        phase = RoastPhase.ROASTING_PRE_FIRST_CRACK if confirm_charge else self._phase
+        validity = self._safety.evaluate_telemetry_validity(
+            phase=phase,
+            telemetry_age_seconds=None if telemetry is None else telemetry.age_seconds,
+            max_stale_seconds=self._config.max_stale_telemetry_seconds,
+            authority=ControlAuthority.HUMAN,
+            charged=charged,
+        )
+        ambient_age = (
+            telemetry.ambient_age_seconds
+            if turn.ambient_validity == "valid" and telemetry is not None
+            else None
+        )
+        turn.evaluations.append(
+            validity.model_copy(
+                update={
+                    "reason": (
+                        f"{validity.reason} (BT {evidence.bean.value}, ET {evidence.env.value}, "
+                        f"accepted reading {freshness.value}, conservative age seconds "
+                        f"{self._accepted_readings.acceptance_age_seconds()}, "
+                        f"ambient {turn.ambient_validity}, ambient age seconds {ambient_age})"
+                    )
+                }
+            )
+        )
+        if validity.verdict is not SafetyVerdict.ALLOW or telemetry is None:
+            await self._act_on_safety(validity, generation=generation)
+            return
+        hard_limits = self._safety.evaluate_telemetry(
+            phase=phase,
+            bean_temp_c=telemetry.bean_temp_c,
+            env_temp_c=telemetry.env_temp_c,
+            t0_confirmed=charged,
+        )
+        turn.evaluations.append(hard_limits)
+        if await self._act_on_safety(hard_limits, generation=generation):
+            return
+        if confirm_charge:
+            self._maybe_emit_charge_guidance(telemetry)
+            self._commit_confirmed_charge(telemetry)
+        reading = self._safety.evaluate_human_reading(
+            phase=self._phase, charged=charged, freshness=freshness
+        )
+        turn.evaluations.append(reading)
+        if await self._act_on_safety(reading, generation=generation):
+            return
+        if self._protection_check_pending and not self._check_human_continuation(turn, evidence):
+            return
+        if protection_eligible(
+            authority=ControlAuthority.HUMAN,
+            phase=self._phase,
+            charged=charged,
+            freshness=freshness,
+            bean_temp_c=evidence.bean_temp_c,
+            endpoint=run.endpoint,
+            command=run.command,
+        ):
+            evaluation = self._safety.evaluate_human_protective_drop(
+                authority=ControlAuthority.HUMAN,
+                phase=self._phase,
+                charged=charged,
+                freshness=freshness,
+                bean_temp_c=evidence.bean_temp_c,
+                endpoint=run.endpoint,
+                command=run.command,
+            )
+            turn.evaluations.append(evaluation)
+            if evaluation.verdict is SafetyVerdict.ALLOW:
+                await self._execute_human_drop(
+                    EndpointOwner.PROTECTION, DropReason.HUMAN_PROTECTION, generation=generation
+                )
+
+    async def _human_escalate_if_needed(self, turn: _HumanTurn, telemetry: RoastTelemetry) -> None:
+        latched = self._latched_verdict
+        if latched is None or self._fault_acknowledged or latched is SafetyVerdict.EMERGENCY_STOP:
+            return
+        evaluation = self._safety.evaluate_telemetry(
+            phase=self._phase,
+            bean_temp_c=telemetry.bean_temp_c,
+            env_temp_c=telemetry.env_temp_c,
+            t0_confirmed=self._t0_confirmed,
+        )
+        severity = _TERMINAL_VERDICT_SEVERITY.get(evaluation.verdict)
+        if severity is not None and severity > _TERMINAL_VERDICT_SEVERITY[latched]:
+            turn.evaluations.append(evaluation)
+            await self._escalate_to_emergency_stop(evaluation)
+
+    async def _finish_human_turn(self) -> None:
+        turn = self._human_turn
+        self._human_turn = None
+        if turn is None:
+            # The serial tick sets its turn before awaits; early clear rethrows.
+            return  # pragma: no cover
+        if self._phase in TERMINAL_LATCH_PHASES and self._generation_is_current(turn.generation):
+            await self._retry_pending_fail_safe(generation=turn.generation)
+        if turn.evidence is not None:
+            await self._snapshots.persist_snapshot(turn.evidence.telemetry)
+        for evaluation in turn.evaluations:
+            await self._snapshots.persist_evaluation(evaluation)
+        if not self._generation_is_current(turn.generation):
+            return
+        self._check_operator_timeout()
+        if (
+            turn.evidence is None
+            or self._phase in TERMINAL_LATCH_PHASES
+            or self._routine_inhibited
+            or self._protection_check_pending
+        ):
+            self._advisory_requested = False
+            return
+        telemetry = turn.evidence.telemetry
+        if telemetry is not None and self._phase is RoastPhase.PREHEATING:
+            self._maybe_emit_charge_guidance(telemetry)
+        if telemetry is not None and self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK:
+            self._maybe_emit_drying_end(telemetry)
+        await self._run_tick_controls(telemetry, generation=turn.generation)
 
     async def tick(self) -> None:
         """Run one controller tick in the documented order.
@@ -2589,6 +3045,14 @@ class RoastController:
         separate, always-available methods, so the latch never reduces what the
         operator can do (#206 operable-faulted intact).
         """
+        if self._human_run is not None:
+            try:
+                if self._human_turn is None:
+                    await self.human_urgent_stage()
+                await self._finish_human_turn()
+            finally:
+                self._human_turn = None
+            return
         generation = self._arbiter.generation
         # An admitted e-stop owns this controller generation until its hardware
         # outcome returns.  Starting another tick in that interval could persist
@@ -2645,6 +3109,11 @@ class RoastController:
         if not self._generation_is_current(generation):
             return
         self._check_operator_timeout()
+        await self._run_tick_controls(telemetry, generation=generation)
+
+    async def _run_tick_controls(
+        self, telemetry: RoastTelemetry | None, *, generation: int
+    ) -> None:
         # D35 §3 (#222): pre-FC the controller deterministically sets heat/fan
         # from the policy — runs AFTER _apply_phase_rules so a tick that just
         # charged (PREHEATING → ROASTING_PRE_FIRST_CRACK) actuates the pre-FC
@@ -3526,6 +3995,318 @@ class RoastController:
                     output.projection_cutoff_runway_seconds,
                 )
 
+    def _join_human_drop(self) -> bool:
+        run = self._human_run
+        assert run is not None
+        if run.command is CommandDisposition.UNKNOWN or run.endpoint in (
+            EndpointDisposition.UNKNOWN,
+            EndpointDisposition.HISTORY_UNKNOWN,
+        ):
+            outcome = "refused_unknown_prior_drop"
+        elif run.endpoint in (
+            EndpointDisposition.ADMITTED,
+            EndpointDisposition.IN_FLIGHT,
+            EndpointDisposition.ISSUED,
+        ):
+            outcome = "joined_protective_endpoint"
+        else:
+            return False
+        self._events.emit(
+            RoastEventKind.COMMAND_FAILED,
+            {
+                "command": "drop_beans",
+                "outcome": outcome,
+                "physical_intervention_required": outcome == "refused_unknown_prior_drop",
+            },
+        )
+        return True
+
+    def _human_recovery_drop_evaluation(
+        self,
+        *,
+        session_matches: bool = True,
+        endpoint: EndpointDisposition | None = None,
+        freshness: ReadingFreshness | None = None,
+    ) -> SafetyEvaluation:
+        run = self._human_run
+        assert run is not None
+        return self._safety.evaluate_human_recovery_drop(
+            phase=self._phase,
+            session_matches=session_matches and self._known_human_identity() is not None,
+            charged=self._t0_confirmed,
+            freshness_at_eval=(
+                self._accepted_readings.recheck() if freshness is None else freshness
+            ),
+            endpoint=run.endpoint if endpoint is None else endpoint,
+            command=run.command,
+        )
+
+    def human_drop_closed(self) -> bool:
+        """Return whether HUMAN drop evidence and admission are closed."""
+        run = self._human_run
+        return run is not None and (run.durably_closed or self._human_closure_started)
+
+    def begin_human_completion(self, *, uncertain: bool = False) -> None:
+        """Close HUMAN drop admission and retain any persistence uncertainty."""
+        self._human_closure_started = True
+        if uncertain:
+            self._human_completion_uncertain = True
+
+    def clear_human_completion_after_proven_non_commit(self) -> None:
+        """Reopen admission after definite non-commit without earlier uncertainty."""
+        if not self._human_completion_uncertain:
+            self._human_closure_started = False
+
+    @staticmethod
+    def _consume_human_drop_evaluation(task: asyncio.Task[int | None]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def settle_human_drop_evaluations(self) -> bool:
+        """Wait for registered writes and retain any unsettled evaluation evidence."""
+        tasks = tuple(self._human_drop_evaluation_tasks)
+        if tasks:
+            await asyncio.wait(tasks)
+        for task in tasks:
+            if not task.cancelled() and task.exception() is None:
+                self._human_drop_evaluation_tasks.discard(task)
+        return not self._human_drop_evaluation_tasks
+
+    def human_drop_evaluation_outstanding(self) -> bool:
+        """Whether pending or cancelled S3 evaluation ownership needs direct e-stop routing."""
+        return self._human_run is not None and any(
+            not task.done() or task.cancelled() for task in self._human_drop_evaluation_tasks
+        )
+
+    def has_pending_fault_drop_readback(self) -> bool:
+        """Return whether a HUMAN fault drop still awaits exact-session readback."""
+        return self._human_run is not None and self._fault_drop_readback is not None
+
+    def resolve_fault_drop_readback(
+        self, session_id: str, observed: FaultControlState | None
+    ) -> None:
+        """Settle one readback record and classify contradictory drop evidence."""
+        if self._human_run is None:
+            # The executor captures its readback resolver from a HUMAN selector.
+            return  # pragma: no cover
+        record = self._fault_drop_readback
+        self._fault_drop_readback = None
+        if (
+            record is None
+            or not self._human_ownership.is_current(record.run)
+            or record.session_id != session_id
+            or record.run.session_id != session_id
+            or record.run.endpoint is not EndpointDisposition.ISSUED
+            or record.run.endpoint_owner is not EndpointOwner.FAULT_CONTROL
+        ):
+            return
+        if (
+            isinstance(observed, FaultControlState)
+            and observed.session_id == record.session_id
+            and type(observed.beans_dropped) is bool
+            and observed.beans_dropped is False
+        ):
+            record.run.endpoint = EndpointDisposition.UNKNOWN
+            record.run.command = CommandDisposition.UNKNOWN
+            if not self.human_drop_closed():
+                self._events.emit(
+                    RoastEventKind.COMMAND_FAILED,
+                    {"command": "drop_beans", "outcome": "unknown"},
+                )
+                if self._generation_is_current(record.generation):
+                    self._project_human_drop_recovery()
+
+    def human_recovery_drop_allowed(self, *, session_id: str | None = None) -> bool:
+        """Project whether available HUMAN evidence admits an explicit drop."""
+        run = self._human_run
+        return (
+            not self.human_drop_closed()
+            and run is not None
+            and (session_id is None or run.session_id == session_id)
+            and self._human_actuation_admitted()
+            and self._human_recovery_drop_evaluation(
+                freshness=self._accepted_readings.project_freshness()
+            ).verdict
+            is SafetyVerdict.ALLOW
+        )
+
+    async def execute_human_fault_drop(
+        self,
+        session_id: str,
+        *,
+        generation: int,
+        lease_current: Callable[[], bool],
+        operation: Callable[[], Awaitable[None]],
+    ) -> bool:
+        """Guard one exact fault-session drop through the HUMAN endpoint latch."""
+        if self.human_drop_closed():
+            return False
+        run = self._human_run
+        if run is None or self._join_human_drop():
+            return False
+        evaluation = self._human_recovery_drop_evaluation(
+            session_matches=run.session_id == session_id
+        )
+        task = asyncio.create_task(self._snapshots.persist_evaluation(evaluation))
+        self._human_drop_evaluation_tasks.add(task)
+        task.add_done_callback(self._consume_human_drop_evaluation)
+        await asyncio.shield(task)
+        self._human_drop_evaluation_tasks.discard(task)
+        if (
+            self.human_drop_closed()
+            or evaluation.verdict is not SafetyVerdict.ALLOW
+            or not lease_current()
+            or not self._generation_is_current(generation)
+            or self._join_human_drop()
+        ):
+            return False
+        return await self._execute_human_drop(
+            EndpointOwner.FAULT_CONTROL,
+            None,
+            generation=generation,
+            fault_dispatch=operation,
+            lease_current=lease_current,
+        )
+
+    async def _execute_human_drop(
+        self,
+        owner: EndpointOwner,
+        reason: DropReason | None,
+        *,
+        generation: int,
+        fault_dispatch: Callable[[], Awaitable[None]] | None = None,
+        lease_current: Callable[[], bool] | None = None,
+    ) -> bool:
+        run = self._human_run
+        assert run is not None
+        prior_endpoint = run.endpoint
+        admission_phase = self._phase
+        run.endpoint = EndpointDisposition.ADMITTED
+        run.endpoint_owner = owner
+        start_utc: datetime | None = None
+        started = 0.0
+
+        async def dispatch() -> AppliedRoasterState | None:
+            nonlocal start_utc, started
+            run.endpoint = EndpointDisposition.IN_FLIGHT
+            start_utc = datetime.now(UTC)
+            started = self._clock()
+            if fault_dispatch is None:
+                return await self._executor.drop_beans()
+            await fault_dispatch()
+            return None
+
+        def admitted() -> bool:
+            return (lease_current is None or lease_current()) and (
+                owner is EndpointOwner.PROTECTION
+                or owner is EndpointOwner.OPERATOR
+                or self._human_recovery_drop_evaluation(endpoint=prior_endpoint).verdict
+                is SafetyVerdict.ALLOW
+            )
+
+        def interval() -> dict[str, object]:
+            if start_utc is None:
+                return {}
+            return {
+                "dispatch_started_at_utc": start_utc.isoformat(),
+                "dispatch_ended_at_utc": datetime.now(UTC).isoformat(),
+                "dispatch_duration_seconds": self._clock() - started,
+            }
+
+        try:
+            dispatched, applied = await self._run_routine_write(
+                generation,
+                dispatch,
+                write_class=WriteClass.DROP,
+                endpoint_owner=owner,
+                admitted=admitted,
+            )
+        except asyncio.CancelledError:
+            self._human_drop_unknown(generation, interval())
+            raise
+        except Exception:
+            self._human_drop_unknown(generation, interval())
+            return False
+        known_applied = fault_dispatch is not None or isinstance(applied, AppliedRoasterState)
+        if not self._generation_is_current(generation) or (
+            lease_current is not None and not lease_current()
+        ):
+            if dispatched and not known_applied:
+                self._human_drop_unknown(generation, interval())
+            elif dispatched:
+                self._events.emit(
+                    RoastEventKind.COMMAND_EXECUTED,
+                    {"command": "drop_beans", "outcome": "superseded", **interval()},
+                )
+            return False
+        if not dispatched:
+            run.endpoint = EndpointDisposition.WITHHELD
+            self._project_human_drop_recovery()
+            await self._contain_human_heat(generation=generation)
+            return False
+        if not known_applied:
+            self._human_drop_unknown(generation, interval())
+            return False
+        run.endpoint = EndpointDisposition.ISSUED
+        if (
+            owner is EndpointOwner.FAULT_CONTROL
+            and admission_phase is RoastPhase.FAULTED
+            and self._phase is RoastPhase.FAULTED
+        ):
+            assert run.session_id is not None
+            self._fault_drop_readback = _FaultDropReadback(run, run.session_id, generation)
+        self._adopt_applied_state(applied)
+        self._events.emit(
+            RoastEventKind.COMMAND_EXECUTED,
+            {
+                "command": "drop_beans",
+                "reason": "operator" if reason is None else reason.value,
+                **interval(),
+                "target_outcome": (
+                    "interrupted_unmet" if owner is EndpointOwner.PROTECTION else "operator"
+                ),
+            },
+        )
+        if (
+            admission_phase is not RoastPhase.FAULTED
+            and self._phase is not RoastPhase.FAULTED
+            and not run.durably_closed
+        ):
+            self.transition_to(RoastPhase.COOLING)
+        return True
+
+    def _human_drop_unknown(self, generation: int, interval: dict[str, object]) -> None:
+        run = self._human_run
+        assert run is not None
+        run.endpoint = EndpointDisposition.UNKNOWN
+        run.command = CommandDisposition.UNKNOWN
+        self._events.emit(
+            RoastEventKind.COMMAND_FAILED,
+            {"command": "drop_beans", "outcome": run.endpoint.value, **interval},
+        )
+        if self._generation_is_current(generation):
+            self._project_human_drop_recovery()
+
+    def _project_human_drop_recovery(self) -> None:
+        run = self._human_run
+        assert run is not None
+        self._routine_inhibited = True
+        if self._phase is RoastPhase.FAULTED:
+            latched = self._latched_verdict
+            if latched is None or (
+                _TERMINAL_VERDICT_SEVERITY[latched]
+                < _TERMINAL_VERDICT_SEVERITY[SafetyVerdict.RECOVERY]
+            ):
+                self._latched_verdict = SafetyVerdict.RECOVERY
+        else:
+            if not run.durably_closed and self._phase is not RoastPhase.OPERATOR_RECOVERY_REQUIRED:
+                self.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+            self._latched_verdict = SafetyVerdict.RECOVERY
+        self._events.emit(
+            RoastEventKind.RECOVERY_REQUIRED,
+            {"endpoint": run.endpoint.value, "physical_intervention_required": True},
+        )
+
     async def _execute_deterministic_drop(self, reason: DropReason, *, generation: int) -> bool:
         """Shared drop-execution sequence for every deterministic (non-advisor,
         non-operator) drop path (D84 Slice C / D88 amendment A1, #405).
@@ -3563,6 +4344,9 @@ class RoastController:
             executor raised (a transient actuator failure, already reported
             via ``COMMAND_FAILED``).
         """
+        if self._human_run is not None:
+            self._join_human_drop()
+            return False
         drop = self._safety.evaluate_drop_recommendation(phase=self._phase)
         await self._snapshots.persist_evaluation(drop)
         # evaluate_drop_recommendation ALLOWs unconditionally in DEVELOPMENT (the
@@ -3575,7 +4359,7 @@ class RoastController:
             return False
         try:
             dispatched, applied = await self._run_routine_write(
-                generation, self._executor.drop_beans
+                generation, self._executor.drop_beans, write_class=WriteClass.DROP
             )
         except Exception:
             self._events.emit(
@@ -4111,19 +4895,7 @@ class RoastController:
                 self._reset_t0_debounce()  # a failed/absent read breaks the window
                 return
             self._maybe_emit_charge_guidance(telemetry)
-            if telemetry.t0_detected:
-                if self._t0_streak == 0:
-                    # Origin the charge clock on the FIRST detect tick (#174), not
-                    # the later debounced transition.
-                    self._t0_first_detect_monotonic = self._clock()
-                self._t0_streak += 1
-                # Latch the MCP turning-point backdate the first tick it appears
-                # (#174/#337): the ``beans_added`` event can race in a tick after
-                # ``t0_status`` flips, so reading it only at the transition missed it.
-                if telemetry.t0_backdate_seconds is not None:
-                    self._pending_t0_backdate = telemetry.t0_backdate_seconds
-            else:
-                self._reset_t0_debounce()
+            self._observe_charge_streak(telemetry)
             if self._t0_streak >= self._config.t0_debounce_ticks:
                 source = self._safety.evaluate_event_source(
                     transition="t0", source=RoastEventSource.MCP
@@ -4136,45 +4908,14 @@ class RoastController:
                     return
                 if source.verdict is not SafetyVerdict.ALLOW:
                     return
-                self._t0_confirmed = True
-                # Cause before effect: consumers see T0_DETECTED, then the
-                # PHASE_CHANGED it explains (review note, E4-S3 PR).
-                self._events.emit(
-                    RoastEventKind.T0_DETECTED,
-                    {"debounce_ticks": self._t0_streak, "bean_temp_c": telemetry.bean_temp_c},
-                )
-                self._t0_streak = 0  # unambiguous post-confirmation state
-                self.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
-                # Stamp the charge clock at the debounced T0 transition: the
-                # advisor's ``seconds_since_charge`` context and the
-                # charge-referenced DTR clock (#219) read from this instant. The
-                # post-charge settle window (#209) is retired under D35 (#222) —
-                # the advisor is no longer consulted pre-FC, so there is no
-                # automatic post-charge consult left to suppress.
-                #
-                # #174/#337: origin the charge clock on the FIRST detect tick of
-                # the debounce streak (un-debounced), backdated to the MCP TURNING
-                # POINT (the local-max bean temp before the decline) — NOT this
-                # debounced transition tick. Two corrections compose: (1) the
-                # agent's own ``t0_debounce_ticks`` debounce, by anchoring to the
-                # latched first detect; (2) the MCP confirmation lag, by subtracting
-                # the latched turning-point delta (confirmed − turning point). A
-                # manual mark / pre-0.1.7 payload carries no delta ⇒ no backdate,
-                # but the first-detect anchor still removes the debounce. Shifts
-                # dev%/DTR/curve x-origin earlier (the lag corrected at T0): one
-                # roast stamped T0 ~10 s late at bean 150 °C vs the 179 °C peak.
-                self._charge_monotonic = self._charge_origin_monotonic(
-                    self._t0_first_detect_monotonic, self._pending_t0_backdate
-                )
-                self._t0_first_detect_monotonic = None
-                self._pending_t0_backdate = None
+                self._commit_confirmed_charge(telemetry)
             return
         if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK and telemetry is not None:
             # Drying-end signal (#351) BEFORE the FC check: a pre-FC observability
             # landmark, so it can only fire while still pre-FC — the FC transition
             # below moves the phase out of pre-FC and ends the window.
             self._maybe_emit_drying_end(telemetry)
-            if telemetry.first_crack_detected:
+            if self._human_run is None and telemetry.first_crack_detected:
                 source = self._safety.evaluate_event_source(
                     transition="first_crack", source=RoastEventSource.MCP
                 )
@@ -4199,6 +4940,55 @@ class RoastController:
                 # ⇒ stamp at receive-tick.
                 self._pending_first_crack_backdate = telemetry.first_crack_backdate_seconds
                 self.transition_to(RoastPhase.DEVELOPMENT)
+
+    def _observe_charge_streak(self, telemetry: RoastTelemetry) -> None:
+        if telemetry.t0_detected:
+            if self._t0_streak == 0:
+                # Origin the charge clock on the FIRST detect tick (#174), not
+                # the later debounced transition.
+                self._t0_first_detect_monotonic = self._clock()
+            self._t0_streak += 1
+            # Latch the MCP turning-point backdate the first tick it appears
+            # (#174/#337): the ``beans_added`` event can race in a tick after
+            # ``t0_status`` flips, so reading it only at the transition missed it.
+            if telemetry.t0_backdate_seconds is not None:
+                self._pending_t0_backdate = telemetry.t0_backdate_seconds
+        else:
+            self._reset_t0_debounce()
+
+    def _commit_confirmed_charge(self, telemetry: RoastTelemetry) -> None:
+        self._t0_confirmed = True
+        # Cause before effect: consumers see T0_DETECTED, then the
+        # PHASE_CHANGED it explains (review note, E4-S3 PR).
+        self._events.emit(
+            RoastEventKind.T0_DETECTED,
+            {"debounce_ticks": self._t0_streak, "bean_temp_c": telemetry.bean_temp_c},
+        )
+        self._t0_streak = 0  # unambiguous post-confirmation state
+        self.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+        # Stamp the charge clock at the debounced T0 transition: the
+        # advisor's ``seconds_since_charge`` context and the
+        # charge-referenced DTR clock (#219) read from this instant. The
+        # post-charge settle window (#209) is retired under D35 (#222) —
+        # the advisor is no longer consulted pre-FC, so there is no
+        # automatic post-charge consult left to suppress.
+        #
+        # #174/#337: origin the charge clock on the FIRST detect tick of
+        # the debounce streak (un-debounced), backdated to the MCP TURNING
+        # POINT (the local-max bean temp before the decline) — NOT this
+        # debounced transition tick. Two corrections compose: (1) the
+        # agent's own ``t0_debounce_ticks`` debounce, by anchoring to the
+        # latched first detect; (2) the MCP confirmation lag, by subtracting
+        # the latched turning-point delta (confirmed − turning point). A
+        # manual mark / pre-0.1.7 payload carries no delta ⇒ no backdate,
+        # but the first-detect anchor still removes the debounce. Shifts
+        # dev%/DTR/curve x-origin earlier (the lag corrected at T0): one
+        # roast stamped T0 ~10 s late at bean 150 °C vs the 179 °C peak.
+        self._charge_monotonic = self._charge_origin_monotonic(
+            self._t0_first_detect_monotonic, self._pending_t0_backdate
+        )
+        self._t0_first_detect_monotonic = None
+        self._pending_t0_backdate = None
 
     def _maybe_emit_charge_guidance(self, telemetry: RoastTelemetry) -> None:
         """Emit the one-shot add-beans cue when the BEAN probe enters the band.
@@ -4344,6 +5134,10 @@ class RoastController:
             self._latched_verdict = SafetyVerdict.FAULT
             return True
         if verdict is SafetyVerdict.RECOVERY:
+            if self._human_run is not None:
+                self._enter_human_recovery(evaluation)
+                await self._contain_human_heat(generation=generation)
+                return True
             await self._apply_fail_safe(evaluation, generation=generation)
             if not self._generation_is_current(generation):
                 return True
@@ -4357,6 +5151,107 @@ class RoastController:
             return True
         # CLAMP/REJECT never arise from telemetry-stage rules.
         return False
+
+    def _enter_human_recovery(self, evaluation: SafetyEvaluation) -> None:
+        self._routine_inhibited = True
+        if self._phase is not RoastPhase.OPERATOR_RECOVERY_REQUIRED:
+            self.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+            self._events.emit(RoastEventKind.RECOVERY_REQUIRED, evaluation.model_dump(mode="json"))
+        self._latched_verdict = SafetyVerdict.RECOVERY
+
+    def _known_human_identity(self) -> tuple[str, int] | None:
+        run = self._human_run
+        if (
+            run is None
+            or not self._human_ownership.is_current(run)
+            or run.session_id is None
+            or run.child_generation is None
+            or self._current_session_id is None
+            or self._current_child_generation is None
+            or self._current_session_id() != run.session_id
+            or self._current_child_generation() != run.child_generation
+        ):
+            return None
+        return run.session_id, run.child_generation
+
+    def _containment_refusal(self) -> RefusedHumanCall | None:
+        kind = PendingHumanCall.CONTAINMENT
+        if self._human_admission is not None and self._human_admission.closed_reason is not None:
+            return RefusedHumanCall(kind, HumanCallRefusal.ADMISSION_CLOSED)
+        if self._teardown_unconfirmed is not None and self._teardown_unconfirmed():
+            return RefusedHumanCall(kind, HumanCallRefusal.CHILD_TEARDOWN_UNCONFIRMED)
+        return None
+
+    async def _contain_human_heat(self, *, generation: int) -> ContainmentResult:
+        run = self._human_run
+        assert run is not None
+        if (
+            self._containment_refusal() is not None
+            or run.containment is ContainmentAttempt.CONSUMED
+            or self._containment_discovered is None
+            or not self._containment_discovered()
+            or self._known_human_identity() is None
+            or run.command is CommandDisposition.UNKNOWN
+            or run.endpoint in (EndpointDisposition.ADMITTED, EndpointDisposition.IN_FLIGHT)
+            or self._arbiter.routine_write_in_flight
+        ):
+            return ContainmentResult(ContainmentOutcome.NOT_ATTEMPTED)
+        run.containment = ContainmentAttempt.CONSUMED
+
+        async def dispatch() -> ContainmentResult:
+            if self._containment_refusal() is not None:
+                # The arbiter rechecks admission and enters dispatch without yielding.
+                return ContainmentResult(ContainmentOutcome.NOT_ATTEMPTED)  # pragma: no cover
+            with self._human_ownership.hold(PendingHumanCall.CONTAINMENT):
+                start_utc = datetime.now(UTC)
+                started = self._clock()
+                try:
+                    result = await self._executor.contain_heat_fixed_zero()
+                    if not isinstance(result, ContainmentResult) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                        result.outcome, ContainmentOutcome
+                    ):
+                        result = ContainmentResult(ContainmentOutcome.UNKNOWN_MALFORMED_RESPONSE)
+                except asyncio.CancelledError:
+                    run.command = CommandDisposition.UNKNOWN
+                    self._record_containment(
+                        ContainmentResult(ContainmentOutcome.UNKNOWN_TRANSPORT), start_utc, started
+                    )
+                    raise
+                except Exception:
+                    result = ContainmentResult(ContainmentOutcome.UNKNOWN_TRANSPORT)
+                if result.outcome.is_unknown:
+                    run.command = CommandDisposition.UNKNOWN
+                self._record_containment(result, start_utc, started)
+                return result
+
+        dispatched, result = await self._run_routine_write(
+            generation,
+            dispatch,
+            write_class=WriteClass.CONTAINMENT,
+            admitted=lambda: self._known_human_identity() is not None,
+        )
+        if not dispatched or result is None:
+            return ContainmentResult(ContainmentOutcome.NOT_ATTEMPTED)
+        return result
+
+    def _record_containment(
+        self, result: ContainmentResult, start_utc: datetime, started: float
+    ) -> None:
+        commanded = result.outcome is ContainmentOutcome.COMMAND_STATE_RETURNED
+        self._events.emit(
+            RoastEventKind.COMMAND_EXECUTED if commanded else RoastEventKind.COMMAND_FAILED,
+            {
+                "command": "contain_heat_fixed_zero",
+                "outcome": result.outcome.value,
+                "reason": None if result.reason is None else result.reason.value,
+                "evidence_heat_zero_commanded": result.evidence_heat_zero_commanded,
+                "evidence_is_pre_fallback": result.evidence_is_pre_fallback,
+                "physical_intervention_required": not commanded,
+                "dispatch_started_at_utc": start_utc.isoformat(),
+                "dispatch_ended_at_utc": datetime.now(UTC).isoformat(),
+                "dispatch_duration_seconds": self._clock() - started,
+            },
+        )
 
     async def _execute_emergency_stop(
         self, evaluation: SafetyEvaluation, *, emergency_already_admitted: bool
@@ -4450,6 +5345,8 @@ class RoastController:
             self._pending_fail_safe_is_emergency_stop_retry
             and self._pending_fail_safe is evaluation
         )
+        if self._human_run is not None and not is_emergency_stop_retry:
+            return
         try:
             dispatched = await self._set_targets(
                 heat_percent=evaluation.adjusted_heat,
@@ -4938,6 +5835,9 @@ class RoastController:
                     fan=evaluation.adjusted_fan,
                     generation=advisory_epoch,
                 )
+        if decision.should_drop and self._human_run is not None:
+            self._join_human_drop()
+            return
         # Compute the SYSTEM development percent ONCE (the #294 compute-once
         # pattern): the same value decides the block, fills the rejection note,
         # and feeds the persisted SafetyEvaluation, so the reported number is
@@ -4999,7 +5899,7 @@ class RoastController:
             if drop.verdict is SafetyVerdict.ALLOW:  # pragma: no branch — see above
                 try:
                     dispatched, applied = await self._run_routine_write(
-                        advisory_epoch, self._executor.drop_beans
+                        advisory_epoch, self._executor.drop_beans, write_class=WriteClass.DROP
                     )
                 except Exception:
                     self._events.emit(
@@ -5339,6 +6239,7 @@ class RoastController:
                     recording_origin=recording_origin,
                     recording_roast_num=(roast_num if recording_origin is not None else None),
                 ),
+                write_class=WriteClass.SESSION_START,
             )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "start_roast_session"})
@@ -5346,6 +6247,11 @@ class RoastController:
             return
         if not dispatched or not self._generation_is_current(generation):
             return
+        if self._human_run is not None:
+            if self._current_session_id is not None:
+                self._human_run.session_id = self._current_session_id()
+            if self._current_child_generation is not None:
+                self._human_run.child_generation = self._current_child_generation()
         self.transition_to(RoastPhase.PREHEATING)
         self._events.emit(RoastEventKind.RUN_STARTED, {"profile": profile.name})
         # Initial heat/fan per profile, through safety policy (runtime
@@ -5468,6 +6374,14 @@ class RoastController:
             elapsed = 0.0  # clock skew: never fabricate a future charge instant
         self._charge_monotonic = self._clock() - elapsed
 
+    def _mark_human_restart_unknown(self) -> None:
+        run = self._human_run
+        if run is not None:
+            run.endpoint = EndpointDisposition.HISTORY_UNKNOWN
+            run.command = CommandDisposition.UNKNOWN
+            run.containment = ContainmentAttempt.CONSUMED
+            self._routine_inhibited = True
+
     async def recover_from_restart(self, persisted_phase: RoastPhase | None) -> None:
         """Startup classification (orchestration plan § Persistence).
 
@@ -5479,6 +6393,7 @@ class RoastController:
         """
         if persisted_phase in (None, RoastPhase.IDLE, RoastPhase.COMPLETE):
             return  # nothing possibly active: stay idle
+        self._mark_human_restart_unknown()
         evaluation = SafetyEvaluation(
             rule="restart_recovery",
             verdict=SafetyVerdict.RECOVERY,
@@ -5515,6 +6430,7 @@ class RoastController:
         """
         if persisted_phase is not RoastPhase.FAULTED:
             return  # not a persisted fault: caller handles via recover_from_restart
+        self._mark_human_restart_unknown()
         evaluation = SafetyEvaluation(
             rule="restart_recovery",
             verdict=SafetyVerdict.FAULT,
@@ -5529,10 +6445,90 @@ class RoastController:
             self.transition_to(RoastPhase.FAULTED)
         self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
 
+    async def human_operator_continue(self, target: RoastPhase) -> bool:
+        """Evaluate explicit continuation and defer protection recheck to the next turn."""
+        run = self._human_run
+        assert run is not None
+        if self._phase is not RoastPhase.OPERATOR_RECOVERY_REQUIRED:
+            return False
+        if target in (RoastPhase.IDLE, RoastPhase.COMPLETE, RoastPhase.COOLING):
+            self._commit_operator_resume(target)
+            return True
+        identity = self._known_human_identity()
+        generation = self._arbiter.generation
+        evaluation = self._human_continuation_evaluation(
+            target, session_matches=identity is not None
+        )
+        await self._snapshots.persist_evaluation(evaluation)
+        if (
+            evaluation.verdict is not SafetyVerdict.ALLOW
+            or identity is None
+            or self._phase is not RoastPhase.OPERATOR_RECOVERY_REQUIRED
+            or self._emergency_stop_transition_pending
+            or not self._generation_is_current(generation)
+            or self._known_human_identity() != identity
+            or self._human_continuation_evaluation(target, session_matches=True).verdict
+            is not SafetyVerdict.ALLOW
+        ):
+            return False
+        self._human_continuation = _HumanContinuation(target, generation, *identity)
+        self._protection_check_pending = True
+        self._routine_inhibited = True
+        self._commit_operator_resume(target)
+        return True
+
+    def _human_continuation_evaluation(
+        self, target: RoastPhase, *, session_matches: bool
+    ) -> SafetyEvaluation:
+        run = self._human_run
+        assert run is not None
+        return self._safety.evaluate_human_continuation(
+            target=target,
+            session_matches=(
+                session_matches
+                and not run.durably_closed
+                and not self._human_ownership.has_pending_call
+            ),
+            charged=self._t0_confirmed,
+            canonical_human_fc_confirmed=self._canonical_human_fc_confirmed,
+            freshness=self._accepted_readings.recheck(),
+            endpoint=run.endpoint,
+            command=run.command,
+        )
+
+    def _check_human_continuation(self, turn: _HumanTurn, evidence: HumanReadEvidence) -> bool:
+        request = self._human_continuation
+        assert request is not None
+        identity_matches = (
+            self._known_human_identity() == (request.session_id, request.child_generation)
+            and evidence.bound_child_epoch == request.child_generation
+            and self._phase is request.target
+            and turn.generation == request.command_generation
+            and not self._emergency_stop_transition_pending
+            and self._human_actuation_admitted()
+        )
+        evaluation = self._human_continuation_evaluation(
+            request.target, session_matches=identity_matches
+        )
+        turn.evaluations.append(evaluation)
+        if evaluation.verdict is not SafetyVerdict.ALLOW:
+            self._enter_human_recovery(evaluation)
+            return False
+        if evidence.bean_temp_c is not None and evidence.bean_temp_c < HUMAN_PROTECTION_BT_C:
+            self._human_continuation = None
+            self._protection_check_pending = False
+            self._routine_inhibited = False
+        return True
+
     def operator_resume(self, target: RoastPhase) -> None:
         """Explicit operator resume out of recovery (the operator gate the
         E4-S1 resume edges require). Heat stays at 0 after a resume until
         separately commanded — this method never writes hardware."""
+        if self._human_run is not None:
+            raise InvalidTransitionError(self._phase, target)
+        self._commit_operator_resume(target)
+
+    def _commit_operator_resume(self, target: RoastPhase) -> None:
         if self._phase is not RoastPhase.OPERATOR_RECOVERY_REQUIRED:
             raise InvalidTransitionError(self._phase, target)
         # The operator has dealt with the recovery state (e.g. a sustained
@@ -5577,9 +6573,22 @@ class RoastController:
         """
         self._fault_acknowledged = True
 
+    def _human_first_crack_mark_is_current(self) -> bool:
+        run = self._human_run
+        return run is not None and run.endpoint is EndpointDisposition.NONE
+
     async def operator_mark_first_crack(self) -> None:
         """Operator FC override: matrix- and source-validated, then relayed
         to MCP with the true OPERATOR source (E3-S5/D16)."""
+        if self._human_run is not None and (
+            self._human_run.endpoint is not EndpointDisposition.NONE
+            or self._human_run.command is CommandDisposition.UNKNOWN
+        ):
+            self._events.emit(
+                RoastEventKind.FIRST_CRACK,
+                {"source": RoastEventSource.OPERATOR.value, "outcome": "recorded_as_note"},
+            )
+            return
         generation = self._arbiter.generation
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.MARK_FIRST_CRACK, phase=self._phase
@@ -5597,7 +6606,12 @@ class RoastController:
             raise InvalidTransitionError(self._phase, RoastPhase.DEVELOPMENT)
         try:
             dispatched, _ = await self._run_routine_write(
-                generation, self._executor.mark_first_crack
+                generation,
+                self._executor.mark_first_crack,
+                write_class=WriteClass.NON_HEAT,
+                admitted=(
+                    None if self._human_run is None else self._human_first_crack_mark_is_current
+                ),
             )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "mark_first_crack"})
@@ -5610,6 +6624,10 @@ class RoastController:
         # a landmark before the controller has consumed telemetry for this run.
         if self._last_telemetry is not None:
             event_payload["bean_temp_c"] = self._last_telemetry.bean_temp_c
+        if self._human_run is not None:
+            if self._human_run.endpoint is not EndpointDisposition.NONE:
+                return
+            self._canonical_human_fc_confirmed = True
         self._events.emit(RoastEventKind.FIRST_CRACK, event_payload)
         self.transition_to(RoastPhase.DEVELOPMENT)
 
@@ -5634,6 +6652,9 @@ class RoastController:
         Hardware is never written unless the resulting state is reachable: the
         transition (when one applies) is guarded first, so a write-then-raise can't
         diverge the FSM from the machine (E4-S4 safety rule)."""
+        if self._human_run is not None:
+            await self._human_operator_drop()
+            return
         generation = self._arbiter.generation
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.DROP_BEANS, phase=self._phase
@@ -5650,7 +6671,7 @@ class RoastController:
             raise InvalidTransitionError(self._phase, RoastPhase.COOLING)
         try:
             dispatched, applied = await self._run_routine_write(
-                generation, self._executor.drop_beans
+                generation, self._executor.drop_beans, write_class=WriteClass.DROP
             )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "drop_beans"})
@@ -5686,6 +6707,31 @@ class RoastController:
         if will_transition:
             self.transition_to(RoastPhase.COOLING)
 
+    async def _human_operator_drop(self) -> None:
+        if self._join_human_drop():
+            return
+        generation = self._arbiter.generation
+        phase = self._phase
+        recovery = phase in TERMINAL_LATCH_PHASES
+        evaluation = (
+            self._human_recovery_drop_evaluation()
+            if recovery
+            else self._safety.evaluate_command_phase(command=RoastCommand.DROP_BEANS, phase=phase)
+        )
+        await self._snapshots.persist_evaluation(evaluation)
+        run = self._human_run
+        assert run is not None
+        if (
+            evaluation.verdict is not SafetyVerdict.ALLOW
+            or not self._generation_is_current(generation)
+            or self._phase is not phase
+            or self._join_human_drop()
+            or (not recovery and run.endpoint is not EndpointDisposition.NONE)
+        ):
+            return
+        owner = EndpointOwner.OPERATOR_RECOVERY if recovery else EndpointOwner.OPERATOR
+        await self._execute_human_drop(owner, None, generation=generation)
+
     async def operator_stop_cooling(self) -> None:
         """Operator stop-cooling: matrix-validated.
 
@@ -5706,7 +6752,9 @@ class RoastController:
         if completes and not self.can_transition(RoastPhase.COMPLETE):  # pragma: no cover
             raise InvalidTransitionError(self._phase, RoastPhase.COMPLETE)
         try:
-            dispatched, _ = await self._run_routine_write(generation, self._executor.stop_cooling)
+            dispatched, _ = await self._run_routine_write(
+                generation, self._executor.stop_cooling, write_class=WriteClass.NON_HEAT
+            )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "stop_cooling"})
             return
@@ -5769,7 +6817,7 @@ class RoastController:
             return
         try:
             dispatched, _ = await self._run_routine_write(
-                generation, self._executor.mark_beans_added
+                generation, self._executor.mark_beans_added, write_class=WriteClass.NON_HEAT
             )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "mark_beans_added"})
@@ -5811,7 +6859,9 @@ class RoastController:
             # includes cooling. Mirrors operator_drop_beans' write-safety guard.
             raise InvalidTransitionError(self._phase, RoastPhase.COOLING)
         try:
-            dispatched, _ = await self._run_routine_write(generation, self._executor.start_cooling)
+            dispatched, _ = await self._run_routine_write(
+                generation, self._executor.start_cooling, write_class=WriteClass.NON_HEAT
+            )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "start_cooling"})
             return
