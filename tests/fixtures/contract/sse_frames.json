@@ -280,7 +280,13 @@
       "id": 0
     },
     {
-      "data": {},
+      "data": {
+        "emergency_fallback_disclosure": null,
+        "human_command_disposition": null,
+        "human_endpoint": null,
+        "physical_intervention_required": null,
+        "run_id": "contract-run"
+      },
       "event": "heartbeat",
       "id": null
     }
