@@ -2676,7 +2676,6 @@ async def test_tf19_legacy_completion_exception_keeps_drop_closed(
                 ("TH13-session", "missing_session"),
             )
         ],
-        pytest.param("run", "barrier", "pending", "direct_audit_raises", "direct", id="TG10D"),
         pytest.param("global", "barrier", "pending", "cancel_http", "priority", id="TG11"),
         pytest.param("run", "barrier", "pending", "none", "priority", id="TP1"),
         pytest.param("run", "proof", "pending", "none", "priority", id="TP2"),
@@ -2763,10 +2762,7 @@ async def test_am5_estop_route_during_owned_human_evaluation(
         safety_evaluation_id: int | None = None,
     ) -> None:
         nonlocal audit_failures
-        if tool is RoastCommand.EMERGENCY_STOP and fault in {
-            "command_audit_raises",
-            "direct_audit_raises",
-        }:
+        if tool is RoastCommand.EMERGENCY_STOP and fault == "command_audit_raises":
             audit_failures += 1
             raise RuntimeError("synthetic emergency command audit failure")
         await original_command(
@@ -2877,7 +2873,7 @@ async def test_am5_estop_route_during_owned_human_evaluation(
     def capability() -> bool:
         nonlocal capability_reads
         capability_reads += 1
-        if fault in {"capability_raises", "direct_audit_raises"}:
+        if fault == "capability_raises":
             raise RuntimeError("synthetic routing capability failure")
         return original_capability()
 
@@ -3131,7 +3127,7 @@ async def test_am5_estop_route_during_owned_human_evaluation(
         assert len(tasks) == 1 and next(iter(tasks)).cancelled()
     if fault not in {"missing", "mock", "truthy"}:
         assert capability_reads == int(interval != "none")
-    if fault in {"capability_raises", "direct_audit_raises"}:
+    if fault == "capability_raises":
         assert "Could not qualify direct live emergency dispatch" in caplog.messages
 
     retry_armed = controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
@@ -3141,14 +3137,10 @@ async def test_am5_estop_route_during_owned_human_evaluation(
         assert not retry_armed
         if route == "run":
             assert dispatch_callbacks[-1:] == [consume_cancelled_waiter]
-    elif fault in {"action_audit_raises", "direct_audit_raises"}:
+    elif fault == "action_audit_raises":
         assert isinstance(stopped, RuntimeError)
-        assert str(stopped) == (
-            "synthetic operator-action audit failure"
-            if fault == "action_audit_raises"
-            else "synthetic emergency command audit failure"
-        )
-        assert confirmations == int(fault == "action_audit_raises")
+        assert str(stopped) == "synthetic operator-action audit failure"
+        assert confirmations == 1
         assert not retry_armed
         assert controller.phase is RoastPhase.FAULTED
     else:
@@ -3596,3 +3588,196 @@ async def test_am6_exact_dispatch_ledger_consumption_floors_at_zero(store: Roast
     runner.consume_admitted_emergency_stop_for_exact_dispatch()
     assert runner._admitted_emergency_stops == 0  # pyright: ignore[reportPrivateUsage]
     assert not arbiter.emergency_stop_active
+
+
+@pytest.mark.parametrize(
+    "failed_write",
+    [
+        pytest.param(False, id="TG10D-success"),
+        pytest.param(True, id="TG10D-failed-write-audit"),
+    ],
+)
+async def test_am6_per_run_capability_doubt_preserves_direct_command_audit(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, failed_write: bool
+) -> None:
+    """Pin D-28 in the default fake, including actual audit failure propagation."""
+    service, runner, actuator, run_id, lease = await _faulted_run(store)
+    controller = runner.controller_for_human_fault_drop()
+    executor = service._fault_control_executor  # pyright: ignore[reportPrivateUsage]
+    gate = service._fault_acknowledgement_gate  # pyright: ignore[reportPrivateUsage]
+    assert controller is not None and executor is not None and lease is not None
+    assert not actuator.reject_unbound_inactive_emergency
+
+    proof_held, release_proof = asyncio.Event(), asyncio.Event()
+    capability_reads = direct_attempts = 0
+    current_request = asyncio.current_task()
+    command_task: asyncio.Task[object] | None = None
+    command_audits: list[tuple[RoastCommand, str]] = []
+    action_audits: list[str] = []
+    command_events: list[RoastEventKind] = []
+    premature_flushes: list[asyncio.Task[object] | None] = []
+    request_in_progress = False
+    actuator_failure = RuntimeError("synthetic direct e-stop actuator failure")
+    audit_failure = RuntimeError("synthetic direct e-stop command audit failure")
+
+    original_read_ack = actuator.read_fault_acknowledgement_state
+    original_emergency = actuator.emergency_stop
+    original_command = store.record_command
+    original_action = store.record_operator_action
+    original_dispatch_audit = runner._record_dispatch_command  # pyright: ignore[reportPrivateUsage]
+    original_flush = runner._flush_events  # pyright: ignore[reportPrivateUsage]
+    emitter = runner._emitter  # pyright: ignore[reportPrivateUsage]
+
+    async def read_ack(session_id: str) -> FaultAcknowledgementState:
+        proof_held.set()
+        await release_proof.wait()
+        return await original_read_ack(session_id)
+
+    def capability_doubt() -> bool:
+        nonlocal capability_reads
+        capability_reads += 1
+        raise RuntimeError("synthetic route capability uncertainty")
+
+    async def emergency(*, reason: str) -> AppliedRoasterState | None:
+        nonlocal direct_attempts
+        direct_attempts += 1
+        if failed_write:
+            raise actuator_failure
+        return await original_emergency(reason=reason)
+
+    async def dispatch_audit(tool: RoastCommand, item: QueuedOperatorAction, *, since: int) -> None:
+        nonlocal command_task
+        if tool is RoastCommand.EMERGENCY_STOP:
+            command_task = asyncio.current_task()
+            command_events.extend(
+                event.kind
+                for event in emitter.peek()[since:]
+                if event.kind in (RoastEventKind.COMMAND_EXECUTED, RoastEventKind.COMMAND_FAILED)
+            )
+        await original_dispatch_audit(tool, item, since=since)
+
+    async def record_command(
+        *,
+        run_id: str,
+        tick: int,
+        tool: RoastCommand,
+        source: Literal["policy", "advisor", "operator", "safety", "recovery"],
+        status: Literal["ok", "failed"],
+        args: object = None,
+        result: object = None,
+        safety_evaluation_id: int | None = None,
+    ) -> None:
+        if (
+            request_in_progress
+            and asyncio.current_task() is command_task
+            and tool is RoastCommand.EMERGENCY_STOP
+            and source == "operator"
+        ):
+            command_audits.append((tool, status))
+            raise audit_failure
+        await original_command(
+            run_id=run_id,
+            tick=tick,
+            tool=tool,
+            source=source,
+            status=status,
+            args=args,
+            result=result,
+            safety_evaluation_id=safety_evaluation_id,
+        )
+
+    async def record_action(
+        *,
+        action: str,
+        result: Literal["accepted", "rejected", "failed"],
+        run_id: str | None = None,
+        payload: object = None,
+    ) -> None:
+        if (
+            asyncio.current_task() is current_request
+            and action == OperatorAction.EMERGENCY_STOP.value
+        ):
+            action_audits.append(result)
+        await original_action(action=action, result=result, run_id=run_id, payload=payload)
+
+    async def flush() -> None:
+        if request_in_progress and command_task is None:
+            premature_flushes.append(asyncio.current_task())
+        await original_flush()
+
+    monkeypatch.setattr(actuator, "read_fault_acknowledgement_state", read_ack)
+    monkeypatch.setattr(actuator, "emergency_stop", emergency)
+    monkeypatch.setattr(runner, "emergency_stop_must_bypass_terminal_writer", capability_doubt)
+    monkeypatch.setattr(runner, "_record_dispatch_command", dispatch_audit)
+    monkeypatch.setattr(runner, "_flush_events", flush)
+    monkeypatch.setattr(store, "record_command", record_command)
+    monkeypatch.setattr(store, "record_operator_action", record_action)
+
+    ack = await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": lease.generation},
+        ),
+    )
+    assert ack.queued
+    tick = asyncio.create_task(runner.tick_once())
+    stopped: OperatorActionResult | None = None
+    propagated: Exception | None = None
+    try:
+        await asyncio.wait_for(proof_held.wait(), 2)
+        finalisation_reserved = gate.fault_finalization_started
+        phase_before = controller.phase
+        retry_before = controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
+        request_in_progress = True
+        try:
+            stopped = await service.submit_operator_action(
+                run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+        except Exception as error:  # noqa: BLE001 - verify propagation by sentinel identity
+            propagated = error
+        finally:
+            request_in_progress = False
+        proof_still_held = not release_proof.is_set() and not tick.done()
+        retry_after = controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
+        phase_after = controller.phase
+    finally:
+        # End the held proof without letting its tick proceed to the controller
+        # retry stage. Cancellation is cleanup, outside the observed request.
+        tick.cancel()
+        release_proof.set()
+        try:
+            with suppress(asyncio.CancelledError):
+                await asyncio.wait_for(tick, 2)
+        finally:
+            try:
+                assert await service.settle_fault_lease_persistence_for_teardown()
+            finally:
+                assert await executor.settle_for_shutdown()
+
+    assert finalisation_reserved and proof_still_held and premature_flushes == []
+    assert phase_before is phase_after is RoastPhase.FAULTED
+    assert tick.cancelled() and actuator.fault_writes == []
+    assert actuator.commands() == ([] if failed_write else ["emergency_stop"])
+    assert capability_reads == direct_attempts == 1
+    assert command_task is not None
+    if failed_write:
+        assert propagated is audit_failure
+        assert stopped is None
+        assert command_events == [RoastEventKind.COMMAND_FAILED]
+        assert command_audits == [(RoastCommand.EMERGENCY_STOP, "failed")]
+        assert action_audits == []
+        assert retry_before is False and retry_after is True
+    else:
+        assert propagated is None and stopped is not None
+        assert stopped.result == "accepted" and not stopped.queued
+        assert stopped.reason == "emergency_stop accepted for controller priority dispatch"
+        # The call counts and unchanged retry state are structural parity pins.
+        assert command_events == [] and command_audits == []
+        assert action_audits == ["accepted"]
+        assert retry_before is retry_after is False
+    async with store.connection.execute(
+        "SELECT result FROM operator_actions WHERE run_id = ? AND action = ?",
+        (run_id, OperatorAction.EMERGENCY_STOP.value),
+    ) as cursor:
+        assert [row[0] for row in await cursor.fetchall()] == ([] if failed_write else ["accepted"])
