@@ -7,7 +7,7 @@ from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
-from unittest.mock import Mock, PropertyMock
+from unittest.mock import AsyncMock, Mock, PropertyMock
 
 import pytest
 import pytest_asyncio
@@ -3973,3 +3973,227 @@ async def test_automatic_fault_completion_cancellation_preserves_live_run(
     persisted = await store.read_run(run.id)
     assert persisted is not None and persisted.completed_at_utc is None
     assert persisted.agent_phase is RoastPhase.FAULTED
+
+
+async def _d216_recovered_service(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, run_id: str, authority: ControlAuthority
+) -> tuple[RoastService, _RunnerRoaster, _LifecycleSpy, _Session, AsyncMock]:
+    await store.create_run(
+        run_id=run_id,
+        profile=PROFILE,
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    clock = FakeClock()
+    roaster = _RunnerRoaster(clock, [])
+    session = _Session(_result({}))
+    child = _LifecycleSpy(session)
+    roaster.epoch = child.child_epoch
+    presence = AsyncMock(return_value="none")
+    monkeypatch.setattr(roaster, "read_session_presence", presence)
+    service = RoastService(
+        store,
+        mcp=child,
+        roaster=roaster,
+        raw_state=roaster,
+        authority=authority,
+        live_serve_mode=True,
+        run_loop=False,
+        clock=clock,
+    )
+    await service.recover_on_start()
+    runner = service.runner
+    assert runner is not None
+    recovered = runner.controller_snapshot()
+    assert recovered.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    if authority is ControlAuthority.HUMAN:
+        assert recovered.human_endpoint is EndpointDisposition.HISTORY_UNKNOWN
+    return service, roaster, child, session, presence
+
+
+async def _d216_owned_phase_actions(service: RoastService, run_id: str) -> object:
+    runner = service.runner
+    assert runner is not None
+    queue = service.events.subscribe(last_event_id=0)
+    try:
+        owned_id = None
+        while not queue.empty():
+            frame = queue.get_nowait()
+            if runner.owns_human_phase_frame(frame.id):
+                owned_id = frame.id
+                break
+        assert owned_id is not None
+    finally:
+        service.events.unsubscribe(queue)
+
+    response = await stream_events(
+        run_id, cast(Request, _FakeRequest(last_event_id_header=str(owned_id - 1))), service
+    )
+    frames = await asyncio.wait_for(_collect_frames(response, 2), 1)
+    data = cast("dict[str, object]", _parse_frame(frames[1])["data"])
+    assert data["phase"] == RoastPhase.OPERATOR_RECOVERY_REQUIRED.value
+    return data["enabled_actions"]
+
+
+@pytest.mark.parametrize("authority", [ControlAuthority.HUMAN, ControlAuthority.AUTOMATIC])
+async def test_d216_confirmed_closure_only_exposes_end_in_recovered_detail(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, authority: ControlAuthority
+) -> None:
+    run_id = "d216-recovered"
+    service, roaster, child, session, presence = await _d216_recovered_service(
+        store, monkeypatch, run_id, authority
+    )
+    allow_drop = Mock(return_value=True)
+    monkeypatch.setattr(service, "_guarded_human_drop_allowed", allow_drop)
+    closure_actions = [OperatorAction.END_RECOVERED_RUN.value, OperatorAction.EMERGENCY_STOP.value]
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app(service)), base_url="http://test"
+    ) as http:
+        url = f"/api/roasts/{run_id}"
+        before = await http.get(url)
+        assert before.status_code == 200
+        assert before.json()["enabled_actions"] == [OperatorAction.EMERGENCY_STOP.value]
+        admitted = await http.post(
+            "/api/restart-clearance/closure-only", json={"physical_confirmation": True}
+        )
+        assert admitted.status_code == 200
+        assert admitted.json()["restart_clearance"]["state"] == "closure_only"
+        detail = await http.get(url)
+        assert detail.status_code == 200
+        assert detail.json()["enabled_actions"] == closure_actions
+        if authority is ControlAuthority.HUMAN:
+            assert await _d216_owned_phase_actions(service, run_id) == closure_actions
+        ended = await http.post(f"{url}/end-recovered-run")
+        assert ended.status_code == 200 and ended.json()["outcome"] == "aborted"
+        completed = await http.get(url)
+        assert completed.status_code == 200
+        assert OperatorAction.END_RECOVERED_RUN.value not in completed.json()["enabled_actions"]
+
+    allow_drop.assert_not_called()
+    persisted = await store.read_run(run_id)
+    assert persisted is not None and persisted.outcome == "aborted"
+    assert (
+        await store.read_process_restart_clearance(service.instance_id)
+    ) is RestartClearanceState.REQUIRED
+    assert presence.await_count == 2
+    assert roaster.calls == []
+    assert session.calls == []
+    assert child.lifecycle == []
+
+
+@pytest.mark.parametrize(
+    "revoked_by",
+    [
+        "emergency-admission",
+        "context-invalidated",
+        "child-stopped",
+        "child-replaced",
+        "lease-open",
+        "lease-unknown",
+        "durable-closed-lease-changed",
+        "shutdown",
+        "other-run",
+    ],
+)
+async def test_d216_stale_or_foreign_closure_does_not_expose_human_end(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, revoked_by: str
+) -> None:
+    run_id = "d216-current"
+    other_run = "d216-prior"
+    if revoked_by == "durable-closed-lease-changed":
+        await store.create_run(
+            run_id=other_run, profile=PROFILE, config=AppConfig(), agent_phase=RoastPhase.FAULTED
+        )
+        await store.complete_run(
+            run_id=other_run, outcome="faulted", agent_phase=RoastPhase.FAULTED
+        )
+    service, roaster, child, session, _ = await _d216_recovered_service(
+        store, monkeypatch, run_id, ControlAuthority.HUMAN
+    )
+    allow_drop = Mock(return_value=True)
+    monkeypatch.setattr(service, "_guarded_human_drop_allowed", allow_drop)
+    replacement: _Session | None = None
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app(service)), base_url="http://test"
+    ) as http:
+        url = f"/api/roasts/{run_id}"
+        admitted = await http.post(
+            "/api/restart-clearance/closure-only", json={"physical_confirmation": True}
+        )
+        assert admitted.status_code == 200
+        current = await http.get(url)
+        assert current.json()["enabled_actions"] == [
+            OperatorAction.END_RECOVERED_RUN.value,
+            OperatorAction.EMERGENCY_STOP.value,
+        ]
+
+        if revoked_by == "emergency-admission":
+            service._note_emergency_stop_admission()  # pyright: ignore[reportPrivateUsage]
+        elif revoked_by == "context-invalidated":
+            service._invalidate_closure_only_clearance()  # pyright: ignore[reportPrivateUsage]
+            await asyncio.gather(*service._closure_invalidation_tasks)  # pyright: ignore[reportPrivateUsage]
+            assert (
+                await store.read_process_restart_clearance(service.instance_id)
+            ) is RestartClearanceState.UNKNOWN
+        elif revoked_by == "child-stopped":
+            child.replace(None)
+            assert not child.running
+        elif revoked_by == "child-replaced":
+            old_epoch = child.child_epoch
+            replacement = _Session(_result({}), session_id=session.session_id)
+            child.replace(replacement)
+            assert child.running and child.child_epoch > old_epoch
+        elif revoked_by == "lease-open":
+            opened = await store.open_fault_control_lease(
+                run_id=run_id, mcp_session_id=roaster.session_id
+            )
+            assert opened.status is FaultLeaseStatus.OPEN
+        elif revoked_by == "lease-unknown":
+            unknown = await store.replace_fault_control_lease_unknown(run_id)
+            assert unknown.status is FaultLeaseStatus.UNKNOWN
+        elif revoked_by == "durable-closed-lease-changed":
+            opened = await store.open_fault_control_lease(
+                run_id=other_run, mcp_session_id="prior-session"
+            )
+            closed = await store.close_fault_control_lease_atomically(
+                generation=opened.generation,
+                run_id=other_run,
+                mcp_session_id="prior-session",
+                fault_reason=None,
+            )
+            assert closed.confirmed
+            assert (await store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+        elif revoked_by == "shutdown":
+            await service.shutdown()
+
+        if revoked_by == "other-run":
+            lease = await store.read_fault_control_lease()
+            foreign_actions = service._human_recovery_actions(  # pyright: ignore[reportPrivateUsage]
+                other_run,
+                RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+                [OperatorAction.DROP_BEANS],
+                lease,
+            )
+            assert foreign_actions == [OperatorAction.EMERGENCY_STOP]
+            wrong_run = await http.post(f"/api/roasts/{other_run}/end-recovered-run")
+            assert wrong_run.status_code == 409
+            same_run = await http.get(url)
+            assert same_run.json()["enabled_actions"] == current.json()["enabled_actions"]
+        else:
+            detail = await http.get(url)
+            assert detail.status_code == 200
+            assert detail.json()["enabled_actions"] == [OperatorAction.EMERGENCY_STOP.value]
+            assert await _d216_owned_phase_actions(service, run_id) == [
+                OperatorAction.EMERGENCY_STOP.value
+            ]
+
+    allow_drop.assert_not_called()
+    persisted = await store.read_run(run_id)
+    assert persisted is not None and persisted.completed_at_utc is None
+    assert roaster.calls == []
+    assert session.calls == []
+    active = await store.active_run()
+    assert active is not None and active.run_id == run_id
+    assert child.lifecycle == []
+    if replacement is not None:
+        assert replacement.calls == []

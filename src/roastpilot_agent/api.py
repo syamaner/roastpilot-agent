@@ -6955,10 +6955,7 @@ class RoastService:
         lease: FaultControlLease,
     ) -> list[OperatorAction]:
         """Qualify the existing recovery action list for server presentation."""
-        if (
-            self._requires_live_restart_clearance
-            and self._restart_clearance_state is not RestartClearanceState.CLEARED
-        ) or (lease.run_id == run_id and lease.status is not FaultLeaseStatus.CLOSED):
+        if lease.run_id == run_id and lease.status is not FaultLeaseStatus.CLOSED:
             return [OperatorAction.EMERGENCY_STOP]
         context = self._closure_only_context
         if (
@@ -6966,8 +6963,14 @@ class RoastService:
             and context.run_id == run_id
             and self._closure_only_binding_is_current(context)
             and lease == context.lease
+            and lease.status is FaultLeaseStatus.CLOSED
         ):
             return [OperatorAction.END_RECOVERED_RUN, OperatorAction.EMERGENCY_STOP]
+        if (
+            self._requires_live_restart_clearance
+            and self._restart_clearance_state is not RestartClearanceState.CLEARED
+        ):
+            return [OperatorAction.EMERGENCY_STOP]
         qualified = _without_recovery_drop(actions)
         if self._guarded_human_drop_allowed(run_id, phase=phase):
             qualified.append(OperatorAction.DROP_BEANS)
