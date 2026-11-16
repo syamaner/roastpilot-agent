@@ -35,6 +35,7 @@ from roastpilot_agent.human_protection import (
     EndpointDisposition,
     HumanReadEvidence,
     ReadingFreshness,
+    ToolDiscovery,
     WriteClass,
 )
 from roastpilot_agent.human_run_ownership import (
@@ -69,7 +70,7 @@ from tests.test_api import (
     _FakeRequest,  # pyright: ignore[reportPrivateUsage]
     _parse_frame,  # pyright: ignore[reportPrivateUsage]
 )
-from tests.test_controller import PROFILE
+from tests.test_controller import PROFILE, reading
 from tests.test_controller_human_mode import HumanRoaster
 from tests.test_mcp_client import EMERGENCY_STOP_EVENT_RESULT_PAYLOAD
 from tests.test_mcp_fixed_zero import (  # pyright: ignore[reportPrivateImportUsage]
@@ -108,7 +109,12 @@ class _RunnerRoaster(HumanRoaster):
 
 
 def _service(
-    store: RoastStore, clock: FakeClock, actuator: _RunnerRoaster, *, exact_child: bool = False
+    store: RoastStore,
+    clock: FakeClock,
+    actuator: _RunnerRoaster,
+    *,
+    exact_child: bool = False,
+    authority: ControlAuthority = ControlAuthority.HUMAN,
 ) -> RoastService:
     child = _LifecycleSpy(_Session(_result({}))) if exact_child else None
     if child is not None:
@@ -118,7 +124,7 @@ def _service(
         mcp=child,
         roaster=actuator,
         raw_state=actuator,
-        authority=ControlAuthority.HUMAN,
+        authority=authority,
         config=AppConfig(controller=ControllerConfig(t0_debounce_ticks=1)),
         clock=clock,
         run_loop=False,
@@ -3781,3 +3787,189 @@ async def test_am6_per_run_capability_doubt_preserves_direct_command_audit(
         (run_id, OperatorAction.EMERGENCY_STOP.value),
     ) as cursor:
         assert [row[0] for row in await cursor.fetchall()] == ([] if failed_write else ["accepted"])
+
+
+async def test_l8_replacement_cannot_reset_a_consumed_containment_attempt(
+    store: RoastStore,
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    child = _LifecycleSpy(_Session(_result({})))
+    assert await child.discover_fixed_zero() is ToolDiscovery.DISCOVERED
+    actuator.epoch = child.child_epoch
+    service = RoastService(
+        store,
+        mcp=child,
+        roaster=actuator,
+        raw_state=actuator,
+        authority=ControlAuthority.HUMAN,
+        config=AppConfig(controller=ControllerConfig(t0_debounce_ticks=1)),
+        clock=clock,
+        run_loop=False,
+    )
+    run = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    owner = controller._human_run  # pyright: ignore[reportPrivateUsage]
+    assert owner is not None
+    await _charge_live_runner(service, actuator, clock)
+    actuator.bound = False
+    clock.advance(0.25)
+    await runner.tick_once()
+    assert actuator.containments == 1
+    assert owner.containment is ContainmentAttempt.CONSUMED
+    assert owner.command is CommandDisposition.SETTLED
+    assert controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    commands_before_replacement = list(actuator.calls)
+
+    with pytest.raises(RoastRunConflictError, match="HUMAN.*ownership"):
+        await service._build_runner("replacement", PROFILE)  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(RoastRunConflictError, match="HUMAN.*ownership"):
+        await service.start_roast(PROFILE)
+    retry = await controller._contain_human_heat(  # pyright: ignore[reportPrivateUsage]
+        generation=controller.command_generation,
+    )
+
+    assert retry.outcome is ContainmentOutcome.NOT_ATTEMPTED
+    assert owner.containment is ContainmentAttempt.CONSUMED
+    assert service._human_ownership.is_current(owner)  # pyright: ignore[reportPrivateUsage]
+    assert service.runner is runner
+    assert actuator.containments == 1
+    assert actuator.resets == 1
+    assert actuator.calls == commands_before_replacement
+    assert actuator.commands().count("start_session") == 1
+    assert [row.id for row in (await service.history()).runs] == [run.id]
+
+
+async def test_t52b_automatic_runner_uses_only_legacy_telemetry(store: RoastStore) -> None:
+    clock = FakeClock()
+    log: list[str] = []
+    actuator = _RunnerRoaster(clock, log)
+    actuator.frames = [reading(185, 200)]
+    service = RoastService(
+        store,
+        roaster=actuator,
+        raw_state=actuator,
+        authority=ControlAuthority.AUTOMATIC,
+        clock=clock,
+        run_loop=False,
+    )
+    await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    log.clear()
+    clock.advance(0.25)
+
+    await runner.tick_once()
+
+    assert log.count("read") == 1
+    assert actuator.reads == 0
+
+
+async def test_human_recovery_detail_without_live_runner_withholds_drop(store: RoastStore) -> None:
+    await store.create_run(
+        run_id="persisted-recovery",
+        profile=PROFILE,
+        config=AppConfig(),
+        agent_phase=RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+    )
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator)
+
+    detail = await service.detail("persisted-recovery")
+
+    assert service.runner is None
+    assert detail.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert OperatorAction.DROP_BEANS not in detail.enabled_actions
+    assert OperatorAction.EMERGENCY_STOP in detail.enabled_actions
+    assert actuator.calls == []
+
+
+async def test_human_recovery_ack_loses_identity_before_runner_dispatch(store: RoastStore) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    run = await service.start_roast(PROFILE)
+    await _charge_live_runner(service, actuator, clock)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    clock.advance(0.25)
+    await runner.tick_once()
+    queued = await service.submit_operator_action(
+        run.id,
+        OperatorActionRequest(
+            action=OperatorAction.ACKNOWLEDGE_RECOVERY,
+            payload={"resume_to": RoastPhase.ROASTING_PRE_FIRST_CRACK.value},
+        ),
+    )
+    assert queued.queued
+    actuator.session_id = "new-synthetic-session"
+    actuator.calls.clear()
+
+    await runner.tick_once()
+
+    assert controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert actuator.calls == []
+    async with store.connection.execute(
+        "SELECT result FROM operator_actions WHERE run_id = ? AND action = ? ORDER BY id",
+        (run.id, OperatorAction.ACKNOWLEDGE_RECOVERY.value),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    assert [row[0] for row in rows][-1] == "failed"
+
+
+@pytest.mark.parametrize("route", ["d212", "legacy"])
+async def test_automatic_fault_completion_cancellation_preserves_live_run(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    clock = FakeClock()
+    actuator = _ExactFaultRunner(clock)
+    service = _service(
+        store, clock, actuator, exact_child=True, authority=ControlAuthority.AUTOMATIC
+    )
+    run = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    runner._controller.transition_to(RoastPhase.FAULTED)  # pyright: ignore[reportPrivateUsage]
+    await runner.tick_once()
+    entered = asyncio.Event()
+
+    async def cancel_at_persistence(**_kwargs: object) -> None:
+        entered.set()
+        await asyncio.Future[None]()
+
+    if route == "d212":
+        lease = await store.open_fault_control_lease(
+            run_id=run.id, mcp_session_id=actuator.session_id
+        )
+        monkeypatch.setattr(store, "close_fault_control_lease_atomically", cancel_at_persistence)
+        request = OperatorActionRequest(
+            action=OperatorAction.STOP_COOLING_AND_ACKNOWLEDGE,
+            payload={"confirmation": True, "expected_generation": lease.generation},
+        )
+    else:
+        monkeypatch.setattr(store, "complete_run", cancel_at_persistence)
+        request = OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    accepted = await service.submit_operator_action(run.id, request)
+    assert accepted.queued
+    tick = asyncio.create_task(runner.tick_once())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert not runner.finalized
+    finally:
+        tick.cancel()
+        with suppress(asyncio.CancelledError):
+            await tick
+
+    assert tick.cancelled()
+    assert not runner.finalized
+    assert not runner._completion_persistence_initiated  # pyright: ignore[reportPrivateUsage]
+    persisted = await store.read_run(run.id)
+    assert persisted is not None and persisted.completed_at_utc is None
+    assert persisted.agent_phase is RoastPhase.FAULTED
