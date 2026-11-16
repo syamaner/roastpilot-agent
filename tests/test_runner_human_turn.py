@@ -1670,14 +1670,21 @@ async def test_fault_acknowledgement_superseded_during_evaluation_barrier(
     actuator.reject_unbound_inactive_emergency = True
     queue = executor._queue  # pyright: ignore[reportPrivateUsage]
     original_put = queue.put_nowait
+    original_emergency = actuator.emergency_stop
     enqueues: list[object] = []
+    unbound_attempts: list[str] = []
 
     def put(item: tuple[object, ...]) -> None:
         if item[2] is OperatorAction.EMERGENCY_STOP:
             enqueues.append(item)
         original_put(item)  # type: ignore[arg-type]
 
+    async def stop_unbound(*, reason: str) -> AppliedRoasterState | None:
+        unbound_attempts.append(reason)
+        return await original_emergency(reason=reason)
+
     monkeypatch.setattr(queue, "put_nowait", put)
+    monkeypatch.setattr(actuator, "emergency_stop", stop_unbound)
     held, release, barrier = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original_record = store.record_safety_evaluation
     original_settle = controller.settle_human_drop_evaluations
@@ -1750,7 +1757,7 @@ async def test_fault_acknowledgement_superseded_during_evaluation_barrier(
         assert await executor.settle_for_shutdown()
         assert stopped.result == "confirmed"
         assert stopped.reason == "terminal emergency stop has fresh exact-session proof"
-        assert actuator.commands().count("emergency_stop") == 0
+        assert unbound_attempts == []
         assert actuator.fault_writes == [OperatorAction.EMERGENCY_STOP]
         assert enqueues == []
         assert refused.result == "failed"
@@ -3579,3 +3586,13 @@ async def test_am6_priority_arbiter_wait_and_supersession(
         )
         if case == "stale_after_write":
             assert retry_armed
+
+
+async def test_am6_exact_dispatch_ledger_consumption_floors_at_zero(store: RoastStore) -> None:
+    """TH11 pins the defensive zero-floor without admitting an arbiter token."""
+    service, runner, _, _, _ = await _faulted_run(store)
+    arbiter = service._command_arbiter  # pyright: ignore[reportPrivateUsage]
+    assert runner._admitted_emergency_stops == 0  # pyright: ignore[reportPrivateUsage]
+    runner.consume_admitted_emergency_stop_for_exact_dispatch()
+    assert runner._admitted_emergency_stops == 0  # pyright: ignore[reportPrivateUsage]
+    assert not arbiter.emergency_stop_active
