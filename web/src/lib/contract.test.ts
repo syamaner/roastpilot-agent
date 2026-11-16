@@ -41,6 +41,7 @@ import type {
   FcStatus,
   MicHealth,
   MicStatus,
+  HumanProtectionHeartbeat,
   RoastDetail,
   RoastEventKind,
   RoastPhase,
@@ -268,6 +269,21 @@ describe("SSE contract — every event type has a real frame", () => {
 
   it("registers an EventSource listener for every server fixture event", () => {
     expect([...SSE_EVENT_TYPES].sort()).toEqual([...EXPECTED_EVENT_TYPES].sort());
+  });
+});
+
+describe("HUMAN protection wire contract", () => {
+  it("distinguishes an explicit clear from missing disclosure fields", () => {
+    const empty = {
+      human_endpoint: null,
+      human_command_disposition: null,
+      physical_intervention_required: null,
+      emergency_fallback_disclosure: null,
+    };
+    expect(rest.roast_detail).toMatchObject(empty);
+    const heartbeat = frame("heartbeat");
+    expect(heartbeat.id).toBeNull();
+    expect(heartbeat.data).toEqual({ run_id: "contract-run", ...empty } satisfies HumanProtectionHeartbeat);
   });
 });
 

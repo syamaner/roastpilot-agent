@@ -86,7 +86,13 @@ from roastpilot_agent.controller import (
     StateReader,
     TickScheduler,
 )
-from roastpilot_agent.human_protection import ControlAuthority, ToolDiscovery, WriteClass
+from roastpilot_agent.human_protection import (
+    CommandDisposition,
+    ControlAuthority,
+    EndpointDisposition,
+    ToolDiscovery,
+    WriteClass,
+)
 from roastpilot_agent.human_run_ownership import (
     AdmissionCloseReason,
     HumanCallAdmissionFence,
@@ -130,6 +136,10 @@ from roastpilot_agent.models import (
     HardwareClearAcknowledgementRequest,
     HardwareClearAcknowledgementResult,
     HealthResponse,
+    HumanCommandProjection,
+    HumanEndpointProjection,
+    HumanProtectionHeartbeat,
+    HumanProtectionProjection,
     InitializeSafetyRecordResult,
     LogManifest,
     MCPChildStatus,
@@ -383,6 +393,21 @@ def _as_event_data(payload: object) -> dict[str, Any]:
 
 
 _HUMAN_RECOVERY_PHASES = frozenset({RoastPhase.OPERATOR_RECOVERY_REQUIRED, RoastPhase.FAULTED})
+
+
+_HUMAN_ENDPOINT_PROJECTION = {
+    EndpointDisposition.NONE: HumanEndpointProjection.NONE,
+    EndpointDisposition.ADMITTED: HumanEndpointProjection.ADMITTED,
+    EndpointDisposition.IN_FLIGHT: HumanEndpointProjection.IN_FLIGHT,
+    EndpointDisposition.ISSUED: HumanEndpointProjection.ISSUED,
+    EndpointDisposition.UNKNOWN: HumanEndpointProjection.UNKNOWN,
+    EndpointDisposition.WITHHELD: HumanEndpointProjection.WITHHELD,
+    EndpointDisposition.HISTORY_UNKNOWN: HumanEndpointProjection.HISTORY_UNKNOWN,
+}
+_HUMAN_COMMAND_PROJECTION = {
+    CommandDisposition.SETTLED: HumanCommandProjection.SETTLED,
+    CommandDisposition.UNKNOWN: HumanCommandProjection.UNKNOWN,
+}
 
 
 def _without_recovery_drop(actions: list[OperatorAction]) -> list[OperatorAction]:
@@ -7010,6 +7035,33 @@ class RoastService:
             id=event.id,
         )
 
+    def human_protection_projection(self, run_id: str) -> HumanProtectionProjection:
+        """Read only the controller state that currently belongs to this run."""
+        runner = self.runner
+        if (
+            self._authority is not ControlAuthority.HUMAN
+            or self.active_run_id != run_id
+            or runner is None
+            or runner.run_id != run_id
+        ):
+            return HumanProtectionProjection()
+        controller = runner.controller_for_human_fault_drop()
+        if controller is None or not controller.owns_human_run(run_id):
+            return HumanProtectionProjection()
+        # Durable closure restricts command admission, but the current runner
+        # can still own the same run's physical-intervention disclosure.
+        snapshot = controller.snapshot()
+        endpoint = snapshot.human_endpoint
+        command = snapshot.human_command_disposition
+        return HumanProtectionProjection(
+            human_endpoint=None if endpoint is None else _HUMAN_ENDPOINT_PROJECTION[endpoint],
+            human_command_disposition=None
+            if command is None
+            else _HUMAN_COMMAND_PROJECTION[command],
+            physical_intervention_required=snapshot.physical_intervention_required,
+            emergency_fallback_disclosure=snapshot.emergency_fallback_disclosure,
+        )
+
     async def detail(self, run_id: str) -> RoastDetail:
         """Run detail, or 404 (plan §6).
 
@@ -7017,7 +7069,11 @@ class RoastService:
         ``mic_status`` (#197) projected from the MCP first-crack status — the
         store has no persisted mic status (it is transient), so historical runs
         carry ``None``. A pure read-only projection, mirroring the
-        ``enabled_actions`` server-derived precedent (D25)."""
+        ``enabled_actions`` server-derived precedent (D25).
+
+        HUMAN disclosure comes from the current runner after the store reads.
+        This endpoint still awaits ``read_run`` before returning any detail.
+        """
         detail = await self._store.read_run(run_id)
         if detail is None:
             raise RoastRunNotFoundError(run_id)
@@ -7078,7 +7134,9 @@ class RoastService:
                 run_id, detail.agent_phase, detail.enabled_actions, lease
             )
             detail = detail.model_copy(update={"enabled_actions": actions})
-        return detail
+        # The last storage await may have allowed a different runner to take
+        # ownership. Bind this transient disclosure only when returning it.
+        return detail.model_copy(update=self.human_protection_projection(run_id).model_dump())
 
     async def _preempt_bean_drafts_for_roast_start(self) -> None:
         """Cancel idle-admitted bean drafts before a roast is persisted."""
@@ -9681,9 +9739,10 @@ async def stream_events(
 
     Subscribes a fresh queue to the broadcaster and streams typed frames:
     every controller event, the per-tick ``telemetry``, and a ``heartbeat``
-    every ``sse_heartbeat_seconds`` of idle. ``run_id`` names the run the
-    client expects; E7 has one active run and a global broadcaster, so the
-    stream carries that run's events. On disconnect the generator's ``finally``
+    every ``sse_heartbeat_seconds`` of idle. Heartbeats also carry current
+    HUMAN disclosure on connection and when it changes during event delivery.
+    The disclosure binds to the requested ``run_id``, independently of the
+    global controller event broadcaster. On disconnect the generator's ``finally``
     unsubscribes — a UI disconnect removes only that subscriber and never
     touches the controller (no cooling, no state change); backend safety runs
     on with no client attached.
@@ -9710,20 +9769,32 @@ async def stream_events(
     queue = service.events.subscribe(last_event_id)
     heartbeat = service.sse_heartbeat_seconds
 
+    def protection_heartbeat(projection: HumanProtectionProjection) -> bytes:
+        data = HumanProtectionHeartbeat(run_id=run_id, **projection.model_dump())
+        return data.to_sse_event().render().encode()
+
     async def frames() -> AsyncIterator[bytes]:
         try:
             # An opening comment flushes headers so the client's onopen fires
             # immediately, before the first event or heartbeat.
             yield b": connected\n\n"
-            while True:
-                if await request.is_disconnected():
-                    break
+            if await request.is_disconnected():
+                return
+            previous = service.human_protection_projection(run_id)
+            yield protection_heartbeat(previous)
+            while not await request.is_disconnected():
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=heartbeat)
                 except TimeoutError:
-                    yield SseEvent(event=SseEventType.HEARTBEAT).render().encode()
-                    continue
-                yield service.project_stream_event(run_id, event).render().encode()
+                    event = None
+                # Sample after the wait. Queued and replayed events never
+                # carry disclosure; a busy stream still publishes changes.
+                current = service.human_protection_projection(run_id)
+                if event is None or current != previous:
+                    previous = current
+                    yield protection_heartbeat(current)
+                if event is not None:
+                    yield service.project_stream_event(run_id, event).render().encode()
         finally:
             service.events.unsubscribe(queue)
 

@@ -1675,7 +1675,45 @@ def _empty_actions() -> list[OperatorAction]:
     return []
 
 
-class RoastDetail(BaseModel):
+class HumanEndpointProjection(Enum):
+    """Wire vocabulary for the controller's HUMAN endpoint disposition."""
+
+    NONE = "none"
+    ADMITTED = "admitted"
+    IN_FLIGHT = "in_flight"
+    ISSUED = "issued"
+    UNKNOWN = "unknown"
+    WITHHELD = "withheld"
+    HISTORY_UNKNOWN = "history_unknown"
+
+
+class HumanCommandProjection(Enum):
+    """Wire vocabulary for the controller's HUMAN command disposition."""
+
+    SETTLED = "settled"
+    UNKNOWN = "unknown"
+
+
+class HumanProtectionProjection(BaseModel):
+    """Read-only HUMAN disclosure, with nulls when live ownership is absent."""
+
+    human_endpoint: HumanEndpointProjection | None = None
+    human_command_disposition: HumanCommandProjection | None = None
+    physical_intervention_required: bool | None = None
+    emergency_fallback_disclosure: str | None = None
+
+
+class HumanProtectionHeartbeat(HumanProtectionProjection):
+    """Current disclosure for the run named by the SSE subscription."""
+
+    run_id: str
+
+    def to_sse_event(self) -> "SseEvent":
+        """Encode the disclosure as an unsequenced keepalive."""
+        return SseEvent(event=SseEventType.HEARTBEAT, data=self.model_dump(mode="json"))
+
+
+class RoastDetail(HumanProtectionProjection):
     """``GET /api/roasts/{id}``: profile, phase, outcome, export manifest.
 
     ``enabled_actions`` is the operator actions valid in the current phase,
