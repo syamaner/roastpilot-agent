@@ -1687,6 +1687,11 @@ class RoastRunner:
         self._controller.admit_emergency_stop()
         self._admitted_emergency_stops += 1
 
+    def consume_admitted_emergency_stop_for_exact_dispatch(self) -> None:
+        """Consume the runner's ledger entry when the executor owns dispatch."""
+        if self._admitted_emergency_stops > 0:
+            self._admitted_emergency_stops -= 1
+
     def rearm_emergency_stop_fail_safe(self) -> None:
         """Keep the controller's typed heat-off retry armed after a failed stop."""
         self._controller.rearm_emergency_stop_fail_safe()
@@ -5256,18 +5261,25 @@ class RoastService:
         # this e-stop has its shared-arbiter priority reservation.
         self._schedule_admitted_fault_control_lease_persistence(admitted)
         executor = self._fault_control_executor
-        # A runner can still be alive while a D212 acknowledgement is awaiting
-        # its durable audit/finalisation.  In that terminal window the retained
-        # exact session is the only path that can prove an e-stop immediately;
-        # queueing behind the stalled completion would report admission rather
-        # than dispatch/readback confirmation.
+        qualifies = False
+        if was_finalizing and live_runner is not None:
+            qualifies = self._live_estop_bypasses_terminal_writer(live_runner)
+            if qualifies:
+                live_runner.consume_admitted_emergency_stop_for_exact_dispatch()
+                session_id = admitted.mcp_session_id
+                if executor is None or session_id is None:
+                    await self._command_arbiter.cancel_emergency_stop_admission()
+                    live_runner.rearm_emergency_stop_fail_safe()
+                    return FaultControlsActionResult(
+                        action=OperatorAction.EMERGENCY_STOP,
+                        result="failed",
+                        reason="software e-stop attempt was not confirmed",
+                        fault_controls=await self._fault_controls_projection_after_action(),
+                    )
         if (
             executor is not None
             and session_id is not None
-            and (
-                live_runner is None
-                or (was_finalizing and not self._live_estop_bypasses_terminal_writer(live_runner))
-            )
+            and (live_runner is None or was_finalizing)
         ):
             dispatch = asyncio.create_task(
                 self._execute_terminal_emergency_stop(
@@ -5276,6 +5288,7 @@ class RoastService:
                     admitted_generation=admitted.generation,
                     emergency_generation=emergency_generation,
                     live_runner=live_runner,
+                    priority=qualifies,
                 )
             )
             self._track_emergency_stop_dispatch(dispatch)
@@ -5361,6 +5374,7 @@ class RoastService:
         admitted_generation: int,
         emergency_generation: int,
         live_runner: RoastRunner | None,
+        priority: bool = False,
     ) -> bool:
         """Own terminal e-stop proof and a failed live fail-safe re-arm.
 
@@ -5368,16 +5382,25 @@ class RoastService:
         must therefore restore the controller's typed heat-off attempt whenever
         an exact terminal executor outcome cannot be confirmed.
         """
+
+        def is_current_generation() -> bool:
+            return self._fault_lease_cache.generation == admitted_generation
+
         try:
-            state = await executor.execute(
-                OperatorAction.EMERGENCY_STOP,
-                session_id,
-                run_id=self._fault_lease_cache.run_id,
-                is_current_generation=lambda: (
-                    self._fault_lease_cache.generation == admitted_generation
-                ),
-                emergency_generation=emergency_generation,
-            )
+            if priority:
+                state = await executor.execute_priority_emergency_stop(
+                    session_id,
+                    run_id=self._fault_lease_cache.run_id,
+                    is_current_generation=is_current_generation,
+                )
+            else:
+                state = await executor.execute(
+                    OperatorAction.EMERGENCY_STOP,
+                    session_id,
+                    run_id=self._fault_lease_cache.run_id,
+                    is_current_generation=is_current_generation,
+                    emergency_generation=emergency_generation,
+                )
             confirmed = state is not None and self._terminal_fault_action_readback_confirms(
                 OperatorAction.EMERGENCY_STOP, state, session_id
             )
@@ -7846,11 +7869,13 @@ class RoastService:
         self, run_id: str, request: OperatorActionRequest
     ) -> OperatorActionResult:
         """Admit a per-run e-stop without waiting on the routine queue or SQLite."""
+        was_finalizing = self._fault_acknowledgement_gate.fault_finalization_started
         # Admission is deliberately first: an e-stop must invalidate a pending
         # Start reservation even when its audit persistence later fails.
         admitted = self._admit_fault_control_lease(run_id)
         runner = self.runner
         dispatched = False
+        confirmed = False
         if (
             runner is not None
             and self.active_run_id == run_id
@@ -7863,35 +7888,65 @@ class RoastService:
             runner.admit_emergency_stop()
             emergency_generation = self._command_arbiter.generation
             self._schedule_admitted_fault_control_lease_persistence(admitted)
-            dispatch = asyncio.create_task(
-                self._dispatch_admitted_live_emergency_stop(
-                    run_id=run_id,
-                    item=QueuedOperatorAction(
-                        run_id=run_id, action=request.action, payload=request.payload
-                    ),
-                    lease=admitted,
-                    emergency_generation=emergency_generation,
+            if was_finalizing and self._live_estop_bypasses_terminal_writer(runner):
+                runner.consume_admitted_emergency_stop_for_exact_dispatch()
+                session_id = admitted.mcp_session_id
+                executor = self._fault_control_executor
+                if executor is None or session_id is None:
+                    await self._command_arbiter.cancel_emergency_stop_admission()
+                    runner.rearm_emergency_stop_fail_safe()
+                else:
+                    dispatch = asyncio.create_task(
+                        self._execute_terminal_emergency_stop(
+                            executor=executor,
+                            session_id=session_id,
+                            admitted_generation=admitted.generation,
+                            emergency_generation=emergency_generation,
+                            live_runner=runner,
+                            priority=True,
+                        )
+                    )
+                    self._track_emergency_stop_dispatch(dispatch)
+                    try:
+                        confirmed = await asyncio.shield(dispatch)
+                    except asyncio.CancelledError:
+                        dispatch.add_done_callback(self._log_cancelled_terminal_estop_dispatch)
+                        raise
+            else:
+                dispatch = asyncio.create_task(
+                    self._dispatch_admitted_live_emergency_stop(
+                        run_id=run_id,
+                        item=QueuedOperatorAction(
+                            run_id=run_id, action=request.action, payload=request.payload
+                        ),
+                        lease=admitted,
+                        emergency_generation=emergency_generation,
+                    )
                 )
-            )
-            self._track_emergency_stop_dispatch(dispatch)
-            # An HTTP disconnect only cancels this waiter. The admitted stop
-            # remains controller-owned until its dispatch reports an outcome.
-            try:
-                dispatched = await asyncio.shield(dispatch)
-            except asyncio.CancelledError:
-                dispatch.add_done_callback(self._log_cancelled_estop_dispatch)
-                raise
+                self._track_emergency_stop_dispatch(dispatch)
+                # An HTTP disconnect only cancels this waiter. The admitted stop
+                # remains controller-owned until its dispatch reports an outcome.
+                try:
+                    dispatched = await asyncio.shield(dispatch)
+                except asyncio.CancelledError:
+                    dispatch.add_done_callback(self._log_cancelled_estop_dispatch)
+                    raise
         else:
             # There is no matching live controller, therefore no controller
             # priority reservation was made.  Persist the fail-closed lease so
             # Start remains fenced, but do not fabricate an arbiter token.
             self._schedule_admitted_fault_control_lease_persistence(admitted)
-        result: Literal["accepted", "rejected", "failed"] = "accepted" if dispatched else "failed"
-        reason = (
-            "emergency_stop accepted for controller priority dispatch"
-            if dispatched
-            else "software e-stop attempt was not confirmed"
+        result: Literal["accepted", "rejected", "failed"] = (
+            "accepted" if confirmed or dispatched else "failed"
         )
+        if confirmed:
+            reason = "terminal emergency stop has fresh exact-session proof"
+        else:
+            reason = (
+                "emergency_stop accepted for controller priority dispatch"
+                if dispatched
+                else "software e-stop attempt was not confirmed"
+            )
         await self._store.record_operator_action(
             action=request.action.value,
             result=result,

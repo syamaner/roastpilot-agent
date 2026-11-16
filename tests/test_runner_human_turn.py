@@ -2,11 +2,11 @@
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Literal, cast
 from unittest.mock import Mock, PropertyMock
 
 import pytest
@@ -51,6 +51,7 @@ from roastpilot_agent.models import (
     FaultControlsActionRequest,
     FaultControlsActionResult,
     FaultControlState,
+    FaultCoolingStopResult,
     FaultLeaseStatus,
     OperatorAction,
     OperatorActionRequest,
@@ -1258,6 +1259,21 @@ class _ExactFaultRunner(_RunnerRoaster):
         self.release_drop_read: asyncio.Event | None = None
         self.cooling = False
         self.fault_reads: list[str] = []
+        self.reject_unbound_inactive_emergency = False
+        self.exact_emergency_write_raises = False
+        self.exact_emergency_read_raises = False
+        self.exact_emergency_read_heat = 0
+        self.latest_fault_session_override: str | None = None
+
+    @property
+    def latest_fault_session_id(self) -> str:
+        return self.latest_fault_session_override or super().latest_fault_session_id
+
+    async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
+        if self.reject_unbound_inactive_emergency:
+            # This port models an inactive, stopped fault session.
+            raise RuntimeError("No active roast session exists.")
+        return await super().emergency_stop(reason=reason)
 
     async def read_fault_acknowledgement_state(self, session_id: str) -> FaultAcknowledgementState:
         state = await super().read_fault_acknowledgement_state(session_id)
@@ -1266,6 +1282,9 @@ class _ExactFaultRunner(_RunnerRoaster):
     async def read_fault_control_state(self, session_id: str) -> FaultControlState:
         assert session_id == self.session_id
         self.fault_reads.append(session_id)
+        emergency_written = OperatorAction.EMERGENCY_STOP in self.fault_writes
+        if emergency_written and self.exact_emergency_read_raises:
+            raise RuntimeError("synthetic emergency readback failure")
         issued = OperatorAction.DROP_BEANS in self.fault_writes
         outcome = self.issued_readback if issued else "before"
         if issued and self.after_drop_read is not None:
@@ -1281,7 +1300,7 @@ class _ExactFaultRunner(_RunnerRoaster):
             mcp_phase="fault",
             active=False,
             device_connected=outcome != "contradiction_disconnected",
-            heat_level_percent=0,
+            heat_level_percent=self.exact_emergency_read_heat if emergency_written else 0,
             fan_level_percent=0,
             cooling_on=self.cooling,
             beans_added=True,
@@ -1299,6 +1318,8 @@ class _ExactFaultRunner(_RunnerRoaster):
     ) -> None:
         assert expected_session_id == self.session_id
         self.fault_writes.append(action)
+        if action is OperatorAction.EMERGENCY_STOP and self.exact_emergency_write_raises:
+            raise RuntimeError("synthetic exact e-stop failure")
         if action in (OperatorAction.START_COOLING, OperatorAction.STOP_COOLING):
             self.cooling = action is OperatorAction.START_COOLING
 
@@ -1644,7 +1665,19 @@ async def test_fault_acknowledgement_superseded_during_evaluation_barrier(
 ) -> None:
     service, runner, actuator, run_id, lease = await _faulted_run(store, open_lease=route == "d212")
     controller = runner.controller_for_human_fault_drop()
-    assert controller is not None
+    executor = service._fault_control_executor  # pyright: ignore[reportPrivateUsage]
+    assert controller is not None and executor is not None
+    actuator.reject_unbound_inactive_emergency = True
+    queue = executor._queue  # pyright: ignore[reportPrivateUsage]
+    original_put = queue.put_nowait
+    enqueues: list[object] = []
+
+    def put(item: tuple[object, ...]) -> None:
+        if item[2] is OperatorAction.EMERGENCY_STOP:
+            enqueues.append(item)
+        original_put(item)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(queue, "put_nowait", put)
     held, release, barrier = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original_record = store.record_safety_evaluation
     original_settle = controller.settle_human_drop_evaluations
@@ -1697,29 +1730,35 @@ async def test_fault_acknowledgement_superseded_during_evaluation_barrier(
             stopped = await service.submit_fault_controls_action(
                 FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
             )
-            assert stopped.result == "accepted"
-            assert actuator.commands().count("emergency_stop") == 1
-            assert actuator.fault_writes == []
             refused = await service.submit_fault_controls_action(
                 FaultControlsActionRequest(action=OperatorAction.START_COOLING)
             )
-            assert refused.result == "failed"
-            with pytest.raises(RoastRunConflictError, match="fault finalization is closing"):
+            conflict: RoastRunConflictError | None = None
+            try:
                 await service.submit_operator_action(
                     run_id, OperatorActionRequest(action=OperatorAction.START_COOLING)
                 )
-            assert await service.settle_fault_lease_persistence_for_teardown()
+            except RoastRunConflictError as error:
+                conflict = error
+            lease_settled = await service.settle_fault_lease_persistence_for_teardown()
             current_lease = await store.read_fault_control_lease()
-            assert current_lease.status is FaultLeaseStatus.OPEN
             projection = await service._fault_controls_projection(current_lease)  # pyright: ignore[reportPrivateUsage]
-            assert OperatorAction.START_COOLING in projection.enabled_actions
         finally:
             release.set()
-            assert not await completion
-        assert not await drop
-        executor = service._fault_control_executor  # pyright: ignore[reportPrivateUsage]
-        assert executor is not None and await executor.settle_for_shutdown()
-        assert actuator.fault_writes == []
+            completed = await completion
+        dropped = await drop
+        assert await executor.settle_for_shutdown()
+        assert stopped.result == "confirmed"
+        assert stopped.reason == "terminal emergency stop has fresh exact-session proof"
+        assert actuator.commands().count("emergency_stop") == 0
+        assert actuator.fault_writes == [OperatorAction.EMERGENCY_STOP]
+        assert enqueues == []
+        assert refused.result == "failed"
+        assert refused.reason == "fault finalization is closing the current exact-session lease"
+        assert str(conflict) == "fault finalization is closing the current lease"
+        assert lease_settled and current_lease.status is FaultLeaseStatus.OPEN
+        assert OperatorAction.START_COOLING in projection.enabled_actions
+        assert completed is False and dropped is False
         detail = await store.read_run(run_id)
         assert detail is not None and detail.completed_at_utc is None
         assert detail.agent_phase is RoastPhase.FAULTED
@@ -2594,32 +2633,63 @@ async def test_tf19_legacy_completion_exception_keeps_drop_closed(
 
 
 @pytest.mark.parametrize(
-    ("interval", "registry", "fault"),
+    ("route", "interval", "registry", "fault", "expected_route"),
     [
-        ("barrier", "pending", "none"),  # TG1 and TG12
-        ("proof", "pending", "none"),  # TG2
-        ("proof", "empty", "none"),  # TG3
-        ("barrier", "empty", "none"),  # TG3
-        ("proof", "raised", "none"),  # TG4
-        ("proof", "cancelled", "none"),  # TG4b
-        ("close", "injected", "none"),  # TG5
-        ("barrier", "pending", "capability_raises"),  # TG9
-        ("barrier", "pending", "missing"),  # TG9b
-        ("barrier", "pending", "truthy"),  # TG9b
-        ("barrier", "pending", "mock"),  # TG9b
-        ("barrier", "pending", "stop_raises"),  # TG10
-        ("barrier", "pending", "flush_raises"),  # TG10
-        ("barrier", "pending", "cancel_http"),  # TG11
-        ("barrier", "pending", "per_run"),  # TG10 and TG13
-        ("none", "pending", "none"),  # TG13
+        pytest.param("global", "barrier", "pending", "none", "priority", id="TG1-TG12"),
+        pytest.param("global", "proof", "pending", "none", "priority", id="TG2-c1"),
+        pytest.param("global", "proof2", "pending", "none", "priority", id="TG2-c2"),
+        pytest.param("global", "proof", "empty", "none", "queued", id="TG3-proof"),
+        pytest.param("global", "barrier", "empty", "none", "queued", id="TG3-barrier"),
+        pytest.param("global", "proof", "raised", "none", "queued", id="TG4"),
+        pytest.param("global", "proof", "cancelled", "none", "priority", id="TG4b"),
+        pytest.param("global", "close", "injected", "none", "queued", id="TG5"),
+        pytest.param("global", "barrier", "pending", "capability_raises", "queued", id="TG9"),
+        *[
+            pytest.param(
+                route,
+                "barrier",
+                "pending",
+                capability,
+                "queued" if route == "global" else "direct",
+                id=f"TG9b-{route}-{capability}",
+            )
+            for route in ("global", "run")
+            for capability in ("missing", "truthy", "mock")
+        ],
+        *[
+            pytest.param(route, "barrier", "pending", fault, "priority", id=f"{row}-{route}")
+            for route in ("global", "run")
+            for row, fault in (
+                ("TG10A", "stop_raises"),
+                ("TG10B-read", "read_raises"),
+                ("TG10B-heat", "read_hot"),
+                ("TG10C", "command_audit_raises"),
+                ("TH4", "latest_identity_changes"),
+                ("TH13-executor", "missing_executor"),
+                ("TH13-session", "missing_session"),
+            )
+        ],
+        pytest.param("run", "barrier", "pending", "direct_audit_raises", "direct", id="TG10D"),
+        pytest.param("global", "barrier", "pending", "cancel_http", "priority", id="TG11"),
+        pytest.param("run", "barrier", "pending", "none", "priority", id="TP1"),
+        pytest.param("run", "proof", "pending", "none", "priority", id="TP2"),
+        pytest.param("run", "none", "pending", "none", "direct", id="TP3-TG13-run"),
+        pytest.param("run", "proof", "empty", "none", "direct", id="TP4-empty"),
+        pytest.param("run", "proof", "raised", "none", "direct", id="TP4-raised"),
+        pytest.param("run", "barrier", "pending", "action_audit_raises", "priority", id="TP5"),
+        pytest.param("run", "barrier", "pending", "cancel_http", "priority", id="TP6"),
+        pytest.param("global", "none", "pending", "none", "direct", id="TG13-global"),
     ],
 )
 async def test_am5_estop_route_during_owned_human_evaluation(
     store: RoastStore,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    route: str,
     interval: str,
     registry: str,
     fault: str,
+    expected_route: str,
 ) -> None:
     service, runner, actuator, run_id, lease = await _faulted_run(store)
     assert lease is not None
@@ -2629,26 +2699,42 @@ async def test_am5_estop_route_during_owned_human_evaluation(
     arbiter = service._command_arbiter  # pyright: ignore[reportPrivateUsage]
     queue = executor._queue  # pyright: ignore[reportPrivateUsage]
     tasks = controller._human_drop_evaluation_tasks  # pyright: ignore[reportPrivateUsage]
+    dispatch_tasks = service._emergency_stop_dispatch_tasks  # pyright: ignore[reportPrivateUsage]
     held, release_evaluation = asyncio.Event(), asyncio.Event()
     reserved, release_finalisation = asyncio.Event(), asyncio.Event()
-    direct_written, estop_enqueued = asyncio.Event(), asyncio.Event()
-    direct_entered, release_direct = asyncio.Event(), asyncio.Event()
+    exact_written, unbound_attempted, estop_enqueued = (asyncio.Event() for _ in range(3))
+    release_write = asyncio.Event()
+    callback_consumed = asyncio.Event()
     completion_operations: list[str] = []
-    capability_reads = 0
-    direct_attempts = 0
-    cancelled_waiter_consumed = asyncio.Event()
-    cooling_samples: list[tuple[str, str]] = []
-    advertised_cooling_while_blocked = False
-    reservation_after_stop = False
+    exact_attempts: list[str] = []
+    dispatch_order: list[str] = []
+    admissions = capability_reads = direct_attempts = ack_reads = ack_writes = 0
+    audit_failures = confirmations = 0
+    dispatch_callbacks: list[object] = []
+    cooling_samples: list[tuple[str, str, str]] = []
+    advertised_cooling_while_blocked = reservation_after_stop = False
+    actuator.reject_unbound_inactive_emergency = expected_route == "priority"
+    actuator.exact_emergency_write_raises = fault == "stop_raises"
+    actuator.exact_emergency_read_raises = fault == "read_raises"
+    actuator.exact_emergency_read_heat = 1 if fault == "read_hot" else 0
+    actuator.cooling = interval in {"proof", "proof2"} and registry == "pending"
 
     original_record = store.record_safety_evaluation
+    original_command = store.record_command
+    original_action_audit = store.record_operator_action
     original_ack = actuator.read_fault_acknowledgement_state
+    original_ack_write = actuator.stop_cooling_for_fault_acknowledgement
     original_settle = controller.settle_human_drop_evaluations
     original_emergency = actuator.emergency_stop
+    original_exact = actuator.write_fault_control
+    original_read = actuator.read_fault_control_state
     original_put = queue.put_nowait
-    original_flush = runner._flush_events  # pyright: ignore[reportPrivateUsage]
     original_capability = runner.emergency_stop_must_bypass_terminal_writer
-    original_consume = service._log_cancelled_estop_dispatch  # pyright: ignore[reportPrivateUsage]
+    original_consume = service._log_cancelled_terminal_estop_dispatch  # pyright: ignore[reportPrivateUsage]
+    original_track = service._track_emergency_stop_dispatch  # pyright: ignore[reportPrivateUsage]
+    original_admit = arbiter.admit_emergency_stop
+    original_confirm = runner.confirm_external_emergency_stop
+    original_admit_lease = service._admit_fault_control_lease  # pyright: ignore[reportPrivateUsage]
 
     async def record(*, run_id: str, tick: int, evaluation: SafetyEvaluation) -> int:
         if evaluation.rule == "human_recovery_drop":
@@ -2658,11 +2744,47 @@ async def test_am5_estop_route_during_owned_human_evaluation(
                 raise RuntimeError("synthetic evaluation persistence failure")
         return await original_record(run_id=run_id, tick=tick, evaluation=evaluation)
 
+    async def record_command(
+        *,
+        run_id: str,
+        tick: int,
+        tool: RoastCommand,
+        source: Literal["policy", "advisor", "operator", "safety", "recovery"],
+        status: Literal["ok", "failed"],
+        args: object = None,
+        result: object = None,
+        safety_evaluation_id: int | None = None,
+    ) -> None:
+        nonlocal audit_failures
+        if tool is RoastCommand.EMERGENCY_STOP and fault in {
+            "command_audit_raises",
+            "direct_audit_raises",
+        }:
+            audit_failures += 1
+            raise RuntimeError("synthetic emergency command audit failure")
+        await original_command(
+            run_id=run_id,
+            tick=tick,
+            tool=tool,
+            source=source,
+            status=status,
+            args=args,
+            result=result,
+            safety_evaluation_id=safety_evaluation_id,
+        )
+
     async def read_ack(session: str) -> FaultAcknowledgementState:
-        if interval == "proof":
+        nonlocal ack_reads
+        ack_reads += 1
+        if (interval, ack_reads) in {("proof", 1), ("proof2", 2)}:
             reserved.set()
             await release_finalisation.wait()
         return await original_ack(session)
+
+    async def stop_ack(session: str) -> FaultCoolingStopResult:
+        nonlocal ack_writes
+        ack_writes += 1
+        return await original_ack_write(session)
 
     async def settle() -> bool:
         if interval == "barrier":
@@ -2687,20 +2809,22 @@ async def test_am5_estop_route_during_owned_human_evaluation(
     async def direct(*, reason: str) -> AppliedRoasterState | None:
         nonlocal direct_attempts
         direct_attempts += 1
-        direct_entered.set()
-        if fault == "cancel_http":
-            await release_direct.wait()
-        if fault in {"stop_raises", "per_run"}:
-            direct_written.set()
-            raise RuntimeError("synthetic direct e-stop failure")
-        state = await original_emergency(reason=reason)
-        direct_written.set()
-        return state
+        unbound_attempted.set()
+        return await original_emergency(reason=reason)
 
-    async def flush() -> None:
-        if fault == "flush_raises" and asyncio.current_task() in dispatch_tasks:
-            raise RuntimeError("synthetic post-write flush failure")
-        await original_flush()
+    async def exact_write(action: OperatorAction, *, expected_session_id: str) -> None:
+        if action is OperatorAction.EMERGENCY_STOP:
+            dispatch_order.append("write")
+            exact_attempts.append(expected_session_id)
+            exact_written.set()
+            if fault == "cancel_http":
+                await release_write.wait()
+        await original_exact(action, expected_session_id=expected_session_id)
+
+    async def read(session: str) -> FaultControlState:
+        if asyncio.current_task() in dispatch_tasks:
+            dispatch_order.append("read")
+        return await original_read(session)
 
     def put(item: tuple[object, ...]) -> None:
         original_put(item)  # type: ignore[arg-type]
@@ -2709,16 +2833,48 @@ async def test_am5_estop_route_during_owned_human_evaluation(
 
     def consume_cancelled_waiter(dispatch: asyncio.Task[bool]) -> None:
         original_consume(dispatch)
-        cancelled_waiter_consumed.set()
+        callback_consumed.set()
+
+    def track(dispatch: asyncio.Task[bool]) -> None:
+        original_track(dispatch)
+        if fault == "latest_identity_changes":
+            actuator.latest_fault_session_override = "identity-after-admission"
+        if fault == "cancel_http":
+            original_add = dispatch.add_done_callback
+
+            def add_callback(callback: object) -> None:
+                dispatch_callbacks.append(callback)
+                original_add(callback)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(dispatch, "add_done_callback", add_callback)
+
+    def admit() -> int:
+        nonlocal admissions
+        admissions += 1
+        return original_admit()
+
+    def confirm() -> None:
+        nonlocal confirmations
+        confirmations += 1
+        original_confirm()
+
+    def admit_lease(
+        run_id: str, *, session_id: str | None = None, use_latest_session: bool = True
+    ) -> FaultControlLease:
+        if fault == "missing_session":
+            return original_admit_lease(run_id, session_id=None, use_latest_session=False)
+        return original_admit_lease(
+            run_id, session_id=session_id, use_latest_session=use_latest_session
+        )
 
     def capability() -> bool:
         nonlocal capability_reads
         capability_reads += 1
-        if fault == "capability_raises":
+        if fault in {"capability_raises", "direct_audit_raises"}:
             raise RuntimeError("synthetic routing capability failure")
         return original_capability()
 
-    async def cooling_sample() -> tuple[str, str]:
+    async def cooling_sample() -> tuple[str, str, str]:
         cooling = await service.submit_fault_controls_action(
             FaultControlsActionRequest(action=OperatorAction.START_COOLING)
         )
@@ -2729,34 +2885,53 @@ async def test_am5_estop_route_during_owned_human_evaluation(
             )
         except RoastRunConflictError as error:
             per_run = str(error)
-        return cooling.result, per_run
+        return cooling.result, cooling.reason, per_run
+
+    async def reject_action_audit(
+        *,
+        action: str,
+        result: Literal["accepted", "rejected", "failed"],
+        run_id: str | None = None,
+        payload: object = None,
+    ) -> None:
+        if action == OperatorAction.EMERGENCY_STOP.value:
+            raise RuntimeError("synthetic operator-action audit failure")
+        await original_action_audit(action=action, result=result, run_id=run_id, payload=payload)
 
     monkeypatch.setattr(store, "record_safety_evaluation", record)
+    monkeypatch.setattr(store, "record_command", record_command)
     monkeypatch.setattr(actuator, "read_fault_acknowledgement_state", read_ack)
+    monkeypatch.setattr(actuator, "stop_cooling_for_fault_acknowledgement", stop_ack)
     monkeypatch.setattr(controller, "settle_human_drop_evaluations", settle)
     monkeypatch.setattr(runner, "_fault_lease_close", close)
     monkeypatch.setattr(runner, "_export_logs", export)
     monkeypatch.setattr(store, "complete_run", complete)
     monkeypatch.setattr(actuator, "emergency_stop", direct)
-    monkeypatch.setattr(runner, "_flush_events", flush)
+    monkeypatch.setattr(actuator, "write_fault_control", exact_write)
+    monkeypatch.setattr(actuator, "read_fault_control_state", read)
     monkeypatch.setattr(queue, "put_nowait", put)
     monkeypatch.setattr(runner, "emergency_stop_must_bypass_terminal_writer", capability)
-    monkeypatch.setattr(service, "_log_cancelled_estop_dispatch", consume_cancelled_waiter)
+    monkeypatch.setattr(runner, "confirm_external_emergency_stop", confirm)
+    monkeypatch.setattr(service, "_log_cancelled_terminal_estop_dispatch", consume_cancelled_waiter)
+    monkeypatch.setattr(service, "_track_emergency_stop_dispatch", track)
+    monkeypatch.setattr(service, "_admit_fault_control_lease", admit_lease)
+    monkeypatch.setattr(arbiter, "admit_emergency_stop", admit)
 
-    dispatch_tasks = service._emergency_stop_dispatch_tasks  # pyright: ignore[reportPrivateUsage]
     live_drops: asyncio.Task[OperatorActionResult] | None = None
     tick: asyncio.Task[bool] | None = None
-    injected: asyncio.Task[None] | None = None
+    injected: asyncio.Task[bool] | None = None
     request: asyncio.Task[FaultControlsActionResult | OperatorActionResult] | None = None
     observers: list[asyncio.Task[bool]] = []
-    dropped: OperatorActionResult | None = None
+    dropped: OperatorActionResult | BaseException | None = None
     stopped: FaultControlsActionResult | OperatorActionResult | BaseException | None = None
     completed: bool | None = None
+    registration_pending_at_dispatch = proof_held_at_dispatch = worker_unchanged = False
+    original_ledger = runner._admitted_emergency_stops  # pyright: ignore[reportPrivateUsage]
     first = ""
     marker_while_reserved = False
 
     async def stop() -> FaultControlsActionResult | OperatorActionResult:
-        if fault == "per_run":
+        if route == "run":
             return await service.submit_operator_action(
                 run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
             )
@@ -2798,17 +2973,8 @@ async def test_am5_estop_route_during_owned_human_evaluation(
             tick = asyncio.create_task(runner.tick_once())
             await asyncio.wait_for(reserved.wait(), 2)
             marker_while_reserved = controller.human_drop_closed()
-            if registry == "pending":
-                (registered,) = tasks
-                assert not registered.done()
-                assert live_drops is not None and not live_drops.done()
         if registry == "injected":
-
-            async def hold_injected() -> None:
-                await release_evaluation.wait()
-
-            injected = asyncio.create_task(hold_injected())
-            # White-box. AM-4 ordinarily forbids registration after the close starts.
+            injected = asyncio.create_task(release_evaluation.wait())
             tasks.add(injected)  # type: ignore[arg-type]
         if fault == "truthy":
             monkeypatch.setattr(runner, "emergency_stop_must_bypass_terminal_writer", lambda: 1)
@@ -2827,21 +2993,35 @@ async def test_am5_estop_route_during_owned_human_evaluation(
             }
             narrow = SimpleNamespace(**attributes) if fault == "missing" else Mock(**attributes)
             monkeypatch.setattr(service, "runner", narrow)
-        if (interval, registry, fault) == ("barrier", "pending", "none"):
+        if fault == "missing_executor":
+            monkeypatch.setattr(service, "_fault_control_executor", None)
+        if fault == "action_audit_raises":
+            monkeypatch.setattr(store, "record_operator_action", reject_action_audit)
+        if (route, interval, registry, fault) == ("global", "barrier", "pending", "none"):
             cooling_samples.append(await cooling_sample())
 
+        worker = executor._worker  # pyright: ignore[reportPrivateUsage]
         request = asyncio.create_task(stop())
-        direct_signal = direct_entered if fault == "cancel_http" else direct_written
-        observers = [asyncio.create_task(event.wait()) for event in (direct_signal, estop_enqueued)]
+        observers = [
+            asyncio.create_task(event.wait())
+            for event in (exact_written, unbound_attempted, estop_enqueued)
+        ]
         observed, _ = await asyncio.wait_for(
             asyncio.wait([*observers, request], return_when=asyncio.FIRST_COMPLETED), 2
         )
-        if direct_signal.is_set() and not estop_enqueued.is_set():
+        if estop_enqueued.is_set():
+            first = "queued"
+        elif unbound_attempted.is_set():
             first = "direct"
-        elif estop_enqueued.is_set():
-            first = "terminal"
+        elif exact_written.is_set():
+            first = "priority"
         elif request in observed:
             first = "returned_without_dispatch"
+        worker_unchanged = executor._worker is worker  # pyright: ignore[reportPrivateUsage]
+        registration_pending_at_dispatch = any(not registered.done() for registered in tasks)
+        proof_held_at_dispatch = not release_finalisation.is_set() and (
+            tick is not None and not tick.done() and reserved.is_set()
+        )
         if fault == "cancel_http":
             request.cancel()
             with suppress(asyncio.CancelledError):
@@ -2858,105 +3038,188 @@ async def test_am5_estop_route_during_owned_human_evaluation(
                 OperatorAction.START_COOLING in projection.enabled_actions
             )
     finally:
-        release_direct.set()
+        release_write.set()
         release_evaluation.set()
         release_finalisation.set()
         for observer in observers:
             observer.cancel()
-        await asyncio.gather(*observers, return_exceptions=True)
-        if injected is not None:
-            await asyncio.wait_for(injected, 2)
-            tasks.discard(injected)  # type: ignore[arg-type]
-        if live_drops is not None and registry not in {"raised", "cancelled"}:
-            dropped = await asyncio.wait_for(live_drops, 2)
-        if tick is not None:
-            completed = await asyncio.wait_for(tick, 2)
-        if request is not None:
+        try:
+            await asyncio.gather(*observers, return_exceptions=True)
+            if injected is not None:
+                try:
+                    await asyncio.wait_for(injected, 2)
+                finally:
+                    tasks.discard(injected)  # type: ignore[arg-type]
+            pending = [
+                task
+                for task in (live_drops, tick, request)
+                if task is not None and not (task is live_drops and registry == "cancelled")
+            ]
+            awaitables: list[Awaitable[object]] = list(pending)
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(*awaitables, return_exceptions=True), 2
+            )
+            for task, outcome in zip(pending, outcomes, strict=True):
+                if task is live_drops:
+                    assert isinstance(outcome, (OperatorActionResult, BaseException))
+                    dropped = outcome
+                elif task is tick:
+                    if isinstance(outcome, BaseException):
+                        raise outcome
+                    assert isinstance(outcome, bool)
+                    completed = outcome
+                else:
+                    assert isinstance(
+                        outcome, (FaultControlsActionResult, OperatorActionResult, BaseException)
+                    )
+                    stopped = outcome
+        finally:
             try:
-                stopped = await asyncio.wait_for(request, 2)
-            except (RuntimeError, asyncio.CancelledError) as error:
-                stopped = error
-        if dispatch_tasks:
-            await asyncio.wait_for(asyncio.gather(*tuple(dispatch_tasks)), 2)
-        assert await service.settle_fault_lease_persistence_for_teardown()
-        assert await executor.settle_for_shutdown()
+                if dispatch_tasks:
+                    await asyncio.wait_for(asyncio.gather(*tuple(dispatch_tasks)), 2)
+            finally:
+                try:
+                    assert await service.settle_fault_lease_persistence_for_teardown()
+                finally:
+                    assert await executor.settle_for_shutdown()
 
-    if fault == "capability_raises":
-        fallback_confirmed = (
-            isinstance(stopped, FaultControlsActionResult) and stopped.result == "confirmed"
-        )
-        assert fallback_confirmed, "capability failure did not retain terminal e-stop"
-
-    direct_expected = (
-        registry in {"pending", "cancelled"} or interval == "none"
-    ) and fault not in {"capability_raises", "missing", "truthy", "mock"}
-    assert first == ("direct" if direct_expected else "terminal"), (
+    missing_binding = fault in {"missing_executor", "missing_session"}
+    assert first == ("returned_without_dispatch" if missing_binding else expected_route), (
         "wrong emergency dispatch route observed"
     )
+    if expected_route == "priority":
+        assert worker_unchanged
+        if registry == "pending":
+            assert registration_pending_at_dispatch
+        if interval.startswith("proof"):
+            assert proof_held_at_dispatch
+        assert exact_attempts == ([] if missing_binding else [actuator.session_id])
+        assert dispatch_order == (
+            [] if missing_binding else ["write"] if fault == "stop_raises" else ["write", "read"]
+        )
     if interval != "none":
         assert completed is False
         assert not service._fault_acknowledgement_gate.fault_finalization_started  # pyright: ignore[reportPrivateUsage]
     assert marker_while_reserved is (interval in {"barrier", "close"})
     assert completion_operations == (["close"] if interval == "close" else [])
+    assert admissions == 1
     assert not arbiter.emergency_stop_active
-    assert direct_attempts == int(direct_expected)
-    assert actuator.fault_writes == ([] if direct_expected else [OperatorAction.EMERGENCY_STOP])
-    assert estop_enqueued.is_set() is not direct_expected
-    if direct_expected and fault not in {"stop_raises", "per_run"}:
+    expected_ledger_delta = int(expected_route == "queued")
+    assert runner._admitted_emergency_stops == original_ledger + expected_ledger_delta  # pyright: ignore[reportPrivateUsage]
+    assert direct_attempts == int(expected_route == "direct")
+    assert unbound_attempted.is_set() is (expected_route == "direct")
+    assert actuator.fault_writes == (
+        [] if expected_route == "direct" or missing_binding else [OperatorAction.EMERGENCY_STOP]
+    )
+    assert estop_enqueued.is_set() is (expected_route == "queued")
+    if expected_route == "direct":
         assert actuator.commands().count("emergency_stop") == 1
     if registry in {"pending", "raised"}:
-        assert dropped is not None and dropped.result == "failed"
+        assert isinstance(dropped, OperatorActionResult) and dropped.result == "failed"
     if registry == "raised":
-        assert len(tasks) == 1 and next(iter(tasks)).done()
+        (registered,) = tasks
+        assert registered.done() and not registered.cancelled()
+        assert isinstance(registered.exception(), RuntimeError)
     if registry == "cancelled":
         assert len(tasks) == 1 and next(iter(tasks)).cancelled()
-    if interval == "none" or fault == "per_run":
-        assert capability_reads == 0
+    if fault not in {"missing", "mock", "truthy"}:
+        assert capability_reads == int(interval != "none")
+    if fault in {"capability_raises", "direct_audit_raises"}:
+        assert "Could not qualify direct live emergency dispatch" in caplog.messages
+
+    retry_armed = controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
     if fault == "cancel_http":
         assert isinstance(stopped, asyncio.CancelledError)
-        assert actuator.commands().count("emergency_stop") == 1
-        assert cancelled_waiter_consumed.is_set()
-    elif fault == "flush_raises":
+        assert callback_consumed.is_set() and confirmations == 1
+        assert not retry_armed
+        if route == "run":
+            assert dispatch_callbacks[-1:] == [consume_cancelled_waiter]
+    elif fault in {"action_audit_raises", "direct_audit_raises"}:
         assert isinstance(stopped, RuntimeError)
-        assert str(stopped) == "synthetic post-write flush failure"
+        assert str(stopped) == (
+            "synthetic operator-action audit failure"
+            if fault == "action_audit_raises"
+            else "synthetic emergency command audit failure"
+        )
+        assert confirmations == int(fault == "action_audit_raises")
+        assert not retry_armed
+        assert controller.phase is RoastPhase.FAULTED
     else:
         assert isinstance(stopped, (FaultControlsActionResult, OperatorActionResult))
-        assert stopped.result == ("accepted" if direct_expected else "confirmed")
-        if direct_expected:
+        if missing_binding or fault in {"stop_raises", "read_raises", "read_hot"}:
+            assert stopped.result == "failed"
+            assert stopped.reason == "software e-stop attempt was not confirmed"
+            assert retry_armed
+        elif expected_route == "direct":
+            assert stopped.result == "accepted"
             assert stopped.reason == "emergency_stop accepted for controller priority dispatch"
+        else:
+            assert stopped.result == ("confirmed" if route == "global" else "accepted")
+            assert stopped.reason == "terminal emergency stop has fresh exact-session proof"
+            assert not retry_armed
+        assert not stopped.queued
+
+    if route == "run":
+        async with store.connection.execute(
+            "SELECT result FROM operator_actions WHERE run_id = ? AND action = ?",
+            (run_id, OperatorAction.EMERGENCY_STOP.value),
+        ) as cursor:
+            rows = [row[0] for row in await cursor.fetchall()]
+        assert rows == ([stopped.result] if isinstance(stopped, OperatorActionResult) else [])
     latest = await store.read_fault_control_lease()
-    assert latest.status is FaultLeaseStatus.OPEN and latest.generation == lease.generation + 1
+    assert latest.generation == lease.generation + 1
+    if not missing_binding:
+        assert latest.status is FaultLeaseStatus.OPEN
     if interval == "barrier":
         assert controller.human_drop_closed()
-    if interval == "proof":
-        assert not any(name == "stop_cooling" for name, _ in actuator.calls)
+    if interval.startswith("proof") and expected_route != "direct":
+        assert ack_writes == 0
+        if actuator.cooling:
+            assert ack_reads == (2 if interval == "proof2" else 1)
         timeline = await store.read_timeline(run_id)
+        expected_reason = (
+            "stop_unconfirmed" if interval == "proof2" else "superseded_by_emergency_stop"
+        )
         assert any(
             event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
             and event.payload is not None
-            and event.payload.get("reason") == "superseded_by_emergency_stop"
+            and event.payload.get("reason") == expected_reason
             for event in timeline.events
         )
     if cooling_samples:
+        assert reservation_after_stop
         assert (
-            cooling_samples == [("failed", "fault finalization is closing the current lease")] * 2
+            cooling_samples
+            == [
+                (
+                    "failed",
+                    "fault finalization is closing the current exact-session lease",
+                    "fault finalization is closing the current lease",
+                )
+            ]
+            * 2
         )
         assert advertised_cooling_while_blocked
         cooling = await service.submit_fault_controls_action(
             FaultControlsActionRequest(action=OperatorAction.START_COOLING)
         )
         assert cooling.result == "accepted"
-        assert actuator.fault_writes == [OperatorAction.START_COOLING]
+        assert actuator.fault_writes == [
+            OperatorAction.EMERGENCY_STOP,
+            OperatorAction.START_COOLING,
+        ]
         assert await executor.settle_for_shutdown()
-    if fault in {"stop_raises", "per_run"}:
+    if fault == "command_audit_raises":
+        assert audit_failures == 1 and confirmations == 1
+        assert "could not persist fault-control command outcome" in caplog.messages
+    if fault == "stop_raises":
         assert controller.phase is RoastPhase.FAULTED
-        assert controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
         await runner.tick_once()
         assert actuator.calls == [
             ("set_heat", {"heat_percent": 0}),
             ("set_fan", {"fan_percent": SafetyLimits().overrun_safe_fan_percent}),
         ]
-        assert direct_attempts == 1 and not actuator.fault_writes
+        assert exact_attempts == [actuator.session_id]
 
 
 async def test_am5_completion_initiation_survives_runner_cancellation(
@@ -2999,9 +3262,11 @@ async def test_am5_completion_initiation_survives_runner_cancellation(
     assert actuator.fault_writes == []
 
 
+@pytest.mark.parametrize("route", ["global", "run"])
 async def test_am5_automatic_finalisation_keeps_exact_terminal_route_without_human_reads(
     store: RoastStore,
     monkeypatch: pytest.MonkeyPatch,
+    route: str,
 ) -> None:
     clock = FakeClock()
     actuator = _ExactFaultRunner(clock)
@@ -3027,6 +3292,10 @@ async def test_am5_automatic_finalisation_keeps_exact_terminal_route_without_hum
         reads += 1
         return True
 
+    ledger_consumer = Mock(wraps=runner.consume_admitted_emergency_stop_for_exact_dispatch)
+    monkeypatch.setattr(
+        runner, "consume_admitted_emergency_stop_for_exact_dispatch", ledger_consumer
+    )
     flag = PropertyMock(return_value=False)
     monkeypatch.setattr(RoastRunner, "_completion_persistence_initiated", flag, raising=False)
     monkeypatch.setattr(controller, "human_drop_evaluation_outstanding", read_human_evidence)
@@ -3042,9 +3311,14 @@ async def test_am5_automatic_finalisation_keeps_exact_terminal_route_without_hum
     tick = asyncio.create_task(runner.tick_once())
     try:
         await asyncio.wait_for(reserved.wait(), 2)
-        stopped = await service.submit_fault_controls_action(
-            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
-        )
+        if route == "global":
+            stopped = await service.submit_fault_controls_action(
+                FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+        else:
+            stopped = await service.submit_operator_action(
+                run.id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
     finally:
         release.set()
         completed = await asyncio.wait_for(tick, 2)
@@ -3054,9 +3328,17 @@ async def test_am5_automatic_finalisation_keeps_exact_terminal_route_without_hum
     assert reads == 0
     assert flag.call_args_list == []
     assert not completed
-    assert stopped.result == "confirmed"
-    assert stopped.reason == "terminal emergency stop has fresh exact-session proof"
-    assert actuator.fault_writes == [OperatorAction.EMERGENCY_STOP]
+    ledger_consumer.assert_not_called()
+    if route == "global":
+        assert stopped.result == "confirmed"
+        assert stopped.reason == "terminal emergency stop has fresh exact-session proof"
+        assert actuator.fault_writes == [OperatorAction.EMERGENCY_STOP]
+        assert actuator.commands().count("emergency_stop") == 0
+    else:
+        assert stopped.result == "accepted"
+        assert stopped.reason == "emergency_stop accepted for controller priority dispatch"
+        assert actuator.fault_writes == []
+        assert actuator.commands().count("emergency_stop") == 1
 
 
 @pytest.mark.parametrize("runner_case", ["finalised", "different", "absent"])
@@ -3103,3 +3385,197 @@ async def test_am5_historical_global_estop_never_consults_unselected_runner(
     assert stopped.result == "confirmed"
     assert stopped.reason == "terminal emergency stop has fresh exact-session proof"
     assert actuator.fault_writes == [OperatorAction.EMERGENCY_STOP]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param("cancel_waiting", id="TH9"),
+        pytest.param("serialize", id="TH10"),
+        pytest.param("stale_before_write", id="TH12-before-write"),
+        pytest.param("stale_after_write", id="TH12-after-write"),
+    ],
+)
+async def test_am6_priority_arbiter_wait_and_supersession(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Observe admission into the shared arbiter before cancelling or superseding."""
+    service, runner, actuator, _, lease = await _faulted_run(store)
+    arbiter = service._command_arbiter  # pyright: ignore[reportPrivateUsage]
+    executor = service._fault_control_executor  # pyright: ignore[reportPrivateUsage]
+    gate = service._fault_acknowledgement_gate  # pyright: ignore[reportPrivateUsage]
+    dispatch_tasks = service._emergency_stop_dispatch_tasks  # pyright: ignore[reportPrivateUsage]
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None and executor is not None and lease is not None
+    actuator.reject_unbound_inactive_emergency = True
+    tasks = controller._human_drop_evaluation_tasks  # pyright: ignore[reportPrivateUsage]
+    # White-box reservation and still-owned evaluation. D212's proof and
+    # completion intervals are exercised through their actual entry points above.
+    release_evaluation = asyncio.Event()
+
+    async def hold_evaluation() -> int:
+        await release_evaluation.wait()
+        return 1
+
+    evaluation = asyncio.create_task(hold_evaluation())
+    tasks.add(evaluation)
+    assert gate.begin_fault_finalization(gate.emergency_request_epoch)
+
+    in_flight, release_in_flight, first_write, release_first_write = (
+        asyncio.Event() for _ in range(4)
+    )
+    first_waiting, second_waiting, old_routine_waiting = (asyncio.Event() for _ in range(3))
+    waiting_dispatches: list[asyncio.Task[object]] = []
+    order: list[str] = []
+    routine: asyncio.Task[tuple[bool, None]] | None = None
+    old_routine: asyncio.Task[tuple[bool, None]] | None = None
+    request_a: asyncio.Task[FaultControlsActionResult] | None = None
+    request_b: asyncio.Task[FaultControlsActionResult] | None = None
+    condition = arbiter._condition  # pyright: ignore[reportPrivateUsage]
+    original_wait = condition.wait
+    original_write = actuator.write_fault_control
+    before_release: list[str] = []
+
+    async def wait() -> bool:
+        task = asyncio.current_task()
+        if task is not None and task in dispatch_tasks and task not in waiting_dispatches:
+            waiting_dispatches.append(task)
+            (first_waiting if len(waiting_dispatches) == 1 else second_waiting).set()
+        elif task is old_routine:
+            old_routine_waiting.set()
+        return await original_wait()
+
+    async def in_flight_write() -> None:
+        order.append("routine_enter")
+        in_flight.set()
+        await release_in_flight.wait()
+        order.append("routine_exit")
+
+    async def old_routine_write() -> None:
+        order.append("stale_routine_write")
+
+    async def following_routine_write() -> None:
+        order.append("following_routine_write")
+
+    async def exact_write(action: OperatorAction, *, expected_session_id: str) -> None:
+        if action is OperatorAction.EMERGENCY_STOP:
+            order.append("priority_write")
+            if not first_write.is_set():
+                first_write.set()
+                if case == "stale_after_write":
+                    await release_first_write.wait()
+        await original_write(action, expected_session_id=expected_session_id)
+
+    async def stop() -> FaultControlsActionResult:
+        return await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+
+    monkeypatch.setattr(condition, "wait", wait)
+    monkeypatch.setattr(actuator, "write_fault_control", exact_write)
+    result_a: FaultControlsActionResult | BaseException | None = None
+    result_b: FaultControlsActionResult | BaseException | None = None
+    old_routine_result: tuple[bool, None] | None = None
+    current_routine_result: tuple[bool, None] | None = None
+    try:
+        if case != "stale_after_write":
+            routine = asyncio.create_task(arbiter.run_routine(arbiter.generation, in_flight_write))
+            await asyncio.wait_for(in_flight.wait(), 2)
+        if case == "serialize":
+            old_routine = asyncio.create_task(
+                arbiter.run_routine(arbiter.generation, old_routine_write)
+            )
+            await asyncio.wait_for(old_routine_waiting.wait(), 2)
+        request_a = asyncio.create_task(stop())
+        if case == "stale_after_write":
+            await asyncio.wait_for(first_write.wait(), 2)
+        else:
+            waiting_observers = [
+                asyncio.create_task(event.wait()) for event in (first_waiting, first_write)
+            ]
+            try:
+                await asyncio.wait_for(
+                    asyncio.wait(
+                        [*waiting_observers, request_a], return_when=asyncio.FIRST_COMPLETED
+                    ),
+                    2,
+                )
+            finally:
+                for observer in waiting_observers:
+                    observer.cancel()
+                await asyncio.gather(*waiting_observers, return_exceptions=True)
+        if case == "cancel_waiting" and first_waiting.is_set():
+            (waiting_dispatch,) = waiting_dispatches
+            waiting_dispatch.cancel()
+            with suppress(asyncio.CancelledError):
+                await request_a
+        elif case == "stale_after_write" or (
+            case == "stale_before_write" and first_waiting.is_set()
+        ):
+            request_b = asyncio.create_task(stop())
+            waiting = second_waiting if case == "stale_before_write" else first_waiting
+            await asyncio.wait_for(waiting.wait(), 2)
+        if case == "serialize" and first_waiting.is_set():
+            current_routine_result = await arbiter.run_routine(
+                arbiter.generation, following_routine_write
+            )
+        before_release = order.copy()
+    finally:
+        release_in_flight.set()
+        release_first_write.set()
+        release_evaluation.set()
+        try:
+            if routine is not None:
+                await asyncio.wait_for(routine, 2)
+            if old_routine is not None:
+                old_routine_result = await asyncio.wait_for(old_routine, 2)
+            if request_a is not None:
+                (result_a,) = await asyncio.wait_for(
+                    asyncio.gather(request_a, return_exceptions=True), 2
+                )
+            if request_b is not None:
+                (result_b,) = await asyncio.wait_for(
+                    asyncio.gather(request_b, return_exceptions=True), 2
+                )
+        finally:
+            await asyncio.wait_for(evaluation, 2)
+            tasks.discard(evaluation)
+            gate.abort_fault_finalization()
+            try:
+                assert await service.settle_fault_lease_persistence_for_teardown()
+            finally:
+                assert await executor.settle_for_shutdown()
+
+    assert actuator.commands().count("emergency_stop") == 0
+    assert not arbiter.emergency_stop_active
+    retry_armed = controller._pending_fail_safe_is_emergency_stop_retry  # pyright: ignore[reportPrivateUsage]
+    if case == "cancel_waiting":
+        assert before_release == ["routine_enter"]
+        assert isinstance(result_a, asyncio.CancelledError)
+        assert actuator.fault_writes == [] and retry_armed
+    elif case == "serialize":
+        assert before_release == ["routine_enter"]
+        assert old_routine_result == current_routine_result == (False, None)
+        assert isinstance(result_a, FaultControlsActionResult) and result_a.result == "confirmed"
+        assert await arbiter.run_routine(arbiter.generation, following_routine_write) == (
+            True,
+            None,
+        )
+        assert order == [
+            "routine_enter",
+            "routine_exit",
+            "priority_write",
+            "following_routine_write",
+        ]
+        assert actuator.fault_writes == [OperatorAction.EMERGENCY_STOP] and not retry_armed
+    else:
+        assert before_release == (
+            ["routine_enter"] if case == "stale_before_write" else ["priority_write"]
+        )
+        assert isinstance(result_a, FaultControlsActionResult) and result_a.result == "failed"
+        assert isinstance(result_b, FaultControlsActionResult) and result_b.result == "confirmed"
+        assert actuator.fault_writes == [OperatorAction.EMERGENCY_STOP] * (
+            1 if case == "stale_before_write" else 2
+        )
+        if case == "stale_after_write":
+            assert retry_armed

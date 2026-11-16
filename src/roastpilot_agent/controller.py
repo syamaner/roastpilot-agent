@@ -738,6 +738,121 @@ class FaultControlExecutor:
                 if not future.done():
                     future.set_result(result)
 
+    async def execute_priority_emergency_stop(
+        self,
+        session_id: str,
+        *,
+        run_id: str | None,
+        is_current_generation: Callable[[], bool],
+    ) -> FaultControlState | None:
+        """Run one already-admitted exact-session e-stop without the worker.
+
+        The caller must already hold exactly one shared-arbiter emergency
+        reservation. This method never admits, queues or retries.
+
+        Args:
+            session_id: Exact session from the admitted fault-control lease.
+            run_id: Run associated with the command audit.
+            is_current_generation: Whether the admitted lease is still current.
+
+        Returns:
+            Fresh exact-session readback when it confirms the stop, otherwise None.
+        """
+        return await self._execute_exact_emergency_stop(session_id, is_current_generation, run_id)
+
+    async def _execute_exact_emergency_stop(
+        self,
+        session_id: str,
+        generation_current: Callable[[], bool],
+        run_id: str | None,
+    ) -> FaultControlState | None:
+        action = OperatorAction.EMERGENCY_STOP
+        evaluation = self._safety.evaluate_emergency_stop(
+            phase=RoastPhase.FAULTED, operator_reason="terminal fault control"
+        )
+        if evaluation.verdict is not SafetyVerdict.EMERGENCY_STOP:
+            await self._arbiter.cancel_emergency_stop_admission()
+            self._schedule_estop_trace(
+                run_id,
+                evaluation,
+                "failed",
+                {
+                    "admission": "rejected",
+                    "dispatch": "not_attempted",
+                    "confirmation": "failed",
+                },
+            )
+            return None
+        # No pre-read may postpone an e-stop attempt.  The guarded command
+        # result and its fresh exact-session readback are the proof.
+        write_started = False
+
+        async def dispatch_estop() -> None:
+            """Mark entry to the adapter so admission failures are not called writes."""
+            nonlocal write_started
+            write_started = True
+            await self._port.write_fault_control(action, expected_session_id=session_id)
+
+        try:
+            await self._arbiter.run_emergency_stop(dispatch_estop, admitted=generation_current)
+        except Exception:
+            self._schedule_estop_trace(
+                run_id,
+                evaluation,
+                "failed",
+                {
+                    "admission": "allowed",
+                    "dispatch": "write_failed" if write_started else "not_dispatched",
+                    "confirmation": "not_attempted",
+                },
+            )
+            raise
+        if not generation_current():
+            self._schedule_estop_trace(
+                run_id,
+                evaluation,
+                "failed",
+                {
+                    "admission": "allowed",
+                    "dispatch": "completed",
+                    "confirmation": "superseded",
+                },
+            )
+            return None
+        try:
+            state = await self._port.read_fault_control_state(session_id)
+        except Exception:
+            self._schedule_estop_trace(
+                run_id,
+                evaluation,
+                "failed",
+                {
+                    "admission": "allowed",
+                    "dispatch": "completed",
+                    "confirmation": "readback_failed",
+                },
+            )
+            raise
+        if not self._readback_confirms(action, state, session_id):
+            self._schedule_estop_trace(
+                run_id,
+                evaluation,
+                "failed",
+                {
+                    "admission": "allowed",
+                    "dispatch": "completed",
+                    "confirmation": "rejected_readback",
+                },
+            )
+            return None
+        self._schedule_estop_trace(
+            run_id,
+            evaluation,
+            "ok",
+            {"admission": "allowed", "dispatch": "completed", "confirmation": "read_back"},
+        )
+        return state
+
     async def _execute_one(
         self,
         action: OperatorAction,
@@ -752,91 +867,7 @@ class FaultControlExecutor:
     ) -> FaultControlState | None:
         """Evaluate and execute one current generation's exact-session action."""
         if action is OperatorAction.EMERGENCY_STOP:
-            evaluation = self._safety.evaluate_emergency_stop(
-                phase=RoastPhase.FAULTED, operator_reason="terminal fault control"
-            )
-            if evaluation.verdict is not SafetyVerdict.EMERGENCY_STOP:
-                await self._arbiter.cancel_emergency_stop_admission()
-                self._schedule_estop_trace(
-                    run_id,
-                    evaluation,
-                    "failed",
-                    {
-                        "admission": "rejected",
-                        "dispatch": "not_attempted",
-                        "confirmation": "failed",
-                    },
-                )
-                return None
-            # No pre-read may postpone an e-stop attempt.  The guarded command
-            # result and its fresh exact-session readback are the proof.
-            write_started = False
-
-            async def dispatch_estop() -> None:
-                """Mark entry to the adapter so admission failures are not called writes."""
-                nonlocal write_started
-                write_started = True
-                await self._port.write_fault_control(action, expected_session_id=session_id)
-
-            try:
-                await self._arbiter.run_emergency_stop(dispatch_estop, admitted=generation_current)
-            except Exception:
-                self._schedule_estop_trace(
-                    run_id,
-                    evaluation,
-                    "failed",
-                    {
-                        "admission": "allowed",
-                        "dispatch": "write_failed" if write_started else "not_dispatched",
-                        "confirmation": "not_attempted",
-                    },
-                )
-                raise
-            if not generation_current():
-                self._schedule_estop_trace(
-                    run_id,
-                    evaluation,
-                    "failed",
-                    {
-                        "admission": "allowed",
-                        "dispatch": "completed",
-                        "confirmation": "superseded",
-                    },
-                )
-                return None
-            try:
-                state = await self._port.read_fault_control_state(session_id)
-            except Exception:
-                self._schedule_estop_trace(
-                    run_id,
-                    evaluation,
-                    "failed",
-                    {
-                        "admission": "allowed",
-                        "dispatch": "completed",
-                        "confirmation": "readback_failed",
-                    },
-                )
-                raise
-            if not self._readback_confirms(action, state, session_id):
-                self._schedule_estop_trace(
-                    run_id,
-                    evaluation,
-                    "failed",
-                    {
-                        "admission": "allowed",
-                        "dispatch": "completed",
-                        "confirmation": "rejected_readback",
-                    },
-                )
-                return None
-            self._schedule_estop_trace(
-                run_id,
-                evaluation,
-                "ok",
-                {"admission": "allowed", "dispatch": "completed", "confirmation": "read_back"},
-            )
-            return state
+            return await self._execute_exact_emergency_stop(session_id, generation_current, run_id)
         # execute() returns before queueing every unmapped routine action.
         if command is None:  # pragma: no cover
             return None
