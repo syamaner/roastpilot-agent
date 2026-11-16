@@ -82,6 +82,10 @@ async def test_human_estop_during_finalisation_over_real_stdio(
     versions = {name: version(name) for name in ("coffee-roaster-mcp", "mcp", "pydantic")}
     print(versions)
     assert versions["coffee-roaster-mcp"] == "0.2.4"
+    # The producer applies COFFEE_* environment overrides after loading YAML.
+    for name in tuple(os.environ):
+        if name.startswith("COFFEE_"):
+            monkeypatch.delenv(name)
     producer_config = tmp_path / "mock.yaml"
     producer_config.write_text(
         "roaster:\n  driver: mock\n"
@@ -97,7 +101,15 @@ async def test_human_estop_during_finalisation_over_real_stdio(
         await child.start()
         try:
             await _exercise_route(
-                store, child, monkeypatch, caplog, route, interval, negative, fail_audit
+                store,
+                child,
+                monkeypatch,
+                caplog,
+                route,
+                interval,
+                negative,
+                fail_audit,
+                producer_config,
             )
         finally:
             await child.stop()
@@ -114,12 +126,19 @@ async def _exercise_route(
     interval: str,
     negative: bool,
     fail_audit: bool,
+    producer_config: Path,
 ) -> None:
     clock = FakeClock()
     adapter = RoasterControlAdapter.from_process(child, clock=clock)
     client = adapter._client  # pyright: ignore[reportPrivateUsage]
     info = await client.get_server_info()
     assert info.bootstrap_safe is True and info.roaster_driver == "mock"
+    assert info.first_crack_mode == "disabled"
+    runtime = await client.get_runtime_config()
+    assert runtime.roaster_driver == "mock" and runtime.first_crack_mode == "disabled"
+    assert runtime.config_source is not None
+    assert Path(runtime.config_source).resolve() == producer_config.resolve()
+    assert Path(runtime.log_dir).resolve() == (producer_config.parent / "logs").resolve()
     service = RoastService(
         store,
         mcp=child,
@@ -149,6 +168,8 @@ async def _exercise_route(
     before = await client.get_roast_state(session)
     assert not before.active and before.phase == "fault" and before.cooling_on
     assert before.beans_added_at_utc is not None
+    assert before.first_crack_status.mode == "disabled"
+    assert not before.first_crack_status.audio_running
     controller.transition_to(RoastPhase.FAULTED)
     clock.advance(0.25)
     await runner.tick_once()
