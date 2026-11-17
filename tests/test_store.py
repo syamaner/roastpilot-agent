@@ -10604,7 +10604,7 @@ async def test_human_ambiguous_commit_keeps_exact_owner_across_diagnostic_evicti
     tmp_store.set_human_history_run("run-1", recovered=False)
     shared = tmp_store.connection
     real_commit = shared.commit
-    ref = CommandReference("session-1", 7, 3, 1)
+    ref = CommandReference("session-1", 7, 3, 1, CommandAuditOwner.ENDPOINT)
 
     async def commit_then_raise() -> None:
         await real_commit()
@@ -10634,9 +10634,9 @@ async def test_human_ambiguous_commit_keeps_exact_owner_across_diagnostic_evicti
         (pending,) = tmp_store.drain_human_storage_receipts()
         assert pending.command == ref
         assert pending.settlement is Settlement.UNRESOLVED
-        assert pending.writer_connection == id(shared)
+        assert pending.writer_connection == id(shared) and pending.writer_entered is True
         assert not await tmp_store.settle_human_storage_for_teardown()
-        assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.UNKNOWN
+        assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.UNAVAILABLE
     finally:
         await tmp_store.close()
 
