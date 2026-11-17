@@ -28,7 +28,7 @@ from roastpilot_agent.api import (
     stream_events,
 )
 from roastpilot_agent.config import AppConfig, ControllerConfig, MCPDeviceConfig, SafetyLimits
-from roastpilot_agent.human_persistence import Settlement
+from roastpilot_agent.human_persistence import HistoryUnavailable, Settlement
 from roastpilot_agent.human_protection import (
     CommandDisposition,
     ContainmentAttempt,
@@ -4834,3 +4834,56 @@ async def test_human_event_cancellation_does_not_start_unentered_siblings(
         if stage == "before_lock":
             flush_lock.release()
         await service.shutdown()
+
+
+@pytest.mark.parametrize("write", ["t0", "phase"])
+async def test_human_one_shot_history_does_not_retry_after_late_commit(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    write: str,
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator)
+    run = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    controller.transition_to(RoastPhase.FAULTED)
+    snapshot = replace(runner.controller_snapshot(), charge_detected=True)
+    store.drain_human_storage_receipts()
+    original_commit = store.connection.commit
+    commits = 0
+
+    async def commit_after_deadline() -> None:
+        nonlocal commits
+        commits += 1
+        clock.advance(1.0)
+        await original_commit()
+
+    monkeypatch.setattr(store.connection, "commit", commit_after_deadline)
+    if write == "t0":
+        write_t0 = runner._persist_t0_if_charged  # pyright: ignore[reportPrivateUsage]
+        await write_t0(snapshot)
+        await write_t0(snapshot)
+        active = await store.read_latest_run()
+        assert (
+            active is not None and active.run_id == run.id and active.t0_detected_at_utc is not None
+        )
+        kind = "record_t0_detected_at"
+    else:
+        write_phase = runner._persist_phase_if_changed  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(HistoryUnavailable, match="deadline"):
+            await write_phase()
+        await write_phase()
+        detail = await store.read_run(run.id)
+        assert detail is not None and detail.agent_phase is RoastPhase.FAULTED
+        kind = "update_run_phase"
+    assert commits == 1
+    (receipt,) = [
+        receipt for receipt in store.drain_human_storage_receipts() if receipt.kind == kind
+    ]
+    assert receipt.settlement is Settlement.OBSERVED_COMMITTED and receipt.timely is False
+    monkeypatch.setattr(store.connection, "commit", original_commit)
+    await service.shutdown()

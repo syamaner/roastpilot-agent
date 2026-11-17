@@ -18,6 +18,18 @@ _T = TypeVar("_T")
 class HistoryUnavailable(RuntimeError):
     """A storage operation cannot supply trusted results within its admission."""
 
+    def __init__(self, message: str, *, receipt: StorageReceipt | None = None) -> None:
+        """Retain exact available evidence for the operation whose caller must stop."""
+        super().__init__(message)
+        self.receipt = receipt
+
+    @property
+    def write_may_have_landed(self) -> bool:
+        """Whether retrying could duplicate an unacknowledged native write."""
+        return (
+            self.receipt is not None and self.receipt.settlement is not Settlement.VERIFIED_NO_WRITE
+        )
+
 
 class Settlement(Enum):
     """Durable disposition of one admitted or refused operation."""

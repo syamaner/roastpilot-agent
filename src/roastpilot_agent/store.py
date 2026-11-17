@@ -1167,11 +1167,13 @@ class RoastStore:
         timely = bool(done) and deadline.remaining() > 0
         self._finish_storage_ack(owner, timely=timely)
         if not timely:
-            raise HistoryUnavailable("HUMAN history deadline elapsed")
+            raise HistoryUnavailable("HUMAN history deadline elapsed", receipt=owner.receipt)
         try:
             return task.result()
         except aiosqlite.Error as exc:
-            raise HistoryUnavailable("HUMAN SQLite operation failed") from exc
+            raise HistoryUnavailable(
+                "HUMAN SQLite operation failed", receipt=owner.receipt
+            ) from exc
 
     def _finish_storage_ack(self, owner: _NativeStorage, *, timely: bool) -> None:
         if owner.receipt.timely is None:

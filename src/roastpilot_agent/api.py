@@ -1196,11 +1196,13 @@ class RoastRunner:
         # from the emitter buffer — so the reason must be captured before the flush.
         self._captured_fault_reason: str | None = None
         self._last_persisted_phase: RoastPhase | None = None
+        self._phase_write_unconfirmed: RoastPhase | None = None
         # Whether the absolute charge/T0 instant has been persisted for this run
         # (#235). Written once, the first tick the controller reports its charge
         # clock stamped, so a later restart→resume can restore the advisory DTR
         # clock. A restore on recovery seeds this True so it is never re-stamped.
         self._t0_persisted = False
+        self._t0_write_unconfirmed = False
         # Whether the ambient (temperature/humidity/pressure) reading has been
         # persisted for this run (#342, D85). Written once, the same tick as
         # ``_t0_persisted`` first goes True (the debounced charge transition) —
@@ -1209,6 +1211,7 @@ class RoastRunner:
         # persisted value and so cannot double as a "not yet written" sentinel
         # the way ``t0_detected_at_utc IS NULL`` does for the T0 write-once guard.
         self._ambient_persisted = False
+        self._ambient_write_unconfirmed = False
         # One operator diagnostic per runner. This is intentionally not persisted:
         # a restart constructs a new runner and may warn once again.
         self._ambient_malformed_warned = False
@@ -2632,11 +2635,15 @@ class RoastRunner:
         keeps a resumed run's restored DTR clock consistent with the live one
         instead of re-introducing the ~17 s T0 lag on recovery. A missing /
         non-finite elapsed falls back to "now" (the pre-#337 behaviour)."""
-        if self._t0_persisted or not snapshot.charge_detected:
+        if self._t0_persisted or self._t0_write_unconfirmed or not snapshot.charge_detected:
             return
         charged_at_utc = self._backdated_charge_utc(snapshot.charge_elapsed_seconds)
         try:
             await self._store.record_t0_detected_at(self._run_id, t0_detected_at_utc=charged_at_utc)
+        except HistoryUnavailable as exc:
+            self._t0_write_unconfirmed = exc.write_may_have_landed
+            self._controller.inhibit_human_routine_for_storage_failure()
+            return
         except Exception:  # pragma: no cover — fail-safe: a store error on this
             # advisory-only breadcrumb must never crash the safety tick; the only
             # cost is a resumed run's DTR degrading to the pre-#235 behaviour.
@@ -2698,7 +2705,11 @@ class RoastRunner:
         charge", which is the mislabel class #745 removed and precisely what this
         bound exists to prevent. A wall-clock deadline stamped on the first
         charged tick closes on time regardless of phase."""
-        if self._ambient_persisted or not snapshot.charge_detected:
+        if (
+            self._ambient_persisted
+            or self._ambient_write_unconfirmed
+            or not snapshot.charge_detected
+        ):
             return
         state = self._tick_raw_state()
         if state is None:
@@ -2726,6 +2737,10 @@ class RoastRunner:
                 humidity_percent=humidity_percent,
                 pressure_hpa=pressure_hpa,
             )
+        except HistoryUnavailable as exc:
+            self._ambient_write_unconfirmed = exc.write_may_have_landed
+            self._controller.inhibit_human_routine_for_storage_failure()
+            return
         except Exception:
             # Fail-safe: a store error on this corpus-only breadcrumb must never
             # crash the safety tick; the only cost is this run's ambient triad
@@ -2898,9 +2913,16 @@ class RoastRunner:
 
     async def _persist_phase_if_changed(self) -> None:
         phase = self._controller.phase
-        if phase is self._last_persisted_phase:
+        if phase is self._last_persisted_phase or phase is self._phase_write_unconfirmed:
             return
-        await self._store.update_run_phase(self._run_id, phase)
+        try:
+            await self._store.update_run_phase(self._run_id, phase)
+        except HistoryUnavailable as exc:
+            if exc.write_may_have_landed:
+                self._last_persisted_phase = None
+                self._phase_write_unconfirmed = phase
+            raise
+        self._phase_write_unconfirmed = None
         self._last_persisted_phase = phase
 
 
