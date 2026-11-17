@@ -467,9 +467,8 @@ async def _exercise_route(
             and event.payload.get("reason") == "superseded_by_emergency_stop"
             for event in timeline.events
         )
+        assert durable_supersession == (not exhaust_proof_history_budget)
         if exhaust_proof_history_budget:
-            assert not durable_supersession
-        if not durable_supersession:
             assert any(
                 r.kind == "record_event"
                 and r.detail == RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED.value
