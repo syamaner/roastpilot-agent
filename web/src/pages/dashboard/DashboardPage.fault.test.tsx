@@ -47,6 +47,12 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { CurvePoint } from "@/components/shared/LiveCurve";
+import {
+  applyEvent,
+  hydrate,
+  initialRoastStreamState,
+  type RoastStreamState,
+} from "@/hooks/roastStreamReducer";
 import type { ConnectionStatus } from "@/hooks/useRoastStream";
 import { roastKeys } from "@/hooks/queries";
 import type { HumanProtectionProjection, RoastTimeline } from "@/lib/types";
@@ -148,6 +154,13 @@ vi.mock("@/hooks/queries", async () => {
       queryHookState.useRealTimeline ? actual.useTimeline(runId) : timelineState,
   };
 });
+
+const AUTOMATIC_PROTECTION: HumanProtectionProjection = {
+  human_endpoint: null,
+  human_command_disposition: null,
+  physical_intervention_required: null,
+  emergency_fallback_disclosure: null,
+};
 
 const streamState: {
   status: ConnectionStatus;
@@ -800,6 +813,7 @@ describe("DashboardPage restored/reloaded fault (#329)", () => {
     // affordance it hosts) must render from that server snapshot, not be stranded.
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
+    streamState.humanProtection = AUTOMATIC_PROTECTION;
     viewState.fault = null; // NO live fault frame (the bug condition)
     streamState.phase = "faulted"; // hydrated from the snapshot's agent_phase
     streamState.enabledActions = ["acknowledge_fault", "emergency_stop"];
@@ -1240,5 +1254,116 @@ describe("HUMAN protection disclosure", () => {
     expect(screen.getByTestId("fault-reason")).toHaveTextContent("Run faulted.");
     expect(screen.getByText("Command outcome unknown")).toBeVisible();
     expect(screen.queryByText(/heat forced off|0% \(forced\)|cooling confirmed/i)).toBeNull();
+  });
+});
+
+describe("Fault posture with missing or valid disclosure", () => {
+  const runId = "run-fault";
+  const snapshot = {
+    id: runId,
+    agent_phase: "faulted",
+    enabled_actions: ["acknowledge_fault", "emergency_stop"],
+    profile: SNAPSHOT_PROFILE,
+  } as const;
+
+  function hydrateFaultSnapshot(fields: object = {}) {
+    const detail = { ...snapshot, enabled_actions: [...snapshot.enabled_actions], ...fields };
+    roastState.data = detail;
+    roastState.isSuccess = true;
+    const stream = hydrate(initialRoastStreamState, detail, runId);
+    applyDashboardStream(stream);
+    return stream;
+  }
+
+  function applyDashboardStream(stream: RoastStreamState) {
+    streamState.phase = stream.phase;
+    streamState.enabledActions = stream.enabledActions;
+    streamState.humanProtection = stream.humanProtection?.data ?? null;
+  }
+
+  function expectUnknownPosture() {
+    const banner = within(screen.getByTestId("fault-banner"));
+    expect(banner.queryByText(/heat forced off|\(forced\)|^held$/i)).toBeNull();
+    expect(screen.getByTestId("fault-acknowledge")).toBeEnabled();
+    expect(screen.getByTestId("action-emergency_stop")).toBeEnabled();
+  }
+
+  beforeEach(() => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: runId, mcp_child: "stopped" };
+  });
+
+  it.each([
+    ["missing", {}],
+    ["partial", { human_endpoint: null }],
+    ["unknown enum", { ...AUTOMATIC_PROTECTION, human_endpoint: "invalid" }],
+    ["nonboolean", { ...AUTOMATIC_PROTECTION, physical_intervention_required: "false" }],
+  ])("keeps snapshot posture unknown after a %s first GET", (_label, fields) => {
+    hydrateFaultSnapshot(fields);
+    renderPage();
+
+    expect(screen.getByTestId("fault-reason")).toHaveTextContent(/^Run faulted\.$/);
+    expectUnknownPosture();
+  });
+
+  it("retains the server reason while only current validated heartbeat changes snapshot posture", () => {
+    let stream = hydrateFaultSnapshot({ fault_reason: "Server-reported obstruction" });
+    const { client, rerender } = renderPage();
+
+    function receiveHeartbeat(data: Record<string, unknown>) {
+      stream = applyEvent(stream, { event: "heartbeat", data }, runId);
+      applyDashboardStream(stream);
+      rerender(
+        <QueryClientProvider client={client}>
+          <MemoryRouter><DashboardPage /></MemoryRouter>
+        </QueryClientProvider>,
+      );
+    }
+
+    receiveHeartbeat({ run_id: "foreign-run", ...AUTOMATIC_PROTECTION });
+    expect(screen.getByTestId("fault-reason")).toHaveTextContent("Server-reported obstruction");
+    expectUnknownPosture();
+
+    receiveHeartbeat({ run_id: runId, ...AUTOMATIC_PROTECTION });
+    expect(screen.getByTestId("fault-reason")).toHaveTextContent("Server-reported obstruction");
+    expect(within(screen.getByTestId("fault-banner")).getByText("0 % (forced)")).toBeVisible();
+
+    receiveHeartbeat({
+      run_id: runId,
+      ...AUTOMATIC_PROTECTION,
+      human_endpoint: "withheld",
+      physical_intervention_required: true,
+    });
+    expect(screen.getByText("Drop withheld")).toBeVisible();
+    expect(screen.getByText("Physical intervention required")).toBeVisible();
+    expect(screen.getByTestId("fault-reason")).toHaveTextContent("Server-reported obstruction");
+    expectUnknownPosture();
+  });
+
+  it("preserves legacy automatic posture with a valid all-null initial GET", () => {
+    hydrateFaultSnapshot(AUTOMATIC_PROTECTION);
+    renderPage();
+
+    const banner = within(screen.getByTestId("fault-banner"));
+    expect(screen.getByTestId("fault-reason")).toHaveTextContent("Run faulted — heat forced off.");
+    expect(banner.getByText("0 % (forced)")).toBeVisible();
+    expect(banner.getByText("held")).toBeVisible();
+  });
+
+  it("keeps explicit zero from a real fault frame when initial disclosure is missing", () => {
+    hydrateFaultSnapshot();
+    viewState.fault = {
+      reason: "Real server fault",
+      rule: "hard_ceiling",
+      verdict: "fault",
+      adjusted_heat: 0,
+      adjusted_fan: 80,
+    };
+    renderPage();
+
+    const banner = within(screen.getByTestId("fault-banner"));
+    expect(screen.getByTestId("fault-reason")).toHaveTextContent("Real server fault");
+    expect(banner.getByText("0 % (forced)")).toBeVisible();
+    expect(banner.getByText("80 % (safe)")).toBeVisible();
   });
 });

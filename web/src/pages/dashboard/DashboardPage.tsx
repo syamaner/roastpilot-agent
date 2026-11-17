@@ -340,7 +340,10 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
   // present so the real evaluation's numbers show; the snapshot stand-in only fills
   // the restore/reload gap. Phase is the server's hydrated truth — never inferred.
   const humanDisclosureAvailable = hasHumanProtection(humanProtection);
-  const effectiveFault = view.fault ?? snapshotFault(phase, detail.data?.fault_reason, humanDisclosureAvailable);
+  // Only a validated all-null projection permits the automatic snapshot placeholder.
+  const legacyPostureAllowed = humanProtection !== null && !humanDisclosureAvailable;
+  const effectiveFault =
+    view.fault ?? snapshotFault(phase, detail.data?.fault_reason, !legacyPostureAllowed);
 
   // #124/#329: pin the run as soon as it faults, so a later `active_run_id`→null
   // from a health refetch resolves `runId` back to this faulted run (via the `??`
@@ -473,7 +476,7 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
         <FaultBanner
           fault={effectiveFault}
           trail={view.safetyTrail}
-          showCommandPosture={!humanDisclosureAvailable}
+          showCommandPosture={view.fault === null ? legacyPostureAllowed : !humanDisclosureAvailable}
           // Render permission still comes solely from the server mirror. The
           // component adds only the operator's cooling-safe confirmation and
           // server-event feedback; it never calls MCP or derives a phase.
