@@ -7090,11 +7090,16 @@ class RoastController:
             nonlocal command
             command = reference
 
-        confirmed = await self._execute_emergency_stop(
-            evaluation,
-            emergency_already_admitted=True,
-            bind_audit=bind,
-        )
+        try:
+            confirmed = await self._execute_emergency_stop(
+                evaluation,
+                emergency_already_admitted=True,
+                bind_audit=bind,
+            )
+        except asyncio.CancelledError:
+            if defer_evaluation is not None:
+                defer_evaluation(evaluation, command)
+            raise
         if defer_evaluation is not None:
             defer_evaluation(evaluation, command)
             return confirmed

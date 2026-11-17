@@ -969,6 +969,22 @@ class BufferingEventEmitter:
         the flush drains it)."""
         return list(self._buffer)
 
+    @property
+    def last_buffered_event(self) -> _BufferedEvent | None:
+        """Return the current tail for a waiter to identify its eligible prefix."""
+        return self._buffer[-1] if self._buffer else None
+
+    def drain_through(self, boundary: _BufferedEvent | None) -> list[_BufferedEvent]:
+        """Remove the still-buffered prefix ending at this exact event."""
+        if boundary is not None:
+            for index, event in enumerate(self._buffer):
+                if event is boundary:
+                    stop = index + 1
+                    prefix = self._buffer[:stop]
+                    del self._buffer[:stop]
+                    return prefix
+        return []
+
     def drain(self) -> list[_BufferedEvent]:
         """Return and clear the buffered events for persistence."""
         items = self._buffer
@@ -1531,8 +1547,11 @@ class RoastRunner:
     def history_durability(self) -> HumanHistoryDurability:
         """Read durability without waiting on the storage or actuation path."""
         value = self._store.human_history_durability(self._run_id)
-        if value is HumanHistoryDurability.COMPLETE and (
-            self._history_turn_in_progress or self._emitter.peek()
+        if value is HumanHistoryDurability.COMPLETE and self._history_turn_in_progress:
+            return HumanHistoryDurability.UNKNOWN
+        if (
+            value in (HumanHistoryDurability.COMPLETE, HumanHistoryDurability.DELAYED)
+            and self._emitter.last_buffered_event is not None
         ):
             return HumanHistoryDurability.UNKNOWN
         return value
@@ -1787,12 +1806,23 @@ class RoastRunner:
         if self._controller.authority is ControlAuthority.AUTOMATIC:
             return await self._dispatch_action(item)
         with self._emitter.capture_dispatch_events() as outcomes:
-            return await self._dispatch_action(
-                item,
-                outcomes=outcomes,
-                deferred_commands=deferred_commands,
-                deferred_evaluations=deferred_evaluations,
-            )
+            try:
+                return await self._dispatch_action(
+                    item,
+                    outcomes=outcomes,
+                    deferred_commands=deferred_commands,
+                    deferred_evaluations=deferred_evaluations,
+                )
+            except asyncio.CancelledError:
+                if deferred_commands is not None and item.action is OperatorAction.EMERGENCY_STOP:
+                    # The controller can emit a failed stop before propagating
+                    # cancellation. Preserve that audit without attempting SQLite.
+                    deferred_commands.extend(
+                        (RoastCommand.EMERGENCY_STOP, item, event)
+                        for event in outcomes
+                        if event.kind is RoastEventKind.COMMAND_FAILED
+                    )
+                raise
 
     async def _dispatch_action(
         self,
@@ -2630,12 +2660,15 @@ class RoastRunner:
         if caller is None:
             await lock.acquire()
         else:
+            boundary = self._emitter.last_buffered_event
             try:
                 await caller.deadline.wait(lock.acquire)
             except (HistoryUnavailable, asyncio.CancelledError) as exc:
-                # Only the flush holding the lock removes its batch. Remaining
-                # buffered items belong to this refused flush and are attributed.
-                self._discard_unwritten_events()
+                # The current lock owner may have consumed this prefix.
+                # Events appended after this waiter began belong to a later flush.
+                with storage_caller(caller):
+                    for event in self._emitter.drain_through(boundary):
+                        self._note_unwritten_event(event)
                 if isinstance(exc, asyncio.CancelledError):
                     raise
                 return False
