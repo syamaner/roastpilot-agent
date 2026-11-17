@@ -4934,6 +4934,134 @@ async def test_human_queued_estop_evaluates_urgent_stage_before_blocked_evaluati
         await service.shutdown()
 
 
+@pytest.mark.parametrize(
+    ("acknowledged", "held_audit"),
+    [
+        pytest.param(False, "record_safety_evaluation", id="unknown-stop-unentered-command"),
+        pytest.param(True, "record_safety_evaluation", id="confirmed-stop-no-command"),
+        pytest.param(False, "record_command", id="unknown-stop-entered-command"),
+    ],
+)
+async def test_cancelled_queued_estop_distinguishes_entered_and_unentered_audits(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, acknowledged: bool, held_audit: str
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    run = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    real_stop = actuator.emergency_stop
+    real_commit = store.connection.commit
+    urgent_stage = controller.human_urgent_stage
+    ordered: list[str] = []
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def stop(*, reason: str) -> AppliedRoasterState | None:
+        result = await real_stop(reason=reason)
+        ordered.append("mock-stop-called")
+        if not acknowledged:
+            raise RuntimeError("mock e-stop acknowledgement lost")
+        return result
+
+    async def urgent(*, emergency_won_batch: bool = False) -> None:
+        assert emergency_won_batch
+        ordered.append("urgent")
+        await urgent_stage(emergency_won_batch=emergency_won_batch)
+
+    async def commit() -> None:
+        owner = store._current_native_storage()  # pyright: ignore[reportPrivateUsage]
+        if owner is not None and owner.receipt.kind == held_audit and not entered.is_set():
+            ordered.append("native-audit-entered")
+            entered.set()
+            await release.wait()
+        await real_commit()
+
+    store.drain_human_storage_receipts()
+    monkeypatch.setattr(actuator, "emergency_stop", stop)
+    monkeypatch.setattr(controller, "human_urgent_stage", urgent)
+    monkeypatch.setattr(store.connection, "commit", commit)
+    events = service.events.subscribe()
+    service.operator_queue.put_nowait(
+        QueuedOperatorAction(run_id=run.id, action=OperatorAction.EMERGENCY_STOP)
+    )
+    tick = asyncio.create_task(runner.tick_once())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert ordered == ["mock-stop-called", "urgent", "native-audit-entered"]
+        assert actuator.commands().count("emergency_stop") == 1
+        assert not release.is_set()
+        tick.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tick
+        assert not release.is_set()
+        receipts = store.drain_human_storage_receipts()
+        (evaluation,) = [r for r in receipts if r.kind == "record_safety_evaluation"]
+        assert evaluation.run_id == run.id and evaluation.turn == runner.current_tick
+        assert evaluation.writer_entered is True
+        exact = evaluation.command
+        assert exact is not None and exact.session_id == actuator.session_id
+        assert exact.child_generation == actuator.epoch
+        assert exact.command_generation == controller.command_generation
+        assert exact.owner is CommandAuditOwner.LEASE
+        commands = [r for r in receipts if r.kind == "record_command"]
+        failed_events = [
+            event
+            for event in (events.get_nowait() for _ in range(events.qsize()))
+            if event.event is SseEventType.COMMAND_FAILED
+            and event.data.get("command") == "emergency_stop"
+        ]
+        assert len(failed_events) == (0 if acknowledged else 1)
+        if acknowledged:
+            assert commands == []
+        else:
+            (command,) = commands
+            assert command.run_id == evaluation.run_id and command.turn == evaluation.turn
+            assert command.deadline == evaluation.deadline and command.command == exact
+            assert command.detail == "emergency_stop" and command.timely is False
+
+        if held_audit == "record_command":
+            (pending,) = commands
+            assert (
+                evaluation.settlement is Settlement.OBSERVED_COMMITTED and evaluation.timely is True
+            )
+        else:
+            pending = evaluation
+            if not acknowledged:
+                (gap,) = commands
+                assert (
+                    gap.writer_entered is False and gap.settlement is Settlement.VERIFIED_NO_WRITE
+                )
+        assert pending.writer_entered is True and pending.timely is False
+        assert pending.settlement is Settlement.UNRESOLVED
+
+        release.set()
+        assert await store.settle_human_storage_for_teardown()
+        (late,) = [r for r in store.drain_human_storage_receipts() if r.token == pending.token]
+        assert late.settlement is Settlement.OBSERVED_COMMITTED and late.timely is False
+        assert late.command == exact
+        known_gap = not acknowledged and held_audit == "record_safety_evaluation"
+        assert runner.history_durability() is (
+            HumanHistoryDurability.INCOMPLETE if known_gap else HumanHistoryDurability.DELAYED
+        )
+        timeline = await store.read_timeline(run.id)
+        assert [
+            entry.status for entry in timeline.commands if entry.tool is RoastCommand.EMERGENCY_STOP
+        ] == (["failed"] if held_audit == "record_command" else [])
+        assert actuator.commands().count("emergency_stop") == 1
+    finally:
+        release.set()
+        if not tick.done():
+            tick.cancel()
+            with suppress(asyncio.CancelledError):
+                await tick
+        await store.settle_human_storage_for_teardown()
+        service.events.unsubscribe(events)
+        await service.shutdown()
+
+
 async def test_human_queued_estop_audit_exception_keeps_subsequent_supervision(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

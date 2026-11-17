@@ -1691,35 +1691,56 @@ class RoastRunner:
         self._emergency_stop_since_last_drain = False
         events_before_urgent: int | None = None
         if self._controller.authority is ControlAuthority.HUMAN:
-            deferred_commands: list[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]] = []
-            deferred_evaluations: list[tuple[SafetyEvaluation, CommandReference | None]] = []
-            for item in batch:
-                if item.action is OperatorAction.EMERGENCY_STOP:
-                    await self._dispatch(
-                        item,
-                        deferred_commands=deferred_commands,
-                        deferred_evaluations=deferred_evaluations,
-                    )
-            events_before_urgent = len(self._emitter.peek())
-            await self._controller.human_urgent_stage(emergency_won_batch=emergency_stop_wins_batch)
-            await self._controller.apply_human_storage_failure_after_urgent()
-            for evaluation, command in deferred_evaluations:
-                caller = current_storage_caller()
-                assert caller is not None  # the HUMAN runner owns this queue turn
-                with storage_caller(replace(caller, command=command)):
-                    try:
-                        await self._store.record_safety_evaluation(
-                            run_id=self._run_id, tick=self._counter.value, evaluation=evaluation
+            deferred_commands: deque[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]] = (
+                deque()
+            )
+            deferred_evaluations: deque[tuple[SafetyEvaluation, CommandReference | None]] = deque()
+            caller = current_storage_caller()
+            assert caller is not None  # the HUMAN runner owns this queue turn
+            try:
+                for item in batch:
+                    if item.action is OperatorAction.EMERGENCY_STOP:
+                        await self._dispatch(
+                            item,
+                            deferred_commands=deferred_commands,
+                            deferred_evaluations=deferred_evaluations,
                         )
-                    except HistoryUnavailable:
-                        self._controller.inhibit_human_routine_for_storage_failure()
-                    except Exception:  # noqa: BLE001 - a trace fault cannot stop supervision
+                events_before_urgent = len(self._emitter.peek())
+                await self._controller.human_urgent_stage(
+                    emergency_won_batch=emergency_stop_wins_batch
+                )
+                await self._controller.apply_human_storage_failure_after_urgent()
+                while deferred_evaluations:
+                    evaluation, command = deferred_evaluations.popleft()
+                    with storage_caller(replace(caller, command=command)):
+                        try:
+                            await self._store.record_safety_evaluation(
+                                run_id=self._run_id, tick=self._counter.value, evaluation=evaluation
+                            )
+                        except HistoryUnavailable:
+                            self._controller.inhibit_human_routine_for_storage_failure()
+                        except Exception:  # noqa: BLE001 - a trace fault cannot stop supervision
+                            self._store.note_human_history_gap(
+                                "record_safety_evaluation", self._run_id, unverified=True
+                            )
+                            self._controller.inhibit_human_routine_for_storage_failure()
+                while deferred_commands:
+                    tool, item, event = deferred_commands.popleft()
+                    await self._persist_dispatch_audit(tool, item, event)
+            except asyncio.CancelledError:
+                # The store retains the audit already passed to it. Entries
+                # still in these queues never entered their storage operation.
+                for _, command in deferred_evaluations:
+                    with storage_caller(replace(caller, command=command)):
+                        self._store.note_human_history_gap("record_safety_evaluation", self._run_id)
+                for tool, _, event in deferred_commands:
+                    with storage_caller(replace(caller, command=event.audit_command)):
                         self._store.note_human_history_gap(
-                            "record_safety_evaluation", self._run_id, unverified=True
+                            "record_command", self._run_id, detail=tool.value
                         )
-                        self._controller.inhibit_human_routine_for_storage_failure()
-            for tool, item, event in deferred_commands:
-                await self._persist_dispatch_audit(tool, item, event)
+                if deferred_evaluations or deferred_commands:
+                    self._controller.inhibit_human_routine_for_storage_failure()
+                raise
             batch = [item for item in batch if item.action is not OperatorAction.EMERGENCY_STOP]
         fault_acknowledgement_seen = False
         for item in batch:
@@ -1759,9 +1780,9 @@ class RoastRunner:
         self,
         item: QueuedOperatorAction,
         *,
-        deferred_commands: list[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]]
+        deferred_commands: deque[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]]
         | None = None,
-        deferred_evaluations: list[tuple[SafetyEvaluation, CommandReference | None]] | None = None,
+        deferred_evaluations: deque[tuple[SafetyEvaluation, CommandReference | None]] | None = None,
     ) -> bool:
         if self._controller.authority is ControlAuthority.AUTOMATIC:
             return await self._dispatch_action(item)
@@ -1778,9 +1799,9 @@ class RoastRunner:
         item: QueuedOperatorAction,
         *,
         outcomes: list[_BufferedEvent] | None = None,
-        deferred_commands: list[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]]
+        deferred_commands: deque[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]]
         | None = None,
-        deferred_evaluations: list[tuple[SafetyEvaluation, CommandReference | None]] | None = None,
+        deferred_evaluations: deque[tuple[SafetyEvaluation, CommandReference | None]] | None = None,
     ) -> bool:
         """Route one operator action to its controller handler and record the
         executed MCP command (when one was issued) in the decision trace.
