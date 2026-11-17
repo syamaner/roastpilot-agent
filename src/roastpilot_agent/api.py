@@ -1873,15 +1873,24 @@ class RoastRunner:
         if tool is not None:
             if outcomes is not None:
                 for event in outcomes:
-                    payload = event.payload
+                    event_payload = event.payload
+                    if not isinstance(event_payload, dict):
+                        continue
+                    command_payload = cast(dict[str, object], event_payload)
+                    if command_payload.get("command") != tool.value:
+                        continue
                     if (
-                        isinstance(payload, dict)
-                        and cast(dict[str, object], payload).get("command") == tool.value
+                        tool is RoastCommand.DROP_BEANS
+                        and event.kind is RoastEventKind.COMMAND_FAILED
+                        and event.audit_command is None
+                        and command_payload.get("outcome") == "withheld"
+                        and command_payload.get("reason") == "history_unavailable"
                     ):
-                        if deferred_commands is None:
-                            await self._persist_dispatch_audit(tool, item, event)
-                        else:
-                            deferred_commands.append((tool, item, event))
+                        continue
+                    if deferred_commands is None:
+                        await self._persist_dispatch_audit(tool, item, event)
+                    else:
+                        deferred_commands.append((tool, item, event))
             else:
                 await self._record_dispatch_command(tool, item, since=before)
         return emergency_stop_confirmed
@@ -3204,7 +3213,7 @@ class RoastService:
                     if authority is ControlAuthority.HUMAN
                     else None
                 ),
-                child_generation=lambda: None if self._mcp is None else self._mcp.child_epoch,
+                audit_child_generation=self._human_fault_audit_child_generation,
                 note_history_gap=(
                     (
                         lambda kind, run_id, detail: store.note_human_history_gap(
@@ -3349,6 +3358,17 @@ class RoastService:
                 that was rendered into the MCP yaml for the most recent spawn.
         """
         self._spawned_mcp_device = device_config
+
+    def _human_fault_audit_child_generation(
+        self, run_id: str | None, session_id: str
+    ) -> int | None:
+        runner = self.runner
+        if runner is None or run_id is None or runner.run_id != run_id:
+            return None
+        controller = runner.controller_for_human_fault_drop()
+        if controller is None:
+            return None
+        return controller.human_command_child_generation(run_id, session_id)
 
     def _human_fault_drop_controller(self, run_id: str | None) -> RoastController | None:
         runner = self.runner
@@ -8310,6 +8330,7 @@ class RoastService:
                 reason = evaluation.reason
 
         queued = False
+        queued_runner: RoastRunner | None = None
         if result == "accepted":
             # No await occurs from this final check through enqueue + epoch
             # increment, so a fault finalization cannot race an accepted e-stop
@@ -8329,6 +8350,7 @@ class RoastService:
                     )
                 )
                 queued = True
+                queued_runner = self.runner
             except asyncio.QueueFull:
                 # Backstop bound hit (pathological spam). Report failed rather
                 # than 500 or silently drop — the operator sees the action did
@@ -8338,7 +8360,9 @@ class RoastService:
                     reason = "operator action queue is full; action not accepted"
 
         if queued:
-            await self._record_admitted_action_outcome(run_id, request, result)
+            await self._record_admitted_action_outcome(
+                run_id, request, result, queued_runner=queued_runner
+            )
         else:
             await self._store.record_operator_action(
                 action=request.action.value,
@@ -8456,6 +8480,8 @@ class RoastService:
         run_id: str,
         request: OperatorActionRequest,
         result: Literal["accepted", "rejected", "failed"],
+        *,
+        queued_runner: RoastRunner | None = None,
     ) -> None:
         try:
             await self._store.record_operator_action(
@@ -8464,6 +8490,7 @@ class RoastService:
                 run_id=run_id,
                 payload=request.payload,
             )
+            return
         except HistoryUnavailable:
             if self._authority is not ControlAuthority.HUMAN:
                 raise
@@ -8476,6 +8503,16 @@ class RoastService:
                 detail=request.action.value,
                 unverified=True,
             )
+
+        if (
+            queued_runner is not None
+            and self.runner is queued_runner
+            and self.active_run_id == run_id == queued_runner.run_id
+            and not queued_runner.finalized
+        ):
+            controller = queued_runner.controller_for_human_fault_drop()
+            if controller is not None and controller.owns_human_run(run_id):
+                controller.inhibit_human_routine_for_storage_failure()
 
     async def _submit_open_fault_lease_action(
         self,
@@ -10189,20 +10226,18 @@ async def _stream_event_or_history_update(
     queue: asyncio.Queue[SseEvent],
     signal: asyncio.Event,
     heartbeat: float,
-) -> tuple[SseEvent | None, bool]:
+) -> SseEvent | None:
     """Wait for a live frame, history projection update, or idle heartbeat."""
     frame = asyncio.create_task(queue.get())
     notice = asyncio.create_task(signal.wait())
     try:
-        done, _ = await asyncio.wait(
-            (frame, notice), timeout=heartbeat, return_when=asyncio.FIRST_COMPLETED
-        )
+        await asyncio.wait((frame, notice), timeout=heartbeat, return_when=asyncio.FIRST_COMPLETED)
     finally:
         for pending in (frame, notice):
             if not pending.done():
                 pending.cancel()
         await asyncio.gather(frame, notice, return_exceptions=True)
-    return (None if frame.cancelled() else frame.result()), not done
+    return None if frame.cancelled() else frame.result()
 
 
 async def stream_events(
@@ -10258,10 +10293,15 @@ async def stream_events(
                 return
             notice = service.events.human_history_signal
             previous = service.human_protection_projection(run_id)
+            loop = asyncio.get_running_loop()
+            next_heartbeat = loop.time() + heartbeat
             yield protection_heartbeat(previous)
             while not await request.is_disconnected():
                 if previous.human_history_durability is not None:
-                    event, idle = await _stream_event_or_history_update(queue, notice, heartbeat)
+                    event = await _stream_event_or_history_update(
+                        queue, notice, max(0.0, next_heartbeat - loop.time())
+                    )
+                    idle = loop.time() >= next_heartbeat
                 else:
                     idle = False
                     try:
@@ -10275,8 +10315,10 @@ async def stream_events(
                 current = service.human_protection_projection(run_id)
                 if idle or current != previous:
                     previous = current
+                    next_heartbeat = loop.time() + heartbeat
                     yield protection_heartbeat(current)
                 if event is not None:
+                    next_heartbeat = loop.time() + heartbeat
                     yield service.project_stream_event(run_id, event).render().encode()
         finally:
             service.events.unsubscribe(queue)

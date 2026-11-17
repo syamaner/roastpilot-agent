@@ -633,7 +633,7 @@ class FaultControlExecutor:
         trace_sink: FaultControlTraceSink | None = None,
         human_drop_controller: "Callable[[str | None], RoastController | None] | None" = None,
         history_deadline: Callable[[], StorageDeadline] | None = None,
-        child_generation: Callable[[], int | None] | None = None,
+        audit_child_generation: Callable[[str | None, str], int | None] | None = None,
         note_history_gap: Callable[[str, str, str], None] | None = None,
     ) -> None:
         self._safety = safety
@@ -642,7 +642,7 @@ class FaultControlExecutor:
         self._trace_sink = trace_sink
         self._human_drop_controller = human_drop_controller
         self._history_deadline = history_deadline
-        self._child_generation = child_generation
+        self._audit_child_generation = audit_child_generation
         self._note_history_gap = note_history_gap
         self._audit_scope: ContextVar[_FaultAudit | None] = ContextVar(
             "fault_control_audit",
@@ -834,14 +834,17 @@ class FaultControlExecutor:
 
     def _bind_exact_audit_command(
         self,
+        run_id: str | None,
         session_id: str,
         generation: int,
         *,
         owner: CommandAuditOwner | None,
     ) -> None:
         audit = self._audit_scope.get()
-        child = None if self._child_generation is None else self._child_generation()
-        if audit is not None and child is not None:
+        if audit is None or self._audit_child_generation is None:
+            return
+        child = self._audit_child_generation(run_id, session_id)
+        if child is not None:
             audit.command = self._arbiter.stamp_history_attempt(
                 session_id, child, generation, owner=owner
             )
@@ -883,7 +886,7 @@ class FaultControlExecutor:
             nonlocal write_started
             write_started = True
             self._bind_exact_audit_command(
-                session_id, self._arbiter.generation, owner=CommandAuditOwner.LEASE
+                run_id, session_id, self._arbiter.generation, owner=CommandAuditOwner.LEASE
             )
             await self._port.write_fault_control(action, expected_session_id=session_id)
 
@@ -1081,7 +1084,7 @@ class FaultControlExecutor:
 
         async def write() -> None:
             if action is not OperatorAction.DROP_BEANS or self._human_drop_controller is None:
-                self._bind_exact_audit_command(session_id, generation, owner=None)
+                self._bind_exact_audit_command(run_id, session_id, generation, owner=None)
             await self._port.write_fault_control(action, expected_session_id=session_id)
 
         controller: RoastController | None = None
@@ -2821,6 +2824,13 @@ class RoastController:
         run = self._human_run
         return run is not None and run.run_id == run_id and self._human_ownership.is_current(run)
 
+    def human_command_child_generation(self, run_id: str, session_id: str) -> int | None:
+        """Return the exact current child for this run/session audit, if proven."""
+        identity = self._known_human_identity() if self.owns_human_run(run_id) else None
+        if identity is not None and identity[0] == session_id:
+            return identity[1]
+        return None
+
     def note_human_run_durably_closed(self) -> None:
         """Record durable local finalization without resolving unknown commands."""
         if self._human_run is not None:
@@ -4378,7 +4388,9 @@ class RoastController:
         try:
             await asyncio.shield(task)
         except HistoryUnavailable:
+            self._human_drop_evaluation_tasks.discard(task)
             self.inhibit_human_routine_for_storage_failure()
+            return False
         self._human_drop_evaluation_tasks.discard(task)
         if (
             self.human_drop_closed()
