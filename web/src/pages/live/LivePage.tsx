@@ -120,7 +120,7 @@ import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 
 import { AppFrame, LiveCurve } from "@/components/shared";
 import { HumanProtectionDisclosure } from "@/components/shared/HumanProtectionDisclosure";
-import { readHumanProtection } from "@/lib/humanProtection";
+import { hasHumanProtection, readHumanProtection } from "@/lib/humanProtection";
 import {
   roastKeys,
   useFreshHealthGate,
@@ -1269,6 +1269,7 @@ function LiveFinishedView({ runId }: LiveFinishedViewProps): React.JSX.Element {
 
   const beanOrigin = roast.data?.profile.bean_origin ?? null;
   const outcome = roast.data?.outcome ?? null;
+  const protection = roast.data && readHumanProtection(roast.data);
 
   return (
     <AppFrame
@@ -1294,8 +1295,10 @@ function LiveFinishedView({ runId }: LiveFinishedViewProps): React.JSX.Element {
           )}
         </header>
 
-        {roast.data && (
-          <HumanProtectionDisclosure protection={readHumanProtection(roast.data)} />
+        {hasHumanProtection(protection) && (
+          <div className="mb-6">
+            <HumanProtectionDisclosure protection={protection} />
+          </div>
         )}
 
         {/* Headline stats */}
