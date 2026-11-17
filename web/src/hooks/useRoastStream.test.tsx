@@ -182,6 +182,51 @@ describe("useRoastStream", () => {
     expect(latest!.status).toBe("live");
   });
 
+  it("ignores late open and error callbacks from replaced EventSources", async () => {
+    vi.useFakeTimers();
+    const fetchSnapshot = vi.fn(async (id: string) => ({ id, agent_phase: "preheating" as const }));
+    const { result, rerender } = renderHook(
+      ({ runId }) => useRoastStream(runId, {
+        createEventSource: (url) => new FakeEventSource(url),
+        fetchSnapshot,
+      }),
+      { initialProps: { runId: "r1" } },
+    );
+    await act(async () => {});
+    const first = FakeEventSource.last!;
+    act(() => first.open());
+    act(() => first.error());
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    const replacement = FakeEventSource.last!;
+    expect(replacement).not.toBe(first);
+    expect(first.closed).toBe(true);
+
+    act(() => first.open());
+    expect(result.current.status).toBe("reconnecting");
+    act(() => replacement.open());
+    expect(result.current.status).toBe("live");
+
+    act(() => first.error());
+    expect(result.current.status).toBe("live");
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(FakeEventSource.last).toBe(replacement);
+    expect(fetchSnapshot.mock.calls).toEqual([["r1"], ["r1"]]);
+
+    rerender({ runId: "r2" });
+    await act(async () => {});
+    const current = FakeEventSource.last!;
+    expect(current).not.toBe(replacement);
+    expect(replacement.closed).toBe(true);
+    act(() => replacement.open());
+    act(() => replacement.error());
+    expect(result.current.status).toBe("connecting");
+    act(() => current.open());
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(result.current.status).toBe("live");
+    expect(FakeEventSource.last).toBe(current);
+    expect(fetchSnapshot.mock.calls).toEqual([["r1"], ["r1"], ["r2"]]);
+  });
+
   it("carries the last applied event id on the explicit reconnect (#339)", async () => {
     vi.useFakeTimers();
     let latest: UseRoastStreamResult | null = null;
