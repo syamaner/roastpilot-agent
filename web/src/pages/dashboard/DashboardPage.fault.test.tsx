@@ -1253,7 +1253,7 @@ describe("HUMAN protection disclosure", () => {
 
     expect(screen.getByTestId("fault-reason")).toHaveTextContent("Run faulted.");
     expect(screen.getByText("Command outcome unknown")).toBeVisible();
-    expect(screen.queryByText(/heat forced off|0% \(forced\)|cooling confirmed/i)).toBeNull();
+    expect(screen.queryByText(/heat forced off|0\s*% \(forced\)|cooling confirmed/i)).toBeNull();
   });
 });
 

@@ -1,12 +1,9 @@
 /**
  * Operator recovery modal (ui-prompts Prompt B §1, kickoff §2).
  *
- * Shown when the service restarted during an active roast and entered
- * `operator_recovery_required`. A blocking modal over the (still-updating)
- * dashboard. The copy MUST communicate that the system will NOT touch heat or fan
- * until the operator chooses — restart never auto-resumes heat/fan (the core
- * safety invariant, AGENTS.md). Explicit actions: resume monitoring (acknowledge),
- * drop, start cooling, emergency stop.
+ * Shown when the server reports `operator_recovery_required`. A blocking
+ * modal over the dashboard. Routine heating does not resume automatically.
+ * Explicit actions: acknowledge, drop, start cooling and emergency stop.
  *
  * Each action button is gated by the server's `enabledActions` (the permission
  * mirror), never a client matrix; emergency stop is always available. The current
@@ -147,6 +144,7 @@ export function RecoveryModal({
 
   if (!open) return null;
   const humanDisclosureAvailable = hasHumanProtection(humanProtection);
+  const legacyTextAllowed = humanProtection != null && !humanDisclosureAvailable;
   // Emergency stop is always available (mirrors evaluate_emergency_stop); the
   // rest are gated by the server mirror.
   const enabled = new Set(enabledActions ?? []);
@@ -237,7 +235,7 @@ export function RecoveryModal({
           >
             Operator Recovery Required
           </h2>
-          {!humanDisclosureAvailable && (
+          {legacyTextAllowed && (
             <p className="text-sm text-muted-foreground">
               The service restarted during an active roast — manual intervention needed.
             </p>
@@ -249,20 +247,20 @@ export function RecoveryModal({
           data-testid="recovery-no-auto-resume"
           className="rounded-md border border-roast-caution/40 bg-roast-caution/10 px-4 py-3 text-sm"
         >
-          {humanDisclosureAvailable
-            ? "Routine heating does not resume automatically."
-            : "No auto-resume. The system will not touch heat or fan until you choose an action below. Dashboard telemetry continues to update in real time."}
+          {legacyTextAllowed
+            ? "No auto-resume. The system will not touch heat or fan until you choose an action below. Dashboard telemetry continues to update in real time."
+            : "Routine heating does not resume automatically."}
         </p>
 
         <dl className="grid grid-cols-2 gap-x-6 gap-y-2 rounded-md border border-border p-4 text-sm">
           <Readout label="Bean Temp (now)" value={formatTempC(beanTempC)} />
           <Readout label="Environment Temp" value={formatTempC(envTempC)} />
           <Readout
-            label={humanDisclosureAvailable ? "Heat command" : "Heat (locked)"}
+            label={legacyTextAllowed ? "Heat (locked)" : "Heat command"}
             value={formatPercent(heatPercent)}
           />
           <Readout
-            label={humanDisclosureAvailable ? "Fan command" : "Fan (locked)"}
+            label={legacyTextAllowed ? "Fan (locked)" : "Fan command"}
             value={formatPercent(fanPercent)}
           />
         </dl>
@@ -285,7 +283,7 @@ export function RecoveryModal({
               <span className="text-sm font-semibold uppercase tracking-wide">
                 {emergencyStopAction.label}
               </span>
-              {!humanDisclosureAvailable && (
+              {legacyTextAllowed && (
                 <span className="text-xs text-muted-foreground">{emergencyStopAction.note}</span>
               )}
             </button>
@@ -421,7 +419,7 @@ export function RecoveryModal({
           </section>
         )}
 
-        {(!humanDisclosureAvailable || routineRecoveryActions.length > 0) && (
+        {(legacyTextAllowed || routineRecoveryActions.length > 0) && (
           <div className="flex flex-col gap-2">
             <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               Select Recovery Action
@@ -445,8 +443,12 @@ export function RecoveryModal({
                     : "border-border bg-secondary hover:bg-accent",
                 )}
               >
-                <span className="text-sm font-semibold uppercase tracking-wide">{label}</span>
-                {!humanDisclosureAvailable && (
+                <span className="text-sm font-semibold uppercase tracking-wide">
+                  {action === "acknowledge_recovery" && !legacyTextAllowed
+                    ? "Acknowledge recovery"
+                    : label}
+                </span>
+                {legacyTextAllowed && (
                   <span className="text-xs text-muted-foreground">{note}</span>
                 )}
               </button>
