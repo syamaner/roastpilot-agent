@@ -1161,7 +1161,11 @@ async def _teardown_live(
                 cast("Callable[[], Awaitable[object]]", marker),
             )
     store_closed, _ = await _cleanup_step("store.close", store.close)
-    return store_closed
+    # The shared connection may already be closed while the final HUMAN
+    # epoch transaction still lacks verified settlement.
+    return store_closed and (
+        not human_storage or getattr(store, "human_storage_quiescent", False) is True
+    )
 
 
 async def _cleanup_step(

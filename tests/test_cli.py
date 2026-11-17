@@ -8,6 +8,7 @@ driven without binding a socket.
 import asyncio
 import os
 import signal
+import sqlite3
 import threading
 from collections.abc import Callable, Coroutine, Iterator
 from pathlib import Path
@@ -2322,7 +2323,9 @@ async def test_human_teardown_dispatches_before_history_and_skips_clean_on_pendi
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["commit_acknowledgement", "worker_close"])
+@pytest.mark.parametrize(
+    "failure", ["commit_acknowledgement", "verification_refused", "worker_close", "no_marker"]
+)
 async def test_human_live_teardown_records_exact_final_marker_settlement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failure: str
 ) -> None:
@@ -2344,8 +2347,9 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
     )
     await store.initialize()
     await service._ensure_restart_epoch()  # pyright: ignore[reportPrivateUsage]
-    assert await store.confirm_process_restart_clearance(service.instance_id)
-    service._restart_clearance_state = RestartClearanceState.CLEARED  # pyright: ignore[reportPrivateUsage]
+    if failure != "no_marker":
+        assert await store.confirm_process_restart_clearance(service.instance_id)
+        service._restart_clearance_state = RestartClearanceState.CLEARED  # pyright: ignore[reportPrivateUsage]
     shared = store.connection
     order: list[str] = []
     marker_workers: list[aiosqlite.Connection] = []
@@ -2358,6 +2362,18 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
     class MCP(MCPServerProcess):
         async def stop(self) -> None:
             order.append("mcp-stop")
+
+    def refuse_marker_read(
+        action: int,
+        table: str | None,
+        _column: str | None,
+        _database: str | None,
+        _trigger: str | None,
+    ) -> int:
+        if action == sqlite3.SQLITE_READ and table == "process_epoch":
+            order.append("verification-refused")
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
 
     async def opened(*, writer: bool = False) -> aiosqlite.Connection:
         connection = await real_open(writer=writer)
@@ -2376,13 +2392,15 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
                         observed_rows.append(sql)
 
                 await connection.set_trace_callback(remember_query)  # pyright: ignore[reportUnknownMemberType]
+                if failure == "verification_refused":
+                    await connection.set_authorizer(refuse_marker_read)
         return connection
 
     async def commit(connection: aiosqlite.Connection) -> None:
         await real_commit(connection)
         if connection in marker_workers:
             order.append("marker-committed")
-            if failure == "commit_acknowledgement":
+            if failure in {"commit_acknowledgement", "verification_refused"}:
                 raise aiosqlite.OperationalError("final marker COMMIT acknowledgement lost")
 
     async def close(connection: aiosqlite.Connection) -> None:
@@ -2394,6 +2412,8 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
             order.append("shared-closed")
         elif connection in marker_workers:
             order.append("marker-closed")
+        elif connection in verify_workers:
+            order.append("verification-closed")
 
     monkeypatch.setattr(store, "_open_connection", opened)
     monkeypatch.setattr(aiosqlite.Connection, "commit", commit)
@@ -2403,12 +2423,6 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
             service, MCP(), store
         )
         assert roaster.calls == []
-        (receipt,) = [
-            r for r in store.drain_human_storage_receipts() if r.kind == "mark_process_epoch_clean"
-        ]
-        (writer,) = marker_workers
-        assert writer is not shared and receipt.writer_connection == id(writer)
-        assert receipt.writer_entered is True
         async with (
             aiosqlite.connect(store.db_path) as independent,
             independent.execute(
@@ -2416,13 +2430,28 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
             ) as cursor,
         ):
             durable = await cursor.fetchone()
-        assert durable is not None and durable[0] == "clean"
-        if failure == "commit_acknowledgement":
+        assert durable is not None
+        if failure == "no_marker":
+            assert durable[0] == "unclean"
+            assert closed and store.human_storage_quiescent
+            assert not marker_workers and not verify_workers
+            assert order == ["mcp-stop", "shared-closed"]
+            assert not any(
+                r.kind == "mark_process_epoch_clean" for r in store.drain_human_storage_receipts()
+            )
+            return
+
+        assert durable[0] == "clean"
+        (receipt,) = [
+            r for r in store.drain_human_storage_receipts() if r.kind == "mark_process_epoch_clean"
+        ]
+        (writer,) = marker_workers
+        assert writer is not shared and receipt.writer_connection == id(writer)
+        assert receipt.writer_entered is True
+        if failure in {"commit_acknowledgement", "verification_refused"}:
             (verification,) = verify_workers
             assert verification is not writer and verification is not shared
-            (selected,) = observed_rows
-            assert service.instance_id in selected
-            assert order == [
+            expected = [
                 "mcp-stop",
                 "shared-closed",
                 "marker-open",
@@ -2430,8 +2459,21 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
                 "marker-closed",
                 "verification-open",
             ]
-            assert closed and store.human_storage_quiescent
-            assert receipt.settlement is Settlement.OBSERVED_COMMITTED and receipt.timely is True
+            if failure == "commit_acknowledgement":
+                (selected,) = observed_rows
+                assert service.instance_id in selected
+                assert order == [*expected, "verification-closed"]
+                assert closed and store.human_storage_quiescent
+                assert (
+                    receipt.settlement is Settlement.OBSERVED_COMMITTED and receipt.timely is True
+                )
+            else:
+                assert not observed_rows
+                assert order == [*expected, "verification-refused", "verification-closed"]
+                assert not store.human_storage_quiescent
+                assert receipt.settlement is Settlement.UNRESOLVED
+                assert "could not verify clean process epoch shutdown" in caplog.text
+                assert not closed
         else:
             assert not verify_workers
             assert order == [
