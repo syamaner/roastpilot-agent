@@ -6,10 +6,12 @@ import sys
 from collections.abc import Awaitable
 from importlib.metadata import version
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
 
+from roastpilot_agent import human_persistence
 from roastpilot_agent.api import RoastRunner, RoastService
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, AppConfig, ControllerConfig, MCPConfig
 from roastpilot_agent.human_persistence import Settlement
@@ -130,6 +132,11 @@ async def _exercise_route(
     producer_config: Path,
 ) -> None:
     clock = FakeClock()
+    # Drive deadline accounting from the case's explicit clock advances so
+    # host/stdio latency cannot choose which side of a barrier wins. Replace
+    # only the deadline module's clock reference; asyncio still bounds waits
+    # on the real event loop, including the held settlement wait in RS6.
+    monkeypatch.setattr(human_persistence, "time", SimpleNamespace(monotonic=clock))
     adapter = RoasterControlAdapter.from_process(child, clock=clock)
     client = adapter._client  # pyright: ignore[reportPrivateUsage]
     info = await client.get_server_info()
