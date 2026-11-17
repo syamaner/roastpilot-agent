@@ -80,7 +80,7 @@ class _LiveExitGuard:
 
     The daemon thread is started before ``asyncio.run`` so it remains able to
     terminate the process if asyncio's residual-task or executor shutdown
-    blocks. It is deliberately armed only after the live store has closed.
+    blocks. It is armed after ordered teardown has attempted store close.
     """
 
     def __init__(self, *, grace_seconds: float = _LIVE_EXIT_GRACE_SECONDS) -> None:
@@ -886,9 +886,13 @@ async def _finish_live_teardown(
             cancelled = True
     # Retrieve an unexpected BaseException even though ordinary teardown-step
     # exceptions are contained by _cleanup_step.
-    teardown.result()
+    store_closed = teardown.result()
     if exit_guard is not None:
         exit_guard.arm(_residual_task_labels())
+        if not store_closed and getattr(store, "human_storage_enabled", False):
+            # An unresolved SQLite worker can survive asyncio task cancellation.
+            # Keep the existing process watchdog armed until it terminates serve.
+            await asyncio.Future[None]()
     if cancelled:
         raise asyncio.CancelledError
 
@@ -1035,7 +1039,7 @@ async def _serve_live(
 
 async def _teardown_live(
     service: "RoastService", mcp: "MCPServerProcess", store: "RoastStore"
-) -> None:
+) -> bool:
     """Tear the live serve down in the safety-critical order (#142).
 
     Graceful shutdown / Ctrl-C must command heat→0 through the safety path
@@ -1055,9 +1059,10 @@ async def _teardown_live(
        shutdown e-stop audit before judging the process epoch clean;
     7. ``store.close`` — close the decision-trace store.
 
-    The child-stop marker and lease-persistence drain sit before ``store.close``
-    deliberately: their outcomes determine whether this process can claim a
-    clean epoch, and both need the store to remain open.
+    The child-stop marker and lease-persistence drain require the open store.
+    HUMAN dispatches heat-off before querying history, waits for exact native
+    storage settlement after the child proof, and closes the shared worker
+    before opening the final process-epoch transaction.
 
     (A hard kill / SIGKILL / power loss is uncatchable and skips this entirely —
     it still relies on restart → ``operator_recovery_required``, never an
@@ -1080,17 +1085,29 @@ async def _teardown_live(
     # unconfirmed active e-stop remains fail-closed even if the store read is
     # unexpectedly empty. The epoch marker rechecks its durable state after
     # every ordered teardown step.
+    human_storage = getattr(store, "human_storage_enabled", False)
+    heat_off_completed, heat_off_outcome = False, None
+    if human_storage:
+        heat_off_completed, heat_off_outcome = await _cleanup_step(
+            "safe_shutdown_heat_off", service.safe_shutdown_heat_off
+        )
     active_run = getattr(store, "active_run", None)
-    if callable(active_run):
+    if human_storage and heat_off_outcome not in (
+        ShutdownHeatOffOutcome.NO_RUNNER,
+        ShutdownHeatOffOutcome.NOT_ACTIVE,
+    ):
+        idle_check_completed, active_before_heat_off = False, None
+    elif callable(active_run):
         idle_check_completed, active_before_heat_off = await _cleanup_step(
             "store.active_run_before_heat_off", cast("Callable[[], Awaitable[object]]", active_run)
         )
     else:  # pragma: no cover - real RoastStore always has this method
         idle_check_completed, active_before_heat_off = False, None
     idle_before_heat_off = idle_check_completed and active_before_heat_off is None
-    heat_off_completed, heat_off_outcome = await _cleanup_step(
-        "safe_shutdown_heat_off", service.safe_shutdown_heat_off
-    )
+    if not human_storage:
+        heat_off_completed, heat_off_outcome = await _cleanup_step(
+            "safe_shutdown_heat_off", service.safe_shutdown_heat_off
+        )
     safe_idle_noop = (
         heat_off_outcome in (ShutdownHeatOffOutcome.NO_RUNNER, ShutdownHeatOffOutcome.NOT_ACTIVE)
         and idle_before_heat_off
@@ -1113,6 +1130,14 @@ async def _teardown_live(
         )
     else:  # pragma: no cover - narrow teardown test doubles omit this seam
         lease_writes_completed, lease_writes_clean = True, True
+    settle_storage = getattr(store, "settle_human_storage_for_teardown", None)
+    if human_storage and callable(settle_storage):
+        store_settled, clean_storage = await _cleanup_step(
+            "settle_human_storage_for_teardown",
+            cast("Callable[[], Awaitable[object]]", settle_storage),
+        )
+    else:
+        store_settled, clean_storage = True, True
     # An epoch may become clean only after every ordered teardown proof has
     # completed: safety heat-off was dispatched (or it was a proven typed idle
     # no-op), service loop stopped, and MCP stop returned without an
@@ -1126,6 +1151,8 @@ async def _teardown_live(
         and stop_unconfirmed is False
         and lease_writes_completed
         and lease_writes_clean is True
+        and store_settled
+        and clean_storage is True
     ):
         marker = getattr(service, "mark_process_epoch_clean_after_ordered_teardown", None)
         if callable(marker):
@@ -1133,7 +1160,8 @@ async def _teardown_live(
                 "mark_process_epoch_clean_after_ordered_teardown",
                 cast("Callable[[], Awaitable[object]]", marker),
             )
-    await _cleanup_step("store.close", store.close)
+    store_closed, _ = await _cleanup_step("store.close", store.close)
+    return store_closed
 
 
 async def _cleanup_step(

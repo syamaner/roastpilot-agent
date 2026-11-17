@@ -277,6 +277,7 @@ describe("HUMAN protection wire contract", () => {
     const empty = {
       human_endpoint: null,
       human_command_disposition: null,
+      human_history_durability: null,
       physical_intervention_required: null,
       emergency_fallback_disclosure: null,
     };

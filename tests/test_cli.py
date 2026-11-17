@@ -2261,3 +2261,61 @@ def test_replay_passes_saved_config_to_create_replay_app(
     assert captured[0].advisor.model_slug == "openai/gpt-4o-mini", (
         "replay service must use the saved-file config value, not the schema default"
     )
+
+
+@pytest.mark.asyncio
+async def test_human_teardown_dispatches_before_history_and_skips_clean_on_pending_owner() -> None:
+    """The independent controller e-stop and MCP shutdown precede store settlement."""
+    order: list[str] = []
+
+    class Service:
+        def close_human_call_admission(self, reason: AdmissionCloseReason) -> None:
+            assert reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+
+        async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
+            order.append("heat-off")
+            return ShutdownHeatOffOutcome.DISPATCHED
+
+        async def shutdown(self) -> None:
+            order.append("service-stop")
+
+        async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+            order.append(f"child-stop:{stop_unconfirmed}")
+
+        async def mark_process_epoch_clean_after_ordered_teardown(self) -> None:
+            pytest.fail("unresolved native owner cannot establish a clean epoch")
+
+    class MCP:
+        stop_unconfirmed = False
+
+        async def stop(self) -> None:
+            order.append("mcp-stop")
+
+    class Store:
+        human_storage_enabled = True
+
+        async def active_run(self) -> None:
+            pytest.fail("a confirmed heat-off must not await a history lookup")
+
+        async def settle_human_storage_for_teardown(self) -> bool:
+            order.append("settle-storage")
+            return False
+
+        async def close(self) -> None:
+            order.append("store-close-refused")
+            raise RuntimeError("SQLite owner still pending")
+
+    closed = await cli._teardown_live(  # pyright: ignore[reportPrivateUsage]
+        Service(),  # type: ignore[arg-type]
+        MCP(),  # type: ignore[arg-type]
+        Store(),  # type: ignore[arg-type]
+    )
+    assert not closed
+    assert order == [
+        "heat-off",
+        "service-stop",
+        "mcp-stop",
+        "child-stop:False",
+        "settle-storage",
+        "store-close-refused",
+    ]

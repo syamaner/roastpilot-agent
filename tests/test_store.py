@@ -20,6 +20,15 @@ import pytest
 from roastpilot_agent import roast_landmarks
 from roastpilot_agent import store as store_module
 from roastpilot_agent.ambient_evidence import AmbientEvidenceVerdict, NotProvenReason
+from roastpilot_agent.human_persistence import (
+    CommandReference,
+    HistoryUnavailable,
+    Settlement,
+    StorageCaller,
+    StorageDeadline,
+    storage_caller,
+)
+from roastpilot_agent.models import HumanHistoryDurability
 from roastpilot_agent.store import (
     MIGRATIONS,
     FaultControlLease,
@@ -29,6 +38,7 @@ from roastpilot_agent.store import (
     RunActivelyDrivenError,
     StrandedFaultRetirementCommit,
 )
+from tests.conftest import FakeClock
 
 # The full migrated table set: the nine v1 tables plus the additive
 # ``bean_profiles`` table from the v4 migration (#303) and the additive
@@ -10413,3 +10423,419 @@ async def test_d225_commit_acknowledgement_failure_after_commit_is_indeterminate
         assert await fetch_one(store, "SELECT COUNT(*) FROM roast_events") == events_before
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_history_refuses_writer_local_timeline_until_exact_commit(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await seeded_store(tmp_store)
+    clock = FakeClock()
+    tmp_store.enable_human_storage(clock, 1.0)
+    tmp_store.set_human_history_run("run-1", recovered=False)
+    entered, release = asyncio.Event(), asyncio.Event()
+    shared = tmp_store.connection
+    real_commit = shared.commit
+
+    async def held_commit() -> None:
+        entered.set()
+        await release.wait()
+        await real_commit()
+
+    monkeypatch.setattr(shared, "commit", held_commit)
+    first = StorageDeadline.start(clock, 1.0)
+
+    async def writer() -> None:
+        with storage_caller(StorageCaller(first, "run-1", 1)):
+            await tmp_store.record_event(
+                run_id="run-1",
+                kind=RoastEventKind.T0_DETECTED,
+                source=RoastEventSource.MCP,
+                monotonic_seconds=10,
+                payload={},
+            )
+
+    task = asyncio.create_task(writer())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        with pytest.raises(HistoryUnavailable):
+            await tmp_store.read_timeline("run-1")
+        with pytest.raises(HistoryUnavailable):
+            await tmp_store.expire_bean_sourcing_drafts()
+        with pytest.raises(HistoryUnavailable):
+            await tmp_store.start_bean_sourcing_attempt(
+                provider="openrouter", model_slug="fake", prompt_version="test"
+            )
+        async with aiosqlite_module.connect(tmp_store.db_path) as independent:
+            async with independent.execute("SELECT COUNT(*) FROM roast_events") as cursor:
+                row = await cursor.fetchone()
+            assert row is not None and row[0] == 0
+        receipt = next(
+            receipt
+            for receipt in tmp_store.drain_human_storage_receipts()
+            if receipt.kind == "record_event"
+        )
+        assert receipt.settlement is Settlement.UNRESOLVED
+        assert receipt.writer_connection == id(shared)
+        assert receipt.run_id == "run-1" and receipt.turn == 1
+        assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.UNKNOWN
+        clock.advance(1.0)
+        release.set()
+        with pytest.raises(HistoryUnavailable):
+            await task
+        visible = await tmp_store.read_timeline("run-1")
+        assert len(visible.events) == 1
+        updated = next(
+            current
+            for current in tmp_store.drain_human_storage_receipts()
+            if current.token == receipt.token
+        )
+        assert updated.settlement is Settlement.OBSERVED_COMMITTED and updated.timely is False
+        assert updated.deadline == receipt.deadline
+        tmp_store.note_human_history_pass("run-1")
+        assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.DELAYED
+    finally:
+        release.set()
+        if not task.done():
+            await task
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pause", ["query", "fetch"])
+async def test_human_read_owns_query_and_fetch(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, pause: str
+) -> None:
+    await seeded_store(tmp_store)
+    tmp_store.enable_human_storage(FakeClock(), 1.0)
+    entered, release = asyncio.Event(), asyncio.Event()
+    shared = tmp_store.connection
+    real_execute = shared.execute
+    real_fetchall = aiosqlite_module.Cursor.fetchall
+
+    def execute(sql: str, *args: Any, **kwargs: Any) -> object:
+        async def first_query() -> None:
+            entered.set()
+            await release.wait()
+
+        query = real_execute(sql, *args, **kwargs)
+        if not entered.is_set():
+
+            async def after_admission() -> aiosqlite_module.Cursor:
+                await first_query()
+                return await query
+
+            return _PausedExecution(after_admission(), sql, lambda _: False, entered, release)
+        return query
+
+    async def fetchall(cursor: aiosqlite_module.Cursor) -> Any:
+        if not entered.is_set():
+            entered.set()
+            await release.wait()
+        return await real_fetchall(cursor)
+
+    if pause == "query":
+        monkeypatch.setattr(shared, "execute", execute)
+    else:
+        monkeypatch.setattr(aiosqlite_module.Cursor, "fetchall", fetchall)
+    task = asyncio.create_task(tmp_store.read_timeline("run-1"))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        with pytest.raises(HistoryUnavailable):
+            await tmp_store.record_event(
+                run_id="run-1",
+                kind=RoastEventKind.T0_DETECTED,
+                source=RoastEventSource.MCP,
+                payload={},
+            )
+        release.set()
+        assert not (await task).events
+    finally:
+        release.set()
+        if not task.done():
+            await task
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_failed_partial_write_cannot_be_committed_by_zero_row_expiry(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await seeded_store(tmp_store)
+    tmp_store.enable_human_storage(FakeClock(), 1.0)
+    shared = tmp_store.connection
+    real_commit = shared.commit
+
+    async def fail_before_commit() -> None:
+        assert shared.in_transaction
+        raise sqlite3.OperationalError("injected pre-commit failure")
+
+    try:
+        with monkeypatch.context() as injected:
+            injected.setattr(shared, "commit", fail_before_commit)
+            with pytest.raises(HistoryUnavailable, match="SQLite operation failed"):
+                await tmp_store.record_event(
+                    run_id="run-1",
+                    kind=RoastEventKind.T0_DETECTED,
+                    source=RoastEventSource.MCP,
+                    payload={},
+                )
+        assert shared.commit == real_commit
+        assert await tmp_store.expire_bean_sourcing_drafts() == 0
+        assert not (await tmp_store.read_timeline("run-1")).events
+        receipt = next(
+            receipt
+            for receipt in tmp_store.drain_human_storage_receipts()
+            if receipt.kind == "record_event"
+        )
+        assert receipt.settlement is Settlement.VERIFIED_NO_WRITE
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_ambiguous_commit_keeps_exact_owner_across_diagnostic_eviction(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await seeded_store(tmp_store)
+    tmp_store.enable_human_storage(FakeClock(), 1.0)
+    tmp_store.set_human_history_run("run-1", recovered=False)
+    shared = tmp_store.connection
+    real_commit = shared.commit
+    ref = CommandReference("session-1", 7, 3, 1)
+
+    async def commit_then_raise() -> None:
+        await real_commit()
+        raise sqlite3.OperationalError("commit acknowledgement lost")
+
+    try:
+        with monkeypatch.context() as injected:
+            injected.setattr(shared, "commit", commit_then_raise)
+            with (
+                storage_caller(
+                    StorageCaller(StorageDeadline.start(FakeClock(), 1), "run-1", 8, ref)
+                ),
+                pytest.raises(HistoryUnavailable, match="SQLite operation failed"),
+            ):
+                await tmp_store.record_event(
+                    run_id="run-1",
+                    kind=RoastEventKind.COMMAND_EXECUTED,
+                    source=RoastEventSource.MCP,
+                    payload={"command": "drop_beans"},
+                )
+        for _ in range(150):
+            with pytest.raises(HistoryUnavailable):
+                await tmp_store.expire_bean_sourcing_drafts()
+        receipts = tmp_store.drain_human_storage_receipts()
+        assert len(receipts) <= 130
+        assert any(r.kind == "diagnostic_backlog_omitted" and r.run_id is None for r in receipts)
+        (pending,) = tmp_store.drain_human_storage_receipts()
+        assert pending.command == ref
+        assert pending.settlement is Settlement.UNRESOLVED
+        assert pending.writer_connection == id(shared)
+        assert not await tmp_store.settle_human_storage_for_teardown()
+        assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.UNKNOWN
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_storage_shares_deadline_at_exact_equality(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await seeded_store(tmp_store)
+    clock = FakeClock()
+    tmp_store.enable_human_storage(clock, 1.0)
+    real_commit = tmp_store.connection.commit
+    spent = iter([0.6, 0.4])
+    entered = 0
+
+    async def commit() -> None:
+        nonlocal entered
+        entered += 1
+        clock.advance(next(spent))
+        await real_commit()
+
+    monkeypatch.setattr(tmp_store.connection, "commit", commit)
+    deadline = StorageDeadline.start(clock, 1.0)
+    try:
+        with storage_caller(StorageCaller(deadline, "run-1", 36)):
+            await tmp_store.record_event(
+                run_id="run-1",
+                kind=RoastEventKind.T0_DETECTED,
+                source=RoastEventSource.MCP,
+                payload={},
+            )
+            assert 0.39 < deadline.remaining() <= 0.4
+            with pytest.raises(HistoryUnavailable, match="deadline"):
+                await tmp_store.update_run_phase("run-1", RoastPhase.PREHEATING)
+            with pytest.raises(HistoryUnavailable, match="admission"):
+                await tmp_store.record_event(
+                    run_id="run-1",
+                    kind=RoastEventKind.DRYING_END,
+                    source=RoastEventSource.CONTROLLER,
+                    payload={},
+                )
+        assert entered == 2
+        timely, late, refused = tmp_store.drain_human_storage_receipts()
+        assert all(
+            r.deadline == deadline.expires_at and r.turn == 36 for r in (timely, late, refused)
+        )
+        assert timely.timely is True and late.timely is False and refused.timely is False
+        assert late.settlement is Settlement.OBSERVED_COMMITTED
+        assert (
+            refused.settlement is Settlement.VERIFIED_NO_WRITE and refused.writer_entered is False
+        )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_clean_epoch_waits_for_shared_connection_close(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await tmp_store.initialize()
+    tmp_store.enable_human_storage(FakeClock(), 1.0)
+    assert await tmp_store.begin_process_epoch("process-under-test")
+    await tmp_store.begin_process_restart_clearance("process-under-test")
+    assert await tmp_store.confirm_process_restart_clearance("process-under-test")
+    shared = tmp_store.connection
+    original = shared.close
+
+    async def fail_close() -> None:
+        raise RuntimeError("close acknowledgement failed")
+
+    try:
+        assert not await tmp_store.mark_process_epoch_clean("process-under-test")
+        monkeypatch.setattr(shared, "close", fail_close)
+        with pytest.raises(RuntimeError, match="close acknowledgement"):
+            await tmp_store.close()
+        async with (
+            aiosqlite_module.connect(tmp_store.db_path) as reader,
+            reader.execute("SELECT status FROM process_epoch") as cursor,
+        ):
+            row = await cursor.fetchone()
+            assert row is not None and row[0] == "unclean"
+    finally:
+        await original()
+
+
+@pytest.mark.asyncio
+async def test_human_clean_epoch_after_shared_worker_join(
+    tmp_store: RoastStore,
+) -> None:
+    await tmp_store.initialize()
+    tmp_store.enable_human_storage(FakeClock(), 1.0)
+    assert await tmp_store.begin_process_epoch("process-under-test")
+    await tmp_store.begin_process_restart_clearance("process-under-test")
+    assert await tmp_store.confirm_process_restart_clearance("process-under-test")
+    await tmp_store.close()
+    assert await tmp_store.mark_process_epoch_clean("process-under-test")
+    assert tmp_store.human_storage_quiescent
+    async with (
+        aiosqlite_module.connect(tmp_store.db_path) as reader,
+        reader.execute("SELECT status FROM process_epoch") as cursor,
+    ):
+        row = await cursor.fetchone()
+        assert row is not None and row[0] == "clean"
+
+
+@pytest.mark.asyncio
+async def test_human_read_cannot_accept_shared_writer_replacement(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await seeded_store(tmp_store)
+    tmp_store.enable_human_storage(FakeClock(), 1.0)
+    shared = tmp_store.connection
+    real = aiosqlite_module.Cursor.fetchall
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def held_fetch(cursor: aiosqlite_module.Cursor) -> Any:
+        if not entered.is_set():
+            entered.set()
+            await release.wait()
+        return await real(cursor)
+
+    monkeypatch.setattr(aiosqlite_module.Cursor, "fetchall", held_fetch)
+    async with aiosqlite_module.connect(tmp_store.db_path) as replacement:
+        reader = asyncio.create_task(tmp_store.read_timeline("run-1"))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            monkeypatch.setattr(tmp_store, "_connection", replacement)
+            release.set()
+            with pytest.raises(HistoryUnavailable, match="shared history connection"):
+                await reader
+            assert not await tmp_store.settle_human_storage_for_teardown()
+        finally:
+            release.set()
+            monkeypatch.setattr(tmp_store, "_connection", shared)
+            if not reader.done():
+                await reader
+            await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_sqlite_lock_retains_exact_owner_and_refuses_additional_mutations(
+    tmp_store: RoastStore,
+) -> None:
+    await seeded_store(tmp_store)
+    tmp_store.enable_human_storage(FakeClock(), 0.15)
+    async with aiosqlite_module.connect(tmp_store.db_path) as other:
+        await other.execute("BEGIN IMMEDIATE")
+        with pytest.raises(HistoryUnavailable, match="deadline"):
+            await tmp_store.update_run_phase("run-1", RoastPhase.PREHEATING)
+        receipts = tmp_store.drain_human_storage_receipts()
+        (pending,) = [
+            receipt for receipt in receipts if receipt.settlement is Settlement.UNRESOLVED
+        ]
+        assert pending.kind == "update_run_phase"
+        assert pending.writer_connection == id(tmp_store.connection)
+        with pytest.raises(HistoryUnavailable):
+            await tmp_store.expire_bean_sourcing_drafts()
+        await other.rollback()
+    try:
+        assert await tmp_store.settle_human_storage_for_teardown()
+        completed = next(
+            receipt
+            for receipt in tmp_store.drain_human_storage_receipts()
+            if receipt.token == pending.token
+        )
+        assert completed.timely is False and completed.settlement is Settlement.OBSERVED_COMMITTED
+        run = await tmp_store.read_run("run-1")
+        assert run is not None and run.agent_phase is RoastPhase.PREHEATING
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_unverified_rollback_never_releases_shared_transaction(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await seeded_store(tmp_store)
+    tmp_store.enable_human_storage(FakeClock(), 1.0)
+
+    async def failed_commit() -> None:
+        raise sqlite3.OperationalError("commit failed")
+
+    async def failed_rollback() -> None:
+        raise sqlite3.OperationalError("rollback proof unavailable")
+
+    monkeypatch.setattr(tmp_store.connection, "commit", failed_commit)
+    monkeypatch.setattr(tmp_store.connection, "rollback", failed_rollback)
+    try:
+        with pytest.raises(HistoryUnavailable, match="operation failed"):
+            await tmp_store.update_run_phase("run-1", RoastPhase.PREHEATING)
+        with pytest.raises(HistoryUnavailable):
+            await tmp_store.expire_bean_sourcing_drafts()
+        assert not await tmp_store.settle_human_storage_for_teardown()
+        pending = next(
+            receipt
+            for receipt in tmp_store.drain_human_storage_receipts()
+            if receipt.kind == "update_run_phase"
+        )
+        assert pending.writer_entered is True and pending.settlement is Settlement.UNRESOLVED
+        async with aiosqlite_module.connect(tmp_store.db_path) as reader:
+            (row,) = await reader.execute_fetchall("SELECT agent_phase FROM roast_runs")
+            assert row[0] == RoastPhase.STARTING.value
+    finally:
+        await tmp_store.close()

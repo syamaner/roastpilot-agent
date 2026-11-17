@@ -22,8 +22,9 @@ import math
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Generator
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
 from pathlib import Path
@@ -86,6 +87,15 @@ from roastpilot_agent.controller import (
     StateReader,
     TickScheduler,
 )
+from roastpilot_agent.human_persistence import (
+    CommandReference,
+    HistoryUnavailable,
+    StorageCaller,
+    StorageDeadline,
+    current_audit_command,
+    current_storage_caller,
+    storage_caller,
+)
 from roastpilot_agent.human_protection import (
     CommandDisposition,
     ControlAuthority,
@@ -138,6 +148,7 @@ from roastpilot_agent.models import (
     HealthResponse,
     HumanCommandProjection,
     HumanEndpointProjection,
+    HumanHistoryDurability,
     HumanProtectionHeartbeat,
     HumanProtectionProjection,
     InitializeSafetyRecordResult,
@@ -848,6 +859,7 @@ class _BufferedEvent:
     kind: RoastEventKind
     payload: object
     monotonic_seconds: float
+    audit_command: CommandReference | None = None
 
 
 def _event_source(event: _BufferedEvent) -> RoastEventSource:
@@ -888,13 +900,41 @@ class BufferingEventEmitter:
         self.human_phase_frame_id: int | None = None
         self._clock = clock
         self._buffer: list[_BufferedEvent] = []
+        self._on_dropped_history: Callable[[_BufferedEvent], None] | None = None
+        self._dispatch_events: ContextVar[
+            tuple[asyncio.Task[object] | None, list[_BufferedEvent]] | None
+        ] = ContextVar("human_dispatch_audit", default=None)
 
     def emit(self, kind: RoastEventKind, payload: object) -> None:
         """``EventEmitter`` protocol: publish to SSE now, buffer for persistence."""
         self._broadcaster.emit(kind, payload, human_run_id=self._human_run_id)
         if self._human_run_id is not None and kind is RoastEventKind.PHASE_CHANGED:
             self.human_phase_frame_id = self._broadcaster.last_event_id
-        self._buffer.append(_BufferedEvent(kind, payload, self._clock()))
+        event = _BufferedEvent(kind, payload, self._clock(), current_audit_command())
+        dispatch = self._dispatch_events.get()
+        if (
+            dispatch is not None
+            and dispatch[0] is asyncio.current_task()
+            and kind in (RoastEventKind.COMMAND_EXECUTED, RoastEventKind.COMMAND_FAILED)
+        ):
+            dispatch[1].append(event)
+        self._buffer.append(event)
+        if self._on_dropped_history is not None and len(self._buffer) > 256:
+            self._on_dropped_history(self._buffer.pop(0))
+
+    @contextlib.contextmanager
+    def capture_dispatch_events(self) -> Generator[list[_BufferedEvent]]:
+        """Capture outcomes from this attempt independently of the shared event buffer."""
+        events: list[_BufferedEvent] = []
+        token = self._dispatch_events.set((asyncio.current_task(), events))
+        try:
+            yield events
+        finally:
+            self._dispatch_events.reset(token)
+
+    def bound_history_buffer(self, on_drop: Callable[[_BufferedEvent], None]) -> None:
+        """Bound the HUMAN audit queue and report discarded rows."""
+        self._on_dropped_history = on_drop
 
     def emit_telemetry(self, data: TelemetryEventData) -> None:
         """Publish the per-tick ``telemetry`` SSE frame (not a persisted event)."""
@@ -1132,6 +1172,11 @@ class RoastRunner:
         self._sleep = sleep
         self._finalized = False
         self._completion_persistence_initiated = False
+        self._completion_storage_uncertain = False
+        self._history_turn_in_progress = False
+        if controller.authority is ControlAuthority.HUMAN:
+            store.enable_human_storage(clock, config.controller.tick_interval_seconds)
+            emitter.bound_history_buffer(self._note_unwritten_event)
         # D221: a pre-retirement e-stop can synchronously revoke D216 closure
         # authority after its durable End CAS has committed.  The runner then
         # remains alive solely to retry its already-admitted heat-off posture;
@@ -1199,6 +1244,8 @@ class RoastRunner:
         await self._controller.start_run(profile, recording_roast_num=recording_roast_num)
         await self._flush_events()
         await self._persist_phase_if_changed()
+        if self._controller.authority is ControlAuthority.HUMAN:
+            self._store.note_human_history_pass(self._run_id)
 
     async def recover(
         self,
@@ -1321,7 +1368,11 @@ class RoastRunner:
             ),
             already_admitted=already_admitted,
         )
-        await self._persist_phase_if_changed()
+        if self._controller.authority is ControlAuthority.HUMAN:
+            with contextlib.suppress(HistoryUnavailable):
+                await self._persist_phase_if_changed()
+        else:
+            await self._persist_phase_if_changed()
         return (
             ShutdownHeatOffOutcome.DISPATCHED if confirmed else ShutdownHeatOffOutcome.UNCONFIRMED
         )
@@ -1345,7 +1396,11 @@ class RoastRunner:
             ),
             already_admitted=already_admitted,
         )
-        await self._persist_phase_if_changed()
+        if self._controller.authority is ControlAuthority.HUMAN:
+            with contextlib.suppress(HistoryUnavailable):
+                await self._persist_phase_if_changed()
+        else:
+            await self._persist_phase_if_changed()
         return (
             ShutdownHeatOffOutcome.DISPATCHED if confirmed else ShutdownHeatOffOutcome.UNCONFIRMED
         )
@@ -1444,6 +1499,15 @@ class RoastRunner:
             and controller.human_drop_evaluation_outstanding()
         )
 
+    def history_durability(self) -> HumanHistoryDurability:
+        """Read durability without waiting on the storage or actuation path."""
+        value = self._store.human_history_durability(self._run_id)
+        if value is HumanHistoryDurability.COMPLETE and (
+            self._history_turn_in_progress or self._emitter.peek()
+        ):
+            return HumanHistoryDurability.UNKNOWN
+        return value
+
     def controller_snapshot(self) -> "ControllerSnapshot":
         """The controller's current post-tick snapshot (phase + commanded levels).
 
@@ -1483,6 +1547,43 @@ class RoastRunner:
         event flush (last, so terminal events like ``run_completed`` /
         ``logs_exported`` are never emitted-but-unpersisted) → telemetry."""
         self._counter.value += 1
+        if self._controller.authority is ControlAuthority.AUTOMATIC:
+            return await self._tick_once(None)
+        caller = self._new_storage_caller(turn=self._counter.value)
+        with storage_caller(caller):
+            self._history_turn_in_progress = True
+            try:
+                finalized = await self._tick_once(caller.deadline)
+                self._store.note_human_history_pass(self._run_id)
+                return finalized
+            except HistoryUnavailable:
+                self._controller.inhibit_human_routine_for_storage_failure()
+                if not self._finalized:
+                    self._release_unconfirmed_fault_finalization()
+                self._discard_unwritten_events()
+                return self._finalized
+            finally:
+                self._history_turn_in_progress = False
+
+    def _new_storage_caller(self, *, turn: int | None = None) -> StorageCaller:
+        return StorageCaller(
+            StorageDeadline.start(self._clock, self._config.controller.tick_interval_seconds),
+            self._run_id,
+            turn,
+        )
+
+    def _release_unconfirmed_fault_finalization(self) -> None:
+        self._fault_acknowledged = False
+        self._fault_acknowledgement_epoch = None
+        self._fault_acknowledgement_session_id = None
+        self._d212_acknowledgement_requested = False
+        self._fault_acknowledgement_gate.abort_fault_finalization()
+        close_generation = self._fault_acknowledgement_command_generation
+        if close_generation is not None:
+            self._controller.release_fault_acknowledgement_close(close_generation)
+            self._fault_acknowledgement_command_generation = None
+
+    async def _tick_once(self, deadline: StorageDeadline | None) -> bool:
         if self._post_durable_end_emergency_retry_only:
             # The durable D216 End transaction already wrote immutable aborted
             # history. Retain only the controller's terminal fail-safe retry;
@@ -1502,8 +1603,18 @@ class RoastRunner:
         await self._controller.tick()
         lock = self._recovered_history_mutation_lock
         if lock is not None:
-            async with lock:
+            if deadline is None:
+                async with lock:
+                    return await self._persist_tick_history(events_before_controller_tick)
+            try:
+                await deadline.wait(lock.acquire)
+            except HistoryUnavailable:
+                self._store.note_human_history_gap("recovered_history_lock", self._run_id)
+                raise
+            try:
                 return await self._persist_tick_history(events_before_controller_tick)
+            finally:
+                lock.release()
         return await self._persist_tick_history(events_before_controller_tick)
 
     async def _persist_tick_history(self, events_before_controller_tick: int) -> bool:
@@ -1550,11 +1661,27 @@ class RoastRunner:
         self._emergency_stop_since_last_drain = False
         events_before_urgent: int | None = None
         if self._controller.authority is ControlAuthority.HUMAN:
+            deferred_commands: list[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]] = []
+            deferred_evaluations: list[SafetyEvaluation] = []
             for item in batch:
                 if item.action is OperatorAction.EMERGENCY_STOP:
-                    await self._dispatch(item)
+                    await self._dispatch(
+                        item,
+                        deferred_commands=deferred_commands,
+                        deferred_evaluations=deferred_evaluations,
+                    )
             events_before_urgent = len(self._emitter.peek())
             await self._controller.human_urgent_stage(emergency_won_batch=emergency_stop_wins_batch)
+            await self._controller.apply_human_storage_failure_after_urgent()
+            for evaluation in deferred_evaluations:
+                try:
+                    await self._store.record_safety_evaluation(
+                        run_id=self._run_id, tick=self._counter.value, evaluation=evaluation
+                    )
+                except HistoryUnavailable:
+                    self._controller.inhibit_human_routine_for_storage_failure()
+            for tool, item, event in deferred_commands:
+                await self._persist_dispatch_audit(tool, item, event)
             batch = [item for item in batch if item.action is not OperatorAction.EMERGENCY_STOP]
         fault_acknowledgement_seen = False
         for item in batch:
@@ -1572,10 +1699,45 @@ class RoastRunner:
                     await self._record_fault_acknowledgement_failure("duplicate")
                     continue
                 fault_acknowledgement_seen = True
-            await self._dispatch(item)
+                if self._completion_storage_uncertain:
+                    with contextlib.suppress(HistoryUnavailable):
+                        await self._record_fault_acknowledgement_failure("persistence_unconfirmed")
+                    continue
+            try:
+                await self._dispatch(item)
+            except HistoryUnavailable:
+                if self._controller.authority is not ControlAuthority.HUMAN:
+                    raise
+                self._controller.inhibit_human_routine_for_storage_failure()
         return events_before_urgent
 
-    async def _dispatch(self, item: QueuedOperatorAction) -> bool:
+    async def _dispatch(
+        self,
+        item: QueuedOperatorAction,
+        *,
+        deferred_commands: list[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]]
+        | None = None,
+        deferred_evaluations: list[SafetyEvaluation] | None = None,
+    ) -> bool:
+        if self._controller.authority is ControlAuthority.AUTOMATIC:
+            return await self._dispatch_action(item)
+        with self._emitter.capture_dispatch_events() as outcomes:
+            return await self._dispatch_action(
+                item,
+                outcomes=outcomes,
+                deferred_commands=deferred_commands,
+                deferred_evaluations=deferred_evaluations,
+            )
+
+    async def _dispatch_action(
+        self,
+        item: QueuedOperatorAction,
+        *,
+        outcomes: list[_BufferedEvent] | None = None,
+        deferred_commands: list[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]]
+        | None = None,
+        deferred_evaluations: list[SafetyEvaluation] | None = None,
+    ) -> bool:
         """Route one operator action to its controller handler and record the
         executed MCP command (when one was issued) in the decision trace.
 
@@ -1615,7 +1777,11 @@ class RoastRunner:
             if already_admitted:
                 self._admitted_emergency_stops -= 1
             emergency_stop_confirmed = await controller.operator_emergency_stop(
-                reason if isinstance(reason, str) else None, already_admitted=already_admitted
+                reason if isinstance(reason, str) else None,
+                already_admitted=already_admitted,
+                defer_evaluation=None
+                if deferred_evaluations is None
+                else deferred_evaluations.append,
             )
             # An e-stop starts a new cooling cycle even if the MCP retains the
             # same session identity, so an earlier stop proof cannot be reused.
@@ -1661,8 +1827,56 @@ class RoastRunner:
                 self._d212_acknowledgement_requested = True
             await self._dispatch_acknowledge_fault(payload)
         if tool is not None:
-            await self._record_dispatch_command(tool, item, since=before)
+            if outcomes is not None:
+                for event in outcomes:
+                    payload = event.payload
+                    if (
+                        isinstance(payload, dict)
+                        and cast(dict[str, object], payload).get("command") == tool.value
+                    ):
+                        if deferred_commands is None:
+                            await self._persist_dispatch_audit(tool, item, event)
+                        else:
+                            deferred_commands.append((tool, item, event))
+            else:
+                await self._record_dispatch_command(tool, item, since=before)
         return emergency_stop_confirmed
+
+    async def _persist_dispatch_audit(
+        self,
+        tool: RoastCommand,
+        item: QueuedOperatorAction,
+        event: _BufferedEvent,
+    ) -> None:
+        caller = current_storage_caller() or self._new_storage_caller()
+        try:
+            with storage_caller(replace(caller, command=event.audit_command)):
+                await self._store.record_command(
+                    run_id=self._run_id,
+                    tick=self._counter.value,
+                    tool=tool,
+                    source="operator",
+                    status="ok" if event.kind is RoastEventKind.COMMAND_EXECUTED else "failed",
+                    args=item.payload,
+                )
+        except HistoryUnavailable:
+            self._controller.inhibit_human_routine_for_storage_failure()
+        except Exception:  # noqa: BLE001 - a trace fault cannot rewrite the command result
+            with storage_caller(replace(caller, command=event.audit_command)):
+                self._store.note_human_history_gap(
+                    "record_command", self._run_id, detail=tool.value
+                )
+            self._controller.inhibit_human_routine_for_storage_failure()
+
+    async def _dispatch_emergency_with_audit(self, item: QueuedOperatorAction) -> bool:
+        if self._controller.authority is ControlAuthority.AUTOMATIC:
+            confirmed = await self._dispatch(item)
+            await self._flush_events()
+            return confirmed
+        with storage_caller(self._new_storage_caller()):
+            confirmed = await self._dispatch(item)
+            await self._flush_events()
+            return confirmed
 
     async def dispatch_priority_emergency_stop(
         self, item: QueuedOperatorAction, *, already_admitted: bool = False
@@ -1680,11 +1894,7 @@ class RoastRunner:
             self._fault_acknowledgement_gate.invalidate_fault_acknowledgement()
             self._emergency_stop_since_last_drain = True
             self.admit_emergency_stop()
-        await self._dispatch(item)
-        # The normal tick may already have passed its final event flush while
-        # awaiting completion persistence. Drain under the shared flush lock so
-        # direct emergency dispatch cannot leave a buffered event behind.
-        await self._flush_events()
+        await self._dispatch_emergency_with_audit(item)
         return True
 
     async def dispatch_shutdown_emergency_stop(
@@ -1703,9 +1913,7 @@ class RoastRunner:
             self._fault_acknowledgement_gate.invalidate_fault_acknowledgement()
             self._emergency_stop_since_last_drain = True
             self.admit_emergency_stop()
-        confirmed = await self._dispatch(item)
-        await self._flush_events()
-        return confirmed
+        return await self._dispatch_emergency_with_audit(item)
 
     def admit_emergency_stop(self) -> None:
         """Synchronously fence routine controller work before queue dispatch."""
@@ -1862,6 +2070,13 @@ class RoastRunner:
                 await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
                 return
             before = await capability.read_fault_acknowledgement_state(session_id)
+            if (
+                self._controller.authority is ControlAuthority.HUMAN
+                and self._fault_acknowledgement_gate.emergency_request_epoch
+                != acknowledgement_epoch
+            ):
+                await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
+                return
             if not self._fault_acknowledgement_state_is_ready(before, session_id):
                 await self._record_fault_acknowledgement_failure("unsafe_state")
                 return
@@ -2061,7 +2276,7 @@ class RoastRunner:
         finalise = phase is RoastPhase.COMPLETE or (
             phase is RoastPhase.FAULTED and self._fault_acknowledgement_epoch is not None
         )
-        if not finalise:
+        if not finalise or self._completion_storage_uncertain:
             return False
         if self._finalized:
             return True
@@ -2103,7 +2318,16 @@ class RoastRunner:
             or (d212_generation is not None and session_id is not None and close is not None)
         ):
             self._controller.begin_human_completion()
-            settled = await self._controller.settle_human_drop_evaluations()
+            caller = current_storage_caller()
+            try:
+                settled = (
+                    await self._controller.settle_human_drop_evaluations()
+                    if caller is None
+                    else await caller.deadline.wait(self._controller.settle_human_drop_evaluations)
+                )
+            except HistoryUnavailable:
+                self._store.note_human_history_gap("terminal_evaluation_settlement", self._run_id)
+                settled = False
             if acknowledgement_epoch is not None and (
                 not self._fault_acknowledgement_gate.finalization_is_current(acknowledgement_epoch)
             ):
@@ -2131,7 +2355,9 @@ class RoastRunner:
                     )
                 except (Exception, asyncio.CancelledError):
                     if human:
+                        self._completion_storage_uncertain = True
                         self._controller.begin_human_completion(uncertain=True)
+                        self._release_unconfirmed_fault_finalization()
                     raise
                 d212_closed_atomically = evidence is _FinalisationCloseEvidence.COMMITTED
                 if human:
@@ -2140,7 +2366,14 @@ class RoastRunner:
                         if not self._controller.human_drop_closed():
                             self._completion_persistence_initiated = False
                     elif evidence is _FinalisationCloseEvidence.UNCERTAIN:
+                        self._completion_storage_uncertain = True
                         self._controller.begin_human_completion(uncertain=True)
+                        self._release_unconfirmed_fault_finalization()
+                        with contextlib.suppress(HistoryUnavailable):
+                            await self._record_fault_acknowledgement_failure(
+                                "persistence_unconfirmed"
+                            )
+                        return False
             if not d212_closed_atomically:
                 self._fault_acknowledged = False
                 self._fault_acknowledgement_epoch = None
@@ -2189,7 +2422,9 @@ class RoastRunner:
                 )
         except (Exception, asyncio.CancelledError):
             if human:
+                self._completion_storage_uncertain = True
                 self._controller.begin_human_completion(uncertain=True)
+                self._release_unconfirmed_fault_finalization()
             raise
         if phase is RoastPhase.FAULTED:
             # A row can become terminal while this await is in flight, but it
@@ -2238,7 +2473,16 @@ class RoastRunner:
                 # Legacy acknowledgement still must wait for the durable row
                 # and the same post-await e-stop fence before it becomes a
                 # confirmed operator outcome.
-                if await self._commit_fault_acknowledgement_confirmation(acknowledgement_epoch):
+                try:
+                    confirmed = await self._commit_fault_acknowledgement_confirmation(
+                        acknowledgement_epoch
+                    )
+                except HistoryUnavailable:
+                    if human:
+                        self._completion_storage_uncertain = True
+                        self._controller.begin_human_completion(uncertain=True)
+                    raise
+                if confirmed:
                     self._fault_acknowledged = True
                     self._controller.note_fault_acknowledged()
                     self._emitter.emit(
@@ -2289,22 +2533,62 @@ class RoastRunner:
                     return reason
         return None  # pragma: no cover — every fault evaluation carries a reason
 
+    def _note_unwritten_event(self, event: _BufferedEvent) -> None:
+        caller = current_storage_caller() or self._new_storage_caller()
+        with storage_caller(replace(caller, command=event.audit_command)):
+            self._store.note_human_history_gap(
+                "record_event", self._run_id, detail=event.kind.value
+            )
+        self._controller.inhibit_human_routine_for_storage_failure()
+
+    def _discard_unwritten_events(self) -> None:
+        for event in self._emitter.drain():
+            self._note_unwritten_event(event)
+
     async def _flush_events(self) -> None:
-        async with self._event_flush_lock:
-            for event in self._emitter.drain():
+        caller = current_storage_caller()
+        if caller is None and self._controller.authority is ControlAuthority.HUMAN:
+            caller = self._new_storage_caller()
+        lock = self._event_flush_lock
+        if caller is None:
+            await lock.acquire()
+        else:
+            try:
+                await caller.deadline.wait(lock.acquire)
+            except (HistoryUnavailable, asyncio.CancelledError) as exc:
+                # Only the flush holding the lock removes its batch. Remaining
+                # buffered items belong to this refused flush and are attributed.
+                self._discard_unwritten_events()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return
+        try:
+            events = self._emitter.drain()
+            for index, event in enumerate(events):
                 try:
-                    payload = self._event_payload_for_persistence(event)
-                    await self._store.record_event(
-                        run_id=self._run_id,
-                        kind=event.kind,
-                        source=_event_source(event),
-                        monotonic_seconds=event.monotonic_seconds,
-                        payload=payload,
-                    )
-                except Exception:
-                    # One bad row never crashes the safety tick loop or drops a
-                    # sibling event already delivered to SSE.
-                    continue
+                    with (
+                        contextlib.nullcontext()
+                        if caller is None
+                        else storage_caller(replace(caller, command=event.audit_command))
+                    ):
+                        payload = self._event_payload_for_persistence(event)
+                        await self._store.record_event(
+                            run_id=self._run_id,
+                            kind=event.kind,
+                            source=_event_source(event),
+                            monotonic_seconds=event.monotonic_seconds,
+                            payload=payload,
+                        )
+                except asyncio.CancelledError:
+                    if caller is not None:
+                        for sibling in events[index + 1 :]:
+                            self._note_unwritten_event(sibling)
+                    raise
+                except Exception:  # noqa: BLE001 - one failed row cannot crash the safety tick
+                    if caller is not None:
+                        self._controller.inhibit_human_routine_for_storage_failure()
+        finally:
+            lock.release()
 
     def _event_payload_for_persistence(self, event: _BufferedEvent) -> object:
         """Add recovery evidence to the persisted copy without changing SSE bytes."""
@@ -2753,6 +3037,8 @@ class RoastService:
         self._closure_invalidation_tasks: set[asyncio.Task[None]] = set()
         self._shutdown_started = False
         self._authority = authority
+        if authority is ControlAuthority.HUMAN:
+            store.enable_human_storage(clock, self._config.controller.tick_interval_seconds)
         self._human_admission = HumanCallAdmissionFence()
         self._human_ownership = HumanRunOwnership()
         self._fault_lease_cache = FaultControlLease(
@@ -2839,6 +3125,17 @@ class RoastService:
                 cast(FaultControlPort, roaster),
                 arbiter=self._command_arbiter,
                 trace_sink=store,
+                history_deadline=(
+                    (
+                        lambda: StorageDeadline.start(
+                            self._clock,
+                            self._config.controller.tick_interval_seconds,
+                        )
+                    )
+                    if authority is ControlAuthority.HUMAN
+                    else None
+                ),
+                child_generation=lambda: None if self._mcp is None else self._mcp.child_epoch,
                 human_drop_controller=(
                     self._human_fault_drop_controller
                     if authority is ControlAuthority.HUMAN
@@ -5284,7 +5581,7 @@ class RoastService:
         # arbitration step.  ``create_task`` may run immediately, so scheduling
         # SQLite first would let a queued routine write observe the task before
         # this e-stop has its shared-arbiter priority reservation.
-        self._schedule_admitted_fault_control_lease_persistence(admitted)
+        lease_audit = self._schedule_admitted_fault_control_lease_persistence(admitted)
         executor = self._fault_control_executor
         qualifies = False
         if was_finalizing and live_runner is not None:
@@ -5295,6 +5592,7 @@ class RoastService:
                 if executor is None or session_id is None:
                     await self._command_arbiter.cancel_emergency_stop_admission()
                     live_runner.rearm_emergency_stop_fail_safe()
+                    await self._settle_emergency_lease_audit(lease_audit)
                     return FaultControlsActionResult(
                         action=OperatorAction.EMERGENCY_STOP,
                         result="failed",
@@ -5324,6 +5622,7 @@ class RoastService:
                 raise
             except Exception:  # noqa: BLE001 - e-stop attempt remains unconfirmed
                 confirmed = False
+            await self._settle_emergency_lease_audit(lease_audit)
             return FaultControlsActionResult(
                 action=OperatorAction.EMERGENCY_STOP,
                 result="confirmed" if confirmed else "failed",
@@ -5345,6 +5644,7 @@ class RoastService:
             # token, so release it explicitly rather than stranding routine
             # command arbitration behind an unconfirmable software stop.
             await self._command_arbiter.cancel_emergency_stop_admission()
+            await self._settle_emergency_lease_audit(lease_audit)
             return FaultControlsActionResult(
                 action=OperatorAction.EMERGENCY_STOP,
                 result="failed",
@@ -5367,6 +5667,7 @@ class RoastService:
             # Keep the controller-owned stop alive when its HTTP waiter exits.
             dispatch.add_done_callback(self._log_cancelled_estop_dispatch)
             raise
+        await self._settle_emergency_lease_audit(lease_audit)
         return FaultControlsActionResult(
             action=OperatorAction.EMERGENCY_STOP,
             result="accepted" if dispatched else "failed",
@@ -5481,7 +5782,9 @@ class RoastService:
         self._unconfirmed_fault_lease_generation = generation
         return self._fault_lease_cache
 
-    def _schedule_admitted_fault_control_lease_persistence(self, lease: FaultControlLease) -> None:
+    def _schedule_admitted_fault_control_lease_persistence(
+        self, lease: FaultControlLease
+    ) -> asyncio.Task[None]:
         """Schedule durable evidence for a fully admitted in-memory lease."""
         if lease.run_id is None:  # pragma: no cover - every admitted lease names its run
             raise RuntimeError("admitted fault-control lease is missing its run id")
@@ -5495,6 +5798,13 @@ class RoastService:
         )
         self._fault_lease_persistence_tasks.add(task)
         task.add_done_callback(self._fault_lease_persistence_tasks.discard)
+        return task
+
+    async def _settle_emergency_lease_audit(self, task: asyncio.Task[None]) -> None:
+        if self._authority is ControlAuthority.HUMAN:
+            # Only a post-dispatch waiter observes this audit. The storage
+            # adapter owns its native write even if the bounded waiter leaves.
+            await asyncio.wait({task}, timeout=self._config.controller.tick_interval_seconds)
 
     async def settle_fault_lease_persistence_for_teardown(self) -> bool:
         """Drain admitted e-stop lease writes before the live store closes.
@@ -5586,6 +5896,12 @@ class RoastService:
             run_id=run_id,
             mcp_session_id=session_id,
         )
+        if self._authority is ControlAuthority.HUMAN and (
+            self._fault_lease_cache != admitted
+            or self._unconfirmed_fault_lease_generation != generation
+        ):
+            self._store.note_human_history_gap("superseded_fault_lease", run_id)
+            return
         if session_id is None:
             lease = await self._store.replace_fault_control_lease_unknown(
                 run_id, generation=generation
@@ -6468,6 +6784,11 @@ class RoastService:
             configured_doctrine_enabled=configured_doctrine_enabled,
             recovered_history_mutation_lock=recovered_history_mutation_lock,
         )
+        if self._authority is ControlAuthority.HUMAN:
+            self._store.set_human_history_run(
+                run_id,
+                recovered=recovered_history_mutation_lock is not None,
+            )
         self.runner = runner
         return runner
 
@@ -6952,7 +7273,7 @@ class RoastService:
             return
         if self._human_ownership.lifecycle_blocked:
             return
-        if not self._fault_control_audit_shutdown_clean:
+        if not self._fault_control_audit_shutdown_clean or not self._store.human_storage_quiescent:
             return
         if self._restart_clearance_state is not RestartClearanceState.CLEARED:
             return
@@ -6964,6 +7285,8 @@ class RoastService:
             lease = await self._read_fault_lease_fail_closed()
             if active is not None or lease.status is not FaultLeaseStatus.CLOSED:
                 return
+            if self._store.human_storage_enabled:
+                await self._store.close()
             if not await self._store.mark_process_epoch_clean(self.instance_id):
                 _log.error("could not durably mark clean process epoch")
         except Exception:  # noqa: BLE001 - uncertainty must remain unclean
@@ -7054,6 +7377,7 @@ class RoastService:
         endpoint = snapshot.human_endpoint
         command = snapshot.human_command_disposition
         return HumanProtectionProjection(
+            human_history_durability=runner.history_durability(),
             human_endpoint=None if endpoint is None else _HUMAN_ENDPOINT_PROJECTION[endpoint],
             human_command_disposition=None
             if command is None
@@ -7950,7 +8274,7 @@ class RoastService:
             runner.invalidate_fault_acknowledgement_for_emergency_stop()
             runner.admit_emergency_stop()
             emergency_generation = self._command_arbiter.generation
-            self._schedule_admitted_fault_control_lease_persistence(admitted)
+            lease_audit = self._schedule_admitted_fault_control_lease_persistence(admitted)
             if was_finalizing and self._live_estop_bypasses_terminal_writer(runner):
                 runner.consume_admitted_emergency_stop_for_exact_dispatch()
                 session_id = admitted.mcp_session_id
@@ -7998,7 +8322,8 @@ class RoastService:
             # There is no matching live controller, therefore no controller
             # priority reservation was made.  Persist the fail-closed lease so
             # Start remains fenced, but do not fabricate an arbiter token.
-            self._schedule_admitted_fault_control_lease_persistence(admitted)
+            lease_audit = self._schedule_admitted_fault_control_lease_persistence(admitted)
+        await self._settle_emergency_lease_audit(lease_audit)
         result: Literal["accepted", "rejected", "failed"] = (
             "accepted" if confirmed or dispatched else "failed"
         )
@@ -8010,12 +8335,24 @@ class RoastService:
                 if dispatched
                 else "software e-stop attempt was not confirmed"
             )
-        await self._store.record_operator_action(
-            action=request.action.value,
-            result=result,
-            run_id=run_id,
-            payload=request.payload,
-        )
+        try:
+            await self._store.record_operator_action(
+                action=request.action.value,
+                result=result,
+                run_id=run_id,
+                payload=request.payload,
+            )
+        except HistoryUnavailable:
+            if self._authority is not ControlAuthority.HUMAN:
+                raise
+        except Exception:  # noqa: BLE001 - the actuator result is independent of an audit failure
+            if self._authority is not ControlAuthority.HUMAN:
+                raise
+            self._store.note_human_history_gap(
+                "record_operator_action",
+                run_id,
+                detail=request.action.value,
+            )
         return OperatorActionResult(
             action=request.action, result=result, reason=reason, queued=False
         )
@@ -8146,12 +8483,16 @@ class RoastService:
             if state is not None
             else "exact fault-session action was not confirmed"
         )
-        await self._store.record_operator_action(
-            action=request.action.value,
-            result=result,
-            run_id=run_id,
-            payload=request.payload,
-        )
+        try:
+            await self._store.record_operator_action(
+                action=request.action.value,
+                result=result,
+                run_id=run_id,
+                payload=request.payload,
+            )
+        except HistoryUnavailable:
+            if self._authority is not ControlAuthority.HUMAN:
+                raise
         return OperatorActionResult(
             action=request.action, result=result, reason=reason, queued=False
         )
@@ -9730,6 +10071,19 @@ def _parse_last_event_id(raw: str | None) -> int | None:
         return None
 
 
+async def _history_unavailable_response(request: Request, _exc: Exception) -> JSONResponse:
+    service = getattr(request.app.state, "service", None)
+    run_id = request.path_params.get("run_id")
+    data: dict[str, object] = {"detail": "HUMAN history is temporarily unavailable"}
+    if isinstance(service, RoastService) and isinstance(run_id, str):
+        projection = service.human_protection_projection(run_id)
+        if projection.human_history_durability is not None:
+            data.update(projection.model_dump(mode="json"))
+            if projection.human_history_durability is not HumanHistoryDurability.UNKNOWN:
+                data["human_history_durability"] = HumanHistoryDurability.UNAVAILABLE.value
+    return JSONResponse(data, status_code=503)
+
+
 async def stream_events(
     run_id: str,
     request: Request,
@@ -9755,10 +10109,11 @@ async def stream_events(
     constructed EventSource sends no header). A malformed value is ignored — the
     connection falls back to a fresh stream plus REST re-hydration.
     """
-    try:
-        await service.detail(run_id)  # 404 a stream for an unknown run
-    except RoastRunNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if service.human_protection_projection(run_id).human_history_durability is None:
+        try:
+            await service.detail(run_id)  # 404 a stream for an unknown run
+        except RoastRunNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
     # Header first (native EventSource resume), query param as the explicit-reconnect
     # fallback. Either parses defensively to None on a malformed value. Use an
     # explicit None check (not `or`) so a legitimate id of 0 — replay the whole
@@ -9910,6 +10265,7 @@ def create_app(
     )
     app.state.service = service
     app.add_exception_handler(RequestValidationError, _request_validation_error_handler)
+    app.add_exception_handler(HistoryUnavailable, _history_unavailable_response)
     app.get(HEALTH_PATH)(health)
     app.get(CONFIG_PATH)(get_config)
     app.put(CONFIG_PATH)(put_config)

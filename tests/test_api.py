@@ -5174,6 +5174,7 @@ async def test_sse_endpoint_emits_heartbeat_when_idle(store: RoastStore) -> None
         "run_id": "run-hb",
         "human_endpoint": None,
         "human_command_disposition": None,
+        "human_history_durability": None,
         "physical_intervention_required": None,
         "emergency_fallback_disclosure": None,
     }
