@@ -11,13 +11,14 @@ import sqlite3
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, NoReturn, cast
 from unittest import mock
 
 import aiosqlite as aiosqlite_module
 import pytest
 
-from roastpilot_agent import roast_landmarks
+from roastpilot_agent import human_persistence, roast_landmarks
 from roastpilot_agent import store as store_module
 from roastpilot_agent.ambient_evidence import AmbientEvidenceVerdict, NotProvenReason
 from roastpilot_agent.human_persistence import (
@@ -10639,6 +10640,30 @@ async def test_human_ambiguous_commit_keeps_exact_owner_across_diagnostic_evicti
         assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.UNAVAILABLE
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_storage_waits_share_absolute_native_expiry_when_clock_is_frozen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logical = FakeClock()
+    native = FakeClock()
+    monkeypatch.setattr(human_persistence, "time", SimpleNamespace(monotonic=native))
+    deadline = StorageDeadline.start(logical, 1.0)
+    entered: list[float] = []
+
+    async def spend(amount: float) -> None:
+        entered.append(amount)
+        native.advance(amount)
+
+    await deadline.wait(lambda: spend(0.625))
+    assert deadline.remaining() == 0.375
+    await deadline.wait(lambda: spend(0.375))
+    assert deadline.remaining() == 0.0
+    assert logical() == 0.0
+    with pytest.raises(HistoryUnavailable, match="deadline"):
+        await deadline.wait(lambda: spend(1.0))
+    assert entered == [0.625, 0.375]
 
 
 @pytest.mark.asyncio

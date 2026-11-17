@@ -221,6 +221,8 @@ async def _exercise_route(
     original_emit = emitter.emit
     registered_evaluations = controller._human_drop_evaluation_tasks  # pyright: ignore[reportPrivateUsage]
     strict_results: list[FaultControlCommandResult] = []
+    acknowledgement_readbacks: list[FaultAcknowledgementState] = []
+    completion: asyncio.Task[bool] | None = None
     emergency_dispatch_generations: list[int] = []
     unbound_errors: list[MCPToolError] = []
     unbound_attempts: list[str] = []
@@ -275,7 +277,9 @@ async def _exercise_route(
         if interval == "proof" and not reserved.is_set():
             reserved.set()
             await release_proof.wait()
-        return await original_read_ack(session_id)
+        state = await original_read_ack(session_id)
+        acknowledgement_readbacks.append(state)
+        return state
 
     async def settle() -> bool:
         if interval == "barrier":
@@ -288,6 +292,9 @@ async def _exercise_route(
     ) -> FaultControlCommandResult:
         strict_tools.append(name)
         if name == "emergency_stop":
+            assert completion is not None and not completion.done(), (
+                "e-stop dispatch must precede completion"
+            )
             emergency_dispatch_generations.append(controller.command_generation)
         result = await original_strict(name, arguments)
         if name == "emergency_stop":
@@ -300,6 +307,9 @@ async def _exercise_route(
         reason: str = "manual emergency stop", *, expected_session_id: str | None = None
     ) -> EventCommandResult:
         assert expected_session_id is None
+        assert completion is not None and not completion.done(), (
+            "e-stop dispatch must precede completion"
+        )
         unbound_attempts.append(reason)
         try:
             return await original_emergency(reason, expected_session_id=expected_session_id)
@@ -342,7 +352,6 @@ async def _exercise_route(
             run.id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
         )
     )
-    completion: asyncio.Task[bool] | None = None
     try:
         await asyncio.wait_for(evaluation_held.wait(), 4)
         if interval == "barrier":
@@ -364,8 +373,16 @@ async def _exercise_route(
         assert acknowledgement.result == "accepted" and acknowledgement.queued
         completion = asyncio.create_task(runner.tick_once())
         await asyncio.wait_for(reserved.wait(), 4)
-        ready = await client.get_roast_state(session)
-        assert ready.cooling_on is (interval == "proof")
+        if interval == "barrier":
+            # D212 already obtained exact-session safe-zero readback before
+            # reaching settlement. Do not spend the held wait on another RPC.
+            pre_stop = acknowledgement_readbacks[-1]
+            assert pre_stop.session_id == session and pre_stop.mcp_phase == "fault"
+            assert not pre_stop.active and not pre_stop.cooling_on
+        else:
+            ready = await client.get_roast_state(session)
+            assert ready.session_id == session and ready.phase == "fault"
+            assert not ready.active and ready.cooling_on
         if route == "global":
             stopped = await asyncio.wait_for(stop_global(), 4)
         else:
