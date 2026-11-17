@@ -12,9 +12,10 @@ from unittest.mock import Mock, PropertyMock
 import pytest
 
 from roastpilot_agent import controller as controller_module
-from roastpilot_agent.advisor import FakeAdvisor, RoastAdvisor
-from roastpilot_agent.config import AppConfig, ControllerConfig, SafetyLimits
+from roastpilot_agent.advisor import AdvisorFailureMode, FakeAdvisor, RoastAdvisor
+from roastpilot_agent.config import AppConfig, ControllerConfig, PostFirstCrackControl, SafetyLimits
 from roastpilot_agent.controller import (
+    AdvisoryTrigger,
     CommandArbiter,
     FaultControlExecutor,
     InvalidTransitionError,
@@ -140,6 +141,7 @@ async def make_human(
     bind_session: bool = True,
     bind_child: bool = True,
     read_port: bool = True,
+    post_first_crack_control: PostFirstCrackControl | None = None,
 ) -> HumanHarness:
     clock = FakeClock()
     log: list[str] = []
@@ -150,7 +152,14 @@ async def make_human(
     fence = HumanCallAdmissionFence()
     arbiter = CommandArbiter()
     controller = RoastController(
-        config=ControllerConfig(t0_debounce_ticks=charge_debounce),
+        config=ControllerConfig(
+            t0_debounce_ticks=charge_debounce,
+            post_first_crack_control=(
+                post_first_crack_control
+                if post_first_crack_control is not None
+                else PostFirstCrackControl()
+            ),
+        ),
         safety=safety if safety is not None else SafetyPolicy(SafetyLimits()),
         state_reader=actuator,
         command_executor=actuator,
@@ -172,6 +181,101 @@ async def make_human(
     if start:
         await controller.start_run(PROFILE)
     return HumanHarness(clock, actuator, sink, emitter, controller, ownership, fence, arbiter, log)
+
+
+@pytest.mark.parametrize(
+    ("phase", "advisor_fails", "post_fc_enabled", "ceiling_enabled"),
+    [
+        pytest.param(
+            RoastPhase.ROASTING_PRE_FIRST_CRACK, False, True, True, id="no-advisor-no-dtr"
+        ),
+        pytest.param(RoastPhase.DEVELOPMENT, False, True, False, id="legacy-ceiling-off"),
+        pytest.param(RoastPhase.DEVELOPMENT, True, False, True, id="failed-advisor-in-dwell"),
+    ],
+)
+async def test_t11_human_protection_does_not_wait_for_legacy_gates(
+    phase: RoastPhase, advisor_fails: bool, post_fc_enabled: bool, ceiling_enabled: bool
+) -> None:
+    advisor = FakeAdvisor([AdvisorFailureMode.PROVIDER_ERROR]) if advisor_fails else None
+    h = await make_human(
+        advisor=advisor,
+        post_first_crack_control=PostFirstCrackControl(
+            enabled=post_fc_enabled, ceiling_guard_drop_enabled=ceiling_enabled
+        ),
+    )
+    await h.turn(bean=180)
+    await h.turn(bean=183, t0=True)
+    if phase is RoastPhase.DEVELOPMENT:
+        await h.controller.operator_mark_first_crack()
+    await h.turn(bean=185)
+
+    before = h.controller.snapshot()
+    assert before.phase is phase
+    assert before.charge_detected
+    assert before.human_endpoint is EndpointDisposition.NONE
+    assert before.human_command_disposition is CommandDisposition.SETTLED
+    assert h.controller._known_human_identity() == (  # pyright: ignore[reportPrivateUsage]
+        h.actuator.session_id,
+        h.actuator.epoch,
+    )
+    assert h.controller._accepted_readings.project_freshness() is ReadingFreshness.FRESH  # pyright: ignore[reportPrivateUsage]
+    if phase is RoastPhase.ROASTING_PRE_FIRST_CRACK:
+        assert before.development_percent is None
+        assert h.controller._development_time_ratio() is None  # pyright: ignore[reportPrivateUsage]
+    if advisor is not None:
+        assert len(advisor.contexts) == 1
+        assert [entry.status for entry in h.sink.advisor_decisions] == ["provider_error"]
+        policy = h.controller._advisory_policy  # pyright: ignore[reportPrivateUsage]
+        threshold = reading(196, 200)
+        assert (
+            policy.evaluate(
+                phase=phase, telemetry=threshold, now=h.clock() + 0.25, manual_request=False
+            )
+            is None
+        )
+        assert (
+            policy.evaluate(
+                phase=phase,
+                telemetry=threshold,
+                now=h.clock() + ControllerConfig().post_fc_min_consult_interval_seconds,
+                manual_request=False,
+            )
+            is AdvisoryTrigger.BEAN_TEMP_DELTA
+        )
+
+    h.actuator.calls.clear()
+    h.sink.evaluations.clear()
+    h.log.clear()
+    await h.turn(bean=196)
+
+    assert h.commands.count("drop_beans") == 1
+    assert h.commands == ["drop_beans"]
+    assert h.controller.phase is RoastPhase.COOLING
+    assert h.controller.snapshot().human_endpoint is EndpointDisposition.ISSUED
+    assert [
+        evaluation.verdict
+        for evaluation in h.sink.evaluations
+        if evaluation.rule == "human_protective_drop"
+    ] == [SafetyVerdict.ALLOW]
+    (command,) = [
+        cast("dict[str, object]", payload)
+        for kind, payload in h.emitter.events
+        if kind is RoastEventKind.COMMAND_EXECUTED
+        and isinstance(payload, dict)
+        and cast("dict[str, object]", payload).get("command") == "drop_beans"
+    ]
+    assert command["reason"] == DropReason.HUMAN_PROTECTION.value
+    assert command["target_outcome"] == "interrupted_unmet"
+    assert h.log.index("drop_beans") < h.log.index("persist_snapshot")
+    threshold_read = h.sink.snapshots[-1]
+    assert threshold_read is not None
+    assert threshold_read.bean_temp_c == 196
+    assert not threshold_read.first_crack_detected
+    await h.turn(bean=196)
+    assert h.commands == ["drop_beans"]
+    if advisor is not None:
+        assert len(advisor.contexts) == 1
+        assert [entry.status for entry in h.sink.advisor_decisions] == ["provider_error"]
 
 
 @pytest.mark.parametrize(("bean", "expected"), [(195.99, 0), (196.0, 1), (196.01, 1)])
