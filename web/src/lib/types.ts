@@ -760,8 +760,32 @@ export interface RoastHistory {
   runs: RoastSummary[];
 }
 
+export type HumanEndpointProjection =
+  | "none"
+  | "admitted"
+  | "in_flight"
+  | "issued"
+  | "unknown"
+  | "withheld"
+  | "history_unknown";
+
+export type HumanCommandProjection = "settled" | "unknown";
+
+/** Explicit null clears the live disclosure. */
+export interface HumanProtectionProjection {
+  human_endpoint: HumanEndpointProjection | null;
+  human_command_disposition: HumanCommandProjection | null;
+  physical_intervention_required: boolean | null;
+  emergency_fallback_disclosure: string | null;
+}
+
+/** On roast SSE, absent legacy heartbeat fields carry no disclosure update. */
+export interface HumanProtectionHeartbeat extends HumanProtectionProjection {
+  run_id: string;
+}
+
 /** `GET /api/roasts/{id}` — the hydrate snapshot the SSE hook reads on connect. */
-export interface RoastDetail {
+export interface RoastDetail extends Partial<HumanProtectionProjection> {
   id: string;
   agent_phase: RoastPhase;
   profile: RoastProfile;

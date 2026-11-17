@@ -339,10 +339,10 @@ def _gap_fill_frames() -> list[SseEvent]:
     * ``recovery_acknowledged`` — controller.py ``{"acknowledged": <phase>}``.
     * ``command_failed`` — controller.py ``{"command": ..., "reason": ...}``.
     * ``logs_exported`` — the export manifest ``model_dump`` (api.py emit site).
-    * ``heartbeat`` — the API-originated keepalive (empty data).
+    * ``heartbeat`` — the API-originated run-bound keepalive.
     """
     from roastpilot_agent.api import EventBroadcaster
-    from roastpilot_agent.models import LogManifest, RoastPhase
+    from roastpilot_agent.models import HumanProtectionHeartbeat, LogManifest, RoastPhase
 
     broadcaster = EventBroadcaster()
     queue = broadcaster.subscribe()
@@ -435,10 +435,7 @@ def _gap_fill_frames() -> list[SseEvent]:
     broadcaster.emit(RoastEventKind.LOGS_EXPORTED, manifest.model_dump(mode="json"))
 
     frames = _drain(queue)
-    # The API-originated keepalive: api.py's SSE generator constructs it directly
-    # as ``SseEvent(event=SseEventType.HEARTBEAT)`` (event-only, empty data) — not
-    # via the broadcaster — so we build it the same way it reaches the wire.
-    frames.append(SseEvent(event=SseEventType.HEARTBEAT))
+    frames.append(HumanProtectionHeartbeat(run_id="contract-run").to_sse_event())
     return frames
 
 

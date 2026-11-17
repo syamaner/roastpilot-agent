@@ -4784,6 +4784,10 @@ class _FakeRequest:
             {"last_event_id": last_event_id_query} if last_event_id_query is not None else {}
         )
 
+    def disconnect(self) -> None:
+        """Simulate the client disconnecting from an open stream."""
+        self._disconnected = True
+
     async def is_disconnected(self) -> bool:
         return self._disconnected
 
@@ -5053,11 +5057,11 @@ async def test_sse_endpoint_resumes_from_last_event_id_header(
     service.events.emit(RoastEventKind.PHASE_CHANGED, {"phase": "development"})  # id 2
     request = cast(Request, _FakeRequest(last_event_id_header="1"))
     response = await stream_events("run-resume", request, service)
-    # First the opening comment, then the replayed id-2 frame.
-    frames = await _collect_frames(response, 2)
+    # The replayed id-2 frame follows the opening comment and keepalive.
+    frames = await _collect_frames(response, 3)
     assert frames[0] == ": connected\n\n"
-    assert "id: 2" in frames[1]
-    assert "event: phase_changed" in frames[1]
+    assert "id: 2" in frames[2]
+    assert "event: phase_changed" in frames[2]
 
 
 @pytest.mark.asyncio
@@ -5071,10 +5075,10 @@ async def test_sse_endpoint_resumes_from_last_event_id_query_param(
     service.events.emit(RoastEventKind.FAULT, {"n": 2})  # id 2
     request = cast(Request, _FakeRequest(last_event_id_query="1"))
     response = await stream_events("run-resume-q", request, service)
-    frames = await _collect_frames(response, 2)
+    frames = await _collect_frames(response, 3)
     assert frames[0] == ": connected\n\n"
-    assert "id: 2" in frames[1]
-    assert "event: fault" in frames[1]
+    assert "id: 2" in frames[2]
+    assert "event: fault" in frames[2]
 
 
 @pytest.mark.asyncio
@@ -5086,13 +5090,13 @@ async def test_sse_endpoint_ignores_malformed_last_event_id_header(
     service.events.emit(RoastEventKind.RUN_STARTED, {"n": 1})  # id 1 (not replayed)
     request = cast(Request, _FakeRequest(last_event_id_header="not-a-number"))
     response = await stream_events("run-bad-id", request, service)
-    # Only the opening comment is immediately available; no buffered frame replays.
+    # Only the opening comment and keepalive are available; no buffered frame replays.
     # A subsequent live emit still flows through.
     service.events.emit(RoastEventKind.RUN_COMPLETED, {})  # id 2 (live)
-    frames = await _collect_frames(response, 2)
+    frames = await _collect_frames(response, 3)
     assert frames[0] == ": connected\n\n"
-    assert "id: 2" in frames[1]
-    assert "id: 1" not in frames[1]
+    assert "id: 2" in frames[2]
+    assert "id: 1" not in frames[2]
 
 
 @pytest.mark.asyncio
@@ -5109,10 +5113,10 @@ async def test_sse_endpoint_header_takes_precedence_over_query_param(
     # everything — proving the header, not the query param, drove the resume.
     request = cast(Request, _FakeRequest(last_event_id_header="2", last_event_id_query="0"))
     response = await stream_events("run-prec", request, service)
-    frames = await _collect_frames(response, 2)
+    frames = await _collect_frames(response, 3)
     assert frames[0] == ": connected\n\n"
-    assert "id: 3" in frames[1]
-    assert "id: 1" not in frames[1] and "id: 2" not in frames[1]
+    assert "id: 3" in frames[2]
+    assert "id: 1" not in frames[2] and "id: 2" not in frames[2]
 
 
 @pytest.mark.asyncio
@@ -5128,10 +5132,10 @@ async def test_sse_endpoint_streams_typed_controller_event(
     assert service.events.subscriber_count == 1
 
     service.events.emit(RoastEventKind.PHASE_CHANGED, {"phase": "preheating"})
-    frames = await _collect_frames(response, 2)  # ": connected" then the event
+    frames = await _collect_frames(response, 3)  # opening comment, keepalive, then event
     assert service.events.subscriber_count == 0  # closed → unsubscribed
 
-    frame = _parse_frame(frames[1])
+    frame = _parse_frame(frames[2])
     assert frame["event"] == "phase_changed"
     # phase_changed is enriched with enabled_actions (E10 option (a), D25).
     frame_data = cast("dict[str, object]", frame["data"])
@@ -5151,8 +5155,8 @@ async def test_sse_endpoint_streams_per_tick_telemetry(
     service.events.emit_telemetry(
         TelemetryEventData(agent_phase=RoastPhase.DEVELOPMENT, bean_temp_c=201.5, env_temp_c=211.0)
     )
-    frames = await _collect_frames(response, 2)
-    frame = _parse_frame(frames[1])
+    frames = await _collect_frames(response, 3)
+    frame = _parse_frame(frames[2])
     assert frame["event"] == "telemetry"
     assert isinstance(frame["data"], dict)
     assert frame["data"]["bean_temp_c"] == 201.5
@@ -5166,9 +5170,44 @@ async def test_sse_endpoint_emits_heartbeat_when_idle(store: RoastStore) -> None
     response = await stream_events("run-hb", cast(Request, _FakeRequest()), fast)
     # Collect two keepalives so the loop iterates past the first (no event).
     frames = await _collect_frames(response, 3)  # ": connected", heartbeat, heartbeat
-    assert _parse_frame(frames[1])["event"] == "heartbeat"
-    assert _parse_frame(frames[1])["data"] == {}
-    assert _parse_frame(frames[2])["event"] == "heartbeat"
+    expected = {
+        "run_id": "run-hb",
+        "human_endpoint": None,
+        "human_command_disposition": None,
+        "physical_intervention_required": None,
+        "emergency_fallback_disclosure": None,
+    }
+    for frame in frames[1:]:
+        assert _parse_frame(frame) == {"event": "heartbeat", "data": expected, "id": None}
+
+
+@pytest.mark.asyncio
+async def test_sse_resumes_after_idle_keepalive_and_stops_on_disconnect(store: RoastStore) -> None:
+    service = RoastService(store, sse_heartbeat_seconds=0.01)
+    run_id = "run-idle-disconnect"
+    await _make_run(store, run_id, RoastPhase.DEVELOPMENT)
+    request = _FakeRequest()
+    response = await stream_events(run_id, cast(Request, request), service)
+    iterator = cast(AsyncGenerator[bytes, None], response.body_iterator)
+
+    async with contextlib.aclosing(iterator) as frames:
+        assert await asyncio.wait_for(anext(frames), 1) == b": connected\n\n"
+        opening = _parse_frame((await asyncio.wait_for(anext(frames), 1)).decode())
+        idle = _parse_frame((await asyncio.wait_for(anext(frames), 1)).decode())
+        assert idle == opening
+        assert idle["event"] == "heartbeat"
+        assert idle["id"] is None
+
+        service.events.emit(RoastEventKind.RUN_COMPLETED, {})
+        resumed = _parse_frame((await asyncio.wait_for(anext(frames), 1)).decode())
+        assert resumed == {"event": "run_completed", "data": {}, "id": 1}
+        assert service.events.subscriber_count == 1
+
+        request.disconnect()
+        service.events.emit(RoastEventKind.LOGS_EXPORTED, {})
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(frames), 1)
+        assert service.events.subscriber_count == 0
 
 
 @pytest.mark.asyncio
@@ -5196,8 +5235,8 @@ async def test_sse_disconnect_unsubscribes_and_backend_continues(
     # Backend continues with no client: a fresh stream still receives events.
     response2 = await stream_events("run-dc", cast(Request, _FakeRequest()), service)
     service.events.emit(RoastEventKind.PHASE_CHANGED, {"phase": "development"})
-    frames2 = await _collect_frames(response2, 2)
-    assert _parse_frame(frames2[1])["event"] == "phase_changed"
+    frames2 = await _collect_frames(response2, 3)
+    assert _parse_frame(frames2[2])["event"] == "phase_changed"
 
 
 # --- E9: live controller-loop wiring (the E7 handoff + restart recovery) ---

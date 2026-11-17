@@ -2,8 +2,9 @@
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Awaitable
-from contextlib import suppress
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
+from contextlib import aclosing, suppress
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
@@ -35,6 +36,7 @@ from roastpilot_agent.human_protection import (
     ControlAuthority,
     EndpointDisposition,
     HumanReadEvidence,
+    RawTemperature,
     ReadingFreshness,
     ToolDiscovery,
     WriteClass,
@@ -52,6 +54,7 @@ from roastpilot_agent.models import (
     FaultAcknowledgementState,
     FaultControlsActionRequest,
     FaultControlsActionResult,
+    FaultControlsProjection,
     FaultControlState,
     FaultCoolingStopResult,
     FaultLeaseStatus,
@@ -60,6 +63,7 @@ from roastpilot_agent.models import (
     OperatorActionResult,
     RestartClearanceState,
     RoastCommand,
+    RoastDetail,
     RoastEventKind,
     RoastPhase,
     SseEventType,
@@ -394,6 +398,18 @@ async def test_t49_human_faulted_restart_retains_unknown_ownership(store: RoastS
         service.runner.controller_snapshot().human_endpoint is EndpointDisposition.HISTORY_UNKNOWN
     )
     assert service.runner.controller_snapshot().phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    detail = await service.detail("persisted-fault")
+    assert _protection_fields(detail.model_dump(mode="json")) == {
+        "human_endpoint": "history_unknown",
+        "human_command_disposition": "unknown",
+        "physical_intervention_required": True,
+        "emergency_fallback_disclosure": _FALLBACK_DISCLOSURE,
+    }
+    stream = await stream_events("persisted-fault", cast(Request, _FakeRequest()), service)
+    frames = await asyncio.wait_for(_collect_frames(stream, 2), 1)
+    assert _protection_heartbeat(frames[1].encode(), "persisted-fault") == _protection_fields(
+        detail.model_dump(mode="json")
+    )
     with pytest.raises(RoastRunConflictError, match="HUMAN.*ownership"):
         await service.start_roast(PROFILE)
     assert actuator.commands() == []
@@ -467,8 +483,8 @@ async def test_human_live_recovery_frame_matches_rest_without_private_fields(
     await runner.tick_once()
     if not fresh:
         clock.advance(20)
-    frames = await asyncio.wait_for(_collect_frames(response, 2), 1)
-    phase = _parse_frame(frames[1])
+    frames = await asyncio.wait_for(_collect_frames(response, 3), 1)
+    phase = _parse_frame(frames[2])
     expected = (await service.detail(run.id)).enabled_actions
     assert (OperatorAction.DROP_BEANS in expected) is fresh
     assert phase["data"] == {
@@ -530,12 +546,317 @@ async def test_human_replay_withholds_drop_for_obsolete_run_or_phase(
     response = await stream_events(
         current.id, cast(Request, _FakeRequest(last_event_id_header=str(resume_from))), service
     )
-    frames = await asyncio.wait_for(_collect_frames(response, 2), 1)
-    obsolete_data = cast("dict[str, object]", _parse_frame(frames[1])["data"])
+    frames = await asyncio.wait_for(_collect_frames(response, 3), 1)
+    obsolete_data = cast("dict[str, object]", _parse_frame(frames[2])["data"])
     assert obsolete_data["phase"] == obsolete_phase.value
     actions = cast("list[str]", obsolete_data["enabled_actions"])
     assert OperatorAction.DROP_BEANS.value not in actions
     assert set(obsolete_data) == {"phase", "enabled_actions"}
+
+
+_PROTECTION_CLEAR: dict[str, object] = {
+    "human_endpoint": None,
+    "human_command_disposition": None,
+    "physical_intervention_required": None,
+    "emergency_fallback_disclosure": None,
+}
+_FALLBACK_DISCLOSURE = (
+    "Emergency fallback may stop the drum and close the chute. "
+    "Admission or RPC return does not establish physical evacuation."
+)
+
+
+def _protection_fields(body: dict[str, object]) -> dict[str, object]:
+    return {key: body[key] for key in _PROTECTION_CLEAR}
+
+
+def _protection_heartbeat(chunk: bytes, run_id: str) -> dict[str, object]:
+    frame = _parse_frame(chunk.decode())
+    assert frame["event"] == "heartbeat"
+    assert frame["id"] is None
+    data = cast("dict[str, object]", frame["data"])
+    assert set(data) == {"run_id", *_PROTECTION_CLEAR}
+    assert data["run_id"] == run_id
+    return _protection_fields(data)
+
+
+@pytest.mark.parametrize("endpoint", list(EndpointDisposition))
+@pytest.mark.parametrize("command", list(CommandDisposition))
+async def test_human_protection_wire_vocabulary_is_exact_and_read_only(
+    store: RoastStore, endpoint: EndpointDisposition, command: CommandDisposition
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator)
+    run = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    ownership = controller._human_run  # pyright: ignore[reportPrivateUsage]
+    assert ownership is not None
+    # Sample the complete output vocabulary, including intermediate command
+    # states that need not stay resident long enough for an ordinary GET.
+    ownership.endpoint = endpoint
+    ownership.command = command
+    expected = {
+        "human_endpoint": endpoint.value,
+        "human_command_disposition": command.value,
+        "physical_intervention_required": (
+            command is CommandDisposition.UNKNOWN or endpoint is EndpointDisposition.WITHHELD
+        ),
+        "emergency_fallback_disclosure": _FALLBACK_DISCLOSURE,
+    }
+    writes_before = store.connection.total_changes
+    calls_before = list(actuator.calls)
+    reads_before = actuator.reads
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app(service)), base_url="http://test"
+    ) as client:
+        response = await client.get(f"/api/roasts/{run.id}")
+    assert response.status_code == 200
+    assert _protection_fields(response.json()) == expected
+    stream = await stream_events(run.id, cast(Request, _FakeRequest()), service)
+    async with aclosing(cast("AsyncGenerator[bytes, None]", stream.body_iterator)) as frames:
+        assert await anext(frames) == b": connected\n\n"
+        assert _protection_heartbeat(await anext(frames), run.id) == expected
+    assert store.connection.total_changes == writes_before
+    assert actuator.calls == calls_before
+    assert actuator.reads == reads_before
+
+
+async def test_human_stream_uses_current_disclosure_before_replay_and_clears_on_replacement(
+    store: RoastStore,
+) -> None:
+    clock = FakeClock()
+    service = _service(store, clock, _RunnerRoaster(clock, []))
+    run = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    ownership = controller._human_run  # pyright: ignore[reportPrivateUsage]
+    assert ownership is not None
+    resume_from = service.events.last_event_id
+    service.events.emit(
+        RoastEventKind.RECOVERY_REQUIRED,
+        {"endpoint": "unknown", "physical_intervention_required": True},
+    )
+    stream = await stream_events(
+        run.id, cast(Request, _FakeRequest(last_event_id_header=str(resume_from))), service
+    )
+    async with aclosing(cast("AsyncGenerator[bytes, None]", stream.body_iterator)) as frames:
+        assert await anext(frames) == b": connected\n\n"
+        initial = _protection_heartbeat(await anext(frames), run.id)
+        assert initial["human_endpoint"] == "none"
+        assert initial["physical_intervention_required"] is False
+        historical = _parse_frame((await anext(frames)).decode())
+        assert historical["id"] == resume_from + 1
+        assert historical["data"] == {"endpoint": "unknown", "physical_intervention_required": True}
+
+        # Still bound after durable closure, including the retained WITHHELD
+        # intervention. A following explicit Start replaces that binding.
+        ownership.endpoint = EndpointDisposition.WITHHELD
+        await store.complete_run(
+            run_id=run.id, outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        runner._finalized = True  # pyright: ignore[reportPrivateUsage]
+        controller.note_human_run_durably_closed()
+        assert not ownership.unresolved
+        retained = _protection_fields((await service.detail(run.id)).model_dump(mode="json"))
+        assert retained["human_endpoint"] == "withheld"
+        assert retained["physical_intervention_required"] is True
+        service.events.emit(RoastEventKind.RUN_COMPLETED, {})
+        assert _protection_heartbeat(await anext(frames), run.id) == retained
+        assert _parse_frame((await anext(frames)).decode())["event"] == "run_completed"
+
+        new_run = await service.start_roast(PROFILE)
+        assert new_run.id != run.id
+        assert _protection_heartbeat(await anext(frames), run.id) == _PROTECTION_CLEAR
+        assert _parse_frame((await anext(frames)).decode())["event"] != "heartbeat"
+        assert (
+            _protection_fields((await service.detail(run.id)).model_dump(mode="json"))
+            == _PROTECTION_CLEAR
+        )
+
+
+@pytest.mark.parametrize("replacement", ["absent", "different_runner", "orphan_same_id"])
+async def test_human_detail_rechecks_ownership_after_last_await(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    clock = FakeClock()
+    service = _service(store, clock, _ExactFaultRunner(clock), exact_child=True)
+    run = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    await store.open_fault_control_lease(run_id=run.id, mcp_session_id="test-session")
+    entered, release = asyncio.Event(), asyncio.Event()
+    project = service._fault_controls_projection  # pyright: ignore[reportPrivateUsage]
+
+    async def hold_projection(lease: FaultControlLease) -> FaultControlsProjection:
+        result = await project(lease)
+        entered.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(service, "_fault_controls_projection", hold_projection)
+    pending = asyncio.create_task(service.detail(run.id))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert not pending.done()
+        if replacement == "absent":
+            service.runner = None
+        elif replacement == "different_runner":
+            foreign = _service(store, clock, _RunnerRoaster(clock, []))
+            service.runner = await foreign._build_runner("foreign-run", PROFILE)  # pyright: ignore[reportPrivateUsage]
+        else:
+            # Same visible run ID, obsolete controller record held by the
+            # runner. String equality alone would leak its disclosure.
+            controller.note_human_run_durably_closed()
+            service._human_ownership.claim_run(run.id)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        release.set()
+        detail = await pending
+    assert _protection_fields(detail.model_dump(mode="json")) == _PROTECTION_CLEAR
+    stream = await stream_events(run.id, cast(Request, _FakeRequest()), service)
+    async with aclosing(cast("AsyncGenerator[bytes, None]", stream.body_iterator)) as frames:
+        await anext(frames)
+        assert _protection_heartbeat(await anext(frames), run.id) == _PROTECTION_CLEAR
+
+
+async def test_existing_stream_heartbeat_does_not_wait_for_rest_read_run(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    service = _service(store, clock, _RunnerRoaster(clock, []))
+    service.sse_heartbeat_seconds = 0.01
+    run = await service.start_roast(PROFILE)
+    stream = await stream_events(run.id, cast(Request, _FakeRequest()), service)
+    async with aclosing(cast("AsyncGenerator[bytes, None]", stream.body_iterator)) as frames:
+        await anext(frames)
+        expected = _protection_heartbeat(await anext(frames), run.id)
+        entered, release = asyncio.Event(), asyncio.Event()
+        read_run = store.read_run
+
+        async def blocked_read(run_id: str) -> RoastDetail | None:
+            entered.set()
+            await release.wait()
+            return await read_run(run_id)
+
+        monkeypatch.setattr(store, "read_run", blocked_read)
+        pending = asyncio.create_task(service.detail(run.id))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            assert not pending.done()
+            assert (
+                _protection_heartbeat(await asyncio.wait_for(anext(frames), 1), run.id) == expected
+            )
+            assert not pending.done()
+        finally:
+            release.set()
+            received = await pending
+        assert _protection_fields(received.model_dump(mode="json")) == expected
+
+
+@pytest.mark.parametrize("stall_sink", [True, False])
+async def test_current_human_stream_updates_without_telemetry_or_store_progress(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, stall_sink: bool
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    service.sse_heartbeat_seconds = 0.01
+    run = await service.start_roast(PROFILE)
+    await _charge_live_runner(service, actuator, clock)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    if not stall_sink:
+        controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    stream = await stream_events(run.id, cast(Request, _FakeRequest()), service)
+    async with aclosing(cast("AsyncGenerator[bytes, None]", stream.body_iterator)) as frames:
+        await anext(frames)
+        assert (
+            _protection_heartbeat(await anext(frames), run.id)["physical_intervention_required"]
+            is False
+        )
+        started, release = asyncio.Event(), asyncio.Event()
+        original_read = actuator.read_human_evidence
+
+        async def unusable_read() -> HumanReadEvidence:
+            if not stall_sink:
+                raise RuntimeError("test read failure")
+            return replace(
+                await original_read(), telemetry=None, env=RawTemperature.INVALID, env_temp_c=None
+            )
+
+        async def blocked_write(**_kwargs: object) -> int:
+            started.set()
+            await release.wait()
+            return 1
+
+        monkeypatch.setattr(actuator, "read_human_evidence", unusable_read)
+        if stall_sink:
+            monkeypatch.setattr(store, "record_safety_evaluation", blocked_write)
+        clock.advance(0.25)
+        tick = asyncio.create_task(runner.tick_once())
+        try:
+            if stall_sink:
+                await asyncio.wait_for(started.wait(), 1)
+                assert not tick.done()
+            else:
+                await asyncio.wait_for(asyncio.shield(tick), 1)
+            assert runner.controller_snapshot().telemetry is None
+            next_frame = await asyncio.wait_for(anext(frames), 1)
+            current = _protection_heartbeat(next_frame, run.id)
+            assert current["human_endpoint"] == "none"
+            assert current["physical_intervention_required"] is True
+        finally:
+            release.set()
+            await tick
+
+
+async def test_projection_evaluator_failure_keeps_tick_row_and_shutdown(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    run = await service.start_roast(PROFILE)
+    await _charge_live_runner(service, actuator, clock)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+
+    evaluator = Mock(side_effect=RuntimeError("private exception value"))
+    monkeypatch.setattr(controller, "_human_recovery_drop_evaluation", evaluator)
+    clock.advance(6.0)
+    await runner.tick_once()
+    points = await store.read_telemetry_points(run.id, downsample=1)
+    assert points[-1].tick == runner.current_tick
+    assert points[-1].agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert points[-1].bean_temp_c == actuator.bean
+    detail = await service.detail(run.id)
+    assert detail.physical_intervention_required is True
+    assert OperatorAction.DROP_BEANS not in detail.enabled_actions
+
+    def forbidden(_: HumanCallAdmissionFence) -> None:
+        pytest.fail("snapshot read the emergency-path admission fence")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(HumanCallAdmissionFence, "closed_reason", property(forbidden))
+        patch.setattr(
+            service, "_human_child_teardown_unconfirmed", Mock(side_effect=AssertionError)
+        )
+        assert await service.safe_shutdown_heat_off() is ShutdownHeatOffOutcome.NOT_ACTIVE
+    assert evaluator.call_count >= 3
+    assert "Could not evaluate HUMAN recovery drop projection" in caplog.text
+    assert "private exception value" not in caplog.text
 
 
 async def test_human_emergency_publish_never_reads_action_fence(
@@ -731,6 +1052,14 @@ async def test_human_open_fault_lease_projection_preserves_exact_recovery_evalua
     assert detail.enabled_actions == [OperatorAction.EMERGENCY_STOP]
     assert detail.fault_controls is not None
     assert OperatorAction.DROP_BEANS in detail.fault_controls.enabled_actions
+    assert detail.physical_intervention_required is False
+    state = controller._human_run  # pyright: ignore[reportPrivateUsage]
+    assert state is not None
+    state.endpoint = EndpointDisposition.WITHHELD
+    withheld = await service.detail(run.id)
+    assert withheld.physical_intervention_required is True
+    assert withheld.enabled_actions == detail.enabled_actions
+    assert withheld.fault_controls == detail.fault_controls
     clock.advance(20)
     stale = await service.detail(run.id)
     assert stale.fault_controls is not None
@@ -1905,8 +2234,8 @@ async def test_tf13_raising_drop_projection_omits_only_drop_in_rest_sse_and_admi
     )
     expected = [action for action in before if action is not OperatorAction.DROP_BEANS]
     assert (await service.detail(run.id)).enabled_actions == expected
-    frames = await asyncio.wait_for(_collect_frames(response, 2), 1)
-    assert _parse_frame(frames[1])["data"] == {
+    frames = await asyncio.wait_for(_collect_frames(response, 3), 1)
+    assert _parse_frame(frames[2])["data"] == {
         "phase": RoastPhase.OPERATOR_RECOVERY_REQUIRED.value,
         "enabled_actions": [action.value for action in expected],
     }
@@ -4031,8 +4360,8 @@ async def _d216_owned_phase_actions(service: RoastService, run_id: str) -> objec
     response = await stream_events(
         run_id, cast(Request, _FakeRequest(last_event_id_header=str(owned_id - 1))), service
     )
-    frames = await asyncio.wait_for(_collect_frames(response, 2), 1)
-    data = cast("dict[str, object]", _parse_frame(frames[1])["data"])
+    frames = await asyncio.wait_for(_collect_frames(response, 3), 1)
+    data = cast("dict[str, object]", _parse_frame(frames[2])["data"])
     assert data["phase"] == RoastPhase.OPERATOR_RECOVERY_REQUIRED.value
     return data["enabled_actions"]
 

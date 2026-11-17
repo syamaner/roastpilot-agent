@@ -2037,10 +2037,7 @@ class RoastController:
             or run.endpoint is EndpointDisposition.WITHHELD
             or (
                 self._phase in TERMINAL_LATCH_PHASES
-                and self._human_recovery_drop_evaluation(
-                    freshness=self._accepted_readings.project_freshness()
-                ).verdict
-                is not SafetyVerdict.ALLOW
+                and not self._guarded_human_recovery_drop_evaluation_allows()
             )
         )
         return ControllerSnapshot(
@@ -2691,6 +2688,11 @@ class RoastController:
     def authority(self) -> ControlAuthority:
         """Return the constructor-bound source of roast authority."""
         return self._authority
+
+    def owns_human_run(self, run_id: str) -> bool:
+        """Check live HUMAN ownership by run ID and current record identity."""
+        run = self._human_run
+        return run is not None and run.run_id == run_id and self._human_ownership.is_current(run)
 
     def note_human_run_durably_closed(self) -> None:
         """Record durable local finalization without resolving unknown commands."""
@@ -4124,11 +4126,22 @@ class RoastController:
             and run is not None
             and (session_id is None or run.session_id == session_id)
             and self._human_actuation_admitted()
-            and self._human_recovery_drop_evaluation(
-                freshness=self._accepted_readings.project_freshness()
-            ).verdict
-            is SafetyVerdict.ALLOW
+            and self._guarded_human_recovery_drop_evaluation_allows()
         )
+
+    def _guarded_human_recovery_drop_evaluation_allows(self) -> bool:
+        # Snapshot also serves shutdown. Keep this evaluation-only and leave
+        # dispatch and its persisted evaluations on their existing paths.
+        try:
+            return (
+                self._human_recovery_drop_evaluation(
+                    freshness=self._accepted_readings.project_freshness()
+                ).verdict
+                is SafetyVerdict.ALLOW
+            )
+        except Exception:  # noqa: BLE001 - projection failure only disables DROP
+            _log.warning("Could not evaluate HUMAN recovery drop projection")
+            return False
 
     async def execute_human_fault_drop(
         self,
