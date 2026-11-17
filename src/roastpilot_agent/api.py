@@ -655,6 +655,14 @@ _FAULT_CONTROLS_ACTIONS_PATH = "/api/fault-controls/actions"
 _FAULT_CONTROLS_MAX_BODY_BYTES = 1024
 
 
+class _OwnedHumanStartHistoryUnavailable(HistoryUnavailable):
+    def __init__(self, run_id: str, original: HistoryUnavailable) -> None:
+        super().__init__(
+            "HUMAN Start is owned and its history is unavailable", receipt=original.receipt
+        )
+        self.run_id = run_id
+
+
 class RoastRunConflictError(Exception):
     """A request conflicts with the current run state (maps to HTTP 409):
     starting a roast while one is active, or rating an in-progress run."""
@@ -1245,7 +1253,9 @@ class RoastRunner:
                 counter.
         """
         await self._controller.start_run(profile, recording_roast_num=recording_roast_num)
-        await self._flush_events()
+        events_persisted = await self._flush_events()
+        if self._controller.authority is ControlAuthority.HUMAN and not events_persisted:
+            raise HistoryUnavailable("HUMAN Start event history is unavailable")
         await self._persist_phase_if_changed()
         if self._controller.authority is ControlAuthority.HUMAN:
             self._store.note_human_history_pass(self._run_id)
@@ -1665,7 +1675,7 @@ class RoastRunner:
         events_before_urgent: int | None = None
         if self._controller.authority is ControlAuthority.HUMAN:
             deferred_commands: list[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]] = []
-            deferred_evaluations: list[SafetyEvaluation] = []
+            deferred_evaluations: list[tuple[SafetyEvaluation, CommandReference | None]] = []
             for item in batch:
                 if item.action is OperatorAction.EMERGENCY_STOP:
                     await self._dispatch(
@@ -1676,11 +1686,14 @@ class RoastRunner:
             events_before_urgent = len(self._emitter.peek())
             await self._controller.human_urgent_stage(emergency_won_batch=emergency_stop_wins_batch)
             await self._controller.apply_human_storage_failure_after_urgent()
-            for evaluation in deferred_evaluations:
+            for evaluation, command in deferred_evaluations:
+                caller = current_storage_caller()
+                assert caller is not None  # the HUMAN runner owns this queue turn
                 try:
-                    await self._store.record_safety_evaluation(
-                        run_id=self._run_id, tick=self._counter.value, evaluation=evaluation
-                    )
+                    with storage_caller(replace(caller, command=command)):
+                        await self._store.record_safety_evaluation(
+                            run_id=self._run_id, tick=self._counter.value, evaluation=evaluation
+                        )
                 except HistoryUnavailable:
                     self._controller.inhibit_human_routine_for_storage_failure()
             for tool, item, event in deferred_commands:
@@ -1695,11 +1708,17 @@ class RoastRunner:
                 # An e-stop in this drain creates or refreshes the fault cooling
                 # cycle. A confirmation captured before it cannot terminate that
                 # new cycle; require a fresh operator acknowledgement afterwards.
-                if emergency_stop_wins_batch:
-                    await self._record_fault_acknowledgement_failure("superseded_by_emergency_stop")
-                    continue
-                if fault_acknowledgement_seen:
-                    await self._record_fault_acknowledgement_failure("duplicate")
+                if emergency_stop_wins_batch or fault_acknowledgement_seen:
+                    try:
+                        await self._record_fault_acknowledgement_failure(
+                            "superseded_by_emergency_stop"
+                            if emergency_stop_wins_batch
+                            else "duplicate"
+                        )
+                    except HistoryUnavailable:
+                        if self._controller.authority is not ControlAuthority.HUMAN:
+                            raise
+                        self._controller.inhibit_human_routine_for_storage_failure()
                     continue
                 fault_acknowledgement_seen = True
                 if self._completion_storage_uncertain:
@@ -1720,7 +1739,7 @@ class RoastRunner:
         *,
         deferred_commands: list[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]]
         | None = None,
-        deferred_evaluations: list[SafetyEvaluation] | None = None,
+        deferred_evaluations: list[tuple[SafetyEvaluation, CommandReference | None]] | None = None,
     ) -> bool:
         if self._controller.authority is ControlAuthority.AUTOMATIC:
             return await self._dispatch_action(item)
@@ -1739,7 +1758,7 @@ class RoastRunner:
         outcomes: list[_BufferedEvent] | None = None,
         deferred_commands: list[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]]
         | None = None,
-        deferred_evaluations: list[SafetyEvaluation] | None = None,
+        deferred_evaluations: list[tuple[SafetyEvaluation, CommandReference | None]] | None = None,
     ) -> bool:
         """Route one operator action to its controller handler and record the
         executed MCP command (when one was issued) in the decision trace.
@@ -1784,7 +1803,7 @@ class RoastRunner:
                 already_admitted=already_admitted,
                 defer_evaluation=None
                 if deferred_evaluations is None
-                else deferred_evaluations.append,
+                else lambda evaluation, command: deferred_evaluations.append((evaluation, command)),
             )
             # An e-stop starts a new cooling cycle even if the MCP retains the
             # same session identity, so an earlier stop proof cannot be reused.
@@ -2551,7 +2570,7 @@ class RoastRunner:
         for event in self._emitter.drain():
             self._note_unwritten_event(event)
 
-    async def _flush_events(self) -> None:
+    async def _flush_events(self) -> bool:
         caller = current_storage_caller()
         if caller is None and self._controller.authority is ControlAuthority.HUMAN:
             caller = self._new_storage_caller()
@@ -2567,7 +2586,8 @@ class RoastRunner:
                 self._discard_unwritten_events()
                 if isinstance(exc, asyncio.CancelledError):
                     raise
-                return
+                return False
+        persisted = True
         try:
             events = self._emitter.drain()
             for index, event in enumerate(events):
@@ -2591,10 +2611,12 @@ class RoastRunner:
                             self._note_unwritten_event(sibling)
                     raise
                 except Exception:  # noqa: BLE001 - one failed row cannot crash the safety tick
+                    persisted = False
                     if caller is not None:
                         self._controller.inhibit_human_routine_for_storage_failure()
         finally:
             lock.release()
+        return persisted
 
     def _event_payload_for_persistence(self, event: _BufferedEvent) -> object:
         """Add recovery evidence to the persisted copy without changing SSE bytes."""
@@ -6505,6 +6527,23 @@ class RoastService:
             # docstring). A store read carries no process identity; the store
             # layer must stay unaware of this process-scoped value.
             return detail.model_copy(update={"instance_id": self.instance_id})
+        except HistoryUnavailable as exc:
+            runner = self.runner
+            if (
+                self._authority is ControlAuthority.HUMAN
+                and runner is not None
+                and runner.run_id == run_id
+                and self.active_run_id == run_id
+            ):
+                controller = runner.controller_for_human_fault_drop()
+                if (
+                    controller is not None
+                    and await controller.contain_unconfirmed_human_start_history()
+                ):
+                    if self._run_loop and (self._loop_task is None or self._loop_task.done()):
+                        self._loop_task = asyncio.create_task(runner.run())
+                    raise _OwnedHumanStartHistoryUnavailable(run_id, exc) from exc
+            raise
         finally:
             if self._starting_run_id == run_id:
                 self._starting_run_id = None
@@ -6609,6 +6648,10 @@ class RoastService:
             start_write_permitted=lambda: (
                 self._fault_lease_cache.generation == lease_generation
                 and self._fault_lease_cache.status is FaultLeaseStatus.CLOSED
+                and (
+                    self._authority is ControlAuthority.AUTOMATIC
+                    or self._store.human_storage_quiescent
+                )
             ),
         )
         if runner is None:  # pragma: no cover — guarded by the caller
@@ -8061,12 +8104,7 @@ class RoastService:
                 # published a controller or session. Revoke first, then audit
                 # the accepted cancellation without leasing or queueing an
                 # unconfirmable hardware stop.
-                await self._store.record_operator_action(
-                    action=request.action.value,
-                    result="accepted",
-                    run_id=run_id,
-                    payload=request.payload,
-                )
+                await self._record_admitted_action_outcome(run_id, request, "accepted")
                 return OperatorActionResult(
                     action=request.action,
                     result="accepted",
@@ -8084,12 +8122,7 @@ class RoastService:
                 result: Literal["accepted", "rejected", "failed"] = (
                     "accepted" if terminal.result == "confirmed" else "failed"
                 )
-                await self._store.record_operator_action(
-                    action=request.action.value,
-                    result=result,
-                    run_id=run_id,
-                    payload=request.payload,
-                )
+                await self._record_admitted_action_outcome(run_id, request, result)
                 return OperatorActionResult(
                     action=request.action,
                     result=result,
@@ -8281,12 +8314,15 @@ class RoastService:
                     result = "failed"
                     reason = "operator action queue is full; action not accepted"
 
-        await self._store.record_operator_action(
-            action=request.action.value,
-            result=result,
-            run_id=run_id,
-            payload=request.payload,
-        )
+        if queued:
+            await self._record_admitted_action_outcome(run_id, request, result)
+        else:
+            await self._store.record_operator_action(
+                action=request.action.value,
+                result=result,
+                run_id=run_id,
+                payload=request.payload,
+            )
         return OperatorActionResult(
             action=request.action, result=result, reason=reason, queued=queued
         )
@@ -8374,25 +8410,7 @@ class RoastService:
                 if dispatched
                 else "software e-stop attempt was not confirmed"
             )
-        try:
-            await self._store.record_operator_action(
-                action=request.action.value,
-                result=result,
-                run_id=run_id,
-                payload=request.payload,
-            )
-        except HistoryUnavailable:
-            if self._authority is not ControlAuthority.HUMAN:
-                raise
-        except Exception:  # noqa: BLE001 - the actuator result is independent of an audit failure
-            if self._authority is not ControlAuthority.HUMAN:
-                raise
-            self._store.note_human_history_gap(
-                "record_operator_action",
-                run_id,
-                detail=request.action.value,
-                unverified=True,
-            )
+        await self._record_admitted_action_outcome(run_id, request, result)
         return OperatorActionResult(
             action=request.action, result=result, reason=reason, queued=False
         )
@@ -8408,6 +8426,32 @@ class RoastService:
             _log.error(
                 "controller-owned emergency-stop dispatch failed after request cancellation",
                 exc_info=(type(error), error, error.__traceback__),
+            )
+
+    async def _record_admitted_action_outcome(
+        self,
+        run_id: str,
+        request: OperatorActionRequest,
+        result: Literal["accepted", "rejected", "failed"],
+    ) -> None:
+        try:
+            await self._store.record_operator_action(
+                action=request.action.value,
+                result=result,
+                run_id=run_id,
+                payload=request.payload,
+            )
+        except HistoryUnavailable:
+            if self._authority is not ControlAuthority.HUMAN:
+                raise
+        except Exception:  # noqa: BLE001 - admitted action outcomes survive audit failure
+            if self._authority is not ControlAuthority.HUMAN:
+                raise
+            self._store.note_human_history_gap(
+                "record_operator_action",
+                run_id,
+                detail=request.action.value,
+                unverified=True,
             )
 
     async def _submit_open_fault_lease_action(
@@ -10111,10 +10155,13 @@ def _parse_last_event_id(raw: str | None) -> int | None:
         return None
 
 
-async def _history_unavailable_response(request: Request, _exc: Exception) -> JSONResponse:
+async def _history_unavailable_response(request: Request, exc: Exception) -> JSONResponse:
     service = getattr(request.app.state, "service", None)
     run_id = request.path_params.get("run_id")
     data: dict[str, object] = {"detail": "HUMAN history is temporarily unavailable"}
+    if isinstance(exc, _OwnedHumanStartHistoryUnavailable):
+        run_id = exc.run_id
+        data.update(detail=str(exc), run_id=run_id, start_owned=True)
     if isinstance(service, RoastService) and isinstance(run_id, str):
         projection = service.human_protection_projection(run_id)
         if projection.human_history_durability is not None:

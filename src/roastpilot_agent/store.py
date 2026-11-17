@@ -866,6 +866,11 @@ class _StorageAccess(Enum):
         return self in (_StorageAccess.SHARED_WRITE, _StorageAccess.DEDICATED_WRITE)
 
 
+class _AuditOwner(Enum):
+    ENDPOINT = "endpoint"
+    LEASE = "lease"
+
+
 @dataclass
 class _NativeStorage:
     receipt: StorageReceipt
@@ -945,6 +950,7 @@ class RoastStore:
         self._storage_token = 0
         self._history_waiting = False
         self._history_receipts: deque[StorageReceipt] = deque(maxlen=128)
+        self._unresolved_owner_audits: dict[_AuditOwner, dict[str, StorageReceipt]] = {}
         self._history_run_id: str | None = None
         self._history_gap = False
         self._history_prior_unknown = False
@@ -973,6 +979,10 @@ class RoastStore:
     def set_human_history_run(self, run_id: str, *, recovered: bool) -> None:
         """Start the aggregate for the exact run without rebinding native owners."""
         if self._history_run_id != run_id:
+            for audit in self._unresolved_owner_audits.values():
+                for receipt in audit.values():
+                    self._append_history_diagnostic(receipt)
+            self._unresolved_owner_audits.clear()
             self._history_run_id = run_id
             self._history_gap = False
             self._history_prior_unknown = recovered
@@ -1012,8 +1022,13 @@ class RoastStore:
             )
             completed = (*completed, replace(gap, writer_entered=None))
             self._history_diagnostics_omitted = 0
+        retained = tuple(
+            receipt
+            for audit in self._unresolved_owner_audits.values()
+            for receipt in audit.values()
+        )
         owner = self._history_owner
-        return completed if owner is None else (*completed, owner.receipt)
+        return (*completed, *retained) if owner is None else (*completed, *retained, owner.receipt)
 
     def note_human_history_pass(self, run_id: str) -> None:
         """Cover the applicable history after a startup or turn completes."""
@@ -1097,9 +1112,53 @@ class RoastStore:
             self._history_gap |= missed_write
             if receipt.settlement is Settlement.OBSERVED_COMMITTED:
                 self._history_delayed |= receipt.timely is False
+        if not self._retain_unresolved_command_audit(receipt):
+            self._append_history_diagnostic(receipt)
+
+    def _append_history_diagnostic(self, receipt: StorageReceipt) -> None:
         if len(self._history_receipts) == self._history_receipts.maxlen:
             self._history_diagnostics_omitted += 1
         self._history_receipts.append(receipt)
+
+    def _retain_unresolved_command_audit(self, receipt: StorageReceipt) -> bool:
+        command = receipt.command
+        if (
+            receipt.run_id != self._history_run_id
+            or receipt.settlement is not Settlement.UNRESOLVED
+            or command is None
+            or receipt.kind not in {"record_command", "record_safety_evaluation"}
+            or (
+                receipt.kind == "record_command"
+                and receipt.detail
+                not in (RoastCommand.DROP_BEANS.value, RoastCommand.EMERGENCY_STOP.value)
+            )
+        ):
+            return False
+        owner = (
+            _AuditOwner.ENDPOINT
+            if receipt.detail == RoastCommand.DROP_BEANS.value
+            else _AuditOwner.LEASE
+        )
+        retained = self._unresolved_owner_audits.setdefault(owner, {})
+        previous = next(iter(retained.values()), None)
+        if previous is not None:
+            prior = previous.command
+            assert prior is not None
+            if prior != command:
+                if (command.child_generation, command.command_generation, command.attempt) <= (
+                    prior.child_generation,
+                    prior.command_generation,
+                    prior.attempt,
+                ):
+                    return False
+                for displaced in retained.values():
+                    self._append_history_diagnostic(displaced)
+                retained.clear()
+        displaced = retained.get(receipt.kind)
+        if displaced is not None:
+            self._append_history_diagnostic(displaced)
+        retained[receipt.kind] = receipt
+        return True
 
     def _current_native_storage(self) -> _NativeStorage | None:
         owner = self._history_owner
@@ -1150,6 +1209,7 @@ class RoastStore:
         remaining = deadline.remaining()
         if (
             self._history_owner is not None
+            or self._history_waiting
             or self._close_task is not None
             or remaining <= 0
             or (self._connection is None and kind not in {"initialize", "mark_process_epoch_clean"})

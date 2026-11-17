@@ -19,7 +19,7 @@ import math
 import time
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Literal, Protocol, TypeVar, runtime_checkable
@@ -745,7 +745,7 @@ class FaultControlExecutor:
         try:
             return await future
         finally:
-            if not future.cancelled():
+            if action is not OperatorAction.EMERGENCY_STOP and not future.cancelled():
                 await self._settle_exact_audit(audit)
 
     async def _drain(self) -> None:
@@ -818,7 +818,6 @@ class FaultControlExecutor:
             )
         finally:
             self._audit_scope.reset(token)
-            await self._settle_exact_audit(audit)
 
     async def _settle_exact_audit(self, audit: _FaultAudit | None) -> None:
         if audit is not None and audit.tasks and audit.deadline is not None:
@@ -1798,6 +1797,7 @@ class RoastController:
         self._accepted_readings = AcceptedReadingTracker(clock, config.max_stale_telemetry_seconds)
         self._routine_inhibited = False
         self._storage_failure_pending = False
+        self._human_confirmed_start_generation: int | None = None
         self._protection_check_pending = False
         self._config = config
         self._safety = safety
@@ -2962,15 +2962,37 @@ class RoastController:
         ):
             return
         self._storage_failure_pending = False
+        evaluation = self._human_history_recovery_evaluation()
         if run.endpoint is not EndpointDisposition.NONE or self._phase not in ACTIVE_ROAST_PHASES:
             return
-        evaluation = SafetyEvaluation(
+        turn.evaluations.append(evaluation)
+        await self._act_on_safety(evaluation, generation=turn.generation)
+
+    @staticmethod
+    def _human_history_recovery_evaluation() -> SafetyEvaluation:
+        return SafetyEvaluation(
             rule="human_history_unavailable",
             verdict=SafetyVerdict.RECOVERY,
             reason="HUMAN history could not be verified within its storage budget",
         )
-        turn.evaluations.append(evaluation)
-        await self._act_on_safety(evaluation, generation=turn.generation)
+
+    async def contain_unconfirmed_human_start_history(self) -> bool:
+        """Recover a confirmed Start whose history acknowledgement was unavailable."""
+        run = self._human_run
+        generation = self._human_confirmed_start_generation
+        if run is None or generation is None or not self._human_ownership.is_current(run):
+            return False
+        self._routine_inhibited = True
+        if (
+            self._generation_is_current(generation)
+            and not self._emergency_stop_transition_pending
+            and run.endpoint is EndpointDisposition.NONE
+            and self._phase in ACTIVE_ROAST_PHASES
+        ):
+            await self._act_on_safety(
+                self._human_history_recovery_evaluation(), generation=generation
+            )
+        return True
 
     def _new_history_command(self, generation: int) -> CommandReference | None:
         identity = self._known_human_identity()
@@ -5438,7 +5460,11 @@ class RoastController:
         )
 
     async def _execute_emergency_stop(
-        self, evaluation: SafetyEvaluation, *, emergency_already_admitted: bool
+        self,
+        evaluation: SafetyEvaluation,
+        *,
+        emergency_already_admitted: bool,
+        bind_audit: Callable[[CommandReference | None], None] | None = None,
     ) -> bool:
         """Execute one policy-approved e-stop and report positive MCP completion.
 
@@ -5458,6 +5484,8 @@ class RoastController:
         async def dispatch() -> AppliedRoasterState | None:
             nonlocal command
             command = self._new_history_command(generation)
+            if bind_audit is not None:
+                bind_audit(command)
             return await self._executor.emergency_stop(reason=evaluation.reason)
 
         try:
@@ -5504,12 +5532,7 @@ class RoastController:
             self._pending_fail_safe = None
             self._pending_fail_safe_is_emergency_stop_retry = False
             confirmed = True
-            if self._human_run is not None:
-                self._emit_history_command(
-                    RoastEventKind.COMMAND_EXECUTED,
-                    {"command": "emergency_stop"},
-                    command,
-                )
+
         # Emit ONCE, only on entry into FAULTED — never while already latched
         # there (the tick loop short-circuits before reaching here in a terminal
         # phase, but the guard keeps the emit transition-bound regardless of
@@ -6446,6 +6469,7 @@ class RoastController:
         if not dispatched or not self._generation_is_current(generation):
             return
         if self._human_run is not None:
+            self._human_confirmed_start_generation = generation
             if self._current_session_id is not None:
                 self._human_run.session_id = self._current_session_id()
             if self._current_child_generation is not None:
@@ -6920,7 +6944,20 @@ class RoastController:
             if recovery
             else self._safety.evaluate_command_phase(command=RoastCommand.DROP_BEANS, phase=phase)
         )
-        await self._snapshots.persist_evaluation(evaluation)
+        try:
+            await self._snapshots.persist_evaluation(evaluation)
+        except HistoryUnavailable:
+            self.inhibit_human_routine_for_storage_failure()
+            if self._generation_is_current(generation) and self._phase is phase:
+                self._events.emit(
+                    RoastEventKind.COMMAND_FAILED,
+                    {
+                        "command": "drop_beans",
+                        "outcome": "withheld",
+                        "reason": "history_unavailable",
+                    },
+                )
+            return
         run = self._human_run
         assert run is not None
         if (
@@ -6987,7 +7024,7 @@ class RoastController:
         reason: str | None = None,
         *,
         already_admitted: bool = False,
-        defer_evaluation: Callable[[SafetyEvaluation], None] | None = None,
+        defer_evaluation: Callable[[SafetyEvaluation, CommandReference | None], None] | None = None,
     ) -> bool:
         """Operator e-stop: always available, from every phase (E3-S4).
 
@@ -6999,12 +7036,27 @@ class RoastController:
         evaluation = self._safety.evaluate_emergency_stop(phase=self._phase, operator_reason=reason)
         if not already_admitted:
             self.admit_emergency_stop()
-        confirmed = await self._execute_emergency_stop(evaluation, emergency_already_admitted=True)
+        command: CommandReference | None = None
+
+        def bind(reference: CommandReference | None) -> None:
+            nonlocal command
+            command = reference
+
+        confirmed = await self._execute_emergency_stop(
+            evaluation,
+            emergency_already_admitted=True,
+            bind_audit=bind,
+        )
         if defer_evaluation is not None:
-            defer_evaluation(evaluation)
+            defer_evaluation(evaluation, command)
             return confirmed
+        caller = current_storage_caller()
         try:
-            await self._snapshots.persist_evaluation(evaluation)
+            if self._human_run is not None and caller is not None:
+                with storage_caller(replace(caller, command=command)):
+                    await self._snapshots.persist_evaluation(evaluation)
+            else:
+                await self._snapshots.persist_evaluation(evaluation)
         except Exception:  # noqa: BLE001 - e-stop must never wait on trace persistence
             _log.exception("could not persist emergency-stop safety evaluation")
         return confirmed

@@ -214,6 +214,7 @@ async def _exercise_route(
     original_emit = emitter.emit
     registered_evaluations = controller._human_drop_evaluation_tasks  # pyright: ignore[reportPrivateUsage]
     strict_results: list[FaultControlCommandResult] = []
+    emergency_dispatch_generations: list[int] = []
     unbound_errors: list[MCPToolError] = []
     unbound_attempts: list[str] = []
     strict_tools: list[str] = []
@@ -279,6 +280,8 @@ async def _exercise_route(
         arguments: dict[str, object],
     ) -> FaultControlCommandResult:
         strict_tools.append(name)
+        if name == "emergency_stop":
+            emergency_dispatch_generations.append(controller.command_generation)
         result = await original_strict(name, arguments)
         if name == "emergency_stop":
             assert any(not evaluation.done() for evaluation in registered_evaluations)
@@ -465,4 +468,4 @@ async def _exercise_route(
         assert missing.command is not None
         assert missing.command.session_id == session
         assert missing.command.child_generation == child.child_epoch
-        assert missing.command.command_generation == controller.command_generation
+        assert emergency_dispatch_generations == [missing.command.command_generation]

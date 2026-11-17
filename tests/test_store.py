@@ -33,6 +33,7 @@ from roastpilot_agent.store import (
     MIGRATIONS,
     FaultControlLease,
     FaultControlLeaseAbsence,
+    PersistedRun,
     PhysicallyImpossibleWeightError,
     RoastStore,
     RunActivelyDrivenError,
@@ -10838,4 +10839,100 @@ async def test_human_unverified_rollback_never_releases_shared_transaction(
             (row,) = await reader.execute_fetchall("SELECT agent_phase FROM roast_runs")
             assert row[0] == RoastPhase.STARTING.value
     finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_unverified_endpoint_audit_survives_unrelated_diagnostic_eviction(
+    tmp_store: RoastStore,
+) -> None:
+    await seeded_store(tmp_store)
+    clock = FakeClock()
+    tmp_store.enable_human_storage(clock, 1.0)
+    tmp_store.set_human_history_run("run-1", recovered=False)
+    endpoint = CommandReference("current-session", 3, 1, 1)
+    lease = CommandReference("current-session", 3, 2, 2)
+    try:
+        for reference, tool in (
+            (endpoint, RoastCommand.DROP_BEANS),
+            (lease, RoastCommand.EMERGENCY_STOP),
+        ):
+            with storage_caller(
+                StorageCaller(StorageDeadline.start(clock, 1.0), "run-1", command=reference)
+            ):
+                tmp_store.note_human_history_gap(
+                    "record_command",
+                    "run-1",
+                    detail=tool.value,
+                    unverified=True,
+                )
+        before = {
+            receipt.command: receipt
+            for receipt in tmp_store.drain_human_storage_receipts()
+            if receipt.settlement is Settlement.UNRESOLVED
+        }
+        assert set(before) == {endpoint, lease}
+        for _ in range(140):
+            await tmp_store.expire_bean_sourcing_drafts()
+        after = tmp_store.drain_human_storage_receipts()
+        assert any(r.kind == "diagnostic_backlog_omitted" and r.run_id is None for r in after)
+        assert {r.command: r for r in after if r.command is not None} == before
+        assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.UNKNOWN
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_turn_waiter_gets_first_admission_after_a_held_history_read(
+    tmp_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await seeded_store(tmp_store)
+    clock = FakeClock()
+    tmp_store.enable_human_storage(clock, 1.0)
+    entered, release = asyncio.Event(), asyncio.Event()
+    real_fetch = aiosqlite_module.Cursor.fetchall
+    publish = tmp_store._publish_settled_storage  # pyright: ignore[reportPrivateUsage]
+    competitors: list[asyncio.Task[PersistedRun | None]] = []
+
+    async def fetch(cursor: aiosqlite_module.Cursor) -> Any:
+        if not entered.is_set():
+            entered.set()
+            await release.wait()
+        return await real_fetch(cursor)
+
+    def on_native_settlement(owner: Any) -> None:
+        if owner.receipt.kind == "read_timeline" and not competitors:
+            # This task is made runnable before the first read's done callback
+            # can wake the older turn's waiting storage coroutine.
+            competitors.append(asyncio.create_task(tmp_store.read_latest_run()))
+        publish(owner)
+
+    async def controller_turn() -> None:
+        with storage_caller(StorageCaller(StorageDeadline.start(clock, 1.0), "run-1", 1)):
+            await tmp_store.update_run_phase("run-1", RoastPhase.PREHEATING)
+
+    monkeypatch.setattr(aiosqlite_module.Cursor, "fetchall", fetch)
+    monkeypatch.setattr(tmp_store, "_publish_settled_storage", on_native_settlement)
+    initial = asyncio.create_task(tmp_store.read_timeline("run-1"))
+    turn: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        turn = asyncio.create_task(controller_turn())
+        async with asyncio.timeout(1):
+            while not tmp_store._history_waiting:  # pyright: ignore[reportPrivateUsage]
+                await asyncio.sleep(0)
+        release.set()
+        await initial
+        await turn
+        (competing_reader,) = competitors
+        with pytest.raises(HistoryUnavailable):
+            await competing_reader
+        row = await tmp_store.read_latest_run()
+        assert row is not None and row.agent_phase is RoastPhase.PREHEATING
+    finally:
+        release.set()
+        if turn is not None:
+            await asyncio.gather(turn, *competitors, return_exceptions=True)
+        await initial
         await tmp_store.close()
