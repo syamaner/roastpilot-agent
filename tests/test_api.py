@@ -4784,6 +4784,10 @@ class _FakeRequest:
             {"last_event_id": last_event_id_query} if last_event_id_query is not None else {}
         )
 
+    def disconnect(self) -> None:
+        """Simulate the client disconnecting from an open stream."""
+        self._disconnected = True
+
     async def is_disconnected(self) -> bool:
         return self._disconnected
 
@@ -5175,6 +5179,35 @@ async def test_sse_endpoint_emits_heartbeat_when_idle(store: RoastStore) -> None
     }
     for frame in frames[1:]:
         assert _parse_frame(frame) == {"event": "heartbeat", "data": expected, "id": None}
+
+
+@pytest.mark.asyncio
+async def test_sse_resumes_after_idle_keepalive_and_stops_on_disconnect(store: RoastStore) -> None:
+    service = RoastService(store, sse_heartbeat_seconds=0.01)
+    run_id = "run-idle-disconnect"
+    await _make_run(store, run_id, RoastPhase.DEVELOPMENT)
+    request = _FakeRequest()
+    response = await stream_events(run_id, cast(Request, request), service)
+    iterator = cast(AsyncGenerator[bytes, None], response.body_iterator)
+
+    async with contextlib.aclosing(iterator) as frames:
+        assert await asyncio.wait_for(anext(frames), 1) == b": connected\n\n"
+        opening = _parse_frame((await asyncio.wait_for(anext(frames), 1)).decode())
+        idle = _parse_frame((await asyncio.wait_for(anext(frames), 1)).decode())
+        assert idle == opening
+        assert idle["event"] == "heartbeat"
+        assert idle["id"] is None
+
+        service.events.emit(RoastEventKind.RUN_COMPLETED, {})
+        resumed = _parse_frame((await asyncio.wait_for(anext(frames), 1)).decode())
+        assert resumed == {"event": "run_completed", "data": {}, "id": 1}
+        assert service.events.subscriber_count == 1
+
+        request.disconnect()
+        service.events.emit(RoastEventKind.LOGS_EXPORTED, {})
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(frames), 1)
+        assert service.events.subscriber_count == 0
 
 
 @pytest.mark.asyncio
