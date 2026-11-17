@@ -71,7 +71,12 @@ from roastpilot_agent.models import (
     SseEventType,
 )
 from roastpilot_agent.safety import SafetyEvaluation
-from roastpilot_agent.store import FaultControlCloseResult, FaultControlLease, RoastStore
+from roastpilot_agent.store import (
+    FaultControlCloseResult,
+    FaultControlLease,
+    PersistedRun,
+    RoastStore,
+)
 from tests.conftest import FakeClock, FakeMCPClient
 from tests.test_api import (
     _collect_frames,  # pyright: ignore[reportPrivateUsage]
@@ -4886,4 +4891,35 @@ async def test_human_one_shot_history_does_not_retry_after_late_commit(
     ]
     assert receipt.settlement is Settlement.OBSERVED_COMMITTED and receipt.timely is False
     monkeypatch.setattr(store.connection, "commit", original_commit)
+    await service.shutdown()
+
+
+async def test_human_health_refuses_unverified_second_active_read(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    service = _service(store, clock, _RunnerRoaster(clock, []))
+    run = await service.start_roast(PROFILE)
+    active_run = store.active_run
+    reads = 0
+
+    async def available_then_refused() -> PersistedRun | None:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            active = await active_run()
+            assert active is not None and active.run_id == run.id
+            return active
+        raise HistoryUnavailable("second query refused")
+
+    with monkeypatch.context() as injected:
+        injected.setattr(store, "active_run", available_then_refused)
+        async with AsyncClient(
+            transport=ASGITransport(app=create_app(service)), base_url="http://test"
+        ) as client:
+            response = await client.get("/api/health")
+    assert reads == 2
+    assert response.status_code == 503
+    assert "active_run_id" not in response.json()
     await service.shutdown()

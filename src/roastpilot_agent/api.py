@@ -3442,6 +3442,8 @@ class RoastService:
         # This is deliberately the final await sequence for the D225-facing
         # fields: all returned retirement state comes from this one snapshot.
         snapshot = await self._stranded_fault_retirement_snapshot()
+        if self._authority is ControlAuthority.HUMAN and snapshot.read_failed:
+            raise HistoryUnavailable("HUMAN active-run history is unavailable")
         active = snapshot.active
         lease = snapshot.lease
         restart_clearance = self._restart_clearance_projection(
