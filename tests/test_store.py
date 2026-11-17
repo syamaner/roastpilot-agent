@@ -21,6 +21,7 @@ from roastpilot_agent import roast_landmarks
 from roastpilot_agent import store as store_module
 from roastpilot_agent.ambient_evidence import AmbientEvidenceVerdict, NotProvenReason
 from roastpilot_agent.human_persistence import (
+    CommandAuditOwner,
     CommandReference,
     HistoryUnavailable,
     Settlement,
@@ -10747,6 +10748,10 @@ async def test_human_read_cannot_accept_shared_writer_replacement(
 ) -> None:
     await seeded_store(tmp_store)
     tmp_store.enable_human_storage(FakeClock(), 1.0)
+    tmp_store.set_human_history_run("run-1", recovered=False)
+    await tmp_store.update_run_phase("run-1", RoastPhase.PREHEATING)
+    tmp_store.note_human_history_pass("run-1")
+    assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.COMPLETE
     shared = tmp_store.connection
     real = aiosqlite_module.Cursor.fetchall
     entered, release = asyncio.Event(), asyncio.Event()
@@ -10762,10 +10767,14 @@ async def test_human_read_cannot_accept_shared_writer_replacement(
         reader = asyncio.create_task(tmp_store.read_timeline("run-1"))
         try:
             await asyncio.wait_for(entered.wait(), 1)
+            assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.COMPLETE
             monkeypatch.setattr(tmp_store, "_connection", replacement)
             release.set()
             with pytest.raises(HistoryUnavailable, match="shared history connection"):
                 await reader
+            assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.UNAVAILABLE
+            with pytest.raises(HistoryUnavailable, match="admission unavailable"):
+                await tmp_store.read_run("run-1")
             assert not await tmp_store.settle_human_storage_for_teardown()
         finally:
             release.set()
@@ -10850,33 +10859,41 @@ async def test_human_unverified_endpoint_audit_survives_unrelated_diagnostic_evi
     clock = FakeClock()
     tmp_store.enable_human_storage(clock, 1.0)
     tmp_store.set_human_history_run("run-1", recovered=False)
-    endpoint = CommandReference("current-session", 3, 1, 1)
-    lease = CommandReference("current-session", 3, 2, 2)
+    await tmp_store.update_run_phase("run-1", RoastPhase.PREHEATING)
+    tmp_store.note_human_history_pass("run-1")
+    assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.COMPLETE
+    endpoint = CommandReference("current-session", 3, 1, 1, CommandAuditOwner.ENDPOINT)
+    lease = CommandReference("current-session", 3, 2, 2, CommandAuditOwner.LEASE)
     try:
-        for reference, tool in (
-            (endpoint, RoastCommand.DROP_BEANS),
-            (lease, RoastCommand.EMERGENCY_STOP),
+        with storage_caller(
+            StorageCaller(StorageDeadline.start(clock, 1.0), "run-1", command=endpoint)
         ):
-            with storage_caller(
-                StorageCaller(StorageDeadline.start(clock, 1.0), "run-1", command=reference)
-            ):
-                tmp_store.note_human_history_gap(
-                    "record_command",
-                    "run-1",
-                    detail=tool.value,
-                    unverified=True,
-                )
+            tmp_store.note_human_history_gap("record_safety_evaluation", "run-1", unverified=True)
+            tmp_store.note_human_history_gap(
+                "record_command", "run-1", detail=RoastCommand.DROP_BEANS.value, unverified=True
+            )
+        with storage_caller(
+            StorageCaller(StorageDeadline.start(clock, 1.0), "run-1", command=lease)
+        ):
+            tmp_store.note_human_history_gap(
+                "record_command", "run-1", detail=RoastCommand.EMERGENCY_STOP.value, unverified=True
+            )
         before = {
-            receipt.command: receipt
+            (receipt.command, receipt.kind): receipt
             for receipt in tmp_store.drain_human_storage_receipts()
             if receipt.settlement is Settlement.UNRESOLVED
         }
-        assert set(before) == {endpoint, lease}
+        assert set(before) == {
+            (endpoint, "record_safety_evaluation"),
+            (endpoint, "record_command"),
+            (lease, "record_command"),
+        }
+        assert before[endpoint, "record_safety_evaluation"].detail is None
         for _ in range(140):
             await tmp_store.expire_bean_sourcing_drafts()
         after = tmp_store.drain_human_storage_receipts()
         assert any(r.kind == "diagnostic_backlog_omitted" and r.run_id is None for r in after)
-        assert {r.command: r for r in after if r.command is not None} == before
+        assert {(r.command, r.kind): r for r in after if r.command is not None} == before
         assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.UNKNOWN
     finally:
         await tmp_store.close()

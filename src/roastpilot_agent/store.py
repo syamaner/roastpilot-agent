@@ -35,6 +35,7 @@ from roastpilot_agent.ambient_evidence import (
 )
 from roastpilot_agent.config import AppConfig, ControllerConfig, SafetyLimits
 from roastpilot_agent.human_persistence import (
+    CommandAuditOwner,
     HistoryUnavailable,
     Settlement,
     StorageDeadline,
@@ -866,11 +867,6 @@ class _StorageAccess(Enum):
         return self in (_StorageAccess.SHARED_WRITE, _StorageAccess.DEDICATED_WRITE)
 
 
-class _AuditOwner(Enum):
-    ENDPOINT = "endpoint"
-    LEASE = "lease"
-
-
 @dataclass
 class _NativeStorage:
     receipt: StorageReceipt
@@ -950,7 +946,7 @@ class RoastStore:
         self._storage_token = 0
         self._history_waiting = False
         self._history_receipts: deque[StorageReceipt] = deque(maxlen=128)
-        self._unresolved_owner_audits: dict[_AuditOwner, dict[str, StorageReceipt]] = {}
+        self._unresolved_owner_audits: dict[CommandAuditOwner, dict[str, StorageReceipt]] = {}
         self._history_run_id: str | None = None
         self._history_gap = False
         self._history_prior_unknown = False
@@ -994,6 +990,8 @@ class RoastStore:
         if self._history_clock is None or self._connection is None:
             return HumanHistoryDurability.UNAVAILABLE
         owner = self._history_owner
+        if owner is not None and owner.tainted:
+            return HumanHistoryDurability.UNAVAILABLE
         if owner is not None and owner.access.writes:
             if owner.receipt.run_id == run_id:
                 return HumanHistoryDurability.UNKNOWN
@@ -1126,20 +1124,11 @@ class RoastStore:
             receipt.run_id != self._history_run_id
             or receipt.settlement is not Settlement.UNRESOLVED
             or command is None
+            or command.owner is None
             or receipt.kind not in {"record_command", "record_safety_evaluation"}
-            or (
-                receipt.kind == "record_command"
-                and receipt.detail
-                not in (RoastCommand.DROP_BEANS.value, RoastCommand.EMERGENCY_STOP.value)
-            )
         ):
             return False
-        owner = (
-            _AuditOwner.ENDPOINT
-            if receipt.detail == RoastCommand.DROP_BEANS.value
-            else _AuditOwner.LEASE
-        )
-        retained = self._unresolved_owner_audits.setdefault(owner, {})
+        retained = self._unresolved_owner_audits.setdefault(command.owner, {})
         previous = next(iter(retained.values()), None)
         if previous is not None:
             prior = previous.command

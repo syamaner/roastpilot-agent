@@ -45,6 +45,7 @@ from roastpilot_agent.control_policy import (
     TrimSignal,
 )
 from roastpilot_agent.human_persistence import (
+    CommandAuditOwner,
     CommandReference,
     HistoryUnavailable,
     StorageCaller,
@@ -178,11 +179,13 @@ class CommandArbiter:
         session_id: str,
         child_generation: int,
         command_generation: int,
+        *,
+        owner: CommandAuditOwner | None,
     ) -> CommandReference:
         """Name one actual command attempt across all users of the actuator."""
         self._next_history_attempt += 1
         return CommandReference(
-            session_id, child_generation, command_generation, self._next_history_attempt
+            session_id, child_generation, command_generation, self._next_history_attempt, owner
         )
 
     def admit_emergency_stop(self) -> int:
@@ -829,11 +832,24 @@ class FaultControlExecutor:
                 remaining = min(remaining, caller.deadline.remaining())
             await asyncio.wait(audit.tasks, timeout=remaining)
 
-    def _bind_exact_audit_command(self, session_id: str, generation: int) -> None:
+    def _bind_exact_audit_command(
+        self,
+        session_id: str,
+        generation: int,
+        *,
+        owner: CommandAuditOwner | None,
+    ) -> None:
         audit = self._audit_scope.get()
         child = None if self._child_generation is None else self._child_generation()
         if audit is not None and child is not None:
-            audit.command = self._arbiter.stamp_history_attempt(session_id, child, generation)
+            audit.command = self._arbiter.stamp_history_attempt(
+                session_id, child, generation, owner=owner
+            )
+
+    def _bind_admitted_drop_audit(self, command: CommandReference | None) -> None:
+        audit = self._audit_scope.get()
+        if audit is not None:
+            audit.command = command
 
     async def _execute_exact_emergency_stop(
         self,
@@ -866,7 +882,9 @@ class FaultControlExecutor:
             """Mark entry to the adapter so admission failures are not called writes."""
             nonlocal write_started
             write_started = True
-            self._bind_exact_audit_command(session_id, self._arbiter.generation)
+            self._bind_exact_audit_command(
+                session_id, self._arbiter.generation, owner=CommandAuditOwner.LEASE
+            )
             await self._port.write_fault_control(action, expected_session_id=session_id)
 
         try:
@@ -1062,7 +1080,8 @@ class FaultControlExecutor:
             return None
 
         async def write() -> None:
-            self._bind_exact_audit_command(session_id, generation)
+            if action is not OperatorAction.DROP_BEANS or self._human_drop_controller is None:
+                self._bind_exact_audit_command(session_id, generation, owner=None)
             await self._port.write_fault_control(action, expected_session_id=session_id)
 
         controller: RoastController | None = None
@@ -1078,6 +1097,7 @@ class FaultControlExecutor:
                             generation=generation,
                             lease_current=generation_current,
                             operation=write,
+                            bind_audit=self._bind_admitted_drop_audit,
                         )
                     )
                 else:
@@ -2976,11 +2996,20 @@ class RoastController:
             reason="HUMAN history could not be verified within its storage budget",
         )
 
+    def owns_confirmed_human_start(self) -> bool:
+        """Whether this controller still owns a positively dispatched Start."""
+        run = self._human_run
+        return (
+            run is not None
+            and self._human_confirmed_start_generation is not None
+            and self._human_ownership.is_current(run)
+        )
+
     async def contain_unconfirmed_human_start_history(self) -> bool:
         """Recover a confirmed Start whose history acknowledgement was unavailable."""
         run = self._human_run
         generation = self._human_confirmed_start_generation
-        if run is None or generation is None or not self._human_ownership.is_current(run):
+        if run is None or generation is None or not self.owns_confirmed_human_start():
             return False
         self._routine_inhibited = True
         if (
@@ -2994,12 +3023,14 @@ class RoastController:
             )
         return True
 
-    def _new_history_command(self, generation: int) -> CommandReference | None:
+    def _new_history_command(
+        self, generation: int, *, owner: CommandAuditOwner
+    ) -> CommandReference | None:
         identity = self._known_human_identity()
         if identity is None:
             return None
         session, child = identity
-        return self._arbiter.stamp_history_attempt(session, child, generation)
+        return self._arbiter.stamp_history_attempt(session, child, generation, owner=owner)
 
     def _emit_history_command(
         self,
@@ -4330,6 +4361,7 @@ class RoastController:
         generation: int,
         lease_current: Callable[[], bool],
         operation: Callable[[], Awaitable[None]],
+        bind_audit: Callable[[CommandReference | None], None] | None = None,
     ) -> bool:
         """Guard one exact fault-session drop through the HUMAN endpoint latch."""
         if self.human_drop_closed():
@@ -4362,6 +4394,7 @@ class RoastController:
             generation=generation,
             fault_dispatch=operation,
             lease_current=lease_current,
+            bind_audit=bind_audit,
         )
 
     async def _execute_human_drop(
@@ -4372,6 +4405,7 @@ class RoastController:
         generation: int,
         fault_dispatch: Callable[[], Awaitable[None]] | None = None,
         lease_current: Callable[[], bool] | None = None,
+        bind_audit: Callable[[CommandReference | None], None] | None = None,
     ) -> bool:
         run = self._human_run
         assert run is not None
@@ -4385,7 +4419,9 @@ class RoastController:
 
         async def dispatch() -> AppliedRoasterState | None:
             nonlocal start_utc, started, command
-            command = self._new_history_command(generation)
+            command = self._new_history_command(generation, owner=CommandAuditOwner.ENDPOINT)
+            if bind_audit is not None:
+                bind_audit(command)
             run.endpoint = EndpointDisposition.IN_FLIGHT
             start_utc = datetime.now(UTC)
             started = self._clock()
@@ -5483,7 +5519,7 @@ class RoastController:
 
         async def dispatch() -> AppliedRoasterState | None:
             nonlocal command
-            command = self._new_history_command(generation)
+            command = self._new_history_command(generation, owner=CommandAuditOwner.LEASE)
             if bind_audit is not None:
                 bind_audit(command)
             return await self._executor.emergency_stop(reason=evaluation.reason)

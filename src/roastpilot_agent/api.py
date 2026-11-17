@@ -490,6 +490,7 @@ class EventBroadcaster:
 
     def __init__(self, *, max_queue: int = 1000, replay_buffer: int | None = None) -> None:
         self._subscribers: set[asyncio.Queue[SseEvent]] = set()
+        self._human_history_signal = asyncio.Event()
         self._max_queue = max_queue
         self._sequence = 0
         # Enforce replay_buffer <= max_queue: subscribe() pre-seeds oldest-first and
@@ -514,6 +515,17 @@ class EventBroadcaster:
         # ``maxlen`` evicts the oldest in O(1) on append, so the buffer never grows
         # and the append never stalls the controller tick.
         self._replay_buffer: deque[SseEvent] = deque(maxlen=effective_replay)
+
+    @property
+    def human_history_signal(self) -> asyncio.Event:
+        """Return the signal for the next HUMAN history projection change."""
+        return self._human_history_signal
+
+    def notify_human_history(self) -> None:
+        """Wake stream views without consuming space in their live event queues."""
+        signal = self._human_history_signal
+        self._human_history_signal = asyncio.Event()
+        signal.set()
 
     @property
     def subscriber_count(self) -> int:
@@ -943,6 +955,10 @@ class BufferingEventEmitter:
     def bound_history_buffer(self, on_drop: Callable[[_BufferedEvent], None]) -> None:
         """Bound the HUMAN audit queue and report discarded rows."""
         self._on_dropped_history = on_drop
+
+    def notify_history_projection(self) -> None:
+        """Wake viewers once a HUMAN turn's projection has settled."""
+        self._broadcaster.notify_human_history()
 
     def emit_telemetry(self, data: TelemetryEventData) -> None:
         """Publish the per-tick ``telemetry`` SSE frame (not a persisted event)."""
@@ -1577,6 +1593,7 @@ class RoastRunner:
                 return self._finalized
             finally:
                 self._history_turn_in_progress = False
+                self._emitter.notify_history_projection()
 
     def _new_storage_caller(self, *, turn: int | None = None) -> StorageCaller:
         return StorageCaller(
@@ -1689,13 +1706,18 @@ class RoastRunner:
             for evaluation, command in deferred_evaluations:
                 caller = current_storage_caller()
                 assert caller is not None  # the HUMAN runner owns this queue turn
-                try:
-                    with storage_caller(replace(caller, command=command)):
+                with storage_caller(replace(caller, command=command)):
+                    try:
                         await self._store.record_safety_evaluation(
                             run_id=self._run_id, tick=self._counter.value, evaluation=evaluation
                         )
-                except HistoryUnavailable:
-                    self._controller.inhibit_human_routine_for_storage_failure()
+                    except HistoryUnavailable:
+                        self._controller.inhibit_human_routine_for_storage_failure()
+                    except Exception:  # noqa: BLE001 - a trace fault cannot stop supervision
+                        self._store.note_human_history_gap(
+                            "record_safety_evaluation", self._run_id, unverified=True
+                        )
+                        self._controller.inhibit_human_routine_for_storage_failure()
             for tool, item, event in deferred_commands:
                 await self._persist_dispatch_audit(tool, item, event)
             batch = [item for item in batch if item.action is not OperatorAction.EMERGENCY_STOP]
@@ -6516,9 +6538,11 @@ class RoastService:
             self._unpublished_start_run_id = None
             self.active_run_id = run_id
             self._starting_run_id = run_id
+        live_start_completed = False
         try:
             if self._roaster is not None:
                 await self._begin_live_run(profile, run_id, lease_generation=lease.generation)
+                live_start_completed = True
             detail = await self._store.read_run(run_id)
             if detail is None:  # pragma: no cover — read immediately after create
                 raise RuntimeError(f"read_run returned None for just-created run {run_id}")
@@ -6536,12 +6560,11 @@ class RoastService:
                 and self.active_run_id == run_id
             ):
                 controller = runner.controller_for_human_fault_drop()
-                if (
-                    controller is not None
-                    and await controller.contain_unconfirmed_human_start_history()
-                ):
-                    if self._run_loop and (self._loop_task is None or self._loop_task.done()):
-                        self._loop_task = asyncio.create_task(runner.run())
+                if controller is not None and controller.owns_confirmed_human_start():
+                    if not live_start_completed:
+                        await controller.contain_unconfirmed_human_start_history()
+                        if self._run_loop and (self._loop_task is None or self._loop_task.done()):
+                            self._loop_task = asyncio.create_task(runner.run())
                     raise _OwnedHumanStartHistoryUnavailable(run_id, exc) from exc
             raise
         finally:
@@ -8567,16 +8590,7 @@ class RoastService:
             if state is not None
             else "exact fault-session action was not confirmed"
         )
-        try:
-            await self._store.record_operator_action(
-                action=request.action.value,
-                result=result,
-                run_id=run_id,
-                payload=request.payload,
-            )
-        except HistoryUnavailable:
-            if self._authority is not ControlAuthority.HUMAN:
-                raise
+        await self._record_admitted_action_outcome(run_id, request, result)
         return OperatorActionResult(
             action=request.action, result=result, reason=reason, queued=False
         )
@@ -10171,6 +10185,26 @@ async def _history_unavailable_response(request: Request, exc: Exception) -> JSO
     return JSONResponse(data, status_code=503)
 
 
+async def _stream_event_or_history_update(
+    queue: asyncio.Queue[SseEvent],
+    signal: asyncio.Event,
+    heartbeat: float,
+) -> tuple[SseEvent | None, bool]:
+    """Wait for a live frame, history projection update, or idle heartbeat."""
+    frame = asyncio.create_task(queue.get())
+    notice = asyncio.create_task(signal.wait())
+    try:
+        done, _ = await asyncio.wait(
+            (frame, notice), timeout=heartbeat, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        for pending in (frame, notice):
+            if not pending.done():
+                pending.cancel()
+        await asyncio.gather(frame, notice, return_exceptions=True)
+    return (None if frame.cancelled() else frame.result()), not done
+
+
 async def stream_events(
     run_id: str,
     request: Request,
@@ -10222,17 +10256,24 @@ async def stream_events(
             yield b": connected\n\n"
             if await request.is_disconnected():
                 return
+            notice = service.events.human_history_signal
             previous = service.human_protection_projection(run_id)
             yield protection_heartbeat(previous)
             while not await request.is_disconnected():
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=heartbeat)
-                except TimeoutError:
-                    event = None
-                # Sample after the wait. Queued and replayed events never
-                # carry disclosure; a busy stream still publishes changes.
+                if previous.human_history_durability is not None:
+                    event, idle = await _stream_event_or_history_update(queue, notice, heartbeat)
+                else:
+                    idle = False
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=heartbeat)
+                    except TimeoutError:
+                        event, idle = None, True
+                notice = service.events.human_history_signal
+                # Sample after either kind of wake. Queued/replayed events do
+                # not carry ownership, and an audit completion cannot hide
+                # behind a continuous live event stream.
                 current = service.human_protection_projection(run_id)
-                if event is None or current != previous:
+                if idle or current != previous:
                     previous = current
                     yield protection_heartbeat(current)
                 if event is not None:

@@ -83,6 +83,13 @@ class StorageDeadline:
             raise HistoryUnavailable("HUMAN history deadline elapsed") from exc
 
 
+class CommandAuditOwner(Enum):
+    """Existing control owner whose exact unresolved audit requires retention."""
+
+    ENDPOINT = "endpoint"
+    LEASE = "lease"
+
+
 @dataclass(frozen=True)
 class CommandReference:
     """Exact MCP command-attempt reference when the caller has positive evidence."""
@@ -91,6 +98,7 @@ class CommandReference:
     child_generation: int
     command_generation: int
     attempt: int
+    owner: CommandAuditOwner | None = None
 
 
 @dataclass(frozen=True)
