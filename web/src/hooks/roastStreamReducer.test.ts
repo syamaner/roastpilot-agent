@@ -158,3 +158,36 @@ describe("roastStreamReducer", () => {
     expect(rebased.phase).toBe("operator_recovery_required");
   });
 });
+
+it("applies only complete same-run HUMAN projections before frame-ID dedup", () => {
+  const current = {
+    run_id: "run-1",
+    human_endpoint: "issued",
+    human_command_disposition: "settled",
+    physical_intervention_required: false,
+    emergency_fallback_disclosure: "Emergency fallback may stop the drum.",
+  };
+  const normal = applyEvent(initialRoastStreamState, {
+    event: "phase_changed", id: 10, data: { phase: "cooling" },
+  });
+  const next = applyEvent(normal, { event: "heartbeat", id: 10, data: current }, "run-1");
+  expect(next).toMatchObject({
+    phase: "cooling",
+    lastEventId: 10,
+    humanProtection: { data: { human_endpoint: "issued" } },
+  });
+  const duplicate = applyEvent(next, {
+    event: "phase_changed", id: 10, data: { phase: "faulted" },
+  });
+  expect(duplicate).toBe(next);
+  for (const data of [
+    { ...current, run_id: "previous-run" },
+    { ...current, human_endpoint: "cooling_confirmed" },
+    { ...current, human_command_disposition: true },
+    { ...current, emergency_fallback_disclosure: 0 },
+  ]) {
+    expect(applyEvent(next, { event: "heartbeat", data }, "run-1")).toBe(next);
+  }
+  expect(hydrate(next, snapshot({ id: "other" }), "run-1").humanProtection)
+    .toBe(next.humanProtection);
+});

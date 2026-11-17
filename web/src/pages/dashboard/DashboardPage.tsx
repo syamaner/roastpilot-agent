@@ -25,6 +25,8 @@ import { useQueryClient } from "@tanstack/react-query";
 
 import { AppFrame, ConnectionIndicator, LiveCurve } from "@/components/shared";
 import { roastKeys, useHealth, useRoast, useTimeline } from "@/hooks/queries";
+import { HumanProtectionDisclosure } from "@/components/shared/HumanProtectionDisclosure";
+import { hasHumanProtection } from "@/lib/humanProtection";
 import { useFrameDrain, useRoastStream } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
 import { isCoherentRestartClearance } from "@/lib/faultControls";
@@ -108,7 +110,8 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
   // Live SSE stream — phase/telemetry/enabledActions are server-derived; the
   // page-local reducer folds the NON-LOSSY frame buffer (frames/frameCount) so a
   // burst never drops a fault/recovery/advisory/marker frame (#122).
-  const { status, phase, telemetry, enabledActions, frames, frameCount } = useRoastStream(runId);
+  const { status, phase, telemetry, enabledActions, humanProtection, frames, frameCount } =
+    useRoastStream(runId);
   const routineActionsRefreshPending =
     health.isFetching && phase === "operator_recovery_required";
   const recoveryDispatchBlocked = healthProjectionStale || routineActionsRefreshPending;
@@ -203,7 +206,8 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
   );
 
   // Operator action POST result (the action bar surfaces its typed reason).
-  const [lastResult, setLastResult] = useState<OperatorActionResultView | null>(null);
+  const [lastAction, setLastAction] = useState<(OperatorActionResultView & { runId: string }) | null>(null);
+  const lastResult = lastAction?.runId === runId ? lastAction : null;
   const handleAcknowledgeFault = useCallback((): boolean => {
     if (healthProjectionStale) return false;
     const ackRunId = runId;
@@ -242,9 +246,10 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
       if (runId === null || (recoveryDispatchBlocked && action !== "emergency_stop")) return;
       try {
         const result = await api.operatorAction(runId, { action });
-        setLastResult({ action, result: result.result, reason: result.reason });
+        setLastAction({ runId, action, result: result.result, reason: result.reason });
       } catch (err) {
-        setLastResult({
+        setLastAction({
+          runId,
           action,
           result: "failed",
           reason: err instanceof Error ? err.message : "request failed",
@@ -301,7 +306,7 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
   // stale toast dismissal. The page can stay mounted across runs.
   useEffect(() => {
     setChargeEnteredElapsed(null);
-    setLastResult(null);
+    setLastAction(null);
     pendingAcknowledgementBaselineRef.current = null;
     setFaultAcknowledgementState({ kind: "ready" });
   }, [runId, setFaultAcknowledgementState]);
@@ -334,7 +339,8 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
   // never render, stranding them (hit twice in roast 3). `view.fault` wins when
   // present so the real evaluation's numbers show; the snapshot stand-in only fills
   // the restore/reload gap. Phase is the server's hydrated truth — never inferred.
-  const effectiveFault = view.fault ?? snapshotFault(phase, detail.data?.fault_reason);
+  const humanDisclosureAvailable = hasHumanProtection(humanProtection);
+  const effectiveFault = view.fault ?? snapshotFault(phase, detail.data?.fault_reason, humanDisclosureAvailable);
 
   // #124/#329: pin the run as soon as it faults, so a later `active_run_id`→null
   // from a health refetch resolves `runId` back to this faulted run (via the `??`
@@ -467,6 +473,7 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
         <FaultBanner
           fault={effectiveFault}
           trail={view.safetyTrail}
+          showCommandPosture={!humanDisclosureAvailable}
           // Render permission still comes solely from the server mirror. The
           // component adds only the operator's cooling-safe confirmation and
           // server-event feedback; it never calls MCP or derives a phase.
@@ -479,6 +486,8 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
             ) : undefined
           }
         />
+
+        {!inRecovery && <HumanProtectionDisclosure protection={humanProtection} />}
 
         <RoastHeader
           phase={phase}
@@ -557,7 +566,7 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
           enabledActions={effectiveEnabled}
           phase={phase}
           onAction={(a) => void dispatchAction(a)}
-          lastResult={lastResult}
+          lastResult={inRecovery && humanDisclosureAvailable ? null : lastResult}
           healthStale={healthProjectionStale}
           routineActionsRefreshPending={routineActionsRefreshPending}
         />
@@ -565,6 +574,8 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
 
       <RecoveryModal
         open={inRecovery}
+        humanProtection={humanProtection}
+        lastResult={lastResult}
         beanTempC={telemetry?.bean_temp_c ?? null}
         envTempC={telemetry?.env_temp_c ?? null}
         heatPercent={telemetry?.heat_percent ?? null}

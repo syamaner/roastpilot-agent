@@ -41,6 +41,7 @@ export interface FaultBannerProps {
   fault: SafetyEvaluationData | null;
   /** The accumulated safety event trail (newest entries appended). */
   trail: SafetyTrailEntry[];
+  showCommandPosture?: boolean;
   /** Optional guarded acknowledgement affordance. Its parent supplies it only
    *  when the server's `enabled_actions` mirror enables `acknowledge_fault`;
    *  omit/undefined renders no affordance. */
@@ -51,6 +52,7 @@ export interface FaultBannerProps {
 export function FaultBanner({
   fault,
   trail,
+  showCommandPosture = true,
   acknowledgeAffordance,
   className,
 }: FaultBannerProps): React.JSX.Element | null {
@@ -78,11 +80,15 @@ export function FaultBanner({
 
       {/* Current forced-safe state — the fail-closed posture (heat 0, fan safe). */}
       <dl className="grid grid-cols-2 gap-x-6 gap-y-1 text-sm sm:grid-cols-3">
-        <SafeStat label="Heat" value={`${formatPercent(fault.adjusted_heat ?? 0)} (forced)`} />
-        <SafeStat
-          label="Fan"
-          value={fault.adjusted_fan != null ? `${formatPercent(fault.adjusted_fan)} (safe)` : "held"}
-        />
+        {showCommandPosture && (
+          <>
+            <SafeStat label="Heat" value={`${formatPercent(fault.adjusted_heat ?? 0)} (forced)`} />
+            <SafeStat
+              label="Fan"
+              value={fault.adjusted_fan != null ? `${formatPercent(fault.adjusted_fan)} (safe)` : "held"}
+            />
+          </>
+        )}
         <SafeStat label="Rule" value={fault.rule} />
       </dl>
 

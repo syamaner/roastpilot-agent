@@ -274,7 +274,7 @@ describe("visual screenshot policy", () => {
     expect(counts).toEqual([
       [SCREENSHOT_CLASSES.CANVAS_PAGE, 12],
       [SCREENSHOT_CLASSES.DOM_PAGE, 11],
-      [SCREENSHOT_CLASSES.DOM_LOCATOR, 4],
+      [SCREENSHOT_CLASSES.DOM_LOCATOR, 5],
       [SCREENSHOT_CLASSES.CANVAS_LOCATOR, 1],
     ]);
     expect(CANVAS_PAGE_MAX_DIFF_PIXEL_RATIO).toBeGreaterThan(0);
@@ -291,6 +291,7 @@ describe("visual screenshot policy", () => {
     ).map((entry) => entry.snapshotName);
     expect(locatorNames.sort()).toEqual([
       "bean-temperature-developed.png",
+      "dashboard-human-recovery.png",
       "foundation-d96-recovering.png",
       "start-roast-add-modal-catalogue-results.png",
       "start-roast-add-modal-draft-panel.png",

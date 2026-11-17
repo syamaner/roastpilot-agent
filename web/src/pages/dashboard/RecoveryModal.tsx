@@ -16,17 +16,23 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { HumanProtectionDisclosure } from "@/components/shared/HumanProtectionDisclosure";
+import { hasHumanProtection } from "@/lib/humanProtection";
 import { cn } from "@/lib/cn";
 import type {
   ClosureOnlyClearanceResult,
   EndRecoveredRunResult,
+  HumanProtectionProjection,
   OperatorAction,
 } from "@/lib/types";
 import { formatPercent, formatTempC } from "./format";
+import type { OperatorActionResultView } from "./OperatorActionBar";
 
 export interface RecoveryModalProps {
   /** When false, the modal is not rendered (driven by phase === recovery). */
   open: boolean;
+  humanProtection?: HumanProtectionProjection | null;
+  lastResult?: OperatorActionResultView | null;
   /** Current hardware readout from the still-flowing telemetry. */
   beanTempC: number | null;
   envTempC: number | null;
@@ -68,6 +74,8 @@ const RECOVERY_ACTIONS: {
 
 export function RecoveryModal({
   open,
+  humanProtection,
+  lastResult,
   beanTempC,
   envTempC,
   heatPercent,
@@ -138,11 +146,12 @@ export function RecoveryModal({
   }, [open]);
 
   if (!open) return null;
+  const humanDisclosureAvailable = hasHumanProtection(humanProtection);
   // Emergency stop is always available (mirrors evaluate_emergency_stop); the
   // rest are gated by the server mirror.
   const enabled = new Set(enabledActions ?? []);
   const routineRecoveryActions = RECOVERY_ACTIONS.filter(
-    ({ action }) => action !== "emergency_stop",
+    ({ action }) => action !== "emergency_stop" && !healthStale && enabled.has(action),
   );
   const emergencyStopAction = RECOVERY_ACTIONS.find(
     ({ action }) => action === "emergency_stop",
@@ -217,7 +226,10 @@ export function RecoveryModal({
       aria-labelledby="recovery-modal-title"
       className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 p-6"
     >
-      <div className="flex max-h-full w-full max-w-xl flex-col gap-4 overflow-auto rounded-lg border border-border bg-card p-6 shadow-2xl">
+      <div
+        data-testid="recovery-modal-panel"
+        className="flex max-h-full w-full max-w-xl flex-col gap-4 overflow-auto rounded-lg border border-border bg-card p-6 shadow-2xl"
+      >
         <header className="flex flex-col gap-1">
           <h2
             id="recovery-modal-title"
@@ -225,9 +237,11 @@ export function RecoveryModal({
           >
             Operator Recovery Required
           </h2>
-          <p className="text-sm text-muted-foreground">
-            The service restarted during an active roast — manual intervention needed.
-          </p>
+          {!humanDisclosureAvailable && (
+            <p className="text-sm text-muted-foreground">
+              The service restarted during an active roast — manual intervention needed.
+            </p>
+          )}
         </header>
 
         {/* The core no-auto-resume guarantee (kickoff §2 required copy). */}
@@ -235,15 +249,22 @@ export function RecoveryModal({
           data-testid="recovery-no-auto-resume"
           className="rounded-md border border-roast-caution/40 bg-roast-caution/10 px-4 py-3 text-sm"
         >
-          No auto-resume. The system will not touch heat or fan until you choose an
-          action below. Dashboard telemetry continues to update in real time.
+          {humanDisclosureAvailable
+            ? "Routine heating does not resume automatically."
+            : "No auto-resume. The system will not touch heat or fan until you choose an action below. Dashboard telemetry continues to update in real time."}
         </p>
 
         <dl className="grid grid-cols-2 gap-x-6 gap-y-2 rounded-md border border-border p-4 text-sm">
           <Readout label="Bean Temp (now)" value={formatTempC(beanTempC)} />
           <Readout label="Environment Temp" value={formatTempC(envTempC)} />
-          <Readout label="Heat (locked)" value={formatPercent(heatPercent)} />
-          <Readout label="Fan (locked)" value={formatPercent(fanPercent)} />
+          <Readout
+            label={humanDisclosureAvailable ? "Heat command" : "Heat (locked)"}
+            value={formatPercent(heatPercent)}
+          />
+          <Readout
+            label={humanDisclosureAvailable ? "Fan command" : "Fan (locked)"}
+            value={formatPercent(fanPercent)}
+          />
         </dl>
 
         {emergencyStopAction !== undefined && (
@@ -264,10 +285,14 @@ export function RecoveryModal({
               <span className="text-sm font-semibold uppercase tracking-wide">
                 {emergencyStopAction.label}
               </span>
-              <span className="text-xs text-muted-foreground">{emergencyStopAction.note}</span>
+              {!humanDisclosureAvailable && (
+                <span className="text-xs text-muted-foreground">{emergencyStopAction.note}</span>
+              )}
             </button>
           </aside>
         )}
+
+        <HumanProtectionDisclosure protection={humanProtection} />
 
         {showClosureOnlyConfirmation && (
           <section
@@ -396,42 +421,47 @@ export function RecoveryModal({
           </section>
         )}
 
-        <div className="flex flex-col gap-2">
-          <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Select Recovery Action
-          </span>
-          {routineRecoveryActions
-            .filter(({ action }) => !healthStale && enabled.has(action))
-            .map(({ action, label, note }) => {
-              return (
-                <button
-                  key={action}
-                  type="button"
-                  data-testid={`recovery-${action}`}
-                    data-enabled={routineDispatchBlocked ? "false" : "true"}
-                    disabled={routineDispatchBlocked}
-                    aria-disabled={routineDispatchBlocked}
-                    onClick={() => {
-                      if (routineDispatchBlocked) return;
-                      onAction(action);
-                    }}
-                  className={cn(
-                    "flex items-center justify-between gap-4 rounded-md border px-4 py-3 text-left transition-colors",
-                    routineDispatchBlocked
-                      ? "cursor-not-allowed border-border/40 bg-transparent text-muted-foreground/50"
-                      : "border-border bg-secondary hover:bg-accent",
-                  )}
-                >
-                  <span className="text-sm font-semibold uppercase tracking-wide">{label}</span>
+        {(!humanDisclosureAvailable || routineRecoveryActions.length > 0) && (
+          <div className="flex flex-col gap-2">
+            <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Select Recovery Action
+            </span>
+            {routineRecoveryActions.map(({ action, label, note }) => (
+              <button
+                key={action}
+                type="button"
+                data-testid={`recovery-${action}`}
+                data-enabled={routineDispatchBlocked ? "false" : "true"}
+                disabled={routineDispatchBlocked}
+                aria-disabled={routineDispatchBlocked}
+                onClick={() => {
+                  if (routineDispatchBlocked) return;
+                  onAction(action);
+                }}
+                className={cn(
+                  "flex items-center justify-between gap-4 rounded-md border px-4 py-3 text-left transition-colors",
+                  routineDispatchBlocked
+                    ? "cursor-not-allowed border-border/40 bg-transparent text-muted-foreground/50"
+                    : "border-border bg-secondary hover:bg-accent",
+                )}
+              >
+                <span className="text-sm font-semibold uppercase tracking-wide">{label}</span>
+                {!humanDisclosureAvailable && (
                   <span className="text-xs text-muted-foreground">{note}</span>
-                </button>
-              );
-            })}
-        </div>
+                )}
+              </button>
+            ))}
+          </div>
+        )}
         {healthStale && (
           <p data-testid="recovery-health-stale" className="text-xs text-roast-fault">
             Health status is stale. Recovery actions are disabled until it recovers; emergency
             stop remains available.
+          </p>
+        )}
+        {humanDisclosureAvailable && lastResult && lastResult.result !== "accepted" && (
+          <p role="alert" className="text-sm text-roast-fault">
+            {lastResult.action.replace(/_/g, " ")} {lastResult.result}: {lastResult.reason}
           </p>
         )}
         {!healthStale && routineDispatchBlocked && (

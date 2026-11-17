@@ -18,6 +18,7 @@ import {
   type UseQueryResult,
 } from "@tanstack/react-query";
 
+import { hasHumanProtection, readHumanProtection } from "@/lib/humanProtection";
 import { api } from "@/lib/api";
 import type { BeanProfileInput, TastingEntryRequest } from "@/lib/types";
 
@@ -160,16 +161,21 @@ export function useFreshHistoryGate() {
 // hazard into a POST-completion dead end, an instance of the batch's
 // "a server-state source rendered authoritatively needs a freshness path"
 // class. The TanStack v5 callback form reads the CURRENT cached data (not a
-// stale closure), so the interval self-cancels the tick immediately after a
-// refetch reports completion — zero ongoing cost on the overwhelmingly common
-// completed-run case (history/detail browsing), the only cost is on an
-// actively-open live detail view, which is rare and short-lived by nature.
+// stale closure), so polling stops after completion unless a current HUMAN
+// disclosure remains. A completed run's projection can outlive its command
+// authority until the server assigns a replacement runner.
 export function useRoast(runId: string | null) {
   return useQuery({
     queryKey: roastKeys.detail(runId ?? ""),
     queryFn: runId === null ? skipToken : () => api.roast(runId),
-    refetchInterval: (query) =>
-      query.state.data !== undefined && query.state.data.completed_at_utc === null ? 5000 : false,
+    refetchInterval: (query) => {
+      const detail = query.state.data;
+      if (detail === undefined) return false;
+      // A completed run can retain a current disclosure until its runner is replaced.
+      return detail.completed_at_utc === null || hasHumanProtection(readHumanProtection(detail))
+        ? 5000
+        : false;
+    },
   });
 }
 

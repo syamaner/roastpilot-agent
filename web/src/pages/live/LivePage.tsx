@@ -119,6 +119,8 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 
 import { AppFrame, LiveCurve } from "@/components/shared";
+import { HumanProtectionDisclosure } from "@/components/shared/HumanProtectionDisclosure";
+import { readHumanProtection } from "@/lib/humanProtection";
 import {
   roastKeys,
   useFreshHealthGate,
@@ -1291,6 +1293,10 @@ function LiveFinishedView({ runId }: LiveFinishedViewProps): React.JSX.Element {
             </p>
           )}
         </header>
+
+        {roast.data && (
+          <HumanProtectionDisclosure protection={readHumanProtection(roast.data)} />
+        )}
 
         {/* Headline stats */}
         <div

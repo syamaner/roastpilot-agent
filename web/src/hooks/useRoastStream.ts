@@ -17,6 +17,7 @@ import { useEffect, useReducer, useRef, useState } from "react";
 
 import { api } from "@/lib/api";
 import type {
+  HumanProtectionProjection,
   OperatorAction,
   RoastPhase,
   SseEvent,
@@ -28,6 +29,7 @@ import {
   hydrate,
   initialRoastStreamState,
   type RoastStreamState,
+  type StreamSnapshot,
 } from "./roastStreamReducer";
 
 declare global {
@@ -49,10 +51,7 @@ export interface UseRoastStreamOptions {
   /** Test seam: construct an EventSource (defaults to the global). */
   createEventSource?: (url: string) => EventSourceLike;
   /** Test seam: snapshot fetch (defaults to the REST client). */
-  fetchSnapshot?: (runId: string) => Promise<{
-    agent_phase: RoastPhase;
-    enabled_actions?: OperatorAction[];
-  }>;
+  fetchSnapshot?: (runId: string) => Promise<StreamSnapshot>;
 }
 
 /** The slice of EventSource we use — narrowed so tests can supply a fake. */
@@ -68,6 +67,7 @@ export interface UseRoastStreamResult {
   phase: RoastPhase | null;
   telemetry: TelemetryEventData | null;
   enabledActions: OperatorAction[] | null;
+  humanProtection: HumanProtectionProjection | null;
   /**
    * The most recent raw frame. CONVENIENCE ONLY — it is a single slot and is
    * LOSSY under a burst: when several frames arrive in one React batch (e.g. a
@@ -95,8 +95,8 @@ const DEFAULT_HEARTBEAT = 15;
 const DEFAULT_MAX_BACKOFF = 30;
 
 type Action =
-  | { kind: "hydrate"; snapshot: { agent_phase: RoastPhase; enabled_actions?: OperatorAction[] } }
-  | { kind: "event"; event: SseEvent }
+  | { kind: "hydrate"; snapshot: StreamSnapshot; runId: string }
+  | { kind: "event"; event: SseEvent; runId: string }
   | { kind: "reset" };
 
 function reduce(state: RoastStreamState, action: Action): RoastStreamState {
@@ -110,13 +110,9 @@ function reduce(state: RoastStreamState, action: Action): RoastStreamState {
     return initialRoastStreamState;
   }
   if (action.kind === "hydrate") {
-    return hydrate(state, {
-      // The reducer only reads agent_phase + enabled_actions off the snapshot.
-      agent_phase: action.snapshot.agent_phase,
-      enabled_actions: action.snapshot.enabled_actions,
-    } as Parameters<typeof hydrate>[1]);
+    return hydrate(state, action.snapshot, action.runId);
   }
-  return applyEvent(state, action.event);
+  return applyEvent(state, action.event, action.runId);
 }
 
 /** Capped exponential backoff: 1, 2, 4, … up to `maxSeconds`. */
@@ -220,7 +216,7 @@ export function useRoastStream(
         .current(runId)
         .then((snapshot) => {
           if (cancelled) return;
-          dispatch({ kind: "hydrate", snapshot });
+          dispatch({ kind: "hydrate", snapshot, runId });
           openStream();
         })
         .catch(() => {
@@ -237,15 +233,17 @@ export function useRoastStream(
       source = es;
 
       es.onopen = () => {
+        if (cancelled || source !== es) return;
         attempt = 0;
         markFrame();
       };
       es.onerror = () => {
+        if (cancelled || source !== es) return;
         // EventSource will try its own reconnect, but we close and drive an
         // explicit capped backoff so the snapshot re-hydrates each attempt and
         // the indicator reflects reconnecting state.
         es.close();
-        if (source === es) source = null;
+        source = null;
         scheduleReconnect();
       };
 
@@ -253,14 +251,16 @@ export function useRoastStream(
       // (EventSource's `onmessage` only fires for the default/unnamed event).
       for (const type of SSE_EVENT_TYPES) {
         es.addEventListener(type, (ev) => {
+          if (cancelled || source !== es) return;
           markFrame();
-          const id = ev.lastEventId ? Number(ev.lastEventId) : null;
+          // An id-less heartbeat can inherit the browser's previous lastEventId.
+          const id = type !== "heartbeat" && ev.lastEventId ? Number(ev.lastEventId) : null;
           const frame: SseEvent = {
             event: type,
             data: parseData(ev.data),
             id,
           };
-          dispatch({ kind: "event", event: frame });
+          dispatch({ kind: "event", event: frame, runId });
           setLastEvent(frame);
           // Non-lossy channel (#122): append every frame to the buffer (in place,
           // synchronously) and bump the count. Even if N frames arrive in one batch
@@ -320,6 +320,7 @@ export function useRoastStream(
     phase: state.phase,
     telemetry: state.telemetry,
     enabledActions: state.enabledActions,
+    humanProtection: state.humanProtection?.runId === runId ? state.humanProtection.data : null,
     lastEvent,
     frames: framesRef.current,
     frameCount,
@@ -388,7 +389,10 @@ export const SSE_EVENT_TYPES = [
 function parseData(raw: string): Record<string, unknown> {
   if (!raw) return {};
   try {
-    return JSON.parse(raw) as Record<string, unknown>;
+    const value: unknown = JSON.parse(raw);
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
   } catch {
     return {};
   }

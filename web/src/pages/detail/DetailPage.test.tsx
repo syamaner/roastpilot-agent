@@ -434,3 +434,61 @@ describe("DetailPage shell", () => {
     expect(screen.queryByTestId("rating-headline")).not.toHaveTextContent("Not yet rated.");
   });
 });
+
+it("preserves a completed run's WITHHELD disclosure across metadata writes until a GET clears it", async () => {
+  const withheld: RoastDetail = {
+    ...FIXTURE_DETAIL,
+    human_endpoint: "withheld",
+    human_command_disposition: "settled",
+    physical_intervention_required: true,
+    emergency_fallback_disclosure: "Emergency fallback may stop the drum and close the chute.",
+  };
+  const cleared: RoastDetail = {
+    ...withheld,
+    human_endpoint: null,
+    human_command_disposition: null,
+    physical_intervention_required: null,
+    emergency_fallback_disclosure: null,
+  };
+  let resolveRefetch!: (value: RoastDetail) => void;
+  const heldRefetch = new Promise<RoastDetail>((resolve) => { resolveRefetch = resolve; });
+  const roast = vi.spyOn(api, "roast").mockResolvedValue(withheld);
+  vi.spyOn(api, "telemetry").mockResolvedValue(FIXTURE_TELEMETRY);
+  vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
+  vi.spyOn(api, "rate").mockResolvedValue({ ...cleared, rating: 4, notes: "Saved roast notes" });
+  vi.spyOn(api, "setRoastedWeight").mockResolvedValue({ ...cleared, roasted_weight_grams: 218 });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 30_000 } } });
+  renderAt(`/roasts/${withheld.id}`, client);
+  expect(await screen.findByText("Drop withheld")).toBeVisible();
+  expect(screen.getByText("Physical intervention required")).toBeVisible();
+  expect(screen.queryByRole("button", { name: /drop beans|emergency stop/i })).toBeNull();
+
+  fireEvent.click(screen.getByTestId("rating-edit"));
+  fireEvent.click(screen.getByTestId("star-4"));
+  fireEvent.change(screen.getByTestId("rating-notes"), { target: { value: "Saved roast notes" } });
+  fireEvent.click(screen.getByTestId("rating-save"));
+  const rating = await screen.findByTestId("rating-headline");
+  expect(within(rating).getByText("Saved roast notes")).toBeVisible();
+  expect(screen.getByText("Drop withheld")).toBeVisible();
+
+  roast.mockReturnValue(heldRefetch);
+  fireEvent.change(screen.getByTestId("roasted-weight-input"), { target: { value: "218" } });
+  fireEvent.click(screen.getByTestId("roasted-weight-save"));
+  await waitFor(() =>
+    expect(client.isFetching({ queryKey: roastKeys.detail(withheld.id), exact: true })).toBe(1),
+  );
+  expect(screen.getByText("Physical intervention required")).toBeVisible();
+  await act(async () => resolveRefetch({
+    ...withheld, rating: 4, notes: "Saved roast notes", roasted_weight_grams: 218,
+  }));
+  await waitFor(() =>
+    expect(client.getQueryData(roastKeys.detail(withheld.id))).toMatchObject({
+      roasted_weight_grams: 218,
+    }),
+  );
+  expect(screen.getByText("Drop withheld")).toBeVisible();
+
+  roast.mockResolvedValue(cleared);
+  await act(async () => client.invalidateQueries({ queryKey: roastKeys.detail(withheld.id), exact: true }));
+  await waitFor(() => expect(screen.queryByText("Drop withheld")).toBeNull());
+});

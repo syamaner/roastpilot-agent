@@ -40,6 +40,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -48,7 +49,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CurvePoint } from "@/components/shared/LiveCurve";
 import type { ConnectionStatus } from "@/hooks/useRoastStream";
 import { roastKeys } from "@/hooks/queries";
-import type { RoastTimeline } from "@/lib/types";
+import type { HumanProtectionProjection, RoastTimeline } from "@/lib/types";
 import { DashboardPage } from "./DashboardPage";
 
 // Spy on the typed REST client so the acknowledge-fault POST can be asserted (#206).
@@ -153,6 +154,7 @@ const streamState: {
   phase: string | null;
   telemetry: unknown;
   enabledActions: unknown;
+  humanProtection: HumanProtectionProjection | null;
   frames: unknown[];
   frameCount: number;
 } = {
@@ -160,6 +162,7 @@ const streamState: {
   phase: null,
   telemetry: null,
   enabledActions: null,
+  humanProtection: null,
   frames: [],
   frameCount: 0,
 };
@@ -228,6 +231,7 @@ beforeEach(() => {
   viewState.fault = null;
   viewState.points = [];
   streamState.enabledActions = null;
+  streamState.humanProtection = null;
   streamState.phase = null;
   streamState.status = "connecting";
   streamState.telemetry = null;
@@ -1119,5 +1123,122 @@ describe("DashboardPage stream drain health invalidation", () => {
     );
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: roastKeys.history });
     expect(invalidateSpy).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe("HUMAN protection disclosure", () => {
+  it("discloses unknown outcomes from server fields even with commanded cooling", async () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-live" };
+    streamState.status = "live";
+    streamState.phase = "operator_recovery_required";
+    streamState.enabledActions = ["emergency_stop"];
+    streamState.telemetry = {
+      env_temp_c: 211.2,
+      ambient_temp_c: 22.8,
+      cooling_on: true,
+      cooling_motor_on: true,
+    };
+    const fallback = "Emergency fallback may stop the drum and close the chute. Admission or RPC return does not establish physical evacuation.";
+    streamState.humanProtection = {
+      human_endpoint: "history_unknown",
+      human_command_disposition: "unknown",
+      physical_intervention_required: true,
+      emergency_fallback_disclosure: fallback,
+    };
+    const { client, rerender } = renderPage();
+
+    expect(screen.getByText("Prior drop history unknown")).toBeVisible();
+    expect(screen.getByText("Command outcome unknown")).toBeVisible();
+    expect(screen.getByText("Physical intervention required")).toBeVisible();
+    expect(screen.getByText(fallback)).toBeVisible();
+    expect(screen.getByText("211.2 °C")).toBeVisible();
+    expect(screen.getByTestId("ambient-temp")).toHaveTextContent("22.8 °C");
+    expect(screen.queryByText(/cooling confirmed/i)).toBeNull();
+    expect(screen.queryByTestId("recovery-drop_beans")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("recovery-emergency_stop"));
+    await waitFor(() => expect(operatorActionMock).toHaveBeenCalledWith(
+      "run-live", { action: "emergency_stop" },
+    ));
+    expect(screen.getByText("Command outcome unknown")).toBeVisible();
+
+    streamState.humanProtection = {
+      human_endpoint: "withheld",
+      human_command_disposition: "settled",
+      physical_intervention_required: false,
+      emergency_fallback_disclosure: null,
+    };
+    rerender(
+      <QueryClientProvider client={client}>
+        <MemoryRouter><DashboardPage /></MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText("Drop withheld")).toBeVisible();
+    expect(screen.queryByText("Command outcome unknown")).toBeNull();
+    expect(screen.queryByText("Physical intervention required")).toBeNull();
+    expect(screen.queryByText(fallback)).toBeNull();
+    expect(screen.queryByText(/cooling confirmed/i)).toBeNull();
+    expect(screen.queryByTestId("recovery-drop_beans")).toBeNull();
+  });
+
+  it("keeps server-admitted recovery drop when intervention is also required", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-live" };
+    streamState.phase = "operator_recovery_required";
+    streamState.enabledActions = ["drop_beans", "emergency_stop"];
+    streamState.humanProtection = {
+      human_endpoint: "withheld",
+      human_command_disposition: "settled",
+      physical_intervention_required: true,
+      emergency_fallback_disclosure: null,
+    };
+    renderPage();
+
+    expect(screen.getByText("Physical intervention required")).toBeVisible();
+    const drop = screen.getByTestId("recovery-drop_beans");
+    expect(drop).toBeEnabled();
+    fireEvent.click(drop);
+    expect(operatorActionMock).toHaveBeenCalledWith("run-live", { action: "drop_beans" });
+  });
+
+  it("shows a cooling refusal in HUMAN recovery after the server returns it", async () => {
+    const reason = "fault finalization is closing the current lease";
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-live" };
+    streamState.phase = "operator_recovery_required";
+    streamState.enabledActions = ["start_cooling", "emergency_stop"];
+    streamState.humanProtection = {
+      human_endpoint: "withheld",
+      human_command_disposition: "settled",
+      physical_intervention_required: true,
+      emergency_fallback_disclosure: null,
+    };
+    operatorActionMock.mockRejectedValueOnce(new Error(reason));
+    renderPage();
+
+    const dialog = within(screen.getByRole("dialog"));
+    expect(dialog.queryByText(reason, { exact: false })).toBeNull();
+    fireEvent.click(dialog.getByTestId("recovery-start_cooling"));
+    expect(await dialog.findByText(reason, { exact: false })).toBeVisible();
+    expect(dialog.getByTestId("recovery-emergency_stop")).toBeEnabled();
+  });
+
+  it("shows fault disclosure without fabricating a safe command posture from phase", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-live" };
+    streamState.phase = "faulted";
+    streamState.enabledActions = ["emergency_stop"];
+    streamState.humanProtection = {
+      human_endpoint: "none",
+      human_command_disposition: "unknown",
+      physical_intervention_required: true,
+      emergency_fallback_disclosure: null,
+    };
+    renderPage();
+
+    expect(screen.getByTestId("fault-reason")).toHaveTextContent("Run faulted.");
+    expect(screen.getByText("Command outcome unknown")).toBeVisible();
+    expect(screen.queryByText(/heat forced off|0% \(forced\)|cooling confirmed/i)).toBeNull();
   });
 });

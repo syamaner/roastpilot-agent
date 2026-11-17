@@ -131,6 +131,33 @@ describe("useRoast polling while the run is LIVE (#533 Codex follow-up, PR #543)
     await vi.advanceTimersByTimeAsync(20_000);
     expect(spy).toHaveBeenCalledTimes(2);
   });
+
+  it("rechecks a completed HUMAN disclosure until the server clears it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const cleared = {
+      ...FIXTURE_DETAIL,
+      human_endpoint: null,
+      human_command_disposition: null,
+      physical_intervention_required: null,
+      emergency_fallback_disclosure: null,
+    };
+    const withheld = {
+      ...cleared,
+      human_endpoint: "withheld",
+      human_command_disposition: "settled",
+      physical_intervention_required: true,
+    } as const;
+    const get = vi.spyOn(api, "roast").mockResolvedValueOnce(withheld).mockResolvedValue(cleared);
+    const { Wrapper } = appDefaultsWrapper();
+    const { result } = renderHook(() => useRoast(withheld.id), { wrapper: Wrapper });
+
+    await vi.waitFor(() => expect(result.current.data?.human_endpoint).toBe("withheld"));
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.waitFor(() => expect(result.current.data?.human_endpoint).toBeNull());
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(get).toHaveBeenCalledTimes(2);
+  });
+
 });
 
 describe("useTimeline (skipToken when runId is null)", () => {

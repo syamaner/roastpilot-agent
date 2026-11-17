@@ -32,6 +32,7 @@ import {
   hydrate,
   initialRoastStreamState,
 } from "@/hooks/roastStreamReducer";
+import { readHumanProtection } from "@/lib/humanProtection";
 import { SSE_EVENT_TYPES } from "@/hooks/useRoastStream";
 import {
   dashboardReducer,
@@ -282,9 +283,12 @@ describe("HUMAN protection wire contract", () => {
       emergency_fallback_disclosure: null,
     };
     expect(rest.roast_detail).toMatchObject(empty);
+    expect(readHumanProtection(rest.roast_detail)).toEqual(empty);
+    expect(readHumanProtection({})).toBeUndefined();
     const heartbeat = frame("heartbeat");
     expect(heartbeat.id).toBeNull();
     expect(heartbeat.data).toEqual({ run_id: "contract-run", ...empty } satisfies HumanProtectionHeartbeat);
+    expect(readHumanProtection(heartbeat.data)).toEqual(empty);
   });
 });
 

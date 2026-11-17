@@ -175,6 +175,7 @@ export const ADVISORY_HISTORY_LIMIT = 4;
 export function snapshotFault(
   phase: RoastPhase | null,
   faultReason: string | null | undefined,
+  humanDisclosureAvailable = false,
 ): SafetyEvaluationData | null {
   if (phase !== "faulted") return null;
   return {
@@ -185,11 +186,13 @@ export function snapshotFault(
     verdict: "fault",
     input_heat: null,
     input_fan: null,
-    // The fail-closed posture the server GUARANTEES in `faulted` (heat off, fan
-    // held) — not a client guess about this run's numbers, but the invariant state.
-    adjusted_heat: 0,
+    // Only the legacy automatic placeholder carries this command posture.
+    // HUMAN endpoint/command disclosure does not report applied heat or fan.
+    adjusted_heat: humanDisclosureAvailable ? null : 0,
     adjusted_fan: null,
-    reason: faultReason ?? "Run faulted — heat forced off.",
+    reason: faultReason ?? (
+      humanDisclosureAvailable ? "Run faulted." : "Run faulted — heat forced off."
+    ),
   };
 }
 
