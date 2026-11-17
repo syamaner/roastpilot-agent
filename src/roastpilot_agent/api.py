@@ -880,6 +880,7 @@ class _BufferedEvent:
     payload: object
     monotonic_seconds: float
     audit_command: CommandReference | None = None
+    storage_origin: StorageCaller | None = None
 
 
 def _event_source(event: _BufferedEvent) -> RoastEventSource:
@@ -930,7 +931,10 @@ class BufferingEventEmitter:
         self._broadcaster.emit(kind, payload, human_run_id=self._human_run_id)
         if self._human_run_id is not None and kind is RoastEventKind.PHASE_CHANGED:
             self.human_phase_frame_id = self._broadcaster.last_event_id
-        event = _BufferedEvent(kind, payload, self._clock(), current_audit_command())
+        origin = current_storage_caller() if self._human_run_id is not None else None
+        if origin is not None and origin.run_id != self._human_run_id:
+            origin = None
+        event = _BufferedEvent(kind, payload, self._clock(), current_audit_command(), origin)
         dispatch = self._dispatch_events.get()
         if (
             dispatch is not None
@@ -1729,36 +1733,11 @@ class RoastRunner:
                     emergency_won_batch=emergency_stop_wins_batch
                 )
                 await self._controller.apply_human_storage_failure_after_urgent()
-                while deferred_evaluations:
-                    evaluation, command = deferred_evaluations.popleft()
-                    with storage_caller(replace(caller, command=command)):
-                        try:
-                            await self._store.record_safety_evaluation(
-                                run_id=self._run_id, tick=self._counter.value, evaluation=evaluation
-                            )
-                        except HistoryUnavailable:
-                            self._controller.inhibit_human_routine_for_storage_failure()
-                        except Exception:  # noqa: BLE001 - a trace fault cannot stop supervision
-                            self._store.note_human_history_gap(
-                                "record_safety_evaluation", self._run_id, unverified=True
-                            )
-                            self._controller.inhibit_human_routine_for_storage_failure()
-                while deferred_commands:
-                    tool, item, event = deferred_commands.popleft()
-                    await self._persist_dispatch_audit(tool, item, event)
+                await self._persist_deferred_stop_audits(
+                    caller, deferred_evaluations, deferred_commands
+                )
             except asyncio.CancelledError:
-                # The store retains the audit already passed to it. Entries
-                # still in these queues never entered their storage operation.
-                for _, command in deferred_evaluations:
-                    with storage_caller(replace(caller, command=command)):
-                        self._store.note_human_history_gap("record_safety_evaluation", self._run_id)
-                for tool, _, event in deferred_commands:
-                    with storage_caller(replace(caller, command=event.audit_command)):
-                        self._store.note_human_history_gap(
-                            "record_command", self._run_id, detail=tool.value
-                        )
-                if deferred_evaluations or deferred_commands:
-                    self._controller.inhibit_human_routine_for_storage_failure()
+                self._note_unentered_stop_audits(caller, deferred_evaluations, deferred_commands)
                 raise
             batch = [item for item in batch if item.action is not OperatorAction.EMERGENCY_STOP]
         fault_acknowledgement_seen = False
@@ -1975,13 +1954,72 @@ class RoastRunner:
                 )
             self._controller.inhibit_human_routine_for_storage_failure()
 
+    async def _persist_deferred_stop_audits(
+        self,
+        caller: StorageCaller,
+        deferred_evaluations: deque[tuple[SafetyEvaluation, CommandReference | None]],
+        deferred_commands: deque[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]],
+    ) -> None:
+        while deferred_evaluations:
+            evaluation, command = deferred_evaluations.popleft()
+            with storage_caller(replace(caller, command=command)):
+                try:
+                    await self._store.record_safety_evaluation(
+                        run_id=self._run_id, tick=self._counter.value, evaluation=evaluation
+                    )
+                except HistoryUnavailable:
+                    self._controller.inhibit_human_routine_for_storage_failure()
+                except Exception:  # noqa: BLE001 - a trace fault cannot stop supervision
+                    self._store.note_human_history_gap(
+                        "record_safety_evaluation", self._run_id, unverified=True
+                    )
+                    self._controller.inhibit_human_routine_for_storage_failure()
+        while deferred_commands:
+            tool, item, event = deferred_commands.popleft()
+            await self._persist_dispatch_audit(tool, item, event)
+
+    def _note_unentered_stop_audits(
+        self,
+        caller: StorageCaller,
+        deferred_evaluations: deque[tuple[SafetyEvaluation, CommandReference | None]],
+        deferred_commands: deque[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]],
+    ) -> None:
+        # The store retains the audit already passed to it. Entries
+        # still in these queues never entered their storage operation.
+        for _, command in deferred_evaluations:
+            with storage_caller(replace(caller, command=command)):
+                self._store.note_human_history_gap("record_safety_evaluation", self._run_id)
+        for tool, _, event in deferred_commands:
+            with storage_caller(replace(caller, command=event.audit_command)):
+                self._store.note_human_history_gap(
+                    "record_command", self._run_id, detail=tool.value
+                )
+        if deferred_evaluations or deferred_commands:
+            self._controller.inhibit_human_routine_for_storage_failure()
+
     async def _dispatch_emergency_with_audit(self, item: QueuedOperatorAction) -> bool:
         if self._controller.authority is ControlAuthority.AUTOMATIC:
             confirmed = await self._dispatch(item)
             await self._flush_events()
             return confirmed
-        with storage_caller(self._new_storage_caller()):
-            confirmed = await self._dispatch(item)
+        caller = self._new_storage_caller()
+        deferred_commands: deque[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]] = (
+            deque()
+        )
+        deferred_evaluations: deque[tuple[SafetyEvaluation, CommandReference | None]] = deque()
+        with storage_caller(caller):
+            try:
+                confirmed = await self._dispatch(
+                    item,
+                    deferred_commands=deferred_commands,
+                    deferred_evaluations=deferred_evaluations,
+                )
+                await self._persist_deferred_stop_audits(
+                    caller, deferred_evaluations, deferred_commands
+                )
+            except asyncio.CancelledError:
+                self._note_unentered_stop_audits(caller, deferred_evaluations, deferred_commands)
+                raise
             await self._flush_events()
             return confirmed
 
@@ -2641,7 +2679,8 @@ class RoastRunner:
         return None  # pragma: no cover — every fault evaluation carries a reason
 
     def _note_unwritten_event(self, event: _BufferedEvent) -> None:
-        caller = current_storage_caller() or self._new_storage_caller()
+        # An ownerless event gets a diagnostic deadline and no turn.
+        caller = event.storage_origin or self._new_storage_caller()
         with storage_caller(replace(caller, command=event.audit_command)):
             self._store.note_human_history_gap(
                 "record_event", self._run_id, detail=event.kind.value
@@ -2666,9 +2705,8 @@ class RoastRunner:
             except (HistoryUnavailable, asyncio.CancelledError) as exc:
                 # The current lock owner may have consumed this prefix.
                 # Events appended after this waiter began belong to a later flush.
-                with storage_caller(caller):
-                    for event in self._emitter.drain_through(boundary):
-                        self._note_unwritten_event(event)
+                for event in self._emitter.drain_through(boundary):
+                    self._note_unwritten_event(event)
                 if isinstance(exc, asyncio.CancelledError):
                     raise
                 return False
