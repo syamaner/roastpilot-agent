@@ -2685,17 +2685,26 @@ async def test_tf18_completed_human_drop_refusal_has_no_history_effect(
         payload={"confirmation": True, "expected_generation": lease.generation},
     )
     assert (await service.submit_operator_action(run_id, request)).queued
-    completion = asyncio.create_task(runner.tick_once())
-    try:
-        await asyncio.wait_for(committed.wait(), 1)
-        stop = await service.submit_fault_controls_action(
-            FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
-        )
-        assert stop.result == "confirmed"
-        assert await service.settle_fault_lease_persistence_for_teardown()
-    finally:
-        release.set()
-        assert await completion
+
+    async def stop_after_commit() -> None:
+        try:
+            await committed.wait()
+            stop = await service.submit_fault_controls_action(
+                FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+            assert stop.result == "confirmed"
+            assert await service.settle_fault_lease_persistence_for_teardown()
+        finally:
+            release.set()
+
+    # The watchdog bounds both participants. The commit event orders them.
+    async with asyncio.timeout(10):
+        async with asyncio.TaskGroup() as tasks:
+            stop_task = tasks.create_task(stop_after_commit())
+            completion = tasks.create_task(runner.tick_once())
+            assert await completion
+            assert committed.is_set(), "runner finished without witnessing the historical commit"
+            await stop_task
     assert runner.finalized
     assert runner._completion_persistence_initiated  # pyright: ignore[reportPrivateUsage]
     later_lease = await store.read_fault_control_lease()
