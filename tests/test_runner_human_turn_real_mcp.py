@@ -12,6 +12,7 @@ import pytest
 
 from roastpilot_agent.api import RoastRunner, RoastService
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, AppConfig, ControllerConfig, MCPConfig
+from roastpilot_agent.human_persistence import Settlement
 from roastpilot_agent.human_protection import (
     ControlAuthority,
     CounterClass,
@@ -206,6 +207,11 @@ async def _exercise_route(
     evaluation_held, release_evaluation = asyncio.Event(), asyncio.Event()
     reserved, release_proof = asyncio.Event(), asyncio.Event()
     confirmed_before_release = False
+    exhaust_proof_history_budget = interval == "proof" and route == "global"
+    completion_left_before_release = False
+    live_acknowledgements: list[object] = []
+    emitter = runner._emitter  # pyright: ignore[reportPrivateUsage]
+    original_emit = emitter.emit
     registered_evaluations = controller._human_drop_evaluation_tasks  # pyright: ignore[reportPrivateUsage]
     strict_results: list[FaultControlCommandResult] = []
     unbound_errors: list[MCPToolError] = []
@@ -219,6 +225,11 @@ async def _exercise_route(
     original_settle = controller.settle_human_drop_evaluations
     original_strict = client._execute_fault_control  # pyright: ignore[reportPrivateUsage]
     original_emergency = client.emergency_stop
+
+    def record_live(kind: RoastEventKind, payload: object) -> None:
+        if kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED:
+            live_acknowledgements.append(payload)
+        original_emit(kind, payload)
 
     async def record(*, run_id: str, tick: int, evaluation: SafetyEvaluation) -> int:
         if evaluation.rule == "human_recovery_drop":
@@ -270,6 +281,7 @@ async def _exercise_route(
         strict_tools.append(name)
         result = await original_strict(name, arguments)
         if name == "emergency_stop":
+            assert any(not evaluation.done() for evaluation in registered_evaluations)
             assert arguments["expected_session_id"] == session
             strict_results.append(result)
         return result
@@ -288,6 +300,7 @@ async def _exercise_route(
     async def forbid_completion(*_args: object, **_kwargs: object) -> None:
         completion_writes.append("completion")
 
+    monkeypatch.setattr(emitter, "emit", record_live)
     monkeypatch.setattr(store, "record_safety_evaluation", record)
     monkeypatch.setattr(store, "record_command", record_command)
     monkeypatch.setattr(adapter, "read_fault_acknowledgement_state", read_ack)
@@ -352,11 +365,18 @@ async def _exercise_route(
                 ),
                 4,
             )
-        confirmed_before_release = (
-            not drop.done()
-            and not completion.done()
-            and any(not evaluation.done() for evaluation in registered_evaluations)
+        if fail_audit:
+            # Let the bounded completion waiter expire while its precise
+            # evaluation owner remains held. The real e-stop has already run.
+            assert not await asyncio.wait_for(asyncio.shield(completion), 3)
+        completion_left_before_release = completion.done()
+        if completion_left_before_release:
+            assert completion.result() is False
+        confirmed_before_release = not drop.done() and any(
+            not evaluation.done() for evaluation in registered_evaluations
         )
+        if exhaust_proof_history_budget:
+            clock.advance(1.0)
     finally:
         release_evaluation.set()
         release_proof.set()
@@ -373,6 +393,15 @@ async def _exercise_route(
     dropped, completed = outcomes
     assert isinstance(dropped, OperatorActionResult) and dropped.result == "failed"
     assert completed is False and completion_writes == []
+    receipts = store.drain_human_storage_receipts()
+    if completion_left_before_release:
+        assert any(
+            r.kind == "terminal_evaluation_settlement"
+            and r.run_id == run.id
+            and r.turn == runner.current_tick
+            and r.settlement is Settlement.VERIFIED_NO_WRITE
+            for r in receipts
+        )
     assert "drop_beans" not in strict_tools
     after = await client.get_roast_state(session)
     before_fault_count = sum(event.kind == "fault" for event in before.events)
@@ -401,12 +430,39 @@ async def _exercise_route(
     if interval == "proof":
         assert "stop_cooling" not in strict_tools
         timeline = await store.read_timeline(run.id)
-        assert any(
+        assert {
+            "outcome": "failed",
+            "reason": "superseded_by_emergency_stop",
+        } in live_acknowledgements
+        durable_supersession = any(
             event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
             and event.payload is not None
             and event.payload.get("reason") == "superseded_by_emergency_stop"
             for event in timeline.events
         )
+        if exhaust_proof_history_budget:
+            assert not durable_supersession
+        if not durable_supersession:
+            assert any(
+                r.kind == "record_event"
+                and r.detail == RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED.value
+                and r.run_id == run.id
+                and r.turn == runner.current_tick
+                and r.settlement is Settlement.VERIFIED_NO_WRITE
+                and r.writer_entered is False
+                for r in receipts
+            )
     if fail_audit:
         assert audit_failures == 1
         assert "could not persist fault-control command outcome" in caplog.messages
+        (missing,) = [
+            r
+            for r in receipts
+            if r.kind == "record_command" and r.detail == RoastCommand.EMERGENCY_STOP.value
+        ]
+        assert missing.run_id == run.id and missing.turn is None
+        assert missing.settlement is Settlement.UNRESOLVED and missing.writer_entered is None
+        assert missing.command is not None
+        assert missing.command.session_id == session
+        assert missing.command.child_generation == child.child_epoch
+        assert missing.command.command_generation == controller.command_generation

@@ -3545,7 +3545,12 @@ async def test_am5_estop_route_during_owned_human_evaluation(
                 receipt.run_id == run_id
                 and receipt.kind == "record_operator_action"
                 and receipt.detail == OperatorAction.EMERGENCY_STOP.value
-                and receipt.settlement is Settlement.VERIFIED_NO_WRITE
+                and receipt.settlement
+                is (
+                    Settlement.UNRESOLVED
+                    if fault == "action_audit_raises"
+                    else Settlement.VERIFIED_NO_WRITE
+                )
                 for receipt in store.drain_human_storage_receipts()
             )
     latest = await store.read_fault_control_lease()
@@ -4167,7 +4172,8 @@ async def test_am6_per_run_capability_doubt_preserves_direct_command_audit(
         receipt.run_id == run_id
         and receipt.kind == "record_command"
         and receipt.detail == RoastCommand.EMERGENCY_STOP.value
-        and receipt.settlement is Settlement.VERIFIED_NO_WRITE
+        and receipt.settlement is Settlement.UNRESOLVED
+        and receipt.writer_entered is None
         and receipt.command is not None
         for receipt in store.drain_human_storage_receipts()
     )

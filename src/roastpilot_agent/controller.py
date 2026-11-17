@@ -631,6 +631,7 @@ class FaultControlExecutor:
         human_drop_controller: "Callable[[str | None], RoastController | None] | None" = None,
         history_deadline: Callable[[], StorageDeadline] | None = None,
         child_generation: Callable[[], int | None] | None = None,
+        note_history_gap: Callable[[str, str, str], None] | None = None,
     ) -> None:
         self._safety = safety
         self._port = port
@@ -639,6 +640,7 @@ class FaultControlExecutor:
         self._human_drop_controller = human_drop_controller
         self._history_deadline = history_deadline
         self._child_generation = child_generation
+        self._note_history_gap = note_history_gap
         self._audit_scope: ContextVar[_FaultAudit | None] = ContextVar(
             "fault_control_audit",
             default=None,
@@ -1219,7 +1221,9 @@ class FaultControlExecutor:
             return await self._trace_sink.record_fault_control_evaluation(
                 run_id=run_id, evaluation=evaluation
             )
-        except Exception:  # noqa: BLE001 - audit uncertainty cannot suppress an e-stop outcome
+        except Exception as exc:  # noqa: BLE001 - audit uncertainty cannot suppress an e-stop outcome
+            if self._note_history_gap is not None and not isinstance(exc, HistoryUnavailable):
+                self._note_history_gap("record_safety_evaluation", run_id, evaluation.rule)
             logging.getLogger(__name__).exception(
                 "could not persist fault-control safety admission"
             )
@@ -1246,7 +1250,9 @@ class FaultControlExecutor:
                 result=result,
                 safety_evaluation_id=evaluation_id,
             )
-        except Exception:  # noqa: BLE001 - audit uncertainty cannot rewrite actuator fact
+        except Exception as exc:  # noqa: BLE001 - audit uncertainty cannot rewrite actuator fact
+            if self._note_history_gap is not None and not isinstance(exc, HistoryUnavailable):
+                self._note_history_gap("record_command", run_id, tool.value)
             logging.getLogger(__name__).exception("could not persist fault-control command outcome")
 
     def _schedule_command_trace(

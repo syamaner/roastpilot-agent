@@ -1867,7 +1867,10 @@ class RoastRunner:
         except Exception:  # noqa: BLE001 - a trace fault cannot rewrite the command result
             with storage_caller(replace(caller, command=event.audit_command)):
                 self._store.note_human_history_gap(
-                    "record_command", self._run_id, detail=tool.value
+                    "record_command",
+                    self._run_id,
+                    detail=tool.value,
+                    unverified=True,
                 )
             self._controller.inhibit_human_routine_for_storage_failure()
 
@@ -3158,6 +3161,18 @@ class RoastService:
                     else None
                 ),
                 child_generation=lambda: None if self._mcp is None else self._mcp.child_epoch,
+                note_history_gap=(
+                    (
+                        lambda kind, run_id, detail: store.note_human_history_gap(
+                            kind,
+                            run_id,
+                            detail=detail,
+                            unverified=True,
+                        )
+                    )
+                    if authority is ControlAuthority.HUMAN
+                    else None
+                ),
                 human_drop_controller=(
                     self._human_fault_drop_controller
                     if authority is ControlAuthority.HUMAN
@@ -8376,6 +8391,7 @@ class RoastService:
                 "record_operator_action",
                 run_id,
                 detail=request.action.value,
+                unverified=True,
             )
         return OperatorActionResult(
             action=request.action, result=result, reason=reason, queued=False

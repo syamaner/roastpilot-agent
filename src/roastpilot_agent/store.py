@@ -1026,8 +1026,9 @@ class RoastStore:
         run_id: str,
         *,
         detail: str | None = None,
+        unverified: bool = False,
     ) -> None:
-        """Record one audit item that could not be submitted to SQLite."""
+        """Record a dropped audit item or an exception outside native attribution."""
         caller = current_storage_caller()
         clock = self._history_clock
         if clock is None:
@@ -1038,11 +1039,16 @@ class RoastStore:
             else StorageDeadline.start(clock, self._history_interval)
         )
         receipt = self._new_storage_receipt(kind, run_id, deadline, detail=detail)
+        if unverified and run_id == self._history_run_id:
+            self._history_prior_unknown = True
         self._record_storage_receipt(
             replace(
-                receipt, writer_entered=False, timely=False, settlement=Settlement.VERIFIED_NO_WRITE
+                receipt,
+                writer_entered=None if unverified else False,
+                timely=False,
+                settlement=Settlement.UNRESOLVED if unverified else Settlement.VERIFIED_NO_WRITE,
             ),
-            missed_write=True,
+            missed_write=not unverified,
         )
 
     @property
