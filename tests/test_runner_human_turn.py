@@ -6398,6 +6398,179 @@ async def test_human_start_history_failure_while_emergency_stop_is_unsettled(
         await service.shutdown()
 
 
+@pytest.mark.parametrize("outcome", ["refused", "cancelled", "confirmed-stop"])
+async def test_later_emergency_retry_supervises_unconfirmed_start_with_failed_history(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    original_start = actuator.start_session
+    original_stop = actuator.emergency_stop
+    original_fan = actuator.set_fan
+    flush_events = RoastRunner._flush_events  # pyright: ignore[reportPrivateUsage]
+    commit = store.connection.commit
+    record_evaluation = store.record_safety_evaluation
+    run_loop = RoastRunner.run
+    at_flush, release_flush, waiting_for_lock = (asyncio.Event() for _ in range(3))
+    writer_entered, release_writer, at_audit, release_audit, retry_dispatched = (
+        asyncio.Event() for _ in range(5)
+    )
+    between_turns = asyncio.Event()
+    supervisors: list[RoastRunner] = []
+    start: asyncio.Task[RoastDetail] | None = None
+    stop: asyncio.Task[FaultControlsActionResult] | None = None
+    writer: asyncio.Task[int] | None = None
+
+    async def lose_start_ack(
+        *, recording_origin: str | None = None, recording_roast_num: int | None = None
+    ) -> None:
+        await original_start(
+            recording_origin=recording_origin, recording_roast_num=recording_roast_num
+        )
+        raise RuntimeError("mock Start acknowledgement lost")
+
+    async def stop_with_optional_lost_ack(*, reason: str) -> AppliedRoasterState | None:
+        result = await original_stop(reason=reason)
+        if outcome != "confirmed-stop":
+            raise RuntimeError("mock stop acknowledgement lost")
+        return result
+
+    async def separate_start_flush(runner: RoastRunner) -> bool:
+        if asyncio.current_task() is start:
+            at_flush.set()
+            await release_flush.wait()
+        return await flush_events(runner)
+
+    async def hold_native_commit() -> None:
+        owner = store._current_native_storage()  # pyright: ignore[reportPrivateUsage]
+        if owner is not None and owner.receipt.kind == "expire_bean_sourcing_drafts":
+            writer_entered.set()
+            await release_writer.wait()
+        await commit()
+
+    async def hold_stop_audit(*, run_id: str, tick: int, evaluation: SafetyEvaluation) -> int:
+        if evaluation.rule == "emergency_stop":
+            at_audit.set()
+            await release_audit.wait()
+        return await record_evaluation(run_id=run_id, tick=tick, evaluation=evaluation)
+
+    async def observe_retry_fan(fan_percent: int) -> None:
+        await original_fan(fan_percent)
+        retry_dispatched.set()
+
+    async def pause_after_first_turn(_delay: float) -> None:
+        between_turns.set()
+        await asyncio.Future[None]()
+
+    async def observe_supervisor(runner: RoastRunner) -> None:
+        assert current_storage_caller() is None
+        monkeypatch.setattr(runner, "_sleep", pause_after_first_turn)
+        supervisors.append(runner)
+        await run_loop(runner)
+
+    monkeypatch.setattr(actuator, "start_session", lose_start_ack)
+    monkeypatch.setattr(actuator, "emergency_stop", stop_with_optional_lost_ack)
+    monkeypatch.setattr(actuator, "set_fan", observe_retry_fan)
+    monkeypatch.setattr(store.connection, "commit", hold_native_commit)
+    monkeypatch.setattr(store, "record_safety_evaluation", hold_stop_audit)
+    monkeypatch.setattr(service, "_run_loop", True)
+    monkeypatch.setattr(RoastRunner, "_flush_events", separate_start_flush)
+    monkeypatch.setattr(RoastRunner, "run", observe_supervisor)
+    start = asyncio.create_task(service.start_roast(PROFILE))
+    try:
+        await asyncio.wait_for(at_flush.wait(), 1)
+        runner = service.runner
+        assert runner is not None and runner.run_id == service.active_run_id
+        controller = runner.controller_for_human_fault_drop()
+        assert controller is not None and controller.owns_human_run(runner.run_id)
+        assert controller.phase is RoastPhase.FAULTED
+        assert not controller.owns_confirmed_human_start()
+        writer = asyncio.create_task(store.expire_bean_sourcing_drafts())
+        await asyncio.wait_for(writer_entered.wait(), 1)
+        held_owner = store._history_owner  # pyright: ignore[reportPrivateUsage]
+        assert held_owner is not None and held_owner.receipt.writer_entered is True
+
+        if outcome == "cancelled":
+            lock = runner._event_flush_lock  # pyright: ignore[reportPrivateUsage]
+            original_acquire = lock.acquire
+
+            async def observe_lock_wait() -> bool:
+                if asyncio.current_task() is start:
+                    waiting_for_lock.set()
+                return await original_acquire()
+
+            async with lock:
+                monkeypatch.setattr(lock, "acquire", observe_lock_wait)
+                release_flush.set()
+                await asyncio.wait_for(waiting_for_lock.wait(), 1)
+                start.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await start
+            assert start.cancelled() and runner.start_history_cancelled
+        else:
+            release_flush.set()
+            with pytest.raises(HistoryUnavailable) as refused:
+                await start
+            assert type(refused.value) is HistoryUnavailable
+
+        assert service._loop_task is None  # pyright: ignore[reportPrivateUsage]
+        assert not controller.has_pending_emergency_stop_work()
+        assert actuator.commands() == ["start_session"]
+        previous_generation = controller.command_generation
+        stop = asyncio.create_task(
+            service.submit_fault_controls_action(
+                FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+        )
+        await asyncio.wait_for(at_audit.wait(), 1)
+        assert not stop.done() and not release_audit.is_set()
+        assert controller.command_generation > previous_generation
+        if outcome == "confirmed-stop":
+            assert service._loop_task is None  # pyright: ignore[reportPrivateUsage]
+            assert not controller.has_pending_emergency_stop_work()
+            assert actuator.commands() == ["start_session", "emergency_stop"]
+        else:
+            # Fail here on the predecessor, before the stop audit can proceed.
+            supervisor = service._loop_task  # pyright: ignore[reportPrivateUsage]
+            assert supervisor is not None
+            await asyncio.wait_for(retry_dispatched.wait(), 1)
+            assert supervisors == [runner]
+            assert service._loop_task is supervisor  # pyright: ignore[reportPrivateUsage]
+            assert store._history_owner is held_owner  # pyright: ignore[reportPrivateUsage]
+            assert not release_writer.is_set() and not stop.done()
+            assert actuator.commands() == ["start_session", "emergency_stop", "set_heat", "set_fan"]
+            assert actuator.calls[-2:] == [
+                ("set_heat", {"heat_percent": 0}),
+                ("set_fan", {"fan_percent": SafetyLimits().overrun_safe_fan_percent}),
+            ]
+        release_writer.set()
+        release_audit.set()
+        result = await asyncio.wait_for(stop, 2)
+        assert result.result == "accepted"
+        assert result.reason == "emergency_stop accepted for controller priority dispatch"
+        assert not controller.owns_confirmed_human_start()
+        assert controller.phase is RoastPhase.FAULTED
+        if outcome != "confirmed-stop":
+            await asyncio.wait_for(between_turns.wait(), 1)
+            assert not controller.has_pending_emergency_stop_work()
+            assert supervisors == [runner]
+    finally:
+        release_flush.set()
+        release_writer.set()
+        release_audit.set()
+        tasks: list[Awaitable[object]] = [
+            task for task in (start, stop, writer) if task is not None
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        loop = service._loop_task  # pyright: ignore[reportPrivateUsage]
+        if loop is not None and not loop.done():
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)
+        assert await store.settle_human_storage_for_teardown()
+        await service.shutdown()
+
+
 async def test_human_start_refused_through_fault_flush_keeps_one_exact_supervisor(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

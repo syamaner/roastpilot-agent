@@ -1219,6 +1219,7 @@ class RoastRunner:
         self._completion_storage_uncertain = False
         self._history_turn_in_progress = False
         self._start_history_cancelled = False
+        self._supervise_on_later_emergency_retry: Callable[[], bool] | None = None
         if controller.authority is ControlAuthority.HUMAN:
             store.enable_human_storage(clock, config.controller.tick_interval_seconds)
             emitter.bound_history_buffer(self._note_unwritten_event)
@@ -2017,7 +2018,13 @@ class RoastRunner:
         if deferred_evaluations or deferred_commands:
             self._controller.inhibit_human_routine_for_storage_failure()
 
-    async def _dispatch_emergency_with_audit(self, item: QueuedOperatorAction) -> bool:
+    def defer_failed_start_supervision(self, supervise: Callable[[], bool]) -> None:
+        """Retain supervision for an existing retry from a later priority stop."""
+        self._supervise_on_later_emergency_retry = supervise
+
+    async def _dispatch_emergency_with_audit(
+        self, item: QueuedOperatorAction, *, resume_failed_start: bool = False
+    ) -> bool:
         if self._controller.authority is ControlAuthority.AUTOMATIC:
             confirmed = await self._dispatch(item)
             await self._flush_events()
@@ -2027,21 +2034,35 @@ class RoastRunner:
             deque()
         )
         deferred_evaluations: deque[tuple[SafetyEvaluation, CommandReference | None]] = deque()
-        with storage_caller(caller):
+        try:
             try:
-                confirmed = await self._dispatch(
-                    item,
-                    deferred_commands=deferred_commands,
-                    deferred_evaluations=deferred_evaluations,
-                )
+                with storage_caller(caller):
+                    confirmed = await self._dispatch(
+                        item,
+                        deferred_commands=deferred_commands,
+                        deferred_evaluations=deferred_evaluations,
+                    )
+            finally:
+                # Hand off the armed retry outside the stop's storage caller,
+                # before any audit can delay the ordinary supervisor.
+                supervise = self._supervise_on_later_emergency_retry
+                if (
+                    resume_failed_start
+                    and supervise is not None
+                    and self._controller.has_pending_emergency_stop_retry()
+                    and supervise()
+                ):
+                    self._supervise_on_later_emergency_retry = None
+            with storage_caller(caller):
                 await self._persist_deferred_stop_audits(
                     caller, deferred_evaluations, deferred_commands
                 )
-            except asyncio.CancelledError:
-                self._note_unentered_stop_audits(caller, deferred_evaluations, deferred_commands)
-                raise
+        except asyncio.CancelledError:
+            self._note_unentered_stop_audits(caller, deferred_evaluations, deferred_commands)
+            raise
+        with storage_caller(caller):
             await self._flush_events()
-            return confirmed
+        return confirmed
 
     async def dispatch_priority_emergency_stop(
         self, item: QueuedOperatorAction, *, already_admitted: bool = False
@@ -2059,7 +2080,7 @@ class RoastRunner:
             self._fault_acknowledgement_gate.invalidate_fault_acknowledgement()
             self._emergency_stop_since_last_drain = True
             self.admit_emergency_stop()
-        await self._dispatch_emergency_with_audit(item)
+        await self._dispatch_emergency_with_audit(item, resume_failed_start=already_admitted)
         return True
 
     async def dispatch_shutdown_emergency_stop(
@@ -6787,7 +6808,9 @@ class RoastService:
         finally:
             self._hardware_clear_request_in_flight = False
 
-    def _supervise_current_failed_human_start(self, runner: RoastRunner, run_id: str) -> None:
+    def _supervise_current_failed_human_start(
+        self, runner: RoastRunner, run_id: str, *, after_start: bool = False
+    ) -> bool:
         """Keep the current failed HUMAN Start on its ordinary supervision path."""
         if (
             not self._run_loop
@@ -6795,14 +6818,23 @@ class RoastService:
             or self._human_admission.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN
             or self.runner is not runner
             or self.active_run_id != run_id
-            or self._starting_run_id != run_id
+            or self._starting_run_id != (None if after_start else run_id)
             or runner.finalized
             or (self._loop_task is not None and not self._loop_task.done())
+            or (
+                after_start
+                and (
+                    self._detached_recovery_loop is not None
+                    or self._fault_acknowledgement_gate.fault_finalization_started
+                )
+            )
         ):
-            return
+            return False
         controller = runner.controller_for_human_fault_drop()
-        if controller is not None and controller.owns_human_run(run_id):
-            self._loop_task = asyncio.create_task(runner.run())
+        if controller is None or not controller.owns_human_run(run_id):
+            return False
+        self._loop_task = asyncio.create_task(runner.run())
+        return True
 
     async def _begin_live_run(
         self, profile: RoastProfile, run_id: str, *, lease_generation: int
@@ -6842,28 +6874,26 @@ class RoastService:
         recording_roast_num = await self._recording_roast_num(profile)
         try:
             await runner.start(profile, recording_roast_num=recording_roast_num)
-        except HistoryUnavailable:
+        except (HistoryUnavailable, asyncio.CancelledError) as exc:
+            cancelled = isinstance(exc, asyncio.CancelledError)
+            if cancelled and not runner.start_history_cancelled:
+                raise
             controller = runner.controller_for_human_fault_drop()
-            if start_history_refused or (
-                controller is not None
-                and not controller.owns_confirmed_human_start()
-                and controller.has_pending_emergency_stop_work()
-            ):
-                self._supervise_current_failed_human_start(runner, run_id)
-            raise
-        except asyncio.CancelledError:
-            controller = runner.controller_for_human_fault_drop()
-            if (
-                runner.start_history_cancelled
-                and controller is not None
-                and (
-                    controller.owns_confirmed_human_start()
-                    or controller.has_pending_emergency_stop_work()
-                )
-            ):
-                # An admitted stop may still need the ordinary supervisor to retry
-                # heat-off. Keep cancellation visible to the caller.
-                self._supervise_current_failed_human_start(runner, run_id)
+            if controller is not None:
+                confirmed = controller.owns_confirmed_human_start()
+                supervise_now = confirmed if cancelled else start_history_refused
+                if supervise_now or (
+                    not confirmed and controller.has_pending_emergency_stop_work()
+                ):
+                    self._supervise_current_failed_human_start(runner, run_id)
+                elif not confirmed and controller.phase is RoastPhase.FAULTED:
+                    # A later admitted stop can arm the ordinary heat-off retry
+                    # after this failed Start request has already returned.
+                    runner.defer_failed_start_supervision(
+                        lambda: self._supervise_current_failed_human_start(
+                            runner, run_id, after_start=True
+                        )
+                    )
             raise
         # A later successful flush records the fault. It cannot confirm a
         # Start withheld at the controller's dispatch boundary.
