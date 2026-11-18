@@ -241,6 +241,58 @@ test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery mo
   await expectScreenshot(page, "dashboard-recovery.png", SCREENSHOT_CLASSES.CANVAS_PAGE);
 });
 
+test("HUMAN recovery discloses a server heartbeat before any telemetry", async ({ page }) => {
+  const fallback = "Emergency fallback may stop the drum and close the chute. Admission or RPC return does not establish physical evacuation.";
+  const actions = ["emergency_stop"];
+  const endpoint = /\/api\/roasts\/[^/?]+(\?.*)?$/;
+  await page.route(endpoint, async (route) => {
+    const response = await route.fetch();
+    await route.fulfill({
+      response,
+      json: { ...await response.json(), agent_phase: "operator_recovery_required", enabled_actions: actions },
+    });
+  });
+  await page.route("**/api/roasts/*/events*", async (route) => {
+    const runId = new URL(route.request().url()).pathname.split("/").at(-2);
+    const phase = { phase: "operator_recovery_required", enabled_actions: actions };
+    const disclosure = {
+      run_id: runId,
+      human_endpoint: "unknown",
+      human_command_disposition: "unknown",
+      physical_intervention_required: true,
+      emergency_fallback_disclosure: fallback,
+    };
+    await route.fulfill({
+      contentType: "text/event-stream",
+      body: `id: 41\nevent: phase_changed\ndata: ${JSON.stringify(phase)}\n\n` +
+        `event: heartbeat\ndata: ${JSON.stringify(disclosure)}\n\n`,
+    });
+  });
+  await page.route("**/api/roasts/*/operator-actions", (route) => route.fulfill({
+    json: { action: "emergency_stop", result: "accepted", queued: false, reason: "Software stop accepted" },
+  }));
+
+  await page.goto(`${WEB_URLS.faultPreT0}/live`);
+  const modal = page.getByTestId("recovery-modal");
+  const disclosure = modal.getByRole("region", { name: "Human-mode protection" });
+  await expect(disclosure).toContainText("Drop outcome unknown");
+  await expect(disclosure).toContainText("Command outcome unknown");
+  await expect(disclosure).toContainText("Physical intervention required");
+  await expect(disclosure).toContainText(fallback);
+  await expect(modal.getByTestId("recovery-drop_beans")).toHaveCount(0);
+  await expect(modal.getByText("cooling confirmed", { exact: false })).toHaveCount(0);
+  await settle(page);
+  const panel = modal.getByTestId("recovery-modal-panel");
+  await expectScreenshot(panel, "dashboard-human-recovery.png", SCREENSHOT_CLASSES.DOM_LOCATOR);
+
+  const request = page.waitForRequest((candidate) =>
+    candidate.method() === "POST" && candidate.url().endsWith("/operator-actions"),
+  );
+  await modal.getByTestId("recovery-emergency_stop").click();
+  expect((await request).postDataJSON()).toEqual({ action: "emergency_stop" });
+  await expect(disclosure).toContainText("Command outcome unknown");
+});
+
 test("dashboard-developed — full ramping curve at first crack (canvas un-masked, real shape)", async ({
   page,
 }) => {

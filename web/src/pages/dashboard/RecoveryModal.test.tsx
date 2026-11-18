@@ -1,11 +1,21 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { hydrate, initialRoastStreamState } from "@/hooks/roastStreamReducer";
+import type { HumanProtectionProjection, OperatorAction } from "@/lib/types";
+
 import { RecoveryModal } from "./RecoveryModal";
 
 afterEach(cleanup);
 
 const READOUT = { beanTempC: 198, envTempC: 215, heatPercent: 60, fanPercent: 55 };
+
+const AUTOMATIC_PROTECTION = {
+  human_endpoint: null,
+  human_command_disposition: null,
+  physical_intervention_required: null,
+  emergency_fallback_disclosure: null,
+} satisfies HumanProtectionProjection;
 
 describe("RecoveryModal", () => {
   it("renders nothing when closed", () => {
@@ -13,11 +23,28 @@ describe("RecoveryModal", () => {
     expect(screen.queryByTestId("recovery-modal")).toBeNull();
   });
 
-  it("states the no-auto-resume guarantee (required copy)", () => {
-    render(<RecoveryModal open {...READOUT} enabledActions={[]} onAction={() => {}} />);
+  it("preserves legacy recovery labels and copy for an explicit all-null projection", () => {
+    const onAction = vi.fn();
+    render(
+      <RecoveryModal
+        open
+        {...READOUT}
+        humanProtection={AUTOMATIC_PROTECTION}
+        enabledActions={["acknowledge_recovery", "start_cooling"]}
+        onAction={onAction}
+      />,
+    );
     const copy = screen.getByTestId("recovery-no-auto-resume");
     expect(copy).toHaveTextContent(/no auto-resume/i);
     expect(copy).toHaveTextContent(/will not touch heat or fan until you choose/i);
+    expect(screen.getByText(/service restarted during an active roast/i)).toBeVisible();
+    expect(screen.getByText("Heat (locked)")).toBeVisible();
+    expect(screen.getByText("Fan (locked)")).toBeVisible();
+    expect(screen.getByText("Halt all systems immediately.")).toBeVisible();
+    expect(screen.getByText("Cut heat, max fan, begin cooldown.")).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Human-mode protection" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /resume monitoring only/i }));
+    expect(onAction).toHaveBeenCalledWith("acknowledge_recovery");
   });
 
   it("shows the current hardware readout", () => {
@@ -344,5 +371,80 @@ describe("RecoveryModal", () => {
     fireEvent.click(screen.getByTestId("closure-only-cancel"));
     fireEvent.click(screen.getByTestId("closure-only-open"));
     expect(screen.queryByTestId("closure-only-error")).toBeNull();
+  });
+});
+
+describe("recovery disclosure copy", () => {
+  const actions: OperatorAction[] = ["acknowledge_recovery", "start_cooling"];
+
+  function renderProjection(protection: HumanProtectionProjection | null | undefined) {
+    const onAction = vi.fn();
+    render(
+      <RecoveryModal
+        open
+        {...READOUT}
+        humanProtection={protection}
+        enabledActions={actions}
+        onAction={onAction}
+      />,
+    );
+    return onAction;
+  }
+
+  function expectConservativeWording() {
+    expect(screen.getByTestId("recovery-no-auto-resume")).toHaveTextContent(
+      "Routine heating does not resume automatically.",
+    );
+    expect(screen.getByText("Heat command")).toBeVisible();
+    expect(screen.getByText("Fan command")).toBeVisible();
+    expect(screen.queryByText(/service restarted|will not touch heat or fan|\(locked\)/i)).toBeNull();
+    expect(screen.queryByText(/halt all systems|cut heat, max fan|heat\/fan stay at safe defaults/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /resume monitoring only/i })).toBeNull();
+  }
+
+  it.each([undefined, null])("keeps wording conservative for %s disclosure", (protection) => {
+    const onAction = renderProjection(protection);
+
+    expectConservativeWording();
+    expect(screen.queryByRole("region", { name: "Human-mode protection" })).toBeNull();
+    expect(screen.queryByTestId("recovery-drop_beans")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Acknowledge recovery" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start Cooling" }));
+    fireEvent.click(screen.getByRole("button", { name: "Emergency Stop" }));
+    expect(onAction.mock.calls).toEqual([
+      ["acknowledge_recovery"], ["start_cooling"], ["emergency_stop"],
+    ]);
+  });
+
+  it.each([
+    ["partial", { human_endpoint: null }],
+    ["invalid endpoint", { ...AUTOMATIC_PROTECTION, human_endpoint: "not_a_disposition" }],
+    ["invalid intervention", { ...AUTOMATIC_PROTECTION, physical_intervention_required: "false" }],
+  ] as const)("keeps wording conservative after a %s first snapshot", (_label, fields) => {
+    const stream = hydrate(initialRoastStreamState, {
+      ...fields,
+      id: "recovering-run",
+      agent_phase: "operator_recovery_required",
+      enabled_actions: actions,
+    } as Parameters<typeof hydrate>[1]);
+    renderProjection(stream.humanProtection?.data ?? null);
+
+    expectConservativeWording();
+    expect(screen.queryByRole("region", { name: "Human-mode protection" })).toBeNull();
+  });
+
+  it("discloses only positive HUMAN fields and keeps acknowledge neutral", () => {
+    const onAction = renderProjection({
+      ...AUTOMATIC_PROTECTION,
+      human_endpoint: "withheld",
+      physical_intervention_required: false,
+    });
+
+    expectConservativeWording();
+    const disclosure = screen.getByRole("region", { name: "Human-mode protection" });
+    expect(disclosure).toHaveTextContent("Drop withheld");
+    expect(disclosure).not.toHaveTextContent(/Physical intervention required|Command outcome unknown/);
+    fireEvent.click(screen.getByRole("button", { name: "Acknowledge recovery" }));
+    expect(onAction).toHaveBeenCalledWith("acknowledge_recovery");
   });
 });

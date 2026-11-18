@@ -16,6 +16,8 @@
 import { useMemo, useState } from "react";
 
 import { LiveCurve } from "@/components/shared";
+import { HumanProtectionDisclosure } from "@/components/shared/HumanProtectionDisclosure";
+import { readHumanProtection } from "@/lib/humanProtection";
 // #205/#344: shared DISPLAY-ONLY curve smoothing (lib/ is the canonical home, #244).
 // Raw `bean_temp_c` / `bean_ror_c_per_min` in the contract are untouched — this only
 // smooths the rendered bean + RoR lines, identically on the live dashboard and this
@@ -100,6 +102,7 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
   return (
     <div className="flex flex-col gap-6" data-testid="detail-view">
       <TitleBlock detail={detail} stats={stats} />
+      <HumanProtectionDisclosure protection={readHumanProtection(detail)} />
 
       <div className="rounded-lg border border-border bg-card p-3">
         <LiveCurve

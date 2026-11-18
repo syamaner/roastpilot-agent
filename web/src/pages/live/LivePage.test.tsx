@@ -39,7 +39,7 @@
  * the roast history list (both from the server).
  */
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import type { ReactNode } from "react";
@@ -54,6 +54,7 @@ import type {
   StrandedFaultRetirementResult,
 } from "@/lib/types";
 import { api, ApiError } from "@/lib/api";
+import { roastKeys } from "@/hooks/queries";
 import { LivePage } from "./LivePage";
 import {
   FIXTURE_FINISHED_DETAIL,
@@ -99,6 +100,7 @@ const historyState: {
 // Mutable stubs for useRoast / useTelemetry — defaulting to null/undefined so
 // gate-only tests don't see real data; the content-assertion tests override them.
 const roastState: { data: unknown } = { data: null };
+const useRoastMock = vi.hoisted(() => vi.fn());
 // useTelemetry is now called twice (downsample=1 for stats, downsample=5 for curve).
 // Separate stubs so tests can control each independently.
 const telemetryFullState: { data: TelemetrySeries | undefined } = { data: undefined };
@@ -127,7 +129,7 @@ vi.mock("@/hooks/queries", async () => {
             },
     }),
     useFreshHistoryGate: () => historyState,
-    useRoast: () => roastState,
+    useRoast: useRoastMock,
     // Return full-res stub for downsample=1 (stats), curve stub for downsample=5.
     useTelemetry: (_runId: string | null, downsample = 1) =>
       downsample === 1 ? telemetryFullState : telemetryCurveState,
@@ -241,6 +243,7 @@ beforeEach(() => {
   });
   // Reset stubs to defaults (null data, no-op traceModel).
   roastState.data = null;
+  useRoastMock.mockImplementation(() => roastState);
   telemetryFullState.data = undefined;
   telemetryCurveState.data = undefined;
   dashboardState.mounts = 0;
@@ -1373,6 +1376,54 @@ describe("LivePage — persistent last-completed summary from history (#523)", (
       expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
     );
     expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
+  });
+
+  it("retains the completed summary when its current GET clears HUMAN disclosure", async () => {
+    const { useRoast } = await vi.importActual<typeof import("@/hooks/queries")>("@/hooks/queries");
+    const { headlineStats } = await vi.importActual<typeof import("@/pages/detail/traceModel")>(
+      "@/pages/detail/traceModel",
+    );
+    const retained: RoastDetail = {
+      ...FIXTURE_FINISHED_DETAIL,
+      human_endpoint: "withheld",
+      human_command_disposition: "settled",
+      physical_intervention_required: true,
+      emergency_fallback_disclosure: null,
+    };
+    const cleared: RoastDetail = {
+      ...retained,
+      human_endpoint: null,
+      human_command_disposition: null,
+      physical_intervention_required: null,
+      emergency_fallback_disclosure: null,
+    };
+    let response = retained;
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: null };
+    historyState.data = { runs: [historyRunFixture(retained.id, "completed")] };
+    telemetryFullState.data = FIXTURE_FINISHED_TELEMETRY;
+    traceModelMock.headlineStats.mockImplementation(headlineStats);
+
+    await useRoastMock.withImplementation(useRoast, async () => {
+      await roastApiMock.withImplementation(async () => response, async () => {
+        const { client } = renderPage();
+        const protection = await screen.findByRole("region", { name: "Human-mode protection" });
+        expect(protection).toHaveTextContent("Drop withheld");
+        expect(protection).toHaveTextContent("Physical intervention required");
+        expect(screen.getByRole("heading", { name: "Colombia, Huila" })).toBeVisible();
+        expect(screen.getByTestId("stat-drop-temp")).toHaveTextContent(FIXTURE_FINISHED_STATS.dropTempDisplay);
+
+        const callsBeforeClear = roastApiMock.mock.calls.length;
+        response = cleared;
+        await act(async () => client.invalidateQueries({ queryKey: roastKeys.detail(retained.id), exact: true }));
+        await waitFor(() => expect(protection).not.toBeInTheDocument());
+        expect(roastApiMock.mock.calls.slice(callsBeforeClear)).toEqual([[retained.id]]);
+        expect(screen.getByTestId("live-finished-view")).toBeVisible();
+        expect(screen.getByTestId("stat-drop-temp")).toHaveTextContent(FIXTURE_FINISHED_STATS.dropTempDisplay);
+        expect(operatorActionMock).not.toHaveBeenCalled();
+        expect(faultControlsActionMock).not.toHaveBeenCalled();
+      });
+    });
   });
 
   it("uses the newest completed run when history has multiple outcomes (newest-first list)", async () => {

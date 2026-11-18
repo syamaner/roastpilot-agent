@@ -182,6 +182,51 @@ describe("useRoastStream", () => {
     expect(latest!.status).toBe("live");
   });
 
+  it("ignores late open and error callbacks from replaced EventSources", async () => {
+    vi.useFakeTimers();
+    const fetchSnapshot = vi.fn(async (id: string) => ({ id, agent_phase: "preheating" as const }));
+    const { result, rerender } = renderHook(
+      ({ runId }) => useRoastStream(runId, {
+        createEventSource: (url) => new FakeEventSource(url),
+        fetchSnapshot,
+      }),
+      { initialProps: { runId: "r1" } },
+    );
+    await act(async () => {});
+    const first = FakeEventSource.last!;
+    act(() => first.open());
+    act(() => first.error());
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    const replacement = FakeEventSource.last!;
+    expect(replacement).not.toBe(first);
+    expect(first.closed).toBe(true);
+
+    act(() => first.open());
+    expect(result.current.status).toBe("reconnecting");
+    act(() => replacement.open());
+    expect(result.current.status).toBe("live");
+
+    act(() => first.error());
+    expect(result.current.status).toBe("live");
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(FakeEventSource.last).toBe(replacement);
+    expect(fetchSnapshot.mock.calls).toEqual([["r1"], ["r1"]]);
+
+    rerender({ runId: "r2" });
+    await act(async () => {});
+    const current = FakeEventSource.last!;
+    expect(current).not.toBe(replacement);
+    expect(replacement.closed).toBe(true);
+    act(() => replacement.open());
+    act(() => replacement.error());
+    expect(result.current.status).toBe("connecting");
+    act(() => current.open());
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(result.current.status).toBe("live");
+    expect(FakeEventSource.last).toBe(current);
+    expect(fetchSnapshot.mock.calls).toEqual([["r1"], ["r1"], ["r2"]]);
+  });
+
   it("carries the last applied event id on the explicit reconnect (#339)", async () => {
     vi.useFakeTimers();
     let latest: UseRoastStreamResult | null = null;
@@ -523,5 +568,90 @@ describe("useFrameDrain", () => {
     rerender({ frames: buffer as readonly SseEvent[], count: 3 });
     expect(seen).toEqual([10, 11, 20, 21, 22]);
     expect(seen.filter((id) => id < 20)).toEqual([10, 11]); // run 1 not re-folded
+  });
+});
+
+describe("run-bound HUMAN disclosure", () => {
+  const runId = "human-1";
+  const clear = {
+    human_endpoint: null,
+    human_command_disposition: null,
+    physical_intervention_required: null,
+    emergency_fallback_disclosure: null,
+  };
+  const withheld = {
+    ...clear,
+    human_endpoint: "withheld",
+    human_command_disposition: "settled",
+    physical_intervention_required: true,
+  } as const;
+  const outcomeUnknown = {
+    ...withheld,
+    human_endpoint: "unknown",
+    human_command_disposition: "unknown",
+  } as const;
+
+  it("applies inherited-ID heartbeats without changing ordered state or the resume cursor", async () => {
+    vi.useFakeTimers();
+    delete window.__lastEventId;
+    const fetchSnapshot = vi.fn(async (id: string) => ({
+      id, agent_phase: "operator_recovery_required" as const, ...withheld,
+    }));
+    const { result, rerender } = renderHook(
+      ({ currentRun }) => useRoastStream(currentRun, {
+        createEventSource: (url) => new FakeEventSource(url),
+        fetchSnapshot,
+      }),
+      { initialProps: { currentRun: runId } },
+    );
+    await act(async () => {});
+    const stream = FakeEventSource.last!;
+    expect(result.current.humanProtection).toEqual(withheld);
+    expect(result.current.telemetry).toBeNull();
+
+    act(() => stream.emit("phase_changed", {
+      phase: "operator_recovery_required", enabled_actions: ["emergency_stop"],
+    }, 41));
+    act(() => stream.emit("heartbeat", { run_id: runId, ...outcomeUnknown }, 41));
+    expect(result.current.humanProtection).toEqual(outcomeUnknown);
+    expect(result.current.lastEvent?.id).toBeNull();
+    expect(result.current.enabledActions).toEqual(["emergency_stop"]);
+
+    act(() => {
+      stream.emit("heartbeat", {}, 41);
+      stream.emit("heartbeat", null, 41);
+      stream.emit("heartbeat", { run_id: "foreign", ...clear }, 41);
+      stream.emit("heartbeat", { run_id: runId, human_endpoint: null }, 41);
+      stream.emit("heartbeat", {
+        run_id: runId, ...clear, physical_intervention_required: "false",
+      }, 41);
+      stream.emit("recovery_required", { endpoint: "withheld", ...withheld }, 42);
+    });
+    expect(result.current.humanProtection).toEqual(outcomeUnknown);
+    act(() => stream.emit("heartbeat", { run_id: runId, ...withheld }, 99));
+    expect(result.current.humanProtection).toEqual(withheld);
+    expect(window.__lastEventId).toBe(42);
+
+    act(() => stream.emit("run_completed", {}, 43));
+    expect(result.current.humanProtection).toEqual(withheld);
+    act(() => stream.emit("heartbeat", { run_id: runId, ...clear }, 43));
+    expect(result.current.humanProtection).toEqual(clear);
+
+    act(() => stream.error());
+    act(() => stream.emit("heartbeat", { run_id: runId, ...outcomeUnknown }, 99));
+    expect(result.current.humanProtection).toEqual(clear);
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(FakeEventSource.last?.url).toContain("last_event_id=43");
+    expect(result.current.humanProtection).toEqual(withheld);
+
+    const reconnect = FakeEventSource.last!;
+    act(() => reconnect.emit("phase_changed", { phase: "faulted" }, 44));
+    expect(result.current.phase).toBe("faulted");
+    expect(result.current.humanProtection).toEqual(withheld);
+    rerender({ currentRun: "human-2" });
+    expect(result.current.humanProtection).toBeNull();
+    await act(async () => {});
+    act(() => reconnect.emit("heartbeat", { run_id: runId, ...outcomeUnknown }, 44));
+    expect(result.current.humanProtection).toEqual(withheld);
   });
 });

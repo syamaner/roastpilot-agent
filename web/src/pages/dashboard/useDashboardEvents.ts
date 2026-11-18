@@ -164,9 +164,10 @@ export const ADVISORY_HISTORY_LIMIT = 4;
  *   - `phase` is the snapshot's `agent_phase` (hydrated by `useRoastStream`) — the
  *     server's truth, NOT inferred here; we only branch on it.
  *   - `faultReason` is the snapshot's `fault_reason` (the persisted fault detail the
- *     `RoastDetail` snapshot carries; the full SafetyEvaluation is not persisted on
- *     the snapshot, so the structured fields below mirror the fail-closed posture the
- *     server guarantees in `faulted`: heat forced to 0, fan held).
+ *     `RoastDetail` snapshot carries).
+ *   - `suppressLegacyCommandPosture` omits the legacy automatic placeholder
+ *     when the caller lacks an explicit all-null projection. The snapshot
+ *     does not include a full SafetyEvaluation or confirm actuator state.
  *
  * Returns null when the server phase is not `faulted` (no banner) — so a non-faulted
  * hydrate shows nothing, and once a LIVE fault frame has been folded the caller
@@ -175,6 +176,7 @@ export const ADVISORY_HISTORY_LIMIT = 4;
 export function snapshotFault(
   phase: RoastPhase | null,
   faultReason: string | null | undefined,
+  suppressLegacyCommandPosture = false,
 ): SafetyEvaluationData | null {
   if (phase !== "faulted") return null;
   return {
@@ -185,11 +187,13 @@ export function snapshotFault(
     verdict: "fault",
     input_heat: null,
     input_fan: null,
-    // The fail-closed posture the server GUARANTEES in `faulted` (heat off, fan
-    // held) — not a client guess about this run's numbers, but the invariant state.
-    adjusted_heat: 0,
+    // Only the legacy automatic placeholder carries this command posture.
+    // HUMAN endpoint/command disclosure does not report applied heat or fan.
+    adjusted_heat: suppressLegacyCommandPosture ? null : 0,
     adjusted_fan: null,
-    reason: faultReason ?? "Run faulted — heat forced off.",
+    reason: faultReason ?? (
+      suppressLegacyCommandPosture ? "Run faulted." : "Run faulted — heat forced off."
+    ),
   };
 }
 

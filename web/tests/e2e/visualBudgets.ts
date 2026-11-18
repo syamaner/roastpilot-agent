@@ -48,6 +48,7 @@ export const SCREENSHOT_INVENTORY = [
   { specFile: "dashboard.spec.ts", snapshotName: "dashboard-live.png", screenshotClass: SCREENSHOT_CLASSES.CANVAS_PAGE },
   { specFile: "dashboard.spec.ts", snapshotName: "dashboard-fault.png", screenshotClass: SCREENSHOT_CLASSES.CANVAS_PAGE },
   { specFile: "dashboard.spec.ts", snapshotName: "dashboard-recovery.png", screenshotClass: SCREENSHOT_CLASSES.CANVAS_PAGE },
+  { specFile: "dashboard.spec.ts", snapshotName: "dashboard-human-recovery.png", screenshotClass: SCREENSHOT_CLASSES.DOM_LOCATOR },
   { specFile: "dashboard.spec.ts", snapshotName: "bean-temperature-developed.png", screenshotClass: SCREENSHOT_CLASSES.DOM_LOCATOR },
   { specFile: "dashboard.spec.ts", snapshotName: "dashboard-developed.png", screenshotClass: SCREENSHOT_CLASSES.CANVAS_PAGE },
   { specFile: "dashboard.spec.ts", snapshotName: "dashboard-charge-window.png", screenshotClass: SCREENSHOT_CLASSES.CANVAS_PAGE },

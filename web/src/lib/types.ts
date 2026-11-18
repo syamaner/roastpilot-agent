@@ -760,16 +760,13 @@ export interface RoastHistory {
   runs: RoastSummary[];
 }
 
-export type HumanEndpointProjection =
-  | "none"
-  | "admitted"
-  | "in_flight"
-  | "issued"
-  | "unknown"
-  | "withheld"
-  | "history_unknown";
+export const HUMAN_ENDPOINT_DISPOSITIONS = [
+  "none", "admitted", "in_flight", "issued", "unknown", "withheld", "history_unknown",
+] as const;
+export type HumanEndpointProjection = (typeof HUMAN_ENDPOINT_DISPOSITIONS)[number];
 
-export type HumanCommandProjection = "settled" | "unknown";
+export const HUMAN_COMMAND_DISPOSITIONS = ["settled", "unknown"] as const;
+export type HumanCommandProjection = (typeof HUMAN_COMMAND_DISPOSITIONS)[number];
 
 /** Explicit null clears the live disclosure. */
 export type HumanHistoryDurability =
@@ -782,7 +779,7 @@ export type HumanHistoryDurability =
 export interface HumanProtectionProjection {
   human_endpoint: HumanEndpointProjection | null;
   human_command_disposition: HumanCommandProjection | null;
-  human_history_durability: HumanHistoryDurability | null;
+  human_history_durability?: HumanHistoryDurability | null;
   physical_intervention_required: boolean | null;
   emergency_fallback_disclosure: string | null;
 }

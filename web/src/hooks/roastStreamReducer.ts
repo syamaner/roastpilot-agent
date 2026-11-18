@@ -13,7 +13,9 @@
  * this module owns state transitions. All temperatures Celsius.
  */
 
+import { readHumanProtection } from "@/lib/humanProtection";
 import type {
+  HumanProtectionProjection,
   OperatorAction,
   PhaseChangedEventData,
   RoastDetail,
@@ -32,6 +34,8 @@ export interface RoastStreamState {
   enabledActions: OperatorAction[] | null;
   /** Monotonic id of the last applied frame (for ordering/dedup). */
   lastEventId: number | null;
+  /** Run-bound disclosure retained independently of phase and action eligibility. */
+  humanProtection: { runId: string; data: HumanProtectionProjection } | null;
 }
 
 export const initialRoastStreamState: RoastStreamState = {
@@ -39,6 +43,7 @@ export const initialRoastStreamState: RoastStreamState = {
   telemetry: null,
   enabledActions: null,
   lastEventId: null,
+  humanProtection: null,
 };
 
 /**
@@ -46,14 +51,23 @@ export const initialRoastStreamState: RoastStreamState = {
  * (re)connect BEFORE replaying live events, so a reconnect re-bases phase on
  * the server's truth rather than trusting stale client state.
  */
+export type StreamSnapshot = Pick<RoastDetail, "agent_phase" | "enabled_actions"> &
+  Partial<Pick<RoastDetail, "id"> & HumanProtectionProjection>;
+
 export function hydrate(
   state: RoastStreamState,
-  snapshot: RoastDetail,
+  snapshot: StreamSnapshot,
+  runId = snapshot.id,
 ): RoastStreamState {
+  const protection = readHumanProtection(snapshot);
   return {
     ...state,
     phase: snapshot.agent_phase,
     enabledActions: snapshot.enabled_actions ?? state.enabledActions,
+    humanProtection:
+      runId !== undefined && snapshot.id === runId && protection !== undefined
+        ? { runId, data: protection }
+        : state.humanProtection,
   };
 }
 
@@ -64,7 +78,16 @@ export function hydrate(
 export function applyEvent(
   state: RoastStreamState,
   event: SseEvent,
+  runId?: string,
 ): RoastStreamState {
+  if (event.event === "heartbeat") {
+    if (runId === undefined || event.data.run_id !== runId) return state;
+    const protection = readHumanProtection(event.data);
+    return protection === undefined
+      ? state
+      : { ...state, humanProtection: { runId, data: protection } };
+  }
+
   // Drop frames we've already applied (the broadcaster stamps a monotonic id);
   // a snapshot hydrate after reconnect may re-deliver buffered frames.
   if (
@@ -106,9 +129,6 @@ function applyByType(
         enabledActions: data.enabled_actions ?? state.enabledActions,
       };
     }
-    case "heartbeat":
-      // Liveness only — no state change. The hook tracks freshness separately.
-      return state;
     default:
       // Other events (advisory, fault, recovery_required, command_*, markers…)
       // are consumed by page-level handlers off the raw event stream, not folded
