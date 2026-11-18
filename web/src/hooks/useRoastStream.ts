@@ -221,21 +221,26 @@ export function useRoastStream(
 
       // Snapshot-first: hydrate from REST, THEN open the stream and apply frames.
       // A failed snapshot is treated as a dropped connection (back off, retry).
-      void fetchSnapshotRef
-        .current(runId)
-        .then((snapshot) => {
+      void fetchSnapshotRef.current(runId).then(
+        (snapshot) => {
           if (cancelled) return;
           dispatch({ kind: "hydrate", snapshot, runId });
-          openStream();
-        })
-        .catch((error: unknown) => {
+          try {
+            openStream();
+          } catch {
+            // The detail read succeeded even though opening its transport failed.
+            scheduleReconnect();
+          }
+        },
+        (error: unknown) => {
           if (cancelled) return;
           const refusal = error instanceof RoastHistoryRefusalError && error.runId === runId
             ? error.historyDurability
             : undefined;
           dispatch({ kind: "hydrateFailed", runId, refusal });
           scheduleReconnect();
-        });
+        },
+      );
     };
 
     const openStream = () => {

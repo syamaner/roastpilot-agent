@@ -71,6 +71,19 @@ describe("api client", () => {
     await expect(request).rejects.toMatchObject({ status, detail, code: "test-code" });
   });
 
+  it.each(["", ".", "..", "../roasts", "r1/timeline", "r1\\timeline", "r1%2ftimeline", "r1?query", "r1#hash", "r1\n"])(
+    "keeps the original URL but does not bind a refusal to route-like ID %j",
+    async (runId) => {
+      mockFetch(503, {
+        detail: "Temporarily unavailable", run_id: runId, human_history_durability: "unknown",
+      });
+      const request = api.roast(runId);
+      expect(fetch).toHaveBeenCalledWith(`/api/roasts/${runId}`, expect.any(Object));
+      await expect(request).rejects.not.toBeInstanceOf(RoastHistoryRefusalError);
+      await expect(request).rejects.toMatchObject({ status: 503, detail: "Temporarily unavailable" });
+    },
+  );
+
   it("ignores history refusal fields on another route and preserves structured error detail", async () => {
     const detail = [{ msg: "validation failed" }];
     mockFetch(503, { detail, run_id: "r1", human_history_durability: "unknown" });

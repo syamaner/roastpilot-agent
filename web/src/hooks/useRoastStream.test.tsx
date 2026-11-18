@@ -726,6 +726,7 @@ describe("run history refusal", () => {
 
     await act(async () => vi.advanceTimersByTimeAsync(1000));
     expect(result.current).toMatchObject({
+      status: "reconnecting",
       humanHistoryDurability: null,
       historyIdentifiesHuman: true,
       enabledActions: ["drop_beans", "emergency_stop"],
@@ -735,6 +736,7 @@ describe("run history refusal", () => {
 
     await act(async () => vi.advanceTimersByTimeAsync(2000));
     expect(result.current).toMatchObject({
+      status: "reconnecting",
       humanProtection: allNull,
       humanHistoryDurability: "unavailable",
       historyIdentifiesHuman: true,
@@ -751,6 +753,30 @@ describe("run history refusal", () => {
       enabledActions: ["emergency_stop"],
       phase: "operator_recovery_required",
     });
+  });
+
+  it("retains accepted history when EventSource construction throws, then reconnects", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(async () => reply({
+      ...recovery, human_history_durability: "complete",
+    })));
+    const createEventSource = vi.fn((url: string) => new FakeEventSource(url))
+      .mockImplementationOnce(() => { throw new Error("could not create EventSource"); });
+    const { result } = renderHook(() => useRoastStream(runId, { createEventSource }));
+    await act(async () => {});
+    expect(result.current).toMatchObject({
+      status: "reconnecting",
+      humanHistoryDurability: "complete",
+      historyIdentifiesHuman: true,
+      phase: "operator_recovery_required",
+    });
+    expect(createEventSource).toHaveBeenCalledTimes(1);
+
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(createEventSource).toHaveBeenCalledTimes(2);
+    act(() => FakeEventSource.last!.open());
+    expect(result.current.status).toBe("live");
+    expect(result.current.humanHistoryDurability).toBe("complete");
   });
 
   it("ignores wrong-run and obsolete same-run failures through a run replacement", async () => {

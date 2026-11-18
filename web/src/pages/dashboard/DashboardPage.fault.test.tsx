@@ -1355,25 +1355,34 @@ describe("Fault posture with missing or valid disclosure", () => {
       ...AUTOMATIC_PROTECTION, human_history_durability: "complete",
     });
     const { client, rerender } = renderPage();
-    expect(screen.getByText("Run history complete")).toBeVisible();
+    const region = screen.getByRole("region", { name: "Human-mode protection" });
+    expect(region).toHaveAttribute("aria-live", "polite");
+    expect(within(region).getByRole("term")).toHaveTextContent("History durability");
+    expect(within(region).getByRole("definition")).toHaveTextContent("Run history complete");
     expectUnknownPosture();
 
     // Arm the existing two-press confirmation while the server still admits it.
     fireEvent.click(screen.getByTestId("fault-acknowledge"));
     expect(screen.getByTestId("fault-acknowledgement-confirmation")).toBeVisible();
 
-    const heartbeat = applyEvent(stream, {
-      id: 41,
-      event: "heartbeat",
-      data: { run_id: runId, ...AUTOMATIC_PROTECTION },
-    }, runId);
-    applyDashboardStream(heartbeat);
-    rerender(
-      <QueryClientProvider client={client}>
-        <MemoryRouter><DashboardPage /></MemoryRouter>
-      </QueryClientProvider>,
-    );
+    let current = stream;
+    function receiveHeartbeat(fields: Record<string, unknown>) {
+      current = applyEvent(current, {
+        id: 41,
+        event: "heartbeat",
+        data: { run_id: runId, ...AUTOMATIC_PROTECTION, ...fields },
+      }, runId);
+      applyDashboardStream(current);
+      rerender(
+        <QueryClientProvider client={client}>
+          <MemoryRouter><DashboardPage /></MemoryRouter>
+        </QueryClientProvider>,
+      );
+    }
+    receiveHeartbeat({ human_history_durability: "delayed" });
+    expect(within(region).getByRole("definition")).toHaveTextContent("Run history recorded late");
 
+    receiveHeartbeat({});
     expect(screen.queryByText("History durability")).toBeNull();
     expectUnknownPosture();
     expect(screen.getByTestId("fault-acknowledgement-confirmation")).toBeVisible();

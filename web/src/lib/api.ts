@@ -145,8 +145,12 @@ export const api = {
   history: () => request<RoastHistory>("/api/roasts"),
 
   /** `GET /api/roasts/{id}` — run detail (the SSE hydrate snapshot). */
-  roast: (runId: string) =>
-    request<RoastDetail>(`/api/roasts/${encodeURIComponent(runId)}`, undefined, runId),
+  roast: (runId: string) => {
+    // Only a single literal path segment can bind refusal evidence to this read.
+    const exactRunSegment =
+      runId.length > 0 && runId !== "." && runId !== ".." && !/[^A-Za-z0-9._~-]/.test(runId);
+    return request<RoastDetail>(`/api/roasts/${runId}`, undefined, exactRunSegment ? runId : undefined);
+  },
 
   /** `GET /api/roasts/{id}/telemetry` — downsampled snapshot series. */
   telemetry: (runId: string, downsample = 1) =>
