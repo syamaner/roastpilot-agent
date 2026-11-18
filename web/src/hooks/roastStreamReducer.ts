@@ -13,8 +13,10 @@
  * this module owns state transitions. All temperatures Celsius.
  */
 
-import { readHumanProtection } from "@/lib/humanProtection";
+import { readHumanHistoryDurability, readHumanProtection } from "@/lib/humanProtection";
 import type {
+  HumanHistoryDurability,
+  HumanHistoryRefusal,
   HumanProtectionProjection,
   OperatorAction,
   PhaseChangedEventData,
@@ -23,6 +25,14 @@ import type {
   SseEvent,
   TelemetryEventData,
 } from "@/lib/types";
+
+interface RunHumanProtection {
+  runId: string;
+  data: HumanProtectionProjection | null;
+  historyDurability: HumanHistoryDurability | null;
+  /** Positive owner evidence persists if a subsequent read omits usable history. */
+  historyIdentifiesHuman: boolean;
+}
 
 /** The live view-model the dashboard renders from. */
 export interface RoastStreamState {
@@ -35,7 +45,7 @@ export interface RoastStreamState {
   /** Monotonic id of the last applied frame (for ordering/dedup). */
   lastEventId: number | null;
   /** Run-bound disclosure retained independently of phase and action eligibility. */
-  humanProtection: { runId: string; data: HumanProtectionProjection } | null;
+  humanProtection: RunHumanProtection | null;
 }
 
 export const initialRoastStreamState: RoastStreamState = {
@@ -59,15 +69,54 @@ export function hydrate(
   snapshot: StreamSnapshot,
   runId = snapshot.id,
 ): RoastStreamState {
-  const protection = readHumanProtection(snapshot);
   return {
     ...state,
     phase: snapshot.agent_phase,
     enabledActions: snapshot.enabled_actions ?? state.enabledActions,
     humanProtection:
-      runId !== undefined && snapshot.id === runId && protection !== undefined
-        ? { runId, data: protection }
+      runId !== undefined && snapshot.id === runId
+        ? readRunHumanProtection(state.humanProtection, runId, snapshot)
         : state.humanProtection,
+  };
+}
+
+function readRunHumanProtection(
+  previous: RunHumanProtection | null,
+  runId: string,
+  payload: Parameters<typeof readHumanProtection>[0],
+): RunHumanProtection | null {
+  const data = readHumanProtection(payload);
+  const current = previous?.runId === runId ? previous : null;
+  if (data === undefined) return current;
+
+  const durability = readHumanHistoryDurability(payload.human_history_durability);
+  return {
+    runId,
+    data,
+    historyDurability: durability ?? null,
+    historyIdentifiesHuman: durability === undefined
+      ? current?.historyIdentifiesHuman ?? false
+      : durability !== null,
+  };
+}
+
+/** Rebase history evidence on a failed detail read, independently of the last accepted snapshot. */
+export function failHydration(
+  state: RoastStreamState,
+  runId: string,
+  refusal?: HumanHistoryRefusal,
+): RoastStreamState {
+  const current = state.humanProtection?.runId === runId ? state.humanProtection : null;
+  if (current === null && refusal === undefined) return state;
+
+  return {
+    ...state,
+    humanProtection: {
+      runId,
+      data: current?.data ?? null,
+      historyDurability: refusal ?? null,
+      historyIdentifiesHuman: refusal !== undefined || (current?.historyIdentifiesHuman ?? false),
+    },
   };
 }
 
@@ -82,10 +131,8 @@ export function applyEvent(
 ): RoastStreamState {
   if (event.event === "heartbeat") {
     if (runId === undefined || event.data.run_id !== runId) return state;
-    const protection = readHumanProtection(event.data);
-    return protection === undefined
-      ? state
-      : { ...state, humanProtection: { runId, data: protection } };
+    const humanProtection = readRunHumanProtection(state.humanProtection, runId, event.data);
+    return humanProtection === state.humanProtection ? state : { ...state, humanProtection };
   }
 
   // Drop frames we've already applied (the broadcaster stamps a monotonic id);

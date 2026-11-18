@@ -32,7 +32,7 @@ import {
   hydrate,
   initialRoastStreamState,
 } from "@/hooks/roastStreamReducer";
-import { readHumanProtection } from "@/lib/humanProtection";
+import { readHumanHistoryDurability, readHumanProtection } from "@/lib/humanProtection";
 import { SSE_EVENT_TYPES } from "@/hooks/useRoastStream";
 import {
   dashboardReducer,
@@ -289,7 +289,19 @@ describe("HUMAN protection wire contract", () => {
     expect(heartbeat.id).toBeNull();
     expect(heartbeat.data).toEqual({ run_id: "contract-run", ...wireEmpty } satisfies HumanProtectionHeartbeat);
     expect(readHumanProtection(heartbeat.data)).toEqual(empty);
+    expect(readHumanHistoryDurability(rest.roast_detail.human_history_durability)).toBeNull();
+    expect(readHumanHistoryDurability(heartbeat.data.human_history_durability)).toBeNull();
   });
+
+  it.each(["complete", "delayed", "incomplete", "unknown", "unavailable", null])(
+    "accepts the exact history value %s",
+    (value) => expect(readHumanHistoryDurability(value)).toBe(value),
+  );
+
+  it.each([undefined, "Complete", " complete", "settled", false, 0, ["unknown"], {}])(
+    "does not translate missing or invalid history %j into a status",
+    (value) => expect(readHumanHistoryDurability(value)).toBeUndefined(),
+  );
 });
 
 describe("fault-control lease SSE contract", () => {

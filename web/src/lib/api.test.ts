@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, api } from "./api";
+import { ApiError, api, RoastHistoryRefusalError } from "./api";
 
 function mockFetch(status: number, body: unknown, headers?: Record<string, string>): void {
   vi.stubGlobal(
@@ -26,6 +26,70 @@ describe("api client", () => {
     const detail = await api.roast("r1");
     expect(detail.id).toBe("r1");
     expect(fetch).toHaveBeenCalledWith("/api/roasts/r1", expect.any(Object));
+  });
+
+  it.each([
+    ["unknown", {}],
+    ["unavailable", { run_id: "r1" }],
+  ] as const)("exposes only the %s history refusal on a roast detail 503", async (durability, identity) => {
+    mockFetch(503, {
+      detail: "HUMAN history is temporarily unavailable",
+      ...identity,
+      human_history_durability: durability,
+      agent_phase: "cooling",
+      enabled_actions: ["start_cooling"],
+      start_owned: true,
+      human_endpoint: "issued",
+    });
+    const request = api.roast("r1");
+    await expect(request).rejects.toBeInstanceOf(RoastHistoryRefusalError);
+    await expect(request).rejects.toMatchObject({
+      status: 503,
+      detail: "HUMAN history is temporarily unavailable",
+      runId: "r1",
+      historyDurability: durability,
+    });
+    for (const field of ["agent_phase", "enabled_actions", "start_owned", "human_endpoint"]) {
+      await expect(request).rejects.not.toHaveProperty(field);
+    }
+  });
+
+  it.each([
+    ["generic 503", 503, { detail: "HUMAN history is temporarily unavailable" }],
+    ["foreign run", 503, { run_id: "r2", human_history_durability: "unknown" }],
+    ["null identity", 503, { run_id: null, human_history_durability: "unknown" }],
+    ["wrong status", 409, { human_history_durability: "unavailable" }],
+    ["malformed", 503, { human_history_durability: ["unknown"] }],
+    ["non-refusal", 503, { human_history_durability: "complete" }],
+    ["clear", 503, { human_history_durability: null }],
+  ] as const)("keeps %s on the ordinary error path", async (_case, status, fields) => {
+    const detail = "HUMAN history is temporarily unavailable";
+    mockFetch(status, { detail, ...fields }, { "X-RoastPilot-Conflict-Code": "test-code" });
+    const request = api.roast("r1");
+    await expect(request).rejects.toBeInstanceOf(ApiError);
+    await expect(request).rejects.not.toBeInstanceOf(RoastHistoryRefusalError);
+    await expect(request).rejects.toMatchObject({ status, detail, code: "test-code" });
+  });
+
+  it.each(["", ".", "..", "../roasts", "r1/timeline", "r1\\timeline", "r1%2ftimeline", "r1?query", "r1#hash", "r1\n"])(
+    "keeps the original URL but does not bind a refusal to route-like ID %j",
+    async (runId) => {
+      mockFetch(503, {
+        detail: "Temporarily unavailable", run_id: runId, human_history_durability: "unknown",
+      });
+      const request = api.roast(runId);
+      expect(fetch).toHaveBeenCalledWith(`/api/roasts/${runId}`, expect.any(Object));
+      await expect(request).rejects.not.toBeInstanceOf(RoastHistoryRefusalError);
+      await expect(request).rejects.toMatchObject({ status: 503, detail: "Temporarily unavailable" });
+    },
+  );
+
+  it("ignores history refusal fields on another route and preserves structured error detail", async () => {
+    const detail = [{ msg: "validation failed" }];
+    mockFetch(503, { detail, run_id: "r1", human_history_durability: "unknown" });
+    const request = api.timeline("r1");
+    await expect(request).rejects.not.toBeInstanceOf(RoastHistoryRefusalError);
+    await expect(request).rejects.toMatchObject({ status: 503, detail: JSON.stringify(detail) });
   });
 
   it("bounds a hung health request so safety gates can enter their unknown state", async () => {

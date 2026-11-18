@@ -55,7 +55,9 @@ import {
 } from "@/hooks/roastStreamReducer";
 import type { ConnectionStatus } from "@/hooks/useRoastStream";
 import { roastKeys } from "@/hooks/queries";
-import type { HumanProtectionProjection, RoastTimeline } from "@/lib/types";
+import type {
+  HumanHistoryDurability, HumanProtectionProjection, RoastTimeline,
+} from "@/lib/types";
 import { DashboardPage } from "./DashboardPage";
 
 // Spy on the typed REST client so the acknowledge-fault POST can be asserted (#206).
@@ -168,6 +170,8 @@ const streamState: {
   telemetry: unknown;
   enabledActions: unknown;
   humanProtection: HumanProtectionProjection | null;
+  humanHistoryDurability: HumanHistoryDurability | null;
+  historyIdentifiesHuman: boolean;
   frames: unknown[];
   frameCount: number;
 } = {
@@ -176,6 +180,8 @@ const streamState: {
   telemetry: null,
   enabledActions: null,
   humanProtection: null,
+  humanHistoryDurability: null,
+  historyIdentifiesHuman: false,
   frames: [],
   frameCount: 0,
 };
@@ -245,6 +251,8 @@ beforeEach(() => {
   viewState.points = [];
   streamState.enabledActions = null;
   streamState.humanProtection = null;
+  streamState.humanHistoryDurability = null;
+  streamState.historyIdentifiesHuman = false;
   streamState.phase = null;
   streamState.status = "connecting";
   streamState.telemetry = null;
@@ -1279,11 +1287,13 @@ describe("Fault posture with missing or valid disclosure", () => {
     streamState.phase = stream.phase;
     streamState.enabledActions = stream.enabledActions;
     streamState.humanProtection = stream.humanProtection?.data ?? null;
+    streamState.humanHistoryDurability = stream.humanProtection?.historyDurability ?? null;
+    streamState.historyIdentifiesHuman = stream.humanProtection?.historyIdentifiesHuman ?? false;
   }
 
   function expectUnknownPosture() {
     const banner = within(screen.getByTestId("fault-banner"));
-    expect(banner.queryByText(/heat forced off|\(forced\)|^held$/i)).toBeNull();
+    expect(banner.queryAllByText(/heat forced off|\(forced\)|^held$/i)).toHaveLength(0);
     expect(screen.getByTestId("fault-acknowledge")).toBeEnabled();
     expect(screen.getByTestId("action-emergency_stop")).toBeEnabled();
   }
@@ -1340,6 +1350,47 @@ describe("Fault posture with missing or valid disclosure", () => {
     expectUnknownPosture();
   });
 
+  it("keeps the permitted fault action across durability-only and legacy-only updates", () => {
+    const stream = hydrateFaultSnapshot({
+      ...AUTOMATIC_PROTECTION, human_history_durability: "complete",
+    });
+    const { client, rerender } = renderPage();
+    const region = screen.getByRole("region", { name: "Human-mode protection" });
+    expect(region).toHaveAttribute("aria-live", "polite");
+    expect(within(region).getByRole("term")).toHaveTextContent("History durability");
+    expect(within(region).getByRole("definition")).toHaveTextContent("Run history complete");
+    expectUnknownPosture();
+
+    // Arm the existing two-press confirmation while the server still admits it.
+    fireEvent.click(screen.getByTestId("fault-acknowledge"));
+    expect(screen.getByTestId("fault-acknowledgement-confirmation")).toBeVisible();
+
+    let current = stream;
+    function receiveHeartbeat(fields: Record<string, unknown>) {
+      current = applyEvent(current, {
+        id: 41,
+        event: "heartbeat",
+        data: { run_id: runId, ...AUTOMATIC_PROTECTION, ...fields },
+      }, runId);
+      applyDashboardStream(current);
+      rerender(
+        <QueryClientProvider client={client}>
+          <MemoryRouter><DashboardPage /></MemoryRouter>
+        </QueryClientProvider>,
+      );
+    }
+    receiveHeartbeat({ human_history_durability: "delayed" });
+    expect(within(region).getByRole("definition")).toHaveTextContent("Run history recorded late");
+
+    receiveHeartbeat({});
+    expect(screen.queryByText("History durability")).toBeNull();
+    expectUnknownPosture();
+    expect(screen.getByTestId("fault-acknowledgement-confirmation")).toBeVisible();
+    fireEvent.click(screen.getByTestId("fault-acknowledge"));
+    expect(operatorActionMock).toHaveBeenCalledWith(runId, { action: "acknowledge_fault" });
+    expect(screen.queryByText(/cooling confirmed|beans dropped|evacuation confirmed/i)).toBeNull();
+  });
+
   it("preserves legacy automatic posture with a valid all-null initial GET", () => {
     hydrateFaultSnapshot(AUTOMATIC_PROTECTION);
     renderPage();
@@ -1350,20 +1401,23 @@ describe("Fault posture with missing or valid disclosure", () => {
     expect(banner.getByText("held")).toBeVisible();
   });
 
-  it("keeps explicit zero from a real fault frame when initial disclosure is missing", () => {
-    hydrateFaultSnapshot();
-    viewState.fault = {
-      reason: "Real server fault",
-      rule: "hard_ceiling",
-      verdict: "fault",
-      adjusted_heat: 0,
-      adjusted_fan: 80,
-    };
-    renderPage();
+  it.each([{}, { ...AUTOMATIC_PROTECTION, human_history_durability: "complete" }])(
+    "keeps explicit zero from a real fault frame with absent or history-only disclosure",
+    (fields) => {
+      hydrateFaultSnapshot(fields);
+      viewState.fault = {
+        reason: "Real server fault",
+        rule: "hard_ceiling",
+        verdict: "fault",
+        adjusted_heat: 0,
+        adjusted_fan: 80,
+      };
+      renderPage();
 
-    const banner = within(screen.getByTestId("fault-banner"));
-    expect(screen.getByTestId("fault-reason")).toHaveTextContent("Real server fault");
-    expect(banner.getByText("0 % (forced)")).toBeVisible();
-    expect(banner.getByText("80 % (safe)")).toBeVisible();
-  });
+      const banner = within(screen.getByTestId("fault-banner"));
+      expect(screen.getByTestId("fault-reason")).toHaveTextContent("Real server fault");
+      expect(banner.getByText("0 % (forced)")).toBeVisible();
+      expect(banner.getByText("80 % (safe)")).toBeVisible();
+    },
+  );
 });

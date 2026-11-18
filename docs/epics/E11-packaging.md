@@ -199,6 +199,7 @@ cold run.
 | E11-S1 | Wheel with bundled SPA + the `[pi]` extra | done — base-wheel, `[pi]`, and native hosted ARM64 package smokes delivered 5 Sep 2026; hosted-runner evidence is not Pi hardware validation |
 | E11-S2 | Native installer, systemd unit, bundled model, deploy doc | done — native installer, managed service/configuration, pinned local model, and deployment guide delivered 12 Sep 2026; package and documentation evidence is not Pi or physical-device validation |
 | E11-S3 | Pi 5 single-primary-mic complete-appliance cold characterisation (overflow validation) | in progress |
+| D230 A2 (#1077) | Bounded HUMAN run history and current-run durability disclosure | software complete on protected merge; next-roast acceptance and target-hardware qualification remain open |
 
 Epic status: **in progress — E11-S1 and E11-S2 are done; E11-S3 is in progress.**
 The **operator manual tests** (D28) are

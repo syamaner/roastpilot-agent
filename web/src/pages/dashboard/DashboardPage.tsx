@@ -110,8 +110,10 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
   // Live SSE stream — phase/telemetry/enabledActions are server-derived; the
   // page-local reducer folds the NON-LOSSY frame buffer (frames/frameCount) so a
   // burst never drops a fault/recovery/advisory/marker frame (#122).
-  const { status, phase, telemetry, enabledActions, humanProtection, frames, frameCount } =
-    useRoastStream(runId);
+  const {
+    status, phase, telemetry, enabledActions, humanProtection, humanHistoryDurability,
+    historyIdentifiesHuman, frames, frameCount,
+  } = useRoastStream(runId);
   const routineActionsRefreshPending =
     health.isFetching && phase === "operator_recovery_required";
   const recoveryDispatchBlocked = healthProjectionStale || routineActionsRefreshPending;
@@ -341,7 +343,8 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
   // the restore/reload gap. Phase is the server's hydrated truth — never inferred.
   const humanDisclosureAvailable = hasHumanProtection(humanProtection);
   // Only a validated all-null projection permits the automatic snapshot placeholder.
-  const legacyPostureAllowed = humanProtection !== null && !humanDisclosureAvailable;
+  const legacyPostureAllowed =
+    humanProtection !== null && !humanDisclosureAvailable && !historyIdentifiesHuman;
   const effectiveFault =
     view.fault ?? snapshotFault(phase, detail.data?.fault_reason, !legacyPostureAllowed);
 
@@ -490,7 +493,9 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
           }
         />
 
-        {!inRecovery && <HumanProtectionDisclosure protection={humanProtection} />}
+        {!inRecovery && (
+          <HumanProtectionDisclosure protection={humanProtection} historyDurability={humanHistoryDurability} />
+        )}
 
         <RoastHeader
           phase={phase}
@@ -578,6 +583,8 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
       <RecoveryModal
         open={inRecovery}
         humanProtection={humanProtection}
+        humanHistoryDurability={humanHistoryDurability}
+        historyIdentifiesHuman={historyIdentifiesHuman}
         lastResult={lastResult}
         beanTempC={telemetry?.bean_temp_c ?? null}
         envTempC={telemetry?.env_temp_c ?? null}

@@ -1,6 +1,8 @@
 import {
   HUMAN_COMMAND_DISPOSITIONS,
   HUMAN_ENDPOINT_DISPOSITIONS,
+  HUMAN_HISTORY_DURABILITIES,
+  type HumanHistoryDurability,
   type HumanProtectionProjection,
 } from "./types";
 
@@ -17,7 +19,12 @@ export function hasHumanProtection(
   return data != null && Object.values(data).some((field) => field !== null);
 }
 
-/** Validate the complete projection. All nulls is an update; absent fields are not. */
+/** Read the live history field, preserving an explicit clear separately from invalid input. */
+export function readHumanHistoryDurability(value: unknown): HumanHistoryDurability | null | undefined {
+  return isNullableMember(value, HUMAN_HISTORY_DURABILITIES) ? value : undefined;
+}
+
+/** Validate the legacy four-field projection. All nulls is an update; absent fields are not. */
 export function readHumanProtection(
   data: Partial<Record<keyof HumanProtectionProjection, unknown>>,
 ): HumanProtectionProjection | undefined {

@@ -1,5 +1,13 @@
 # RoastPilot Agent Project State Registry
 
+**18 Nov 2026, D230 A2 software delivery (#1077):**
+Protected S1 (#1092) supplied the server's bounded HUMAN history durability
+projection. S2 renders the current run's validated status on the dashboard
+and in recovery, including a verified detail-read refusal. Server phase and
+action authority still come from the accepted snapshots and events.
+A2 software is complete on protected merge. Next-roast acceptance and
+target-hardware qualification remain open, alongside E11-S3 and #954.
+
 **11 Nov 2026, #1079 watchdog probe import-readiness split:**
 The A1 S1 full native gate failed at
 `test_live_exit_watchdog_bounds_cancellation_resistant_owner` inside the
