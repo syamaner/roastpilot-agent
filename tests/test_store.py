@@ -10978,3 +10978,423 @@ async def test_human_turn_waiter_gets_first_admission_after_a_held_history_read(
             await asyncio.gather(turn, *competitors, return_exceptions=True)
         await initial
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_audit_ownership_retains_latest_exact_attempt_until_run_changes(
+    tmp_store: RoastStore,
+) -> None:
+    await seeded_store(tmp_store)
+    try:
+        assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.UNAVAILABLE
+        tmp_store.note_human_history_gap("record_command", "run-1")
+        assert tmp_store.drain_human_storage_receipts() == ()
+        clock = FakeClock()
+        tmp_store.enable_human_storage(clock, 1.0)
+        tmp_store.set_human_history_run("run-1", recovered=False)
+        tmp_store.note_human_history_pass("other-run")
+        assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.UNKNOWN
+
+        older = CommandReference("session", 4, 5, 1, CommandAuditOwner.ENDPOINT)
+        current = CommandReference("session", 4, 5, 2, CommandAuditOwner.ENDPOINT)
+        newer = CommandReference("session", 4, 6, 3, CommandAuditOwner.ENDPOINT)
+
+        def report(command: CommandReference, detail: str) -> None:
+            with storage_caller(
+                StorageCaller(StorageDeadline.start(clock, 1.0), "run-1", command=command)
+            ):
+                tmp_store.note_human_history_gap(
+                    "record_command", "run-1", detail=detail, unverified=True
+                )
+
+        report(current, "initial")
+        report(older, "older")
+        report(current, "same-attempt")
+        tmp_store.set_human_history_run("run-1", recovered=False)
+        assert [r.detail for r in tmp_store.drain_human_storage_receipts()] == [
+            "older",
+            "initial",
+            "same-attempt",
+        ]
+        (pending,) = tmp_store.drain_human_storage_receipts()
+        assert pending.command == current and pending.detail == "same-attempt"
+        report(newer, "newer-attempt")
+        displaced, retained = tmp_store.drain_human_storage_receipts()
+        assert displaced == pending
+        assert retained.command == newer and retained.settlement is Settlement.UNRESOLVED
+
+        tmp_store.set_human_history_run("other-run", recovered=False)
+        assert tmp_store.drain_human_storage_receipts() == (retained,)
+        assert tmp_store.drain_human_storage_receipts() == ()
+        assert tmp_store.human_history_durability("other-run") is HumanHistoryDurability.UNKNOWN
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_cancelled_turn_waiter_refuses_its_own_write_and_preserves_native_owner(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await seeded_store(tmp_store)
+    clock = FakeClock()
+    tmp_store.enable_human_storage(clock, 0.15)
+    tmp_store.set_human_history_run("run-1", recovered=False)
+    shared = tmp_store.connection
+    commit = shared.commit
+    entered, waiting, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    wait = asyncio.wait
+
+    async def hold_commit() -> None:
+        entered.set()
+        await release.wait()
+        await commit()
+
+    async def observe_wait(*args: Any, **kwargs: Any) -> Any:
+        if asyncio.current_task() is waiter:
+            waiting.set()
+        return await wait(*args, **kwargs)
+
+    async def write() -> None:
+        with storage_caller(StorageCaller(StorageDeadline.start(clock, 1.0), "run-1", 14)):
+            await tmp_store.record_event(
+                run_id="run-1",
+                kind=RoastEventKind.T0_DETECTED,
+                source=RoastEventSource.MCP,
+                payload={},
+            )
+
+    monkeypatch.setattr(shared, "commit", hold_commit)
+    monkeypatch.setattr(store_module.asyncio, "wait", observe_wait)  # pyright: ignore[reportPrivateImportUsage]
+    waiter: asyncio.Task[None] | None = None
+    native = asyncio.create_task(tmp_store.expire_bean_sourcing_drafts())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.UNAVAILABLE
+        waiter = asyncio.create_task(write())
+        await asyncio.wait_for(waiting.wait(), 1)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        refused, pending = tmp_store.drain_human_storage_receipts()
+        assert refused.kind == "record_event" and refused.turn == 14
+        assert (
+            refused.settlement is Settlement.VERIFIED_NO_WRITE and refused.writer_entered is False
+        )
+        assert pending.kind == "expire_bean_sourcing_drafts" and pending.writer_entered
+        assert pending.settlement is Settlement.UNRESOLVED
+        with pytest.raises(HistoryUnavailable, match="worker is still pending"):
+            await tmp_store.close()
+        (still_pending,) = tmp_store.drain_human_storage_receipts()
+        assert still_pending.token == pending.token
+        assert still_pending.settlement is Settlement.UNRESOLVED
+        assert still_pending.writer_connection == pending.writer_connection
+
+        release.set()
+        assert await tmp_store.settle_human_storage_for_teardown()
+        (settled,) = tmp_store.drain_human_storage_receipts()
+        assert (
+            settled.token == pending.token and settled.settlement is Settlement.OBSERVED_COMMITTED
+        )
+        assert await fetch_one(tmp_store, "SELECT COUNT(*) FROM roast_events") == (0,)
+        assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.INCOMPLETE
+    finally:
+        release.set()
+        if waiter is not None:
+            await asyncio.gather(waiter, return_exceptions=True)
+        await asyncio.gather(native, return_exceptions=True)
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_store_close_keeps_exact_pending_worker_after_timeout(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await tmp_store.initialize()
+    tmp_store.enable_human_storage(FakeClock(), 0.15)
+    shared = tmp_store.connection
+    close = shared.close
+    entered, release = asyncio.Event(), asyncio.Event()
+    close_calls = 0
+
+    async def hold_close() -> None:
+        nonlocal close_calls
+        close_calls += 1
+        entered.set()
+        await release.wait()
+        await close()
+
+    monkeypatch.setattr(shared, "close", hold_close)
+    try:
+        with pytest.raises(HistoryUnavailable, match="close deadline elapsed"):
+            await tmp_store.close()
+        assert entered.is_set() and close_calls == 1
+        assert not tmp_store.human_storage_quiescent
+        with pytest.raises(HistoryUnavailable, match="admission unavailable"):
+            await tmp_store.schema_version()
+        release.set()
+        await tmp_store.close()
+        assert close_calls == 1
+        assert not tmp_store.human_storage_quiescent
+        assert tmp_store.human_history_durability("run-1") is HumanHistoryDurability.UNAVAILABLE
+        assert not await tmp_store.mark_process_epoch_clean("unused")
+    finally:
+        release.set()
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_expired_native_entry_does_not_touch_sqlite(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await seeded_store(tmp_store)
+    clock = FakeClock()
+    tmp_store.enable_human_storage(clock, 1.0)
+    execute_history = tmp_store._execute_history  # pyright: ignore[reportPrivateUsage]
+
+    async def start_after_deadline(*args: Any) -> Any:
+        clock.advance(1.0)
+        return await execute_history(*args)
+
+    try:
+        with monkeypatch.context() as timing:
+            timing.setattr(tmp_store, "_execute_history", start_after_deadline)
+            with pytest.raises(HistoryUnavailable, match="deadline elapsed") as refused:
+                await tmp_store.update_run_phase("run-1", RoastPhase.PREHEATING)
+        (receipt,) = tmp_store.drain_human_storage_receipts()
+        assert receipt == refused.value.receipt
+        assert (
+            receipt.settlement is Settlement.VERIFIED_NO_WRITE and receipt.writer_entered is False
+        )
+        assert receipt.timely is False and tmp_store.human_storage_quiescent
+        run = await tmp_store.read_run("run-1")
+        assert run is not None and run.agent_phase is RoastPhase.STARTING
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_store_does_not_adopt_an_unowned_sqlite_transaction(
+    tmp_store: RoastStore,
+) -> None:
+    await seeded_store(tmp_store)
+    tmp_store.enable_human_storage(FakeClock(), 1.0)
+    shared = tmp_store.connection
+    await shared.execute("BEGIN IMMEDIATE")
+    await shared.execute("UPDATE roast_runs SET agent_phase = ?", (RoastPhase.PREHEATING.value,))
+    try:
+        with pytest.raises(HistoryUnavailable, match="unowned transaction"):
+            await tmp_store.update_run_phase("run-1", RoastPhase.FAULTED)
+        (receipt,) = tmp_store.drain_human_storage_receipts()
+        assert receipt.settlement is Settlement.UNRESOLVED and receipt.writer_entered is False
+        assert shared.in_transaction and not tmp_store.human_storage_quiescent
+        with pytest.raises(HistoryUnavailable, match="admission unavailable"):
+            await tmp_store.read_run("run-1")
+        async with aiosqlite_module.connect(tmp_store.db_path) as reader:
+            (row,) = await reader.execute_fetchall("SELECT agent_phase FROM roast_runs")
+            assert row[0] == RoastPhase.STARTING.value
+    finally:
+        await shared.rollback()
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_native_connect_failure_has_no_entered_writer_or_retained_owner(
+    tmp_store: RoastStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await tmp_store.initialize()
+    tmp_store.enable_human_storage(FakeClock(), 1.0)
+    try:
+        with monkeypatch.context() as invalid_path:
+            invalid_path.setattr(tmp_store, "_db_path", tmp_path)
+            with pytest.raises(HistoryUnavailable, match="SQLite operation failed"):
+                await tmp_store.begin_process_epoch("unopened")
+            assert not await tmp_store.closure_only_end_postcondition(
+                process_id="unopened", run_id="none", lease_generation=1
+            )
+        writer, reader = tmp_store.drain_human_storage_receipts()
+        assert (
+            writer.kind == "begin_process_epoch" and reader.kind == "closure_only_end_postcondition"
+        )
+        assert writer.writer_connection is not None and reader.writer_connection is None
+        assert all(
+            receipt.settlement is Settlement.VERIFIED_NO_WRITE and receipt.writer_entered is False
+            for receipt in (writer, reader)
+        )
+        assert tmp_store.human_storage_quiescent
+        assert await tmp_store.begin_process_epoch("opened")
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["closure-only", "safety-record"])
+@pytest.mark.parametrize(
+    "fault", ["cancelled-native-write", "readback-denied", "after-confirmed-commit"]
+)
+async def test_human_dedicated_safety_write_classifies_rollback_and_readback(
+    tmp_store: RoastStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    fault: str,
+) -> None:
+    run_id = "recovered-run"
+    if operation == "closure-only":
+        store = tmp_store
+        process_id = "closure-process"
+        await seeded_store(store, run_id=run_id)
+        await store.update_run_phase(run_id, RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+        await store.begin_process_restart_clearance(process_id)
+        assert await store.confirm_process_closure_only_clearance(process_id)
+        lease = await _closed_recovered_lease(store, run_id=run_id, generation=32)
+        action = OperatorAction.END_RECOVERED_RUN
+        kind = "end_closure_only_recovered_run"
+
+        async def write() -> bool:
+            return await store.end_closure_only_recovered_run(
+                process_id=process_id, run_id=run_id, expected_lease=lease
+            )
+
+    else:
+        store = await _d220_store_with_unclean_epoch(tmp_path, "bounded-safety-record")
+        process_id = "d220-process"
+        assert (
+            await store.probe_fault_control_lease_absence()
+            is FaultControlLeaseAbsence.ABSENT_UNTRUSTED
+        )
+        action = OperatorAction.INITIALIZE_SAFETY_RECORD
+        kind = "initialize_missing_fault_control_safety_record"
+
+        async def write() -> bool:
+            return await store.initialize_missing_fault_control_safety_record(
+                process_id=process_id, generation=1, operation_id="bounded-operation"
+            )
+
+    store.enable_human_storage(FakeClock(), 1.0)
+    original_commit = store._commit_connection  # pyright: ignore[reportPrivateUsage]
+    original_open = store._open_connection  # pyright: ignore[reportPrivateUsage]
+    failure = RuntimeError("post-commit driver failure")
+    readers: list[aiosqlite_module.Connection] = []
+
+    async def commit(connection: aiosqlite_module.Connection) -> None:
+        if fault == "cancelled-native-write":
+            assert connection.in_transaction
+            raise asyncio.CancelledError("cancelled during dedicated mutation")
+        await original_commit(connection)
+        raise failure
+
+    async def commit_without_acknowledgement(connection: aiosqlite_module.Connection) -> None:
+        await sqlite_commit(connection)
+        raise failure
+
+    def deny_read(
+        action: int, _table: str | None, _column: str | None, _db: str | None, _source: str | None
+    ) -> int:
+        return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_READ else sqlite3.SQLITE_OK
+
+    async def open_connection(*, writer: bool = False) -> aiosqlite_module.Connection:
+        connection = await original_open(writer=writer)
+        if not writer:
+            readers.append(connection)
+            if fault == "readback-denied":
+                await connection.set_authorizer(deny_read)
+        return connection
+
+    sqlite_commit = aiosqlite_module.Connection.commit
+    try:
+        with monkeypatch.context() as injected:
+            injected.setattr(store, "_open_connection", open_connection)
+            if fault == "readback-denied":
+                injected.setattr(
+                    aiosqlite_module.Connection, "commit", commit_without_acknowledgement
+                )
+                assert await write() is False
+            else:
+                injected.setattr(store, "_commit_connection", commit)
+                if fault == "cancelled-native-write":
+                    with pytest.raises(asyncio.CancelledError):
+                        await write()
+                else:
+                    with pytest.raises(RuntimeError) as failed:
+                        await write()
+                    assert failed.value is failure
+
+        (receipt,) = store.drain_human_storage_receipts()
+        assert receipt.kind == kind and receipt.writer_entered is True
+        expected = {
+            "cancelled-native-write": Settlement.VERIFIED_NO_WRITE,
+            "readback-denied": Settlement.UNRESOLVED,
+            "after-confirmed-commit": Settlement.OBSERVED_COMMITTED,
+        }[fault]
+        assert receipt.settlement is expected
+        if fault == "readback-denied":
+            (reader,) = readers
+            assert id(reader) != receipt.writer_connection
+            assert not await store.settle_human_storage_for_teardown()
+        else:
+            assert readers == [] and await store.settle_human_storage_for_teardown()
+
+        async with aiosqlite_module.connect(store.db_path) as reader:
+            (audit,) = await reader.execute_fetchall(
+                "SELECT COUNT(*) FROM operator_actions WHERE action = ?", (action.value,)
+            )
+            committed = fault != "cancelled-native-write"
+            assert audit[0] == int(committed)
+            if operation == "closure-only":
+                (run,) = await reader.execute_fetchall(
+                    "SELECT agent_phase FROM roast_runs WHERE id = ?", (run_id,)
+                )
+                assert run[0] == (
+                    RoastPhase.COMPLETE.value
+                    if committed
+                    else RoastPhase.OPERATOR_RECOVERY_REQUIRED.value
+                )
+            else:
+                (count,) = await reader.execute_fetchall("SELECT COUNT(*) FROM fault_control_lease")
+                assert count[0] == int(committed)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rolled_back_in_driver", [False, True])
+async def test_human_clean_epoch_cannot_verify_an_uncommitted_marker(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch, rolled_back_in_driver: bool
+) -> None:
+    await tmp_store.initialize()
+    tmp_store.enable_human_storage(FakeClock(), 1.0)
+    assert await tmp_store.begin_process_epoch("unclean")
+    assert (
+        await tmp_store.begin_process_restart_clearance("unclean") is RestartClearanceState.REQUIRED
+    )
+    assert await tmp_store.confirm_process_restart_clearance("unclean")
+    await tmp_store.close()
+    tmp_store.drain_human_storage_receipts()
+
+    async def reject_commit(connection: aiosqlite_module.Connection) -> None:
+        assert connection.in_transaction
+        if rolled_back_in_driver:
+            await connection.rollback()
+        raise aiosqlite_module.OperationalError("final marker was not committed")
+
+    try:
+        with monkeypatch.context() as injected:
+            injected.setattr(aiosqlite_module.Connection, "commit", reject_commit)
+            if rolled_back_in_driver:
+                assert await tmp_store.mark_process_epoch_clean("unclean") is False
+            else:
+                with pytest.raises(HistoryUnavailable, match="SQLite operation failed"):
+                    await tmp_store.mark_process_epoch_clean("unclean")
+        (receipt,) = tmp_store.drain_human_storage_receipts()
+        assert receipt.kind == "mark_process_epoch_clean" and receipt.writer_entered is True
+        assert receipt.settlement is (
+            Settlement.UNRESOLVED if rolled_back_in_driver else Settlement.VERIFIED_NO_WRITE
+        )
+        assert tmp_store.human_storage_quiescent is not rolled_back_in_driver
+        async with aiosqlite_module.connect(tmp_store.db_path) as independent:
+            (row,) = await independent.execute_fetchall(
+                "SELECT status FROM process_epoch WHERE process_id = ?", ("unclean",)
+            )
+            assert row[0] == "unclean"
+    finally:
+        await tmp_store.close()
