@@ -1218,7 +1218,7 @@ class RoastRunner:
         self._completion_persistence_initiated = False
         self._completion_storage_uncertain = False
         self._history_turn_in_progress = False
-        self._confirmed_start_history_cancelled = False
+        self._start_history_cancelled = False
         if controller.authority is ControlAuthority.HUMAN:
             store.enable_human_storage(clock, config.controller.tick_interval_seconds)
             emitter.bound_history_buffer(self._note_unwritten_event)
@@ -1306,14 +1306,15 @@ class RoastRunner:
             self._store.note_human_history_pass(self._run_id)
 
     def _note_start_history_cancellation(self) -> None:
-        if self._controller.owns_confirmed_human_start():
-            self._controller.inhibit_human_routine_for_storage_failure()
-            self._confirmed_start_history_cancelled = True
+        if self._controller.authority is ControlAuthority.HUMAN:
+            self._start_history_cancelled = True
+            if self._controller.owns_confirmed_human_start():
+                self._controller.inhibit_human_routine_for_storage_failure()
 
     @property
-    def confirmed_start_history_cancelled(self) -> bool:
-        """Whether caller cancellation interrupted this confirmed Start's history."""
-        return self._confirmed_start_history_cancelled
+    def start_history_cancelled(self) -> bool:
+        """Whether caller cancellation interrupted this HUMAN Start's history."""
+        return self._start_history_cancelled
 
     async def recover(
         self,
@@ -6842,13 +6843,26 @@ class RoastService:
         try:
             await runner.start(profile, recording_roast_num=recording_roast_num)
         except HistoryUnavailable:
-            if start_history_refused:
+            controller = runner.controller_for_human_fault_drop()
+            if start_history_refused or (
+                controller is not None
+                and not controller.owns_confirmed_human_start()
+                and controller.has_pending_emergency_stop_retry()
+            ):
                 self._supervise_current_failed_human_start(runner, run_id)
             raise
         except asyncio.CancelledError:
-            if runner.confirmed_start_history_cancelled:
-                # The ordinary turn handles the pending storage failure
-                # after urgent evaluation, under current run ownership.
+            controller = runner.controller_for_human_fault_drop()
+            if (
+                runner.start_history_cancelled
+                and controller is not None
+                and (
+                    controller.owns_confirmed_human_start()
+                    or controller.has_pending_emergency_stop_retry()
+                )
+            ):
+                # The ordinary turn owns any pending safety recovery or
+                # emergency retry. Keep cancellation visible to the caller.
                 self._supervise_current_failed_human_start(runner, run_id)
             raise
         # A later successful flush records the fault. It cannot confirm a

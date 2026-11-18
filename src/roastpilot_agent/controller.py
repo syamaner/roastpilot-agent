@@ -5716,6 +5716,12 @@ class RoastController:
             reason="fail-closed retry: heat 0 %, overrun-safe fan",
         )
 
+    def has_pending_emergency_stop_retry(self) -> bool:
+        """Whether an admitted emergency stop already owns a heat-off retry."""
+        return (
+            self._pending_fail_safe_is_emergency_stop_retry and self._pending_fail_safe is not None
+        )
+
     def rearm_emergency_stop_fail_safe(self) -> None:
         """Retain a typed heat-off retry after an unconfirmed external stop.
 
