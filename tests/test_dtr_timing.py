@@ -520,6 +520,80 @@ def test_unavailable_never_met(slot: str, reason: TimingReason) -> None:
     _expect(_call(**_absent(slot)), UNAVAILABLE, reason)
 
 
+# Only ``None`` means absent. Every other falsy value in an optional slot is a
+# wrong-typed operand, so a truthiness check in place of ``is not None`` would
+# misreport it as absent (UNAVAILABLE) instead of INVALID.
+_EMPTY_LIST: list[object] = []
+_EMPTY_TUPLE: tuple[object, ...] = ()
+_EMPTY_DICT: dict[str, object] = {}
+_FALSY_VALUES = [
+    pytest.param(0, id="int-0"),
+    pytest.param(0.0, id="float-0.0"),
+    pytest.param(False, id="false"),
+    pytest.param("", id="empty-str"),
+    pytest.param(_EMPTY_LIST, id="empty-list"),
+    pytest.param(_EMPTY_TUPLE, id="empty-tuple"),
+    pytest.param(_EMPTY_DICT, id="empty-dict"),
+]
+
+
+def _falsy_in(slot: str, value: object) -> dict[str, object]:
+    kwargs = _kwargs()
+    if slot == "acquisition":
+        kwargs["sample"] = BeanTempSample(cast(Any, value), _bt(205, 210))
+    elif slot == "bean_temp":
+        kwargs["sample"] = BeanTempSample(_iv(100, 100), cast(Any, value))
+    else:
+        kwargs[slot] = value
+    return kwargs
+
+
+def _check_falsy(slot: str, value: object) -> None:
+    assert not value and value is not None
+    _expect(_call(**_falsy_in(slot, value)), INVALID, R.INVALID_OPERAND)
+
+
+@pytest.mark.parametrize("value", _FALSY_VALUES)
+def test_falsy_charge_invalid_not_absent(value: object) -> None:
+    _check_falsy("charge", value)
+
+
+@pytest.mark.parametrize("value", _FALSY_VALUES)
+def test_falsy_first_crack_invalid_not_absent(value: object) -> None:
+    _check_falsy("first_crack", value)
+
+
+@pytest.mark.parametrize("value", _FALSY_VALUES)
+def test_falsy_sample_invalid_not_absent(value: object) -> None:
+    _check_falsy("sample", value)
+
+
+@pytest.mark.parametrize("value", _FALSY_VALUES)
+def test_falsy_sample_acquisition_invalid_not_absent(value: object) -> None:
+    _check_falsy("acquisition", value)
+
+
+@pytest.mark.parametrize("value", _FALSY_VALUES)
+def test_falsy_sample_bean_temp_invalid_not_absent(value: object) -> None:
+    _check_falsy("bean_temp", value)
+
+
+@pytest.mark.parametrize(
+    "domain",
+    [
+        pytest.param(_SubDomain("session-1", "epoch-1"), id="subclassed-domain"),
+        pytest.param(_iv(0, 0), id="interval-as-domain"),
+        pytest.param(_bt(0, 0), id="bounds-as-domain"),
+        pytest.param(RecipeTimingTarget(14, 200), id="target-as-domain"),
+    ],
+)
+@pytest.mark.parametrize("position", _POSITIONS)
+def test_wrong_or_subclassed_domain_is_invalid_domain(position: str, domain: object) -> None:
+    # Contract step 2(b): the domain must be an exact TimingDomain; a wrong exact type
+    # or a TimingDomain subclass (even with valid, matching tokens) is INVALID_DOMAIN.
+    _expect(_call(**_with_domain(position, domain)), INVALID, R.INVALID_DOMAIN)
+
+
 def test_absent_is_not_zero() -> None:
     # A charge at exactly 0 s qualifies as MET; an absent charge must not.
     _expect(_run(), MET, R.TARGETS_MET, _L14, _L14, ABOVE, ABOVE)
