@@ -6847,7 +6847,7 @@ class RoastService:
             if start_history_refused or (
                 controller is not None
                 and not controller.owns_confirmed_human_start()
-                and controller.has_pending_emergency_stop_retry()
+                and controller.has_pending_emergency_stop_work()
             ):
                 self._supervise_current_failed_human_start(runner, run_id)
             raise
@@ -6858,11 +6858,11 @@ class RoastService:
                 and controller is not None
                 and (
                     controller.owns_confirmed_human_start()
-                    or controller.has_pending_emergency_stop_retry()
+                    or controller.has_pending_emergency_stop_work()
                 )
             ):
-                # The ordinary turn owns any pending safety recovery or
-                # emergency retry. Keep cancellation visible to the caller.
+                # An admitted stop may still need the ordinary supervisor to retry
+                # heat-off. Keep cancellation visible to the caller.
                 self._supervise_current_failed_human_start(runner, run_id)
             raise
         # A later successful flush records the fault. It cannot confirm a

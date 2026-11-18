@@ -5722,6 +5722,12 @@ class RoastController:
             self._pending_fail_safe_is_emergency_stop_retry and self._pending_fail_safe is not None
         )
 
+    def has_pending_emergency_stop_work(self) -> bool:
+        """Whether this controller owns an unsettled stop or its heat-off retry."""
+        return self.has_pending_emergency_stop_retry() or (
+            self._emergency_stop_transition_pending and self._arbiter.emergency_stop_active
+        )
+
     def rearm_emergency_stop_fail_safe(self) -> None:
         """Retain a typed heat-off retry after an unconfirmed external stop.
 
