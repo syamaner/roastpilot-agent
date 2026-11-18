@@ -30,8 +30,10 @@ from roastpilot_agent.api import (
     stream_events,
 )
 from roastpilot_agent.config import AppConfig, ControllerConfig, MCPDeviceConfig, SafetyLimits
+from roastpilot_agent.controller import FaultControlExecutor, FaultControlTraceSink
 from roastpilot_agent.human_persistence import (
     CommandAuditOwner,
+    CommandReference,
     HistoryUnavailable,
     Settlement,
     StorageCaller,
@@ -83,7 +85,7 @@ from roastpilot_agent.models import (
     RoastTimeline,
     SseEventType,
 )
-from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
+from roastpilot_agent.safety import SafetyEvaluation, SafetyPolicy, SafetyVerdict
 from roastpilot_agent.store import (
     FaultControlCloseResult,
     FaultControlLease,
@@ -1842,6 +1844,167 @@ class _ExactFaultRunner(_RunnerRoaster):
             raise RuntimeError("synthetic exact e-stop failure")
         if action in (OperatorAction.START_COOLING, OperatorAction.STOP_COOLING):
             self.cooling = action is OperatorAction.START_COOLING
+
+
+@pytest.mark.parametrize("outcome", ["confirmed", "write-failed", "safety-error"])
+async def test_live_estop_dispatch_is_independent_of_audit_identity_lookup(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None and controller.owns_confirmed_human_start()
+    emitter = runner._emitter  # pyright: ignore[reportPrivateUsage]
+    stop_once = actuator.emergency_stop
+    previous_commands = actuator.commands()
+    previous_generation = controller.command_generation
+    evaluated: list[tuple[SafetyEvaluation, CommandReference | None]] = []
+    identity = Mock(side_effect=RuntimeError("diagnostic attribution failed"))
+    safety_failure = RuntimeError("safety admission failed")
+
+    async def observe_stop(*, reason: str) -> AppliedRoasterState | None:
+        identity.assert_called_once()
+        result = await stop_once(reason=reason)
+        if outcome == "write-failed":
+            raise OSError("stop acknowledgement lost")
+        return result
+
+    def defer(evaluation: SafetyEvaluation, command: CommandReference | None) -> None:
+        evaluated.append((evaluation, command))
+
+    monkeypatch.setattr(controller, "_new_history_command", identity)
+    monkeypatch.setattr(actuator, "emergency_stop", observe_stop)
+    if outcome == "safety-error":
+        safety = controller._safety  # pyright: ignore[reportPrivateUsage]
+        monkeypatch.setattr(safety, "evaluate_emergency_stop", Mock(side_effect=safety_failure))
+
+    try:
+        if outcome == "safety-error":
+            with pytest.raises(RuntimeError) as failed:
+                await controller.operator_emergency_stop(defer_evaluation=defer)
+            assert failed.value is safety_failure
+            assert controller.command_generation == previous_generation
+            identity.assert_not_called()
+            assert evaluated == []
+            assert actuator.commands() == previous_commands
+            return
+
+        confirmed = await controller.operator_emergency_stop(defer_evaluation=defer)
+        assert actuator.commands() == [*previous_commands, "emergency_stop"]
+        assert confirmed is (outcome == "confirmed")
+        assert controller.phase is RoastPhase.FAULTED
+        assert controller.has_pending_emergency_stop_retry() is (outcome == "write-failed")
+        identity.assert_called_once_with(
+            controller.command_generation, owner=CommandAuditOwner.LEASE
+        )
+        ((evaluation, command),) = evaluated
+        assert evaluation.verdict is SafetyVerdict.EMERGENCY_STOP and command is None
+        failed_events = [
+            event for event in emitter.peek() if event.kind is RoastEventKind.COMMAND_FAILED
+        ]
+        if outcome == "write-failed":
+            (event,) = failed_events
+            assert event.audit_command is None
+        else:
+            assert failed_events == []
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.parametrize("outcome", ["confirmed", "write-failed", "stale", "rejected-readback"])
+async def test_terminal_estop_dispatch_is_independent_of_audit_identity_lookup(
+    outcome: str,
+) -> None:
+    clock = FakeClock()
+    actuator = _ExactFaultRunner(clock)
+    actuator.exact_emergency_write_raises = outcome == "write-failed"
+    actuator.exact_emergency_read_heat = 5 if outcome == "rejected-readback" else 0
+    evaluation_callers: list[StorageCaller] = []
+    command_callers: list[StorageCaller] = []
+    identity = Mock(side_effect=RuntimeError("diagnostic attribution failed"))
+    trace = Mock(spec=FaultControlTraceSink)
+
+    async def record_evaluation(*, run_id: str, evaluation: SafetyEvaluation) -> int:
+        caller = current_storage_caller()
+        assert caller is not None and caller.run_id == run_id == "terminal-run"
+        assert evaluation.verdict is SafetyVerdict.EMERGENCY_STOP
+        assert actuator.fault_writes == (
+            [] if outcome == "stale" else [OperatorAction.EMERGENCY_STOP]
+        )
+        evaluation_callers.append(caller)
+        return 42
+
+    async def record_command(**kwargs: object) -> None:
+        caller = current_storage_caller()
+        assert caller is not None and caller.run_id == kwargs["run_id"] == "terminal-run"
+        command_callers.append(caller)
+
+    trace.record_fault_control_evaluation.side_effect = record_evaluation
+    trace.record_fault_control_command.side_effect = record_command
+    executor = FaultControlExecutor(
+        SafetyPolicy(SafetyLimits()),
+        actuator,
+        trace_sink=trace,
+        history_deadline=lambda: StorageDeadline.start(clock, 1),
+        audit_child_generation=identity,
+    )
+
+    async def attempt_stop() -> FaultControlState | None:
+        return await executor.execute(
+            OperatorAction.EMERGENCY_STOP,
+            actuator.session_id,
+            run_id="terminal-run",
+            is_current_generation=lambda: outcome != "stale",
+        )
+
+    try:
+        if outcome == "write-failed":
+            with pytest.raises(RuntimeError, match="synthetic exact e-stop failure"):
+                await attempt_stop()
+        elif outcome == "stale":
+            with pytest.raises(RuntimeError, match="admission is no longer current"):
+                await attempt_stop()
+        else:
+            state = await attempt_stop()
+            if outcome == "confirmed":
+                assert state is not None and state.session_id == actuator.session_id
+                assert state.heat_level_percent == 0
+            else:
+                assert state is None
+        assert actuator.fault_writes == (
+            [] if outcome == "stale" else [OperatorAction.EMERGENCY_STOP]
+        )
+        assert actuator.fault_reads == (
+            [actuator.session_id] if outcome in {"confirmed", "rejected-readback"} else []
+        )
+        if outcome == "stale":
+            identity.assert_not_called()
+        else:
+            identity.assert_called_once_with("terminal-run", actuator.session_id)
+    finally:
+        assert await executor.settle_for_shutdown()
+
+    (evaluation_caller,) = evaluation_callers
+    (command_caller,) = command_callers
+    assert evaluation_caller is command_caller and command_caller.command is None
+    dispatch, confirmation = {
+        "confirmed": ("completed", "read_back"),
+        "write-failed": ("write_failed", "not_attempted"),
+        "stale": ("not_dispatched", "not_attempted"),
+        "rejected-readback": ("completed", "rejected_readback"),
+    }[outcome]
+    trace.record_fault_control_command.assert_awaited_once_with(
+        run_id="terminal-run",
+        tool=RoastCommand.EMERGENCY_STOP,
+        status="ok" if outcome == "confirmed" else "failed",
+        args={"fault_control": True},
+        result={"admission": "allowed", "dispatch": dispatch, "confirmation": confirmation},
+        safety_evaluation_id=42,
+    )
 
 
 async def _faulted_run(

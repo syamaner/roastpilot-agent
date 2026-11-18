@@ -884,10 +884,12 @@ class FaultControlExecutor:
         async def dispatch_estop() -> None:
             """Mark entry to the adapter so admission failures are not called writes."""
             nonlocal write_started
+            # Audit attribution has no authority over an admitted stop.
+            with contextlib.suppress(Exception):
+                self._bind_exact_audit_command(
+                    run_id, session_id, self._arbiter.generation, owner=CommandAuditOwner.LEASE
+                )
             write_started = True
-            self._bind_exact_audit_command(
-                run_id, session_id, self._arbiter.generation, owner=CommandAuditOwner.LEASE
-            )
             await self._port.write_fault_control(action, expected_session_id=session_id)
 
         try:
@@ -5531,9 +5533,12 @@ class RoastController:
 
         async def dispatch() -> AppliedRoasterState | None:
             nonlocal command
-            command = self._new_history_command(generation, owner=CommandAuditOwner.LEASE)
-            if bind_audit is not None:
-                bind_audit(command)
+            # Leave failed attribution unknown without delaying the stop.
+            with contextlib.suppress(Exception):
+                reference = self._new_history_command(generation, owner=CommandAuditOwner.LEASE)
+                if bind_audit is not None:
+                    bind_audit(reference)
+                command = reference
             return await self._executor.emergency_stop(reason=evaluation.reason)
 
         try:
