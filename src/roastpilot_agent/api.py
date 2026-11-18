@@ -6802,7 +6802,24 @@ class RoastService:
         if runner is None:  # pragma: no cover — guarded by the caller
             return
         recording_roast_num = await self._recording_roast_num(profile)
-        await runner.start(profile, recording_roast_num=recording_roast_num)
+        try:
+            await runner.start(profile, recording_roast_num=recording_roast_num)
+        except HistoryUnavailable:
+            # The dispatch refusal already left this controller faulted.
+            # Keep its normal supervision so later turns can persist that
+            # phase when storage settles, without re-entering Start.
+            if (
+                start_history_refused
+                and self._run_loop
+                and self.runner is runner
+                and self.active_run_id == self._starting_run_id == run_id
+                and not runner.finalized
+                and (self._loop_task is None or self._loop_task.done())
+            ):
+                controller = runner.controller_for_human_fault_drop()
+                if controller is not None and controller.owns_human_run(run_id):
+                    self._loop_task = asyncio.create_task(runner.run())
+            raise
         if self._run_loop:
             self._loop_task = asyncio.create_task(runner.run())
         # A later successful flush records the fault. It cannot confirm a

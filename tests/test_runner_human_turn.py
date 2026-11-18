@@ -5728,6 +5728,111 @@ async def test_human_start_storage_refusal_remains_unavailable_after_native_writ
         await service.shutdown()
 
 
+async def test_human_start_refused_through_fault_flush_keeps_one_exact_supervisor(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    recording_number = service._recording_roast_num  # pyright: ignore[reportPrivateUsage]
+    commit = store.connection.commit
+    entered, release = asyncio.Event(), asyncio.Event()
+    supervised, allow_tick, phase_saved, finish = (asyncio.Event() for _ in range(4))
+    background: asyncio.Task[int] | None = None
+    supervisors: list[RoastRunner] = []
+
+    async def hold_background_commit() -> None:
+        owner = store._current_native_storage()  # pyright: ignore[reportPrivateUsage]
+        if owner is not None and owner.receipt.kind == "expire_bean_sourcing_drafts":
+            entered.set()
+            await release.wait()
+        await commit()
+
+    async def admit_writer_after_recording_lookup(profile: RoastProfile) -> int | None:
+        nonlocal background
+        result = await recording_number(profile)
+        background = asyncio.create_task(store.expire_bean_sourcing_drafts())
+        await asyncio.wait_for(entered.wait(), 1)
+        return result
+
+    async def supervise(runner: RoastRunner) -> None:
+        supervisors.append(runner)
+        assert runner is service.runner and runner.run_id == service.active_run_id
+        assert runner.controller_snapshot().phase is RoastPhase.FAULTED
+        supervised.set()
+        await allow_tick.wait()
+        assert not await runner.tick_once()
+        phase_saved.set()
+        await finish.wait()
+
+    monkeypatch.setattr(service, "_run_loop", True)
+    monkeypatch.setattr(RoastRunner, "run", supervise)
+    monkeypatch.setattr(store.connection, "commit", hold_background_commit)
+    monkeypatch.setattr(service, "_recording_roast_num", admit_writer_after_recording_lookup)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=create_app(service)), base_url="http://test"
+        ) as client:
+            start = await client.post("/api/roasts", json=PROFILE.model_dump(mode="json"))
+            assert start.status_code == 503
+            assert start.json() == {"detail": "HUMAN history is temporarily unavailable"}
+            assert not release.is_set() and not store.human_storage_quiescent
+            assert actuator.commands() == []
+            receipts = store.drain_human_storage_receipts()
+            (pending,) = [r for r in receipts if r.kind == "expire_bean_sourcing_drafts"]
+            assert pending.settlement is Settlement.UNRESOLVED and pending.writer_entered is True
+            run_id = service.active_run_id
+            assert run_id is not None
+            (refused,) = [
+                r
+                for r in receipts
+                if r.kind == "record_event"
+                and r.run_id == run_id
+                and r.detail == RoastEventKind.COMMAND_FAILED.value
+            ]
+            assert refused.settlement is Settlement.VERIFIED_NO_WRITE
+            assert refused.writer_entered is False
+            supervisor = service._loop_task  # pyright: ignore[reportPrivateUsage]
+            assert supervisor is not None and not supervisor.done()
+            await asyncio.wait_for(supervised.wait(), 1)
+
+            release.set()
+            assert background is not None
+            await background
+            (settled,) = [
+                r for r in store.drain_human_storage_receipts() if r.token == pending.token
+            ]
+            assert settled.settlement is Settlement.OBSERVED_COMMITTED
+            active = await store.active_run()
+            assert active is not None and active.run_id == run_id
+            assert active.agent_phase is RoastPhase.STARTING
+
+            clock.advance(0.25)
+            allow_tick.set()
+            await asyncio.wait_for(phase_saved.wait(), 1)
+            detail = await client.get(f"/api/roasts/{run_id}")
+            assert detail.status_code == 200 and detail.json()["agent_phase"] == "faulted"
+            phase_writes = store.drain_human_storage_receipts()
+            assert any(
+                r.kind == "update_run_phase"
+                and r.run_id == run_id
+                and r.settlement is Settlement.OBSERVED_COMMITTED
+                for r in phase_writes
+            )
+            retry = await client.post("/api/roasts", json=PROFILE.model_dump(mode="json"))
+            assert retry.status_code == 409
+            assert service._loop_task is supervisor  # pyright: ignore[reportPrivateUsage]
+            assert supervisors == [service.runner]
+            assert actuator.commands() == []
+    finally:
+        release.set()
+        allow_tick.set()
+        finish.set()
+        if background is not None:
+            await background
+        await service.shutdown()
+
+
 async def test_automatic_start_keeps_positive_dispatch_without_human_storage_proof(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
