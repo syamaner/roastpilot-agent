@@ -1289,19 +1289,26 @@ class RoastRunner:
                 filename. ``None`` lets the controller fall back to its per-process
                 counter.
         """
-        await self._controller.start_run(profile, recording_roast_num=recording_roast_num)
+        await self._controller.start_run(
+            profile,
+            recording_roast_num=recording_roast_num,
+            on_history_cancelled=self._note_start_history_cancellation,
+        )
         try:
             events_persisted = await self._flush_events()
             if self._controller.authority is ControlAuthority.HUMAN and not events_persisted:
                 raise HistoryUnavailable("HUMAN Start event history is unavailable")
             await self._persist_phase_if_changed()
         except asyncio.CancelledError:
-            if self._controller.owns_confirmed_human_start():
-                self._controller.inhibit_human_routine_for_storage_failure()
-                self._confirmed_start_history_cancelled = True
+            self._note_start_history_cancellation()
             raise
         if self._controller.authority is ControlAuthority.HUMAN:
             self._store.note_human_history_pass(self._run_id)
+
+    def _note_start_history_cancellation(self) -> None:
+        if self._controller.owns_confirmed_human_start():
+            self._controller.inhibit_human_routine_for_storage_failure()
+            self._confirmed_start_history_cancelled = True
 
     @property
     def confirmed_start_history_cancelled(self) -> bool:

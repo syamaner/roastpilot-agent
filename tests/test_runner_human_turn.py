@@ -5728,9 +5728,12 @@ async def test_human_start_storage_refusal_remains_unavailable_after_native_writ
         await service.shutdown()
 
 
+@pytest.mark.parametrize(
+    "held_write", ["record_safety_evaluation", "record_event", "update_run_phase"]
+)
 @pytest.mark.parametrize("teardown", [False, True], ids=["keep-supervision", "teardown-fenced"])
 async def test_cancelled_confirmed_start_history_hands_recovery_to_current_supervisor(
-    store: RoastStore, monkeypatch: pytest.MonkeyPatch, teardown: bool
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, teardown: bool, held_write: str
 ) -> None:
     clock = FakeClock()
     actuator = _RunnerRoaster(clock, [])
@@ -5742,7 +5745,7 @@ async def test_cancelled_confirmed_start_history_hands_recovery_to_current_super
 
     async def hold_start_audit() -> None:
         owner = store._current_native_storage()  # pyright: ignore[reportPrivateUsage]
-        if owner is not None and owner.receipt.kind == "record_event" and not entered.is_set():
+        if owner is not None and owner.receipt.kind == held_write and not entered.is_set():
             entered.set()
             await release.wait()
         await commit()
@@ -5785,7 +5788,7 @@ async def test_cancelled_confirmed_start_history_hands_recovery_to_current_super
         (pending,) = [
             r
             for r in store.drain_human_storage_receipts()
-            if r.kind == "record_event" and r.settlement is Settlement.UNRESOLVED
+            if r.kind == held_write and r.settlement is Settlement.UNRESOLVED
         ]
         assert pending.run_id == runner.run_id and pending.writer_entered is True
         assert pending.timely is False
@@ -5863,6 +5866,76 @@ async def test_start_adapter_cancellation_without_confirmation_does_not_start_su
         assert controller is not None and not controller.owns_confirmed_human_start()
         assert service._loop_task is None  # pyright: ignore[reportPrivateUsage]
         assert actuator.commands() == ["start_session"]
+    finally:
+        if not request.done():
+            request.cancel()
+            with suppress(asyncio.CancelledError):
+                await request
+        await service.shutdown()
+
+
+async def test_confirmed_start_target_transport_cancellation_is_not_a_storage_fault(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    original_start = actuator.start_session
+    original_set_heat = actuator.set_heat
+    heat_entered = asyncio.Event()
+
+    async def start_with_fresh_readings(
+        *, recording_origin: str | None = None, recording_roast_num: int | None = None
+    ) -> None:
+        await original_start(
+            recording_origin=recording_origin, recording_roast_num=recording_roast_num
+        )
+        runner = service.runner
+        assert runner is not None
+        controller = runner.controller_for_human_fault_drop()
+        assert controller is not None
+        tracker = controller._accepted_readings  # pyright: ignore[reportPrivateUsage]
+        for _ in range(2):
+            clock.advance(0.125)
+            evidence = await actuator.read_human_evidence()
+            assert evidence.bound_child_epoch is not None
+            tracker.observe(
+                child_epoch=evidence.bound_child_epoch,
+                counters=evidence.counters,
+                bean_temp_c=evidence.bean_temp_c,
+                env_temp_c=evidence.env_temp_c,
+                request_admitted_at=evidence.request_admitted_at,
+            )
+        assert tracker.recheck() is ReadingFreshness.FRESH
+
+    async def hold_initial_heat(heat_percent: int) -> None:
+        await original_set_heat(heat_percent)
+        heat_entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(actuator, "start_session", start_with_fresh_readings)
+    monkeypatch.setattr(actuator, "set_heat", hold_initial_heat)
+    monkeypatch.setattr(service, "_run_loop", True)
+    request = asyncio.create_task(service.start_roast(PROFILE))
+    try:
+        await asyncio.wait_for(heat_entered.wait(), 1)
+        assert actuator.commands() == ["start_session", "set_heat"]
+        assert store.human_storage_quiescent
+        assert any(
+            r.kind == "record_safety_evaluation" and r.settlement is Settlement.OBSERVED_COMMITTED
+            for r in store.drain_human_storage_receipts()
+        )
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        runner = service.runner
+        assert runner is not None
+        controller = runner.controller_for_human_fault_drop()
+        assert controller is not None and controller.owns_confirmed_human_start()
+        assert not runner.confirmed_start_history_cancelled
+        assert not controller._routine_inhibited  # pyright: ignore[reportPrivateUsage]
+        assert service._loop_task is None  # pyright: ignore[reportPrivateUsage]
+        assert actuator.commands() == ["start_session", "set_heat"]
     finally:
         if not request.done():
             request.cancel()

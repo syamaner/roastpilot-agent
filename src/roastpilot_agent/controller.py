@@ -6426,7 +6426,11 @@ class RoastController:
     # --- E4-S4: run lifecycle and operator actions ---
 
     async def start_run(
-        self, profile: RoastProfile, *, recording_roast_num: int | None = None
+        self,
+        profile: RoastProfile,
+        *,
+        recording_roast_num: int | None = None,
+        on_history_cancelled: Callable[[], None] | None = None,
     ) -> None:
         """Start a new roast run (E4-S4).
 
@@ -6444,6 +6448,8 @@ class RoastController:
                 this origin + 1). When ``None`` (a direct caller / a count
                 failure), the controller falls back to its per-process counter so
                 recording naming is always best-effort and never blocks the roast.
+            on_history_cancelled: Synchronous notification if cancellation
+                interrupts initial safety evaluation persistence.
         """
         generation = self._arbiter.generation
         self.transition_to(RoastPhase.STARTING)  # raises unless idle
@@ -6540,7 +6546,12 @@ class RoastController:
             seconds_since_last_command=self._seconds_since_last_command(),
             bounds=self._control_limits(),
         )
-        await self._snapshots.persist_evaluation(evaluation)
+        try:
+            await self._snapshots.persist_evaluation(evaluation)
+        except asyncio.CancelledError:
+            if on_history_cancelled is not None:
+                on_history_cancelled()
+            raise
         if not self._generation_is_current(generation):
             return
         await self._execute_targets(evaluation, generation=generation)
