@@ -9,6 +9,7 @@ synchronous ``TestClient`` over a temporary built-SPA tree.
 
 import asyncio
 import json
+import os
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import replace
 from pathlib import Path
@@ -37,7 +38,9 @@ from roastpilot_agent.config import (
 )
 from roastpilot_agent.controller import ControllerSnapshot, RoastController
 from roastpilot_agent.human_protection import ControlAuthority
+from roastpilot_agent.launch_composition import AUTHORITY_ENV_KEY, LaunchRefusal
 from roastpilot_agent.mcp_client import (
+    LaunchCompositionError,
     MCPConnectionError,
     MCPServerProcess,
     RoasterControlAdapter,
@@ -836,4 +839,141 @@ async def test_runner_persists_same_tick_accepted_trace_but_emits_current_author
             None,
         ]
     finally:
+        await store.close()
+
+
+# --- #1078 C1: forwarding parity through launch composition (TF1-TF3) -----------
+#
+# live.py and forward_coffee_env are unchanged; these prove the settled forwarder
+# output is preserved and that the normal compositor refuses forwarded
+# incompatible authority before factory entry.
+
+
+class _C1Probe(_GoodFactory):
+    """Healthy session factory that also records how often it was entered."""
+
+    def __init__(self) -> None:
+        super().__init__(_info_session())
+        self.calls = 0
+
+    def __call__(self, params: object) -> _GoodFactory._Ctx:
+        self.calls += 1
+        return super().__call__(params)
+
+
+@pytest.fixture
+def c1_clean(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Isolated cwd without a default YAML; no inherited COFFEE_* keys."""
+    for key in [k for k in os.environ if k.startswith(live.COFFEE_ENV_PREFIX)]:
+        monkeypatch.delenv(key)
+    work = tmp_path / "cwd"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    return work
+
+
+@pytest.mark.parametrize(
+    "environ",
+    [
+        {AUTHORITY_ENV_KEY: "manual", "COFFEE_ROASTER_DRIVER": "mock", "PATH": "/usr/bin"},
+        {AUTHORITY_ENV_KEY: " Manual "},
+        {AUTHORITY_ENV_KEY: "garbage", "COFFEE_ROASTER_DRIVER": "hottop_kn8828b_2k_plus"},
+    ],
+)
+@pytest.mark.asyncio
+async def test_tf1_forwarded_incompatible_authority_is_kept_then_refused(
+    c1_clean: Path, environ: dict[str, str]
+) -> None:
+    """TF1/G1: forwarder output is unchanged; composition refuses before the factory.
+
+    The custom environ carries the incompatible value while os.environ lacks the
+    key, so a provenance rewrite cannot silently erase that intent.
+    """
+    assert AUTHORITY_ENV_KEY not in os.environ
+    config = AppConfig()
+    live.forward_coffee_env(config, dict(environ))
+    assert config.mcp.env == {k: v for k, v in environ.items() if k.startswith("COFFEE_")}
+    probe = _C1Probe()
+    process = MCPServerProcess(config.mcp, device_config=config.mcp_device, session_factory=probe)
+    with pytest.raises(LaunchCompositionError) as raised:
+        await process.start()
+    assert raised.value.refusal is LaunchRefusal.EXPLICIT_AUTHORITY_INCOMPATIBLE
+    assert probe.calls == 0
+    assert process.running is False and process.child_epoch == 0
+
+
+@pytest.mark.asyncio
+async def test_tf1_explicit_config_wins_precedence_is_unchanged(c1_clean: Path) -> None:
+    """TF1: an explicit config value still wins over forwarding, and manual is refused."""
+    config = AppConfig(mcp=MCPConfig(env={AUTHORITY_ENV_KEY: "manual"}))
+    live.forward_coffee_env(
+        config, {AUTHORITY_ENV_KEY: "automatic", "COFFEE_ROASTER_DRIVER": "mock"}
+    )
+    assert config.mcp.env == {AUTHORITY_ENV_KEY: "manual", "COFFEE_ROASTER_DRIVER": "mock"}
+    probe = _C1Probe()
+    process = MCPServerProcess(config.mcp, session_factory=probe)
+    with pytest.raises(LaunchCompositionError) as raised:
+        await process.start()
+    assert raised.value.refusal is LaunchRefusal.EXPLICIT_AUTHORITY_INCOMPATIBLE
+    assert probe.calls == 0
+
+
+def test_tf2_inherited_automatic_forwarding_preserves_every_value(
+    c1_clean: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TF2: the forwarded automatic key stays verbatim; the merge equals the old launcher."""
+    monkeypatch.setenv(AUTHORITY_ENV_KEY, " Automatic ")
+    monkeypatch.setenv("COFFEE_ROASTER_DRIVER", "mock")
+    monkeypatch.setenv("C1_UNRELATED_SENTINEL", "keep-me")
+    config = AppConfig()
+    live.forward_coffee_env(config)
+    params = MCPServerProcess(config.mcp, device_config=config.mcp_device).build_server_parameters()
+    assert params.env == {**os.environ, **config.mcp.env}
+    assert params.env is not None and params.env[AUTHORITY_ENV_KEY] == " Automatic "
+
+
+def test_tf2_authority_only_inherited_automatic_keeps_the_legacy_merge(
+    c1_clean: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TF2/G37: forwarding an authority-only shell keeps the map nonempty and the merge exact."""
+    monkeypatch.setenv(AUTHORITY_ENV_KEY, "automatic")
+    monkeypatch.setenv("C1_UNRELATED_SENTINEL", "keep-me")
+    config = AppConfig()
+    assert all(value is None for value in config.mcp_device.model_dump().values())
+    live.forward_coffee_env(config)
+    assert config.mcp.env == {AUTHORITY_ENV_KEY: "automatic"}
+    params = MCPServerProcess(config.mcp, device_config=config.mcp_device).build_server_parameters()
+    legacy = {**os.environ, **config.mcp.env}
+    assert params.env == legacy
+    assert params.env is not None and params.env["C1_UNRELATED_SENTINEL"] == "keep-me"
+    # A direct builder without forwarding keeps the SDK default (env=None).
+    assert MCPServerProcess(MCPConfig()).build_server_parameters().env is None
+
+
+@pytest.mark.asyncio
+async def test_tf3_live_service_never_injects_human_capture(
+    c1_clean: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TF3/G28: build_live_service passes no human_capture; the record is AUTOMATIC."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    captured: list[dict[str, object]] = []
+
+    def factory(config: MCPConfig, **kwargs: object) -> MCPServerProcess:
+        captured.append(dict(kwargs))
+        return MCPServerProcess(config, session_factory=_C1Probe())
+
+    monkeypatch.setattr(live, "MCPServerProcess", factory)
+    _service, mcp, store = await live.build_live_service(
+        AppConfig(), store_path=tmp_path / "live.sqlite3"
+    )
+    try:
+        assert len(captured) == 1
+        assert "human_capture" not in captured[0]
+        record = mcp.launch_record_for_epoch(mcp.child_epoch)
+        assert record is not None
+        assert record.evidence.authority is ControlAuthority.AUTOMATIC
+        assert record.evidence.pinned_env == ()
+        assert record.evidence.capture is None
+    finally:
+        await mcp.stop()
         await store.close()
