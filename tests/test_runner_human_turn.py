@@ -5728,6 +5728,102 @@ async def test_human_start_storage_refusal_remains_unavailable_after_native_writ
         await service.shutdown()
 
 
+@pytest.mark.parametrize("teardown", [False, True], ids=["keep-supervision", "teardown-fenced"])
+async def test_cancelled_confirmed_start_containment_keeps_only_current_supervision(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, teardown: bool
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    child = _LifecycleSpy(_Session(_result({})))
+    actuator.epoch = child.child_epoch
+    monkeypatch.setattr(child, "_fixed_zero_discovery", ToolDiscovery.DISCOVERED)
+    service = RoastService(
+        store,
+        mcp=child,
+        roaster=actuator,
+        raw_state=actuator,
+        authority=ControlAuthority.HUMAN,
+        clock=clock,
+        run_loop=True,
+    )
+    commit = store.connection.commit
+    contained, supervised, finish = (asyncio.Event() for _ in range(3))
+    crossed_budget = False
+    containments = 0
+    supervisors: list[RoastRunner] = []
+
+    async def commit_after_deadline() -> None:
+        nonlocal crossed_budget
+        owner = store._current_native_storage()  # pyright: ignore[reportPrivateUsage]
+        if not crossed_budget and owner is not None and owner.receipt.kind == "record_event":
+            crossed_budget = True
+            clock.advance(1.0)
+        await commit()
+
+    async def hold_containment() -> ContainmentResult:
+        nonlocal containments
+        containments += 1
+        contained.set()
+        await asyncio.Event().wait()
+        raise AssertionError("held containment unexpectedly completed")
+
+    async def supervise(runner: RoastRunner) -> None:
+        supervisors.append(runner)
+        assert runner is service.runner and runner.run_id == service.active_run_id
+        assert runner.controller_snapshot().phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+        await runner.tick_once()
+        supervised.set()
+        await finish.wait()
+
+    monkeypatch.setattr(store.connection, "commit", commit_after_deadline)
+    monkeypatch.setattr(actuator, "contain_heat_fixed_zero", hold_containment)
+    monkeypatch.setattr(RoastRunner, "run", supervise)
+    request = asyncio.create_task(service.start_roast(PROFILE))
+    try:
+        await asyncio.wait_for(contained.wait(), 1)
+        assert crossed_budget and containments == 1
+        assert actuator.commands().count("start_session") == 1
+        runner = service.runner
+        assert runner is not None and runner.run_id == service.active_run_id
+        controller = runner.controller_for_human_fault_drop()
+        assert controller is not None
+        if teardown:
+            service.close_human_call_admission(AdmissionCloseReason.APPLICATION_TEARDOWN)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert request.cancelled() and controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+        assert controller.owns_confirmed_human_start()
+        assert controller.owns_human_run(runner.run_id)
+        assert controller._known_human_identity() == (actuator.session_id, child.child_epoch)  # pyright: ignore[reportPrivateUsage]
+        owner = controller._human_run  # pyright: ignore[reportPrivateUsage]
+        assert owner is not None and owner.containment is ContainmentAttempt.CONSUMED
+        assert (
+            owner.command is CommandDisposition.UNKNOWN
+            and owner.endpoint is EndpointDisposition.NONE
+        )
+        supervisor = service._loop_task  # pyright: ignore[reportPrivateUsage]
+        if teardown:
+            assert supervisor is None
+            await asyncio.sleep(0)
+            assert supervisors == []
+        else:
+            assert supervisor is not None and not supervisor.done()
+            await asyncio.wait_for(supervised.wait(), 1)
+            assert supervisors == [runner]
+        with pytest.raises(RoastRunConflictError):
+            await service.start_roast(PROFILE)
+        assert containments == 1
+        assert actuator.commands() == ["start_session"]
+    finally:
+        if not request.done():
+            request.cancel()
+            with suppress(asyncio.CancelledError):
+                await request
+        finish.set()
+        await service.shutdown()
+
+
 async def test_human_start_refused_through_fault_flush_keeps_one_exact_supervisor(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

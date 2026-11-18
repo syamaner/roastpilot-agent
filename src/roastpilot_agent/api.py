@@ -6674,9 +6674,10 @@ class RoastService:
                 controller = runner.controller_for_human_fault_drop()
                 if controller is not None and controller.owns_confirmed_human_start():
                     if not live_start_completed:
-                        await controller.contain_unconfirmed_human_start_history()
-                        if self._run_loop and (self._loop_task is None or self._loop_task.done()):
-                            self._loop_task = asyncio.create_task(runner.run())
+                        try:
+                            await controller.contain_unconfirmed_human_start_history()
+                        finally:
+                            self._supervise_current_failed_human_start(runner, run_id)
                     raise _OwnedHumanStartHistoryUnavailable(run_id, exc) from exc
             raise
         finally:
@@ -6766,6 +6767,23 @@ class RoastService:
         finally:
             self._hardware_clear_request_in_flight = False
 
+    def _supervise_current_failed_human_start(self, runner: RoastRunner, run_id: str) -> None:
+        """Keep the current failed HUMAN Start on its ordinary supervision path."""
+        if (
+            not self._run_loop
+            or self._shutdown_started
+            or self._human_admission.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+            or self.runner is not runner
+            or self.active_run_id != run_id
+            or self._starting_run_id != run_id
+            or runner.finalized
+            or (self._loop_task is not None and not self._loop_task.done())
+        ):
+            return
+        controller = runner.controller_for_human_fault_drop()
+        if controller is not None and controller.owns_human_run(run_id):
+            self._loop_task = asyncio.create_task(runner.run())
+
     async def _begin_live_run(
         self, profile: RoastProfile, run_id: str, *, lease_generation: int
     ) -> None:
@@ -6805,27 +6823,16 @@ class RoastService:
         try:
             await runner.start(profile, recording_roast_num=recording_roast_num)
         except HistoryUnavailable:
-            # The dispatch refusal already left this controller faulted.
-            # Keep its normal supervision so later turns can persist that
-            # phase when storage settles, without re-entering Start.
-            if (
-                start_history_refused
-                and self._run_loop
-                and self.runner is runner
-                and self.active_run_id == self._starting_run_id == run_id
-                and not runner.finalized
-                and (self._loop_task is None or self._loop_task.done())
-            ):
-                controller = runner.controller_for_human_fault_drop()
-                if controller is not None and controller.owns_human_run(run_id):
-                    self._loop_task = asyncio.create_task(runner.run())
+            if start_history_refused:
+                self._supervise_current_failed_human_start(runner, run_id)
             raise
-        if self._run_loop:
-            self._loop_task = asyncio.create_task(runner.run())
         # A later successful flush records the fault. It cannot confirm a
         # Start withheld at the controller's dispatch boundary.
         if start_history_refused:
+            self._supervise_current_failed_human_start(runner, run_id)
             raise HistoryUnavailable("HUMAN Start was withheld while storage was unresolved")
+        if self._run_loop:
+            self._loop_task = asyncio.create_task(runner.run())
 
     async def _recording_roast_num(self, profile: RoastProfile) -> int | None:
         """The store-derived per-origin recording roast number (#385).
