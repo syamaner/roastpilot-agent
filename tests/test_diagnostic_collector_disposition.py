@@ -523,9 +523,14 @@ def _ack_report(rows: list[_Payload]) -> DispositionReport:
     return _report(_bytes({"persistence_ack": rows}))
 
 
-def test_t6_acknowledged_presence_is_satisfied_alongside_unknown() -> None:
+@pytest.mark.parametrize(
+    "other_status", [_ACK.UNKNOWN, _ACK.UNAVAILABLE], ids=["unknown", "unavailable"]
+)
+def test_t6_acknowledged_presence_is_satisfied_alongside_other_label(
+    other_status: AckStatusValue,
+) -> None:
     """Presence of an exact acknowledged label satisfies only the presence question."""
-    rows = [_ack("unknown", at=1), _ack("acknowledged", at=1)]
+    rows = [_ack(other_status.value, at=1), _ack("acknowledged", at=1)]
     forward = _ack_report(rows)
     reverse = _ack_report(rows[::-1])
     for report in (forward, reverse):
@@ -536,12 +541,12 @@ def test_t6_acknowledged_presence_is_satisfied_alongside_unknown() -> None:
         assert settlement.reason is _R.PRODUCER_WITNESS_ABSENT
         assert settlement.status is CheckStatus.UNRESOLVED and settlement.evidence == ()
     assert _labels(_check(forward, _N.PERSISTENCE_ACKNOWLEDGEMENT)) == [
-        (_ACK.UNKNOWN, 1, 0),
+        (other_status, 1, 0),
         (_ACK.ACKNOWLEDGED, 1, 1),
     ]
     assert _labels(_check(reverse, _N.PERSISTENCE_ACKNOWLEDGEMENT)) == [
         (_ACK.ACKNOWLEDGED, 1, 0),
-        (_ACK.UNKNOWN, 1, 1),
+        (other_status, 1, 1),
     ]
 
 
@@ -1002,7 +1007,9 @@ def test_t13_calls_admission_once_preserving_identities(monkeypatch: pytest.Monk
 # T14 ------------------------------------------------------------------------------------------
 
 
-def _ref(seq: object, stream: CollectorStream = _C.COMMAND, instants: int = 1) -> EvidenceRef:
+def _ref(
+    seq: object, stream: CollectorStream | None = _C.COMMAND, instants: int = 1
+) -> EvidenceRef:
     return EvidenceRef.model_construct(
         stream=stream, seq=seq, instants=(Instant(clock=_AGENT, value=1),) * instants
     )
@@ -1380,10 +1387,6 @@ _INVALID: list[tuple[str, _Invalid]] = [
         "witness-evidence",
         lambda: _result(_N.COMMAND_INVOCATION_WITNESS, _R.PRODUCER_WITNESS_ABSENT, (_ref(0),)),
     ),
-    (
-        "provenance-evidence",
-        lambda: _result(_N.OBSERVED_PROVENANCE, _R.SYNTHETIC_EVIDENCE, (_ref(0),)),
-    ),
     ("prerequisite-evidence", lambda: _result(_CMD_CHECK, _R.EVIDENCE_ABSENT, (_ref(0),))),
     ("duplicates-equal-selected", lambda: _returned_detail(duplicates=1)),
     ("empty-stream-inventory", lambda: _detail_of()),
@@ -1405,6 +1408,140 @@ def test_t14_contradictory_results_are_rejected(build: _Invalid) -> None:
     """Every contradictory public construction is rejected by the closed validators."""
     with pytest.raises(pydantic.ValidationError):
         build()
+
+
+def test_t14_provenance_evidence_must_be_empty() -> None:
+    """A fabricated streamless reference still violates the provenance evidence rule."""
+    with pytest.raises(pydantic.ValidationError, match="expected empty witness, provenance"):
+        _result(_N.OBSERVED_PROVENANCE, _R.SYNTHETIC_EVIDENCE, (_ref(0, None),))
+
+
+def test_t14_duplicate_observation_cannot_hide_distinct_coordinates() -> None:
+    """An otherwise satisfied result cannot count different coordinates as duplicates."""
+    stream = _C.OPERATOR_OBSERVATION
+    first = _ref(0, stream)
+    detail = _detail_of(_label(_OBS.HEAT_OFF, 2), duplicates=1)
+    for clock, value in ((_AGENT, 2), (ClockName.MCP_SESSION_SECONDS, 1)):
+        different = EvidenceRef(stream=stream, seq=1, instants=(Instant(clock=clock, value=value),))
+        with pytest.raises(
+            pydantic.ValidationError, match="non-duplicate rows for distinct instant"
+        ):
+            _result(_OBS_CHECK, None, (first, different), lambda: detail)
+        conflict = _result(
+            _OBS_CHECK,
+            _R.CONFLICT,
+            (first, different),
+            lambda: _detail_of(_label(_OBS.HEAT_OFF, 2)),
+        )
+        assert conflict.status is CheckStatus.INVALID
+    same = EvidenceRef(stream=stream, seq=1, instants=(Instant(clock=_AGENT, value=1.0),))
+    assert _result(_OBS_CHECK, None, (first, same), lambda: detail).status is CheckStatus.SATISFIED
+
+
+def test_t14_duplicate_acknowledgement_cannot_hide_distinct_labels() -> None:
+    """Acknowledgement presence needs enough distinct payloads for both retained labels."""
+    stream = _C.PERSISTENCE_ACK
+    with pytest.raises(pydantic.ValidationError, match="non-duplicate rows for retained labels"):
+        _result(
+            _ACK_CHECK,
+            None,
+            (_ref(0, stream), _ref(1, stream)),
+            lambda: _detail_of(
+                _label(_ACK.ACKNOWLEDGED), _label(_ACK.UNAVAILABLE, 1, 1), duplicates=1
+            ),
+        )
+
+
+def test_t14_duplicate_command_cannot_hide_heat_or_another_label() -> None:
+    """The distinct-row budget must cover both returned heat values and other labels."""
+    with pytest.raises(pydantic.ValidationError, match="non-duplicate rows for heat values"):
+        _result(
+            _CMD_CHECK,
+            _R.CONFLICT,
+            (_ref(0), _ref(1), _ref(2)),
+            lambda: _detail_of(
+                _label(_RET, 2), _label(_CMD.NOT_DISPATCHED, 1, 2), duplicates=1, heats=2
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("raw_fields", "message"),
+    [
+        pytest.param({"value": 1}, "complete raw instant", id="missing-clock"),
+        pytest.param({"clock": _AGENT}, "complete raw instant", id="missing-value"),
+        pytest.param({"clock": _AGENT.value, "value": 1}, "valid raw instant", id="clock-string"),
+        pytest.param({"clock": _AGENT, "value": True}, "valid raw instant", id="bool"),
+        pytest.param({"clock": _AGENT, "value": "1"}, "valid raw instant", id="numeric-string"),
+        pytest.param({"clock": _AGENT, "value": -1}, "valid raw instant", id="negative"),
+        pytest.param({"clock": _AGENT, "value": float("inf")}, "valid raw instant", id="infinity"),
+        pytest.param({"clock": _AGENT, "value": float("nan")}, "valid raw instant", id="nan"),
+        pytest.param(
+            {"clock": ClockName.RECORDING_SAMPLES, "value": 1.0},
+            "valid raw instant",
+            id="float-samples",
+        ),
+    ],
+)
+def test_t14_constructed_instants_are_revalidated(raw_fields: _Payload, message: str) -> None:
+    """An EvidenceRef that bypassed validation cannot carry a fabricated raw coordinate."""
+    ref = EvidenceRef.model_construct(
+        stream=_C.COMMAND, seq=0, instants=(Instant.model_construct(None, **raw_fields),)
+    )
+    with pytest.raises(pydantic.ValidationError, match=message):
+        _result(_CMD_CHECK, None, (ref,), _returned_detail)
+
+
+@pytest.mark.parametrize(
+    ("instants", "message"),
+    [
+        pytest.param(({"clock": _AGENT, "value": 1},), "complete raw instant", id="raw-mapping"),
+        pytest.param([Instant(clock=_AGENT, value=1)], "ordered single-instant", id="list"),
+    ],
+)
+def test_t14_constructed_instant_inventory_is_revalidated(instants: object, message: str) -> None:
+    """A fabricated reference must still carry a tuple containing one Instant."""
+    ref = EvidenceRef.model_construct(stream=_C.COMMAND, seq=0, instants=instants)
+    with pytest.raises(pydantic.ValidationError, match=message):
+        _result(_CMD_CHECK, None, (ref,), _returned_detail)
+
+
+def test_t14_recording_sample_integer_is_a_valid_raw_coordinate() -> None:
+    """An exact sample integer is valid and retained without conversion."""
+    instant = Instant(clock=ClockName.RECORDING_SAMPLES, value=1)
+    ref = EvidenceRef(stream=_C.COMMAND, seq=0, instants=(instant,))
+    assert _result(_CMD_CHECK, None, (ref,), _returned_detail).evidence == (ref,)
+
+
+@pytest.mark.parametrize(
+    ("labels", "message"),
+    [
+        pytest.param(
+            (_label(_ACK.ACKNOWLEDGED, 4, 3),), "first label at the first selected", id="late-first"
+        ),
+        pytest.param(
+            (_label(_ACK.ACKNOWLEDGED, 1, 0), _label(_ACK.UNAVAILABLE, 3, 6)),
+            "label counts to fit the remaining evidence",
+            id="insufficient-for-one",
+        ),
+        pytest.param(
+            (
+                _label(_ACK.ACKNOWLEDGED, 1, 0),
+                _label(_ACK.UNAVAILABLE, 2, 6),
+                _label(_ACK.UNKNOWN, 1, 9),
+            ),
+            "label counts to fit the remaining evidence",
+            id="insufficient-for-both",
+        ),
+    ],
+)
+def test_t14_label_first_sequences_must_fit_the_evidence(
+    labels: tuple[RetainedLabel, ...], message: str
+) -> None:
+    """Sparse sequence numbers cannot be used as extra positions for label rows."""
+    refs = tuple(_ref(seq, _C.PERSISTENCE_ACK) for seq in (0, 3, 6, 9))
+    with pytest.raises(pydantic.ValidationError, match=message):
+        _result(_ACK_CHECK, None, refs, lambda: _detail_of(*labels))
 
 
 def _report_fields(**changes: object) -> dict[str, object]:
@@ -1499,6 +1636,40 @@ def test_t14_contradictory_reports_are_rejected(fields: Callable[[], dict[str, o
     assert DispositionReport.model_validate(_report_fields()) == _report(_bytes())
     with pytest.raises(pydantic.ValidationError):
         DispositionReport.model_validate(fields())
+
+
+def test_t14_selection_checks_must_share_scope() -> None:
+    """An isolated scope mismatch is unreachable even with the correct witness reason."""
+    baseline = _report(_bytes(), _expect(session_id="different_session"))
+    assert all(
+        _check(baseline, selection).reason is _R.SCOPE_MISMATCH for selection in _SELECTION.values()
+    )
+    checks = tuple(
+        _result(_END_CHECK, _R.EXPECTATION_UNBOUND) if result.check is _END_CHECK else result
+        for result in baseline.checks
+    )
+    with pytest.raises(
+        pydantic.ValidationError, match="all selection checks to share scope mismatch"
+    ):
+        DispositionReport.model_validate(_report_fields(checks=checks))
+
+
+@pytest.mark.parametrize("stream", ["command", "persistence_ack"])
+def test_t14_owned_selection_checks_must_share_binding(stream: str) -> None:
+    """Malformed evidence can mask the shared unbound state on only its own stream."""
+    baseline = _report(_bytes({stream: [{}]}), _expect(command=None))
+    other = "persistence_ack" if stream == "command" else "command"
+    assert _check(baseline, _SELECTION[stream]).reason is _R.EVIDENCE_MALFORMED
+    assert _check(baseline, _SELECTION[other]).reason is _R.EXPECTATION_UNBOUND
+    replacements = {
+        _SELECTION[stream]: _result(_SELECTION[stream], _R.EVIDENCE_ABSENT),
+        _WITNESS[stream]: _result(_WITNESS[stream], _R.EVIDENCE_ABSENT),
+    }
+    checks = tuple(replacements.get(result.check, result) for result in baseline.checks)
+    with pytest.raises(
+        pydantic.ValidationError, match="command and acknowledgement to share binding"
+    ):
+        DispositionReport.model_validate(_report_fields(checks=checks))
 
 
 def test_t14_vocabularies_mirror_v1_literals_and_status_map() -> None:

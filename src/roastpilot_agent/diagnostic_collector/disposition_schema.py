@@ -8,7 +8,7 @@ can never satisfy.
 """
 
 from enum import Enum
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Self, cast
 
 from pydantic import (
     BaseModel,
@@ -25,8 +25,10 @@ from roastpilot_agent.diagnostic_collector.bundle_reader import (
     MAX_STREAM_RECORDS,
 )
 from roastpilot_agent.diagnostic_collector.bundle_schema import (
+    ClockName,
     CollectorAuthority,
     CollectorStream,
+    Instant,
 )
 from roastpilot_agent.diagnostic_collector.interpretation_schema import (
     CheckStatus,
@@ -51,6 +53,24 @@ def _exact_text(value: object) -> object:
     if type(value) is not str:
         raise ValueError("expected exact text")
     return value
+
+
+def _instant_coordinate(instant: object) -> tuple[ClockName, int | float]:
+    if type(instant) is not Instant:
+        raise ValueError("expected a complete raw instant")
+    fields = vars(instant)
+    if fields.keys() != {"clock", "value"}:
+        raise ValueError("expected a complete raw instant")
+    clock: object = fields["clock"]
+    value: object = fields["value"]
+    if (
+        type(clock) is not ClockName
+        or (type(value) is not int and type(value) is not float)
+        or not 0 <= value < float("inf")
+        or (clock is ClockName.RECORDING_SAMPLES and type(value) is not int)
+    ):
+        raise ValueError("expected a valid raw instant coordinate")
+    return clock, value
 
 
 _Count = Annotated[int, BeforeValidator(_exact_int), Field(ge=0)]
@@ -325,41 +345,66 @@ class DispositionCheckResult(_ClosedModel):
             raise ValueError("detail does not match check and reason")
         if not selection and self.evidence:
             raise ValueError("expected empty witness, provenance, or prerequisite evidence")
-        self._validate_references()
+        coordinates = self._validate_references()
         if self.detail is not None:
-            self._validate_detail(self.detail)
+            self._validate_detail(self.detail, len(coordinates))
         return self
 
-    def _validate_references(self) -> None:
+    def _validate_references(self) -> set[tuple[ClockName, int | float]]:
         stream = DISPOSITION_CHECK_STREAM[self.check]
         previous = -1
+        coordinates: set[tuple[ClockName, int | float]] = set()
         for ref in self.evidence:
-            seq: object = ref.seq
+            fields = vars(ref)
+            seq: object = fields.get("seq")
+            instants = cast("tuple[object, ...]", fields.get("instants"))
             if (
-                ref.stream is not stream
+                fields.get("stream") is not stream
                 or type(seq) is not int
                 or not previous < seq <= MAX_SEQUENCE
-                or len(ref.instants) != 1
+                or type(instants) is not tuple
+                or len(instants) != 1
             ):
                 raise ValueError("expected ordered single-instant references to this stream")
-            previous = ref.seq
+            coordinates.add(_instant_coordinate(instants[0]))
+            previous = seq
+        return coordinates
 
-    def _validate_detail(self, detail: DispositionSelectionDetail) -> None:
+    def _validate_detail(
+        self, detail: DispositionSelectionDetail, distinct_coordinates: int
+    ) -> None:
         if len(self.evidence) != detail.selected_rows:
             raise ValueError("expected one reference per selected row")
-        if not {label.first_seq for label in detail.labels} <= {ref.seq for ref in self.evidence}:
-            raise ValueError("expected label first seqs among the references")
+        self._validate_label_positions(detail.labels)
         if any(type(label.value) is not _LABEL_TYPES[self.check] for label in detail.labels):
             raise ValueError("expected labels of this check's vocabulary")
         if detail.foreign_identity_rows and self.check not in _OWNED_CHECKS:
             raise ValueError("expected no foreign-identity rows for this check")
         if (self.reason is _Reason.NO_MATCHING_IDENTITY) is not (detail.selected_rows == 0):
             raise ValueError("expected no matching identity exactly when nothing is selected")
-        self._validate_heat(detail)
+        distinct = detail.selected_rows - detail.exact_duplicate_rows
+        if distinct < len(detail.labels):
+            raise ValueError("expected enough non-duplicate rows for retained labels")
+        if distinct < distinct_coordinates:
+            raise ValueError("expected enough non-duplicate rows for distinct instant coordinates")
+        self._validate_heat(detail, distinct)
         if not self._outcome_supported(detail):
             raise ValueError("labels and counts do not support the reason")
 
-    def _validate_heat(self, detail: DispositionSelectionDetail) -> None:
+    def _validate_label_positions(self, labels: tuple[RetainedLabel, ...]) -> None:
+        positions = {ref.seq: index for index, ref in enumerate(self.evidence)}
+        if not {label.first_seq for label in labels} <= positions.keys():
+            raise ValueError("expected label first seqs among the references")
+        if labels and labels[0].first_seq != self.evidence[0].seq:
+            raise ValueError("expected the first label at the first selected sequence")
+        # The first label's suffix is the whole evidence inventory.
+        suffix_rows = 0
+        for label in reversed(labels[1:]):
+            suffix_rows += label.rows
+            if suffix_rows > len(self.evidence) - positions[label.first_seq]:
+                raise ValueError("expected label counts to fit the remaining evidence")
+
+    def _validate_heat(self, detail: DispositionSelectionDetail, distinct: int) -> None:
         heats = detail.distinct_returned_heat_values
         if self.check is not _Name.COMMAND_REPORTED_DISPOSITION:
             if heats != 0 or detail.returned_heat_percent is not None:
@@ -376,6 +421,9 @@ class DispositionCheckResult(_ClosedModel):
             or (detail.returned_heat_percent is not None) is not (heats == 1)
         ):
             raise ValueError("expected returned heat values only for returned command state")
+        non_returned_labels = len(detail.labels) - int(returned_rows > 0)
+        if distinct < heats + non_returned_labels:
+            raise ValueError("expected enough non-duplicate rows for heat values and other labels")
 
     def _outcome_supported(self, detail: DispositionSelectionDetail) -> bool:
         values = {label.value for label in detail.labels}
@@ -432,6 +480,15 @@ class DispositionReport(_ClosedModel):
         if tuple(result.check for result in self.checks) != tuple(DispositionCheckName):
             raise ValueError("expected one disposition result per check in schema order")
         results = {result.check: result for result in self.checks}
+        selection_reasons = {results[selection].reason for selection in _LABEL_TYPES}
+        if _Reason.SCOPE_MISMATCH in selection_reasons and len(selection_reasons) != 1:
+            raise ValueError("expected all selection checks to share scope mismatch")
+        owned_reasons = {results[selection].reason for selection in _OWNED_CHECKS}
+        if _Reason.EXPECTATION_UNBOUND in owned_reasons and not owned_reasons <= {
+            _Reason.EXPECTATION_UNBOUND,
+            _Reason.EVIDENCE_MALFORMED,
+        }:
+            raise ValueError("expected command and acknowledgement to share binding")
         for witness, selection in _WITNESS_SELECTION.items():
             prerequisite = results[selection].reason
             expected = (
