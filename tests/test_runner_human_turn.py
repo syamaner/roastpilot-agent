@@ -4337,7 +4337,7 @@ async def test_am6_exact_dispatch_ledger_consumption_floors_at_zero(store: Roast
 async def test_am6_per_run_capability_doubt_preserves_direct_command_audit(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch, failed_write: bool
 ) -> None:
-    """Pin D-28 in the default fake, including actual audit failure propagation."""
+    """Keep the admitted stop response and action row when its command audit fails."""
     service, runner, actuator, run_id, lease = await _faulted_run(store)
     controller = runner.controller_for_human_fault_drop()
     executor = service._fault_control_executor  # pyright: ignore[reportPrivateUsage]
@@ -4503,6 +4503,14 @@ async def test_am6_per_run_capability_doubt_preserves_direct_command_audit(
     assert command_events == ([RoastEventKind.COMMAND_FAILED] if failed_write else [])
     assert command_audits == ([(RoastCommand.EMERGENCY_STOP, "failed")] if failed_write else [])
     assert action_audits == ["accepted"]
+    async with (
+        aiosqlite.connect(store.db_path) as reader,
+        reader.execute(
+            "SELECT result FROM operator_actions WHERE run_id = ? AND action = ?",
+            (run_id, OperatorAction.EMERGENCY_STOP.value),
+        ) as cursor,
+    ):
+        assert [row[0] for row in await cursor.fetchall()] == ["accepted"]
     assert retry_before is False and retry_after is failed_write
     assert (
         any(
@@ -4944,7 +4952,9 @@ async def test_malformed_phase_broadcast_preserves_payload_without_enabled_actio
         events.unsubscribe(subscriber)
 
 
-@pytest.mark.parametrize("sample", ["trigger", "below", "stale"])
+@pytest.mark.parametrize(
+    "sample", ["trigger", "audit-failure", "executor-failure", "below", "stale"]
+)
 async def test_bounded_prior_turn_telemetry_does_not_take_urgent_authority(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch, sample: str
 ) -> None:
@@ -4968,6 +4978,8 @@ async def test_bounded_prior_turn_telemetry_does_not_take_urgent_authority(
     detail = await service.start_roast(PROFILE)
     runner = service.runner
     assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
     clock.advance(0.1)
     await runner.tick_once()
     actuator.charged = True
@@ -4982,6 +4994,7 @@ async def test_bounded_prior_turn_telemetry_does_not_take_urgent_authority(
     real_commit = store.connection.commit
     real_telemetry = store.record_telemetry
     native_reached_telemetry = False
+    attribution_failure = Mock(side_effect=RuntimeError("diagnostic identity unavailable"))
 
     async def held_telemetry(**kwargs: object) -> bool:
         nonlocal native_reached_telemetry
@@ -5002,6 +5015,9 @@ async def test_bounded_prior_turn_telemetry_does_not_take_urgent_authority(
     try:
         await asyncio.wait_for(entered.wait(), 1)
         assert not await asyncio.wait_for(pending_turn, 1)
+        held_owner = store._history_owner  # pyright: ignore[reportPrivateUsage]
+        assert held_owner is not None and held_owner.receipt.writer_entered is True
+        assert held_owner.receipt.kind == "record_telemetry"
         assert runner.controller_snapshot().phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
         async with AsyncClient(
             transport=ASGITransport(app=create_app(service)), base_url="http://test"
@@ -5016,6 +5032,20 @@ async def test_bounded_prior_turn_telemetry_does_not_take_urgent_authority(
             frame_data = cast("dict[str, object]", frame["data"])
             assert frame_data["human_history_durability"] == "unknown"
         actuator.bean = 195 if sample == "below" else 196
+        if sample == "audit-failure":
+            monkeypatch.setattr(controller, "_known_human_identity", attribution_failure)
+        drop_once = actuator.drop_beans
+
+        async def observe_drop() -> AppliedRoasterState | None:
+            assert not release.is_set()
+            assert store._history_owner is held_owner  # pyright: ignore[reportPrivateUsage]
+            assert controller.snapshot().human_endpoint is EndpointDisposition.IN_FLIGHT
+            result = await drop_once()
+            if sample == "executor-failure":
+                raise OSError("mock Drop acknowledgement lost")
+            return result
+
+        monkeypatch.setattr(actuator, "drop_beans", observe_drop)
         if sample == "stale":
 
             async def stale_read() -> None:
@@ -5024,13 +5054,39 @@ async def test_bounded_prior_turn_telemetry_does_not_take_urgent_authority(
             actuator.collect = stale_read
         clock.advance(0.1)
         assert not await asyncio.wait_for(runner.tick_once(), 1)
-        assert actuator.commands().count("drop_beans") == (1 if sample == "trigger" else 0), (
+        attempted = sample in {"trigger", "audit-failure", "executor-failure"}
+        confirmed = sample in {"trigger", "audit-failure"}
+        assert actuator.commands().count("drop_beans") == int(attempted), (
             runner.controller_snapshot(),
             actuator.reads,
         )
         assert runner.controller_snapshot().phase is (
-            RoastPhase.COOLING if sample == "trigger" else RoastPhase.OPERATOR_RECOVERY_REQUIRED
+            RoastPhase.COOLING if confirmed else RoastPhase.OPERATOR_RECOVERY_REQUIRED
         )
+        if sample == "audit-failure":
+            attribution_failure.assert_called_once_with()
+            assert runner.controller_snapshot().human_endpoint is EndpointDisposition.ISSUED
+            (gap,) = [
+                receipt
+                for receipt in store.drain_human_storage_receipts()
+                if receipt.run_id == detail.id
+                and receipt.turn == runner.current_tick
+                and receipt.kind == "record_event"
+                and receipt.detail == RoastEventKind.COMMAND_EXECUTED.value
+            ]
+            assert gap.command is None and gap.writer_entered is False
+            assert gap.settlement is Settlement.VERIFIED_NO_WRITE
+        if sample == "executor-failure":
+            snapshot = runner.controller_snapshot()
+            assert snapshot.human_endpoint is EndpointDisposition.UNKNOWN
+            assert snapshot.human_command_disposition is CommandDisposition.UNKNOWN
+            assert snapshot.physical_intervention_required
+            release.set()
+            assert await store.settle_human_storage_for_teardown()
+            clock.advance(0.1)
+            assert not await runner.tick_once()
+            assert runner.controller_snapshot().human_endpoint is EndpointDisposition.UNKNOWN
+            assert actuator.commands().count("drop_beans") == 1
     finally:
         release.set()
         await store.settle_human_storage_for_teardown()

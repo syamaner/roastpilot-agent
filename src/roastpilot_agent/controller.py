@@ -4433,7 +4433,13 @@ class RoastController:
 
         async def dispatch() -> AppliedRoasterState | None:
             nonlocal start_utc, started, command
-            command = self._new_history_command(generation, owner=CommandAuditOwner.ENDPOINT)
+            # Attribution cannot hold up an already-admitted protective Drop.
+            with (
+                contextlib.suppress(Exception)
+                if owner is EndpointOwner.PROTECTION
+                else contextlib.nullcontext()
+            ):
+                command = self._new_history_command(generation, owner=CommandAuditOwner.ENDPOINT)
             if bind_audit is not None:
                 bind_audit(command)
             run.endpoint = EndpointDisposition.IN_FLIGHT
