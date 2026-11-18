@@ -6204,7 +6204,9 @@ async def test_superseded_human_start_history_failure_keeps_existing_emergency_r
         release_native.set()
         allow_tick.set()
         finish.set()
-        tasks = [task for task in (start, stop, background) if task is not None]
+        tasks: list[Awaitable[object]] = [
+            task for task in (start, stop, background) if task is not None
+        ]
         await asyncio.gather(*tasks, return_exceptions=True)
         await store.settle_human_storage_for_teardown()
         await service.shutdown()
