@@ -191,3 +191,72 @@ it("applies only complete same-run HUMAN projections before frame-ID dedup", () 
   expect(hydrate(next, snapshot({ id: "other" }), "run-1").humanProtection)
     .toBe(next.humanProtection);
 });
+
+describe("run history durability", () => {
+  const allNull = {
+    human_endpoint: null,
+    human_command_disposition: null,
+    physical_intervention_required: null,
+    emergency_fallback_disclosure: null,
+  };
+  const runId = "run-1";
+
+  it.each(["complete", "delayed", "incomplete", "unknown", "unavailable"] as const)(
+    "hydrates a durability-only %s snapshot without deriving phase or actions",
+    (durability) => {
+      const state = hydrate(initialRoastStreamState, snapshot({
+        ...allNull,
+        agent_phase: "operator_recovery_required",
+        enabled_actions: ["emergency_stop"],
+        human_history_durability: durability,
+      }));
+      expect(state).toMatchObject({
+        phase: "operator_recovery_required",
+        enabledActions: ["emergency_stop"],
+        lastEventId: null,
+        humanProtection: {
+          runId, data: allNull, historyDurability: durability, historyIdentifiesHuman: true,
+        },
+      });
+    },
+  );
+
+  it("accepts changed legacy evidence with bad history and keeps verified owner until an explicit clear", () => {
+    const start = hydrate(initialRoastStreamState, snapshot({
+      ...allNull, human_history_durability: "complete",
+    }));
+    const heartbeat = (data: Record<string, unknown>, state = start) =>
+      applyEvent(state, { event: "heartbeat", id: 99, data: { run_id: runId, ...data } }, runId);
+
+    const incompleteLegacy = { ...allNull, physical_intervention_required: undefined };
+    expect(heartbeat({ ...incompleteLegacy, human_history_durability: "delayed" })).toBe(start);
+    expect(heartbeat({ ...incompleteLegacy, human_history_durability: null })).toBe(start);
+    expect(heartbeat({ ...allNull, run_id: "other", human_history_durability: "unavailable" }))
+      .toBe(start);
+
+    const legacyChange = heartbeat({
+      ...allNull, human_endpoint: "withheld", human_history_durability: ["delayed"],
+    });
+    expect(legacyChange.humanProtection).toEqual({
+      runId,
+      data: { ...allNull, human_endpoint: "withheld" },
+      historyDurability: null,
+      historyIdentifiesHuman: true,
+    });
+    expect(legacyChange.lastEventId).toBeNull();
+
+    const legacyOnly = heartbeat(allNull, legacyChange);
+    expect(legacyOnly.humanProtection).toMatchObject({
+      data: allNull, historyDurability: null, historyIdentifiesHuman: true,
+    });
+    const clear = heartbeat({ ...allNull, human_history_durability: null }, legacyOnly);
+    expect(clear.humanProtection).toMatchObject({
+      data: allNull, historyDurability: null, historyIdentifiesHuman: false,
+    });
+
+    const replacement = hydrate(start, snapshot({ ...allNull, id: "new-run" }), "new-run");
+    expect(replacement.humanProtection).toMatchObject({
+      runId: "new-run", data: allNull, historyDurability: null, historyIdentifiesHuman: false,
+    });
+  });
+});

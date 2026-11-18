@@ -1,6 +1,7 @@
 import { act, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { RoastHistoryRefusalError } from "@/lib/api";
 import type { RoastPhase, SseEvent } from "@/lib/types";
 import {
   useFrameDrain,
@@ -74,7 +75,10 @@ function Probe({
 beforeEach(() => {
   FakeEventSource.last = null;
 });
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 describe("useRoastStream", () => {
   it("hydrates phase from the snapshot before opening the stream", async () => {
@@ -596,6 +600,7 @@ describe("run-bound HUMAN disclosure", () => {
     delete window.__lastEventId;
     const fetchSnapshot = vi.fn(async (id: string) => ({
       id, agent_phase: "operator_recovery_required" as const, ...withheld,
+      human_history_durability: "complete" as const,
     }));
     const { result, rerender } = renderHook(
       ({ currentRun }) => useRoastStream(currentRun, {
@@ -612,15 +617,20 @@ describe("run-bound HUMAN disclosure", () => {
     act(() => stream.emit("phase_changed", {
       phase: "operator_recovery_required", enabled_actions: ["emergency_stop"],
     }, 41));
-    act(() => stream.emit("heartbeat", { run_id: runId, ...outcomeUnknown }, 41));
+    act(() => stream.emit("heartbeat", {
+      run_id: runId, ...outcomeUnknown, human_history_durability: "incomplete",
+    }, 41));
     expect(result.current.humanProtection).toEqual(outcomeUnknown);
+    expect(result.current.humanHistoryDurability).toBe("incomplete");
     expect(result.current.lastEvent?.id).toBeNull();
     expect(result.current.enabledActions).toEqual(["emergency_stop"]);
 
     act(() => {
       stream.emit("heartbeat", {}, 41);
       stream.emit("heartbeat", null, 41);
-      stream.emit("heartbeat", { run_id: "foreign", ...clear }, 41);
+      stream.emit("heartbeat", {
+        run_id: "foreign", ...clear, human_history_durability: "unavailable",
+      }, 41);
       stream.emit("heartbeat", { run_id: runId, human_endpoint: null }, 41);
       stream.emit("heartbeat", {
         run_id: runId, ...clear, physical_intervention_required: "false",
@@ -628,18 +638,27 @@ describe("run-bound HUMAN disclosure", () => {
       stream.emit("recovery_required", { endpoint: "withheld", ...withheld }, 42);
     });
     expect(result.current.humanProtection).toEqual(outcomeUnknown);
-    act(() => stream.emit("heartbeat", { run_id: runId, ...withheld }, 99));
+    expect(result.current.humanHistoryDurability).toBe("incomplete");
+    act(() => stream.emit("heartbeat", {
+      run_id: runId, ...withheld, human_history_durability: "delayed",
+    }, 99));
     expect(result.current.humanProtection).toEqual(withheld);
     expect(window.__lastEventId).toBe(42);
 
     act(() => stream.emit("run_completed", {}, 43));
     expect(result.current.humanProtection).toEqual(withheld);
-    act(() => stream.emit("heartbeat", { run_id: runId, ...clear }, 43));
+    act(() => stream.emit("heartbeat", {
+      run_id: runId, ...clear, human_history_durability: null,
+    }, 43));
     expect(result.current.humanProtection).toEqual(clear);
 
     act(() => stream.error());
-    act(() => stream.emit("heartbeat", { run_id: runId, ...outcomeUnknown }, 99));
+    act(() => stream.emit("heartbeat", {
+      run_id: runId, ...outcomeUnknown, human_history_durability: "unavailable",
+    }, 99));
     expect(result.current.humanProtection).toEqual(clear);
+    expect(result.current.humanHistoryDurability).toBeNull();
+    expect(result.current.historyIdentifiesHuman).toBe(false);
     await act(async () => vi.advanceTimersByTimeAsync(1000));
     expect(FakeEventSource.last?.url).toContain("last_event_id=43");
     expect(result.current.humanProtection).toEqual(withheld);
@@ -651,7 +670,124 @@ describe("run-bound HUMAN disclosure", () => {
     rerender({ currentRun: "human-2" });
     expect(result.current.humanProtection).toBeNull();
     await act(async () => {});
-    act(() => reconnect.emit("heartbeat", { run_id: runId, ...outcomeUnknown }, 44));
+    act(() => reconnect.emit("heartbeat", {
+      run_id: runId, ...outcomeUnknown, human_history_durability: "unavailable",
+    }, 44));
     expect(result.current.humanProtection).toEqual(withheld);
+    expect(result.current.humanHistoryDurability).toBe("complete");
+  });
+});
+
+describe("run history refusal", () => {
+  const runId = "history-run";
+  const allNull = {
+    human_endpoint: null,
+    human_command_disposition: null,
+    physical_intervention_required: null,
+    emergency_fallback_disclosure: null,
+  };
+  function reply(body: object, status = 200) {
+    return new Response(JSON.stringify(body), { status });
+  }
+
+  const recovery = {
+    id: runId,
+    agent_phase: "operator_recovery_required",
+    enabled_actions: ["emergency_stop"],
+    ...allNull,
+  };
+
+  it("replaces complete after failure without rebasing phase, actions or the resume cursor", async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(reply({ ...recovery, human_history_durability: "complete" }))
+      .mockResolvedValueOnce(reply({ detail: "HUMAN history is temporarily unavailable" }, 503))
+      .mockResolvedValueOnce(reply({
+        ...allNull,
+        detail: "HUMAN history is temporarily unavailable",
+        human_history_durability: "unavailable",
+        human_endpoint: "issued",
+        agent_phase: "cooling",
+        enabled_actions: ["start_cooling"],
+        start_owned: true,
+      }, 503))
+      .mockResolvedValueOnce(reply({ ...recovery, human_history_durability: "delayed" }));
+    vi.stubGlobal("fetch", fetch);
+    const createEventSource = vi.fn((url: string) => new FakeEventSource(url));
+    const { result } = renderHook(() => useRoastStream(runId, { createEventSource }));
+    await act(async () => {});
+    const stream = FakeEventSource.last!;
+    expect(result.current.humanHistoryDurability).toBe("complete");
+    act(() => stream.emit("phase_changed", {
+      phase: "operator_recovery_required",
+      enabled_actions: ["drop_beans", "emergency_stop"],
+    }, 75));
+    act(() => stream.error());
+
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(result.current).toMatchObject({
+      humanHistoryDurability: null,
+      historyIdentifiesHuman: true,
+      enabledActions: ["drop_beans", "emergency_stop"],
+      phase: "operator_recovery_required",
+    });
+    expect(createEventSource).toHaveBeenCalledTimes(1);
+
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(result.current).toMatchObject({
+      humanProtection: allNull,
+      humanHistoryDurability: "unavailable",
+      historyIdentifiesHuman: true,
+      enabledActions: ["drop_beans", "emergency_stop"],
+      phase: "operator_recovery_required",
+    });
+    expect(createEventSource).toHaveBeenCalledTimes(1);
+
+    await act(async () => vi.advanceTimersByTimeAsync(4000));
+    expect(createEventSource).toHaveBeenCalledTimes(2);
+    expect(FakeEventSource.last?.url).toContain("last_event_id=75");
+    expect(result.current).toMatchObject({
+      humanHistoryDurability: "delayed",
+      enabledActions: ["emergency_stop"],
+      phase: "operator_recovery_required",
+    });
+  });
+
+  it("ignores wrong-run and obsolete same-run failures through a run replacement", async () => {
+    let refuseFirstRequest!: (response: Response) => void;
+    const firstRequest = new Promise<Response>((resolve) => { refuseFirstRequest = resolve; });
+    const fetch = vi.fn()
+      .mockReturnValueOnce(firstRequest)
+      .mockResolvedValueOnce(reply({ ...recovery, id: "replacement" }))
+      .mockResolvedValueOnce(reply({ ...recovery, human_history_durability: "delayed" }));
+    vi.stubGlobal("fetch", fetch);
+    const createEventSource = vi.fn((url: string) => new FakeEventSource(url));
+    const { result, rerender } = renderHook(({ id }) => useRoastStream(id, { createEventSource }), {
+      initialProps: { id: runId },
+    });
+    rerender({ id: "replacement" });
+    await act(async () => {});
+    expect(result.current.historyIdentifiesHuman).toBe(false);
+    rerender({ id: runId });
+    await act(async () => {});
+    expect(result.current.humanHistoryDurability).toBe("delayed");
+
+    await act(async () => refuseFirstRequest(reply({ human_history_durability: "unknown" }, 503)));
+    expect(result.current.humanHistoryDurability).toBe("delayed");
+    expect(createEventSource).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not apply a typed refusal for a different request's run", async () => {
+    const createEventSource = vi.fn();
+    const { result } = renderHook(() => useRoastStream(runId, {
+      createEventSource,
+      fetchSnapshot: async () => {
+        throw new RoastHistoryRefusalError("Unavailable", undefined, "another-run", "unavailable");
+      },
+    }));
+    await act(async () => {});
+    expect(result.current.humanHistoryDurability).toBeNull();
+    expect(result.current.historyIdentifiesHuman).toBe(false);
+    expect(createEventSource).not.toHaveBeenCalled();
   });
 });

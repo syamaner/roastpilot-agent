@@ -768,13 +768,11 @@ export type HumanEndpointProjection = (typeof HUMAN_ENDPOINT_DISPOSITIONS)[numbe
 export const HUMAN_COMMAND_DISPOSITIONS = ["settled", "unknown"] as const;
 export type HumanCommandProjection = (typeof HUMAN_COMMAND_DISPOSITIONS)[number];
 
-/** Explicit null clears the live disclosure. */
-export type HumanHistoryDurability =
-  | "complete"
-  | "delayed"
-  | "incomplete"
-  | "unknown"
-  | "unavailable";
+export const HUMAN_HISTORY_DURABILITIES = [
+  "complete", "delayed", "incomplete", "unknown", "unavailable",
+] as const;
+export type HumanHistoryDurability = (typeof HUMAN_HISTORY_DURABILITIES)[number];
+export type HumanHistoryRefusal = Extract<HumanHistoryDurability, "unknown" | "unavailable">;
 
 export interface HumanProtectionProjection {
   human_endpoint: HumanEndpointProjection | null;

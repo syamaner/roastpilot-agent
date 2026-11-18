@@ -1,7 +1,7 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { hydrate, initialRoastStreamState } from "@/hooks/roastStreamReducer";
+import { applyEvent, hydrate, initialRoastStreamState } from "@/hooks/roastStreamReducer";
 import type { HumanProtectionProjection, OperatorAction } from "@/lib/types";
 
 import { RecoveryModal } from "./RecoveryModal";
@@ -431,6 +431,65 @@ describe("recovery disclosure copy", () => {
 
     expectConservativeWording();
     expect(screen.queryByRole("region", { name: "Human-mode protection" })).toBeNull();
+  });
+
+  it("updates one history row without changing dialog focus or server-owned recovery actions", () => {
+    const runId = "recovering-run";
+    let stream = hydrate(initialRoastStreamState, {
+      ...AUTOMATIC_PROTECTION,
+      id: runId,
+      agent_phase: "operator_recovery_required",
+      enabled_actions: actions,
+      human_history_durability: "complete",
+    });
+    const onAction = vi.fn();
+    const modal = () => (
+      <RecoveryModal
+        open
+        {...READOUT}
+        humanProtection={stream.humanProtection?.data}
+        humanHistoryDurability={stream.humanProtection?.historyDurability}
+        historyIdentifiesHuman={stream.humanProtection?.historyIdentifiesHuman}
+        enabledActions={stream.enabledActions}
+        onAction={onAction}
+      />
+    );
+    const { rerender } = render(modal());
+    const dialog = within(screen.getByRole("dialog"));
+    const cooling = dialog.getByRole("button", { name: "Start Cooling" });
+    cooling.focus();
+    fireEvent.click(cooling);
+    expect(dialog.getByText("Run history complete")).toBeVisible();
+    expectConservativeWording();
+
+    function receiveHeartbeat(data: object) {
+      stream = applyEvent(stream, { event: "heartbeat", data: {
+        run_id: runId, ...AUTOMATIC_PROTECTION, ...data,
+      } }, runId);
+      rerender(modal());
+    }
+
+    receiveHeartbeat({ human_history_durability: "incomplete" });
+    const disclosure = dialog.getByRole("region", { name: "Human-mode protection" });
+    expect(within(disclosure).getByRole("term")).toHaveTextContent("History durability");
+    expect(within(disclosure).getByRole("definition")).toHaveTextContent("Run history incomplete");
+    expect(dialog.getAllByText("History durability")).toHaveLength(1);
+    expect(cooling).toHaveFocus();
+
+    receiveHeartbeat({});
+    expect(dialog.queryByText("History durability")).toBeNull();
+    expectConservativeWording();
+    expect(cooling).toHaveFocus();
+    expect(cooling).toBeEnabled();
+    expect(dialog.queryByRole("button", { name: "Drop Beans Now" })).toBeNull();
+    expect(dialog.queryByText(/cooling confirmed|beans dropped|evacuation confirmed/i)).toBeNull();
+    fireEvent.click(cooling);
+    fireEvent.click(dialog.getByRole("button", { name: "Emergency Stop" }));
+    expect(onAction.mock.calls).toEqual([["start_cooling"], ["start_cooling"], ["emergency_stop"]]);
+
+    receiveHeartbeat({ human_history_durability: null });
+    expect(dialog.queryByText("History durability")).toBeNull();
+    expect(dialog.getByText("Heat (locked)")).toBeVisible();
   });
 
   it("discloses only positive HUMAN fields and keeps acknowledge neutral", () => {

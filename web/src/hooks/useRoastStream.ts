@@ -15,8 +15,10 @@
 
 import { useEffect, useReducer, useRef, useState } from "react";
 
-import { api } from "@/lib/api";
+import { api, RoastHistoryRefusalError } from "@/lib/api";
 import type {
+  HumanHistoryDurability,
+  HumanHistoryRefusal,
   HumanProtectionProjection,
   OperatorAction,
   RoastPhase,
@@ -26,6 +28,7 @@ import type {
 } from "@/lib/types";
 import {
   applyEvent,
+  failHydration,
   hydrate,
   initialRoastStreamState,
   type RoastStreamState,
@@ -68,6 +71,8 @@ export interface UseRoastStreamResult {
   telemetry: TelemetryEventData | null;
   enabledActions: OperatorAction[] | null;
   humanProtection: HumanProtectionProjection | null;
+  humanHistoryDurability: HumanHistoryDurability | null;
+  historyIdentifiesHuman: boolean;
   /**
    * The most recent raw frame. CONVENIENCE ONLY — it is a single slot and is
    * LOSSY under a burst: when several frames arrive in one React batch (e.g. a
@@ -96,6 +101,7 @@ const DEFAULT_MAX_BACKOFF = 30;
 
 type Action =
   | { kind: "hydrate"; snapshot: StreamSnapshot; runId: string }
+  | { kind: "hydrateFailed"; runId: string; refusal?: HumanHistoryRefusal }
   | { kind: "event"; event: SseEvent; runId: string }
   | { kind: "reset" };
 
@@ -111,6 +117,9 @@ function reduce(state: RoastStreamState, action: Action): RoastStreamState {
   }
   if (action.kind === "hydrate") {
     return hydrate(state, action.snapshot, action.runId);
+  }
+  if (action.kind === "hydrateFailed") {
+    return failHydration(state, action.runId, action.refusal);
   }
   return applyEvent(state, action.event, action.runId);
 }
@@ -219,8 +228,13 @@ export function useRoastStream(
           dispatch({ kind: "hydrate", snapshot, runId });
           openStream();
         })
-        .catch(() => {
-          if (!cancelled) scheduleReconnect();
+        .catch((error: unknown) => {
+          if (cancelled) return;
+          const refusal = error instanceof RoastHistoryRefusalError && error.runId === runId
+            ? error.historyDurability
+            : undefined;
+          dispatch({ kind: "hydrateFailed", runId, refusal });
+          scheduleReconnect();
         });
     };
 
@@ -315,12 +329,15 @@ export function useRoastStream(
     };
   }, [runId, heartbeat, maxBackoff]);
 
+  const protection = state.humanProtection?.runId === runId ? state.humanProtection : null;
   return {
     status,
     phase: state.phase,
     telemetry: state.telemetry,
     enabledActions: state.enabledActions,
-    humanProtection: state.humanProtection?.runId === runId ? state.humanProtection.data : null,
+    humanProtection: protection?.data ?? null,
+    humanHistoryDurability: protection?.historyDurability ?? null,
+    historyIdentifiesHuman: protection?.historyIdentifiesHuman ?? false,
     lastEvent,
     frames: framesRef.current,
     frameCount,

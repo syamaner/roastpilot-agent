@@ -63,3 +63,31 @@ describe("HumanProtectionDisclosure state labels", () => {
     expect(region.queryByRole("definition")).toBeNull();
   });
 });
+
+describe("run history durability disclosure", () => {
+  it.each([
+    ["complete", "Run history complete"],
+    ["delayed", "Run history recorded late"],
+    ["incomplete", "Run history incomplete"],
+    ["unknown", "Run history status unknown"],
+    ["unavailable", "Run history unavailable"],
+  ] as const)("shows %s as a single accessible history term", (status, label) => {
+    render(<HumanProtectionDisclosure protection={null} historyDurability={status} />);
+
+    const region = screen.getByRole("region", { name: "Human-mode protection" });
+    expect(region).toHaveAttribute("aria-live", "polite");
+    expect(disclosure().getByRole("term")).toHaveTextContent("History durability");
+    expect(disclosure().getByRole("definition")).toHaveTextContent(label);
+    expect(region).not.toHaveTextContent(physicalSuccess);
+    expect(region).not.toHaveTextContent(/command disposition|physical intervention required/i);
+  });
+
+  it("omits the history term on an explicit clear while keeping legacy evidence", () => {
+    render(<HumanProtectionDisclosure
+      protection={{ ...emptyProjection, human_endpoint: "withheld" }}
+      historyDurability={null}
+    />);
+    expect(disclosure().getByText("Drop withheld")).toBeVisible();
+    expect(disclosure().queryByText("History durability")).toBeNull();
+  });
+});

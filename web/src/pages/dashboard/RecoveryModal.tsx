@@ -19,6 +19,7 @@ import { cn } from "@/lib/cn";
 import type {
   ClosureOnlyClearanceResult,
   EndRecoveredRunResult,
+  HumanHistoryDurability,
   HumanProtectionProjection,
   OperatorAction,
 } from "@/lib/types";
@@ -29,6 +30,8 @@ export interface RecoveryModalProps {
   /** When false, the modal is not rendered (driven by phase === recovery). */
   open: boolean;
   humanProtection?: HumanProtectionProjection | null;
+  humanHistoryDurability?: HumanHistoryDurability | null;
+  historyIdentifiesHuman?: boolean;
   lastResult?: OperatorActionResultView | null;
   /** Current hardware readout from the still-flowing telemetry. */
   beanTempC: number | null;
@@ -72,6 +75,8 @@ const RECOVERY_ACTIONS: {
 export function RecoveryModal({
   open,
   humanProtection,
+  humanHistoryDurability,
+  historyIdentifiesHuman = false,
   lastResult,
   beanTempC,
   envTempC,
@@ -144,7 +149,8 @@ export function RecoveryModal({
 
   if (!open) return null;
   const humanDisclosureAvailable = hasHumanProtection(humanProtection);
-  const legacyTextAllowed = humanProtection != null && !humanDisclosureAvailable;
+  const legacyTextAllowed =
+    humanProtection != null && !humanDisclosureAvailable && !historyIdentifiesHuman;
   // Emergency stop is always available (mirrors evaluate_emergency_stop); the
   // rest are gated by the server mirror.
   const enabled = new Set(enabledActions ?? []);
@@ -290,7 +296,7 @@ export function RecoveryModal({
           </aside>
         )}
 
-        <HumanProtectionDisclosure protection={humanProtection} />
+        <HumanProtectionDisclosure protection={humanProtection} historyDurability={humanHistoryDurability} />
 
         {showClosureOnlyConfirmation && (
           <section

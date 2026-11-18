@@ -24,6 +24,7 @@ import type {
   FaultControlsActionRequest,
   FaultControlsActionResult,
   HealthResponse,
+  HumanHistoryRefusal,
   HardwareClearAcknowledgementRequest,
   HardwareClearAcknowledgementResult,
   InitializeSafetyRecordResult,
@@ -43,6 +44,7 @@ import type {
 } from "./types";
 import { parseCatalogueRecommendationList } from "./types";
 import { parseStrandedFaultRetirementResult } from "./faultControls";
+import { readHumanHistoryDurability } from "./humanProtection";
 
 /** API base. Empty string in the browser: requests are same-origin and Vite
  *  proxies `/api` to the agent in dev. Overridable for tests/SSR. */
@@ -63,17 +65,25 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/** A verified history refusal for the requested roast detail only. */
+export class RoastHistoryRefusalError extends ApiError {
+  constructor(
+    detail: string,
+    code: string | undefined,
+    readonly runId: string,
+    readonly historyDurability: HumanHistoryRefusal,
+  ) {
+    super(503, detail, code);
+  }
+}
+
+async function request<T>(path: string, init?: RequestInit, roastDetailRunId?: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers: { "Content-Type": "application/json", ...init?.headers },
   });
   if (!response.ok) {
-    throw new ApiError(
-      response.status,
-      await readDetail(response),
-      response.headers.get("X-RoastPilot-Conflict-Code") ?? undefined,
-    );
+    throw await readError(response, roastDetailRunId);
   }
   // 204/empty bodies never occur on these routes, but guard anyway.
   const text = await response.text();
@@ -96,13 +106,27 @@ async function healthRequest(): Promise<HealthResponse> {
   }
 }
 
-async function readDetail(response: Response): Promise<string> {
+async function readError(response: Response, roastDetailRunId?: string): Promise<ApiError> {
+  const code = response.headers.get("X-RoastPilot-Conflict-Code") ?? undefined;
   try {
-    const body = (await response.json()) as { detail?: unknown };
-    if (typeof body.detail === "string") return body.detail;
-    return JSON.stringify(body.detail ?? body);
+    const body = (await response.json()) as {
+      detail?: unknown;
+      run_id?: unknown;
+      human_history_durability?: unknown;
+    };
+    const detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail ?? body);
+    if (
+      response.status === 503 && roastDetailRunId !== undefined &&
+      (!Object.hasOwn(body, "run_id") || body.run_id === roastDetailRunId)
+    ) {
+      const durability = readHumanHistoryDurability(body.human_history_durability);
+      if (durability === "unknown" || durability === "unavailable") {
+        return new RoastHistoryRefusalError(detail, code, roastDetailRunId, durability);
+      }
+    }
+    return new ApiError(response.status, detail, code);
   } catch {
-    return response.statusText;
+    return new ApiError(response.status, response.statusText, code);
   }
 }
 
@@ -121,7 +145,8 @@ export const api = {
   history: () => request<RoastHistory>("/api/roasts"),
 
   /** `GET /api/roasts/{id}` — run detail (the SSE hydrate snapshot). */
-  roast: (runId: string) => request<RoastDetail>(`/api/roasts/${runId}`),
+  roast: (runId: string) =>
+    request<RoastDetail>(`/api/roasts/${encodeURIComponent(runId)}`, undefined, runId),
 
   /** `GET /api/roasts/{id}/telemetry` — downsampled snapshot series. */
   telemetry: (runId: string, downsample = 1) =>
